@@ -135,18 +135,18 @@ ORDER BY similarity LIMIT 25
 
 ## What Makes CoordiNode Different
 
-| | CoordiNode | Neo4j CE | MongoDB | Weaviate | Elasticsearch |
+| | CoordiNode | Neo4j CE | MongoDB | SurrealDB | Pinecone |
 |---|:---:|:---:|:---:|:---:|:---:|
-| Graph + vector + text in one query | **Yes** | No | Partial ($graphLookup + Atlas) | No graph | No graph |
-| Nested document properties | **Yes** (dot-notation) | No (flat props) | Yes | No graph | Yes |
-| Vector search on edges | **Yes** | No | No | N/A | N/A |
-| Spatial queries | **Yes** | Via APOC | Yes | No | Yes |
+| Graph + vector + text in one query | **Yes** | No | Partial ($graphLookup + Atlas) | Partial (no FTS in graph) | No graph |
+| Nested document properties | **Yes** (dot-notation) | No (flat props) | Yes | Yes | No |
+| Vector search on edges | **Yes** | No | No | No | N/A |
+| Spatial queries | **Yes** | Via APOC | Yes | No | No |
 | Encrypted search | **Yes** | No | No | No | No |
 | Time-travel queries | **Yes** | No | No | No | No |
 | Built-in query advisor | **Yes** | No | Yes (explain) | No | No |
-| OpenCypher queries | **Yes** | Yes | No | No | No |
-| Language | Rust (zero GC) | Java (JVM) | C++ | Go | Java (JVM) |
-| License | AGPL-3.0 | GPL-3.0 | SSPL | BSD-3 | SSPL |
+| OpenCypher queries | **Yes** | Yes | No | SurrealQL | No |
+| Language | Rust (zero GC) | Java (JVM) | C++ | Rust | Cloud-only |
+| License | AGPL-3.0 | GPL-3.0 | SSPL | BSL-1.1 | Proprietary |
 
 ## Full-Text Search: 23+ Languages
 
