@@ -302,6 +302,7 @@ fn optimize_edge_vector_search(op: LogicalOp) -> LogicalOp {
             function,
             less_than,
             threshold,
+            decay_field,
         } => {
             // First, recursively optimize children
             let input = Box::new(optimize_edge_vector_search(*input));
@@ -374,6 +375,7 @@ fn optimize_edge_vector_search(op: LogicalOp) -> LogicalOp {
                 function,
                 less_than,
                 threshold,
+                decay_field,
             }
         }
 
@@ -920,7 +922,70 @@ fn try_extract_vector_filter(expr: &Expr, input: LogicalOp) -> Option<LogicalOp>
                 function: name.clone(),
                 less_than,
                 threshold,
+                decay_field: None,
             });
+        }
+
+        // Detect decay-weighted vector pattern:
+        //   vector_fn(a, b) * decay_expr > threshold
+        //   decay_expr * vector_fn(a, b) > threshold
+        if let Expr::BinaryOp {
+            left: mul_left,
+            op: BinaryOperator::Mul,
+            right: mul_right,
+        } = fn_expr
+        {
+            // Try both orderings: vector_fn * decay or decay * vector_fn
+            let (vec_fn, decay_expr) = if matches!(mul_left.as_ref(), Expr::FunctionCall { .. }) {
+                (mul_left.as_ref(), mul_right.as_ref())
+            } else if matches!(mul_right.as_ref(), Expr::FunctionCall { .. }) {
+                (mul_right.as_ref(), mul_left.as_ref())
+            } else {
+                return None;
+            };
+
+            // decay_expr must be a property reference (e.g., n._recency), not a literal.
+            // Reject literal multipliers like `vector_similarity(...) * 0.5` — those
+            // should stay in generic Filter, not be treated as decay fields.
+            let is_property_ref =
+                matches!(decay_expr, Expr::PropertyAccess { .. } | Expr::Variable(_));
+            if !is_property_ref {
+                return None;
+            }
+
+            if let Expr::FunctionCall { name, args, .. } = vec_fn {
+                let is_vector_fn = matches!(
+                    name.as_str(),
+                    "vector_distance" | "vector_similarity" | "vector_dot" | "vector_manhattan"
+                );
+                if !is_vector_fn || args.len() != 2 {
+                    return None;
+                }
+
+                let threshold = match threshold_expr {
+                    Expr::Literal(Value::Float(f)) => *f,
+                    Expr::Literal(Value::Int(i)) => *i as f64,
+                    _ => return None,
+                };
+
+                let query_is_constant = matches!(
+                    &args[1],
+                    Expr::Literal(_) | Expr::Parameter(_) | Expr::List(_)
+                );
+                if !query_is_constant {
+                    return None;
+                }
+
+                return Some(LogicalOp::VectorFilter {
+                    input: Box::new(input),
+                    vector_expr: args[0].clone(),
+                    query_vector: args[1].clone(),
+                    function: name.clone(),
+                    less_than,
+                    threshold,
+                    decay_field: Some(decay_expr.clone()),
+                });
+            }
         }
     }
     None
