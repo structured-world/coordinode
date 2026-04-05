@@ -1837,6 +1837,9 @@ fn build_target_row(
     Ok(Some(out_row))
 }
 
+/// Collected OCC read-set keys from parallel processing (G067).
+type OccReadKeys = Mutex<Vec<(Partition, Vec<u8>)>>;
+
 /// Read-only context extracted from `ExecutionContext` for parallel processing.
 /// All fields are `Send + Sync`, enabling safe rayon parallelism.
 struct ParallelCtx<'a> {
@@ -1845,6 +1848,11 @@ struct ParallelCtx<'a> {
     shard_id: u16,
     mvcc_snapshot: Option<StorageSnapshot>,
     chunk_size: usize,
+    /// OCC read-set keys collected during parallel processing (G067).
+    /// When `Some`, parallel workers push `(Partition, key)` for each storage
+    /// read so that the caller can merge them into `ExecutionContext::mvcc_read_set`
+    /// after the parallel block. `None` when MVCC oracle is inactive (legacy mode).
+    occ_read_keys: Option<OccReadKeys>,
 }
 
 /// Process target nodes in parallel using rayon when fan-out exceeds threshold.
@@ -1854,7 +1862,10 @@ struct ParallelCtx<'a> {
 /// traversal because:
 /// - Target nodes are not being modified in the current transaction
 /// - RYOW (read-your-own-writes) is irrelevant for reading OTHER nodes
-/// - OCC read-set tracking is skipped (traversal targets don't need conflict detection)
+///
+/// OCC read-set tracking (G067): when `pctx.occ_read_keys` is `Some`, all
+/// read keys are collected into the `Mutex<Vec>` for the caller to merge into
+/// `ExecutionContext::mvcc_read_set` after the parallel block completes.
 fn process_targets_parallel(
     neighbors: &[(u64, u64, usize)],
     input_row: &Row,
@@ -1884,6 +1895,14 @@ fn process_targets_parallel(
                     pctx.engine.get(Partition::Node, &target_key).ok()?
                 };
                 let bytes = bytes?;
+
+                // Track Node key in OCC read-set (G067)
+                if let Some(ref keys) = pctx.occ_read_keys {
+                    if let Ok(mut guard) = keys.lock() {
+                        guard.push((Partition::Node, target_key.to_vec()));
+                    }
+                }
+
                 let target_record = NodeRecord::from_msgpack(&bytes).ok()?;
 
                 // Label filter
@@ -1948,6 +1967,12 @@ fn process_targets_parallel(
                             } else {
                                 pctx.engine.get(Partition::EdgeProp, &ep_key).ok().flatten()
                             };
+                            // Track EdgeProp key in OCC read-set (G067)
+                            if let Some(ref keys) = pctx.occ_read_keys {
+                                if let Ok(mut guard) = keys.lock() {
+                                    guard.push((Partition::EdgeProp, ep_key));
+                                }
+                            }
                             if let Some(ep_bytes) = ep_bytes {
                                 if let Ok(prop_map) =
                                     rmp_serde::from_slice::<Vec<(u32, Value)>>(&ep_bytes)
@@ -2026,6 +2051,11 @@ fn execute_single_hop_traverse(
                 shard_id: ctx.shard_id,
                 mvcc_snapshot: ctx.mvcc_snapshot,
                 chunk_size: ctx.adaptive.parallel_chunk_size,
+                occ_read_keys: if ctx.mvcc_oracle.is_some() {
+                    Some(Mutex::new(Vec::new()))
+                } else {
+                    None
+                },
             };
             let src_raw = source_id.as_raw();
             let with_src: Vec<(u64, u64, usize)> = neighbors
@@ -2033,6 +2063,12 @@ fn execute_single_hop_traverse(
                 .map(|&(tgt, et_idx)| (src_raw, tgt, et_idx))
                 .collect();
             let parallel_rows = process_targets_parallel(&with_src, row, params, &pctx);
+            // Merge OCC read keys from parallel workers (G067)
+            if let Some(ref keys_mutex) = pctx.occ_read_keys {
+                if let Ok(keys) = keys_mutex.lock() {
+                    ctx.mvcc_read_set.extend(keys.iter().cloned());
+                }
+            }
             results.extend(parallel_rows);
         } else {
             // Sequential path for normal fan-out
@@ -2171,8 +2207,19 @@ fn execute_varlen_traverse(
                     shard_id: ctx.shard_id,
                     mvcc_snapshot: ctx.mvcc_snapshot,
                     chunk_size: ctx.adaptive.parallel_chunk_size,
+                    occ_read_keys: if ctx.mvcc_oracle.is_some() {
+                        Some(Mutex::new(Vec::new()))
+                    } else {
+                        None
+                    },
                 };
                 let parallel_rows = process_targets_parallel(&depth_neighbors, row, params, &pctx);
+                // Merge OCC read keys from parallel workers (G067)
+                if let Some(ref keys_mutex) = pctx.occ_read_keys {
+                    if let Ok(keys) = keys_mutex.lock() {
+                        ctx.mvcc_read_set.extend(keys.iter().cloned());
+                    }
+                }
                 results.extend(parallel_rows);
             } else {
                 for &(src_uid, tgt_uid, et_idx) in &depth_neighbors {
@@ -7738,5 +7785,220 @@ mod tests {
         super::collect_expr_vars(&expr, &mut vars);
         assert!(vars.contains(&"a".to_string()));
         assert!(vars.contains(&"b".to_string()));
+    }
+
+    // -- G067: Parallel path OCC read-set tracking --
+
+    #[test]
+    fn g067_parallel_traversal_populates_occ_read_set() {
+        // Verify that parallel traversal collects read keys into mvcc_read_set
+        // so OCC conflict detection works for write transactions on super-nodes.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::new(dir.path()),
+            oracle.clone(),
+        )
+        .expect("open with oracle");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new();
+
+        // Hub node with 10 targets (threshold=5 triggers parallel)
+        insert_node(
+            &engine,
+            1,
+            1,
+            "User",
+            &[("name", Value::String("Hub".into()))],
+            &mut interner,
+        );
+        for i in 2..=11u64 {
+            insert_node(
+                &engine,
+                1,
+                i,
+                "User",
+                &[("name", Value::String(format!("T{i}")))],
+                &mut interner,
+            );
+            insert_edge(&engine, "FOLLOWS", 1, i);
+        }
+
+        // Allocate a read timestamp and take a snapshot
+        let read_ts = oracle.next();
+        let snap = engine.snapshot_at(read_ts.as_raw());
+
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = read_ts;
+        ctx.mvcc_snapshot = snap;
+        ctx.adaptive.parallel_threshold = 5; // trigger parallel on 10 edges
+
+        let plan = LogicalPlan {
+            snapshot_ts: None,
+            vector_consistency: VectorConsistencyMode::default(),
+            root: LogicalOp::Traverse {
+                input: Box::new(LogicalOp::NodeScan {
+                    variable: "a".into(),
+                    labels: vec!["User".into()],
+                    property_filters: vec![(
+                        "name".into(),
+                        Expr::Literal(Value::String("Hub".into())),
+                    )],
+                }),
+                source: "a".into(),
+                edge_types: vec!["FOLLOWS".into()],
+                direction: Direction::Outgoing,
+                target_variable: "b".into(),
+                target_labels: vec![],
+                length: None,
+                edge_variable: None,
+                target_filters: vec![],
+                edge_filters: vec![],
+            },
+        };
+
+        let result = execute(&plan, &mut ctx).expect("execute");
+        assert_eq!(result.len(), 10, "should return all 10 targets");
+
+        // Verify parallel was triggered
+        assert!(
+            ctx.warnings.iter().any(|w| w.contains("parallel")),
+            "expected parallel activation, got: {:?}",
+            ctx.warnings,
+        );
+
+        // Verify OCC read-set contains Node keys for target nodes.
+        // The source node (Hub, id=1) is read via sequential mvcc_get in NodeScan,
+        // and 10 target nodes are read via parallel path — all should be tracked.
+        let node_read_keys: Vec<_> = ctx
+            .mvcc_read_set
+            .iter()
+            .filter(|(part, _)| *part == Partition::Node)
+            .collect();
+
+        // At least 10 target Node keys must be in read-set (from parallel path)
+        // plus 1 for the Hub node (from sequential NodeScan)
+        assert!(
+            node_read_keys.len() >= 10,
+            "expected ≥10 Node keys in OCC read-set (parallel targets), got {}",
+            node_read_keys.len(),
+        );
+
+        // Verify specific target keys are tracked
+        for target_id in 2..=11u64 {
+            let target_key = encode_node_key(1, NodeId::from_raw(target_id));
+            assert!(
+                ctx.mvcc_read_set
+                    .contains(&(Partition::Node, target_key.to_vec())),
+                "target node {target_id} should be in OCC read-set",
+            );
+        }
+    }
+
+    #[test]
+    fn g067_parallel_occ_detects_conflict_on_target_node() {
+        // End-to-end: parallel traversal reads target nodes, concurrent write
+        // modifies one target, OCC conflict detection catches it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::new(dir.path()),
+            oracle.clone(),
+        )
+        .expect("open with oracle");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new();
+
+        // Hub + 10 targets
+        insert_node(
+            &engine,
+            1,
+            1,
+            "User",
+            &[("name", Value::String("Hub".into()))],
+            &mut interner,
+        );
+        for i in 2..=11u64 {
+            insert_node(
+                &engine,
+                1,
+                i,
+                "User",
+                &[("name", Value::String(format!("T{i}")))],
+                &mut interner,
+            );
+            insert_edge(&engine, "FOLLOWS", 1, i);
+        }
+
+        // T1: Start read transaction
+        let read_ts = oracle.next();
+        let snap = engine.snapshot_at(read_ts.as_raw());
+
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = read_ts;
+        ctx.mvcc_snapshot = snap;
+        ctx.adaptive.parallel_threshold = 5;
+
+        let plan = LogicalPlan {
+            snapshot_ts: None,
+            vector_consistency: VectorConsistencyMode::default(),
+            root: LogicalOp::Traverse {
+                input: Box::new(LogicalOp::NodeScan {
+                    variable: "a".into(),
+                    labels: vec!["User".into()],
+                    property_filters: vec![(
+                        "name".into(),
+                        Expr::Literal(Value::String("Hub".into())),
+                    )],
+                }),
+                source: "a".into(),
+                edge_types: vec!["FOLLOWS".into()],
+                direction: Direction::Outgoing,
+                target_variable: "b".into(),
+                target_labels: vec![],
+                length: None,
+                edge_variable: None,
+                target_filters: vec![],
+                edge_filters: vec![],
+            },
+        };
+
+        let result = execute(&plan, &mut ctx).expect("execute");
+        assert_eq!(result.len(), 10);
+
+        // T2: Concurrent transaction modifies target node 5 (after T1's read_ts)
+        let _write_ts = oracle.next();
+        let mut modified_record = NodeRecord::new("User");
+        // Use field_id 0 directly — "name" was interned first by insert_node,
+        // so it has id 0. Avoids borrowing interner while ctx is alive.
+        modified_record.set(0, Value::String("T5-modified".into()));
+        let target5_key = encode_node_key(1, NodeId::from_raw(5));
+        engine
+            .put(
+                Partition::Node,
+                &target5_key,
+                &modified_record.to_msgpack().expect("serialize"),
+            )
+            .expect("concurrent write");
+
+        // T1: Add a dummy write so mvcc_flush doesn't skip conflict check
+        // (read-only transactions return early without OCC check)
+        let dummy_key = encode_node_key(1, NodeId::from_raw(999));
+        ctx.mvcc_write_buffer
+            .insert((Partition::Node, dummy_key), Some(b"dummy".to_vec()));
+
+        // T1: OCC conflict check via mvcc_flush should detect the write to target 5
+        let conflict = ctx.mvcc_flush();
+        assert!(
+            conflict.is_err(),
+            "OCC should detect conflict on target node 5 modified after read_ts",
+        );
+        let err_msg = format!("{}", conflict.unwrap_err());
+        assert!(
+            err_msg.contains("OCC conflict"),
+            "expected OCC conflict error, got: {err_msg}",
+        );
     }
 }
