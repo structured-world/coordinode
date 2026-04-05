@@ -70,6 +70,9 @@ aes-gcm = "0.10"
 hmac = "0.12"
 rand = "0.8"
 
+# Parallelism
+rayon = "1.10"
+
 # Utilities
 bytes = "1"
 

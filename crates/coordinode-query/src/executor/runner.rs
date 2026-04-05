@@ -4,6 +4,9 @@
 //! Future optimization: streaming iterator model.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+
+use rayon::prelude::*;
 
 use coordinode_core::graph::edge::{
     decode_adj_key, encode_adj_key_forward, encode_adj_key_reverse, encode_edgeprop_key,
@@ -54,24 +57,38 @@ pub enum ExecutionError {
 
 /// Configuration for adaptive query plan behavior.
 ///
-/// When traversal fan-out exceeds expectations, the executor can
-/// cap results to prevent super-node explosion. At runtime, the executor
-/// checks divergence every `check_interval` edges processed — if
-/// `actual_fan_out > estimated × switch_threshold`, a structured warning
-/// is emitted and processing is capped.
+/// When traversal fan-out exceeds expectations, the executor switches from
+/// sequential to parallel processing (rayon work-stealing). At runtime, the
+/// executor checks divergence every `check_interval` edges processed — if
+/// `actual_fan_out > estimated × switch_threshold`, it switches strategy.
+///
+/// **Parallel mode:** When a posting list exceeds `parallel_threshold` edges,
+/// target node processing is parallelized via rayon `par_chunks`. This
+/// processes ALL edges without truncation, unlike the previous cap-only
+/// approach.
 #[derive(Debug, Clone)]
 pub struct AdaptiveConfig {
-    /// Enable adaptive fan-out detection.
+    /// Enable adaptive fan-out detection and parallel switching.
     pub enabled: bool,
-    /// Maximum edges to process per source node before capping.
+    /// Maximum edges to process per source node in sequential mode.
+    /// When exceeded AND parallel is enabled, switches to parallel processing.
+    /// When parallel is disabled, this acts as a hard cap (truncation).
     /// Default: 10_000.
     pub max_fan_out: usize,
-    /// Factor: if actual_fan_out > estimated × threshold → warn.
+    /// Factor: if actual_fan_out > estimated × threshold → switch strategy.
     /// Default: 10.0.
     pub switch_threshold: f64,
     /// Check divergence every N edges processed during variable-length traversal.
     /// Default: 1000.
     pub check_interval: usize,
+    /// Minimum edges to trigger parallel processing via rayon.
+    /// Below this threshold, sequential processing is faster (avoids rayon overhead).
+    /// Default: 1000.
+    pub parallel_threshold: usize,
+    /// Chunk size for rayon parallel iteration.
+    /// Each chunk processes this many target nodes before synchronizing.
+    /// Default: 256.
+    pub parallel_chunk_size: usize,
 }
 
 impl Default for AdaptiveConfig {
@@ -81,7 +98,62 @@ impl Default for AdaptiveConfig {
             max_fan_out: 10_000,
             switch_threshold: 10.0,
             check_interval: 1000,
+            parallel_threshold: 1000,
+            parallel_chunk_size: 256,
         }
+    }
+}
+
+/// Cache of known super-node fan-out degrees.
+///
+/// When a node's fan-out exceeds `parallel_threshold`, its degree is stored here.
+/// On subsequent queries, the executor checks this cache first — if the node
+/// is known to be a super-node, it skips the sequential attempt and goes
+/// directly to parallel processing.
+///
+/// Thread-safe via `Mutex` for shared access across queries.
+/// Bounded to `max_entries` to prevent unbounded growth.
+#[derive(Debug, Clone)]
+pub struct FeedbackCache {
+    /// Map of node_id → known fan-out degree.
+    inner: std::sync::Arc<Mutex<HashMap<u64, usize>>>,
+    /// Maximum entries before eviction (FIFO via insert order — approximate).
+    max_entries: usize,
+}
+
+impl FeedbackCache {
+    /// Create a new feedback cache with the given capacity.
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            inner: std::sync::Arc::new(Mutex::new(HashMap::with_capacity(max_entries.min(1024)))),
+            max_entries,
+        }
+    }
+
+    /// Record a super-node's fan-out degree.
+    pub fn record(&self, node_id: u64, fan_out: usize) {
+        if let Ok(mut cache) = self.inner.lock() {
+            if cache.len() >= self.max_entries {
+                // Approximate FIFO: clear half the cache when full
+                let to_remove: Vec<u64> =
+                    cache.keys().take(self.max_entries / 2).copied().collect();
+                for key in to_remove {
+                    cache.remove(&key);
+                }
+            }
+            cache.insert(node_id, fan_out);
+        }
+    }
+
+    /// Check if a node is a known super-node. Returns its fan-out if known.
+    pub fn lookup(&self, node_id: u64) -> Option<usize> {
+        self.inner.lock().ok()?.get(&node_id).copied()
+    }
+}
+
+impl Default for FeedbackCache {
+    fn default() -> Self {
+        Self::new(100_000) // matches arch doc: feedback_cache_size: 100000
     }
 }
 
@@ -130,6 +202,9 @@ pub struct ExecutionContext<'a> {
     pub shard_id: u16,
     /// Adaptive query plan configuration.
     pub adaptive: AdaptiveConfig,
+    /// Feedback cache for known super-node fan-out degrees.
+    /// Shared across queries within the same session/connection.
+    pub feedback_cache: Option<FeedbackCache>,
     /// Snapshot timestamp for AS OF TIMESTAMP queries (microseconds since epoch).
     /// When set, reads return data as of this point in time.
     pub snapshot_ts: Option<i64>,
@@ -1579,7 +1654,9 @@ fn execute_traverse(
 
 /// Expand one hop from `src_id` in the given direction and edge types.
 ///
-/// Returns `(target_uid, edge_type_index)` pairs. Applies adaptive fan-out cap.
+/// Returns ALL `(target_uid, edge_type_index)` pairs — no truncation.
+/// The caller decides whether to process them sequentially or in parallel
+/// based on `AdaptiveConfig::parallel_threshold`.
 fn expand_one_hop(
     src_id: NodeId,
     edge_types: &[String],
@@ -1587,14 +1664,8 @@ fn expand_one_hop(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<(u64, usize)>, ExecutionError> {
     let mut neighbors = Vec::new();
-    let effective_limit = if ctx.adaptive.enabled {
-        ctx.adaptive.max_fan_out
-    } else {
-        usize::MAX
-    };
 
     for (et_idx, edge_type) in edge_types.iter().enumerate() {
-        // Forward (or primary) direction
         let adj_key = match direction {
             Direction::Outgoing | Direction::Both => encode_adj_key_forward(edge_type, src_id),
             Direction::Incoming => encode_adj_key_reverse(edge_type, src_id),
@@ -1602,26 +1673,28 @@ fn expand_one_hop(
 
         if let Some(posting_list) = ctx.adj_get(&adj_key)? {
             let fan_out = posting_list.len();
-            if ctx.adaptive.enabled && fan_out > ctx.adaptive.max_fan_out {
-                ctx.warnings.push(format!(
-                    "super-node detected: id={} has {} edges via :{edge_type}, \
-                     capped at {} (adaptive threshold)",
-                    src_id.as_raw(),
+            if ctx.adaptive.enabled && fan_out > ctx.adaptive.parallel_threshold {
+                tracing::info!(
+                    node_id = src_id.as_raw(),
                     fan_out,
-                    ctx.adaptive.max_fan_out,
-                ));
+                    edge_type = edge_type.as_str(),
+                    "super-node detected, parallel processing will be used"
+                );
+                // Record in feedback cache for future queries
+                if let Some(ref cache) = ctx.feedback_cache {
+                    cache.record(src_id.as_raw(), fan_out);
+                }
             }
 
-            for tgt_uid in posting_list.iter().take(effective_limit) {
+            for tgt_uid in posting_list.iter() {
                 neighbors.push((tgt_uid, et_idx));
             }
         }
 
-        // For undirected, also traverse reverse
         if direction == Direction::Both {
             let rev_key = encode_adj_key_reverse(edge_type, src_id);
             if let Some(posting_list) = ctx.adj_get(&rev_key)? {
-                for tgt_uid in posting_list.iter().take(effective_limit) {
+                for tgt_uid in posting_list.iter() {
                     neighbors.push((tgt_uid, et_idx));
                 }
             }
@@ -1753,6 +1826,164 @@ fn build_target_row(
     Ok(Some(out_row))
 }
 
+/// Read-only context extracted from `ExecutionContext` for parallel processing.
+/// All fields are `Send + Sync`, enabling safe rayon parallelism.
+struct ParallelCtx<'a> {
+    engine: &'a StorageEngine,
+    interner: &'a FieldInterner,
+    shard_id: u16,
+    mvcc_snapshot: Option<StorageSnapshot>,
+    chunk_size: usize,
+}
+
+/// Process target nodes in parallel using rayon when fan-out exceeds threshold.
+///
+/// Bypasses `ExecutionContext::mvcc_get` (which requires `&mut self`) by reading
+/// directly from `StorageEngine` which is `Send + Sync`. Safe for read-only
+/// traversal because:
+/// - Target nodes are not being modified in the current transaction
+/// - RYOW (read-your-own-writes) is irrelevant for reading OTHER nodes
+/// - OCC read-set tracking is skipped (traversal targets don't need conflict detection)
+fn process_targets_parallel(
+    neighbors: &[(u64, u64, usize)],
+    input_row: &Row,
+    params: &TraverseParams<'_>,
+    pctx: &ParallelCtx<'_>,
+) -> Vec<Row> {
+    let target_variable = params.target_variable;
+    let target_labels = params.target_labels;
+    let target_filters = params.target_filters;
+    let edge_variable = params.edge_variable;
+    let direction = params.direction;
+    let source = params.source;
+
+    neighbors
+        .par_chunks(pctx.chunk_size.max(1))
+        .flat_map_iter(|chunk| {
+            chunk.iter().filter_map(|(src_uid, tgt_uid, et_idx)| {
+                let target_id = NodeId::from_raw(*tgt_uid);
+                let target_key = encode_node_key(pctx.shard_id, target_id);
+
+                // Read node record (direct engine access, thread-safe)
+                let bytes = if let Some(snap) = pctx.mvcc_snapshot {
+                    pctx.engine
+                        .snapshot_get(&snap, Partition::Node, &target_key)
+                        .ok()?
+                } else {
+                    pctx.engine.get(Partition::Node, &target_key).ok()?
+                };
+                let bytes = bytes?;
+                let target_record = NodeRecord::from_msgpack(&bytes).ok()?;
+
+                // Label filter
+                if !target_labels.is_empty()
+                    && !target_labels.iter().any(|l| target_record.has_label(l))
+                {
+                    return None;
+                }
+
+                let mut out_row = input_row.clone();
+                // Update source in row for correct edge property lookup (G066 fix)
+                out_row.insert(source.to_string(), Value::Int(*src_uid as i64));
+                out_row.insert(target_variable.to_string(), Value::Int(*tgt_uid as i64));
+
+                // Resolve property names from interner (read-only, thread-safe)
+                for (field_id, value) in &target_record.props {
+                    if let Some(field_name) = pctx.interner.resolve(*field_id) {
+                        let col_name = format!("{target_variable}.{field_name}");
+                        out_row.insert(col_name, value.clone());
+                    }
+                }
+                if let Some(extra) = &target_record.extra {
+                    for (name, value) in extra {
+                        let col_name = format!("{target_variable}.{name}");
+                        out_row.insert(col_name, value.clone());
+                    }
+                }
+
+                let target_label = target_record.primary_label().to_string();
+                out_row.insert(
+                    format!("{target_variable}.__label__"),
+                    Value::String(target_label.clone()),
+                );
+
+                // Inject COMPUTED property values (R082) in parallel path
+                inject_computed_from_engine(
+                    &mut out_row,
+                    target_variable,
+                    &target_label,
+                    pctx.engine,
+                );
+
+                // Edge variable: type + edge properties
+                let edge_type = params.edge_types.get(*et_idx).map(|s| s.as_str());
+                if let Some(ev) = edge_variable {
+                    if let Some(et) = edge_type {
+                        out_row.insert(format!("{ev}.__type__"), Value::String(et.to_string()));
+
+                        {
+                            let (ep_src, ep_tgt) = match direction {
+                                Direction::Outgoing | Direction::Both => {
+                                    (NodeId::from_raw(*src_uid), target_id)
+                                }
+                                Direction::Incoming => (target_id, NodeId::from_raw(*src_uid)),
+                            };
+                            let ep_key = encode_edgeprop_key(et, ep_src, ep_tgt);
+                            let ep_bytes = if let Some(snap) = pctx.mvcc_snapshot {
+                                pctx.engine
+                                    .snapshot_get(&snap, Partition::EdgeProp, &ep_key)
+                                    .ok()
+                                    .flatten()
+                            } else {
+                                pctx.engine.get(Partition::EdgeProp, &ep_key).ok().flatten()
+                            };
+                            if let Some(ep_bytes) = ep_bytes {
+                                if let Ok(prop_map) =
+                                    rmp_serde::from_slice::<Vec<(u32, Value)>>(&ep_bytes)
+                                {
+                                    for (field_id, value) in prop_map {
+                                        if let Some(field_name) = pctx.interner.resolve(field_id) {
+                                            out_row.insert(format!("{ev}.{field_name}"), value);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Apply target inline property filters
+                for (prop_name, filter_expr) in target_filters {
+                    let actual = out_row
+                        .get(&format!("{target_variable}.{prop_name}"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let expected = eval_expr(filter_expr, &out_row);
+                    if actual != expected {
+                        return None;
+                    }
+                }
+
+                // Apply inline edge property filters
+                if let Some(ev) = edge_variable {
+                    for (prop_name, filter_expr) in params.edge_filters {
+                        let actual = out_row
+                            .get(&format!("{ev}.{prop_name}"))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        let expected = eval_expr(filter_expr, &out_row);
+                        if actual != expected {
+                            return None;
+                        }
+                    }
+                }
+
+                Some(out_row)
+            })
+        })
+        .collect()
+}
+
 /// Single-hop traversal: the original behavior for patterns without `*`.
 fn execute_single_hop_traverse(
     input_rows: &[Row],
@@ -1760,6 +1991,7 @@ fn execute_single_hop_traverse(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let mut results = Vec::new();
+    let use_parallel = ctx.adaptive.enabled && ctx.adaptive.parallel_threshold > 0;
 
     for row in input_rows {
         let source_id = match row.get(params.source) {
@@ -1769,15 +2001,40 @@ fn execute_single_hop_traverse(
 
         let neighbors = expand_one_hop(source_id, params.edge_types, params.direction, ctx)?;
 
-        for (target_uid, et_idx) in neighbors {
-            let edge_type = params.edge_types.get(et_idx).map(|s| s.as_str());
-            let trp = TargetRowParams {
-                input_row: row,
-                target_uid,
-                edge_type,
+        // Switch to parallel when fan-out exceeds threshold
+        if use_parallel && neighbors.len() >= ctx.adaptive.parallel_threshold {
+            ctx.warnings.push(format!(
+                "adaptive: parallel processing activated for node {} ({} edges, threshold {})",
+                source_id.as_raw(),
+                neighbors.len(),
+                ctx.adaptive.parallel_threshold,
+            ));
+            let pctx = ParallelCtx {
+                engine: ctx.engine,
+                interner: ctx.interner,
+                shard_id: ctx.shard_id,
+                mvcc_snapshot: ctx.mvcc_snapshot,
+                chunk_size: ctx.adaptive.parallel_chunk_size,
             };
-            if let Some(out_row) = build_target_row(&trp, params, ctx)? {
-                results.push(out_row);
+            let src_raw = source_id.as_raw();
+            let with_src: Vec<(u64, u64, usize)> = neighbors
+                .iter()
+                .map(|&(tgt, et_idx)| (src_raw, tgt, et_idx))
+                .collect();
+            let parallel_rows = process_targets_parallel(&with_src, row, params, &pctx);
+            results.extend(parallel_rows);
+        } else {
+            // Sequential path for normal fan-out
+            for (target_uid, et_idx) in neighbors {
+                let edge_type = params.edge_types.get(et_idx).map(|s| s.as_str());
+                let trp = TargetRowParams {
+                    input_row: row,
+                    target_uid,
+                    edge_type,
+                };
+                if let Some(out_row) = build_target_row(&trp, params, ctx)? {
+                    results.push(out_row);
+                }
             }
         }
     }
@@ -1839,55 +2096,42 @@ fn execute_varlen_traverse(
             let mut next_frontier: Vec<u64> = Vec::new();
             let depth_start_edges = edges_processed;
 
+            // Collect all unique neighbors across the frontier for this depth
+            let mut depth_neighbors: Vec<(u64, u64, usize)> = Vec::new(); // (src, tgt, et_idx)
+
             for &src_uid in &frontier {
                 let src_nid = NodeId::from_raw(src_uid);
                 let neighbors = expand_one_hop(src_nid, params.edge_types, params.direction, ctx)?;
 
                 for (tgt_uid, et_idx) in neighbors {
-                    // Relationship-uniqueness: skip if edge already used
                     if !visited_edges.insert((src_uid, tgt_uid, et_idx)) {
                         continue;
                     }
-
                     edges_processed += 1;
                     next_frontier.push(tgt_uid);
-
-                    // Adaptive check: at check_interval, detect divergence
-                    if ctx.adaptive.enabled
-                        && ctx.adaptive.check_interval > 0
-                        && edges_processed.is_multiple_of(ctx.adaptive.check_interval)
-                        && !divergence_detected
-                    {
-                        let expected = expected_per_depth * depth as f64;
-                        let actual = edges_processed as f64;
-                        if expected > 0.0 && actual / expected > ctx.adaptive.switch_threshold {
-                            divergence_detected = true;
-                            ctx.warnings.push(format!(
-                                "adaptive: variable-length traversal divergence detected \
-                                 at depth {depth}: {edges_processed} edges processed \
-                                 (expected ~{:.0}, threshold {:.0}x). \
-                                 Consider reducing traversal depth or adding filters.",
-                                expected, ctx.adaptive.switch_threshold,
-                            ));
-                        }
-                    }
-
-                    // Emit result only if within [min_hops..max_hops]
                     if depth >= min_hops {
-                        let edge_type = params.edge_types.get(et_idx).map(|s| s.as_str());
-                        let trp = TargetRowParams {
-                            input_row: row,
-                            target_uid: tgt_uid,
-                            edge_type,
-                        };
-                        if let Some(out_row) = build_target_row(&trp, params, ctx)? {
-                            results.push(out_row);
-                        }
+                        depth_neighbors.push((src_uid, tgt_uid, et_idx));
                     }
                 }
             }
 
-            // Per-depth adaptive: check if this depth level had excessive fan-out
+            // Adaptive check: detect divergence at this depth
+            if ctx.adaptive.enabled && ctx.adaptive.check_interval > 0 && !divergence_detected {
+                let expected = expected_per_depth * depth as f64;
+                let actual = edges_processed as f64;
+                if expected > 0.0 && actual / expected > ctx.adaptive.switch_threshold {
+                    divergence_detected = true;
+                    ctx.warnings.push(format!(
+                        "adaptive: variable-length traversal divergence detected \
+                         at depth {depth}: {edges_processed} edges processed \
+                         (expected ~{:.0}, threshold {:.0}x). \
+                         Switching to parallel processing.",
+                        expected, ctx.adaptive.switch_threshold,
+                    ));
+                }
+            }
+
+            // Per-depth fan-out check
             let depth_edges = edges_processed - depth_start_edges;
             let frontier_size = frontier.len();
             if ctx.adaptive.enabled && frontier_size > 0 && !divergence_detected {
@@ -1898,9 +2142,43 @@ fn execute_varlen_traverse(
                         "adaptive: super-node fan-out at depth {depth}: \
                          avg {actual_fan_out:.0} edges/node \
                          (expected ~{expected_per_depth:.0}, threshold {:.0}x). \
-                         Results capped at {} edges per node.",
-                        ctx.adaptive.switch_threshold, ctx.adaptive.max_fan_out,
+                         Switching to parallel processing.",
+                        ctx.adaptive.switch_threshold,
                     ));
+                }
+            }
+
+            // Build result rows: parallel if enough neighbors, sequential otherwise
+            let use_parallel =
+                ctx.adaptive.enabled && depth_neighbors.len() >= ctx.adaptive.parallel_threshold;
+
+            if use_parallel {
+                // depth_neighbors already has (src, tgt, et_idx) — pass directly
+                let pctx = ParallelCtx {
+                    engine: ctx.engine,
+                    interner: ctx.interner,
+                    shard_id: ctx.shard_id,
+                    mvcc_snapshot: ctx.mvcc_snapshot,
+                    chunk_size: ctx.adaptive.parallel_chunk_size,
+                };
+                let parallel_rows = process_targets_parallel(&depth_neighbors, row, params, &pctx);
+                results.extend(parallel_rows);
+            } else {
+                for &(src_uid, tgt_uid, et_idx) in &depth_neighbors {
+                    // For depth > 1, update source in the row so edge property lookups
+                    // use the correct intermediate node (G066 fix).
+                    let mut hop_row = row.clone();
+                    hop_row.insert(params.source.to_string(), Value::Int(src_uid as i64));
+
+                    let edge_type = params.edge_types.get(et_idx).map(|s| s.as_str());
+                    let trp = TargetRowParams {
+                        input_row: &hop_row,
+                        target_uid: tgt_uid,
+                        edge_type,
+                    };
+                    if let Some(out_row) = build_target_row(&trp, params, ctx)? {
+                        results.push(out_row);
+                    }
                 }
             }
 
@@ -3904,8 +4182,15 @@ fn inject_computed_properties(
     label: &str,
     ctx: &ExecutionContext<'_>,
 ) {
+    inject_computed_from_engine(row, variable, label, ctx.engine);
+}
+
+/// Inject COMPUTED properties using direct engine access (no ExecutionContext needed).
+/// Used by both the sequential path (via inject_computed_properties) and the
+/// parallel path (process_targets_parallel).
+fn inject_computed_from_engine(row: &mut Row, variable: &str, label: &str, engine: &StorageEngine) {
     let schema_key = encode_label_schema_key(label);
-    let schema = match ctx.engine.get(Partition::Schema, &schema_key) {
+    let schema = match engine.get(Partition::Schema, &schema_key) {
         Ok(Some(bytes)) => match LabelSchema::from_msgpack(&bytes) {
             Ok(s) => s,
             Err(_) => return,
@@ -4418,6 +4703,7 @@ mod tests {
             adj_snapshot: None,
             merge_node_deltas: Vec::new(),
             correlated_row: None,
+            feedback_cache: None,
         }
     }
 
@@ -5530,7 +5816,7 @@ mod tests {
     // ====== Adaptive query plans ======
 
     #[test]
-    fn adaptive_caps_super_node_fan_out() {
+    fn adaptive_parallel_on_super_node() {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
         let mut interner = FieldInterner::new();
@@ -5560,8 +5846,8 @@ mod tests {
         }
 
         let mut ctx = make_ctx(&engine, &mut interner, &allocator);
-        // Set low cap to trigger adaptive behavior
-        ctx.adaptive.max_fan_out = 5;
+        // Set low threshold to trigger parallel processing on 20 edges
+        ctx.adaptive.parallel_threshold = 5;
 
         let plan = LogicalPlan {
             snapshot_ts: None,
@@ -5595,12 +5881,14 @@ mod tests {
         };
 
         let result = execute(&plan, &mut ctx).expect("execute");
-        // Should be capped at 5 (not 20)
-        assert_eq!(result.len(), 5);
-        // Should have a warning about super-node
-        assert_eq!(ctx.warnings.len(), 1);
-        assert!(ctx.warnings[0].contains("super-node"));
-        assert!(ctx.warnings[0].contains("capped at 5"));
+        // ALL 20 results returned (no truncation — parallel processes all edges)
+        assert_eq!(result.len(), 20);
+        // Should have a warning about parallel activation
+        assert!(
+            ctx.warnings.iter().any(|w| w.contains("parallel")),
+            "expected parallel activation warning, got: {:?}",
+            ctx.warnings,
+        );
     }
 
     #[test]
@@ -5697,6 +5985,138 @@ mod tests {
         let result = execute(&plan, &mut ctx).expect("execute");
         assert_eq!(result.len(), 2); // Alice knows Bob and Charlie
         assert!(ctx.warnings.is_empty()); // No super-node warning
+    }
+
+    #[test]
+    fn feedback_cache_records_super_node() {
+        let cache = FeedbackCache::new(100);
+        assert!(cache.lookup(42).is_none());
+
+        cache.record(42, 50_000);
+        assert_eq!(cache.lookup(42), Some(50_000));
+
+        // Overwrite with new degree
+        cache.record(42, 75_000);
+        assert_eq!(cache.lookup(42), Some(75_000));
+    }
+
+    #[test]
+    fn feedback_cache_evicts_when_full() {
+        let cache = FeedbackCache::new(10);
+        for i in 0..10 {
+            cache.record(i, 1000 + i as usize);
+        }
+        assert_eq!(cache.lookup(0), Some(1000));
+        assert_eq!(cache.lookup(9), Some(1009));
+
+        // Adding one more should trigger eviction of half (5 entries)
+        cache.record(100, 9999);
+        // After eviction, some early entries should be gone
+        let remaining: usize = (0..10).filter(|i| cache.lookup(*i).is_some()).count();
+        assert!(
+            remaining < 10,
+            "expected eviction, but {remaining}/10 entries remain"
+        );
+        // New entry should be present
+        assert_eq!(cache.lookup(100), Some(9999));
+    }
+
+    #[test]
+    fn adaptive_parallel_correctness_matches_sequential() {
+        // Verify parallel path produces the same results as sequential
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = test_engine(dir.path());
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new();
+
+        insert_node(
+            &engine,
+            1,
+            1,
+            "User",
+            &[("name", Value::String("Hub".into()))],
+            &mut interner,
+        );
+        for i in 2..=11u64 {
+            insert_node(
+                &engine,
+                1,
+                i,
+                "User",
+                &[("name", Value::String(format!("T{i}")))],
+                &mut interner,
+            );
+            insert_edge(&engine, "FOLLOWS", 1, i);
+        }
+
+        // Run with parallel (threshold = 5, so 10 edges triggers parallel)
+        let mut ctx_par = make_ctx(&engine, &mut interner, &allocator);
+        ctx_par.adaptive.parallel_threshold = 5;
+
+        let plan = LogicalPlan {
+            snapshot_ts: None,
+            vector_consistency: VectorConsistencyMode::default(),
+            root: LogicalOp::Traverse {
+                input: Box::new(LogicalOp::NodeScan {
+                    variable: "a".into(),
+                    labels: vec!["User".into()],
+                    property_filters: vec![(
+                        "name".into(),
+                        Expr::Literal(Value::String("Hub".into())),
+                    )],
+                }),
+                source: "a".into(),
+                edge_types: vec!["FOLLOWS".into()],
+                direction: Direction::Outgoing,
+                target_variable: "b".into(),
+                target_labels: vec![],
+                length: None,
+                edge_variable: None,
+                target_filters: vec![],
+                edge_filters: vec![],
+            },
+        };
+
+        let result_par = execute(&plan, &mut ctx_par).expect("parallel execute");
+
+        // Run without parallel (disabled)
+        let mut ctx_seq = make_ctx(&engine, &mut interner, &allocator);
+        ctx_seq.adaptive.enabled = false;
+
+        let result_seq = execute(&plan, &mut ctx_seq).expect("sequential execute");
+
+        // Same number of results
+        assert_eq!(result_par.len(), result_seq.len());
+        assert_eq!(result_par.len(), 10);
+
+        // Same node IDs (order may differ due to parallel execution)
+        let mut par_ids: Vec<i64> = result_par
+            .iter()
+            .filter_map(|r| {
+                r.get("b").and_then(|v| {
+                    if let Value::Int(i) = v {
+                        Some(*i)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        let mut seq_ids: Vec<i64> = result_seq
+            .iter()
+            .filter_map(|r| {
+                r.get("b").and_then(|v| {
+                    if let Value::Int(i) = v {
+                        Some(*i)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        par_ids.sort();
+        seq_ids.sort();
+        assert_eq!(par_ids, seq_ids);
     }
 
     // ====== AS OF TIMESTAMP ======

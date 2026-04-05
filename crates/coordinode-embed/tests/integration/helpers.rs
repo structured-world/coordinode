@@ -59,6 +59,7 @@ pub fn make_ctx_legacy<'a>(
         adj_snapshot: None,
         merge_node_deltas: Vec::new(),
         correlated_row: None,
+        feedback_cache: None,
     }
 }
 
@@ -106,6 +107,7 @@ pub fn make_ctx_mvcc<'a>(
         adj_snapshot: None,
         merge_node_deltas: Vec::new(),
         correlated_row: None,
+        feedback_cache: None,
     }
 }
 
@@ -154,5 +156,6 @@ pub fn make_ctx_with_pipeline<'a>(
         adj_snapshot: None,
         merge_node_deltas: Vec::new(),
         correlated_row: None,
+        feedback_cache: None,
     }
 }

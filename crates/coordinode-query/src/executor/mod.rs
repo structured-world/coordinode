@@ -8,4 +8,6 @@ pub mod row;
 pub mod runner;
 
 pub use row::Row;
-pub use runner::{execute, AdaptiveConfig, ExecutionContext, ExecutionError, WriteStats};
+pub use runner::{
+    execute, AdaptiveConfig, ExecutionContext, ExecutionError, FeedbackCache, WriteStats,
+};
