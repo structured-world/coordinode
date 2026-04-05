@@ -25,7 +25,8 @@ ignore = true
 
 [advisories]
 # Ignore unmaintained `encoding` crate — transitive dep from lindera (CJK tokenization).
-# No alternative available; lindera upstream tracks this.
+# Fix submitted: https://github.com/lindera/lindera/pull/654
+# When merged: `cargo update -p encoding` and remove this ignore.
 ignore = ["RUSTSEC-2021-0153"]
 
 [bans]
