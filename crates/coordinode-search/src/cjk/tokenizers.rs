@@ -49,11 +49,29 @@ impl Default for JiebaTokenizer {
 
 #[cfg(feature = "cjk-zh")]
 impl JiebaTokenizer {
-    /// Create a new jieba tokenizer with the default dictionary.
+    /// Create a new jieba tokenizer with the default embedded dictionary.
     pub fn new() -> Self {
         Self {
             jieba: Arc::new(jieba_rs::Jieba::new()),
         }
+    }
+
+    /// Create a jieba tokenizer loading the dictionary from a file path.
+    ///
+    /// The dictionary file must be in jieba format: one word per line,
+    /// each line containing `word freq [tag]` (space-separated).
+    ///
+    /// This enables Docker images without embedded CJK dictionaries (~21MB savings).
+    /// Mount the dictionary file as a volume and pass its path here.
+    pub fn with_dict_path(path: &std::path::Path) -> Result<Self, String> {
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("failed to open jieba dictionary {}: {e}", path.display()))?;
+        let mut reader = std::io::BufReader::new(file);
+        let jieba = jieba_rs::Jieba::with_dict(&mut reader)
+            .map_err(|e| format!("failed to parse jieba dictionary {}: {e}", path.display()))?;
+        Ok(Self {
+            jieba: Arc::new(jieba),
+        })
     }
 }
 
@@ -176,6 +194,10 @@ impl LinderaTokenizer {
     /// Loads the embedded dictionary for Japanese (IPAdic) or Korean (KO-dic).
     /// Returns an error if the dictionary cannot be loaded (should not happen
     /// with embedded dictionaries compiled via feature flags).
+    /// Create a new lindera tokenizer with the embedded dictionary.
+    ///
+    /// Requires the corresponding embed feature: `cjk-ja` (embed-ipadic)
+    /// or `cjk-ko` (embed-ko-dic).
     pub fn new(language: CjkLanguage) -> Result<Self, String> {
         let dict_uri = match language {
             #[cfg(feature = "cjk-ja")]
@@ -183,7 +205,23 @@ impl LinderaTokenizer {
             #[cfg(feature = "cjk-ko")]
             CjkLanguage::Korean => "embedded://ko-dic",
         };
+        Self::from_uri(dict_uri)
+    }
 
+    /// Create a lindera tokenizer loading the dictionary from a filesystem path.
+    ///
+    /// The path must point to a compiled lindera dictionary directory
+    /// (containing `dict.da`, `char_def.bin`, etc.).
+    ///
+    /// This enables Docker images without embedded CJK dictionaries
+    /// (~15MB savings for Japanese, ~34MB for Korean). Mount the dictionary
+    /// directory as a volume and pass its path here.
+    pub fn with_dict_path(path: &std::path::Path) -> Result<Self, String> {
+        let uri = format!("file://{}", path.display());
+        Self::from_uri(&uri)
+    }
+
+    fn from_uri(dict_uri: &str) -> Result<Self, String> {
         let dictionary = lindera::dictionary::load_dictionary(dict_uri)
             .map_err(|e| format!("failed to load lindera dictionary {dict_uri}: {e}"))?;
 
@@ -313,7 +351,7 @@ fn is_cjk_punctuation(s: &str) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -476,5 +514,71 @@ mod tests {
             !tokens.iter().any(|t| t == "、" || t == "。"),
             "punctuation should be filtered: {tokens:?}"
         );
+    }
+
+    // -- External dictionary loading tests --
+
+    #[cfg(feature = "cjk-zh")]
+    #[test]
+    fn jieba_with_dict_path_loads_file() {
+        use std::io::Write;
+
+        // Create a minimal jieba dictionary file with a custom word
+        let dir = tempfile::tempdir().unwrap();
+        let dict_path = dir.path().join("custom.dict");
+        {
+            let mut f = std::fs::File::create(&dict_path).unwrap();
+            // jieba dict format: word freq tag (space-separated)
+            writeln!(f, "coordinode 5 n").unwrap();
+            writeln!(f, "数据库 10 n").unwrap();
+        }
+
+        let mut tok = JiebaTokenizer::with_dict_path(&dict_path).expect("load custom dict");
+        let mut stream = tok.token_stream("coordinode是一个数据库");
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        // Custom word "coordinode" should be recognized as a single token
+        assert!(
+            tokens.iter().any(|t| t == "coordinode"),
+            "custom dict word should be recognized: {tokens:?}"
+        );
+    }
+
+    #[cfg(feature = "cjk-zh")]
+    #[test]
+    fn jieba_with_dict_path_nonexistent_errors() {
+        let result = JiebaTokenizer::with_dict_path(std::path::Path::new("/nonexistent/dict.txt"));
+        assert!(result.is_err(), "nonexistent path should error");
+    }
+
+    #[cfg(feature = "cjk-zh")]
+    #[test]
+    fn cjk_dict_config_chinese_embedded() {
+        use crate::cjk::CjkDictConfig;
+        let config = CjkDictConfig::default();
+        let tok = config.chinese_tokenizer().expect("embedded should work");
+        let mut tok = tok;
+        let mut stream = tok.token_stream("中文测试");
+        assert!(stream.advance(), "embedded tokenizer should work");
+    }
+
+    #[cfg(feature = "cjk-ja")]
+    #[test]
+    fn lindera_with_dict_path_nonexistent_errors() {
+        let result = LinderaTokenizer::with_dict_path(std::path::Path::new("/nonexistent/ipadic/"));
+        assert!(result.is_err(), "nonexistent path should error");
+    }
+
+    #[cfg(feature = "cjk-ja")]
+    #[test]
+    fn cjk_dict_config_japanese_embedded() {
+        use crate::cjk::CjkDictConfig;
+        let config = CjkDictConfig::default();
+        let tok = config.japanese_tokenizer().expect("embedded should work");
+        let mut tok = tok;
+        let mut stream = tok.token_stream("東京");
+        assert!(stream.advance(), "embedded tokenizer should work");
     }
 }
