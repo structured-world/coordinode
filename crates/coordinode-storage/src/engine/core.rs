@@ -559,11 +559,158 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn test_engine() -> (StorageEngine, TempDir) {
-        let dir = TempDir::new().expect("failed to create temp dir");
-        let config = StorageConfig::new(dir.path());
-        let engine = StorageEngine::open(&config).expect("failed to open engine");
-        (engine, dir)
+    /// Counter for unique MemFs paths across parallel tests.
+    static MEMFS_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Create a test engine. Uses MemFs when `COORDINODE_TEST_MEMFS=1` env var is set,
+    /// otherwise falls back to tempfile on disk.
+    ///
+    /// MemFs is ~10x faster (no disk I/O) but has limitations:
+    /// - No oplog support (oplog uses std::fs directly)
+    /// - Compaction finalization may fail on some code paths (lsm-tree known limitation)
+    /// - TieredCache layers not supported (filesystem-based)
+    ///
+    /// Returns `(StorageEngine, Option<TempDir>)` — TempDir is None for MemFs.
+    fn test_engine() -> (StorageEngine, Option<TempDir>) {
+        if std::env::var("COORDINODE_TEST_MEMFS").as_deref() == Ok("1") {
+            let engine = test_engine_memfs();
+            (engine, None)
+        } else {
+            let dir = TempDir::new().expect("failed to create temp dir");
+            let config = StorageConfig::new(dir.path());
+            let engine = StorageEngine::open(&config).expect("failed to open engine");
+            (engine, Some(dir))
+        }
+    }
+
+    fn test_engine_memfs() -> StorageEngine {
+        let id = MEMFS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let config = StorageConfig::with_memfs(format!("/memfs/test_{id}"));
+        StorageEngine::open(&config).expect("failed to open memfs engine")
+    }
+
+    #[test]
+    fn memfs_engine_basic_kv() {
+        let engine = test_engine_memfs();
+        engine
+            .put(Partition::Node, b"node:00:00000001", b"hello")
+            .expect("put");
+        let val = engine
+            .get(Partition::Node, b"node:00:00000001")
+            .expect("get");
+        assert_eq!(val.as_deref(), Some(b"hello".as_slice()));
+    }
+
+    #[test]
+    fn memfs_engine_all_partitions() {
+        let engine = test_engine_memfs();
+        for &part in Partition::all() {
+            assert!(engine.tree(part).is_ok(), "partition {:?} missing", part);
+        }
+    }
+
+    #[test]
+    fn memfs_engine_multi_partition_writes() {
+        let engine = test_engine_memfs();
+
+        // Write to multiple partitions
+        engine
+            .put(Partition::Node, b"node:00:00000001", b"alice")
+            .expect("put node");
+        engine
+            .put(Partition::Schema, b"schema:label:User", b"schema_data")
+            .expect("put schema");
+        engine
+            .put(
+                Partition::EdgeProp,
+                b"edgeprop:KNOWS:00000001:00000002",
+                b"props",
+            )
+            .expect("put edgeprop");
+
+        // Read back from each partition
+        assert_eq!(
+            engine
+                .get(Partition::Node, b"node:00:00000001")
+                .expect("get")
+                .as_deref(),
+            Some(b"alice".as_slice())
+        );
+        assert_eq!(
+            engine
+                .get(Partition::Schema, b"schema:label:User")
+                .expect("get")
+                .as_deref(),
+            Some(b"schema_data".as_slice())
+        );
+        assert_eq!(
+            engine
+                .get(Partition::EdgeProp, b"edgeprop:KNOWS:00000001:00000002")
+                .expect("get")
+                .as_deref(),
+            Some(b"props".as_slice())
+        );
+
+        // Non-existent key returns None
+        assert!(engine
+            .get(Partition::Node, b"node:00:99999999")
+            .expect("get")
+            .is_none());
+    }
+
+    #[test]
+    fn memfs_engine_merge_operator_adj() {
+        use crate::engine::merge::encode_add_batch;
+
+        let engine = test_engine_memfs();
+
+        // Merge operator on Adj partition (PostingListMerge)
+        let key = b"adj:KNOWS:out:00000001";
+        let delta1 = encode_add_batch(&[100, 200]);
+        let delta2 = encode_add_batch(&[300]);
+
+        engine.merge(Partition::Adj, key, &delta1).expect("merge 1");
+        engine.merge(Partition::Adj, key, &delta2).expect("merge 2");
+
+        // Read merged posting list
+        let val = engine.get(Partition::Adj, key).expect("get adj");
+        assert!(val.is_some(), "merged adj key should exist");
+        let bytes = val.expect("adj bytes");
+        let plist = coordinode_core::graph::edge::PostingList::from_bytes(&bytes)
+            .expect("decode posting list");
+        let uids: Vec<u64> = plist.iter().collect();
+        assert_eq!(uids, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn memfs_engine_snapshot_read() {
+        let engine = test_engine_memfs();
+
+        // Write version 1
+        engine
+            .put(Partition::Node, b"node:00:00000001", b"v1")
+            .expect("put v1");
+
+        // Take snapshot: next_seqno() returns the seqno for the next write.
+        // Snapshot at this value sees all writes with seqno < snap (i.e., v1).
+        let snap = engine.next_seqno();
+
+        // Write version 2
+        engine
+            .put(Partition::Node, b"node:00:00000001", b"v2")
+            .expect("put v2");
+
+        // Current read sees v2
+        let current = engine
+            .get(Partition::Node, b"node:00:00000001")
+            .expect("get current");
+        assert_eq!(current.as_deref(), Some(b"v2".as_slice()));
+
+        // Snapshot read sees v1
+        let historical = engine
+            .snapshot_get(&snap, Partition::Node, b"node:00:00000001")
+            .expect("snapshot get");
+        assert_eq!(historical.as_deref(), Some(b"v1".as_slice()));
     }
 
     #[test]
