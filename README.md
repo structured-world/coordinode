@@ -135,18 +135,18 @@ ORDER BY similarity LIMIT 25
 
 ## What Makes CoordiNode Different
 
-| | CoordiNode | Neo4j CE | Weaviate | Elasticsearch |
-|---|:---:|:---:|:---:|:---:|
-| Graph + vector + text in one query | **Yes** | No (separate calls) | No graph | No graph |
-| Nested document properties | **Yes** (dot-notation) | No (flat props) | No graph | Yes |
-| Vector search on edges | **Yes** | No | N/A | N/A |
-| Spatial queries | **Yes** | Via APOC | No | Yes |
-| Encrypted search | **Yes** | No | No | No |
-| Time-travel queries | **Yes** | No | No | No |
-| Built-in query advisor | **Yes** | No | No | No |
-| OpenCypher queries | **Yes** | Yes | No | No |
-| Language | Rust (zero GC) | Java (JVM) | Go | Java (JVM) |
-| License | AGPL-3.0 | GPL-3.0 | BSD-3 | SSPL |
+| | CoordiNode | Neo4j CE | MongoDB | Weaviate | Elasticsearch |
+|---|:---:|:---:|:---:|:---:|:---:|
+| Graph + vector + text in one query | **Yes** | No | Partial ($graphLookup + Atlas) | No graph | No graph |
+| Nested document properties | **Yes** (dot-notation) | No (flat props) | Yes | No graph | Yes |
+| Vector search on edges | **Yes** | No | No | N/A | N/A |
+| Spatial queries | **Yes** | Via APOC | Yes | No | Yes |
+| Encrypted search | **Yes** | No | No | No | No |
+| Time-travel queries | **Yes** | No | No | No | No |
+| Built-in query advisor | **Yes** | No | Yes (explain) | No | No |
+| OpenCypher queries | **Yes** | Yes | No | No | No |
+| Language | Rust (zero GC) | Java (JVM) | C++ | Go | Java (JVM) |
+| License | AGPL-3.0 | GPL-3.0 | SSPL | BSD-3 | SSPL |
 
 ## Full-Text Search: 23+ Languages
 
