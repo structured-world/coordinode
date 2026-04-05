@@ -103,10 +103,14 @@ impl CompressionConfig {
 }
 
 /// Configuration for the CoordiNode storage engine.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StorageConfig {
     /// Path to the data directory.
     pub data_dir: PathBuf,
+
+    /// Optional custom filesystem backend. When `None`, uses the default
+    /// OS filesystem (`StdFs`). Set to `Arc<MemFs>` for in-memory tests.
+    pub fs: Option<Arc<dyn lsm_tree::fs::Fs>>,
 
     /// WAL flush policy. Default: SyncPerBatch.
     pub flush_policy: FlushPolicy,
@@ -173,11 +177,31 @@ pub struct StorageConfig {
     pub drain_buffer_capacity_bytes: u64,
 }
 
+impl std::fmt::Debug for StorageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageConfig")
+            .field("data_dir", &self.data_dir)
+            .field(
+                "fs",
+                &if self.fs.is_some() {
+                    "custom"
+                } else {
+                    "default"
+                },
+            )
+            .field("flush_policy", &self.flush_policy)
+            .field("compression", &self.compression)
+            .field("block_cache_bytes", &self.block_cache_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
 impl StorageConfig {
-    /// Create a new config with the given data directory.
+    /// Create a new config with the given data directory (OS filesystem).
     pub fn new(data_dir: impl AsRef<Path>) -> Self {
         Self {
             data_dir: data_dir.as_ref().to_path_buf(),
+            fs: None,
             flush_policy: FlushPolicy::default(),
             compression: CompressionConfig::default(),
             block_cache_bytes: 64 * 1024 * 1024,
@@ -197,6 +221,19 @@ impl StorageConfig {
             drain_batch_max: 10_000,
             drain_buffer_capacity_bytes: 100 * 1024 * 1024,
         }
+    }
+
+    /// Create a config backed by an in-memory filesystem (`MemFs`).
+    ///
+    /// Trees are stored entirely in RAM with no disk I/O. Ideal for tests:
+    /// ~10x faster than tempfile, zero filesystem side effects.
+    ///
+    /// The `data_dir` path is virtual — only used as a namespace for tree paths.
+    pub fn with_memfs(data_dir: impl AsRef<Path>) -> Self {
+        let fs = Arc::new(lsm_tree::fs::MemFs::new());
+        let mut config = Self::new(data_dir);
+        config.fs = Some(fs);
+        config
     }
 
     /// Build an lsm-tree `Config` for a specific partition.
@@ -231,6 +268,11 @@ impl StorageConfig {
             Arc::clone(&seqno), // visible_seqno = seqno: all writes immediately visible
         )
         .data_block_compression_policy(compression_policy);
+
+        // Custom filesystem backend (e.g., MemFs for in-memory tests)
+        if let Some(ref fs) = self.fs {
+            config = config.with_shared_fs(Arc::clone(fs));
+        }
 
         // Partitions with merge operators: no retention filter
         // (merge operands must survive compaction for the merge function to combine them).
