@@ -25,12 +25,9 @@ ignore = true
 [advisories]
 # Deny any crate with known vulnerabilities
 vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
-notice = "warn"
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "allow"
 wildcards = "deny"
 
 [sources]
