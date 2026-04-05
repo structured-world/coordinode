@@ -1292,31 +1292,26 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             function,
             less_than,
             threshold,
+            decay_field,
         } => {
             let rows = execute_op(input, ctx)?;
             let mode = ctx.vector_consistency;
 
-            // Try HNSW-accelerated path when vector index registry is available.
-            let result = if let Some(hnsw_result) = try_hnsw_vector_filter(
-                &rows,
-                vector_expr,
-                query_vector,
+            let score_params = VectorScoreParams {
                 function,
-                *less_than,
-                *threshold,
-                ctx,
-            )? {
+                less_than: *less_than,
+                threshold: *threshold,
+                decay_field: decay_field.as_ref(),
+            };
+
+            // Try HNSW-accelerated path when vector index registry is available.
+            let result = if let Some(hnsw_result) =
+                try_hnsw_vector_filter(&rows, vector_expr, query_vector, &score_params, ctx)?
+            {
                 hnsw_result
             } else {
                 // Fallback to brute-force distance computation per row.
-                execute_vector_filter(
-                    &rows,
-                    vector_expr,
-                    query_vector,
-                    function,
-                    *less_than,
-                    *threshold,
-                )?
+                execute_vector_filter(&rows, vector_expr, query_vector, &score_params)?
             };
             // In snapshot/exact mode, apply MVCC visibility post-filter.
             // For brute-force path, rows are already MVCC-consistent from
@@ -1448,14 +1443,13 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             ..
         } => {
             let rows = execute_op(input, ctx)?;
-            execute_vector_filter(
-                &rows,
-                vector_expr,
-                query_vector,
+            let edge_params = VectorScoreParams {
                 function,
-                *less_than,
-                *threshold,
-            )
+                less_than: *less_than,
+                threshold: *threshold,
+                decay_field: None,
+            };
+            execute_vector_filter(&rows, vector_expr, query_vector, &edge_params)
         }
 
         LogicalOp::ProcedureCall {
@@ -2215,13 +2209,19 @@ fn execute_varlen_traverse(
 /// Strategy: extract (label, property) from the vector expression, look up
 /// the VectorIndexRegistry, use HNSW search to get candidate node IDs,
 /// then intersect with input rows and apply threshold filter on HNSW scores.
+/// Parameters for vector score filtering (threshold comparison + optional decay).
+struct VectorScoreParams<'a> {
+    function: &'a str,
+    less_than: bool,
+    threshold: f64,
+    decay_field: Option<&'a Expr>,
+}
+
 fn try_hnsw_vector_filter(
     rows: &[Row],
     vector_expr: &Expr,
     query_vector_expr: &Expr,
-    function: &str,
-    less_than: bool,
-    threshold: f64,
+    params: &VectorScoreParams<'_>,
     ctx: &ExecutionContext<'_>,
 ) -> Result<Option<Vec<Row>>, ExecutionError> {
     // Need a vector index registry to attempt HNSW path.
@@ -2263,8 +2263,14 @@ fn try_hnsw_vector_filter(
     };
 
     // Determine K for HNSW search: fetch enough candidates to cover threshold.
-    // Use a generous K since threshold filtering will reduce the set.
-    let k = rows.len().clamp(100, 10_000);
+    // When decay is present, overfetch by 2x since decay reduces scores,
+    // requiring more candidates to find enough passing the combined threshold.
+    let base_k = rows.len().clamp(100, 10_000);
+    let k = if params.decay_field.is_some() {
+        (base_k * 2).min(10_000)
+    } else {
+        base_k
+    };
 
     let results =
         match registry.search_with_loader(label, property, &query_vec, k, ctx.vector_loader) {
@@ -2289,16 +2295,13 @@ fn try_hnsw_vector_filter(
         }
 
         // Re-compute exact score for threshold comparison.
-        // HNSW scores are metric-specific distances (lower = closer),
-        // but Cypher functions have their own semantics (similarity vs distance).
-        // Re-computing ensures exact threshold matching identical to brute-force.
         let vec_val = eval_expr(vector_expr, row);
         let a = match coerce_value_to_vec(&vec_val) {
             Some(v) if v.len() == query_vec.len() => v,
             _ => continue,
         };
 
-        let score = match function {
+        let raw_score = match params.function {
             "vector_distance" => {
                 coordinode_vector::metrics::euclidean_distance(&a, &query_vec) as f64
             }
@@ -2312,10 +2315,12 @@ fn try_hnsw_vector_filter(
             _ => continue,
         };
 
-        let passes = if less_than {
-            score < threshold
+        let score = apply_decay_multiplier(raw_score, params.decay_field, row);
+
+        let passes = if params.less_than {
+            score < params.threshold
         } else {
-            score > threshold
+            score > params.threshold
         };
 
         if passes {
@@ -2330,13 +2335,26 @@ fn try_hnsw_vector_filter(
 ///
 /// For each row, compute vector function(vector_expr, query_vector),
 /// compare against threshold. Keep rows that pass the comparison.
+/// Apply decay multiplier to a raw vector score when a decay field is present.
+fn apply_decay_multiplier(raw_score: f64, decay_field: Option<&Expr>, row: &Row) -> f64 {
+    if let Some(decay_expr) = decay_field {
+        let decay_val = eval_expr(decay_expr, row);
+        let decay_factor = match decay_val {
+            Value::Float(f) => f,
+            Value::Int(i) => i as f64,
+            _ => 1.0, // missing decay → no attenuation
+        };
+        raw_score * decay_factor
+    } else {
+        raw_score
+    }
+}
+
 fn execute_vector_filter(
     rows: &[Row],
     vector_expr: &Expr,
     query_vector: &Expr,
-    function: &str,
-    less_than: bool,
-    threshold: f64,
+    params: &VectorScoreParams<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let mut results = Vec::new();
 
@@ -2356,7 +2374,7 @@ fn execute_vector_filter(
             continue; // dimension mismatch
         }
 
-        let score = match function {
+        let raw_score = match params.function {
             "vector_distance" => coordinode_vector::metrics::euclidean_distance(&a, &b) as f64,
             "vector_similarity" => coordinode_vector::metrics::cosine_similarity(&a, &b) as f64,
             "vector_dot" => coordinode_vector::metrics::dot_product(&a, &b) as f64,
@@ -2364,10 +2382,12 @@ fn execute_vector_filter(
             _ => continue,
         };
 
-        let passes = if less_than {
-            score < threshold
+        let score = apply_decay_multiplier(raw_score, params.decay_field, row);
+
+        let passes = if params.less_than {
+            score < params.threshold
         } else {
-            score > threshold
+            score > params.threshold
         };
 
         if passes {

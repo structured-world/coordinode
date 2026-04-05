@@ -224,6 +224,10 @@ pub enum LogicalOp {
         less_than: bool,
         /// Threshold value.
         threshold: f64,
+        /// Optional decay field expression for COMPUTED VECTOR_DECAY.
+        /// When present, the effective score is `vector_score * decay_value`.
+        /// Detected from `vector_similarity(...) * decay_field > threshold` pattern.
+        decay_field: Option<Expr>,
     },
 
     /// Edge vector search: vector-first strategy for edge HNSW indexes.
@@ -1226,11 +1230,17 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             function,
             threshold,
             less_than,
+            decay_field,
             ..
         } => {
             let op = if *less_than { "<" } else { ">" };
+            let decay_info = if decay_field.is_some() {
+                " * decay"
+            } else {
+                ""
+            };
             output.push_str(&format!(
-                "{prefix}VectorFilter({function} {op} {threshold})\n"
+                "{prefix}VectorFilter({function}{decay_info} {op} {threshold})\n"
             ));
             explain_op(input, indent + 1, output);
         }

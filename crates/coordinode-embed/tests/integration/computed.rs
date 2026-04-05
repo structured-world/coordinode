@@ -492,3 +492,609 @@ fn computed_ttl_reaper_via_pipeline() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("c"), Some(&Value::String("fresh".into())),);
 }
+
+// ── COMPUTED VECTOR_DECAY × vector_similarity ────────────────────
+
+/// Helper: create a schema with VECTOR_DECAY + embedding for decay-weighted vector tests.
+fn setup_vector_decay_schema(db: &mut Database) {
+    let mut schema = LabelSchema::new("Article");
+    schema.add_property(PropertyDef::new("title", PropertyType::String));
+    schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
+    schema.add_property(PropertyDef::new(
+        "embedding",
+        PropertyType::Vector {
+            dimensions: 3,
+            metric: coordinode_core::graph::types::VectorMetric::Cosine,
+        },
+    ));
+    schema.add_property(PropertyDef::computed(
+        "_recency",
+        ComputedSpec::VectorDecay {
+            formula: DecayFormula::Linear,
+            duration_secs: 86400, // 1 day
+            anchor_field: "created_at".into(),
+        },
+    ));
+
+    let schema_key = coordinode_core::schema::definition::encode_label_schema_key("Article");
+    let bytes = schema.to_msgpack().expect("serialize schema");
+    db.engine_shared()
+        .put(
+            coordinode_storage::engine::partition::Partition::Schema,
+            &schema_key,
+            &bytes,
+        )
+        .expect("persist schema");
+}
+
+/// Planner detects `vector_similarity() * _recency > threshold` and applies
+/// decay-weighted scoring: fresh articles pass, old articles are filtered out
+/// because their effective score (similarity × decay) falls below threshold.
+#[test]
+fn vector_decay_weights_similarity_scores() {
+    let (mut db, _dir) = open_db();
+    setup_vector_decay_schema(&mut db);
+
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+
+    // Fresh article: created now → _recency ≈ 1.0
+    db.execute_cypher(&format!(
+        "CREATE (a:Article {{title: 'fresh', created_at: {now_us}, embedding: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create fresh article");
+
+    // Old article: created 2 days ago → _recency = 0.0 (linear, beyond 1 day)
+    let old_us = now_us - 2 * 86400 * 1_000_000;
+    db.execute_cypher(&format!(
+        "CREATE (a:Article {{title: 'old', created_at: {old_us}, embedding: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create old article");
+
+    // Both articles have identical embeddings and identical cosine similarity to query.
+    // Without decay: both pass similarity > 0.5 (cosine with self = 1.0)
+    // With decay: fresh passes (1.0 * 1.0 ≈ 1.0 > 0.5), old fails (1.0 * 0.0 = 0.0 < 0.5)
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:Article) \
+         WHERE vector_similarity(a.embedding, [1.0, 0.0, 0.0]) * a._recency > 0.5 \
+         RETURN a.title AS title",
+        )
+        .expect("decay-weighted vector query");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "only fresh article should pass decay-weighted filter"
+    );
+    assert_eq!(
+        rows[0].get("title"),
+        Some(&Value::String("fresh".into())),
+        "fresh article should pass"
+    );
+}
+
+/// Without decay multiplication, both articles pass the raw similarity threshold.
+/// This test verifies the baseline behavior (no decay in WHERE).
+#[test]
+fn vector_similarity_without_decay_returns_all() {
+    let (mut db, _dir) = open_db();
+    setup_vector_decay_schema(&mut db);
+
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+
+    db.execute_cypher(&format!(
+        "CREATE (a:Article {{title: 'fresh', created_at: {now_us}, embedding: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create fresh");
+
+    let old_us = now_us - 2 * 86400 * 1_000_000;
+    db.execute_cypher(&format!(
+        "CREATE (a:Article {{title: 'old', created_at: {old_us}, embedding: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create old");
+
+    // Raw similarity without decay — both pass.
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:Article) \
+         WHERE vector_similarity(a.embedding, [1.0, 0.0, 0.0]) > 0.5 \
+         RETURN a.title AS title",
+        )
+        .expect("raw vector query");
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "both articles should pass raw similarity filter"
+    );
+}
+
+/// VECTOR_DECAY field is accessible in RETURN for score inspection.
+#[test]
+fn vector_decay_field_in_return() {
+    let (mut db, _dir) = open_db();
+    setup_vector_decay_schema(&mut db);
+
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+
+    db.execute_cypher(&format!(
+        "CREATE (a:Article {{title: 'recent', created_at: {now_us}, embedding: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create");
+
+    let rows = db
+        .execute_cypher("MATCH (a:Article) RETURN a._recency AS recency")
+        .expect("query recency");
+
+    assert_eq!(rows.len(), 1);
+    match rows[0].get("recency").expect("recency field") {
+        Value::Float(f) => {
+            assert!(*f > 0.99, "freshly created → _recency ≈ 1.0, got {f}");
+        }
+        other => panic!("expected Float for _recency, got {other:?}"),
+    }
+}
+
+/// Reverse multiplication order: `_recency * vector_similarity()` should also
+/// be detected by the planner and produce identical results.
+#[test]
+fn vector_decay_reverse_multiply_order() {
+    let (mut db, _dir) = open_db();
+    setup_vector_decay_schema(&mut db);
+
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+
+    db.execute_cypher(&format!(
+        "CREATE (a:Article {{title: 'fresh', created_at: {now_us}, embedding: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create fresh");
+
+    let old_us = now_us - 2 * 86400 * 1_000_000;
+    db.execute_cypher(&format!(
+        "CREATE (a:Article {{title: 'old', created_at: {old_us}, embedding: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create old");
+
+    // Reverse order: decay * vector_fn (instead of vector_fn * decay)
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:Article) \
+         WHERE a._recency * vector_similarity(a.embedding, [1.0, 0.0, 0.0]) > 0.5 \
+         RETURN a.title AS title",
+        )
+        .expect("reverse order decay query");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "reverse multiply order should produce same result"
+    );
+    assert_eq!(rows[0].get("title"), Some(&Value::String("fresh".into())),);
+}
+
+/// Missing anchor field → _recency evaluates to Null → decay factor = 1.0
+/// (fallback). Article without created_at still passes raw similarity.
+#[test]
+fn vector_decay_missing_anchor_uses_fallback() {
+    let (mut db, _dir) = open_db();
+    setup_vector_decay_schema(&mut db);
+
+    // Article WITHOUT created_at → anchor missing → _recency = Null → factor = 1.0
+    db.execute_cypher("CREATE (a:Article {title: 'no_anchor', embedding: [1.0, 0.0, 0.0]})")
+        .expect("create article without anchor");
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:Article) \
+         WHERE vector_similarity(a.embedding, [1.0, 0.0, 0.0]) * a._recency > 0.5 \
+         RETURN a.title AS title",
+        )
+        .expect("query with missing anchor");
+
+    // _recency = Null → decay factor = 1.0 → score = 1.0 * 1.0 = 1.0 > 0.5 → passes
+    // Wait — actually eval_expr returns Null for missing computed field.
+    // In apply_decay_multiplier, Null → factor 1.0 (no attenuation).
+    // But the expression is `vector_similarity(...) * a._recency` which the PLANNER
+    // extracts as VectorFilter with decay_field. The decay_field evaluates to Null,
+    // and apply_decay_multiplier maps Null → 1.0.
+    //
+    // However, if the planner DIDN'T detect the pattern (e.g., it fell through to
+    // generic Filter), then eval_expr would compute Float(1.0) * Null = Null,
+    // and Null > 0.5 = false. This would mean the article is FILTERED OUT.
+    //
+    // Both behaviors are acceptable: the optimized path treats Null as 1.0 (no decay),
+    // the generic path treats Null * X = Null (filtered). Since we DO detect the pattern,
+    // the article should pass with factor=1.0.
+    assert_eq!(
+        rows.len(),
+        1,
+        "missing anchor → Null decay → factor 1.0 → passes"
+    );
+}
+
+/// Exponential decay formula: half-life behavior.
+/// Article at exactly half the duration should have _recency ≈ 0.5 (for lambda=ln(2)).
+#[test]
+fn vector_decay_exponential_formula() {
+    let (mut db, _dir) = open_db();
+
+    // Exponential with lambda = ln(2) ≈ 0.693 → half-life at t=1.0 gives e^(-0.693) ≈ 0.5
+    let mut schema = LabelSchema::new("ExpArticle");
+    schema.add_property(PropertyDef::new("title", PropertyType::String));
+    schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
+    schema.add_property(PropertyDef::new(
+        "embedding",
+        PropertyType::Vector {
+            dimensions: 3,
+            metric: coordinode_core::graph::types::VectorMetric::Cosine,
+        },
+    ));
+    schema.add_property(PropertyDef::computed(
+        "_recency",
+        ComputedSpec::VectorDecay {
+            formula: DecayFormula::Exponential {
+                lambda: std::f64::consts::LN_2,
+            },
+            duration_secs: 86400, // 1 day
+            anchor_field: "created_at".into(),
+        },
+    ));
+
+    let schema_key = coordinode_core::schema::definition::encode_label_schema_key("ExpArticle");
+    let bytes = schema.to_msgpack().expect("serialize");
+    db.engine_shared()
+        .put(
+            coordinode_storage::engine::partition::Partition::Schema,
+            &schema_key,
+            &bytes,
+        )
+        .expect("persist schema");
+
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+
+    // Article at exactly 1 day old → t = 1.0 → decay = e^(-ln2) ≈ 0.5
+    // similarity = 1.0, effective = 1.0 * 0.5 = 0.5
+    let one_day_ago = now_us - 86400 * 1_000_000;
+    db.execute_cypher(&format!(
+        "CREATE (a:ExpArticle {{title: 'day_old', created_at: {one_day_ago}, embedding: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create day-old");
+
+    // threshold = 0.4 → 0.5 > 0.4 → should pass
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:ExpArticle) \
+         WHERE vector_similarity(a.embedding, [1.0, 0.0, 0.0]) * a._recency > 0.4 \
+         RETURN a.title AS title",
+        )
+        .expect("exponential decay query");
+    assert_eq!(
+        rows.len(),
+        1,
+        "day-old article with exp decay ≈ 0.5 should pass threshold 0.4"
+    );
+
+    // threshold = 0.6 → 0.5 < 0.6 → should NOT pass
+    let rows2 = db
+        .execute_cypher(
+            "MATCH (a:ExpArticle) \
+         WHERE vector_similarity(a.embedding, [1.0, 0.0, 0.0]) * a._recency > 0.6 \
+         RETURN a.title AS title",
+        )
+        .expect("exponential decay query strict");
+    assert_eq!(
+        rows2.len(),
+        0,
+        "day-old article with exp decay ≈ 0.5 should NOT pass threshold 0.6"
+    );
+}
+
+/// vector_distance (not similarity) × decay pattern: distance uses < threshold.
+/// Old article's effective distance (raw_dist * decay) shrinks to 0, passing < threshold.
+/// Fresh article's effective distance stays at raw_dist.
+#[test]
+fn vector_decay_with_distance_function() {
+    let (mut db, _dir) = open_db();
+    setup_vector_decay_schema(&mut db);
+
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+
+    // Both articles at distance ~1.0 from query [0.0, 1.0, 0.0]
+    db.execute_cypher(&format!(
+        "CREATE (a:Article {{title: 'fresh', created_at: {now_us}, embedding: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create fresh");
+
+    let old_us = now_us - 2 * 86400 * 1_000_000;
+    db.execute_cypher(&format!(
+        "CREATE (a:Article {{title: 'old', created_at: {old_us}, embedding: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create old");
+
+    // vector_distance × decay < 0.5
+    // Fresh: distance(~1.414) * decay(1.0) ≈ 1.414 → NOT < 0.5 → filtered
+    // Old:   distance(~1.414) * decay(0.0) = 0.0  → < 0.5 → passes
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:Article) \
+         WHERE vector_distance(a.embedding, [0.0, 1.0, 0.0]) * a._recency < 0.5 \
+         RETURN a.title AS title",
+        )
+        .expect("distance × decay query");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "old article passes (distance × 0.0 = 0.0 < 0.5)"
+    );
+    assert_eq!(rows[0].get("title"), Some(&Value::String("old".into())),);
+}
+
+/// Literal multiplier `vector_similarity() * 0.5 > threshold` should NOT be
+/// extracted as decay pattern — it falls through to generic Filter.
+#[test]
+fn literal_multiplier_not_detected_as_decay() {
+    let (mut db, _dir) = open_db();
+    setup_vector_decay_schema(&mut db);
+
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+
+    db.execute_cypher(&format!(
+        "CREATE (a:Article {{title: 'test', created_at: {now_us}, embedding: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create");
+
+    // similarity(self, self) = 1.0, × 0.5 = 0.5, > 0.4 → passes
+    // This uses literal 0.5, NOT a property reference — should fall through
+    // to generic Filter which evaluates the expression normally.
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:Article) \
+         WHERE vector_similarity(a.embedding, [1.0, 0.0, 0.0]) * 0.5 > 0.4 \
+         RETURN a.title AS title",
+        )
+        .expect("literal multiplier query");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "literal multiplier should work via generic Filter"
+    );
+}
+
+/// EXPLAIN output shows `* decay` annotation when decay pattern detected.
+#[test]
+fn explain_shows_decay_annotation() {
+    let (mut db, _dir) = open_db();
+    setup_vector_decay_schema(&mut db);
+
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+
+    db.execute_cypher(&format!(
+        "CREATE (a:Article {{title: 'test', created_at: {now_us}, embedding: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create");
+
+    let explain = db
+        .explain_cypher(
+            "MATCH (a:Article) \
+         WHERE vector_similarity(a.embedding, [1.0, 0.0, 0.0]) * a._recency > 0.5 \
+         RETURN a.title",
+        )
+        .expect("explain decay query");
+
+    assert!(
+        explain.contains("* decay"),
+        "EXPLAIN should show '* decay' annotation, got: {explain}"
+    );
+}
+
+/// Step formula: binary cutoff at duration boundary.
+#[test]
+fn vector_decay_step_formula() {
+    let (mut db, _dir) = open_db();
+
+    let mut schema = LabelSchema::new("StepArticle");
+    schema.add_property(PropertyDef::new("title", PropertyType::String));
+    schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
+    schema.add_property(PropertyDef::new(
+        "embedding",
+        PropertyType::Vector {
+            dimensions: 3,
+            metric: coordinode_core::graph::types::VectorMetric::Cosine,
+        },
+    ));
+    schema.add_property(PropertyDef::computed(
+        "_recency",
+        ComputedSpec::VectorDecay {
+            formula: DecayFormula::Step,
+            duration_secs: 86400, // 1 day
+            anchor_field: "created_at".into(),
+        },
+    ));
+
+    let schema_key = coordinode_core::schema::definition::encode_label_schema_key("StepArticle");
+    let bytes = schema.to_msgpack().expect("serialize");
+    db.engine_shared()
+        .put(
+            coordinode_storage::engine::partition::Partition::Schema,
+            &schema_key,
+            &bytes,
+        )
+        .expect("persist schema");
+
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+
+    // Fresh: < 1 day → step = 1.0
+    db.execute_cypher(&format!(
+        "CREATE (a:StepArticle {{title: 'fresh', created_at: {now_us}, embedding: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create fresh");
+
+    // Old: > 1 day → step = 0.0
+    let old_us = now_us - 2 * 86400 * 1_000_000;
+    db.execute_cypher(&format!(
+        "CREATE (a:StepArticle {{title: 'old', created_at: {old_us}, embedding: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create old");
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:StepArticle) \
+         WHERE vector_similarity(a.embedding, [1.0, 0.0, 0.0]) * a._recency > 0.5 \
+         RETURN a.title AS title",
+        )
+        .expect("step decay query");
+
+    assert_eq!(rows.len(), 1, "only fresh (step=1.0) passes");
+    assert_eq!(rows[0].get("title"), Some(&Value::String("fresh".into())));
+}
+
+/// PowerLaw formula: fat-tail decay, slower than exponential at high t.
+#[test]
+fn vector_decay_power_law_formula() {
+    let (mut db, _dir) = open_db();
+
+    // PowerLaw: (1 + t/0.5)^(-1.0)
+    // At t=1.0 (full duration): (1 + 1.0/0.5)^(-1) = (3)^(-1) = 0.333
+    let mut schema = LabelSchema::new("PLArticle");
+    schema.add_property(PropertyDef::new("title", PropertyType::String));
+    schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
+    schema.add_property(PropertyDef::new(
+        "embedding",
+        PropertyType::Vector {
+            dimensions: 3,
+            metric: coordinode_core::graph::types::VectorMetric::Cosine,
+        },
+    ));
+    schema.add_property(PropertyDef::computed(
+        "_recency",
+        ComputedSpec::VectorDecay {
+            formula: DecayFormula::PowerLaw {
+                tau: 0.5,
+                alpha: 1.0,
+            },
+            duration_secs: 86400,
+            anchor_field: "created_at".into(),
+        },
+    ));
+
+    let schema_key = coordinode_core::schema::definition::encode_label_schema_key("PLArticle");
+    let bytes = schema.to_msgpack().expect("serialize");
+    db.engine_shared()
+        .put(
+            coordinode_storage::engine::partition::Partition::Schema,
+            &schema_key,
+            &bytes,
+        )
+        .expect("persist schema");
+
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+
+    // 1 day old → t=1.0 → decay = (1+2)^(-1) = 0.333
+    // score = 1.0 * 0.333 = 0.333
+    let one_day_ago = now_us - 86400 * 1_000_000;
+    db.execute_cypher(&format!(
+        "CREATE (a:PLArticle {{title: 'day_old', created_at: {one_day_ago}, embedding: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create");
+
+    // threshold 0.2 → 0.333 > 0.2 → passes (fat tail)
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:PLArticle) \
+         WHERE vector_similarity(a.embedding, [1.0, 0.0, 0.0]) * a._recency > 0.2 \
+         RETURN a.title AS title",
+        )
+        .expect("power law query");
+    assert_eq!(rows.len(), 1, "power law fat tail: 0.333 > 0.2 → passes");
+
+    // threshold 0.5 → 0.333 < 0.5 → filtered
+    let rows2 = db
+        .execute_cypher(
+            "MATCH (a:PLArticle) \
+         WHERE vector_similarity(a.embedding, [1.0, 0.0, 0.0]) * a._recency > 0.5 \
+         RETURN a.title AS title",
+        )
+        .expect("power law strict");
+    assert_eq!(rows2.len(), 0, "power law: 0.333 < 0.5 → filtered");
+}
+
+/// Compound WHERE: decay pattern is extracted alongside property filter.
+/// `WHERE vector_similarity() * decay > 0.5 AND a.title = 'fresh'`
+/// should split into VectorFilter(decay) + generic Filter(title).
+#[test]
+fn vector_decay_in_compound_where() {
+    let (mut db, _dir) = open_db();
+    setup_vector_decay_schema(&mut db);
+
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+
+    db.execute_cypher(&format!(
+        "CREATE (a:Article {{title: 'fresh', created_at: {now_us}, embedding: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create fresh");
+
+    db.execute_cypher(&format!(
+        "CREATE (a:Article {{title: 'also_fresh', created_at: {now_us}, embedding: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create also_fresh");
+
+    let old_us = now_us - 2 * 86400 * 1_000_000;
+    db.execute_cypher(&format!(
+        "CREATE (a:Article {{title: 'old', created_at: {old_us}, embedding: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create old");
+
+    // Compound: decay filter + property filter
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:Article) \
+         WHERE vector_similarity(a.embedding, [1.0, 0.0, 0.0]) * a._recency > 0.5 \
+         AND a.title = 'fresh' \
+         RETURN a.title AS title",
+        )
+        .expect("compound decay + property query");
+
+    // 3 articles: 'fresh' (passes both), 'also_fresh' (passes decay, fails title), 'old' (fails decay)
+    assert_eq!(
+        rows.len(),
+        1,
+        "compound filter: only 'fresh' passes both conditions"
+    );
+    assert_eq!(rows[0].get("title"), Some(&Value::String("fresh".into())));
+}

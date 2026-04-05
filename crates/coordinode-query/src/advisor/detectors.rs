@@ -706,6 +706,7 @@ mod tests {
             function: "vector_distance".to_string(),
             less_than: true,
             threshold: 0.5,
+            decay_field: None,
         });
         let suggestions = detect_suggestions(&p, None);
 
@@ -739,6 +740,7 @@ mod tests {
             function: "vector_distance".to_string(),
             less_than: true,
             threshold: 0.5,
+            decay_field: None,
         });
         let suggestions = detect_suggestions(&p, None);
         assert!(suggestions.is_empty());
