@@ -434,33 +434,49 @@ impl TextIndex {
                     .build();
                 index.tokenizers().register(tokenizer_name, analyzer);
             }
-            // CJK: dictionary-based segmenters
+            // CJK: dictionary-based segmenters.
+            // Uses CjkDictConfig::from_env() for external dictionary paths.
+            // When COORDINODE_CJK_ZH/JA/KO_DICT env vars are set, loads from
+            // filesystem instead of embedded dictionaries (~70MB savings).
             #[cfg(feature = "cjk-zh")]
             "chinese_jieba" => {
-                let tokenizer = cjk::JiebaTokenizer::new();
-                let analyzer = TextAnalyzer::builder(tokenizer).filter(LowerCaser).build();
-                index.tokenizers().register(tokenizer_name, analyzer);
+                let cjk_config = cjk::CjkDictConfig::from_env();
+                match cjk_config.chinese_tokenizer() {
+                    Ok(tokenizer) => {
+                        let analyzer = TextAnalyzer::builder(tokenizer).filter(LowerCaser).build();
+                        index.tokenizers().register(tokenizer_name, analyzer);
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to create Chinese tokenizer: {e}");
+                    }
+                }
             }
             #[cfg(feature = "cjk-ja")]
-            "japanese_lindera" => match cjk::LinderaTokenizer::new(cjk::CjkLanguage::Japanese) {
-                Ok(tokenizer) => {
-                    let analyzer = TextAnalyzer::builder(tokenizer).filter(LowerCaser).build();
-                    index.tokenizers().register(tokenizer_name, analyzer);
+            "japanese_lindera" => {
+                let cjk_config = cjk::CjkDictConfig::from_env();
+                match cjk_config.japanese_tokenizer() {
+                    Ok(tokenizer) => {
+                        let analyzer = TextAnalyzer::builder(tokenizer).filter(LowerCaser).build();
+                        index.tokenizers().register(tokenizer_name, analyzer);
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to create Japanese tokenizer: {e}");
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("failed to create Japanese tokenizer: {e}");
-                }
-            },
+            }
             #[cfg(feature = "cjk-ko")]
-            "korean_lindera" => match cjk::LinderaTokenizer::new(cjk::CjkLanguage::Korean) {
-                Ok(tokenizer) => {
-                    let analyzer = TextAnalyzer::builder(tokenizer).filter(LowerCaser).build();
-                    index.tokenizers().register(tokenizer_name, analyzer);
+            "korean_lindera" => {
+                let cjk_config = cjk::CjkDictConfig::from_env();
+                match cjk_config.korean_tokenizer() {
+                    Ok(tokenizer) => {
+                        let analyzer = TextAnalyzer::builder(tokenizer).filter(LowerCaser).build();
+                        index.tokenizers().register(tokenizer_name, analyzer);
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to create Korean tokenizer: {e}");
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("failed to create Korean tokenizer: {e}");
-                }
-            },
+            }
             // Snowball stemmers
             lang => {
                 if let Some(algorithm) = stem::algorithm_for_language(lang) {
@@ -1580,5 +1596,47 @@ mod tests {
 
         let ru = idx.search_with_language("бег", 10, "russian").unwrap();
         assert!(!ru.is_empty(), "new Russian content should be found");
+    }
+
+    /// Integration test: TextIndex with external jieba dictionary via env var.
+    ///
+    /// Each nextest test runs in its own process, so env var setting is safe.
+    #[cfg(feature = "cjk-zh")]
+    #[test]
+    fn chinese_jieba_external_dict_via_env() {
+        use std::io::Write;
+
+        // Create a custom jieba dictionary with a domain-specific word
+        let dict_dir = tempfile::tempdir().unwrap();
+        let dict_path = dict_dir.path().join("custom_jieba.dict");
+        {
+            let mut f = std::fs::File::create(&dict_path).unwrap();
+            // jieba dict format: word freq tag
+            writeln!(f, "coordinode 100 n").unwrap();
+            writeln!(f, "图数据库 50 n").unwrap();
+        }
+
+        // Set env var to point to our custom dict
+        std::env::set_var("COORDINODE_CJK_ZH_DICT", &dict_path);
+
+        // Create TextIndex with chinese_jieba — should use external dict
+        let idx_dir = tempfile::tempdir().unwrap();
+        let mut idx =
+            TextIndex::open_or_create(idx_dir.path(), 15_000_000, Some("chinese_jieba")).unwrap();
+
+        idx.add_document(1, "coordinode是新一代图数据库").unwrap();
+        idx.add_document(2, "传统数据库不支持图查询").unwrap();
+
+        // "coordinode" should be a single token (custom dict word)
+        let results = idx.search("coordinode", 10).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "custom dict word 'coordinode' should match: {results:?}"
+        );
+        assert_eq!(results[0].node_id, 1);
+
+        // Clean up env var
+        std::env::remove_var("COORDINODE_CJK_ZH_DICT");
     }
 }

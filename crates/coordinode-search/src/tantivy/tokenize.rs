@@ -117,10 +117,16 @@ fn tokenize_auto_detect(text: &str) -> Vec<Token> {
 
 #[cfg(feature = "cjk-zh")]
 fn tokenize_cjk_chinese(text: &str) -> Vec<Token> {
-    use crate::cjk::JiebaTokenizer;
+    use crate::cjk::CjkDictConfig;
     use tantivy::tokenizer::{TokenStream, Tokenizer};
 
-    let mut tok = JiebaTokenizer::new();
+    let mut tok = match CjkDictConfig::from_env().chinese_tokenizer() {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("failed to create Chinese tokenizer: {e}");
+            return tokenize_simple(text);
+        }
+    };
     let mut stream = tok.token_stream(text);
     let mut tokens = Vec::new();
 
@@ -141,10 +147,10 @@ fn tokenize_cjk_chinese(text: &str) -> Vec<Token> {
 
 #[cfg(feature = "cjk-ja")]
 fn tokenize_cjk_japanese(text: &str) -> Vec<Token> {
-    use crate::cjk::{CjkLanguage, LinderaTokenizer};
     use tantivy::tokenizer::{TokenStream, Tokenizer};
 
-    let mut tok = match LinderaTokenizer::new(CjkLanguage::Japanese) {
+    let cjk_config = crate::cjk::CjkDictConfig::from_env();
+    let mut tok = match cjk_config.japanese_tokenizer() {
         Ok(t) => t,
         Err(e) => {
             tracing::error!("failed to create Japanese tokenizer: {e}");
@@ -170,10 +176,10 @@ fn tokenize_cjk_japanese(text: &str) -> Vec<Token> {
 
 #[cfg(feature = "cjk-ko")]
 fn tokenize_cjk_korean(text: &str) -> Vec<Token> {
-    use crate::cjk::{CjkLanguage, LinderaTokenizer};
     use tantivy::tokenizer::{TokenStream, Tokenizer};
 
-    let mut tok = match LinderaTokenizer::new(CjkLanguage::Korean) {
+    let cjk_config = crate::cjk::CjkDictConfig::from_env();
+    let mut tok = match cjk_config.korean_tokenizer() {
         Ok(t) => t,
         Err(e) => {
             tracing::error!("failed to create Korean tokenizer: {e}");
