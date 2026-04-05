@@ -222,6 +222,19 @@ fn write_clause(buf: &mut String, clause: &Clause) {
             buf.push_str("DROP TEXT INDEX ");
             buf.push_str(&c.name);
         }
+        Clause::CreateEncryptedIndex(c) => {
+            buf.push_str("CREATE ENCRYPTED INDEX ");
+            buf.push_str(&c.name);
+            buf.push_str(" ON :");
+            buf.push_str(&c.label);
+            buf.push('(');
+            buf.push_str(&c.property);
+            buf.push(')');
+        }
+        Clause::DropEncryptedIndex(c) => {
+            buf.push_str("DROP ENCRYPTED INDEX ");
+            buf.push_str(&c.name);
+        }
     }
 }
 

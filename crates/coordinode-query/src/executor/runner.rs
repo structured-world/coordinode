@@ -1394,6 +1394,15 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             execute_text_filter(&rows, text_expr, query_string, language.as_deref(), ctx)
         }
 
+        LogicalOp::EncryptedFilter {
+            input,
+            field_expr,
+            token_expr,
+        } => {
+            let rows = execute_op(input, ctx)?;
+            execute_encrypted_filter(&rows, field_expr, token_expr, ctx)
+        }
+
         LogicalOp::Unwind {
             input,
             expr,
@@ -1473,6 +1482,14 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         ),
 
         LogicalOp::DropTextIndex { name } => execute_drop_text_index(name, ctx),
+
+        LogicalOp::CreateEncryptedIndex {
+            name,
+            label,
+            property,
+        } => execute_create_encrypted_index(name, label, property, ctx),
+
+        LogicalOp::DropEncryptedIndex { name } => execute_drop_encrypted_index(name, ctx),
 
         LogicalOp::Empty => Ok(vec![Row::new()]),
 
@@ -2519,6 +2536,136 @@ fn execute_text_filter(
                 // Store BM25 score for text_score() access in RETURN clause
                 out_row.insert("__text_score__".to_string(), Value::Float(score as f64));
                 results.push(out_row);
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// EncryptedFilter: SSE equality search via storage-backed token index.
+///
+/// For each row, extracts the variable's label and the property name from `field_expr`,
+/// creates an `EncryptedIndex` on the fly from `ctx.engine`, evaluates `token_expr`
+/// to get the search token bytes, and filters rows by matching node IDs.
+/// Decode a hex string to bytes. Returns `None` if the string is not valid hex.
+fn decode_hex_string(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(s.len() / 2);
+    for chunk in s.as_bytes().chunks(2) {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        bytes.push((hi << 4) | lo);
+    }
+    Some(bytes)
+}
+
+/// Convert an ASCII hex character to its nibble value (0-15).
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn execute_encrypted_filter(
+    rows: &[Row],
+    field_expr: &Expr,
+    token_expr: &Expr,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    use coordinode_search::encrypted::{EncryptedIndex, SearchToken};
+
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Evaluate token from expression (parameter or literal).
+    // Use the first row for context (token expression is typically a parameter,
+    // independent of row data).
+    let token_val = eval_expr(token_expr, &rows[0]);
+    let token_bytes = match &token_val {
+        Value::Binary(b) => b.clone(),
+        Value::String(s) => {
+            // Accept hex-encoded token strings: decode hex → raw bytes.
+            // If not valid hex (odd length or invalid chars), fall back to raw UTF-8 bytes.
+            decode_hex_string(s).unwrap_or_else(|| s.as_bytes().to_vec())
+        }
+        _ => {
+            ctx.warnings.push(
+                "encrypted_match() token expression did not evaluate to Binary or String."
+                    .to_string(),
+            );
+            return Ok(Vec::new());
+        }
+    };
+
+    let search_token = match SearchToken::from_bytes(&token_bytes) {
+        Some(t) => t,
+        None => {
+            ctx.warnings.push(format!(
+                "encrypted_match() token is {} bytes, expected 32.",
+                token_bytes.len()
+            ));
+            return Ok(Vec::new());
+        }
+    };
+
+    // Extract variable name and property from field_expr (e.g., "u" and "email" from u.email).
+    let (variable, property) = match field_expr {
+        Expr::PropertyAccess { expr, property } => {
+            if let Expr::Variable(var) = expr.as_ref() {
+                (var.clone(), property.clone())
+            } else {
+                return Ok(rows.to_vec()); // can't determine variable
+            }
+        }
+        _ => return Ok(rows.to_vec()),
+    };
+
+    // Extract label from the first row's __label__ field.
+    let label = rows
+        .first()
+        .and_then(|r| {
+            r.get(&format!("{variable}.__label__"))
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+        })
+        .unwrap_or_default();
+
+    if label.is_empty() {
+        ctx.warnings.push(format!(
+            "encrypted_match() could not determine label for variable '{variable}'."
+        ));
+        return Ok(rows.to_vec());
+    }
+
+    // Create storage-backed SSE index on the fly (cheap — just stores engine ref + strings).
+    let index = EncryptedIndex::new(ctx.engine, &label, &property);
+    let matching_ids = index
+        .search(&search_token)
+        .map_err(|e| ExecutionError::Unsupported(format!("encrypted search error: {e}")))?;
+
+    // Build a set for O(1) lookup.
+    let matching_set: std::collections::HashSet<u64> = matching_ids.into_iter().collect();
+
+    // Filter rows: keep those whose node ID is in the match set.
+    let mut results = Vec::new();
+    for row in rows {
+        let node_id = row.get(&variable).and_then(|v| {
+            if let Value::Int(id) = v {
+                Some(*id as u64)
+            } else {
+                None
+            }
+        });
+
+        if let Some(nid) = node_id {
+            if matching_set.contains(&nid) {
+                results.push(row.clone());
             }
         }
     }
@@ -4505,6 +4652,52 @@ fn execute_drop_text_index(
     let schema_key = def.schema_key();
     ctx.mvcc_write_buffer
         .insert((Partition::Schema, schema_key), None);
+
+    let mut row = Row::new();
+    row.insert("index".to_string(), Value::String(name.to_string()));
+    row.insert("dropped".to_string(), Value::Bool(true));
+    Ok(vec![row])
+}
+
+/// Execute CREATE ENCRYPTED INDEX — stores blind-index metadata in the schema partition.
+///
+/// The encrypted index enables token-based equality search on encrypted properties
+/// without exposing plaintext to the server.
+fn execute_create_encrypted_index(
+    name: &str,
+    label: &str,
+    property: &str,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    // Store the index definition keyed by name for easy DROP lookup.
+    let schema_key = format!("encrypted_index:{name}");
+    let meta = format!("{{\"name\":\"{name}\",\"label\":\"{label}\",\"property\":\"{property}\"}}");
+    ctx.mvcc_write_buffer.insert(
+        (Partition::Schema, schema_key.into_bytes()),
+        Some(meta.into_bytes()),
+    );
+
+    let mut row = Row::new();
+    row.insert("index".to_string(), Value::String(name.to_string()));
+    row.insert("label".to_string(), Value::String(label.to_string()));
+    row.insert("property".to_string(), Value::String(property.to_string()));
+    row.insert("created".to_string(), Value::Bool(true));
+    Ok(vec![row])
+}
+
+/// Execute DROP ENCRYPTED INDEX — removes blind-index metadata from the schema partition.
+fn execute_drop_encrypted_index(
+    name: &str,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    // Scan for the schema key matching this index name.
+    // Since we don't have a registry for encrypted indexes yet, we tombstone
+    // all schema keys that end with the index name.
+    // For now, write a tombstone for the known key pattern.
+    // A full implementation would scan the schema partition.
+    let tombstone_key = format!("encrypted_index:{name}");
+    ctx.mvcc_write_buffer
+        .insert((Partition::Schema, tombstone_key.into_bytes()), None);
 
     let mut row = Row::new();
     row.insert("index".to_string(), Value::String(name.to_string()));

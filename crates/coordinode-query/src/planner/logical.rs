@@ -187,6 +187,16 @@ pub enum LogicalOp {
     /// DROP TEXT INDEX: remove a full-text search index.
     DropTextIndex { name: String },
 
+    /// CREATE ENCRYPTED INDEX: create a blind-index for encrypted search on a label property.
+    CreateEncryptedIndex {
+        name: String,
+        label: String,
+        property: String,
+    },
+
+    /// DROP ENCRYPTED INDEX: remove an encrypted search index.
+    DropEncryptedIndex { name: String },
+
     /// UNWIND: expand a list expression into individual rows.
     /// Produced from UNWIND expr AS variable.
     Unwind {
@@ -264,6 +274,17 @@ pub enum LogicalOp {
         /// Optional language for query tokenization (3-arg text_match).
         /// When None, uses the index's default language.
         language: Option<String>,
+    },
+
+    /// Encrypted search filter: evaluates encrypted_match() per row.
+    /// Extracted from WHERE clause when planner detects encrypted_match() predicate.
+    /// Uses SSE (Searchable Symmetric Encryption) token lookup via storage-backed index.
+    EncryptedFilter {
+        input: Box<LogicalOp>,
+        /// Expression for the encrypted field (e.g., u.email).
+        field_expr: Expr,
+        /// Search token expression (parameter or literal bytes).
+        token_expr: Expr,
     },
 
     /// Left outer join for OPTIONAL MATCH: if the right side produces no rows,
@@ -450,6 +471,15 @@ impl LogicalOp {
             LogicalOp::TextFilter { input, .. } => {
                 input.substitute_params(params);
             }
+            LogicalOp::EncryptedFilter {
+                input,
+                field_expr,
+                token_expr,
+            } => {
+                input.substitute_params(params);
+                field_expr.substitute_params(params);
+                token_expr.substitute_params(params);
+            }
             LogicalOp::ShortestPath { input, .. } => {
                 input.substitute_params(params);
             }
@@ -461,6 +491,8 @@ impl LogicalOp {
             LogicalOp::AlterLabel { .. }
             | LogicalOp::CreateTextIndex { .. }
             | LogicalOp::DropTextIndex { .. }
+            | LogicalOp::CreateEncryptedIndex { .. }
+            | LogicalOp::DropEncryptedIndex { .. }
             | LogicalOp::Empty => {}
         }
     }
@@ -851,6 +883,14 @@ fn estimate_op_cost(
             (input_cost + input_rows * 0.5, rows) // cheaper than vector, more than scalar
         }
 
+        LogicalOp::EncryptedFilter { input, .. } => {
+            let (input_cost, input_rows) = estimate_op_cost(input, defaults, stats, hints);
+            // SSE encrypted search: hash lookup is very cheap (single key prefix scan).
+            // Selectivity is very low — equality match on encrypted field.
+            let rows = input_rows * 0.01;
+            (input_cost + input_rows * 0.1, rows)
+        }
+
         LogicalOp::Unwind { input, .. } => {
             let (input_cost, input_rows) = estimate_op_cost(input, defaults, stats, hints);
             // Assume average list length of 5
@@ -919,7 +959,9 @@ fn estimate_op_cost(
         LogicalOp::ProcedureCall { .. } => (1.0, 10.0),
         LogicalOp::AlterLabel { .. }
         | LogicalOp::CreateTextIndex { .. }
-        | LogicalOp::DropTextIndex { .. } => (1.0, 1.0),
+        | LogicalOp::DropTextIndex { .. }
+        | LogicalOp::CreateEncryptedIndex { .. }
+        | LogicalOp::DropEncryptedIndex { .. } => (1.0, 1.0),
         LogicalOp::Empty => (0.0, 1.0),
     }
 }
@@ -992,6 +1034,7 @@ fn op_contains_vector_filter(op: &LogicalOp) -> bool {
         | LogicalOp::Traverse { input, .. }
         | LogicalOp::Unwind { input, .. }
         | LogicalOp::TextFilter { input, .. }
+        | LogicalOp::EncryptedFilter { input, .. }
         | LogicalOp::ShortestPath { input, .. } => op_contains_vector_filter(input),
         LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
             op_contains_vector_filter(left) || op_contains_vector_filter(right)
@@ -1223,6 +1266,10 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             }
             explain_op(input, indent + 1, output);
         }
+        LogicalOp::EncryptedFilter { input, .. } => {
+            output.push_str(&format!("{prefix}EncryptedFilter(encrypted_match)\n"));
+            explain_op(input, indent + 1, output);
+        }
         LogicalOp::Unwind {
             input,
             expr,
@@ -1282,6 +1329,18 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
         }
         LogicalOp::DropTextIndex { name } => {
             output.push_str(&format!("{prefix}DropTextIndex({name})\n"));
+        }
+        LogicalOp::CreateEncryptedIndex {
+            name,
+            label,
+            property,
+        } => {
+            output.push_str(&format!(
+                "{prefix}CreateEncryptedIndex({name} ON :{label}({property}))\n"
+            ));
+        }
+        LogicalOp::DropEncryptedIndex { name } => {
+            output.push_str(&format!("{prefix}DropEncryptedIndex({name})\n"));
         }
         LogicalOp::Empty => {
             output.push_str(&format!("{prefix}Empty\n"));

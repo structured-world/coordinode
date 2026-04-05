@@ -46,6 +46,8 @@ pub enum Clause {
     AlterLabel(AlterLabelClause),
     CreateTextIndex(CreateTextIndexClause),
     DropTextIndex(DropTextIndexClause),
+    CreateEncryptedIndex(CreateEncryptedIndexClause),
+    DropEncryptedIndex(DropEncryptedIndexClause),
 
     // Write clauses
     Create(CreateClause),
@@ -100,6 +102,32 @@ pub struct CreateTextIndexClause {
 /// Syntax: `DROP TEXT INDEX idx_name`
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropTextIndexClause {
+    /// Index name to drop.
+    pub name: String,
+}
+
+/// CREATE ENCRYPTED INDEX clause (SSE).
+///
+/// Syntax: `CREATE ENCRYPTED INDEX idx_name ON :Label(property)`
+///
+/// Creates a searchable symmetric encryption index for equality queries
+/// on encrypted fields. The client provides search tokens (HMAC-SHA256);
+/// the server matches tokens without seeing plaintext.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateEncryptedIndexClause {
+    /// Index name.
+    pub name: String,
+    /// Label to index.
+    pub label: String,
+    /// Property name to index.
+    pub property: String,
+}
+
+/// DROP ENCRYPTED INDEX clause.
+///
+/// Syntax: `DROP ENCRYPTED INDEX idx_name`
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropEncryptedIndexClause {
     /// Index name to drop.
     pub name: String,
 }

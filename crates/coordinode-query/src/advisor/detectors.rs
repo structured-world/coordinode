@@ -240,7 +240,9 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::ProcedureCall { .. }
         | LogicalOp::AlterLabel { .. }
         | LogicalOp::CreateTextIndex { .. }
-        | LogicalOp::DropTextIndex { .. } => vec![],
+        | LogicalOp::DropTextIndex { .. }
+        | LogicalOp::CreateEncryptedIndex { .. }
+        | LogicalOp::DropEncryptedIndex { .. } => vec![],
 
         LogicalOp::Filter { input, .. }
         | LogicalOp::Project { input, .. }
@@ -257,6 +259,7 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::VectorFilter { input, .. }
         | LogicalOp::EdgeVectorSearch { input, .. }
         | LogicalOp::TextFilter { input, .. }
+        | LogicalOp::EncryptedFilter { input, .. }
         | LogicalOp::ShortestPath { input, .. } => vec![input],
 
         LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {

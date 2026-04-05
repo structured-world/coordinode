@@ -186,7 +186,11 @@ impl<'a> Analyzer<'a> {
                     self.check_expr(arg);
                 }
             }
-            Clause::AlterLabel(_) | Clause::CreateTextIndex(_) | Clause::DropTextIndex(_) => {
+            Clause::AlterLabel(_)
+            | Clause::CreateTextIndex(_)
+            | Clause::DropTextIndex(_)
+            | Clause::CreateEncryptedIndex(_)
+            | Clause::DropEncryptedIndex(_) => {
                 // DDL — no variable references to validate.
             }
         }

@@ -180,6 +180,14 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let c = build_drop_text_index_clause(pair)?;
             clauses.push(Clause::DropTextIndex(c));
         }
+        Rule::create_encrypted_index_clause => {
+            let c = build_create_encrypted_index_clause(pair)?;
+            clauses.push(Clause::CreateEncryptedIndex(c));
+        }
+        Rule::drop_encrypted_index_clause => {
+            let c = build_drop_encrypted_index_clause(pair)?;
+            clauses.push(Clause::DropEncryptedIndex(c));
+        }
         Rule::create_clause => {
             let cc = build_create_clause(pair)?;
             clauses.push(Clause::Create(cc));
@@ -817,6 +825,53 @@ fn build_drop_text_index_clause(pair: Pair<'_, Rule>) -> Result<DropTextIndexCla
     }
 
     Ok(DropTextIndexClause { name })
+}
+
+// --- Encrypted Index DDL (SSE, G017) ---
+
+fn build_create_encrypted_index_clause(
+    pair: Pair<'_, Rule>,
+) -> Result<CreateEncryptedIndexClause, ParseError> {
+    let mut identifiers = Vec::new();
+
+    for inner in pair.into_inner() {
+        if inner.as_rule() == Rule::identifier {
+            identifiers.push(inner.as_str().to_string());
+        }
+    }
+
+    // Expected: index_name, label, property (3 identifiers after keywords)
+    if identifiers.len() < 3 {
+        return Err(ParseError::Invalid(
+            "CREATE ENCRYPTED INDEX requires: name ON :Label(property)".into(),
+        ));
+    }
+
+    Ok(CreateEncryptedIndexClause {
+        name: identifiers[0].clone(),
+        label: identifiers[1].clone(),
+        property: identifiers[2].clone(),
+    })
+}
+
+fn build_drop_encrypted_index_clause(
+    pair: Pair<'_, Rule>,
+) -> Result<DropEncryptedIndexClause, ParseError> {
+    let mut name = String::new();
+
+    for inner in pair.into_inner() {
+        if inner.as_rule() == Rule::identifier {
+            name = inner.as_str().to_string();
+        }
+    }
+
+    if name.is_empty() {
+        return Err(ParseError::Invalid(
+            "DROP ENCRYPTED INDEX requires index name".into(),
+        ));
+    }
+
+    Ok(DropEncryptedIndexClause { name })
 }
 
 // --- Write clauses ---

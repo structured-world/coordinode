@@ -21,11 +21,13 @@ clause = {
   | as_of_timestamp_clause
   | call_clause
   | alter_label_clause
+  | create_encrypted_index_clause
   | create_text_index_clause
   | create_clause
   | merge_clause
   | upsert_clause
   | detach_delete_clause
+  | drop_encrypted_index_clause
   | drop_text_index_clause
   | delete_clause
   | set_clause
@@ -154,6 +156,16 @@ text_index_language_override = { kw_language ~ kw_override ~ string_literal }
 
 // DROP TEXT INDEX idx_name
 drop_text_index_clause = { kw_drop ~ kw_text ~ kw_index ~ identifier }
+
+// --- CREATE/DROP ENCRYPTED INDEX (SSE, G017) ---
+
+// CREATE ENCRYPTED INDEX idx_name ON :Label(property)
+create_encrypted_index_clause = {
+    kw_create ~ kw_encrypted ~ kw_index ~ identifier ~ kw_on ~ ":" ~ identifier ~ "(" ~ identifier ~ ")"
+}
+
+// DROP ENCRYPTED INDEX idx_name
+drop_encrypted_index_clause = { kw_drop ~ kw_encrypted ~ kw_index ~ identifier }
 
 // --- CREATE ---
 
@@ -372,6 +384,7 @@ kw_alter      = @{ ^"alter" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_label      = @{ ^"label" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_schema     = @{ ^"schema" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_text       = @{ ^"text" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_encrypted  = @{ ^"encrypted" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_index      = @{ ^"index" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_drop       = @{ ^"drop" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_language   = @{ ^"language" ~ !(ASCII_ALPHANUMERIC | "_") }

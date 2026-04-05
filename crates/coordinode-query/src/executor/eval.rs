@@ -465,6 +465,10 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
                 Value::Bool(false)
             }
         }
+        // encrypted_match(field, token) → boolean. Used in WHERE clause.
+        // When used in RETURN, the row has already been filtered by EncryptedFilter,
+        // so if the row is present, it matched. Always returns true for surviving rows.
+        "encrypted_match" => Value::Bool(true),
         // Spatial functions
         "point" => {
             // point({latitude: X, longitude: Y}) → Geo(Point { lat, lon })

@@ -273,6 +273,14 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
         Clause::DropTextIndex(c) => Ok(LogicalOp::DropTextIndex {
             name: c.name.clone(),
         }),
+        Clause::CreateEncryptedIndex(c) => Ok(LogicalOp::CreateEncryptedIndex {
+            name: c.name.clone(),
+            label: c.label.clone(),
+            property: c.property.clone(),
+        }),
+        Clause::DropEncryptedIndex(c) => Ok(LogicalOp::DropEncryptedIndex {
+            name: c.name.clone(),
+        }),
     }
 }
 
@@ -437,6 +445,15 @@ fn optimize_edge_vector_search(op: LogicalOp) -> LogicalOp {
             text_expr,
             query_string,
             language,
+        },
+        LogicalOp::EncryptedFilter {
+            input,
+            field_expr,
+            token_expr,
+        } => LogicalOp::EncryptedFilter {
+            input: Box::new(optimize_edge_vector_search(*input)),
+            field_expr,
+            token_expr,
         },
         LogicalOp::CartesianProduct { left, right } => LogicalOp::CartesianProduct {
             left: Box::new(optimize_edge_vector_search(*left)),
@@ -928,6 +945,7 @@ fn apply_compound_where(predicate: &Expr, input: LogicalOp) -> LogicalOp {
 
     let mut vector_conjuncts = Vec::new();
     let mut text_conjuncts = Vec::new();
+    let mut encrypted_conjuncts = Vec::new();
     let mut remaining_conjuncts = Vec::new();
 
     // Step 2: Classify each conjunct
@@ -936,20 +954,25 @@ fn apply_compound_where(predicate: &Expr, input: LogicalOp) -> LogicalOp {
             vector_conjuncts.push(conj.clone());
         } else if try_extract_text_filter(conj, LogicalOp::Empty).is_some() {
             text_conjuncts.push(conj.clone());
+        } else if try_extract_encrypted_filter(conj, LogicalOp::Empty).is_some() {
+            encrypted_conjuncts.push(conj.clone());
         } else {
             remaining_conjuncts.push(conj.clone());
         }
     }
 
     // If nothing was split (single predicate or no specialized), fast path
-    if vector_conjuncts.is_empty() && text_conjuncts.is_empty() {
+    if vector_conjuncts.is_empty() && text_conjuncts.is_empty() && encrypted_conjuncts.is_empty() {
         // No specialized predicates found — try the original extraction on full predicate
-        // (handles cases where the top-level expression IS a vector/text call, not AND)
+        // (handles cases where the top-level expression IS a vector/text/encrypted call, not AND)
         if let Some(vf) = try_extract_vector_filter(predicate, input.clone()) {
             return vf;
         }
         if let Some(tf) = try_extract_text_filter(predicate, input.clone()) {
             return tf;
+        }
+        if let Some(ef) = try_extract_encrypted_filter(predicate, input.clone()) {
+            return ef;
         }
         return LogicalOp::Filter {
             input: Box::new(input),
@@ -969,6 +992,13 @@ fn apply_compound_where(predicate: &Expr, input: LogicalOp) -> LogicalOp {
     for tf_expr in &text_conjuncts {
         if let Some(tf) = try_extract_text_filter(tf_expr, result.clone()) {
             result = tf;
+        }
+    }
+
+    // Encrypted filters next (SSE equality lookups — very cheap hash lookup)
+    for ef_expr in &encrypted_conjuncts {
+        if let Some(ef) = try_extract_encrypted_filter(ef_expr, result.clone()) {
+            result = ef;
         }
     }
 
@@ -1032,6 +1062,7 @@ fn collect_op_variables(op: &LogicalOp) -> Vec<String> {
         LogicalOp::Filter { input, .. }
         | LogicalOp::VectorFilter { input, .. }
         | LogicalOp::TextFilter { input, .. }
+        | LogicalOp::EncryptedFilter { input, .. }
         | LogicalOp::Aggregate { input, .. }
         | LogicalOp::Project { input, .. }
         | LogicalOp::Sort { input, .. }
@@ -1177,6 +1208,19 @@ fn try_extract_text_filter(expr: &Expr, input: LogicalOp) -> Option<LogicalOp> {
                     language,
                 });
             }
+        }
+    }
+    None
+}
+
+fn try_extract_encrypted_filter(expr: &Expr, input: LogicalOp) -> Option<LogicalOp> {
+    if let Expr::FunctionCall { name, args, .. } = expr {
+        if name == "encrypted_match" && args.len() == 2 {
+            return Some(LogicalOp::EncryptedFilter {
+                input: Box::new(input),
+                field_expr: args[0].clone(),
+                token_expr: args[1].clone(),
+            });
         }
     }
     None

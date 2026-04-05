@@ -16,6 +16,7 @@ mod integration {
     mod cypher;
     mod document;
     mod drain;
+    mod encrypted_search;
     mod helpers;
     mod hnsw;
     mod merge_stress;
