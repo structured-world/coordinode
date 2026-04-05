@@ -4,6 +4,7 @@
 //! Each test creates an isolated temp directory for crash safety.
 
 mod integration {
+    mod adaptive;
     mod advisor;
     mod alter_label;
     mod compound_queries;

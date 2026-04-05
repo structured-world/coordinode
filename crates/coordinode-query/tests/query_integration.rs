@@ -61,6 +61,7 @@ fn make_test_ctx<'a>(
         adj_snapshot: None,
         merge_node_deltas: Vec::new(),
         correlated_row: None,
+        feedback_cache: None,
     }
 }
 
@@ -2129,6 +2130,7 @@ fn adaptive_divergence_detected_on_high_fan_out() {
         max_fan_out: 10_000,
         switch_threshold: 0.3, // trigger when actual > 0.3 × expected (low threshold for test)
         check_interval: 10,    // check every 10 edges
+        ..AdaptiveConfig::default()
     };
 
     let (_results, warnings) = run_cypher_adaptive(
@@ -2157,6 +2159,7 @@ fn adaptive_no_divergence_on_small_graph() {
         max_fan_out: 10_000,
         switch_threshold: 10.0,
         check_interval: 1000,
+        ..AdaptiveConfig::default()
     };
 
     let (_results, warnings) = run_cypher_adaptive(
@@ -2199,6 +2202,7 @@ fn adaptive_disabled_no_warnings() {
         max_fan_out: 10_000,
         switch_threshold: 1.0,
         check_interval: 5,
+        ..AdaptiveConfig::default()
     };
 
     let (_results, warnings) = run_cypher_adaptive(
@@ -2225,6 +2229,7 @@ fn adaptive_check_interval_config() {
         max_fan_out: 10_000,
         switch_threshold: 0.01, // very low threshold — any traversal exceeds
         check_interval: 1,      // check every single edge
+        ..AdaptiveConfig::default()
     };
 
     let (_results, warnings) = run_cypher_adaptive(

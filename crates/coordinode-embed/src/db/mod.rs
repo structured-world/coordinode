@@ -20,7 +20,7 @@ use coordinode_query::advisor::{
 use coordinode_query::cypher;
 use coordinode_query::executor::row::Row;
 use coordinode_query::executor::runner::{
-    execute, AdaptiveConfig, ExecutionContext, ExecutionError, WriteStats,
+    execute, AdaptiveConfig, ExecutionContext, ExecutionError, FeedbackCache, WriteStats,
 };
 use coordinode_query::planner;
 use coordinode_raft::proposal::{LocalProposalPipeline, OwnedLocalProposalPipeline};
@@ -196,6 +196,11 @@ pub struct Database {
     vector_index_registry: coordinode_query::index::VectorIndexRegistry,
     /// Text index registry — holds live tantivy indexes for full-text search.
     text_index_registry: coordinode_query::index::TextIndexRegistry,
+    /// Adaptive query plan configuration — controls parallel traversal thresholds.
+    adaptive_config: AdaptiveConfig,
+    /// Feedback cache for known super-node fan-out degrees.
+    /// Shared across queries within the same Database session via Arc.
+    feedback_cache: FeedbackCache,
     /// Volatile write drain buffer for w:memory and w:cache write concerns.
     /// Shared between all ExecutionContext instances. The background drain
     /// thread batches buffered mutations into proposal pipeline calls.
@@ -348,6 +353,8 @@ impl Database {
             index_registry,
             vector_index_registry,
             text_index_registry,
+            adaptive_config: AdaptiveConfig::default(),
+            feedback_cache: FeedbackCache::default(),
             drain_buffer,
             _drain_handle: drain_handle,
             _ttl_reaper_handle: ttl_reaper_handle,
@@ -794,7 +801,7 @@ impl Database {
             interner: &mut self.interner,
             id_allocator: &self.allocator,
             shard_id: self.shard_id,
-            adaptive: AdaptiveConfig::default(),
+            adaptive: self.adaptive_config.clone(),
             snapshot_ts: None,
             retention_window_us: 7 * 24 * 3600 * 1_000_000,
             warnings: Vec::new(),
@@ -826,6 +833,7 @@ impl Database {
             adj_snapshot: None,
             merge_node_deltas: Vec::new(),
             correlated_row: None,
+            feedback_cache: Some(self.feedback_cache.clone()),
         };
 
         let start = Instant::now();
@@ -975,6 +983,14 @@ impl Database {
     /// or explicit `invalidate_stats_cache()`).
     pub fn set_stats_ttl(&mut self, ttl: Duration) {
         self.stats_ttl = ttl;
+    }
+
+    /// Set the adaptive parallel threshold for traversal.
+    ///
+    /// When a node's fan-out exceeds this threshold, the executor switches
+    /// to rayon parallel processing instead of sequential iteration.
+    pub fn set_adaptive_parallel_threshold(&mut self, threshold: usize) {
+        self.adaptive_config.parallel_threshold = threshold;
     }
 
     /// Get the underlying storage engine.
