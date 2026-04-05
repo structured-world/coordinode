@@ -315,6 +315,14 @@ impl TextIndex {
 
     /// Search the index for documents matching a query string.
     ///
+    /// Register a custom tokenizer/analyzer by name.
+    ///
+    /// Overrides any previously registered tokenizer with the same name.
+    /// Used for testing with external CJK dictionaries.
+    pub fn register_tokenizer(&self, name: &str, analyzer: tantivy::tokenizer::TextAnalyzer) {
+        self.index.tokenizers().register(name, analyzer);
+    }
+
     /// Returns up to `limit` results sorted by BM25 score (descending).
     /// Query syntax: boolean (AND/OR/NOT), phrase ("..."), prefix (word*).
     pub fn search(
@@ -720,7 +728,7 @@ fn strip_leading_operators(query: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1598,31 +1606,36 @@ mod tests {
         assert!(!ru.is_empty(), "new Russian content should be found");
     }
 
-    /// Integration test: TextIndex with external jieba dictionary via env var.
+    /// Integration test: TextIndex with external jieba dictionary.
     ///
-    /// Each nextest test runs in its own process, so env var setting is safe.
+    /// Tests the full pipeline: custom dict → JiebaTokenizer → TextIndex → search.
+    /// Uses explicit CjkDictConfig (not env var) to avoid race conditions
+    /// with parallel tests in `cargo test`.
     #[cfg(feature = "cjk-zh")]
     #[test]
-    fn chinese_jieba_external_dict_via_env() {
+    fn chinese_jieba_external_dict_text_index() {
         use std::io::Write;
+        use tantivy::tokenizer::{LowerCaser, TextAnalyzer};
 
         // Create a custom jieba dictionary with a domain-specific word
         let dict_dir = tempfile::tempdir().unwrap();
         let dict_path = dict_dir.path().join("custom_jieba.dict");
         {
             let mut f = std::fs::File::create(&dict_path).unwrap();
-            // jieba dict format: word freq tag
             writeln!(f, "coordinode 100 n").unwrap();
             writeln!(f, "图数据库 50 n").unwrap();
         }
 
-        // Set env var to point to our custom dict
-        std::env::set_var("COORDINODE_CJK_ZH_DICT", &dict_path);
+        // Create tokenizer from external dict explicitly (no env var)
+        let tokenizer = cjk::JiebaTokenizer::with_dict_path(&dict_path).expect("load custom dict");
+        let analyzer = TextAnalyzer::builder(tokenizer).filter(LowerCaser).build();
 
-        // Create TextIndex with chinese_jieba — should use external dict
+        // Create TextIndex and register the external-dict tokenizer manually
         let idx_dir = tempfile::tempdir().unwrap();
         let mut idx =
             TextIndex::open_or_create(idx_dir.path(), 15_000_000, Some("chinese_jieba")).unwrap();
+        // Override the default tokenizer with our custom-dict one
+        idx.register_tokenizer("chinese_jieba", analyzer);
 
         idx.add_document(1, "coordinode是新一代图数据库").unwrap();
         idx.add_document(2, "传统数据库不支持图查询").unwrap();
@@ -1635,8 +1648,5 @@ mod tests {
             "custom dict word 'coordinode' should match: {results:?}"
         );
         assert_eq!(results[0].node_id, 1);
-
-        // Clean up env var
-        std::env::remove_var("COORDINODE_CJK_ZH_DICT");
     }
 }
