@@ -1073,6 +1073,153 @@ async fn cluster_snapshot_grpc_transfer_to_new_node() {
     );
 }
 
+/// G046: Multi-chunk gRPC snapshot transfer.
+/// Same pattern as cluster_snapshot_grpc_transfer_to_new_node but with
+/// large payload (>4MB) to verify chunked transfer protocol works
+/// end-to-end through real gRPC.
+#[tokio::test(flavor = "multi_thread")]
+async fn cluster_snapshot_multi_chunk_transfer() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=info,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
+        let p1 = alloc_port();
+        let p2 = alloc_port();
+
+        let dir1 = tempfile::tempdir().expect("d1");
+        let e1 = Arc::new(StorageEngine::open(&StorageConfig::new(dir1.path())).expect("open1"));
+        let snap_config = coordinode_raft::cluster::SnapshotTriggerConfig {
+            check_interval: Duration::from_secs(3600),
+            disk_space_threshold: u64::MAX,
+        };
+
+        let n1 = RaftNode::open_cluster_with_snapshot_config(
+            1,
+            Arc::clone(&e1),
+            format!("127.0.0.1:{p1}").parse().expect("a"),
+            format!("http://127.0.0.1:{p1}"),
+            snap_config,
+        )
+        .await
+        .expect("leader");
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(n1.is_leader().await, "n1 should be leader");
+
+        // Write enough data to produce >4MB snapshot (multiple chunks).
+        // Each value is 4KB, 1200 entries ≈ 4.8MB of node data.
+        let pipeline = n1.pipeline();
+        let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+        let value_4kb = vec![0xABu8; 4096];
+
+        for batch_start in (0..1200u64).step_by(50) {
+            let mutations: Vec<Mutation> = (batch_start..batch_start + 50)
+                .map(|i| Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: format!("node:1:big-{i:05}").into_bytes(),
+                    value: value_4kb.clone(),
+                })
+                .collect();
+            let p = RaftProposal {
+                id: id_gen.next(),
+                mutations,
+                commit_ts: Timestamp::from_raw(1000 + batch_start),
+                start_ts: Timestamp::from_raw(999 + batch_start),
+                bypass_rate_limiter: false,
+            };
+            pipeline.propose_and_wait(&p).expect("propose batch");
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Verify snapshot is large enough to produce multiple chunks
+        let snap_data =
+            coordinode_raft::snapshot::build_full_snapshot(&e1).expect("build snapshot");
+        let chunk_count = coordinode_raft::snapshot::chunk_snapshot_data(&snap_data).count();
+        assert!(
+            chunk_count > 1,
+            "snapshot should produce multiple chunks, got {chunk_count} \
+             (data size: {} bytes, chunk size: {})",
+            snap_data.len(),
+            coordinode_raft::snapshot::SNAPSHOT_CHUNK_SIZE,
+        );
+        tracing::info!(
+            data_bytes = snap_data.len(),
+            chunk_count,
+            "verified snapshot is multi-chunk"
+        );
+        drop(snap_data); // free memory
+
+        // Trigger snapshot and purge logs to force gRPC snapshot transfer
+        n1.raft()
+            .trigger()
+            .snapshot()
+            .await
+            .expect("trigger snapshot");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let applied = n1.applied_index();
+        if applied > 1 {
+            n1.raft()
+                .trigger()
+                .purge_log(applied)
+                .await
+                .expect("trigger purge");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        // Add new node — must receive snapshot via chunked gRPC transfer
+        let dir2 = tempfile::tempdir().expect("d2");
+        let e2 = Arc::new(StorageEngine::open(&StorageConfig::new(dir2.path())).expect("open2"));
+
+        let n2 = RaftNode::open_joining(
+            2,
+            Arc::clone(&e2),
+            format!("127.0.0.1:{p2}").parse().expect("a"),
+        )
+        .await
+        .expect("joining node");
+
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add node 2");
+
+        // Wait for multi-chunk snapshot transfer
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        // Verify data reached the new node
+        let mut found = 0;
+        for i in 0..1200u64 {
+            let key = format!("node:1:big-{i:05}");
+            if let Ok(Some(_)) = e2.get(Partition::Node, key.as_bytes()) {
+                found += 1;
+            }
+        }
+
+        assert!(
+            found >= 1000,
+            "new node should have received most data via multi-chunk \
+             snapshot transfer, found {found}/1200 entries"
+        );
+
+        tracing::info!(
+            found,
+            "multi-chunk gRPC snapshot transfer verified: {found}/1200 entries"
+        );
+
+        n1.shutdown().await.expect("shutdown 1");
+        n2.shutdown().await.expect("shutdown 2");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — cluster_snapshot_multi_chunk_transfer"
+    );
+}
+
 /// G042: Follower restart reconnection.
 /// Leader has cached gRPC connection to follower → follower shuts down →
 /// follower restarts on same port → leader reconnects automatically →
