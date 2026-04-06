@@ -214,36 +214,52 @@ impl NetSnapshot<C> for GrpcNetwork {
             openraft::error::StreamingError::Unreachable(Unreachable::new(&io_err))
         })?;
 
-        // Serialize snapshot into a transfer message:
-        // - vote (for the receiver to validate leadership)
-        // - snapshot metadata
-        // - snapshot data (full storage KV dump)
-        let transfer = crate::snapshot::SnapshotTransfer {
+        // Build chunked snapshot transfer: header message + data chunks.
+        // This avoids sending the entire snapshot as a single gRPC message
+        // which would cause OOM on large snapshots (>1GB).
+        let snapshot_data = snapshot.snapshot.into_inner();
+        let data_size = snapshot_data.len() as u64;
+
+        let header = crate::snapshot::SnapshotTransferHeader {
             vote,
             meta: snapshot.meta.clone(),
-            data: snapshot.snapshot.into_inner(),
+            data_size,
             since_ts: None, // Full snapshot; incremental uses Some(ts)
         };
 
-        let payload_bytes = rmp_serde::to_vec(&transfer).map_err(|e| {
+        let header_msg = crate::snapshot::SnapshotChunkMessage::Header(header);
+        let header_bytes = rmp_serde::to_vec(&header_msg).map_err(|e| {
             openraft::error::StreamingError::Unreachable(Unreachable::new(&std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("serialize snapshot transfer: {e}"),
+                format!("serialize snapshot header: {e}"),
             )))
         })?;
 
-        let payload = RaftPayload {
-            data: payload_bytes,
-        };
+        // Build the stream: header message + data chunk messages
+        let mut payloads = vec![RaftPayload { data: header_bytes }];
+
+        for chunk in crate::snapshot::chunk_snapshot_data(&snapshot_data) {
+            let chunk_msg = crate::snapshot::SnapshotChunkMessage::DataChunk(chunk.to_vec());
+            let chunk_bytes = rmp_serde::to_vec(&chunk_msg).map_err(|e| {
+                openraft::error::StreamingError::Unreachable(Unreachable::new(
+                    &std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("serialize snapshot chunk: {e}"),
+                    ),
+                ))
+            })?;
+            payloads.push(RaftPayload { data: chunk_bytes });
+        }
 
         tracing::info!(
-            snapshot_id = %transfer.meta.snapshot_id,
-            payload_bytes = payload.data.len(),
+            snapshot_id = %snapshot.meta.snapshot_id,
+            data_bytes = data_size,
+            chunks = payloads.len() - 1,
             target = %target_addr,
-            "sending snapshot to follower"
+            "sending chunked snapshot to follower"
         );
 
-        let request_stream = futures_util::stream::once(async { payload });
+        let request_stream = futures_util::stream::iter(payloads);
 
         // Race the gRPC call against openraft's cancel signal.
         // If replication is cancelled (leader steps down, follower removed),
