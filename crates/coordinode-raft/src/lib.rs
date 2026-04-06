@@ -2,6 +2,7 @@ pub mod cluster;
 pub mod proposal;
 pub mod snapshot;
 pub mod storage;
+pub mod wait_majority;
 
 /// Generated protobuf types for Raft inter-node gRPC protocol.
 pub mod proto {

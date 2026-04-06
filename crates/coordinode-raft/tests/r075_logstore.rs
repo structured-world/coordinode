@@ -40,7 +40,7 @@ fn make_entry(index: u64, term: u64) -> Entry {
         bypass_rate_limiter: false,
     };
     let log_id = openraft::LogId::new(CommittedLeaderId { term, node_id: 0 }, index);
-    Entry::new_normal(log_id, Request { proposal })
+    Entry::new_normal(log_id, Request::single(proposal))
 }
 
 fn make_log_id(index: u64, term: u64) -> LogId {
