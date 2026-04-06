@@ -707,31 +707,23 @@ impl<'a> ExecutionContext<'a> {
                 bypass_rate_limiter: false,
             };
 
-            // Apply timeout tracking if configured (wtimeout > 0).
+            // Apply write concern timeout if configured (wtimeout > 0).
             //
-            // NOTE: This is a post-hoc check — propose_and_wait is synchronous
-            // and blocks until completion. The timeout doesn't interrupt the
-            // proposal; it checks elapsed time after return. In embedded
-            // single-node mode, proposals complete in microseconds so this
-            // is effectively never hit. For cluster mode with true async
-            // timeout, ProposalPipeline needs async refactor (see G048).
+            // propose_with_timeout uses true async timeout in cluster mode
+            // (RaftProposalPipeline wraps propose_async with tokio::time::timeout).
+            // In embedded/single-node mode, the default impl delegates to
+            // propose_and_wait (proposals complete in µs, timeout irrelevant).
             //
             // Per MongoDB spec: "On timeout, data is NOT rolled back."
-            // So post-hoc semantics are correct for the client contract.
+            // The proposal may still commit after timeout fires.
             let timeout_ms = self.write_concern.timeout_ms;
             if timeout_ms > 0 {
-                let start = std::time::Instant::now();
-                let result = pipeline.propose_and_wait(&proposal);
-                let elapsed_ms = start.elapsed().as_millis() as u32;
-                result.map_err(|e| {
-                    ExecutionError::Serialization(format!("proposal pipeline error: {e}"))
-                })?;
-                if elapsed_ms > timeout_ms {
-                    return Err(ExecutionError::Serialization(format!(
-                        "write concern timeout: waited {elapsed_ms}ms, limit {timeout_ms}ms. \
-                         Data IS written but acknowledgement exceeded timeout."
-                    )));
-                }
+                let timeout = std::time::Duration::from_millis(u64::from(timeout_ms));
+                pipeline
+                    .propose_with_timeout(&proposal, timeout)
+                    .map_err(|e| {
+                        ExecutionError::Serialization(format!("proposal pipeline error: {e}"))
+                    })?;
             } else {
                 pipeline.propose_and_wait(&proposal).map_err(|e| {
                     ExecutionError::Serialization(format!("proposal pipeline error: {e}"))

@@ -244,6 +244,19 @@ pub enum ProposalError {
     /// Raft consensus error (e.g., network, quorum lost).
     #[error("raft error: {0}")]
     Raft(String),
+
+    /// WriteConcern timeout: the client-specified `wtimeout` expired before
+    /// the proposal was confirmed committed. The data may or may not have
+    /// been written — it is NOT rolled back.
+    ///
+    /// Per MongoDB spec: "when wtimeout fires, the data is not rolled back —
+    /// it may or may not replicate eventually. The client must handle this
+    /// ambiguity (retry or read-back to verify)."
+    ///
+    /// Distinct from [`Timeout`](ProposalError::Timeout) which means all
+    /// internal retry attempts were exhausted (Raft-level timeout).
+    #[error("write concern timeout: {timeout_ms}ms exceeded")]
+    WriteConcernTimeout { timeout_ms: u32 },
 }
 
 /// Abstraction for replicating and applying mutation proposals.
@@ -269,6 +282,27 @@ pub trait ProposalPipeline: Send + Sync {
     /// In cluster mode: replicates via Raft, waits for majority
     /// ACK, then applies. Returns after the mutations are durable.
     fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<(), ProposalError>;
+
+    /// Propose mutations with a client-specified write concern timeout.
+    ///
+    /// If `timeout` elapses before the proposal is confirmed committed,
+    /// returns [`ProposalError::WriteConcernTimeout`]. The proposal is NOT
+    /// cancelled — data may still be committed after timeout fires.
+    ///
+    /// ## Default implementation
+    ///
+    /// Delegates to [`propose_and_wait`](Self::propose_and_wait) (ignoring
+    /// timeout). This is correct for `LocalProposalPipeline` where proposals
+    /// complete in microseconds. `RaftProposalPipeline` overrides with true
+    /// async timeout via `tokio::time::timeout`.
+    fn propose_with_timeout(
+        &self,
+        proposal: &RaftProposal,
+        timeout: std::time::Duration,
+    ) -> Result<(), ProposalError> {
+        let _ = timeout; // default: ignore timeout (local proposals are instant)
+        self.propose_and_wait(proposal)
+    }
 }
 
 #[cfg(test)]

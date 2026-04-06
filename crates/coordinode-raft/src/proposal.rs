@@ -398,6 +398,31 @@ impl ProposalPipeline for RaftProposalPipeline {
             tokio::runtime::Handle::current().block_on(self.propose_async(proposal))
         })
     }
+
+    fn propose_with_timeout(
+        &self,
+        proposal: &RaftProposal,
+        timeout: Duration,
+    ) -> Result<(), ProposalError> {
+        // True async timeout: if wtimeout fires before Raft commits,
+        // the client gets an error immediately. The proposal is NOT
+        // cancelled — openraft may still commit the entry after timeout.
+        // Per MongoDB spec: data is NOT rolled back on wtimeout.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                match tokio::time::timeout(timeout, self.propose_async(proposal)).await {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        metrics::counter!("coordinode_raft_write_concern_timeouts_total")
+                            .increment(1);
+                        Err(ProposalError::WriteConcernTimeout {
+                            timeout_ms: timeout.as_millis() as u32,
+                        })
+                    }
+                }
+            })
+        })
+    }
 }
 
 #[cfg(test)]
