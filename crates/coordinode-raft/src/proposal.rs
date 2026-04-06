@@ -764,4 +764,89 @@ mod tests {
         // High 16 bits should contain node_id
         assert_eq!(id.as_raw() >> 48, node_id);
     }
+
+    // ── propose_with_timeout tests (G048) ────────────────────────
+
+    /// LocalProposalPipeline: propose_with_timeout delegates to propose_and_wait
+    /// (ignores timeout). Proposals complete in µs, timeout irrelevant.
+    #[test]
+    fn local_pipeline_propose_with_timeout_succeeds() {
+        let (engine, _dir) = setup();
+        let pipeline = LocalProposalPipeline::new(&engine);
+        let id_gen = ProposalIdGenerator::new();
+
+        let proposal = RaftProposal {
+            id: id_gen.next(),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:1:timeout-local".to_vec(),
+                value: b"value".to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(100),
+            start_ts: Timestamp::from_raw(99),
+            bypass_rate_limiter: false,
+        };
+
+        // Even with a very short timeout, local pipeline ignores it
+        pipeline
+            .propose_with_timeout(&proposal, Duration::from_nanos(1))
+            .expect("local propose_with_timeout should succeed (timeout ignored)");
+
+        let val = engine
+            .get(Partition::Node, b"node:1:timeout-local")
+            .expect("read");
+        assert_eq!(val.as_deref(), Some(b"value".as_slice()));
+    }
+
+    /// RaftProposalPipeline: propose_with_timeout with generous timeout succeeds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn raft_pipeline_propose_with_timeout_succeeds() {
+        let (_dir, engine) = test_engine();
+        let node = RaftNode::single_node(engine.clone())
+            .await
+            .expect("bootstrap");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let pipeline = RaftProposalPipeline::new(Arc::clone(node.raft()));
+        let id_gen = ProposalIdGenerator::new();
+
+        let proposal = RaftProposal {
+            id: id_gen.next(),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:1:timeout-raft".to_vec(),
+                value: b"raft-val".to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(100),
+            start_ts: Timestamp::from_raw(99),
+            bypass_rate_limiter: false,
+        };
+
+        // 10 seconds is more than enough for single-node
+        pipeline
+            .propose_with_timeout(&proposal, Duration::from_secs(10))
+            .expect("propose_with_timeout should succeed with generous timeout");
+
+        let val = engine
+            .get(Partition::Node, b"node:1:timeout-raft")
+            .expect("read");
+        assert_eq!(val.as_deref(), Some(b"raft-val".as_slice()));
+
+        node.shutdown().await.expect("shutdown");
+    }
+
+    /// WriteConcernTimeout error has correct format.
+    #[test]
+    fn write_concern_timeout_error_display() {
+        let err = ProposalError::WriteConcernTimeout { timeout_ms: 5000 };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("5000ms"),
+            "error should contain timeout_ms: {msg}"
+        );
+        assert!(
+            msg.contains("write concern timeout"),
+            "error should mention write concern: {msg}"
+        );
+    }
 }

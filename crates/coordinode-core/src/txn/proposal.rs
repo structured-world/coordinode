@@ -387,4 +387,25 @@ mod tests {
         let id = ProposalId::from_raw(42);
         assert_eq!(format!("{id}"), "prop:42");
     }
+
+    #[test]
+    fn write_concern_timeout_is_cloneable() {
+        let err = ProposalError::WriteConcernTimeout { timeout_ms: 3000 };
+        let cloned = err.clone();
+        assert_eq!(format!("{err}"), format!("{cloned}"));
+    }
+
+    #[test]
+    fn write_concern_timeout_distinct_from_retry_timeout() {
+        let wc_timeout = ProposalError::WriteConcernTimeout { timeout_ms: 5000 };
+        let retry_timeout = ProposalError::Timeout { retries: 3 };
+
+        let wc_msg = format!("{wc_timeout}");
+        let retry_msg = format!("{retry_timeout}");
+
+        // Both are timeout-related but have distinct messages
+        assert!(wc_msg.contains("write concern"), "wc: {wc_msg}");
+        assert!(retry_msg.contains("retries"), "retry: {retry_msg}");
+        assert_ne!(wc_msg, retry_msg);
+    }
 }
