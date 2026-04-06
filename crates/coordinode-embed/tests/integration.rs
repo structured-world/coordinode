@@ -17,6 +17,7 @@ mod integration {
     mod document;
     mod drain;
     mod encrypted_search;
+    mod g063_from_engine;
     mod helpers;
     mod hnsw;
     mod merge_stress;

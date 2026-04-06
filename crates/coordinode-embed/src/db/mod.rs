@@ -239,14 +239,43 @@ pub enum DatabaseError {
 impl Database {
     /// Open or create a database at the given path.
     ///
-    /// Recovers the node ID allocator from the persisted high-water mark
-    /// in the `schema:` partition. Pre-allocates a batch of IDs to minimize
-    /// I/O on the write path.
+    /// Uses `OwnedLocalProposalPipeline` for embedded single-node mode.
+    /// For cluster mode (CE 3-node HA), use `open_with_pipeline()` with
+    /// a `RaftProposalPipeline` instead.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
         let config = StorageConfig::new(path.as_ref());
         let oracle = Arc::new(TimestampOracle::new());
         let engine = StorageEngine::open_with_oracle(&config, oracle.clone())?;
+        let engine = Arc::new(engine);
+        let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
+            Arc::new(OwnedLocalProposalPipeline::new(&engine));
+        Self::finish_open(path.as_ref(), config, oracle, engine, pipeline)
+    }
 
+    /// Initialize a database from pre-opened engine, oracle, and pipeline.
+    ///
+    /// Used by the server binary in cluster mode (G063): the server creates
+    /// a shared `StorageEngine` + `TimestampOracle` for the `RaftNode`, then
+    /// passes the same engine + a `RaftProposalPipeline` here. The DrainBuffer
+    /// and TTL reaper submit mutations through Raft for replication.
+    pub fn from_engine(
+        path: impl AsRef<Path>,
+        engine: Arc<StorageEngine>,
+        oracle: Arc<TimestampOracle>,
+        pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline>,
+    ) -> Result<Self, DatabaseError> {
+        let config = StorageConfig::new(path.as_ref());
+        Self::finish_open(path.as_ref(), config, oracle, engine, pipeline)
+    }
+
+    /// Shared initialization logic for both `open()` and `open_with_pipeline()`.
+    fn finish_open(
+        path: &Path,
+        config: StorageConfig,
+        oracle: Arc<TimestampOracle>,
+        engine: Arc<StorageEngine>,
+        pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline>,
+    ) -> Result<Self, DatabaseError> {
         // Recover node ID allocator from persisted high-water mark.
         // The HWM is the ceiling of the last reserved batch — on crash,
         // some IDs in the batch may be unused (gaps), but no duplicates.
@@ -293,14 +322,15 @@ impl Database {
             Self::load_vector_indexes(&engine, &interner, 1 /* shard_id */);
 
         // Load text index definitions and rebuild tantivy indexes from stored nodes.
-        let text_index_base = path.as_ref().join("text_indexes");
+        let text_index_base = path.join("text_indexes");
         let text_index_registry =
             Self::load_text_indexes(&engine, &interner, 1 /* shard_id */, &text_index_base);
 
-        let engine = Arc::new(engine);
         let proposal_id_gen = Arc::new(ProposalIdGenerator::new());
 
         // Create drain buffer and background drain thread for volatile writes.
+        // The pipeline is either OwnedLocalProposalPipeline (embedded) or
+        // RaftProposalPipeline (cluster mode, via open_with_pipeline).
         let drain_config = coordinode_core::txn::drain::DrainConfig {
             interval_ms: config.drain_interval_ms,
             batch_max: config.drain_batch_max,
@@ -309,8 +339,6 @@ impl Database {
         let drain_buffer = Arc::new(coordinode_core::txn::drain::DrainBuffer::new(
             drain_config.capacity_bytes,
         ));
-        let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
-            Arc::new(OwnedLocalProposalPipeline::new(&engine));
         let drain_handle = coordinode_core::txn::drain::DrainHandle::start(
             Arc::clone(&drain_buffer),
             Arc::clone(&pipeline),

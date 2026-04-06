@@ -84,23 +84,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli::Command::Serve {
             grpc_addr,
             data_dir,
+            peers,
         } => {
             logging::init_logging();
 
             let addr: SocketAddr = grpc_addr.parse()?;
+            let cluster_mode = peers.is_some();
             info!(
                 data_dir = %data_dir,
+                cluster = cluster_mode,
                 "coordinode v{} starting on {addr}",
                 env!("CARGO_PKG_VERSION")
             );
 
             coordinode_vector::metrics::log_simd_capabilities();
 
-            // Open embedded Database — single storage instance for all services.
-            let database = Arc::new(std::sync::Mutex::new(
-                coordinode_embed::Database::open(&data_dir)
-                    .map_err(|e| format!("failed to open database: {e}"))?,
-            ));
+            // Open database with appropriate proposal pipeline:
+            // - Embedded (no --peers): OwnedLocalProposalPipeline (local writes)
+            // - Cluster (--peers): RaftProposalPipeline (Raft-replicated writes)
+            //
+            // In cluster mode, DrainBuffer and TTL reaper submit mutations
+            // through Raft for replication to followers (G063).
+            let database = if let Some(ref peer_addrs) = peers {
+                info!(
+                    peers = peer_addrs.len(),
+                    "cluster mode: DrainBuffer using RaftProposalPipeline"
+                );
+                // Create Raft node and proposal pipeline for cluster mode.
+                // RaftNode handles leader election, log replication, and
+                // state machine apply. The pipeline wraps client_write().
+                let storage_config =
+                    coordinode_storage::engine::config::StorageConfig::new(&data_dir);
+                let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+                let engine = coordinode_storage::engine::core::StorageEngine::open_with_oracle(
+                    &storage_config,
+                    oracle.clone(),
+                )
+                .map_err(|e| format!("failed to open storage: {e}"))?;
+                let engine = Arc::new(engine);
+
+                // Node ID 1 for single-node bootstrap; peer discovery wiring
+                // is deferred to R150 (monolithic binary --mode selection).
+                let raft_node = coordinode_raft::cluster::RaftNode::open_with_oracle(
+                    1, // node_id
+                    Arc::clone(&engine),
+                    Some(Arc::clone(&oracle)),
+                )
+                .await
+                .map_err(|e| format!("failed to open Raft node: {e}"))?;
+
+                let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
+                    Arc::new(coordinode_raft::proposal::RaftProposalPipeline::new(
+                        Arc::clone(raft_node.raft()),
+                    ));
+
+                // Share engine + oracle between RaftNode and Database.
+                // RaftNode uses engine for state machine apply.
+                // Database uses engine for reads + ExecutionContext.
+                Arc::new(std::sync::Mutex::new(
+                    coordinode_embed::Database::from_engine(&data_dir, engine, oracle, pipeline)
+                        .map_err(|e| format!("failed to open database: {e}"))?,
+                ))
+            } else {
+                // Embedded mode: OwnedLocalProposalPipeline (default).
+                Arc::new(std::sync::Mutex::new(
+                    coordinode_embed::Database::open(&data_dir)
+                        .map_err(|e| format!("failed to open database: {e}"))?,
+                ))
+            };
 
             let query_registry = Arc::new(coordinode_query::advisor::QueryRegistry::new());
             let nplus1_detector =
