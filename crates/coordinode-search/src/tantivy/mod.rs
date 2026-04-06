@@ -333,7 +333,7 @@ impl TextIndex {
         let searcher = self.reader.searcher();
         let query = self.build_query(query_str, None)?;
 
-        let top_docs = searcher.search(&*query, &TopDocs::with_limit(limit))?;
+        let top_docs = searcher.search(&*query, &TopDocs::with_limit(limit).order_by_score())?;
 
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
@@ -361,7 +361,7 @@ impl TextIndex {
         let searcher = self.reader.searcher();
         let query = self.build_query(query_str, Some(boost))?;
 
-        let top_docs = searcher.search(&*query, &TopDocs::with_limit(limit))?;
+        let top_docs = searcher.search(&*query, &TopDocs::with_limit(limit).order_by_score())?;
 
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
@@ -388,7 +388,7 @@ impl TextIndex {
         let searcher = self.reader.searcher();
         let query = self.build_query(query_str, None)?;
 
-        let top_docs = searcher.search(&*query, &TopDocs::with_limit(limit))?;
+        let top_docs = searcher.search(&*query, &TopDocs::with_limit(limit).order_by_score())?;
         let snippet_gen = SnippetGenerator::create(&searcher, &*query, self.body_field)?;
 
         let mut results = Vec::with_capacity(top_docs.len());
@@ -611,7 +611,7 @@ impl TextIndex {
 
         let query = BooleanQuery::new(subqueries);
         let searcher = self.reader.searcher();
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
 
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
@@ -1006,7 +1006,7 @@ mod tests {
         let fuzzy_query = FuzzyTermQuery::new(term, 2, true);
         let searcher = idx.reader.searcher();
         let top_docs = searcher
-            .search(&fuzzy_query, &TopDocs::with_limit(10))
+            .search(&fuzzy_query, &TopDocs::with_limit(10).order_by_score())
             .unwrap();
         assert_eq!(
             top_docs.len(),
@@ -1030,7 +1030,7 @@ mod tests {
             PhrasePrefixQuery::new(vec![tantivy::Term::from_field_text(idx.body_field, "data")]);
         let searcher = idx.reader.searcher();
         let top_docs = searcher
-            .search(&prefix_query, &TopDocs::with_limit(10))
+            .search(&prefix_query, &TopDocs::with_limit(10).order_by_score())
             .unwrap();
         assert_eq!(
             top_docs.len(),
