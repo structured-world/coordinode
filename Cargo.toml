@@ -29,7 +29,7 @@ authors = ["structured.world <dev@structured.world>"]
 openraft = { version = "0.10.0-alpha.17", features = ["serde"] }
 
 # Full-text search
-tantivy = "0.25"
+tantivy = "0.26"
 rust-stemmers = { git = "https://github.com/structured-world/rust-stemmers.git", branch = "main" }
 whatlang = "0.18"
 
