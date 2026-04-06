@@ -8,7 +8,7 @@
 //! In CE, key management is the caller's responsibility.
 //! In EE, KMS integration (Vault, AWS KMS, etc.) wraps these keys.
 
-use rand::RngCore;
+use rand::Rng;
 
 /// AES-256-GCM key for field value encryption/decryption.
 ///

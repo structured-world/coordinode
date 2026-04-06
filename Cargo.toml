@@ -34,7 +34,7 @@ rust-stemmers = { git = "https://github.com/structured-world/rust-stemmers.git",
 whatlang = "0.18"
 
 # CJK tokenization (optional, per-language feature flags)
-lindera = { version = "2.3", default-features = false }
+lindera = { version = "3", default-features = false }
 jieba-rs = "0.8"
 
 # gRPC
@@ -68,7 +68,7 @@ thiserror = "2"
 sha2 = "0.11"
 aes-gcm = "0.10"
 hmac = "0.13"
-rand = "0.9"
+rand = "0.10"
 
 # Parallelism
 rayon = "1.10"

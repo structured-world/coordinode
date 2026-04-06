@@ -46,7 +46,7 @@ criterion = { workspace = true }
 # Storage internal test dependencies (consumed from fjall per ADR-019)
 nanoid = "0.4.0"
 test-log = "0.2.18"
-rand = "0.8"
+rand = "0.10"
 
 [[bench]]
 name = "merge_stress"

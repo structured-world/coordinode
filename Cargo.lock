@@ -539,6 +539,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
+name = "chacha20"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f8d983286843e49675a4b7a2d174efe136dc93a18d69130dd18198a6c167601"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "rand_core 0.10.0",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -729,9 +740,9 @@ dependencies = [
 
 [[package]]
 name = "coordinode-lsm-tree"
-version = "4.3.0"
+version = "4.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b3ba6dcd9a323ee62b551248c04c42e79407c0eea0606bfdf97265cb0fd61d3"
+checksum = "f3fc62ca77591d84a2a63bd027362d61d18aaca8c1a189e5d243a15c5d1b393e"
 dependencies = [
  "aes-gcm",
  "byteorder-lite",
@@ -826,7 +837,7 @@ dependencies = [
  "hmac",
  "jieba-rs",
  "lindera",
- "rand 0.9.2",
+ "rand 0.10.0",
  "rust-stemmers 1.2.0 (git+https://github.com/structured-world/rust-stemmers.git?branch=main)",
  "serde",
  "sha2 0.11.0",
@@ -884,7 +895,7 @@ dependencies = [
  "lz4_flex",
  "nanoid",
  "proptest",
- "rand 0.8.5",
+ "rand 0.10.0",
  "rmp-serde",
  "rmpv",
  "serde",
@@ -1320,70 +1331,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
-name = "encoding"
-version = "0.2.33"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b0d943856b990d12d3b55b359144ff341533e516d94098b1d3fc1ac666d36ec"
-dependencies = [
- "encoding-index-japanese",
- "encoding-index-korean",
- "encoding-index-simpchinese",
- "encoding-index-singlebyte",
- "encoding-index-tradchinese",
-]
-
-[[package]]
-name = "encoding-index-japanese"
-version = "1.20141219.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04e8b2ff42e9a05335dbf8b5c6f7567e5591d0d916ccef4e0b1710d32a0d0c91"
-dependencies = [
- "encoding_index_tests",
-]
-
-[[package]]
-name = "encoding-index-korean"
-version = "1.20141219.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4dc33fb8e6bcba213fe2f14275f0963fd16f0a02c878e3095ecfdf5bee529d81"
-dependencies = [
- "encoding_index_tests",
-]
-
-[[package]]
-name = "encoding-index-simpchinese"
-version = "1.20141219.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d87a7194909b9118fc707194baa434a4e3b0fb6a5a757c73c3adb07aa25031f7"
-dependencies = [
- "encoding_index_tests",
-]
-
-[[package]]
-name = "encoding-index-singlebyte"
-version = "1.20141219.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3351d5acffb224af9ca265f435b859c7c01537c0849754d3db3fdf2bfe2ae84a"
-dependencies = [
- "encoding_index_tests",
-]
-
-[[package]]
-name = "encoding-index-tradchinese"
-version = "1.20141219.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd0e20d5688ce3cab59eb3ef3a2083a5c77bf496cb798dc6fcdb75f323890c18"
-dependencies = [
- "encoding_index_tests",
-]
-
-[[package]]
-name = "encoding_index_tests"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a246d82be1c9d791c5dfde9a2bd045fc3cbba3fa2b11ad558f27d01712f00569"
-
-[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1661,6 +1608,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi 6.0.0",
+ "rand_core 0.10.0",
  "wasip2",
  "wasip3",
 ]
@@ -2327,9 +2275,9 @@ dependencies = [
 
 [[package]]
 name = "lindera"
-version = "2.3.4"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bb784bf51d22be2350667c35c0796250ca4dd6888ee98fe8a41f16f400f6c9b"
+checksum = "78cf64c99134f2baa558bb75ffabe87251073028c8909b91f173080cbf30dbed"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2356,16 +2304,15 @@ dependencies = [
 
 [[package]]
 name = "lindera-dictionary"
-version = "2.3.4"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5cd0aa640fbefa4b4251f8ab001e47f213fdecf7bbbd0ee4a17a27b2cbff5ef1"
+checksum = "04d3069e8e2bf6fa53b0f5bed964f59743bbac1d70aa3d36eef3676e2ab5d984"
 dependencies = [
  "anyhow",
  "byteorder",
  "csv",
  "daachorse",
  "derive_builder",
- "encoding",
  "encoding_rs",
  "encoding_rs_io",
  "flate2",
@@ -2390,32 +2337,28 @@ dependencies = [
 
 [[package]]
 name = "lindera-ipadic"
-version = "2.3.4"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94c8eebbfaee36d6ebd674aa796decbbb186e42c8b7a919f3495ba610cc8fcb6"
+checksum = "5eaa3fab05bc33dc250aaa59fc00951726a5e502ed411092efc5568941a423c9"
 dependencies = [
  "anyhow",
  "byteorder",
  "csv",
  "lindera-dictionary",
- "once_cell",
- "rkyv 0.8.15",
  "serde_json",
  "tokio",
 ]
 
 [[package]]
 name = "lindera-ko-dic"
-version = "2.3.4"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38f7f33c519e1ad6a9fe66a7520288d4ef117e8ae357fdd64d33c67030e527ea"
+checksum = "9a7706701322a4e9df6ac710a61082a89a1e50696f815fbab90bf19d1c8b1d6d"
 dependencies = [
  "anyhow",
  "byteorder",
  "csv",
  "lindera-dictionary",
- "once_cell",
- "rkyv 0.8.15",
  "serde_json",
  "tokio",
 ]
@@ -3381,6 +3324,8 @@ version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc266eb313df6c5c09c1c7b1fbe2510961e5bcd3add930c1e31f7ed9da0feff8"
 dependencies = [
+ "chacha20",
+ "getrandom 0.4.2",
  "rand_core 0.10.0",
 ]
 
