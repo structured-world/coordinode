@@ -56,19 +56,40 @@ const DEDUP_GC_INTERVAL_SECS: u64 = 300;
 
 // ── Type Configuration ──────────────────────────────────────────────
 
-/// Application request data: a Raft proposal containing mutations.
+/// Application request data: one or more proposals batched into a single
+/// Raft log entry.
+///
+/// Batching reduces the number of Raft round-trips for concurrent writers:
+/// N individual `client_write()` calls become 1 batched entry.
+/// [`WaitForMajorityService`](crate::wait_majority::WaitForMajorityService)
+/// uses this to coalesce proposals from multiple writers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Request {
-    pub proposal: RaftProposal,
+    pub proposals: Vec<RaftProposal>,
+}
+
+impl Request {
+    /// Create a request from a single proposal (non-batched path).
+    pub fn single(proposal: RaftProposal) -> Self {
+        Self {
+            proposals: vec![proposal],
+        }
+    }
+
+    /// Create a request from a batch of proposals (coalesced path).
+    pub fn batch(proposals: Vec<RaftProposal>) -> Self {
+        Self { proposals }
+    }
 }
 
 impl std::fmt::Display for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total_mutations: usize = self.proposals.iter().map(|p| p.mutations.len()).sum();
         write!(
             f,
-            "Request(id={}, mutations={})",
-            self.proposal.id,
-            self.proposal.mutations.len()
+            "Request(proposals={}, mutations={})",
+            self.proposals.len(),
+            total_mutations
         )
     }
 }
@@ -238,12 +259,13 @@ impl LogStore {
         let raft_op = OplogOp::RaftEntry { data };
 
         // Extract decoded mutation ops from Normal entries for CDC filtering.
+        // Batched entries flatten all proposals' mutations into a single ops list.
         let (mut ops, is_migration) = match &entry.payload {
             openraft::entry::EntryPayload::Normal(request) => {
                 let decoded: Vec<OplogOp> = request
-                    .proposal
-                    .mutations
+                    .proposals
                     .iter()
+                    .flat_map(|p| p.mutations.iter())
                     .map(|m| match m {
                         Mutation::Put {
                             partition,
@@ -932,7 +954,14 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
             // → applied_index ahead of actual data → openraft won't replay.
             let response = match &entry.payload {
                 openraft::entry::EntryPayload::Normal(request) => {
-                    self.apply_proposal(&request.proposal)?
+                    let mut total = 0;
+                    for proposal in &request.proposals {
+                        let r = self.apply_proposal(proposal)?;
+                        total += r.mutations_applied;
+                    }
+                    Response {
+                        mutations_applied: total,
+                    }
                 }
                 _ => Response {
                     mutations_applied: 0,
@@ -1638,7 +1667,7 @@ mod tests {
         let committed_leader_id = CommittedLeaderId { term, node_id: 0 };
         let log_id = openraft::LogId::new(committed_leader_id, index);
 
-        Entry::new_normal(log_id, Request { proposal })
+        Entry::new_normal(log_id, Request::single(proposal))
     }
 
     // -- R068: oracle.advance_to() during Raft apply --

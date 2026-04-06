@@ -296,9 +296,7 @@ impl RaftProposalPipeline {
     /// Async propose-and-wait: submit proposal through openraft and wait
     /// for it to be committed and applied by the state machine.
     async fn propose_async(&self, proposal: &RaftProposal) -> Result<(), ProposalError> {
-        let request = Request {
-            proposal: proposal.clone(),
-        };
+        let request = Request::single(proposal.clone());
         let start = std::time::Instant::now();
 
         for attempt in 0..MAX_RETRIES {

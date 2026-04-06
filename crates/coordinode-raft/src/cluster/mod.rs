@@ -22,8 +22,9 @@ use std::sync::Arc;
 
 use coordinode_storage::engine::core::StorageEngine;
 
-use crate::proposal::RaftProposalPipeline;
+use crate::proposal::{RaftProposalPipeline, RateLimiter};
 use crate::storage::{default_raft_config, CoordinodeStateMachine, LogStore, TypeConfig};
+use crate::wait_majority::{BatchConfig, WaitForMajorityService};
 
 use grpc_server::RaftGrpcHandler;
 use network::{GrpcNetworkFactory, StubNetworkFactory};
@@ -452,9 +453,32 @@ impl RaftNode {
     /// Create a [`RaftProposalPipeline`] for submitting proposals.
     ///
     /// The pipeline can be shared across threads via `Arc`. It includes
-    /// rate limiting and retry logic.
+    /// rate limiting and retry logic. Each proposal gets its own Raft
+    /// log entry and round-trip.
+    ///
+    /// For high-concurrency scenarios (>100 concurrent writers), prefer
+    /// [`batch_pipeline()`](Self::batch_pipeline) which coalesces
+    /// proposals into fewer Raft entries.
     pub fn pipeline(&self) -> RaftProposalPipeline {
         RaftProposalPipeline::new(Arc::clone(&self.raft))
+    }
+
+    /// Create a [`WaitForMajorityService`] for batched proposal submission.
+    ///
+    /// Coalesces concurrent proposals into fewer Raft log entries,
+    /// reducing N round-trips to ~1 under high concurrency. Each writer
+    /// still gets an individual result.
+    ///
+    /// The returned service spawns a background drain task. Call
+    /// [`WaitForMajorityService::shutdown()`] before dropping for
+    /// graceful cleanup.
+    pub fn batch_pipeline(&self) -> WaitForMajorityService {
+        WaitForMajorityService::spawn_default(Arc::clone(&self.raft), RateLimiter::default())
+    }
+
+    /// Create a [`WaitForMajorityService`] with custom batch configuration.
+    pub fn batch_pipeline_with_config(&self, config: BatchConfig) -> WaitForMajorityService {
+        WaitForMajorityService::spawn(Arc::clone(&self.raft), RateLimiter::default(), config)
     }
 
     /// Get the current applied log index (non-blocking).

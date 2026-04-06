@@ -216,7 +216,7 @@ impl RaftProposal {
 }
 
 /// Error from the proposal pipeline.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ProposalError {
     /// Storage-level error during apply.
     #[error("storage error: {0}")]

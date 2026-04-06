@@ -66,7 +66,7 @@ fn make_entry(index: u64, term: u64) -> Entry {
         1000 + index,
     );
     let log_id = openraft::LogId::new(CommittedLeaderId { term, node_id: 0 }, index);
-    Entry::new_normal(log_id, Request { proposal })
+    Entry::new_normal(log_id, Request::single(proposal))
 }
 
 // Key in Partition::Schema where the state machine persists last_applied.
