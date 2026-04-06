@@ -244,56 +244,144 @@ async fn drain_loop(
     }
 }
 
-/// Submit a batch of proposals as a single Raft entry and notify all callers.
+/// Base timeout for batch Raft submission (first attempt).
+/// Doubles on each retry: 4s → 8s → 16s.
+/// Matches `RaftProposalPipeline::propose_async` constants.
+const BATCH_BASE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Maximum retry attempts before returning error to all callers.
+const BATCH_MAX_RETRIES: u32 = 3;
+
+/// Submit a batch of proposals as a single Raft entry with retry.
+///
+/// Retries on timeout with exponential backoff (4s, 8s, 16s).
+/// ForwardToLeader and fatal Raft errors are NOT retried — callers
+/// get the error immediately.
+///
+/// Matches the retry strategy of `RaftProposalPipeline::propose_async`
+/// but applied at the batch level: one retry loop for N proposals.
 async fn submit_batch(raft: &RaftInstance, batch: Vec<BatchEntry>, kind: &str) {
     let batch_size = batch.len();
     let proposals: Vec<RaftProposal> = batch.iter().map(|e| e.proposal.clone()).collect();
-    let request = Request::batch(proposals);
 
     metrics::counter!("coordinode_raft_batch_proposals_total", "kind" => kind.to_owned())
         .increment(batch_size as u64);
     metrics::histogram!("coordinode_raft_batch_size", "kind" => kind.to_owned())
         .record(batch_size as f64);
 
-    let result = raft.client_write(request).await;
+    let start = std::time::Instant::now();
 
-    match result {
-        Ok(response) => {
-            tracing::debug!(
-                batch_size,
-                kind,
-                mutations = response.data.mutations_applied,
-                log_id = ?response.log_id,
-                "batched proposal committed"
-            );
-            metrics::counter!(
-                "coordinode_raft_batch_entries_total",
-                "status" => "ok",
-                "kind" => kind.to_owned()
-            )
-            .increment(1);
-            for entry in batch {
-                let _ = entry.response_tx.send(Ok(()));
+    for attempt in 0..BATCH_MAX_RETRIES {
+        let timeout = BATCH_BASE_TIMEOUT * (1 << attempt);
+        let request = Request::batch(proposals.clone());
+
+        let result = tokio::time::timeout(timeout, raft.client_write(request)).await;
+
+        match result {
+            Ok(Ok(response)) => {
+                // Success — notify all callers
+                let elapsed = start.elapsed().as_secs_f64();
+                tracing::debug!(
+                    batch_size,
+                    kind,
+                    attempt,
+                    mutations = response.data.mutations_applied,
+                    log_id = ?response.log_id,
+                    elapsed_s = elapsed,
+                    "batched proposal committed"
+                );
+                metrics::counter!(
+                    "coordinode_raft_batch_entries_total",
+                    "status" => "ok",
+                    "kind" => kind.to_owned()
+                )
+                .increment(1);
+                metrics::histogram!("coordinode_raft_batch_duration_seconds").record(elapsed);
+                for entry in batch {
+                    let _ = entry.response_tx.send(Ok(()));
+                }
+                return;
+            }
+            Ok(Err(raft_err)) => {
+                // Raft error — check if retryable
+                let proposal_err = convert_raft_error(&raft_err);
+                match &proposal_err {
+                    ProposalError::NotLeader { .. } => {
+                        // Not retryable — forward immediately
+                        tracing::warn!(
+                            batch_size,
+                            kind,
+                            error = %raft_err,
+                            "batched proposal: not leader"
+                        );
+                        metrics::counter!(
+                            "coordinode_raft_batch_entries_total",
+                            "status" => "not_leader",
+                            "kind" => kind.to_owned()
+                        )
+                        .increment(1);
+                        for entry in batch {
+                            let _ = entry.response_tx.send(Err(proposal_err.clone()));
+                        }
+                        return;
+                    }
+                    _ => {
+                        // Fatal Raft error — not retryable
+                        tracing::warn!(
+                            batch_size,
+                            kind,
+                            error = %raft_err,
+                            "batched proposal: fatal raft error"
+                        );
+                        metrics::counter!(
+                            "coordinode_raft_batch_entries_total",
+                            "status" => "error",
+                            "kind" => kind.to_owned()
+                        )
+                        .increment(1);
+                        for entry in batch {
+                            let _ = entry.response_tx.send(Err(proposal_err.clone()));
+                        }
+                        return;
+                    }
+                }
+            }
+            Err(_elapsed) => {
+                // Timeout — retry with exponential backoff
+                metrics::counter!("coordinode_raft_batch_retries_total").increment(1);
+                tracing::warn!(
+                    batch_size,
+                    kind,
+                    attempt = attempt + 1,
+                    timeout_ms = timeout.as_millis() as u64,
+                    "batched proposal timed out, retrying"
+                );
+                continue;
             }
         }
-        Err(raft_err) => {
-            let proposal_err = convert_raft_error(&raft_err);
-            tracing::warn!(
-                batch_size,
-                kind,
-                error = %raft_err,
-                "batched proposal failed"
-            );
-            metrics::counter!(
-                "coordinode_raft_batch_entries_total",
-                "status" => "error",
-                "kind" => kind.to_owned()
-            )
-            .increment(1);
-            for entry in batch {
-                let _ = entry.response_tx.send(Err(proposal_err.clone()));
-            }
-        }
+    }
+
+    // All retries exhausted
+    let elapsed = start.elapsed().as_secs_f64();
+    tracing::error!(
+        batch_size,
+        kind,
+        retries = BATCH_MAX_RETRIES,
+        elapsed_s = elapsed,
+        "batched proposal: all retries exhausted"
+    );
+    metrics::counter!(
+        "coordinode_raft_batch_entries_total",
+        "status" => "timeout",
+        "kind" => kind.to_owned()
+    )
+    .increment(1);
+    metrics::histogram!("coordinode_raft_batch_duration_seconds").record(elapsed);
+    let err = ProposalError::Timeout {
+        retries: BATCH_MAX_RETRIES,
+    };
+    for entry in batch {
+        let _ = entry.response_tx.send(Err(err.clone()));
     }
 }
 
