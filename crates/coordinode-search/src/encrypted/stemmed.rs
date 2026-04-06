@@ -303,20 +303,20 @@ mod tests {
         let key = test_key();
 
         // WRITE: stem + tokenize + persist
-        let fjall_idx = EncryptedIndex::new(&engine, "Article", "body_stems");
+        let idx = EncryptedIndex::new(&engine, "Article", "body_stems");
         let stems = stem_and_tokenize("running through the forest", "english", &key);
         for st in &stems {
-            fjall_idx.insert(&st.token, 1).unwrap();
+            idx.insert(&st.token, 1).unwrap();
         }
 
         let stems2 = stem_and_tokenize("swimming in the ocean", "english", &key);
         for st in &stems2 {
-            fjall_idx.insert(&st.token, 2).unwrap();
+            idx.insert(&st.token, 2).unwrap();
         }
 
         // SEARCH: "run" → stem → HMAC → storage lookup
         let query_token = stem_query_token("run", "english", &key).unwrap();
-        let results = fjall_idx.search(&query_token).unwrap();
+        let results = idx.search(&query_token).unwrap();
         assert!(results.contains(&1), "'run' should find doc 1 in SSE index");
         assert!(
             !results.contains(&2),
