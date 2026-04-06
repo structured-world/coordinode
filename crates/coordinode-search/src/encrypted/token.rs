@@ -6,6 +6,7 @@
 //!
 //! Song-Wagner-Perrig 2000 base scheme: T_w = HMAC(K, w)
 
+use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 

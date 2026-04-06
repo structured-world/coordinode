@@ -50,7 +50,7 @@ fn bench_search(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("top10", n), &n, |b, _| {
             b.iter(|| {
                 let results = index.search(query, 10);
-                criterion::black_box(results);
+                std::hint::black_box(results);
             });
         });
     }
@@ -69,7 +69,7 @@ fn bench_sequential_searches(c: &mut Criterion) {
             for i in 0..100 {
                 let query = &vectors[i % n];
                 let results = index.search(query, 10);
-                criterion::black_box(results);
+                std::hint::black_box(results);
             }
         });
     });

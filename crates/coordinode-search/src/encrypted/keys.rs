@@ -22,7 +22,7 @@ impl FieldKey {
     /// Generate a random field key using the system CSPRNG.
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         Self { bytes }
     }
 
@@ -71,7 +71,7 @@ impl SearchKey {
     /// Generate a random search key using the system CSPRNG.
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         Self { bytes }
     }
 

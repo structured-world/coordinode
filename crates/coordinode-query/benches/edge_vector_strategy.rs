@@ -28,7 +28,7 @@ fn bench_strategy_selection(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("decide", name), name, |b, _| {
             b.iter(|| {
                 let strategy = select_edge_vector_strategy(*fan_out, *selectivity);
-                criterion::black_box(strategy);
+                std::hint::black_box(strategy);
             });
         });
     }
@@ -62,7 +62,7 @@ fn bench_edge_vector_explain(c: &mut Criterion) {
                 let ast = coordinode_query::cypher::parse(q).expect("parse");
                 let plan = coordinode_query::planner::build_logical_plan(&ast).expect("plan");
                 let explain = plan.explain();
-                criterion::black_box(explain);
+                std::hint::black_box(explain);
             });
         });
     }
@@ -106,7 +106,7 @@ fn bench_edge_vector_execution(c: &mut Criterion) {
                      RETURN f.name",
                 )
                 .expect("query");
-            criterion::black_box(results);
+            std::hint::black_box(results);
         });
     });
 
