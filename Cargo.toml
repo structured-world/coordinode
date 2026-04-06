@@ -22,7 +22,7 @@ repository = "https://github.com/structured-world/coordinode"
 authors = ["structured.world <dev@structured.world>"]
 
 [workspace.dependencies]
-# Storage — fjall consumed into coordinode-storage per ADR-019
+# Storage — coordinode-lsm-tree as crates.io dep (ADR-018), fjall consumed (ADR-019)
 # coordinode-lsm-tree remains as external crates.io dependency (ADR-018)
 
 # Consensus

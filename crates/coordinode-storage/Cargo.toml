@@ -1,6 +1,6 @@
 [package]
 name = "coordinode-storage"
-description = "Storage engine: Fjall LSM integration, WAL, BlobStore, compression"
+description = "Storage engine: LSM-tree, WAL, BlobStore, compression"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -18,7 +18,7 @@ coordinode-core = { workspace = true }
 # LSM engine — permanent fork (ADR-018), crates.io dependency
 lsm-tree = { package = "coordinode-lsm-tree", version = "4", default-features = false }
 
-# Fjall internals dependencies (consumed per ADR-019)
+# Storage internals dependencies (consumed from fjall per ADR-019)
 dashmap = "6.1.0"
 flume = { version = "0.12.0", default-features = false }
 byteorder = { package = "byteorder-lite", version = "0.1.0" }
@@ -43,7 +43,7 @@ crc32fast = "1"
 tempfile = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
-# Fjall internal test dependencies (consumed per ADR-019)
+# Storage internal test dependencies (consumed from fjall per ADR-019)
 nanoid = "0.4.0"
 test-log = "0.2.18"
 rand = "0.8"
