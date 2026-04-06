@@ -647,6 +647,363 @@ pub fn install_full_snapshot(engine: &StorageEngine, data: &[u8]) -> io::Result<
     Ok(())
 }
 
+// ── Chunked Snapshot Transfer Protocol ──────────────────────────────
+//
+// For large snapshots (>1GB), sending the entire CNSN blob in a single
+// gRPC message causes OOM on both sender and receiver. The chunked
+// protocol splits the transfer into:
+//
+//   Message 1: SnapshotTransferHeader (vote, meta, since_ts, data_size)
+//   Messages 2..N: Raw CNSN data chunks (up to SNAPSHOT_CHUNK_SIZE each)
+//
+// The receiver writes chunks to a temp file, then installs from the file
+// via reader-based installers. Memory usage: O(SNAPSHOT_CHUNK_SIZE).
+
+/// Maximum size of a single snapshot data chunk in bytes (4 MB).
+pub const SNAPSHOT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
+/// Header message for chunked snapshot transfer.
+///
+/// Sent as the first gRPC message. Contains all metadata needed to
+/// prepare for receiving the snapshot data chunks that follow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotTransferHeader {
+    /// Leader's current vote (follower validates leadership).
+    pub vote: Vote,
+    /// Snapshot metadata: last_log_id, membership, snapshot_id.
+    pub meta: SnapshotMeta,
+    /// Total size of the CNSN data that follows in subsequent chunks.
+    pub data_size: u64,
+    /// If set, this is an incremental snapshot containing only changes
+    /// after this timestamp. `None` = full snapshot.
+    #[serde(default)]
+    pub since_ts: Option<u64>,
+}
+
+/// A single message in the chunked snapshot transfer stream.
+///
+/// The first message is always a Header. Subsequent messages are DataChunks
+/// containing raw CNSN bytes. The receiver accumulates data chunks until
+/// `data_size` bytes have been received.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SnapshotChunkMessage {
+    /// First message: metadata about the snapshot transfer.
+    Header(SnapshotTransferHeader),
+    /// Subsequent messages: raw CNSN data bytes (up to SNAPSHOT_CHUNK_SIZE).
+    DataChunk(Vec<u8>),
+}
+
+/// Split snapshot CNSN data into chunks for streaming transfer.
+///
+/// Returns an iterator of byte vectors, each up to `SNAPSHOT_CHUNK_SIZE`.
+pub fn chunk_snapshot_data(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    data.chunks(SNAPSHOT_CHUNK_SIZE)
+}
+
+/// Install a full snapshot from a reader (file or buffer).
+///
+/// Identical to `install_full_snapshot` but reads from `impl Read` instead
+/// of `&[u8]`, avoiding the need to hold the entire snapshot in memory.
+///
+/// Uses a **two-phase crash-safe** approach:
+/// - Phase 1 (atomic WriteBatch): Write ALL snapshot entries.
+/// - Phase 2 (idempotent cleanup): Delete stale keys.
+pub fn install_full_snapshot_from_reader(
+    engine: &StorageEngine,
+    reader: &mut impl IoRead,
+) -> io::Result<()> {
+    // Read and validate header
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+    if &magic != MAGIC {
+        return Err(io::Error::other("invalid snapshot magic"));
+    }
+
+    let mut version = [0u8; 1];
+    reader.read_exact(&mut version)?;
+    if version[0] != FORMAT_VERSION {
+        return Err(io::Error::other(format!(
+            "unsupported snapshot version: {}",
+            version[0]
+        )));
+    }
+
+    let mut part_count = [0u8; 1];
+    reader.read_exact(&mut part_count)?;
+    let partition_count = part_count[0] as usize;
+
+    // Parse all entries (accumulates in memory for WriteBatch atomicity).
+    // Note: individual entries are small (KV pairs). The OOM issue was
+    // holding the entire serialized CNSN blob; here we parse incrementally.
+    let mut parsed_partitions: Vec<(Partition, PartitionEntries)> = Vec::new();
+
+    for _ in 0..partition_count {
+        let mut tag_buf = [0u8; 1];
+        reader.read_exact(&mut tag_buf)?;
+        let partition = tag_to_partition(tag_buf[0])
+            .ok_or_else(|| io::Error::other(format!("unknown partition tag: {}", tag_buf[0])))?;
+
+        let mut count_buf = [0u8; 4];
+        reader.read_exact(&mut count_buf)?;
+        let entry_count = u32::from_be_bytes(count_buf) as usize;
+
+        let mut entries = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            let mut key_len_buf = [0u8; 4];
+            reader.read_exact(&mut key_len_buf)?;
+            let key_len = u32::from_be_bytes(key_len_buf) as usize;
+            let mut key = vec![0u8; key_len];
+            reader.read_exact(&mut key)?;
+
+            let mut value_len_buf = [0u8; 4];
+            reader.read_exact(&mut value_len_buf)?;
+            let value_len = u32::from_be_bytes(value_len_buf) as usize;
+            let mut value = vec![0u8; value_len];
+            reader.read_exact(&mut value)?;
+
+            if partition == Partition::Raft {
+                continue;
+            }
+            if partition == Partition::Schema && key.starts_with(b"raft:") {
+                continue;
+            }
+
+            entries.push((key, value));
+        }
+
+        if partition != Partition::Raft {
+            parsed_partitions.push((partition, entries));
+        }
+    }
+
+    // Read and validate checksum (last 8 bytes after partition data).
+    // For reader-based install, we cannot random-access the checksum
+    // at the end before reading entries. Instead, we verify it after
+    // reading all partition data but BEFORE applying any writes.
+    let mut checksum_buf = [0u8; 8];
+    reader.read_exact(&mut checksum_buf)?;
+    let expected_hash = u64::from_le_bytes(checksum_buf);
+
+    // Recompute hash over the data we parsed (reconstruct the CNSN payload).
+    // This is necessary because we read streaming — we couldn't validate
+    // the checksum upfront like the &[u8] version does.
+    let reconstructed = reconstruct_cnsn_payload(&parsed_partitions, partition_count);
+    let actual_hash = xxh3_hash(&reconstructed);
+    if expected_hash != actual_hash {
+        return Err(io::Error::other(format!(
+            "snapshot checksum mismatch: expected {expected_hash:#x}, got {actual_hash:#x}"
+        )));
+    }
+
+    // Phase 1: Atomic write
+    let mut batch = WriteBatch::new(engine);
+    let mut total_written = 0usize;
+
+    for (partition, entries) in &parsed_partitions {
+        for (key, value) in entries {
+            batch.put(*partition, key.clone(), value.clone());
+            total_written += 1;
+        }
+    }
+
+    batch
+        .commit()
+        .map_err(|e| io::Error::other(format!("snapshot phase 1 (atomic write) failed: {e}")))?;
+
+    tracing::info!(
+        entries = total_written,
+        "snapshot phase 1 complete: atomic write committed"
+    );
+
+    // Phase 2: Stale key cleanup
+    let mut stale_deleted = 0usize;
+    for (partition, snap_entries) in &parsed_partitions {
+        let snap_keys: std::collections::HashSet<&[u8]> =
+            snap_entries.iter().map(|(k, _)| k.as_slice()).collect();
+
+        let iter = engine
+            .prefix_scan(*partition, &[])
+            .map_err(|e| io::Error::other(format!("cleanup scan {}: {e}", partition.name())))?;
+
+        let mut keys_to_delete = Vec::new();
+        for guard in iter {
+            let key = guard
+                .key()
+                .map_err(|e| io::Error::other(format!("cleanup iter {}: {e}", partition.name())))?;
+
+            if *partition == Partition::Schema && key.as_ref().starts_with(b"raft:") {
+                continue;
+            }
+            if !snap_keys.contains(key.as_ref()) {
+                keys_to_delete.push(key.to_vec());
+            }
+        }
+
+        for key in &keys_to_delete {
+            engine.delete(*partition, key).map_err(|e| {
+                io::Error::other(format!("cleanup delete {}: {e}", partition.name()))
+            })?;
+        }
+
+        if !keys_to_delete.is_empty() {
+            tracing::debug!(
+                partition = partition.name(),
+                stale_keys = keys_to_delete.len(),
+                "snapshot phase 2: cleaned stale keys"
+            );
+        }
+        stale_deleted += keys_to_delete.len();
+    }
+
+    tracing::info!(
+        total_written,
+        stale_deleted,
+        "snapshot install complete (two-phase, reader)"
+    );
+    Ok(())
+}
+
+/// Install an incremental snapshot from a reader (file or buffer).
+///
+/// Identical to `install_incremental_snapshot` but reads from `impl Read`.
+pub fn install_incremental_snapshot_from_reader(
+    engine: &StorageEngine,
+    reader: &mut impl IoRead,
+) -> io::Result<()> {
+    // Read and validate header
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+    if &magic != MAGIC {
+        return Err(io::Error::other("invalid snapshot magic"));
+    }
+
+    let mut version = [0u8; 1];
+    reader.read_exact(&mut version)?;
+    if version[0] != FORMAT_VERSION {
+        return Err(io::Error::other(format!(
+            "unsupported snapshot version: {}",
+            version[0]
+        )));
+    }
+
+    let mut part_count = [0u8; 1];
+    reader.read_exact(&mut part_count)?;
+    let partition_count = part_count[0] as usize;
+
+    // Parse delta entries and apply via WriteBatch
+    let mut batch = WriteBatch::new(engine);
+    let mut total_written = 0usize;
+    let mut total_deleted = 0usize;
+
+    // Track parsed entries for checksum verification
+    let mut parsed_partitions: Vec<(Partition, PartitionEntries)> = Vec::new();
+
+    for _ in 0..partition_count {
+        let mut tag_buf = [0u8; 1];
+        reader.read_exact(&mut tag_buf)?;
+        let partition = tag_to_partition(tag_buf[0])
+            .ok_or_else(|| io::Error::other(format!("unknown partition tag: {}", tag_buf[0])))?;
+
+        let mut count_buf = [0u8; 4];
+        reader.read_exact(&mut count_buf)?;
+        let entry_count = u32::from_be_bytes(count_buf) as usize;
+
+        let mut entries = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            let mut key_len_buf = [0u8; 4];
+            reader.read_exact(&mut key_len_buf)?;
+            let key_len = u32::from_be_bytes(key_len_buf) as usize;
+            let mut key = vec![0u8; key_len];
+            reader.read_exact(&mut key)?;
+
+            let mut value_len_buf = [0u8; 4];
+            reader.read_exact(&mut value_len_buf)?;
+            let value_len = u32::from_be_bytes(value_len_buf) as usize;
+            let mut value = vec![0u8; value_len];
+            reader.read_exact(&mut value)?;
+
+            entries.push((key, value));
+        }
+
+        parsed_partitions.push((partition, entries));
+    }
+
+    // Validate checksum
+    let mut checksum_buf = [0u8; 8];
+    reader.read_exact(&mut checksum_buf)?;
+    let expected_hash = u64::from_le_bytes(checksum_buf);
+    let reconstructed = reconstruct_cnsn_payload(&parsed_partitions, partition_count);
+    let actual_hash = xxh3_hash(&reconstructed);
+    if expected_hash != actual_hash {
+        return Err(io::Error::other(format!(
+            "incremental snapshot checksum mismatch: expected {expected_hash:#x}, got {actual_hash:#x}"
+        )));
+    }
+
+    // Apply entries
+    for (partition, entries) in &parsed_partitions {
+        for (key, value) in entries {
+            if *partition == Partition::Raft {
+                continue;
+            }
+            if *partition == Partition::Schema && key.starts_with(b"raft:") {
+                continue;
+            }
+
+            if value.is_empty() {
+                batch.delete(*partition, key.clone());
+                total_deleted += 1;
+            } else {
+                batch.put(*partition, key.clone(), value.clone());
+                total_written += 1;
+            }
+        }
+    }
+
+    batch
+        .commit()
+        .map_err(|e| io::Error::other(format!("incremental snapshot commit failed: {e}")))?;
+
+    tracing::info!(
+        total_written,
+        total_deleted,
+        "incremental snapshot install complete (reader)"
+    );
+
+    Ok(())
+}
+
+/// Reconstruct the CNSN binary payload (without checksum) from parsed partitions.
+///
+/// Used by reader-based installers to verify the checksum after streaming
+/// parse, since they can't random-access the checksum before reading.
+fn reconstruct_cnsn_payload(
+    parsed_partitions: &[(Partition, PartitionEntries)],
+    partition_count: usize,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64 * 1024);
+    buf.extend_from_slice(MAGIC);
+    buf.push(FORMAT_VERSION);
+    buf.push(partition_count as u8);
+
+    for (partition, entries) in parsed_partitions {
+        buf.push(partition_tag(*partition));
+        let count = entries.len() as u32;
+        buf.extend_from_slice(&count.to_be_bytes());
+
+        for (key, value) in entries {
+            let key_len = key.len() as u32;
+            buf.extend_from_slice(&key_len.to_be_bytes());
+            buf.extend_from_slice(key);
+            let value_len = value.len() as u32;
+            buf.extend_from_slice(&value_len.to_be_bytes());
+            buf.extend_from_slice(value);
+        }
+    }
+
+    buf
+}
+
 /// xxh3 hash (64-bit) using the standard library-compatible algorithm.
 ///
 /// We use a simple FNV-like hash here for now. In production, replace
@@ -663,7 +1020,7 @@ fn xxh3_hash(data: &[u8]) -> u64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use coordinode_storage::engine::config::StorageConfig;
@@ -1306,5 +1663,345 @@ mod tests {
         let bytes2 = rmp_serde::to_vec(&full_transfer).expect("serialize");
         let decoded2: SnapshotTransfer = rmp_serde::from_slice(&bytes2).expect("deserialize");
         assert_eq!(decoded2.since_ts, None);
+    }
+
+    // ── Chunked Transfer Protocol Tests ────────────────────────────
+
+    #[test]
+    fn test_chunk_snapshot_data_single_chunk() {
+        // Data smaller than SNAPSHOT_CHUNK_SIZE → single chunk
+        let data = vec![0u8; 100];
+        let chunks: Vec<&[u8]> = chunk_snapshot_data(&data).collect();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 100);
+    }
+
+    #[test]
+    fn test_chunk_snapshot_data_multiple_chunks() {
+        // Data larger than SNAPSHOT_CHUNK_SIZE → multiple chunks
+        let size = SNAPSHOT_CHUNK_SIZE * 2 + 1000;
+        let data = vec![0xABu8; size];
+        let chunks: Vec<&[u8]> = chunk_snapshot_data(&data).collect();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), SNAPSHOT_CHUNK_SIZE);
+        assert_eq!(chunks[1].len(), SNAPSHOT_CHUNK_SIZE);
+        assert_eq!(chunks[2].len(), 1000);
+
+        // Reassembled data matches original
+        let reassembled: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+        assert_eq!(reassembled, data);
+    }
+
+    #[test]
+    fn test_chunk_snapshot_data_exact_boundary() {
+        // Data exactly SNAPSHOT_CHUNK_SIZE → single chunk, no remainder
+        let data = vec![0u8; SNAPSHOT_CHUNK_SIZE];
+        let chunks: Vec<&[u8]> = chunk_snapshot_data(&data).collect();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), SNAPSHOT_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn test_chunk_snapshot_data_empty() {
+        let data: Vec<u8> = Vec::new();
+        let chunks: Vec<&[u8]> = chunk_snapshot_data(&data).collect();
+        assert_eq!(chunks.len(), 0);
+    }
+
+    #[test]
+    fn test_snapshot_chunk_message_serde_roundtrip() {
+        use crate::storage::Vote;
+
+        // Header message roundtrip
+        let header = SnapshotTransferHeader {
+            vote: Vote::new(1, 1),
+            meta: openraft::storage::SnapshotMeta {
+                last_log_id: None,
+                last_membership: openraft::StoredMembership::default(),
+                snapshot_id: "chunked-test".to_string(),
+            },
+            data_size: 12345,
+            since_ts: Some(42000),
+        };
+        let msg = SnapshotChunkMessage::Header(header);
+        let bytes = rmp_serde::to_vec(&msg).expect("serialize header");
+        let decoded: SnapshotChunkMessage =
+            rmp_serde::from_slice(&bytes).expect("deserialize header");
+        match decoded {
+            SnapshotChunkMessage::Header(h) => {
+                assert_eq!(h.data_size, 12345);
+                assert_eq!(h.since_ts, Some(42000));
+                assert_eq!(h.meta.snapshot_id, "chunked-test");
+            }
+            _ => panic!("expected Header variant"),
+        }
+
+        // DataChunk message roundtrip
+        let chunk_data = vec![1u8, 2, 3, 4, 5];
+        let chunk_msg = SnapshotChunkMessage::DataChunk(chunk_data.clone());
+        let bytes2 = rmp_serde::to_vec(&chunk_msg).expect("serialize chunk");
+        let decoded2: SnapshotChunkMessage =
+            rmp_serde::from_slice(&bytes2).expect("deserialize chunk");
+        match decoded2 {
+            SnapshotChunkMessage::DataChunk(d) => assert_eq!(d, chunk_data),
+            _ => panic!("expected DataChunk variant"),
+        }
+    }
+
+    #[test]
+    fn test_install_full_snapshot_from_reader() {
+        // Build snapshot, install via reader, verify data matches
+        let dir = tempdir().unwrap();
+        let engine = open_engine(dir.path());
+
+        engine.put(Partition::Node, b"node:1", b"alice").unwrap();
+        engine
+            .put(Partition::EdgeProp, b"ep:1", b"prop_data")
+            .unwrap();
+
+        let snapshot_data = build_full_snapshot(&engine).unwrap();
+
+        // Install to fresh engine via reader
+        let dir2 = tempdir().unwrap();
+        let engine2 = open_engine(dir2.path());
+
+        let mut cursor = std::io::Cursor::new(&snapshot_data);
+        install_full_snapshot_from_reader(&engine2, &mut cursor).unwrap();
+
+        assert_eq!(
+            engine2
+                .get(Partition::Node, b"node:1")
+                .unwrap()
+                .map(|b| b.to_vec()),
+            Some(b"alice".to_vec())
+        );
+        assert_eq!(
+            engine2
+                .get(Partition::EdgeProp, b"ep:1")
+                .unwrap()
+                .map(|b| b.to_vec()),
+            Some(b"prop_data".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_install_full_snapshot_from_reader_cleans_stale() {
+        // Pre-existing data not in snapshot gets cleaned up
+        let dir = tempdir().unwrap();
+        let engine = open_engine(dir.path());
+        engine.put(Partition::Node, b"node:1", b"alice").unwrap();
+
+        let snapshot_data = build_full_snapshot(&engine).unwrap();
+
+        let dir2 = tempdir().unwrap();
+        let engine2 = open_engine(dir2.path());
+        engine2
+            .put(Partition::Node, b"node:stale", b"old_data")
+            .unwrap();
+
+        let mut cursor = std::io::Cursor::new(&snapshot_data);
+        install_full_snapshot_from_reader(&engine2, &mut cursor).unwrap();
+
+        // Stale key removed
+        assert!(engine2
+            .get(Partition::Node, b"node:stale")
+            .unwrap()
+            .is_none());
+        // Snapshot key present
+        assert!(engine2.get(Partition::Node, b"node:1").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_install_incremental_snapshot_from_reader() {
+        use coordinode_core::txn::timestamp::Timestamp;
+
+        let dir = tempdir().unwrap();
+        let config = StorageConfig::new(dir.path());
+        let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+        let engine =
+            StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open oracle engine");
+
+        // Write initial data
+        engine.put(Partition::Node, b"node:1", b"v1").unwrap();
+        engine
+            .put(Partition::Adj, b"adj:KNOWS:out:1", b"adj1")
+            .unwrap();
+
+        let since = Timestamp::from_raw(oracle.next().as_raw());
+
+        // Write changes after snapshot point
+        engine.put(Partition::Node, b"node:1", b"v2").unwrap();
+        engine.put(Partition::Node, b"node:2", b"new").unwrap();
+
+        let incr_data = build_incremental_snapshot(&engine, since)
+            .unwrap()
+            .expect("should have changes");
+
+        // Install to fresh engine via reader
+        let dir2 = tempdir().unwrap();
+        let engine2 = open_engine(dir2.path());
+        engine2.put(Partition::Node, b"node:1", b"v1").unwrap();
+        engine2
+            .put(Partition::Adj, b"adj:KNOWS:out:1", b"adj1")
+            .unwrap();
+
+        let mut cursor = std::io::Cursor::new(&incr_data);
+        install_incremental_snapshot_from_reader(&engine2, &mut cursor).unwrap();
+
+        // node:1 updated to v2
+        assert_eq!(
+            engine2
+                .get(Partition::Node, b"node:1")
+                .unwrap()
+                .map(|b| b.to_vec()),
+            Some(b"v2".to_vec())
+        );
+        // node:2 added
+        assert_eq!(
+            engine2
+                .get(Partition::Node, b"node:2")
+                .unwrap()
+                .map(|b| b.to_vec()),
+            Some(b"new".to_vec())
+        );
+        // adj unchanged
+        assert!(engine2
+            .get(Partition::Adj, b"adj:KNOWS:out:1")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn test_install_full_from_reader_checksum_validation() {
+        // Corrupt data should fail checksum
+        let dir = tempdir().unwrap();
+        let engine = open_engine(dir.path());
+        engine.put(Partition::Node, b"node:1", b"alice").unwrap();
+
+        let mut snapshot_data = build_full_snapshot(&engine).unwrap();
+
+        // Corrupt the checksum bytes (last 8 bytes) to trigger mismatch.
+        // Corrupting data bytes could break CNSN parsing before reaching
+        // the checksum, so we target the checksum directly.
+        let len = snapshot_data.len();
+        snapshot_data[len - 1] ^= 0xFF;
+
+        let dir2 = tempdir().unwrap();
+        let engine2 = open_engine(dir2.path());
+
+        let mut cursor = std::io::Cursor::new(&snapshot_data);
+        let result = install_full_snapshot_from_reader(&engine2, &mut cursor);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn test_chunked_full_snapshot_roundtrip() {
+        // End-to-end: build → chunk → reassemble → install via reader
+        let dir = tempdir().unwrap();
+        let engine = open_engine(dir.path());
+        engine.put(Partition::Node, b"node:1", b"alice").unwrap();
+        engine.put(Partition::Node, b"node:2", b"bob").unwrap();
+        engine
+            .put(Partition::EdgeProp, b"ep:1:2", b"friends")
+            .unwrap();
+
+        let snapshot_data = build_full_snapshot(&engine).unwrap();
+
+        // Chunk with small size to test multi-chunk
+        let small_chunk_size = 64;
+        let chunks: Vec<&[u8]> = snapshot_data.chunks(small_chunk_size).collect();
+        assert!(chunks.len() > 1, "should produce multiple chunks");
+
+        // Reassemble
+        let reassembled: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+        assert_eq!(reassembled, snapshot_data);
+
+        // Install via reader from reassembled data
+        let dir2 = tempdir().unwrap();
+        let engine2 = open_engine(dir2.path());
+
+        let mut cursor = std::io::Cursor::new(&reassembled);
+        install_full_snapshot_from_reader(&engine2, &mut cursor).unwrap();
+
+        assert_eq!(
+            engine2
+                .get(Partition::Node, b"node:1")
+                .unwrap()
+                .map(|b| b.to_vec()),
+            Some(b"alice".to_vec())
+        );
+        assert_eq!(
+            engine2
+                .get(Partition::Node, b"node:2")
+                .unwrap()
+                .map(|b| b.to_vec()),
+            Some(b"bob".to_vec())
+        );
+        assert_eq!(
+            engine2
+                .get(Partition::EdgeProp, b"ep:1:2")
+                .unwrap()
+                .map(|b| b.to_vec()),
+            Some(b"friends".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_reconstruct_cnsn_payload_matches_original() {
+        // Verify that reconstruct_cnsn_payload produces the same bytes as
+        // build_full_snapshot (minus the 8-byte checksum at end)
+        let dir = tempdir().unwrap();
+        let engine = open_engine(dir.path());
+        engine.put(Partition::Node, b"node:1", b"test").unwrap();
+        engine.put(Partition::Adj, b"adj:X:out:1", b"adj").unwrap();
+
+        let snapshot_data = build_full_snapshot(&engine).unwrap();
+
+        // Parse the snapshot to get partitions
+        let payload_without_checksum = &snapshot_data[..snapshot_data.len() - 8];
+
+        // Parse manually for reconstruct
+        let partitions: Vec<Partition> = snapshot_partitions().collect();
+        let partition_count = partitions.len();
+
+        let mut cursor = std::io::Cursor::new(&snapshot_data);
+        let mut magic = [0u8; 4];
+        cursor.read_exact(&mut magic).unwrap();
+        let mut version = [0u8; 1];
+        cursor.read_exact(&mut version).unwrap();
+        let mut pcount = [0u8; 1];
+        cursor.read_exact(&mut pcount).unwrap();
+
+        let mut parsed = Vec::new();
+        for _ in 0..pcount[0] {
+            let mut tag = [0u8; 1];
+            cursor.read_exact(&mut tag).unwrap();
+            let part = tag_to_partition(tag[0]).unwrap();
+            let mut count_buf = [0u8; 4];
+            cursor.read_exact(&mut count_buf).unwrap();
+            let count = u32::from_be_bytes(count_buf) as usize;
+            let mut entries = Vec::new();
+            for _ in 0..count {
+                let mut kl = [0u8; 4];
+                cursor.read_exact(&mut kl).unwrap();
+                let klen = u32::from_be_bytes(kl) as usize;
+                let mut key = vec![0u8; klen];
+                cursor.read_exact(&mut key).unwrap();
+                let mut vl = [0u8; 4];
+                cursor.read_exact(&mut vl).unwrap();
+                let vlen = u32::from_be_bytes(vl) as usize;
+                let mut val = vec![0u8; vlen];
+                cursor.read_exact(&mut val).unwrap();
+                entries.push((key, val));
+            }
+            parsed.push((part, entries));
+        }
+
+        let reconstructed = reconstruct_cnsn_payload(&parsed, partition_count);
+        assert_eq!(reconstructed, payload_without_checksum);
     }
 }

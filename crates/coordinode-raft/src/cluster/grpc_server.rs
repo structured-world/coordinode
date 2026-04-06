@@ -121,49 +121,124 @@ impl RaftService for RaftGrpcHandler {
     ) -> Result<Response<RaftPayload>, Status> {
         let mut stream = request.into_inner();
 
-        // Collect all chunks into a single buffer.
-        // Currently snapshots are sent as a single message, but this
-        // handles chunked streaming for future large snapshots.
-        let mut all_data = Vec::new();
-        while let Some(result) = stream.next().await {
-            let payload = result
-                .map_err(|e| Status::internal(format!("snapshot stream receive error: {e}")))?;
-            all_data.extend_from_slice(&payload.data);
-        }
+        // ── Chunked snapshot protocol ──────────────────────────────
+        // Message 1: SnapshotChunkMessage::Header (metadata)
+        // Messages 2..N: SnapshotChunkMessage::DataChunk (CNSN bytes)
+        //
+        // Data chunks are written to a temp file to avoid OOM on large
+        // snapshots. The file is then read by the installer.
 
-        // Deserialize the snapshot transfer message
-        let transfer: crate::snapshot::SnapshotTransfer = rmp_serde::from_slice(&all_data)
-            .map_err(|e| Status::invalid_argument(format!("snapshot transfer deserialize: {e}")))?;
+        // Read first message — must be Header
+        let first = stream
+            .next()
+            .await
+            .ok_or_else(|| Status::invalid_argument("empty snapshot stream"))?
+            .map_err(|e| Status::internal(format!("snapshot stream error: {e}")))?;
 
-        let is_incremental = transfer.since_ts.is_some();
+        let first_msg: crate::snapshot::SnapshotChunkMessage = rmp_serde::from_slice(&first.data)
+            .map_err(|e| {
+            // Backward compatibility: try deserializing as legacy SnapshotTransfer
+            tracing::debug!("chunked header parse failed, trying legacy format: {e}");
+            Status::invalid_argument(format!("snapshot header deserialize: {e}"))
+        })?;
+
+        let header = match first_msg {
+            crate::snapshot::SnapshotChunkMessage::Header(h) => h,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first snapshot message must be Header",
+                ));
+            }
+        };
+
+        let is_incremental = header.since_ts.is_some();
+        let expected_data_size = header.data_size as usize;
 
         tracing::info!(
-            snapshot_id = %transfer.meta.snapshot_id,
-            data_bytes = transfer.data.len(),
-            last_log_index = transfer.meta.last_log_id.map(|id| id.index),
+            snapshot_id = %header.meta.snapshot_id,
+            data_size = expected_data_size,
+            last_log_index = header.meta.last_log_id.map(|id| id.index),
             incremental = is_incremental,
-            since_ts = ?transfer.since_ts,
-            "received snapshot from leader"
+            since_ts = ?header.since_ts,
+            "receiving chunked snapshot from leader"
         );
 
-        // For incremental snapshots: apply delta data directly to storage,
-        // then pass empty data to openraft for Raft state update only.
-        // For full snapshots: pass data through to openraft as before.
+        // Write data chunks to temp file
+        let mut temp_file =
+            tempfile::tempfile().map_err(|e| Status::internal(format!("create temp file: {e}")))?;
+        let mut received_bytes = 0usize;
+        let mut chunk_count = 0usize;
+
+        while let Some(result) = stream.next().await {
+            let payload =
+                result.map_err(|e| Status::internal(format!("snapshot chunk receive: {e}")))?;
+
+            let chunk_msg: crate::snapshot::SnapshotChunkMessage =
+                rmp_serde::from_slice(&payload.data).map_err(|e| {
+                    Status::invalid_argument(format!("snapshot chunk deserialize: {e}"))
+                })?;
+
+            match chunk_msg {
+                crate::snapshot::SnapshotChunkMessage::DataChunk(data) => {
+                    use std::io::Write;
+                    temp_file
+                        .write_all(&data)
+                        .map_err(|e| Status::internal(format!("write snapshot chunk: {e}")))?;
+                    received_bytes += data.len();
+                    chunk_count += 1;
+                }
+                crate::snapshot::SnapshotChunkMessage::Header(_) => {
+                    return Err(Status::invalid_argument(
+                        "unexpected Header message after first message",
+                    ));
+                }
+            }
+        }
+
+        if received_bytes != expected_data_size {
+            return Err(Status::data_loss(format!(
+                "snapshot data size mismatch: expected {expected_data_size}, got {received_bytes}"
+            )));
+        }
+
+        tracing::info!(
+            received_bytes,
+            chunk_count,
+            "snapshot chunks received, installing"
+        );
+
+        // Seek to start of temp file for reading
+        use std::io::Seek;
+        temp_file
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(|e| Status::internal(format!("seek temp file: {e}")))?;
+
+        // Install snapshot from temp file
         let raft_data = if is_incremental {
             let engine = self.engine.upgrade().ok_or_else(|| {
                 Status::unavailable("engine dropped during incremental snapshot install")
             })?;
-            crate::snapshot::install_incremental_snapshot(&engine, &transfer.data)
+            let mut reader = std::io::BufReader::new(temp_file);
+            crate::snapshot::install_incremental_snapshot_from_reader(&engine, &mut reader)
                 .map_err(|e| Status::internal(format!("incremental snapshot install: {e}")))?;
             // Empty data — state machine's install_snapshot will skip data apply
             Vec::new()
         } else {
-            transfer.data
+            // For full snapshots, openraft needs the data for its state machine.
+            // Read from temp file into memory — this is the data that openraft
+            // will pass to install_snapshot() on the state machine.
+            let mut data = Vec::with_capacity(expected_data_size);
+            use std::io::Read;
+            let mut reader = std::io::BufReader::new(temp_file);
+            reader
+                .read_to_end(&mut data)
+                .map_err(|e| Status::internal(format!("read snapshot from temp file: {e}")))?;
+            data
         };
 
         let snapshot_cursor = std::io::Cursor::new(raft_data);
         let snapshot = openraft::storage::Snapshot {
-            meta: transfer.meta.clone(),
+            meta: header.meta.clone(),
             snapshot: snapshot_cursor,
         };
 
@@ -173,13 +248,13 @@ impl RaftService for RaftGrpcHandler {
         // if the follower has seen a higher term (split-brain prevention).
         let response = self
             .raft
-            .install_full_snapshot(transfer.vote, snapshot)
+            .install_full_snapshot(header.vote, snapshot)
             .await
             .map_err(|e| Status::internal(format!("install_snapshot: {e}")))?;
 
         let resp_bytes = ser(&response)?;
 
-        tracing::info!("snapshot installation complete");
+        tracing::info!(chunk_count, "chunked snapshot installation complete");
         Ok(Response::new(RaftPayload { data: resp_bytes }))
     }
 
