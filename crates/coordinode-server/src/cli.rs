@@ -4,10 +4,10 @@
 //! - `serve` (default) — start gRPC + ops servers
 //! - `version` — print version
 //! - `verify --deep` — verify storage integrity
-//!
-//! Future subcommands (when storage wiring is complete):
-//! - `import <file>` — bulk import JSON/CSV
-//! - `backup <path>` — snapshot backup
+//! - `backup` — export database to file
+//! - `restore` — import database from file
+
+use coordinode_embed::backup::BackupFormat;
 
 /// Parsed CLI command.
 pub enum Command {
@@ -31,21 +31,50 @@ pub enum Command {
         /// Deep verification (checksums on all pages).
         deep: bool,
     },
+    /// Export database to a backup file.
+    ///
+    /// Takes a consistent MVCC snapshot at the start — ongoing writes
+    /// are not blocked during backup.
+    Backup {
+        /// Data directory (source database).
+        data_dir: String,
+        /// Output file path.
+        output: String,
+        /// Backup format: json, cypher, or binary.
+        format: BackupFormat,
+        /// Optional namespace filter (export only this namespace).
+        namespace: Option<String>,
+    },
+    /// Restore database from a backup file.
+    Restore {
+        /// Data directory (target database — will be created if empty).
+        data_dir: String,
+        /// Input file path.
+        input: String,
+        /// Backup format: json, cypher, or binary.
+        format: BackupFormat,
+        /// Optional target namespace (restore into this namespace).
+        namespace: Option<String>,
+    },
 }
 
 /// Parse command line arguments.
 pub fn parse_args() -> Command {
     let args: Vec<String> = std::env::args().collect();
+    parse_args_from(&args)
+}
 
+/// Parse from an explicit args slice (testable without std::env::args).
+pub fn parse_args_from(args: &[String]) -> Command {
     if args.len() < 2 {
         return default_serve();
     }
 
     match args[1].as_str() {
         "serve" => {
-            let grpc_addr = find_flag(&args, "--addr").unwrap_or_else(|| "[::]:7080".to_string());
-            let data_dir = find_flag(&args, "--data").unwrap_or_else(|| "./data".to_string());
-            let peers = find_flag(&args, "--peers").map(|p| {
+            let grpc_addr = find_flag(args, "--addr").unwrap_or_else(|| "[::]:7080".to_string());
+            let data_dir = find_flag(args, "--data").unwrap_or_else(|| "./data".to_string());
+            let peers = find_flag(args, "--peers").map(|p| {
                 p.split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
@@ -59,13 +88,55 @@ pub fn parse_args() -> Command {
         }
         "version" | "--version" | "-v" => Command::Version,
         "verify" => {
-            let data_dir = find_flag(&args, "--data").unwrap_or_else(|| "./data".to_string());
+            let data_dir = find_flag(args, "--data").unwrap_or_else(|| "./data".to_string());
             let deep = args.iter().any(|a| a == "--deep");
             Command::Verify { data_dir, deep }
         }
+        "backup" => {
+            let data_dir = find_flag(args, "--data").unwrap_or_else(|| "./data".to_string());
+            let output = match find_flag(args, "--output") {
+                Some(o) => o,
+                None => {
+                    eprintln!("error: --output is required for backup");
+                    std::process::exit(1);
+                }
+            };
+            let format = parse_format(args);
+            let namespace = find_flag(args, "--namespace");
+            Command::Backup {
+                data_dir,
+                output,
+                format,
+                namespace,
+            }
+        }
+        "restore" => {
+            let data_dir = find_flag(args, "--data").unwrap_or_else(|| "./data".to_string());
+            let input = match find_flag(args, "--input") {
+                Some(i) => i,
+                None => {
+                    eprintln!("error: --input is required for restore");
+                    std::process::exit(1);
+                }
+            };
+            let format = parse_format(args);
+            let namespace = find_flag(args, "--namespace");
+            Command::Restore {
+                data_dir,
+                input,
+                format,
+                namespace,
+            }
+        }
         _ => {
             eprintln!(
-                "coordinode v{}\n\nUsage:\n  coordinode serve [--addr ADDR] [--data DIR]\n  coordinode version\n  coordinode verify [--data DIR] [--deep]\n",
+                "coordinode v{}\n\n\
+                 Usage:\n  \
+                 coordinode serve [--addr ADDR] [--data DIR] [--peers PEERS]\n  \
+                 coordinode backup --output FILE [--data DIR] [--format json|cypher|binary] [--namespace NS]\n  \
+                 coordinode restore --input FILE [--data DIR] [--format json|cypher|binary] [--namespace NS]\n  \
+                 coordinode verify [--data DIR] [--deep]\n  \
+                 coordinode version\n",
                 env!("CARGO_PKG_VERSION")
             );
             std::process::exit(1);
@@ -86,4 +157,126 @@ fn find_flag(args: &[String], flag: &str) -> Option<String> {
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+/// Parse --format flag (default: json).
+fn parse_format(args: &[String]) -> BackupFormat {
+    match find_flag(args, "--format").as_deref() {
+        Some("json") | None => BackupFormat::Json,
+        Some("cypher") => BackupFormat::Cypher,
+        Some("binary") => BackupFormat::Binary,
+        Some(other) => {
+            eprintln!("error: unknown format '{other}'. Use: json, cypher, or binary");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn args(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn backup_json_default_format() {
+        let cmd = parse_args_from(&args("coordinode backup --output /tmp/backup.json"));
+        match cmd {
+            Command::Backup {
+                output,
+                format,
+                namespace,
+                ..
+            } => {
+                assert_eq!(output, "/tmp/backup.json");
+                assert_eq!(format, BackupFormat::Json);
+                assert!(namespace.is_none());
+            }
+            _ => panic!("expected Backup command"),
+        }
+    }
+
+    #[test]
+    fn backup_binary_with_namespace() {
+        let cmd = parse_args_from(&args(
+            "coordinode backup --output /tmp/b.bin --format binary --namespace prod --data /db",
+        ));
+        match cmd {
+            Command::Backup {
+                data_dir,
+                output,
+                format,
+                namespace,
+            } => {
+                assert_eq!(data_dir, "/db");
+                assert_eq!(output, "/tmp/b.bin");
+                assert_eq!(format, BackupFormat::Binary);
+                assert_eq!(namespace.as_deref(), Some("prod"));
+            }
+            _ => panic!("expected Backup command"),
+        }
+    }
+
+    #[test]
+    fn backup_cypher_format() {
+        let cmd = parse_args_from(&args(
+            "coordinode backup --output dump.cypher --format cypher",
+        ));
+        match cmd {
+            Command::Backup { format, .. } => assert_eq!(format, BackupFormat::Cypher),
+            _ => panic!("expected Backup command"),
+        }
+    }
+
+    #[test]
+    fn restore_json() {
+        let cmd = parse_args_from(&args(
+            "coordinode restore --input /tmp/backup.json --data /db2",
+        ));
+        match cmd {
+            Command::Restore {
+                data_dir,
+                input,
+                format,
+                namespace,
+            } => {
+                assert_eq!(data_dir, "/db2");
+                assert_eq!(input, "/tmp/backup.json");
+                assert_eq!(format, BackupFormat::Json);
+                assert!(namespace.is_none());
+            }
+            _ => panic!("expected Restore command"),
+        }
+    }
+
+    #[test]
+    fn restore_binary_with_namespace() {
+        let cmd = parse_args_from(&args(
+            "coordinode restore --input b.bin --format binary --namespace staging",
+        ));
+        match cmd {
+            Command::Restore {
+                format, namespace, ..
+            } => {
+                assert_eq!(format, BackupFormat::Binary);
+                assert_eq!(namespace.as_deref(), Some("staging"));
+            }
+            _ => panic!("expected Restore command"),
+        }
+    }
+
+    #[test]
+    fn default_is_serve() {
+        let cmd = parse_args_from(&args("coordinode"));
+        assert!(matches!(cmd, Command::Serve { .. }));
+    }
+
+    #[test]
+    fn version_command() {
+        let cmd = parse_args_from(&args("coordinode version"));
+        assert!(matches!(cmd, Command::Version));
+    }
 }

@@ -215,6 +215,132 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .serve(addr)
                 .await?;
         }
+
+        cli::Command::Backup {
+            data_dir,
+            output,
+            format,
+            namespace: _namespace,
+        } => {
+            logging::init_logging();
+            info!(
+                data_dir = %data_dir,
+                output = %output,
+                format = ?format,
+                "starting backup"
+            );
+
+            let db = coordinode_embed::Database::open(&data_dir)
+                .map_err(|e| format!("failed to open database: {e}"))?;
+
+            let snapshot = db.engine().snapshot();
+            let shard_id = 1u16;
+
+            let file = std::fs::File::create(&output)
+                .map_err(|e| format!("failed to create output file '{output}': {e}"))?;
+            let mut writer = std::io::BufWriter::new(file);
+
+            let stats = match format {
+                coordinode_embed::backup::BackupFormat::Json => {
+                    coordinode_embed::backup::export::export_json(
+                        db.engine(),
+                        db.interner(),
+                        shard_id,
+                        &snapshot,
+                        &mut writer,
+                    )
+                    .map_err(|e| format!("backup failed: {e}"))?
+                }
+                coordinode_embed::backup::BackupFormat::Cypher => {
+                    coordinode_embed::backup::export::export_cypher(
+                        db.engine(),
+                        db.interner(),
+                        shard_id,
+                        &snapshot,
+                        &mut writer,
+                    )
+                    .map_err(|e| format!("backup failed: {e}"))?
+                }
+                coordinode_embed::backup::BackupFormat::Binary => {
+                    coordinode_embed::backup::export::export_binary(
+                        db.engine(),
+                        db.interner(),
+                        shard_id,
+                        &snapshot,
+                        &mut writer,
+                    )
+                    .map_err(|e| format!("backup failed: {e}"))?
+                }
+            };
+
+            info!(
+                nodes = stats.nodes,
+                edges = stats.edges,
+                output = %output,
+                "backup complete"
+            );
+        }
+
+        cli::Command::Restore {
+            data_dir,
+            input,
+            format,
+            namespace: _namespace,
+        } => {
+            logging::init_logging();
+            info!(
+                data_dir = %data_dir,
+                input = %input,
+                format = ?format,
+                "starting restore"
+            );
+
+            let db = coordinode_embed::Database::open(&data_dir)
+                .map_err(|e| format!("failed to open database: {e}"))?;
+
+            let file = std::fs::File::open(&input)
+                .map_err(|e| format!("failed to open input file '{input}': {e}"))?;
+
+            match format {
+                coordinode_embed::backup::BackupFormat::Json => {
+                    let mut reader = std::io::BufReader::new(file);
+                    let mut interner = db.interner().clone();
+                    let shard_id = 1u16;
+                    let stats = coordinode_embed::backup::restore::restore_json(
+                        db.engine(),
+                        &mut interner,
+                        shard_id,
+                        &mut reader,
+                    )
+                    .map_err(|e| format!("restore failed: {e}"))?;
+                    info!(
+                        nodes = stats.nodes,
+                        edges = stats.edges,
+                        schema = stats.schema_entries,
+                        "restore complete (json)"
+                    );
+                }
+                coordinode_embed::backup::BackupFormat::Binary => {
+                    let mut reader = std::io::BufReader::new(file);
+                    let (stats, _interner) =
+                        coordinode_embed::backup::restore::restore_binary(db.engine(), &mut reader)
+                            .map_err(|e| format!("restore failed: {e}"))?;
+                    info!(
+                        nodes = stats.nodes,
+                        edges = stats.edges,
+                        schema = stats.schema_entries,
+                        "restore complete (binary)"
+                    );
+                }
+                coordinode_embed::backup::BackupFormat::Cypher => {
+                    eprintln!(
+                        "error: Cypher restore not yet implemented. \
+                         Use json or binary format for restore."
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 
     Ok(())
