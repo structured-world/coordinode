@@ -659,8 +659,11 @@ pub fn install_full_snapshot(engine: &StorageEngine, data: &[u8]) -> io::Result<
 // The receiver writes chunks to a temp file, then installs from the file
 // via reader-based installers. Memory usage: O(SNAPSHOT_CHUNK_SIZE).
 
-/// Maximum size of a single snapshot data chunk in bytes (4 MB).
-pub const SNAPSHOT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+/// Maximum size of a single snapshot data chunk in bytes (2 MB).
+///
+/// Kept below tonic's default 4MB max message size to leave room for
+/// the msgpack envelope overhead of `SnapshotChunkMessage::DataChunk`.
+pub const SNAPSHOT_CHUNK_SIZE: usize = 2 * 1024 * 1024;
 
 /// Header message for chunked snapshot transfer.
 ///
