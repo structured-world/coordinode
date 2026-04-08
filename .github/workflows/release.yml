@@ -81,6 +81,135 @@ jobs:
           tag_name: ${{ env.TAG_NAME }}
           files: coordinode-${{ env.TAG_NAME }}-${{ matrix.artifact }}
 
+  package:
+    name: Build deb/rpm packages
+    runs-on: ubuntu-latest
+    needs: build-musl
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download amd64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: coordinode-linux-amd64
+          path: /tmp/bins/amd64/
+
+      - name: Download arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: coordinode-linux-arm64
+          path: /tmp/bins/arm64/
+
+      - name: Install nfpm
+        run: |
+          curl -sfL https://raw.githubusercontent.com/goreleaser/nfpm/main/godownloader.sh \
+            | bash -s -- -b /usr/local/bin v2.40.0
+
+      - name: Prepare binaries
+        run: |
+          VERSION=$(echo "${{ env.TAG_NAME }}" | sed 's/^v//')
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          # Rename artifact files to plain 'coordinode' for nfpm
+          mv /tmp/bins/amd64/coordinode-*-coordinode-linux-amd64 /tmp/bins/amd64/coordinode || \
+            cp /tmp/bins/amd64/* /tmp/bins/amd64/coordinode 2>/dev/null || true
+          mv /tmp/bins/arm64/coordinode-*-coordinode-linux-arm64 /tmp/bins/arm64/coordinode || \
+            cp /tmp/bins/arm64/* /tmp/bins/arm64/coordinode 2>/dev/null || true
+          chmod +x /tmp/bins/amd64/coordinode /tmp/bins/arm64/coordinode
+          ls -la /tmp/bins/amd64/ /tmp/bins/arm64/
+
+      - name: Build DEB packages
+        run: |
+          mkdir -p /tmp/pkgs/deb
+          for arch in amd64 arm64; do
+            # nfpm uses GOARCH-style names
+            GOARCH=$arch VERSION="$VERSION" BINARY="/tmp/bins/$arch/coordinode" \
+              nfpm package --config packaging/nfpm.yaml --packager deb --target /tmp/pkgs/deb/
+          done
+          ls -la /tmp/pkgs/deb/
+
+      - name: Build RPM packages (x86_64)
+        run: |
+          mkdir -p /tmp/pkgs/rpm-base
+          GOARCH=amd64 VERSION="$VERSION" BINARY="/tmp/bins/amd64/coordinode" \
+            nfpm package --config packaging/nfpm.yaml --packager rpm --target /tmp/pkgs/rpm-base/
+          # Extract the base RPM name and create per-Fedora-version copies
+          BASE_RPM=$(ls /tmp/pkgs/rpm-base/*.rpm | head -1)
+          BASE_NAME=$(basename "$BASE_RPM" .rpm)
+          for FC in 40 41 42; do
+            mkdir -p "/tmp/pkgs/rpm-fc${FC}"
+            cp "$BASE_RPM" "/tmp/pkgs/rpm-fc${FC}/${BASE_NAME}.fc${FC}.x86_64.rpm"
+          done
+          ls -la /tmp/pkgs/rpm-fc*/
+
+      - name: Stage artifacts by distro
+        run: |
+          # DEB: same binary works on all distros — one dir per codename
+          for codename in jammy noble bookworm; do
+            mkdir -p "/tmp/artifacts/deb-${codename}"
+            cp /tmp/pkgs/deb/*_amd64.deb "/tmp/artifacts/deb-${codename}/" 2>/dev/null || true
+            cp /tmp/pkgs/deb/*_arm64.deb "/tmp/artifacts/deb-${codename}/" 2>/dev/null || true
+          done
+          # RPM: per-Fedora-version directories
+          for FC in 40 41 42; do
+            mkdir -p "/tmp/artifacts/rpm-fc${FC}"
+            cp "/tmp/pkgs/rpm-fc${FC}/"*.rpm "/tmp/artifacts/rpm-fc${FC}/"
+          done
+          # Manifest for repo.sw.foundation docs
+          mkdir -p /tmp/artifacts/repo-meta-coordinode
+          cp packaging/manifest.json /tmp/artifacts/repo-meta-coordinode/
+
+      - name: Upload deb artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-jammy
+          path: /tmp/artifacts/deb-jammy/
+
+      - name: Upload deb-noble artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-noble
+          path: /tmp/artifacts/deb-noble/
+
+      - name: Upload deb-bookworm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-bookworm
+          path: /tmp/artifacts/deb-bookworm/
+
+      - name: Upload rpm-fc40 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-fc40
+          path: /tmp/artifacts/rpm-fc40/
+
+      - name: Upload rpm-fc41 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-fc41
+          path: /tmp/artifacts/rpm-fc41/
+
+      - name: Upload rpm-fc42 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-fc42
+          path: /tmp/artifacts/rpm-fc42/
+
+      - name: Upload repo-meta artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-meta-coordinode
+          path: /tmp/artifacts/repo-meta-coordinode/
+
+      - name: Trigger repo publish
+        env:
+          GH_TOKEN: ${{ secrets.RELEASER_APP_TOKEN }}
+        run: |
+          gh api repos/structured-world/repo/dispatches \
+            --method POST \
+            -f event_type=publish-from-coordinode \
+            -f client_payload[coordinode_run_id]="${{ github.run_id }}" \
+            -f client_payload[coordinode_repo]="${{ github.repository }}"
+
   # Build per-platform images on native runners, then merge into a multi-arch manifest.
   # This avoids QEMU emulation (~90 min for arm64) — each platform builds natively (~15 min).
   docker-build:

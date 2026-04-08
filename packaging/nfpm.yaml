@@ -1,0 +1,21 @@
+name: coordinode
+arch: ${GOARCH}
+platform: linux
+version: ${VERSION}
+version_schema: semver
+section: database
+priority: optional
+maintainer: Structured World Foundation <oss@sw.foundation>
+description: |
+  CoordiNode — unified database for AI-native applications.
+  Graph + Vector + Full-Text + Document + Time-Series in one engine,
+  one query language (OpenCypher), one transaction.
+vendor: Structured World Foundation
+homepage: https://github.com/structured-world/coordinode
+license: AGPL-3.0-only
+
+contents:
+  - src: ${BINARY}
+    dst: /usr/bin/coordinode
+    file_info:
+      mode: 0755
