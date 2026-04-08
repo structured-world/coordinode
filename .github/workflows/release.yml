@@ -3,11 +3,17 @@ name: Release
 on:
   release:
     types: [created]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag to build (e.g. v0.1.0-alpha.1)"
+        required: true
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   REGISTRY: ghcr.io
+  TAG_NAME: ${{ github.event.release.tag_name || inputs.tag_name }}
   IMAGE_NAME: ${{ github.repository }}
 
 permissions:
@@ -63,21 +69,21 @@ jobs:
 
       - name: Package
         run: |
-          VERSION=${{ github.event.release.tag_name }}
+          VERSION=${{ env.TAG_NAME }}
           cp target/${{ matrix.target }}/release/coordinode coordinode-${VERSION}-${{ matrix.artifact }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: coordinode-${{ github.event.release.tag_name }}-${{ matrix.artifact }}
+          path: coordinode-${{ env.TAG_NAME }}-${{ matrix.artifact }}
           retention-days: 1
 
       - name: Attach binary to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.release.tag_name }}
-          files: coordinode-${{ github.event.release.tag_name }}-${{ matrix.artifact }}
+          tag_name: ${{ env.TAG_NAME }}
+          files: coordinode-${{ env.TAG_NAME }}-${{ matrix.artifact }}
 
   docker:
     name: Build + push Docker image
@@ -106,8 +112,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}},value=${{ github.event.release.tag_name }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ github.event.release.tag_name }}
+            type=semver,pattern={{version}},value=${{ env.TAG_NAME }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG_NAME }}
             type=raw,value=latest,enable=${{ !github.event.release.prerelease }}
 
       - name: Build and push multi-arch image
