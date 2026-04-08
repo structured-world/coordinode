@@ -32,6 +32,10 @@ fn extract_source_context<T>(request: &Request<T>) -> Option<SourceContext> {
 }
 
 /// Convert a coordinode Value to a proto PropertyValue.
+pub(crate) fn value_to_proto_pub(value: &Value) -> common::PropertyValue {
+    value_to_proto(value)
+}
+
 fn value_to_proto(value: &Value) -> common::PropertyValue {
     let v = match value {
         Value::Null => None,
@@ -75,6 +79,10 @@ fn value_to_proto(value: &Value) -> common::PropertyValue {
 }
 
 /// Convert a proto PropertyValue to a coordinode Value.
+pub(crate) fn proto_to_value_pub(pv: &common::PropertyValue) -> Value {
+    proto_to_value(pv)
+}
+
 fn proto_to_value(pv: &common::PropertyValue) -> Value {
     match &pv.value {
         None => Value::Null,
