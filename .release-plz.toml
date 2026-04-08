@@ -1,0 +1,26 @@
+[workspace]
+# No crates.io publishing — coordinode is a server binary, not a library.
+# Releases produce musl binaries + Docker image pushed to ghcr.io.
+semver_check = false
+git_only = true
+publish = false
+git_release_enable = true
+changelog_update = true
+git_tag_name = "v{{ version }}"
+
+[changelog]
+commit_parsers = [
+    { message = "^chore", skip = true },
+    { message = "^ci", skip = true },
+    { message = "^style", skip = true },
+    { message = "^build", skip = true },
+    { message = "^docs\\(ci\\)", skip = true },
+    { message = "^docs\\(copilot\\)", skip = true },
+    { message = "^Merge", skip = true },
+    { message = "^docs", group = "Documentation" },
+    { message = "^feat", group = "Added" },
+    { message = "^fix", group = "Fixed" },
+    { message = "^perf", group = "Performance" },
+    { message = "^refactor", group = "Refactored" },
+    { message = "^test", group = "Testing" },
+]

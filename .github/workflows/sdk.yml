@@ -1,0 +1,151 @@
+name: SDK CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "sdk/**"
+      - ".github/workflows/sdk.yml"
+  pull_request:
+    paths:
+      - "sdk/**"
+  release:
+    types: [created]
+
+jobs:
+  lint-python:
+    name: Lint Python SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Lint
+        run: ruff check sdk/python sdk/langchain sdk/llama-index
+
+  test-python:
+    name: Test Python SDK (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install SDK + dependencies
+        working-directory: sdk/python
+        run: |
+          pip install -e ".[dev]"
+          make proto
+
+      - name: Run unit tests
+        working-directory: sdk/python
+        run: pytest tests/unit/ -v
+
+  # Integration tests only run on release (require a running CoordiNode).
+  # They are gated behind a secret COORDINODE_ADDR set to a staging instance.
+  test-integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    services:
+      coordinode:
+        image: ghcr.io/structured-world/coordinode:latest
+        ports:
+          - 7080:7080
+          - 7084:7084
+        options: >-
+          --health-cmd "wget -qO- http://localhost:7084/health || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install SDK
+        working-directory: sdk/python
+        run: |
+          pip install -e ".[dev]"
+          make proto
+
+      - name: Run integration tests
+        working-directory: sdk/python
+        env:
+          COORDINODE_ADDR: "localhost:7080"
+        run: pytest tests/integration/ -v
+
+  publish-pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    needs: [lint-python, test-python]
+    environment: pypi
+    permissions:
+      id-token: write  # OIDC token for trusted publishing
+    strategy:
+      matrix:
+        package:
+          - path: sdk/python
+            name: coordinode
+          - path: sdk/langchain
+            name: langchain-coordinode
+          - path: sdk/llama-index
+            name: llama-index-graph-stores-coordinode
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tools + protoc
+        run: |
+          pip install build hatchling
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Generate proto (coordinode package only)
+        if: matrix.package.name == 'coordinode'
+        working-directory: sdk/python
+        run: |
+          pip install grpcio-tools
+          make proto
+
+      - name: Build
+        working-directory: ${{ matrix.package.path }}
+        run: python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: ${{ matrix.package.path }}/dist/

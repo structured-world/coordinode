@@ -150,7 +150,7 @@ ORDER BY similarity LIMIT 25
 
 ## Full-Text Search: 23+ Languages
 
-Built-in stemming for: Arabic, Armenian, Basque, Catalan, Danish, Dutch, English, Finnish, French, German, Greek, Hindi, Hungarian, Indonesian, Irish, Italian, Lithuanian, Nepali, Norwegian, Portuguese, Romanian, Russian, Serbian, Spanish, Swedish, Tamil, Turkish, Ukrainian, Yiddish.
+Built-in stemming for: Arabic, Armenian, Danish, Dutch, English, Finnish, French, German, Greek, Hungarian, Italian, Norwegian, Portuguese, Romanian, Russian, Spanish, Swedish, Tamil, Turkish, Ukrainian (20 languages via Snowball).
 
 CJK (Chinese, Japanese, Korean) via feature flags: `cjk-zh`, `cjk-ja`, `cjk-ko`.
 
@@ -170,6 +170,16 @@ curl http://localhost:7084/health
 ```
 
 See [docs/QUICKSTART.md](docs/QUICKSTART.md) for a complete 5-minute tutorial with sample data.
+
+## Python SDK
+
+```bash
+pip install coordinode                               # core gRPC client
+pip install langchain-coordinode                     # LangChain GraphStore
+pip install llama-index-graph-stores-coordinode      # LlamaIndex PropertyGraphStore
+```
+
+Source: [structured-world/coordinode-python](https://github.com/structured-world/coordinode-python)
 
 ## Architecture
 

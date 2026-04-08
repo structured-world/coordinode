@@ -8,7 +8,7 @@
 # before building if proto/ is empty.
 
 # ─── Stage 1: Builder ────────────────────────────────────────────────
-FROM rust:latest AS builder
+FROM rust:1.94-bookworm AS builder
 
 # Override rust-toolchain.toml — Docker uses image's stable toolchain.
 ENV RUSTUP_TOOLCHAIN=stable
