@@ -52,6 +52,11 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build static binary
+        env:
+          # musl cross-compile: disable glibc fortify so zstd C code doesn't
+          # reference __memcpy_chk / __memset_chk which don't exist in musl.
+          CFLAGS_aarch64_unknown_linux_musl: "-D_FORTIFY_SOURCE=0"
+          CFLAGS_x86_64_unknown_linux_musl: "-D_FORTIFY_SOURCE=0"
         run: |
           cargo build --release --target ${{ matrix.target }} --bin coordinode
           strip target/${{ matrix.target }}/release/coordinode || true
