@@ -127,9 +127,11 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
 
         // Traverse from start node up to max_depth hops, then rank by vector
         // distance and return top_k neighbours.
+        // `start = $start_id` compares the node variable (Value::Int(node_id))
+        // directly — same mechanism used in get_node and traverse.
         let cypher = format!(
             "MATCH (start)-[:{edge_type}*1..{max_depth}]->(n) \
-             WHERE id(start) = $start_id \
+             WHERE start = $start_id \
              WITH n, vector_distance(n.{property}, $qv) AS _dist \
              ORDER BY _dist \
              LIMIT {top_k} \

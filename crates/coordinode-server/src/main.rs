@@ -157,7 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let nplus1_detector =
                 Arc::new(coordinode_query::advisor::nplus1::NPlus1Detector::new());
 
-            let graph_service = services::graph::GraphServiceImpl;
+            let graph_service = services::graph::GraphServiceImpl::new(Arc::clone(&database));
             let schema_service = services::schema::SchemaServiceImpl;
             let cypher_service = services::cypher::CypherServiceImpl::new(
                 Arc::clone(&database),
