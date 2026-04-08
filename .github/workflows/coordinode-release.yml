@@ -38,6 +38,7 @@ jobs:
 
       - name: Run release-plz release
         uses: release-plz/action@v0.5
+        continue-on-error: true  # no-op until Release PR is merged; expected to fail before that
         with:
           command: release
           config: .release-plz.toml
