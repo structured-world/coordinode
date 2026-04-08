@@ -61,16 +61,10 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         );
 
         let mut params = std::collections::HashMap::new();
-        params.insert(
-            "qv".to_string(),
-            Value::Vector(query_vector.values.clone()),
-        );
+        params.insert("qv".to_string(), Value::Vector(query_vector.values.clone()));
 
         let rows = {
-            let mut db = self
-                .database
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
             db.execute_cypher_with_params(&cypher, params)
                 .map_err(|e| Status::internal(format!("vector search error: {e}")))?
         };
@@ -140,16 +134,10 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
 
         let mut params = std::collections::HashMap::new();
         params.insert("start_id".to_string(), Value::Int(start_node_id as i64));
-        params.insert(
-            "qv".to_string(),
-            Value::Vector(query_vector.values.clone()),
-        );
+        params.insert("qv".to_string(), Value::Vector(query_vector.values.clone()));
 
         let rows = {
-            let mut db = self
-                .database
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
             db.execute_cypher_with_params(&cypher, params)
                 .map_err(|e| Status::internal(format!("hybrid search error: {e}")))?
         };
@@ -290,14 +278,15 @@ mod tests {
             .expect("vector search should succeed");
 
         let body = result.into_inner();
-        assert_eq!(body.results.len(), 1, "top_k=1 should return exactly 1 result");
+        assert_eq!(
+            body.results.len(),
+            1,
+            "top_k=1 should return exactly 1 result"
+        );
 
         let top = &body.results[0];
         assert!(top.distance >= 0.0, "distance must be non-negative");
-        assert!(
-            top.node.is_some(),
-            "result must have a node"
-        );
+        assert!(top.node.is_some(), "result must have a node");
         // The closest to [1,0,0] should have near-zero distance.
         assert!(
             top.distance < 0.1,

@@ -39,8 +39,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             .collect();
 
         // Build `{key1: $p0, key2: $p1, ...}` part and collect parameters.
-        let mut params: std::collections::HashMap<String, Value> =
-            std::collections::HashMap::new();
+        let mut params: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
         let prop_assignments: Vec<String> = req
             .properties
             .iter()
@@ -87,19 +86,15 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
     ) -> Result<Response<graph::Node>, Status> {
         let req = request.into_inner();
 
-        let mut params: std::collections::HashMap<String, Value> =
-            std::collections::HashMap::new();
+        let mut params: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
         params.insert("id".to_string(), Value::Int(req.node_id as i64));
 
         // `n = $id` compares the node variable (Value::Int(node_id) from NodeScan)
         // with the target id, which is the correct way to filter by internal node ID.
         let rows = {
             let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
-            db.execute_cypher_with_params(
-                "MATCH (n) WHERE n = $id RETURN n, n.__label__",
-                params,
-            )
-            .map_err(|e| Status::internal(format!("get_node error: {e}")))?
+            db.execute_cypher_with_params("MATCH (n) WHERE n = $id RETURN n, n.__label__", params)
+                .map_err(|e| Status::internal(format!("get_node error: {e}")))?
         };
 
         let row = rows
@@ -108,12 +103,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
 
         let node_id = match row.get("n") {
             Some(Value::Int(id)) => *id as u64,
-            _ => {
-                return Err(Status::not_found(format!(
-                    "node {} not found",
-                    req.node_id
-                )))
-            }
+            _ => return Err(Status::not_found(format!("node {} not found", req.node_id))),
         };
 
         // Primary label stored by NodeScan as `n.__label__`.
@@ -154,8 +144,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
 
         let rel_type = cypher_ident(&req.edge_type);
 
-        let mut params: std::collections::HashMap<String, Value> =
-            std::collections::HashMap::new();
+        let mut params: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
         params.insert("src_id".to_string(), Value::Int(req.source_node_id as i64));
         params.insert("dst_id".to_string(), Value::Int(req.target_node_id as i64));
 
@@ -235,12 +224,8 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             .map(|p| p.page_size.max(1) as usize)
             .unwrap_or(100);
 
-        let mut params: std::collections::HashMap<String, Value> =
-            std::collections::HashMap::new();
-        params.insert(
-            "start_id".to_string(),
-            Value::Int(req.start_node_id as i64),
-        );
+        let mut params: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        params.insert("start_id".to_string(), Value::Int(req.start_node_id as i64));
 
         let cypher = if req.edge_type.is_empty() {
             format!(
