@@ -164,7 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::clone(&query_registry),
                 Arc::clone(&nplus1_detector),
             );
-            let vector_service = services::vector::VectorServiceImpl;
+            let vector_service = services::vector::VectorServiceImpl::new(Arc::clone(&database));
             let health_service = services::health::HealthServiceImpl;
             // CDC service: tails oplog/<shard>/ dir. Empty stream in embedded mode
             // (no oplog); populated in Raft cluster mode (LogStore writes oplog).
