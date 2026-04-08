@@ -1,7 +1,8 @@
-//! Integration tests: COMPUTED property query-time evaluation (R082).
+//! Integration tests: COMPUTED property query-time evaluation (R082, R085).
 //!
 //! Tests that COMPUTED properties (Decay, TTL, VectorDecay) are evaluated
 //! inline during query execution and visible in RETURN and WHERE clauses.
+//! R085 tests verify multi-timestamp decay interpolation and TTL subtree scope.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -1097,4 +1098,261 @@ fn vector_decay_in_compound_where() {
         "compound filter: only 'fresh' passes both conditions"
     );
     assert_eq!(rows[0].get("title"), Some(&Value::String("fresh".into())));
+}
+
+// ── R085: COMPUTED integration tests ────────────────────────────────
+
+// ── (1) Decay returns correct interpolated value at 5 timestamps ────
+
+/// Create 5 nodes at different points in the decay window and verify
+/// the linear decay formula produces correct values at each point.
+#[test]
+fn computed_decay_at_5_timestamps() {
+    let (mut db, _dir) = open_db();
+
+    // Schema with 7-day linear decay (same as setup_memory_schema).
+    let duration_secs: u64 = 604800; // 7 days
+    setup_memory_schema(&mut db);
+
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+
+    // 5 timestamps: 0%, 25%, 50%, 75%, 100% of duration elapsed.
+    let fractions = [0.0_f64, 0.25, 0.50, 0.75, 1.0];
+    let names = ["t0", "t25", "t50", "t75", "t100"];
+
+    for (i, frac) in fractions.iter().enumerate() {
+        let elapsed_us = (*frac * duration_secs as f64 * 1_000_000.0) as i64;
+        let created_at = now_us - elapsed_us;
+        db.execute_cypher(&format!(
+            "CREATE (m:Memory {{content: '{}', created_at: {}}})",
+            names[i], created_at
+        ))
+        .expect("create node");
+    }
+
+    // Query all and collect relevance values indexed by content.
+    let rows = db
+        .execute_cypher(
+            "MATCH (m:Memory) RETURN m.content AS name, m.relevance AS rel ORDER BY m.content",
+        )
+        .expect("query decay values");
+
+    assert_eq!(rows.len(), 5, "should have 5 nodes");
+
+    // Build a map: name → relevance.
+    let mut values: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for row in &rows {
+        let name = match row.get("name") {
+            Some(Value::String(s)) => s.clone(),
+            other => panic!("expected String name, got {other:?}"),
+        };
+        let rel = match row.get("rel") {
+            Some(Value::Float(f)) => *f,
+            other => panic!("expected Float relevance for {name}, got {other:?}"),
+        };
+        values.insert(name, rel);
+    }
+
+    // Verify: linear decay f(t) = max(0, 1 - t).
+    // Allow ±0.02 tolerance for timing jitter.
+    let tolerance = 0.02;
+
+    // t=0% → relevance ≈ 1.0
+    let v = values["t0"];
+    assert!(
+        (v - 1.0).abs() < tolerance,
+        "t0 (elapsed=0%): expected ≈1.0, got {v}"
+    );
+
+    // t=25% → relevance ≈ 0.75
+    let v = values["t25"];
+    assert!(
+        (v - 0.75).abs() < tolerance,
+        "t25 (elapsed=25%): expected ≈0.75, got {v}"
+    );
+
+    // t=50% → relevance ≈ 0.50
+    let v = values["t50"];
+    assert!(
+        (v - 0.50).abs() < tolerance,
+        "t50 (elapsed=50%): expected ≈0.50, got {v}"
+    );
+
+    // t=75% → relevance ≈ 0.25
+    let v = values["t75"];
+    assert!(
+        (v - 0.25).abs() < tolerance,
+        "t75 (elapsed=75%): expected ≈0.25, got {v}"
+    );
+
+    // t=100% → relevance ≈ 0.0
+    let v = values["t100"];
+    assert!(
+        v.abs() < tolerance,
+        "t100 (elapsed=100%): expected ≈0.0, got {v}"
+    );
+
+    // Verify monotonic decrease.
+    assert!(
+        values["t0"] > values["t25"]
+            && values["t25"] > values["t50"]
+            && values["t50"] > values["t75"]
+            && values["t75"] > values["t100"],
+        "decay values should decrease monotonically: {:?}",
+        fractions
+            .iter()
+            .zip(names.iter())
+            .map(|(_, n)| (n, values[*n]))
+            .collect::<Vec<_>>()
+    );
+}
+
+// ── (3) TTL scope=subtree: node survives, anchor removed ────────────
+
+/// TTL with scope=Subtree removes the anchor property while the node
+/// and nested DOCUMENT properties survive.
+///
+/// Uses inline map literal in CREATE to store nested DOCUMENT content.
+/// Map literals are auto-converted to Document type on write.
+///
+/// Note: current implementation treats Subtree = Field (removes anchor).
+/// See G068 for the gap between current behavior and arch doc intent.
+#[test]
+fn computed_ttl_subtree_removes_anchor_preserves_document() {
+    let (mut db, _dir) = open_db();
+
+    // Schema with TTL scope=Subtree and short duration.
+    let mut schema = LabelSchema::new("CachedDoc");
+    schema.add_property(PropertyDef::new("title", PropertyType::String).not_null());
+    schema.add_property(PropertyDef::new("cached_at", PropertyType::Timestamp));
+    schema.add_property(PropertyDef::new("payload", PropertyType::Document));
+    schema.add_property(PropertyDef::computed(
+        "_cache_ttl",
+        ComputedSpec::Ttl {
+            duration_secs: 60, // 1 minute
+            anchor_field: "cached_at".into(),
+            scope: TtlScope::Subtree,
+        },
+    ));
+
+    let schema_key = coordinode_core::schema::definition::encode_label_schema_key("CachedDoc");
+    let bytes = schema.to_msgpack().expect("serialize schema");
+    db.engine_shared()
+        .put(
+            coordinode_storage::engine::partition::Partition::Schema,
+            &schema_key,
+            &bytes,
+        )
+        .expect("persist schema");
+
+    // Create expired node with nested DOCUMENT via inline map literal.
+    let old_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64
+        - 120 * 1_000_000; // 2 min ago, TTL=60s → expired
+
+    db.execute_cypher(&format!(
+        "CREATE (d:CachedDoc {{title: 'report', cached_at: {old_us}, \
+         payload: {{summary: 'quarterly', pages: 42}}}})"
+    ))
+    .expect("create expired node with nested doc");
+
+    // Create fresh node with nested DOCUMENT.
+    let fresh_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+
+    db.execute_cypher(&format!(
+        "CREATE (d:CachedDoc {{title: 'fresh report', cached_at: {fresh_us}, \
+         payload: {{summary: 'monthly', pages: 10}}}})"
+    ))
+    .expect("create fresh node with nested doc");
+
+    // Verify both exist with nested DOCUMENT accessible via dot-notation.
+    let rows = db
+        .execute_cypher(
+            "MATCH (d:CachedDoc) \
+             RETURN d.title AS t, d.payload.summary AS s \
+             ORDER BY d.title",
+        )
+        .expect("query before reap");
+    assert_eq!(rows.len(), 2, "should have 2 nodes before reap");
+    // Verify dot-notation into nested DOCUMENT works.
+    let report_row = rows
+        .iter()
+        .find(|r| r.get("t") == Some(&Value::String("report".into())))
+        .expect("report row before reap");
+    assert_eq!(
+        report_row.get("s"),
+        Some(&Value::String("quarterly".into())),
+        "dot-notation into nested DOCUMENT should work"
+    );
+
+    // Run reaper.
+    let result =
+        coordinode_query::index::ttl_reaper::reap_computed_ttl(&db.engine_shared(), 1, 1000);
+    assert_eq!(
+        result.subtrees_removed, 1,
+        "should remove 1 subtree (expired node's anchor)"
+    );
+    assert_eq!(
+        result.nodes_deleted, 0,
+        "no nodes should be deleted in subtree scope"
+    );
+
+    // Verify: both nodes survive, expired node's cached_at removed,
+    // nested DOCUMENT content intact on both.
+    let rows = db
+        .execute_cypher(
+            "MATCH (d:CachedDoc) \
+             RETURN d.title AS t, d.cached_at AS ca, d.payload.summary AS s \
+             ORDER BY d.title",
+        )
+        .expect("query after reap");
+    assert_eq!(rows.len(), 2, "both nodes should survive subtree TTL");
+
+    let fresh_row = rows
+        .iter()
+        .find(|r| r.get("t") == Some(&Value::String("fresh report".into())))
+        .expect("fresh row");
+    let expired_row = rows
+        .iter()
+        .find(|r| r.get("t") == Some(&Value::String("report".into())))
+        .expect("expired row");
+
+    // Fresh node: all properties intact.
+    assert!(
+        matches!(
+            fresh_row.get("ca"),
+            Some(Value::Int(_)) | Some(Value::Timestamp(_))
+        ),
+        "fresh node's cached_at should survive"
+    );
+    assert_eq!(
+        fresh_row.get("s"),
+        Some(&Value::String("monthly".into())),
+        "fresh node's nested DOCUMENT should survive"
+    );
+
+    // Expired node: anchor (cached_at) removed, nested doc survives.
+    assert_eq!(
+        expired_row.get("ca"),
+        Some(&Value::Null),
+        "expired node's cached_at should be removed by subtree TTL"
+    );
+    assert_eq!(
+        expired_row.get("t"),
+        Some(&Value::String("report".into())),
+        "expired node's title should survive subtree TTL"
+    );
+    assert_eq!(
+        expired_row.get("s"),
+        Some(&Value::String("quarterly".into())),
+        "expired node's nested DOCUMENT content should survive subtree TTL"
+    );
 }

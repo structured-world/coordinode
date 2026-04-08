@@ -302,6 +302,13 @@ pub struct ExecutionContext<'a> {
     /// Raft replication instead of going through the synchronous
     /// proposal pipeline.
     pub drain_buffer: Option<&'a coordinode_core::txn::drain::DrainBuffer>,
+    /// NVMe-backed write buffer for `w:cache` crash recovery.
+    ///
+    /// When set and write concern is `Cache`, mutations are persisted to this
+    /// NVMe file before ACK so they survive process crashes. The drain thread's
+    /// checkpoint protocol (`begin_drain` / `complete_drain`) ensures entries
+    /// are cleaned up after successful Raft commit.
+    pub nvme_write_buffer: Option<&'a coordinode_storage::cache::write_buffer::NvmeWriteBuffer>,
     /// Pending merge-add UIDs per adj key (raw key, no MVCC timestamp).
     ///
     /// Edge creates accumulate UIDs here instead of read-modify-write.
@@ -632,6 +639,16 @@ impl<'a> ExecutionContext<'a> {
                     commit_ts,
                     self.mvcc_read_ts,
                 );
+
+                // w:cache: persist to NVMe before ACK for process-crash recovery.
+                // w:memory skips this — data loss on crash is the explicit contract.
+                if effective_level == WriteConcernLevel::Cache {
+                    if let Some(wb) = self.nvme_write_buffer {
+                        wb.append(&entry).map_err(|e| {
+                            ExecutionError::Serialization(format!("w:cache NVMe write failed: {e}"))
+                        })?;
+                    }
+                }
 
                 drain_buf.append(entry).map_err(|e| {
                     ExecutionError::Serialization(format!("volatile write backpressure: {e}"))
@@ -3669,7 +3686,8 @@ fn execute_create_node(
 
         let mut record = NodeRecord::with_labels(labels.to_vec());
         for (prop_name, expr) in properties {
-            let val = eval_expr(expr, input_row);
+            // Map literals → Document for full dot-notation support in storage.
+            let val = eval_expr(expr, input_row).map_to_document();
 
             if is_validated {
                 // VALIDATED: declared properties → interned props,
@@ -3793,7 +3811,7 @@ fn execute_create_edge(
             let mut prop_map: Vec<(u32, Value)> = Vec::with_capacity(properties.len());
             for (prop_name, expr) in properties {
                 let field_id = ctx.interner.intern(prop_name);
-                let value = eval_expr(expr, row);
+                let value = eval_expr(expr, row).map_to_document();
                 prop_map.push((field_id, value));
             }
             let prop_bytes = rmp_serde::to_vec(&prop_map)
@@ -3839,7 +3857,8 @@ fn execute_update(
                     property,
                     expr,
                 } => {
-                    let val = eval_expr(expr, &out_row);
+                    // Map literals → Document for nested property storage.
+                    let val = eval_expr(expr, &out_row).map_to_document();
                     let node_id = match out_row.get(variable) {
                         Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                         _ => continue,
@@ -4949,6 +4968,7 @@ mod tests {
             read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::Local,
             write_concern: coordinode_core::txn::write_concern::WriteConcern::majority(),
             drain_buffer: None,
+            nvme_write_buffer: None,
             merge_adj_adds: std::collections::HashMap::new(),
             merge_adj_removes: std::collections::HashMap::new(),
             mvcc_snapshot: None,

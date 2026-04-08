@@ -196,6 +196,22 @@ impl Value {
         }
     }
 
+    /// Convert `Value::Map` to `Value::Document` for storage as nested document.
+    ///
+    /// Map literals in Cypher (`{key: 'value'}`) evaluate to `Value::Map`,
+    /// but when stored as node properties they should be `Value::Document`
+    /// to support full dot-notation traversal and merge operators.
+    ///
+    /// Non-Map values are returned unchanged.
+    pub fn map_to_document(self) -> Self {
+        if matches!(self, Self::Map(_)) {
+            let rmpv = self.to_rmpv();
+            Self::Document(rmpv)
+        } else {
+            self
+        }
+    }
+
     /// Check if this is a null value.
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null)

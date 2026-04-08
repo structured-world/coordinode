@@ -1416,9 +1416,9 @@ checksum = "9afc2bd4d5a73106dd53d10d73d3401c2f32730ba2c0b93ddb888a8983680471"
 
 [[package]]
 name = "fastrand"
-version = "2.4.0"
+version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a043dc74da1e37d6afe657061213aa6f425f855399a11d3463c6ecccc4dfda1f"
+checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "filetime"
@@ -2275,9 +2275,9 @@ dependencies = [
 
 [[package]]
 name = "lindera"
-version = "3.0.0"
+version = "3.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78cf64c99134f2baa558bb75ffabe87251073028c8909b91f173080cbf30dbed"
+checksum = "4ce25da9c3144349af5546272989a6c63dde6ed080e69b31e45ecdeea22e5b6e"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2304,9 +2304,9 @@ dependencies = [
 
 [[package]]
 name = "lindera-dictionary"
-version = "3.0.0"
+version = "3.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04d3069e8e2bf6fa53b0f5bed964f59743bbac1d70aa3d36eef3676e2ab5d984"
+checksum = "dd1a70080131053ed2d123616a906140356b24babd7fd5a925863fcee2b8bb7a"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2337,9 +2337,9 @@ dependencies = [
 
 [[package]]
 name = "lindera-ipadic"
-version = "3.0.0"
+version = "3.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5eaa3fab05bc33dc250aaa59fc00951726a5e502ed411092efc5568941a423c9"
+checksum = "2c6f5f45a942763fec5995dad9a0674dcd4cad1873982dff1aab6f53452f0d7a"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2351,9 +2351,9 @@ dependencies = [
 
 [[package]]
 name = "lindera-ko-dic"
-version = "3.0.0"
+version = "3.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a7706701322a4e9df6ac710a61082a89a1e50696f815fbab90bf19d1c8b1d6d"
+checksum = "ba19a1f1e2a897ea77895eeecdb31caaa3be958e937ec52884ccbffedad0df7f"
 dependencies = [
  "anyhow",
  "byteorder",

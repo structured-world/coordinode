@@ -188,6 +188,84 @@ RETURN dept.name, count(emp) AS headcount, avg(emp.salary) AS avg_salary
 ORDER BY headcount DESC
 ```
 
+## Document Operations
+
+### Nested Document Properties
+
+Map literals in CREATE and SET are stored as nested DOCUMENT values with full dot-notation support:
+
+```cypher
+-- Create node with nested document property
+CREATE (device:Device {
+  name: 'Router-A',
+  config: {
+    network: {ssid: 'office', channel: 6},
+    security: {protocol: 'WPA3', key_rotation: 3600}
+  }
+})
+
+-- Dot-notation reads at any depth
+MATCH (d:Device {name: 'Router-A'})
+RETURN d.config.network.ssid, d.config.security.protocol
+
+-- Partial update via dot-notation (O(1) merge operator, no read)
+MATCH (d:Device {name: 'Router-A'})
+SET d.config.network.ssid = 'home'
+
+-- Remove nested key
+MATCH (d:Device {name: 'Router-A'})
+REMOVE d.config.security.key_rotation
+```
+
+### Array Operators
+
+Merge-operator-based array mutations (concurrent-safe, no OCC conflicts):
+
+```cypher
+-- Append to array
+MATCH (n:Bag) SET doc_push(n.data.items, 'new_item')
+
+-- Remove from array
+MATCH (n:Bag) SET doc_pull(n.data.items, 'old_item')
+
+-- Add only if not present (set semantics)
+MATCH (n:Bag) SET doc_add_to_set(n.data.tags, 'unique_tag')
+
+-- Atomic increment
+MATCH (n:Stats) SET doc_inc(n.data.view_count, 1)
+```
+
+### Schema Modes
+
+```cypher
+-- STRICT (default): only declared properties, all interned
+-- VALIDATED: declared + undeclared in overflow map
+-- FLEXIBLE: all properties accepted, all interned
+ALTER LABEL Config SET SCHEMA FLEXIBLE
+```
+
+## Computed Properties
+
+Query-time evaluated fields with zero per-node storage overhead:
+
+```cypher
+-- Decay: interpolated value over time (schema API, DDL planned)
+-- Declared as: COMPUTED DECAY(formula: 'linear', initial: 1.0, target: 0.0,
+--                              duration: '7d', anchor: created_at)
+MATCH (m:Memory)
+WHERE m.relevance > 0.5
+RETURN m.content, m.relevance
+
+-- TTL: auto-delete after duration
+-- Scopes: field (remove one property), subtree (remove document), node (delete node + edges)
+-- Background reaper runs every 60s, 1000 deletions per batch
+
+-- Vector decay: similarity × recency weight
+MATCH (a:Article)
+WHERE vector_similarity(a.embedding, $query) * a._recency > 0.5
+RETURN a.title
+```
+
 ## Query Advisor
 
 ```cypher

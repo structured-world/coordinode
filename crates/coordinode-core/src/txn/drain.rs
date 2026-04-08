@@ -192,6 +192,35 @@ impl std::fmt::Debug for DrainBuffer {
     }
 }
 
+/// Hook for persistent write buffer backends (e.g. NVMe cache for `w:cache`).
+///
+/// Implementations write drain entries to persistent storage so they survive
+/// process crashes. The drain thread calls `begin_drain()` before taking entries
+/// from RAM, and `complete_drain(token)` after proposals commit successfully.
+///
+/// Atomic rename protocol (implemented by `NvmeWriteBuffer`):
+/// - `begin_drain(token)` → renames `write_buffer_current.bin` to
+///   `write_buffer_draining.<token>.bin` (atomic on POSIX).
+/// - `complete_drain(token)` → deletes `write_buffer_draining.<token>.bin`.
+/// - On crash during drain: draining file survives → replay on restart.
+/// - New writes after `begin_drain` go to a fresh current file.
+pub trait WriteBufferHook: Send + Sync {
+    /// Called before entries are taken from RAM buffer.
+    ///
+    /// Should atomically "checkpoint" the current write buffer — making
+    /// current pending entries available for recovery if the process
+    /// crashes before `complete_drain()` is called.
+    ///
+    /// Returns a token identifying this drain checkpoint (e.g. a generation counter).
+    fn begin_drain(&self) -> u64;
+
+    /// Called after all Raft proposals for a drain batch succeed.
+    ///
+    /// Should discard the checkpoint identified by `token` — those entries
+    /// are now durable in the Raft oplog and no longer need crash recovery.
+    fn complete_drain(&self, token: u64);
+}
+
 /// Handle to the background drain thread.
 ///
 /// The drain thread periodically takes all entries from the [`DrainBuffer`],
@@ -210,11 +239,18 @@ impl DrainHandle {
     /// The thread runs until `shutdown()` is called or the handle is dropped.
     /// On shutdown, all remaining buffered entries are flushed through the
     /// pipeline before the thread exits.
+    ///
+    /// `write_buffer`: optional persistent write buffer hook for `w:cache`
+    /// crash recovery. When set, the drain thread calls `begin_drain()` before
+    /// taking entries and `complete_drain(token)` after successful proposals.
+    /// Entries already in RAM buffer when the thread starts are handled by the
+    /// first `drain_once()` call.
     pub fn start(
         buffer: Arc<DrainBuffer>,
         pipeline: Arc<dyn ProposalPipeline>,
         id_gen: Arc<ProposalIdGenerator>,
         config: DrainConfig,
+        write_buffer: Option<Arc<dyn WriteBufferHook>>,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
@@ -232,6 +268,7 @@ impl DrainHandle {
                     &id_gen,
                     &config,
                     &shutdown_clone,
+                    write_buffer.as_deref(),
                 );
             }) {
             Ok(handle) => Some(handle),
@@ -282,31 +319,48 @@ fn drain_loop(
     id_gen: &ProposalIdGenerator,
     config: &DrainConfig,
     shutdown: &AtomicBool,
+    write_buffer: Option<&dyn WriteBufferHook>,
 ) {
     let interval = std::time::Duration::from_millis(config.interval_ms);
 
     loop {
         std::thread::sleep(interval);
 
-        drain_once(buffer, pipeline, id_gen, config.batch_max);
+        drain_once(buffer, pipeline, id_gen, config.batch_max, write_buffer);
 
         if shutdown.load(Ordering::Acquire) {
             // Final flush — drain everything remaining.
-            drain_once(buffer, pipeline, id_gen, config.batch_max);
+            drain_once(buffer, pipeline, id_gen, config.batch_max, write_buffer);
             break;
         }
     }
 }
 
 /// Drain all buffered entries once, batching into proposals.
+///
+/// If `write_buffer` is set:
+/// 1. `begin_drain()` is called first → atomically checkpoints the NVMe write buffer.
+/// 2. After all proposals succeed, `complete_drain(token)` removes the checkpoint.
+/// 3. On crash between step 1 and 2: the checkpoint file survives for replay on restart.
 fn drain_once(
     buffer: &DrainBuffer,
     pipeline: &dyn ProposalPipeline,
     id_gen: &ProposalIdGenerator,
     batch_max: u32,
+    write_buffer: Option<&dyn WriteBufferHook>,
 ) {
+    // Checkpoint the NVMe write buffer BEFORE taking entries from RAM.
+    // This ensures: if the process crashes during drain, the checkpoint
+    // file contains all entries being drained and can be replayed on restart.
+    let drain_token = write_buffer.map(|wb| wb.begin_drain());
+
     let entries = buffer.take_all();
     if entries.is_empty() {
+        // No entries to drain. If we checkpointed (unlikely but possible on
+        // race), complete it immediately to avoid leaving a stale file.
+        if let (Some(wb), Some(token)) = (write_buffer, drain_token) {
+            wb.complete_drain(token);
+        }
         return;
     }
 
@@ -315,19 +369,22 @@ fn drain_once(
     let mut current_mutations: Vec<Mutation> = Vec::new();
     let mut current_commit_ts = Timestamp::from_raw(0);
     let mut current_start_ts = Timestamp::from_raw(0);
+    let mut all_ok = true;
 
     for entry in entries {
         // If this entry would exceed batch size, flush current batch first.
         if !current_mutations.is_empty()
             && current_mutations.len() + entry.mutations.len() > batch_max as usize
-        {
-            submit_proposal(
+            && submit_proposal(
                 pipeline,
                 id_gen,
                 std::mem::take(&mut current_mutations),
                 current_commit_ts,
                 current_start_ts,
-            );
+            )
+            .is_err()
+        {
+            all_ok = false;
         }
 
         // Use the latest commit_ts in the batch (highest = most recent).
@@ -342,26 +399,41 @@ fn drain_once(
     }
 
     // Flush remaining mutations.
-    if !current_mutations.is_empty() {
-        submit_proposal(
+    if !current_mutations.is_empty()
+        && submit_proposal(
             pipeline,
             id_gen,
             current_mutations,
             current_commit_ts,
             current_start_ts,
-        );
+        )
+        .is_err()
+    {
+        all_ok = false;
+    }
+
+    // If all proposals committed, the checkpoint is no longer needed for
+    // crash recovery — the data is now in the Raft oplog.
+    // If any proposal failed, we leave the checkpoint for recovery.
+    if all_ok {
+        if let (Some(wb), Some(token)) = (write_buffer, drain_token) {
+            wb.complete_drain(token);
+        }
     }
 }
 
 /// Submit a single RaftProposal through the pipeline.
-/// Errors are logged but not propagated — volatile writes accept data loss.
+///
+/// Returns `Ok(())` if the proposal committed, `Err(())` if it failed.
+/// Errors are logged — volatile writes accept data loss, but the caller
+/// uses the error to decide whether to complete the NVMe checkpoint.
 fn submit_proposal(
     pipeline: &dyn ProposalPipeline,
     id_gen: &ProposalIdGenerator,
     mutations: Vec<Mutation>,
     commit_ts: Timestamp,
     start_ts: Timestamp,
-) {
+) -> Result<(), ()> {
     let count = mutations.len();
     let proposal = RaftProposal {
         id: id_gen.next(),
@@ -373,22 +445,27 @@ fn submit_proposal(
         bypass_rate_limiter: true,
     };
 
-    if let Err(e) = pipeline.propose_and_wait(&proposal) {
-        // Log error but don't retry — volatile writes accept data loss.
-        // The mutations are already applied locally; this drain is for
-        // replication/durability only.
-        tracing::warn!(
-            count,
-            commit_ts = commit_ts.as_raw(),
-            error = %e,
-            "drain proposal failed — volatile mutations not replicated"
-        );
-    } else {
-        tracing::debug!(
-            count,
-            commit_ts = commit_ts.as_raw(),
-            "drain batch submitted"
-        );
+    match pipeline.propose_and_wait(&proposal) {
+        Ok(()) => {
+            tracing::debug!(
+                count,
+                commit_ts = commit_ts.as_raw(),
+                "drain batch submitted"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // Log error but don't retry — volatile writes accept data loss.
+            // The mutations are already applied locally; this drain is for
+            // replication/durability only.
+            tracing::warn!(
+                count,
+                commit_ts = commit_ts.as_raw(),
+                error = %e,
+                "drain proposal failed — volatile mutations not replicated"
+            );
+            Err(())
+        }
     }
 }
 
@@ -487,7 +564,7 @@ mod tests {
         buf.append(test_entry(5, 100)).unwrap();
         buf.append(test_entry(3, 200)).unwrap();
 
-        drain_once(&buf, pipeline.as_ref(), &id_gen, 10_000);
+        drain_once(&buf, pipeline.as_ref(), &id_gen, 10_000, None);
 
         // Both entries should be batched into one proposal (8 mutations < 10K).
         assert_eq!(pipeline.proposal_count(), 1);
@@ -506,7 +583,7 @@ mod tests {
         buf.append(test_entry(5, 200)).unwrap();
         buf.append(test_entry(5, 300)).unwrap();
 
-        drain_once(&buf, pipeline.as_ref(), &id_gen, 7);
+        drain_once(&buf, pipeline.as_ref(), &id_gen, 7, None);
 
         // Should produce 2 proposals: [5, 5+5] won't fit → [5], [5, 5]
         // Actually: first=5 (fits), second=5 (5+5=10>7 → flush first, then second),
@@ -521,7 +598,7 @@ mod tests {
         let pipeline = Arc::new(RecordingPipeline::new());
         let id_gen = ProposalIdGenerator::new();
 
-        drain_once(&buf, pipeline.as_ref(), &id_gen, 10_000);
+        drain_once(&buf, pipeline.as_ref(), &id_gen, 10_000, None);
 
         assert_eq!(pipeline.proposal_count(), 0);
     }
@@ -535,7 +612,7 @@ mod tests {
         buf.append(test_entry(2, 100)).unwrap();
         buf.append(test_entry(2, 500)).unwrap();
 
-        drain_once(&buf, pipeline.as_ref(), &id_gen, 10_000);
+        drain_once(&buf, pipeline.as_ref(), &id_gen, 10_000, None);
 
         let proposals = pipeline.proposals.lock().unwrap();
         // Batched into one proposal — commit_ts should be the max (500).
@@ -549,7 +626,7 @@ mod tests {
         let id_gen = ProposalIdGenerator::new();
 
         buf.append(test_entry(1, 100)).unwrap();
-        drain_once(&buf, pipeline.as_ref(), &id_gen, 10_000);
+        drain_once(&buf, pipeline.as_ref(), &id_gen, 10_000, None);
 
         let proposals = pipeline.proposals.lock().unwrap();
         assert!(proposals[0].bypass_rate_limiter);
@@ -574,6 +651,7 @@ mod tests {
             Arc::clone(&pipeline) as Arc<dyn ProposalPipeline>,
             Arc::clone(&id_gen),
             config,
+            None,
         );
 
         // Give drain thread time to process.
@@ -604,7 +682,7 @@ mod tests {
         buf.append(test_entry(3, 100)).unwrap();
 
         // Should not panic — errors are logged and swallowed.
-        drain_once(&buf, pipeline.as_ref(), &id_gen, 10_000);
+        drain_once(&buf, pipeline.as_ref(), &id_gen, 10_000, None);
 
         // Buffer should be drained even though pipeline failed.
         assert!(buf.is_empty());

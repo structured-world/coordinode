@@ -12,3 +12,4 @@
 pub mod access;
 pub mod config;
 pub mod tiered;
+pub mod write_buffer;

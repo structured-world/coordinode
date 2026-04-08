@@ -205,6 +205,9 @@ pub struct Database {
     /// Shared between all ExecutionContext instances. The background drain
     /// thread batches buffered mutations into proposal pipeline calls.
     drain_buffer: Arc<coordinode_core::txn::drain::DrainBuffer>,
+    /// NVMe-backed write buffer for `w:cache` crash recovery.
+    /// `None` when `nvme_write_buffer_path` is not configured in `StorageConfig`.
+    nvme_write_buffer: Option<Arc<coordinode_storage::cache::write_buffer::NvmeWriteBuffer>>,
     /// Handle to the background drain thread. Dropped on Database::drop,
     /// which flushes remaining entries (graceful shutdown).
     _drain_handle: coordinode_core::txn::drain::DrainHandle,
@@ -339,11 +342,39 @@ impl Database {
         let drain_buffer = Arc::new(coordinode_core::txn::drain::DrainBuffer::new(
             drain_config.capacity_bytes,
         ));
+
+        // Open the NVMe write buffer for w:cache crash recovery (if configured).
+        // Recovery runs first: any entries from a previous crash are re-injected
+        // into the DrainBuffer before the drain thread starts, ensuring they are
+        // drained to Raft in the next drain cycle.
+        let nvme_write_buffer = if let Some(ref nvme_path) = config.nvme_write_buffer_path {
+            let recovered =
+                coordinode_storage::cache::write_buffer::NvmeWriteBuffer::recover(nvme_path)
+                    .map_err(|e| {
+                        DatabaseError::Other(format!("NVMe write buffer recovery failed: {e}"))
+                    })?;
+            for entry in recovered {
+                drain_buffer.append(entry).map_err(|e| {
+                    DatabaseError::Other(format!(
+                        "failed to re-inject recovered w:cache entry: {e}"
+                    ))
+                })?;
+            }
+            let wb = coordinode_storage::cache::write_buffer::NvmeWriteBuffer::open(nvme_path)
+                .map_err(|e| DatabaseError::Other(format!("NVMe write buffer open failed: {e}")))?;
+            Some(Arc::new(wb))
+        } else {
+            None
+        };
+
         let drain_handle = coordinode_core::txn::drain::DrainHandle::start(
             Arc::clone(&drain_buffer),
             Arc::clone(&pipeline),
             Arc::clone(&proposal_id_gen),
             drain_config,
+            nvme_write_buffer
+                .as_ref()
+                .map(|wb| Arc::clone(wb) as Arc<dyn coordinode_core::txn::drain::WriteBufferHook>),
         );
 
         // Start COMPUTED TTL background reaper (default: 60s interval, 1000 batch).
@@ -384,6 +415,7 @@ impl Database {
             adaptive_config: AdaptiveConfig::default(),
             feedback_cache: FeedbackCache::default(),
             drain_buffer,
+            nvme_write_buffer,
             _drain_handle: drain_handle,
             _ttl_reaper_handle: ttl_reaper_handle,
         })
@@ -855,6 +887,7 @@ impl Database {
             read_concern: self.read_concern,
             write_concern: self.write_concern.clone(),
             drain_buffer: Some(&self.drain_buffer),
+            nvme_write_buffer: self.nvme_write_buffer.as_deref(),
             merge_adj_adds: std::collections::HashMap::new(),
             merge_adj_removes: std::collections::HashMap::new(),
             mvcc_snapshot: None,

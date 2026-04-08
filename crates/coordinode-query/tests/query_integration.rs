@@ -55,6 +55,7 @@ fn make_test_ctx<'a>(
         read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::Local,
         write_concern: coordinode_core::txn::write_concern::WriteConcern::majority(),
         drain_buffer: None,
+        nvme_write_buffer: None,
         merge_adj_adds: std::collections::HashMap::new(),
         merge_adj_removes: std::collections::HashMap::new(),
         mvcc_snapshot: None,

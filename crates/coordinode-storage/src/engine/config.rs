@@ -175,6 +175,17 @@ pub struct StorageConfig {
     /// Maximum drain buffer capacity in bytes. When full, new volatile
     /// writes are rejected with backpressure. Default: 100 MB.
     pub drain_buffer_capacity_bytes: u64,
+
+    /// Directory for the NVMe-backed write buffer used by `w:cache` write concern.
+    ///
+    /// When set, `w:cache` writes are persisted to this directory before ACK,
+    /// enabling recovery of undraiend entries after a process crash (not power
+    /// failure). Two files are managed in this directory:
+    /// - `write_buffer_current.bin` — active write buffer being appended
+    /// - `write_buffer_draining.NNN.bin` — checkpoint in progress (drain thread)
+    ///
+    /// When `None` (default), `w:cache` is treated identically to `w:memory`.
+    pub nvme_write_buffer_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for StorageConfig {
@@ -220,6 +231,7 @@ impl StorageConfig {
             drain_interval_ms: 100,
             drain_batch_max: 10_000,
             drain_buffer_capacity_bytes: 100 * 1024 * 1024,
+            nvme_write_buffer_path: None,
         }
     }
 
