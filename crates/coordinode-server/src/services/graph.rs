@@ -411,6 +411,70 @@ mod tests {
         assert_eq!(edge.target_node_id, b.node_id);
     }
 
+    /// Regression: node created via create_node RPC must be visible via CypherService
+    /// sharing the same Database instance.
+    ///
+    /// On the live server, `create_node` was observed to return `node_id = 0` and
+    /// the node was not findable via `MATCH`. This test verifies cross-service
+    /// persistence: GraphService write → CypherService read must observe the mutation.
+    ///
+    /// If this test fails, the two services are using different Database instances
+    /// (broken wiring in `main.rs`).
+    #[tokio::test]
+    async fn create_node_visible_via_cypher_service() {
+        use crate::proto::query;
+        use crate::services::cypher::CypherServiceImpl;
+        use coordinode_query::advisor::nplus1::NPlus1Detector;
+        use coordinode_query::advisor::QueryRegistry;
+        use query::cypher_service_server::CypherService as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database = Arc::new(Mutex::new(
+            Database::open(dir.path()).expect("open database"),
+        ));
+
+        // Both services share the same Arc — exactly as main.rs wires them.
+        let graph_svc = GraphServiceImpl::new(Arc::clone(&database));
+        let cypher_svc = CypherServiceImpl::new(
+            Arc::clone(&database),
+            Arc::new(QueryRegistry::new()),
+            Arc::new(NPlus1Detector::new()),
+        );
+
+        // Create node via GraphService RPC.
+        let created = graph_svc
+            .create_node(Request::new(graph::CreateNodeRequest {
+                labels: vec!["RegTest".to_string()],
+                properties: std::collections::HashMap::new(),
+            }))
+            .await
+            .expect("create_node should succeed")
+            .into_inner();
+
+        assert!(
+            created.node_id > 0,
+            "node_id must be > 0, got {}",
+            created.node_id
+        );
+
+        // Verify via CypherService that the node exists.
+        let resp = cypher_svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "MATCH (n:RegTest) RETURN n".to_string(),
+                parameters: std::collections::HashMap::new(),
+            }))
+            .await
+            .expect("execute_cypher should succeed")
+            .into_inner();
+
+        assert_eq!(
+            resp.rows.len(),
+            1,
+            "node created via GraphService must be visible via CypherService, got {} rows",
+            resp.rows.len()
+        );
+    }
+
     /// cypher_ident escapes backticks.
     #[test]
     fn cypher_ident_escapes() {
