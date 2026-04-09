@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/structured-world/coordinode/releases/tag/v0.3.0) - 2026-04-09
+
+### Added
+
+- *(computed)* R085 decay interpolation tests and NVMe write buffer for w:cache
+- *(raft)* true async wtimeout via propose_with_timeout (G048)
+- *(raft)* add WaitForMajorityService for batched proposal coalescing (G047)
+- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+
+### Testing
+
+- *(raft)* add tests for propose_with_timeout and WriteConcernTimeout (G048)
+
 ## [0.1.0-alpha.1](https://github.com/structured-world/coordinode/releases/tag/v0.1.0-alpha.1) - 2026-04-08
 
 ### Added
