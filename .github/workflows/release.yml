@@ -204,6 +204,7 @@ jobs:
           path: /tmp/artifacts/repo-meta-coordinode/
 
       - name: Trigger repo publish
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.RELEASER_APP_TOKEN }}
         run: |
