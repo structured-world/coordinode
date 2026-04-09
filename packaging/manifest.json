@@ -14,8 +14,7 @@
       "summary": "Unified database for AI-native applications",
       "category": "main",
       "icon": "database",
-      "requires": null,
-      "docs": null
+      "requires": null
     }
   ],
   "platforms": {
@@ -37,17 +36,14 @@
         {
           "id": "ubuntu",
           "name": "Ubuntu",
-          "versions": [
-            { "codename": "noble", "version": "24.04" },
-            { "codename": "jammy", "version": "22.04" }
-          ]
+          "codenames": ["noble", "jammy"],
+          "versions": ["24.04", "22.04"]
         },
         {
           "id": "debian",
           "name": "Debian",
-          "versions": [
-            { "codename": "bookworm", "version": "12" }
-          ]
+          "codenames": ["bookworm"],
+          "versions": ["12"]
         }
       ],
       "repoSetup": "curl -fsSL https://repo.sw.foundation/keys/sw.gpg | sudo gpg --dearmor -o /etc/apt/keyrings/sw.gpg\necho \"deb [signed-by=/etc/apt/keyrings/sw.gpg] https://repo.sw.foundation/deb $(lsb_release -cs) main\" | sudo tee /etc/apt/sources.list.d/sw.list\nsudo apt-get update",
