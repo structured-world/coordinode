@@ -122,8 +122,9 @@ jobs:
         run: |
           mkdir -p /tmp/pkgs/deb
           for arch in amd64 arm64; do
-            # nfpm uses GOARCH-style names
-            GOARCH=$arch VERSION="$VERSION" BINARY="/tmp/bins/$arch/coordinode" \
+            # nfpm uses GOARCH-style names; copy binary to fixed path (env vars not expanded in src)
+            cp /tmp/bins/$arch/coordinode /tmp/coordinode-current
+            GOARCH=$arch VERSION="$VERSION" \
               nfpm package --config packaging/nfpm.yaml --packager deb --target /tmp/pkgs/deb/
           done
           ls -la /tmp/pkgs/deb/
@@ -131,7 +132,8 @@ jobs:
       - name: Build RPM packages (x86_64)
         run: |
           mkdir -p /tmp/pkgs/rpm-base
-          GOARCH=amd64 VERSION="$VERSION" BINARY="/tmp/bins/amd64/coordinode" \
+          cp /tmp/bins/amd64/coordinode /tmp/coordinode-current
+          GOARCH=amd64 VERSION="$VERSION" \
             nfpm package --config packaging/nfpm.yaml --packager rpm --target /tmp/pkgs/rpm-base/
           # Extract the base RPM name and create per-Fedora-version copies
           BASE_RPM=$(ls /tmp/pkgs/rpm-base/*.rpm | head -1)

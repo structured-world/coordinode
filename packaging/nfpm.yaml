@@ -15,7 +15,7 @@ homepage: https://github.com/structured-world/coordinode
 license: AGPL-3.0-only
 
 contents:
-  - src: ${BINARY}
+  - src: /tmp/coordinode-current
     dst: /usr/bin/coordinode
     file_info:
       mode: 0755
