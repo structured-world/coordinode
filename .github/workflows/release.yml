@@ -203,10 +203,17 @@ jobs:
           name: repo-meta-coordinode
           path: /tmp/artifacts/repo-meta-coordinode/
 
+      - name: Generate release bot token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+          repositories: repo
+
       - name: Trigger repo publish
-        continue-on-error: true
         env:
-          GH_TOKEN: ${{ secrets.RELEASER_APP_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           gh api repos/structured-world/repo/dispatches \
             --method POST \
