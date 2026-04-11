@@ -20,6 +20,7 @@ rust-version = "1.90"
 license = "AGPL-3.0-only"
 repository = "https://github.com/structured-world/coordinode"
 authors = ["structured.world <dev@structured.world>"]
+publish = false
 
 [workspace.dependencies]
 # Storage — coordinode-lsm-tree as crates.io dep (ADR-018), fjall consumed (ADR-019)
