@@ -29,6 +29,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Run release-plz release-pr
+        # continue-on-error: release-plz runs `cargo package` for change detection
+        # even with `git_only = true`. For monorepos where crates have internal
+        # path dependencies not published to crates.io, this always fails.
+        # TODO: replace with git-cliff + custom version bump script.
+        continue-on-error: true
         uses: release-plz/action@v0.5
         with:
           command: release-pr
