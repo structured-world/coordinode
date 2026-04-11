@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/structured-world/coordinode/compare/v0.3.0...v0.3.1) - 2026-04-11
+
+### Added
+
+- *(query)* HNSW-accelerated vector top-K via planner optimization
+
+### Testing
+
+- *(server)* add cross-service regression test for create_node persistence
+
 ## [0.3.0](https://github.com/structured-world/coordinode/releases/tag/v0.3.0) - 2026-04-09
 
 ### Added
