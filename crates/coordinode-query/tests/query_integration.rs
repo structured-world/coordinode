@@ -6424,3 +6424,218 @@ fn test_merge_relationship_edge_properties_current_behavior() {
         "G075: property-blind MERGE — currently 1 edge regardless of property value differences"
     );
 }
+
+/// G072 — two MERGE relationship clauses in a single query.
+///
+/// Plan structure: CartesianProduct{CartesianProduct{MATCH, Merge1}, Merge2}.
+/// Verifies that the nested correlated execution works correctly for both levels.
+///
+/// What this tests:
+/// - MERGE (a)-[r1:KNOWS]->(b) and MERGE (a)-[r2:LIKES]->(b) in one query
+/// - Both edges are created with correct types
+/// - Re-running the query is idempotent (still exactly 1 KNOWS and 1 LIKES)
+#[test]
+fn test_merge_two_relationship_clauses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    run_cypher_with_alloc(
+        "CREATE (:Person {name: 'Alice'}), (:Person {name: 'Bob'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // Both MERGEs in one query — plan is nested CartesianProduct
+    run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
+         MERGE (a)-[r1:KNOWS]->(b) \
+         MERGE (a)-[r2:LIKES]->(b) \
+         RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    let knows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) RETURN count(*) AS cnt",
+        &engine, &mut interner, &allocator,
+    );
+    assert_eq!(
+        knows[0].get("cnt"),
+        Some(&Value::Int(1)),
+        "KNOWS edge should exist"
+    );
+
+    let likes = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'})-[r:LIKES]->(b:Person {name: 'Bob'}) RETURN count(*) AS cnt",
+        &engine, &mut interner, &allocator,
+    );
+    assert_eq!(
+        likes[0].get("cnt"),
+        Some(&Value::Int(1)),
+        "LIKES edge should exist"
+    );
+
+    // Re-run — both MERGEs must be idempotent
+    run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
+         MERGE (a)-[r1:KNOWS]->(b) \
+         MERGE (a)-[r2:LIKES]->(b) \
+         RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    let knows2 = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) RETURN count(*) AS cnt",
+        &engine, &mut interner, &allocator,
+    );
+    assert_eq!(
+        knows2[0].get("cnt"),
+        Some(&Value::Int(1)),
+        "KNOWS still 1 after re-run"
+    );
+
+    let likes2 = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'})-[r:LIKES]->(b:Person {name: 'Bob'}) RETURN count(*) AS cnt",
+        &engine, &mut interner, &allocator,
+    );
+    assert_eq!(
+        likes2[0].get("cnt"),
+        Some(&Value::Int(1)),
+        "LIKES still 1 after re-run"
+    );
+}
+
+/// G072 — self-loop MERGE: source and target variable are the same node.
+///
+/// What this tests:
+/// - MERGE (a)-[r:SELF_REF]->(a) where source and target are the same node ID
+/// - execute_merge_relationship_check handles src == tgt (adj key lookup of node onto itself)
+/// - execute_merge_relationship_create writes both fwd and rev adj for the same node
+/// - Idempotency on self-loop
+#[test]
+fn test_merge_relationship_self_loop() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    run_cypher_with_alloc(
+        "CREATE (:Node {name: 'X'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // Self-referential MERGE
+    let rows = run_cypher_with_alloc(
+        "MATCH (a:Node {name: 'X'}) MERGE (a)-[r:SELF_REF]->(a) RETURN r.__type__ AS rel_type",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 1, "self-loop MERGE should return 1 row");
+    assert_eq!(
+        rows[0].get("rel_type"),
+        Some(&Value::String("SELF_REF".to_string()))
+    );
+
+    // Verify retrievable
+    let check = run_cypher_with_alloc(
+        "MATCH (a:Node {name: 'X'})-[r:SELF_REF]->(b:Node {name: 'X'}) RETURN count(*) AS cnt",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(
+        check[0].get("cnt"),
+        Some(&Value::Int(1)),
+        "self-loop should exist"
+    );
+
+    // Idempotency
+    run_cypher_with_alloc(
+        "MATCH (a:Node {name: 'X'}) MERGE (a)-[r:SELF_REF]->(a) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    let check2 = run_cypher_with_alloc(
+        "MATCH (a:Node {name: 'X'})-[r:SELF_REF]->(b:Node {name: 'X'}) RETURN count(*) AS cnt",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(
+        check2[0].get("cnt"),
+        Some(&Value::Int(1)),
+        "self-loop MERGE must be idempotent"
+    );
+}
+
+/// G069 + G072 integration — wildcard MATCH after Cypher MERGE.
+///
+/// The G069 fix (list_edge_types reads schema partition) must see edge types
+/// registered by execute_merge_relationship_create (which writes schema key).
+/// This test verifies end-to-end: Cypher MERGE → schema key written → wildcard
+/// MATCH finds the edge.
+///
+/// What this tests:
+/// - No manual insert_edge — edges created purely via Cypher MERGE
+/// - Wildcard [r] returns the MERGE-created edge with correct __type__
+/// - count(r) on the MERGE-created edge returns 1 (G070 + G072 integration)
+#[test]
+fn test_g069_wildcard_after_cypher_merge() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    run_cypher_with_alloc(
+        "CREATE (:Person {name: 'Alice'}), (:Person {name: 'Bob'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // Create edge via MERGE (not manual insert_edge)
+    run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
+         MERGE (a)-[r:KNOWS]->(b) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // Wildcard [r] must find the MERGE-created KNOWS edge (G069 fix)
+    let wild_rows = run_cypher_with_alloc(
+        "MATCH (a)-[r]->(b) RETURN r.__type__ AS t",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(wild_rows.len(), 1, "wildcard should return 1 edge");
+    assert_eq!(
+        wild_rows[0].get("t"),
+        Some(&Value::String("KNOWS".to_string())),
+        "wildcard should return KNOWS type"
+    );
+
+    // count(r) on the MERGE-created edge must return 1 (G070 fix)
+    let cnt_rows = run_cypher_with_alloc(
+        "MATCH (a)-[r:KNOWS]->(b) RETURN count(r) AS cnt",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(
+        cnt_rows[0].get("cnt"),
+        Some(&Value::Int(1)),
+        "count(r) after Cypher MERGE must return 1"
+    );
+}
