@@ -89,6 +89,21 @@ fn insert_node(
     engine.put(Partition::Node, &key, &bytes).expect("put node");
 }
 
+/// Register an edge type in the schema partition so wildcard relationship
+/// patterns (`MATCH (n)-[r]->(m)`) can enumerate it via `schema:edge_type:` scan.
+///
+/// In production, this is done automatically when edges are created via the
+/// Cypher executor. In tests that insert edges directly (bypassing the executor),
+/// call this alongside `insert_edge` to keep schema and adj index in sync.
+fn register_schema_edge_type(engine: &StorageEngine, edge_type: &str) {
+    const PREFIX: &[u8] = b"schema:edge_type:";
+    let mut key = PREFIX.to_vec();
+    key.extend_from_slice(edge_type.as_bytes());
+    engine
+        .put(Partition::Schema, &key, b"")
+        .expect("put schema edge type");
+}
+
 fn insert_edge(engine: &StorageEngine, edge_type: &str, source_id: u64, target_id: u64) {
     let fwd_key = encode_adj_key_forward(edge_type, NodeId::from_raw(source_id));
     let mut fwd_list = match engine.get(Partition::Adj, &fwd_key).expect("get") {
@@ -5749,4 +5764,311 @@ fn r165_doc_pull_missing_value_noop() {
     } else {
         panic!("expected Document");
     }
+}
+
+// ── G069: wildcard relationship pattern ──────────────────────────────────────
+
+/// Regression test for G069: `MATCH (n)-[r]->(m)` (no type filter) returned 0
+/// rows because `expand_one_hop` with empty `edge_types` iterated an empty slice.
+///
+/// Verifies:
+/// - Wildcard `[r]` returns all edges regardless of type (KNOWS + LIKES)
+/// - `r.__type__` column is populated for each returned row
+/// - Typed `[r:KNOWS]` still works and is not affected by the fix
+#[test]
+fn test_wildcard_relationship_returns_results() {
+    // Graph: Alice(1) -[:KNOWS]-> Bob(2), Alice(1) -[:LIKES]-> Eve(5)
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Person",
+        &[("name", Value::String("Alice".into()))],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        2,
+        "Person",
+        &[("name", Value::String("Bob".into()))],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        5,
+        "Person",
+        &[("name", Value::String("Eve".into()))],
+        &mut interner,
+    );
+
+    insert_edge(&engine, "KNOWS", 1, 2);
+    insert_edge(&engine, "LIKES", 1, 5);
+
+    // Register edge types in schema so wildcard scan can enumerate them (G069).
+    // In production, the executor registers these automatically on CREATE.
+    register_schema_edge_type(&engine, "KNOWS");
+    register_schema_edge_type(&engine, "LIKES");
+
+    // Wildcard: should return both KNOWS and LIKES edges (2 rows)
+    let rows = run_cypher(
+        "MATCH (n)-[r]->(m) RETURN r.__type__",
+        &engine,
+        &mut interner,
+    );
+    assert_eq!(
+        rows.len(),
+        2,
+        "wildcard [r] should return all edges; got {} rows",
+        rows.len()
+    );
+
+    // Both edge types should be present
+    let types: std::collections::HashSet<String> = rows
+        .iter()
+        .filter_map(|row| {
+            if let Some(Value::String(t)) = row.get("r.__type__") {
+                Some(t.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(types.contains("KNOWS"), "expected KNOWS in wildcard result");
+    assert!(types.contains("LIKES"), "expected LIKES in wildcard result");
+
+    // Typed pattern should still work and return only KNOWS (regression guard)
+    let typed_rows = run_cypher(
+        "MATCH (n)-[r:KNOWS]->(m) RETURN r.__type__",
+        &engine,
+        &mut interner,
+    );
+    assert_eq!(
+        typed_rows.len(),
+        1,
+        "typed [r:KNOWS] should still return 1 row"
+    );
+    assert_eq!(
+        typed_rows[0].get("r.__type__"),
+        Some(&Value::String("KNOWS".into()))
+    );
+}
+
+/// G069 edge case: wildcard on a graph with no schema-registered edge types returns 0 rows.
+#[test]
+fn test_wildcard_relationship_empty_schema_returns_zero() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Person",
+        &[("name", Value::String("Loner".into()))],
+        &mut interner,
+    );
+    // No edges inserted, no schema edge types registered
+
+    let rows = run_cypher(
+        "MATCH (n)-[r]->(m) RETURN r.__type__",
+        &engine,
+        &mut interner,
+    );
+    assert_eq!(
+        rows.len(),
+        0,
+        "empty schema should return 0 rows for wildcard"
+    );
+}
+
+// ── G070: count(r) for relationship variable ─────────────────────────────────
+
+/// Regression test for G070: `count(r)` returned 0 for relationship variables
+/// because `r` was not stored as a row column — only `r.__type__` was stored.
+/// `eval_aggregate_values` filtered out the resulting `Value::Null`, giving 0.
+///
+/// Verifies:
+/// - `count(r)` returns the correct number of edges (not 0)
+/// - `count(*)` is unaffected
+/// - `count(n)` (node variable) is unaffected
+#[test]
+fn test_count_relationship_variable() {
+    // Graph: Alice(1) -[:KNOWS]-> Bob(2), Alice(1) -[:KNOWS]-> Charlie(3)
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Person",
+        &[("name", Value::String("Alice".into()))],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        2,
+        "Person",
+        &[("name", Value::String("Bob".into()))],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        3,
+        "Person",
+        &[("name", Value::String("Charlie".into()))],
+        &mut interner,
+    );
+
+    insert_edge(&engine, "KNOWS", 1, 2);
+    insert_edge(&engine, "KNOWS", 1, 3);
+    register_schema_edge_type(&engine, "KNOWS");
+
+    // count(r) should return 2, not 0
+    let rows = run_cypher(
+        "MATCH (a)-[r:KNOWS]->(b) RETURN count(r) AS cnt",
+        &engine,
+        &mut interner,
+    );
+    assert_eq!(rows.len(), 1, "aggregation should produce exactly 1 row");
+    assert_eq!(
+        rows[0].get("cnt"),
+        Some(&Value::Int(2)),
+        "count(r) should return 2; got {:?}",
+        rows[0].get("cnt")
+    );
+
+    // count(*) should also return 2 (unaffected baseline)
+    let rows_star = run_cypher(
+        "MATCH (a)-[r:KNOWS]->(b) RETURN count(*) AS cnt",
+        &engine,
+        &mut interner,
+    );
+    assert_eq!(
+        rows_star[0].get("cnt"),
+        Some(&Value::Int(2)),
+        "count(*) baseline"
+    );
+
+    // count(a) (node variable) should also return 2 (unaffected baseline)
+    let rows_node = run_cypher(
+        "MATCH (a)-[r:KNOWS]->(b) RETURN count(a) AS cnt",
+        &engine,
+        &mut interner,
+    );
+    assert_eq!(
+        rows_node[0].get("cnt"),
+        Some(&Value::Int(2)),
+        "count(a) baseline"
+    );
+}
+
+// ── G072: MERGE relationship pattern ─────────────────────────────────────────
+
+/// Regression test for G072: `MERGE (src)-[r:TYPE]->(dst)` between already-bound
+/// nodes failed with "MERGE create from non-NodeScan pattern".
+///
+/// What this tests:
+/// - MERGE (a)-[:KNOWS]->(b) creates the edge when it doesn't exist
+/// - Repeated MERGE is idempotent: edge count stays at 1
+/// - The MERGE correctly uses the bound src/dst from the preceding MATCH
+///
+/// Why this matters: LangChain `add_graph_documents()` and LlamaIndex
+/// `upsert_relations()` use MERGE for idempotent edge creation.
+#[test]
+fn test_merge_relationship_creates_edge() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    // Create two nodes via Cypher
+    run_cypher_with_alloc(
+        "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // MERGE relationship — should CREATE because edge doesn't exist yet
+    // G072: previously failed with "MERGE create from non-NodeScan pattern"
+    let merge_q = "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
+                   MERGE (a)-[r:KNOWS]->(b) RETURN r.__type__ AS rel_type";
+    let merge_rows = run_cypher_with_alloc(merge_q, &engine, &mut interner, &allocator);
+    assert_eq!(
+        merge_rows.len(),
+        1,
+        "MERGE should return exactly 1 row (created edge); got {:?}",
+        merge_rows
+    );
+    assert_eq!(
+        merge_rows[0].get("rel_type"),
+        Some(&Value::String("KNOWS".to_string())),
+        "edge type should be KNOWS"
+    );
+
+    // Verify edge actually exists
+    let check_rows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) RETURN count(*) AS cnt",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(
+        check_rows[0].get("cnt"),
+        Some(&Value::Int(1)),
+        "should have exactly 1 KNOWS edge"
+    );
+
+    // MERGE again — should be IDEMPOTENT (match existing, no duplicates)
+    let merge_rows2 = run_cypher_with_alloc(merge_q, &engine, &mut interner, &allocator);
+    assert_eq!(
+        merge_rows2.len(),
+        1,
+        "second MERGE should also return 1 row (matched); got {:?}",
+        merge_rows2
+    );
+
+    // Count edges — must still be 1 (idempotent)
+    let count_rows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) RETURN count(*) AS cnt",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(
+        count_rows[0].get("cnt"),
+        Some(&Value::Int(1)),
+        "MERGE must be idempotent: expected 1 edge after two MERGEs, got {:?}",
+        count_rows[0].get("cnt")
+    );
+
+    // Ensure unrelated node pair returns 0 (correct scoping)
+    let _ = run_cypher_with_alloc(
+        "CREATE (c:Person {name: 'Charlie'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    let no_edge_rows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(c:Person {name: 'Charlie'}) RETURN count(*) AS cnt",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(
+        no_edge_rows[0].get("cnt"),
+        Some(&Value::Int(0)),
+        "Alice→Charlie KNOWS edge should not exist"
+    );
 }

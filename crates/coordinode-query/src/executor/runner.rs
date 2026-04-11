@@ -1156,9 +1156,22 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             edge_filters,
         } => {
             let input_rows = execute_op(input, ctx)?;
+
+            // G069: wildcard relationship pattern `MATCH (n)-[r]->(m)` — no type filter.
+            // When edge_types is empty, expand over all schema-registered edge types.
+            // This scans `schema:edge_type:<name>` keys (written on every CREATE edge)
+            // plus any uncommitted registrations in the current transaction's write buffer.
+            let resolved_types: Vec<String>;
+            let effective_types: &[String] = if edge_types.is_empty() {
+                resolved_types = ctx.list_edge_types()?;
+                &resolved_types
+            } else {
+                edge_types
+            };
+
             let params = TraverseParams {
                 source,
-                edge_types,
+                edge_types: effective_types,
                 direction: *direction,
                 target_variable,
                 target_labels,
@@ -1282,6 +1295,27 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
 
         LogicalOp::CartesianProduct { left, right } => {
             let left_rows = execute_op(left, ctx)?;
+
+            // G072: MERGE (src)-[r:TYPE]->(tgt) in a CartesianProduct context requires
+            // correlated execution so the Merge can access the bound src/tgt variables.
+            // Without this, execute_merge gets no source/target IDs and fails when it
+            // tries to create the edge from a non-NodeScan pattern.
+            if is_relationship_merge(right) {
+                let prev_corr = ctx.correlated_row.take();
+                let mut result = Vec::new();
+                for lr in &left_rows {
+                    ctx.correlated_row = Some(lr.clone());
+                    let rr = execute_op(right, ctx)?;
+                    for r in rr {
+                        let mut merged = lr.clone();
+                        merged.extend(r);
+                        result.push(merged);
+                    }
+                }
+                ctx.correlated_row = prev_corr;
+                return Ok(result);
+            }
+
             let right_rows = execute_op(right, ctx)?;
             let mut result = Vec::with_capacity(left_rows.len() * right_rows.len());
             for lr in &left_rows {
@@ -1788,6 +1822,12 @@ fn build_target_row(
     if let Some(ev) = edge_variable {
         if let Some(et) = edge_type {
             out_row.insert(format!("{ev}.__type__"), Value::String(et.to_string()));
+            // G070: also store the relationship variable itself (not only `r.__type__`)
+            // so that aggregate expressions like `count(r)` evaluate to a non-null value.
+            // Without this, eval_expr("r") returns Null → eval_aggregate_values filters it
+            // out → count(r) = 0. Storing the edge type string as the variable value makes
+            // count(r) behave identically to count(r.__type__).
+            out_row.insert(ev.to_string(), Value::String(et.to_string()));
 
             // Load edge properties from EdgeProp partition.
             // Source ID comes from the input row (the node we traversed from).
@@ -1959,6 +1999,8 @@ fn process_targets_parallel(
                 if let Some(ev) = edge_variable {
                     if let Some(et) = edge_type {
                         out_row.insert(format!("{ev}.__type__"), Value::String(et.to_string()));
+                        // G070: store relationship variable itself for count(r) support
+                        out_row.insert(ev.to_string(), Value::String(et.to_string()));
 
                         {
                             let (ep_src, ep_tgt) = match direction {
@@ -3371,6 +3413,27 @@ fn execute_merge(
     on_create: &[crate::cypher::ast::SetItem],
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
+    // G072: MERGE (src)-[r:TYPE]->(tgt) — relationship pattern with correlated bindings.
+    // When the pattern is a Traverse and ctx.correlated_row has src/tgt bound, use the
+    // targeted match+create path instead of the generic execute_op + execute_create_from_pattern.
+    // The generic path scans all nodes and fails to create edges from Traverse patterns.
+    if let (Some(traverse), Some(correlated)) =
+        (as_traverse_op(pattern), ctx.correlated_row.clone())
+    {
+        let matches = execute_merge_relationship_check(traverse, &correlated, ctx)?;
+        if !matches.is_empty() {
+            if on_match.is_empty() {
+                return Ok(matches);
+            }
+            return execute_update(&matches, on_match, ctx);
+        }
+        let created = execute_merge_relationship_create(traverse, &correlated, ctx)?;
+        if on_create.is_empty() {
+            return Ok(created);
+        }
+        return execute_update(&created, on_create, ctx);
+    }
+
     // Phase 1: Try to find existing matches
     let matches = execute_op(pattern, ctx)?;
 
@@ -3388,6 +3451,178 @@ fn execute_merge(
         }
         execute_update(&created, on_create, ctx)
     }
+}
+
+/// Returns true if op is a `Merge` whose inner pattern is (or wraps) a `Traverse`.
+///
+/// Used by `CartesianProduct` to detect `MATCH (a), (b) MERGE (a)-[r:T]->(b)` patterns
+/// that need correlated per-left-row execution so the Merge can access bound variables.
+fn is_relationship_merge(op: &LogicalOp) -> bool {
+    match op {
+        LogicalOp::Merge { pattern, .. } => as_traverse_op(pattern).is_some(),
+        _ => false,
+    }
+}
+
+/// Returns a reference to the innermost `Traverse` op if `op` is Traverse or a chain of
+/// Filter wrappers over a Traverse (e.g., Filter { input: Traverse { .. } }).
+fn as_traverse_op(op: &LogicalOp) -> Option<&LogicalOp> {
+    match op {
+        LogicalOp::Traverse { .. } => Some(op),
+        LogicalOp::Filter { input, .. } => as_traverse_op(input),
+        _ => None,
+    }
+}
+
+/// Check whether the relationship described by `traverse` already exists between the
+/// source and target nodes bound in `correlated`.
+///
+/// Returns a non-empty Vec (one row with the edge variable set) if the edge exists,
+/// or an empty Vec if it does not. Called from `execute_merge` for the correlated path.
+fn execute_merge_relationship_check(
+    traverse: &LogicalOp,
+    correlated: &Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    let (source, edge_types, direction, target_variable, edge_variable) = match traverse {
+        LogicalOp::Traverse {
+            source,
+            edge_types,
+            direction,
+            target_variable,
+            edge_variable,
+            ..
+        } => (
+            source,
+            edge_types,
+            direction,
+            target_variable,
+            edge_variable,
+        ),
+        _ => unreachable!("execute_merge_relationship_check: not a Traverse"),
+    };
+
+    let source_id = match correlated.get(source.as_str()) {
+        Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+        _ => {
+            return Err(ExecutionError::Unsupported(format!(
+                "MERGE relationship: source variable '{source}' not bound in scope"
+            )))
+        }
+    };
+    let target_id = match correlated.get(target_variable.as_str()) {
+        Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+        _ => {
+            return Err(ExecutionError::Unsupported(format!(
+                "MERGE relationship: target variable '{target_variable}' not bound in scope"
+            )))
+        }
+    };
+
+    // Resolve wildcard edge types against schema.
+    let resolved_types: Vec<String>;
+    let effective_types: &[String] = if edge_types.is_empty() {
+        resolved_types = ctx.list_edge_types()?;
+        &resolved_types
+    } else {
+        edge_types
+    };
+
+    let target_raw = target_id.as_raw();
+    for et in effective_types {
+        let neighbors = expand_one_hop(source_id, std::slice::from_ref(et), *direction, ctx)?;
+        if neighbors.iter().any(|(tgt, _)| *tgt == target_raw) {
+            let mut row = correlated.clone();
+            if let Some(ev) = edge_variable {
+                row.insert(format!("{ev}.__type__"), Value::String(et.clone()));
+                row.insert(ev.clone(), Value::String(et.clone()));
+            }
+            return Ok(vec![row]);
+        }
+    }
+
+    Ok(vec![])
+}
+
+/// Create a relationship edge described by `traverse` between the source and target
+/// nodes bound in `correlated`. Called from `execute_merge` when no existing edge
+/// was found by `execute_merge_relationship_check`.
+fn execute_merge_relationship_create(
+    traverse: &LogicalOp,
+    correlated: &Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    let (source, edge_types, direction, target_variable, edge_variable) = match traverse {
+        LogicalOp::Traverse {
+            source,
+            edge_types,
+            direction,
+            target_variable,
+            edge_variable,
+            ..
+        } => (
+            source,
+            edge_types,
+            direction,
+            target_variable,
+            edge_variable,
+        ),
+        _ => unreachable!("execute_merge_relationship_create: not a Traverse"),
+    };
+
+    if edge_types.is_empty() {
+        return Err(ExecutionError::Unsupported(
+            "MERGE relationship: cannot create edge with wildcard type — specify a relationship type".into(),
+        ));
+    }
+
+    let source_id = match correlated.get(source.as_str()) {
+        Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+        _ => {
+            return Err(ExecutionError::Unsupported(format!(
+                "MERGE relationship: source variable '{source}' not bound in scope"
+            )))
+        }
+    };
+    let target_id = match correlated.get(target_variable.as_str()) {
+        Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+        _ => {
+            return Err(ExecutionError::Unsupported(format!(
+                "MERGE relationship: target variable '{target_variable}' not bound in scope"
+            )))
+        }
+    };
+
+    // Use the first (and typically only) edge type for creation.
+    let et = &edge_types[0];
+
+    // Direction determines which node is "from" vs "to" in the adjacency lists.
+    let (from_id, to_id) = match direction {
+        Direction::Outgoing | Direction::Both => (source_id, target_id),
+        Direction::Incoming => (target_id, source_id),
+    };
+    let fwd_key = encode_adj_key_forward(et, from_id);
+    ctx.adj_merge_add(&fwd_key, to_id.as_raw());
+    let rev_key = encode_adj_key_reverse(et, to_id);
+    ctx.adj_merge_add(&rev_key, from_id.as_raw());
+    ctx.write_stats.edges_created += 1;
+
+    // Register edge type in schema (idempotent).
+    let et_key = edge_type_schema_key(et);
+    if !ctx
+        .mvcc_write_buffer
+        .contains_key(&(Partition::Schema, et_key.clone()))
+    {
+        ctx.mvcc_put(Partition::Schema, &et_key, b"")?;
+    }
+
+    let mut row = correlated.clone();
+    if let Some(ev) = edge_variable {
+        row.insert(format!("{ev}.__type__"), Value::String(et.clone()));
+        row.insert(ev.clone(), Value::String(et.clone()));
+    }
+
+    Ok(vec![row])
 }
 
 /// UPSERT MATCH: atomic match-or-create.
