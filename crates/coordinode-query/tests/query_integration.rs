@@ -6246,3 +6246,181 @@ fn test_merge_relationship_standalone_returns_error() {
         "error should mention MERGE, got: {msg}"
     );
 }
+
+/// G072 — MERGE relationship with ON MATCH SET applies properties only when edge already exists.
+///
+/// What this tests:
+/// - When the edge already exists, ON MATCH SET fires (updates node/property)
+/// - When the edge does NOT yet exist, ON MATCH SET does NOT fire
+#[test]
+fn test_merge_relationship_on_match_set() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    run_cypher_with_alloc(
+        "CREATE (:Person {name: 'Alice', visits: 0}), (:Person {name: 'Bob'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // First MERGE — creates edge; ON MATCH SET must NOT fire (no match yet)
+    let rows1 = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
+         MERGE (a)-[r:KNOWS]->(b) ON MATCH SET a.visits = a.visits + 1 RETURN a.visits AS v",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows1.len(), 1);
+    assert_eq!(
+        rows1[0].get("v"),
+        Some(&Value::Int(0)),
+        "ON MATCH SET must not fire on create path — visits should still be 0"
+    );
+
+    // Second MERGE — edge exists; ON MATCH SET must fire
+    let rows2 = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
+         MERGE (a)-[r:KNOWS]->(b) ON MATCH SET a.visits = a.visits + 1 RETURN a.visits AS v",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows2.len(), 1);
+    assert_eq!(
+        rows2[0].get("v"),
+        Some(&Value::Int(1)),
+        "ON MATCH SET must fire on match path — visits should be 1"
+    );
+}
+
+/// G072 — MERGE incoming relationship `MERGE (a)<-[r:T]-(b)`.
+///
+/// What this tests:
+/// - Direction::Incoming is handled correctly in execute_merge_relationship_check
+///   (adj reverse key lookup) and execute_merge_relationship_create (fwd/rev swap)
+/// - The edge is created and retrievable via the reverse pattern
+#[test]
+fn test_merge_relationship_incoming_direction() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    run_cypher_with_alloc(
+        "CREATE (:Person {name: 'Alice'}), (:Person {name: 'Bob'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // MERGE with incoming direction: Alice receives a KNOWS edge from Bob
+    // Semantics: (a)<-[r:KNOWS]-(b) means Bob→Alice
+    let rows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
+         MERGE (a)<-[r:KNOWS]-(b) RETURN r.__type__ AS rel_type",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 1, "incoming MERGE should return 1 row");
+    assert_eq!(
+        rows[0].get("rel_type"),
+        Some(&Value::String("KNOWS".to_string())),
+        "edge type should be KNOWS"
+    );
+
+    // Verify the edge exists in the forward direction (Bob→Alice)
+    let check = run_cypher_with_alloc(
+        "MATCH (b:Person {name: 'Bob'})-[r:KNOWS]->(a:Person {name: 'Alice'}) RETURN count(*) AS cnt",
+        &engine, &mut interner, &allocator,
+    );
+    assert_eq!(
+        check[0].get("cnt"),
+        Some(&Value::Int(1)),
+        "Bob→Alice KNOWS edge should exist"
+    );
+
+    // Idempotency: second incoming MERGE → still 1 edge
+    run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
+         MERGE (a)<-[r:KNOWS]-(b) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    let check2 = run_cypher_with_alloc(
+        "MATCH (b:Person {name: 'Bob'})-[r:KNOWS]->(a:Person {name: 'Alice'}) RETURN count(*) AS cnt",
+        &engine, &mut interner, &allocator,
+    );
+    assert_eq!(
+        check2[0].get("cnt"),
+        Some(&Value::Int(1)),
+        "incoming MERGE must be idempotent"
+    );
+}
+
+/// G072 / G075 — MERGE (a)-[r:T {prop: val}]->(b): edge properties in the MERGE pattern.
+///
+/// Current behavior: edge_filters in the Traverse are IGNORED during the correlated
+/// match+create path — the property is not used for matching and not stored on creation.
+/// This means a second MERGE with different property values matches the first edge
+/// (property-blind) and does not create a new edge.
+///
+/// This test documents current behavior. When edge-property-aware MERGE is implemented
+/// (G075), update assertions to verify property matching and storage.
+#[test]
+fn test_merge_relationship_edge_properties_current_behavior() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    run_cypher_with_alloc(
+        "CREATE (:Person {name: 'Alice'}), (:Person {name: 'Bob'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // First MERGE with weight:1 — creates the edge (edge_filters ignored on create)
+    let rows1 = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
+         MERGE (a)-[r:KNOWS {weight: 1}]->(b) RETURN r.__type__ AS rel_type",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows1.len(), 1, "first MERGE should return 1 row");
+    assert_eq!(
+        rows1[0].get("rel_type"),
+        Some(&Value::String("KNOWS".to_string()))
+    );
+
+    // Second MERGE with weight:2 — current behavior: matches existing edge (property-blind)
+    // Edge count remains 1 (not 2). Document this as the known limitation.
+    let rows2 = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
+         MERGE (a)-[r:KNOWS {weight: 2}]->(b) RETURN r.__type__ AS rel_type",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows2.len(), 1, "second MERGE should return 1 row");
+
+    let total = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) RETURN count(*) AS cnt",
+        &engine, &mut interner, &allocator,
+    );
+    // G075: current behavior — property-blind match treats both MERGEs as the same edge.
+    // Correct Cypher semantics would create 2 edges (different property values).
+    // When G075 is fixed, this assertion should change to Value::Int(2).
+    assert_eq!(
+        total[0].get("cnt"),
+        Some(&Value::Int(1)),
+        "G075: property-blind MERGE — currently 1 edge regardless of property value differences"
+    );
+}
