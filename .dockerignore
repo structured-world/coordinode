@@ -1,0 +1,15 @@
+target/
+.git/
+.github/
+arch/
+benches/
+docs/
+examples/
+tests/
+data/
+deploy/grafana/
+deploy/k8s/
+*.md
+!README.md
+.cargo/
+sdk/
