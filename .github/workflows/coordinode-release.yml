@@ -28,24 +28,41 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Run release-plz release-pr
-        # continue-on-error: release-plz runs `cargo package` for change detection
-        # even with `git_only = true`. For monorepos where crates have internal
-        # path dependencies not published to crates.io, this always fails.
-        # TODO: replace with git-cliff + custom version bump script.
-        continue-on-error: true
-        uses: release-plz/action@v0.5
+      - uses: Swatinem/rust-cache@v2
         with:
-          command: release-pr
-          config: .release-plz.toml
+          key: release-plz-fork
+
+      # We build release-plz from our own fork which patches the git_only cargo
+      # package fallback bug (upstream issue #2595). Upstream v0.3.157 runs
+      # `cargo package --workspace` against the baseline tag checkout and fails
+      # when `[workspace.dependencies]` path entries don't have a version field
+      # at that commit. Our fork falls back to a source-directory comparator.
+      #
+      # When upstream release-plz ships a proper fix, this step should be
+      # replaced with `uses: release-plz/action@v0.5` again.
+      - name: Install forked release-plz
+        run: |
+          cargo install --git https://github.com/structured-world/release-plz.git \
+            --branch 'fix/#2595-git-only-skip-cargo-package' \
+            --locked \
+            release-plz
+
+      - name: Run release-plz release-pr
+        run: |
+          release-plz release-pr \
+            --git-token "${GITHUB_TOKEN}" \
+            --config .release-plz.toml \
+            --verbose
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
       - name: Run release-plz release
-        uses: release-plz/action@v0.5
-        continue-on-error: true  # no-op until Release PR is merged; expected to fail before that
-        with:
-          command: release
-          config: .release-plz.toml
+        # No-op until Release PR is merged; expected to exit 0 before that.
+        continue-on-error: true
+        run: |
+          release-plz release \
+            --git-token "${GITHUB_TOKEN}" \
+            --config .release-plz.toml \
+            --verbose
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
