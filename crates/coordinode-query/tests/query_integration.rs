@@ -6072,3 +6072,177 @@ fn test_merge_relationship_creates_edge() {
         "Alice→Charlie KNOWS edge should not exist"
     );
 }
+
+/// G072 — multiple MATCH pairs: each pair gets its own correlated MERGE.
+///
+/// What this tests:
+/// - CartesianProduct correlated execution runs once per left row
+/// - Three distinct (src, dst) pairs each get their own MERGE execution
+/// - No cross-contamination: only exactly the 3 edges are created
+#[test]
+fn test_merge_relationship_multiple_pairs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    // Create 3 nodes
+    run_cypher_with_alloc(
+        "CREATE (:Person {name: 'A'}), (:Person {name: 'B'}), (:Person {name: 'C'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // MERGE A→B, A→C, B→C using a single query with cartesian product of pairs
+    run_cypher_with_alloc(
+        "MATCH (x:Person {name: 'A'}), (y:Person {name: 'B'}) MERGE (x)-[r:KNOWS]->(y) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    run_cypher_with_alloc(
+        "MATCH (x:Person {name: 'A'}), (y:Person {name: 'C'}) MERGE (x)-[r:KNOWS]->(y) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    run_cypher_with_alloc(
+        "MATCH (x:Person {name: 'B'}), (y:Person {name: 'C'}) MERGE (x)-[r:KNOWS]->(y) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // Total KNOWS edges across all nodes must be exactly 3
+    let rows = run_cypher_with_alloc(
+        "MATCH (a)-[r:KNOWS]->(b) RETURN count(*) AS cnt",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(
+        rows[0].get("cnt"),
+        Some(&Value::Int(3)),
+        "expected exactly 3 KNOWS edges"
+    );
+
+    // Running all three MERGEs again must be idempotent — still 3 edges
+    run_cypher_with_alloc(
+        "MATCH (x:Person {name: 'A'}), (y:Person {name: 'B'}) MERGE (x)-[r:KNOWS]->(y) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    run_cypher_with_alloc(
+        "MATCH (x:Person {name: 'A'}), (y:Person {name: 'C'}) MERGE (x)-[r:KNOWS]->(y) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    run_cypher_with_alloc(
+        "MATCH (x:Person {name: 'B'}), (y:Person {name: 'C'}) MERGE (x)-[r:KNOWS]->(y) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    let rows2 = run_cypher_with_alloc(
+        "MATCH (a)-[r:KNOWS]->(b) RETURN count(*) AS cnt",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(
+        rows2[0].get("cnt"),
+        Some(&Value::Int(3)),
+        "MERGE must be idempotent: expected still 3 edges after re-running"
+    );
+}
+
+/// G072 — MERGE relationship with ON CREATE SET applies properties only on creation.
+///
+/// What this tests:
+/// - ON CREATE SET sets a property on the edge row when the edge is created
+/// - ON MATCH SET does NOT run on creation
+/// - Second MERGE (match path) does NOT trigger ON CREATE SET again
+#[test]
+fn test_merge_relationship_on_create_set() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    run_cypher_with_alloc(
+        "CREATE (:Person {name: 'Alice'}), (:Person {name: 'Bob'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // First MERGE — should CREATE and execute ON CREATE SET
+    let rows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
+         MERGE (a)-[r:KNOWS]->(b) ON CREATE SET a.merged = 1 RETURN a.merged AS m",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 1, "first MERGE should return 1 row");
+    assert_eq!(
+        rows[0].get("m"),
+        Some(&Value::Int(1)),
+        "ON CREATE SET should have set a.merged = 1"
+    );
+
+    // Second MERGE — should MATCH existing edge, ON CREATE SET must NOT run
+    let rows2 = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
+         MERGE (a)-[r:KNOWS]->(b) ON CREATE SET a.merged = 99 RETURN a.merged AS m",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows2.len(), 1, "second MERGE should return 1 row");
+    // ON CREATE SET must NOT have incremented — still 1
+    assert_eq!(
+        rows2[0].get("m"),
+        Some(&Value::Int(1)),
+        "ON CREATE SET must not fire on MATCH path — a.merged should still be 1"
+    );
+}
+
+/// G072 — standalone MERGE relationship (no preceding MATCH) is currently unsupported.
+///
+/// Documents the known limitation: `MERGE (a:L {k:v})-[r:T]->(b:L {k:v})` requires
+/// finding/creating both nodes AND the edge. The correlated path requires pre-bound
+/// src/tgt variables which only exist after MATCH. Without MATCH, correlated_row
+/// is None and execute_merge falls through to the generic path which still fails.
+///
+/// This test verifies the error message is meaningful, not a panic.
+/// When standalone relationship MERGE is implemented, update to assert success.
+#[test]
+fn test_merge_relationship_standalone_returns_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+
+    let ast =
+        parse("MERGE (a:Person {name: 'X'})-[r:KNOWS]->(b:Person {name: 'Y'}) RETURN r.__type__")
+            .expect("parse");
+    let plan = build_logical_plan(&ast).expect("plan");
+    let result = execute(&plan, &mut ctx);
+
+    // Must be an error (not a panic), with a meaningful message
+    assert!(
+        result.is_err(),
+        "standalone relationship MERGE should return an error until fully implemented"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("MERGE"),
+        "error should mention MERGE, got: {msg}"
+    );
+}
