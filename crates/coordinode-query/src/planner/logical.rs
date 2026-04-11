@@ -267,6 +267,30 @@ pub enum LogicalOp {
         strategy: EdgeVectorStrategy,
     },
 
+    /// Vector top-K search: returns K nearest rows by vector distance.
+    ///
+    /// Extracted from the pattern `Sort(vector_distance(n.prop, q) ASC) + Limit(K)`
+    /// where `n.prop` has an HNSW vector index. Uses `HnswIndex::search(q, K)` for
+    /// O(log N) retrieval instead of brute-force O(N) scan.
+    ///
+    /// Fallback to brute-force computation per row when:
+    /// - No HNSW index exists for the (label, property) pair
+    /// - Input rows do not correspond to a full NodeScan (e.g. after Filter/Traverse)
+    VectorTopK {
+        input: Box<LogicalOp>,
+        /// Expression for the vector property (e.g., `n.embedding`).
+        vector_expr: Expr,
+        /// Query vector literal or parameter.
+        query_vector: Expr,
+        /// Distance function name: `vector_distance`, `vector_similarity`, `vector_dot`, `vector_manhattan`.
+        function: String,
+        /// Top-K count (from LIMIT clause).
+        k: usize,
+        /// Optional distance alias (e.g., `AS d` in `WITH n, vector_distance(n.emb, $q) AS d`).
+        /// When present, the resulting rows include a column with the computed distance.
+        distance_alias: Option<String>,
+    },
+
     /// Full-text search filter: evaluates text_match() per row.
     /// Extracted from WHERE clause when planner detects text_match() predicate.
     TextFilter {
@@ -453,6 +477,16 @@ impl LogicalOp {
                 expr.substitute_params(params);
             }
             LogicalOp::VectorFilter {
+                input,
+                vector_expr,
+                query_vector,
+                ..
+            } => {
+                input.substitute_params(params);
+                vector_expr.substitute_params(params);
+                query_vector.substitute_params(params);
+            }
+            LogicalOp::VectorTopK {
                 input,
                 vector_expr,
                 query_vector,
@@ -879,6 +913,18 @@ fn estimate_op_cost(
             (input_cost + input_rows * 1.0, rows)
         }
 
+        LogicalOp::VectorTopK { input, k, .. } => {
+            let (input_cost, input_rows) = estimate_op_cost(input, defaults, stats, hints);
+            // With HNSW index: O(log N * ef_search). Without: O(N log K) (partial sort).
+            // Assume HNSW is available (optimistic cost estimate) — typical case after
+            // the planner has already selected this operator as applicable.
+            let k_f = (*k as f64).max(1.0);
+            // ef_search ≈ 200 in current config, amortized log N lookup.
+            let hnsw_cost = (input_rows.max(1.0).ln() * 200.0).max(1.0);
+            let rows = k_f.min(input_rows);
+            (input_cost + hnsw_cost, rows)
+        }
+
         LogicalOp::TextFilter { input, .. } => {
             let (input_cost, input_rows) = estimate_op_cost(input, defaults, stats, hints);
             // Text search: tantivy index lookup is fast (inverted index), but
@@ -1025,10 +1071,12 @@ impl LogicalPlan {
     }
 }
 
-/// Check if a logical operator tree contains any VectorFilter or EdgeVectorSearch.
+/// Check if a logical operator tree contains any VectorFilter, EdgeVectorSearch, or VectorTopK.
 fn op_contains_vector_filter(op: &LogicalOp) -> bool {
     match op {
-        LogicalOp::VectorFilter { .. } | LogicalOp::EdgeVectorSearch { .. } => true,
+        LogicalOp::VectorFilter { .. }
+        | LogicalOp::EdgeVectorSearch { .. }
+        | LogicalOp::VectorTopK { .. } => true,
         LogicalOp::Filter { input, .. }
         | LogicalOp::Project { input, .. }
         | LogicalOp::Aggregate { input, .. }
@@ -1256,6 +1304,22 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             let op = if *less_than { "<" } else { ">" };
             output.push_str(&format!(
                 "{prefix}EdgeVectorSearch(:{edge_type}, {function} {op} {threshold}, strategy: {strategy})\n"
+            ));
+            explain_op(input, indent + 1, output);
+        }
+        LogicalOp::VectorTopK {
+            input,
+            function,
+            k,
+            distance_alias,
+            ..
+        } => {
+            let alias_info = match distance_alias {
+                Some(a) => format!(" AS {a}"),
+                None => String::new(),
+            };
+            output.push_str(&format!(
+                "{prefix}VectorTopK({function} k={k}{alias_info})\n"
             ));
             explain_op(input, indent + 1, output);
         }

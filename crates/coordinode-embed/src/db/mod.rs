@@ -1089,7 +1089,12 @@ impl Database {
             }
         }
 
-        self.vector_index_registry.register(def);
+        // Register in both registries: VectorIndexRegistry holds the live HNSW
+        // graph for query acceleration; IndexRegistry mirrors the definition so
+        // advisors and planners can see all indexes (scalar + vector) through
+        // a single source of truth.
+        self.vector_index_registry.register(def.clone());
+        self.index_registry.register_in_memory(def);
     }
 
     /// Get a reference to the vector index registry.

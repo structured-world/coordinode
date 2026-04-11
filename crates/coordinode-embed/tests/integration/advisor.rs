@@ -393,6 +393,91 @@ fn explain_suggest_detects_knn_without_index() {
     );
 }
 
+/// EXPLAIN SUGGEST does NOT emit CreateVectorIndex when the HNSW index already
+/// exists — prevents false-positive suggestions for already-optimized queries.
+#[test]
+fn explain_suggest_skips_knn_suggestion_when_index_exists() {
+    use coordinode_core::graph::types::VectorMetric;
+    use coordinode_query::index::VectorIndexConfig;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+
+    // Create HNSW index for (Place, location).
+    db.create_vector_index(
+        "place_loc_idx",
+        "Place",
+        "location",
+        VectorIndexConfig {
+            dimensions: 2,
+            metric: VectorMetric::L2,
+            m: 16,
+            ef_construction: 200,
+            quantization: false,
+            offload_vectors: false,
+        },
+    );
+
+    let result = db
+        .explain_suggest(
+            "MATCH (n:Place) RETURN n \
+             ORDER BY vector_distance(n.location, [40.7, -74.0]) LIMIT 10",
+        )
+        .expect("explain_suggest");
+
+    assert!(
+        !result
+            .suggestions
+            .iter()
+            .any(|s| s.kind == coordinode_query::advisor::SuggestionKind::CreateVectorIndex),
+        "must NOT suggest CreateVectorIndex when HNSW index exists: {:?}",
+        result.suggestions
+    );
+}
+
+/// EXPLAIN SUGGEST emits CreateVectorIndex suggestion for a DIFFERENT property
+/// even when one (label, property) pair has an HNSW index. Verifies per-property
+/// granularity of the suggestion skip.
+#[test]
+fn explain_suggest_suggests_for_different_property_when_one_indexed() {
+    use coordinode_core::graph::types::VectorMetric;
+    use coordinode_query::index::VectorIndexConfig;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+
+    // Index on (Place, location), but query on (Place, thumbnail) — different property.
+    db.create_vector_index(
+        "place_loc_idx",
+        "Place",
+        "location",
+        VectorIndexConfig {
+            dimensions: 2,
+            metric: VectorMetric::L2,
+            m: 16,
+            ef_construction: 200,
+            quantization: false,
+            offload_vectors: false,
+        },
+    );
+
+    let result = db
+        .explain_suggest(
+            "MATCH (n:Place) RETURN n \
+             ORDER BY vector_distance(n.thumbnail, [0.1, 0.2, 0.3]) LIMIT 5",
+        )
+        .expect("explain_suggest");
+
+    assert!(
+        result
+            .suggestions
+            .iter()
+            .any(|s| s.kind == coordinode_query::advisor::SuggestionKind::CreateVectorIndex),
+        "should suggest for thumbnail even when location is indexed: {:?}",
+        result.suggestions
+    );
+}
+
 /// Multiple suggestions are ranked by severity.
 #[test]
 fn explain_suggest_ranks_by_severity() {

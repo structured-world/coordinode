@@ -8,15 +8,16 @@
 //! - KnnWithoutIndex: distance ORDER BY + LIMIT without spatial index
 //! - VectorWithoutPreFilter: vector scan without graph narrowing
 
-use crate::index::IndexRegistry;
+use crate::index::{IndexRegistry, IndexType};
 use crate::planner::logical::{LogicalOp, LogicalPlan};
 
 use super::suggest::{Severity, Suggestion, SuggestionKind};
 
 /// Run all CE detectors on a logical plan and return suggestions.
 ///
-/// When `registry` is provided, the MissingIndex detector will skip suggestions
-/// for properties that already have an index — preventing false positives.
+/// When `registry` is provided, the MissingIndex and KnnWithoutIndex detectors
+/// will skip suggestions for properties that already have an index — preventing
+/// false positives.
 ///
 /// Suggestions are sorted by severity (Critical first, then Warning, then Info).
 pub fn detect_suggestions(plan: &LogicalPlan, registry: Option<&IndexRegistry>) -> Vec<Suggestion> {
@@ -25,7 +26,7 @@ pub fn detect_suggestions(plan: &LogicalPlan, registry: Option<&IndexRegistry>) 
     detect_missing_index(&plan.root, &mut suggestions, registry);
     detect_unbounded_traversal(&plan.root, &mut suggestions);
     detect_cartesian_product(&plan.root, &mut suggestions);
-    detect_knn_without_index(&plan.root, &mut suggestions);
+    detect_knn_without_index(&plan.root, &mut suggestions, registry);
     detect_vector_without_prefilter(&plan.root, &mut suggestions);
 
     // Sort by severity descending (Critical > Warning > Info)
@@ -175,7 +176,17 @@ fn detect_cartesian_product(op: &LogicalOp, suggestions: &mut Vec<Suggestion>) {
 // Detects: Sort by distance function + Limit, without a dedicated spatial/vector index.
 // Pattern: Limit { input: Sort { items containing point.distance or vector_distance } }
 
-fn detect_knn_without_index(op: &LogicalOp, suggestions: &mut Vec<Suggestion>) {
+fn detect_knn_without_index(
+    op: &LogicalOp,
+    suggestions: &mut Vec<Suggestion>,
+    registry: Option<&IndexRegistry>,
+) {
+    // Legacy pattern: Limit { Sort { vector_distance } } — present when the
+    // planner's VectorTopK optimization did NOT rewrite the subtree (e.g. Sort is
+    // on non-vector alias, there's no LIMIT, or the inner Project dropped the
+    // vector variable). In these cases we cannot easily extract (label, property)
+    // so we emit the suggestion unconditionally — the user benefits from knowing
+    // that ORDER BY distance is a KNN query.
     if let LogicalOp::Limit { input, .. } = op {
         if let LogicalOp::Sort { input: _, items } = input.as_ref() {
             for item in items {
@@ -201,9 +212,111 @@ fn detect_knn_without_index(op: &LogicalOp, suggestions: &mut Vec<Suggestion>) {
         }
     }
 
-    for child in children(op) {
-        detect_knn_without_index(child, suggestions);
+    // Optimized pattern: VectorTopK (after planner rewrite). Extract the
+    // (label, property) pair from `vector_expr` + upstream NodeScan and check
+    // the registry: if an HNSW index already exists, the user is already using
+    // acceleration — no suggestion needed (avoids false positives).
+    if let LogicalOp::VectorTopK {
+        vector_expr, input, ..
+    } = op
+    {
+        if let Some((label, property)) = extract_label_and_property(vector_expr, input) {
+            // If we have a registry and an HNSW index exists for this (label, prop),
+            // don't emit the suggestion — the query is already optimized.
+            let has_hnsw_index = registry
+                .map(|r| {
+                    r.indexes_for_property(&label, &property)
+                        .iter()
+                        .any(|idx| idx.index_type == IndexType::Hnsw)
+                })
+                .unwrap_or(false);
+
+            if !has_hnsw_index {
+                suggestions.push(
+                    Suggestion::new(
+                        SuggestionKind::CreateVectorIndex,
+                        Severity::Info,
+                        format!(
+                            "ORDER BY distance + LIMIT on {label}({property}) without vector \
+                             index — computing distance for all candidates. A vector index \
+                             (HNSW) can accelerate KNN queries."
+                        ),
+                    )
+                    .with_ddl(format!(
+                        "CREATE VECTOR INDEX ON {label}({property}) \
+                         OPTIONS {{metric: 'cosine', dimensions: <N>}}"
+                    )),
+                );
+            }
+        } else {
+            // Could not extract label/property (e.g. missing NodeScan ancestor) —
+            // fall back to the generic suggestion.
+            suggestions.push(
+                Suggestion::new(
+                    SuggestionKind::CreateVectorIndex,
+                    Severity::Info,
+                    "ORDER BY distance + LIMIT without vector/spatial index — \
+                     computing distance for all candidates. \
+                     A vector index (HNSW) or spatial index can accelerate KNN queries"
+                        .to_string(),
+                )
+                .with_ddl(
+                    "CREATE VECTOR INDEX ON <Label>(<property>) \
+                     OPTIONS {metric: 'cosine', dimensions: <N>}"
+                        .to_string(),
+                ),
+            );
+        }
     }
+
+    for child in children(op) {
+        detect_knn_without_index(child, suggestions, registry);
+    }
+}
+
+/// Extract `(label, property)` for a VectorTopK operator by matching `vector_expr`
+/// (must be `Variable(var).prop`) to the nearest upstream `NodeScan` that binds
+/// the same variable with a single label.
+///
+/// Returns `None` if:
+/// - `vector_expr` is not `Variable.prop`
+/// - no NodeScan with the matching variable is found in `input`
+/// - the NodeScan has no labels or multiple labels (ambiguous)
+fn extract_label_and_property(
+    vector_expr: &crate::cypher::ast::Expr,
+    input: &LogicalOp,
+) -> Option<(String, String)> {
+    use crate::cypher::ast::Expr;
+
+    let (var_name, property) = match vector_expr {
+        Expr::PropertyAccess { expr, property } => match expr.as_ref() {
+            Expr::Variable(v) => (v.clone(), property.clone()),
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    let label = find_node_scan_label(input, &var_name)?;
+    Some((label, property))
+}
+
+/// Recursively search for a `NodeScan { variable, labels }` with matching variable.
+/// Returns the first label (NodeScan bindings use single-label convention in practice).
+fn find_node_scan_label(op: &LogicalOp, var_name: &str) -> Option<String> {
+    if let LogicalOp::NodeScan {
+        variable, labels, ..
+    } = op
+    {
+        if variable == var_name && !labels.is_empty() {
+            return Some(labels[0].clone());
+        }
+    }
+    for child in children(op) {
+        if let Some(l) = find_node_scan_label(child, var_name) {
+            return Some(l);
+        }
+    }
+    None
 }
 
 // --- Detector 5: VectorWithoutPreFilter ---
@@ -257,6 +370,7 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::Delete { input, .. }
         | LogicalOp::Unwind { input, .. }
         | LogicalOp::VectorFilter { input, .. }
+        | LogicalOp::VectorTopK { input, .. }
         | LogicalOp::EdgeVectorSearch { input, .. }
         | LogicalOp::TextFilter { input, .. }
         | LogicalOp::EncryptedFilter { input, .. }

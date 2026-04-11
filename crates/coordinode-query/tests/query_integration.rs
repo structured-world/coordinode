@@ -2088,6 +2088,568 @@ fn mixed_traverse_then_vector_filter() {
     assert_eq!(results.len(), 1, "only ML doc should pass vector filter");
 }
 
+/// `WITH ... AS alias ORDER BY alias LIMIT K` (Pattern B) must
+/// produce correct top-K results with brute-force fallback when no HNSW index
+/// exists. Uses simple aliases (no dot-notation) for stable column lookup.
+#[test]
+fn vector_top_k_pattern_b_end_to_end() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    // 5 documents with deterministic embeddings along the X axis.
+    for i in 1..=5 {
+        let x = i as f32 / 5.0;
+        insert_node(
+            &engine,
+            1,
+            i as u64,
+            "Doc",
+            &[
+                ("name", Value::String(format!("doc{i}"))),
+                ("embedding", Value::Vector(vec![x, 0.0, 0.0])),
+            ],
+            &mut interner,
+        );
+    }
+
+    // Pattern B shape: project name + distance alias in WITH, ORDER BY alias,
+    // LIMIT, RETURN explicit aliases. Expect top-2 closest to [1,0,0]: doc5, doc4.
+    let results = run_cypher(
+        "MATCH (d:Doc) \
+         WITH d.name AS docname, vector_distance(d.embedding, [1.0, 0.0, 0.0]) AS dist \
+         ORDER BY dist \
+         LIMIT 2 \
+         RETURN docname, dist",
+        &engine,
+        &mut interner,
+    );
+
+    assert_eq!(results.len(), 2, "top_k=2 should return exactly 2 rows");
+
+    let names: Vec<String> = results
+        .iter()
+        .filter_map(|r| {
+            r.get("docname")
+                .and_then(|v| v.as_str().map(str::to_string))
+        })
+        .collect();
+    assert_eq!(names.len(), 2, "expected 2 docname values, got {names:?}");
+    assert_eq!(names[0], "doc5", "nearest to [1,0,0] should be doc5");
+    assert_eq!(names[1], "doc4", "second nearest should be doc4");
+
+    let extract_dist = |row: &coordinode_query::executor::Row| -> f64 {
+        row.get("dist")
+            .and_then(|v| match v {
+                Value::Float(f) => Some(*f),
+                _ => None,
+            })
+            .unwrap_or(f64::NAN)
+    };
+    let d0 = extract_dist(&results[0]);
+    let d1 = extract_dist(&results[1]);
+    assert!(d0 < 0.01, "doc5 distance should be near zero, got {d0}");
+    assert!(d0 <= d1, "results must be sorted ascending: {d0} > {d1}");
+}
+
+/// VectorTopK on empty input returns empty result without panic.
+/// Verifies `rows.is_empty() → Ok(Vec::new())` early-return in both HNSW
+/// and brute-force paths of the executor.
+#[test]
+fn vector_top_k_empty_input_returns_empty() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    // No nodes inserted — MATCH returns 0 rows.
+    let results = run_cypher(
+        "MATCH (n:Nonexistent) \
+         WITH n.name AS name, vector_distance(n.v, [1.0, 0.0]) AS d \
+         ORDER BY d \
+         LIMIT 5 \
+         RETURN name, d",
+        &engine,
+        &mut interner,
+    );
+
+    assert_eq!(
+        results.len(),
+        0,
+        "empty label must produce empty VectorTopK results"
+    );
+}
+
+/// Dimension mismatch between query vector and stored embeddings.
+/// Rows whose vector has a different dimension than the query must be skipped
+/// via `if v.len() == query_vec.len()` guard in brute-force fallback.
+#[test]
+fn vector_top_k_dimension_mismatch_skips_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    // Mixed dimensions: 2 nodes with dim=3, 1 with dim=2 (mismatch).
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Mixed",
+        &[
+            ("nid", Value::Int(1)),
+            ("v", Value::Vector(vec![1.0, 0.0, 0.0])), // dim=3, matches
+        ],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        2,
+        "Mixed",
+        &[
+            ("nid", Value::Int(2)),
+            ("v", Value::Vector(vec![0.5, 0.5])), // dim=2, mismatch — skipped
+        ],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        3,
+        "Mixed",
+        &[
+            ("nid", Value::Int(3)),
+            ("v", Value::Vector(vec![0.0, 1.0, 0.0])), // dim=3, matches
+        ],
+        &mut interner,
+    );
+
+    let results = run_cypher(
+        "MATCH (n:Mixed) \
+         WITH n.nid AS nid, vector_distance(n.v, [1.0, 0.0, 0.0]) AS d \
+         ORDER BY d \
+         LIMIT 5 \
+         RETURN nid, d",
+        &engine,
+        &mut interner,
+    );
+
+    // Only 2 rows returned (dim=2 node silently skipped).
+    assert_eq!(
+        results.len(),
+        2,
+        "dim mismatch row must be silently skipped"
+    );
+
+    let top_id = results[0]
+        .get("nid")
+        .and_then(|v| match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        })
+        .expect("nid populated");
+    assert_eq!(top_id, 1, "closest to [1,0,0] is n1");
+
+    let second_id = results[1]
+        .get("nid")
+        .and_then(|v| match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        })
+        .expect("second nid populated");
+    assert_eq!(
+        second_id, 3,
+        "second is n3 (n2 skipped due to dim mismatch)"
+    );
+}
+
+/// SKIP between ORDER BY and LIMIT → planner does NOT apply optimization
+/// (Sort is under Skip, not directly under Limit). Sort+Skip+Limit fallback
+/// must work correctly for paginated top-K queries.
+#[test]
+fn vector_top_k_skip_limit_fallback() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    // 5 nodes at increasing distances from [0.0, 0.0]:
+    //   n1..n5 with x = 0.1 .. 0.5
+    for i in 1..=5u64 {
+        let x = i as f32 / 10.0;
+        insert_node(
+            &engine,
+            1,
+            i,
+            "P",
+            &[
+                ("nid", Value::Int(i as i64)),
+                ("v", Value::Vector(vec![x, 0.0])),
+            ],
+            &mut interner,
+        );
+    }
+
+    // SKIP 1 LIMIT 2 → skip n1, return n2 and n3.
+    let results = run_cypher(
+        "MATCH (n:P) \
+         WITH n.nid AS nid, vector_distance(n.v, [0.0, 0.0]) AS d \
+         ORDER BY d \
+         SKIP 1 \
+         LIMIT 2 \
+         RETURN nid, d",
+        &engine,
+        &mut interner,
+    );
+
+    assert_eq!(results.len(), 2, "SKIP 1 LIMIT 2 returns 2 rows");
+
+    let top_id = results[0]
+        .get("nid")
+        .and_then(|v| match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        })
+        .expect("nid populated");
+    assert_eq!(top_id, 2, "after SKIP 1 first is n2");
+
+    let second_id = results[1]
+        .get("nid")
+        .and_then(|v| match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        })
+        .expect("second nid populated");
+    assert_eq!(second_id, 3, "after SKIP 1 second is n3");
+}
+
+/// vector_manhattan metric through VectorTopK Pattern B (brute force).
+/// Verifies the optimizer handles all four vector metric functions, not only
+/// vector_distance. Manhattan distance uses ASC ordering (lower = closer).
+#[test]
+fn vector_top_k_manhattan_metric() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    // 3 nodes at known Manhattan distances from [1.0, 0.0, 0.0]:
+    //   n1: [1.0, 0.0, 0.0] → L1 = 0.0
+    //   n2: [0.5, 0.5, 0.0] → L1 = 1.0
+    //   n3: [0.0, 1.0, 1.0] → L1 = 3.0
+    insert_node(
+        &engine,
+        1,
+        1,
+        "M",
+        &[
+            ("nid", Value::Int(1)),
+            ("v", Value::Vector(vec![1.0, 0.0, 0.0])),
+        ],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        2,
+        "M",
+        &[
+            ("nid", Value::Int(2)),
+            ("v", Value::Vector(vec![0.5, 0.5, 0.0])),
+        ],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        3,
+        "M",
+        &[
+            ("nid", Value::Int(3)),
+            ("v", Value::Vector(vec![0.0, 1.0, 1.0])),
+        ],
+        &mut interner,
+    );
+
+    let results = run_cypher(
+        "MATCH (n:M) \
+         WITH n.nid AS nid, vector_manhattan(n.v, [1.0, 0.0, 0.0]) AS d \
+         ORDER BY d \
+         LIMIT 2 \
+         RETURN nid, d",
+        &engine,
+        &mut interner,
+    );
+
+    assert_eq!(results.len(), 2, "top_k=2 for manhattan");
+
+    // Top-1 must be n1 (exact match, L1 = 0).
+    let top_id = results[0]
+        .get("nid")
+        .and_then(|v| match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        })
+        .expect("nid populated");
+    assert_eq!(top_id, 1, "manhattan closest to [1,0,0] is n1");
+
+    let d0 = results[0]
+        .get("d")
+        .and_then(|v| match v {
+            Value::Float(f) => Some(*f),
+            _ => None,
+        })
+        .expect("d populated");
+    assert!(
+        d0.abs() < 1e-5,
+        "n1 manhattan distance should be ~0, got {d0}"
+    );
+
+    let second_id = results[1]
+        .get("nid")
+        .and_then(|v| match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        })
+        .expect("second nid populated");
+    assert_eq!(second_id, 2, "manhattan second is n2");
+}
+
+/// vector_similarity (cosine) with DESC ordering through VectorTopK Pattern B.
+/// Similarity metrics require DESC (higher = closer) — `is_valid_direction`
+/// must accept this direction and the executor must sort correctly.
+#[test]
+fn vector_top_k_similarity_desc_metric() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    // 3 unit vectors with known cosine similarity to [1.0, 0.0]:
+    //   n1: [1.0, 0.0] → cos = 1.0
+    //   n2: [0.7, 0.7] → cos ≈ 0.707
+    //   n3: [0.0, 1.0] → cos = 0.0
+    insert_node(
+        &engine,
+        1,
+        1,
+        "S",
+        &[("nid", Value::Int(1)), ("v", Value::Vector(vec![1.0, 0.0]))],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        2,
+        "S",
+        &[("nid", Value::Int(2)), ("v", Value::Vector(vec![0.7, 0.7]))],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        3,
+        "S",
+        &[("nid", Value::Int(3)), ("v", Value::Vector(vec![0.0, 1.0]))],
+        &mut interner,
+    );
+
+    let results = run_cypher(
+        "MATCH (n:S) \
+         WITH n.nid AS nid, vector_similarity(n.v, [1.0, 0.0]) AS sim \
+         ORDER BY sim DESC \
+         LIMIT 2 \
+         RETURN nid, sim",
+        &engine,
+        &mut interner,
+    );
+
+    assert_eq!(results.len(), 2, "top_k=2 for similarity DESC");
+
+    let top_id = results[0]
+        .get("nid")
+        .and_then(|v| match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        })
+        .expect("nid populated");
+    assert_eq!(top_id, 1, "similarity top is n1 (exact match)");
+
+    let s0 = results[0]
+        .get("sim")
+        .and_then(|v| match v {
+            Value::Float(f) => Some(*f),
+            _ => None,
+        })
+        .expect("sim populated");
+    assert!(
+        (s0 - 1.0).abs() < 1e-4,
+        "n1 cosine similarity should be ~1.0, got {s0}"
+    );
+
+    let second_id = results[1]
+        .get("nid")
+        .and_then(|v| match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        })
+        .expect("second nid populated");
+    assert_eq!(second_id, 2, "similarity second is n2 (0.707)");
+
+    let s1 = results[1]
+        .get("sim")
+        .and_then(|v| match v {
+            Value::Float(f) => Some(*f),
+            _ => None,
+        })
+        .expect("second sim populated");
+    assert!(s0 >= s1, "similarity DESC violated: {s0} < {s1}");
+}
+
+/// ORDER BY vector_distance() DESC ("find furthest" use case) is NOT
+/// optimized (wrong direction), but must still work via unoptimized Sort+Limit.
+#[test]
+fn vector_top_k_distance_desc_fallback_works() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    // 4 nodes at known distances from [0.0, 0.0, 0.0]:
+    //   n1..n4 at [1.0..4.0, 0.0, 0.0]
+    for i in 1..=4u64 {
+        let x = i as f32;
+        insert_node(
+            &engine,
+            1,
+            i,
+            "F",
+            &[
+                ("nid", Value::Int(i as i64)),
+                ("v", Value::Vector(vec![x, 0.0, 0.0])),
+            ],
+            &mut interner,
+        );
+    }
+
+    let results = run_cypher(
+        "MATCH (n:F) \
+         WITH n.nid AS nid, vector_distance(n.v, [0.0, 0.0, 0.0]) AS d \
+         ORDER BY d DESC \
+         LIMIT 2 \
+         RETURN nid, d",
+        &engine,
+        &mut interner,
+    );
+
+    assert_eq!(results.len(), 2, "top_k=2 farthest");
+
+    // Farthest first: n4 (dist=4.0), then n3 (dist=3.0).
+    let top_id = results[0]
+        .get("nid")
+        .and_then(|v| match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        })
+        .expect("nid populated");
+    assert_eq!(top_id, 4, "farthest from origin is n4");
+
+    let second_id = results[1]
+        .get("nid")
+        .and_then(|v| match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        })
+        .expect("second nid populated");
+    assert_eq!(second_id, 3, "second farthest is n3");
+
+    let d0 = results[0]
+        .get("d")
+        .and_then(|v| match v {
+            Value::Float(f) => Some(*f),
+            _ => None,
+        })
+        .expect("d0 populated");
+    let d1 = results[1]
+        .get("d")
+        .and_then(|v| match v {
+            Value::Float(f) => Some(*f),
+            _ => None,
+        })
+        .expect("d1 populated");
+    assert!(d0 > d1, "DESC violated: {d0} <= {d1}");
+    assert!(
+        (d0 - 4.0).abs() < 1e-4,
+        "n4 distance should be 4.0, got {d0}"
+    );
+}
+
+/// Brute-force VectorTopK path with a larger dataset. Verifies top-K
+/// ordering and that the distance alias is populated correctly.
+#[test]
+fn vector_top_k_brute_force_without_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    // 6 nodes with varying distances to [1.0, 0.0, 0.0].
+    let embeddings: [(u64, Vec<f32>); 6] = [
+        (1, vec![1.0, 0.0, 0.0]),  // dist = 0.0 — closest
+        (2, vec![0.9, 0.1, 0.0]),  // dist ≈ 0.14
+        (3, vec![0.5, 0.5, 0.0]),  // dist ≈ 0.71
+        (4, vec![0.0, 1.0, 0.0]),  // dist ≈ 1.41
+        (5, vec![0.0, 0.0, 1.0]),  // dist ≈ 1.41
+        (6, vec![-1.0, 0.0, 0.0]), // dist = 2.0 — farthest
+    ];
+    for (id, vec) in &embeddings {
+        insert_node(
+            &engine,
+            1,
+            *id,
+            "Vec",
+            &[
+                ("nid", Value::Int(*id as i64)),
+                ("embedding", Value::Vector(vec.clone())),
+            ],
+            &mut interner,
+        );
+    }
+
+    // Top-3 via Pattern B with explicit aliases.
+    let results = run_cypher(
+        "MATCH (n:Vec) \
+         WITH n.nid AS nid, vector_distance(n.embedding, [1.0, 0.0, 0.0]) AS d \
+         ORDER BY d \
+         LIMIT 3 \
+         RETURN nid, d",
+        &engine,
+        &mut interner,
+    );
+
+    assert_eq!(results.len(), 3, "top_k=3 should return 3 rows");
+
+    // Verify ascending distance order.
+    let extract_d = |row: &coordinode_query::executor::Row| -> f64 {
+        row.get("d")
+            .and_then(|v| match v {
+                Value::Float(f) => Some(*f),
+                _ => None,
+            })
+            .unwrap_or(f64::MAX)
+    };
+    let d0 = extract_d(&results[0]);
+    let d1 = extract_d(&results[1]);
+    let d2 = extract_d(&results[2]);
+    assert!(d0 < 0.01, "closest should be ~0, got {d0}");
+    assert!(d0 <= d1, "sort violated: {d0} > {d1}");
+    assert!(d1 <= d2, "sort violated: {d1} > {d2}");
+
+    // The closest node id is 1 (exact match on embedding).
+    let top_id = results[0]
+        .get("nid")
+        .and_then(|v| match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        })
+        .expect("nid column populated");
+    assert_eq!(top_id, 1, "closest to [1,0,0] is node id 1");
+}
+
 #[test]
 fn vector_filter_cost_in_explain() {
     let ast =

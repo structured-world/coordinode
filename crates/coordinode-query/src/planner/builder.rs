@@ -46,6 +46,10 @@ pub fn build_logical_plan(query: &Query) -> Result<LogicalPlan, PlanError> {
     // Optimization pass: detect edge vector patterns and select strategy
     let root = optimize_edge_vector_search(root);
 
+    // Optimization pass: detect `Sort(vector_distance) + Limit(K)` and rewrite
+    // to VectorTopK for HNSW-accelerated top-K search.
+    let root = optimize_vector_top_k(root);
+
     // Extract vector_consistency from per-query hints (overrides session default).
     let vector_consistency = query
         .hints
@@ -468,6 +472,355 @@ fn optimize_edge_vector_search(op: LogicalOp) -> LogicalOp {
 
         // Leaf nodes and ops that don't contain VectorFilter — return as-is
         other => other,
+    }
+}
+
+/// Optimization pass: detect `Sort(vector_distance) + Limit(K)` patterns and
+/// rewrite to `LogicalOp::VectorTopK` for HNSW-accelerated top-K search.
+///
+/// Detects two shapes:
+///
+/// **Pattern A (direct function call in ORDER BY):**
+/// ```text
+/// Limit(k) { Sort([SortItem { expr: vector_distance(n.prop, q), asc: true }]) { X } }
+///   → VectorTopK(k, fn, vector_expr=n.prop, query_vector=q, input: X)
+/// ```
+///
+/// **Pattern B (alias via Project, from `WITH` clause):**
+/// ```text
+/// Limit(k) {
+///   Sort([SortItem { expr: Variable("d"), asc: true }]) {
+///     Project([..., vector_distance(n.prop, q) AS d]) { X }
+///   }
+/// }
+///   → VectorTopK(k, fn, vector_expr=n.prop, query_vector=q, distance_alias=Some("d"), input: X)
+/// ```
+///
+/// The rewrite unwraps the inner `Project` when its only computation is the
+/// vector_distance expression bound to the alias. Other projected columns are
+/// preserved by leaving the outer `Project` (if any) untouched.
+///
+/// `vector_similarity`/`vector_dot` use DESC ordering (higher is better), so
+/// we detect `ascending: false` for those.
+fn optimize_vector_top_k(op: LogicalOp) -> LogicalOp {
+    // Walk the tree bottom-up: recurse into children first, then try to rewrite
+    // the current node.
+    let op = descend_optimize_top_k(op);
+    rewrite_top_k_at_root(op)
+}
+
+fn descend_optimize_top_k(op: LogicalOp) -> LogicalOp {
+    match op {
+        LogicalOp::Filter { input, predicate } => LogicalOp::Filter {
+            input: Box::new(optimize_vector_top_k(*input)),
+            predicate,
+        },
+        LogicalOp::Project {
+            input,
+            items,
+            distinct,
+        } => LogicalOp::Project {
+            input: Box::new(optimize_vector_top_k(*input)),
+            items,
+            distinct,
+        },
+        LogicalOp::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => LogicalOp::Aggregate {
+            input: Box::new(optimize_vector_top_k(*input)),
+            group_by,
+            aggregates,
+        },
+        LogicalOp::Sort { input, items } => LogicalOp::Sort {
+            input: Box::new(optimize_vector_top_k(*input)),
+            items,
+        },
+        LogicalOp::Limit { input, count } => LogicalOp::Limit {
+            input: Box::new(optimize_vector_top_k(*input)),
+            count,
+        },
+        LogicalOp::Skip { input, count } => LogicalOp::Skip {
+            input: Box::new(optimize_vector_top_k(*input)),
+            count,
+        },
+        LogicalOp::Unwind {
+            input,
+            expr,
+            variable,
+        } => LogicalOp::Unwind {
+            input: Box::new(optimize_vector_top_k(*input)),
+            expr,
+            variable,
+        },
+        LogicalOp::CartesianProduct { left, right } => LogicalOp::CartesianProduct {
+            left: Box::new(optimize_vector_top_k(*left)),
+            right: Box::new(optimize_vector_top_k(*right)),
+        },
+        LogicalOp::LeftOuterJoin { left, right } => LogicalOp::LeftOuterJoin {
+            left: Box::new(optimize_vector_top_k(*left)),
+            right: Box::new(optimize_vector_top_k(*right)),
+        },
+        // Write/DDL/leaf ops: no children to optimize
+        other => other,
+    }
+}
+
+/// Attempt to rewrite a `Limit { Sort { ... } }` subtree into `VectorTopK`.
+///
+/// Returns the input unchanged when the pattern does not match.
+fn rewrite_top_k_at_root(op: LogicalOp) -> LogicalOp {
+    // Match: Limit { count: int literal, input: Sort { single item, ASC, ... } }
+    let LogicalOp::Limit {
+        input: limit_input,
+        count,
+    } = op
+    else {
+        return op_identity_limit(op);
+    };
+
+    // k must be a non-negative integer literal.
+    let k = match &count {
+        Expr::Literal(Value::Int(n)) if *n >= 0 => *n as usize,
+        _ => {
+            return LogicalOp::Limit {
+                input: limit_input,
+                count,
+            };
+        }
+    };
+
+    // Inner must be Sort with exactly one item.
+    let inner_sort = match *limit_input {
+        LogicalOp::Sort { input, items } if items.len() == 1 => (input, items),
+        other => {
+            return LogicalOp::Limit {
+                input: Box::new(other),
+                count,
+            };
+        }
+    };
+    let (sort_input, mut sort_items) = inner_sort;
+    let sort_item = sort_items.remove(0);
+
+    // Try Pattern A: the sort expression is a direct vector_distance call.
+    if let Some((vector_expr, query_vector, function)) = match_vector_distance_call(&sort_item.expr)
+    {
+        // Ascending for distance/manhattan, descending for similarity/dot_product.
+        if !is_valid_direction(&function, sort_item.ascending) {
+            return reconstruct_limit_sort(k, sort_item, *sort_input);
+        }
+
+        // Pattern A correctness check: when Sort.input is a Project that does NOT
+        // carry through the vector variable as a full node reference, VectorTopK
+        // would see a row missing `n.embedding` and produce an empty result. The
+        // unoptimized Sort path, by contrast, computes vector_distance via the
+        // original row which is still valid. Fall back to Sort+Limit in this case.
+        //
+        // This happens for: `MATCH (n) RETURN n.name ORDER BY vector_distance(n.emb,...) LIMIT K`
+        // — Project drops `n.embedding`, so VectorTopK input rows don't have it.
+        if let LogicalOp::Project { items, .. } = sort_input.as_ref() {
+            if !project_preserves_vector_expr(&vector_expr, items) {
+                return LogicalOp::Limit {
+                    input: Box::new(LogicalOp::Sort {
+                        input: sort_input,
+                        items: vec![sort_item],
+                    }),
+                    count,
+                };
+            }
+        }
+
+        return LogicalOp::VectorTopK {
+            input: sort_input,
+            vector_expr,
+            query_vector,
+            function,
+            k,
+            distance_alias: None,
+        };
+    }
+
+    // Pattern B: sort expr is a variable reference to an alias defined in
+    // the inner Project.
+    let alias_name = match &sort_item.expr {
+        Expr::Variable(v) => Some(v.clone()),
+        _ => None,
+    };
+
+    if let Some(alias) = alias_name {
+        // Inner input must be a Project where one item is `vector_distance(...) AS alias`.
+        if let LogicalOp::Project {
+            input: proj_input,
+            items,
+            distinct,
+        } = *sort_input
+        {
+            // Find the project item whose alias matches.
+            let matching_idx = items
+                .iter()
+                .position(|it| it.alias.as_ref() == Some(&alias));
+            if let Some(idx) = matching_idx {
+                if let Some((vector_expr, query_vector, function)) =
+                    match_vector_distance_call(&items[idx].expr)
+                {
+                    if is_valid_direction(&function, sort_item.ascending) {
+                        // Remove the vector_distance item from the Project items;
+                        // VectorTopK will write the alias directly into result rows.
+                        // Preserve other Project items by wrapping VectorTopK in a
+                        // replacement Project.
+                        let mut other_items: Vec<ProjectItem> = items
+                            .into_iter()
+                            .enumerate()
+                            .filter_map(|(i, it)| if i == idx { None } else { Some(it) })
+                            .collect();
+                        // Ensure the alias is still projected as a passthrough so
+                        // downstream operators see it.
+                        other_items.push(ProjectItem {
+                            expr: Expr::Variable(alias.clone()),
+                            alias: Some(alias.clone()),
+                        });
+
+                        let top_k = LogicalOp::VectorTopK {
+                            input: proj_input,
+                            vector_expr,
+                            query_vector,
+                            function,
+                            k,
+                            distance_alias: Some(alias),
+                        };
+
+                        return LogicalOp::Project {
+                            input: Box::new(top_k),
+                            items: other_items,
+                            distinct,
+                        };
+                    }
+                }
+            }
+
+            // Pattern B didn't match — rebuild original tree.
+            return LogicalOp::Limit {
+                input: Box::new(LogicalOp::Sort {
+                    input: Box::new(LogicalOp::Project {
+                        input: proj_input,
+                        items,
+                        distinct,
+                    }),
+                    items: vec![sort_item],
+                }),
+                count,
+            };
+        }
+
+        // alias lookup failed — rebuild original tree
+        return LogicalOp::Limit {
+            input: Box::new(LogicalOp::Sort {
+                input: sort_input,
+                items: vec![sort_item],
+            }),
+            count,
+        };
+    }
+
+    // Neither pattern matched — rebuild original tree
+    LogicalOp::Limit {
+        input: Box::new(LogicalOp::Sort {
+            input: sort_input,
+            items: vec![sort_item],
+        }),
+        count,
+    }
+}
+
+/// Identity rebuild for non-Limit operators (recursive descent already handled children).
+fn op_identity_limit(op: LogicalOp) -> LogicalOp {
+    op
+}
+
+/// Check whether a Project's items preserve the variable referenced by `vector_expr`.
+///
+/// `vector_expr` is expected to be `Variable(var).property`. A Project preserves it if:
+/// - One of its items is `Expr::Star` (pass-through), OR
+/// - One of its items is `Expr::Variable(var)` without alias rename (full node ref), OR
+/// - One of its items is the exact same PropertyAccess `var.property`
+///
+/// When true, VectorTopK can run over the Project's output rows.
+/// When false, VectorTopK would see a row missing the vector column — fall back.
+fn project_preserves_vector_expr(vector_expr: &Expr, items: &[ProjectItem]) -> bool {
+    let Expr::PropertyAccess {
+        expr: inner,
+        property,
+    } = vector_expr
+    else {
+        return false;
+    };
+    let Expr::Variable(var_name) = inner.as_ref() else {
+        return false;
+    };
+
+    for item in items {
+        match &item.expr {
+            Expr::Star => return true,
+            Expr::Variable(v) if v == var_name => {
+                // Only a passthrough if the alias is either None or same as var.
+                // An aliased variable (`n AS m`) would rename the row key.
+                if item.alias.is_none() || item.alias.as_ref() == Some(v) {
+                    return true;
+                }
+            }
+            Expr::PropertyAccess {
+                expr: item_inner,
+                property: item_prop,
+            } => {
+                if let Expr::Variable(item_var) = item_inner.as_ref() {
+                    if item_var == var_name && item_prop == property && item.alias.is_none() {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Match `vector_distance(<vector_expr>, <query_vector>)` function call.
+/// Returns `(vector_expr, query_vector, function_name)` if matched.
+fn match_vector_distance_call(expr: &Expr) -> Option<(Expr, Expr, String)> {
+    if let Expr::FunctionCall { name, args, .. } = expr {
+        if matches!(
+            name.as_str(),
+            "vector_distance" | "vector_similarity" | "vector_dot" | "vector_manhattan"
+        ) && args.len() == 2
+        {
+            return Some((args[0].clone(), args[1].clone(), name.clone()));
+        }
+    }
+    None
+}
+
+/// Validate that the ORDER BY direction matches the metric semantics.
+///
+/// - `vector_distance`, `vector_manhattan`: lower is better → ASC is valid
+/// - `vector_similarity`, `vector_dot`: higher is better → DESC is valid
+fn is_valid_direction(function: &str, ascending: bool) -> bool {
+    match function {
+        "vector_distance" | "vector_manhattan" => ascending,
+        "vector_similarity" | "vector_dot" => !ascending,
+        _ => false,
+    }
+}
+
+/// Rebuild a `Limit { Sort { ... } }` subtree (used when optimization was rejected).
+fn reconstruct_limit_sort(k: usize, sort_item: SortItem, sort_input: LogicalOp) -> LogicalOp {
+    LogicalOp::Limit {
+        input: Box::new(LogicalOp::Sort {
+            input: Box::new(sort_input),
+            items: vec![sort_item],
+        }),
+        count: Expr::Literal(Value::Int(k as i64)),
     }
 }
 
@@ -1864,6 +2217,301 @@ mod tests {
         assert!(
             explain.contains("User"),
             "EXPLAIN should show label name: {explain}"
+        );
+    }
+
+    // --- VectorTopK optimization tests ---
+
+    /// Find VectorTopK in a plan tree (depth-first). Returns a borrowed reference.
+    fn find_vector_top_k(op: &LogicalOp) -> Option<&LogicalOp> {
+        if matches!(op, LogicalOp::VectorTopK { .. }) {
+            return Some(op);
+        }
+        match op {
+            LogicalOp::Project { input, .. }
+            | LogicalOp::Filter { input, .. }
+            | LogicalOp::Sort { input, .. }
+            | LogicalOp::Limit { input, .. }
+            | LogicalOp::Skip { input, .. }
+            | LogicalOp::Aggregate { input, .. }
+            | LogicalOp::Unwind { input, .. } => find_vector_top_k(input),
+            LogicalOp::CartesianProduct { left, right }
+            | LogicalOp::LeftOuterJoin { left, right } => {
+                find_vector_top_k(left).or_else(|| find_vector_top_k(right))
+            }
+            _ => None,
+        }
+    }
+
+    /// Pattern A: direct function call in ORDER BY.
+    /// `ORDER BY vector_distance(n.emb, $qv)` without an alias.
+    #[test]
+    fn vector_top_k_pattern_a_direct_call() {
+        let root = plan_root(
+            "MATCH (n:Doc) \
+             RETURN n \
+             ORDER BY vector_distance(n.embedding, [1.0, 0.0]) \
+             LIMIT 5",
+        );
+        let top_k = find_vector_top_k(&root).expect("VectorTopK not found in plan");
+        if let LogicalOp::VectorTopK {
+            function,
+            k,
+            distance_alias,
+            ..
+        } = top_k
+        {
+            assert_eq!(function, "vector_distance");
+            assert_eq!(*k, 5);
+            assert!(
+                distance_alias.is_none(),
+                "pattern A has no alias: {distance_alias:?}"
+            );
+        } else {
+            panic!("expected VectorTopK");
+        }
+    }
+
+    /// Pattern B: alias via WITH before ORDER BY.
+    /// This is the shape that VectorServiceImpl generates.
+    #[test]
+    fn vector_top_k_pattern_b_alias_via_with() {
+        let root = plan_root(
+            "MATCH (n:Doc) \
+             WITH n, vector_distance(n.embedding, [1.0, 0.0]) AS _dist \
+             ORDER BY _dist \
+             LIMIT 10 \
+             RETURN n, _dist",
+        );
+        let top_k = find_vector_top_k(&root).expect("VectorTopK not found in plan");
+        if let LogicalOp::VectorTopK {
+            function,
+            k,
+            distance_alias,
+            ..
+        } = top_k
+        {
+            assert_eq!(function, "vector_distance");
+            assert_eq!(*k, 10);
+            assert_eq!(distance_alias.as_deref(), Some("_dist"));
+        } else {
+            panic!("expected VectorTopK");
+        }
+    }
+
+    /// No LIMIT → no optimization (Sort remains).
+    #[test]
+    fn vector_top_k_no_limit_not_optimized() {
+        let root = plan_root(
+            "MATCH (n:Doc) \
+             RETURN n \
+             ORDER BY vector_distance(n.embedding, [1.0, 0.0])",
+        );
+        assert!(
+            find_vector_top_k(&root).is_none(),
+            "ORDER BY without LIMIT should not produce VectorTopK: {root:?}"
+        );
+    }
+
+    /// ORDER BY DESC on distance function → not optimized (wrong direction).
+    #[test]
+    fn vector_top_k_wrong_direction_not_optimized() {
+        let root = plan_root(
+            "MATCH (n:Doc) \
+             RETURN n \
+             ORDER BY vector_distance(n.embedding, [1.0, 0.0]) DESC \
+             LIMIT 5",
+        );
+        assert!(
+            find_vector_top_k(&root).is_none(),
+            "DESC on vector_distance should not produce VectorTopK: {root:?}"
+        );
+    }
+
+    /// vector_similarity uses DESC (higher is better) — this IS valid.
+    #[test]
+    fn vector_top_k_similarity_desc_optimized() {
+        let root = plan_root(
+            "MATCH (n:Doc) \
+             RETURN n \
+             ORDER BY vector_similarity(n.embedding, [1.0, 0.0]) DESC \
+             LIMIT 3",
+        );
+        let top_k = find_vector_top_k(&root).expect("VectorTopK not found in plan");
+        if let LogicalOp::VectorTopK { function, k, .. } = top_k {
+            assert_eq!(function, "vector_similarity");
+            assert_eq!(*k, 3);
+        }
+    }
+
+    /// Non-vector ORDER BY → not optimized.
+    #[test]
+    fn vector_top_k_non_vector_order_not_optimized() {
+        let root = plan_root("MATCH (n:User) RETURN n ORDER BY n.age LIMIT 5");
+        assert!(
+            find_vector_top_k(&root).is_none(),
+            "ORDER BY non-vector should not produce VectorTopK"
+        );
+    }
+
+    /// Multi-item ORDER BY → not optimized (only single-key ORDER BY supported).
+    #[test]
+    fn vector_top_k_multi_item_order_not_optimized() {
+        let root = plan_root(
+            "MATCH (n:Doc) \
+             RETURN n \
+             ORDER BY vector_distance(n.embedding, [1.0, 0.0]), n.title \
+             LIMIT 5",
+        );
+        assert!(
+            find_vector_top_k(&root).is_none(),
+            "multi-item ORDER BY should not produce VectorTopK"
+        );
+    }
+
+    /// Pattern A with RETURN that drops the vector variable → NOT optimized.
+    /// `RETURN n.name` removes `n.embedding` from intermediate rows, so the
+    /// optimizer must fall back to plain Sort+Limit. This guards against the
+    /// regression found by g009_forced_offload_cypher_e2e integration test.
+    #[test]
+    fn vector_top_k_pattern_a_dropped_variable_not_optimized() {
+        let root = plan_root(
+            "MATCH (n:Doc) \
+             RETURN n.name \
+             ORDER BY vector_distance(n.embedding, [1.0, 0.0]) \
+             LIMIT 5",
+        );
+        assert!(
+            find_vector_top_k(&root).is_none(),
+            "Pattern A must skip optimization when Project drops the vector variable: {root:?}"
+        );
+    }
+
+    /// Pattern A with RETURN * preserves all columns → optimized.
+    #[test]
+    fn vector_top_k_pattern_a_return_star_optimized() {
+        let root = plan_root(
+            "MATCH (n:Doc) \
+             RETURN * \
+             ORDER BY vector_distance(n.embedding, [1.0, 0.0]) \
+             LIMIT 5",
+        );
+        assert!(
+            find_vector_top_k(&root).is_some(),
+            "RETURN * preserves all columns — should still optimize: {root:?}"
+        );
+    }
+
+    /// Pattern A with RETURN n (full node ref) keeps n.embedding accessible → optimized.
+    #[test]
+    fn vector_top_k_pattern_a_return_node_optimized() {
+        let root = plan_root(
+            "MATCH (n:Doc) \
+             RETURN n \
+             ORDER BY vector_distance(n.embedding, [1.0, 0.0]) \
+             LIMIT 5",
+        );
+        assert!(
+            find_vector_top_k(&root).is_some(),
+            "RETURN n preserves the full node — should optimize: {root:?}"
+        );
+    }
+
+    /// SKIP between Limit and Sort: `ORDER BY d SKIP 5 LIMIT 10` produces
+    /// `Limit { Skip { Sort { ... } } }`. The optimizer must NOT apply —
+    /// Pattern A/B requires Sort directly under Limit. Fallback Sort+Skip+Limit
+    /// is correct, but VectorTopK cannot express skip semantics.
+    #[test]
+    fn vector_top_k_skip_limit_not_optimized() {
+        let root = plan_root(
+            "MATCH (n:Doc) \
+             WITH n, vector_distance(n.embedding, [1.0, 0.0]) AS d \
+             ORDER BY d \
+             SKIP 5 \
+             LIMIT 10 \
+             RETURN n, d",
+        );
+        assert!(
+            find_vector_top_k(&root).is_none(),
+            "SKIP between Sort and Limit should not produce VectorTopK: {root:?}"
+        );
+    }
+
+    /// Nested WITH: two sequential WITH clauses with vector_distance. The outer
+    /// WITH removes the vector variable, so Pattern B's guard (`project_preserves_vector_expr`)
+    /// should still allow optimization because inner WITH projects the vector
+    /// via alias which carries through.
+    #[test]
+    fn vector_top_k_nested_with_still_optimized() {
+        let root = plan_root(
+            "MATCH (n:Doc) \
+             WITH n, n.title AS title \
+             WITH n, title, vector_distance(n.embedding, [1.0, 0.0]) AS d \
+             ORDER BY d \
+             LIMIT 3 \
+             RETURN title, d",
+        );
+        // Pattern B should match the innermost `WITH ... AS d` + ORDER BY + LIMIT.
+        assert!(
+            find_vector_top_k(&root).is_some(),
+            "Nested WITH with Pattern B should still optimize: {root:?}"
+        );
+    }
+
+    /// Parameter-passed query vector (via `$qv` parameter) — the typical shape
+    /// generated by the Python SDK. Pattern B alias + parameter must optimize.
+    #[test]
+    fn vector_top_k_with_parameter_query_vector() {
+        let root = plan_root(
+            "MATCH (n:Doc) \
+             WITH n, vector_distance(n.embedding, $qv) AS d \
+             ORDER BY d \
+             LIMIT 10 \
+             RETURN n, d",
+        );
+        let top_k =
+            find_vector_top_k(&root).expect("VectorTopK not found when query vector is parameter");
+        if let LogicalOp::VectorTopK {
+            query_vector,
+            distance_alias,
+            k,
+            ..
+        } = top_k
+        {
+            // query_vector must be the parameter expression (not substituted).
+            assert!(
+                matches!(query_vector, Expr::Parameter(_)),
+                "query_vector should be Parameter, got {query_vector:?}"
+            );
+            assert_eq!(*k, 10);
+            assert_eq!(distance_alias.as_deref(), Some("d"));
+        } else {
+            panic!("expected VectorTopK");
+        }
+    }
+
+    /// EXPLAIN output for VectorTopK shows function and k.
+    #[test]
+    fn vector_top_k_explain_output() {
+        let p = plan(
+            "MATCH (n:Doc) \
+             WITH n, vector_distance(n.embedding, [1.0, 0.0]) AS d \
+             ORDER BY d \
+             LIMIT 7 \
+             RETURN n",
+        );
+        let explain = p.explain();
+        assert!(
+            explain.contains("VectorTopK"),
+            "EXPLAIN should show VectorTopK: {explain}"
+        );
+        assert!(
+            explain.contains("k=7"),
+            "EXPLAIN should show k=7: {explain}"
+        );
+        assert!(
+            explain.contains("vector_distance"),
+            "EXPLAIN should show function: {explain}"
         );
     }
 }

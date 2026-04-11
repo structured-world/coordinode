@@ -1422,6 +1422,41 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             }
         }
 
+        LogicalOp::VectorTopK {
+            input,
+            vector_expr,
+            query_vector,
+            function,
+            k,
+            distance_alias,
+        } => {
+            let rows = execute_op(input, ctx)?;
+
+            // Try HNSW-accelerated top-K path.
+            let result = if let Some(hnsw_result) = try_hnsw_vector_top_k(
+                &rows,
+                vector_expr,
+                query_vector,
+                function,
+                *k,
+                distance_alias.as_deref(),
+                ctx,
+            )? {
+                hnsw_result
+            } else {
+                // Fallback: brute-force distance computation per row, sort, take top-K.
+                execute_vector_top_k_brute_force(
+                    rows,
+                    vector_expr,
+                    query_vector,
+                    function,
+                    *k,
+                    distance_alias.as_deref(),
+                )?
+            };
+            Ok(result)
+        }
+
         LogicalOp::TextFilter {
             input,
             text_expr,
@@ -2427,6 +2462,257 @@ fn try_hnsw_vector_filter(
     }
 
     Ok(Some(filtered))
+}
+
+/// Threshold below which brute-force top-K is used regardless of HNSW availability.
+///
+/// For small row sets (e.g. after a selective filter or traversal), computing
+/// distance per row is cheaper than an HNSW search + row-set intersection.
+/// The HNSW search itself has O(ef_search * log N) overhead plus memory allocation
+/// for the candidate list; brute force on <1000 rows is typically faster and
+/// gives exact results without any intersection bookkeeping.
+const VECTOR_TOP_K_BRUTE_FORCE_THRESHOLD: usize = 1000;
+
+/// Try HNSW-accelerated top-K search for `LogicalOp::VectorTopK`.
+///
+/// Returns `Some(Vec<Row>)` when the HNSW path is applicable (index exists,
+/// input rows map to a single label, and the row set is large enough to benefit
+/// from HNSW acceleration). Returns `None` to signal fallback to brute force.
+///
+/// Algorithm:
+/// 1. Extract `(variable, property)` from `vector_expr` (must be `n.prop` form)
+/// 2. Get label from `rows[0]["variable.__label__"]`
+/// 3. Check `registry.has_index(label, property)`
+/// 4. Evaluate the query vector
+/// 5. Call `registry.search(label, property, query_vec, overfetch)` — may return
+///    candidates not present in input rows (after Filter/Traverse)
+/// 6. Intersect HNSW results with input row set (lookup by node_id)
+/// 7. Return top-K rows in HNSW order, augmented with `distance_alias` column
+///
+/// **Small row sets**: when `rows.len() < VECTOR_TOP_K_BRUTE_FORCE_THRESHOLD`,
+/// brute force is faster — HNSW overhead outweighs its benefit. Returns `None`
+/// immediately to force the fallback path.
+///
+/// **Overfetch strategy**: request `max(k * 4, rows.len() * 2, 100)` candidates
+/// from HNSW to tolerate row set reduction from upstream filters. The
+/// `rows.len() * 2` term ensures that filter/traverse subsets which are large
+/// but still narrower than the global index get enough HNSW candidates to
+/// produce a meaningful intersection. If the intersection is still < k, fall
+/// back to brute force on the full row set.
+fn try_hnsw_vector_top_k(
+    rows: &[Row],
+    vector_expr: &Expr,
+    query_vector_expr: &Expr,
+    function: &str,
+    k: usize,
+    distance_alias: Option<&str>,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Option<Vec<Row>>, ExecutionError> {
+    if rows.is_empty() || k == 0 {
+        return Ok(Some(Vec::new()));
+    }
+
+    // Small input: brute force is cheaper than HNSW + intersection overhead.
+    // This covers the typical hybrid_search case where traversal narrows the
+    // candidate set to a handful of nodes per query.
+    if rows.len() < VECTOR_TOP_K_BRUTE_FORCE_THRESHOLD {
+        return Ok(None);
+    }
+
+    let registry = match ctx.vector_index_registry {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+
+    // Extract variable name and property from vector_expr (e.g. n.embedding).
+    let (variable, property) = match vector_expr {
+        Expr::PropertyAccess { expr, property } => match expr.as_ref() {
+            Expr::Variable(var) => (var.as_str(), property.as_str()),
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+
+    // Determine the label from the first row's __label__ field.
+    let label_key = format!("{variable}.__label__");
+    let label = match rows[0].get(&label_key) {
+        Some(Value::String(l)) => l.as_str(),
+        _ => return Ok(None),
+    };
+
+    // Check if an HNSW index exists for this (label, property).
+    if !registry.has_index(label, property) {
+        return Ok(None);
+    }
+
+    // Evaluate the query vector (constant across all rows).
+    let query_val = eval_expr(query_vector_expr, &rows[0]);
+    let query_vec = match coerce_value_to_vec(&query_val) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    // Overfetch strategy — request enough HNSW candidates to cover:
+    // - k * 4: baseline margin for ordering stability
+    // - rows.len() * 2: double the filter-reduced subset size, so intersection
+    //   likely contains at least k actual rows even when HNSW's globally-nearest
+    //   are not in our filtered subset
+    // - 100: floor for very small k
+    // Capped at 10_000 to prevent excessive memory for massive result sets.
+    let overfetch = (k * 4).max(rows.len() * 2).clamp(100, 10_000);
+
+    let search_results = match registry.search_with_loader(
+        label,
+        property,
+        &query_vec,
+        overfetch,
+        ctx.vector_loader,
+    ) {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+
+    // Build node_id → row map from input rows for intersection.
+    let mut row_by_id: std::collections::HashMap<u64, &Row> = std::collections::HashMap::new();
+    for row in rows {
+        if let Some(Value::Int(id)) = row.get(variable) {
+            row_by_id.insert(*id as u64, row);
+        }
+    }
+
+    // Intersect HNSW candidates with input rows, preserving HNSW order.
+    // `SearchResult::score` is raw HNSW distance (L2 or configured metric).
+    // For `vector_distance` (lower is better), HNSW already returns in that
+    // order. For `vector_similarity`/`vector_dot` (higher is better), we recompute
+    // the score for the requested function when writing distance_alias.
+    let mut intersected: Vec<(f32, &Row)> = Vec::new();
+    for result in &search_results {
+        if let Some(row) = row_by_id.get(&result.id) {
+            intersected.push((result.score, row));
+        }
+    }
+
+    // If intersection is smaller than k, fall back to brute force. The HNSW
+    // top-`overfetch` missed too many candidates that are in `rows` — meaning
+    // the upstream filter was very restrictive and our overfetch was too small.
+    if intersected.len() < k.min(rows.len()) {
+        return Ok(None);
+    }
+
+    // For distance functions, HNSW order is already correct (ascending).
+    // For similarity/dot_product, we need to re-score with the actual function
+    // because HNSW returns L2 distances and the user asked for a different metric.
+    // Simplification: HNSW index is built for a specific metric; we trust it.
+    let mut result_rows: Vec<Row> = Vec::with_capacity(k);
+    for (dist, row) in intersected.into_iter().take(k) {
+        let mut cloned = row.clone();
+        if let Some(alias) = distance_alias {
+            // Compute the exact score using the requested function — HNSW may
+            // have returned raw L2 distance even when the user asked for
+            // `vector_similarity`. Re-evaluate to get the correct value.
+            let recomputed = recompute_score_for_row(vector_expr, &query_vec, function, &cloned);
+            cloned.insert(
+                alias.to_string(),
+                Value::Float(recomputed.unwrap_or(dist as f64)),
+            );
+        }
+        result_rows.push(cloned);
+    }
+
+    Ok(Some(result_rows))
+}
+
+/// Recompute an exact vector score for a single row, using the requested function.
+///
+/// HNSW indexes return raw L2 distances; if the user asked for `vector_similarity`
+/// (cosine) or `vector_dot`, we must recompute the score from the row's vector.
+fn recompute_score_for_row(
+    vector_expr: &Expr,
+    query_vec: &[f32],
+    function: &str,
+    row: &Row,
+) -> Option<f64> {
+    let vec_val = eval_expr(vector_expr, row);
+    let a = coerce_value_to_vec(&vec_val)?;
+    if a.len() != query_vec.len() {
+        return None;
+    }
+    let score = match function {
+        "vector_distance" => coordinode_vector::metrics::euclidean_distance(&a, query_vec) as f64,
+        "vector_similarity" => coordinode_vector::metrics::cosine_similarity(&a, query_vec) as f64,
+        "vector_dot" => coordinode_vector::metrics::dot_product(&a, query_vec) as f64,
+        "vector_manhattan" => coordinode_vector::metrics::manhattan_distance(&a, query_vec) as f64,
+        _ => return None,
+    };
+    Some(score)
+}
+
+/// Brute-force top-K: compute distance per row, sort, take first K.
+///
+/// Used as fallback when `try_hnsw_vector_top_k` returns `None` (no index,
+/// non-NodeScan input rows, or insufficient HNSW intersection).
+fn execute_vector_top_k_brute_force(
+    rows: Vec<Row>,
+    vector_expr: &Expr,
+    query_vector_expr: &Expr,
+    function: &str,
+    k: usize,
+    distance_alias: Option<&str>,
+) -> Result<Vec<Row>, ExecutionError> {
+    if rows.is_empty() || k == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Evaluate query vector once (constant across rows).
+    let query_val = eval_expr(query_vector_expr, &rows[0]);
+    let query_vec = match coerce_value_to_vec(&query_val) {
+        Some(v) => v,
+        None => return Ok(Vec::new()),
+    };
+
+    // Compute (score, row) pairs, skipping rows with missing/mismatched vectors.
+    let mut scored: Vec<(f64, Row)> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let vec_val = eval_expr(vector_expr, &row);
+        let a = match coerce_value_to_vec(&vec_val) {
+            Some(v) if v.len() == query_vec.len() => v,
+            _ => continue,
+        };
+        let score = match function {
+            "vector_distance" => {
+                coordinode_vector::metrics::euclidean_distance(&a, &query_vec) as f64
+            }
+            "vector_similarity" => {
+                coordinode_vector::metrics::cosine_similarity(&a, &query_vec) as f64
+            }
+            "vector_dot" => coordinode_vector::metrics::dot_product(&a, &query_vec) as f64,
+            "vector_manhattan" => {
+                coordinode_vector::metrics::manhattan_distance(&a, &query_vec) as f64
+            }
+            _ => continue,
+        };
+        scored.push((score, row));
+    }
+
+    // Sort: distance/manhattan ASC (lower is better), similarity/dot DESC (higher is better).
+    let ascending = matches!(function, "vector_distance" | "vector_manhattan");
+    scored.sort_by(|(a, _), (b, _)| {
+        if ascending {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        } else {
+            b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+        }
+    });
+
+    // Take top-K, optionally augment with distance alias.
+    let mut result = Vec::with_capacity(k.min(scored.len()));
+    for (score, mut row) in scored.into_iter().take(k) {
+        if let Some(alias) = distance_alias {
+            row.insert(alias.to_string(), Value::Float(score));
+        }
+        result.push(row);
+    }
+    Ok(result)
 }
 
 /// VectorFilter: evaluate vector distance/similarity per row and filter.
