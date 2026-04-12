@@ -1254,12 +1254,31 @@ fn build_expression(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
         Rule::integer_literal => build_integer_literal(pair),
         Rule::boolean_literal => build_boolean_literal(pair),
         Rule::null_literal => Ok(Expr::Literal(Value::Null)),
+        Rule::pattern_predicate => build_pattern_predicate_expr(pair),
         Rule::star => Ok(Expr::Star),
         _ => Err(ParseError::Invalid(format!(
             "unexpected expression rule: {:?}",
             pair.as_rule()
         ))),
     }
+}
+
+fn build_pattern_predicate_expr(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
+    let mut elements = Vec::new();
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::node_pattern => {
+                elements.push(PatternElement::Node(build_node_pattern(inner)?));
+            }
+            Rule::relationship_pattern => {
+                elements.push(PatternElement::Relationship(build_relationship_pattern(
+                    inner,
+                )?));
+            }
+            _ => {}
+        }
+    }
+    Ok(Expr::PatternPredicate(Pattern { elements }))
 }
 
 fn build_binary_chain(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
@@ -3198,5 +3217,95 @@ mod tests {
             }
             other => panic!("expected CreateTextIndex, got {other:?}"),
         }
+    }
+
+    // ── Pattern predicate parsing ────────────────────────────────────────
+
+    /// Helper: extract inline WHERE expression from first MATCH clause.
+    fn extract_match_where(q: &Query) -> Option<&Expr> {
+        q.clauses.iter().find_map(|c| match c {
+            Clause::Match(m) => m.where_clause.as_ref(),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn parse_where_pattern_predicate() {
+        let q = parse("MATCH (a), (b) WHERE (a)-[:KNOWS]->(b) RETURN a").unwrap();
+        let where_expr = extract_match_where(&q).expect("WHERE clause missing");
+        if let Expr::PatternPredicate(p) = where_expr {
+            assert_eq!(p.elements.len(), 3); // node, rel, node
+        } else {
+            panic!("expected PatternPredicate, got {where_expr:?}");
+        }
+    }
+
+    #[test]
+    fn parse_where_not_pattern_predicate() {
+        let q = parse("MATCH (a), (b) WHERE NOT (a)-[:KNOWS]->(b) RETURN a").unwrap();
+        let where_expr = extract_match_where(&q).expect("WHERE clause missing");
+        if let Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr,
+        } = where_expr
+        {
+            assert!(
+                matches!(expr.as_ref(), Expr::PatternPredicate(_)),
+                "expected PatternPredicate inside NOT, got {expr:?}"
+            );
+        } else {
+            panic!("expected NOT expression, got {where_expr:?}");
+        }
+    }
+
+    #[test]
+    fn parse_pattern_predicate_with_labels() {
+        let q = parse("MATCH (a:Person), (b:Person) WHERE (a)-[:KNOWS]->(b) RETURN a").unwrap();
+        let where_expr = extract_match_where(&q).expect("WHERE clause missing");
+        assert!(
+            matches!(where_expr, Expr::PatternPredicate(_)),
+            "expected PatternPredicate"
+        );
+    }
+
+    #[test]
+    fn parse_pattern_predicate_undirected() {
+        let q = parse("MATCH (a), (b) WHERE (a)-[:KNOWS]-(b) RETURN a").unwrap();
+        let where_expr = extract_match_where(&q).expect("WHERE clause missing");
+        if let Expr::PatternPredicate(p) = where_expr {
+            if let PatternElement::Relationship(rel) = &p.elements[1] {
+                assert_eq!(rel.direction, Direction::Both);
+            } else {
+                panic!("expected relationship element");
+            }
+        } else {
+            panic!("expected PatternPredicate");
+        }
+    }
+
+    #[test]
+    fn parse_pattern_predicate_and_scalar() {
+        let q = parse("MATCH (a), (b) WHERE (a)-[:KNOWS]->(b) AND a.age > 30 RETURN a").unwrap();
+        let where_expr = extract_match_where(&q).expect("WHERE clause missing");
+        if let Expr::BinaryOp { left, op, right } = where_expr {
+            assert_eq!(*op, BinaryOperator::And);
+            assert!(
+                matches!(left.as_ref(), Expr::PatternPredicate(_)),
+                "left should be PatternPredicate"
+            );
+            assert!(matches!(right.as_ref(), Expr::BinaryOp { .. }));
+        } else {
+            panic!("expected AND expression, got {where_expr:?}");
+        }
+    }
+
+    #[test]
+    fn parse_parenthesized_expr_not_pattern_predicate() {
+        let q = parse("MATCH (n) WHERE (n.age) > 5 RETURN n").unwrap();
+        let where_expr = extract_match_where(&q).expect("WHERE clause missing");
+        assert!(
+            !matches!(where_expr, Expr::PatternPredicate(_)),
+            "parenthesized expression should not be PatternPredicate"
+        );
     }
 }

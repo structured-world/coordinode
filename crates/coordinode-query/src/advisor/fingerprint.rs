@@ -535,6 +535,9 @@ fn write_expr(buf: &mut String, expr: &Expr) {
             }
             buf.push('}');
         }
+        Expr::PatternPredicate(_) => {
+            buf.push_str("PATTERN_PRED");
+        }
     }
 }
 

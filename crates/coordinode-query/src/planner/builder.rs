@@ -1569,6 +1569,28 @@ fn collect_expr_variables_inner(expr: &Expr, vars: &mut Vec<String>) {
                 collect_expr_variables_inner(e, vars);
             }
         }
+        Expr::PatternPredicate(pattern) => {
+            for elem in &pattern.elements {
+                match elem {
+                    PatternElement::Node(node) => {
+                        if let Some(ref name) = node.variable {
+                            vars.push(name.clone());
+                        }
+                        for (_, v) in &node.properties {
+                            collect_expr_variables_inner(v, vars);
+                        }
+                    }
+                    PatternElement::Relationship(rel) => {
+                        if let Some(ref name) = rel.variable {
+                            vars.push(name.clone());
+                        }
+                        for (_, v) in &rel.properties {
+                            collect_expr_variables_inner(v, vars);
+                        }
+                    }
+                }
+            }
+        }
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Star => {}
     }
 }

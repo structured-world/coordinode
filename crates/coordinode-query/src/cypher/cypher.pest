@@ -283,9 +283,14 @@ atom = {
   | integer_literal
   | boolean_literal
   | null_literal
+  | pattern_predicate
   | property_or_variable
   | "(" ~ expression ~ ")"
 }
+
+// Pattern predicate in expression context: `(a)-[:R]->(b)` evaluates to boolean.
+// Must contain at least one relationship (otherwise it's just a parenthesized expression).
+pattern_predicate = { node_pattern ~ (relationship_pattern ~ node_pattern)+ }
 
 // --- Atoms ---
 

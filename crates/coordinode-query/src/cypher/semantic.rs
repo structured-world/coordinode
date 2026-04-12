@@ -422,6 +422,30 @@ impl<'a> Analyzer<'a> {
                     }
                 }
             }
+            Expr::PatternPredicate(pattern) => {
+                // Check variables referenced in pattern nodes/relationships
+                for elem in &pattern.elements {
+                    match elem {
+                        PatternElement::Node(node) => {
+                            if let Some(ref name) = node.variable {
+                                if !self.scope.contains_key(name) {
+                                    self.errors.push(SemanticError::UndefinedVariable {
+                                        name: name.clone(),
+                                    });
+                                }
+                            }
+                            for (_, v) in &node.properties {
+                                self.check_expr(v);
+                            }
+                        }
+                        PatternElement::Relationship(rel) => {
+                            for (_, v) in &rel.properties {
+                                self.check_expr(v);
+                            }
+                        }
+                    }
+                }
+            }
             // Literals, parameters, star — no variable references
             Expr::Literal(_) | Expr::Parameter(_) | Expr::Star => {}
         }

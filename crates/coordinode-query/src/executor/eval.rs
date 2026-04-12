@@ -180,12 +180,17 @@ pub fn eval_expr(expr: &Expr, row: &Row) -> Value {
                 Value::Null
             }
         }
+        // Pattern predicates require storage access — evaluated in the executor
+        // (eval_pattern_predicate), not in the pure expression evaluator. If we
+        // reach this branch it means the predicate was not intercepted by the
+        // storage-aware Filter path, so we conservatively return false.
+        Expr::PatternPredicate(_) => Value::Bool(false),
         Expr::Star => Value::Null,
     }
 }
 
 /// Evaluate a binary operation.
-fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) -> Value {
+pub(crate) fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) -> Value {
     match op {
         // Arithmetic
         BinaryOperator::Add => match (left, right) {
@@ -332,7 +337,7 @@ fn compare_values(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
 }
 
 /// Evaluate a unary operation.
-fn eval_unary_op(op: UnaryOperator, val: &Value) -> Value {
+pub(crate) fn eval_unary_op(op: UnaryOperator, val: &Value) -> Value {
     match op {
         UnaryOperator::Not => match val {
             Value::Bool(b) => Value::Bool(!b),

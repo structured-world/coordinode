@@ -27,9 +27,12 @@ use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::StorageSnapshot;
 use coordinode_storage::Guard;
 
-use super::eval::{eval_expr, is_truthy};
+use super::eval::{eval_binary_op, eval_expr, eval_unary_op, is_truthy};
 use super::row::Row;
-use crate::cypher::ast::{Direction, Expr, LengthBound, Pattern, PatternElement};
+use crate::cypher::ast::{
+    BinaryOperator, Direction, Expr, LengthBound, NodePattern, Pattern, PatternElement,
+    RelationshipPattern,
+};
 use crate::planner::logical::*;
 
 /// Default maximum hops for unbounded variable-length paths.
@@ -1186,21 +1189,40 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         LogicalOp::Filter { input, predicate } => {
             let rows = execute_op(input, ctx)?;
             let corr = ctx.correlated_row.clone();
-            Ok(rows
-                .into_iter()
-                .filter(|row| {
-                    if let Some(ref outer) = corr {
-                        // Correlated OPTIONAL MATCH: merge outer-scope variables
-                        // so predicates like `c.age > a.age` can resolve `a`.
-                        // Current row takes precedence over outer scope.
+            if expr_contains_pattern_predicate(predicate) {
+                // Storage-aware path: pattern predicates need edge lookups.
+                let mut result = Vec::new();
+                for row in rows {
+                    let effective_row = if let Some(ref outer) = corr {
                         let mut merged = outer.clone();
                         merged.extend(row.iter().map(|(k, v)| (k.clone(), v.clone())));
-                        is_truthy(&eval_expr(predicate, &merged))
+                        merged
                     } else {
-                        is_truthy(&eval_expr(predicate, row))
+                        row.clone()
+                    };
+                    let val = eval_predicate_with_storage(predicate, &effective_row, ctx)?;
+                    if is_truthy(&val) {
+                        result.push(row);
                     }
-                })
-                .collect())
+                }
+                Ok(result)
+            } else {
+                Ok(rows
+                    .into_iter()
+                    .filter(|row| {
+                        if let Some(ref outer) = corr {
+                            // Correlated OPTIONAL MATCH: merge outer-scope variables
+                            // so predicates like `c.age > a.age` can resolve `a`.
+                            // Current row takes precedence over outer scope.
+                            let mut merged = outer.clone();
+                            merged.extend(row.iter().map(|(k, v)| (k.clone(), v.clone())));
+                            is_truthy(&eval_expr(predicate, &merged))
+                        } else {
+                            is_truthy(&eval_expr(predicate, row))
+                        }
+                    })
+                    .collect())
+            }
         }
 
         LogicalOp::Project {
@@ -3313,6 +3335,28 @@ fn collect_expr_vars(expr: &Expr, vars: &mut Vec<String>) {
                 collect_expr_vars(el, vars);
             }
         }
+        Expr::PatternPredicate(pattern) => {
+            for elem in &pattern.elements {
+                match elem {
+                    crate::cypher::ast::PatternElement::Node(node) => {
+                        if let Some(ref name) = node.variable {
+                            vars.push(name.clone());
+                        }
+                        for (_, v) in &node.properties {
+                            collect_expr_vars(v, vars);
+                        }
+                    }
+                    crate::cypher::ast::PatternElement::Relationship(rel) => {
+                        if let Some(ref name) = rel.variable {
+                            vars.push(name.clone());
+                        }
+                        for (_, v) in &rel.properties {
+                            collect_expr_vars(v, vars);
+                        }
+                    }
+                }
+            }
+        }
         // Literal, Parameter, Star — no variable references.
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Star => {}
     }
@@ -3828,6 +3872,161 @@ fn execute_merge_relationship_check(
     }
 
     Ok(vec![])
+}
+
+/// Check whether an expression tree contains any `PatternPredicate` nodes.
+fn expr_contains_pattern_predicate(expr: &Expr) -> bool {
+    match expr {
+        Expr::PatternPredicate(_) => true,
+        Expr::UnaryOp { expr, .. } => expr_contains_pattern_predicate(expr),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_pattern_predicate(left) || expr_contains_pattern_predicate(right)
+        }
+        _ => false,
+    }
+}
+
+/// Evaluate a predicate expression that may contain pattern predicates.
+/// Unlike `eval_expr`, this has access to the storage engine for edge lookups.
+fn eval_predicate_with_storage(
+    expr: &Expr,
+    row: &Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Value, ExecutionError> {
+    match expr {
+        Expr::PatternPredicate(pattern) => check_pattern_exists(pattern, row, ctx),
+        Expr::UnaryOp { op, expr } => {
+            let v = eval_predicate_with_storage(expr, row, ctx)?;
+            Ok(eval_unary_op(*op, &v))
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let lv = eval_predicate_with_storage(left, row, ctx)?;
+            // Short-circuit for AND/OR
+            match op {
+                BinaryOperator::And if !is_truthy(&lv) => return Ok(Value::Bool(false)),
+                BinaryOperator::Or if is_truthy(&lv) => return Ok(Value::Bool(true)),
+                _ => {}
+            }
+            let rv = eval_predicate_with_storage(right, row, ctx)?;
+            Ok(eval_binary_op(&lv, *op, &rv))
+        }
+        other => Ok(eval_expr(other, row)),
+    }
+}
+
+/// Check if a pattern predicate matches: does the described path exist in the graph?
+///
+/// Handles bound endpoints (variables already in the row) by checking specific
+/// edge existence via `expand_one_hop`, and unbound endpoints by checking if
+/// any matching neighbor exists.
+fn check_pattern_exists(
+    pattern: &Pattern,
+    row: &Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Value, ExecutionError> {
+    // Pattern must be node-rel-node (possibly chained).
+    // Extract triples: (src_node, relationship, dst_node)
+    let elements = &pattern.elements;
+    if elements.len() < 3 {
+        return Ok(Value::Bool(false));
+    }
+
+    // Walk the pattern in (node, rel, node) triples
+    let mut i = 0;
+    while i + 2 < elements.len() {
+        let src_node = match &elements[i] {
+            PatternElement::Node(n) => n,
+            _ => return Ok(Value::Bool(false)),
+        };
+        let rel = match &elements[i + 1] {
+            PatternElement::Relationship(r) => r,
+            _ => return Ok(Value::Bool(false)),
+        };
+        let dst_node = match &elements[i + 2] {
+            PatternElement::Node(n) => n,
+            _ => return Ok(Value::Bool(false)),
+        };
+
+        let exists = check_single_hop_exists(src_node, rel, dst_node, row, ctx)?;
+        if !exists {
+            return Ok(Value::Bool(false));
+        }
+
+        i += 2; // advance to next triple (overlapping nodes)
+    }
+
+    Ok(Value::Bool(true))
+}
+
+/// Check if a single hop (src)-[rel]->(dst) exists.
+fn check_single_hop_exists(
+    src_node: &NodePattern,
+    rel: &RelationshipPattern,
+    dst_node: &NodePattern,
+    row: &Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<bool, ExecutionError> {
+    // Resolve source node ID from bound variable
+    let src_id = match &src_node.variable {
+        Some(name) => match row.get(name.as_str()) {
+            Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+            _ => return Ok(false), // unbound or not a node → no match
+        },
+        None => return Ok(false), // anonymous source not supported in predicate context
+    };
+
+    // Resolve edge types (empty = wildcard)
+    let resolved_types: Vec<String>;
+    let effective_types: &[String] = if rel.rel_types.is_empty() {
+        resolved_types = ctx.list_edge_types()?;
+        &resolved_types
+    } else {
+        &rel.rel_types
+    };
+
+    // Check if destination is bound
+    let dst_bound = dst_node.variable.as_ref().and_then(|name| {
+        row.get(name.as_str()).and_then(|v| {
+            if let Value::Int(id) = v {
+                Some(*id as u64)
+            } else {
+                None
+            }
+        })
+    });
+
+    for et in effective_types {
+        let neighbors = expand_one_hop(src_id, std::slice::from_ref(et), rel.direction, ctx)?;
+        if let Some(target_raw) = dst_bound {
+            // Both endpoints bound: check specific edge
+            if neighbors.iter().any(|(tgt, _)| *tgt == target_raw) {
+                return Ok(true);
+            }
+        } else {
+            // Destination unbound: check if any neighbor exists
+            // Optionally filter by label
+            if dst_node.labels.is_empty() {
+                if !neighbors.is_empty() {
+                    return Ok(true);
+                }
+            } else {
+                // Check labels on neighbors
+                for (tgt_uid, _) in &neighbors {
+                    let tgt_id = NodeId::from_raw(*tgt_uid);
+                    let node_key = encode_node_key(ctx.shard_id, tgt_id);
+                    if let Some(data) = ctx.mvcc_get(Partition::Node, &node_key)? {
+                        if let Ok(record) = NodeRecord::from_msgpack(&data) {
+                            if dst_node.labels.iter().all(|l| record.labels.contains(l)) {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 /// Create a relationship edge described by `traverse` between the source and target

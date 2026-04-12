@@ -306,6 +306,11 @@ pub enum Expr {
         else_clause: Option<Box<Expr>>,
     },
 
+    /// Pattern predicate: `(a)-[:R]->(b)` in expression context.
+    /// Evaluates to `true` if the pattern matches at least one path, `false` otherwise.
+    /// Used in WHERE clauses: `WHERE (a)-[:KNOWS]->(b)` or `WHERE NOT (a)-[:KNOWS]->(b)`.
+    PatternPredicate(Pattern),
+
     /// Star expression for `count(*)` or `RETURN *`.
     Star,
 }
@@ -372,6 +377,19 @@ impl Expr {
                 }
                 if let Some(el) = else_clause {
                     el.substitute_params(params);
+                }
+            }
+            Expr::PatternPredicate(pattern) => {
+                for elem in &mut pattern.elements {
+                    if let PatternElement::Node(node) = elem {
+                        for (_, v) in &mut node.properties {
+                            v.substitute_params(params);
+                        }
+                    } else if let PatternElement::Relationship(rel) = elem {
+                        for (_, v) in &mut rel.properties {
+                            v.substitute_params(params);
+                        }
+                    }
                 }
             }
             Expr::Literal(_) | Expr::Variable(_) | Expr::Star => {}

@@ -7330,3 +7330,364 @@ fn test_g069_wildcard_after_cypher_merge() {
         "count(r) after Cypher MERGE must return 1"
     );
 }
+
+// ── Pattern predicate in WHERE (G071) ────────────────────────────────────
+
+#[test]
+fn g071_where_pattern_predicate_positive() {
+    // WHERE (a)-[:KNOWS]->(b) should return rows where the edge exists
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Person",
+        &[("name", Value::String("Alice".into()))],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        2,
+        "Person",
+        &[("name", Value::String("Bob".into()))],
+        &mut interner,
+    );
+    insert_edge(&engine, "KNOWS", 1, 2);
+    register_schema_edge_type(&engine, "KNOWS");
+
+    let rows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) WHERE (a)-[:KNOWS]->(b) RETURN a.name AS src, b.name AS dst",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 1, "edge exists → 1 row");
+    assert_eq!(rows[0].get("src"), Some(&Value::String("Alice".into())));
+    assert_eq!(rows[0].get("dst"), Some(&Value::String("Bob".into())));
+}
+
+#[test]
+fn g071_where_not_pattern_predicate() {
+    // WHERE NOT (a)-[:KNOWS]->(b) should return rows where the edge does NOT exist
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Person",
+        &[("name", Value::String("Alice".into()))],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        2,
+        "Person",
+        &[("name", Value::String("Bob".into()))],
+        &mut interner,
+    );
+    // No KNOWS edge from Alice to Bob
+    register_schema_edge_type(&engine, "KNOWS");
+
+    let rows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) WHERE NOT (a)-[:KNOWS]->(b) RETURN a.name AS src, b.name AS dst",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 1, "no edge → NOT pattern should return 1 row");
+    assert_eq!(rows[0].get("src"), Some(&Value::String("Alice".into())));
+}
+
+#[test]
+fn g071_where_not_pattern_predicate_blocks_when_edge_exists() {
+    // WHERE NOT (a)-[:KNOWS]->(b) should filter out rows where the edge DOES exist
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Person",
+        &[("name", Value::String("Alice".into()))],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        2,
+        "Person",
+        &[("name", Value::String("Bob".into()))],
+        &mut interner,
+    );
+    insert_edge(&engine, "KNOWS", 1, 2);
+    register_schema_edge_type(&engine, "KNOWS");
+
+    let rows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) WHERE NOT (a)-[:KNOWS]->(b) RETURN a.name",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(
+        rows.len(),
+        0,
+        "edge exists → NOT pattern should filter out row"
+    );
+}
+
+#[test]
+fn g071_pattern_predicate_with_and() {
+    // WHERE (a)-[:KNOWS]->(b) AND b.age > 20
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Person",
+        &[("name", Value::String("Alice".into()))],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        2,
+        "Person",
+        &[
+            ("name", Value::String("Bob".into())),
+            ("age", Value::Int(25)),
+        ],
+        &mut interner,
+    );
+    insert_edge(&engine, "KNOWS", 1, 2);
+    register_schema_edge_type(&engine, "KNOWS");
+
+    let rows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) WHERE (a)-[:KNOWS]->(b) AND b.age > 20 RETURN b.name AS name",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Bob".into())));
+}
+
+#[test]
+fn g071_pattern_predicate_wildcard_type() {
+    // WHERE (a)-[]->(b) — wildcard edge type
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Person",
+        &[("name", Value::String("Alice".into()))],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        2,
+        "Person",
+        &[("name", Value::String("Bob".into()))],
+        &mut interner,
+    );
+    insert_edge(&engine, "FOLLOWS", 1, 2);
+    register_schema_edge_type(&engine, "FOLLOWS");
+
+    let rows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) WHERE (a)-[]->(b) RETURN b.name AS name",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 1, "wildcard edge match should find FOLLOWS");
+}
+
+#[test]
+fn g071_pattern_predicate_wrong_direction() {
+    // WHERE (a)-[:KNOWS]->(b) but edge is b→a, not a→b
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Person",
+        &[("name", Value::String("Alice".into()))],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        2,
+        "Person",
+        &[("name", Value::String("Bob".into()))],
+        &mut interner,
+    );
+    insert_edge(&engine, "KNOWS", 2, 1); // Bob→Alice, not Alice→Bob
+    register_schema_edge_type(&engine, "KNOWS");
+
+    let rows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) WHERE (a)-[:KNOWS]->(b) RETURN a.name",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 0, "wrong direction → no match");
+}
+
+#[test]
+fn g071_standalone_where_not_pattern() {
+    // Standalone WHERE (two separate MATCH clauses + WHERE) — the exact syntax from G071 description:
+    // MATCH (src) MATCH (dst) WHERE NOT (src)-[:TYPE]->(dst) CREATE ...
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Person",
+        &[("name", Value::String("Alice".into()))],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        2,
+        "Person",
+        &[("name", Value::String("Bob".into()))],
+        &mut interner,
+    );
+    register_schema_edge_type(&engine, "FOLLOWS");
+
+    // No FOLLOWS edge from Alice to Bob → NOT should pass
+    let rows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}) MATCH (b:Person {name: 'Bob'}) WHERE NOT (a)-[:FOLLOWS]->(b) RETURN a.name AS src, b.name AS dst",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 1, "no edge → NOT pattern should return row");
+    assert_eq!(rows[0].get("src"), Some(&Value::String("Alice".into())));
+
+    // Now add edge and verify NOT filters it out
+    insert_edge(&engine, "FOLLOWS", 1, 2);
+    let rows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}) MATCH (b:Person {name: 'Bob'}) WHERE NOT (a)-[:FOLLOWS]->(b) RETURN a.name",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 0, "edge exists → NOT pattern should filter out");
+}
+
+#[test]
+fn g071_pattern_predicate_incoming_direction() {
+    // WHERE (a)<-[:KNOWS]-(b) — incoming direction
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Person",
+        &[("name", Value::String("Alice".into()))],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        2,
+        "Person",
+        &[("name", Value::String("Bob".into()))],
+        &mut interner,
+    );
+    insert_edge(&engine, "KNOWS", 2, 1); // Bob→Alice (so Alice has incoming KNOWS from Bob)
+    register_schema_edge_type(&engine, "KNOWS");
+
+    let rows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) WHERE (a)<-[:KNOWS]-(b) RETURN a.name AS name",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 1, "incoming edge should match");
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Alice".into())));
+}
+
+#[test]
+fn g071_pattern_predicate_in_or() {
+    // WHERE (a)-[:KNOWS]->(b) OR a.name = 'Charlie'
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Person",
+        &[("name", Value::String("Alice".into()))],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        2,
+        "Person",
+        &[("name", Value::String("Bob".into()))],
+        &mut interner,
+    );
+    // No edge but name doesn't match Charlie either → 0 rows
+    register_schema_edge_type(&engine, "KNOWS");
+
+    let rows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) WHERE (a)-[:KNOWS]->(b) OR a.name = 'Charlie' RETURN a.name",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 0, "neither condition met → 0 rows");
+
+    // Now add edge → OR's first branch is true
+    insert_edge(&engine, "KNOWS", 1, 2);
+    let rows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) WHERE (a)-[:KNOWS]->(b) OR a.name = 'Charlie' RETURN a.name AS name",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 1, "edge exists → OR true");
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Alice".into())));
+}
