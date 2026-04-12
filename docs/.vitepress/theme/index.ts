@@ -14,7 +14,9 @@ const GA_ID = (import.meta.env as Record<string, string>).VITE_GA_ID || "";
 const consentTheme = enhanceWithConsent(DefaultTheme, {
   gaId: GA_ID,
   // KV storage via Cloudflare Worker (configured in R-DOC2 — bug-reports-worker)
-  storage: createKVStorage("/api/consent"),
+  // Absolute URL: coordinode.com DNS is on PowerDNS (not Cloudflare), so the
+  // consent worker is proxied through coordinode-docs.sw.foundation (CF zone).
+  storage: createKVStorage("https://coordinode-docs.sw.foundation/api/consent"),
 });
 
 export default {
