@@ -383,22 +383,39 @@ fn reap_label(
                 }
             }
             TtlScope::Subtree => {
-                // Subtree: delete `target_field` if specified, otherwise fall back
-                // to deleting the anchor field itself (same behaviour as Field scope).
-                let (del_field_id, del_field_name) = match &target.target_field {
-                    Some(tf) => (target.target_field_id, tf.as_str()),
-                    None => (target.anchor_field_id, target.anchor_field.as_str()),
-                };
-                match collect_property_removal_mutations(engine, &key, del_field_id, del_field_name)
-                {
-                    Ok(mutations) => {
-                        pending.extend(mutations);
-                        result.subtrees_removed += 1;
-                    }
-                    Err(e) => {
-                        result.errors.push(format!(
-                            "collect remove {del_field_name} from node {node_id}: {e}",
-                        ));
+                // Subtree: delete `target_field` if specified and resolved,
+                // otherwise fall back to the anchor field (same as Field scope).
+                //
+                // When `target_field` is Some but `target_field_id` is None the
+                // interner did not hold this name — only possible via the no-interner
+                // convenience wrapper `reap_computed_ttl`. In that case we skip the
+                // mutation rather than let the timestamp heuristic in
+                // `collect_property_removal_mutations` remove the wrong field.
+                // The production path (`reap_computed_ttl_via_pipeline`) always
+                // provides a populated interner and resolves `target_field_id`.
+                let to_delete: Option<(Option<u32>, &str)> =
+                    match (&target.target_field, target.target_field_id) {
+                        (Some(tf), Some(_)) => Some((target.target_field_id, tf.as_str())),
+                        (Some(_), None) => None, // unresolved — skip to avoid heuristic
+                        (None, _) => Some((target.anchor_field_id, target.anchor_field.as_str())),
+                    };
+
+                if let Some((del_field_id, del_field_name)) = to_delete {
+                    match collect_property_removal_mutations(
+                        engine,
+                        &key,
+                        del_field_id,
+                        del_field_name,
+                    ) {
+                        Ok(mutations) => {
+                            pending.extend(mutations);
+                            result.subtrees_removed += 1;
+                        }
+                        Err(e) => {
+                            result.errors.push(format!(
+                                "collect remove {del_field_name} from node {node_id}: {e}",
+                            ));
+                        }
                     }
                 }
             }
