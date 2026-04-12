@@ -21,7 +21,7 @@ trim = true
 conventional_commits = true
 filter_unconventional = true
 # Tags that mark a release — used to group commits by version.
-tag_pattern = "coordinode-server-v[0-9].*"
+tag_pattern = "v[0-9].*"
 commit_parsers = [
     { message = "^chore",           skip = true },
     { message = "^ci",              skip = true },
