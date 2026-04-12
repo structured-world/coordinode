@@ -417,7 +417,18 @@ fn reap_label(
                 // (Some(_), None) arm is unreachable here.
                 let to_delete: Option<(Option<u32>, &str)> =
                     match (&target.target_field, target.target_field_id) {
-                        (Some(tf), Some(_)) => Some((target.target_field_id, tf.as_str())),
+                        (Some(tf), Some(field_id)) => {
+                            // Skip if the target field is already absent — anchor_field
+                            // is preserved by design, so the node stays visible to the
+                            // reaper on every pass.  Without this check, subtrees_removed
+                            // would be incremented and a (no-op) merge mutation submitted
+                            // on every reap cycle after the first deletion.
+                            if record.props.contains_key(&field_id) {
+                                Some((target.target_field_id, tf.as_str()))
+                            } else {
+                                None
+                            }
+                        }
                         (Some(_), None) => unreachable!(
                             "unresolved target_field should have been caught by early return"
                         ),
@@ -1242,6 +1253,71 @@ mod tests {
             updated.props.contains_key(&payload_field),
             "payload must NOT be removed when target_field_id is unresolved"
         );
+    }
+
+    /// When `target_field` is specified and the first reap deletes it, the node
+    /// stays alive (anchor_field preserved by design).  On the second pass,
+    /// `resolve_anchor()` still finds the expired anchor — but the target field
+    /// is already absent, so NO mutation should be submitted and `subtrees_removed`
+    /// must NOT be incremented again.
+    ///
+    /// Without the `record.props.contains_key` guard this would emit a no-op
+    /// merge mutation and increment the counter on every subsequent pass.
+    #[test]
+    fn reap_subtree_second_pass_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = test_engine(dir.path());
+        let mut interner = FieldInterner::new();
+
+        let mut schema = LabelSchema::new("Profile");
+        schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
+        schema.add_property(PropertyDef::new("bio", PropertyType::String));
+        schema.add_property(PropertyDef::computed(
+            "_ttl",
+            ComputedSpec::Ttl {
+                duration_secs: 60,
+                anchor_field: "created_at".into(),
+                scope: TtlScope::Subtree,
+                target_field: Some("bio".into()),
+            },
+        ));
+        persist_schema(&engine, &schema);
+
+        let old_ts = now_us() - 120 * 1_000_000;
+        let ts_field = interner.intern("created_at");
+        let bio_field = interner.intern("bio");
+        let mut record = NodeRecord::new("Profile");
+        record.set(ts_field, Value::Timestamp(old_ts));
+        record.set(bio_field, Value::String("hello".into()));
+        let key = encode_node_key(1, NodeId::from_raw(77));
+        engine
+            .put(Partition::Node, &key, &record.to_msgpack().expect("ser"))
+            .expect("put");
+
+        // First reap: bio must be removed, node survives, subtrees_removed = 1.
+        let r1 = reap_computed_ttl_with_interner(&engine, 1, 1000, &interner);
+        assert_eq!(r1.subtrees_removed, 1, "first pass must remove bio");
+        assert!(node_exists(&engine, 1, 77), "node must survive subtree TTL");
+
+        // Verify bio is gone.
+        let raw = engine
+            .get(Partition::Node, &key)
+            .expect("get")
+            .expect("node exists");
+        let after_r1 = NodeRecord::from_msgpack(&raw).expect("decode");
+        assert!(
+            !after_r1.props.contains_key(&bio_field),
+            "bio removed after first pass"
+        );
+        assert!(after_r1.props.contains_key(&ts_field), "anchor preserved");
+
+        // Second reap: bio already absent — subtrees_removed must be 0 (idempotent).
+        let r2 = reap_computed_ttl_with_interner(&engine, 1, 1000, &interner);
+        assert_eq!(
+            r2.subtrees_removed, 0,
+            "second pass must not count already-absent target as removed"
+        );
+        assert!(r2.errors.is_empty(), "no errors on idempotent second pass");
     }
 
     #[test]
