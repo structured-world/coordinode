@@ -4,11 +4,11 @@
 semver_check = false
 git_only = true
 publish = false
-# Defaults: no git tag / release / changelog for library crates.
-# coordinode-server overrides these below.
+# Defaults: all crates get CHANGELOG.md (visible per-crate in release PR).
+# Only coordinode-server gets a git tag and GitHub Release.
 git_tag_enable = false
 git_release_enable = false
-changelog_update = false
+changelog_update = true
 git_tag_name = "v{{ version }}"
 
 [changelog]
@@ -29,10 +29,7 @@ commit_parsers = [
     { message = "^test", group = "Testing" },
 ]
 
-# The shipped binary — only this crate gets a git tag, GitHub Release,
-# and CHANGELOG entry. All library crates are tracked for changes (so
-# dependency-chain bumps cascade correctly) but don't produce their own
-# releases.
+# The shipped binary — only this crate gets a git tag and GitHub Release.
 [[package]]
 name = "coordinode-server"
 git_tag_enable = true
