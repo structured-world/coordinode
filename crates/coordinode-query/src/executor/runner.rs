@@ -231,6 +231,10 @@ pub struct ExecutionContext<'a> {
     /// When set, VectorFilter checks for applicable HNSW indexes
     /// before falling back to brute-force distance computation.
     pub vector_index_registry: Option<&'a crate::index::VectorIndexRegistry>,
+    /// B-tree index registry for unique constraint enforcement.
+    /// When set, `execute_create_node` calls `on_node_created` to check
+    /// unique constraints and maintain B-tree index entries.
+    pub btree_index_registry: Option<&'a crate::index::IndexRegistry>,
     /// Optional VectorLoader for disk-backed f32 reranking (G009).
     /// When HNSW indexes have `offload_vectors` enabled, this loader provides
     /// f32 vectors from storage for exact reranking of SQ8 candidates.
@@ -4617,6 +4621,26 @@ fn execute_create_from_pattern(
             let bytes = record
                 .to_msgpack()
                 .map_err(|e| ExecutionError::Serialization(format!("node serialize: {e}")))?;
+
+            // Enforce unique constraints via B-tree index registry.
+            if let Some(btree_reg) = ctx.btree_index_registry {
+                if !label.is_empty() {
+                    let props_for_index: Vec<(String, Value)> = property_filters
+                        .iter()
+                        .map(|(name, expr)| (name.clone(), eval_expr(expr, &empty_row)))
+                        .collect();
+                    btree_reg
+                        .on_node_created(ctx.engine, node_id, &label, &props_for_index)
+                        .map_err(|v| {
+                            ExecutionError::Conflict(format!(
+                                "unique constraint violated on index `{}`: \
+                                 property `{}` already has value {:?}",
+                                v.index_name, v.property, v.value
+                            ))
+                        })?;
+                }
+            }
+
             ctx.mvcc_put(Partition::Node, &key, &bytes)?;
 
             let mut row = Row::new();
@@ -4722,6 +4746,26 @@ fn execute_create_node(
         let bytes = record
             .to_msgpack()
             .map_err(|e| ExecutionError::Serialization(format!("node serialization: {e}")))?;
+
+        // Enforce unique constraints via B-tree index registry BEFORE writing
+        // the node to storage. If a constraint would be violated, fail early.
+        if let Some(btree_reg) = ctx.btree_index_registry {
+            if let Some(primary_label) = labels.first() {
+                let props_for_index: Vec<(String, Value)> = properties
+                    .iter()
+                    .map(|(name, expr)| (name.clone(), eval_expr(expr, input_row)))
+                    .collect();
+                btree_reg
+                    .on_node_created(ctx.engine, node_id, primary_label, &props_for_index)
+                    .map_err(|v| {
+                        ExecutionError::Conflict(format!(
+                            "unique constraint violated on index `{}`: \
+                             property `{}` already has value {:?}",
+                            v.index_name, v.property, v.value
+                        ))
+                    })?;
+            }
+        }
 
         ctx.mvcc_put(Partition::Node, &key, &bytes)?;
         ctx.write_stats.nodes_created += 1;
@@ -5964,6 +6008,7 @@ mod tests {
             text_index: None,
             text_index_registry: None,
             vector_index_registry: None,
+            btree_index_registry: None,
             vector_loader: None,
             mvcc_oracle: None,
             mvcc_read_ts: coordinode_core::txn::timestamp::Timestamp::ZERO,

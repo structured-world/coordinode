@@ -41,6 +41,7 @@ fn make_test_ctx<'a>(
         text_index: None,
         text_index_registry: None,
         vector_index_registry: None,
+        btree_index_registry: None,
         vector_loader: None,
         mvcc_oracle: None,
         mvcc_read_ts: coordinode_core::txn::timestamp::Timestamp::ZERO,

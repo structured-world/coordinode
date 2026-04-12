@@ -2,12 +2,55 @@ use std::sync::{Arc, Mutex};
 
 use tonic::{Request, Response, Status};
 
-use coordinode_core::graph::types::Value;
+use coordinode_core::graph::types::{Value, VectorMetric};
+use coordinode_core::schema::definition::{EdgeTypeSchema, LabelSchema, PropertyDef, PropertyType};
 use coordinode_embed::Database;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::Guard;
 
 use crate::proto::graph;
+
+/// Map proto `PropertyType` integer value to internal `PropertyType`.
+///
+/// Proto integers:
+///   0 = UNSPECIFIED, 1 = INT64, 2 = FLOAT64, 3 = STRING, 4 = BOOL,
+///   5 = BYTES, 6 = TIMESTAMP, 7 = VECTOR, 8 = LIST, 9 = MAP
+fn proto_type_to_property_type(t: i32) -> PropertyType {
+    match t {
+        1 => PropertyType::Int,
+        2 => PropertyType::Float,
+        3 => PropertyType::String,
+        4 => PropertyType::Bool,
+        5 => PropertyType::Binary,
+        6 => PropertyType::Timestamp,
+        // VECTOR without explicit dimensions — schema stores structural intent;
+        // HNSW index creation (R-API3) will fill dimensions from CREATE VECTOR INDEX.
+        7 => PropertyType::Vector {
+            dimensions: 0,
+            metric: VectorMetric::Cosine,
+        },
+        8 => PropertyType::Array(Box::new(PropertyType::String)),
+        9 => PropertyType::Map,
+        _ => PropertyType::String, // UNSPECIFIED → String (most permissive)
+    }
+}
+
+/// Map internal `PropertyType` to proto integer for list_labels responses.
+fn property_type_to_proto(pt: &PropertyType) -> i32 {
+    match pt {
+        PropertyType::Int => 1,
+        PropertyType::Float => 2,
+        PropertyType::String => 3,
+        PropertyType::Bool => 4,
+        PropertyType::Binary | PropertyType::Blob => 5,
+        PropertyType::Timestamp => 6,
+        PropertyType::Vector { .. } => 7,
+        PropertyType::Array(_) => 8,
+        PropertyType::Map => 9,
+        // Document, Geo, Computed have no direct proto representation → MAP as closest.
+        _ => 9,
+    }
+}
 
 pub struct SchemaServiceImpl {
     database: Arc<Mutex<Database>>,
@@ -26,13 +69,30 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
         request: Request<graph::CreateLabelRequest>,
     ) -> Result<Response<graph::Label>, Status> {
         let req = request.into_inner();
-        // Label schemas are optional (VALIDATED mode). A label without a schema
-        // works in free-form mode. Return the request as-is — label creation is
-        // implicit on first node write and does not require explicit declaration.
+        // Build internal LabelSchema from the proto request.
+        let mut schema = LabelSchema::new(&req.name);
+        for prop_def in &req.properties {
+            let property_type = proto_type_to_property_type(prop_def.r#type);
+            let mut prop = PropertyDef::new(&prop_def.name, property_type);
+            if prop_def.required {
+                prop = prop.not_null();
+            }
+            if prop_def.unique {
+                prop = prop.unique();
+            }
+            schema.add_property(prop);
+        }
+
+        let version = {
+            let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
+            db.create_label_schema(schema)
+                .map_err(|e| Status::internal(format!("create_label error: {e}")))?
+        };
+
         Ok(Response::new(graph::Label {
             name: req.name,
             properties: req.properties,
-            version: 1,
+            version,
         }))
     }
 
@@ -41,10 +101,31 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
         request: Request<graph::CreateEdgeTypeRequest>,
     ) -> Result<Response<graph::EdgeType>, Status> {
         let req = request.into_inner();
+
+        // Build internal EdgeTypeSchema from the proto request.
+        let mut schema = EdgeTypeSchema::new(&req.name);
+        for prop_def in &req.properties {
+            let property_type = proto_type_to_property_type(prop_def.r#type);
+            let mut prop = PropertyDef::new(&prop_def.name, property_type);
+            if prop_def.required {
+                prop = prop.not_null();
+            }
+            if prop_def.unique {
+                prop = prop.unique();
+            }
+            schema.add_property(prop);
+        }
+
+        let version = {
+            let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
+            db.create_edge_type_schema(schema)
+                .map_err(|e| Status::internal(format!("create_edge_type error: {e}")))?
+        };
+
         Ok(Response::new(graph::EdgeType {
             name: req.name,
             properties: req.properties,
-            version: 1,
+            version,
         }))
     }
 
@@ -52,31 +133,86 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
         &self,
         _request: Request<graph::ListLabelsRequest>,
     ) -> Result<Response<graph::ListLabelsResponse>, Status> {
-        // Discover labels by scanning all nodes and collecting distinct primary
-        // labels (stored as n.__label__ by NodeScan). DISTINCT deduplicated by
-        // the executor; ORDER BY gives stable output.
-        // Note: `label` is a Cypher reserved keyword — use `lbl` as alias.
-        let rows = {
-            let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
-            db.execute_cypher("MATCH (n) RETURN DISTINCT n.__label__ AS lbl ORDER BY lbl")
-                .map_err(|e| Status::internal(format!("list_labels error: {e}")))?
+        // Two-pass: first load declared schemas (with property metadata),
+        // then add any undeclared labels discovered from existing nodes.
+        const SCHEMA_PREFIX: &[u8] = b"schema:label:";
+
+        let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Pass 1: scan `schema:label:*` for persisted LabelSchema entries.
+        let mut label_map: std::collections::BTreeMap<String, graph::Label> = {
+            let iter = db
+                .engine()
+                .prefix_scan(Partition::Schema, SCHEMA_PREFIX)
+                .map_err(|e| Status::internal(format!("list_labels scan error: {e}")))?;
+
+            let mut map = std::collections::BTreeMap::new();
+            for guard in iter {
+                let Ok((key, val_bytes)) = guard.into_inner() else {
+                    continue;
+                };
+                let Ok(name) = std::str::from_utf8(&key[SCHEMA_PREFIX.len()..]) else {
+                    continue;
+                };
+                if name.is_empty() {
+                    continue;
+                }
+                // Decode the persisted LabelSchema and convert properties.
+                if let Ok(schema) =
+                    coordinode_core::schema::definition::LabelSchema::from_msgpack(&val_bytes)
+                {
+                    let properties = schema
+                        .properties
+                        .values()
+                        .map(|p| graph::PropertyDefinition {
+                            name: p.name.clone(),
+                            r#type: property_type_to_proto(&p.property_type),
+                            required: p.not_null,
+                            unique: p.unique,
+                        })
+                        .collect();
+                    map.insert(
+                        schema.name.clone(),
+                        graph::Label {
+                            name: schema.name,
+                            properties,
+                            version: schema.version,
+                        },
+                    );
+                } else {
+                    // Unreadable schema entry — still expose the name.
+                    map.entry(name.to_string()).or_insert_with(|| graph::Label {
+                        name: name.to_string(),
+                        properties: vec![],
+                        version: 0,
+                    });
+                }
+            }
+            map
         };
 
-        let labels: Vec<graph::Label> = rows
-            .into_iter()
-            .filter_map(|row| {
-                if let Some(Value::String(name)) = row.get("lbl") {
-                    if !name.is_empty() {
-                        return Some(graph::Label {
+        // Pass 2: discover undeclared labels from existing nodes via Cypher.
+        // Note: `label` is a Cypher reserved keyword — use `lbl` as alias.
+        let rows = db
+            .execute_cypher("MATCH (n) RETURN DISTINCT n.__label__ AS lbl ORDER BY lbl")
+            .map_err(|e| Status::internal(format!("list_labels cypher error: {e}")))?;
+
+        for row in rows {
+            if let Some(Value::String(name)) = row.get("lbl") {
+                if !name.is_empty() {
+                    label_map
+                        .entry(name.clone())
+                        .or_insert_with(|| graph::Label {
                             name: name.clone(),
                             properties: vec![],
                             version: 0,
                         });
-                    }
                 }
-                None
-            })
-            .collect();
+            }
+        }
+
+        let mut labels: Vec<graph::Label> = label_map.into_values().collect();
+        labels.sort_by(|a, b| a.name.cmp(&b.name));
 
         Ok(Response::new(graph::ListLabelsResponse { labels }))
     }
@@ -228,6 +364,182 @@ mod tests {
         assert!(
             edge_types.contains(&"LIKES".to_string()),
             "should contain LIKES, got: {edge_types:?}"
+        );
+    }
+
+    // ── R-API1: create_label / create_edge_type now persists schema ──
+
+    /// create_label persists schema and returns version > 0.
+    #[tokio::test]
+    async fn create_label_persists_schema() {
+        let (svc, _dir) = test_service();
+
+        let resp = svc
+            .create_label(Request::new(graph::CreateLabelRequest {
+                name: "Article".to_string(),
+                properties: vec![
+                    graph::PropertyDefinition {
+                        name: "title".to_string(),
+                        r#type: 3, // STRING
+                        required: true,
+                        unique: false,
+                    },
+                    graph::PropertyDefinition {
+                        name: "slug".to_string(),
+                        r#type: 3, // STRING
+                        required: false,
+                        unique: true,
+                    },
+                ],
+            }))
+            .await
+            .expect("create_label should succeed");
+
+        let label = resp.into_inner();
+        assert_eq!(label.name, "Article");
+        assert!(label.version > 0, "version must be positive after persist");
+        assert_eq!(label.properties.len(), 2);
+
+        // Verify schema is in storage.
+        use coordinode_storage::engine::partition::Partition;
+        let db = svc.database.lock().unwrap();
+        let key = coordinode_core::schema::definition::encode_label_schema_key("Article");
+        let bytes = db
+            .engine()
+            .get(Partition::Schema, &key)
+            .expect("storage get")
+            .expect("schema must be persisted");
+        let schema = coordinode_core::schema::definition::LabelSchema::from_msgpack(&bytes)
+            .expect("deserialize");
+        assert_eq!(schema.name, "Article");
+        assert_eq!(schema.properties.len(), 2);
+        // `slug` must be unique.
+        assert!(schema.get_property("slug").is_some_and(|p| p.unique));
+    }
+
+    /// create_label with unique property → duplicate CREATE fails.
+    #[tokio::test]
+    async fn create_label_unique_property_enforces_constraint() {
+        let (svc, _dir) = test_service();
+
+        // Declare label with unique email.
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Customer".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "email".to_string(),
+                r#type: 3, // STRING
+                required: false,
+                unique: true,
+            }],
+        }))
+        .await
+        .expect("create_label");
+
+        // First node — should succeed.
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (c:Customer {email: 'x@test.com'})")
+                .expect("first create");
+        }
+
+        // Second node with same email — must fail.
+        {
+            let mut db = svc.database.lock().unwrap();
+            let result = db.execute_cypher("CREATE (c:Customer {email: 'x@test.com'})");
+            assert!(
+                result.is_err(),
+                "duplicate email must be rejected by unique constraint"
+            );
+        }
+    }
+
+    /// create_edge_type persists schema and returns version > 0.
+    #[tokio::test]
+    async fn create_edge_type_persists_schema() {
+        let (svc, _dir) = test_service();
+
+        let resp = svc
+            .create_edge_type(Request::new(graph::CreateEdgeTypeRequest {
+                name: "FOLLOWS".to_string(),
+                properties: vec![graph::PropertyDefinition {
+                    name: "since".to_string(),
+                    r#type: 6, // TIMESTAMP
+                    required: true,
+                    unique: false,
+                }],
+            }))
+            .await
+            .expect("create_edge_type should succeed");
+
+        let et = resp.into_inner();
+        assert_eq!(et.name, "FOLLOWS");
+        assert!(et.version > 0);
+
+        // Verify in storage.
+        use coordinode_storage::engine::partition::Partition;
+        let db = svc.database.lock().unwrap();
+        let key = coordinode_core::schema::definition::encode_edge_type_schema_key("FOLLOWS");
+        let bytes = db
+            .engine()
+            .get(Partition::Schema, &key)
+            .expect("storage get")
+            .expect("edge schema must be persisted");
+        let schema = coordinode_core::schema::definition::EdgeTypeSchema::from_msgpack(&bytes)
+            .expect("deserialize");
+        assert_eq!(schema.name, "FOLLOWS");
+        assert_eq!(schema.properties.len(), 1);
+        assert!(schema.get_property("since").is_some_and(|p| p.not_null));
+    }
+
+    /// list_labels returns schema properties for declared labels.
+    #[tokio::test]
+    async fn list_labels_returns_schema_properties() {
+        let (svc, _dir) = test_service();
+
+        // Declare label with known properties.
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Post".to_string(),
+            properties: vec![
+                graph::PropertyDefinition {
+                    name: "title".to_string(),
+                    r#type: 3, // STRING
+                    required: true,
+                    unique: false,
+                },
+                graph::PropertyDefinition {
+                    name: "views".to_string(),
+                    r#type: 1, // INT64
+                    required: false,
+                    unique: false,
+                },
+            ],
+        }))
+        .await
+        .expect("create_label");
+
+        let labels = svc
+            .list_labels(Request::new(graph::ListLabelsRequest {}))
+            .await
+            .expect("list_labels")
+            .into_inner()
+            .labels;
+
+        let post_label = labels
+            .iter()
+            .find(|l| l.name == "Post")
+            .expect("Post label must be in list");
+
+        assert_eq!(
+            post_label.properties.len(),
+            2,
+            "Post label must expose 2 declared properties"
+        );
+        assert!(
+            post_label
+                .properties
+                .iter()
+                .any(|p| p.name == "title" && p.required),
+            "title must be required"
         );
     }
 }
