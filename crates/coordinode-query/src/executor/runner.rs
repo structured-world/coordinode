@@ -1150,6 +1150,14 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             property_filters,
         } => execute_node_scan(variable, labels, property_filters, ctx),
 
+        LogicalOp::IndexScan {
+            variable,
+            label,
+            index_name,
+            property,
+            value_expr,
+        } => execute_btree_index_scan(variable, label, index_name, property, value_expr, ctx),
+
         LogicalOp::Traverse {
             input,
             source,
@@ -1589,6 +1597,25 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
 
         LogicalOp::DropEncryptedIndex { name } => execute_drop_encrypted_index(name, ctx),
 
+        LogicalOp::CreateIndex {
+            name,
+            label,
+            property,
+            unique,
+            sparse,
+            filter,
+        } => execute_create_btree_index(
+            name,
+            label,
+            property,
+            *unique,
+            *sparse,
+            filter.as_ref(),
+            ctx,
+        ),
+
+        LogicalOp::DropIndex { name } => execute_drop_btree_index(name, ctx),
+
         LogicalOp::Empty => Ok(vec![Row::new()]),
 
         LogicalOp::CreateNode {
@@ -1734,6 +1761,82 @@ fn execute_node_scan(
         if matches {
             results.push(row);
         }
+    }
+
+    Ok(results)
+}
+
+/// Execute a B-tree index point-lookup (`IndexScan` logical operator).
+///
+/// Evaluates `value_expr` against an empty row to obtain the lookup value,
+/// calls `index_scan_exact` to retrieve matching node IDs from the index,
+/// then fetches each node record and builds result rows in the same format
+/// as `execute_node_scan` (variable → node_id, variable.prop → value).
+fn execute_btree_index_scan(
+    variable: &str,
+    label: &str,
+    index_name: &str,
+    _property: &str,
+    value_expr: &Expr,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    // Evaluate the lookup value from the expression.
+    let lookup_val = eval_expr(value_expr, &Row::new());
+
+    // Use index_scan_exact to find node IDs matching the lookup value.
+    let node_ids = crate::index::ops::index_scan_exact(ctx.engine, index_name, &lookup_val)
+        .map_err(ExecutionError::Storage)?;
+
+    let mut results = Vec::with_capacity(node_ids.len());
+
+    for raw_id in node_ids {
+        let node_id = NodeId::from_raw(raw_id);
+        let key = encode_node_key(ctx.shard_id, node_id);
+
+        // Fetch the node record.
+        let bytes_opt = ctx
+            .engine
+            .get(Partition::Node, &key)
+            .map_err(ExecutionError::Storage)?;
+
+        let Some(bytes) = bytes_opt else {
+            // Node was deleted since the index entry was created — skip stale entry.
+            continue;
+        };
+
+        let record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
+            ExecutionError::Serialization(format!("node {raw_id} deserialization: {e}"))
+        })?;
+
+        // Verify label matches (guards against stale index entries for deleted/relabeled nodes).
+        if !record.has_label(label) {
+            continue;
+        }
+
+        let mut row = Row::new();
+        row.insert(variable.to_string(), Value::Int(raw_id as i64));
+
+        // Add properties under `variable.prop` columns.
+        for (field_id, value) in &record.props {
+            if let Some(field_name) = ctx.interner.resolve(*field_id) {
+                row.insert(format!("{variable}.{field_name}"), value.clone());
+            }
+        }
+        if let Some(extra) = &record.extra {
+            for (name, value) in extra {
+                row.insert(format!("{variable}.{name}"), value.clone());
+            }
+        }
+
+        let primary_label = record.primary_label().to_string();
+        row.insert(
+            format!("{variable}.__label__"),
+            Value::String(primary_label.clone()),
+        );
+
+        inject_computed_properties(&mut row, variable, &primary_label, ctx);
+
+        results.push(row);
     }
 
     Ok(results)
@@ -5837,6 +5940,157 @@ fn execute_drop_encrypted_index(
     Ok(vec![row])
 }
 
+/// Execute `CREATE [UNIQUE] [SPARSE] INDEX idx ON :Label(prop) [WHERE pred]`.
+///
+/// 1. Validates the registry is available.
+/// 2. Checks for duplicate index name.
+/// 3. Builds an `IndexDefinition` with optional `.unique()` / `.sparse()` / `.with_filter()`.
+/// 4. Persists the definition to the `Schema` partition via the registry.
+/// 5. Backfills existing nodes of the target label into the new index.
+fn execute_create_btree_index(
+    name: &str,
+    label: &str,
+    property: &str,
+    unique: bool,
+    sparse: bool,
+    filter: Option<&crate::index::definition::PartialFilter>,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    let Some(registry) = ctx.btree_index_registry else {
+        return Err(ExecutionError::Unsupported(
+            "CREATE INDEX requires btree_index_registry in ExecutionContext".into(),
+        ));
+    };
+
+    // Reject duplicate index names.
+    if registry.get(name).is_some() {
+        return Err(ExecutionError::Unsupported(format!(
+            "index '{name}' already exists"
+        )));
+    }
+
+    // Build the index definition.
+    let mut def = crate::index::IndexDefinition::btree(name, label, property);
+    if unique {
+        def = def.unique();
+    }
+    if sparse {
+        def = def.sparse();
+    }
+    if let Some(f) = filter {
+        def = def.with_filter(f.clone());
+    }
+
+    // Persist to storage and update in-memory registry.
+    registry
+        .register(ctx.engine, def)
+        .map_err(|e| ExecutionError::Unsupported(format!("register index '{name}': {e}")))?;
+
+    // Backfill existing nodes that match the label.
+    let node_prefix = {
+        let mut p = Vec::with_capacity(8);
+        p.extend_from_slice(b"node:");
+        p.extend_from_slice(&ctx.shard_id.to_be_bytes());
+        p.push(b':');
+        p
+    };
+
+    let field_id = ctx.interner.lookup(property);
+    let mut backfilled = 0u64;
+
+    if let Ok(iter) = ctx.engine.prefix_scan(Partition::Node, &node_prefix) {
+        for guard in iter {
+            let Ok((_key, value)) = guard.into_inner() else {
+                continue;
+            };
+            let Ok(record) = NodeRecord::from_msgpack(&value) else {
+                continue;
+            };
+            if record.primary_label() != label {
+                continue;
+            }
+            let Some((_, node_id)) = coordinode_core::graph::node::decode_node_key(&_key) else {
+                continue;
+            };
+
+            let prop_val = if let Some(fid) = field_id {
+                record.props.get(&fid).cloned().unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
+
+            // Sparse indexes skip null values.
+            if sparse && prop_val.is_null() {
+                continue;
+            }
+
+            // Apply partial filter if any.
+            if let Some(f) = filter {
+                let props = [(property.to_string(), prop_val.clone())];
+                if !f.matches(&props) {
+                    continue;
+                }
+            }
+
+            let props = [(property.to_string(), prop_val)];
+            if let Err(e) = registry.on_node_created(ctx.engine, node_id, label, &props) {
+                tracing::warn!(
+                    "CREATE INDEX backfill: unique violation on node {node_id:?} ({label}.{property}): {e}"
+                );
+            } else {
+                backfilled += 1;
+            }
+        }
+    }
+
+    let mut row = Row::new();
+    row.insert("index".to_string(), Value::String(name.to_string()));
+    row.insert("label".to_string(), Value::String(label.to_string()));
+    row.insert("property".to_string(), Value::String(property.to_string()));
+    row.insert("unique".to_string(), Value::Bool(unique));
+    row.insert("sparse".to_string(), Value::Bool(sparse));
+    row.insert("nodes_indexed".to_string(), Value::Int(backfilled as i64));
+    Ok(vec![row])
+}
+
+/// Execute `DROP INDEX idx`: removes a B-tree index by name.
+///
+/// 1. Looks up the definition in the registry.
+/// 2. Drops all index entries from storage (`ops::drop_index`).
+/// 3. Unregisters from the in-memory registry.
+fn execute_drop_btree_index(
+    name: &str,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    let Some(registry) = ctx.btree_index_registry else {
+        return Err(ExecutionError::Unsupported(
+            "DROP INDEX requires btree_index_registry in ExecutionContext".into(),
+        ));
+    };
+
+    // Verify the index exists before attempting to drop it.
+    let def = registry
+        .get(name)
+        .ok_or_else(|| ExecutionError::Unsupported(format!("index '{name}' not found")))?;
+
+    let label = def.label.clone();
+    let property = def.property().to_string();
+
+    // Drop definition + all index entries from storage.
+    crate::index::ops::drop_index(ctx.engine, &def)
+        .map_err(|e| ExecutionError::Unsupported(format!("drop index '{name}': {e}")))?;
+
+    // Remove from in-memory registry.
+    registry.unregister(name);
+
+    let mut row = Row::new();
+    row.insert("index".to_string(), Value::String(name.to_string()));
+    row.insert("label".to_string(), Value::String(label));
+    row.insert("property".to_string(), Value::String(property));
+    row.insert("dropped".to_string(), Value::Bool(true));
+    Ok(vec![row])
+}
+
 /// Execute a procedure call: evaluate args, dispatch to the procedure registry,
 /// convert output rows to Row format.
 fn execute_procedure_call(
@@ -9069,6 +9323,350 @@ mod tests {
         assert!(
             err_msg.contains("OCC conflict"),
             "expected OCC conflict error, got: {err_msg}",
+        );
+    }
+
+    // --- CREATE INDEX / DROP INDEX DDL integration tests (R-API2) ---
+
+    /// Helper: build an ExecutionContext with the btree_index_registry wired in.
+    fn make_ctx_with_btree<'a>(
+        engine: &'a StorageEngine,
+        interner: &'a mut FieldInterner,
+        allocator: &'a NodeIdAllocator,
+        registry: &'a crate::index::IndexRegistry,
+    ) -> ExecutionContext<'a> {
+        ExecutionContext {
+            btree_index_registry: Some(registry),
+            ..make_ctx(engine, interner, allocator)
+        }
+    }
+
+    #[test]
+    fn create_index_registers_and_backfills() {
+        // Verify that CREATE INDEX registers the index in the registry and backfills
+        // existing nodes.
+        let (_dir, engine, mut interner) = setup_test_graph();
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+        let registry = crate::index::IndexRegistry::new();
+
+        // Pre-condition: no index for User.name yet.
+        assert!(registry.get("user_name_idx").is_none());
+
+        let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
+
+        let result = execute_op(
+            &LogicalOp::CreateIndex {
+                name: "user_name_idx".to_string(),
+                label: "User".to_string(),
+                property: "name".to_string(),
+                unique: false,
+                sparse: false,
+                filter: None,
+            },
+            &mut ctx,
+        )
+        .expect("CREATE INDEX failed");
+
+        // Should return one row with index metadata.
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].get("index"),
+            Some(&Value::String("user_name_idx".to_string()))
+        );
+
+        // Registry should now contain the new index.
+        assert!(
+            registry.get("user_name_idx").is_some(),
+            "index should be registered after CREATE INDEX"
+        );
+
+        // Backfill count: setup_test_graph inserts 3 User nodes and 1 Post.
+        // All 3 Users have a 'name' property so nodes_indexed should be >= 1.
+        let nodes_indexed = match result[0].get("nodes_indexed") {
+            Some(Value::Int(n)) => *n,
+            other => panic!("expected nodes_indexed as Int, got {other:?}"),
+        };
+        assert!(
+            nodes_indexed >= 1,
+            "expected at least 1 node backfilled, got {nodes_indexed}"
+        );
+    }
+
+    #[test]
+    fn create_unique_index_enforces_constraint_on_insert() {
+        // After CREATE UNIQUE INDEX, inserting a node with a duplicate property value
+        // must return UniqueViolation.
+        let (_dir, engine, mut interner) = setup_test_graph();
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+        let registry = crate::index::IndexRegistry::new();
+
+        // Register a unique index on User.name (skip backfill — insert two fresh nodes).
+        let unique_def = crate::index::IndexDefinition::btree("u_name", "User", "name").unique();
+        registry
+            .register(&engine, unique_def)
+            .expect("register unique index");
+
+        let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
+
+        // First insert: should succeed.
+        let r1 = execute_op(
+            &LogicalOp::CreateNode {
+                input: None,
+                variable: None,
+                labels: vec!["User".to_string()],
+                properties: vec![(
+                    "name".to_string(),
+                    crate::cypher::ast::Expr::Literal(Value::String("UniqueUser".into())),
+                )],
+            },
+            &mut ctx,
+        );
+        assert!(r1.is_ok(), "first insert should succeed");
+
+        // Second insert with same 'name' value: must fail with unique violation.
+        let r2 = execute_op(
+            &LogicalOp::CreateNode {
+                input: None,
+                variable: None,
+                labels: vec!["User".to_string()],
+                properties: vec![(
+                    "name".to_string(),
+                    crate::cypher::ast::Expr::Literal(Value::String("UniqueUser".into())),
+                )],
+            },
+            &mut ctx,
+        );
+        assert!(
+            r2.is_err(),
+            "second insert with duplicate name should fail with unique constraint violation"
+        );
+        let err_msg = format!("{}", r2.unwrap_err());
+        assert!(
+            err_msg.to_lowercase().contains("unique")
+                || err_msg.to_lowercase().contains("constraint"),
+            "error should mention unique constraint, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn drop_index_removes_from_registry() {
+        // CREATE then DROP should leave the registry empty for that index name.
+        let (_dir, engine, mut interner) = setup_test_graph();
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+        let registry = crate::index::IndexRegistry::new();
+
+        // Pre-register an index.
+        let def = crate::index::IndexDefinition::btree("to_drop", "User", "age");
+        registry.register(&engine, def).expect("register");
+        assert!(registry.get("to_drop").is_some());
+
+        let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
+
+        let result = execute_op(
+            &LogicalOp::DropIndex {
+                name: "to_drop".to_string(),
+            },
+            &mut ctx,
+        )
+        .expect("DROP INDEX failed");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].get("dropped"), Some(&Value::Bool(true)));
+
+        // Index should be gone from registry.
+        assert!(
+            registry.get("to_drop").is_none(),
+            "index should be absent after DROP INDEX"
+        );
+    }
+
+    #[test]
+    fn drop_index_not_found_returns_error() {
+        let (_dir, engine, mut interner) = setup_test_graph();
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+        let registry = crate::index::IndexRegistry::new();
+        let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
+
+        let result = execute_op(
+            &LogicalOp::DropIndex {
+                name: "nonexistent".to_string(),
+            },
+            &mut ctx,
+        );
+        assert!(
+            result.is_err(),
+            "DROP INDEX on nonexistent index should fail"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("nonexistent") || err_msg.contains("not found"),
+            "error should mention missing index, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn create_index_duplicate_name_returns_error() {
+        let (_dir, engine, mut interner) = setup_test_graph();
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+        let registry = crate::index::IndexRegistry::new();
+
+        // Register once.
+        let def = crate::index::IndexDefinition::btree("dup_idx", "User", "age");
+        registry.register(&engine, def).expect("register");
+
+        let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
+
+        // Attempt to CREATE INDEX with the same name again.
+        let result = execute_op(
+            &LogicalOp::CreateIndex {
+                name: "dup_idx".to_string(),
+                label: "User".to_string(),
+                property: "age".to_string(),
+                unique: false,
+                sparse: false,
+                filter: None,
+            },
+            &mut ctx,
+        );
+        assert!(result.is_err(), "duplicate CREATE INDEX should fail");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("dup_idx") || err_msg.contains("already exists"),
+            "error should mention duplicate index, got: {err_msg}"
+        );
+    }
+
+    /// Regression test (R-API2): after CREATE INDEX, EXPLAIN must show IndexScan
+    /// instead of NodeScan for a matching WHERE clause.
+    ///
+    /// Without `optimize_index_selection`, MATCH (n:User) WHERE n.name = "Alice"
+    /// produces `Filter(NodeScan)`. After registering the index and running the
+    /// optimizer, the plan must be rewritten to `IndexScan`.
+    #[test]
+    fn explain_shows_index_scan_after_create_index() {
+        use crate::planner::optimize_index_selection;
+        use coordinode_core::graph::types::VectorConsistencyMode;
+
+        let registry = crate::index::IndexRegistry::new();
+
+        // Register a B-tree index on User.name (no storage needed for planner test).
+        // We skip storage-backed register and use register_in_memory directly.
+        let def = crate::index::IndexDefinition::btree("user_name_idx", "User", "name");
+        registry.register_in_memory(def);
+
+        // Build Filter(NodeScan) — what the planner emits BEFORE optimization.
+        let node_scan = LogicalOp::NodeScan {
+            variable: "n".to_string(),
+            labels: vec!["User".to_string()],
+            property_filters: vec![],
+        };
+        let filter_plan = LogicalOp::Filter {
+            input: Box::new(node_scan),
+            predicate: Expr::BinaryOp {
+                left: Box::new(Expr::PropertyAccess {
+                    expr: Box::new(Expr::Variable("n".to_string())),
+                    property: "name".to_string(),
+                }),
+                op: BinaryOperator::Eq,
+                right: Box::new(Expr::Literal(coordinode_core::graph::types::Value::String(
+                    "Alice".into(),
+                ))),
+            },
+        };
+
+        // Verify baseline EXPLAIN contains NodeScan (optimizer not applied yet).
+        let baseline = crate::planner::logical::LogicalPlan {
+            root: filter_plan.clone(),
+            snapshot_ts: None,
+            vector_consistency: VectorConsistencyMode::default(),
+        };
+        let baseline_explain = baseline.explain();
+        assert!(
+            baseline_explain.contains("NodeScan"),
+            "baseline plan should contain NodeScan, got:\n{baseline_explain}"
+        );
+
+        // Apply index selection optimizer — this is the post-build pass.
+        let optimized_root = optimize_index_selection(filter_plan, &registry);
+        let optimized_plan = crate::planner::logical::LogicalPlan {
+            root: optimized_root,
+            snapshot_ts: None,
+            vector_consistency: VectorConsistencyMode::default(),
+        };
+
+        let explain = optimized_plan.explain();
+
+        // Primary assertion: IndexScan must appear, NodeScan must NOT.
+        assert!(
+            explain.contains("IndexScan"),
+            "optimized plan EXPLAIN must contain 'IndexScan', got:\n{explain}"
+        );
+        assert!(
+            !explain.contains("NodeScan"),
+            "optimized plan EXPLAIN must NOT contain 'NodeScan' (should be rewritten), got:\n{explain}"
+        );
+
+        // Secondary: the EXPLAIN line should name the index and property.
+        assert!(
+            explain.contains("user_name_idx") && explain.contains("name"),
+            "EXPLAIN must reference index name and property, got:\n{explain}"
+        );
+    }
+
+    /// Integration test: IndexScan execution returns nodes matching the index lookup.
+    ///
+    /// Creates an index, inserts nodes, then queries via `LogicalOp::IndexScan`
+    /// directly and verifies the correct node is returned.
+    #[test]
+    fn index_scan_returns_correct_node() {
+        let (_dir, engine, mut interner) = setup_test_graph();
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+        let registry = crate::index::IndexRegistry::new();
+
+        // CREATE INDEX on User.name — will backfill Alice, Bob, Charlie.
+        let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
+        execute_op(
+            &LogicalOp::CreateIndex {
+                name: "user_name_idx".to_string(),
+                label: "User".to_string(),
+                property: "name".to_string(),
+                unique: false,
+                sparse: false,
+                filter: None,
+            },
+            &mut ctx,
+        )
+        .expect("CREATE INDEX failed");
+
+        // Execute IndexScan for name = "Bob".
+        let rows = execute_op(
+            &LogicalOp::IndexScan {
+                variable: "n".to_string(),
+                label: "User".to_string(),
+                index_name: "user_name_idx".to_string(),
+                property: "name".to_string(),
+                value_expr: Expr::Literal(coordinode_core::graph::types::Value::String(
+                    "Bob".into(),
+                )),
+            },
+            &mut ctx,
+        )
+        .expect("IndexScan failed");
+
+        // Should return exactly one row for Bob.
+        assert_eq!(
+            rows.len(),
+            1,
+            "IndexScan for 'Bob' should return exactly one row, got {}",
+            rows.len()
+        );
+
+        // The row should bind variable 'n' with name = "Bob".
+        let name_val = rows[0].get("n.name");
+        assert_eq!(
+            name_val,
+            Some(&coordinode_core::graph::types::Value::String("Bob".into())),
+            "row should have n.name = Bob, got {name_val:?}"
         );
     }
 }

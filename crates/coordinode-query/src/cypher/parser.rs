@@ -188,6 +188,14 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let c = build_drop_encrypted_index_clause(pair)?;
             clauses.push(Clause::DropEncryptedIndex(c));
         }
+        Rule::create_index_clause => {
+            let c = build_create_index_clause(pair)?;
+            clauses.push(Clause::CreateIndex(c));
+        }
+        Rule::drop_index_clause => {
+            let c = build_drop_index_clause(pair)?;
+            clauses.push(Clause::DropIndex(c));
+        }
         Rule::create_clause => {
             let cc = build_create_clause(pair)?;
             clauses.push(Clause::Create(cc));
@@ -876,6 +884,56 @@ fn build_drop_encrypted_index_clause(
     }
 
     Ok(DropEncryptedIndexClause { name })
+}
+
+fn build_create_index_clause(pair: Pair<'_, Rule>) -> Result<CreateIndexClause, ParseError> {
+    let mut unique = false;
+    let mut sparse = false;
+    let mut identifiers: Vec<String> = Vec::new();
+    let mut filter_expr: Option<Expr> = None;
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::kw_unique => unique = true,
+            Rule::kw_sparse => sparse = true,
+            Rule::identifier => identifiers.push(inner.as_str().to_string()),
+            Rule::where_inline => {
+                filter_expr = Some(find_expression(inner)?);
+            }
+            _ => {}
+        }
+    }
+
+    if identifiers.len() < 3 {
+        return Err(ParseError::Invalid(
+            "CREATE INDEX requires name, label, and property".into(),
+        ));
+    }
+
+    Ok(CreateIndexClause {
+        name: identifiers[0].clone(),
+        label: identifiers[1].clone(),
+        property: identifiers[2].clone(),
+        unique,
+        sparse,
+        filter_expr,
+    })
+}
+
+fn build_drop_index_clause(pair: Pair<'_, Rule>) -> Result<DropIndexClause, ParseError> {
+    let mut name = String::new();
+
+    for inner in pair.into_inner() {
+        if inner.as_rule() == Rule::identifier {
+            name = inner.as_str().to_string();
+        }
+    }
+
+    if name.is_empty() {
+        return Err(ParseError::Invalid("DROP INDEX requires index name".into()));
+    }
+
+    Ok(DropIndexClause { name })
 }
 
 // --- Write clauses ---
@@ -3310,6 +3368,104 @@ mod tests {
         assert!(
             !matches!(where_expr, Expr::PatternPredicate(_)),
             "parenthesized expression should not be PatternPredicate"
+        );
+    }
+
+    // --- CREATE INDEX / DROP INDEX DDL (R-API2) ---
+
+    #[test]
+    fn create_index_simple() {
+        let q = parse_ok("CREATE INDEX email_idx ON :User(email)");
+        assert_eq!(q.clauses.len(), 1);
+        match &q.clauses[0] {
+            Clause::CreateIndex(c) => {
+                assert_eq!(c.name, "email_idx");
+                assert_eq!(c.label, "User");
+                assert_eq!(c.property, "email");
+                assert!(!c.unique);
+                assert!(!c.sparse);
+                assert!(c.filter_expr.is_none());
+            }
+            other => panic!("expected CreateIndex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_unique_index() {
+        let q = parse_ok("CREATE UNIQUE INDEX email_idx ON :User(email)");
+        match &q.clauses[0] {
+            Clause::CreateIndex(c) => {
+                assert_eq!(c.name, "email_idx");
+                assert!(c.unique, "expected unique=true");
+                assert!(!c.sparse);
+            }
+            other => panic!("expected CreateIndex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_sparse_index() {
+        let q = parse_ok("CREATE SPARSE INDEX opt_idx ON :User(optional_prop)");
+        match &q.clauses[0] {
+            Clause::CreateIndex(c) => {
+                assert_eq!(c.name, "opt_idx");
+                assert!(c.sparse, "expected sparse=true");
+                assert!(!c.unique);
+            }
+            other => panic!("expected CreateIndex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_unique_sparse_index() {
+        let q = parse_ok("CREATE UNIQUE SPARSE INDEX us_idx ON :Item(code)");
+        match &q.clauses[0] {
+            Clause::CreateIndex(c) => {
+                assert!(c.unique);
+                assert!(c.sparse);
+                assert_eq!(c.label, "Item");
+                assert_eq!(c.property, "code");
+            }
+            other => panic!("expected CreateIndex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_index_with_where_clause() {
+        let q = parse_ok("CREATE INDEX active_users ON :User(email) WHERE n.active = true");
+        match &q.clauses[0] {
+            Clause::CreateIndex(c) => {
+                assert_eq!(c.name, "active_users");
+                // The filter_expr should be present (partial index).
+                assert!(
+                    c.filter_expr.is_some(),
+                    "expected filter_expr from WHERE clause"
+                );
+            }
+            other => panic!("expected CreateIndex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_index_simple() {
+        let q = parse_ok("DROP INDEX email_idx");
+        assert_eq!(q.clauses.len(), 1);
+        match &q.clauses[0] {
+            Clause::DropIndex(c) => {
+                assert_eq!(c.name, "email_idx");
+            }
+            other => panic!("expected DropIndex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_index_does_not_shadow_create_node() {
+        // Verify that CREATE INDEX DDL does not interfere with regular CREATE (node) parsing.
+        let q = parse_ok("CREATE (n:User {email: 'alice@example.com'})");
+        assert_eq!(q.clauses.len(), 1);
+        assert!(
+            matches!(q.clauses[0], Clause::Create(_)),
+            "regular CREATE should still parse as Clause::Create"
         );
     }
 }

@@ -383,6 +383,10 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         LogicalOp::CreateNode { input, .. } => input.as_ref().map_or(vec![], |i| vec![i.as_ref()]),
 
         LogicalOp::Merge { pattern, .. } | LogicalOp::Upsert { pattern, .. } => vec![pattern],
+
+        LogicalOp::CreateIndex { .. }
+        | LogicalOp::DropIndex { .. }
+        | LogicalOp::IndexScan { .. } => vec![],
     }
 }
 
@@ -634,7 +638,7 @@ mod tests {
     fn no_missing_index_when_index_exists() {
         use crate::index::{IndexDefinition, IndexRegistry};
 
-        let mut reg = IndexRegistry::new();
+        let reg = IndexRegistry::new();
         reg.register_in_memory(IndexDefinition::btree("user_email", "User", "email"));
 
         let p = plan(filter(node_scan("n", "User"), prop_eq("n", "email")));
@@ -654,7 +658,7 @@ mod tests {
     fn missing_index_for_unindexed_property() {
         use crate::index::{IndexDefinition, IndexRegistry};
 
-        let mut reg = IndexRegistry::new();
+        let reg = IndexRegistry::new();
         reg.register_in_memory(IndexDefinition::btree("user_name", "User", "name"));
 
         // Filtering on "email" which is NOT indexed (only "name" is)
@@ -671,7 +675,7 @@ mod tests {
     fn missing_index_different_label() {
         use crate::index::{IndexDefinition, IndexRegistry};
 
-        let mut reg = IndexRegistry::new();
+        let reg = IndexRegistry::new();
         reg.register_in_memory(IndexDefinition::btree("post_title", "Post", "email"));
 
         // Filtering User.email but only Post.email is indexed

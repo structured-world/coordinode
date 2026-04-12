@@ -4,6 +4,7 @@
 //! when nodes are created, modified, or deleted.
 
 use std::collections::HashMap;
+use std::sync::RwLock;
 
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
@@ -16,96 +17,132 @@ use super::ops::{create_index_entry, delete_index_entry, save_index_definition};
 
 /// Registry of active indexes.
 ///
-/// Maintains a map of index definitions and provides methods for
-/// automatic index maintenance during write operations.
+/// Uses interior mutability (`RwLock`) so `register` / `unregister` / `load_all`
+/// can be called via `&self`. This allows Cypher DDL (`CREATE INDEX`) executed
+/// from within the runner to update the live registry without requiring
+/// a `&mut` reference through the `ExecutionContext`.
 pub struct IndexRegistry {
     /// Active indexes: name → definition.
-    indexes: HashMap<String, IndexDefinition>,
+    indexes: RwLock<HashMap<String, IndexDefinition>>,
 }
 
 impl IndexRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self {
-            indexes: HashMap::new(),
+            indexes: RwLock::new(HashMap::new()),
         }
     }
 
     /// Register a new index. Also persists the definition to storage.
+    ///
+    /// Uses interior mutability — safe to call via `&self`.
     pub fn register(
-        &mut self,
+        &self,
         engine: &StorageEngine,
         index: IndexDefinition,
     ) -> Result<(), StorageError> {
         save_index_definition(engine, &index)?;
-        self.indexes.insert(index.name.clone(), index);
+        self.indexes
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(index.name.clone(), index);
         Ok(())
     }
 
     /// Register an index in memory only (no storage persistence).
     ///
     /// Used for testing and for pre-populating the registry from cached state.
-    pub fn register_in_memory(&mut self, index: IndexDefinition) {
-        self.indexes.insert(index.name.clone(), index);
+    /// Uses interior mutability — safe to call via `&self`.
+    pub fn register_in_memory(&self, index: IndexDefinition) {
+        self.indexes
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(index.name.clone(), index);
     }
 
     /// Unregister an index (does NOT drop entries — use `ops::drop_index` for that).
-    pub fn unregister(&mut self, name: &str) {
-        self.indexes.remove(name);
+    ///
+    /// Uses interior mutability — safe to call via `&self`.
+    pub fn unregister(&self, name: &str) {
+        self.indexes
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
     }
 
     /// Load all index definitions from storage.
-    pub fn load_all(&mut self, engine: &StorageEngine) -> Result<(), StorageError> {
+    ///
+    /// Uses interior mutability — safe to call via `&self`.
+    pub fn load_all(&self, engine: &StorageEngine) -> Result<(), StorageError> {
         // Scan the schema:idx: prefix for all index definitions
         let iter = engine.prefix_scan(
             coordinode_storage::engine::partition::Partition::Schema,
             b"schema:idx:",
         )?;
 
+        let mut map = self.indexes.write().unwrap_or_else(|e| e.into_inner());
         for guard in iter {
             let (_key, value) = guard.into_inner().map_err(StorageError::Engine)?;
             if let Ok(def) = rmp_serde::from_slice::<IndexDefinition>(&value) {
-                self.indexes.insert(def.name.clone(), def);
+                map.insert(def.name.clone(), def);
             }
         }
 
         Ok(())
     }
 
-    /// Get all indexes for a specific label.
-    pub fn indexes_for_label(&self, label: &str) -> Vec<&IndexDefinition> {
+    /// Get all indexes for a specific label (returns owned clones).
+    pub fn indexes_for_label(&self, label: &str) -> Vec<IndexDefinition> {
         self.indexes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .filter(|idx| idx.label == label)
+            .cloned()
             .collect()
     }
 
-    /// Get all indexes that cover a specific label + property.
-    pub fn indexes_for_property(&self, label: &str, property: &str) -> Vec<&IndexDefinition> {
+    /// Get all indexes that cover a specific label + property (returns owned clones).
+    pub fn indexes_for_property(&self, label: &str, property: &str) -> Vec<IndexDefinition> {
         self.indexes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .filter(|idx| idx.label == label && idx.properties.contains(&property.to_string()))
+            .cloned()
             .collect()
     }
 
-    /// Get an index by name.
-    pub fn get(&self, name: &str) -> Option<&IndexDefinition> {
-        self.indexes.get(name)
+    /// Get an index by name (returns owned clone).
+    pub fn get(&self, name: &str) -> Option<IndexDefinition> {
+        self.indexes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
     }
 
     /// Check if any index exists for a label.
     pub fn has_indexes_for(&self, label: &str) -> bool {
-        self.indexes.values().any(|idx| idx.label == label)
+        self.indexes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|idx| idx.label == label)
     }
 
     /// Number of registered indexes.
     pub fn len(&self) -> usize {
-        self.indexes.len()
+        self.indexes.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Whether the registry is empty.
     pub fn is_empty(&self) -> bool {
-        self.indexes.is_empty()
+        self.indexes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
     /// Maintain indexes when a node is created.
@@ -128,20 +165,20 @@ impl IndexRegistry {
 
             // For single-field indexes, find the matching property
             if !idx.is_compound() {
-                let prop_name = idx.property();
-                if let Some((_, value)) = properties.iter().find(|(k, _)| k == prop_name) {
+                let prop_name = idx.property().to_string();
+                if let Some((_, value)) = properties.iter().find(|(k, _)| k == &prop_name) {
                     if idx.sparse && value.is_null() {
                         continue;
                     }
-                    create_index_entry(engine, idx, node_id, value).map_err(|e| match e {
+                    create_index_entry(engine, &idx, node_id, value).map_err(|e| match e {
                         StorageError::Conflict => UniqueViolation {
                             index_name: idx.name.clone(),
-                            property: prop_name.to_string(),
+                            property: prop_name.clone(),
                             value: value.clone(),
                         },
                         _ => UniqueViolation {
                             index_name: idx.name.clone(),
-                            property: prop_name.to_string(),
+                            property: prop_name.clone(),
                             value: Value::Null,
                         },
                     })?;
@@ -170,12 +207,12 @@ impl IndexRegistry {
 
             // Delete old entry
             if let Some(old) = old_value {
-                let _ = delete_index_entry(engine, idx, node_id, old);
+                let _ = delete_index_entry(engine, &idx, node_id, old);
             }
 
             // Create new entry
             if !(idx.sparse && new_value.is_null()) {
-                create_index_entry(engine, idx, node_id, new_value).map_err(|e| match e {
+                create_index_entry(engine, &idx, node_id, new_value).map_err(|e| match e {
                     StorageError::Conflict => UniqueViolation {
                         index_name: idx.name.clone(),
                         property: property.to_string(),
@@ -202,9 +239,9 @@ impl IndexRegistry {
     ) -> Result<(), StorageError> {
         for idx in self.indexes_for_label(label) {
             if !idx.is_compound() {
-                let prop_name = idx.property();
-                if let Some((_, value)) = properties.iter().find(|(k, _)| k == prop_name) {
-                    delete_index_entry(engine, idx, node_id, value)?;
+                let prop_name = idx.property().to_string();
+                if let Some((_, value)) = properties.iter().find(|(k, _)| k == &prop_name) {
+                    delete_index_entry(engine, &idx, node_id, value)?;
                 }
             }
         }
@@ -242,7 +279,7 @@ mod tests {
     fn register_and_lookup() {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
-        let mut reg = IndexRegistry::new();
+        let reg = IndexRegistry::new();
 
         let idx = IndexDefinition::btree("user_email", "User", "email").unique();
         reg.register(&engine, idx).expect("register");
@@ -257,7 +294,7 @@ mod tests {
     fn indexes_for_property() {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
-        let mut reg = IndexRegistry::new();
+        let reg = IndexRegistry::new();
 
         reg.register(
             &engine,
@@ -276,7 +313,7 @@ mod tests {
     fn on_node_created_unique_ok() {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
-        let mut reg = IndexRegistry::new();
+        let reg = IndexRegistry::new();
 
         reg.register(
             &engine,
@@ -307,7 +344,7 @@ mod tests {
     fn on_node_created_unique_violation() {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
-        let mut reg = IndexRegistry::new();
+        let reg = IndexRegistry::new();
 
         reg.register(
             &engine,
@@ -341,7 +378,7 @@ mod tests {
     fn on_property_changed_updates_index() {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
-        let mut reg = IndexRegistry::new();
+        let reg = IndexRegistry::new();
 
         reg.register(
             &engine,
@@ -392,7 +429,7 @@ mod tests {
     fn on_property_changed_unique_violation() {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
-        let mut reg = IndexRegistry::new();
+        let reg = IndexRegistry::new();
 
         reg.register(
             &engine,
@@ -433,7 +470,7 @@ mod tests {
     fn on_node_deleted_removes_index() {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
-        let mut reg = IndexRegistry::new();
+        let reg = IndexRegistry::new();
 
         reg.register(
             &engine,
@@ -475,7 +512,7 @@ mod tests {
 
         // Save definitions
         {
-            let mut reg = IndexRegistry::new();
+            let reg = IndexRegistry::new();
             reg.register(
                 &engine,
                 IndexDefinition::btree("idx1", "User", "email").unique(),
@@ -486,7 +523,7 @@ mod tests {
         }
 
         // Load in new registry
-        let mut reg2 = IndexRegistry::new();
+        let reg2 = IndexRegistry::new();
         reg2.load_all(&engine).expect("load");
         assert_eq!(reg2.len(), 2);
         assert!(reg2.get("idx1").is_some());
@@ -497,7 +534,7 @@ mod tests {
     fn sparse_index_skips_null_on_create() {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
-        let mut reg = IndexRegistry::new();
+        let reg = IndexRegistry::new();
 
         reg.register(
             &engine,
@@ -515,7 +552,7 @@ mod tests {
         .expect("create");
 
         let idx = reg.get("user_bio").expect("get");
-        let results = super::super::ops::index_scan(&engine, idx).expect("scan");
+        let results = super::super::ops::index_scan(&engine, &idx).expect("scan");
         assert!(results.is_empty());
     }
 
@@ -525,7 +562,7 @@ mod tests {
     fn partial_index_filters_on_create() {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
-        let mut reg = IndexRegistry::new();
+        let reg = IndexRegistry::new();
 
         // Index only active users
         reg.register(
@@ -565,7 +602,7 @@ mod tests {
 
         // Only active user should be in index
         let idx = reg.get("active_email").expect("get");
-        let results = super::super::ops::index_scan(&engine, idx).expect("scan");
+        let results = super::super::ops::index_scan(&engine, &idx).expect("scan");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], 1); // Only Alice
     }
@@ -574,7 +611,7 @@ mod tests {
     fn partial_index_bool_filter() {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
-        let mut reg = IndexRegistry::new();
+        let reg = IndexRegistry::new();
 
         reg.register(
             &engine,
@@ -612,7 +649,7 @@ mod tests {
         .expect("create");
 
         let idx = reg.get("verified_email").expect("get");
-        let results = super::super::ops::index_scan(&engine, idx).expect("scan");
+        let results = super::super::ops::index_scan(&engine, &idx).expect("scan");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], 1);
     }
@@ -621,7 +658,7 @@ mod tests {
     fn partial_index_exists_filter() {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
-        let mut reg = IndexRegistry::new();
+        let reg = IndexRegistry::new();
 
         reg.register(
             &engine,
@@ -658,7 +695,7 @@ mod tests {
         .expect("create");
 
         let idx = reg.get("user_bio_idx").expect("get");
-        let results = super::super::ops::index_scan(&engine, idx).expect("scan");
+        let results = super::super::ops::index_scan(&engine, &idx).expect("scan");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], 1);
     }

@@ -23,6 +23,7 @@ clause = {
   | alter_label_clause
   | create_encrypted_index_clause
   | create_text_index_clause
+  | create_index_clause
   | create_clause
   | merge_all_clause
   | merge_clause
@@ -30,6 +31,7 @@ clause = {
   | detach_delete_clause
   | drop_encrypted_index_clause
   | drop_text_index_clause
+  | drop_index_clause
   | delete_clause
   | set_clause
   | remove_clause
@@ -167,6 +169,17 @@ create_encrypted_index_clause = {
 
 // DROP ENCRYPTED INDEX idx_name
 drop_encrypted_index_clause = { kw_drop ~ kw_encrypted ~ kw_index ~ identifier }
+
+// --- CREATE/DROP BTREE INDEX ---
+
+// CREATE [UNIQUE] [SPARSE] INDEX idx_name ON :Label(prop) [WHERE pred]
+create_index_clause = {
+    kw_create ~ kw_unique? ~ kw_sparse? ~ kw_index ~ identifier ~ kw_on ~ ":" ~ identifier ~ "(" ~ identifier ~ ")"
+    ~ where_inline?
+}
+
+// DROP INDEX idx_name
+drop_index_clause = { kw_drop ~ kw_index ~ identifier }
 
 // --- CREATE ---
 
@@ -402,6 +415,8 @@ kw_language   = @{ ^"language" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_default    = @{ ^"default" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_override   = @{ ^"override" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_analyzer   = @{ ^"analyzer" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_unique     = @{ ^"unique" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_sparse     = @{ ^"sparse" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // --- Identifiers ---
 

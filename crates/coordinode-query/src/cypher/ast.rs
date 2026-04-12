@@ -48,6 +48,8 @@ pub enum Clause {
     DropTextIndex(DropTextIndexClause),
     CreateEncryptedIndex(CreateEncryptedIndexClause),
     DropEncryptedIndex(DropEncryptedIndexClause),
+    CreateIndex(CreateIndexClause),
+    DropIndex(DropIndexClause),
 
     // Write clauses
     Create(CreateClause),
@@ -130,6 +132,41 @@ pub struct CreateEncryptedIndexClause {
 /// Syntax: `DROP ENCRYPTED INDEX idx_name`
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropEncryptedIndexClause {
+    /// Index name to drop.
+    pub name: String,
+}
+
+/// CREATE [UNIQUE] [SPARSE] INDEX clause (B-tree single-field index).
+///
+/// Syntax: `CREATE [UNIQUE] [SPARSE] INDEX idx_name ON :Label(prop) [WHERE pred]`
+///
+/// The optional WHERE clause restricts index membership to nodes matching
+/// a simple predicate (partial index). Supported predicates:
+/// - `prop = 'string'`
+/// - `prop = 42`
+/// - `prop = true/false`
+/// - `prop IS NOT NULL`
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndexClause {
+    /// Index name.
+    pub name: String,
+    /// Label to index.
+    pub label: String,
+    /// Property to index.
+    pub property: String,
+    /// Whether this index enforces uniqueness.
+    pub unique: bool,
+    /// Whether to skip null values (sparse index).
+    pub sparse: bool,
+    /// Optional WHERE predicate expression for partial index.
+    pub filter_expr: Option<Expr>,
+}
+
+/// DROP INDEX clause.
+///
+/// Syntax: `DROP INDEX idx_name`
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropIndexClause {
     /// Index name to drop.
     pub name: String,
 }

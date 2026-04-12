@@ -314,7 +314,7 @@ impl Database {
         };
 
         // Load index registry from storage for EXPLAIN SUGGEST accuracy.
-        let mut index_registry = coordinode_query::index::IndexRegistry::new();
+        let index_registry = coordinode_query::index::IndexRegistry::new();
         if let Err(e) = index_registry.load_all(&engine) {
             tracing::warn!("failed to load index registry: {e}, starting fresh");
         }
@@ -822,6 +822,10 @@ impl Database {
         // Inject session-level vector consistency into the plan for EXPLAIN output.
         plan.vector_consistency = self.vector_consistency;
 
+        // Apply index selection optimizer: rewrite Filter(NodeScan) → IndexScan
+        // when a matching B-tree index is registered.
+        plan.root = planner::optimize_index_selection(plan.root, &self.index_registry);
+
         // Bind parameters: replace $name references with literal values.
         if let Some(ref p) = params {
             plan.substitute_params(p);
@@ -980,6 +984,10 @@ impl Database {
         let ast = cypher::parse(query)?;
         let mut plan = planner::build_logical_plan(&ast)?;
         plan.vector_consistency = self.vector_consistency;
+        // Apply index selection optimizer so EXPLAIN reflects the actual plan
+        // that would be executed (IndexScan instead of Filter+NodeScan when
+        // a matching B-tree index is registered).
+        plan.root = planner::optimize_index_selection(plan.root, &self.index_registry);
         let stats = self.compute_stats();
         let stats_ref = stats
             .as_ref()

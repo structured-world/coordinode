@@ -302,6 +302,221 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
         Clause::DropEncryptedIndex(c) => Ok(LogicalOp::DropEncryptedIndex {
             name: c.name.clone(),
         }),
+        Clause::CreateIndex(c) => {
+            let filter = c.filter_expr.as_ref().and_then(expr_to_partial_filter);
+            Ok(LogicalOp::CreateIndex {
+                name: c.name.clone(),
+                label: c.label.clone(),
+                property: c.property.clone(),
+                unique: c.unique,
+                sparse: c.sparse,
+                filter,
+            })
+        }
+        Clause::DropIndex(c) => Ok(LogicalOp::DropIndex {
+            name: c.name.clone(),
+        }),
+    }
+}
+
+/// Attempt to convert a WHERE expression to a `PartialFilter` predicate.
+///
+/// Supports:
+/// - `n.prop = 'value'`  → `PartialFilter::PropertyEquals`
+/// - `n.prop = 42`       → `PartialFilter::PropertyEqualsInt`
+/// - `n.prop = true`     → `PartialFilter::PropertyEqualsBool`
+/// - `EXISTS(n.prop)`    → `PartialFilter::PropertyExists`
+/// - `n.prop IS NOT NULL` → `PartialFilter::PropertyExists`
+///
+/// Returns `None` for unsupported expressions (index is still created; filter
+/// is simply not applied during backfill or at write time).
+fn expr_to_partial_filter(expr: &Expr) -> Option<crate::index::definition::PartialFilter> {
+    use crate::index::definition::PartialFilter;
+    use coordinode_core::graph::types::Value;
+
+    match expr {
+        // n.prop = <literal>
+        Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Eq => {
+            let prop = extract_property_name(left)?;
+            match right.as_ref() {
+                Expr::Literal(Value::String(s)) => Some(PartialFilter::PropertyEquals {
+                    property: prop,
+                    value: s.clone(),
+                }),
+                Expr::Literal(Value::Int(n)) => Some(PartialFilter::PropertyEqualsInt {
+                    property: prop,
+                    value: *n,
+                }),
+                Expr::Literal(Value::Bool(b)) => Some(PartialFilter::PropertyEqualsBool {
+                    property: prop,
+                    value: *b,
+                }),
+                _ => None,
+            }
+        }
+        // n.prop IS NOT NULL
+        Expr::IsNull {
+            expr: inner,
+            negated: true,
+        } => {
+            let prop = extract_property_name(inner)?;
+            Some(PartialFilter::PropertyExists { property: prop })
+        }
+        // EXISTS(n.prop) — represented as FunctionCall { name: "exists", args: [PropertyAccess] }
+        Expr::FunctionCall { name, args, .. } if name.eq_ignore_ascii_case("exists") => {
+            args.first().and_then(|a| {
+                let prop = extract_property_name(a)?;
+                Some(PartialFilter::PropertyExists { property: prop })
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Extract the property name from a `PropertyAccess` or `Variable` expression.
+///
+/// Handles `n.status` (PropertyAccess) as well as bare variable strings that
+/// encode property access as `"n.status"` (Variable fallback).
+fn extract_property_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::PropertyAccess { property, .. } => Some(property.clone()),
+        // Some parser representations encode n.prop as Variable("n.prop")
+        Expr::Variable(v) if v.contains('.') => v.split_once('.').map(|(_, prop)| prop.to_string()),
+        _ => None,
+    }
+}
+
+/// Optimization pass: replace `Filter { input: NodeScan { label }, predicate: prop=val }` with
+/// `IndexScan` when a matching B-tree index is registered in the registry.
+///
+/// The rewrite is applied bottom-up. Only equality predicates (`prop = literal/param`) on a
+/// single-label `NodeScan` are eligible. Compound predicates (`AND`/`OR`) are not rewritten —
+/// only the top-level equality is matched.
+///
+/// This pass is separate from `build_logical_plan` so callers without an index registry can
+/// skip it without changing the planner's public signature.
+pub fn optimize_index_selection(
+    op: LogicalOp,
+    registry: &crate::index::IndexRegistry,
+) -> LogicalOp {
+    // For Filter(NodeScan), check if we can rewrite to IndexScan before recursing.
+    if let LogicalOp::Filter { input, predicate } = op {
+        // Check if the pattern matches: Filter(NodeScan{single-label}, var.prop = val).
+        if let LogicalOp::NodeScan {
+            ref variable,
+            ref labels,
+            ref property_filters,
+        } = *input
+        {
+            if labels.len() == 1 && property_filters.is_empty() {
+                if let Expr::BinaryOp {
+                    ref left,
+                    op: BinaryOperator::Eq,
+                    ref right,
+                } = predicate
+                {
+                    let label = &labels[0];
+                    if let Some(prop) = extract_index_property(left, variable) {
+                        if matches!(right.as_ref(), Expr::Literal(_) | Expr::Parameter(_)) {
+                            let indexes = registry.indexes_for_property(label, &prop);
+                            if let Some(idx) = indexes.into_iter().next() {
+                                return LogicalOp::IndexScan {
+                                    variable: variable.clone(),
+                                    label: label.clone(),
+                                    index_name: idx.name.clone(),
+                                    property: prop,
+                                    value_expr: *right.clone(),
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Pattern not matched — recurse into input, keep Filter.
+        return LogicalOp::Filter {
+            input: Box::new(optimize_index_selection(*input, registry)),
+            predicate,
+        };
+    }
+
+    // For all other operators, recurse into direct children only.
+    match op {
+        LogicalOp::Project {
+            input,
+            items,
+            distinct,
+        } => LogicalOp::Project {
+            input: Box::new(optimize_index_selection(*input, registry)),
+            items,
+            distinct,
+        },
+        LogicalOp::Sort { input, items } => LogicalOp::Sort {
+            input: Box::new(optimize_index_selection(*input, registry)),
+            items,
+        },
+        LogicalOp::Limit { input, count } => LogicalOp::Limit {
+            input: Box::new(optimize_index_selection(*input, registry)),
+            count,
+        },
+        LogicalOp::Traverse {
+            input,
+            source,
+            edge_types,
+            direction,
+            target_variable,
+            target_labels,
+            length,
+            edge_variable,
+            target_filters,
+            edge_filters,
+        } => LogicalOp::Traverse {
+            input: Box::new(optimize_index_selection(*input, registry)),
+            source,
+            edge_types,
+            direction,
+            target_variable,
+            target_labels,
+            length,
+            edge_variable,
+            target_filters,
+            edge_filters,
+        },
+        LogicalOp::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => LogicalOp::Aggregate {
+            input: Box::new(optimize_index_selection(*input, registry)),
+            group_by,
+            aggregates,
+        },
+        // Leaf ops, DDL ops, and any ops without an input field — return as-is.
+        other => other,
+    }
+}
+
+/// Extract a property name from an expression that references `variable.property`.
+///
+/// Matches `PropertyAccess { expr: Variable(var), property }` and `Variable("var.prop")`.
+fn extract_index_property(expr: &Expr, variable: &str) -> Option<String> {
+    match expr {
+        Expr::PropertyAccess {
+            expr: inner,
+            property,
+        } => {
+            if matches!(inner.as_ref(), Expr::Variable(v) if v == variable) {
+                Some(property.clone())
+            } else {
+                None
+            }
+        }
+        // Fallback: some nodes use Variable("n.prop")
+        Expr::Variable(v) => {
+            let expected_prefix = format!("{variable}.");
+            v.strip_prefix(&expected_prefix).map(|s| s.to_string())
+        }
+        _ => None,
     }
 }
 

@@ -7,6 +7,7 @@ mod integration {
     mod adaptive;
     mod advisor;
     mod alter_label;
+    mod btree_index;
     mod compound_queries;
     mod computed;
     mod concurrent;

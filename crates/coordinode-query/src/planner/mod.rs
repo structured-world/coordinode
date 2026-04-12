@@ -7,7 +7,7 @@
 pub mod builder;
 pub mod logical;
 
-pub use builder::{build_logical_plan, PlanError};
+pub use builder::{build_logical_plan, optimize_index_selection, PlanError};
 pub use logical::{
     estimate_cost, estimate_cost_with_stats, AggregateItem, CostEstimate, LogicalOp, LogicalPlan,
     ProjectItem,

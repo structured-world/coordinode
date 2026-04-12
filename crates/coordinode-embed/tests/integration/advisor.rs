@@ -1417,7 +1417,7 @@ fn explain_suggest_no_false_positive_when_index_exists() {
     {
         let config = StorageConfig::new(dir.path());
         let engine = StorageEngine::open(&config).expect("open engine");
-        let mut reg = IndexRegistry::new();
+        let reg = IndexRegistry::new();
         reg.register(
             &engine,
             IndexDefinition::btree("user_email", "User", "email"),
@@ -1462,7 +1462,7 @@ fn explain_suggest_partial_coverage() {
     {
         let config = StorageConfig::new(dir.path());
         let engine = StorageEngine::open(&config).expect("open engine");
-        let mut reg = IndexRegistry::new();
+        let reg = IndexRegistry::new();
         reg.register(&engine, IndexDefinition::btree("user_name", "User", "name"))
             .expect("register");
     }

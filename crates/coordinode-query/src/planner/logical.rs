@@ -73,6 +73,27 @@ pub enum LogicalOp {
         edge_filters: Vec<(String, Expr)>,
     },
 
+    /// B-tree index point-lookup: replaces `Filter { input: NodeScan }` when a matching index exists.
+    ///
+    /// Produced by the index-selection optimizer pass when:
+    /// - The input is a `NodeScan` for a single label.
+    /// - The WHERE predicate is `variable.property = value_expr` (equality).
+    /// - A B-tree index for (label, property) is registered in the registry.
+    ///
+    /// EXPLAIN display: `IndexScan(variable:Label ON idx_name(property))`
+    IndexScan {
+        /// Variable name for the result nodes.
+        variable: String,
+        /// Label this scan covers.
+        label: String,
+        /// Index name used for the lookup.
+        index_name: String,
+        /// Property being looked up.
+        property: String,
+        /// Lookup value expression (literal or parameter).
+        value_expr: Expr,
+    },
+
     /// Filter rows by a predicate expression.
     Filter {
         input: Box<LogicalOp>,
@@ -202,6 +223,20 @@ pub enum LogicalOp {
 
     /// DROP ENCRYPTED INDEX: remove an encrypted search index.
     DropEncryptedIndex { name: String },
+
+    /// CREATE [UNIQUE] [SPARSE] INDEX: create a B-tree index on a label property.
+    CreateIndex {
+        name: String,
+        label: String,
+        property: String,
+        unique: bool,
+        sparse: bool,
+        /// Optional partial-index filter predicate.
+        filter: Option<crate::index::definition::PartialFilter>,
+    },
+
+    /// DROP INDEX: remove a B-tree index by name.
+    DropIndex { name: String },
 
     /// UNWIND: expand a list expression into individual rows.
     /// Produced from UNWIND expr AS variable.
@@ -384,6 +419,9 @@ impl LogicalOp {
                     expr.substitute_params(params);
                 }
             }
+            LogicalOp::IndexScan { value_expr, .. } => {
+                value_expr.substitute_params(params);
+            }
             LogicalOp::Filter { input, predicate } => {
                 input.substitute_params(params);
                 predicate.substitute_params(params);
@@ -538,6 +576,8 @@ impl LogicalOp {
             | LogicalOp::DropTextIndex { .. }
             | LogicalOp::CreateEncryptedIndex { .. }
             | LogicalOp::DropEncryptedIndex { .. }
+            | LogicalOp::CreateIndex { .. }
+            | LogicalOp::DropIndex { .. }
             | LogicalOp::Empty => {}
         }
     }
@@ -785,6 +825,9 @@ fn estimate_op_cost(
             (rows, rows)
         }
 
+        // IndexScan is a point-lookup: O(log N) cost, ~1 result row on average.
+        LogicalOp::IndexScan { .. } => (1.0, 1.0),
+
         LogicalOp::Traverse {
             input,
             length,
@@ -1018,7 +1061,9 @@ fn estimate_op_cost(
         | LogicalOp::CreateTextIndex { .. }
         | LogicalOp::DropTextIndex { .. }
         | LogicalOp::CreateEncryptedIndex { .. }
-        | LogicalOp::DropEncryptedIndex { .. } => (1.0, 1.0),
+        | LogicalOp::DropEncryptedIndex { .. }
+        | LogicalOp::CreateIndex { .. }
+        | LogicalOp::DropIndex { .. } => (1.0, 1.0),
         LogicalOp::Empty => (0.0, 1.0),
     }
 }
@@ -1117,6 +1162,17 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
                     labels.join(":")
                 ));
             }
+        }
+        LogicalOp::IndexScan {
+            variable,
+            label,
+            index_name,
+            property,
+            ..
+        } => {
+            output.push_str(&format!(
+                "{prefix}IndexScan({variable}:{label} ON {index_name}({property}))\n"
+            ));
         }
         LogicalOp::Traverse {
             input,
@@ -1424,6 +1480,33 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
         }
         LogicalOp::DropEncryptedIndex { name } => {
             output.push_str(&format!("{prefix}DropEncryptedIndex({name})\n"));
+        }
+        LogicalOp::CreateIndex {
+            name,
+            label,
+            property,
+            unique,
+            sparse,
+            filter,
+        } => {
+            let mut flags = String::new();
+            if *unique {
+                flags.push_str(" UNIQUE");
+            }
+            if *sparse {
+                flags.push_str(" SPARSE");
+            }
+            let filter_str = if let Some(f) = filter {
+                format!(", filter={f:?}")
+            } else {
+                String::new()
+            };
+            output.push_str(&format!(
+                "{prefix}CreateIndex({name}{flags} ON :{label}({property}){filter_str})\n"
+            ));
+        }
+        LogicalOp::DropIndex { name } => {
+            output.push_str(&format!("{prefix}DropIndex({name})\n"));
         }
         LogicalOp::Empty => {
             output.push_str(&format!("{prefix}Empty\n"));
