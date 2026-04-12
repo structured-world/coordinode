@@ -157,6 +157,41 @@ fn create_label_schema_persists_across_reopen() {
     }
 }
 
+/// Unique index survives a database reopen and still enforces constraints.
+///
+/// Regression test: `load_all` on `Database::open()` must restore index state.
+#[test]
+fn create_label_schema_unique_constraint_enforced_after_reopen() {
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Create schema with unique email, insert first node.
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        let mut schema = LabelSchema::new("Account");
+        schema.add_property(PropertyDef::new("email", PropertyType::String).unique());
+        db.create_label_schema(schema).expect("create schema");
+        db.execute_cypher("CREATE (u:Account {email: 'bob@test.com'})")
+            .expect("first create should succeed");
+    }
+
+    // Reopen — unique index must be reloaded and still enforced.
+    {
+        let mut db2 = Database::open(dir.path()).expect("reopen");
+        let result = db2.execute_cypher("CREATE (u:Account {email: 'bob@test.com'})");
+        assert!(
+            result.is_err(),
+            "duplicate email must be rejected after reopen (load_all must restore index)"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("unique") || msg.contains("constraint") || msg.contains("index"),
+            "error should mention unique/constraint/index, got: {msg}"
+        );
+    }
+}
+
 /// `unique: true` property → B-tree unique index is registered and enforced.
 /// Regression test: duplicate value via MERGE must fail after create_label_schema.
 #[test]
