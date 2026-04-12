@@ -1,0 +1,47 @@
+/**
+ * Custom theme overrides for CoordiNode documentation.
+ */
+
+/* Widen content area on large screens */
+@media (min-width: 1440px) {
+  .VPDoc .container {
+    max-width: 1104px;
+  }
+
+  .VPDoc:not(.has-aside) .container {
+    max-width: 1104px;
+  }
+
+  .VPDoc:not(.has-aside) .container > .content {
+    max-width: 900px;
+  }
+}
+
+@media (min-width: 1600px) {
+  .VPDoc .container {
+    max-width: 1280px;
+  }
+
+  .VPDoc:not(.has-aside) .container {
+    max-width: 1280px;
+  }
+
+  .VPDoc:not(.has-aside) .container > .content {
+    max-width: 1040px;
+  }
+}
+
+/* Brand colors */
+:root {
+  --vp-c-brand-1: #e85d2c;
+  --vp-c-brand-2: #c94d20;
+  --vp-c-brand-3: #f07040;
+  --vp-c-brand-soft: rgba(232, 93, 44, 0.14);
+}
+
+.dark {
+  --vp-c-brand-1: #f07040;
+  --vp-c-brand-2: #e85d2c;
+  --vp-c-brand-3: #f59070;
+  --vp-c-brand-soft: rgba(240, 112, 64, 0.16);
+}

@@ -72,3 +72,10 @@ Thumbs.db
 *.profraw
 *.profdata
 data/
+
+# Node.js / VitePress docs
+node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+.yarn/cache/
+.yarn/install-state.gz
