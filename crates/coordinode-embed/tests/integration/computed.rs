@@ -38,6 +38,7 @@ fn setup_memory_schema(db: &mut Database) {
             duration_secs: 2592000, // 30 days
             anchor_field: "created_at".into(),
             scope: TtlScope::Node,
+            target_field: None,
         },
     ));
 
@@ -351,6 +352,7 @@ fn computed_ttl_field_removal_survives_reopen() {
                 duration_secs: 1,
                 anchor_field: "cached_at".into(),
                 scope: TtlScope::Field,
+                target_field: None,
             },
         ));
 
@@ -1235,6 +1237,7 @@ fn computed_ttl_subtree_removes_anchor_preserves_document() {
             duration_secs: 60, // 1 minute
             anchor_field: "cached_at".into(),
             scope: TtlScope::Subtree,
+            target_field: None,
         },
     ));
 
