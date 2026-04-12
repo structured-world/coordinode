@@ -3764,7 +3764,29 @@ fn execute_merge(
         return execute_update(&created, on_create, ctx);
     }
 
-    // Phase 1: Try to find existing matches
+    // G074: Standalone relationship MERGE — no correlated_row (no preceding MATCH).
+    // Pattern: MERGE (a:L {k:v})-[r:T]->(b:L {k:v})
+    // Algorithm:
+    //   1. Try to find the complete existing path via execute_op (full graph scan).
+    //   2. If found → ON MATCH path (reuse existing nodes and edge).
+    //   3. If not found → find-or-create src node, find-or-create tgt node,
+    //      then create the edge between them → ON CREATE path.
+    if let Some(traverse) = as_traverse_op(pattern) {
+        let matches = execute_op(pattern, ctx)?;
+        if !matches.is_empty() {
+            if on_match.is_empty() {
+                return Ok(matches);
+            }
+            return execute_update(&matches, on_match, ctx);
+        }
+        let created = execute_merge_relationship_standalone_create(traverse, ctx)?;
+        if on_create.is_empty() {
+            return Ok(created);
+        }
+        return execute_update(&created, on_create, ctx);
+    }
+
+    // Generic path: NodeScan (node-only MERGE) — find or create a single node.
     let matches = execute_op(pattern, ctx)?;
 
     if !matches.is_empty() {
@@ -4108,6 +4130,96 @@ fn execute_merge_relationship_create(
     }
 
     Ok(vec![row])
+}
+
+/// G074: Create a complete relationship pattern for standalone MERGE (no preceding MATCH).
+///
+/// Called from `execute_merge` when the pattern is a Traverse but `correlated_row` is `None`
+/// and no existing complete path was found by `execute_op`.
+///
+/// Algorithm:
+///   1. Find or create the source node using the Traverse's `input` (NodeScan).
+///   2. Build a target NodeScan from `target_variable`, `target_labels`, `target_filters`.
+///   3. Find or create the target node.
+///   4. Merge the two node rows into a synthetic correlated row.
+///   5. Delegate edge creation to `execute_merge_relationship_create`.
+///
+/// "Find or create" semantics per GAPS.md G074:
+///   - If a node matching the label+property pattern already exists, reuse the first match.
+///   - If no matching node exists, create a new one with the given labels and properties.
+fn execute_merge_relationship_standalone_create(
+    traverse: &LogicalOp,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    let (input, target_variable, target_labels, target_filters) = match traverse {
+        LogicalOp::Traverse {
+            input,
+            target_variable,
+            target_labels,
+            target_filters,
+            ..
+        } => (input, target_variable, target_labels, target_filters),
+        _ => unreachable!("execute_merge_relationship_standalone_create: not a Traverse"),
+    };
+
+    // Step 1: Find or create source node from the Traverse's input (NodeScan).
+    // Ambiguous pattern (multiple matching nodes) is an error: MERGE requires a unique match.
+    // Use MERGEMANY (future) if multi-target upsert is needed.
+    let src_rows = execute_op(input, ctx)?;
+    let src_row = match src_rows.len() {
+        0 => {
+            let created = execute_create_from_pattern(input, ctx)?;
+            created.into_iter().next().ok_or_else(|| {
+                ExecutionError::Unsupported("MERGE: failed to find or create source node".into())
+            })?
+        }
+        1 => src_rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| ExecutionError::Unsupported("MERGE: source row missing".into()))?,
+        n => {
+            return Err(ExecutionError::Unsupported(format!(
+                "MERGE relationship: ambiguous source pattern — {n} nodes match. \
+                 Use a more specific property filter or MERGEMANY for multi-target upsert."
+            )))
+        }
+    };
+
+    // Step 2: Find or create target node synthesized from Traverse target fields.
+    // Same ambiguity check as Step 1.
+    let target_scan = LogicalOp::NodeScan {
+        variable: target_variable.clone(),
+        labels: target_labels.clone(),
+        property_filters: target_filters.clone(),
+    };
+    let tgt_rows = execute_op(&target_scan, ctx)?;
+    let tgt_row = match tgt_rows.len() {
+        0 => {
+            let created = execute_create_from_pattern(&target_scan, ctx)?;
+            created.into_iter().next().ok_or_else(|| {
+                ExecutionError::Unsupported("MERGE: failed to find or create target node".into())
+            })?
+        }
+        1 => tgt_rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| ExecutionError::Unsupported("MERGE: target row missing".into()))?,
+        n => {
+            return Err(ExecutionError::Unsupported(format!(
+                "MERGE relationship: ambiguous target pattern — {n} nodes match. \
+                 Use a more specific property filter or MERGEMANY for multi-target upsert."
+            )))
+        }
+    };
+
+    // Step 3: Build synthetic correlated row with both node IDs in scope.
+    // Target row entries overwrite source row entries on key collision, but
+    // source and target variables are always distinct in valid Cypher patterns.
+    let mut correlated = src_row;
+    correlated.extend(tgt_row);
+
+    // Step 4: Create the edge. The complete path was verified absent by the caller.
+    execute_merge_relationship_create(traverse, &correlated, ctx)
 }
 
 /// UPSERT MATCH: atomic match-or-create.

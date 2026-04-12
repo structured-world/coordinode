@@ -241,6 +241,50 @@ fn merge_no_duplicate() {
     assert_eq!(rows.len(), 1);
 }
 
+/// G074 — standalone relationship MERGE through the embed API.
+///
+/// What this tests:
+/// - `MERGE (a:L {k:v})-[r:T]->(b:L {k:v})` succeeds end-to-end via Database API
+/// - Idempotent: second run finds existing path, does not create duplicates
+#[test]
+fn merge_relationship_standalone() {
+    let (mut db, _dir) = open_db();
+
+    // First run — creates both nodes and the edge
+    db.execute_cypher(
+        "MERGE (a:Device {id: 'sensor-1'})-[r:CONNECTED_TO]->(b:Device {id: 'hub-1'})",
+    )
+    .expect("standalone relationship MERGE should succeed");
+
+    // Verify the edge was created
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:Device {id: 'sensor-1'})-[r:CONNECTED_TO]->(b:Device {id: 'hub-1'}) \
+             RETURN a.id, b.id",
+        )
+        .expect("match after MERGE");
+    assert_eq!(rows.len(), 1, "edge should exist after standalone MERGE");
+
+    // Second run — idempotent, must not create duplicates
+    db.execute_cypher(
+        "MERGE (a:Device {id: 'sensor-1'})-[r:CONNECTED_TO]->(b:Device {id: 'hub-1'})",
+    )
+    .expect("idempotent standalone MERGE should succeed");
+
+    // Verify no duplicates: MATCH returns exactly 2 Device nodes (one per label+id combo)
+    let rows2 = db
+        .execute_cypher(
+            "MATCH (a:Device {id: 'sensor-1'})-[:CONNECTED_TO]->(b:Device {id: 'hub-1'}) \
+             RETURN a.id, b.id",
+        )
+        .expect("match after second MERGE");
+    assert_eq!(
+        rows2.len(),
+        1,
+        "must still be exactly 1 path after second MERGE (no duplicates)"
+    );
+}
+
 // ── Persistence ─────────────────────────────────────────────────────
 
 #[test]
