@@ -84,6 +84,12 @@ struct TtlTarget {
     /// `None` = interner didn't have this name (fall back to heuristic scan).
     anchor_field_id: Option<u32>,
     scope: TtlScope,
+    /// For `scope = Subtree`: the DOCUMENT property to delete on expiry.
+    /// If `None`, falls back to deleting `anchor_field` (same as `Field` scope).
+    target_field: Option<String>,
+    /// Resolved field ID for `target_field` (from interner).
+    /// `None` when no interner or field not yet interned.
+    target_field_id: Option<u32>,
 }
 
 /// Run a single COMPUTED TTL reap pass (no interner, no pipeline — direct engine writes).
@@ -230,9 +236,12 @@ fn discover_ttl_targets(
                 duration_secs,
                 anchor_field,
                 scope,
+                target_field,
             }) = &prop_def.property_type
             {
                 let anchor_field_id = interner.and_then(|int| int.lookup(anchor_field));
+                let target_field_id =
+                    interner.and_then(|int| target_field.as_deref().and_then(|tf| int.lookup(tf)));
                 targets.push(TtlTarget {
                     label: label_name.clone(),
                     _property_name: prop_name.clone(),
@@ -240,6 +249,8 @@ fn discover_ttl_targets(
                     anchor_field: anchor_field.clone(),
                     anchor_field_id,
                     scope: *scope,
+                    target_field: target_field.clone(),
+                    target_field_id,
                 });
             }
         }
@@ -352,7 +363,7 @@ fn reap_label(
                     }
                 }
             }
-            TtlScope::Field | TtlScope::Subtree => {
+            TtlScope::Field => {
                 match collect_property_removal_mutations(
                     engine,
                     &key,
@@ -361,16 +372,32 @@ fn reap_label(
                 ) {
                     Ok(mutations) => {
                         pending.extend(mutations);
-                        if target.scope == TtlScope::Field {
-                            result.fields_removed += 1;
-                        } else {
-                            result.subtrees_removed += 1;
-                        }
+                        result.fields_removed += 1;
                     }
                     Err(e) => {
                         result.errors.push(format!(
                             "collect remove {} from node {node_id}: {e}",
                             target.anchor_field
+                        ));
+                    }
+                }
+            }
+            TtlScope::Subtree => {
+                // Subtree: delete `target_field` if specified, otherwise fall back
+                // to deleting the anchor field itself (same behaviour as Field scope).
+                let (del_field_id, del_field_name) = match &target.target_field {
+                    Some(tf) => (target.target_field_id, tf.as_str()),
+                    None => (target.anchor_field_id, target.anchor_field.as_str()),
+                };
+                match collect_property_removal_mutations(engine, &key, del_field_id, del_field_name)
+                {
+                    Ok(mutations) => {
+                        pending.extend(mutations);
+                        result.subtrees_removed += 1;
+                    }
+                    Err(e) => {
+                        result.errors.push(format!(
+                            "collect remove {del_field_name} from node {node_id}: {e}",
                         ));
                     }
                 }
@@ -884,6 +911,7 @@ mod tests {
                 duration_secs,
                 anchor_field: "created_at".into(),
                 scope,
+                target_field: None,
             },
         ));
         schema
@@ -1037,6 +1065,73 @@ mod tests {
     }
 
     // ── reap_computed_ttl: scope Subtree ─────────────────────────────
+
+    /// When `target_field` is specified, Subtree scope must delete the target
+    /// DOCUMENT field, NOT the anchor TIMESTAMP field that triggered expiry.
+    ///
+    /// Regression test for G068: previously Subtree behaved identically to Field
+    /// (always deleted anchor_field regardless of target_field).
+    #[test]
+    fn reap_subtree_with_target_field_deletes_target_not_anchor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = test_engine(dir.path());
+        let mut interner = FieldInterner::new();
+
+        // Schema: anchor = created_at (TIMESTAMP), target = profile_data (String).
+        let mut schema = LabelSchema::new("Profile");
+        schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
+        schema.add_property(PropertyDef::new("profile_data", PropertyType::String));
+        schema.add_property(PropertyDef::computed(
+            "_ttl",
+            ComputedSpec::Ttl {
+                duration_secs: 60,
+                anchor_field: "created_at".into(),
+                scope: TtlScope::Subtree,
+                target_field: Some("profile_data".into()),
+            },
+        ));
+        persist_schema(&engine, &schema);
+
+        // Insert node with expired anchor (created 2 minutes ago) + profile_data content.
+        let old_ts = now_us() - 120 * 1_000_000;
+        let mut record = NodeRecord::new("Profile");
+        let ts_field = interner.intern("created_at");
+        let pd_field = interner.intern("profile_data");
+        record.set(ts_field, Value::Timestamp(old_ts));
+        record.set(pd_field, Value::String("sensitive content".into()));
+        let key = encode_node_key(1, NodeId::from_raw(30));
+        engine
+            .put(Partition::Node, &key, &record.to_msgpack().expect("ser"))
+            .expect("put");
+
+        // Use the same interner so the reaper can resolve target_field_id = pd_field.
+        // Without an interner, the reaper has no way to map "profile_data" → u32 field_id
+        // (props is keyed by u32, not by name).
+        let result = reap_computed_ttl_with_interner(&engine, 1, 1000, &interner);
+        assert_eq!(
+            result.subtrees_removed, 1,
+            "subtree removal should be counted"
+        );
+        assert!(
+            node_exists(&engine, 1, 30),
+            "node must survive subtree removal"
+        );
+
+        // Reload node and verify: profile_data deleted, created_at preserved.
+        let raw = engine
+            .get(Partition::Node, &key)
+            .expect("get")
+            .expect("node exists");
+        let updated = NodeRecord::from_msgpack(&raw).expect("decode");
+        assert!(
+            !updated.props.contains_key(&pd_field),
+            "profile_data must be removed by subtree TTL"
+        );
+        assert!(
+            updated.props.contains_key(&ts_field),
+            "created_at (anchor) must NOT be removed — only the target field is deleted"
+        );
+    }
 
     #[test]
     fn reap_removes_subtree_on_expiry() {

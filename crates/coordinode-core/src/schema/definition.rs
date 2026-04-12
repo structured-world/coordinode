@@ -620,6 +620,7 @@ mod tests {
                 duration_secs: 2592000,
                 anchor_field: "created_at".into(),
                 scope: TtlScope::Node,
+                target_field: None,
             },
         ));
 
