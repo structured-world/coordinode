@@ -54,7 +54,9 @@ async function submit() {
   errorMessage.value = "";
 
   try {
-    const response = await fetch("/api/report-bug", {
+    // Absolute URL: coordinode.com DNS is on PowerDNS (not Cloudflare), so the
+    // bug-reports worker is proxied through coordinode-docs.sw.foundation (CF zone).
+    const response = await fetch("https://coordinode-docs.sw.foundation/api/report-bug", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
