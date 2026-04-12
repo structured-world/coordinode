@@ -295,6 +295,20 @@ mod tests {
         }
     }
 
+    /// `target_field = Some(...)` must survive msgpack roundtrip.
+    #[test]
+    fn ttl_with_target_field_msgpack_roundtrip() {
+        let spec = ComputedSpec::Ttl {
+            duration_secs: 3600,
+            anchor_field: "created_at".into(),
+            scope: TtlScope::Subtree,
+            target_field: Some("profile_data".into()),
+        };
+        let bytes = rmp_serde::to_vec(&spec).expect("serialize");
+        let decoded: ComputedSpec = rmp_serde::from_slice(&bytes).expect("deserialize");
+        assert_eq!(spec, decoded);
+    }
+
     #[test]
     fn ttl_scope_roundtrip() {
         for scope in &[TtlScope::Field, TtlScope::Subtree, TtlScope::Node] {
