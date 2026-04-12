@@ -387,16 +387,25 @@ fn reap_label(
                 // otherwise fall back to the anchor field (same as Field scope).
                 //
                 // When `target_field` is Some but `target_field_id` is None the
-                // interner did not hold this name — only possible via the no-interner
-                // convenience wrapper `reap_computed_ttl`. In that case we skip the
-                // mutation rather than let the timestamp heuristic in
+                // field name was not present in the interner snapshot given to the
+                // reaper at startup — this can happen in production when a schema
+                // with a new `target_field` is added after the database is opened
+                // and no nodes carrying that field have been written yet.
+                // Skipping is safer than letting the timestamp heuristic in
                 // `collect_property_removal_mutations` remove the wrong field.
-                // The production path (`reap_computed_ttl_via_pipeline`) always
-                // provides a populated interner and resolves `target_field_id`.
+                // The skip is recorded in `result.errors` so operators can detect
+                // the stale interner condition.
                 let to_delete: Option<(Option<u32>, &str)> =
                     match (&target.target_field, target.target_field_id) {
                         (Some(tf), Some(_)) => Some((target.target_field_id, tf.as_str())),
-                        (Some(_), None) => None, // unresolved — skip to avoid heuristic
+                        (Some(tf), None) => {
+                            result.errors.push(format!(
+                                "label {}: target_field '{tf}' not in interner — \
+                                 Subtree deletion skipped for node {node_id}",
+                                target.label,
+                            ));
+                            None
+                        }
                         (None, _) => Some((target.anchor_field_id, target.anchor_field.as_str())),
                     };
 
@@ -1147,6 +1156,76 @@ mod tests {
         assert!(
             updated.props.contains_key(&ts_field),
             "created_at (anchor) must NOT be removed — only the target field is deleted"
+        );
+    }
+
+    /// When `target_field` is specified but the field name is NOT in the interner
+    /// (e.g., schema added after database open, no nodes with that field yet),
+    /// the reaper must skip the deletion AND surface an error in `result.errors`.
+    ///
+    /// This is NOT a silent no-op — operators must be able to detect the condition.
+    #[test]
+    fn reap_subtree_unresolved_target_field_records_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = test_engine(dir.path());
+        // Empty interner — "payload" is not interned.
+        let interner = FieldInterner::new();
+
+        // Schema with target_field = "payload", but "payload" is not in the interner.
+        let mut schema = LabelSchema::new("Cache");
+        schema.add_property(PropertyDef::new("cached_at", PropertyType::Timestamp));
+        schema.add_property(PropertyDef::new("payload", PropertyType::String));
+        schema.add_property(PropertyDef::computed(
+            "_ttl",
+            ComputedSpec::Ttl {
+                duration_secs: 60,
+                anchor_field: "cached_at".into(),
+                scope: TtlScope::Subtree,
+                target_field: Some("payload".into()),
+            },
+        ));
+        persist_schema(&engine, &schema);
+
+        // Insert expired node using a separate interner (simulates data written after startup).
+        let mut write_interner = FieldInterner::new();
+        let old_ts = now_us() - 120 * 1_000_000;
+        let ts_field = write_interner.intern("cached_at");
+        let payload_field = write_interner.intern("payload");
+        let mut record = NodeRecord::new("Cache");
+        record.set(ts_field, Value::Timestamp(old_ts));
+        record.set(payload_field, Value::String("stale data".into()));
+        let key = encode_node_key(1, NodeId::from_raw(99));
+        engine
+            .put(Partition::Node, &key, &record.to_msgpack().expect("ser"))
+            .expect("put");
+
+        // Reap with the EMPTY interner — target_field_id will be None.
+        let result = reap_computed_ttl_with_interner(&engine, 1, 1000, &interner);
+
+        // No deletion should happen (safe no-op), but an error must be recorded.
+        assert_eq!(
+            result.subtrees_removed, 0,
+            "no deletion when target unresolved"
+        );
+        assert!(
+            !result.errors.is_empty(),
+            "must record error for unresolved target_field"
+        );
+        assert!(
+            result.errors[0].contains("payload"),
+            "error must mention the unresolved field name, got: {:?}",
+            result.errors[0]
+        );
+
+        // The node must be untouched.
+        let raw = engine
+            .get(Partition::Node, &key)
+            .expect("get")
+            .expect("node exists");
+        let updated = NodeRecord::from_msgpack(&raw).expect("decode");
+        assert!(
+            updated.props.contains_key(&payload_field),
+            "payload must NOT be removed when target_field_id is unresolved"
         );
     }
 
