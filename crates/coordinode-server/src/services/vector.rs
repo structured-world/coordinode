@@ -15,6 +15,22 @@ fn cypher_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
+/// Map a `DistanceMetric` proto integer to the Cypher function and ORDER direction.
+///
+/// Returns `(fn_name, order)` where `order` is `"ASC"` for distance-based metrics
+/// (lower = closer) and `"DESC"` for similarity-based metrics (higher = closer).
+///
+/// Proto enum values:
+///   UNSPECIFIED=0, COSINE=1, L2=2, DOT=3, L1=4
+fn metric_cypher(metric: i32) -> (&'static str, &'static str) {
+    match metric {
+        1 => ("vector_similarity", "DESC"), // COSINE: higher similarity = closer
+        3 => ("vector_dot", "DESC"),        // DOT: higher dot product = closer
+        4 => ("vector_manhattan", "ASC"),   // L1: lower distance = closer
+        _ => ("vector_distance", "ASC"),    // UNSPECIFIED or L2: lower distance = closer
+    }
+}
+
 pub struct VectorServiceImpl {
     database: Arc<Mutex<Database>>,
 }
@@ -49,13 +65,13 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         let property = cypher_ident(&req.property);
         let top_k = req.top_k as usize;
 
-        // Cypher: compute distance per node, sort ascending, take top_k.
-        // Uses the HNSW-backed vector_distance() function.
-        // vector_distance() returns f32 L2 distance by default.
+        // Cypher: compute distance/similarity per node, sort, take top_k.
+        // The function and ORDER direction depend on the requested metric.
+        let (dist_fn, order_dir) = metric_cypher(req.metric);
         let cypher = format!(
             "MATCH (n:{label}) \
-             WITH n, vector_distance(n.{property}, $qv) AS _dist \
-             ORDER BY _dist \
+             WITH n, {dist_fn}(n.{property}, $qv) AS _dist \
+             ORDER BY _dist {order_dir} \
              LIMIT {top_k} \
              RETURN n AS _nid, _dist"
         );
@@ -120,14 +136,15 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         let start_node_id = req.start_node_id;
 
         // Traverse from start node up to max_depth hops, then rank by vector
-        // distance and return top_k neighbours.
+        // distance/similarity and return top_k neighbours.
         // `start = $start_id` compares the node variable (Value::Int(node_id))
         // directly — same mechanism used in get_node and traverse.
+        let (dist_fn, order_dir) = metric_cypher(req.metric);
         let cypher = format!(
             "MATCH (start)-[:{edge_type}*1..{max_depth}]->(n) \
              WHERE start = $start_id \
-             WITH n, vector_distance(n.{property}, $qv) AS _dist \
-             ORDER BY _dist \
+             WITH n, {dist_fn}(n.{property}, $qv) AS _dist \
+             ORDER BY _dist {order_dir} \
              LIMIT {top_k} \
              RETURN n AS _nid, _dist"
         );
@@ -433,6 +450,73 @@ mod tests {
             body.results[0].distance < 0.05,
             "closest node should have near-zero distance, got {}",
             body.results[0].distance
+        );
+    }
+
+    /// REGRESSION: vector_search must honour the `metric` parameter.
+    ///
+    /// Uses vectors where COSINE and L2 rankings diverge:
+    ///   - Node A = [3.0, 0.0]: far from origin but perfectly aligned with query.
+    ///   - Node B = [0.7, 0.7]: closer in L2 but at 45° (lower cosine similarity).
+    ///   - Query  = [1.0, 0.0]
+    ///
+    /// L2 ranking:     B first (dist≈0.76), A second (dist=2.0)
+    /// COSINE ranking: A first (similarity=1.0), B second (similarity≈0.707)
+    ///
+    /// Before the fix, both metric values produced identical results (L2).
+    #[tokio::test]
+    async fn vector_search_respects_metric_parameter() {
+        let (svc, _dir) = test_service();
+
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (n:MetricTest {emb: [3.0, 0.0]})")
+                .expect("create node A");
+            db.execute_cypher("CREATE (n:MetricTest {emb: [0.7, 0.7]})")
+                .expect("create node B");
+        }
+
+        // L2 metric (2) — expect node B as top-1 (closer in Euclidean space).
+        let l2_resp = svc
+            .vector_search(Request::new(query::VectorSearchRequest {
+                label: "MetricTest".to_string(),
+                property: "emb".to_string(),
+                query_vector: Some(crate::proto::common::Vector {
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 1,
+                metric: 2, // DISTANCE_METRIC_L2
+            }))
+            .await
+            .expect("l2 search should succeed");
+
+        // COSINE metric (1) — expect node A as top-1 (perfect cosine alignment).
+        let cosine_resp = svc
+            .vector_search(Request::new(query::VectorSearchRequest {
+                label: "MetricTest".to_string(),
+                property: "emb".to_string(),
+                query_vector: Some(crate::proto::common::Vector {
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 1,
+                metric: 1, // DISTANCE_METRIC_COSINE
+            }))
+            .await
+            .expect("cosine search should succeed");
+
+        let l2_dist = l2_resp.into_inner().results[0].distance;
+        let cosine_score = cosine_resp.into_inner().results[0].distance;
+
+        // COSINE top-1 (node A, score=1.0) must differ from L2 top-1 (node B, dist≈0.76).
+        assert!(
+            (cosine_score - l2_dist).abs() > 0.1,
+            "metric=COSINE and metric=L2 must produce different scores; \
+             cosine_score={cosine_score}, l2_dist={l2_dist}"
+        );
+        // COSINE similarity to a perfectly aligned vector must be 1.0.
+        assert!(
+            (cosine_score - 1.0).abs() < 1e-5,
+            "top cosine result should have similarity=1.0, got {cosine_score}"
         );
     }
 
