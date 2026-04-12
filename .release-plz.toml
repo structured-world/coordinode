@@ -10,6 +10,9 @@ publish = false
 git_tag_enable = false
 git_release_enable = false
 git_tag_name = "v{{ version }}"
+# All crate changes are aggregated into a single CHANGELOG.md at the repo root.
+# Each crate gets its own subsection grouped under the version header.
+workspace_changelog = "CHANGELOG.md"
 
 [changelog]
 commit_parsers = [
