@@ -196,6 +196,10 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let mc = build_merge_clause(pair)?;
             clauses.push(Clause::Merge(mc));
         }
+        Rule::merge_all_clause => {
+            let mc = build_merge_clause(pair)?;
+            clauses.push(Clause::MergeMany(mc));
+        }
         Rule::upsert_clause => {
             let uc = build_upsert_clause(pair)?;
             clauses.push(Clause::Upsert(uc));

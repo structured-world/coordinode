@@ -52,6 +52,8 @@ pub enum Clause {
     // Write clauses
     Create(CreateClause),
     Merge(MergeClause),
+    /// MERGE ALL: Cartesian-product relationship merge — all matching src × tgt pairs.
+    MergeMany(MergeClause),
     Upsert(UpsertClause),
     Delete(DeleteClause),
     Set(Vec<SetItem>),

@@ -1644,7 +1644,8 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             pattern,
             on_match,
             on_create,
-        } => execute_merge(pattern, on_match, on_create, ctx),
+            multi,
+        } => execute_merge(pattern, on_match, on_create, *multi, ctx),
 
         LogicalOp::Upsert {
             pattern,
@@ -3741,12 +3742,15 @@ fn execute_merge(
     pattern: &LogicalOp,
     on_match: &[crate::cypher::ast::SetItem],
     on_create: &[crate::cypher::ast::SetItem],
+    multi: bool,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     // G072: MERGE (src)-[r:TYPE]->(tgt) — relationship pattern with correlated bindings.
     // When the pattern is a Traverse and ctx.correlated_row has src/tgt bound, use the
     // targeted match+create path instead of the generic execute_op + execute_create_from_pattern.
     // The generic path scans all nodes and fails to create edges from Traverse patterns.
+    // MERGE ALL with correlated row: same per-pair logic (the CartesianProduct executor
+    // feeds each (src, tgt) pair as a correlated row, so multi=true behaves identically here).
     if let (Some(traverse), Some(correlated)) =
         (as_traverse_op(pattern), ctx.correlated_row.clone())
     {
@@ -3762,6 +3766,18 @@ fn execute_merge(
             return Ok(created);
         }
         return execute_update(&created, on_create, ctx);
+    }
+
+    // G077: Standalone MERGE ALL — Cartesian product across all matching src × tgt nodes.
+    // Pattern: MERGE ALL (a:L {k:v})-[r:T]->(b:L {k:v})
+    // Algorithm:
+    //   1. Find or create source nodes (all of them).
+    //   2. Find or create target nodes (all of them).
+    //   3. For each (src, tgt) pair: find-or-create the relationship individually.
+    if multi {
+        if let Some(traverse) = as_traverse_op(pattern) {
+            return execute_mergemany_standalone(traverse, on_match, on_create, ctx);
+        }
     }
 
     // G074: Standalone relationship MERGE — no correlated_row (no preceding MATCH).
@@ -3803,6 +3819,80 @@ fn execute_merge(
         }
         execute_update(&created, on_create, ctx)
     }
+}
+
+/// MERGE ALL standalone: Cartesian product of all matching src × tgt nodes.
+///
+/// For each (src, tgt) pair from all matching nodes, find-or-create the relationship.
+/// If no src nodes exist → create one; if no tgt nodes exist → create one.
+/// Unlike MERGE, multiple matching nodes are NOT an error — this is the intended semantics.
+fn execute_mergemany_standalone(
+    traverse: &LogicalOp,
+    on_match: &[crate::cypher::ast::SetItem],
+    on_create: &[crate::cypher::ast::SetItem],
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    let (input, target_variable, target_labels, target_filters) = match traverse {
+        LogicalOp::Traverse {
+            input,
+            target_variable,
+            target_labels,
+            target_filters,
+            ..
+        } => (input, target_variable, target_labels, target_filters),
+        _ => unreachable!("execute_mergemany_standalone: not a Traverse"),
+    };
+
+    // Step 1: Collect all matching source nodes (or create one if none exist).
+    let src_rows = execute_op(input, ctx)?;
+    let src_rows = if src_rows.is_empty() {
+        execute_create_from_pattern(input, ctx)?
+    } else {
+        src_rows
+    };
+
+    // Step 2: Collect all matching target nodes (or create one if none exist).
+    let target_scan = LogicalOp::NodeScan {
+        variable: target_variable.clone(),
+        labels: target_labels.clone(),
+        property_filters: target_filters.clone(),
+    };
+    let tgt_rows = execute_op(&target_scan, ctx)?;
+    let tgt_rows = if tgt_rows.is_empty() {
+        execute_create_from_pattern(&target_scan, ctx)?
+    } else {
+        tgt_rows
+    };
+
+    // Step 3: For each (src, tgt) pair, find-or-create the relationship.
+    let mut all_rows: Vec<Row> = Vec::new();
+    for src_row in &src_rows {
+        for tgt_row in &tgt_rows {
+            let mut correlated = src_row.clone();
+            correlated.extend(tgt_row.clone());
+
+            let matches = execute_merge_relationship_check(traverse, &correlated, ctx)?;
+            let pair_rows = if !matches.is_empty() {
+                // Relationship already exists — ON MATCH path.
+                if on_match.is_empty() {
+                    matches
+                } else {
+                    execute_update(&matches, on_match, ctx)?
+                }
+            } else {
+                // Relationship absent — create it → ON CREATE path.
+                let created = execute_merge_relationship_create(traverse, &correlated, ctx)?;
+                if on_create.is_empty() {
+                    created
+                } else {
+                    execute_update(&created, on_create, ctx)?
+                }
+            };
+            all_rows.extend(pair_rows);
+        }
+    }
+
+    Ok(all_rows)
 }
 
 /// Returns true if op is a `Merge` whose inner pattern is (or wraps) a `Traverse`.
@@ -4252,7 +4342,7 @@ fn execute_merge_relationship_standalone_create(
 
     // Step 1: Find or create source node from the Traverse's input (NodeScan).
     // Ambiguous pattern (multiple matching nodes) is an error: MERGE requires a unique match.
-    // Use MERGEMANY (future) if multi-target upsert is needed.
+    // Use MERGE ALL if multi-target upsert is needed.
     let src_rows = execute_op(input, ctx)?;
     let src_row = match src_rows.len() {
         0 => {
@@ -4268,7 +4358,7 @@ fn execute_merge_relationship_standalone_create(
         n => {
             return Err(ExecutionError::Unsupported(format!(
                 "MERGE relationship: ambiguous source pattern — {n} nodes match. \
-                 Use a more specific property filter or MERGEMANY for multi-target upsert."
+                 Use a more specific property filter or MERGE ALL for multi-target upsert."
             )))
         }
     };
@@ -4295,7 +4385,7 @@ fn execute_merge_relationship_standalone_create(
         n => {
             return Err(ExecutionError::Unsupported(format!(
                 "MERGE relationship: ambiguous target pattern — {n} nodes match. \
-                 Use a more specific property filter or MERGEMANY for multi-target upsert."
+                 Use a more specific property filter or MERGE ALL for multi-target upsert."
             )))
         }
     };
@@ -6731,6 +6821,7 @@ mod tests {
                     property: "name".into(),
                     expr: Expr::Literal(Value::String("Alice".into())),
                 }],
+                multi: false,
             },
         };
 
@@ -6765,6 +6856,7 @@ mod tests {
                     expr: Expr::Literal(Value::Int(31)),
                 }],
                 on_create: vec![],
+                multi: false,
             },
         };
 
@@ -6804,6 +6896,7 @@ mod tests {
                 }),
                 on_match: vec![],
                 on_create: vec![],
+                multi: false,
             },
         };
 

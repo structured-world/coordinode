@@ -201,6 +201,23 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 pattern: Box::new(scan),
                 on_match: mc.on_match.clone(),
                 on_create: mc.on_create.clone(),
+                multi: false,
+            };
+            match current {
+                Some(existing) => Ok(LogicalOp::CartesianProduct {
+                    left: Box::new(existing),
+                    right: Box::new(merge_op),
+                }),
+                None => Ok(merge_op),
+            }
+        }
+        Clause::MergeMany(mc) => {
+            let scan = build_pattern_scan(&mc.pattern)?;
+            let merge_op = LogicalOp::Merge {
+                pattern: Box::new(scan),
+                on_match: mc.on_match.clone(),
+                on_create: mc.on_create.clone(),
+                multi: true,
             };
             match current {
                 Some(existing) => Ok(LogicalOp::CartesianProduct {

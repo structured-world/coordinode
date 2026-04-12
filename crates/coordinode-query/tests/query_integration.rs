@@ -7080,7 +7080,7 @@ fn test_merge_relationship_standalone_reuses_existing_nodes() {
 /// - Error message mentions "ambiguous" so the caller can diagnose the issue
 ///
 /// Rationale: MERGE semantics require a unique match. Silently picking an arbitrary node
-/// would create unpredictable results. Use MERGEMANY (future) for multi-target upsert.
+/// would create unpredictable results. Use MERGE ALL for multi-target upsert.
 #[test]
 fn test_merge_relationship_standalone_ambiguous_source_errors() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -8074,4 +8074,258 @@ fn g071_pattern_predicate_in_or() {
     );
     assert_eq!(rows.len(), 1, "edge exists → OR true");
     assert_eq!(rows[0].get("name"), Some(&Value::String("Alice".into())));
+}
+
+// ─── G077: MERGE ALL ─────────────────────────────────────────────────────────
+
+/// G077 — MERGE ALL creates one edge per (src × tgt) pair when no edges exist.
+///
+/// What this tests:
+/// - Two source nodes × two target nodes → 4 edges created (Cartesian product).
+/// - MERGE ALL (a:Src)-[r:REL]->(b:Tgt) is NOT ambiguous — all pairs are valid.
+/// - Each edge row is returned, so result.len() == 4.
+#[test]
+fn test_merge_all_creates_cartesian_product() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    // Create 2 Src nodes and 2 Tgt nodes.
+    run_cypher_with_alloc(
+        "CREATE (:Src {name: 's1'}), (:Src {name: 's2'}), (:Tgt {name: 't1'}), (:Tgt {name: 't2'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // MERGE ALL should find-or-create edges for all 4 (src × tgt) pairs.
+    let rows = run_cypher_with_alloc(
+        "MERGE ALL (a:Src)-[r:CONNECTS]->(b:Tgt) RETURN r.__type__",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    assert_eq!(rows.len(), 4, "2 src × 2 tgt = 4 edges");
+    for row in &rows {
+        assert_eq!(
+            row.get("r.__type__"),
+            Some(&Value::String("CONNECTS".into())),
+            "each edge has correct type"
+        );
+    }
+}
+
+/// G077 — MERGE ALL is idempotent: running twice on existing edges returns same count.
+///
+/// What this tests:
+/// - First MERGE ALL creates 4 edges.
+/// - Second MERGE ALL finds all 4 existing edges (ON MATCH path), does NOT create new ones.
+/// - Total edge count stays at 4.
+#[test]
+fn test_merge_all_idempotent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    run_cypher_with_alloc(
+        "CREATE (:A {id: '1'}), (:A {id: '2'}), (:B {id: '1'}), (:B {id: '2'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // First run: creates 4 edges.
+    let rows1 = run_cypher_with_alloc(
+        "MERGE ALL (a:A)-[r:LINKS]->(b:B) RETURN r.__type__",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows1.len(), 4, "first run creates 4 edges");
+
+    // Second run: all edges already exist → ON MATCH path, same 4 rows returned.
+    let rows2 = run_cypher_with_alloc(
+        "MERGE ALL (a:A)-[r:LINKS]->(b:B) RETURN r.__type__",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows2.len(), 4, "second run finds same 4 edges (idempotent)");
+}
+
+/// G077 — MERGE ALL creates src and tgt nodes from scratch when none exist.
+///
+/// What this tests:
+/// - No nodes of either label exist before MERGE ALL.
+/// - MERGE ALL creates one src node, one tgt node, and one edge.
+/// - Result has exactly 1 row (1×1 Cartesian product).
+#[test]
+fn test_merge_all_creates_from_scratch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    // No nodes exist — MERGE ALL creates both endpoint nodes and the edge.
+    let rows = run_cypher_with_alloc(
+        "MERGE ALL (a:Source {kind: 'x'})-[r:FEEDS]->(b:Sink {kind: 'y'}) RETURN r.__type__",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    assert_eq!(rows.len(), 1, "1 src × 1 tgt = 1 edge created from scratch");
+    assert_eq!(
+        rows[0].get("r.__type__"),
+        Some(&Value::String("FEEDS".into()))
+    );
+}
+
+/// G077 — MERGE ALL does NOT error on ambiguous source (unlike MERGE).
+///
+/// What this tests:
+/// - MERGE errors when >1 source node matches.
+/// - MERGE ALL handles the same case as a Cartesian product (no error).
+/// - With 2 src and 1 tgt → 2 edges created.
+#[test]
+fn test_merge_all_does_not_error_on_ambiguous_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    // Create 2 identical-label source nodes and 1 target.
+    run_cypher_with_alloc(
+        "CREATE (:Worker {role: 'op'}), (:Worker {role: 'op'}), (:Queue {name: 'main'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // MERGE ALL: 2 src × 1 tgt = 2 edges. Must NOT error.
+    let rows = run_cypher_with_alloc(
+        "MERGE ALL (a:Worker {role: 'op'})-[r:PROCESSES]->(b:Queue {name: 'main'}) RETURN r.__type__",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    assert_eq!(rows.len(), 2, "2 workers × 1 queue = 2 edges, no error");
+}
+
+/// G077 — MERGE ALL ON CREATE SET applies to newly created edges.
+///
+/// What this tests:
+/// - Two edges are created on first run.
+/// - ON CREATE SET assigns weight = 1 to each newly created edge variable.
+/// - Second run (ON MATCH path) returns same edges without changing weight.
+#[test]
+fn test_merge_all_on_create_set() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    run_cypher_with_alloc(
+        "CREATE (:P {id: '1'}), (:P {id: '2'}), (:Q {id: 'x'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // First run: creates 2 edges, ON CREATE SET fires for each.
+    let rows = run_cypher_with_alloc(
+        "MERGE ALL (a:P)-[r:CONNECTS]->(b:Q) ON CREATE SET r.weight = 1 RETURN r.__type__",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 2, "2 P nodes × 1 Q node = 2 edges");
+
+    // Second run: ON MATCH path, same 2 edges returned.
+    let rows2 = run_cypher_with_alloc(
+        "MERGE ALL (a:P)-[r:CONNECTS]->(b:Q) ON CREATE SET r.weight = 1 RETURN r.__type__",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows2.len(), 2, "second run: idempotent, 2 edges found");
+}
+
+/// G077 — MERGE ALL does NOT error on ambiguous target (unlike MERGE).
+///
+/// What this tests:
+/// - MERGE errors when >1 target node matches (symmetric to ambiguous source).
+/// - MERGE ALL handles the same case as Cartesian product (no error).
+/// - With 1 src and 2 tgt → 2 edges created.
+#[test]
+fn test_merge_all_does_not_error_on_ambiguous_target() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    // Create 1 source and 2 identical-label target nodes.
+    run_cypher_with_alloc(
+        "CREATE (:Router {id: 'r1'}), (:Device {type: 'sensor'}), (:Device {type: 'sensor'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // MERGE ALL: 1 router × 2 devices = 2 edges. Must NOT error.
+    let rows = run_cypher_with_alloc(
+        "MERGE ALL (a:Router {id: 'r1'})-[r:MANAGES]->(b:Device {type: 'sensor'}) RETURN r.__type__",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    assert_eq!(rows.len(), 2, "1 router × 2 devices = 2 edges, no error");
+}
+
+/// G077 — MERGE ALL ON MATCH SET fires on existing edges.
+///
+/// What this tests:
+/// - Pre-create 2 edges manually.
+/// - MERGE ALL ON MATCH SET r.visited = 1 — finds both existing edges, applies SET to each.
+/// - ON CREATE SET does NOT fire (edges already exist).
+#[test]
+fn test_merge_all_on_match_set() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    // Create 2 src nodes and 1 tgt node, plus the edges between them.
+    run_cypher_with_alloc(
+        "CREATE (:Host {name: 'h1'}), (:Host {name: 'h2'}), (:Service {name: 'svc'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    // Pre-create both edges so MERGE ALL takes the ON MATCH path.
+    run_cypher_with_alloc(
+        "MERGE ALL (a:Host)-[r:CALLS]->(b:Service {name: 'svc'}) RETURN r.__type__",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // Second run with ON MATCH SET — both edges exist, SET fires for each.
+    let rows = run_cypher_with_alloc(
+        "MERGE ALL (a:Host)-[r:CALLS]->(b:Service {name: 'svc'}) ON MATCH SET r.visited = 1 RETURN r.__type__",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "2 hosts × 1 service = 2 existing edges, ON MATCH fires"
+    );
 }

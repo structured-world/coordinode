@@ -24,6 +24,7 @@ clause = {
   | create_encrypted_index_clause
   | create_text_index_clause
   | create_clause
+  | merge_all_clause
   | merge_clause
   | upsert_clause
   | detach_delete_clause
@@ -177,6 +178,10 @@ merge_clause = { kw_merge ~ pattern ~ merge_action* }
 merge_action = { on_match_action | on_create_action }
 on_match_action  = { kw_on ~ kw_match ~ kw_set ~ set_items }
 on_create_action = { kw_on ~ kw_create ~ kw_set ~ set_items }
+
+// --- MERGE ALL (CoordiNode extension: Cartesian-product relationship merge) ---
+
+merge_all_clause = { kw_merge ~ kw_all ~ pattern ~ merge_action* }
 
 // --- UPSERT MATCH (CoordiNode extension) ---
 
@@ -377,6 +382,7 @@ kw_else       = @{ ^"else" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_end        = @{ ^"end" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_create     = @{ ^"create" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_merge      = @{ ^"merge" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_all        = @{ ^"all" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_delete     = @{ ^"delete" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_detach     = @{ ^"detach" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_set        = @{ ^"set" ~ !(ASCII_ALPHANUMERIC | "_") }

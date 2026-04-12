@@ -164,6 +164,9 @@ impl<'a> Analyzer<'a> {
             Clause::Merge(mc) => {
                 self.analyze_merge(mc);
             }
+            Clause::MergeMany(mc) => {
+                self.analyze_merge(mc);
+            }
             Clause::Upsert(uc) => {
                 self.analyze_upsert(uc);
             }

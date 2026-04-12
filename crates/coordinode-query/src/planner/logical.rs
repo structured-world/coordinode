@@ -151,7 +151,11 @@ pub enum LogicalOp {
         detach: bool,
     },
 
-    /// MERGE: match-or-create with optional ON MATCH SET / ON CREATE SET.
+    /// MERGE / MERGE ALL: match-or-create with optional ON MATCH SET / ON CREATE SET.
+    ///
+    /// When `multi = false` (MERGE): unique match — errors if >1 src OR >1 tgt matches.
+    /// When `multi = true` (MERGE ALL): Cartesian product — for every (src, tgt) pair
+    /// from all matching nodes, find-or-create the relationship.
     Merge {
         /// Pattern scan to find existing nodes/edges.
         pattern: Box<LogicalOp>,
@@ -159,6 +163,8 @@ pub enum LogicalOp {
         on_match: Vec<SetItem>,
         /// SET items to apply when creating new pattern.
         on_create: Vec<SetItem>,
+        /// `true` for MERGE ALL (Cartesian product), `false` for MERGE (unique match).
+        multi: bool,
     },
 
     /// UPSERT MATCH: atomic upsert with ON MATCH SET / ON CREATE CREATE.
@@ -450,6 +456,7 @@ impl LogicalOp {
                 pattern,
                 on_match,
                 on_create,
+                ..
             } => {
                 pattern.substitute_params(params);
                 for item in on_match {
@@ -1253,9 +1260,11 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             pattern,
             on_match,
             on_create,
+            multi,
         } => {
+            let op_name = if *multi { "MergeMany" } else { "Merge" };
             output.push_str(&format!(
-                "{prefix}Merge(on_match={}, on_create={})\n",
+                "{prefix}{op_name}(on_match={}, on_create={})\n",
                 on_match.len(),
                 on_create.len()
             ));

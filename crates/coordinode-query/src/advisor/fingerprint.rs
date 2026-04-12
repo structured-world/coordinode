@@ -135,6 +135,18 @@ fn write_clause(buf: &mut String, clause: &Clause) {
                 write_set_items(buf, &m.on_create);
             }
         }
+        Clause::MergeMany(m) => {
+            buf.push_str("MERGE ALL ");
+            write_pattern(buf, &m.pattern);
+            if !m.on_match.is_empty() {
+                buf.push_str(" ON MATCH SET ");
+                write_set_items(buf, &m.on_match);
+            }
+            if !m.on_create.is_empty() {
+                buf.push_str(" ON CREATE SET ");
+                write_set_items(buf, &m.on_create);
+            }
+        }
         Clause::Upsert(u) => {
             buf.push_str("UPSERT ");
             write_pattern(buf, &u.pattern);
