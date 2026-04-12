@@ -47,20 +47,23 @@ jobs:
             --locked \
             release-plz
 
-      - name: Run release-plz release-pr
+      - name: Run release-plz release
+        # Runs first so the git tag exists before release-pr computes the next
+        # version. Running release-pr first caused duplicate release PRs: it saw
+        # the old tag and proposed the same version again (e.g. 0.3.3→0.3.4 twice).
+        # No-op on feature pushes; expected to exit 0 before a release PR is merged.
+        continue-on-error: true
         run: |
-          release-plz release-pr \
+          release-plz release \
             --git-token "${GITHUB_TOKEN}" \
             --config .release-plz.toml \
             --verbose
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
-      - name: Run release-plz release
-        # No-op until Release PR is merged; expected to exit 0 before that.
-        continue-on-error: true
+      - name: Run release-plz release-pr
         run: |
-          release-plz release \
+          release-plz release-pr \
             --git-token "${GITHUB_TOKEN}" \
             --config .release-plz.toml \
             --verbose
