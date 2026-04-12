@@ -5,7 +5,8 @@ use tonic::{Request, Response, Status};
 use coordinode_core::graph::types::Value;
 use coordinode_embed::Database;
 
-use crate::proto::{graph, query};
+use crate::proto::{common, graph, query};
+use crate::services::cypher::value_to_proto_pub;
 
 /// Backtick-escape a Cypher identifier (label or property key).
 ///
@@ -29,6 +30,53 @@ fn metric_cypher(metric: i32) -> (&'static str, &'static str) {
         4 => ("vector_manhattan", "ASC"),   // L1: lower distance = closer
         _ => ("vector_distance", "ASC"),    // UNSPECIFIED or L2: lower distance = closer
     }
+}
+
+/// Convert a raw result row (from a vector/hybrid Cypher query) into a `VectorResult`.
+///
+/// Expects the row to have been produced by a query that uses `WITH *, ... AS _dist RETURN *`
+/// so that all node properties (`n.*`) are present in the row alongside `n.__label__`
+/// and `_dist`.
+///
+/// Returns `None` if the row lacks the required `n` (node_id) or `_dist` columns.
+fn row_to_vector_result(
+    row: std::collections::BTreeMap<String, Value>,
+) -> Option<query::VectorResult> {
+    let node_id = match row.get("n")? {
+        Value::Int(id) => *id as u64,
+        _ => return None,
+    };
+    let distance = match row.get("_dist")? {
+        Value::Float(d) => *d as f32,
+        Value::Int(d) => *d as f32,
+        _ => return None,
+    };
+    let label = match row.get("n.__label__") {
+        Some(Value::String(s)) => s.clone(),
+        _ => String::new(),
+    };
+    let labels = if label.is_empty() {
+        vec![]
+    } else {
+        vec![label]
+    };
+    let mut properties: std::collections::HashMap<String, common::PropertyValue> =
+        std::collections::HashMap::new();
+    for (k, v) in &row {
+        if let Some(prop_name) = k.strip_prefix("n.") {
+            if !prop_name.starts_with("__") {
+                properties.insert(prop_name.to_string(), value_to_proto_pub(v));
+            }
+        }
+    }
+    Some(query::VectorResult {
+        node: Some(graph::Node {
+            node_id,
+            labels,
+            properties,
+        }),
+        distance,
+    })
 }
 
 pub struct VectorServiceImpl {
@@ -66,14 +114,16 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         let top_k = req.top_k as usize;
 
         // Cypher: compute distance/similarity per node, sort, take top_k.
-        // The function and ORDER direction depend on the requested metric.
+        // `WITH *` preserves all n.* columns through the Project so that labels
+        // and properties are available in result rows (VectorTopK optimization
+        // operates on the pre-WITH NodeScan rows and passes them through Star).
         let (dist_fn, order_dir) = metric_cypher(req.metric);
         let cypher = format!(
             "MATCH (n:{label}) \
-             WITH n, {dist_fn}(n.{property}, $qv) AS _dist \
+             WITH *, {dist_fn}(n.{property}, $qv) AS _dist \
              ORDER BY _dist {order_dir} \
              LIMIT {top_k} \
-             RETURN n AS _nid, _dist"
+             RETURN *"
         );
 
         let mut params = std::collections::HashMap::new();
@@ -85,28 +135,8 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
                 .map_err(|e| Status::internal(format!("vector search error: {e}")))?
         };
 
-        let results: Vec<query::VectorResult> = rows
-            .into_iter()
-            .filter_map(|row| {
-                let node_id = match row.get("_nid")? {
-                    Value::Int(id) => *id as u64,
-                    _ => return None,
-                };
-                let distance = match row.get("_dist")? {
-                    Value::Float(d) => *d as f32,
-                    Value::Int(d) => *d as f32,
-                    _ => return None,
-                };
-                Some(query::VectorResult {
-                    node: Some(graph::Node {
-                        node_id,
-                        labels: vec![req.label.clone()],
-                        properties: std::collections::HashMap::new(),
-                    }),
-                    distance,
-                })
-            })
-            .collect();
+        let results: Vec<query::VectorResult> =
+            rows.into_iter().filter_map(row_to_vector_result).collect();
 
         Ok(Response::new(query::VectorSearchResponse { results }))
     }
@@ -139,14 +169,16 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         // distance/similarity and return top_k neighbours.
         // `start = $start_id` compares the node variable (Value::Int(node_id))
         // directly — same mechanism used in get_node and traverse.
+        // `WITH *` preserves all n.* columns through the Project so that labels
+        // and properties are available in result rows (same as vector_search).
         let (dist_fn, order_dir) = metric_cypher(req.metric);
         let cypher = format!(
             "MATCH (start)-[:{edge_type}*1..{max_depth}]->(n) \
              WHERE start = $start_id \
-             WITH n, {dist_fn}(n.{property}, $qv) AS _dist \
+             WITH *, {dist_fn}(n.{property}, $qv) AS _dist \
              ORDER BY _dist {order_dir} \
              LIMIT {top_k} \
-             RETURN n AS _nid, _dist"
+             RETURN *"
         );
 
         let mut params = std::collections::HashMap::new();
@@ -159,28 +191,8 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
                 .map_err(|e| Status::internal(format!("hybrid search error: {e}")))?
         };
 
-        let results: Vec<query::VectorResult> = rows
-            .into_iter()
-            .filter_map(|row| {
-                let node_id = match row.get("_nid")? {
-                    Value::Int(id) => *id as u64,
-                    _ => return None,
-                };
-                let distance = match row.get("_dist")? {
-                    Value::Float(d) => *d as f32,
-                    Value::Int(d) => *d as f32,
-                    _ => return None,
-                };
-                Some(query::VectorResult {
-                    node: Some(graph::Node {
-                        node_id,
-                        labels: vec![],
-                        properties: std::collections::HashMap::new(),
-                    }),
-                    distance,
-                })
-            })
-            .collect();
+        let results: Vec<query::VectorResult> =
+            rows.into_iter().filter_map(row_to_vector_result).collect();
 
         Ok(Response::new(query::HybridSearchResponse { results }))
     }
@@ -450,6 +462,114 @@ mod tests {
             body.results[0].distance < 0.05,
             "closest node should have near-zero distance, got {}",
             body.results[0].distance
+        );
+    }
+
+    /// REGRESSION: vector_search must populate labels and properties in results.
+    ///
+    /// Creates nodes with a known label and a `score` property, then asserts
+    /// that the returned VectorResult has non-empty labels and properties.
+    ///
+    /// Before the fix, labels was always [] and properties was always {}.
+    #[tokio::test]
+    async fn vector_search_returns_labels_and_properties() {
+        let (svc, _dir) = test_service();
+
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (n:PropTest {emb: [1.0, 0.0], score: 42})")
+                .expect("create node");
+        }
+
+        let result = svc
+            .vector_search(Request::new(query::VectorSearchRequest {
+                label: "PropTest".to_string(),
+                property: "emb".to_string(),
+                query_vector: Some(crate::proto::common::Vector {
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 1,
+                metric: 0,
+            }))
+            .await
+            .expect("vector_search should succeed");
+
+        let body = result.into_inner();
+        assert_eq!(body.results.len(), 1);
+
+        let node = body.results[0].node.as_ref().expect("node must be present");
+        assert!(
+            !node.labels.is_empty(),
+            "labels must not be empty; got {:?}",
+            node.labels
+        );
+        assert_eq!(node.labels[0], "PropTest", "label should match query label");
+        assert!(
+            node.properties.contains_key("score"),
+            "properties must include 'score'; got keys {:?}",
+            node.properties.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// REGRESSION: hybrid_search must populate labels in results.
+    ///
+    /// Before the fix, labels was always [] for hybrid_search results (unlike
+    /// vector_search which at least returned req.label).
+    #[tokio::test]
+    async fn hybrid_search_returns_labels_and_properties() {
+        let (svc, _dir) = test_service();
+
+        let start_id: u64;
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (h:Hub {name: 'hub'})")
+                .expect("hub");
+            db.execute_cypher("CREATE (n:Member {name: 'alice', emb: [1.0, 0.0], rank: 7})")
+                .expect("alice");
+            db.execute_cypher(
+                "MATCH (h:Hub {name: 'hub'}), (m:Member {name: 'alice'}) \
+                 CREATE (h)-[:LINK]->(m)",
+            )
+            .expect("edge");
+
+            let rows = db
+                .execute_cypher("MATCH (h:Hub {name: 'hub'}) RETURN h")
+                .expect("get hub id");
+            start_id = match rows[0].get("h").expect("h binding") {
+                coordinode_core::graph::types::Value::Int(i) => *i as u64,
+                _ => panic!("hub id not int"),
+            };
+        }
+
+        let result = svc
+            .hybrid_search(Request::new(query::HybridSearchRequest {
+                start_node_id: start_id,
+                edge_type: "LINK".to_string(),
+                max_depth: 1,
+                vector_property: "emb".to_string(),
+                query_vector: Some(crate::proto::common::Vector {
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 1,
+                metric: 0,
+            }))
+            .await
+            .expect("hybrid_search should succeed");
+
+        let body = result.into_inner();
+        assert_eq!(body.results.len(), 1);
+
+        let node = body.results[0].node.as_ref().expect("node must be present");
+        assert!(
+            !node.labels.is_empty(),
+            "hybrid_search labels must not be empty; got {:?}",
+            node.labels
+        );
+        assert_eq!(node.labels[0], "Member", "label should be 'Member'");
+        assert!(
+            node.properties.contains_key("rank"),
+            "properties must include 'rank'; got keys {:?}",
+            node.properties.keys().collect::<Vec<_>>()
         );
     }
 
