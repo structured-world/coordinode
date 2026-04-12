@@ -105,6 +105,17 @@ pub enum ComputedSpec {
         anchor_field: String,
         /// What to delete when expired.
         scope: TtlScope,
+        /// For `scope = Subtree`: the DOCUMENT property to delete on expiry.
+        ///
+        /// The `anchor_field` is the TIMESTAMP trigger; `target_field` is the
+        /// content to remove. If `None` (or `scope != Subtree`), the anchor
+        /// field itself is removed (same as `scope = Field`).
+        ///
+        /// Example: `anchor_field = "created_at"`, `target_field = Some("metadata")`
+        /// → deletes the `metadata` DOCUMENT property when `created_at` is older
+        /// than `duration_secs`, while `created_at` is left intact.
+        #[serde(default)]
+        target_field: Option<String>,
     },
 
     /// Multiplier applied to vector similarity scores at query time.
@@ -227,6 +238,7 @@ mod tests {
             duration_secs: 3600,
             anchor_field: "expires_at".into(),
             scope: TtlScope::Node,
+            target_field: None,
         };
         assert_eq!(ttl.anchor_field(), "expires_at");
     }
@@ -265,6 +277,7 @@ mod tests {
                 duration_secs: 2592000,
                 anchor_field: "created_at".into(),
                 scope: TtlScope::Node,
+                target_field: None,
             },
             ComputedSpec::VectorDecay {
                 formula: DecayFormula::PowerLaw {
@@ -280,6 +293,20 @@ mod tests {
             let decoded: ComputedSpec = rmp_serde::from_slice(&bytes).expect("deserialize");
             assert_eq!(*spec, decoded);
         }
+    }
+
+    /// `target_field = Some(...)` must survive msgpack roundtrip.
+    #[test]
+    fn ttl_with_target_field_msgpack_roundtrip() {
+        let spec = ComputedSpec::Ttl {
+            duration_secs: 3600,
+            anchor_field: "created_at".into(),
+            scope: TtlScope::Subtree,
+            target_field: Some("profile_data".into()),
+        };
+        let bytes = rmp_serde::to_vec(&spec).expect("serialize");
+        let decoded: ComputedSpec = rmp_serde::from_slice(&bytes).expect("deserialize");
+        assert_eq!(spec, decoded);
     }
 
     #[test]
