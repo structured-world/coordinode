@@ -705,6 +705,59 @@ mod tests {
         )));
     }
 
+    // -- WITH * (Star projection) --
+
+    /// `WITH *` keeps all upstream variables in scope.
+    #[test]
+    fn with_star_keeps_variables() {
+        let errors = parse_and_analyze("MATCH (n:User) WITH * RETURN n");
+        assert!(errors.is_empty(), "WITH * must keep n in scope: {errors:?}");
+    }
+
+    /// `WITH *, expr AS alias` — Star + explicit alias: both the original variable
+    /// AND the new alias must be in scope after WITH.
+    ///
+    /// REGRESSION: `analyze_with` used to `break` when it encountered Star, so any
+    /// aliases listed after Star (e.g. `_dist`) were never added to the new scope.
+    /// That caused "undefined variable" errors for ORDER BY / RETURN on the alias.
+    #[test]
+    fn with_star_plus_alias_both_in_scope() {
+        let errors =
+            parse_and_analyze("MATCH (n:User) WITH *, n.age AS age_alias RETURN n, age_alias");
+        assert!(
+            errors.is_empty(),
+            "WITH *, expr AS alias must put both n and age_alias in scope: {errors:?}"
+        );
+    }
+
+    /// ORDER BY on an alias introduced alongside Star must work — this is the
+    /// exact pattern used in vector_search / hybrid_search:
+    ///   `WITH *, vector_distance(n.emb, $qv) AS _dist ORDER BY _dist LIMIT k`
+    #[test]
+    fn with_star_alias_usable_in_order_by() {
+        let errors = parse_and_analyze(
+            "MATCH (n:User) \
+             WITH *, n.age AS _score \
+             ORDER BY _score DESC \
+             LIMIT 10 \
+             RETURN n, _score",
+        );
+        assert!(
+            errors.is_empty(),
+            "alias from WITH * must be usable in ORDER BY: {errors:?}"
+        );
+    }
+
+    /// Original variable from Star projection must still be visible in ORDER BY.
+    #[test]
+    fn with_star_original_var_usable_in_order_by() {
+        let errors = parse_and_analyze("MATCH (n:User) WITH * ORDER BY n.name RETURN n");
+        assert!(
+            errors.is_empty(),
+            "WITH * must keep n accessible in ORDER BY: {errors:?}"
+        );
+    }
+
     #[test]
     fn unwind_introduces_variable() {
         let errors = parse_and_analyze("UNWIND [1, 2, 3] AS x RETURN x");
