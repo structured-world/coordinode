@@ -43,7 +43,7 @@ jobs:
       - name: Install forked release-plz
         run: |
           cargo install --git https://github.com/structured-world/release-plz.git \
-            --branch 'fix/#2595-git-only-skip-cargo-package' \
+            --branch 'feat/#2791-workspace-changelog' \
             --locked \
             release-plz
 
