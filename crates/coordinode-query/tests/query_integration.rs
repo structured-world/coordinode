@@ -6903,38 +6903,310 @@ fn test_merge_relationship_on_create_set() {
     );
 }
 
-/// G072 — standalone MERGE relationship (no preceding MATCH) is currently unsupported.
+/// G074 — standalone MERGE relationship creates both nodes and edge from scratch.
 ///
-/// Documents the known limitation: `MERGE (a:L {k:v})-[r:T]->(b:L {k:v})` requires
-/// finding/creating both nodes AND the edge. The correlated path requires pre-bound
-/// src/tgt variables which only exist after MATCH. Without MATCH, correlated_row
-/// is None and execute_merge falls through to the generic path which still fails.
-///
-/// This test verifies the error message is meaningful, not a panic.
-/// When standalone relationship MERGE is implemented, update to assert success.
+/// What this tests:
+/// - `MERGE (a:Person {name:'X'})-[r:KNOWS]->(b:Person {name:'Y'})` succeeds with no
+///   preceding MATCH and no pre-existing data
+/// - Returns the relationship type in the result row
+/// - Both source and target nodes are created implicitly
 #[test]
-fn test_merge_relationship_standalone_returns_error() {
+fn test_merge_relationship_standalone_creates_from_scratch() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
-    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
 
-    let ast =
-        parse("MERGE (a:Person {name: 'X'})-[r:KNOWS]->(b:Person {name: 'Y'}) RETURN r.__type__")
-            .expect("parse");
+    let rows = run_cypher_with_alloc(
+        "MERGE (a:Person {name: 'X'})-[r:KNOWS]->(b:Person {name: 'Y'}) RETURN r.__type__",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    assert_eq!(rows.len(), 1, "should return one row");
+    assert_eq!(
+        rows[0].get("r.__type__"),
+        Some(&Value::String("KNOWS".to_string())),
+        "relationship type should be KNOWS"
+    );
+
+    // Verify the edge persists: the path can be found in a subsequent MATCH
+    let match_rows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'X'})-[r:KNOWS]->(b:Person {name: 'Y'}) RETURN a.name, b.name",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(
+        match_rows.len(),
+        1,
+        "edge should persist after standalone MERGE"
+    );
+    assert_eq!(
+        match_rows[0].get("a.name"),
+        Some(&Value::String("X".to_string())),
+    );
+    assert_eq!(
+        match_rows[0].get("b.name"),
+        Some(&Value::String("Y".to_string())),
+    );
+}
+
+/// G074 — standalone MERGE is idempotent: second run finds the existing path.
+///
+/// What this tests:
+/// - Running the same standalone MERGE twice does not create duplicate nodes or edges
+/// - Second run returns the same relationship (ON MATCH path, not ON CREATE)
+/// - ON CREATE SET fires only on the first run; ON MATCH SET fires on the second
+#[test]
+fn test_merge_relationship_standalone_idempotent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    // First MERGE — creates nodes and edge. ON CREATE SET should fire.
+    let rows1 = run_cypher_with_alloc(
+        "MERGE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) \
+         ON CREATE SET a.created = 1 \
+         RETURN r.__type__, a.created AS c",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows1.len(), 1);
+    assert_eq!(
+        rows1[0].get("r.__type__"),
+        Some(&Value::String("KNOWS".to_string())),
+    );
+    assert_eq!(
+        rows1[0].get("c"),
+        Some(&Value::Int(1)),
+        "ON CREATE SET must fire on first run"
+    );
+
+    // Second MERGE — path exists. ON CREATE SET must NOT fire; ON MATCH SET should fire.
+    let rows2 = run_cypher_with_alloc(
+        "MERGE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) \
+         ON MATCH SET a.matched = 1 \
+         RETURN r.__type__, a.matched AS m",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows2.len(), 1);
+    assert_eq!(
+        rows2[0].get("r.__type__"),
+        Some(&Value::String("KNOWS".to_string())),
+        "second run should find same relationship type"
+    );
+    assert_eq!(
+        rows2[0].get("m"),
+        Some(&Value::Int(1)),
+        "ON MATCH SET must fire on second run (path already exists)"
+    );
+
+    // Verify no duplicate nodes: only one Person {name:'Alice'} should exist
+    let alice_rows = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}) RETURN count(a) AS cnt",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(alice_rows.len(), 1);
+    assert_eq!(
+        alice_rows[0].get("cnt"),
+        Some(&Value::Int(1)),
+        "standalone MERGE must not create duplicate nodes"
+    );
+}
+
+/// G074 — standalone MERGE reuses existing nodes when the edge is missing.
+///
+/// What this tests:
+/// - Pre-existing nodes are reused (not duplicated) when the edge doesn't exist yet
+/// - Edge is created between the two pre-existing nodes
+/// - Node count stays the same after MERGE
+#[test]
+fn test_merge_relationship_standalone_reuses_existing_nodes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    // Pre-create both nodes without any edge
+    run_cypher_with_alloc(
+        "CREATE (:City {name: 'Paris'}), (:City {name: 'London'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // Standalone MERGE should find both existing nodes and create only the edge
+    let rows = run_cypher_with_alloc(
+        "MERGE (a:City {name: 'Paris'})-[r:CONNECTED_TO]->(b:City {name: 'London'}) \
+         RETURN r.__type__",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("r.__type__"),
+        Some(&Value::String("CONNECTED_TO".to_string())),
+    );
+
+    // Verify node count: still exactly 2 City nodes (no duplicates)
+    let city_rows = run_cypher_with_alloc(
+        "MATCH (c:City) RETURN count(c) AS cnt",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(city_rows.len(), 1);
+    assert_eq!(
+        city_rows[0].get("cnt"),
+        Some(&Value::Int(2)),
+        "standalone MERGE must reuse existing nodes, not create duplicates"
+    );
+}
+
+/// G074 — standalone MERGE errors when the source pattern is ambiguous (multiple matches).
+///
+/// What this tests:
+/// - If multiple nodes match the source pattern, MERGE returns an error (not silent take-first)
+/// - If multiple nodes match the target pattern, MERGE returns an error
+/// - Error message mentions "ambiguous" so the caller can diagnose the issue
+///
+/// Rationale: MERGE semantics require a unique match. Silently picking an arbitrary node
+/// would create unpredictable results. Use MERGEMANY (future) for multi-target upsert.
+#[test]
+fn test_merge_relationship_standalone_ambiguous_source_errors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    // Create two Person nodes with the same label and property
+    run_cypher_with_alloc(
+        "CREATE (:Person {role: 'admin'}), (:Person {role: 'admin'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // MERGE with ambiguous source (2 matching nodes) should error
+    let ast = parse(
+        "MERGE (a:Person {role: 'admin'})-[r:MANAGES]->(b:Device {id: 'x'}) RETURN r.__type__",
+    )
+    .expect("parse");
     let plan = build_logical_plan(&ast).expect("plan");
+    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
     let result = execute(&plan, &mut ctx);
 
-    // Must be an error (not a panic), with a meaningful message
-    assert!(
-        result.is_err(),
-        "standalone relationship MERGE should return an error until fully implemented"
-    );
+    assert!(result.is_err(), "ambiguous source should return an error");
     let msg = result.unwrap_err().to_string();
     assert!(
-        msg.contains("MERGE"),
-        "error should mention MERGE, got: {msg}"
+        msg.to_lowercase().contains("ambiguous"),
+        "error should mention 'ambiguous', got: {msg}"
+    );
+}
+
+/// G074 — standalone MERGE errors when the target pattern is ambiguous.
+#[test]
+fn test_merge_relationship_standalone_ambiguous_target_errors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    // Create two Device nodes with the same label and property
+    run_cypher_with_alloc(
+        "CREATE (:Device {type: 'sensor'}), (:Device {type: 'sensor'}) RETURN 1",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // MERGE with ambiguous target (2 matching nodes) should error
+    let ast = parse(
+        "MERGE (a:Gateway {id: 'gw1'})-[r:MONITORS]->(b:Device {type: 'sensor'}) RETURN r.__type__",
+    )
+    .expect("parse");
+    let plan = build_logical_plan(&ast).expect("plan");
+    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let result = execute(&plan, &mut ctx);
+
+    assert!(result.is_err(), "ambiguous target should return an error");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.to_lowercase().contains("ambiguous"),
+        "error should mention 'ambiguous', got: {msg}"
+    );
+}
+
+/// G074 — standalone MERGE RETURN exposes node variables directly (not just r.__type__).
+///
+/// What this tests:
+/// - `MERGE (a:L {k:v})-[r:T]->(b:L {k:v}) RETURN a.name, b.name, r.__type__` returns all three
+/// - The synthetic correlated row produced by standalone create carries src and tgt fields
+/// - Both ON CREATE and ON MATCH paths produce rows with accessible node properties
+#[test]
+fn test_merge_relationship_standalone_return_node_variables() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    // --- First run: both nodes and edge are created from scratch ---
+    let rows1 = run_cypher_with_alloc(
+        "MERGE (a:Author {name: 'Alice'})-[r:WROTE]->(b:Book {title: 'Rust101'}) \
+         RETURN a.name, b.title, r.__type__",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows1.len(), 1, "create path: should return one row");
+    assert_eq!(
+        rows1[0].get("a.name"),
+        Some(&Value::String("Alice".to_string())),
+        "create path: a.name should be Alice"
+    );
+    assert_eq!(
+        rows1[0].get("b.title"),
+        Some(&Value::String("Rust101".to_string())),
+        "create path: b.title should be Rust101"
+    );
+    assert_eq!(
+        rows1[0].get("r.__type__"),
+        Some(&Value::String("WROTE".to_string())),
+        "create path: r.__type__ should be WROTE"
+    );
+
+    // --- Second run: path already exists, ON MATCH path — same row shape ---
+    let rows2 = run_cypher_with_alloc(
+        "MERGE (a:Author {name: 'Alice'})-[r:WROTE]->(b:Book {title: 'Rust101'}) \
+         RETURN a.name, b.title, r.__type__",
+        &engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows2.len(), 1, "match path: should return one row");
+    assert_eq!(
+        rows2[0].get("a.name"),
+        Some(&Value::String("Alice".to_string())),
+        "match path: a.name should be Alice"
+    );
+    assert_eq!(
+        rows2[0].get("b.title"),
+        Some(&Value::String("Rust101".to_string())),
+        "match path: b.title should be Rust101"
+    );
+    assert_eq!(
+        rows2[0].get("r.__type__"),
+        Some(&Value::String("WROTE".to_string())),
+        "match path: r.__type__ should be WROTE"
     );
 }
 
