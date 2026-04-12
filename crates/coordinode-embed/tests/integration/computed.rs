@@ -38,6 +38,7 @@ fn setup_memory_schema(db: &mut Database) {
             duration_secs: 2592000, // 30 days
             anchor_field: "created_at".into(),
             scope: TtlScope::Node,
+            target_field: None,
         },
     ));
 
@@ -351,6 +352,7 @@ fn computed_ttl_field_removal_survives_reopen() {
                 duration_secs: 1,
                 anchor_field: "cached_at".into(),
                 scope: TtlScope::Field,
+                target_field: None,
             },
         ));
 
@@ -1218,8 +1220,9 @@ fn computed_decay_at_5_timestamps() {
 /// Uses inline map literal in CREATE to store nested DOCUMENT content.
 /// Map literals are auto-converted to Document type on write.
 ///
-/// Note: current implementation treats Subtree = Field (removes anchor).
-/// See G068 for the gap between current behavior and arch doc intent.
+/// Subtree scope with `target_field = None` falls back to removing the anchor
+/// (same behaviour as Field scope). For the case where `target_field = Some(...)`,
+/// see `computed_ttl_subtree_target_field_deletes_target_not_anchor`.
 #[test]
 fn computed_ttl_subtree_removes_anchor_preserves_document() {
     let (mut db, _dir) = open_db();
@@ -1235,6 +1238,7 @@ fn computed_ttl_subtree_removes_anchor_preserves_document() {
             duration_secs: 60, // 1 minute
             anchor_field: "cached_at".into(),
             scope: TtlScope::Subtree,
+            target_field: None,
         },
     ));
 
@@ -1354,5 +1358,92 @@ fn computed_ttl_subtree_removes_anchor_preserves_document() {
         expired_row.get("s"),
         Some(&Value::String("quarterly".into())),
         "expired node's nested DOCUMENT content should survive subtree TTL"
+    );
+}
+
+/// Regression test for G068: Subtree scope with `target_field = Some(...)` must
+/// delete the specified target property, NOT the anchor TIMESTAMP field.
+///
+/// Schema: anchor = `cached_at` (TIMESTAMP trigger), target = `payload` (Document).
+/// After reap: `payload` removed, `cached_at` preserved, node survives.
+#[test]
+fn computed_ttl_subtree_target_field_deletes_target_not_anchor() {
+    let (mut db, _dir) = open_db();
+
+    // Schema: TTL triggers on cached_at, but expires the payload DOCUMENT field.
+    let mut schema = LabelSchema::new("PrivateDoc");
+    schema.add_property(PropertyDef::new("title", PropertyType::String).not_null());
+    schema.add_property(PropertyDef::new("cached_at", PropertyType::Timestamp));
+    schema.add_property(PropertyDef::new("payload", PropertyType::Document));
+    schema.add_property(PropertyDef::computed(
+        "_ttl",
+        ComputedSpec::Ttl {
+            duration_secs: 60,
+            anchor_field: "cached_at".into(),
+            scope: TtlScope::Subtree,
+            target_field: Some("payload".into()),
+        },
+    ));
+
+    let schema_key = coordinode_core::schema::definition::encode_label_schema_key("PrivateDoc");
+    let bytes = schema.to_msgpack().expect("serialize schema");
+    db.engine_shared()
+        .put(
+            coordinode_storage::engine::partition::Partition::Schema,
+            &schema_key,
+            &bytes,
+        )
+        .expect("persist schema");
+
+    // Create expired node (cached_at = 2 min ago, TTL = 60s → expired).
+    let old_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64
+        - 120 * 1_000_000;
+
+    db.execute_cypher(&format!(
+        "CREATE (d:PrivateDoc {{title: 'secret', cached_at: {old_us}, \
+         payload: {{data: 'sensitive'}}}})"
+    ))
+    .expect("create expired node");
+
+    // Use the DB's own interner — it maps "payload" → the same u32 field_id
+    // that was assigned when the CREATE query wrote the node.
+    let result = coordinode_query::index::ttl_reaper::reap_computed_ttl_with_interner(
+        &db.engine_shared(),
+        1,
+        1000,
+        db.interner(),
+    );
+    assert_eq!(result.subtrees_removed, 1, "subtree removal counted");
+    assert_eq!(result.nodes_deleted, 0, "node must survive");
+
+    // Verify: payload gone, cached_at and title preserved.
+    let rows = db
+        .execute_cypher(
+            "MATCH (d:PrivateDoc) \
+             RETURN d.title AS t, d.cached_at AS ca, d.payload AS p",
+        )
+        .expect("query after reap");
+    assert_eq!(rows.len(), 1, "node must survive subtree TTL");
+
+    let row = &rows[0];
+    assert_eq!(
+        row.get("t"),
+        Some(&Value::String("secret".into())),
+        "title must survive"
+    );
+    assert!(
+        matches!(
+            row.get("ca"),
+            Some(Value::Int(_)) | Some(Value::Timestamp(_))
+        ),
+        "cached_at (anchor) must NOT be removed — only target_field is deleted"
+    );
+    assert_eq!(
+        row.get("p"),
+        Some(&Value::Null),
+        "payload (target_field) must be removed by subtree TTL"
     );
 }
