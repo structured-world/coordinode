@@ -282,9 +282,9 @@ impl<'a> Analyzer<'a> {
         let mut new_scope = HashMap::new();
         for item in &wc.items {
             if item.expr == Expr::Star {
-                // Star projects everything
-                new_scope = self.scope.clone();
-                break;
+                // Star projects everything — continue to also add explicit aliases
+                new_scope.extend(self.scope.clone());
+                continue;
             }
 
             let name = if let Some(ref alias) = item.alias {
