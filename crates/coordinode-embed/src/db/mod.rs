@@ -869,6 +869,7 @@ impl Database {
             text_index: None,
             text_index_registry: Some(&self.text_index_registry),
             vector_index_registry: Some(&self.vector_index_registry),
+            btree_index_registry: Some(&self.index_registry),
             vector_loader: Some(&vector_loader),
             mvcc_oracle: Some(&self.oracle),
             mvcc_read_ts: read_ts,
@@ -1095,6 +1096,138 @@ impl Database {
         // a single source of truth.
         self.vector_index_registry.register(def.clone());
         self.index_registry.register_in_memory(def);
+    }
+
+    /// Persist a label schema to storage and auto-create unique B-tree indexes.
+    ///
+    /// Idempotent: existing schema for this label is replaced. For each property
+    /// with `unique = true`, a B-tree unique index is created (if not already
+    /// present) and existing nodes are backfilled into the index.
+    ///
+    /// Returns the schema version after persistence.
+    pub fn create_label_schema(
+        &mut self,
+        schema: coordinode_core::schema::definition::LabelSchema,
+    ) -> Result<u64, DatabaseError> {
+        use coordinode_core::schema::definition::encode_label_schema_key;
+
+        // 1. Persist the schema to storage.
+        let key = encode_label_schema_key(&schema.name);
+        let bytes = schema
+            .to_msgpack()
+            .map_err(|e| DatabaseError::Other(format!("serialize label schema: {e}")))?;
+        self.engine.put(Partition::Schema, &key, &bytes)?;
+
+        let version = schema.version;
+        let label_name = schema.name.clone();
+
+        // 2. For each unique property, register a B-tree unique index.
+        // Collect first to avoid borrowing schema while mutably borrowing registries.
+        let unique_props: Vec<String> = schema
+            .properties
+            .values()
+            .filter(|p| p.unique)
+            .map(|p| p.name.clone())
+            .collect();
+
+        for prop_name in unique_props {
+            let idx_name = format!("{}_{}", label_name.to_lowercase(), prop_name.to_lowercase());
+            if self.index_registry.get(&idx_name).is_some() {
+                continue; // index already registered — skip
+            }
+
+            let idx =
+                coordinode_query::index::IndexDefinition::btree(&idx_name, &label_name, &prop_name)
+                    .unique();
+            self.index_registry
+                .register(&self.engine, idx)
+                .map_err(DatabaseError::Storage)?;
+
+            // Backfill existing nodes of this label into the new index.
+            // Duplicate values in pre-existing data are logged as warnings —
+            // we do not reject the schema creation because of historical data.
+            self.backfill_btree_index(&label_name, &prop_name);
+        }
+
+        Ok(version)
+    }
+
+    /// Backfill a B-tree index for nodes of `label` that are already in storage.
+    ///
+    /// Called after a new unique B-tree index is registered via `create_label_schema`.
+    /// Unique violations in pre-existing data are logged as warnings, not errors.
+    fn backfill_btree_index(&self, label: &str, property: &str) {
+        use coordinode_core::graph::node::{decode_node_key, NodeRecord};
+        use coordinode_core::graph::types::Value;
+
+        let node_prefix = {
+            let mut p = Vec::with_capacity(8);
+            p.extend_from_slice(b"node:");
+            p.extend_from_slice(&self.shard_id.to_be_bytes());
+            p.push(b':');
+            p
+        };
+
+        let iter = match self.engine.prefix_scan(Partition::Node, &node_prefix) {
+            Ok(it) => it,
+            Err(e) => {
+                tracing::warn!(
+                    "backfill_btree_index: failed to scan nodes for {label}.{property}: {e}"
+                );
+                return;
+            }
+        };
+
+        let field_id = self.interner.lookup(property);
+
+        for guard in iter {
+            let Ok((_key, value)) = guard.into_inner() else {
+                continue;
+            };
+            let Ok(record) = NodeRecord::from_msgpack(&value) else {
+                continue;
+            };
+            if record.primary_label() != label {
+                continue;
+            }
+            let Some((_, node_id)) = decode_node_key(&_key) else {
+                continue;
+            };
+
+            let prop_val = if let Some(fid) = field_id {
+                record.props.get(&fid).cloned().unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
+
+            let props = [(property.to_string(), prop_val)];
+            if let Err(e) =
+                self.index_registry
+                    .on_node_created(&self.engine, node_id, label, &props)
+            {
+                tracing::warn!(
+                    "backfill_btree_index: unique violation for {label}.{property} on node {node_id:?}: {e}"
+                );
+            }
+        }
+    }
+
+    /// Persist an edge type schema to storage.
+    ///
+    /// Idempotent: existing schema for this edge type is replaced.
+    /// Returns the schema version after persistence.
+    pub fn create_edge_type_schema(
+        &mut self,
+        schema: coordinode_core::schema::definition::EdgeTypeSchema,
+    ) -> Result<u64, DatabaseError> {
+        use coordinode_core::schema::definition::encode_edge_type_schema_key;
+
+        let key = encode_edge_type_schema_key(&schema.name);
+        let bytes = schema
+            .to_msgpack()
+            .map_err(|e| DatabaseError::Other(format!("serialize edge type schema: {e}")))?;
+        self.engine.put(Partition::Schema, &key, &bytes)?;
+        Ok(schema.version)
     }
 
     /// Get a reference to the vector index registry.
