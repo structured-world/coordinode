@@ -4,8 +4,10 @@
 semver_check = false
 git_only = true
 publish = false
-git_release_enable = true
-changelog_update = true
+# Defaults: no git release / changelog for library crates.
+# coordinode-server overrides these below.
+git_release_enable = false
+changelog_update = false
 git_tag_name = "v{{ version }}"
 
 [changelog]
@@ -17,6 +19,7 @@ commit_parsers = [
     { message = "^docs\\(ci\\)", skip = true },
     { message = "^docs\\(copilot\\)", skip = true },
     { message = "^Merge", skip = true },
+    { message = "^Revert", skip = true },
     { message = "^docs", group = "Documentation" },
     { message = "^feat", group = "Added" },
     { message = "^fix", group = "Fixed" },
@@ -25,45 +28,11 @@ commit_parsers = [
     { message = "^test", group = "Testing" },
 ]
 
-# Library crates are internal implementation details — not released individually.
-# All crates share the workspace version via version.workspace = true.
-# release-plz tracks only coordinode-server (the shipped binary) for version
-# bumping; it updates [workspace.package].version which cascades to all crates.
-# This prevents cargo package from being run on library crates whose internal
-# interdependencies are not published to crates.io.
-
+# The shipped binary — only this crate gets a git tag, GitHub Release,
+# and CHANGELOG entry. All library crates are tracked for changes (so
+# dependency-chain bumps cascade correctly) but don't produce their own
+# releases.
 [[package]]
-name = "coordinode-core"
-release = false
-
-[[package]]
-name = "coordinode-query"
-release = false
-
-[[package]]
-name = "coordinode-vector"
-release = false
-
-[[package]]
-name = "coordinode-search"
-release = false
-
-[[package]]
-name = "coordinode-storage"
-release = false
-
-[[package]]
-name = "coordinode-raft"
-release = false
-
-[[package]]
-name = "coordinode-auth"
-release = false
-
-[[package]]
-name = "coordinode-s3"
-release = false
-
-[[package]]
-name = "coordinode-embed"
-release = false
+name = "coordinode-server"
+git_release_enable = true
+changelog_update = true
