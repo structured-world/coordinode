@@ -3836,23 +3836,26 @@ fn execute_merge_relationship_check(
     correlated: &Row,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    let (source, edge_types, direction, target_variable, edge_variable) = match traverse {
-        LogicalOp::Traverse {
-            source,
-            edge_types,
-            direction,
-            target_variable,
-            edge_variable,
-            ..
-        } => (
-            source,
-            edge_types,
-            direction,
-            target_variable,
-            edge_variable,
-        ),
-        _ => unreachable!("execute_merge_relationship_check: not a Traverse"),
-    };
+    let (source, edge_types, direction, target_variable, edge_variable, edge_filters) =
+        match traverse {
+            LogicalOp::Traverse {
+                source,
+                edge_types,
+                direction,
+                target_variable,
+                edge_variable,
+                edge_filters,
+                ..
+            } => (
+                source,
+                edge_types,
+                direction,
+                target_variable,
+                edge_variable,
+                edge_filters,
+            ),
+            _ => unreachable!("execute_merge_relationship_check: not a Traverse"),
+        };
 
     let source_id = match correlated.get(source.as_str()) {
         Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
@@ -3883,14 +3886,71 @@ fn execute_merge_relationship_check(
     let target_raw = target_id.as_raw();
     for et in effective_types {
         let neighbors = expand_one_hop(source_id, std::slice::from_ref(et), *direction, ctx)?;
-        if neighbors.iter().any(|(tgt, _)| *tgt == target_raw) {
-            let mut row = correlated.clone();
-            if let Some(ev) = edge_variable {
-                row.insert(format!("{ev}.__type__"), Value::String(et.clone()));
-                row.insert(ev.clone(), Value::String(et.clone()));
-            }
-            return Ok(vec![row]);
+        if !neighbors.iter().any(|(tgt, _)| *tgt == target_raw) {
+            continue;
         }
+
+        // Edge (src → tgt) exists in adjacency list.
+        // G075: if edge_filters are specified, also verify that the stored edge properties
+        // match. Two MERGEs with different property values for the same (src, tgt, type) are
+        // treated as distinct — no match if properties differ (since the data model stores
+        // one EdgeProp record per (type, src, tgt), a mismatch means the edge's current
+        // properties don't satisfy this MERGE pattern).
+        if !edge_filters.is_empty() {
+            let (ep_src, ep_tgt) = match direction {
+                Direction::Outgoing | Direction::Both => (source_id, target_id),
+                Direction::Incoming => (target_id, source_id),
+            };
+            let ep_key = encode_edgeprop_key(et, ep_src, ep_tgt);
+            // Load stored edge properties into a flat name→value map.
+            let mut stored: std::collections::HashMap<String, Value> =
+                std::collections::HashMap::new();
+            if let Some(ep_bytes) = ctx.mvcc_get(Partition::EdgeProp, &ep_key)? {
+                if let Ok(prop_map) = rmp_serde::from_slice::<Vec<(u32, Value)>>(&ep_bytes) {
+                    for (field_id, value) in prop_map {
+                        if let Some(field_name) = ctx.interner.resolve(field_id) {
+                            stored.insert(field_name.to_string(), value);
+                        }
+                    }
+                }
+            }
+            // All filter expressions must match stored values.
+            let filters_match = edge_filters.iter().all(|(prop_name, filter_expr)| {
+                let actual = stored.get(prop_name).cloned().unwrap_or(Value::Null);
+                let expected = eval_expr(filter_expr, correlated);
+                actual == expected
+            });
+            if !filters_match {
+                // This edge exists but has different property values — treat as no match.
+                continue;
+            }
+        }
+
+        // Edge found and all property filters match.
+        let mut row = correlated.clone();
+        if let Some(ev) = edge_variable {
+            row.insert(format!("{ev}.__type__"), Value::String(et.clone()));
+            row.insert(ev.clone(), Value::String(et.clone()));
+            // Populate stored edge properties into the result row so ON MATCH SET can
+            // reference them via `r.prop_name`.
+            if !edge_filters.is_empty() {
+                let (ep_src, ep_tgt) = match direction {
+                    Direction::Outgoing | Direction::Both => (source_id, target_id),
+                    Direction::Incoming => (target_id, source_id),
+                };
+                let ep_key = encode_edgeprop_key(et, ep_src, ep_tgt);
+                if let Some(ep_bytes) = ctx.mvcc_get(Partition::EdgeProp, &ep_key)? {
+                    if let Ok(prop_map) = rmp_serde::from_slice::<Vec<(u32, Value)>>(&ep_bytes) {
+                        for (field_id, value) in prop_map {
+                            if let Some(field_name) = ctx.interner.resolve(field_id) {
+                                row.insert(format!("{ev}.{field_name}"), value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(vec![row]);
     }
 
     Ok(vec![])
@@ -4054,28 +4114,34 @@ fn check_single_hop_exists(
 /// Create a relationship edge described by `traverse` between the source and target
 /// nodes bound in `correlated`. Called from `execute_merge` when no existing edge
 /// was found by `execute_merge_relationship_check`.
+///
+/// G075: edge properties from `edge_filters` are now stored in the EdgeProp partition
+/// so that subsequent MATCH or MERGE can retrieve and compare them.
 fn execute_merge_relationship_create(
     traverse: &LogicalOp,
     correlated: &Row,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    let (source, edge_types, direction, target_variable, edge_variable) = match traverse {
-        LogicalOp::Traverse {
-            source,
-            edge_types,
-            direction,
-            target_variable,
-            edge_variable,
-            ..
-        } => (
-            source,
-            edge_types,
-            direction,
-            target_variable,
-            edge_variable,
-        ),
-        _ => unreachable!("execute_merge_relationship_create: not a Traverse"),
-    };
+    let (source, edge_types, direction, target_variable, edge_variable, edge_filters) =
+        match traverse {
+            LogicalOp::Traverse {
+                source,
+                edge_types,
+                direction,
+                target_variable,
+                edge_variable,
+                edge_filters,
+                ..
+            } => (
+                source,
+                edge_types,
+                direction,
+                target_variable,
+                edge_variable,
+                edge_filters,
+            ),
+            _ => unreachable!("execute_merge_relationship_create: not a Traverse"),
+        };
 
     if edge_types.is_empty() {
         return Err(ExecutionError::Unsupported(
@@ -4127,6 +4193,28 @@ fn execute_merge_relationship_create(
     if let Some(ev) = edge_variable {
         row.insert(format!("{ev}.__type__"), Value::String(et.clone()));
         row.insert(ev.clone(), Value::String(et.clone()));
+    }
+
+    // G075: store edge properties (from pattern `[r:TYPE {prop: val}]`) in EdgeProp partition.
+    // Key: edgeprop:<TYPE>:<from_id BE>:<to_id BE>  (same format as CREATE clause).
+    // Value: MessagePack Vec<(field_id, Value)>.
+    // Note: if this edge already existed with different properties, the new values
+    // overwrite the old (upsert semantics within a single-edge-per-type data model).
+    if !edge_filters.is_empty() {
+        let mut prop_map: Vec<(u32, Value)> = Vec::with_capacity(edge_filters.len());
+        for (prop_name, expr) in edge_filters {
+            let field_id = ctx.interner.intern(prop_name);
+            let value = eval_expr(expr, correlated);
+            prop_map.push((field_id, value.clone()));
+            if let Some(ev) = edge_variable {
+                row.insert(format!("{ev}.{prop_name}"), value);
+            }
+        }
+        let prop_bytes = rmp_serde::to_vec(&prop_map)
+            .map_err(|e| ExecutionError::Serialization(format!("edge prop encode: {e}")))?;
+        let ep_key = encode_edgeprop_key(et, from_id, to_id);
+        ctx.mvcc_put(Partition::EdgeProp, &ep_key, &prop_bytes)?;
+        ctx.write_stats.properties_set += edge_filters.len() as u64;
     }
 
     Ok(vec![row])
