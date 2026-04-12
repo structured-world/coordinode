@@ -497,18 +497,32 @@ mod tests {
         let body = result.into_inner();
         assert_eq!(body.results.len(), 1);
 
-        let node = body.results[0].node.as_ref().expect("node must be present");
+        let res = &body.results[0];
+        let node = res.node.as_ref().expect("node must be present");
+
+        // node_id must be a valid (non-zero) storage ID.
+        assert!(node.node_id > 0, "node_id must be non-zero");
+
         assert!(
             !node.labels.is_empty(),
             "labels must not be empty; got {:?}",
             node.labels
         );
         assert_eq!(node.labels[0], "PropTest", "label should match query label");
+
         assert!(
             node.properties.contains_key("score"),
             "properties must include 'score'; got keys {:?}",
             node.properties.keys().collect::<Vec<_>>()
         );
+        // Verify the property VALUE is correct, not just the key.
+        let score_val = node.properties.get("score").expect("score must exist");
+        match &score_val.value {
+            Some(crate::proto::common::property_value::Value::IntValue(v)) => {
+                assert_eq!(*v, 42, "score should be 42, got {v}");
+            }
+            other => panic!("score should be IntValue, got {other:?}"),
+        }
     }
 
     /// REGRESSION: hybrid_search must populate labels in results.
@@ -559,7 +573,10 @@ mod tests {
         let body = result.into_inner();
         assert_eq!(body.results.len(), 1);
 
-        let node = body.results[0].node.as_ref().expect("node must be present");
+        let res = &body.results[0];
+        let node = res.node.as_ref().expect("node must be present");
+
+        assert!(node.node_id > 0, "node_id must be non-zero");
         assert!(
             !node.labels.is_empty(),
             "hybrid_search labels must not be empty; got {:?}",
@@ -570,6 +587,90 @@ mod tests {
             node.properties.contains_key("rank"),
             "properties must include 'rank'; got keys {:?}",
             node.properties.keys().collect::<Vec<_>>()
+        );
+        // Verify rank value is correct.
+        let rank_val = node.properties.get("rank").expect("rank must exist");
+        match &rank_val.value {
+            Some(crate::proto::common::property_value::Value::IntValue(v)) => {
+                assert_eq!(*v, 7, "rank should be 7, got {v}");
+            }
+            other => panic!("rank should be IntValue, got {other:?}"),
+        }
+    }
+
+    /// REGRESSION: hybrid_search must honour the `metric` parameter.
+    ///
+    /// Mirrors `vector_search_respects_metric_parameter` through the graph-traversal
+    /// path: two members connected from a hub, with vectors where COSINE and L2
+    /// rankings diverge.  Before the fix the `metric` field was ignored even in the
+    /// hybrid path (the same `metric_cypher` call was missing).
+    #[tokio::test]
+    async fn hybrid_search_respects_metric_parameter() {
+        let (svc, _dir) = test_service();
+
+        let start_id: u64;
+        {
+            let mut db = svc.database.lock().unwrap();
+            // Hub
+            db.execute_cypher("CREATE (h:HMetric {name: 'hub'})")
+                .expect("hub");
+            // Node A: far in L2, but perfectly aligned with query [1,0].
+            db.execute_cypher("CREATE (n:HMetric {emb: [3.0, 0.0]})")
+                .expect("node A");
+            // Node B: closer in L2, but at 45° (lower cosine similarity).
+            db.execute_cypher("CREATE (n:HMetric {emb: [0.7, 0.7]})")
+                .expect("node B");
+            // Edges from hub to both members.
+            db.execute_cypher(
+                "MATCH (h:HMetric {name: 'hub'}), (m:HMetric) \
+                 WHERE m.emb IS NOT NULL \
+                 CREATE (h)-[:HLINK]->(m)",
+            )
+            .expect("edges");
+
+            let rows = db
+                .execute_cypher("MATCH (h:HMetric {name: 'hub'}) RETURN h")
+                .expect("get hub");
+            start_id = match rows[0].get("h").expect("h") {
+                coordinode_core::graph::types::Value::Int(i) => *i as u64,
+                _ => panic!("hub id not int"),
+            };
+        }
+
+        let make_req = |metric: i32| query::HybridSearchRequest {
+            start_node_id: start_id,
+            edge_type: "HLINK".to_string(),
+            max_depth: 1,
+            vector_property: "emb".to_string(),
+            query_vector: Some(crate::proto::common::Vector {
+                values: vec![1.0, 0.0],
+            }),
+            top_k: 1,
+            metric,
+        };
+
+        let l2_resp = svc
+            .hybrid_search(Request::new(make_req(2)))
+            .await
+            .expect("l2 hybrid should succeed");
+
+        let cosine_resp = svc
+            .hybrid_search(Request::new(make_req(1)))
+            .await
+            .expect("cosine hybrid should succeed");
+
+        let l2_dist = l2_resp.into_inner().results[0].distance;
+        let cosine_score = cosine_resp.into_inner().results[0].distance;
+
+        assert!(
+            (cosine_score - l2_dist).abs() > 0.1,
+            "metric=COSINE and metric=L2 must produce different scores in hybrid_search; \
+             cosine_score={cosine_score}, l2_dist={l2_dist}"
+        );
+        // COSINE top-1 on node A = [3,0] vs query [1,0]: perfect alignment → score=1.0.
+        assert!(
+            (cosine_score - 1.0).abs() < 1e-5,
+            "cosine top-1 (node A) should have similarity=1.0, got {cosine_score}"
         );
     }
 
