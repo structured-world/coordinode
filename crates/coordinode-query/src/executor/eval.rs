@@ -396,8 +396,30 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
             _ => Value::Null,
         },
         "type" => {
-            // Returns the type name of a relationship (stored as label in our model)
-            Value::Null // Resolved at executor level, not expression level
+            // type(r) → relationship type string.
+            // The executor stores edge type as `r.__type__` in the row.
+            // Extract the variable name from the first argument, then look up
+            // `<variable>.__type__` in the row.
+            if let Some(Expr::Variable(var)) = args.first() {
+                let key = format!("{var}.__type__");
+                row.get(&key).cloned().unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            }
+        }
+        "labels" => {
+            // labels(n) → list of label strings for a node.
+            // The executor stores primary label as `n.__label__` in the row.
+            // CoordiNode nodes currently have exactly one label.
+            if let Some(Expr::Variable(var)) = args.first() {
+                let key = format!("{var}.__label__");
+                match row.get(&key) {
+                    Some(Value::String(l)) => Value::Array(vec![Value::String(l.clone())]),
+                    _ => Value::Array(vec![]),
+                }
+            } else {
+                Value::Array(vec![])
+            }
         }
         "now" => {
             // Return current timestamp in microseconds

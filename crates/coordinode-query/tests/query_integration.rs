@@ -2650,6 +2650,135 @@ fn vector_top_k_brute_force_without_index() {
     assert_eq!(top_id, 1, "closest to [1,0,0] is node id 1");
 }
 
+// ── type() and labels() scalar functions (R523/R524 partial) ──────────
+
+/// `type(r)` returns the relationship type as a string.
+#[test]
+fn type_function_returns_edge_type() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let alloc = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+
+    run_cypher_with_alloc(
+        "CREATE (a:Person {name: 'Alice'})",
+        &engine,
+        &mut interner,
+        &alloc,
+    );
+    run_cypher_with_alloc(
+        "CREATE (b:Person {name: 'Bob'})",
+        &engine,
+        &mut interner,
+        &alloc,
+    );
+    run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+        &engine,
+        &mut interner,
+        &alloc,
+    );
+
+    let results = run_cypher_with_alloc(
+        "MATCH (a)-[r]->(b) RETURN type(r) AS rel_type",
+        &engine,
+        &mut interner,
+        &alloc,
+    );
+
+    assert_eq!(results.len(), 1, "should find one relationship");
+    let rel_type = results[0]
+        .get("rel_type")
+        .and_then(|v| v.as_str())
+        .expect("rel_type populated");
+    assert_eq!(rel_type, "KNOWS");
+}
+
+/// `labels(n)` returns a list containing the node's label.
+#[test]
+fn labels_function_returns_node_label() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Movie",
+        &[("title", Value::String("Matrix".into()))],
+        &mut interner,
+    );
+
+    let results = run_cypher(
+        "MATCH (n:Movie) RETURN labels(n) AS lbls",
+        &engine,
+        &mut interner,
+    );
+
+    assert_eq!(results.len(), 1);
+    let lbls = results[0].get("lbls").expect("lbls populated");
+    match lbls {
+        Value::Array(arr) => {
+            assert_eq!(arr.len(), 1, "single-label node");
+            assert_eq!(arr[0], Value::String("Movie".into()));
+        }
+        _ => panic!("expected Array, got {lbls:?}"),
+    }
+}
+
+/// `type(r)` with multiple edge types returns correct type per edge.
+#[test]
+fn type_function_multiple_edge_types() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let alloc = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+
+    run_cypher_with_alloc(
+        "CREATE (a:Person {name: 'X'})",
+        &engine,
+        &mut interner,
+        &alloc,
+    );
+    run_cypher_with_alloc(
+        "CREATE (b:Company {name: 'Y'})",
+        &engine,
+        &mut interner,
+        &alloc,
+    );
+    run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'X'}), (b:Company {name: 'Y'}) CREATE (a)-[:WORKS_AT]->(b)",
+        &engine,
+        &mut interner,
+        &alloc,
+    );
+    run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'X'}), (b:Company {name: 'Y'}) CREATE (a)-[:INVESTED_IN]->(b)",
+        &engine,
+        &mut interner,
+        &alloc,
+    );
+
+    let results = run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'X'})-[r]->(b) RETURN type(r) AS t ORDER BY t",
+        &engine,
+        &mut interner,
+        &alloc,
+    );
+
+    assert_eq!(results.len(), 2);
+    let types: Vec<&str> = results
+        .iter()
+        .filter_map(|r| r.get("t").and_then(|v| v.as_str()))
+        .collect();
+    assert!(types.contains(&"WORKS_AT"), "missing WORKS_AT: {types:?}");
+    assert!(
+        types.contains(&"INVESTED_IN"),
+        "missing INVESTED_IN: {types:?}"
+    );
+}
+
 #[test]
 fn vector_filter_cost_in_explain() {
     let ast =
