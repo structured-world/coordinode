@@ -1,7 +1,7 @@
 import { defineConfig, type HeadConfig } from "vitepress";
 
 const base = (process.env.DOCS_BASE as `/${string}/` | undefined) ?? "/";
-const hostname = "https://coordinode.dev";
+const hostname = "https://docs.coordinode.com";
 
 const siteDescription =
   "Graph + Vector + Full-Text retrieval in a single MVCC transaction. OpenCypher-compatible. Built in Rust.";
@@ -128,9 +128,9 @@ export default defineConfig({
   },
 
   head: [
-    ["link", { rel: "icon", type: "image/x-icon", href: `${base}favicon.ico` }],
-    ["link", { rel: "icon", type: "image/png", sizes: "32x32", href: `${base}favicon-32x32.png` }],
-    ["link", { rel: "icon", type: "image/png", sizes: "16x16", href: `${base}favicon-16x16.png` }],
+    ["link", { rel: "icon", type: "image/x-icon", href: "/favicon.ico" }],
+    ["link", { rel: "icon", type: "image/png", sizes: "32x32", href: "/favicon-32x32.png" }],
+    ["link", { rel: "icon", type: "image/png", sizes: "16x16", href: "/favicon-16x16.png" }],
     ["meta", { property: "og:image", content: `${hostname}/og-image.png` }],
     ["meta", { property: "og:image:width", content: "1200" }],
     ["meta", { property: "og:image:height", content: "630" }],
