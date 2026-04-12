@@ -4,8 +4,9 @@
 semver_check = false
 git_only = true
 publish = false
-# Defaults: no git release / changelog for library crates.
+# Defaults: no git tag / release / changelog for library crates.
 # coordinode-server overrides these below.
+git_tag_enable = false
 git_release_enable = false
 changelog_update = false
 git_tag_name = "v{{ version }}"
@@ -34,5 +35,6 @@ commit_parsers = [
 # releases.
 [[package]]
 name = "coordinode-server"
+git_tag_enable = true
 git_release_enable = true
 changelog_update = true
