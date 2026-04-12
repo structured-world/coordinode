@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3](https://github.com/structured-world/coordinode/compare/v0.3.2...v0.3.3) - 2026-04-12
+
+### Added
+
+- *(query)* implement standalone MERGE relationship (G074)
+
 ## [0.3.0](https://github.com/structured-world/coordinode/releases/tag/v0.3.0) - 2026-04-09
 
 ### Added
