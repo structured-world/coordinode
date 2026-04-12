@@ -294,6 +294,23 @@ fn reap_label(
     let mut result = ComputedTtlReapResult::default();
     let mut pending: Vec<Mutation> = Vec::new();
 
+    // Guard: if Subtree scope specifies a target_field that was not in the
+    // interner snapshot at startup, skip the entire label scan and record a
+    // single diagnostic.  Continuing into the node loop would emit one
+    // identical error per expired node and scan the entire shard uselessly —
+    // target_field_id is fixed per TtlTarget and cannot become Some mid-pass.
+    if let (TtlScope::Subtree, Some(tf), None) = (
+        target.scope,
+        target.target_field.as_deref(),
+        target.target_field_id,
+    ) {
+        result.errors.push(format!(
+            "label {}: target_field '{tf}' not in interner — Subtree deletion skipped",
+            target.label,
+        ));
+        return result;
+    }
+
     let cutoff_us = now_us - (target.duration_secs as i64 * 1_000_000);
 
     let node_prefix = {
@@ -395,17 +412,15 @@ fn reap_label(
                 // `collect_property_removal_mutations` remove the wrong field.
                 // The skip is recorded in `result.errors` so operators can detect
                 // the stale interner condition.
+                // Guard at reap_label entry already returns early when
+                // target_field is Some but target_field_id is None, so the
+                // (Some(_), None) arm is unreachable here.
                 let to_delete: Option<(Option<u32>, &str)> =
                     match (&target.target_field, target.target_field_id) {
                         (Some(tf), Some(_)) => Some((target.target_field_id, tf.as_str())),
-                        (Some(tf), None) => {
-                            result.errors.push(format!(
-                                "label {}: target_field '{tf}' not in interner — \
-                                 Subtree deletion skipped for node {node_id}",
-                                target.label,
-                            ));
-                            None
-                        }
+                        (Some(_), None) => unreachable!(
+                            "unresolved target_field should have been caught by early return"
+                        ),
                         (None, _) => Some((target.anchor_field_id, target.anchor_field.as_str())),
                     };
 
