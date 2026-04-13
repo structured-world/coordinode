@@ -91,9 +91,11 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
 
         // `n = $id` compares the node variable (Value::Int(node_id) from NodeScan)
         // with the target id, which is the correct way to filter by internal node ID.
+        // `RETURN *` copies ALL columns from NodeScan: `n`, `n.__label__`, `n.<prop>`.
+        // An explicit `RETURN n, n.__label__` would strip `n.*` properties in the Project step.
         let rows = {
             let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
-            db.execute_cypher_with_params("MATCH (n) WHERE n = $id RETURN n, n.__label__", params)
+            db.execute_cypher_with_params("MATCH (n) WHERE n = $id RETURN *", params)
                 .map_err(|e| Status::internal(format!("get_node error: {e}")))?
         };
 
@@ -238,11 +240,14 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             _ => ("-[", "]->"),
         };
 
+        // RETURN * copies all row columns produced by the Traverse operator, which already
+        // includes `n.__label__` and all `n.<prop>` columns. An explicit `RETURN n, n.__label__`
+        // would strip all `n.*` properties via the Project operator.
         let cypher = if req.edge_type.is_empty() {
             format!(
                 "MATCH (start){arrow_left}*1..{depth}{arrow_right}(n) \
                  WHERE start = $start_id \
-                 RETURN n \
+                 RETURN * \
                  LIMIT {limit}"
             )
         } else {
@@ -250,7 +255,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             format!(
                 "MATCH (start){arrow_left}:{rel_type}*1..{depth}{arrow_right}(n) \
                  WHERE start = $start_id \
-                 RETURN n \
+                 RETURN * \
                  LIMIT {limit}"
             )
         };
@@ -264,14 +269,39 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         let nodes: Vec<graph::Node> = rows
             .iter()
             .filter_map(|row| {
+                // `RETURN *` copies all columns from the Traverse operator row:
+                // `n` = node_id, `n.__label__` = primary label, `n.<prop>` = properties.
                 let node_id = match row.get("n")? {
                     Value::Int(id) => *id as u64,
                     _ => return None,
                 };
+
+                // Primary label stored by the Traverse operator as `n.__label__`.
+                let label = match row.get("n.__label__") {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                let labels = if label.is_empty() {
+                    vec![]
+                } else {
+                    vec![label]
+                };
+
+                // All node properties are in the row as `n.<prop>` (excluding internal `__*`).
+                let mut properties: std::collections::HashMap<String, common::PropertyValue> =
+                    std::collections::HashMap::new();
+                for (k, v) in row {
+                    if let Some(prop_name) = k.strip_prefix("n.") {
+                        if !prop_name.starts_with("__") {
+                            properties.insert(prop_name.to_string(), value_to_proto_pub(v));
+                        }
+                    }
+                }
+
                 Some(graph::Node {
                     node_id,
-                    labels: vec![],
-                    properties: std::collections::HashMap::new(),
+                    labels,
+                    properties,
                 })
             })
             .collect();
@@ -368,6 +398,58 @@ mod tests {
             .into_inner();
 
         assert_eq!(fetched.node_id, created.node_id);
+    }
+
+    /// get_node returns labels and properties for the created node.
+    ///
+    /// Regression: `RETURN n, n.__label__` strips `n.*` in Project; `RETURN *` is required.
+    #[tokio::test]
+    async fn get_node_returns_labels_and_properties() {
+        let (svc, _dir) = test_service();
+
+        let created = svc
+            .create_node(Request::new(graph::CreateNodeRequest {
+                labels: vec!["Widget".to_string()],
+                properties: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert(
+                        "size".to_string(),
+                        common::PropertyValue {
+                            value: Some(crate::proto::common::property_value::Value::StringValue(
+                                "large".to_string(),
+                            )),
+                        },
+                    );
+                    m
+                },
+            }))
+            .await
+            .expect("create should succeed")
+            .into_inner();
+
+        let fetched = svc
+            .get_node(Request::new(graph::GetNodeRequest {
+                node_id: created.node_id,
+            }))
+            .await
+            .expect("get_node should succeed")
+            .into_inner();
+
+        assert_eq!(fetched.node_id, created.node_id);
+        assert!(
+            !fetched.labels.is_empty(),
+            "get_node must populate labels, got empty vec"
+        );
+        assert!(
+            fetched.labels.contains(&"Widget".to_string()),
+            "labels must contain 'Widget', got {:?}",
+            fetched.labels
+        );
+        assert!(
+            fetched.properties.contains_key("size"),
+            "get_node must populate properties, got {:?}",
+            fetched.properties.keys().collect::<Vec<_>>()
+        );
     }
 
     /// get_node returns not_found for a non-existent node.
@@ -625,6 +707,90 @@ mod tests {
             resp.nodes.is_empty(),
             "outbound traverse from B must return nothing (edge is A→B); got {:?}",
             resp.nodes.len()
+        );
+    }
+
+    /// Regression G079: traverse must populate labels and properties in returned nodes.
+    ///
+    /// Before fix: `labels: vec![]`, `properties: HashMap::new()` always.
+    /// After fix: labels contain the primary label, properties contain the node's properties.
+    #[tokio::test]
+    async fn traverse_returns_labels_and_properties() {
+        let (svc, _dir) = test_service();
+
+        // Create a source node.
+        let src = svc
+            .create_node(Request::new(graph::CreateNodeRequest {
+                labels: vec!["Source".to_string()],
+                properties: std::collections::HashMap::new(),
+            }))
+            .await
+            .expect("create source")
+            .into_inner();
+
+        // Create a target node with a label and a property.
+        let dst = svc
+            .create_node(Request::new(graph::CreateNodeRequest {
+                labels: vec!["Target".to_string()],
+                properties: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert(
+                        "color".to_string(),
+                        common::PropertyValue {
+                            value: Some(crate::proto::common::property_value::Value::StringValue(
+                                "blue".to_string(),
+                            )),
+                        },
+                    );
+                    m
+                },
+            }))
+            .await
+            .expect("create target")
+            .into_inner();
+
+        svc.create_edge(Request::new(graph::CreateEdgeRequest {
+            edge_type: "POINTS_TO".to_string(),
+            source_node_id: src.node_id,
+            target_node_id: dst.node_id,
+            properties: std::collections::HashMap::new(),
+        }))
+        .await
+        .expect("create edge");
+
+        let resp = svc
+            .traverse(Request::new(graph::TraverseRequest {
+                start_node_id: src.node_id,
+                max_depth: 1,
+                edge_type: "POINTS_TO".to_string(),
+                direction: graph::TraversalDirection::Outbound as i32,
+                pagination: None,
+            }))
+            .await
+            .expect("traverse should succeed")
+            .into_inner();
+
+        assert_eq!(resp.nodes.len(), 1, "should return exactly the target node");
+        let node = &resp.nodes[0];
+
+        assert_eq!(node.node_id, dst.node_id, "node_id must match");
+
+        // G079 regression: labels must not be empty.
+        assert!(
+            !node.labels.is_empty(),
+            "traverse must populate labels, got empty vec"
+        );
+        assert!(
+            node.labels.contains(&"Target".to_string()),
+            "labels must contain 'Target', got {:?}",
+            node.labels
+        );
+
+        // G079 regression: properties must not be empty.
+        assert!(
+            node.properties.contains_key("color"),
+            "traverse must populate properties, got {:?}",
+            node.properties.keys().collect::<Vec<_>>()
         );
     }
 }
