@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.3.5 — 2026-04-13
+
+### coordinode-embed
+## [0.3.5](https://github.com/structured-world/coordinode/compare/v0.3.4...v0.3.5) - 2026-04-13
+
+#### Added
+
+- *(query)* implement CREATE/DROP INDEX Cypher DDL with IndexScan optimizer
+
+### coordinode-query
+## [0.3.5](https://github.com/structured-world/coordinode/compare/v0.3.4...v0.3.5) - 2026-04-13
+
+#### Added
+
+- *(query)* implement CREATE/DROP INDEX Cypher DDL with IndexScan optimizer
+
+---
+
 ## v0.3.4 — 2026-04-12
 
 ### coordinode-core
