@@ -1771,4 +1771,100 @@ mod tests {
         );
         assert_eq!(results[0].node_id, 1);
     }
+
+    // -- search_with_highlights_fuzzy --
+
+    #[test]
+    fn search_with_highlights_fuzzy_finds_typo() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = TextIndex::open_or_create(dir.path(), 15_000_000, None).unwrap();
+
+        idx.add_document(1, "graph database systems").unwrap();
+        idx.add_document(2, "cooking recipes collection").unwrap();
+
+        // "groph" is Levenshtein-1 from "graph"
+        let results = idx.search_with_highlights_fuzzy("groph", 10).unwrap();
+        assert!(
+            !results.is_empty(),
+            "fuzzy search 'groph' must match 'graph' (edit-1)"
+        );
+        assert_eq!(results[0].node_id, 1);
+        assert!(results[0].score > 0.0);
+    }
+
+    #[test]
+    fn search_with_highlights_fuzzy_no_match_beyond_edit1() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = TextIndex::open_or_create(dir.path(), 15_000_000, None).unwrap();
+
+        idx.add_document(1, "rust").unwrap();
+
+        // "xxxx" has edit distance > 1 from "rust" — should not match
+        let results = idx.search_with_highlights_fuzzy("xxxx", 10).unwrap();
+        assert!(
+            results.is_empty(),
+            "fuzzy edit-distance >1 must not match: {results:?}"
+        );
+    }
+
+    #[test]
+    fn search_with_highlights_fuzzy_empty_query_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = TextIndex::open_or_create(dir.path(), 15_000_000, None).unwrap();
+        idx.add_document(1, "anything").unwrap();
+
+        let results = idx.search_with_highlights_fuzzy("", 10).unwrap();
+        assert!(results.is_empty(), "empty fuzzy query must return empty");
+    }
+
+    // -- search_with_highlights_and_language --
+
+    #[test]
+    fn search_with_highlights_and_language_english_stemming() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = TextIndex::open_or_create(dir.path(), 15_000_000, Some("english")).unwrap();
+
+        idx.add_document(1, "running databases efficiently")
+            .unwrap();
+        idx.add_document(2, "baking bread recipes").unwrap();
+
+        // "run" stems to "run"; "database" stems to "databas"
+        let results = idx
+            .search_with_highlights_and_language("databases", 10, "english")
+            .unwrap();
+        assert!(
+            !results.is_empty(),
+            "English language path should find 'running databases'"
+        );
+        assert_eq!(results[0].node_id, 1);
+        assert!(results[0].score > 0.0);
+    }
+
+    #[test]
+    fn search_with_highlights_and_language_returns_empty_on_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = TextIndex::open_or_create(dir.path(), 15_000_000, Some("english")).unwrap();
+
+        idx.add_document(1, "graph traversal algorithms").unwrap();
+
+        let results = idx
+            .search_with_highlights_and_language("бібліотека", 10, "english")
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "Ukrainian query against English index must return empty"
+        );
+    }
+
+    #[test]
+    fn search_with_highlights_and_language_empty_query_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = TextIndex::open_or_create(dir.path(), 15_000_000, Some("english")).unwrap();
+        idx.add_document(1, "something").unwrap();
+
+        let results = idx
+            .search_with_highlights_and_language("", 10, "english")
+            .unwrap();
+        assert!(results.is_empty(), "empty query must return empty");
+    }
 }
