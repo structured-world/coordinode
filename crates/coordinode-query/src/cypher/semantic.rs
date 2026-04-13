@@ -195,7 +195,9 @@ impl<'a> Analyzer<'a> {
             | Clause::CreateEncryptedIndex(_)
             | Clause::DropEncryptedIndex(_)
             | Clause::CreateIndex(_)
-            | Clause::DropIndex(_) => {
+            | Clause::DropIndex(_)
+            | Clause::CreateVectorIndex(_)
+            | Clause::DropVectorIndex(_) => {
                 // DDL — no variable references to validate.
             }
         }

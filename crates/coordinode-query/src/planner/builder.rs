@@ -316,6 +316,36 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
         Clause::DropIndex(c) => Ok(LogicalOp::DropIndex {
             name: c.name.clone(),
         }),
+        Clause::CreateVectorIndex(c) => {
+            let metric = parse_vector_metric(c.metric.as_deref());
+            Ok(LogicalOp::CreateVectorIndex {
+                name: c.name.clone(),
+                label: c.label.clone(),
+                property: c.property.clone(),
+                m: c.m.unwrap_or(16),
+                ef_construction: c.ef_construction.unwrap_or(200),
+                metric,
+                dimensions: c.dimensions.unwrap_or(0),
+            })
+        }
+        Clause::DropVectorIndex(c) => Ok(LogicalOp::DropVectorIndex {
+            name: c.name.clone(),
+        }),
+    }
+}
+
+/// Parse a metric string into a `VectorMetric`.
+///
+/// Accepts: "cosine", "euclidean" (alias for L2), "l2", "dot", "dotproduct", "l1".
+/// Defaults to `Cosine` for unknown or None.
+fn parse_vector_metric(s: Option<&str>) -> coordinode_core::graph::types::VectorMetric {
+    use coordinode_core::graph::types::VectorMetric;
+    match s.map(|m| m.to_lowercase()).as_deref() {
+        Some("cosine") | None => VectorMetric::Cosine,
+        Some("euclidean") | Some("l2") => VectorMetric::L2,
+        Some("dot") | Some("dotproduct") | Some("dot_product") => VectorMetric::DotProduct,
+        Some("l1") | Some("manhattan") => VectorMetric::L1,
+        _ => VectorMetric::Cosine,
     }
 }
 
@@ -516,6 +546,123 @@ fn extract_index_property(expr: &Expr, variable: &str) -> Option<String> {
             let expected_prefix = format!("{variable}.");
             v.strip_prefix(&expected_prefix).map(|s| s.to_string())
         }
+        _ => None,
+    }
+}
+
+/// Annotation pass: walk the plan tree and annotate each `VectorTopK` node with
+/// `hnsw_index = Some(name)` when a matching HNSW index exists in the registry.
+///
+/// This drives the `strategy: HnswScan(idx) | BruteForce` line in EXPLAIN output.
+/// The executor itself independently checks the registry at runtime — this pass
+/// is only for EXPLAIN accuracy.
+pub fn annotate_vector_top_k(
+    op: LogicalOp,
+    registry: &crate::index::VectorIndexRegistry,
+) -> LogicalOp {
+    match op {
+        LogicalOp::VectorTopK {
+            input,
+            vector_expr,
+            query_vector,
+            function,
+            k,
+            distance_alias,
+            ..
+        } => {
+            // Determine (variable, property) from the vector expression.
+            let (variable, property) = match &vector_expr {
+                Expr::PropertyAccess {
+                    expr,
+                    property: prop,
+                } => match expr.as_ref() {
+                    Expr::Variable(v) => (Some(v.clone()), Some(prop.clone())),
+                    _ => (None, None),
+                },
+                _ => (None, None),
+            };
+
+            // Try to determine label from the input NodeScan (best effort).
+            let label = variable.as_deref().and_then(|_| extract_scan_label(&input));
+
+            // Look up the HNSW index definition when (label, property) are known.
+            let hnsw_index = match (label, property) {
+                (Some(lbl), Some(prop)) => registry
+                    .get_definition(lbl, &prop)
+                    .map(|def| def.name.clone()),
+                _ => None,
+            };
+
+            // Recurse into input.
+            let input = Box::new(annotate_vector_top_k(*input, registry));
+
+            LogicalOp::VectorTopK {
+                input,
+                vector_expr,
+                query_vector,
+                function,
+                k,
+                distance_alias,
+                hnsw_index,
+            }
+        }
+
+        // Recurse into all other operators with children.
+        LogicalOp::Filter { input, predicate } => LogicalOp::Filter {
+            input: Box::new(annotate_vector_top_k(*input, registry)),
+            predicate,
+        },
+        LogicalOp::Project {
+            input,
+            items,
+            distinct,
+        } => LogicalOp::Project {
+            input: Box::new(annotate_vector_top_k(*input, registry)),
+            items,
+            distinct,
+        },
+        LogicalOp::Sort { input, items } => LogicalOp::Sort {
+            input: Box::new(annotate_vector_top_k(*input, registry)),
+            items,
+        },
+        LogicalOp::Limit { input, count } => LogicalOp::Limit {
+            input: Box::new(annotate_vector_top_k(*input, registry)),
+            count,
+        },
+        LogicalOp::Skip { input, count } => LogicalOp::Skip {
+            input: Box::new(annotate_vector_top_k(*input, registry)),
+            count,
+        },
+        LogicalOp::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => LogicalOp::Aggregate {
+            input: Box::new(annotate_vector_top_k(*input, registry)),
+            group_by,
+            aggregates,
+        },
+        LogicalOp::CartesianProduct { left, right } => LogicalOp::CartesianProduct {
+            left: Box::new(annotate_vector_top_k(*left, registry)),
+            right: Box::new(annotate_vector_top_k(*right, registry)),
+        },
+        LogicalOp::LeftOuterJoin { left, right } => LogicalOp::LeftOuterJoin {
+            left: Box::new(annotate_vector_top_k(*left, registry)),
+            right: Box::new(annotate_vector_top_k(*right, registry)),
+        },
+        // Leaf nodes, DDL, Traverse, EdgeVectorSearch, and other complex operators.
+        // VectorTopK always sits above the NodeScan/Traverse level, so these never
+        // contain a VectorTopK child in a valid plan. Return unchanged.
+        other => other,
+    }
+}
+
+/// Extract a single label from a NodeScan (or Filter over NodeScan) in the plan subtree.
+fn extract_scan_label(op: &LogicalOp) -> Option<&str> {
+    match op {
+        LogicalOp::NodeScan { labels, .. } if labels.len() == 1 => Some(&labels[0]),
+        LogicalOp::Filter { input, .. } => extract_scan_label(input),
+        LogicalOp::IndexScan { label, .. } => Some(label),
         _ => None,
     }
 }
@@ -871,6 +1018,7 @@ fn rewrite_top_k_at_root(op: LogicalOp) -> LogicalOp {
             function,
             k,
             distance_alias: None,
+            hnsw_index: None,
         };
     }
 
@@ -921,6 +1069,7 @@ fn rewrite_top_k_at_root(op: LogicalOp) -> LogicalOp {
                             function,
                             k,
                             distance_alias: Some(alias),
+                            hnsw_index: None,
                         };
 
                         return LogicalOp::Project {

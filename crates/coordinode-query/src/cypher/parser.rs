@@ -196,6 +196,14 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let c = build_drop_index_clause(pair)?;
             clauses.push(Clause::DropIndex(c));
         }
+        Rule::create_vector_index_clause => {
+            let c = build_create_vector_index_clause(pair)?;
+            clauses.push(Clause::CreateVectorIndex(c));
+        }
+        Rule::drop_vector_index_clause => {
+            let c = build_drop_vector_index_clause(pair)?;
+            clauses.push(Clause::DropVectorIndex(c));
+        }
         Rule::create_clause => {
             let cc = build_create_clause(pair)?;
             clauses.push(Clause::Create(cc));
@@ -934,6 +942,87 @@ fn build_drop_index_clause(pair: Pair<'_, Rule>) -> Result<DropIndexClause, Pars
     }
 
     Ok(DropIndexClause { name })
+}
+
+fn build_create_vector_index_clause(
+    pair: Pair<'_, Rule>,
+) -> Result<CreateVectorIndexClause, ParseError> {
+    let mut identifiers: Vec<String> = Vec::new();
+    let mut m: Option<usize> = None;
+    let mut ef_construction: Option<usize> = None;
+    let mut metric: Option<String> = None;
+    let mut dimensions: Option<u32> = None;
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::identifier => identifiers.push(inner.as_str().to_string()),
+            Rule::vector_index_options => {
+                for opt in inner.into_inner() {
+                    if opt.as_rule() == Rule::vector_index_option {
+                        let mut key = String::new();
+                        let mut val_str = String::new();
+                        for part in opt.into_inner() {
+                            match part.as_rule() {
+                                Rule::identifier => key = part.as_str().to_string(),
+                                Rule::integer_literal => val_str = part.as_str().to_string(),
+                                Rule::float_literal => val_str = part.as_str().to_string(),
+                                Rule::string_literal => {
+                                    // Strip surrounding quotes
+                                    let raw = part.as_str();
+                                    val_str = raw[1..raw.len() - 1].to_string();
+                                }
+                                _ => {}
+                            }
+                        }
+                        match key.to_lowercase().as_str() {
+                            "m" => m = val_str.parse().ok(),
+                            "ef_construction" => ef_construction = val_str.parse().ok(),
+                            "metric" => metric = Some(val_str),
+                            "dimensions" => dimensions = val_str.parse().ok(),
+                            _ => {} // unknown options silently ignored
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if identifiers.len() < 3 {
+        return Err(ParseError::Invalid(
+            "CREATE VECTOR INDEX requires name, label, and property".into(),
+        ));
+    }
+
+    Ok(CreateVectorIndexClause {
+        name: identifiers[0].clone(),
+        label: identifiers[1].clone(),
+        property: identifiers[2].clone(),
+        m,
+        ef_construction,
+        metric,
+        dimensions,
+    })
+}
+
+fn build_drop_vector_index_clause(
+    pair: Pair<'_, Rule>,
+) -> Result<DropVectorIndexClause, ParseError> {
+    let mut name = String::new();
+
+    for inner in pair.into_inner() {
+        if inner.as_rule() == Rule::identifier {
+            name = inner.as_str().to_string();
+        }
+    }
+
+    if name.is_empty() {
+        return Err(ParseError::Invalid(
+            "DROP VECTOR INDEX requires index name".into(),
+        ));
+    }
+
+    Ok(DropVectorIndexClause { name })
 }
 
 // --- Write clauses ---

@@ -22,23 +22,28 @@ pub type HnswHandle = Arc<RwLock<HnswIndex>>;
 
 /// Registry of active HNSW vector indexes.
 ///
+/// Uses interior mutability (`RwLock`) so `register` / `unregister` can be
+/// called via `&self`. This allows Cypher DDL (`CREATE VECTOR INDEX`) executed
+/// from within the runner to update the live registry without requiring
+/// a `&mut` reference through the `ExecutionContext`.
+///
 /// Holds live HNSW graph structures in memory. Each index corresponds
 /// to an `IndexDefinition` with `index_type == Hnsw` persisted in the
 /// schema partition. The HNSW graph itself is rebuilt from stored vectors
 /// on startup and maintained incrementally during writes.
 pub struct VectorIndexRegistry {
     /// Active HNSW indexes: (label, property) → live HNSW graph.
-    indexes: HashMap<VectorIndexKey, HnswHandle>,
+    indexes: RwLock<HashMap<VectorIndexKey, HnswHandle>>,
     /// Index definitions keyed by (label, property) for metadata lookup.
-    definitions: HashMap<VectorIndexKey, IndexDefinition>,
+    definitions: RwLock<HashMap<VectorIndexKey, IndexDefinition>>,
 }
 
 impl VectorIndexRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self {
-            indexes: HashMap::new(),
-            definitions: HashMap::new(),
+            indexes: RwLock::new(HashMap::new()),
+            definitions: RwLock::new(HashMap::new()),
         }
     }
 
@@ -46,8 +51,10 @@ impl VectorIndexRegistry {
     ///
     /// Creates the HNSW structure from the index definition's config.
     /// The caller is responsible for populating the index with existing
-    /// vectors (see `populate_from_storage`).
-    pub fn register(&mut self, def: IndexDefinition) {
+    /// vectors (see `bulk_insert`).
+    ///
+    /// Uses interior mutability — safe to call via `&self`.
+    pub fn register(&self, def: IndexDefinition) {
         let Some(config) = def.vector_config.as_ref() else {
             tracing::error!(
                 "register called with non-vector IndexDefinition: {}",
@@ -73,66 +80,113 @@ impl VectorIndexRegistry {
         let hnsw = HnswIndex::new(hnsw_config);
         let key = (def.label.clone(), def.property().to_string());
         self.indexes
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(key.clone(), Arc::new(RwLock::new(hnsw)));
-        self.definitions.insert(key, def);
+        self.definitions
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, def);
     }
 
     /// Register an index with a pre-built HNSW graph (e.g. after rebuild).
-    pub fn register_with_index(&mut self, def: IndexDefinition, hnsw: HnswIndex) {
+    ///
+    /// Uses interior mutability — safe to call via `&self`.
+    pub fn register_with_index(&self, def: IndexDefinition, hnsw: HnswIndex) {
         let key = (def.label.clone(), def.property().to_string());
         self.indexes
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(key.clone(), Arc::new(RwLock::new(hnsw)));
-        self.definitions.insert(key, def);
+        self.definitions
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, def);
     }
 
     /// Unregister a vector index.
-    pub fn unregister(&mut self, label: &str, property: &str) {
+    ///
+    /// Uses interior mutability — safe to call via `&self`.
+    pub fn unregister(&self, label: &str, property: &str) {
         let key = (label.to_string(), property.to_string());
-        self.indexes.remove(&key);
-        self.definitions.remove(&key);
+        self.indexes
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        self.definitions
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
     }
 
     /// Get a handle to the HNSW index for a (label, property) pair.
-    pub fn get(&self, label: &str, property: &str) -> Option<&HnswHandle> {
-        self.indexes.get(&(label.to_string(), property.to_string()))
+    pub fn get(&self, label: &str, property: &str) -> Option<HnswHandle> {
+        self.indexes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(label.to_string(), property.to_string()))
+            .cloned()
     }
 
     /// Get the index definition for a (label, property) pair.
-    pub fn get_definition(&self, label: &str, property: &str) -> Option<&IndexDefinition> {
+    pub fn get_definition(&self, label: &str, property: &str) -> Option<IndexDefinition> {
         self.definitions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&(label.to_string(), property.to_string()))
+            .cloned()
     }
 
     /// List all registered vector indexes for a given label.
-    pub fn indexes_for_label(&self, label: &str) -> Vec<(&str, &HnswHandle)> {
+    pub fn indexes_for_label(&self, label: &str) -> Vec<(String, HnswHandle)> {
         self.indexes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|((l, _), _)| l == label)
-            .map(|((_, p), h)| (p.as_str(), h))
+            .map(|((_, p), h)| (p.clone(), h.clone()))
             .collect()
     }
 
     /// Check if a vector index exists for a (label, property).
     pub fn has_index(&self, label: &str, property: &str) -> bool {
         self.indexes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .contains_key(&(label.to_string(), property.to_string()))
     }
 
     /// Number of registered vector indexes.
     pub fn len(&self) -> usize {
-        self.indexes.len()
+        self.indexes.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Whether the registry is empty.
     pub fn is_empty(&self) -> bool {
-        self.indexes.is_empty()
+        self.indexes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
-    /// Iterate over all registered index definitions.
+    /// Iterate over all registered index definitions, calling `f` for each.
     ///
     /// Used during startup to rebuild HNSW graphs from stored vectors.
-    pub fn definitions(&self) -> impl Iterator<Item = &IndexDefinition> {
-        self.definitions.values()
+    pub fn for_each_definition(&self, mut f: impl FnMut(&IndexDefinition)) {
+        let defs = self.definitions.read().unwrap_or_else(|e| e.into_inner());
+        for def in defs.values() {
+            f(def);
+        }
+    }
+
+    /// Collect all index definitions into a `Vec`.
+    pub fn all_definitions(&self) -> Vec<IndexDefinition> {
+        self.definitions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Insert a vector into all applicable HNSW indexes for a node.
@@ -198,7 +252,7 @@ impl VectorIndexRegistry {
 
     /// Bulk-insert multiple vectors into a specific HNSW index.
     ///
-    /// Used during index rebuild (on Database::open or CREATE INDEX).
+    /// Used during index rebuild (on Database::open or CREATE VECTOR INDEX).
     /// The caller is responsible for scanning stored nodes and extracting
     /// vectors — this method just does the HNSW insertions.
     pub fn bulk_insert(
@@ -208,7 +262,7 @@ impl VectorIndexRegistry {
         vectors: impl Iterator<Item = (u64, Vec<f32>)>,
     ) -> usize {
         let handle = match self.get(label, property) {
-            Some(h) => h.clone(),
+            Some(h) => h,
             None => return 0,
         };
 
@@ -249,7 +303,7 @@ mod tests {
 
     #[test]
     fn register_and_lookup() {
-        let mut reg = VectorIndexRegistry::new();
+        let reg = VectorIndexRegistry::new();
         let def = IndexDefinition::hnsw("movie_embedding", "Movie", "embedding", test_config());
 
         reg.register(def);
@@ -262,7 +316,7 @@ mod tests {
 
     #[test]
     fn search_empty_index_returns_empty() {
-        let mut reg = VectorIndexRegistry::new();
+        let reg = VectorIndexRegistry::new();
         let def = IndexDefinition::hnsw("movie_embedding", "Movie", "embedding", test_config());
         reg.register(def);
 
@@ -273,7 +327,7 @@ mod tests {
 
     #[test]
     fn insert_and_search() {
-        let mut reg = VectorIndexRegistry::new();
+        let reg = VectorIndexRegistry::new();
         let def = IndexDefinition::hnsw("movie_embedding", "Movie", "embedding", test_config());
         reg.register(def);
 
@@ -295,7 +349,7 @@ mod tests {
 
     #[test]
     fn indexes_for_label() {
-        let mut reg = VectorIndexRegistry::new();
+        let reg = VectorIndexRegistry::new();
         reg.register(IndexDefinition::hnsw(
             "movie_embed",
             "Movie",
@@ -324,7 +378,7 @@ mod tests {
 
     #[test]
     fn unregister() {
-        let mut reg = VectorIndexRegistry::new();
+        let reg = VectorIndexRegistry::new();
         reg.register(IndexDefinition::hnsw(
             "movie_embed",
             "Movie",

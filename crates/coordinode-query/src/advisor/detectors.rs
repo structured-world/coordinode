@@ -355,7 +355,9 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::CreateTextIndex { .. }
         | LogicalOp::DropTextIndex { .. }
         | LogicalOp::CreateEncryptedIndex { .. }
-        | LogicalOp::DropEncryptedIndex { .. } => vec![],
+        | LogicalOp::DropEncryptedIndex { .. }
+        | LogicalOp::CreateVectorIndex { .. }
+        | LogicalOp::DropVectorIndex { .. } => vec![],
 
         LogicalOp::Filter { input, .. }
         | LogicalOp::Project { input, .. }

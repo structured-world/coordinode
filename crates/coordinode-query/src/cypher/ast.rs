@@ -50,6 +50,8 @@ pub enum Clause {
     DropEncryptedIndex(DropEncryptedIndexClause),
     CreateIndex(CreateIndexClause),
     DropIndex(DropIndexClause),
+    CreateVectorIndex(CreateVectorIndexClause),
+    DropVectorIndex(DropVectorIndexClause),
 
     // Write clauses
     Create(CreateClause),
@@ -167,6 +169,39 @@ pub struct CreateIndexClause {
 /// Syntax: `DROP INDEX idx_name`
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropIndexClause {
+    /// Index name to drop.
+    pub name: String,
+}
+
+/// CREATE VECTOR INDEX clause (HNSW).
+///
+/// Syntax: `CREATE VECTOR INDEX idx ON :Label(property) OPTIONS { m: 16, ef_construction: 200, metric: "cosine", dimensions: 128 }`
+///
+/// Creates an HNSW approximate nearest-neighbor index for vector similarity search.
+/// After creation, `VectorTopK` plans use HnswScan instead of brute-force O(N) scan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateVectorIndexClause {
+    /// Index name.
+    pub name: String,
+    /// Label to index.
+    pub label: String,
+    /// Vector property to index.
+    pub property: String,
+    /// HNSW M parameter: number of bi-directional links per node (default: 16).
+    pub m: Option<usize>,
+    /// HNSW ef_construction: dynamic list size during build (default: 200).
+    pub ef_construction: Option<usize>,
+    /// Distance metric: "cosine", "euclidean", "dot" (default: "cosine").
+    pub metric: Option<String>,
+    /// Vector dimensionality (required unless inferrable from data).
+    pub dimensions: Option<u32>,
+}
+
+/// DROP VECTOR INDEX clause.
+///
+/// Syntax: `DROP VECTOR INDEX idx_name`
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropVectorIndexClause {
     /// Index name to drop.
     pub name: String,
 }

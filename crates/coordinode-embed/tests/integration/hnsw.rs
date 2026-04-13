@@ -1217,7 +1217,7 @@ fn vector_query_brute_force_without_index() {
 fn hnsw_bulk_insert_and_search() {
     use coordinode_query::index::{VectorIndexConfig, VectorIndexRegistry};
 
-    let mut reg = VectorIndexRegistry::new();
+    let reg = VectorIndexRegistry::new();
     reg.register(coordinode_query::index::IndexDefinition::hnsw(
         "test_idx",
         "Item",

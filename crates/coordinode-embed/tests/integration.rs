@@ -32,4 +32,5 @@ mod integration {
     mod text_index;
     mod tiered_cache;
     mod validated_extra;
+    mod vector_index_ddl;
 }

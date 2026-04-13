@@ -238,6 +238,26 @@ pub enum LogicalOp {
     /// DROP INDEX: remove a B-tree index by name.
     DropIndex { name: String },
 
+    /// CREATE VECTOR INDEX: build an HNSW index on a label's vector property.
+    ///
+    /// Backfills existing nodes; future inserts/updates maintain the index incrementally.
+    CreateVectorIndex {
+        name: String,
+        label: String,
+        property: String,
+        /// HNSW M parameter (default: 16).
+        m: usize,
+        /// HNSW ef_construction (default: 200).
+        ef_construction: usize,
+        /// Distance metric: cosine, euclidean, dot (default: cosine).
+        metric: coordinode_core::graph::types::VectorMetric,
+        /// Vector dimensionality (0 = infer from first vector seen).
+        dimensions: u32,
+    },
+
+    /// DROP VECTOR INDEX: remove an HNSW vector index by name.
+    DropVectorIndex { name: String },
+
     /// UNWIND: expand a list expression into individual rows.
     /// Produced from UNWIND expr AS variable.
     Unwind {
@@ -330,6 +350,10 @@ pub enum LogicalOp {
         /// Optional distance alias (e.g., `AS d` in `WITH n, vector_distance(n.emb, $q) AS d`).
         /// When present, the resulting rows include a column with the computed distance.
         distance_alias: Option<String>,
+        /// HNSW index name when an applicable vector index exists for (label, property).
+        /// Set by the planner annotation pass after index lookup.
+        /// `Some(name)` → EXPLAIN shows "HnswScan"; `None` → "BruteForce".
+        hnsw_index: Option<String>,
     },
 
     /// Full-text search filter: evaluates text_match() per row.
@@ -578,6 +602,8 @@ impl LogicalOp {
             | LogicalOp::DropEncryptedIndex { .. }
             | LogicalOp::CreateIndex { .. }
             | LogicalOp::DropIndex { .. }
+            | LogicalOp::CreateVectorIndex { .. }
+            | LogicalOp::DropVectorIndex { .. }
             | LogicalOp::Empty => {}
         }
     }
@@ -1063,7 +1089,9 @@ fn estimate_op_cost(
         | LogicalOp::CreateEncryptedIndex { .. }
         | LogicalOp::DropEncryptedIndex { .. }
         | LogicalOp::CreateIndex { .. }
-        | LogicalOp::DropIndex { .. } => (1.0, 1.0),
+        | LogicalOp::DropIndex { .. }
+        | LogicalOp::CreateVectorIndex { .. }
+        | LogicalOp::DropVectorIndex { .. } => (1.0, 1.0),
         LogicalOp::Empty => (0.0, 1.0),
     }
 }
@@ -1377,14 +1405,19 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             function,
             k,
             distance_alias,
+            hnsw_index,
             ..
         } => {
             let alias_info = match distance_alias {
                 Some(a) => format!(" AS {a}"),
                 None => String::new(),
             };
+            let strategy = match hnsw_index {
+                Some(idx) => format!("HnswScan({idx})"),
+                None => "BruteForce".to_string(),
+            };
             output.push_str(&format!(
-                "{prefix}VectorTopK({function} k={k}{alias_info})\n"
+                "{prefix}VectorTopK({function} k={k}{alias_info}, strategy: {strategy})\n"
             ));
             explain_op(input, indent + 1, output);
         }
@@ -1507,6 +1540,22 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
         }
         LogicalOp::DropIndex { name } => {
             output.push_str(&format!("{prefix}DropIndex({name})\n"));
+        }
+        LogicalOp::CreateVectorIndex {
+            name,
+            label,
+            property,
+            m,
+            ef_construction,
+            metric,
+            dimensions,
+        } => {
+            output.push_str(&format!(
+                "{prefix}CreateVectorIndex({name} ON :{label}({property}), m={m}, ef={ef_construction}, metric={metric:?}, dim={dimensions})\n"
+            ));
+        }
+        LogicalOp::DropVectorIndex { name } => {
+            output.push_str(&format!("{prefix}DropVectorIndex({name})\n"));
         }
         LogicalOp::Empty => {
             output.push_str(&format!("{prefix}Empty\n"));

@@ -1463,6 +1463,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             function,
             k,
             distance_alias,
+            ..
         } => {
             let rows = execute_op(input, ctx)?;
 
@@ -1615,6 +1616,27 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         ),
 
         LogicalOp::DropIndex { name } => execute_drop_btree_index(name, ctx),
+
+        LogicalOp::CreateVectorIndex {
+            name,
+            label,
+            property,
+            m,
+            ef_construction,
+            metric,
+            dimensions,
+        } => execute_create_vector_index(
+            name,
+            label,
+            property,
+            *m,
+            *ef_construction,
+            *metric,
+            *dimensions,
+            ctx,
+        ),
+
+        LogicalOp::DropVectorIndex { name } => execute_drop_vector_index(name, ctx),
 
         LogicalOp::Empty => Ok(vec![Row::new()]),
 
@@ -5936,6 +5958,150 @@ fn execute_drop_encrypted_index(
 
     let mut row = Row::new();
     row.insert("index".to_string(), Value::String(name.to_string()));
+    row.insert("dropped".to_string(), Value::Bool(true));
+    Ok(vec![row])
+}
+
+/// Execute `CREATE VECTOR INDEX idx ON :Label(property) OPTIONS {m, ef_construction, metric, dimensions}`.
+///
+/// 1. Validates vector_index_registry is available.
+/// 2. Builds a `VectorIndexConfig` from the OPTIONS.
+/// 3. Persists the `IndexDefinition` to the `Schema` partition.
+/// 4. Registers the empty HNSW graph in the registry.
+/// 5. Backfills existing nodes that have the indexed vector property.
+#[allow(clippy::too_many_arguments)]
+fn execute_create_vector_index(
+    name: &str,
+    label: &str,
+    property: &str,
+    m: usize,
+    ef_construction: usize,
+    metric: coordinode_core::graph::types::VectorMetric,
+    dimensions: u32,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    let Some(registry) = ctx.vector_index_registry else {
+        return Err(ExecutionError::Unsupported(
+            "CREATE VECTOR INDEX requires vector_index_registry in ExecutionContext".into(),
+        ));
+    };
+
+    // Reject duplicate index names.
+    if registry.has_index(label, property) {
+        return Err(ExecutionError::Unsupported(format!(
+            "vector index on :{label}({property}) already exists"
+        )));
+    }
+
+    // Build the index definition.
+    let config = crate::index::VectorIndexConfig {
+        dimensions,
+        metric,
+        m,
+        ef_construction,
+        quantization: false,
+        offload_vectors: false,
+    };
+    let def = crate::index::IndexDefinition::hnsw(name, label, property, config);
+
+    // Persist definition to the schema partition.
+    crate::index::ops::save_index_definition(ctx.engine, &def)
+        .map_err(|e| ExecutionError::Unsupported(format!("persist vector index '{name}': {e}")))?;
+
+    // Register the empty HNSW graph in memory.
+    registry.register(def);
+
+    // Backfill existing nodes that have the indexed vector property.
+    let node_prefix = {
+        let mut p = Vec::with_capacity(8);
+        p.extend_from_slice(b"node:");
+        p.extend_from_slice(&ctx.shard_id.to_be_bytes());
+        p.push(b':');
+        p
+    };
+
+    let field_id = ctx.interner.lookup(property);
+    let mut backfilled = 0u64;
+
+    if let Ok(iter) = ctx.engine.prefix_scan(Partition::Node, &node_prefix) {
+        for guard in iter {
+            let Ok((_key, value)) = guard.into_inner() else {
+                continue;
+            };
+            let Ok(record) = NodeRecord::from_msgpack(&value) else {
+                continue;
+            };
+            if record.primary_label() != label {
+                continue;
+            }
+            let Some((_shard, node_id)) = coordinode_core::graph::node::decode_node_key(&_key)
+            else {
+                continue;
+            };
+
+            let Some(fid) = field_id else {
+                continue;
+            };
+            let Some(val) = record.props.get(&fid) else {
+                continue;
+            };
+            if let Some(vec_data) = try_extract_vector(val) {
+                registry.on_vector_written(label, node_id, property, &vec_data);
+                backfilled += 1;
+            }
+        }
+    }
+
+    let mut row = Row::new();
+    row.insert("index".to_string(), Value::String(name.to_string()));
+    row.insert("label".to_string(), Value::String(label.to_string()));
+    row.insert("property".to_string(), Value::String(property.to_string()));
+    row.insert("nodes_indexed".to_string(), Value::Int(backfilled as i64));
+    Ok(vec![row])
+}
+
+/// Execute `DROP VECTOR INDEX idx`: removes an HNSW vector index by name.
+///
+/// 1. Looks up the definition in the vector registry by label+property matching index name.
+/// 2. Removes definition from schema partition.
+/// 3. Unregisters from the in-memory vector registry.
+fn execute_drop_vector_index(
+    name: &str,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    let Some(registry) = ctx.vector_index_registry else {
+        return Err(ExecutionError::Unsupported(
+            "DROP VECTOR INDEX requires vector_index_registry in ExecutionContext".into(),
+        ));
+    };
+
+    // Find the definition by name to get (label, property).
+    let def = registry
+        .all_definitions()
+        .into_iter()
+        .find(|d| d.name == name);
+
+    let Some(def) = def else {
+        return Err(ExecutionError::Unsupported(format!(
+            "vector index '{name}' not found"
+        )));
+    };
+
+    let label = def.label.clone();
+    let property = def.property().to_string();
+
+    // Tombstone the schema definition key.
+    let schema_key = def.schema_key();
+    ctx.mvcc_write_buffer
+        .insert((Partition::Schema, schema_key), None);
+
+    // Remove from in-memory registry.
+    registry.unregister(&label, &property);
+
+    let mut row = Row::new();
+    row.insert("index".to_string(), Value::String(name.to_string()));
+    row.insert("label".to_string(), Value::String(label));
+    row.insert("property".to_string(), Value::String(property));
     row.insert("dropped".to_string(), Value::Bool(true));
     Ok(vec![row])
 }

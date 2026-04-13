@@ -23,6 +23,7 @@ clause = {
   | alter_label_clause
   | create_encrypted_index_clause
   | create_text_index_clause
+  | create_vector_index_clause
   | create_index_clause
   | create_clause
   | merge_all_clause
@@ -31,6 +32,7 @@ clause = {
   | detach_delete_clause
   | drop_encrypted_index_clause
   | drop_text_index_clause
+  | drop_vector_index_clause
   | drop_index_clause
   | delete_clause
   | set_clause
@@ -169,6 +171,21 @@ create_encrypted_index_clause = {
 
 // DROP ENCRYPTED INDEX idx_name
 drop_encrypted_index_clause = { kw_drop ~ kw_encrypted ~ kw_index ~ identifier }
+
+// --- CREATE/DROP VECTOR INDEX ---
+
+// CREATE VECTOR INDEX idx_name ON :Label(property) OPTIONS { m: 16, ef_construction: 200, metric: "cosine", dimensions: 128 }
+create_vector_index_clause = {
+    kw_create ~ kw_vector ~ kw_index ~ identifier ~ kw_on ~ ":" ~ identifier ~ "(" ~ identifier ~ ")"
+    ~ (kw_options ~ vector_index_options)?
+}
+
+// Vector index OPTIONS map: { key: value, ... }
+vector_index_options = { "{" ~ vector_index_option ~ ("," ~ vector_index_option)* ~ ","? ~ "}" }
+vector_index_option  = { identifier ~ ":" ~ (float_literal | integer_literal | string_literal) }
+
+// DROP VECTOR INDEX idx_name
+drop_vector_index_clause = { kw_drop ~ kw_vector ~ kw_index ~ identifier }
 
 // --- CREATE/DROP BTREE INDEX ---
 
@@ -417,6 +434,8 @@ kw_override   = @{ ^"override" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_analyzer   = @{ ^"analyzer" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_unique     = @{ ^"unique" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_sparse     = @{ ^"sparse" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_vector     = @{ ^"vector" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_options    = @{ ^"options" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // --- Identifiers ---
 

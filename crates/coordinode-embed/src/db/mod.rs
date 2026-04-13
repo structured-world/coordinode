@@ -433,7 +433,7 @@ impl Database {
         use coordinode_core::graph::node::NodeRecord;
         use coordinode_query::index::IndexType;
 
-        let mut registry = coordinode_query::index::VectorIndexRegistry::new();
+        let registry = coordinode_query::index::VectorIndexRegistry::new();
 
         // Step 1: Scan schema:idx:* for HNSW index definitions.
         let iter = match engine.prefix_scan(Partition::Schema, b"schema:idx:") {
@@ -988,6 +988,7 @@ impl Database {
         // that would be executed (IndexScan instead of Filter+NodeScan when
         // a matching B-tree index is registered).
         plan.root = planner::optimize_index_selection(plan.root, &self.index_registry);
+        plan.root = planner::annotate_vector_top_k(plan.root, &self.vector_index_registry);
         let stats = self.compute_stats();
         let stats_ref = stats
             .as_ref()
