@@ -185,6 +185,33 @@ pub fn eval_expr(expr: &Expr, row: &Row) -> Value {
         // reach this branch it means the predicate was not intercepted by the
         // storage-aware Filter path, so we conservatively return false.
         Expr::PatternPredicate(_) => Value::Bool(false),
+
+        // Subscript / index access: expr[index]
+        //
+        // List: list[n] → element at index n (negative = from end). Out of bounds → null.
+        // Map:  map["key"] → value at key. Missing key → null.
+        // Anything else → null.
+        Expr::Subscript { expr, index } => {
+            let base = eval_expr(expr, row);
+            let idx = eval_expr(index, row);
+            match (base, idx) {
+                (Value::Array(arr), Value::Int(i)) => {
+                    let len = arr.len() as i64;
+                    // Support negative indexing: -1 → last element.
+                    let real_idx = if i < 0 { len + i } else { i };
+                    if real_idx >= 0 && real_idx < len {
+                        arr[real_idx as usize].clone()
+                    } else {
+                        Value::Null
+                    }
+                }
+                (Value::Map(map), Value::String(key)) => {
+                    map.get(&key).cloned().unwrap_or(Value::Null)
+                }
+                _ => Value::Null,
+            }
+        }
+
         Expr::Star => Value::Null,
     }
 }

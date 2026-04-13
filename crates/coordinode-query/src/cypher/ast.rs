@@ -60,8 +60,26 @@ pub enum Clause {
     MergeMany(MergeClause),
     Upsert(UpsertClause),
     Delete(DeleteClause),
-    Set(Vec<SetItem>),
+    /// SET clause with optional ON VIOLATION SKIP modifier.
+    ///
+    /// Syntax: `SET n.prop = val [ON VIOLATION SKIP]`
+    ///
+    /// With `ViolationMode::Skip`, nodes that would violate schema constraints
+    /// are silently skipped (not updated) rather than failing the entire query.
+    /// The caller receives only the rows that were successfully updated.
+    Set(Vec<SetItem>, ViolationMode),
     Remove(Vec<RemoveItem>),
+}
+
+/// How to handle schema constraint violations during a SET operation.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum ViolationMode {
+    /// Fail the entire query on the first violation (default, strict semantics).
+    #[default]
+    Fail,
+    /// Skip nodes that would violate schema constraints; continue with others.
+    /// Syntax: `SET ... ON VIOLATION SKIP`
+    Skip,
 }
 
 /// ALTER LABEL clause: change schema mode for a label.
@@ -385,6 +403,13 @@ pub enum Expr {
     /// Used in WHERE clauses: `WHERE (a)-[:KNOWS]->(b)` or `WHERE NOT (a)-[:KNOWS]->(b)`.
     PatternPredicate(Pattern),
 
+    /// Subscript / index access: `expr[index]`.
+    ///
+    /// For list values: `list[0]` → first element, `list[-1]` → last element.
+    /// For map values: `map["key"]` → value at key.
+    /// Out-of-bounds list access and missing map keys evaluate to `null`.
+    Subscript { expr: Box<Expr>, index: Box<Expr> },
+
     /// Star expression for `count(*)` or `RETURN *`.
     Star,
 }
@@ -465,6 +490,10 @@ impl Expr {
                         }
                     }
                 }
+            }
+            Expr::Subscript { expr, index } => {
+                expr.substitute_params(params);
+                index.substitute_params(params);
             }
             Expr::Literal(_) | Expr::Variable(_) | Expr::Star => {}
         }

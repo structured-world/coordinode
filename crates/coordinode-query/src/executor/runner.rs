@@ -32,7 +32,7 @@ use super::eval::{eval_binary_op, eval_expr, eval_unary_op, is_truthy};
 use super::row::Row;
 use crate::cypher::ast::{
     BinaryOperator, Direction, Expr, LengthBound, NodePattern, Pattern, PatternElement,
-    RelationshipPattern,
+    RelationshipPattern, ViolationMode,
 };
 use crate::planner::logical::*;
 
@@ -1690,9 +1690,13 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             )
         }
 
-        LogicalOp::Update { input, items } => {
+        LogicalOp::Update {
+            input,
+            items,
+            violation_mode,
+        } => {
             let input_rows = execute_op(input, ctx)?;
-            execute_update(&input_rows, items, ctx)
+            execute_update(&input_rows, items, violation_mode, ctx)
         }
 
         LogicalOp::RemoveOp { input, items } => {
@@ -3531,6 +3535,10 @@ fn collect_expr_vars(expr: &Expr, vars: &mut Vec<String>) {
                 }
             }
         }
+        Expr::Subscript { expr, index } => {
+            collect_expr_vars(expr, vars);
+            collect_expr_vars(index, vars);
+        }
         // Literal, Parameter, Star — no variable references.
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Star => {}
     }
@@ -3932,13 +3940,13 @@ fn execute_merge(
             if on_match.is_empty() {
                 return Ok(matches);
             }
-            return execute_update(&matches, on_match, ctx);
+            return execute_update(&matches, on_match, &ViolationMode::Fail, ctx);
         }
         let created = execute_merge_relationship_create(traverse, &correlated, ctx)?;
         if on_create.is_empty() {
             return Ok(created);
         }
-        return execute_update(&created, on_create, ctx);
+        return execute_update(&created, on_create, &ViolationMode::Fail, ctx);
     }
 
     // G077: Standalone MERGE ALL — Cartesian product across all matching src × tgt nodes.
@@ -3966,13 +3974,13 @@ fn execute_merge(
             if on_match.is_empty() {
                 return Ok(matches);
             }
-            return execute_update(&matches, on_match, ctx);
+            return execute_update(&matches, on_match, &ViolationMode::Fail, ctx);
         }
         let created = execute_merge_relationship_standalone_create(traverse, ctx)?;
         if on_create.is_empty() {
             return Ok(created);
         }
-        return execute_update(&created, on_create, ctx);
+        return execute_update(&created, on_create, &ViolationMode::Fail, ctx);
     }
 
     // Generic path: NodeScan (node-only MERGE) — find or create a single node.
@@ -3983,14 +3991,14 @@ fn execute_merge(
         if on_match.is_empty() {
             return Ok(matches);
         }
-        execute_update(&matches, on_match, ctx)
+        execute_update(&matches, on_match, &ViolationMode::Fail, ctx)
     } else {
         // Pattern not found — create new node from pattern, then apply ON CREATE SET
         let created = execute_create_from_pattern(pattern, ctx)?;
         if on_create.is_empty() {
             return Ok(created);
         }
-        execute_update(&created, on_create, ctx)
+        execute_update(&created, on_create, &ViolationMode::Fail, ctx)
     }
 }
 
@@ -4050,7 +4058,7 @@ fn execute_mergemany_standalone(
                 if on_match.is_empty() {
                     matches
                 } else {
-                    execute_update(&matches, on_match, ctx)?
+                    execute_update(&matches, on_match, &ViolationMode::Fail, ctx)?
                 }
             } else {
                 // Relationship absent — create it → ON CREATE path.
@@ -4058,7 +4066,7 @@ fn execute_mergemany_standalone(
                 if on_create.is_empty() {
                     created
                 } else {
-                    execute_update(&created, on_create, ctx)?
+                    execute_update(&created, on_create, &ViolationMode::Fail, ctx)?
                 }
             };
             all_rows.extend(pair_rows);
@@ -4650,7 +4658,7 @@ fn execute_upsert(
             }
         }
 
-        execute_update(&matches, on_match, ctx)
+        execute_update(&matches, on_match, &ViolationMode::Fail, ctx)
     } else {
         // Phase 3: ON CREATE — create nodes and edges from patterns (two-pass)
         let mut results = vec![Row::new()];
@@ -5122,14 +5130,25 @@ fn execute_create_edge(
 }
 
 /// SET: update properties/labels on existing nodes.
+///
+/// When `violation_mode` is `ViolationMode::Skip`, nodes that would violate
+/// schema constraints are silently skipped. The output contains only rows
+/// for nodes that were successfully updated (or had no schema to check).
+/// When `violation_mode` is `ViolationMode::Fail` (default), any schema
+/// violation immediately aborts the entire SET with an error.
 fn execute_update(
     input_rows: &[Row],
     items: &[crate::cypher::ast::SetItem],
+    violation_mode: &ViolationMode,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
+    let skip_on_violation = matches!(violation_mode, ViolationMode::Skip);
+
     let mut results = Vec::new();
 
-    for row in input_rows {
+    // 'row_loop label: when violation_mode == Skip, `continue 'row_loop` silently
+    // drops the row instead of propagating the schema error.
+    'row_loop: for row in input_rows {
         let mut out_row = row.clone();
 
         for item in items {
@@ -5156,47 +5175,62 @@ fn execute_update(
                         // Enforce schema mode before writing the property.
                         // Load the label schema for the node's primary label and
                         // check STRICT/VALIDATED constraints on the property name.
+                        // Returns None if no schema exists (schemaless node → always allowed).
                         let label = record.primary_label().to_string();
                         let schema_key = encode_label_schema_key(&label);
                         let label_schema = match ctx.mvcc_get(Partition::Schema, &schema_key)? {
                             Some(s_bytes) => LabelSchema::from_msgpack(&s_bytes).ok(),
                             None => None,
                         };
-                        if let Some(ref ls) = label_schema {
+
+                        // Collect potential schema violation into Option<ExecutionError> so we can
+                        // choose between skip (ON VIOLATION SKIP) and fail (default) after the check.
+                        let schema_err: Option<ExecutionError> = if let Some(ref ls) = label_schema
+                        {
                             match ls.mode {
                                 SchemaMode::Strict => match ls.get_property(property) {
-                                    None => {
-                                        return Err(ExecutionError::SchemaViolation(format!(
-                                                "unknown property '{property}' for strict label '{label}'"
-                                            )));
-                                    }
+                                    None => Some(ExecutionError::SchemaViolation(format!(
+                                        "unknown property '{property}' for strict label '{label}'"
+                                    ))),
                                     Some(def) if def.is_computed() => {
-                                        return Err(ExecutionError::SchemaViolation(format!(
+                                        Some(ExecutionError::SchemaViolation(format!(
                                             "cannot SET computed property '{property}'"
-                                        )));
+                                        )))
                                     }
-                                    Some(def) => {
-                                        // Validate type for declared property.
-                                        validate_one(property, &val, def).map_err(|e| {
-                                            ExecutionError::SchemaViolation(e.to_string())
-                                        })?;
-                                    }
+                                    Some(def) => validate_one(property, &val, def)
+                                        .map_err(|e| ExecutionError::SchemaViolation(e.to_string()))
+                                        .err(),
                                 },
                                 SchemaMode::Validated => {
                                     if let Some(def) = ls.get_property(property) {
                                         if def.is_computed() {
-                                            return Err(ExecutionError::SchemaViolation(format!(
+                                            Some(ExecutionError::SchemaViolation(format!(
                                                 "cannot SET computed property '{property}'"
-                                            )));
+                                            )))
+                                        } else {
+                                            validate_one(property, &val, def)
+                                                .map_err(|e| {
+                                                    ExecutionError::SchemaViolation(e.to_string())
+                                                })
+                                                .err()
                                         }
-                                        // Validate type for declared property.
-                                        validate_one(property, &val, def).map_err(|e| {
-                                            ExecutionError::SchemaViolation(e.to_string())
-                                        })?;
+                                    } else {
+                                        None
                                     }
                                 }
-                                SchemaMode::Flexible => {}
+                                SchemaMode::Flexible => None,
                             }
+                        } else {
+                            None
+                        };
+
+                        // ON VIOLATION SKIP: silently drop this row and move to next.
+                        // Default (Fail): propagate the error immediately.
+                        if let Some(err) = schema_err {
+                            if skip_on_violation {
+                                continue 'row_loop;
+                            }
+                            return Err(err);
                         }
 
                         let field_id = ctx.interner.intern(property);
@@ -5342,6 +5376,70 @@ fn execute_update(
                             ExecutionError::Serialization(format!("node decode: {e}"))
                         })?;
 
+                        // Schema validation: SET n = {map} replaces ALL properties.
+                        // In STRICT mode every key must be declared; VALIDATED checks declared keys only.
+                        let label = record.primary_label().to_string();
+                        let schema_key = encode_label_schema_key(&label);
+                        let label_schema = match ctx.mvcc_get(Partition::Schema, &schema_key)? {
+                            Some(s_bytes) => LabelSchema::from_msgpack(&s_bytes).ok(),
+                            None => None,
+                        };
+                        if let (Some(ref ls), Value::Map(ref map)) = (&label_schema, &map_val) {
+                            let schema_err: Option<ExecutionError> = 'schema: {
+                                for (k, v) in map {
+                                    match ls.mode {
+                                        SchemaMode::Strict => match ls.get_property(k) {
+                                            None => break 'schema Some(
+                                                ExecutionError::SchemaViolation(format!(
+                                                    "unknown property '{k}' for strict label '{label}'"
+                                                )),
+                                            ),
+                                            Some(def) if def.is_computed() => break 'schema Some(
+                                                ExecutionError::SchemaViolation(format!(
+                                                    "cannot SET computed property '{k}'"
+                                                )),
+                                            ),
+                                            Some(def) => {
+                                                if let Err(e) = validate_one(k, v, def) {
+                                                    break 'schema Some(
+                                                        ExecutionError::SchemaViolation(
+                                                            e.to_string(),
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        },
+                                        SchemaMode::Validated => {
+                                            if let Some(def) = ls.get_property(k) {
+                                                if def.is_computed() {
+                                                    break 'schema Some(
+                                                        ExecutionError::SchemaViolation(format!(
+                                                            "cannot SET computed property '{k}'"
+                                                        )),
+                                                    );
+                                                }
+                                                if let Err(e) = validate_one(k, v, def) {
+                                                    break 'schema Some(
+                                                        ExecutionError::SchemaViolation(
+                                                            e.to_string(),
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        SchemaMode::Flexible => {}
+                                    }
+                                }
+                                None
+                            };
+                            if let Some(err) = schema_err {
+                                if skip_on_violation {
+                                    continue 'row_loop;
+                                }
+                                return Err(err);
+                            }
+                        }
+
                         // Clear existing props and set new ones from map
                         record.props.clear();
                         if let Value::Map(ref map) = map_val {
@@ -5393,6 +5491,70 @@ fn execute_update(
                         let mut record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
                             ExecutionError::Serialization(format!("node decode: {e}"))
                         })?;
+
+                        // Schema validation: SET n += {map} merges new properties.
+                        // STRICT: every key in map must be declared; VALIDATED: checks declared keys.
+                        let label = record.primary_label().to_string();
+                        let schema_key = encode_label_schema_key(&label);
+                        let label_schema = match ctx.mvcc_get(Partition::Schema, &schema_key)? {
+                            Some(s_bytes) => LabelSchema::from_msgpack(&s_bytes).ok(),
+                            None => None,
+                        };
+                        if let (Some(ref ls), Value::Map(ref map)) = (&label_schema, &map_val) {
+                            let schema_err: Option<ExecutionError> = 'schema: {
+                                for (k, v) in map {
+                                    match ls.mode {
+                                        SchemaMode::Strict => match ls.get_property(k) {
+                                            None => break 'schema Some(
+                                                ExecutionError::SchemaViolation(format!(
+                                                    "unknown property '{k}' for strict label '{label}'"
+                                                )),
+                                            ),
+                                            Some(def) if def.is_computed() => break 'schema Some(
+                                                ExecutionError::SchemaViolation(format!(
+                                                    "cannot SET computed property '{k}'"
+                                                )),
+                                            ),
+                                            Some(def) => {
+                                                if let Err(e) = validate_one(k, v, def) {
+                                                    break 'schema Some(
+                                                        ExecutionError::SchemaViolation(
+                                                            e.to_string(),
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        },
+                                        SchemaMode::Validated => {
+                                            if let Some(def) = ls.get_property(k) {
+                                                if def.is_computed() {
+                                                    break 'schema Some(
+                                                        ExecutionError::SchemaViolation(format!(
+                                                            "cannot SET computed property '{k}'"
+                                                        )),
+                                                    );
+                                                }
+                                                if let Err(e) = validate_one(k, v, def) {
+                                                    break 'schema Some(
+                                                        ExecutionError::SchemaViolation(
+                                                            e.to_string(),
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        SchemaMode::Flexible => {}
+                                    }
+                                }
+                                None
+                            };
+                            if let Some(err) = schema_err {
+                                if skip_on_violation {
+                                    continue 'row_loop;
+                                }
+                                return Err(err);
+                            }
+                        }
 
                         if let Value::Map(ref map) = map_val {
                             for (k, v) in map {
@@ -7275,6 +7437,7 @@ mod tests {
                     property: "name".into(),
                     expr: Expr::Literal(Value::String("Alicia".into())),
                 }],
+                violation_mode: crate::cypher::ast::ViolationMode::Fail,
             },
         };
 

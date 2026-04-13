@@ -173,7 +173,7 @@ impl<'a> Analyzer<'a> {
             Clause::Delete(dc) => {
                 self.analyze_delete(dc);
             }
-            Clause::Set(items) => {
+            Clause::Set(items, _violation_mode) => {
                 for item in items {
                     self.check_set_item(item);
                 }
@@ -452,6 +452,10 @@ impl<'a> Analyzer<'a> {
                         }
                     }
                 }
+            }
+            Expr::Subscript { expr, index } => {
+                self.check_expr(expr);
+                self.check_expr(index);
             }
             // Literals, parameters, star — no variable references
             Expr::Literal(_) | Expr::Parameter(_) | Expr::Star => {}

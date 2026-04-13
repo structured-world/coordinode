@@ -1447,4 +1447,252 @@ mod tests {
                 .expect("SET on schemaless node must succeed regardless of unknown property");
         }
     }
+
+    /// MERGE on a STRICT label — ON CREATE SET path must be schema-checked.
+    /// Merging with a declared property succeeds; merging with an unknown property fails.
+    #[tokio::test]
+    async fn strict_mode_merge_on_create_set_rejected_for_unknown_property() {
+        let (svc, _dir) = test_service();
+
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Product".to_string(),
+            properties: vec![
+                graph::PropertyDefinition {
+                    name: "sku".to_string(),
+                    r#type: 3, // STRING
+                    required: false,
+                    unique: false,
+                },
+                graph::PropertyDefinition {
+                    name: "price".to_string(),
+                    r#type: 2, // FLOAT64
+                    required: false,
+                    unique: false,
+                },
+            ],
+            computed_properties: vec![],
+            schema_mode: 1, // STRICT
+        }))
+        .await
+        .expect("create_label Product");
+
+        // ON CREATE SET with declared property — must succeed (creates node).
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("MERGE (p:Product {sku: 'A1'}) ON CREATE SET p.price = 9.99")
+                .expect("MERGE ON CREATE SET with declared property must succeed");
+        }
+
+        // ON MATCH SET with unknown property — must fail (node now exists → ON MATCH path).
+        {
+            let mut db = svc.database.lock().unwrap();
+            let result = db
+                .execute_cypher("MERGE (p:Product {sku: 'A1'}) ON MATCH SET p.unknown_field = 'x'");
+            assert!(
+                result.is_err(),
+                "MERGE ON MATCH SET with unknown property on STRICT label must fail, got: {result:?}"
+            );
+        }
+    }
+
+    /// SET n = {map} (ReplaceProperties) on STRICT label — unknown key in map must be rejected.
+    #[tokio::test]
+    async fn strict_mode_replace_properties_rejects_unknown_key() {
+        let (svc, _dir) = test_service();
+
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Config".to_string(),
+            properties: vec![
+                graph::PropertyDefinition {
+                    name: "host".to_string(),
+                    r#type: 3, // STRING
+                    required: false,
+                    unique: false,
+                },
+                graph::PropertyDefinition {
+                    name: "port".to_string(),
+                    r#type: 1, // INT64
+                    required: false,
+                    unique: false,
+                },
+            ],
+            computed_properties: vec![],
+            schema_mode: 1, // STRICT
+        }))
+        .await
+        .expect("create_label Config");
+
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (c:Config {host: 'localhost', port: 5432})")
+                .expect("create Config node");
+        }
+
+        // Replace with only declared keys — must succeed.
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("MATCH (c:Config) SET c = {host: 'db.internal', port: 3306}")
+                .expect("SET n = {map} with declared keys must succeed");
+        }
+
+        // Replace introducing unknown key — must fail.
+        {
+            let mut db = svc.database.lock().unwrap();
+            let result = db
+                .execute_cypher("MATCH (c:Config) SET c = {host: 'x', port: 3306, extra: 'oops'}");
+            assert!(
+                result.is_err(),
+                "SET n = {{map}} with unknown key on STRICT label must fail, got: {result:?}"
+            );
+        }
+    }
+
+    /// SET n += {map} (MergeProperties) on STRICT label — unknown key in merge map must be rejected.
+    #[tokio::test]
+    async fn strict_mode_merge_properties_rejects_unknown_key() {
+        let (svc, _dir) = test_service();
+
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "AppService".to_string(),
+            properties: vec![
+                graph::PropertyDefinition {
+                    name: "name".to_string(),
+                    r#type: 3, // STRING
+                    required: false,
+                    unique: false,
+                },
+                graph::PropertyDefinition {
+                    name: "version".to_string(),
+                    r#type: 3, // STRING
+                    required: false,
+                    unique: false,
+                },
+            ],
+            computed_properties: vec![],
+            schema_mode: 1, // STRICT
+        }))
+        .await
+        .expect("create_label AppService");
+
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (s:AppService {name: 'api', version: '1.0'})")
+                .expect("create AppService node");
+        }
+
+        // Merge with declared keys — must succeed.
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("MATCH (s:AppService) SET s += {version: '2.0'}")
+                .expect("SET n += {map} with declared keys must succeed");
+        }
+
+        // Merge introducing unknown key — must fail.
+        {
+            let mut db = svc.database.lock().unwrap();
+            let result = db
+                .execute_cypher("MATCH (s:AppService) SET s += {version: '3.0', secret: 'leaked'}");
+            assert!(
+                result.is_err(),
+                "SET n += {{map}} with unknown key on STRICT label must fail, got: {result:?}"
+            );
+        }
+    }
+
+    /// ON VIOLATION SKIP: nodes that violate schema are excluded from results; compliant nodes proceed.
+    #[tokio::test]
+    async fn on_violation_skip_excludes_violating_nodes() {
+        let (svc, _dir) = test_service();
+
+        // Gadget has a strict schema: only 'name' and 'status' are allowed.
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Gadget".to_string(),
+            properties: vec![
+                graph::PropertyDefinition {
+                    name: "name".to_string(),
+                    r#type: 3, // STRING
+                    required: false,
+                    unique: false,
+                },
+                graph::PropertyDefinition {
+                    name: "status".to_string(),
+                    r#type: 3, // STRING
+                    required: false,
+                    unique: false,
+                },
+            ],
+            computed_properties: vec![],
+            schema_mode: 1, // STRICT
+        }))
+        .await
+        .expect("create_label Gadget");
+
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (g:Gadget {name: 'light', status: 'on'})")
+                .expect("create g1");
+            db.execute_cypher("CREATE (g:Gadget {name: 'fan', status: 'off'})")
+                .expect("create g2");
+        }
+
+        // Without ON VIOLATION SKIP: setting unknown property on all Gadget nodes fails.
+        {
+            let mut db = svc.database.lock().unwrap();
+            let result = db.execute_cypher("MATCH (g:Gadget) SET g.firmware = 'v1'");
+            assert!(
+                result.is_err(),
+                "SET unknown property on STRICT label without SKIP must fail"
+            );
+        }
+
+        // With ON VIOLATION SKIP: query succeeds; violating nodes are excluded from output.
+        // 'firmware' is unknown → all Gadget nodes are skipped → empty result set.
+        {
+            let mut db = svc.database.lock().unwrap();
+            let rows = db
+                .execute_cypher(
+                    "MATCH (g:Gadget) SET g.firmware = 'v1' ON VIOLATION SKIP RETURN g.name",
+                )
+                .expect("ON VIOLATION SKIP must not fail");
+            assert_eq!(
+                rows.len(),
+                0,
+                "all violating nodes skipped → empty result, got: {rows:?}"
+            );
+        }
+
+        // ON VIOLATION SKIP with a valid property: all nodes are updated, all returned.
+        {
+            let mut db = svc.database.lock().unwrap();
+            let rows = db
+                .execute_cypher(
+                    "MATCH (g:Gadget) SET g.status = 'idle' ON VIOLATION SKIP RETURN g.name",
+                )
+                .expect("ON VIOLATION SKIP with valid property must succeed");
+            assert_eq!(rows.len(), 2, "both Gadget nodes updated, got: {rows:?}");
+        }
+    }
+
+    /// labels(n)[0] — subscript access on function result returns the primary label.
+    #[tokio::test]
+    async fn labels_function_subscript_access() {
+        let (svc, _dir) = test_service();
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (n:Robot {name: 'R2D2'})")
+                .expect("create");
+        }
+
+        let mut db = svc.database.lock().unwrap();
+        let rows = db
+            .execute_cypher("MATCH (n:Robot) RETURN labels(n)[0] AS lbl")
+            .expect("labels(n)[0] must be supported");
+        assert_eq!(rows.len(), 1, "expected one row");
+        let lbl = rows[0].get("lbl").cloned().unwrap_or(Value::Null);
+        assert_eq!(
+            lbl,
+            Value::String("Robot".into()),
+            "labels(n)[0] must return primary label 'Robot', got: {lbl:?}"
+        );
+    }
 }

@@ -261,11 +261,12 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 detach: dc.detach,
             })
         }
-        Clause::Set(items) => {
+        Clause::Set(items, violation_mode) => {
             let input = current.unwrap_or(LogicalOp::Empty);
             Ok(LogicalOp::Update {
                 input: Box::new(input),
                 items: items.clone(),
+                violation_mode: violation_mode.clone(),
             })
         }
         Clause::Remove(items) => {
@@ -1987,6 +1988,10 @@ fn collect_expr_variables_inner(expr: &Expr, vars: &mut Vec<String>) {
                     }
                 }
             }
+        }
+        Expr::Subscript { expr, index } => {
+            collect_expr_variables_inner(expr, vars);
+            collect_expr_variables_inner(index, vars);
         }
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Star => {}
     }
