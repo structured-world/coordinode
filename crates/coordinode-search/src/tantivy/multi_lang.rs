@@ -723,6 +723,105 @@ mod tests {
         );
     }
 
+    /// Ukrainian default language — indexing + stemmed search via MultiLanguageTextIndex.
+    ///
+    /// Uses `default_language = "ukrainian"`. Documents are added via `add_node` (the
+    /// normal path). Search uses `search_with_language("ukrainian")` which must apply the
+    /// same Snowball Ukrainian stemmer at query time, matching the indexed stems.
+    ///
+    /// "книга" (book) → stem "книг".  Searching for "книга" should find node 1 because
+    /// the query is also stemmed to "книг" before lookup.
+    #[test]
+    fn ukrainian_default_language_stemmed_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = MultiLangConfig::with_default_language("ukrainian");
+        let mut idx =
+            MultiLanguageTextIndex::open_or_create(dir.path(), 15_000_000, config).unwrap();
+
+        idx.add_node(1, &props(&[("body", "книга про історію міста")]))
+            .unwrap();
+        idx.add_node(2, &props(&[("body", "кішка сидить на дивані")]))
+            .unwrap();
+
+        // Query "книга" → stemmed to "книг" at query time → matches doc 1
+        let results = idx.search_with_language("книга", 10, "ukrainian").unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "Ukrainian stemmer: 'книга' should match indexed 'книга' (both stem to 'книг')"
+        );
+        assert_eq!(results[0].node_id, 1);
+
+        // Unrelated query should not match
+        let no_match = idx
+            .search_with_language("автомобіль", 10, "ukrainian")
+            .unwrap();
+        assert!(no_match.is_empty(), "unrelated term should not match");
+    }
+
+    /// Ukrainian auto-detect: document with Ukrainian text, no explicit language set.
+    ///
+    /// When `default_language = "english"` but the document text is Ukrainian, whatlang
+    /// auto-detection should kick in and index with the Ukrainian pipeline. Searching
+    /// with explicit `language="ukrainian"` must find it.
+    #[test]
+    fn ukrainian_auto_detect_indexes_with_ukrainian_stemmer() {
+        let dir = tempfile::tempdir().unwrap();
+        // Default is english — but Ukrainian text will be auto-detected
+        let config = MultiLangConfig::with_default_language("english");
+        let mut idx =
+            MultiLanguageTextIndex::open_or_create(dir.path(), 15_000_000, config).unwrap();
+
+        // Distinctly Ukrainian text — whatlang should detect Lang::Ukr
+        idx.add_node(
+            1,
+            &props(&[("body", "Україна розташована у Східній Європі")]),
+        )
+        .unwrap();
+
+        // Searching with Ukrainian stemmer should find the node
+        let results = idx
+            .search_with_language("Україна", 10, "ukrainian")
+            .unwrap();
+        assert!(
+            !results.is_empty(),
+            "auto-detected Ukrainian text should be findable via ukrainian search"
+        );
+    }
+
+    /// search_with_highlights on Ukrainian default-language index returns results.
+    ///
+    /// This exercises Path A of TextService (non-fuzzy, no explicit language):
+    /// MultiLanguageTextIndex.search_with_highlights → search_with_highlights_and_language
+    /// with `default_language = "ukrainian"`.
+    #[test]
+    fn ukrainian_search_with_highlights() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = MultiLangConfig::with_default_language("ukrainian");
+        let mut idx =
+            MultiLanguageTextIndex::open_or_create(dir.path(), 15_000_000, config).unwrap();
+
+        idx.add_node(
+            1,
+            &props(&[("body", "бібліотека програмного забезпечення")]),
+        )
+        .unwrap();
+        idx.add_node(2, &props(&[("body", "рецепти приготування їжі")]))
+            .unwrap();
+
+        // "бібліотек" is stem of "бібліотека" — Path A queries via search_with_highlights
+        let results = idx.search_with_highlights("бібліотека", 10).unwrap();
+        assert!(
+            !results.is_empty(),
+            "search_with_highlights on Ukrainian index should find 'бібліотека'"
+        );
+        assert_eq!(results[0].node_id, 1);
+
+        // Unrelated query
+        let no = idx.search_with_highlights("автомобіль", 10).unwrap();
+        assert!(no.is_empty());
+    }
+
     #[test]
     fn empty_properties_skipped() {
         let dir = tempfile::tempdir().unwrap();

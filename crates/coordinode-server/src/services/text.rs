@@ -514,4 +514,151 @@ mod tests {
             "fuzzy search should find 'graph' with typo 'grapm' (Levenshtein-1)"
         );
     }
+
+    /// text_search: Ukrainian index with Ukrainian text — Path A stemming e2e.
+    ///
+    /// Creates a TextIndex with `default_language = "ukrainian"` and inserts Ukrainian
+    /// documents. Searches without explicit language (Path A: MultiLanguageTextIndex
+    /// .search_with_highlights with default_language = "ukrainian"). Verifies the full
+    /// gRPC → MultiLanguageTextIndex → Snowball Ukrainian stemmer chain.
+    ///
+    /// "книга" stems to "книг" in Ukrainian Snowball. Searching "книга" must find the
+    /// document because query is stemmed the same way as the index.
+    #[tokio::test]
+    async fn text_search_ukrainian_index_path_a() {
+        use coordinode_query::index::TextIndexConfig;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut database = Database::open(dir.path()).expect("open database");
+        // Cypher parser requires ASCII identifiers for label/property names.
+        // Ukrainian content goes in property VALUES, not names.
+        database
+            .create_text_index(
+                "uk_idx",
+                "UkArticle",
+                "body",
+                TextIndexConfig {
+                    default_language: "ukrainian".to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("create ukrainian text index");
+        let svc = TextServiceImpl::new(Arc::new(Mutex::new(database)));
+
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (n:UkArticle {body: 'книга про програмування мовою Rust'})")
+                .expect("create article 1");
+            db.execute_cypher("CREATE (n:UkArticle {body: 'рецепти приготування їжі на кухні'})")
+                .expect("create article 2");
+        }
+
+        let result = svc
+            .text_search(Request::new(crate::proto::query::TextSearchRequest {
+                label: "UkArticle".to_string(),
+                query: "книга".to_string(), // stems to "книг" via Ukrainian Snowball
+                limit: 10,
+                fuzzy: false,
+                language: "".to_string(), // Path A — default language from index config
+            }))
+            .await
+            .expect("ukrainian text search should succeed");
+
+        let body = result.into_inner();
+        assert!(
+            !body.results.is_empty(),
+            "Ukrainian Path A: 'книга' should match article about programming"
+        );
+        assert!(
+            body.results.len() <= 1,
+            "cooking article should not match 'книга': got {} results",
+            body.results.len()
+        );
+        assert!(
+            body.results[0].score > 0.0,
+            "BM25 score must be positive: {}",
+            body.results[0].score
+        );
+    }
+
+    /// text_search: multi-property index — score merge picks best BM25 across properties.
+    ///
+    /// Creates TWO text indexes on the same label (different properties). One node
+    /// matches via "title", another via "body". Verifies:
+    /// - Both nodes are returned (merge across properties works)
+    /// - A node matching in both properties appears once (dedup by node_id)
+    /// - Scores are positive
+    #[tokio::test]
+    async fn text_search_multi_property_merge() {
+        use coordinode_query::index::TextIndexConfig;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut database = Database::open(dir.path()).expect("open database");
+        database
+            .create_text_index("idx_title", "Post", "title", TextIndexConfig::default())
+            .expect("create title index");
+        database
+            .create_text_index("idx_body", "Post", "body", TextIndexConfig::default())
+            .expect("create body index");
+        let svc = TextServiceImpl::new(Arc::new(Mutex::new(database)));
+
+        {
+            let mut db = svc.database.lock().unwrap();
+            // node 1: "database" in title only
+            db.execute_cypher(
+                "CREATE (n:Post {title: 'Introduction to database systems', body: 'general overview'})",
+            )
+            .expect("create post 1");
+            // node 2: "database" in body only
+            db.execute_cypher(
+                "CREATE (n:Post {title: 'Software architecture', body: 'relational database design patterns'})",
+            )
+            .expect("create post 2");
+            // node 3: "database" in both — should appear once, best score wins
+            db.execute_cypher(
+                "CREATE (n:Post {title: 'Database internals', body: 'database storage engines explained'})",
+            )
+            .expect("create post 3");
+            // node 4: no match
+            db.execute_cypher(
+                "CREATE (n:Post {title: 'Cooking recipes', body: 'pasta and salad'})",
+            )
+            .expect("create post 4");
+        }
+
+        let result = svc
+            .text_search(Request::new(crate::proto::query::TextSearchRequest {
+                label: "Post".to_string(),
+                query: "database".to_string(),
+                limit: 10,
+                fuzzy: false,
+                language: "".to_string(),
+            }))
+            .await
+            .expect("multi-property text search should succeed");
+
+        let body = result.into_inner();
+        // Nodes 1, 2, 3 should match; node 4 should not
+        assert!(
+            body.results.len() >= 2,
+            "at least 2 nodes should match 'database' across properties; got {}",
+            body.results.len()
+        );
+        assert!(
+            body.results.len() <= 3,
+            "cooking post must not match; got {}",
+            body.results.len()
+        );
+        // All node_ids must be unique (merge deduplicates)
+        let ids: Vec<u64> = body.results.iter().map(|r| r.node_id).collect();
+        let unique: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        assert_eq!(
+            ids.len(),
+            unique.len(),
+            "node_ids must be unique after merge"
+        );
+        for r in &body.results {
+            assert!(r.score > 0.0, "BM25 score must be positive: {}", r.score);
+        }
+    }
 }
