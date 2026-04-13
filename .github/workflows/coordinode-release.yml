@@ -61,6 +61,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
+      - name: Fetch tags after release
+        # release-plz release creates tags via GitHub API (not git tag + push),
+        # so the local git clone does not see the new tag after the previous step.
+        # Without this fetch, release-pr queries local tags, finds the old tag,
+        # and generates a duplicate release PR (e.g. 0.3.4→0.3.5 when already at 0.3.5).
+        run: git fetch --tags
+
       - name: Run release-plz release-pr
         run: |
           release-plz release-pr \
