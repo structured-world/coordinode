@@ -1463,9 +1463,18 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             function,
             k,
             distance_alias,
-            ..
+            hnsw_index,
         } => {
             let rows = execute_op(input, ctx)?;
+
+            // Extract the index name from the planner annotation ("name, metric" → "name").
+            // The annotation is set by `annotate_vector_top_k` during planning when an HNSW
+            // index exists for (label, property). Using it allows the executor to skip
+            // row-based label detection and resolve the index directly by name.
+            let hnsw_index_name: Option<&str> = hnsw_index.as_deref().map(|s| {
+                // Format is "name, metric" (e.g. "item_emb, cosine") — take name part.
+                s.split(", ").next().unwrap_or(s)
+            });
 
             // Try HNSW-accelerated top-K path.
             let result = if let Some(hnsw_result) = try_hnsw_vector_top_k(
@@ -1475,6 +1484,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 function,
                 *k,
                 distance_alias.as_deref(),
+                hnsw_index_name,
                 ctx,
             )? {
                 hnsw_result
@@ -2633,9 +2643,8 @@ const VECTOR_TOP_K_BRUTE_FORCE_THRESHOLD: usize = 1000;
 ///
 /// Algorithm:
 /// 1. Extract `(variable, property)` from `vector_expr` (must be `n.prop` form)
-/// 2. Get label from `rows[0]["variable.__label__"]`
-/// 3. Check `registry.has_index(label, property)`
-/// 4. Evaluate the query vector
+/// 2. Resolve `(label, property)` via planner annotation (preferred) or `rows[0]["variable.__label__"]`
+/// 3. Evaluate the query vector
 /// 5. Call `registry.search(label, property, query_vec, overfetch)` — may return
 ///    candidates not present in input rows (after Filter/Traverse)
 /// 6. Intersect HNSW results with input row set (lookup by node_id)
@@ -2651,6 +2660,11 @@ const VECTOR_TOP_K_BRUTE_FORCE_THRESHOLD: usize = 1000;
 /// but still narrower than the global index get enough HNSW candidates to
 /// produce a meaningful intersection. If the intersection is still < k, fall
 /// back to brute force on the full row set.
+/// `hnsw_index_name`: optional index name from the planner annotation (set by
+/// `annotate_vector_top_k`). When provided, (label, property) are resolved via
+/// `registry.get_definition_by_name` — skipping the `__label__` row heuristic.
+/// When None, falls back to detecting label from `rows[0].__label__`.
+#[allow(clippy::too_many_arguments)]
 fn try_hnsw_vector_top_k(
     rows: &[Row],
     vector_expr: &Expr,
@@ -2658,6 +2672,7 @@ fn try_hnsw_vector_top_k(
     function: &str,
     k: usize,
     distance_alias: Option<&str>,
+    hnsw_index_name: Option<&str>,
     ctx: &ExecutionContext<'_>,
 ) -> Result<Option<Vec<Row>>, ExecutionError> {
     if rows.is_empty() || k == 0 {
@@ -2685,17 +2700,40 @@ fn try_hnsw_vector_top_k(
         _ => return Ok(None),
     };
 
-    // Determine the label from the first row's __label__ field.
-    let label_key = format!("{variable}.__label__");
-    let label = match rows[0].get(&label_key) {
-        Some(Value::String(l)) => l.as_str(),
-        _ => return Ok(None),
+    // Resolve (label, property) — prefer the planner annotation over row heuristic.
+    //
+    // Using the planner annotation avoids a runtime string lookup in `rows[0]` and
+    // handles cases where `__label__` may not be projected into the row set.
+    // Falls back to `__label__` detection when the annotation is absent or the
+    // named index was dropped between plan and execution.
+    let (label_str, property_str): (String, String) = if let Some(name) = hnsw_index_name {
+        if let Some(def) = registry.get_definition_by_name(name) {
+            // Planner annotation resolves index directly by name — no row scan needed.
+            (def.label.clone(), def.property().to_string())
+        } else {
+            // Index was dropped after planning — fall back to row-based detection.
+            let label_key = format!("{variable}.__label__");
+            let l = match rows[0].get(&label_key) {
+                Some(Value::String(l)) => l.clone(),
+                _ => return Ok(None),
+            };
+            if !registry.has_index(&l, property) {
+                return Ok(None);
+            }
+            (l, property.to_string())
+        }
+    } else {
+        // No planner annotation — detect label from the first row's __label__ field.
+        let label_key = format!("{variable}.__label__");
+        let l = match rows[0].get(&label_key) {
+            Some(Value::String(l)) => l.clone(),
+            _ => return Ok(None),
+        };
+        if !registry.has_index(&l, property) {
+            return Ok(None);
+        }
+        (l, property.to_string())
     };
-
-    // Check if an HNSW index exists for this (label, property).
-    if !registry.has_index(label, property) {
-        return Ok(None);
-    }
 
     // Evaluate the query vector (constant across all rows).
     let query_val = eval_expr(query_vector_expr, &rows[0]);
@@ -2714,8 +2752,8 @@ fn try_hnsw_vector_top_k(
     let overfetch = (k * 4).max(rows.len() * 2).clamp(100, 10_000);
 
     let search_results = match registry.search_with_loader(
-        label,
-        property,
+        &label_str,
+        &property_str,
         &query_vec,
         overfetch,
         ctx.vector_loader,

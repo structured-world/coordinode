@@ -551,11 +551,15 @@ fn extract_index_property(expr: &Expr, variable: &str) -> Option<String> {
 }
 
 /// Annotation pass: walk the plan tree and annotate each `VectorTopK` node with
-/// `hnsw_index = Some(name)` when a matching HNSW index exists in the registry.
+/// Annotates `VectorTopK` nodes with `hnsw_index = Some("name, metric")` when
+/// a matching HNSW index exists in the registry for the (label, property) pair.
 ///
-/// This drives the `strategy: HnswScan(idx) | BruteForce` line in EXPLAIN output.
-/// The executor itself independently checks the registry at runtime — this pass
-/// is only for EXPLAIN accuracy.
+/// This serves two purposes:
+/// 1. **EXPLAIN output** — drives the `strategy: HnswScan(idx, metric) | BruteForce` line.
+/// 2. **Executor optimization** — the executor's `try_hnsw_vector_top_k` uses the
+///    annotation to resolve (label, property) by index name instead of scanning
+///    `rows[0].__label__`. Falls back to row detection when annotation is absent
+///    or the index was dropped between planning and execution.
 pub fn annotate_vector_top_k(
     op: LogicalOp,
     registry: &crate::index::VectorIndexRegistry,
@@ -586,10 +590,22 @@ pub fn annotate_vector_top_k(
             let label = variable.as_deref().and_then(|_| extract_scan_label(&input));
 
             // Look up the HNSW index definition when (label, property) are known.
+            // Store "name, metric" so EXPLAIN can show HnswScan(idx, cosine).
             let hnsw_index = match (label, property) {
-                (Some(lbl), Some(prop)) => registry
-                    .get_definition(lbl, &prop)
-                    .map(|def| def.name.clone()),
+                (Some(lbl), Some(prop)) => registry.get_definition(lbl, &prop).map(|def| {
+                    let metric = match def
+                        .vector_config
+                        .as_ref()
+                        .map(|c| c.metric)
+                        .unwrap_or(coordinode_core::graph::types::VectorMetric::Cosine)
+                    {
+                        coordinode_core::graph::types::VectorMetric::Cosine => "cosine",
+                        coordinode_core::graph::types::VectorMetric::L2 => "l2",
+                        coordinode_core::graph::types::VectorMetric::L1 => "l1",
+                        coordinode_core::graph::types::VectorMetric::DotProduct => "dot",
+                    };
+                    format!("{}, {metric}", def.name)
+                }),
                 _ => None,
             };
 

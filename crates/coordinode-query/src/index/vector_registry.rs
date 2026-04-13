@@ -137,6 +137,19 @@ impl VectorIndexRegistry {
             .cloned()
     }
 
+    /// Get the index definition by index name.
+    ///
+    /// Used by the executor to resolve a planner-annotated index name (e.g. `"item_emb"`)
+    /// back to its (label, property) key for `search_with_loader`.
+    pub fn get_definition_by_name(&self, name: &str) -> Option<IndexDefinition> {
+        self.definitions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .find(|def| def.name == name)
+            .cloned()
+    }
+
     /// List all registered vector indexes for a given label.
     pub fn indexes_for_label(&self, label: &str) -> Vec<(String, HnswHandle)> {
         self.indexes

@@ -494,7 +494,10 @@ impl Database {
             }
         };
 
-        let mut total_vectors = 0usize;
+        // Track per-index vector counts for structured logging.
+        let mut per_index_counts: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
+
         for guard in node_iter {
             let Ok((_key, value)) = guard.into_inner() else {
                 continue;
@@ -526,17 +529,27 @@ impl Database {
                                 prop_name,
                                 &vec_data,
                             );
-                            total_vectors += 1;
+                            *per_index_counts
+                                .entry((primary_label.to_string(), prop_name.clone()))
+                                .or_insert(0) += 1;
                         }
                     }
                 }
             }
         }
 
-        if total_vectors > 0 {
+        // Log per-index rebuild counts for observability.
+        for def in &hnsw_defs {
+            let count = per_index_counts
+                .get(&(def.label.clone(), def.property().to_string()))
+                .copied()
+                .unwrap_or(0);
             tracing::info!(
-                "rebuilt {} HNSW index(es) with {total_vectors} vector(s)",
-                hnsw_defs.len()
+                index = %def.name,
+                label = %def.label,
+                property = %def.property(),
+                vectors = count,
+                "rebuilt HNSW index on reopen"
             );
         }
 
@@ -825,6 +838,11 @@ impl Database {
         // Apply index selection optimizer: rewrite Filter(NodeScan) → IndexScan
         // when a matching B-tree index is registered.
         plan.root = planner::optimize_index_selection(plan.root, &self.index_registry);
+
+        // Annotate VectorTopK nodes with the HNSW index name when an applicable
+        // index exists. This ensures the executor's VectorTopK operator carries
+        // the resolved index name at execution time, not just at EXPLAIN time.
+        plan.root = planner::annotate_vector_top_k(plan.root, &self.vector_index_registry);
 
         // Bind parameters: replace $name references with literal values.
         if let Some(ref p) = params {
