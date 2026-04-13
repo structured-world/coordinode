@@ -270,6 +270,23 @@ impl TextIndex {
         query_str: &str,
         boost: Option<f32>,
     ) -> Result<Box<dyn tantivy::query::Query>, TextSearchError> {
+        self.build_query_inner(query_str, boost, false)
+    }
+
+    fn build_query_fuzzy(
+        &self,
+        query_str: &str,
+        boost: Option<f32>,
+    ) -> Result<Box<dyn tantivy::query::Query>, TextSearchError> {
+        self.build_query_inner(query_str, boost, true)
+    }
+
+    fn build_query_inner(
+        &self,
+        query_str: &str,
+        boost: Option<f32>,
+        fuzzy: bool,
+    ) -> Result<Box<dyn tantivy::query::Query>, TextSearchError> {
         use tantivy::query::PhrasePrefixQuery;
 
         let (prefix_terms, remainder) = extract_prefix_terms(query_str);
@@ -279,6 +296,12 @@ impl TextIndex {
             let mut parser = QueryParser::for_index(&self.index, vec![self.body_field]);
             if let Some(b) = boost {
                 parser.set_field_boost(self.body_field, b);
+            }
+            if fuzzy {
+                // Enable Levenshtein-1 fuzzy expansion for all terms.
+                // tantivy's QueryParser does NOT support `term~N` syntax — fuzzy
+                // must be enabled via set_field_fuzzy before parsing.
+                parser.set_field_fuzzy(self.body_field, false, 1, true);
             }
             let q = parser.parse_query(query_str)?;
             return Ok(q);
@@ -369,6 +392,41 @@ impl TextIndex {
             if let Some(node_id_val) = doc.get_first(self.node_id_field) {
                 if let Some(node_id) = node_id_val.as_u64() {
                     results.push(TextSearchResult { node_id, score });
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Search with highlighted snippets and Levenshtein-1 fuzzy expansion.
+    ///
+    /// Uses `set_field_fuzzy` on the QueryParser so every bare term in the query
+    /// automatically expands to its edit-1 neighbourhood. This is the correct way
+    /// to do fuzzy search in tantivy — NOT by appending `~1` to terms (which is
+    /// phrase-slop syntax, not fuzzy-term syntax).
+    pub fn search_with_highlights_fuzzy(
+        &self,
+        query_str: &str,
+        limit: usize,
+    ) -> Result<Vec<HighlightedResult>, TextSearchError> {
+        let searcher = self.reader.searcher();
+        let query = self.build_query_fuzzy(query_str, None)?;
+
+        let top_docs = searcher.search(&*query, &TopDocs::with_limit(limit).order_by_score())?;
+        let snippet_gen = SnippetGenerator::create(&searcher, &*query, self.body_field)?;
+
+        let mut results = Vec::with_capacity(top_docs.len());
+        for (score, doc_address) in top_docs {
+            let doc: TantivyDocument = searcher.doc(doc_address)?;
+            if let Some(node_id_val) = doc.get_first(self.node_id_field) {
+                if let Some(node_id) = node_id_val.as_u64() {
+                    let snippet = snippet_gen.snippet_from_doc(&doc);
+                    results.push(HighlightedResult {
+                        node_id,
+                        score,
+                        snippet_html: snippet.to_html(),
+                    });
                 }
             }
         }
@@ -619,6 +677,70 @@ impl TextIndex {
             if let Some(node_id_val) = doc.get_first(self.node_id_field) {
                 if let Some(node_id) = node_id_val.as_u64() {
                     results.push(TextSearchResult { node_id, score });
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Search with highlighted snippets using language-aware tokenization.
+    ///
+    /// Unlike `search_with_highlights` (which uses the schema-level `QueryParser`
+    /// tokenizer), this method tokenizes the query via the same language pipeline
+    /// used at index time, ensuring stemming/stopword consistency.
+    ///
+    /// Snippets are generated from the same query used for scoring, so highlighted
+    /// terms reflect the language-normalized forms.
+    pub fn search_with_highlights_and_language(
+        &self,
+        query_str: &str,
+        limit: usize,
+        language: &str,
+    ) -> Result<Vec<HighlightedResult>, TextSearchError> {
+        use tantivy::query::PhrasePrefixQuery;
+
+        let (prefix_terms, remainder) = extract_prefix_terms(query_str);
+        let tokens = tokenize::tokenize_text(remainder.trim(), language);
+
+        if tokens.is_empty() && prefix_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut subqueries: Vec<(Occur, Box<dyn tantivy::query::Query>)> = tokens
+            .into_iter()
+            .map(|tok| {
+                let term = tantivy::Term::from_field_text(self.body_field, &tok.text);
+                let tq = TermQuery::new(term, IndexRecordOption::WithFreqs);
+                (
+                    Occur::Should,
+                    Box::new(tq) as Box<dyn tantivy::query::Query>,
+                )
+            })
+            .collect();
+
+        for prefix in &prefix_terms {
+            let term = tantivy::Term::from_field_text(self.body_field, prefix);
+            let pq = PhrasePrefixQuery::new(vec![term]);
+            subqueries.push((Occur::Should, Box::new(pq)));
+        }
+
+        let query = BooleanQuery::new(subqueries);
+        let searcher = self.reader.searcher();
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
+        let snippet_gen = SnippetGenerator::create(&searcher, &query, self.body_field)?;
+
+        let mut results = Vec::with_capacity(top_docs.len());
+        for (score, doc_address) in top_docs {
+            let doc: TantivyDocument = searcher.doc(doc_address)?;
+            if let Some(node_id_val) = doc.get_first(self.node_id_field) {
+                if let Some(node_id) = node_id_val.as_u64() {
+                    let snippet = snippet_gen.snippet_from_doc(&doc);
+                    results.push(HighlightedResult {
+                        node_id,
+                        score,
+                        snippet_html: snippet.to_html(),
+                    });
                 }
             }
         }

@@ -165,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::clone(&nplus1_detector),
             );
             let vector_service = services::vector::VectorServiceImpl::new(Arc::clone(&database));
+            let text_service = services::text::TextServiceImpl::new(Arc::clone(&database));
             let health_service = services::health::HealthServiceImpl;
             // CDC service: tails oplog/<shard>/ dir. Empty stream in embedded mode
             // (no oplog); populated in Raft cluster mode (LogStore writes oplog).
@@ -200,6 +201,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .add_service(
                     proto::query::vector_service_server::VectorServiceServer::new(vector_service),
+                )
+                .add_service(
+                    proto::query::text_service_server::TextServiceServer::new(text_service),
                 )
                 .add_service(
                     proto::health::health_service_server::HealthServiceServer::new(health_service),

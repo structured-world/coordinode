@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::tokenize;
-use super::{TextIndex, TextSearchError, TextSearchResult};
+use super::{HighlightedResult, TextIndex, TextSearchError, TextSearchResult};
 
 /// Configuration for a multi-language text index.
 #[derive(Debug, Clone)]
@@ -287,6 +287,25 @@ impl MultiLanguageTextIndex {
     ) -> Result<Vec<TextSearchResult>, TextSearchError> {
         self.inner
             .search_with_language(query_str, limit, &self.config.default_language)
+    }
+
+    /// Search with HTML-highlighted snippets using the index's default language.
+    ///
+    /// Uses the same language-aware tokenization as `search()` so that stemming
+    /// and stopword filtering are consistent between indexing and query time.
+    /// This avoids the tokenizer mismatch that occurs when using
+    /// `inner().search_with_highlights()` directly (which uses the schema-level
+    /// `QueryParser` tokenizer, not the per-language pipeline).
+    pub fn search_with_highlights(
+        &self,
+        query_str: &str,
+        limit: usize,
+    ) -> Result<Vec<HighlightedResult>, TextSearchError> {
+        self.inner.search_with_highlights_and_language(
+            query_str,
+            limit,
+            &self.config.default_language,
+        )
     }
 
     /// Search using a specific language for query tokenization.
