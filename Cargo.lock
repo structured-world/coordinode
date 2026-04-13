@@ -866,6 +866,7 @@ name = "coordinode-server"
 version = "0.3.8"
 dependencies = [
  "coordinode-auth",
+ "coordinode-client",
  "coordinode-core",
  "coordinode-embed",
  "coordinode-query",

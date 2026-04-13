@@ -495,6 +495,83 @@ mod tests {
         );
     }
 
+    /// End-to-end: CoordinodeClient with debug_source_tracking injects
+    /// x-source-* metadata that CypherServiceImpl extracts and records in
+    /// the QueryRegistry. Covers the full path:
+    ///   client (#[track_caller]) → gRPC transport → extract_source_context()
+    ///   → query_registry.record_with_source()
+    #[tokio::test]
+    async fn grpc_source_tracking_round_trip() {
+        use tokio::net::TcpListener;
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        // Shared registry so we can inspect it after the query executes.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database = Arc::new(Mutex::new(
+            Database::open(dir.path()).expect("open database"),
+        ));
+        let registry = Arc::new(QueryRegistry::new());
+        let detector = Arc::new(NPlus1Detector::new());
+        let svc = CypherServiceImpl::new(
+            Arc::clone(&database),
+            Arc::clone(&registry),
+            Arc::clone(&detector),
+        );
+
+        // Bind to OS-assigned port to avoid conflicts.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local_addr");
+        let incoming = TcpListenerStream::new(listener);
+
+        // Serve in background; task exits when all clients disconnect.
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    crate::proto::query::cypher_service_server::CypherServiceServer::new(svc),
+                )
+                .serve_with_incoming(incoming)
+                .await
+                .expect("server error");
+        });
+
+        // Connect via CoordinodeClient with source tracking enabled.
+        let mut client = coordinode_client::CoordinodeClient::builder(format!("http://{addr}"))
+            .debug_source_tracking(true)
+            .app_name("test-service")
+            .app_version("0.0.1")
+            .build()
+            .await
+            .expect("connect");
+
+        // Execute from a known call site (this line is the call site).
+        client
+            .execute_cypher("CREATE (n:SrcTest)")
+            .await
+            .expect("execute_cypher");
+
+        // Verify the registry captured the source location.
+        let top = registry.top_by_count(10);
+        assert_eq!(top.len(), 1, "one fingerprint should be recorded");
+
+        let entry = &top[0];
+        assert_eq!(entry.sources.len(), 1, "one source location expected");
+
+        let src = &entry.sources[0];
+        // File must point to this test file, not to client or transport internals.
+        // The #[track_caller] wrapper on execute_cypher captures the call site in
+        // this test (cypher.rs), which is then injected as x-source-file metadata.
+        assert!(
+            src.file.contains("cypher.rs"),
+            "source file should be cypher.rs, got: {}",
+            src.file
+        );
+        assert!(src.line > 0, "line must be non-zero");
+        assert_eq!(src.app, "test-service");
+        assert_eq!(src.call_count, 1);
+    }
+
     /// gRPC execute_cypher records execution time > 0.
     #[tokio::test]
     async fn grpc_execute_records_timing() {
