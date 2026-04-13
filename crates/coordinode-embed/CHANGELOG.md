@@ -1,36 +1,41 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+All notable changes to this crate are documented in this file.
+This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.3.6](https://github.com/structured-world/coordinode/compare/v0.3.5...v0.3.6) - 2026-04-13
 
-## [Unreleased]
+#### Added
 
-## [0.3.3](https://github.com/structured-world/coordinode/compare/v0.3.2...v0.3.3) - 2026-04-12
+- *(query)* use planner hnsw_index annotation in executor for index-name lookup
+- *(query)* CREATE/DROP VECTOR INDEX Cypher DDL
 
-### Added
+#### Testing
 
-- *(query)* implement standalone MERGE relationship (G074)
+- *(embed)* full integration coverage for CREATE/DROP VECTOR INDEX (R-API3)
+- *(embed)* complete R-API3 integration test suite for CREATE/DROP VECTOR INDEX
 
-## [0.3.0](https://github.com/structured-world/coordinode/releases/tag/v0.3.0) - 2026-04-09
+---
 
-### Added
+## [0.3.5](https://github.com/structured-world/coordinode/compare/v0.3.4...v0.3.5) - 2026-04-13
 
-- *(computed)* R085 decay interpolation tests and NVMe write buffer for w:cache
-- *(server)* wire DrainBuffer with RaftProposalPipeline in cluster mode (G063)
-- *(query)* COMPUTED VECTOR_DECAY planner pattern detection (R084)
-- *(query)* SSE encrypted search via Cypher DDL + encrypted_match() (G017)
-- *(query)* adaptive parallel traversal via rayon (G010) + varlen edge props fix (G066)
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+#### Added
 
-## [0.1.0-alpha.1](https://github.com/structured-world/coordinode/releases/tag/v0.1.0-alpha.1) - 2026-04-08
+- *(query)* implement CREATE/DROP INDEX Cypher DDL with IndexScan optimizer
 
-### Added
+---
 
-- *(computed)* R085 decay interpolation tests and NVMe write buffer for w:cache
-- *(server)* wire DrainBuffer with RaftProposalPipeline in cluster mode (G063)
-- *(query)* COMPUTED VECTOR_DECAY planner pattern detection (R084)
-- *(query)* SSE encrypted search via Cypher DDL + encrypted_match() (G017)
-- *(query)* adaptive parallel traversal via rayon (G010) + varlen edge props fix (G066)
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+## [0.3.4](https://github.com/structured-world/coordinode/compare/v0.3.3...v0.3.4) - 2026-04-12
+
+#### Added
+
+- *(schema)* wire create_label/create_edge_type to persist schemas with unique index enforcement
+
+#### Fixed
+
+- *(embed)* add missing target_field to ComputedSpec::Ttl in integration tests
+
+#### Testing
+
+- *(schema)* add reopen test — unique constraint enforced after load_all
+- *(embed)* add integration test for TTL Subtree+target_field (G068)
