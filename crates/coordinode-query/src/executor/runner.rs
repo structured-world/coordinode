@@ -56,6 +56,11 @@ pub enum ExecutionError {
 
     #[error("write conflict: {0}")]
     Conflict(String),
+
+    /// Schema mode violation: STRICT label rejected an undeclared property, or
+    /// a write attempted to SET a COMPUTED (read-only) property.
+    #[error("schema violation: {0}")]
+    SchemaViolation(String),
 }
 
 /// Configuration for adaptive query plan behavior.
@@ -4874,9 +4879,13 @@ fn execute_create_node(
         None
     };
 
-    let is_validated = schema
+    // Effective mode: use schema mode when a schema is declared, otherwise FLEXIBLE
+    // (no schema = no enforcement, preserving backward-compatible behaviour for
+    // labels that were never declared via CreateLabel).
+    let mode = schema
         .as_ref()
-        .is_some_and(|s| s.mode == SchemaMode::Validated);
+        .map(|s| s.mode)
+        .unwrap_or(SchemaMode::Flexible);
 
     for input_row in input_rows {
         let node_id = ctx.id_allocator.next();
@@ -4886,22 +4895,52 @@ fn execute_create_node(
             // Map literals → Document for full dot-notation support in storage.
             let val = eval_expr(expr, input_row).map_to_document();
 
-            if is_validated {
-                // VALIDATED: declared properties → interned props,
-                // undeclared → extra overflow map (string keys).
-                let Some(schema_ref) = schema.as_ref() else {
-                    unreachable!()
-                };
-                if schema_ref.get_property(prop_name).is_some() {
+            match mode {
+                SchemaMode::Validated => {
+                    let Some(schema_ref) = schema.as_ref() else {
+                        unreachable!()
+                    };
+                    match schema_ref.get_property(prop_name) {
+                        Some(def) if def.is_computed() => {
+                            return Err(ExecutionError::SchemaViolation(format!(
+                                "cannot SET computed property '{prop_name}'"
+                            )));
+                        }
+                        Some(_) => {
+                            // Declared non-computed property → intern and set.
+                            let field_id = ctx.interner.intern(prop_name);
+                            record.set(field_id, val.clone());
+                        }
+                        None => {
+                            // Undeclared in VALIDATED mode → extra overflow map.
+                            record.set_extra(prop_name, val.clone());
+                        }
+                    }
+                }
+                SchemaMode::Strict => {
+                    let label_name = labels.first().map_or("?", String::as_str);
+                    match schema.as_ref().and_then(|s| s.get_property(prop_name)) {
+                        None => {
+                            return Err(ExecutionError::SchemaViolation(format!(
+                                "unknown property '{prop_name}' for strict label '{label_name}'"
+                            )));
+                        }
+                        Some(def) if def.is_computed() => {
+                            return Err(ExecutionError::SchemaViolation(format!(
+                                "cannot SET computed property '{prop_name}'"
+                            )));
+                        }
+                        Some(_) => {
+                            let field_id = ctx.interner.intern(prop_name);
+                            record.set(field_id, val.clone());
+                        }
+                    }
+                }
+                SchemaMode::Flexible => {
+                    // No schema enforcement — intern and set unconditionally.
                     let field_id = ctx.interner.intern(prop_name);
                     record.set(field_id, val.clone());
-                } else {
-                    record.set_extra(prop_name, val.clone());
                 }
-            } else {
-                // STRICT / FLEXIBLE / no schema: all properties interned.
-                let field_id = ctx.interner.intern(prop_name);
-                record.set(field_id, val.clone());
             }
         }
 
@@ -5087,6 +5126,43 @@ fn execute_update(
                         let mut record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
                             ExecutionError::Serialization(format!("node decode: {e}"))
                         })?;
+
+                        // Enforce schema mode before writing the property.
+                        // Load the label schema for the node's primary label and
+                        // check STRICT/VALIDATED constraints on the property name.
+                        let label = record.primary_label().to_string();
+                        let schema_key = encode_label_schema_key(&label);
+                        let label_schema = match ctx.mvcc_get(Partition::Schema, &schema_key)? {
+                            Some(s_bytes) => LabelSchema::from_msgpack(&s_bytes).ok(),
+                            None => None,
+                        };
+                        if let Some(ref ls) = label_schema {
+                            match ls.mode {
+                                SchemaMode::Strict => match ls.get_property(property) {
+                                    None => {
+                                        return Err(ExecutionError::SchemaViolation(format!(
+                                                "unknown property '{property}' for strict label '{label}'"
+                                            )));
+                                    }
+                                    Some(def) if def.is_computed() => {
+                                        return Err(ExecutionError::SchemaViolation(format!(
+                                            "cannot SET computed property '{property}'"
+                                        )));
+                                    }
+                                    Some(_) => {}
+                                },
+                                SchemaMode::Validated => {
+                                    if let Some(def) = ls.get_property(property) {
+                                        if def.is_computed() {
+                                            return Err(ExecutionError::SchemaViolation(format!(
+                                                "cannot SET computed property '{property}'"
+                                            )));
+                                        }
+                                    }
+                                }
+                                SchemaMode::Flexible => {}
+                            }
+                        }
 
                         let field_id = ctx.interner.intern(property);
                         record.set(field_id, val.clone());
