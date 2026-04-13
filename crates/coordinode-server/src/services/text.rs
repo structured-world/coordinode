@@ -1162,4 +1162,201 @@ mod tests {
             "at least one result needed for weight test"
         );
     }
+
+    // ─── E2E LangChain Integration Test ────────────────────────────────────
+
+    /// E2E: LangChain / gRPC API correctness — all search modalities on shared data.
+    ///
+    /// This test mirrors the LangChain usage pattern:
+    ///   1. Create a document node with both a text property and a vector embedding.
+    ///   2. Vector search with COSINE metric — the node must be found and metric must
+    ///      be applied correctly (cosine similarity, not L2 distance).
+    ///   3. Text search — the node must be found by BM25 term matching.
+    ///   4. Hybrid search (RRF) — the node must appear in the fused ranking with a
+    ///      score > 0, because it appears in BOTH the text and vector rankings.
+    ///
+    /// All three search services share the same Database instance, exercising the
+    /// full data path from write (via Cypher) to read (via each gRPC service handler).
+    #[tokio::test]
+    async fn langchain_e2e_all_search_modalities() {
+        use crate::proto::common;
+        use crate::proto::query::text_service_server::TextService as TextServiceTrait;
+        use crate::proto::query::vector_service_server::VectorService as VectorServiceTrait;
+        use crate::services::vector::VectorServiceImpl;
+        use coordinode_query::index::TextIndexConfig;
+
+        // --- Setup: shared database ---
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = Database::open(dir.path()).expect("open database");
+
+        // Create text index on (LangDoc, content).
+        db.create_text_index(
+            "langchain_idx",
+            "LangDoc",
+            "content",
+            TextIndexConfig::default(),
+        )
+        .expect("create text index");
+
+        // Create a node with both text content AND a 3-dimensional embedding.
+        // "graph database search engine" — will match text query "database".
+        // embedding = [1.0, 0.0, 0.0] — will match cosine query [1.0, 0.0, 0.0] exactly.
+        db.execute_cypher(
+            "CREATE (n:LangDoc {content: 'graph database search engine', embedding: [1.0, 0.0, 0.0]})",
+        )
+        .expect("create langchain test node");
+
+        // Create an unrelated node to verify specificity of results.
+        db.execute_cypher(
+            "CREATE (n:LangDoc {content: 'cooking recipes and pasta salad', embedding: [0.0, 1.0, 0.0]})",
+        )
+        .expect("create unrelated node");
+
+        let db = Arc::new(Mutex::new(db));
+
+        let text_svc = TextServiceImpl::new(Arc::clone(&db));
+        let vector_svc = VectorServiceImpl::new(Arc::clone(&db));
+
+        // ─── Step 2: Vector search with COSINE ───────────────────────────
+        // COSINE = metric proto value 1.
+        // The node with embedding [1.0, 0.0, 0.0] should be rank 1
+        // (cosine similarity = 1.0 with query [1.0, 0.0, 0.0]).
+        // The unrelated node [0.0, 1.0, 0.0] has cosine = 0.0 and should rank last.
+        let vector_result = vector_svc
+            .vector_search(Request::new(crate::proto::query::VectorSearchRequest {
+                label: "LangDoc".to_string(),
+                property: "embedding".to_string(),
+                query_vector: Some(common::Vector {
+                    values: vec![1.0, 0.0, 0.0],
+                }),
+                top_k: 5,
+                metric: 1, // COSINE
+            }))
+            .await
+            .expect("vector search should succeed");
+
+        let vector_body = vector_result.into_inner();
+        assert!(
+            !vector_body.results.is_empty(),
+            "vector search (COSINE) must find the embedding node"
+        );
+        // COSINE: highest similarity = first. The embedding node has sim=1.0.
+        // Verify: top result has distance < 1.0 (COSINE returns 1-cosine as distance
+        // OR the raw similarity depending on the metric_cypher mapping).
+        // Our metric_cypher(COSINE) returns ("vector_similarity", "DESC") — higher = closer.
+        // So top result's distance field holds the cosine similarity value.
+        let top_vector = &vector_body.results[0];
+        assert!(
+            top_vector.distance > 0.0,
+            "COSINE similarity of top result should be positive: {}",
+            top_vector.distance
+        );
+        // Verify the top result has a node attached.
+        assert!(
+            top_vector.node.is_some(),
+            "vector search result must include node data"
+        );
+        let top_node = top_vector.node.as_ref().unwrap();
+        // The matching node has label "LangDoc".
+        assert!(
+            top_node.labels.contains(&"LangDoc".to_string()),
+            "vector search result must include correct label"
+        );
+
+        // ─── Step 3: Text search ─────────────────────────────────────────
+        // "database" matches "graph database search engine" but not "cooking recipes".
+        let text_result = text_svc
+            .text_search(Request::new(crate::proto::query::TextSearchRequest {
+                label: "LangDoc".to_string(),
+                query: "database".to_string(),
+                limit: 10,
+                fuzzy: false,
+                language: "".to_string(),
+            }))
+            .await
+            .expect("text search should succeed");
+
+        let text_body = text_result.into_inner();
+        assert!(
+            !text_body.results.is_empty(),
+            "text search must find the 'database' node"
+        );
+        assert!(
+            text_body.results.len() == 1,
+            "only the 'database' node should match, not the cooking node: got {}",
+            text_body.results.len()
+        );
+        assert!(
+            text_body.results[0].score > 0.0,
+            "BM25 score must be positive: {}",
+            text_body.results[0].score
+        );
+
+        // ─── Step 4: Hybrid search (RRF) ─────────────────────────────────
+        // The "database" node appears in BOTH text rank AND vector rank (COSINE similarity 1.0).
+        // The cooking node appears only in vector rank (distant, low similarity).
+        // Therefore the "database" node should rank first.
+        let hybrid_result = text_svc
+            .hybrid_text_vector_search(Request::new(
+                crate::proto::query::HybridTextVectorSearchRequest {
+                    label: "LangDoc".to_string(),
+                    text_query: "database".to_string(),
+                    vector: vec![1.0, 0.0, 0.0],
+                    limit: 10,
+                    text_weight: 0.5,
+                    vector_weight: 0.5,
+                    vector_property: "embedding".to_string(),
+                },
+            ))
+            .await
+            .expect("hybrid search should succeed");
+
+        let hybrid_body = hybrid_result.into_inner();
+        assert!(
+            !hybrid_body.results.is_empty(),
+            "hybrid search must return results"
+        );
+        // The "database" node must be in the results.
+        assert!(
+            !hybrid_body.results.is_empty(),
+            "at least one hybrid result expected"
+        );
+        for r in &hybrid_body.results {
+            assert!(
+                r.score > 0.0,
+                "hybrid RRF score must be positive: {}",
+                r.score
+            );
+        }
+        // Results must be in descending score order.
+        for i in 1..hybrid_body.results.len() {
+            assert!(
+                hybrid_body.results[i - 1].score >= hybrid_body.results[i].score,
+                "hybrid results must be sorted by score descending"
+            );
+        }
+        // The "database" node (text rank 1 + vector rank 1) must outscore
+        // the cooking node (no text match, lower vector similarity).
+        if hybrid_body.results.len() >= 2 {
+            // Top result must have the node that matched BOTH text and vector.
+            // Its score: 0.5/(60+1) + 0.5/(60+1) ≈ 0.0164
+            // Cooking node (only vector rank 2): 0.5/(60+2) ≈ 0.0081
+            // Strict: first > second.
+            assert!(
+                hybrid_body.results[0].score > hybrid_body.results[1].score,
+                "dual-hit node must strictly outrank single-hit node: {} vs {}",
+                hybrid_body.results[0].score,
+                hybrid_body.results[1].score
+            );
+        }
+        // The same node_id must appear in text search AND hybrid search results.
+        let text_ids: std::collections::HashSet<u64> =
+            text_body.results.iter().map(|r| r.node_id).collect();
+        let hybrid_top_id = hybrid_body.results[0].node_id;
+        assert!(
+            text_ids.contains(&hybrid_top_id),
+            "hybrid top result node_id {} must also appear in text search results",
+            hybrid_top_id
+        );
+    }
 }
