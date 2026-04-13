@@ -555,6 +555,8 @@ mod tests {
             .execute_cypher(Request::new(query::ExecuteCypherRequest {
                 query: "MATCH (n:RegTest) RETURN n".to_string(),
                 parameters: std::collections::HashMap::new(),
+                read_preference: 0, // UNSPECIFIED → Primary
+                read_concern: None, // UNSPECIFIED → Local
             }))
             .await
             .expect("execute_cypher should succeed")

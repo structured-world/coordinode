@@ -34,6 +34,12 @@ pub mod proto {
         pub mod cdc {
             tonic::include_proto!("coordinode.v1.replication");
         }
+        // Re-export replication types at this level so generated code for other
+        // proto packages that import coordinode.v1.replication can resolve them
+        // via `super::replication::TypeName`.
+        pub use cdc::ReadConcern;
+        pub use cdc::ReadConcernLevel;
+        pub use cdc::ReadPreference;
     }
 }
 
@@ -105,6 +111,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             //
             // In cluster mode, DrainBuffer and TTL reaper submit mutations
             // through Raft for replication to followers (G063).
+            // `raft_node_shared` is kept alive for the server's lifetime in cluster mode.
+            // It provides read fence (R141) and is `None` in standalone mode.
+            let mut raft_node_shared: Option<Arc<coordinode_raft::cluster::RaftNode>> = None;
+
             let database = if let Some(ref peer_addrs) = peers {
                 info!(
                     peers = peer_addrs.len(),
@@ -132,6 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await
                 .map_err(|e| format!("failed to open Raft node: {e}"))?;
+                let raft_node = Arc::new(raft_node);
 
                 let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
                     Arc::new(coordinode_raft::proposal::RaftProposalPipeline::new(
@@ -141,10 +152,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Share engine + oracle between RaftNode and Database.
                 // RaftNode uses engine for state machine apply.
                 // Database uses engine for reads + ExecutionContext.
-                Arc::new(std::sync::Mutex::new(
+                let db = Arc::new(std::sync::Mutex::new(
                     coordinode_embed::Database::from_engine(&data_dir, engine, oracle, pipeline)
                         .map_err(|e| format!("failed to open database: {e}"))?,
-                ))
+                ));
+                raft_node_shared = Some(raft_node);
+                db
             } else {
                 // Embedded mode: OwnedLocalProposalPipeline (default).
                 Arc::new(std::sync::Mutex::new(
@@ -159,11 +172,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let graph_service = services::graph::GraphServiceImpl::new(Arc::clone(&database));
             let schema_service = services::schema::SchemaServiceImpl::new(Arc::clone(&database));
-            let cypher_service = services::cypher::CypherServiceImpl::new(
-                Arc::clone(&database),
-                Arc::clone(&query_registry),
-                Arc::clone(&nplus1_detector),
-            );
+            let cypher_service = {
+                let svc = services::cypher::CypherServiceImpl::new(
+                    Arc::clone(&database),
+                    Arc::clone(&query_registry),
+                    Arc::clone(&nplus1_detector),
+                );
+                if let Some(ref rn) = raft_node_shared {
+                    svc.with_raft_node(Arc::clone(rn))
+                } else {
+                    svc
+                }
+            };
             let vector_service = services::vector::VectorServiceImpl::new(Arc::clone(&database));
             let text_service = services::text::TextServiceImpl::new(Arc::clone(&database));
             let health_service = services::health::HealthServiceImpl;

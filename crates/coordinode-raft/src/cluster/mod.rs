@@ -538,15 +538,42 @@ impl RaftNode {
         Ok(self.applied_index())
     }
 
-    /// Get the current Raft commit index (majority-acknowledged).
+    /// Get the current Raft commit index (last applied on this node).
     ///
-    /// Data at or below this index is durably committed and will not be
-    /// rolled back. Used for `readConcern: "majority"`.
+    /// Returns `last_applied.index` — the highest log entry that this node's
+    /// state machine has applied. Data at or below this index is durable and
+    /// visible to reads. Used for `readConcern: "majority"`.
+    ///
+    /// Note: `last_log_index` would return the highest entry received in the
+    /// log, which may not yet be applied (committed but pending apply). We
+    /// return `last_applied` to match what callers can actually read.
     pub fn commit_index(&self) -> u64 {
         use openraft::async_runtime::watch::WatchReceiver;
 
         let metrics = self.raft.metrics().borrow_watched().clone();
-        metrics.last_log_index.unwrap_or(0)
+        metrics
+            .last_applied
+            .as_ref()
+            .map(|lid| lid.index)
+            .unwrap_or(0)
+    }
+
+    /// Subscribe to applied index updates.
+    ///
+    /// Returns a clone of the applied watermark receiver. The receiver
+    /// delivers the latest applied log index whenever the state machine
+    /// advances. Used by [`ReadFence`] for causal read fencing.
+    pub fn subscribe_applied(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.applied_rx.clone()
+    }
+
+    /// Create a per-request read fence for enforcing read preference and concern.
+    ///
+    /// The returned [`ReadFence`] is cheap to create — it clones a watch
+    /// receiver (pointer copy) and an Arc clone. Call [`ReadFence::apply()`]
+    /// before executing a query to enforce routing and consistency guarantees.
+    pub fn read_fence(&self) -> crate::read_fence::ReadFence {
+        crate::read_fence::ReadFence::new(self.applied_rx.clone(), Arc::clone(&self.raft))
     }
 
     /// Get this node's ID.
