@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.3.9 — 2026-04-13
+
+### coordinode-embed
+## [0.3.9](https://github.com/structured-world/coordinode/compare/v0.3.8...v0.3.9) - 2026-04-13
+
+#### Performance
+
+- *(executor)* cache schema label per node per statement (R-API6)
+
+### coordinode-query
+## [0.3.9](https://github.com/structured-world/coordinode/compare/v0.3.8...v0.3.9) - 2026-04-13
+
+#### Performance
+
+- *(executor)* cache schema label per node per statement (R-API6)
+
+### coordinode-search
+## [0.3.9](https://github.com/structured-world/coordinode/compare/v0.3.8...v0.3.9) - 2026-04-13
+
+#### Added
+
+- *(text-search)* implement TextService gRPC with fuzzy + language-aware search
+
+#### Testing
+
+- *(search)* direct unit tests for search_with_highlights_fuzzy and search_with_highlights_and_language
+- *(text-search)* Ukrainian e2e + multi-property merge coverage
+
+### coordinode-server
+## [0.3.9](https://github.com/structured-world/coordinode/compare/v0.3.8...v0.3.9) - 2026-04-13
+
+#### Added
+
+- *(text)* HybridTextVectorSearch with RRF (Reciprocal Rank Fusion)
+- *(text-search)* implement TextService gRPC with fuzzy + language-aware search
+
+#### Fixed
+
+- *(graph)* traverse and get_node return full labels and properties
+- *(traverse)* respect direction field in Traverse RPC
+
+#### Performance
+
+- *(executor)* cache schema label per node per statement (R-API6)
+
+#### Testing
+
+- *(e2e)* LangChain gRPC API correctness — all search modalities
+- *(text-search)* Ukrainian e2e + multi-property merge coverage
+- *(text-search)* verify explicit language search routes to Path C
+- *(schema)* add DocFunction cache test + fix clippy in R-API6
+
+---
+
 ## v0.3.8 — 2026-04-13
 
 ### coordinode-core
