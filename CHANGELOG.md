@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.3.6 — 2026-04-13
+
+### coordinode-embed
+## [0.3.6](https://github.com/structured-world/coordinode/compare/v0.3.5...v0.3.6) - 2026-04-13
+
+#### Added
+
+- *(query)* use planner hnsw_index annotation in executor for index-name lookup
+- *(query)* CREATE/DROP VECTOR INDEX Cypher DDL
+
+#### Testing
+
+- *(embed)* full integration coverage for CREATE/DROP VECTOR INDEX (R-API3)
+- *(embed)* complete R-API3 integration test suite for CREATE/DROP VECTOR INDEX
+
+### coordinode-query
+## [0.3.6](https://github.com/structured-world/coordinode/compare/v0.3.5...v0.3.6) - 2026-04-13
+
+#### Added
+
+- *(query)* use planner hnsw_index annotation in executor for index-name lookup
+- *(query)* CREATE/DROP VECTOR INDEX Cypher DDL
+
+---
+
 ## v0.3.5 — 2026-04-13
 
 ### coordinode-embed
