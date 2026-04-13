@@ -4,7 +4,9 @@ use tonic::{Request, Response, Status};
 
 use coordinode_core::graph::types::{Value, VectorMetric};
 use coordinode_core::schema::computed::{ComputedSpec, DecayFormula, TtlScope};
-use coordinode_core::schema::definition::{EdgeTypeSchema, LabelSchema, PropertyDef, PropertyType};
+use coordinode_core::schema::definition::{
+    EdgeTypeSchema, LabelSchema, PropertyDef, PropertyType, SchemaMode,
+};
 use coordinode_embed::Database;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::Guard;
@@ -198,6 +200,28 @@ fn set_formula_fields(def: &mut graph::ComputedPropertyDefinition, formula: &Dec
     }
 }
 
+/// Convert a proto `SchemaMode` integer to the internal `SchemaMode`.
+///
+/// Proto values:
+///   0 = UNSPECIFIED → defaults to STRICT (most type-safe)
+///   1 = STRICT, 2 = VALIDATED, 3 = FLEXIBLE
+fn proto_to_schema_mode(v: i32) -> SchemaMode {
+    match v {
+        2 => SchemaMode::Validated,
+        3 => SchemaMode::Flexible,
+        _ => SchemaMode::Strict, // UNSPECIFIED (0) and STRICT (1) both → Strict
+    }
+}
+
+/// Convert an internal `SchemaMode` to a proto integer.
+fn schema_mode_to_proto(mode: SchemaMode) -> i32 {
+    match mode {
+        SchemaMode::Strict => 1,
+        SchemaMode::Validated => 2,
+        SchemaMode::Flexible => 3,
+    }
+}
+
 /// Map internal `PropertyType` to proto integer for list_labels responses.
 fn property_type_to_proto(pt: &PropertyType) -> i32 {
     match pt {
@@ -234,6 +258,11 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
         let req = request.into_inner();
         // Build internal LabelSchema from the proto request.
         let mut schema = LabelSchema::new(&req.name);
+
+        // Apply schema mode (defaults to STRICT when unspecified).
+        let mode = proto_to_schema_mode(req.schema_mode);
+        schema.set_mode(mode);
+
         for prop_def in &req.properties {
             let property_type = proto_type_to_property_type(prop_def.r#type);
             let mut prop = PropertyDef::new(&prop_def.name, property_type);
@@ -268,6 +297,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
             properties: req.properties,
             version,
             computed_properties: echo_computed,
+            schema_mode: schema_mode_to_proto(mode),
         }))
     }
 
@@ -355,10 +385,11 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
                     map.insert(
                         schema.name.clone(),
                         graph::Label {
-                            name: schema.name,
+                            name: schema.name.clone(),
                             properties,
                             version: schema.version,
                             computed_properties,
+                            schema_mode: schema_mode_to_proto(schema.mode),
                         },
                     );
                 } else {
@@ -368,6 +399,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
                         properties: vec![],
                         version: 0,
                         computed_properties: vec![],
+                        schema_mode: schema_mode_to_proto(SchemaMode::Strict),
                     });
                 }
             }
@@ -390,6 +422,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
                             properties: vec![],
                             version: 0,
                             computed_properties: vec![],
+                            schema_mode: 0, // UNSPECIFIED — no declared schema
                         });
                 }
             }
@@ -576,6 +609,7 @@ mod tests {
                     },
                 ],
                 computed_properties: vec![],
+                schema_mode: 0, // UNSPECIFIED → STRICT
             }))
             .await
             .expect("create_label should succeed");
@@ -617,6 +651,7 @@ mod tests {
                 unique: true,
             }],
             computed_properties: vec![],
+            schema_mode: 0, // UNSPECIFIED → STRICT
         }))
         .await
         .expect("create_label");
@@ -700,6 +735,7 @@ mod tests {
                 },
             ],
             computed_properties: vec![],
+            schema_mode: 0, // UNSPECIFIED → STRICT
         }))
         .await
         .expect("create_label");
@@ -762,6 +798,7 @@ mod tests {
                 scope: 3, // NODE
                 ..Default::default()
             }],
+            schema_mode: 0, // UNSPECIFIED → STRICT
         }))
         .await
         .expect("create_label with TTL should succeed");
@@ -785,6 +822,7 @@ mod tests {
                     scope: 3,
                     ..Default::default()
                 }],
+                schema_mode: 0, // UNSPECIFIED → STRICT
             }))
             .await
             .expect("create_label should succeed");
@@ -902,6 +940,7 @@ mod tests {
                 anchor_field: "published_at".to_string(),
                 ..Default::default()
             }],
+            schema_mode: 0, // UNSPECIFIED → STRICT
         }))
         .await
         .expect("create_label with DECAY should succeed");
@@ -957,6 +996,7 @@ mod tests {
                     anchor_field: "ts".to_string(),
                     ..Default::default()
                 }],
+                schema_mode: 0,
             }))
             .await;
 
@@ -982,9 +1022,165 @@ mod tests {
                     anchor_field: String::new(), // empty — must be rejected
                     ..Default::default()
                 }],
+                schema_mode: 0,
             }))
             .await;
 
         assert!(result.is_err(), "empty anchor_field must be rejected");
+    }
+
+    // ── R-API5: SchemaMode via gRPC — CREATE/SET enforcement ────────────────
+
+    /// create_label with schema_mode=STRICT (1) persists the mode; SET of an
+    /// unknown property on a STRICT label is rejected.
+    ///
+    /// Regression: schema_mode field must flow from proto → LabelSchema → executor
+    /// enforcement. STRICT = no undeclared properties allowed at write time.
+    #[tokio::test]
+    async fn strict_mode_set_unknown_property_rejected() {
+        let (svc, _dir) = test_service();
+
+        // Declare User label with schema_mode=STRICT, only `name` declared.
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "User".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "name".to_string(),
+                r#type: 3, // STRING
+                required: false,
+                unique: false,
+            }],
+            computed_properties: vec![],
+            schema_mode: 1, // STRICT
+        }))
+        .await
+        .expect("create_label should succeed");
+
+        // Verify schema was persisted with STRICT mode.
+        {
+            use coordinode_core::schema::definition::SchemaMode;
+            use coordinode_storage::engine::partition::Partition;
+
+            let db = svc.database.lock().unwrap();
+            let key = coordinode_core::schema::definition::encode_label_schema_key("User");
+            let bytes = db
+                .engine()
+                .get(Partition::Schema, &key)
+                .expect("storage get")
+                .expect("User schema must be persisted");
+            let schema = coordinode_core::schema::definition::LabelSchema::from_msgpack(&bytes)
+                .expect("deserialize");
+            assert_eq!(
+                schema.mode,
+                SchemaMode::Strict,
+                "schema mode must be Strict"
+            );
+        }
+
+        // CREATE a User node with the declared property.
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (u:User {name: 'Alice'})")
+                .expect("CREATE with declared property must succeed on STRICT label");
+        }
+
+        // SET an unknown property on the STRICT label — must be rejected.
+        {
+            let mut db = svc.database.lock().unwrap();
+            let result =
+                db.execute_cypher("MATCH (u:User {name: 'Alice'}) SET u.unknown_field = 'boom'");
+            assert!(
+                result.is_err(),
+                "SET unknown property must be rejected on STRICT label, got: {result:?}"
+            );
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("unknown_field") || err_msg.contains("strict"),
+                "error must mention the unknown property or strict mode, got: {err_msg}"
+            );
+        }
+    }
+
+    /// create_label with schema_mode=FLEXIBLE (3) — SET of any property is allowed.
+    ///
+    /// Regression: FLEXIBLE mode must pass through all properties without enforcement.
+    #[tokio::test]
+    async fn flexible_mode_set_unknown_property_allowed() {
+        let (svc, _dir) = test_service();
+
+        // Declare Device label with schema_mode=FLEXIBLE, only `id` declared.
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Device".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "id".to_string(),
+                r#type: 3, // STRING
+                required: false,
+                unique: false,
+            }],
+            computed_properties: vec![],
+            schema_mode: 3, // FLEXIBLE
+        }))
+        .await
+        .expect("create_label should succeed");
+
+        // CREATE a Device node.
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (d:Device {id: 'd1'})")
+                .expect("CREATE should succeed");
+        }
+
+        // SET an undeclared property — must succeed on FLEXIBLE label.
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("MATCH (d:Device {id: 'd1'}) SET d.firmware_version = '1.2.3'")
+                .expect("SET undeclared property must succeed on FLEXIBLE label");
+        }
+    }
+
+    /// create_label response includes schema_mode field reflecting the
+    /// requested mode; list_labels echoes the persisted mode.
+    #[tokio::test]
+    async fn schema_mode_echoed_in_response_and_list() {
+        let (svc, _dir) = test_service();
+
+        // Create with VALIDATED mode.
+        let resp = svc
+            .create_label(Request::new(graph::CreateLabelRequest {
+                name: "Event".to_string(),
+                properties: vec![graph::PropertyDefinition {
+                    name: "ts".to_string(),
+                    r#type: 6, // TIMESTAMP
+                    required: false,
+                    unique: false,
+                }],
+                computed_properties: vec![],
+                schema_mode: 2, // VALIDATED
+            }))
+            .await
+            .expect("create_label should succeed");
+
+        let label = resp.into_inner();
+        assert_eq!(
+            label.schema_mode, 2,
+            "create_label response must echo schema_mode=VALIDATED(2)"
+        );
+
+        // list_labels must return the persisted mode.
+        let labels = svc
+            .list_labels(Request::new(graph::ListLabelsRequest {}))
+            .await
+            .expect("list_labels")
+            .into_inner()
+            .labels;
+
+        let event = labels
+            .iter()
+            .find(|l| l.name == "Event")
+            .expect("Event label must be in list");
+
+        assert_eq!(
+            event.schema_mode, 2,
+            "list_labels must return schema_mode=VALIDATED(2) for Event"
+        );
     }
 }
