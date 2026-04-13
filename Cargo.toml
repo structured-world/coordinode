@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 rust-version = "1.90"
 license = "AGPL-3.0-only"
@@ -86,16 +86,16 @@ criterion = { version = "0.8", features = ["html_reports"] }
 
 # Internal crates — version required for `cargo package` (release-plz strips path,
 # substitutes version from crates.io; without it packaging fails).
-coordinode-core = { path = "crates/coordinode-core", version = "0.3.7" }
-coordinode-query = { path = "crates/coordinode-query", version = "0.3.7" }
-coordinode-vector = { path = "crates/coordinode-vector", version = "0.3.7" }
-coordinode-search = { path = "crates/coordinode-search", version = "0.3.7" }
-coordinode-storage = { path = "crates/coordinode-storage", version = "0.3.7" }
-coordinode-raft = { path = "crates/coordinode-raft", version = "0.3.7" }
-coordinode-auth = { path = "crates/coordinode-auth", version = "0.3.7" }
-coordinode-server = { path = "crates/coordinode-server", version = "0.3.7" }
-coordinode-s3 = { path = "crates/coordinode-s3", version = "0.3.7" }
-coordinode-embed = { path = "crates/coordinode-embed", version = "0.3.7" }
+coordinode-core = { path = "crates/coordinode-core", version = "0.3.8" }
+coordinode-query = { path = "crates/coordinode-query", version = "0.3.8" }
+coordinode-vector = { path = "crates/coordinode-vector", version = "0.3.8" }
+coordinode-search = { path = "crates/coordinode-search", version = "0.3.8" }
+coordinode-storage = { path = "crates/coordinode-storage", version = "0.3.8" }
+coordinode-raft = { path = "crates/coordinode-raft", version = "0.3.8" }
+coordinode-auth = { path = "crates/coordinode-auth", version = "0.3.8" }
+coordinode-server = { path = "crates/coordinode-server", version = "0.3.8" }
+coordinode-s3 = { path = "crates/coordinode-s3", version = "0.3.8" }
+coordinode-embed = { path = "crates/coordinode-embed", version = "0.3.8" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

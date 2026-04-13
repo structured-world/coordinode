@@ -1,5 +1,57 @@
 # Changelog
 
+## v0.3.8 — 2026-04-13
+
+### coordinode-core
+## [0.3.8](https://github.com/structured-world/coordinode/compare/v0.3.7...v0.3.8) - 2026-04-13
+
+#### Added
+
+- *(schema)* R-API5 schema modes STRICT/VALIDATED/FLEXIBLE
+
+### coordinode-embed
+## [0.3.8](https://github.com/structured-world/coordinode/compare/v0.3.7...v0.3.8) - 2026-04-13
+
+#### Added
+
+- *(schema)* R-API5 schema modes STRICT/VALIDATED/FLEXIBLE
+
+### coordinode-query
+## [0.3.8](https://github.com/structured-world/coordinode/compare/v0.3.7...v0.3.8) - 2026-04-13
+
+#### Added
+
+- *(schema)* complete R-API5 schema modes enforcement
+- *(schema)* enforce required fields at CREATE + multi-update tests
+- *(schema)* R-API5 schema modes STRICT/VALIDATED/FLEXIBLE
+- *(schema)* implement SchemaMode enforcement in executor (R-API5)
+
+#### Fixed
+
+- *(executor)* schema enforcement for PropertyPath, DocFunction, map SET ops
+
+### coordinode-server
+## [0.3.8](https://github.com/structured-world/coordinode/compare/v0.3.7...v0.3.8) - 2026-04-13
+
+#### Added
+
+- *(schema)* complete R-API5 schema modes enforcement
+- *(schema)* enforce required fields at CREATE + multi-update tests
+- *(schema)* R-API5 schema modes STRICT/VALIDATED/FLEXIBLE
+- *(schema)* implement SchemaMode enforcement in executor (R-API5)
+- *(schema)* wire ComputedPropertyDefinition in CreateLabel gRPC API
+
+#### Fixed
+
+- *(executor)* schema enforcement for PropertyPath, DocFunction, map SET ops
+
+#### Testing
+
+- *(schema)* add thoroughness integration tests for R-API5 schema modes
+- *(schema)* add validated_mode_set_extra_accepted_mismatch_rejected
+
+---
+
 ## v0.3.6 — 2026-04-13
 
 ### coordinode-embed
