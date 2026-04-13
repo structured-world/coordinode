@@ -435,6 +435,48 @@ mod tests {
         );
     }
 
+    /// text_search: explicit language routes to Path C (language-specific stemming).
+    ///
+    /// Path C uses `search_with_language` which tokenizes the query with the same
+    /// per-language pipeline used at index time. Snippets are empty (SnippetGenerator
+    /// is not compatible with the direct TermQuery construction used in this path).
+    ///
+    /// Uses "en" (English) language — index default is English so this exercises the
+    /// same stemmer pipeline. "graph" stems to "graph" under Snowball (no change);
+    /// "concept" stems to "concept" — both should match.
+    #[tokio::test]
+    async fn text_search_explicit_language_path_c() {
+        let (svc, _dir) = test_service_with_text_index("Page", "body");
+
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (n:Page {body: 'graph concepts and algorithms'})")
+                .expect("create page");
+        }
+
+        let result = svc
+            .text_search(Request::new(crate::proto::query::TextSearchRequest {
+                label: "Page".to_string(),
+                query: "graph".to_string(),
+                limit: 10,
+                fuzzy: false,
+                language: "en".to_string(), // explicit language → Path C
+            }))
+            .await
+            .expect("explicit language search should succeed");
+
+        let body = result.into_inner();
+        assert!(
+            !body.results.is_empty(),
+            "explicit language=en search should find 'graph'"
+        );
+        for r in &body.results {
+            assert!(r.score > 0.0, "BM25 score must be positive: {}", r.score);
+            // Path C does not produce snippets by design (no SnippetGenerator).
+            // snippet field is empty — that is correct behavior, not a bug.
+        }
+    }
+
     /// text_search: fuzzy=true matches near-typos via tantivy QueryParser `~1`.
     ///
     /// Fuzzy search routes through tantivy's QueryParser which natively handles
