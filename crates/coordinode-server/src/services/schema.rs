@@ -2072,15 +2072,15 @@ mod tests {
         assert_eq!(rows.len(), 1);
         // Arrays are stored as lists; each doc_push appends one element.
         assert!(
-            rows[0].get("q.jobs").is_some(),
+            rows[0].contains_key("q.jobs"),
             "q.jobs must be set after doc_push"
         );
         assert!(
-            rows[0].get("q.errors").is_some(),
+            rows[0].contains_key("q.errors"),
             "q.errors must be set after doc_push"
         );
         assert!(
-            rows[0].get("q.metrics").is_some(),
+            rows[0].contains_key("q.metrics"),
             "q.metrics must be set after doc_push"
         );
     }
