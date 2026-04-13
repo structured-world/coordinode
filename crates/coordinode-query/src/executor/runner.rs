@@ -4950,6 +4950,26 @@ fn execute_create_node(
             }
         }
 
+        // For STRICT and VALIDATED: verify all required (NOT NULL) properties
+        // are present in the CREATE clause. Per proto PropertyDefinition.required:
+        // "Writes missing this property are rejected in STRICT and VALIDATED modes."
+        if matches!(mode, SchemaMode::Strict | SchemaMode::Validated) {
+            if let Some(schema_ref) = schema.as_ref() {
+                let provided: std::collections::HashSet<&str> =
+                    properties.iter().map(|(n, _)| n.as_str()).collect();
+                for (prop_name, def) in &schema_ref.properties {
+                    if def.not_null
+                        && def.default.is_none()
+                        && !provided.contains(prop_name.as_str())
+                    {
+                        return Err(ExecutionError::SchemaViolation(format!(
+                            "required property '{prop_name}' is missing in CREATE"
+                        )));
+                    }
+                }
+            }
+        }
+
         let key = encode_node_key(ctx.shard_id, node_id);
         let bytes = record
             .to_msgpack()

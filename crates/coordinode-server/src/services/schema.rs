@@ -1338,4 +1338,113 @@ mod tests {
             );
         }
     }
+
+    /// STRICT label: CREATE omitting a required (NOT NULL) property is rejected.
+    ///
+    /// Regression: required field enforcement must apply at CREATE time in STRICT
+    /// and VALIDATED modes. The executor must check that all NOT NULL properties
+    /// without a default are present in the CREATE clause, not only validate
+    /// properties that are provided.
+    #[tokio::test]
+    async fn strict_mode_create_missing_required_property_rejected() {
+        let (svc, _dir) = test_service();
+
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Task".to_string(),
+            properties: vec![
+                graph::PropertyDefinition {
+                    name: "title".to_string(),
+                    r#type: 3, // STRING
+                    required: true,
+                    unique: false,
+                },
+                graph::PropertyDefinition {
+                    name: "priority".to_string(),
+                    r#type: 1, // INT64
+                    required: false,
+                    unique: false,
+                },
+            ],
+            computed_properties: vec![],
+            schema_mode: 1, // STRICT
+        }))
+        .await
+        .expect("create_label should succeed");
+
+        {
+            let mut db = svc.database.lock().unwrap();
+
+            // CREATE with required `title` present — must succeed.
+            db.execute_cypher("CREATE (t:Task {title: 'Buy milk', priority: 1})")
+                .expect("CREATE with all required properties must succeed");
+
+            // CREATE omitting required `title` — must be rejected.
+            let result = db.execute_cypher("CREATE (t:Task {priority: 2})");
+            assert!(
+                result.is_err(),
+                "CREATE omitting required property must be rejected in STRICT mode, got: {result:?}"
+            );
+
+            // Optional property only — must be rejected (title still required).
+            let result2 = db.execute_cypher("CREATE (t:Task {priority: 3})");
+            assert!(
+                result2.is_err(),
+                "CREATE omitting required property must be rejected in STRICT mode, got: {result2:?}"
+            );
+        }
+    }
+
+    /// Multi-update (MATCH returns mixed labels): STRICT nodes fail, FLEXIBLE pass.
+    ///
+    /// When MATCH returns nodes of different labels — some with STRICT schema,
+    /// some without schema (FLEXIBLE) — SET enforcement is per-node based on
+    /// that node's primary label schema. A violation on any STRICT node fails
+    /// the entire query (transactional semantics).
+    ///
+    /// This test also verifies forward-only enforcement: nodes created BEFORE a
+    /// schema was declared retain their schemaless properties — SET on such a node
+    /// validates only the specific property being SET, not existing properties.
+    #[tokio::test]
+    async fn multi_update_strict_node_fails_whole_query() {
+        let (svc, _dir) = test_service();
+
+        // Declare STRICT schema for Monitored label (only `host` property).
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Monitored".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "host".to_string(),
+                r#type: 3, // STRING
+                required: false,
+                unique: false,
+            }],
+            computed_properties: vec![],
+            schema_mode: 1, // STRICT
+        }))
+        .await
+        .expect("create_label should succeed");
+
+        {
+            let mut db = svc.database.lock().unwrap();
+
+            // Create one STRICT node and one schemaless node.
+            db.execute_cypher("CREATE (m:Monitored {host: 'server-01'})")
+                .expect("create strict node");
+            db.execute_cypher("CREATE (s:Server {host: 'server-02'})")
+                .expect("create schemaless node");
+
+            // SET on Monitored (STRICT) with an undeclared property — fails the whole query.
+            // Even though Server has no schema (FLEXIBLE), the STRICT violation on
+            // Monitored causes the entire multi-update to be rejected.
+            let result =
+                db.execute_cypher("MATCH (n) WHERE n.host IS NOT NULL SET n.unknown_prop = 'x'");
+            assert!(
+                result.is_err(),
+                "multi-update touching a STRICT node with unknown property must fail entire query, got: {result:?}"
+            );
+
+            // SET only on schemaless (Server) nodes — succeeds even with unknown property.
+            db.execute_cypher("MATCH (s:Server) SET s.extra = 'ok'")
+                .expect("SET on schemaless node must succeed regardless of unknown property");
+        }
+    }
 }
