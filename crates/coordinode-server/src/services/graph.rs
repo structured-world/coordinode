@@ -227,9 +227,20 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         let mut params: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
         params.insert("start_id".to_string(), Value::Int(req.start_node_id as i64));
 
+        // Build direction-aware edge pattern.
+        // INBOUND: (start)<-[...]-(n), BOTH: (start)-[...]-(n), OUTBOUND/UNSPECIFIED: (start)-[...]->(n)
+        let direction = graph::TraversalDirection::try_from(req.direction)
+            .unwrap_or(graph::TraversalDirection::Unspecified);
+        let (arrow_left, arrow_right) = match direction {
+            graph::TraversalDirection::Inbound => ("<-[", "]-"),
+            graph::TraversalDirection::Both => ("-[", "]-"),
+            // OUTBOUND or UNSPECIFIED → outbound
+            _ => ("-[", "]->"),
+        };
+
         let cypher = if req.edge_type.is_empty() {
             format!(
-                "MATCH (start)-[*1..{depth}]->(n) \
+                "MATCH (start){arrow_left}*1..{depth}{arrow_right}(n) \
                  WHERE start = $start_id \
                  RETURN n \
                  LIMIT {limit}"
@@ -237,7 +248,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         } else {
             let rel_type = cypher_ident(&req.edge_type);
             format!(
-                "MATCH (start)-[:{rel_type}*1..{depth}]->(n) \
+                "MATCH (start){arrow_left}:{rel_type}*1..{depth}{arrow_right}(n) \
                  WHERE start = $start_id \
                  RETURN n \
                  LIMIT {limit}"
@@ -480,5 +491,140 @@ mod tests {
     fn cypher_ident_escapes() {
         assert_eq!(cypher_ident("Person"), "`Person`");
         assert_eq!(cypher_ident("my`type"), "`my``type`");
+    }
+
+    /// Helper: create A -[LINK]-> B and return (svc, a_id, b_id).
+    async fn setup_two_nodes_with_edge() -> (GraphServiceImpl, tempfile::TempDir, u64, u64) {
+        let (svc, dir) = test_service();
+
+        let a = svc
+            .create_node(Request::new(graph::CreateNodeRequest {
+                labels: vec!["X".to_string()],
+                properties: std::collections::HashMap::new(),
+            }))
+            .await
+            .expect("create A")
+            .into_inner();
+
+        let b = svc
+            .create_node(Request::new(graph::CreateNodeRequest {
+                labels: vec!["Y".to_string()],
+                properties: std::collections::HashMap::new(),
+            }))
+            .await
+            .expect("create B")
+            .into_inner();
+
+        svc.create_edge(Request::new(graph::CreateEdgeRequest {
+            edge_type: "LINK".to_string(),
+            source_node_id: a.node_id,
+            target_node_id: b.node_id,
+            properties: std::collections::HashMap::new(),
+        }))
+        .await
+        .expect("create edge")
+        .into_inner();
+
+        (svc, dir, a.node_id, b.node_id)
+    }
+
+    /// Regression: traverse OUTBOUND from A must reach B (default behaviour).
+    #[tokio::test]
+    async fn traverse_outbound_reaches_target() {
+        let (svc, _dir, a_id, b_id) = setup_two_nodes_with_edge().await;
+
+        let resp = svc
+            .traverse(Request::new(graph::TraverseRequest {
+                start_node_id: a_id,
+                max_depth: 1,
+                edge_type: "LINK".to_string(),
+                direction: graph::TraversalDirection::Outbound as i32,
+                pagination: None,
+            }))
+            .await
+            .expect("traverse outbound should succeed")
+            .into_inner();
+
+        let ids: Vec<u64> = resp.nodes.iter().map(|n| n.node_id).collect();
+        assert!(
+            ids.contains(&b_id),
+            "outbound traverse from A must reach B; got ids={ids:?}"
+        );
+    }
+
+    /// Regression: traverse INBOUND from B must reach A.
+    ///
+    /// Previously the service ignored req.direction and always emitted `->`,
+    /// so INBOUND from B would return nothing. This test verifies the fix.
+    #[tokio::test]
+    async fn traverse_inbound_reaches_source() {
+        let (svc, _dir, a_id, b_id) = setup_two_nodes_with_edge().await;
+
+        let resp = svc
+            .traverse(Request::new(graph::TraverseRequest {
+                start_node_id: b_id,
+                max_depth: 1,
+                edge_type: "LINK".to_string(),
+                direction: graph::TraversalDirection::Inbound as i32,
+                pagination: None,
+            }))
+            .await
+            .expect("traverse inbound should succeed")
+            .into_inner();
+
+        let ids: Vec<u64> = resp.nodes.iter().map(|n| n.node_id).collect();
+        assert!(
+            ids.contains(&a_id),
+            "inbound traverse from B must reach A; got ids={ids:?}"
+        );
+    }
+
+    /// Regression: traverse BOTH from B must also reach A via the reverse edge.
+    #[tokio::test]
+    async fn traverse_both_reaches_source_from_target() {
+        let (svc, _dir, a_id, b_id) = setup_two_nodes_with_edge().await;
+
+        let resp = svc
+            .traverse(Request::new(graph::TraverseRequest {
+                start_node_id: b_id,
+                max_depth: 1,
+                edge_type: "LINK".to_string(),
+                direction: graph::TraversalDirection::Both as i32,
+                pagination: None,
+            }))
+            .await
+            .expect("traverse both should succeed")
+            .into_inner();
+
+        let ids: Vec<u64> = resp.nodes.iter().map(|n| n.node_id).collect();
+        assert!(
+            ids.contains(&a_id),
+            "BOTH traverse from B must reach A; got ids={ids:?}"
+        );
+    }
+
+    /// Regression: OUTBOUND from B must NOT reach A (edge is A→B, not B→A).
+    #[tokio::test]
+    async fn traverse_outbound_does_not_traverse_reverse() {
+        let (svc, _dir, _a_id, b_id) = setup_two_nodes_with_edge().await;
+
+        let resp = svc
+            .traverse(Request::new(graph::TraverseRequest {
+                start_node_id: b_id,
+                max_depth: 1,
+                edge_type: "LINK".to_string(),
+                direction: graph::TraversalDirection::Outbound as i32,
+                pagination: None,
+            }))
+            .await
+            .expect("traverse outbound from B should succeed")
+            .into_inner();
+
+        // B has no outbound LINK edges — result must be empty.
+        assert!(
+            resp.nodes.is_empty(),
+            "outbound traverse from B must return nothing (edge is A→B); got {:?}",
+            resp.nodes.len()
+        );
     }
 }
