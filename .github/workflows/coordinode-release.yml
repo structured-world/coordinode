@@ -76,3 +76,22 @@ jobs:
             --verbose
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Split workspace changelog into per-crate files
+        # Regenerates crates/*/CHANGELOG.md from the workspace CHANGELOG.md.
+        # Library crates have release=false so release-plz never updates their
+        # per-crate files. This step derives them from the workspace changelog
+        # (which release-plz keeps current) and commits the result to main.
+        # The commit uses "chore:" prefix so release-plz skips it.
+        # No-op on non-release pushes (git diff --quiet exits 0, step skipped).
+        continue-on-error: true
+        run: |
+          python3 scripts/split-changelog.py
+          git diff --quiet && exit 0
+          git config user.name "sw-release-bot[bot]"
+          git config user.email "255865126+sw-release-bot[bot]@users.noreply.github.com"
+          git add crates/*/CHANGELOG.md scripts/split-changelog.py
+          git commit -m "chore(changelog): regenerate per-crate changelogs from workspace"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}

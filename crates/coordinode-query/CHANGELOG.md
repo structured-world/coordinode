@@ -1,49 +1,41 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+All notable changes to this crate are documented in this file.
+This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.3.6](https://github.com/structured-world/coordinode/compare/v0.3.5...v0.3.6) - 2026-04-13
 
-## [Unreleased]
+#### Added
 
-## [0.3.3](https://github.com/structured-world/coordinode/compare/v0.3.2...v0.3.3) - 2026-04-12
+- *(query)* use planner hnsw_index annotation in executor for index-name lookup
+- *(query)* CREATE/DROP VECTOR INDEX Cypher DDL
 
-### Added
+---
 
-- *(query)* implement standalone MERGE relationship (G074)
-- *(query)* implement pattern predicates in WHERE clause
+## [0.3.5](https://github.com/structured-world/coordinode/compare/v0.3.4...v0.3.5) - 2026-04-13
 
-### Fixed
+#### Added
 
-- *(query)* store and check edge properties in MERGE relationship (G075)
+- *(query)* implement CREATE/DROP INDEX Cypher DDL with IndexScan optimizer
 
-## [0.3.0](https://github.com/structured-world/coordinode/releases/tag/v0.3.0) - 2026-04-09
+---
 
-### Added
+## [0.3.4](https://github.com/structured-world/coordinode/compare/v0.3.3...v0.3.4) - 2026-04-12
 
-- *(computed)* R085 decay interpolation tests and NVMe write buffer for w:cache
-- *(raft)* true async wtimeout via propose_with_timeout (G048)
-- *(query)* COMPUTED VECTOR_DECAY planner pattern detection (R084)
-- *(query)* SSE encrypted search via Cypher DDL + encrypted_match() (G017)
-- *(query)* adaptive parallel traversal via rayon (G010) + varlen edge props fix (G066)
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+#### Added
 
-### Fixed
+- *(schema)* wire create_label/create_edge_type to persist schemas with unique index enforcement
+- *(query)* add MERGE ALL — Cartesian-product relationship upsert
 
-- *(query)* track OCC read-set in parallel traversal path (G067)
+#### Fixed
 
-## [0.1.0-alpha.1](https://github.com/structured-world/coordinode/releases/tag/v0.1.0-alpha.1) - 2026-04-08
+- *(vector)* fill labels/properties in VectorResult, respect distance metric
+- *(query)* skip Subtree removal when target_field already absent
+- *(query)* short-circuit reap_label when Subtree target_field_id unresolved
+- *(query)* log error when Subtree target_field_id unresolved
+- *(query)* skip Subtree deletion when target_field_id unresolved
+- *(query)* TTL scope=Subtree now deletes target_field, not anchor
 
-### Added
+#### Testing
 
-- *(computed)* R085 decay interpolation tests and NVMe write buffer for w:cache
-- *(raft)* true async wtimeout via propose_with_timeout (G048)
-- *(query)* COMPUTED VECTOR_DECAY planner pattern detection (R084)
-- *(query)* SSE encrypted search via Cypher DDL + encrypted_match() (G017)
-- *(query)* adaptive parallel traversal via rayon (G010) + varlen edge props fix (G066)
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
-
-### Fixed
-
-- *(query)* track OCC read-set in parallel traversal path (G067)
+- *(semantic)* add WITH * regression tests for analyze_with fix
