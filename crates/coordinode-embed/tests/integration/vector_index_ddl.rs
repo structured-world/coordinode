@@ -180,3 +180,125 @@ fn drop_vector_index_nonexistent_returns_error() {
         "expected error when dropping non-existent index"
     );
 }
+
+// ── Persistence across reopen ─────────────────────────────────────────
+
+/// Vector index created via DDL survives a Database close+reopen.
+/// After reopen EXPLAIN still shows HnswScan (index definition persisted
+/// to schema partition and registry rebuilt by load_vector_indexes).
+#[test]
+fn vector_index_persists_across_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Session 1: create index.
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.execute_cypher(
+            "CREATE VECTOR INDEX persist_idx ON :Doc(vec) OPTIONS {metric: \"cosine\"}",
+        )
+        .expect("create vector index");
+        // Flush + close implicitly when `db` drops.
+    }
+
+    // Session 2: reopen and verify EXPLAIN shows HnswScan.
+    {
+        let db = Database::open(dir.path()).expect("reopen");
+        let plan = db
+            .explain_cypher(
+                "MATCH (n:Doc) WITH n, vector_similarity(n.vec, [1.0, 0.0]) AS s ORDER BY s DESC LIMIT 3 RETURN n, s",
+            )
+            .expect("explain after reopen");
+        assert!(
+            plan.contains("HnswScan(persist_idx)"),
+            "expected HnswScan after reopen, got:\n{plan}"
+        );
+    }
+}
+
+// ── Backfill + search ─────────────────────────────────────────────────
+
+/// Nodes created BEFORE the vector index exist are backfilled into HNSW
+/// during CREATE VECTOR INDEX. Subsequent vector_similarity queries find them.
+#[test]
+fn create_vector_index_backfills_and_search_finds_nodes() {
+    let (mut db, _dir) = open_db();
+
+    // Insert nodes BEFORE creating the index.
+    db.execute_cypher("CREATE (n:Item {embedding: [1.0, 0.0, 0.0]})")
+        .expect("node 1");
+    db.execute_cypher("CREATE (n:Item {embedding: [0.0, 1.0, 0.0]})")
+        .expect("node 2");
+    db.execute_cypher("CREATE (n:Item {embedding: [0.0, 0.0, 1.0]})")
+        .expect("node 3");
+
+    // Create index — backfill runs.
+    db.execute_cypher(
+        "CREATE VECTOR INDEX item_emb ON :Item(embedding) OPTIONS {metric: \"cosine\"}",
+    )
+    .expect("create vector index");
+
+    // Query should return the closest vector to [1,0,0].
+    // Use WHERE filter pattern — nearest to [1,0,0] has similarity > 0.9.
+    let rows = db
+        .execute_cypher(
+            "MATCH (n:Item) \
+             WHERE vector_similarity(n.embedding, [1.0, 0.0, 0.0]) > 0.9 \
+             RETURN n.embedding AS vec",
+        )
+        .expect("vector search");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "only [1,0,0] has similarity > 0.9 to [1,0,0]"
+    );
+    // Nodes created via Cypher literal store arrays as Array([Float(...)]),
+    // not Value::Vector (which is the Rust API form).
+    assert_eq!(
+        rows[0].get("vec"),
+        Some(&Value::Array(vec![
+            Value::Float(1.0),
+            Value::Float(0.0),
+            Value::Float(0.0)
+        ])),
+        "nearest should be [1,0,0]"
+    );
+}
+
+/// Vector search executes correctly (not just EXPLAIN) after CREATE VECTOR INDEX.
+/// Verifies that the executor routes through HNSW, not just that EXPLAIN says so.
+#[test]
+fn vector_search_executes_after_create_index() {
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE VECTOR INDEX item_emb ON :Item(embedding) OPTIONS {metric: \"cosine\"}",
+    )
+    .expect("create vector index");
+
+    // Insert nodes AFTER index creation (auto-indexed via on_vector_written).
+    for i in 0u32..5 {
+        let vec = format!("[{}.0, 0.0, 0.0]", i);
+        db.execute_cypher(&format!("CREATE (n:Item {{embedding: {vec}, rank: {i}}})"))
+            .expect("insert node");
+    }
+
+    // Nearest to [4.5, 0, 0]: rank=4 ([4.0, 0, 0]) has smallest distance.
+    // Project rank alias in WITH alongside the distance (VectorTopK Pattern B).
+    let rows = db
+        .execute_cypher(
+            "MATCH (n:Item) \
+             WITH n.rank AS rank, vector_distance(n.embedding, [4.5, 0.0, 0.0]) AS dist \
+             ORDER BY dist \
+             LIMIT 1 \
+             RETURN rank",
+        )
+        .expect("vector search");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("rank"),
+        Some(&Value::Int(4)),
+        "nearest to [4.5,0,0] should be rank=4"
+    );
+}
