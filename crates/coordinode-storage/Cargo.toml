@@ -39,6 +39,7 @@ bytes = { workspace = true }
 tracing = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crc32fast = "1"
+rayon = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -63,6 +64,10 @@ harness = false
 
 [[bench]]
 name = "flush_compaction"
+harness = false
+
+[[bench]]
+name = "write_batch_parallel"
 harness = false
 
 [lints]

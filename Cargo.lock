@@ -910,6 +910,7 @@ dependencies = [
  "nanoid",
  "proptest",
  "rand 0.10.1",
+ "rayon",
  "rmp-serde",
  "rmpv",
  "serde",

@@ -14,12 +14,25 @@
 //! - No writes from the batch are visible after restart
 //! - The storage WAL ensures consistency
 
+use std::collections::HashMap;
+
 use lsm_tree::AbstractTree;
+use rayon::prelude::*;
 
 use crate::engine::config::FlushPolicy;
 use crate::engine::core::StorageEngine;
 use crate::engine::partition::Partition;
 use crate::error::StorageResult;
+
+/// Minimum number of mutations required to engage the parallel memtable-write
+/// path in [`WriteBatch::commit`].
+///
+/// Below this threshold the rayon work-stealing overhead (task spawn + thread
+/// wake-up) exceeds the time saved by concurrent memtable inserts, so the
+/// single-threaded path is used instead.  The threshold also requires at least
+/// two distinct partitions (if everything targets one partition there is no
+/// parallelism to exploit).
+const PARALLEL_THRESHOLD: usize = 16;
 
 /// A mutation to be applied in a write batch.
 #[derive(Debug)]
@@ -43,6 +56,17 @@ pub(crate) enum Mutation {
         key: Vec<u8>,
         operand: Vec<u8>,
     },
+}
+
+impl Mutation {
+    /// Return the partition this mutation targets.
+    fn partition(&self) -> Partition {
+        match self {
+            Self::Put { partition, .. }
+            | Self::Delete { partition, .. }
+            | Self::Merge { partition, .. } => *partition,
+        }
+    }
 }
 
 /// An atomic write batch with crash safety guarantees.
@@ -120,44 +144,91 @@ impl<'a> WriteBatch<'a> {
     /// Commit all staged mutations atomically.
     ///
     /// All mutations share a single seqno, providing logical atomicity for
-    /// MVCC reads. With `FlushPolicy::SyncPerBatch`, the memtable is flushed
+    /// MVCC reads.  With `FlushPolicy::SyncPerBatch`, the memtable is flushed
     /// to an SST file (crash-safe atomic rename) before returning.
+    ///
+    /// ## Parallel memtable writes
+    ///
+    /// When the batch contains at least [`PARALLEL_THRESHOLD`] mutations that
+    /// target at least two distinct partitions, mutations are grouped by
+    /// partition and each group is applied concurrently on a rayon thread.
+    /// This is safe because:
+    ///
+    /// - Each partition maps to a separate `AnyTree` (no shared mutable state
+    ///   between groups).
+    /// - `Tree::insert / remove / merge` take `&self` and use a concurrent
+    ///   skip-list internally — safe to call from multiple threads with the
+    ///   same seqno.
+    /// - The `StorageEngine` `HashMap<Partition, AnyTree>` is read-only during
+    ///   `commit()` (trees are only inserted at `open()` time).
+    ///
+    /// Below the threshold the single-threaded path avoids the rayon
+    /// work-stealing overhead.
     pub fn commit(self) -> StorageResult<()> {
         if self.mutations.is_empty() {
             return Ok(());
         }
 
-        // Single seqno for the entire batch — logical atomicity.
-        let seqno = self.engine.next_seqno();
+        // Destructure to satisfy borrow checker: `engine` and `mutations` are
+        // used independently in closures below.
+        let WriteBatch { engine, mutations } = self;
 
-        for mutation in &self.mutations {
-            match mutation {
-                Mutation::Put {
-                    partition,
-                    key,
-                    value,
-                } => {
-                    let tree = self.engine.tree(*partition)?;
-                    tree.insert(key, value, seqno);
-                }
-                Mutation::Delete { partition, key } => {
-                    let tree = self.engine.tree(*partition)?;
-                    tree.remove(key, seqno);
-                }
-                Mutation::Merge {
-                    partition,
-                    key,
-                    operand,
-                } => {
-                    let tree = self.engine.tree(*partition)?;
-                    tree.merge(key, operand, seqno);
+        // Single seqno for the entire batch — logical atomicity.
+        let seqno = engine.next_seqno();
+
+        // Group mutations by partition.  Preserves insertion order within each
+        // group so that multiple mutations on the same key are applied in the
+        // order they were staged.
+        let mut groups: HashMap<Partition, Vec<&Mutation>> =
+            HashMap::with_capacity(Partition::all().len());
+        for m in &mutations {
+            groups.entry(m.partition()).or_default().push(m);
+        }
+
+        if groups.len() >= 2 && mutations.len() >= PARALLEL_THRESHOLD {
+            // Parallel path: scatter each partition group to a rayon thread.
+            groups
+                .par_iter()
+                .try_for_each(|(&part, group)| -> StorageResult<()> {
+                    let tree = engine.tree(part)?;
+                    for mutation in group {
+                        match mutation {
+                            Mutation::Put { key, value, .. } => {
+                                tree.insert(key, value, seqno);
+                            }
+                            Mutation::Delete { key, .. } => {
+                                tree.remove(key, seqno);
+                            }
+                            Mutation::Merge { key, operand, .. } => {
+                                tree.merge(key, operand, seqno);
+                            }
+                        }
+                    }
+                    Ok(())
+                })?;
+        } else {
+            // Serial path: small batch or single-partition — skip rayon overhead.
+            for (&part, group) in &groups {
+                let tree = engine.tree(part)?;
+                for mutation in group {
+                    match mutation {
+                        Mutation::Put { key, value, .. } => {
+                            tree.insert(key, value, seqno);
+                        }
+                        Mutation::Delete { key, .. } => {
+                            tree.remove(key, seqno);
+                        }
+                        Mutation::Merge { key, operand, .. } => {
+                            tree.merge(key, operand, seqno);
+                        }
+                    }
                 }
             }
         }
 
         // Invalidate cache for all mutated keys to prevent stale reads.
-        if let Some(cache) = self.engine.tiered_cache() {
-            for mutation in &self.mutations {
+        if let Some(cache) = engine.tiered_cache() {
+            for mutation in &mutations {
                 let (partition, key) = match mutation {
                     Mutation::Put { partition, key, .. }
                     | Mutation::Delete { partition, key }
@@ -168,8 +239,8 @@ impl<'a> WriteBatch<'a> {
         }
 
         // If SyncPerBatch, flush memtable to SST immediately after commit.
-        if self.engine.flush_policy() == FlushPolicy::SyncPerBatch {
-            self.engine.persist()?;
+        if engine.flush_policy() == FlushPolicy::SyncPerBatch {
+            engine.persist()?;
         }
 
         Ok(())
@@ -406,6 +477,162 @@ mod tests {
             .expect("should exist");
         let plist = PostingList::from_bytes(&data).expect("decode");
         assert_eq!(plist.as_slice(), &[10, 20, 30]);
+    }
+
+    /// PARALLEL_THRESHOLD mutations across multiple partitions trigger the
+    /// parallel commit path.  All writes must be visible after commit — same
+    /// correctness guarantee as the serial path.
+    #[test]
+    fn parallel_commit_all_writes_visible() {
+        let (engine, _dir) = test_engine_with_policy(FlushPolicy::Manual);
+
+        let mut batch = WriteBatch::new(&engine);
+        // Spread 8 keys across Node and Schema (2 distinct partitions) to
+        // guarantee the parallel threshold of 16 total mutations is reached.
+        for i in 0..8u8 {
+            batch.put(Partition::Node, format!("node:{i}").into_bytes(), vec![i]);
+            batch.put(
+                Partition::Schema,
+                format!("schema:{i}").into_bytes(),
+                vec![i + 100],
+            );
+        }
+        assert!(
+            batch.len() >= PARALLEL_THRESHOLD,
+            "test precondition: must be >= PARALLEL_THRESHOLD for parallel path"
+        );
+        batch.commit().expect("parallel commit failed");
+
+        // Verify every key is visible with the correct value.
+        for i in 0..8u8 {
+            let v = engine
+                .get(Partition::Node, format!("node:{i}").as_bytes())
+                .expect("get node")
+                .expect("node should exist");
+            assert_eq!(&*v, &[i], "wrong value for node:{i}");
+
+            let v = engine
+                .get(Partition::Schema, format!("schema:{i}").as_bytes())
+                .expect("get schema")
+                .expect("schema should exist");
+            assert_eq!(&*v, &[i + 100], "wrong value for schema:{i}");
+        }
+    }
+
+    /// Parallel path with Delete and Merge operations (not just Put).
+    /// Verifies all three mutation kinds are applied correctly when the
+    /// parallel threshold is crossed.
+    #[test]
+    fn parallel_commit_delete_and_merge() {
+        use crate::engine::merge::encode_add;
+        use coordinode_core::graph::edge::PostingList;
+
+        let (engine, _dir) = test_engine_with_policy(FlushPolicy::Manual);
+
+        // Pre-populate keys that will be deleted/merged via the parallel path.
+        for i in 0..8u8 {
+            engine
+                .put(Partition::Node, format!("del:{i}").as_bytes(), b"old")
+                .expect("pre-put");
+        }
+
+        let mut batch = WriteBatch::new(&engine);
+        // 8 Deletes on Node + 8 Merges on Adj = 16 mutations, 2 partitions → parallel path.
+        for i in 0..8u8 {
+            batch.delete(Partition::Node, format!("del:{i}").into_bytes());
+            batch.merge(
+                Partition::Adj,
+                format!("adj:{i}").into_bytes(),
+                encode_add(u64::from(i)),
+            );
+        }
+        assert!(
+            batch.len() >= PARALLEL_THRESHOLD,
+            "test precondition: must trigger parallel path"
+        );
+        batch.commit().expect("parallel delete+merge failed");
+
+        // All deleted keys must be gone.
+        for i in 0..8u8 {
+            assert!(
+                engine
+                    .get(Partition::Node, format!("del:{i}").as_bytes())
+                    .expect("get")
+                    .is_none(),
+                "node del:{i} should be deleted"
+            );
+        }
+
+        // All adj merge results must be visible.
+        for i in 0..8u8 {
+            let data = engine
+                .get(Partition::Adj, format!("adj:{i}").as_bytes())
+                .expect("get adj")
+                .expect("adj should exist");
+            let plist = PostingList::from_bytes(&data).expect("decode posting list");
+            assert_eq!(plist.as_slice(), &[u64::from(i)]);
+        }
+    }
+
+    /// 16 mutations but all on one partition → serial path (no parallel benefit).
+    /// Ensures the single-partition gate works and results are still correct.
+    #[test]
+    fn single_partition_large_batch_uses_serial_path() {
+        let (engine, _dir) = test_engine_with_policy(FlushPolicy::Manual);
+
+        let mut batch = WriteBatch::new(&engine);
+        for i in 0..16u8 {
+            batch.put(Partition::Node, format!("k:{i}").into_bytes(), vec![i]);
+        }
+        // Same batch size as PARALLEL_THRESHOLD but only one partition.
+        assert_eq!(batch.len(), PARALLEL_THRESHOLD);
+        batch.commit().expect("large single-partition batch failed");
+
+        for i in 0..16u8 {
+            let v = engine
+                .get(Partition::Node, format!("k:{i}").as_bytes())
+                .expect("get")
+                .expect("should exist");
+            assert_eq!(&*v, &[i]);
+        }
+    }
+
+    /// 15 mutations across 2 partitions → serial path (below threshold).
+    /// Ensures the mutation-count gate prevents premature rayon dispatch.
+    #[test]
+    fn below_threshold_multi_partition_uses_serial_path() {
+        let (engine, _dir) = test_engine_with_policy(FlushPolicy::Manual);
+
+        let mut batch = WriteBatch::new(&engine);
+        // 7 Node + 8 Schema = 15 mutations, 2 partitions, below PARALLEL_THRESHOLD.
+        for i in 0..7u8 {
+            batch.put(Partition::Node, format!("n:{i}").into_bytes(), vec![i]);
+        }
+        for i in 0..8u8 {
+            batch.put(
+                Partition::Schema,
+                format!("s:{i}").into_bytes(),
+                vec![i + 50],
+            );
+        }
+        assert_eq!(batch.len(), 15);
+        assert!(batch.len() < PARALLEL_THRESHOLD);
+        batch.commit().expect("below-threshold batch failed");
+
+        for i in 0..7u8 {
+            let v = engine
+                .get(Partition::Node, format!("n:{i}").as_bytes())
+                .expect("get")
+                .expect("should exist");
+            assert_eq!(&*v, &[i]);
+        }
+        for i in 0..8u8 {
+            let v = engine
+                .get(Partition::Schema, format!("s:{i}").as_bytes())
+                .expect("get")
+                .expect("should exist");
+            assert_eq!(&*v, &[i + 50]);
+        }
     }
 
     #[test]
