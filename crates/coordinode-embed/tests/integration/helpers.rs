@@ -62,6 +62,7 @@ pub fn make_ctx_legacy<'a>(
         merge_node_deltas: Vec::new(),
         correlated_row: None,
         feedback_cache: None,
+        schema_label_cache: HashMap::new(),
     }
 }
 
@@ -112,6 +113,7 @@ pub fn make_ctx_mvcc<'a>(
         merge_node_deltas: Vec::new(),
         correlated_row: None,
         feedback_cache: None,
+        schema_label_cache: HashMap::new(),
     }
 }
 
@@ -163,5 +165,6 @@ pub fn make_ctx_with_pipeline<'a>(
         merge_node_deltas: Vec::new(),
         correlated_row: None,
         feedback_cache: None,
+        schema_label_cache: HashMap::new(),
     }
 }

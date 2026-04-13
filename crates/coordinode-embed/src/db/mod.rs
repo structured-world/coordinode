@@ -918,6 +918,7 @@ impl Database {
             merge_node_deltas: Vec::new(),
             correlated_row: None,
             feedback_cache: Some(self.feedback_cache.clone()),
+            schema_label_cache: std::collections::HashMap::new(),
         };
 
         let start = Instant::now();

@@ -364,6 +364,21 @@ pub struct ExecutionContext<'a> {
     /// `OPTIONAL MATCH (b)-[:R]->(c) WHERE c.x = a.y` where `a` comes
     /// from the outer MATCH scope.
     pub correlated_row: Option<Row>,
+    /// Per-statement cache: NodeId → primary label string.
+    ///
+    /// Schema checks in PropertyPath and DocFunction SET items read the node's
+    /// primary label via `schema_peek_node`. For a statement like
+    /// `SET n.a.x=1, n.a.y=2, n.a.z=3` targeting 100 nodes, each SET-item
+    /// calls `schema_peek_node` per node → N×M engine reads without this cache.
+    ///
+    /// With the cache: first access reads + deserializes NodeRecord once per
+    /// node per statement; subsequent SET-items on the same node hit the cache
+    /// (O(1) HashMap lookup, no engine read, no deserialization).
+    ///
+    /// Primary labels are immutable within a transaction (no Cypher clause
+    /// changes the primary label after node creation), so the cache is always
+    /// valid for the lifetime of the statement. No invalidation required.
+    pub schema_label_cache: HashMap<NodeId, String>,
 }
 
 /// Convert storage `Partition` to serializable `PartitionId`.
@@ -407,6 +422,34 @@ impl<'a> ExecutionContext<'a> {
         } else {
             Ok(self.engine.get(Partition::Node, key)?.map(|b| b.to_vec()))
         }
+    }
+
+    /// Return the primary label for a node, using the per-statement cache.
+    ///
+    /// On first access for a given `node_id`, reads the node bytes via
+    /// `schema_peek_node` and deserializes the `NodeRecord` to extract the
+    /// primary label, then stores it in `schema_label_cache`.
+    ///
+    /// Subsequent calls for the same `node_id` within the same statement return
+    /// the cached label without any engine I/O or deserialization.
+    ///
+    /// Returns `None` if the node does not exist (deleted or never created).
+    pub fn schema_label_for_node(
+        &mut self,
+        node_id: NodeId,
+        key: &[u8],
+    ) -> Result<Option<String>, ExecutionError> {
+        if let Some(label) = self.schema_label_cache.get(&node_id) {
+            return Ok(Some(label.clone()));
+        }
+        let Some(bytes) = self.schema_peek_node(key)? else {
+            return Ok(None);
+        };
+        let record = NodeRecord::from_msgpack(&bytes)
+            .map_err(|e| ExecutionError::Serialization(format!("node decode: {e}")))?;
+        let label = record.primary_label().to_string();
+        self.schema_label_cache.insert(node_id, label.clone());
+        Ok(Some(label))
     }
 
     /// MVCC-aware read: write buffer → snapshot O(1) → legacy fallback.
@@ -5307,14 +5350,10 @@ fn execute_update(
                     // In VALIDATED mode unknown root props are accepted (extra fields allowed).
                     // The merge operand write is O(1); this read is only for schema validation
                     // and is skipped when no schema exists (schemaless node) or mode = FLEXIBLE.
-                    // Uses schema_peek_node (not mvcc_get) to avoid triggering RYOW merge-delta
-                    // materialization when multiple PropertyPath items target the same node.
+                    // schema_label_for_node caches the primary label per node per statement:
+                    // SET n.a.x=1, n.a.y=2, n.a.z=3 on 100 nodes = 100 reads (not 300).
                     let schema_err: Option<ExecutionError> = {
-                        if let Some(bytes) = ctx.schema_peek_node(&key)? {
-                            let record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
-                                ExecutionError::Serialization(format!("node decode: {e}"))
-                            })?;
-                            let label = record.primary_label().to_string();
+                        if let Some(label) = ctx.schema_label_for_node(node_id, &key)? {
                             let schema_key = encode_label_schema_key(&label);
                             match ctx.mvcc_get(Partition::Schema, &schema_key)? {
                                 Some(s_bytes) => {
@@ -5409,15 +5448,11 @@ fn execute_update(
                     } else {
                         path[0].as_str()
                     };
-                    // Uses schema_peek_node (not mvcc_get) for the same reason as PropertyPath:
-                    // must not trigger RYOW merge-delta materialization mid-statement.
+                    // schema_label_for_node caches the primary label per node per statement —
+                    // same invariant as PropertyPath: must not trigger RYOW materialization.
                     let schema_err: Option<ExecutionError> = {
                         let key = encode_node_key(ctx.shard_id, node_id);
-                        if let Some(bytes) = ctx.schema_peek_node(&key)? {
-                            let record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
-                                ExecutionError::Serialization(format!("node decode: {e}"))
-                            })?;
-                            let label = record.primary_label().to_string();
+                        if let Some(label) = ctx.schema_label_for_node(node_id, &key)? {
                             let schema_key = encode_label_schema_key(&label);
                             match ctx.mvcc_get(Partition::Schema, &schema_key)? {
                                 Some(s_bytes) => match LabelSchema::from_msgpack(&s_bytes).ok() {
@@ -6939,6 +6974,7 @@ mod tests {
             merge_node_deltas: Vec::new(),
             correlated_row: None,
             feedback_cache: None,
+            schema_label_cache: std::collections::HashMap::new(),
         }
     }
 

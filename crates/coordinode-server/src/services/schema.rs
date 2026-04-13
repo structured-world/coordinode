@@ -1970,4 +1970,118 @@ mod tests {
         // Use a declared Document property to test the PropertyPath success path properly.
         // (No Document property declared here, so just verify SKIP on all-fail → empty.)
     }
+
+    /// Multiple PropertyPath SET-items on the same node in one statement (R-API6 cache).
+    ///
+    /// Verifies that N PropertyPath items targeting the same node in a single SET
+    /// clause all succeed. This exercises the `schema_label_cache` path: the first
+    /// item reads + caches the label; subsequent items hit the cache (O(1), no I/O).
+    /// Also guards against the RYOW merge-delta materialization bug (g064): each
+    /// DocDelta must land independently when multiple paths target the same node.
+    #[tokio::test]
+    async fn schema_label_cache_multiple_paths_same_node() {
+        let (svc, _dir) = test_service();
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Config".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "cfg".to_string(),
+                r#type: 3, // STRING (DOCUMENT will be inferred at runtime)
+                required: false,
+                unique: false,
+            }],
+            computed_properties: vec![],
+            schema_mode: 2, // VALIDATED — extra paths allowed
+        }))
+        .await
+        .expect("create_label Config");
+
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (c:Config)").expect("create node");
+        }
+
+        // Three PropertyPath items on the same node in one statement.
+        // Each uses schema_label_for_node — only the first should hit the engine;
+        // items 2 and 3 should read the cached label.
+        let mut db = svc.database.lock().unwrap();
+        db.execute_cypher(
+            "MATCH (c:Config) SET c.cfg.host = 'db1', c.cfg.port = 5432, c.cfg.ssl = true",
+        )
+        .expect("multi PropertyPath on same node must succeed");
+
+        let rows = db
+            .execute_cypher("MATCH (c:Config) RETURN c.cfg.host, c.cfg.port, c.cfg.ssl")
+            .expect("return multi paths");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get("c.cfg.host"),
+            Some(&Value::String("db1".to_string())),
+            "c.cfg.host must be 'db1'"
+        );
+        assert_eq!(
+            rows[0].get("c.cfg.port"),
+            Some(&Value::Int(5432)),
+            "c.cfg.port must be 5432"
+        );
+        assert_eq!(
+            rows[0].get("c.cfg.ssl"),
+            Some(&Value::Bool(true)),
+            "c.cfg.ssl must be true"
+        );
+    }
+
+    /// Multiple DocFunction SET-items on the same node in one statement (R-API6 cache).
+    ///
+    /// Verifies that N `doc_push` items targeting the same node's arrays in a single
+    /// SET clause all succeed. DocFunction uses the same `schema_label_for_node` cache
+    /// as PropertyPath — first item reads + caches, subsequent items hit cache (O(1)).
+    #[tokio::test]
+    async fn schema_label_cache_multiple_doc_functions_same_node() {
+        let (svc, _dir) = test_service();
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Queue".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "jobs".to_string(),
+                r#type: 3, // STRING
+                required: false,
+                unique: false,
+            }],
+            computed_properties: vec![],
+            schema_mode: 2, // VALIDATED — extra roots allowed
+        }))
+        .await
+        .expect("create_label Queue");
+
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (q:Queue)").expect("create node");
+        }
+
+        // Three doc_push items on the same node in one statement.
+        // 'jobs', 'errors', 'metrics' are all undeclared roots on VALIDATED →
+        // all accepted. schema_label_for_node cache: 1 engine read for all three.
+        let mut db = svc.database.lock().unwrap();
+        db.execute_cypher(
+            "MATCH (q:Queue) SET doc_push(q.jobs, 'job1'), doc_push(q.errors, 'err1'), doc_push(q.metrics, 42)",
+        )
+        .expect("multi doc_push on same node must succeed");
+
+        let rows = db
+            .execute_cypher("MATCH (q:Queue) RETURN q.jobs, q.errors, q.metrics")
+            .expect("return after multi doc_push");
+        assert_eq!(rows.len(), 1);
+        // Arrays are stored as lists; each doc_push appends one element.
+        assert!(
+            rows[0].get("q.jobs").is_some(),
+            "q.jobs must be set after doc_push"
+        );
+        assert!(
+            rows[0].get("q.errors").is_some(),
+            "q.errors must be set after doc_push"
+        );
+        assert!(
+            rows[0].get("q.metrics").is_some(),
+            "q.metrics must be set after doc_push"
+        );
+    }
 }

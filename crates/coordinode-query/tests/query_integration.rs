@@ -64,6 +64,7 @@ fn make_test_ctx<'a>(
         merge_node_deltas: Vec::new(),
         correlated_row: None,
         feedback_cache: None,
+        schema_label_cache: std::collections::HashMap::new(),
     }
 }
 
