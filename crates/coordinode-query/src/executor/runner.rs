@@ -382,6 +382,33 @@ fn partition_to_id(p: Partition) -> PartitionId {
 }
 
 impl<'a> ExecutionContext<'a> {
+    /// Read a Node key for schema checks without triggering RYOW merge-delta materialization.
+    ///
+    /// Schema checks in PropertyPath and DocFunction SET items need the node's primary
+    /// label to look up the label schema, but must not consume pending merge deltas.
+    /// Calling `mvcc_get` would trigger `materialize_node_deltas` for any key with
+    /// in-flight deltas, breaking multi-item SET statements like
+    /// `SET n.doc.a = 1, n.doc.b = 2` (the second item would not see delta from first).
+    ///
+    /// Read order: write buffer first, then committed engine state.
+    /// Does not consult `merge_node_deltas`.
+    pub fn schema_peek_node(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ExecutionError> {
+        // Check write buffer (nodes already written or materialized in this txn).
+        let buf_key = (Partition::Node, key.to_vec());
+        if let Some(buffered) = self.mvcc_write_buffer.get(&buf_key) {
+            return Ok(buffered.clone());
+        }
+        // Fall back to committed state in the engine.
+        if let Some(ref snap) = self.mvcc_snapshot {
+            Ok(self
+                .engine
+                .snapshot_get(snap, Partition::Node, key)?
+                .map(|b| b.to_vec()))
+        } else {
+            Ok(self.engine.get(Partition::Node, key)?.map(|b| b.to_vec()))
+        }
+    }
+
     /// MVCC-aware read: write buffer → snapshot O(1) → legacy fallback.
     ///
     /// 1. Check write buffer (read-your-own-writes within this statement)
@@ -5272,12 +5299,81 @@ fn execute_update(
                         _ => continue,
                     };
 
-                    // O(1) write via merge operand — no read required.
+                    let key = encode_node_key(ctx.shard_id, node_id);
+
+                    // Schema check for the root property (path[0]).
+                    // PropertyPath writes nested doc fields (e.g. SET n.config.host = "x").
+                    // In STRICT mode the root property must be declared in the schema.
+                    // In VALIDATED mode unknown root props are accepted (extra fields allowed).
+                    // The merge operand write is O(1); this read is only for schema validation
+                    // and is skipped when no schema exists (schemaless node) or mode = FLEXIBLE.
+                    // Uses schema_peek_node (not mvcc_get) to avoid triggering RYOW merge-delta
+                    // materialization when multiple PropertyPath items target the same node.
+                    let schema_err: Option<ExecutionError> = {
+                        if let Some(bytes) = ctx.schema_peek_node(&key)? {
+                            let record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
+                                ExecutionError::Serialization(format!("node decode: {e}"))
+                            })?;
+                            let label = record.primary_label().to_string();
+                            let schema_key = encode_label_schema_key(&label);
+                            match ctx.mvcc_get(Partition::Schema, &schema_key)? {
+                                Some(s_bytes) => {
+                                    match LabelSchema::from_msgpack(&s_bytes).ok() {
+                                        Some(ls) => {
+                                            let root = &path[0];
+                                            match ls.mode {
+                                                SchemaMode::Strict => {
+                                                    match ls.get_property(root) {
+                                                        None => Some(
+                                                            ExecutionError::SchemaViolation(
+                                                                format!("unknown property '{root}' for strict label '{label}'"),
+                                                            ),
+                                                        ),
+                                                        Some(def) if def.is_computed() => Some(
+                                                            ExecutionError::SchemaViolation(format!(
+                                                                "cannot SET computed property '{root}'"
+                                                            )),
+                                                        ),
+                                                        Some(_) => None,
+                                                    }
+                                                }
+                                                SchemaMode::Validated => {
+                                                    if let Some(def) = ls.get_property(root) {
+                                                        if def.is_computed() {
+                                                            Some(ExecutionError::SchemaViolation(
+                                                                format!("cannot SET computed property '{root}'"),
+                                                            ))
+                                                        } else {
+                                                            None
+                                                        }
+                                                    } else {
+                                                        None // unknown root prop allowed in VALIDATED
+                                                    }
+                                                }
+                                                SchemaMode::Flexible => None,
+                                            }
+                                        }
+                                        None => None,
+                                    }
+                                }
+                                None => None,
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(err) = schema_err {
+                        if skip_on_violation {
+                            continue 'row_loop;
+                        }
+                        return Err(err);
+                    }
+
+                    // O(1) write via merge operand.
                     // path[0] = property name → resolved to field_id via interner
                     // path[1..] = nested path within the DOCUMENT value
                     let field_id = ctx.interner.intern(&path[0]);
                     let sub_path = &path[1..];
-                    let key = encode_node_key(ctx.shard_id, node_id);
 
                     let delta = coordinode_core::graph::doc_delta::DocDelta::SetPath {
                         target: coordinode_core::graph::doc_delta::PathTarget::PropField(field_id),
@@ -5304,6 +5400,68 @@ fn execute_update(
                         Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                         _ => continue,
                     };
+
+                    // Schema validation: root property must be declared in STRICT mode.
+                    // DocFunction path[0] is the root property (e.g. `doc` in `doc_push(n.doc, v)`).
+                    // If path is empty the function targets the node itself (edge case), use variable.
+                    let root_prop = if path.is_empty() {
+                        variable.as_str()
+                    } else {
+                        path[0].as_str()
+                    };
+                    // Uses schema_peek_node (not mvcc_get) for the same reason as PropertyPath:
+                    // must not trigger RYOW merge-delta materialization mid-statement.
+                    let schema_err: Option<ExecutionError> = {
+                        let key = encode_node_key(ctx.shard_id, node_id);
+                        if let Some(bytes) = ctx.schema_peek_node(&key)? {
+                            let record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
+                                ExecutionError::Serialization(format!("node decode: {e}"))
+                            })?;
+                            let label = record.primary_label().to_string();
+                            let schema_key = encode_label_schema_key(&label);
+                            match ctx.mvcc_get(Partition::Schema, &schema_key)? {
+                                Some(s_bytes) => match LabelSchema::from_msgpack(&s_bytes).ok() {
+                                    Some(ls) => match ls.mode {
+                                        SchemaMode::Strict => match ls.get_property(root_prop) {
+                                            None => Some(ExecutionError::SchemaViolation(format!(
+                                                "unknown property '{root_prop}' for strict label '{label}'"
+                                            ))),
+                                            Some(def) if def.is_computed() => {
+                                                Some(ExecutionError::SchemaViolation(format!(
+                                                    "cannot SET computed property '{root_prop}'"
+                                                )))
+                                            }
+                                            Some(_) => None,
+                                        },
+                                        SchemaMode::Validated => {
+                                            if let Some(def) = ls.get_property(root_prop) {
+                                                if def.is_computed() {
+                                                    Some(ExecutionError::SchemaViolation(format!(
+                                                        "cannot SET computed property '{root_prop}'"
+                                                    )))
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                None // unknown root prop allowed in VALIDATED
+                                            }
+                                        }
+                                        SchemaMode::Flexible => None,
+                                    },
+                                    None => None,
+                                },
+                                None => None,
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(err) = schema_err {
+                        if skip_on_violation {
+                            continue 'row_loop;
+                        }
+                        return Err(err);
+                    }
 
                     // Resolve property name → field_id. For doc_* functions,
                     // path[0] is the root property, path[1..] is the nested path.
@@ -5454,6 +5612,17 @@ fn execute_update(
                         })?;
                         ctx.mvcc_put(Partition::Node, &key, &new_bytes)?;
 
+                        // Update out_row so that RETURN clauses in the same statement
+                        // see the post-SET values. Remove all old variable.* entries
+                        // (replaced), then insert the new map contents.
+                        let prefix = format!("{variable}.");
+                        out_row.retain(|k, _| !k.starts_with(&prefix));
+                        if let Value::Map(ref map) = map_val {
+                            for (k, v) in map {
+                                out_row.insert(format!("{variable}.{k}"), v.clone());
+                            }
+                        }
+
                         // Notify vector index registry for any vector properties in the replacement map.
                         if let Some(registry) = ctx.vector_index_registry {
                             let label = record.primary_label().to_string();
@@ -5567,6 +5736,14 @@ fn execute_update(
                             ExecutionError::Serialization(format!("node encode: {e}"))
                         })?;
                         ctx.mvcc_put(Partition::Node, &key, &new_bytes)?;
+
+                        // Update out_row so RETURN clauses see the merged values.
+                        // MergeProperties adds/overwrites; existing untouched props stay.
+                        if let Value::Map(ref map) = map_val {
+                            for (k, v) in map {
+                                out_row.insert(format!("{variable}.{k}"), v.clone());
+                            }
+                        }
 
                         // Notify vector index registry for any vector properties in the merged map.
                         if let Some(registry) = ctx.vector_index_registry {

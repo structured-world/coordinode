@@ -1673,6 +1673,154 @@ mod tests {
         }
     }
 
+    /// SET n.unknownDoc.subfield = val on a STRICT label must fail:
+    /// the root property 'unknownDoc' is not declared.
+    #[tokio::test]
+    async fn strict_mode_property_path_rejects_unknown_root() {
+        let (svc, _dir) = test_service();
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Device".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "serial".to_string(),
+                r#type: 3, // STRING
+                required: true,
+                unique: false,
+            }],
+            computed_properties: vec![],
+            schema_mode: 1, // STRICT
+        }))
+        .await
+        .expect("create_label Device");
+
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (d:Device {serial: 'SN-001'})")
+                .expect("create device");
+        }
+
+        // 'config' is not declared on Device (STRICT) — SET d.config.timeout = 30 must fail.
+        let mut db = svc.database.lock().unwrap();
+        let result =
+            db.execute_cypher("MATCH (d:Device) SET d.config.timeout = 30 RETURN d.serial");
+        assert!(
+            result.is_err(),
+            "PropertyPath with unknown root on STRICT label must fail, got: {result:?}"
+        );
+    }
+
+    /// doc_push(n.unknownList, val) on a STRICT label must fail:
+    /// the root property 'unknownList' is not declared.
+    #[tokio::test]
+    async fn strict_mode_doc_function_rejects_unknown_root() {
+        let (svc, _dir) = test_service();
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Shelf".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "name".to_string(),
+                r#type: 3, // STRING
+                required: true,
+                unique: false,
+            }],
+            computed_properties: vec![],
+            schema_mode: 1, // STRICT
+        }))
+        .await
+        .expect("create_label Shelf");
+
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (s:Shelf {name: 'A1'})")
+                .expect("create shelf");
+        }
+
+        // 'items' is not declared on Shelf (STRICT) — doc_push on unknown root prop must fail.
+        // Syntax: `SET doc_push(n.prop, val)` — function call IS the set item.
+        let mut db = svc.database.lock().unwrap();
+        let result = db.execute_cypher("MATCH (s:Shelf) SET doc_push(s.items, 'book')");
+        assert!(
+            result.is_err(),
+            "doc_push on unknown root property of STRICT label must fail, got: {result:?}"
+        );
+    }
+
+    /// SET n = {host: 'x', extra: 'ok'} on a VALIDATED label must succeed:
+    /// in VALIDATED mode unknown keys are allowed (declared keys are type-checked).
+    #[tokio::test]
+    async fn validated_mode_replace_properties_allows_unknown_key() {
+        let (svc, _dir) = test_service();
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Server".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "host".to_string(),
+                r#type: 3, // STRING
+                required: false,
+                unique: false,
+            }],
+            computed_properties: vec![],
+            schema_mode: 2, // VALIDATED
+        }))
+        .await
+        .expect("create_label Server");
+
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (s:Server {host: 'db1'})")
+                .expect("create server");
+        }
+
+        // Replace with map that has extra unknown key 'datacenter' — must succeed in VALIDATED.
+        let mut db = svc.database.lock().unwrap();
+        let rows = db
+            .execute_cypher(
+                "MATCH (s:Server) SET s = {host: 'db2', datacenter: 'eu-west-1'} RETURN s.host",
+            )
+            .expect("SET n = {map} with unknown key on VALIDATED label must succeed");
+        assert_eq!(rows.len(), 1, "expected one updated row, got: {rows:?}");
+        assert_eq!(
+            rows[0].get("s.host").cloned().unwrap_or(Value::Null),
+            Value::String("db2".into()),
+            "declared property 'host' must be updated"
+        );
+    }
+
+    /// SET n += {extra: 'ok'} on a VALIDATED label must succeed:
+    /// in VALIDATED mode unknown keys in merge-properties are allowed.
+    #[tokio::test]
+    async fn validated_mode_merge_properties_allows_unknown_key() {
+        let (svc, _dir) = test_service();
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Cache".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "size".to_string(),
+                r#type: 1, // INT64
+                required: false,
+                unique: false,
+            }],
+            computed_properties: vec![],
+            schema_mode: 2, // VALIDATED
+        }))
+        .await
+        .expect("create_label Cache");
+
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (c:Cache {size: 100})")
+                .expect("create cache");
+        }
+
+        // Merge with unknown key 'policy' — must succeed in VALIDATED.
+        let mut db = svc.database.lock().unwrap();
+        let rows = db
+            .execute_cypher("MATCH (c:Cache) SET c += {size: 200, policy: 'lru'} RETURN c.size")
+            .expect("SET n += {map} with unknown key on VALIDATED label must succeed");
+        assert_eq!(rows.len(), 1, "expected one updated row, got: {rows:?}");
+        assert_eq!(
+            rows[0].get("c.size").cloned().unwrap_or(Value::Null),
+            Value::Int(200),
+            "declared property 'size' must be updated to 200"
+        );
+    }
+
     /// labels(n)[0] — subscript access on function result returns the primary label.
     #[tokio::test]
     async fn labels_function_subscript_access() {
