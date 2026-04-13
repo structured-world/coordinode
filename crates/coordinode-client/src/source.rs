@@ -16,9 +16,9 @@
 //! | `x-source-app`        | `ClientConfig::app_name`              |
 //! | `x-source-version`    | `ClientConfig::app_version`           |
 //!
-//! `x-source-function` is intentionally omitted: `Location` does not expose
-//! the enclosing function name. Users who need it can pass it as a parameter
-//! via `execute_cypher_annotated`.
+//! `x-source-function` is intentionally omitted: Rust's `Location` does not
+//! expose the enclosing function name. TypeScript and Python drivers can send
+//! it via `Error.captureStackTrace` / `inspect.stack()` respectively.
 
 use std::panic::Location;
 
