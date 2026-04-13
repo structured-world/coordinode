@@ -1294,4 +1294,48 @@ mod tests {
             );
         }
     }
+
+    /// VALIDATED label: SET with undeclared property is accepted; SET with type
+    /// mismatch on declared property is rejected.
+    ///
+    /// Regression: VALIDATED enforcement must apply to the SET path (MATCH … SET),
+    /// not only to CREATE. Both acceptance of extras and rejection of type mismatches
+    /// must be consistent across write paths.
+    #[tokio::test]
+    async fn validated_mode_set_extra_accepted_mismatch_rejected() {
+        let (svc, _dir) = test_service();
+
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Metric".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "value".to_string(),
+                r#type: 2, // FLOAT64
+                required: false,
+                unique: false,
+            }],
+            computed_properties: vec![],
+            schema_mode: 2, // VALIDATED
+        }))
+        .await
+        .expect("create_label should succeed");
+
+        {
+            let mut db = svc.database.lock().unwrap();
+
+            // Create node with only the declared property.
+            db.execute_cypher("CREATE (m:Metric {value: 3.14})")
+                .expect("CREATE declared property must succeed");
+
+            // SET undeclared property on VALIDATED label — must be accepted.
+            db.execute_cypher("MATCH (m:Metric) SET m.source = 'sensor-01'")
+                .expect("SET undeclared property must be accepted in VALIDATED mode");
+
+            // SET type mismatch on declared property — must be rejected.
+            let result = db.execute_cypher("MATCH (m:Metric) SET m.value = 'not_a_float'");
+            assert!(
+                result.is_err(),
+                "SET with type mismatch on declared property must be rejected in VALIDATED mode, got: {result:?}"
+            );
+        }
+    }
 }
