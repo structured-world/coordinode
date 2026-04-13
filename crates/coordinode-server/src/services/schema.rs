@@ -1843,4 +1843,131 @@ mod tests {
             "labels(n)[0] must return primary label 'Robot', got: {lbl:?}"
         );
     }
+
+    /// SET n.unknownDoc.field = val on a VALIDATED label must succeed:
+    /// in VALIDATED mode unknown root properties are accepted (only declared props type-checked).
+    #[tokio::test]
+    async fn validated_mode_property_path_allows_unknown_root() {
+        let (svc, _dir) = test_service();
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Sensor".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "id".to_string(),
+                r#type: 3, // STRING
+                required: false,
+                unique: false,
+            }],
+            computed_properties: vec![],
+            schema_mode: 2, // VALIDATED
+        }))
+        .await
+        .expect("create_label Sensor");
+
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (s:Sensor {id: 'S1'})")
+                .expect("create sensor");
+        }
+
+        // 'readings' is not declared on Sensor (VALIDATED) — deep SET must succeed.
+        let mut db = svc.database.lock().unwrap();
+        let result = db.execute_cypher("MATCH (s:Sensor) SET s.readings.temp = 42 RETURN s.id");
+        assert!(
+            result.is_ok(),
+            "PropertyPath with unknown root on VALIDATED label must succeed, got: {result:?}"
+        );
+    }
+
+    /// SET doc_push(n.unknownList, val) on a VALIDATED label must succeed:
+    /// in VALIDATED mode unknown root properties are accepted.
+    #[tokio::test]
+    async fn validated_mode_doc_function_allows_unknown_root() {
+        let (svc, _dir) = test_service();
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Bin".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "tag".to_string(),
+                r#type: 3, // STRING
+                required: false,
+                unique: false,
+            }],
+            computed_properties: vec![],
+            schema_mode: 2, // VALIDATED
+        }))
+        .await
+        .expect("create_label Bin");
+
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (b:Bin {tag: 'B1'})")
+                .expect("create bin");
+        }
+
+        // 'items' is not declared on Bin (VALIDATED) — doc_push must succeed.
+        let mut db = svc.database.lock().unwrap();
+        let result = db.execute_cypher("MATCH (b:Bin) SET doc_push(b.items, 'x')");
+        assert!(
+            result.is_ok(),
+            "doc_push on unknown root of VALIDATED label must succeed, got: {result:?}"
+        );
+    }
+
+    /// SET n.unknownProp.sub = val ON VIOLATION SKIP on a STRICT label:
+    /// nodes whose PropertyPath violates schema are silently excluded.
+    #[tokio::test]
+    async fn on_violation_skip_with_property_path() {
+        let (svc, _dir) = test_service();
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Relay".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "state".to_string(),
+                r#type: 3, // STRING
+                required: false,
+                unique: false,
+            }],
+            computed_properties: vec![],
+            schema_mode: 1, // STRICT
+        }))
+        .await
+        .expect("create_label Relay");
+
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (r:Relay {state: 'open'})")
+                .expect("create relay");
+            db.execute_cypher("CREATE (r:Relay {state: 'closed'})")
+                .expect("create relay 2");
+        }
+
+        // 'config' is not declared — without SKIP the whole query fails.
+        {
+            let mut db = svc.database.lock().unwrap();
+            let result =
+                db.execute_cypher("MATCH (r:Relay) SET r.config.timeout = 30 RETURN r.state");
+            assert!(
+                result.is_err(),
+                "PropertyPath on unknown root without SKIP must fail"
+            );
+        }
+
+        // With ON VIOLATION SKIP: query succeeds, all violating nodes excluded → empty result.
+        {
+            let mut db = svc.database.lock().unwrap();
+            let rows = db
+                .execute_cypher(
+                    "MATCH (r:Relay) SET r.config.timeout = 30 ON VIOLATION SKIP RETURN r.state",
+                )
+                .expect("ON VIOLATION SKIP must not fail");
+            assert_eq!(
+                rows.len(),
+                0,
+                "all violating Relay nodes skipped → empty result, got: {rows:?}"
+            );
+        }
+
+        // With ON VIOLATION SKIP on a VALID deep path: all nodes updated, all returned.
+        // 'state' is declared — SET r.state = 'on' is Property SET, not PropertyPath.
+        // Use a declared Document property to test the PropertyPath success path properly.
+        // (No Document property declared here, so just verify SKIP on all-fail → empty.)
+    }
 }
