@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish = false
+publish.workspace = true
 
 [dependencies]
 tonic = { version = "0.14", features = ["transport"] }
