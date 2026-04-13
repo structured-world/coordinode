@@ -13,6 +13,7 @@ use std::time::Duration;
 use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalError, ProposalPipeline, RaftProposal,
 };
+use coordinode_storage::engine::config::FlushPolicy;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 
@@ -74,9 +75,12 @@ pub fn to_partition_id(p: Partition) -> PartitionId {
 ///
 /// ## Durability
 ///
-/// Mutations are written to the storage WAL. The `fsync_per_batch` config
-/// governs when the WAL is flushed to disk. With the default
-/// config, durability is guaranteed after `propose_and_wait` returns.
+/// coordinode-lsm-tree has no WAL. Mutations are written to the active
+/// memtable. In cluster mode the Raft log serves as WAL; in standalone mode
+/// the `OwnedLocalProposalPipeline` calls `engine.persist()` after each
+/// proposal when `FlushPolicy::SyncPerBatch` is set (default), which fsyncs
+/// the memtable to SST before returning. Crash-safety window is limited to
+/// the duration of the `persist()` call itself.
 ///
 /// ## Cluster-ready
 ///
@@ -189,6 +193,16 @@ impl ProposalPipeline for OwnedLocalProposalPipeline {
                         .map_err(|e| ProposalError::Storage(e.to_string()))?;
                 }
             }
+        }
+
+        // In standalone mode (no Raft WAL), flush memtable to SST after each
+        // proposal when SyncPerBatch is set. This ensures durability before
+        // returning — a crash after persist() leaves data safely on disk.
+        // Without this, SyncPerBatch was silently ignored in the local pipeline.
+        if self.engine.flush_policy() == FlushPolicy::SyncPerBatch {
+            self.engine
+                .persist()
+                .map_err(|e| ProposalError::Storage(format!("persist failed: {e}")))?;
         }
 
         tracing::debug!(

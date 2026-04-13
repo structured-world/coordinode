@@ -7,6 +7,8 @@ use coordinode_embed::{Database, DatabaseError};
 use coordinode_query::advisor::nplus1::NPlus1Detector;
 use coordinode_query::advisor::source::{self, grpc_keys, SourceContext};
 use coordinode_query::advisor::QueryRegistry;
+use coordinode_raft::cluster::RaftNode;
+use coordinode_raft::read_fence::{ReadConcern, ReadFenceError, ReadPreference};
 
 use crate::proto::{common, query};
 
@@ -131,10 +133,24 @@ fn db_error_to_status(err: DatabaseError) -> Status {
     }
 }
 
+/// Convert a ReadFenceError to a tonic Status.
+fn fence_error_to_status(err: ReadFenceError) -> Status {
+    match err {
+        ReadFenceError::NotFollower => Status::failed_precondition(err.to_string()),
+        ReadFenceError::NotLeader => Status::failed_precondition(err.to_string()),
+        ReadFenceError::LinearizableRequiresLeader => Status::failed_precondition(err.to_string()),
+        ReadFenceError::StaleReplica { .. } => Status::unavailable(err.to_string()),
+        ReadFenceError::Timeout { .. } => Status::deadline_exceeded(err.to_string()),
+        ReadFenceError::Raft(e) => Status::internal(format!("Raft error: {e}")),
+    }
+}
+
 pub struct CypherServiceImpl {
     database: Arc<Mutex<Database>>,
     query_registry: Arc<QueryRegistry>,
     nplus1_detector: Arc<NPlus1Detector>,
+    /// Raft node for read fence (follower reads). `None` in standalone mode.
+    raft_node: Option<Arc<RaftNode>>,
 }
 
 impl CypherServiceImpl {
@@ -147,7 +163,14 @@ impl CypherServiceImpl {
             database,
             query_registry,
             nplus1_detector,
+            raft_node: None,
         }
+    }
+
+    /// Attach a Raft node for read fence enforcement (cluster mode).
+    pub fn with_raft_node(mut self, raft_node: Arc<RaftNode>) -> Self {
+        self.raft_node = Some(raft_node);
+        self
     }
 }
 
@@ -161,6 +184,28 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         let req = request.into_inner();
 
         let start = std::time::Instant::now();
+
+        // --- Read fence: enforce readPreference and readConcern before query ---
+        //
+        // In cluster mode, apply the fence before touching the database.
+        // In standalone mode (raft_node = None), skip — always serves locally.
+        let (applied_index, served_by_leader) = if let Some(ref raft) = self.raft_node {
+            let preference = ReadPreference::from_proto(req.read_preference);
+            // ReadConcern is a proto message with a `level: ReadConcernLevel` field.
+            // Extract the level (i32) and convert to our enum.
+            let concern_level = req.read_concern.as_ref().map(|rc| rc.level).unwrap_or(0);
+            let concern = ReadConcern::from_proto(concern_level);
+            let mut fence = raft.read_fence();
+            fence
+                .apply_default(preference, concern)
+                .await
+                .map_err(fence_error_to_status)?;
+            let idx = fence.applied_index();
+            let is_leader = raft.is_leader().await;
+            (idx, is_leader)
+        } else {
+            (0u64, false)
+        };
 
         // Execute query through the embedded Database engine.
         // Convert proto parameters to Value map for parameter binding.
@@ -248,6 +293,8 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                 edges_deleted: 0,
                 properties_set: 0,
                 execution_time_ms: duration_ms as i64,
+                applied_index,
+                served_by_leader,
             }),
         }))
     }
@@ -421,6 +468,8 @@ mod tests {
         Request::new(query::ExecuteCypherRequest {
             query: q.to_string(),
             parameters: std::collections::HashMap::new(),
+            read_preference: 0, // UNSPECIFIED → Primary
+            read_concern: None, // UNSPECIFIED → Local
         })
     }
 

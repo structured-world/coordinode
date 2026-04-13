@@ -1,5 +1,6 @@
 pub mod cluster;
 pub mod proposal;
+pub mod read_fence;
 pub mod snapshot;
 pub mod storage;
 pub mod wait_majority;
