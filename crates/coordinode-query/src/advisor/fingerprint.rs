@@ -171,7 +171,7 @@ fn write_clause(buf: &mut String, clause: &Clause) {
                 write_expr(buf, expr);
             }
         }
-        Clause::Set(items) => {
+        Clause::Set(items, _violation_mode) => {
             buf.push_str("SET ");
             write_set_items(buf, items);
         }
@@ -575,6 +575,12 @@ fn write_expr(buf: &mut String, expr: &Expr) {
         }
         Expr::PatternPredicate(_) => {
             buf.push_str("PATTERN_PRED");
+        }
+        Expr::Subscript { expr, index } => {
+            write_expr(buf, expr);
+            buf.push('[');
+            write_expr(buf, index);
+            buf.push(']');
         }
     }
 }

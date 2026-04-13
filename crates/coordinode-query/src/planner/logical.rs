@@ -157,6 +157,8 @@ pub enum LogicalOp {
     Update {
         input: Box<LogicalOp>,
         items: Vec<SetItem>,
+        /// How to handle schema violations: fail the query or skip the node.
+        violation_mode: crate::cypher::ast::ViolationMode,
     },
 
     /// Remove properties/labels.
@@ -507,7 +509,11 @@ impl LogicalOp {
                     expr.substitute_params(params);
                 }
             }
-            LogicalOp::Update { input, items } => {
+            LogicalOp::Update {
+                input,
+                items,
+                violation_mode: _,
+            } => {
                 input.substitute_params(params);
                 for item in items {
                     substitute_params_in_set_item(item, params);
@@ -1328,7 +1334,11 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             ));
             explain_op(input, indent + 1, output);
         }
-        LogicalOp::Update { input, items } => {
+        LogicalOp::Update {
+            input,
+            items,
+            violation_mode: _,
+        } => {
             output.push_str(&format!("{prefix}Update({} items)\n", items.len()));
             explain_op(input, indent + 1, output);
         }

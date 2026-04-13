@@ -229,8 +229,8 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             clauses.push(Clause::Delete(dc));
         }
         Rule::set_clause => {
-            let items = build_set_clause(pair)?;
-            clauses.push(Clause::Set(items));
+            let (items, violation_mode) = build_set_clause(pair)?;
+            clauses.push(Clause::Set(items, violation_mode));
         }
         Rule::remove_clause => {
             let items = build_remove_clause(pair)?;
@@ -1137,13 +1137,24 @@ fn build_delete_clause(pair: Pair<'_, Rule>, detach: bool) -> Result<DeleteClaus
     Ok(DeleteClause { detach, exprs })
 }
 
-fn build_set_clause(pair: Pair<'_, Rule>) -> Result<Vec<SetItem>, ParseError> {
+fn build_set_clause(pair: Pair<'_, Rule>) -> Result<(Vec<SetItem>, ViolationMode), ParseError> {
+    let mut items = None;
+    let mut mode = ViolationMode::Fail;
     for inner in pair.into_inner() {
-        if inner.as_rule() == Rule::set_items {
-            return build_set_items(inner);
+        match inner.as_rule() {
+            Rule::set_items => {
+                items = Some(build_set_items(inner)?);
+            }
+            Rule::on_violation_skip => {
+                mode = ViolationMode::Skip;
+            }
+            _ => {}
         }
     }
-    Err(ParseError::Invalid("SET clause missing items".into()))
+    match items {
+        Some(i) => Ok((i, mode)),
+        None => Err(ParseError::Invalid("SET clause missing items".into())),
+    }
 }
 
 fn build_set_items(pair: Pair<'_, Rule>) -> Result<Vec<SetItem>, ParseError> {
@@ -1392,6 +1403,7 @@ fn build_expression(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
         Rule::comparison => build_comparison(pair),
         Rule::addition | Rule::multiplication => build_binary_chain(pair),
         Rule::unary => build_unary(pair),
+        Rule::postfix => build_postfix(pair),
         Rule::atom => build_atom(pair),
         Rule::property_or_variable => build_property_or_variable(pair),
         Rule::function_call => build_function_call(pair),
@@ -1675,10 +1687,10 @@ fn build_comparison_tail(left: Expr, tail: Pair<'_, Rule>) -> Result<Expr, Parse
 }
 
 fn build_unary(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
-    // `unary = { "-" ~ unary | atom }`
+    // `unary = { "-" ~ unary | postfix }`
     // In pest, "-" is a string literal — not a named rule, so no pair for it.
     // If negation matched: inner = [unary] (the nested unary after "-")
-    // If atom matched: inner = [atom]
+    // If postfix matched: inner = [postfix]
     // We distinguish by the rule of the single child.
     let child = first_inner(pair)?;
 
@@ -1692,6 +1704,33 @@ fn build_unary(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
     } else {
         build_expression(child)
     }
+}
+
+/// Build a postfix expression: `atom ("[" expression "]")*`
+///
+/// Handles zero or more subscript accesses chained after an atom:
+/// - `list[0]`         → `Subscript { expr: list, index: 0 }`
+/// - `labels(n)[0]`    → `Subscript { expr: labels(n), index: 0 }`
+/// - `matrix[0][1]`    → nested Subscript
+///
+/// In pest, string literals `[` and `]` are consumed without producing pairs,
+/// so `postfix`'s inner pairs are: `[atom, expression₁, expression₂, ...]`.
+fn build_postfix(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
+    let mut inner = pair.into_inner();
+    let atom_pair = inner
+        .next()
+        .ok_or_else(|| ParseError::Invalid("postfix: missing atom".into()))?;
+    let mut expr = build_expression(atom_pair)?;
+
+    // Each remaining pair is an index expression (the content between `[` and `]`).
+    for index_pair in inner {
+        let index = build_expression(index_pair)?;
+        expr = Expr::Subscript {
+            expr: Box::new(expr),
+            index: Box::new(index),
+        };
+    }
+    Ok(expr)
 }
 
 fn build_atom(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
@@ -2800,7 +2839,7 @@ mod tests {
     #[test]
     fn set_property() {
         let q = parse_ok("MATCH (n:User {id: 42}) SET n.name = 'Bob'");
-        if let Clause::Set(ref items) = q.clauses[1] {
+        if let Clause::Set(ref items, _) = q.clauses[1] {
             assert_eq!(items.len(), 1);
             assert!(matches!(
                 items[0],
@@ -2818,7 +2857,7 @@ mod tests {
     #[test]
     fn set_multiple_properties() {
         let q = parse_ok("MATCH (n) SET n.name = 'Bob', n.age = 30");
-        if let Clause::Set(ref items) = q.clauses[1] {
+        if let Clause::Set(ref items, _) = q.clauses[1] {
             assert_eq!(items.len(), 2);
         } else {
             panic!("expected SET clause");
@@ -2828,7 +2867,7 @@ mod tests {
     #[test]
     fn set_merge_properties() {
         let q = parse_ok("MATCH (n) SET n += {name: 'Bob', age: 30}");
-        if let Clause::Set(ref items) = q.clauses[1] {
+        if let Clause::Set(ref items, _) = q.clauses[1] {
             assert!(matches!(items[0], SetItem::MergeProperties { .. }));
         } else {
             panic!("expected SET clause");
@@ -2838,7 +2877,7 @@ mod tests {
     #[test]
     fn set_replace_properties() {
         let q = parse_ok("MATCH (n) SET n = {name: 'Bob'}");
-        if let Clause::Set(ref items) = q.clauses[1] {
+        if let Clause::Set(ref items, _) = q.clauses[1] {
             assert!(matches!(items[0], SetItem::ReplaceProperties { .. }));
         } else {
             panic!("expected SET clause");
@@ -2848,7 +2887,7 @@ mod tests {
     #[test]
     fn set_label() {
         let q = parse_ok("MATCH (n) SET n:Admin");
-        if let Clause::Set(ref items) = q.clauses[1] {
+        if let Clause::Set(ref items, _) = q.clauses[1] {
             assert!(matches!(
                 items[0],
                 SetItem::AddLabel {
@@ -2865,7 +2904,7 @@ mod tests {
     #[test]
     fn set_property_path_deep() {
         let q = parse_ok("MATCH (n) SET n.config.network.ssid = 'home'");
-        if let Clause::Set(ref items) = q.clauses[1] {
+        if let Clause::Set(ref items, _) = q.clauses[1] {
             assert_eq!(items.len(), 1);
             assert!(matches!(
                 items[0],
@@ -2884,7 +2923,7 @@ mod tests {
     fn set_property_path_two_levels_is_property() {
         // Two-level path (n.name) should still be SetItem::Property, not PropertyPath.
         let q = parse_ok("MATCH (n) SET n.name = 'Alice'");
-        if let Clause::Set(ref items) = q.clauses[1] {
+        if let Clause::Set(ref items, _) = q.clauses[1] {
             assert!(matches!(items[0], SetItem::Property { .. }));
         } else {
             panic!("expected SET clause");
@@ -2894,7 +2933,7 @@ mod tests {
     #[test]
     fn set_multiple_with_path() {
         let q = parse_ok("MATCH (n) SET n.config.network.ssid = 'home', n.name = 'Alice'");
-        if let Clause::Set(ref items) = q.clauses[1] {
+        if let Clause::Set(ref items, _) = q.clauses[1] {
             assert_eq!(items.len(), 2);
             assert!(matches!(items[0], SetItem::PropertyPath { .. }));
             assert!(matches!(items[1], SetItem::Property { .. }));
@@ -2908,7 +2947,7 @@ mod tests {
     #[test]
     fn set_doc_push() {
         let q = parse_ok("MATCH (n) SET doc_push(n.tags, 'new')");
-        if let Clause::Set(ref items) = q.clauses[1] {
+        if let Clause::Set(ref items, _) = q.clauses[1] {
             assert!(matches!(
                 items[0],
                 SetItem::DocFunction {
@@ -2926,7 +2965,7 @@ mod tests {
     #[test]
     fn set_doc_inc_nested_path() {
         let q = parse_ok("MATCH (n) SET doc_inc(n.stats.views, 1)");
-        if let Clause::Set(ref items) = q.clauses[1] {
+        if let Clause::Set(ref items, _) = q.clauses[1] {
             assert!(matches!(
                 items[0],
                 SetItem::DocFunction {
@@ -2944,7 +2983,7 @@ mod tests {
     #[test]
     fn set_multiple_doc_functions() {
         let q = parse_ok("MATCH (n) SET doc_push(n.tags, 'a'), doc_add_to_set(n.labels, 'b')");
-        if let Clause::Set(ref items) = q.clauses[1] {
+        if let Clause::Set(ref items, _) = q.clauses[1] {
             assert_eq!(items.len(), 2);
             assert!(
                 matches!(items[0], SetItem::DocFunction { ref function, .. } if function == "doc_push")
@@ -3056,7 +3095,7 @@ mod tests {
     fn match_set_return() {
         let q = parse_ok("MATCH (n:User {id: $id}) SET n.name = $name, n.updated = $now RETURN n");
         assert!(matches!(q.clauses[0], Clause::Match(_)));
-        assert!(matches!(q.clauses[1], Clause::Set(_)));
+        assert!(matches!(q.clauses[1], Clause::Set(_, _)));
         assert!(matches!(q.clauses[2], Clause::Return(_)));
     }
 
@@ -3556,5 +3595,80 @@ mod tests {
             matches!(q.clauses[0], Clause::Create(_)),
             "regular CREATE should still parse as Clause::Create"
         );
+    }
+
+    #[test]
+    fn subscript_access_on_function_call() {
+        // labels(n)[0] → Subscript { expr: FunctionCall("labels", [Variable("n")]), index: Literal(0) }
+        let q = parse_ok("MATCH (n) RETURN labels(n)[0] AS lbl");
+        if let Clause::Return(ref rc) = q.clauses[1] {
+            if let Expr::Subscript {
+                ref expr,
+                ref index,
+            } = rc.items[0].expr
+            {
+                assert!(
+                    matches!(**expr, Expr::FunctionCall { ref name, .. } if name == "labels"),
+                    "base must be FunctionCall(labels), got {expr:?}"
+                );
+                assert_eq!(**index, Expr::Literal(Value::Int(0)), "index must be 0");
+            } else {
+                panic!("expected Subscript expr, got {:?}", rc.items[0].expr);
+            }
+        } else {
+            panic!("expected RETURN clause at index 1");
+        }
+    }
+
+    #[test]
+    fn subscript_access_on_list_literal() {
+        // [1, 2, 3][1] → Subscript { expr: List([1,2,3]), index: Literal(1) }
+        let q = parse_ok("RETURN [1, 2, 3][1] AS x");
+        if let Clause::Return(ref rc) = q.clauses[0] {
+            assert!(
+                matches!(rc.items[0].expr, Expr::Subscript { .. }),
+                "expected Subscript, got {:?}",
+                rc.items[0].expr
+            );
+        } else {
+            panic!("expected RETURN clause");
+        }
+    }
+
+    #[test]
+    fn chained_subscript_access() {
+        // matrix[0][1] → Subscript { Subscript { Variable("matrix"), 0 }, 1 }
+        let q = parse_ok("RETURN matrix[0][1] AS v");
+        if let Clause::Return(ref rc) = q.clauses[0] {
+            if let Expr::Subscript {
+                ref expr,
+                ref index,
+            } = rc.items[0].expr
+            {
+                assert_eq!(**index, Expr::Literal(Value::Int(1)));
+                assert!(
+                    matches!(**expr, Expr::Subscript { .. }),
+                    "inner must also be Subscript, got {expr:?}"
+                );
+            } else {
+                panic!("expected outer Subscript, got {:?}", rc.items[0].expr);
+            }
+        }
+    }
+
+    #[test]
+    fn on_violation_skip_parsed() {
+        // SET ... ON VIOLATION SKIP should set ViolationMode::Skip.
+        let q = parse_ok("MATCH (n:X) SET n.y = 1 ON VIOLATION SKIP");
+        if let Clause::Set(_, violation_mode) = &q.clauses[1] {
+            use crate::cypher::ast::ViolationMode;
+            assert_eq!(
+                *violation_mode,
+                ViolationMode::Skip,
+                "ON VIOLATION SKIP should set Skip mode"
+            );
+        } else {
+            panic!("expected Clause::Set at index 1, got {:?}", q.clauses[1]);
+        }
     }
 }

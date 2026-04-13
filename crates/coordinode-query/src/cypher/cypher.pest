@@ -228,7 +228,8 @@ expression_list = { expression ~ ("," ~ expression)* }
 
 // --- SET ---
 
-set_clause = { kw_set ~ set_items }
+set_clause = { kw_set ~ set_items ~ on_violation_skip? }
+on_violation_skip = { kw_on ~ kw_violation ~ kw_skip }
 set_items  = { set_item ~ ("," ~ set_item)* }
 
 set_item = {
@@ -304,7 +305,11 @@ add_op   = { "+" | "-" }
 multiplication = { unary ~ ((mul_op) ~ unary)* }
 mul_op         = { "*" | "/" | "%" }
 
-unary = { "-" ~ unary | atom }
+unary = { "-" ~ unary | postfix }
+
+// postfix: atom optionally followed by one or more subscript accesses: expr[index]
+// Supports: labels(n)[0], list[i], map["key"], nested[0][1], etc.
+postfix = { atom ~ ("[" ~ expression ~ "]")* }
 
 atom = {
     function_call
@@ -418,6 +423,7 @@ kw_detach     = @{ ^"detach" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_set        = @{ ^"set" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_remove     = @{ ^"remove" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_on         = @{ ^"on" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_violation  = @{ ^"violation" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_upsert     = @{ ^"upsert" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_call       = @{ ^"call" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_yield      = @{ ^"yield" ~ !(ASCII_ALPHANUMERIC | "_") }
