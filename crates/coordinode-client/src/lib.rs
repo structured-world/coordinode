@@ -344,4 +344,14 @@ mod tests {
         let loc = simulate_execute(false);
         assert!(loc.is_none());
     }
+
+    /// invalid endpoint URI returns ClientError::InvalidEndpoint, not a panic.
+    #[tokio::test]
+    async fn connect_invalid_endpoint_returns_error() {
+        let result = CoordinodeClient::connect("not a valid uri !!!").await;
+        assert!(
+            matches!(result, Err(ClientError::InvalidEndpoint(_))),
+            "expected InvalidEndpoint error"
+        );
+    }
 }

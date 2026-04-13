@@ -572,6 +572,72 @@ mod tests {
         assert_eq!(src.call_count, 1);
     }
 
+    /// End-to-end: source tracking works when query has parameters
+    /// (the `has_params=true, source_ctx=Some` branch in execute_cypher).
+    #[tokio::test]
+    async fn grpc_source_tracking_with_params_round_trip() {
+        use tokio::net::TcpListener;
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database = Arc::new(Mutex::new(
+            Database::open(dir.path()).expect("open database"),
+        ));
+        let registry = Arc::new(QueryRegistry::new());
+        let detector = Arc::new(NPlus1Detector::new());
+        let svc = CypherServiceImpl::new(
+            Arc::clone(&database),
+            Arc::clone(&registry),
+            Arc::clone(&detector),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local_addr");
+        let incoming = TcpListenerStream::new(listener);
+
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    crate::proto::query::cypher_service_server::CypherServiceServer::new(svc),
+                )
+                .serve_with_incoming(incoming)
+                .await
+                .expect("server error");
+        });
+
+        let mut client = coordinode_client::CoordinodeClient::builder(format!("http://{addr}"))
+            .debug_source_tracking(true)
+            .app_name("param-service")
+            .build()
+            .await
+            .expect("connect");
+
+        // Execute with parameters — exercises the (Some(src), true) branch.
+        let mut params = std::collections::HashMap::new();
+        params.insert(
+            "name".to_string(),
+            coordinode_client::Value::String("Bob".to_string()),
+        );
+        client
+            .execute_cypher_with_params("CREATE (n:Person {name: $name})", params)
+            .await
+            .expect("execute_cypher_with_params");
+
+        let top = registry.top_by_count(10);
+        assert_eq!(top.len(), 1, "one fingerprint should be recorded");
+        let src = &top[0].sources[0];
+        assert!(
+            src.file.contains("cypher.rs"),
+            "source file should be cypher.rs, got: {}",
+            src.file
+        );
+        assert!(src.line > 0);
+        assert_eq!(src.app, "param-service");
+        assert_eq!(src.call_count, 1);
+    }
+
     /// gRPC execute_cypher records execution time > 0.
     #[tokio::test]
     async fn grpc_execute_records_timing() {
