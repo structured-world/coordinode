@@ -17,6 +17,7 @@ use coordinode_core::graph::node::NodeIdAllocator;
 use coordinode_core::graph::node::{encode_node_key, NodeId, NodeRecord};
 use coordinode_core::graph::types::{Value, VectorConsistencyMode, VectorMvccStats};
 use coordinode_core::schema::definition::{encode_label_schema_key, LabelSchema, SchemaMode};
+use coordinode_core::schema::validation::validate_one;
 use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
@@ -4906,8 +4907,10 @@ fn execute_create_node(
                                 "cannot SET computed property '{prop_name}'"
                             )));
                         }
-                        Some(_) => {
-                            // Declared non-computed property → intern and set.
+                        Some(def) => {
+                            // Declared non-computed property → validate type, then intern and set.
+                            validate_one(prop_name, &val, def)
+                                .map_err(|e| ExecutionError::SchemaViolation(e.to_string()))?;
                             let field_id = ctx.interner.intern(prop_name);
                             record.set(field_id, val.clone());
                         }
@@ -4930,7 +4933,10 @@ fn execute_create_node(
                                 "cannot SET computed property '{prop_name}'"
                             )));
                         }
-                        Some(_) => {
+                        Some(def) => {
+                            // Declared non-computed property → validate type, then intern and set.
+                            validate_one(prop_name, &val, def)
+                                .map_err(|e| ExecutionError::SchemaViolation(e.to_string()))?;
                             let field_id = ctx.interner.intern(prop_name);
                             record.set(field_id, val.clone());
                         }
@@ -5149,7 +5155,12 @@ fn execute_update(
                                             "cannot SET computed property '{property}'"
                                         )));
                                     }
-                                    Some(_) => {}
+                                    Some(def) => {
+                                        // Validate type for declared property.
+                                        validate_one(property, &val, def).map_err(|e| {
+                                            ExecutionError::SchemaViolation(e.to_string())
+                                        })?;
+                                    }
                                 },
                                 SchemaMode::Validated => {
                                     if let Some(def) = ls.get_property(property) {
@@ -5158,6 +5169,10 @@ fn execute_update(
                                                 "cannot SET computed property '{property}'"
                                             )));
                                         }
+                                        // Validate type for declared property.
+                                        validate_one(property, &val, def).map_err(|e| {
+                                            ExecutionError::SchemaViolation(e.to_string())
+                                        })?;
                                     }
                                 }
                                 SchemaMode::Flexible => {}

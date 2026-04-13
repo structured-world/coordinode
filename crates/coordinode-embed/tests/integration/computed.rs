@@ -8,7 +8,7 @@
 
 use coordinode_core::graph::types::Value;
 use coordinode_core::schema::computed::{ComputedSpec, DecayFormula, TtlScope};
-use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
+use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
 use coordinode_embed::Database;
 
 fn open_db() -> (Database, tempfile::TempDir) {
@@ -19,7 +19,9 @@ fn open_db() -> (Database, tempfile::TempDir) {
 
 /// Helper: create a schema with COMPUTED properties and persist it.
 fn setup_memory_schema(db: &mut Database) {
+    // FLEXIBLE: tests exercise computed property semantics, not schema enforcement.
     let mut schema = LabelSchema::new("Memory");
+    schema.set_mode(SchemaMode::Flexible);
     schema.add_property(PropertyDef::new("content", PropertyType::String).not_null());
     schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
     schema.add_property(PropertyDef::computed(
@@ -343,7 +345,9 @@ fn computed_ttl_field_removal_survives_reopen() {
         let mut db = Database::open(dir.path()).expect("open");
 
         // TTL schema with Field scope, 1-second TTL.
+        // FLEXIBLE: test exercises TTL semantics, not schema enforcement.
         let mut schema = LabelSchema::new("CacheEntry");
+        schema.set_mode(SchemaMode::Flexible);
         schema.add_property(PropertyDef::new("data", PropertyType::String));
         schema.add_property(PropertyDef::new("cached_at", PropertyType::Timestamp));
         schema.add_property(PropertyDef::computed(
@@ -500,7 +504,9 @@ fn computed_ttl_reaper_via_pipeline() {
 
 /// Helper: create a schema with VECTOR_DECAY + embedding for decay-weighted vector tests.
 fn setup_vector_decay_schema(db: &mut Database) {
+    // FLEXIBLE: test exercises vector decay semantics, not schema enforcement.
     let mut schema = LabelSchema::new("Article");
+    schema.set_mode(SchemaMode::Flexible);
     schema.add_property(PropertyDef::new("title", PropertyType::String));
     schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
     schema.add_property(PropertyDef::new(
@@ -735,7 +741,9 @@ fn vector_decay_exponential_formula() {
     let (mut db, _dir) = open_db();
 
     // Exponential with lambda = ln(2) ≈ 0.693 → half-life at t=1.0 gives e^(-0.693) ≈ 0.5
+    // FLEXIBLE: test exercises exponential decay formula, not schema enforcement.
     let mut schema = LabelSchema::new("ExpArticle");
+    schema.set_mode(SchemaMode::Flexible);
     schema.add_property(PropertyDef::new("title", PropertyType::String));
     schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
     schema.add_property(PropertyDef::new(
@@ -922,7 +930,9 @@ fn explain_shows_decay_annotation() {
 fn vector_decay_step_formula() {
     let (mut db, _dir) = open_db();
 
+    // FLEXIBLE: test exercises step formula semantics, not schema enforcement.
     let mut schema = LabelSchema::new("StepArticle");
+    schema.set_mode(SchemaMode::Flexible);
     schema.add_property(PropertyDef::new("title", PropertyType::String));
     schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
     schema.add_property(PropertyDef::new(
@@ -988,7 +998,9 @@ fn vector_decay_power_law_formula() {
 
     // PowerLaw: (1 + t/0.5)^(-1.0)
     // At t=1.0 (full duration): (1 + 1.0/0.5)^(-1) = (3)^(-1) = 0.333
+    // FLEXIBLE: test exercises power-law formula semantics, not schema enforcement.
     let mut schema = LabelSchema::new("PLArticle");
+    schema.set_mode(SchemaMode::Flexible);
     schema.add_property(PropertyDef::new("title", PropertyType::String));
     schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
     schema.add_property(PropertyDef::new(
@@ -1228,7 +1240,9 @@ fn computed_ttl_subtree_removes_anchor_preserves_document() {
     let (mut db, _dir) = open_db();
 
     // Schema with TTL scope=Subtree and short duration.
+    // FLEXIBLE: test exercises TTL subtree semantics, not schema enforcement.
     let mut schema = LabelSchema::new("CachedDoc");
+    schema.set_mode(SchemaMode::Flexible);
     schema.add_property(PropertyDef::new("title", PropertyType::String).not_null());
     schema.add_property(PropertyDef::new("cached_at", PropertyType::Timestamp));
     schema.add_property(PropertyDef::new("payload", PropertyType::Document));
@@ -1371,7 +1385,9 @@ fn computed_ttl_subtree_target_field_deletes_target_not_anchor() {
     let (mut db, _dir) = open_db();
 
     // Schema: TTL triggers on cached_at, but expires the payload DOCUMENT field.
+    // FLEXIBLE: test exercises TTL subtree target_field semantics, not schema enforcement.
     let mut schema = LabelSchema::new("PrivateDoc");
+    schema.set_mode(SchemaMode::Flexible);
     schema.add_property(PropertyDef::new("title", PropertyType::String).not_null());
     schema.add_property(PropertyDef::new("cached_at", PropertyType::Timestamp));
     schema.add_property(PropertyDef::new("payload", PropertyType::Document));

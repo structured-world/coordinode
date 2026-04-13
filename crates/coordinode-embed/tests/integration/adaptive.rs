@@ -166,12 +166,14 @@ fn parallel_single_hop_edge_properties() {
 #[test]
 fn parallel_traversal_injects_computed_properties() {
     use coordinode_core::schema::computed::{ComputedSpec, DecayFormula};
-    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
 
     let (mut db, _dir) = open_db();
 
-    // Create schema with COMPUTED Decay property
+    // Create schema with COMPUTED Decay property.
+    // FLEXIBLE: test exercises computed property semantics, not schema enforcement.
     let mut schema = LabelSchema::new("Memory");
+    schema.set_mode(SchemaMode::Flexible);
     schema.add_property(PropertyDef::new("content", PropertyType::String));
     schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
     schema.add_property(PropertyDef::computed(

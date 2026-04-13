@@ -119,6 +119,19 @@ fn value_matches_type(value: &Value, expected: &PropertyType) -> bool {
     }
 }
 
+/// Validate a single property value against its schema definition.
+///
+/// Called per-property at write time in STRICT and VALIDATED modes. Checks type
+/// compatibility, NOT NULL constraints, vector dimensions, and array homogeneity.
+/// Returns the first validation error found for this property.
+pub fn validate_one(
+    prop_name: &str,
+    value: &Value,
+    def: &PropertyDef,
+) -> Result<(), ValidationError> {
+    validate_property(prop_name, value, def)
+}
+
 /// Validate a single property value against its definition.
 fn validate_property(
     prop_name: &str,

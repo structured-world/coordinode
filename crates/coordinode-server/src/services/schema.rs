@@ -798,7 +798,7 @@ mod tests {
                 scope: 3, // NODE
                 ..Default::default()
             }],
-            schema_mode: 0, // UNSPECIFIED → STRICT
+            schema_mode: 3, // FLEXIBLE — test exercises TTL reaper, not schema enforcement
         }))
         .await
         .expect("create_label with TTL should succeed");
@@ -822,7 +822,7 @@ mod tests {
                     scope: 3,
                     ..Default::default()
                 }],
-                schema_mode: 0, // UNSPECIFIED → STRICT
+                schema_mode: 3, // FLEXIBLE — test exercises TTL reaper, not schema enforcement
             }))
             .await
             .expect("create_label should succeed");
@@ -1182,5 +1182,116 @@ mod tests {
             event.schema_mode, 2,
             "list_labels must return schema_mode=VALIDATED(2) for Event"
         );
+    }
+
+    /// STRICT label rejects type mismatch at CREATE time.
+    ///
+    /// Regression: type validation for declared properties must be applied at
+    /// write time in STRICT mode, not silently stored with wrong type.
+    #[tokio::test]
+    async fn strict_mode_create_type_mismatch_rejected() {
+        let (svc, _dir) = test_service();
+
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Sensor".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "reading".to_string(),
+                r#type: 2, // FLOAT64
+                required: false,
+                unique: false,
+            }],
+            computed_properties: vec![],
+            schema_mode: 1, // STRICT
+        }))
+        .await
+        .expect("create_label should succeed");
+
+        // CREATE with wrong type for declared property — must be rejected.
+        let mut db = svc.database.lock().unwrap();
+        let result = db.execute_cypher("CREATE (s:Sensor {reading: 'not_a_float'})");
+        assert!(
+            result.is_err(),
+            "CREATE with type mismatch must be rejected in STRICT mode, got: {result:?}"
+        );
+    }
+
+    /// VALIDATED label enforces type for declared properties but accepts undeclared.
+    ///
+    /// Regression: VALIDATED mode = "type-check declared, accept undeclared".
+    /// Type mismatch on a declared property must be rejected; extra property accepted.
+    #[tokio::test]
+    async fn validated_mode_type_mismatch_rejected_but_extra_accepted() {
+        let (svc, _dir) = test_service();
+
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Log".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "level".to_string(),
+                r#type: 1, // INT64
+                required: false,
+                unique: false,
+            }],
+            computed_properties: vec![],
+            schema_mode: 2, // VALIDATED
+        }))
+        .await
+        .expect("create_label should succeed");
+
+        {
+            let mut db = svc.database.lock().unwrap();
+
+            // Type mismatch on declared property — must be rejected even in VALIDATED.
+            let result = db.execute_cypher("CREATE (l:Log {level: 'warn'})");
+            assert!(
+                result.is_err(),
+                "type mismatch on declared property must be rejected in VALIDATED mode"
+            );
+
+            // Undeclared property — must be accepted in VALIDATED mode.
+            db.execute_cypher("CREATE (l:Log {level: 5, extra_tag: 'deployment'})")
+                .expect("CREATE with undeclared property must succeed in VALIDATED mode");
+        }
+    }
+
+    /// CREATE with an undeclared property on a STRICT label is rejected.
+    ///
+    /// Regression: schema enforcement must trigger at CREATE time, not only at SET
+    /// time. STRICT mode means "no write path allows undeclared properties".
+    #[tokio::test]
+    async fn strict_mode_create_with_unknown_property_rejected() {
+        let (svc, _dir) = test_service();
+
+        // Declare Product label with STRICT mode; only `sku` declared.
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Product".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "sku".to_string(),
+                r#type: 3, // STRING
+                required: false,
+                unique: false,
+            }],
+            computed_properties: vec![],
+            schema_mode: 1, // STRICT
+        }))
+        .await
+        .expect("create_label should succeed");
+
+        // CREATE with only the declared property — must succeed.
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (p:Product {sku: 'SKU-001'})")
+                .expect("CREATE with declared property must succeed on STRICT label");
+        }
+
+        // CREATE with an undeclared property — must be rejected.
+        {
+            let mut db = svc.database.lock().unwrap();
+            let result =
+                db.execute_cypher("CREATE (p:Product {sku: 'SKU-002', extra_field: 'forbidden'})");
+            assert!(
+                result.is_err(),
+                "CREATE with undeclared property must be rejected on STRICT label, got: {result:?}"
+            );
+        }
     }
 }
