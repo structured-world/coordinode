@@ -47,6 +47,8 @@ tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+coordinode-client = { workspace = true }
+tokio-stream = "0.1"
 
 [lints]
 workspace = true
