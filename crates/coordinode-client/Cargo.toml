@@ -1,0 +1,26 @@
+[package]
+name = "coordinode-client"
+description = "Official Rust client for CoordiNode — gRPC driver with source location tracking"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

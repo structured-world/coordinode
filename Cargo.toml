@@ -11,6 +11,7 @@ members = [
     "crates/coordinode-server",
     "crates/coordinode-s3",
     "crates/coordinode-embed",
+    "crates/coordinode-client",
 ]
 
 [workspace.package]
@@ -96,6 +97,7 @@ coordinode-auth = { path = "crates/coordinode-auth", version = "0.3.8" }
 coordinode-server = { path = "crates/coordinode-server", version = "0.3.8" }
 coordinode-s3 = { path = "crates/coordinode-s3", version = "0.3.8" }
 coordinode-embed = { path = "crates/coordinode-embed", version = "0.3.8" }
+coordinode-client = { path = "crates/coordinode-client", version = "0.3.8" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

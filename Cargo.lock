@@ -702,6 +702,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "coordinode-client"
+version = "0.3.8"
+dependencies = [
+ "prost",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "coordinode-core"
 version = "0.3.8"
 dependencies = [

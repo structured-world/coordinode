@@ -32,8 +32,35 @@ hits = client.vector_search(
 )
 ```
 
+## Source Location Tracking
+
+Enable `debug_source_tracking` in development to let the Query Advisor map slow-query suggestions to exact call sites in your application.
+
+```python
+from coordinode import CoordinodeClient
+
+client = CoordinodeClient(
+    "localhost:7080",
+    debug_source_tracking=True,
+    app_name="my-service",
+    app_version="1.2.3",
+)
+
+# Every query call automatically attaches the call site to the request.
+# The server will record:
+#   x-source-file: "api/handlers/feed.py"
+#   x-source-line: "47"
+#   x-source-app:  "my-service"
+results = client.cypher("MATCH (u:User)-[:FOLLOWS]->(f) RETURN f LIMIT 10")
+```
+
+Source tracking uses Python's `inspect.stack()` to read the immediate caller's file and line number. The overhead is negligible and is zero when `debug_source_tracking=False`.
+
+> **Recommendation:** Enable in development and staging; disable in production.
+
 ## See Also
 
+- [TypeScript SDK](/sdk/typescript) — Node.js gRPC client
 - [LlamaIndex integration](/sdk/llama-index) — PropertyGraphIndex with CoordiNode backend
 - [LangChain integration](/sdk/langchain) — GraphCypherQAChain
 - [GitHub: structured-world/coordinode-python](https://github.com/structured-world/coordinode-python)
