@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status};
 
 use coordinode_core::graph::types::{Value, VectorMetric};
+use coordinode_core::schema::computed::{ComputedSpec, DecayFormula, TtlScope};
 use coordinode_core::schema::definition::{EdgeTypeSchema, LabelSchema, PropertyDef, PropertyType};
 use coordinode_embed::Database;
 use coordinode_storage::engine::partition::Partition;
@@ -32,6 +33,168 @@ fn proto_type_to_property_type(t: i32) -> PropertyType {
         8 => PropertyType::Array(Box::new(PropertyType::String)),
         9 => PropertyType::Map,
         _ => PropertyType::String, // UNSPECIFIED → String (most permissive)
+    }
+}
+
+/// Convert a proto `ComputedPropertyDefinition` to an internal `ComputedSpec`.
+///
+/// Returns `Err(Status::invalid_argument)` if required fields are missing or
+/// the computed_type is UNSPECIFIED.
+fn proto_to_computed_spec(def: &graph::ComputedPropertyDefinition) -> Result<ComputedSpec, Status> {
+    let computed_type = def.computed_type;
+    let formula_type = def.formula_type;
+
+    let formula = match formula_type {
+        // 0 = UNSPECIFIED → default to Linear (acceptable for TTL where formula is unused)
+        0 | 1 => DecayFormula::Linear,
+        2 => DecayFormula::Exponential { lambda: def.lambda },
+        3 => DecayFormula::PowerLaw {
+            tau: def.tau,
+            alpha: def.alpha,
+        },
+        4 => DecayFormula::Step,
+        _ => {
+            return Err(Status::invalid_argument(format!(
+                "unknown decay_formula_type: {formula_type}"
+            )));
+        }
+    };
+
+    let anchor = def.anchor_field.clone();
+    if anchor.is_empty() {
+        return Err(Status::invalid_argument(
+            "computed_property: anchor_field must not be empty",
+        ));
+    }
+    if def.duration_secs == 0 {
+        return Err(Status::invalid_argument(
+            "computed_property: duration_secs must be > 0",
+        ));
+    }
+
+    match computed_type {
+        1 => {
+            // TTL
+            let scope = match def.scope {
+                0 | 3 => TtlScope::Node, // UNSPECIFIED defaults to Node
+                1 => TtlScope::Field,
+                2 => TtlScope::Subtree,
+                _ => {
+                    return Err(Status::invalid_argument(format!(
+                        "unknown ttl_scope: {}",
+                        def.scope
+                    )));
+                }
+            };
+            let target_field = if def.target_field.is_empty() {
+                None
+            } else {
+                Some(def.target_field.clone())
+            };
+            Ok(ComputedSpec::Ttl {
+                duration_secs: def.duration_secs,
+                anchor_field: anchor,
+                scope,
+                target_field,
+            })
+        }
+        2 => {
+            // Decay
+            Ok(ComputedSpec::Decay {
+                formula,
+                initial: def.initial,
+                target: def.target,
+                duration_secs: def.duration_secs,
+                anchor_field: anchor,
+            })
+        }
+        3 => {
+            // VectorDecay
+            Ok(ComputedSpec::VectorDecay {
+                formula,
+                duration_secs: def.duration_secs,
+                anchor_field: anchor,
+            })
+        }
+        0 => Err(Status::invalid_argument(
+            "computed_property: computed_type must not be UNSPECIFIED",
+        )),
+        _ => Err(Status::invalid_argument(format!(
+            "unknown computed_type: {computed_type}"
+        ))),
+    }
+}
+
+/// Convert an internal `ComputedSpec` to a proto `ComputedPropertyDefinition`.
+fn computed_spec_to_proto(name: &str, spec: &ComputedSpec) -> graph::ComputedPropertyDefinition {
+    let mut def = graph::ComputedPropertyDefinition {
+        name: name.to_string(),
+        ..Default::default()
+    };
+
+    match spec {
+        ComputedSpec::Ttl {
+            duration_secs,
+            anchor_field,
+            scope,
+            target_field,
+        } => {
+            def.computed_type = 1; // TTL
+            def.duration_secs = *duration_secs;
+            def.anchor_field = anchor_field.clone();
+            def.scope = match scope {
+                TtlScope::Field => 1,
+                TtlScope::Subtree => 2,
+                TtlScope::Node => 3,
+            };
+            def.target_field = target_field.clone().unwrap_or_default();
+        }
+        ComputedSpec::Decay {
+            formula,
+            initial,
+            target,
+            duration_secs,
+            anchor_field,
+        } => {
+            def.computed_type = 2; // Decay
+            def.duration_secs = *duration_secs;
+            def.anchor_field = anchor_field.clone();
+            def.initial = *initial;
+            def.target = *target;
+            set_formula_fields(&mut def, formula);
+        }
+        ComputedSpec::VectorDecay {
+            formula,
+            duration_secs,
+            anchor_field,
+        } => {
+            def.computed_type = 3; // VectorDecay
+            def.duration_secs = *duration_secs;
+            def.anchor_field = anchor_field.clone();
+            set_formula_fields(&mut def, formula);
+        }
+    }
+
+    def
+}
+
+fn set_formula_fields(def: &mut graph::ComputedPropertyDefinition, formula: &DecayFormula) {
+    match formula {
+        DecayFormula::Linear => {
+            def.formula_type = 1;
+        }
+        DecayFormula::Exponential { lambda } => {
+            def.formula_type = 2;
+            def.lambda = *lambda;
+        }
+        DecayFormula::PowerLaw { tau, alpha } => {
+            def.formula_type = 3;
+            def.tau = *tau;
+            def.alpha = *alpha;
+        }
+        DecayFormula::Step => {
+            def.formula_type = 4;
+        }
     }
 }
 
@@ -83,6 +246,17 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
             schema.add_property(prop);
         }
 
+        // Wire COMPUTED property specs into the schema.
+        // TtlReaper picks up TTL specs automatically; DECAY/VECTOR_DECAY are
+        // evaluated inline at query time during MATCH/RETURN execution.
+        let mut echo_computed: Vec<graph::ComputedPropertyDefinition> =
+            Vec::with_capacity(req.computed_properties.len());
+        for cp in &req.computed_properties {
+            let spec = proto_to_computed_spec(cp)?;
+            schema.add_property(PropertyDef::computed(&cp.name, spec));
+            echo_computed.push(cp.clone());
+        }
+
         let version = {
             let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
             db.create_label_schema(schema)
@@ -93,6 +267,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
             name: req.name,
             properties: req.properties,
             version,
+            computed_properties: echo_computed,
         }))
     }
 
@@ -161,22 +336,29 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
                 if let Ok(schema) =
                     coordinode_core::schema::definition::LabelSchema::from_msgpack(&val_bytes)
                 {
-                    let properties = schema
-                        .properties
-                        .values()
-                        .map(|p| graph::PropertyDefinition {
-                            name: p.name.clone(),
-                            r#type: property_type_to_proto(&p.property_type),
-                            required: p.not_null,
-                            unique: p.unique,
-                        })
-                        .collect();
+                    let mut properties = Vec::new();
+                    let mut computed_properties = Vec::new();
+
+                    for p in schema.properties.values() {
+                        if let PropertyType::Computed(ref spec) = p.property_type {
+                            computed_properties.push(computed_spec_to_proto(&p.name, spec));
+                        } else {
+                            properties.push(graph::PropertyDefinition {
+                                name: p.name.clone(),
+                                r#type: property_type_to_proto(&p.property_type),
+                                required: p.not_null,
+                                unique: p.unique,
+                            });
+                        }
+                    }
+
                     map.insert(
                         schema.name.clone(),
                         graph::Label {
                             name: schema.name,
                             properties,
                             version: schema.version,
+                            computed_properties,
                         },
                     );
                 } else {
@@ -185,6 +367,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
                         name: name.to_string(),
                         properties: vec![],
                         version: 0,
+                        computed_properties: vec![],
                     });
                 }
             }
@@ -206,6 +389,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
                             name: name.clone(),
                             properties: vec![],
                             version: 0,
+                            computed_properties: vec![],
                         });
                 }
             }
@@ -391,6 +575,7 @@ mod tests {
                         unique: true,
                     },
                 ],
+                computed_properties: vec![],
             }))
             .await
             .expect("create_label should succeed");
@@ -431,6 +616,7 @@ mod tests {
                 required: false,
                 unique: true,
             }],
+            computed_properties: vec![],
         }))
         .await
         .expect("create_label");
@@ -513,6 +699,7 @@ mod tests {
                     unique: false,
                 },
             ],
+            computed_properties: vec![],
         }))
         .await
         .expect("create_label");
@@ -541,5 +728,263 @@ mod tests {
                 .any(|p| p.name == "title" && p.required),
             "title must be required"
         );
+    }
+
+    // ── R-API4: ComputedPropertyDefinition via gRPC ──────────────────────────
+
+    /// create_label with TTL ComputedPropertyDefinition → schema persisted with
+    /// ComputedSpec::Ttl; TtlReaper deletes an expired node.
+    ///
+    /// Regression: ComputedSpec must reach storage via the gRPC API path, not
+    /// only via direct Rust API (PropertyDef::computed). This test validates
+    /// the full proto → SchemaService → LabelSchema → storage → TtlReaper chain.
+    #[tokio::test]
+    async fn create_label_with_ttl_computed_property_reaper_deletes_expired_node() {
+        let (svc, _dir) = test_service();
+
+        // Declare label with a TIMESTAMP anchor and a TTL COMPUTED property (60s,
+        // Node scope). The TtlReaper background thread is not used here — we call
+        // reap_computed_ttl() directly to avoid real-time sleeping.
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Session".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "started_at".to_string(),
+                r#type: 6, // TIMESTAMP
+                required: true,
+                unique: false,
+            }],
+            computed_properties: vec![graph::ComputedPropertyDefinition {
+                name: "_ttl".to_string(),
+                computed_type: 1,  // TTL
+                formula_type: 0,   // unspecified (not used for TTL)
+                duration_secs: 60, // 60 seconds lifetime
+                anchor_field: "started_at".to_string(),
+                scope: 3, // NODE
+                ..Default::default()
+            }],
+        }))
+        .await
+        .expect("create_label with TTL should succeed");
+
+        // Verify the response echoes computed_properties.
+        let resp = svc
+            .create_label(Request::new(graph::CreateLabelRequest {
+                name: "Session2".to_string(),
+                properties: vec![graph::PropertyDefinition {
+                    name: "started_at".to_string(),
+                    r#type: 6, // TIMESTAMP
+                    required: true,
+                    unique: false,
+                }],
+                computed_properties: vec![graph::ComputedPropertyDefinition {
+                    name: "_ttl".to_string(),
+                    computed_type: 1,
+                    formula_type: 0,
+                    duration_secs: 60,
+                    anchor_field: "started_at".to_string(),
+                    scope: 3,
+                    ..Default::default()
+                }],
+            }))
+            .await
+            .expect("create_label should succeed");
+
+        let label = resp.into_inner();
+        assert_eq!(
+            label.computed_properties.len(),
+            1,
+            "response must echo computed_properties"
+        );
+        assert_eq!(label.computed_properties[0].name, "_ttl");
+        assert_eq!(label.computed_properties[0].computed_type, 1); // TTL
+        assert_eq!(label.computed_properties[0].duration_secs, 60);
+        assert_eq!(label.computed_properties[0].anchor_field, "started_at");
+
+        // Verify schema was persisted correctly: LabelSchema must contain ComputedSpec::Ttl.
+        {
+            use coordinode_core::schema::computed::{ComputedSpec, TtlScope};
+            use coordinode_core::schema::definition::PropertyType;
+            use coordinode_storage::engine::partition::Partition;
+
+            let db = svc.database.lock().unwrap();
+            let key = coordinode_core::schema::definition::encode_label_schema_key("Session");
+            let bytes = db
+                .engine()
+                .get(Partition::Schema, &key)
+                .expect("storage get")
+                .expect("Session schema must be persisted");
+            let schema = coordinode_core::schema::definition::LabelSchema::from_msgpack(&bytes)
+                .expect("deserialize");
+
+            let ttl_prop = schema
+                .get_property("_ttl")
+                .expect("_ttl property must exist");
+            assert!(
+                matches!(
+                    &ttl_prop.property_type,
+                    PropertyType::Computed(ComputedSpec::Ttl {
+                        duration_secs: 60,
+                        scope: TtlScope::Node,
+                        ..
+                    })
+                ),
+                "ComputedSpec::Ttl must be persisted with correct parameters, got: {:?}",
+                ttl_prop.property_type
+            );
+        }
+
+        // Now create two nodes: one expired (started_at far in the past), one fresh.
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        let expired_us = now_us - 120 * 1_000_000; // 120s ago → past 60s TTL
+
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher(&format!("CREATE (s:Session {{started_at: {expired_us}}})"))
+                .expect("create expired session");
+            db.execute_cypher(&format!("CREATE (s:Session {{started_at: {now_us}}})"))
+                .expect("create fresh session");
+        }
+
+        // Verify both nodes exist before reaping.
+        {
+            let mut db = svc.database.lock().unwrap();
+            let rows = db
+                .execute_cypher("MATCH (s:Session) RETURN s.started_at AS ts")
+                .expect("match before reap");
+            assert_eq!(rows.len(), 2, "must have 2 Session nodes before reap");
+        }
+
+        // Run TtlReaper directly — no background thread, no waiting.
+        let result = {
+            let db = svc.database.lock().unwrap();
+            coordinode_query::index::ttl_reaper::reap_computed_ttl(&db.engine_shared(), 1, 1000)
+        };
+
+        assert_eq!(
+            result.nodes_deleted, 1,
+            "reaper must delete exactly 1 expired Session node"
+        );
+
+        // Verify only the fresh node remains.
+        {
+            let mut db = svc.database.lock().unwrap();
+            let rows = db
+                .execute_cypher("MATCH (s:Session) RETURN s.started_at AS ts")
+                .expect("match after reap");
+            assert_eq!(rows.len(), 1, "exactly 1 Session node must survive");
+        }
+    }
+
+    /// create_label with DECAY ComputedPropertyDefinition → schema persisted,
+    /// list_labels returns computed_properties.
+    #[tokio::test]
+    async fn create_label_with_decay_computed_property_list_labels_returns_it() {
+        let (svc, _dir) = test_service();
+
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "Article".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "published_at".to_string(),
+                r#type: 6, // TIMESTAMP
+                required: true,
+                unique: false,
+            }],
+            computed_properties: vec![graph::ComputedPropertyDefinition {
+                name: "relevance".to_string(),
+                computed_type: 2, // DECAY
+                formula_type: 1,  // LINEAR
+                initial: 1.0,
+                target: 0.0,
+                duration_secs: 604800, // 7 days
+                anchor_field: "published_at".to_string(),
+                ..Default::default()
+            }],
+        }))
+        .await
+        .expect("create_label with DECAY should succeed");
+
+        // list_labels must return the computed property back to the caller.
+        let labels = svc
+            .list_labels(Request::new(graph::ListLabelsRequest {}))
+            .await
+            .expect("list_labels")
+            .into_inner()
+            .labels;
+
+        let article = labels
+            .iter()
+            .find(|l| l.name == "Article")
+            .expect("Article label must be in list");
+
+        // Regular properties are separated from computed properties.
+        assert_eq!(
+            article.properties.len(),
+            1,
+            "Article must have 1 regular property (published_at)"
+        );
+        assert_eq!(
+            article.computed_properties.len(),
+            1,
+            "Article must have 1 computed property (relevance)"
+        );
+
+        let cp = &article.computed_properties[0];
+        assert_eq!(cp.name, "relevance");
+        assert_eq!(cp.computed_type, 2); // DECAY
+        assert_eq!(cp.formula_type, 1); // LINEAR
+        assert!((cp.initial - 1.0).abs() < f64::EPSILON);
+        assert!((cp.target - 0.0).abs() < f64::EPSILON);
+        assert_eq!(cp.duration_secs, 604800);
+        assert_eq!(cp.anchor_field, "published_at");
+    }
+
+    /// proto_to_computed_spec rejects COMPUTED_TYPE_UNSPECIFIED.
+    #[tokio::test]
+    async fn create_label_computed_type_unspecified_returns_error() {
+        let (svc, _dir) = test_service();
+
+        let result = svc
+            .create_label(Request::new(graph::CreateLabelRequest {
+                name: "Bad".to_string(),
+                properties: vec![],
+                computed_properties: vec![graph::ComputedPropertyDefinition {
+                    name: "broken".to_string(),
+                    computed_type: 0, // UNSPECIFIED
+                    duration_secs: 60,
+                    anchor_field: "ts".to_string(),
+                    ..Default::default()
+                }],
+            }))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "UNSPECIFIED computed_type must be rejected"
+        );
+    }
+
+    /// proto_to_computed_spec rejects empty anchor_field.
+    #[tokio::test]
+    async fn create_label_computed_empty_anchor_field_returns_error() {
+        let (svc, _dir) = test_service();
+
+        let result = svc
+            .create_label(Request::new(graph::CreateLabelRequest {
+                name: "Bad2".to_string(),
+                properties: vec![],
+                computed_properties: vec![graph::ComputedPropertyDefinition {
+                    name: "ttl".to_string(),
+                    computed_type: 1, // TTL
+                    duration_secs: 60,
+                    anchor_field: String::new(), // empty — must be rejected
+                    ..Default::default()
+                }],
+            }))
+            .await;
+
+        assert!(result.is_err(), "empty anchor_field must be rejected");
     }
 }
