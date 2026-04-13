@@ -104,8 +104,8 @@ fn explain_shows_hnsw_scan_after_create() {
         )
         .expect("explain after");
     assert!(
-        after.contains("HnswScan(item_emb)"),
-        "expected HnswScan(item_emb) after index, got:\n{after}"
+        after.contains("HnswScan(item_emb, cosine)"),
+        "expected HnswScan(item_emb, cosine) after index, got:\n{after}"
     );
 }
 
@@ -144,7 +144,7 @@ fn drop_vector_index_removes_index() {
         )
         .expect("explain after create");
     assert!(
-        after_create.contains("HnswScan(item_emb)"),
+        after_create.contains("HnswScan(item_emb, cosine)"),
         "expected HnswScan after create, got:\n{after_create}"
     );
 
@@ -216,7 +216,7 @@ fn vector_index_persists_across_reopen() {
             )
             .expect("explain after reopen");
         assert!(
-            plan.contains("HnswScan(persist_idx)"),
+            plan.contains("HnswScan(persist_idx, cosine)"),
             "expected HnswScan after reopen, got:\n{plan}"
         );
     }
@@ -450,8 +450,8 @@ fn drop_then_recreate_vector_index_succeeds() {
         )
         .expect("explain after re-create");
     assert!(
-        plan.contains("HnswScan(item_emb2)"),
-        "expected HnswScan(item_emb2) after re-create, got:\n{plan}"
+        plan.contains("HnswScan(item_emb2, cosine)"),
+        "expected HnswScan(item_emb2, cosine) after re-create, got:\n{plan}"
     );
 }
 
@@ -565,6 +565,114 @@ fn delete_node_removes_from_vector_index() {
         0,
         "deleted node should not appear in vector search"
     );
+}
+
+// ── Non-default metric in EXPLAIN ─────────────────────────────────────
+
+/// EXPLAIN for a non-default metric (l2) shows the metric name in HnswScan.
+///
+/// Verifies that `annotate_vector_top_k` encodes the metric into the EXPLAIN
+/// string for all supported metrics, not just the default (cosine).
+#[test]
+fn explain_shows_non_default_metric_in_hnsw_scan() {
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(r#"CREATE VECTOR INDEX l2_idx ON :Embed(vec) OPTIONS {metric: "l2"}"#)
+        .expect("create l2 index");
+
+    let plan = db
+        .explain_cypher(
+            "MATCH (n:Embed) WITH n, vector_distance(n.vec, [1.0, 0.0]) AS d ORDER BY d LIMIT 5 RETURN n, d",
+        )
+        .expect("explain");
+
+    assert!(
+        plan.contains("HnswScan(l2_idx, l2)"),
+        "expected HnswScan(l2_idx, l2) for l2 metric, got:\n{plan}"
+    );
+}
+
+/// EXPLAIN with dot_product metric shows "dot" in HnswScan.
+#[test]
+fn explain_shows_dot_metric_in_hnsw_scan() {
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(r#"CREATE VECTOR INDEX dot_idx ON :Dot(vec) OPTIONS {metric: "dot"}"#)
+        .expect("create dot index");
+
+    let plan = db
+        .explain_cypher(
+            "MATCH (n:Dot) WITH n, vector_distance(n.vec, [1.0, 0.0]) AS d ORDER BY d LIMIT 5 RETURN n, d",
+        )
+        .expect("explain");
+
+    assert!(
+        plan.contains("HnswScan(dot_idx, dot)"),
+        "expected HnswScan(dot_idx, dot) for dot_product metric, got:\n{plan}"
+    );
+}
+
+/// EXPLAIN with l1 metric shows "l1" in HnswScan.
+#[test]
+fn explain_shows_l1_metric_in_hnsw_scan() {
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(r#"CREATE VECTOR INDEX l1_idx ON :L1Vec(vec) OPTIONS {metric: "l1"}"#)
+        .expect("create l1 index");
+
+    let plan = db
+        .explain_cypher(
+            "MATCH (n:L1Vec) WITH n, vector_distance(n.vec, [1.0, 0.0]) AS d ORDER BY d LIMIT 5 RETURN n, d",
+        )
+        .expect("explain");
+
+    assert!(
+        plan.contains("HnswScan(l1_idx, l1)"),
+        "expected HnswScan(l1_idx, l1) for l1 metric, got:\n{plan}"
+    );
+}
+
+// ── Vector search after reopen ────────────────────────────────────────
+
+/// After reopen the HNSW index is rebuilt from stored nodes and produces
+/// correct search results (not just EXPLAIN — actual execution).
+#[test]
+fn vector_search_executes_correctly_after_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Session 1: create index and insert nodes.
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.execute_cypher(
+            "CREATE VECTOR INDEX persist_emb ON :Doc(vec) OPTIONS {metric: \"cosine\"}",
+        )
+        .expect("create index");
+        db.execute_cypher("CREATE (n:Doc {name: 'near', vec: [1.0, 0.0, 0.0]})")
+            .expect("near node");
+        db.execute_cypher("CREATE (n:Doc {name: 'far', vec: [0.0, 0.0, 1.0]})")
+            .expect("far node");
+    }
+
+    // Session 2: reopen — HNSW is rebuilt from storage.
+    {
+        let mut db = Database::open(dir.path()).expect("reopen");
+
+        // Nearest to [1,0,0]: 'near' has similarity 1.0, 'far' has similarity 0.0.
+        let rows = db
+            .execute_cypher(
+                "MATCH (n:Doc) \
+                 WHERE vector_similarity(n.vec, [1.0, 0.0, 0.0]) > 0.9 \
+                 RETURN n.name AS name",
+            )
+            .expect("vector search after reopen");
+
+        assert_eq!(rows.len(), 1, "only 'near' should match after reopen");
+        assert_eq!(
+            rows[0].get("name"),
+            Some(&Value::String("near".into())),
+            "found node should be 'near'"
+        );
+    }
 }
 
 /// REMOVE a.embedding removes the property from the HNSW index.

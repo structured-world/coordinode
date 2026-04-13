@@ -350,9 +350,14 @@ pub enum LogicalOp {
         /// Optional distance alias (e.g., `AS d` in `WITH n, vector_distance(n.emb, $q) AS d`).
         /// When present, the resulting rows include a column with the computed distance.
         distance_alias: Option<String>,
-        /// HNSW index name when an applicable vector index exists for (label, property).
-        /// Set by the planner annotation pass after index lookup.
-        /// `Some(name)` → EXPLAIN shows "HnswScan"; `None` → "BruteForce".
+        /// Planner annotation: `Some("name, metric")` when an HNSW index exists for
+        /// (label, property), e.g. `"item_emb, cosine"`. Set by `annotate_vector_top_k`.
+        ///
+        /// Used in two places:
+        /// - EXPLAIN: `HnswScan(item_emb, cosine)` vs `BruteForce`
+        /// - Executor: resolves (label, property) by index name for `search_with_loader`
+        ///
+        /// `None` → "BruteForce" in EXPLAIN; executor falls back to `__label__` detection.
         hnsw_index: Option<String>,
     },
 
