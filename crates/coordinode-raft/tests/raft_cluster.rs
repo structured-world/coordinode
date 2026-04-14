@@ -2389,9 +2389,7 @@ async fn cluster_join_monitor_and_promote() {
             let arc = std::sync::Arc::new(n1.node);
             let arc2 = std::sync::Arc::clone(&arc);
             let tx_clone = tx.clone();
-            let handle = tokio::spawn(async move {
-                arc2.monitor_and_promote(2, tx_clone).await
-            });
+            let handle = tokio::spawn(async move { arc2.monitor_and_promote(2, tx_clone).await });
             // Keep the original Arc alive for shutdown
             (arc, handle)
         };
