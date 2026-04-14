@@ -39,8 +39,15 @@ name = "coordinode-server"
 git_tag_enable = true
 git_release_enable = true
 
-# Library crate — release-plz skips version bumping and cargo package for it.
+# Library crate — release-plz tracks changelog but does not create releases.
 # Changelog is derived from workspace CHANGELOG.md via scripts/split-changelog.py.
+#
+# git_tag_name must be package-specific so the workspace tag `v0.3.9` (owned by
+# coordinode-server) does NOT match this crate's release regex.  Without a unique
+# tag pattern, release-plz would find v0.3.9 as coordinode-client's baseline,
+# check out that commit, and fail with "package not found" because coordinode-client
+# did not exist in the workspace at that tag.
 [[package]]
 name = "coordinode-client"
 release = false
+git_tag_name = "coordinode-client-v{{ version }}"
