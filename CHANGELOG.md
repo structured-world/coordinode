@@ -1,5 +1,61 @@
 # Changelog
 
+## v0.3.11 — 2026-04-14
+
+### coordinode-core
+## [0.3.11](https://github.com/structured-world/coordinode/compare/v0.3.10...v0.3.11) - 2026-04-14
+
+#### Added
+
+- *(storage)* implement standalone WAL for crash durability
+
+### coordinode-embed
+## [0.3.11](https://github.com/structured-world/coordinode/compare/v0.3.10...v0.3.11) - 2026-04-14
+
+#### Added
+
+- *(storage)* implement standalone WAL for crash durability
+
+### coordinode-raft
+## [0.3.11](https://github.com/structured-world/coordinode/compare/v0.3.10...v0.3.11) - 2026-04-14
+
+#### Added
+
+- *(cluster)* implement cluster join protocol (R091b)
+- *(storage)* implement standalone WAL for crash durability
+
+#### Fixed
+
+- *(cluster)* rollback Learner on change_membership failure in monitor_and_promote
+
+### coordinode-server
+## [0.3.11](https://github.com/structured-world/coordinode/compare/v0.3.10...v0.3.11) - 2026-04-14
+
+#### Added
+
+- *(cluster)* implement cluster join protocol (R091b)
+- *(storage)* implement standalone WAL for crash durability
+
+#### Testing
+
+- *(server)* add CLI unit tests for AdminNodeJoin parsing
+
+### coordinode-storage
+## [0.3.11](https://github.com/structured-world/coordinode/compare/v0.3.10...v0.3.11) - 2026-04-14
+
+#### Added
+
+- *(storage)* implement standalone WAL for crash durability
+
+### coordinode-vector
+## [0.3.11](https://github.com/structured-world/coordinode/compare/v0.3.10...v0.3.11) - 2026-04-14
+
+#### Fixed
+
+- *(vector)* update HNSW graph position when node vector is overwritten (G082)
+
+---
+
 ## v0.3.10 — 2026-04-14
 
 ### coordinode-raft
