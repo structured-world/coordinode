@@ -36,6 +36,9 @@ SERVICE_ORDER = [
     "ClusterService",
 ]
 
+# Services that are internal (inter-node only) — get a warning banner
+INTERNAL_SERVICES = {"RaftService"}
+
 SERVICE_SLUG = {
     "CypherService": "cypher",
     "VectorService": "vector",
@@ -541,6 +544,13 @@ def generate_service_page(
     lines.append(f"# {svc.name}\n")
     if svc.comment:
         lines.append(f"{_escape_md(svc.comment)}\n")
+    if svc.name in INTERNAL_SERVICES:
+        lines.append(
+            "::: warning Internal API\n"
+            "This service is used for **inter-node communication only**. "
+            "It is not intended for external clients and may change without notice.\n"
+            ":::\n"
+        )
     if proto_path_hint:
         lines.append(
             f"::: tip Proto source\n"
@@ -713,7 +723,7 @@ def generate_index_page(services: list[ProtoService]) -> str:
     lines.append("| Port | Protocol | Purpose |")
     lines.append("|------|----------|---------|")
     lines.append("| 7080 | gRPC (HTTP/2) | Native API, inter-node communication |")
-    lines.append("| 7081 | HTTP/1.1 + JSON | REST transcoding, GraphQL, management |")
+    lines.append("| 7081 | HTTP/1.1 + JSON | REST/JSON transcoding of gRPC endpoints |")
     lines.append("| 7082 | Bolt | Neo4j wire protocol compatibility |")
     lines.append("| 7083 | WebSocket | Subscriptions, live queries |")
     lines.append("| 7084 | HTTP | Prometheus `/metrics`, `/health` |")
