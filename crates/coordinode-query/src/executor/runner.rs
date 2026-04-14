@@ -5304,6 +5304,35 @@ fn execute_update(
                         }
 
                         let field_id = ctx.interner.intern(property);
+
+                        // Capture old value BEFORE updating the record, so
+                        // the B-tree index can remove the stale entry.
+                        let old_value: Option<Value> = record.get(field_id).cloned();
+
+                        // Update B-tree index: remove old entry, add new entry
+                        // (which also enforces uniqueness on the new value).
+                        // Must happen BEFORE writing the record to storage so
+                        // that a unique violation rolls back cleanly.
+                        if let Some(btree_reg) = ctx.btree_index_registry {
+                            let label = record.primary_label().to_string();
+                            btree_reg
+                                .on_property_changed(
+                                    ctx.engine,
+                                    node_id,
+                                    &label,
+                                    property,
+                                    old_value.as_ref(),
+                                    &val,
+                                )
+                                .map_err(|v| {
+                                    ExecutionError::Conflict(format!(
+                                        "unique constraint violated on index `{}`: \
+                                         property `{}` already has value {:?}",
+                                        v.index_name, v.property, v.value
+                                    ))
+                                })?;
+                        }
+
                         record.set(field_id, val.clone());
 
                         let new_bytes = record.to_msgpack().map_err(|e| {

@@ -355,3 +355,79 @@ fn plain_delete_cleans_unique_btree_index() {
         result.err()
     );
 }
+
+// ── SET property B-tree index update regression ───────────────────────
+
+#[test]
+fn set_property_updates_unique_btree_index() {
+    // Regression: SET must update the B-tree index entries for a node.
+    // Without this update:
+    //   1. The old value stays in the index → another node cannot be
+    //      created with the old value (stale unique constraint).
+    //   2. The new value is never added to the index → IndexScan won't
+    //      find the node by its new value.
+    //
+    // Root cause: execute_update() in runner.rs notified vector/text
+    // registries but never touched btree_index_registry.
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :User(email)")
+        .expect("CREATE UNIQUE INDEX");
+
+    db.execute_cypher("CREATE (:User {email: 'alice@example.com'})")
+        .expect("initial CREATE");
+
+    // Update the indexed property to a new value.
+    db.execute_cypher(
+        "MATCH (n:User {email: 'alice@example.com'}) SET n.email = 'alice2@example.com'",
+    )
+    .expect("SET email");
+
+    // 1. The new value must be findable via index.
+    let rows = db
+        .execute_cypher("MATCH (n:User) WHERE n.email = 'alice2@example.com' RETURN n.email")
+        .expect("MATCH by new value");
+    assert_eq!(
+        rows.len(),
+        1,
+        "node must be findable by new indexed value; B-tree index must be updated on SET"
+    );
+
+    // 2. The old value must NOT block a new CREATE (stale unique entry must be gone).
+    let result = db.execute_cypher("CREATE (:User {email: 'alice@example.com'})");
+    assert!(
+        result.is_ok(),
+        "CREATE with old value after SET must succeed; \
+         stale index entry must be removed on SET. Got error: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn set_property_unique_conflict_still_enforced() {
+    // After SET, the unique constraint on the NEW value must still be enforced.
+    // Setting n.email to a value already taken by another node must fail.
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :User(email)")
+        .expect("CREATE UNIQUE INDEX");
+
+    db.execute_cypher("CREATE (:User {email: 'alice@example.com'})")
+        .expect("create alice");
+    db.execute_cypher("CREATE (:User {email: 'bob@example.com'})")
+        .expect("create bob");
+
+    // Try to SET bob's email to alice's email — must fail (unique violation).
+    let result = db.execute_cypher(
+        "MATCH (n:User {email: 'bob@example.com'}) SET n.email = 'alice@example.com'",
+    );
+    assert!(
+        result.is_err(),
+        "SET to an already-taken unique value must fail"
+    );
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.to_lowercase().contains("unique") || msg.to_lowercase().contains("constraint"),
+        "error must mention unique constraint, got: {msg}"
+    );
+}
