@@ -56,7 +56,7 @@ MVCC retains older versions of data for the configured retention window (default
 ```cypher
 MATCH (n:Person {name: "Alice"})
 RETURN n.age
-AT TIMESTAMP datetime("2024-06-01T12:00:00Z")
+AS OF TIMESTAMP '2024-06-01T12:00:00Z'
 ```
 
 This is useful for auditing, debugging, and point-in-time recovery.
