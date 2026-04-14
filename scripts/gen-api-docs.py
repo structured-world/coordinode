@@ -431,6 +431,15 @@ def _fmt_type(field: ProtoField) -> str:
     return t
 
 
+def _escape_md(text: str) -> str:
+    """Escape characters that break VitePress/Vue parsing in table cells."""
+    # Pipe breaks markdown tables
+    text = text.replace("|", "\\|")
+    # Angle brackets are parsed as Vue component tags by VitePress
+    text = text.replace("<", "&lt;").replace(">", "&gt;")
+    return text
+
+
 def _field_table(fields: list[ProtoField], messages: dict, link_prefix: str = "") -> str:
     if not fields:
         return "_No fields._\n"
@@ -438,7 +447,7 @@ def _field_table(fields: list[ProtoField], messages: dict, link_prefix: str = ""
     for f in fields:
         name = f"`{f.name}`"
         typ = _fmt_type(f)
-        desc = f.comment.replace("|", "\\|") if f.comment else "—"
+        desc = _escape_md(f.comment) if f.comment else "—"
         rows.append(f"| {name} | {typ} | {desc} |")
     return "\n".join(rows) + "\n"
 
@@ -446,7 +455,7 @@ def _field_table(fields: list[ProtoField], messages: dict, link_prefix: str = ""
 def _enum_table(enum: ProtoEnum) -> str:
     rows = ["| Value | Number | Description |", "|-------|--------|-------------|"]
     for v in enum.values:
-        desc = v.comment.replace("|", "\\|") if v.comment else "—"
+        desc = _escape_md(v.comment) if v.comment else "—"
         rows.append(f"| `{v.name}` | `{v.number}` | {desc} |")
     return "\n".join(rows) + "\n"
 
@@ -460,7 +469,7 @@ def _message_section(msg: ProtoMessage, messages: dict, heading: str = "###") ->
     anchor = _anchor(msg.name)
     parts.append(f"{heading} {msg.name} {{#{anchor}}}\n")
     if msg.comment:
-        parts.append(f"{msg.comment}\n")
+        parts.append(f"{_escape_md(msg.comment)}\n")
 
     if msg.nested_enums:
         for ne in msg.nested_enums:
@@ -521,16 +530,17 @@ def generate_service_page(
     slug = SERVICE_SLUG.get(svc.name, svc.name.lower())
     lines: list[str] = []
 
-    # frontmatter
+    # frontmatter — YAML: escape only double quotes (no HTML entities needed)
     lines.append("---")
     if svc.comment:
-        lines.append(f'description: "{svc.name} — {svc.comment}"')
+        safe_desc = svc.comment.replace('"', '\\"')
+        lines.append(f'description: "{svc.name} — {safe_desc}"')
     lines.append("---\n")
 
     # Title
     lines.append(f"# {svc.name}\n")
     if svc.comment:
-        lines.append(f"{svc.comment}\n")
+        lines.append(f"{_escape_md(svc.comment)}\n")
     if proto_path_hint:
         lines.append(
             f"::: tip Proto source\n"
@@ -544,7 +554,7 @@ def generate_service_page(
         for rpc in svc.methods:
             lines.append(f"### {rpc.name}\n")
             if rpc.comment:
-                lines.append(f"{rpc.comment}\n")
+                lines.append(f"{_escape_md(rpc.comment)}\n")
 
             if rpc.http_method and rpc.http_path:
                 lines.append(
@@ -631,7 +641,7 @@ def generate_service_page(
             anchor = _anchor(ename)
             lines.append(f"### {ename} {{#{anchor}}}\n")
             if enum.comment:
-                lines.append(f"{enum.comment}\n")
+                lines.append(f"{_escape_md(enum.comment)}\n")
             lines.append(_enum_table(enum))
             lines.append("")
 
