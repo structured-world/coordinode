@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.3.10 — 2026-04-14
+
+### coordinode-raft
+## [0.3.10](https://github.com/structured-world/coordinode/compare/v0.3.9...v0.3.10) - 2026-04-14
+
+#### Added
+
+- *(raft)* R141 follower reads — ReadFence, SyncPerBatch persist fix
+
+#### Fixed
+
+- *(server)* resolve proto submodule and clippy::panic in tests
+
+#### Testing
+
+- *(raft)* R141 complete test coverage — follower scenarios + StaleReplica
+
+### coordinode-server
+## [0.3.10](https://github.com/structured-world/coordinode/compare/v0.3.9...v0.3.10) - 2026-04-14
+
+#### Added
+
+- *(raft)* R141 follower reads — ReadFence, SyncPerBatch persist fix
+
+#### Testing
+
+- *(client,server)* cover params+source gRPC branch and invalid endpoint
+- *(server)* add gRPC source tracking round-trip test
+
+### coordinode-storage
+## [0.3.10](https://github.com/structured-world/coordinode/compare/v0.3.9...v0.3.10) - 2026-04-14
+
+#### Performance
+
+- *(storage)* parallel memtable writes within write batch (R091)
+
+---
+
 ## v0.3.9 — 2026-04-13
 
 ### coordinode-embed
