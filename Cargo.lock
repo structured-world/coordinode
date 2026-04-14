@@ -147,7 +147,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -158,7 +158,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-auth"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "serde",
  "tempfile",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-client"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "prost",
  "thiserror 2.0.18",
@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-core"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "bytes",
  "criterion",
@@ -733,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-embed"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "coordinode-core",
  "coordinode-lsm-tree",
@@ -753,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-integration"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "prost",
  "rand 0.10.1",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-query"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "coordinode-core",
  "coordinode-embed",
@@ -813,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-raft"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "bytes",
  "coordinode-core",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-s3"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "bytes",
  "coordinode-core",
@@ -857,7 +857,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-search"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "aes-gcm",
  "coordinode-storage",
@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-server"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "coordinode-auth",
  "coordinode-client",
@@ -909,7 +909,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-storage"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "byteorder-lite",
  "bytes",
@@ -941,7 +941,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-vector"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "coordinode-core",
  "coordinode-storage",
@@ -1445,7 +1445,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1853,9 +1853,9 @@ dependencies = [
 
 [[package]]
 name = "hyper-rustls"
-version = "0.27.8"
+version = "0.27.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2b52f86d1d4bc0d6b4e6826d960b1b333217e07d36b882dca570a5e1c48895b"
+checksum = "33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f"
 dependencies = [
  "http",
  "hyper",
@@ -2648,7 +2648,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3755,7 +3755,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3812,7 +3812,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4110,7 +4110,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4394,7 +4394,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5226,7 +5226,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
