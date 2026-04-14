@@ -152,6 +152,24 @@ impl ProposalPipeline for LocalProposalPipeline<'_> {
 ///
 /// Used by the drain thread and other contexts that need `'static` lifetime
 /// on the pipeline. Same apply logic as `LocalProposalPipeline`.
+///
+/// ## Durability
+///
+/// Two modes depending on whether the engine was opened with a standalone WAL:
+///
+/// **WAL mode** (`StorageEngine::open_with_wal`):
+/// 1. Append mutations to WAL + fsync (≤0.5 ms for ≤4 KB record)
+/// 2. Apply mutations to memtable
+/// 3. Return — no SST flush per proposal
+///    Checkpoint (WAL rotation) happens automatically when `persist()` is called.
+///
+/// **Legacy mode** (plain `StorageEngine::open`, no WAL):
+/// Apply to memtable, then `persist()` when `FlushPolicy::SyncPerBatch`.
+/// Correct but expensive (5–50 ms SST flush per write). Use WAL mode for
+/// production embedded deployments.
+///
+/// Cluster mode always uses `RaftProposalPipeline`; `OwnedLocalProposalPipeline`
+/// is only for embedded/standalone (unit tests, CLI tools, embedded library).
 pub struct OwnedLocalProposalPipeline {
     engine: Arc<StorageEngine>,
 }
@@ -167,6 +185,20 @@ impl OwnedLocalProposalPipeline {
 
 impl ProposalPipeline for OwnedLocalProposalPipeline {
     fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<(), ProposalError> {
+        // ── WAL-first write path ─────────────────────────────────────────────
+        // When a standalone WAL is active: append mutations to the journal and
+        // fsync BEFORE applying to the memtable.  This ensures any record that
+        // reached the WAL survives a crash and is replayed on recovery.
+        //
+        // When no WAL is configured (cluster mode or tests that use plain open):
+        // fall through to the legacy persist() path below.
+        if self.engine.has_wal() {
+            self.engine
+                .wal_append(&proposal.mutations)
+                .map_err(|e| ProposalError::Storage(format!("WAL append: {e}")))?;
+        }
+
+        // Apply mutations to the memtable (same logic as LocalProposalPipeline).
         for mutation in &proposal.mutations {
             match mutation {
                 Mutation::Put {
@@ -195,11 +227,11 @@ impl ProposalPipeline for OwnedLocalProposalPipeline {
             }
         }
 
-        // In standalone mode (no Raft WAL), flush memtable to SST after each
-        // proposal when SyncPerBatch is set. This ensures durability before
-        // returning — a crash after persist() leaves data safely on disk.
-        // Without this, SyncPerBatch was silently ignored in the local pipeline.
-        if self.engine.flush_policy() == FlushPolicy::SyncPerBatch {
+        // ── Legacy durability path (no WAL) ──────────────────────────────────
+        // Without a WAL the only way to guarantee crash safety is a full SST
+        // flush after every proposal (atomic rename — no corruption possible).
+        // This is expensive but correct. Open with WAL to avoid this overhead.
+        if !self.engine.has_wal() && self.engine.flush_policy() == FlushPolicy::SyncPerBatch {
             self.engine
                 .persist()
                 .map_err(|e| ProposalError::Storage(format!("persist failed: {e}")))?;
@@ -209,6 +241,7 @@ impl ProposalPipeline for OwnedLocalProposalPipeline {
             proposal_id = %proposal.id,
             mutations = proposal.mutation_count(),
             commit_ts = proposal.commit_ts.as_raw(),
+            has_wal = self.engine.has_wal(),
             "owned local proposal applied"
         );
 
