@@ -1043,7 +1043,16 @@ impl RaftNode {
             new_members.push(node_id);
         }
 
-        self.change_membership(new_members).await.map_err(|e| {
+        if let Err(e) = self.change_membership(new_members).await {
+            // Graceful rollback: remove the Learner from membership so it stops
+            // consuming replication bandwidth. Best-effort — log if remove fails.
+            if let Err(rm_err) = self.remove_node(node_id).await {
+                tracing::warn!(
+                    node_id,
+                    error = %rm_err,
+                    "monitor_and_promote: rollback remove_node failed (node remains as Learner)"
+                );
+            }
             let _ = progress_tx.send(JoinProgressEvent {
                 node_id,
                 phase: JoinPhase::Failed,
@@ -1051,8 +1060,8 @@ impl RaftNode {
                 percent: 99,
                 message: format!("change_membership failed: {e}"),
             });
-            e
-        })?;
+            return Err(e);
+        }
 
         let _ = progress_tx.send(JoinProgressEvent {
             node_id,
