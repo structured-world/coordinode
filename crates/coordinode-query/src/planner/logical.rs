@@ -720,6 +720,9 @@ pub struct AggregateItem {
     pub distinct: bool,
     /// Output alias.
     pub alias: Option<String>,
+    /// Percentile value for percentileCont / percentileDisc (second argument).
+    /// Valid range: [0.0, 1.0]. None = use default (0.5, median).
+    pub percentile: Option<f64>,
 }
 
 /// Query cost estimation result.

@@ -182,12 +182,8 @@ Aggregation functions require a GROUP BY context (explicit or implicit via non-a
 | `collect` | `collect(DISTINCT x)` | List | Distinct non-null values |
 | `stDev` | `stDev(x)` | Float | Sample standard deviation |
 | `stDevP` | `stDevP(x)` | Float | Population standard deviation |
-| `percentileCont` | `percentileCont(x, p)` | Float | Interpolated percentile. ⚠️ Percentile argument `p` ignored — always returns median (0.5) |
-| `percentileDisc` | `percentileDisc(x, p)` | Float | Discrete percentile. ⚠️ Percentile argument `p` ignored — always returns median (0.5) |
-
-::: warning percentileCont / percentileDisc
-The percentile argument `p` is accepted by the parser but currently ignored — both functions always return the **median (p=0.5)**. Use `percentileCont(x, 0.5)` or `percentileDisc(x, 0.5)` to document the intent; any other value will silently produce median. Full percentile support is planned.
-:::
+| `percentileCont` | `percentileCont(x, p)` | Float | Interpolated percentile (linear interpolation). `p` must be in [0.0, 1.0] |
+| `percentileDisc` | `percentileDisc(x, p)` | Float | Discrete percentile (nearest rank). `p` must be in [0.0, 1.0] |
 
 ```cypher
 MATCH (dept:Department)<-[:WORKS_IN]-(emp:Employee)

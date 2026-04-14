@@ -1414,11 +1414,27 @@ fn build_return_op(input: LogicalOp, rc: &ReturnClause) -> Result<LogicalOp, Pla
                     let arg = args.first().cloned().unwrap_or(Expr::Star);
                     // Use alias or function name as the column key
                     let agg_col = item.alias.clone().unwrap_or_else(|| name.clone());
+                    // For percentileCont/percentileDisc, extract the second argument (percentile p).
+                    let percentile = if matches!(name.as_str(), "percentileCont" | "percentileDisc")
+                    {
+                        args.get(1).and_then(|e| {
+                            if let Expr::Literal(Value::Float(f)) = e {
+                                Some(*f)
+                            } else if let Expr::Literal(Value::Int(i)) = e {
+                                Some(*i as f64)
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        None
+                    };
                     aggregates.push(AggregateItem {
                         function: name.clone(),
                         arg,
                         distinct: *distinct,
                         alias: Some(agg_col.clone()),
+                        percentile,
                     });
                     // Project references the pre-computed aggregate column
                     project_items.push(ProjectItem {
@@ -1483,11 +1499,26 @@ fn build_with_op(input: LogicalOp, wc: &WithClause) -> Result<LogicalOp, PlanErr
                 {
                     let agg_col = item.alias.clone().unwrap_or_else(|| name.clone());
                     let arg = args.first().cloned().unwrap_or(Expr::Star);
+                    let percentile = if matches!(name.as_str(), "percentileCont" | "percentileDisc")
+                    {
+                        args.get(1).and_then(|e| {
+                            if let Expr::Literal(Value::Float(f)) = e {
+                                Some(*f)
+                            } else if let Expr::Literal(Value::Int(i)) = e {
+                                Some(*i as f64)
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        None
+                    };
                     aggregates.push(AggregateItem {
                         function: name.clone(),
                         arg,
                         distinct: *distinct,
                         alias: Some(agg_col.clone()),
+                        percentile,
                     });
                     project_items.push(ProjectItem {
                         expr: Expr::Variable(agg_col.clone()),

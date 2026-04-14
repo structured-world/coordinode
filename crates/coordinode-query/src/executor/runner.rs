@@ -3908,14 +3908,15 @@ fn compute_aggregate(agg: &AggregateItem, rows: &[&Row]) -> Value {
 
             values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-            // Default percentile = 0.5 (median)
-            let percentile = 0.5_f64;
+            // Percentile from the second argument; default to 0.5 (median) if not specified.
+            let percentile = agg.percentile.unwrap_or(0.5).clamp(0.0, 1.0);
 
             if agg.function == "percentileDisc" {
-                // Nearest rank method
-                let idx =
-                    ((percentile * values.len() as f64).ceil() as usize).min(values.len()) - 1;
-                Value::Float(values[idx.min(values.len() - 1)])
+                // Nearest rank method: ceil(p * n) gives 1-based index; clamp to [0, n-1].
+                let idx = ((percentile * values.len() as f64).ceil() as usize)
+                    .saturating_sub(1)
+                    .min(values.len() - 1);
+                Value::Float(values[idx])
             } else {
                 // Linear interpolation (percentileCont)
                 let rank = percentile * (values.len() - 1) as f64;
@@ -7257,6 +7258,7 @@ mod tests {
                         arg: Expr::Star,
                         distinct: false,
                         alias: Some("cnt".into()),
+                        percentile: None,
                     }],
                 }),
                 items: vec![crate::planner::logical::ProjectItem {
@@ -7299,6 +7301,7 @@ mod tests {
                             },
                             distinct: false,
                             alias: Some("total".into()),
+                            percentile: None,
                         },
                         AggregateItem {
                             function: "avg".into(),
@@ -7308,6 +7311,7 @@ mod tests {
                             },
                             distinct: false,
                             alias: Some("average".into()),
+                            percentile: None,
                         },
                     ],
                 }),
@@ -7356,6 +7360,7 @@ mod tests {
                         },
                         distinct: false,
                         alias: Some("youngest".into()),
+                        percentile: None,
                     },
                     AggregateItem {
                         function: "max".into(),
@@ -7365,6 +7370,7 @@ mod tests {
                         },
                         distinct: false,
                         alias: Some("oldest".into()),
+                        percentile: None,
                     },
                 ],
             },
@@ -7400,6 +7406,7 @@ mod tests {
                     },
                     distinct: false,
                     alias: Some("names".into()),
+                    percentile: None,
                 }],
             },
         };
@@ -7443,6 +7450,7 @@ mod tests {
                     },
                     distinct: false,
                     alias: Some("median".into()),
+                    percentile: None,
                 }],
             },
         };
@@ -7451,6 +7459,73 @@ mod tests {
         assert_eq!(result.len(), 1);
         // Median of [25, 30, 35] = 30.0
         assert_eq!(result[0].get("median"), Some(&Value::Float(30.0)));
+    }
+
+    #[test]
+    fn aggregate_percentile_cont_non_median() {
+        // Regression test: verifies that the percentile argument is actually used,
+        // not silently replaced with 0.5 (median). Ages: [25, 30, 35].
+        let (_dir, engine, mut interner) = setup_test_graph();
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+
+        // percentileCont(n.age, 1.0) — 100th percentile of [25, 30, 35] = 35.0
+        let plan = LogicalPlan {
+            snapshot_ts: None,
+            vector_consistency: VectorConsistencyMode::default(),
+            root: LogicalOp::Aggregate {
+                input: Box::new(LogicalOp::NodeScan {
+                    variable: "n".into(),
+                    labels: vec!["User".into()],
+                    property_filters: vec![],
+                }),
+                group_by: vec![],
+                aggregates: vec![AggregateItem {
+                    function: "percentileCont".into(),
+                    arg: Expr::PropertyAccess {
+                        expr: Box::new(Expr::Variable("n".into())),
+                        property: "age".into(),
+                    },
+                    distinct: false,
+                    alias: Some("p100".into()),
+                    percentile: Some(1.0),
+                }],
+            },
+        };
+
+        let result = execute(&plan, &mut ctx).expect("execute");
+        assert_eq!(result.len(), 1);
+        // 100th percentile of [25, 30, 35] = 35.0 (not 30.0 = median)
+        assert_eq!(result[0].get("p100"), Some(&Value::Float(35.0)));
+
+        // Also verify percentileDisc(n.age, 0.0) = 25.0
+        let plan2 = LogicalPlan {
+            snapshot_ts: None,
+            vector_consistency: VectorConsistencyMode::default(),
+            root: LogicalOp::Aggregate {
+                input: Box::new(LogicalOp::NodeScan {
+                    variable: "n".into(),
+                    labels: vec!["User".into()],
+                    property_filters: vec![],
+                }),
+                group_by: vec![],
+                aggregates: vec![AggregateItem {
+                    function: "percentileDisc".into(),
+                    arg: Expr::PropertyAccess {
+                        expr: Box::new(Expr::Variable("n".into())),
+                        property: "age".into(),
+                    },
+                    distinct: false,
+                    alias: Some("p0".into()),
+                    percentile: Some(0.0),
+                }],
+            },
+        };
+
+        let result2 = execute(&plan2, &mut ctx).expect("execute");
+        assert_eq!(result2.len(), 1);
+        // 0th percentile of [25, 30, 35] = 25.0 (not 30.0 = median)
+        assert_eq!(result2[0].get("p0"), Some(&Value::Float(25.0)));
     }
 
     #[test]
@@ -7477,6 +7552,7 @@ mod tests {
                     },
                     distinct: false,
                     alias: Some("sd".into()),
+                    percentile: None,
                 }],
             },
         };
@@ -7517,12 +7593,14 @@ mod tests {
                         },
                         distinct: false,
                         alias: Some("total".into()),
+                        percentile: None,
                     },
                     AggregateItem {
                         function: "count".into(),
                         arg: Expr::Star,
                         distinct: false,
                         alias: Some("cnt".into()),
+                        percentile: None,
                     },
                 ],
             },
@@ -9130,6 +9208,7 @@ mod tests {
                         },
                         distinct: true,
                         alias: Some("unique_ages".into()),
+                        percentile: None,
                     },
                     AggregateItem {
                         function: "count".into(),
@@ -9139,6 +9218,7 @@ mod tests {
                         },
                         distinct: false,
                         alias: Some("total_ages".into()),
+                        percentile: None,
                     },
                 ],
             },
@@ -9188,6 +9268,7 @@ mod tests {
                     },
                     distinct: true,
                     alias: Some("ages".into()),
+                    percentile: None,
                 }],
             },
         };
@@ -9226,6 +9307,7 @@ mod tests {
                     },
                     distinct: false,
                     alias: Some("total".into()),
+                    percentile: None,
                 }],
             },
         };
@@ -9289,6 +9371,7 @@ mod tests {
                     arg: Expr::Star,
                     distinct: false,
                     alias: Some("cnt".into()),
+                    percentile: None,
                 }],
             },
         };
@@ -9321,18 +9404,21 @@ mod tests {
                         arg: Expr::Star,
                         distinct: false,
                         alias: Some("cnt".into()),
+                        percentile: None,
                     },
                     AggregateItem {
                         function: "sum".into(),
                         arg: Expr::Literal(Value::Int(1)),
                         distinct: false,
                         alias: Some("total".into()),
+                        percentile: None,
                     },
                     AggregateItem {
                         function: "avg".into(),
                         arg: Expr::Literal(Value::Int(1)),
                         distinct: false,
                         alias: Some("mean".into()),
+                        percentile: None,
                     },
                 ],
             },
@@ -9371,6 +9457,7 @@ mod tests {
                             arg: Expr::Star,
                             distinct: false,
                             alias: Some("cnt".into()),
+                            percentile: None,
                         }],
                     }),
                     items: vec![ProjectItem {
