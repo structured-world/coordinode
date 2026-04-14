@@ -20,6 +20,10 @@
 //! cargo nextest run -p coordinode-integration --test cluster
 //! ```
 
+// Test infrastructure: expect/unwrap panics are intentional — infrastructure
+// failures should abort with a clear message, not be silently swallowed.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use coordinode_integration::harness::CoordinodeProcess;
 use coordinode_integration::proto::admin::{DecommissionNodeRequest, GetClusterStatusRequest};
 
