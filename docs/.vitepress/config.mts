@@ -151,8 +151,11 @@ export default defineConfig({
       {
         text: "OpenCypher",
         items: [
-          { text: "Extensions", link: "/CYPHER_EXTENSIONS" },
-          { text: "Compatibility", link: "/COMPATIBILITY" },
+          { text: "Overview", link: "/cypher/" },
+          { text: "Language Reference", link: "/cypher/reference" },
+          { text: "Functions", link: "/cypher/functions" },
+          { text: "Extensions", link: "/cypher/extensions" },
+          { text: "Neo4j Compatibility", link: "/cypher/compatibility" },
         ],
       },
       {
@@ -172,6 +175,28 @@ export default defineConfig({
     ],
 
     sidebar: {
+      "/cypher/": [
+        {
+          text: "OpenCypher",
+          items: [
+            { text: "Overview", link: "/cypher/" },
+            { text: "Language Reference", link: "/cypher/reference" },
+            { text: "Functions", link: "/cypher/functions" },
+          ],
+        },
+        {
+          text: "Extensions",
+          items: [
+            { text: "Extensions Overview", link: "/cypher/extensions" },
+          ],
+        },
+        {
+          text: "Compatibility",
+          items: [
+            { text: "Neo4j Compatibility", link: "/cypher/compatibility" },
+          ],
+        },
+      ],
       "/guide/": [
         {
           text: "Getting Started",
