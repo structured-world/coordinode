@@ -3,6 +3,29 @@
 All notable changes to this crate are documented in this file.
 This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
+## [0.3.9](https://github.com/structured-world/coordinode/compare/v0.3.8...v0.3.9) - 2026-04-13
+
+#### Performance
+
+- *(executor)* cache schema label per node per statement (R-API6)
+
+---
+
+## [0.3.8](https://github.com/structured-world/coordinode/compare/v0.3.7...v0.3.8) - 2026-04-13
+
+#### Added
+
+- *(schema)* complete R-API5 schema modes enforcement
+- *(schema)* enforce required fields at CREATE + multi-update tests
+- *(schema)* R-API5 schema modes STRICT/VALIDATED/FLEXIBLE
+- *(schema)* implement SchemaMode enforcement in executor (R-API5)
+
+#### Fixed
+
+- *(executor)* schema enforcement for PropertyPath, DocFunction, map SET ops
+
+---
+
 ## [0.3.6](https://github.com/structured-world/coordinode/compare/v0.3.5...v0.3.6) - 2026-04-13
 
 #### Added

@@ -3,6 +3,30 @@
 All notable changes to this crate are documented in this file.
 This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
+## [0.3.11](https://github.com/structured-world/coordinode/compare/v0.3.10...v0.3.11) - 2026-04-14
+
+#### Added
+
+- *(storage)* implement standalone WAL for crash durability
+
+---
+
+## [0.3.9](https://github.com/structured-world/coordinode/compare/v0.3.8...v0.3.9) - 2026-04-13
+
+#### Performance
+
+- *(executor)* cache schema label per node per statement (R-API6)
+
+---
+
+## [0.3.8](https://github.com/structured-world/coordinode/compare/v0.3.7...v0.3.8) - 2026-04-13
+
+#### Added
+
+- *(schema)* R-API5 schema modes STRICT/VALIDATED/FLEXIBLE
+
+---
+
 ## [0.3.6](https://github.com/structured-world/coordinode/compare/v0.3.5...v0.3.6) - 2026-04-13
 
 #### Added
