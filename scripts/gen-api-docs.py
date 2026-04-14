@@ -558,6 +558,17 @@ def generate_service_page(
             f":::\n"
         )
 
+    # Check if any method has HTTP annotation (transcoding paths)
+    has_http = any(m.http_method for m in svc.methods)
+    if has_http and svc.name not in INTERNAL_SERVICES:
+        lines.append(
+            "::: info Transport\n"
+            "All methods are available via **gRPC on port 7080**. "
+            "HTTP/JSON transcoding paths shown below are annotations planned for port 7081 "
+            "and are **not yet available** in this release.\n"
+            ":::\n"
+        )
+
     # Methods
     if svc.methods:
         lines.append("## Methods\n")
@@ -568,7 +579,7 @@ def generate_service_page(
 
             if rpc.http_method and rpc.http_path:
                 lines.append(
-                    f"**HTTP:** `{rpc.http_method} {rpc.http_path}`\n"
+                    f"**HTTP** _(planned, port 7081)_: `{rpc.http_method} {rpc.http_path}`\n"
                 )
             elif rpc.streaming_response and not rpc.http_path:
                 lines.append("**Transport:** Server-streaming gRPC only (no HTTP transcoding)\n")
@@ -701,8 +712,10 @@ def generate_index_page(services: list[ProtoService]) -> str:
     lines.append("---\n")
     lines.append("# API Reference\n")
     lines.append(
-        "CoordiNode exposes a gRPC API with HTTP/JSON transcoding on port 7081. "
-        "All services are available at `host:7080` (gRPC) and `host:7081` (REST).\n"
+        "CoordiNode exposes a native gRPC API on port **7080**. "
+        "All services documented here are available via gRPC (HTTP/2). "
+        "HTTP/JSON transcoding (port 7081), Bolt protocol (7082), and WebSocket subscriptions (7083) "
+        "are planned for a future release.\n"
     )
     lines.append("## Services\n")
     lines.append("| Service | Description | Proto |")
@@ -720,13 +733,13 @@ def generate_index_page(services: list[ProtoService]) -> str:
         "[Common Types](./common-types)\n"
     )
     lines.append("## Ports\n")
-    lines.append("| Port | Protocol | Purpose |")
-    lines.append("|------|----------|---------|")
-    lines.append("| 7080 | gRPC (HTTP/2) | Native API, inter-node communication |")
-    lines.append("| 7081 | HTTP/1.1 + JSON | REST/JSON transcoding of gRPC endpoints |")
-    lines.append("| 7082 | Bolt | Neo4j wire protocol compatibility |")
-    lines.append("| 7083 | WebSocket | Subscriptions, live queries |")
-    lines.append("| 7084 | HTTP | Prometheus `/metrics`, `/health` |")
+    lines.append("| Port | Protocol | Status | Purpose |")
+    lines.append("|------|----------|--------|---------|")
+    lines.append("| 7080 | gRPC (HTTP/2) | **Active** | Native gRPC API, inter-node communication |")
+    lines.append("| 7081 | HTTP/1.1 + JSON | Planned | REST/JSON transcoding of gRPC endpoints |")
+    lines.append("| 7082 | Bolt | Planned | Neo4j wire protocol compatibility |")
+    lines.append("| 7083 | WebSocket | Planned | Subscriptions, live queries |")
+    lines.append("| 7084 | HTTP | **Active** | Prometheus `/metrics`, `/health`, `/ready` |")
     lines.append("")
 
     return "\n".join(lines)
