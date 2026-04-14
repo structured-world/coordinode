@@ -51,3 +51,11 @@ git_release_enable = true
 name = "coordinode-client"
 release = false
 git_tag_name = "coordinode-client-v{{ version }}"
+
+# Test-only crate — not a releasable package. Excluded from release-plz
+# processing to avoid "package not found in workspace" errors: release-plz
+# checks out an old baseline tag where this crate did not yet exist.
+[[package]]
+name = "coordinode-integration"
+release = false
+git_tag_name = "coordinode-integration-v{{ version }}"
