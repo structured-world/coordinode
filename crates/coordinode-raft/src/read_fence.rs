@@ -183,6 +183,18 @@ pub struct ReadFence {
     applied_rx: tokio::sync::watch::Receiver<u64>,
     /// Underlying openraft instance (for leader check + linearizable read).
     raft: Arc<RaftInstance>,
+    /// Staleness threshold override. `None` → use `CE_STALENESS_THRESHOLD_ENTRIES`.
+    ///
+    /// EE sets this per-connection via `max_staleness_seconds` configuration.
+    /// Tests use `with_staleness_threshold()` to inject a low value.
+    staleness_threshold: Option<u64>,
+    /// Inject a specific lag value instead of computing from openraft metrics.
+    ///
+    /// `None` → compute from live metrics (production path).
+    /// `Some(n)` → return n from `staleness_entries()` (EE per-connection
+    /// overrides and integration tests). Tests use this to trigger `StaleReplica`
+    /// reliably without needing to write 10K+ log entries of real lag.
+    staleness_lag_override: Option<u64>,
 }
 
 impl ReadFence {
@@ -193,7 +205,32 @@ impl ReadFence {
         applied_rx: tokio::sync::watch::Receiver<u64>,
         raft: Arc<RaftInstance>,
     ) -> Self {
-        Self { applied_rx, raft }
+        Self {
+            applied_rx,
+            raft,
+            staleness_threshold: None,
+            staleness_lag_override: None,
+        }
+    }
+
+    /// Inject a specific lag value for `staleness_entries()`.
+    ///
+    /// Used by integration tests to trigger `StaleReplica` without needing
+    /// to write 10K+ entries of real lag. Also available to EE for
+    /// per-connection staleness budget enforcement.
+    pub fn with_staleness_lag(mut self, lag: u64) -> Self {
+        self.staleness_lag_override = Some(lag);
+        self
+    }
+
+    /// Override the staleness threshold for this fence.
+    ///
+    /// Used by EE to apply per-connection `max_staleness_entries` limits.
+    /// In tests, set to a low value to force `StaleReplica` without needing
+    /// to write 10K log entries.
+    pub fn with_staleness_threshold(mut self, threshold: u64) -> Self {
+        self.staleness_threshold = Some(threshold);
+        self
     }
 
     /// Apply read preference and concern checks before executing a query.
@@ -338,6 +375,10 @@ impl ReadFence {
     /// Positive value means the state machine is catching up.
     /// CE threshold: `CE_STALENESS_THRESHOLD_ENTRIES`.
     pub fn staleness_entries(&self) -> u64 {
+        if let Some(lag) = self.staleness_lag_override {
+            return lag;
+        }
+
         use openraft::async_runtime::watch::WatchReceiver as _;
 
         let metrics = self.raft.metrics().borrow_watched().clone();
@@ -360,12 +401,12 @@ impl ReadFence {
     }
 
     fn check_staleness(&self) -> Result<(), ReadFenceError> {
+        let threshold = self
+            .staleness_threshold
+            .unwrap_or(CE_STALENESS_THRESHOLD_ENTRIES);
         let lag = self.staleness_entries();
-        if lag > CE_STALENESS_THRESHOLD_ENTRIES {
-            return Err(ReadFenceError::StaleReplica {
-                lag,
-                threshold: CE_STALENESS_THRESHOLD_ENTRIES,
-            });
+        if lag > threshold {
+            return Err(ReadFenceError::StaleReplica { lag, threshold });
         }
         Ok(())
     }

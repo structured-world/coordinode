@@ -4,6 +4,7 @@
 //! Verifies:
 //! - `ReadFence::apply()` passes for all valid preference/concern combos
 //! - `ReadPreference::Primary` passes on leader
+//! - `ReadPreference::Primary` fails on follower (`NotLeader`)
 //! - `ReadPreference::Secondary` fails on leader (`NotFollower`)
 //! - `ReadConcern::Linearizable` passes on leader
 //! - `ReadConcern::Linearizable` fails on follower (`LinearizableRequiresLeader`)
@@ -26,6 +27,78 @@ use coordinode_raft::read_fence::{
 };
 use coordinode_storage::engine::config::StorageConfig;
 use coordinode_storage::engine::core::StorageEngine;
+
+/// Hard timeout for multi-node tests that require cluster formation.
+const CLUSTER_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn alloc_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0 for port alloc");
+    let port = listener.local_addr().expect("local_addr").port();
+    drop(listener);
+    port
+}
+
+/// Bootstrap a 3-node cluster. Returns (leader_node, follower_node, dirs).
+/// Caller must keep dirs alive for the duration of the test.
+async fn bootstrap_3node() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    RaftNode,
+    RaftNode,
+    RaftNode,
+) {
+    init_test_tracing();
+    let p1 = alloc_port();
+    let p2 = alloc_port();
+    let p3 = alloc_port();
+
+    let d1 = tempfile::tempdir().expect("d1");
+    let d2 = tempfile::tempdir().expect("d2");
+    let d3 = tempfile::tempdir().expect("d3");
+
+    let e1 = Arc::new(StorageEngine::open(&StorageConfig::new(d1.path())).expect("e1"));
+    let e2 = Arc::new(StorageEngine::open(&StorageConfig::new(d2.path())).expect("e2"));
+    let e3 = Arc::new(StorageEngine::open(&StorageConfig::new(d3.path())).expect("e3"));
+
+    let n1 = RaftNode::open_cluster(
+        1,
+        Arc::clone(&e1),
+        format!("127.0.0.1:{p1}").parse().expect("a1"),
+        format!("http://127.0.0.1:{p1}"),
+    )
+    .await
+    .expect("n1");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let n2 = RaftNode::open_joining(
+        2,
+        Arc::clone(&e2),
+        format!("127.0.0.1:{p2}").parse().expect("a2"),
+    )
+    .await
+    .expect("n2");
+    let n3 = RaftNode::open_joining(
+        3,
+        Arc::clone(&e3),
+        format!("127.0.0.1:{p3}").parse().expect("a3"),
+    )
+    .await
+    .expect("n3");
+
+    n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+        .await
+        .expect("add n2");
+    n1.add_node(3, format!("http://127.0.0.1:{p3}"))
+        .await
+        .expect("add n3");
+    n1.change_membership(vec![1, 2, 3])
+        .await
+        .expect("membership");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    (d1, d2, d3, n1, n2, n3)
+}
 
 fn init_test_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -190,6 +263,84 @@ async fn staleness_zero_on_fresh_node() {
     );
 }
 
+/// StaleReplica returned when lag exceeds CE threshold.
+///
+/// CE_STALENESS_THRESHOLD_ENTRIES = 10_000 makes it impractical to produce
+/// real lag in a unit test. We use `with_staleness_lag()` to inject a lag
+/// value that exceeds a custom threshold set via `with_staleness_threshold()`.
+///
+/// Requires a 3-node cluster: staleness is only checked on non-leader nodes
+/// (the role check for `Secondary` on leader returns `NotFollower` first).
+/// n2 is a follower so the `check_staleness()` path is exercised.
+///
+/// Verifies the full `StaleReplica` error path including correct error fields.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_replica_error_when_lag_exceeds_threshold() {
+    let result = tokio::time::timeout(CLUSTER_TEST_TIMEOUT, async {
+        let (_d1, _d2, _d3, n1, n2, n3) = bootstrap_3node().await;
+
+        // n2 is a follower. Inject lag=50, threshold=10: 50 > 10 → StaleReplica.
+        let mut fence = n2
+            .read_fence()
+            .with_staleness_lag(50)
+            .with_staleness_threshold(10);
+
+        let err = fence
+            .apply_default(ReadPreference::Secondary, ReadConcern::Local)
+            .await
+            .expect_err("should fail with StaleReplica when lag > threshold");
+
+        match err {
+            ReadFenceError::StaleReplica { lag, threshold } => {
+                assert_eq!(lag, 50, "lag should match injected value");
+                assert_eq!(threshold, 10, "threshold should match configured value");
+            }
+            other => panic!("expected StaleReplica, got {other:?}"),
+        }
+
+        n1.shutdown().await.expect("s1");
+        n2.shutdown().await.expect("s2");
+        n3.shutdown().await.expect("s3");
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — stale_replica_error_when_lag_exceeds_threshold"
+    );
+}
+
+/// StaleReplica is NOT returned on a follower when lag is within the threshold.
+///
+/// Uses a 3-node cluster (follower role needed for staleness check path) with
+/// an injected lag below the custom threshold. Verifies that Secondary
+/// preference succeeds when lag ≤ threshold even with a tight custom threshold.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_stale_replica_when_lag_within_threshold() {
+    let result = tokio::time::timeout(CLUSTER_TEST_TIMEOUT, async {
+        let (_d1, _d2, _d3, n1, n2, n3) = bootstrap_3node().await;
+
+        // Inject lag=5, threshold=10: 5 > 10 is false → pass.
+        let mut fence = n2
+            .read_fence()
+            .with_staleness_lag(5)
+            .with_staleness_threshold(10);
+
+        fence
+            .apply_default(ReadPreference::Secondary, ReadConcern::Local)
+            .await
+            .expect("Secondary on follower with lag within threshold should pass");
+
+        n1.shutdown().await.expect("s1");
+        n2.shutdown().await.expect("s2");
+        n3.shutdown().await.expect("s3");
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — no_stale_replica_when_lag_within_threshold"
+    );
+}
+
 // ── applied_index advances after commit ──────────────────────────────────────
 
 /// After committing a proposal, applied_index should be ≥ 1.
@@ -295,4 +446,114 @@ async fn subscribe_applied_reflects_current_index() {
     // Initial value after bootstrap — at least the config entry should be applied.
     // We just verify the channel is live and readable.
     let _ = val; // no panic = receiver works
+}
+
+// ── Multi-node: follower role checks ─────────────────────────────────────────
+
+/// ReadPreference::Primary fails on a follower with NotLeader.
+///
+/// Requires a 3-node cluster so we can exercise the fence on a non-leader node.
+#[tokio::test(flavor = "multi_thread")]
+async fn primary_preference_fails_on_follower() {
+    let result = tokio::time::timeout(CLUSTER_TEST_TIMEOUT, async {
+        let (_d1, _d2, _d3, n1, n2, n3) = bootstrap_3node().await;
+
+        // n1 is the leader (bootstrapped first). n2 is a follower.
+        let mut fence = n2.read_fence();
+        let err = fence
+            .apply_default(ReadPreference::Primary, ReadConcern::Local)
+            .await
+            .expect_err("Primary on follower should fail");
+
+        assert!(
+            matches!(err, ReadFenceError::NotLeader),
+            "expected NotLeader on follower, got {err:?}"
+        );
+
+        n1.shutdown().await.expect("s1");
+        n2.shutdown().await.expect("s2");
+        n3.shutdown().await.expect("s3");
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — primary_preference_fails_on_follower"
+    );
+}
+
+/// ReadConcern::Linearizable fails on follower with LinearizableRequiresLeader.
+///
+/// Linearizable concern requires the node to be the Raft leader (lease read).
+/// On a follower, the read fence must reject the request.
+#[tokio::test(flavor = "multi_thread")]
+async fn linearizable_concern_fails_on_follower() {
+    let result = tokio::time::timeout(CLUSTER_TEST_TIMEOUT, async {
+        let (_d1, _d2, _d3, n1, n2, n3) = bootstrap_3node().await;
+
+        // Use SecondaryPreferred so the role check passes on a follower, then
+        // the concern check should reject with LinearizableRequiresLeader.
+        let mut fence = n2.read_fence();
+        let err = fence
+            .apply_default(
+                ReadPreference::SecondaryPreferred,
+                ReadConcern::Linearizable,
+            )
+            .await
+            .expect_err("Linearizable on follower should fail");
+
+        assert!(
+            matches!(err, ReadFenceError::LinearizableRequiresLeader),
+            "expected LinearizableRequiresLeader on follower, got {err:?}"
+        );
+
+        n1.shutdown().await.expect("s1");
+        n2.shutdown().await.expect("s2");
+        n3.shutdown().await.expect("s3");
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — linearizable_concern_fails_on_follower"
+    );
+}
+
+/// Secondary preference succeeds on a follower (within staleness threshold).
+///
+/// The fence should pass when the follower is caught up (lag ≤ CE_STALENESS_THRESHOLD_ENTRIES).
+#[tokio::test(flavor = "multi_thread")]
+async fn secondary_preference_passes_on_follower() {
+    let result = tokio::time::timeout(CLUSTER_TEST_TIMEOUT, async {
+        let (_d1, _d2, _d3, n1, n2, n3) = bootstrap_3node().await;
+
+        // Write one entry so followers have something applied.
+        let id_gen = ProposalIdGenerator::new();
+        let proposal = RaftProposal {
+            id: id_gen.next(),
+            commit_ts: Timestamp::from_raw(1),
+            start_ts: Timestamp::from_raw(0),
+            bypass_rate_limiter: false,
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"r141:secondary:key".to_vec(),
+                value: b"v".to_vec(),
+            }],
+        };
+        n1.pipeline().propose_and_wait(&proposal).expect("propose");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut fence = n2.read_fence();
+        fence
+            .apply_default(ReadPreference::Secondary, ReadConcern::Local)
+            .await
+            .expect("Secondary on caught-up follower should pass");
+
+        n1.shutdown().await.expect("s1");
+        n2.shutdown().await.expect("s2");
+        n3.shutdown().await.expect("s3");
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — secondary_preference_passes_on_follower"
+    );
 }
