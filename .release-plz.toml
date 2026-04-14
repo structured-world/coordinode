@@ -39,8 +39,8 @@ name = "coordinode-server"
 git_tag_enable = true
 git_release_enable = true
 
-# coordinode-client has a proto build step requiring the proto/ submodule.
-# release-plz temp worktrees don't run --recurse-submodules, so build.rs
-# falls back to pre-generated files in proto_gen/ when the submodule is absent.
+# Library crate — release-plz skips version bumping and cargo package for it.
+# Changelog is derived from workspace CHANGELOG.md via scripts/split-changelog.py.
 [[package]]
 name = "coordinode-client"
+release = false
