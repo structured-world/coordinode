@@ -40,10 +40,7 @@ git_tag_enable = true
 git_release_enable = true
 
 # coordinode-client has a proto build step requiring the proto/ submodule.
-# release-plz temp worktrees don't run --recurse-submodules, so cargo package
-# falls back to pre-generated files in proto_gen/. The package_no_verify flag
-# skips the cargo build verification step inside the packaging sandbox where
-# the pre-generated files may not match the current proto state perfectly.
+# release-plz temp worktrees don't run --recurse-submodules, so build.rs
+# falls back to pre-generated files in proto_gen/ when the submodule is absent.
 [[package]]
 name = "coordinode-client"
-package_no_verify = true
