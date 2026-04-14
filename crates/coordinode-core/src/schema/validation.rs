@@ -166,11 +166,13 @@ fn validate_property(
         });
     }
 
-    // Vector dimension check
+    // Vector dimension check.
+    // dimensions=0 means "unset" (e.g. gRPC proto PropertyDefinition has no dimensions
+    // field — SchemaService/CreateLabel always writes 0). Treat 0 as "any dimension".
     if let (Value::Vector(vec), PropertyType::Vector { dimensions, .. }) =
         (value, &def.property_type)
     {
-        if vec.len() != *dimensions as usize {
+        if *dimensions != 0 && vec.len() != *dimensions as usize {
             return Err(ValidationError::VectorDimsMismatch {
                 property: prop_name.to_string(),
                 expected: *dimensions,

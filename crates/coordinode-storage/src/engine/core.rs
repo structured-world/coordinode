@@ -8,8 +8,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use coordinode_core::txn::proposal::Mutation;
 use lsm_tree::{AbstractTree, Guard};
 use tracing::info;
 
@@ -22,6 +23,7 @@ use crate::engine::config::{FlushPolicy, StorageConfig};
 use crate::engine::flush::FlushManager;
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
+use crate::wal::{StandaloneWal, WalConfig};
 
 /// Newtype wrapper that bridges coordinode-core's `TimestampOracle` to
 /// lsm-tree's `SequenceNumberGenerator` trait. Makes every write's LSM
@@ -92,6 +94,11 @@ pub struct StorageEngine {
     /// Root data directory — exposed so subsystems (e.g. Raft oplog) can
     /// derive their own sub-directories without re-reading the config.
     data_dir: PathBuf,
+    /// Optional standalone WAL (embedded / no-Raft mode only).
+    ///
+    /// `Some` only when opened via `open_with_wal`. In cluster mode this is
+    /// always `None` — Raft log is the crash-recovery mechanism (ADR-017).
+    wal: Option<Arc<Mutex<StandaloneWal>>>,
 }
 
 impl StorageEngine {
@@ -102,7 +109,35 @@ impl StorageEngine {
         let gc_watermark = Arc::new(AtomicU64::new(0));
         let seqno: lsm_tree::SharedSequenceNumberGenerator =
             Arc::new(lsm_tree::SequenceNumberCounter::default());
-        Self::finish_open(config, seqno, gc_watermark)
+        Self::finish_open(config, seqno, gc_watermark, None)
+    }
+
+    /// Open with a standalone WAL for crash durability (embedded / no-Raft mode).
+    ///
+    /// Pass `wal_config = None` to use the WAL with default settings:
+    /// - Path: `<data_dir>/standalone.wal`
+    /// - Sync: `SyncPerRecord` (full crash safety)
+    ///
+    /// Pass `wal_config = Some(WalConfig { … })` to customise path or sync
+    /// policy (e.g. `NoSync` for test environments).
+    ///
+    /// In cluster mode, pass `None` for `wal_config` to `StorageEngine::open`
+    /// directly — WAL is not used in cluster mode (Raft log = recovery, ADR-017).
+    ///
+    /// # Recovery
+    ///
+    /// If `standalone.wal` exists on open (crash recovery), all valid records
+    /// are replayed into the memtable, then a `persist()` flushes them to SST.
+    /// The WAL is then deleted and a fresh journal is started for new writes.
+    pub fn open_with_wal(
+        config: &StorageConfig,
+        wal_config: Option<WalConfig>,
+    ) -> StorageResult<Self> {
+        let gc_watermark = Arc::new(AtomicU64::new(0));
+        let seqno: lsm_tree::SharedSequenceNumberGenerator =
+            Arc::new(lsm_tree::SequenceNumberCounter::default());
+        let wal_config = wal_config.unwrap_or_default();
+        Self::finish_open(config, seqno, gc_watermark, Some(wal_config))
     }
 
     /// Open with a custom `TimestampOracle` as the seqno generator.
@@ -116,13 +151,14 @@ impl StorageEngine {
     ) -> StorageResult<Self> {
         let gc_watermark = Arc::new(AtomicU64::new(0));
         let seqno: lsm_tree::SharedSequenceNumberGenerator = Arc::new(OracleSeqnoGenerator(oracle));
-        Self::finish_open(config, seqno, gc_watermark)
+        Self::finish_open(config, seqno, gc_watermark, None)
     }
 
     fn finish_open(
         config: &StorageConfig,
         seqno: lsm_tree::SharedSequenceNumberGenerator,
         gc_watermark: Arc<AtomicU64>,
+        wal_config: Option<WalConfig>,
     ) -> StorageResult<Self> {
         // Shared block cache across all partition trees.
         let cache = Arc::new(lsm_tree::Cache::with_capacity_bytes(
@@ -193,6 +229,83 @@ impl StorageEngine {
             "storage engine opened"
         );
 
+        // ── Standalone WAL setup ──────────────────────────────────────────────
+        // Open and replay WAL if requested.  Must happen AFTER the lsm-tree
+        // partitions are open so we can apply replayed mutations directly.
+        let wal = if let Some(wal_cfg) = wal_config {
+            let wal_path = wal_cfg
+                .path
+                .unwrap_or_else(|| config.data_dir.join("standalone.wal"));
+            let sync = wal_cfg.sync;
+
+            let (mut standalone_wal, replay_records) = StandaloneWal::open(wal_path.clone(), sync)?;
+
+            if !replay_records.is_empty() {
+                // Replay WAL records into the lsm-tree partitions.
+                tracing::info!(
+                    count = replay_records.len(),
+                    "WAL: applying replay records to memtable"
+                );
+                for record in &replay_records {
+                    for mutation in &record.mutations {
+                        use coordinode_core::txn::proposal::Mutation as CoreMutation;
+                        let part_seqno = seqno.next();
+                        match mutation {
+                            CoreMutation::Put {
+                                partition,
+                                key,
+                                value,
+                            } => {
+                                let part = Partition::from(*partition);
+                                let tree = trees.get(&part).ok_or_else(|| {
+                                    StorageError::PartitionNotFound {
+                                        name: part.name().to_string(),
+                                    }
+                                })?;
+                                tree.insert(key, value, part_seqno);
+                            }
+                            CoreMutation::Delete { partition, key } => {
+                                let part = Partition::from(*partition);
+                                let tree = trees.get(&part).ok_or_else(|| {
+                                    StorageError::PartitionNotFound {
+                                        name: part.name().to_string(),
+                                    }
+                                })?;
+                                tree.remove(key, part_seqno);
+                            }
+                            CoreMutation::Merge {
+                                partition,
+                                key,
+                                operand,
+                            } => {
+                                let part = Partition::from(*partition);
+                                let tree = trees.get(&part).ok_or_else(|| {
+                                    StorageError::PartitionNotFound {
+                                        name: part.name().to_string(),
+                                    }
+                                })?;
+                                tree.merge(key, operand, part_seqno);
+                            }
+                        }
+                    }
+                }
+
+                // Flush replayed memtable data to SST for durability.
+                tracing::info!("WAL: flushing replayed data to SST");
+                for tree in trees.values() {
+                    tree.flush_active_memtable(0)?;
+                }
+
+                // WAL replay complete — checkpoint (rotate) to start fresh.
+                tracing::info!(path = %wal_path.display(), "WAL: checkpoint after recovery");
+                standalone_wal.checkpoint()?;
+            }
+
+            Some(Arc::new(Mutex::new(standalone_wal)))
+        } else {
+            None
+        };
+
         Ok(Self {
             flush_manager: Some(flush_manager),
             compaction_scheduler: Some(compaction_scheduler),
@@ -204,6 +317,7 @@ impl StorageEngine {
             access_tracker: AccessTracker::new(),
             gc_watermark,
             data_dir: config.data_dir.clone(),
+            wal,
         })
     }
 
@@ -347,11 +461,49 @@ impl StorageEngine {
     /// Flushes the active memtable of every partition tree to an SST file.
     /// SST files are written atomically (atomic rename), so this provides
     /// crash safety without requiring a separate WAL fsync.
+    ///
+    /// When a standalone WAL is active, a WAL checkpoint (rotation) is
+    /// performed after the SST flush.  This keeps the WAL small: all data
+    /// that was in the WAL is now in SST, so the journal can be truncated.
     pub fn persist(&self) -> StorageResult<()> {
         for tree in self.trees.values() {
             tree.flush_active_memtable(0)?;
         }
+        // Checkpoint WAL after successful SST flush.
+        if let Some(wal) = &self.wal {
+            let mut guard = wal
+                .lock()
+                .map_err(|_| StorageError::Io("WAL mutex poisoned".into()))?;
+            guard.checkpoint()?;
+        }
         Ok(())
+    }
+
+    /// Append mutations to the standalone WAL before applying them to the memtable.
+    ///
+    /// Called by `OwnedLocalProposalPipeline` when a WAL is configured.
+    /// Replaces the per-proposal `persist()` call: instead of flushing the
+    /// entire memtable to SST on every write, a lightweight WAL record
+    /// (≤4 KB typical, fsync ~0.1–0.5 ms) is written and memtable follows.
+    ///
+    /// Returns `Some(lsn)` if a WAL record was written, `None` when no WAL
+    /// is configured (cluster mode or plain `open()`).
+    pub fn wal_append(&self, mutations: &[Mutation]) -> StorageResult<Option<u64>> {
+        match &self.wal {
+            None => Ok(None),
+            Some(wal) => {
+                let mut guard = wal
+                    .lock()
+                    .map_err(|_| StorageError::Io("WAL mutex poisoned".into()))?;
+                let lsn = guard.append(mutations)?;
+                Ok(Some(lsn))
+            }
+        }
+    }
+
+    /// Return `true` if a standalone WAL is active.
+    pub fn has_wal(&self) -> bool {
+        self.wal.is_some()
     }
 
     /// Get approximate disk space used by the engine in bytes.
@@ -968,6 +1120,281 @@ mod tests {
                 .expect("get failed")
                 .is_none());
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod wal_integration_tests {
+    //! Integration tests for standalone WAL crash recovery.
+    //!
+    //! These tests validate the full round-trip:
+    //!   open_with_wal → wal_append → drop (simulated crash) → open_with_wal → verify recovery.
+    //!
+    //! Unlike unit tests in `wal/mod.rs` (which test the WAL file directly),
+    //! these tests go through `StorageEngine::open_with_wal` and verify that
+    //! data written to the WAL is visible after engine reopen.
+
+    use super::*;
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    use tempfile::TempDir;
+
+    /// Returns a `StorageConfig` pointing at `dir` with WAL enabled (WAL path = `dir/standalone.wal`).
+    fn cfg_with_wal(dir: &TempDir) -> (StorageConfig, WalConfig) {
+        let config = StorageConfig::new(dir.path());
+        let wal_config = WalConfig {
+            path: Some(dir.path().join("standalone.wal")),
+            sync: crate::wal::WalSyncPolicy::SyncPerRecord,
+        };
+        (config, wal_config)
+    }
+
+    #[test]
+    fn wal_recovery_put_survives_crash() {
+        // Verifies that a Put mutation written to the WAL (but not yet flushed to SST)
+        // is recovered after the engine is dropped (simulating a crash) and reopened.
+        let dir = TempDir::new().expect("temp dir");
+        let (config, wal_config) = cfg_with_wal(&dir);
+
+        // Phase 1: write to WAL, then "crash" (drop without persist).
+        {
+            let engine =
+                StorageEngine::open_with_wal(&config, Some(wal_config.clone())).expect("open");
+            assert!(engine.has_wal());
+
+            // Write through WAL — must NOT call persist() so data stays only in WAL.
+            let mutations = vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:00:00000042".to_vec(),
+                value: b"crashed-payload".to_vec(),
+            }];
+            engine.wal_append(&mutations).expect("wal_append");
+
+            // Apply to memtable (mirrors what OwnedLocalProposalPipeline does).
+            engine
+                .put(Partition::Node, b"node:00:00000042", b"crashed-payload")
+                .expect("put");
+
+            // Drop engine WITHOUT calling persist() — simulates crash.
+            // Data is in memtable + WAL but NOT in any SST.
+        }
+
+        // Phase 2: reopen with WAL — recovery must replay the WAL record.
+        {
+            let engine = StorageEngine::open_with_wal(&config, Some(wal_config)).expect("reopen");
+
+            let val = engine
+                .get(Partition::Node, b"node:00:00000042")
+                .expect("get after recovery");
+
+            assert_eq!(
+                val.as_deref(),
+                Some(b"crashed-payload".as_slice()),
+                "WAL recovery must restore Put written before crash"
+            );
+        }
+    }
+
+    #[test]
+    fn wal_recovery_delete_survives_crash() {
+        // Verifies that a Delete mutation in the WAL (after a prior Put in SST)
+        // is replayed correctly: the key must be absent after recovery.
+        let dir = TempDir::new().expect("temp dir");
+        let (config, wal_config) = cfg_with_wal(&dir);
+
+        // Phase 1: persist a key to SST.
+        {
+            let engine =
+                StorageEngine::open_with_wal(&config, Some(wal_config.clone())).expect("open");
+            engine
+                .put(Partition::Node, b"node:00:deadbeef", b"to-be-deleted")
+                .expect("put");
+            engine.persist().expect("persist");
+            // persist() also checkpoints the WAL — WAL is now clean.
+        }
+
+        // Phase 2: delete via WAL, then crash.
+        {
+            let engine =
+                StorageEngine::open_with_wal(&config, Some(wal_config.clone())).expect("open2");
+
+            let mutations = vec![Mutation::Delete {
+                partition: PartitionId::Node,
+                key: b"node:00:deadbeef".to_vec(),
+            }];
+            engine.wal_append(&mutations).expect("wal_append");
+            engine
+                .delete(Partition::Node, b"node:00:deadbeef")
+                .expect("delete");
+            // Crash — no persist().
+        }
+
+        // Phase 3: reopen — delete must be replayed, key must be gone.
+        {
+            let engine = StorageEngine::open_with_wal(&config, Some(wal_config)).expect("reopen");
+
+            let val = engine
+                .get(Partition::Node, b"node:00:deadbeef")
+                .expect("get after recovery");
+
+            assert!(
+                val.is_none(),
+                "WAL recovery must replay Delete: key must be absent after crash"
+            );
+        }
+    }
+
+    #[test]
+    fn wal_recovery_multiple_mutations_across_two_writes() {
+        // Writes multiple WAL records (two separate wal_append calls), crashes,
+        // reopens, and verifies ALL records are recovered in order.
+        let dir = TempDir::new().expect("temp dir");
+        let (config, wal_config) = cfg_with_wal(&dir);
+
+        {
+            let engine =
+                StorageEngine::open_with_wal(&config, Some(wal_config.clone())).expect("open");
+
+            // First WAL record: two puts.
+            let batch1 = vec![
+                Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: b"node:00:00000001".to_vec(),
+                    value: b"alpha".to_vec(),
+                },
+                Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: b"node:00:00000002".to_vec(),
+                    value: b"beta".to_vec(),
+                },
+            ];
+            engine.wal_append(&batch1).expect("wal_append batch1");
+            for m in &batch1 {
+                if let Mutation::Put {
+                    partition,
+                    key,
+                    value,
+                } = m
+                {
+                    engine
+                        .put(Partition::from(*partition), key, value)
+                        .expect("put");
+                }
+            }
+
+            // Second WAL record: one more put.
+            let batch2 = vec![Mutation::Put {
+                partition: PartitionId::Schema,
+                key: b"schema:label:Person".to_vec(),
+                value: b"{}".to_vec(),
+            }];
+            engine.wal_append(&batch2).expect("wal_append batch2");
+            engine
+                .put(Partition::Schema, b"schema:label:Person", b"{}")
+                .expect("put schema");
+
+            // Crash.
+        }
+
+        // Reopen and verify all three keys recovered.
+        {
+            let engine = StorageEngine::open_with_wal(&config, Some(wal_config)).expect("reopen");
+
+            let v1 = engine
+                .get(Partition::Node, b"node:00:00000001")
+                .expect("get 1");
+            let v2 = engine
+                .get(Partition::Node, b"node:00:00000002")
+                .expect("get 2");
+            let v3 = engine
+                .get(Partition::Schema, b"schema:label:Person")
+                .expect("get 3");
+
+            assert_eq!(
+                v1.as_deref(),
+                Some(b"alpha".as_slice()),
+                "key 1 must recover"
+            );
+            assert_eq!(
+                v2.as_deref(),
+                Some(b"beta".as_slice()),
+                "key 2 must recover"
+            );
+            assert_eq!(v3.as_deref(), Some(b"{}".as_slice()), "key 3 must recover");
+        }
+    }
+
+    #[test]
+    fn wal_checkpoint_on_persist_clears_wal_file() {
+        // Verifies that calling persist() on an engine with WAL:
+        //   1. Flushes memtable to SST.
+        //   2. Checkpoints (rotates) the WAL so the file is empty.
+        // After reopen, no replay happens (WAL is clean) and data is still readable from SST.
+        let dir = TempDir::new().expect("temp dir");
+        let (config, wal_config) = cfg_with_wal(&dir);
+
+        {
+            let engine =
+                StorageEngine::open_with_wal(&config, Some(wal_config.clone())).expect("open");
+
+            let mutations = vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:00:persisted".to_vec(),
+                value: b"safe".to_vec(),
+            }];
+            engine.wal_append(&mutations).expect("wal_append");
+            engine
+                .put(Partition::Node, b"node:00:persisted", b"safe")
+                .expect("put");
+
+            // persist() must flush to SST AND checkpoint the WAL.
+            engine.persist().expect("persist");
+
+            // WAL file must be empty (or minimal header) after checkpoint.
+            let wal_path = dir.path().join("standalone.wal");
+            let wal_size = std::fs::metadata(&wal_path)
+                .expect("wal file must exist after persist")
+                .len();
+            assert_eq!(
+                wal_size, 0,
+                "WAL must be empty after checkpoint via persist()"
+            );
+        }
+
+        // Reopen: no WAL replay needed (SST has the data), key still readable.
+        {
+            let engine = StorageEngine::open_with_wal(&config, Some(wal_config)).expect("reopen");
+
+            let val = engine
+                .get(Partition::Node, b"node:00:persisted")
+                .expect("get");
+            assert_eq!(
+                val.as_deref(),
+                Some(b"safe".as_slice()),
+                "data persisted to SST must survive WAL checkpoint + reopen"
+            );
+        }
+    }
+
+    #[test]
+    fn no_wal_engine_wal_append_returns_none() {
+        // Verifies that wal_append() on a plain open() engine (no WAL) returns None
+        // without error — caller can use this to branch between WAL and legacy paths.
+        let dir = TempDir::new().expect("temp dir");
+        let config = StorageConfig::new(dir.path());
+        let engine = StorageEngine::open(&config).expect("open without wal");
+
+        assert!(!engine.has_wal(), "plain open must have no WAL");
+
+        let mutations = vec![Mutation::Put {
+            partition: PartitionId::Node,
+            key: b"node:00:noop".to_vec(),
+            value: b"x".to_vec(),
+        }];
+        let result = engine
+            .wal_append(&mutations)
+            .expect("wal_append must not error without wal");
+        assert!(result.is_none(), "wal_append without WAL must return None");
     }
 }
 

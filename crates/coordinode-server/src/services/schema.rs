@@ -674,6 +674,55 @@ mod tests {
         }
     }
 
+    /// MERGE on an existing node with a unique property must match the node
+    /// (ON MATCH), NOT fall through to CREATE and throw "unique constraint violated".
+    ///
+    /// Regression test for the gRPC repro:
+    ///   SchemaService/CreateLabel (unique id) → CREATE node → MERGE same id → ERROR
+    #[tokio::test]
+    async fn merge_on_existing_unique_node_does_not_error() {
+        let (svc, _dir) = test_service();
+
+        // Create label with unique id (STRING) via SchemaService path.
+        svc.create_label(Request::new(graph::CreateLabelRequest {
+            name: "TestNode".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "id".to_string(),
+                r#type: 3, // STRING
+                required: true,
+                unique: true,
+            }],
+            computed_properties: vec![],
+            schema_mode: 1, // STRICT
+        }))
+        .await
+        .expect("create_label");
+
+        // Create initial node.
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (n:TestNode {id: 'x1'})")
+                .expect("create node");
+        }
+
+        // MERGE on existing id — must find the node via NodeScan and apply ON MATCH.
+        // Bug: NodeScan misses the node → MERGE falls through to CREATE →
+        //      B-tree unique index: "unique constraint violated on index testnode_id".
+        {
+            let mut db = svc.database.lock().unwrap();
+            let result = db.execute_cypher(
+                "MERGE (n:TestNode {id: 'x1'}) ON MATCH SET n.id = 'x1' RETURN n.id",
+            );
+            assert!(
+                result.is_ok(),
+                "MERGE on existing unique node must succeed: {:?}",
+                result.err()
+            );
+            let rows = result.unwrap();
+            assert_eq!(rows.len(), 1, "MERGE must match exactly one node");
+        }
+    }
+
     /// create_edge_type persists schema and returns version > 0.
     #[tokio::test]
     async fn create_edge_type_persists_schema() {

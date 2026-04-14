@@ -45,6 +45,22 @@ pub enum Partition {
     Counter,
 }
 
+impl From<coordinode_core::txn::proposal::PartitionId> for Partition {
+    fn from(id: coordinode_core::txn::proposal::PartitionId) -> Self {
+        use coordinode_core::txn::proposal::PartitionId;
+        match id {
+            PartitionId::Node => Self::Node,
+            PartitionId::Adj => Self::Adj,
+            PartitionId::EdgeProp => Self::EdgeProp,
+            PartitionId::Blob => Self::Blob,
+            PartitionId::BlobRef => Self::BlobRef,
+            PartitionId::Schema => Self::Schema,
+            PartitionId::Idx => Self::Idx,
+            PartitionId::Counter => Self::Counter,
+        }
+    }
+}
+
 impl Partition {
     /// The storage partition name for this logical partition.
     pub fn name(self) -> &'static str {
