@@ -10,10 +10,9 @@ A **node** represents an entity. It has:
 
 - One or more **labels** (type tags): `:Person`, `:Document`, `:Sensor`
 - A map of **properties** (typed key-value pairs)
-- An optional **embedding** property (dense float vector for similarity search)
 
 ```cypher
-CREATE (p:Person {name: "Alice", age: 30, embedding: $vec})
+CREATE (p:Person {name: "Alice", age: 30})
 ```
 
 ### Edges (Relationships)
@@ -47,58 +46,48 @@ CoordiNode supports all standard property types:
 
 ## Labels and Modalities
 
-Labels control how CoordiNode stores and indexes a node's data. A node can carry multiple labels, each triggering a different storage mode:
+Labels are arbitrary user-defined strings — `:Person`, `:Article`, `:Sensor`. CoordiNode does not have reserved "special" labels for storage modes.
 
-| Label pattern | Storage mode | Use case |
-|---------------|-------------|---------|
-| Standard label (`:Person`) | Graph record | Entities, relationships |
-| `:VECTOR` label | HNSW index | Embedding similarity search |
-| `:DOCUMENT` label | Tantivy index | Full-text search |
-| `:TIMESERIES` label | Bucketed LSM | Sensor data, events, metrics |
-| `:GEO` label | R*-tree index | Points, polygons, spatial queries |
-| `:BLOB` label | BlobStore | Large binary objects |
-
-A node can have multiple modality labels at once:
+A node becomes **multi-modal** through its **property types**. A node with a vector-typed property participates in vector search; a node with a text property participates in full-text search — regardless of its label name.
 
 ```cypher
-CREATE (d:Document:VECTOR:DOCUMENT {
+-- One node: graph + vector + full-text, defined by its properties
+CREATE (d:Document {
   title: "Attention Is All You Need",
   body: "We propose a new simple network architecture...",
-  embedding: $vec
+  embedding: [0.1, 0.2, ...]   -- stored as a Vector property → HNSW index
 })
 ```
 
-This single node is simultaneously reachable by graph traversal, vector similarity, and full-text queries.
-
-## Identifiers
-
-Every node and edge gets an immutable system-assigned `id` (64-bit integer) on creation. You can read it with `id(n)` in Cypher:
-
-```cypher
-MATCH (n:Person {name: "Alice"}) RETURN id(n)
-```
+| Property type | Storage | Use case |
+|--------------|---------|---------|
+| String, Int, Float, Bool | Graph record | Standard entities |
+| Vector (`[f32, ...]`) | HNSW index | Embedding similarity search |
+| Geo point | Spatial index | Points, distance queries |
+| Map | Nested document | Config, structured data |
+| Bytes/Blob | BlobStore | Large binary objects |
 
 ## Indexes
 
-CoordiNode maintains indexes automatically when you create them:
+CoordiNode maintains indexes when you create them:
 
 ```cypher
--- Exact property index (B-tree in LSM)
-CREATE INDEX person_email ON Person(email)
+-- Exact property index (B-tree in LSM) — implemented
+CREATE INDEX :Person(email)
 
--- Vector index (HNSW, in-memory at alpha)
-CREATE VECTOR INDEX doc_embedding ON Document(embedding)
-  OPTIONS {dimensions: 384, metric: "cosine"}
-
--- Full-text index (Tantivy)
-CREATE TEXT INDEX doc_body ON Document(body)
+-- Full-text index (Tantivy) — implemented
+CREATE TEXT INDEX doc_body ON :Document(body)
+  OPTIONS {analyzer: "english"}
 ```
 
-`EXPLAIN SUGGEST` tells you which indexes to create for a given query:
+> **Note:** Vector index DDL (`CREATE VECTOR INDEX`) is currently available via the programmatic API (`Database::create_vector_index()`). Cypher DDL syntax is planned.
+
+`EXPLAIN SUGGEST` analyzes a query and recommends missing indexes. Available via gRPC or, when running Docker, via the REST proxy on port 7081:
 
 ```bash
 curl -X POST http://localhost:7081/v1/query/cypher/explain \
-  -d '{"query": "MATCH (u:User) WHERE u.email = $e RETURN u"}'
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (u:User) WHERE u.email = $e RETURN u", "parameters": {}}'
 ```
 
 ## Transactions and MVCC
