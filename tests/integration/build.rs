@@ -48,6 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[
                 format!("{proto_root_str}/coordinode/v1/graph/schema.proto"),
                 format!("{proto_root_str}/coordinode/v1/query/cypher.proto"),
+                format!("{proto_root_str}/coordinode/v1/admin/cluster.proto"),
             ],
             &includes,
         )?;

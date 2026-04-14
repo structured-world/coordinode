@@ -13,6 +13,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use crate::proto::{
+    admin::cluster_service_client::ClusterServiceClient,
     graph::schema_service_client::SchemaServiceClient,
     query::cypher_service_client::CypherServiceClient,
 };
@@ -126,6 +127,16 @@ impl CoordinodeProcess {
             .await
             .expect("connect to cypher service");
         CypherServiceClient::new(channel)
+    }
+
+    /// Build a `ClusterServiceClient` connected to this process.
+    pub async fn cluster_client(&self) -> ClusterServiceClient<tonic::transport::Channel> {
+        let channel = tonic::transport::Endpoint::from_shared(self.endpoint())
+            .expect("valid endpoint")
+            .connect()
+            .await
+            .expect("connect to cluster service");
+        ClusterServiceClient::new(channel)
     }
 
     /// Block (async) until the gRPC port accepts TCP connections or `timeout` elapses.

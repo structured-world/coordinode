@@ -24,3 +24,8 @@ pub mod replication {
 pub mod query {
     include!(concat!(env!("OUT_DIR"), "/coordinode.v1.query.rs"));
 }
+
+#[allow(clippy::all, dead_code)]
+pub mod admin {
+    include!(concat!(env!("OUT_DIR"), "/coordinode.v1.admin.rs"));
+}
