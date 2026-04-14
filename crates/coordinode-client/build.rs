@@ -1,12 +1,30 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;
-    // Proto files are in the `proto/` submodule at the workspace root.
-    // From this crate (crates/coordinode-client/) that's ../../proto.
-    let proto_root = std::path::Path::new(&manifest_dir)
-        .join("../../proto")
+    let proto_root_path = std::path::Path::new(&manifest_dir).join("../../proto");
+
+    // Guard against un-initialised proto submodule (release-plz temp worktrees,
+    // shallow clones without --recurse-submodules, CI without submodule init, etc.).
+    // Use a sentinel file that only exists when the submodule is checked out.
+    let sentinel = proto_root_path.join("coordinode/v1/query/cypher.proto");
+    if !sentinel.exists() {
+        // Copy pre-generated files (committed in proto_gen/) to OUT_DIR so that
+        // the `include!()` macros in lib.rs compile without a live proto submodule.
+        // These files must be regenerated when proto changes (run `cargo build -p
+        // coordinode-client` and copy target/debug/build/coordinode-client-*/out/
+        // coordinode.v1.*.rs to crates/coordinode-client/proto_gen/).
+        let out_dir = std::env::var("OUT_DIR")?;
+        let fallback_dir = std::path::Path::new(&manifest_dir).join("proto_gen");
+        for entry in std::fs::read_dir(&fallback_dir)? {
+            let entry = entry?;
+            let dest = std::path::Path::new(&out_dir).join(entry.file_name());
+            std::fs::copy(entry.path(), dest)?;
+        }
+        return Ok(());
+    }
+
+    let proto_root = proto_root_path
         .canonicalize()
         .unwrap_or_else(|_| std::path::PathBuf::from("../../proto"));
-
     let proto_root_str = proto_root.display().to_string();
 
     let mut includes = vec![proto_root_str.clone()];
