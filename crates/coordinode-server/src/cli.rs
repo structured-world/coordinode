@@ -74,6 +74,23 @@ pub enum Command {
         /// If set, stream join progress until COMPLETE or FAILED.
         follow: bool,
     },
+    /// Gracefully decommission a node from the cluster.
+    AdminNodeDecommission {
+        /// gRPC address of any cluster member (usually the leader).
+        /// Example: "http://node1:7080"
+        cluster_addr: String,
+        /// Numeric node ID to decommission. Must be in the current voter set.
+        node_id: u64,
+        /// If set, mark node data for deletion after removal.
+        /// In CE, operator must delete data on the decommissioned node manually.
+        pruning: bool,
+        /// Emergency decommission: skip quorum gate and drain checks.
+        /// Forces membership remove even if the node is unreachable.
+        /// May cause permanent data loss — requires --skip-confirmation.
+        force: bool,
+        /// Required when --force is set. Confirms awareness of potential data loss.
+        skip_confirmation: bool,
+    },
 }
 
 /// Parse command line arguments.
@@ -158,7 +175,8 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  coordinode restore --input FILE [--data DIR] [--format json|cypher|binary] [--namespace NS]\n  \
                  coordinode verify [--data DIR] [--deep]\n  \
                  coordinode version\n  \
-                 coordinode admin node join --node CLUSTER_ADDR --id NODE_ID --addr NODE_ADDR [--pre-seeded] [--follow]\n",
+                 coordinode admin node join --node CLUSTER_ADDR --id NODE_ID --addr NODE_ADDR [--pre-seeded] [--follow]\n  \
+                 coordinode admin node decommission --node CLUSTER_ADDR --id NODE_ID [--pruning] [--force] [--skip-confirmation]\n",
                 env!("CARGO_PKG_VERSION")
             );
             std::process::exit(1);
@@ -168,7 +186,9 @@ pub fn parse_args_from(args: &[String]) -> Command {
 
 /// Parse `coordinode admin <subcommand> ...` arguments.
 ///
-/// Currently supports: `coordinode admin node join --node ADDR --id ID --addr ADDR`
+/// Supports:
+/// - `coordinode admin node join --node ADDR --id ID --addr ADDR [--pre-seeded] [--follow]`
+/// - `coordinode admin node decommission --node ADDR --id ID [--pruning] [--force] [--skip-confirmation]`
 fn parse_admin_args(args: &[String]) -> Command {
     // args[1] = "admin", args[2] should be the admin object
     let object = args.get(2).map(|s| s.as_str()).unwrap_or("");
@@ -214,11 +234,45 @@ fn parse_admin_args(args: &[String]) -> Command {
                 follow,
             }
         }
+        ("node", "decommission") => {
+            let cluster_addr = match find_flag(args, "--node") {
+                Some(a) => a,
+                None => {
+                    eprintln!("error: --node CLUSTER_ADDR is required for admin node decommission");
+                    std::process::exit(1);
+                }
+            };
+            let node_id_str = match find_flag(args, "--id") {
+                Some(s) => s,
+                None => {
+                    eprintln!("error: --id NODE_ID is required for admin node decommission");
+                    std::process::exit(1);
+                }
+            };
+            let node_id: u64 = match node_id_str.parse() {
+                Ok(id) => id,
+                Err(_) => {
+                    eprintln!("error: --id must be a positive integer, got '{node_id_str}'");
+                    std::process::exit(1);
+                }
+            };
+            let pruning = args.iter().any(|a| a == "--pruning");
+            let force = args.iter().any(|a| a == "--force");
+            let skip_confirmation = args.iter().any(|a| a == "--skip-confirmation");
+            Command::AdminNodeDecommission {
+                cluster_addr,
+                node_id,
+                pruning,
+                force,
+                skip_confirmation,
+            }
+        }
         _ => {
             eprintln!(
                 "coordinode admin: unknown subcommand '{object} {subcommand}'\n\n\
                  Admin commands:\n  \
-                 coordinode admin node join --node CLUSTER_ADDR --id NODE_ID --addr NODE_ADDR [--pre-seeded] [--follow]\n"
+                 coordinode admin node join --node CLUSTER_ADDR --id NODE_ID --addr NODE_ADDR [--pre-seeded] [--follow]\n  \
+                 coordinode admin node decommission --node CLUSTER_ADDR --id NODE_ID [--pruning] [--force] [--skip-confirmation]\n"
             );
             std::process::exit(1);
         }
@@ -402,6 +456,70 @@ mod tests {
                 assert!(follow);
             }
             _ => panic!("expected AdminNodeJoin"),
+        }
+    }
+
+    #[test]
+    fn admin_node_decommission_required_flags() {
+        let cmd = parse_args_from(&args(
+            "coordinode admin node decommission --node http://leader:7080 --id 3",
+        ));
+        match cmd {
+            Command::AdminNodeDecommission {
+                cluster_addr,
+                node_id,
+                pruning,
+                force,
+                skip_confirmation,
+            } => {
+                assert_eq!(cluster_addr, "http://leader:7080");
+                assert_eq!(node_id, 3);
+                assert!(!pruning);
+                assert!(!force);
+                assert!(!skip_confirmation);
+            }
+            _ => panic!("expected AdminNodeDecommission"),
+        }
+    }
+
+    #[test]
+    fn admin_node_decommission_with_pruning() {
+        let cmd = parse_args_from(&args(
+            "coordinode admin node decommission --node http://n1:7080 --id 2 --pruning",
+        ));
+        match cmd {
+            Command::AdminNodeDecommission {
+                node_id,
+                pruning,
+                force,
+                ..
+            } => {
+                assert_eq!(node_id, 2);
+                assert!(pruning);
+                assert!(!force);
+            }
+            _ => panic!("expected AdminNodeDecommission"),
+        }
+    }
+
+    #[test]
+    fn admin_node_decommission_force_requires_skip_confirmation() {
+        // CLI parsing sets both flags independently — the enforcement is in the server.
+        let cmd = parse_args_from(&args(
+            "coordinode admin node decommission --node http://n1:7080 --id 4 --force --skip-confirmation",
+        ));
+        match cmd {
+            Command::AdminNodeDecommission {
+                node_id,
+                force,
+                skip_confirmation,
+                ..
+            } => {
+                assert_eq!(node_id, 4);
+                assert!(force);
+                assert!(skip_confirmation);
+            }
+            _ => panic!("expected AdminNodeDecommission"),
         }
     }
 }

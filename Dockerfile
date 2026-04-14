@@ -32,6 +32,10 @@ WORKDIR /build
 COPY proto/ /build/proto/
 COPY Cargo.toml Cargo.lock rust-toolchain.toml /build/
 COPY crates/ /build/crates/
+# Integration test crate is a workspace member — Cargo needs its Cargo.toml
+# for workspace resolution even when building only the server binary.
+# The test code itself is not compiled during Docker build.
+COPY tests/ /build/tests/
 
 # Build the coordinode binary (static musl link, release profile with LTO)
 RUN MUSL_TARGET="$(uname -m)-unknown-linux-musl" \

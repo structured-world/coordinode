@@ -111,38 +111,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             coordinode_vector::metrics::log_simd_capabilities();
 
-            // Open database with appropriate proposal pipeline:
-            // - Embedded (no --peers): OwnedLocalProposalPipeline (local writes)
-            // - Cluster (--peers): RaftProposalPipeline (Raft-replicated writes)
+            // All modes use RaftProposalPipeline — unified write path.
             //
-            // In cluster mode, DrainBuffer and TTL reaper submit mutations
-            // through Raft for replication to followers (G063).
-            // `raft_node_shared` is kept alive for the server's lifetime in cluster mode.
-            // It provides read fence (R141) and is `None` in standalone mode.
-            let mut raft_node_shared: Option<Arc<coordinode_raft::cluster::RaftNode>> = None;
+            // - Standalone (no --peers): single-node Raft (node_id=1, StubNetwork).
+            //   Writes go through Raft → oplog always populated → CDC works in both modes.
+            // - Cluster (--peers): multi-node Raft (GrpcNetwork, leader election).
+            //   Writes replicated to followers before commit.
+            //
+            // `raft_node_shared` provides the read fence (R141), ClusterService
+            // administration, and ensures consistent apply ordering via oracle.
 
-            let database = if let Some(ref peer_addrs) = peers {
-                info!(
-                    peers = peer_addrs.len(),
-                    "cluster mode: DrainBuffer using RaftProposalPipeline"
-                );
-                // Create Raft node and proposal pipeline for cluster mode.
-                // RaftNode handles leader election, log replication, and
-                // state machine apply. The pipeline wraps client_write().
-                let storage_config =
-                    coordinode_storage::engine::config::StorageConfig::new(&data_dir);
-                let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
-                let engine = coordinode_storage::engine::core::StorageEngine::open_with_oracle(
-                    &storage_config,
-                    oracle.clone(),
-                )
-                .map_err(|e| format!("failed to open storage: {e}"))?;
-                let engine = Arc::new(engine);
+            // Common setup: open storage engine + timestamp oracle.
+            let storage_config = coordinode_storage::engine::config::StorageConfig::new(&data_dir);
+            let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+            let engine = coordinode_storage::engine::core::StorageEngine::open_with_oracle(
+                &storage_config,
+                oracle.clone(),
+            )
+            .map_err(|e| format!("failed to open storage: {e}"))?;
+            let engine = Arc::new(engine);
 
-                // Node ID 1 for single-node bootstrap; peer discovery wiring
+            // Open Raft node and build database — both modes use RaftProposalPipeline.
+            let (database, raft_node_shared) = {
+                let (mode_label, peer_count) = if peers.is_some() {
+                    (
+                        "cluster mode: RaftProposalPipeline (multi-node Raft)",
+                        peers.as_ref().map(|p| p.len()).unwrap_or(0),
+                    )
+                } else {
+                    (
+                        "standalone mode: RaftProposalPipeline (single-node Raft)",
+                        0,
+                    )
+                };
+                if peer_count > 0 {
+                    info!(peers = peer_count, "{mode_label}");
+                } else {
+                    info!("{mode_label}");
+                }
+
+                // Node ID 1 for single-node or bootstrap; peer discovery wiring
                 // is deferred to R150 (monolithic binary --mode selection).
                 let raft_node = coordinode_raft::cluster::RaftNode::open_with_oracle(
-                    1, // node_id
+                    1,
                     Arc::clone(&engine),
                     Some(Arc::clone(&oracle)),
                 )
@@ -155,22 +166,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Arc::clone(raft_node.raft()),
                     ));
 
-                // Share engine + oracle between RaftNode and Database.
-                // RaftNode uses engine for state machine apply.
-                // Database uses engine for reads + ExecutionContext.
                 let db = Arc::new(std::sync::Mutex::new(
-                    coordinode_embed::Database::from_engine(&data_dir, engine, oracle, pipeline)
-                        .map_err(|e| format!("failed to open database: {e}"))?,
+                    coordinode_embed::Database::from_engine(
+                        &data_dir,
+                        Arc::clone(&engine),
+                        oracle.clone(),
+                        pipeline,
+                    )
+                    .map_err(|e| format!("failed to open database: {e}"))?,
                 ));
-                raft_node_shared = Some(raft_node);
-                db
-            } else {
-                // Embedded mode: OwnedLocalProposalPipeline (default).
-                Arc::new(std::sync::Mutex::new(
-                    coordinode_embed::Database::open(&data_dir)
-                        .map_err(|e| format!("failed to open database: {e}"))?,
-                ))
+                (db, Arc::clone(&raft_node))
             };
+            let raft_node_shared: Option<Arc<coordinode_raft::cluster::RaftNode>> =
+                Some(raft_node_shared);
 
             let query_registry = Arc::new(coordinode_query::advisor::QueryRegistry::new());
             let nplus1_detector =
@@ -423,6 +431,88 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             admin_node_join(cluster_addr, node_id, node_addr, pre_seeded, follow).await?;
         }
+
+        cli::Command::AdminNodeDecommission {
+            cluster_addr,
+            node_id,
+            pruning,
+            force,
+            skip_confirmation,
+        } => {
+            admin_node_decommission(cluster_addr, node_id, pruning, force, skip_confirmation)
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Execute `coordinode admin node decommission` — connect to a running cluster and
+/// gracefully decommission a node via the Phase 0-2 protocol.
+///
+/// Steps:
+/// 1. Connect to any cluster member via gRPC.
+/// 2. Call `ClusterService.DecommissionNode` — executes quorum gate, leadership
+///    transfer (if target is leader), and membership remove.
+/// 3. Print the result including any advisory cleanup message.
+async fn admin_node_decommission(
+    cluster_addr: String,
+    node_id: u64,
+    pruning: bool,
+    force: bool,
+    skip_confirmation: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use proto::admin::cluster::{
+        cluster_service_client::ClusterServiceClient, DecommissionNodeRequest,
+    };
+
+    if force && !skip_confirmation {
+        eprintln!(
+            "error: --force requires --skip-confirmation to acknowledge potential data loss.\n\
+             Emergency decommission may cause permanent data loss if the node held\n\
+             the only copy of any data. Re-run with both --force --skip-confirmation."
+        );
+        std::process::exit(1);
+    }
+
+    let endpoint = if cluster_addr.starts_with("http://") || cluster_addr.starts_with("https://") {
+        cluster_addr.clone()
+    } else {
+        format!("http://{cluster_addr}")
+    };
+
+    eprintln!("Connecting to cluster at {endpoint} ...");
+
+    let mut client = ClusterServiceClient::connect(endpoint)
+        .await
+        .map_err(|e| format!("failed to connect to cluster: {e}"))?;
+
+    eprintln!(
+        "Decommissioning node {node_id}{}{}...",
+        if pruning { " (--pruning)" } else { "" },
+        if force { " [EMERGENCY --force]" } else { "" },
+    );
+
+    let resp = client
+        .decommission_node(DecommissionNodeRequest {
+            node_id,
+            pruning,
+            force,
+            skip_confirmation,
+        })
+        .await
+        .map_err(|e| format!("DecommissionNode failed: {e}"))?
+        .into_inner();
+
+    eprintln!("Decommission complete: {}", resp.message);
+
+    if resp.operator_cleanup_required {
+        eprintln!(
+            "\nNOTE: Data cleanup required on node {node_id}.\n\
+             CE does not automatically wipe decommissioned node data.\n\
+             Operator must manually delete the data directory on node {node_id}\n\
+             after verifying the node is no longer serving traffic."
+        );
     }
 
     Ok(())

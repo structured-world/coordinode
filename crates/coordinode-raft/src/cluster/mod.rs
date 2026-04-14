@@ -732,7 +732,7 @@ impl RaftNode {
     ///
     /// Returns the first voter ID that isn't this node, or None if
     /// this is a single-node cluster.
-    fn find_transfer_target(&self) -> Option<u64> {
+    pub fn find_transfer_target(&self) -> Option<u64> {
         use openraft::async_runtime::watch::WatchReceiver;
 
         let metrics = self.raft.metrics().borrow_watched().clone();
@@ -888,6 +888,175 @@ pub enum NodeRole {
     Follower,
     /// Non-voting learner (receives replication but doesn't vote).
     Learner,
+}
+
+// ── Decommission Protocol ─────────────────────────────────────────────────────
+
+/// Result of a successful node decommission (Phases 0-2).
+///
+/// Phase 3 (local data deletion) is the operator's responsibility in CE — the
+/// server cannot remotely wipe data on the decommissioned node.
+#[derive(Debug, Clone)]
+pub struct DecommissionResult {
+    /// Node ID that was removed from cluster membership.
+    pub node_id: u64,
+    /// Human-readable summary of phases executed.
+    pub message: String,
+    /// Set when `pruning=true` was requested.
+    /// Operator must manually delete data on the decommissioned node (CE).
+    pub operator_cleanup_required: bool,
+}
+
+impl RaftNode {
+    /// Graceful node decommission: Phases 0-2 for CE.
+    ///
+    /// ## Phase 0 — Quorum gate (unless `force`)
+    /// Verifies that removing `node_id` leaves ≥ 2 voters in the cluster.
+    /// CE 3-node minimum: after removal, 2 voters remain (quorum = 2).
+    /// Returns `RaftNodeError::Membership` if quorum would be lost or if
+    /// `node_id` is not in the current voter set.
+    ///
+    /// ## Phase 1 — Leadership transfer (unless `force`)
+    /// If `node_id` is the current Raft leader, the caller must handle leadership
+    /// transfer before calling this method (service layer responsibility). This
+    /// method returns `RaftNodeError::Membership` if called as non-leader when
+    /// `node_id` is the current leader — the service layer must transfer first.
+    ///
+    /// ## Phase 2 — Membership remove
+    /// Calls `change_membership(remove: node_id)` via openraft. Only succeeds
+    /// when this node is the current leader (openraft invariant).
+    ///
+    /// ## Force path
+    /// When `force=true`, skips Phase 0 and Phase 1. Useful for permanently
+    /// unavailable nodes. May cause data loss if the node held single-copy shards.
+    ///
+    /// # Errors
+    /// - `Membership("not in voter set")` — target not a voter (non-force only)
+    /// - `Membership("quorum loss")` — would drop below minimum (non-force only)
+    /// - `Membership("target is leader")` — service must transfer leadership first
+    /// - `Membership("change_membership failed: …")` — openraft error
+    pub async fn decommission_node(
+        &self,
+        node_id: u64,
+        pruning: bool,
+        force: bool,
+    ) -> Result<DecommissionResult, RaftNodeError> {
+        use openraft::async_runtime::watch::WatchReceiver;
+
+        let metrics = self.raft.metrics().borrow_watched().clone();
+
+        // Snapshot current voter set from openraft membership config.
+        let current_voters: std::collections::BTreeSet<u64> = {
+            let joint = metrics.membership_config.membership().get_joint_config();
+            joint
+                .first()
+                .map(|voters| voters.iter().copied().collect())
+                .unwrap_or_default()
+        };
+
+        if !force {
+            // Phase 0a: node must be a current voter.
+            if !current_voters.contains(&node_id) {
+                return Err(RaftNodeError::Membership(format!(
+                    "node {node_id} is not in the current voter set — cannot decommission"
+                )));
+            }
+
+            // Phase 0b: quorum gate — CE requires ≥ 2 voters after removal.
+            // Quorum = majority of voters; for 2 voters: majority = 2 (no fault tolerance).
+            // For 1 voter: cluster cannot reach consensus.
+            let remaining = current_voters.len().saturating_sub(1);
+            if remaining < 2 {
+                return Err(RaftNodeError::Membership(format!(
+                    "cannot decommission node {node_id}: would leave {remaining} voter(s), \
+                     minimum 2 required for CE cluster quorum. \
+                     The cluster must have at least 3 nodes to decommission one."
+                )));
+            }
+
+            // Phase 1: Leadership check.
+            // If the target node is the current leader and it is NOT us (this node),
+            // we cannot call change_membership (only the leader can). Return an error
+            // so the service layer can handle forwarding.
+            // If the target IS us and we are the leader, the service layer must have
+            // already transferred leadership before calling this method.
+            let current_leader = metrics.current_leader;
+            if current_leader == Some(node_id) && node_id != self.node_id {
+                return Err(RaftNodeError::Membership(format!(
+                    "node {node_id} is the current Raft leader. \
+                     Call DecommissionNode on node {node_id} directly (self-decommission path) \
+                     or transfer leadership first via `coordinode admin node transfer-leader`."
+                )));
+            }
+            // If node_id == self.node_id and we are the leader: the service layer is
+            // responsible for transferring leadership before calling this method.
+            // By the time we reach here, we should no longer be the leader.
+            // This is enforced in ClusterServiceImpl::decommission_node().
+        }
+
+        // Phase 2: Membership remove.
+        // Compute new voter set (current minus node_id).
+        let new_members: std::collections::BTreeSet<u64> = current_voters
+            .into_iter()
+            .filter(|&id| id != node_id)
+            .collect();
+
+        if new_members.is_empty() {
+            return Err(RaftNodeError::Membership(
+                "cannot remove last voting member — cluster would be empty".to_string(),
+            ));
+        }
+
+        self.raft
+            .change_membership(new_members, false)
+            .await
+            .map_err(|e| RaftNodeError::Membership(format!("change_membership failed: {e}")))?;
+
+        tracing::info!(
+            node_id,
+            pruning,
+            force,
+            "decommission: node removed from cluster membership"
+        );
+
+        let message = if force {
+            format!(
+                "Node {node_id} forcibly removed from cluster membership (emergency decommission). \
+                 Verify data integrity — some shards may have lost replicas."
+            )
+        } else {
+            format!("Node {node_id} gracefully decommissioned (Phases 0-2 complete).")
+        };
+
+        Ok(DecommissionResult {
+            node_id,
+            message,
+            operator_cleanup_required: pruning,
+        })
+    }
+
+    /// Get the gRPC advertise address for a given node ID from openraft membership.
+    ///
+    /// Returns `None` if the node is not in the current membership config or
+    /// if the address is empty. Used for service-layer forwarding in the
+    /// self-decommission path.
+    pub fn node_address(&self, node_id: u64) -> Option<String> {
+        use openraft::async_runtime::watch::WatchReceiver;
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        // Collect all (id, addr) pairs first — avoids borrow-lifetime issues where
+        // `.membership()` returns a reference that borrows from `metrics`.
+        let addrs: Vec<(u64, String)> = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(&id, node)| (id, node.addr.clone()))
+            .collect();
+        addrs
+            .into_iter()
+            .find(|(id, _)| *id == node_id)
+            .map(|(_, addr)| addr)
+            .filter(|addr| !addr.is_empty())
+    }
 }
 
 // ── Join Protocol ─────────────────────────────────────────────────────────────

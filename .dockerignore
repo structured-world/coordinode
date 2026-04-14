@@ -5,7 +5,8 @@ arch/
 benches/
 docs/
 examples/
-tests/
+# Exclude test sources but keep Cargo.toml + proto_gen/ for workspace resolution.
+tests/integration/src/
 data/
 deploy/grafana/
 deploy/k8s/

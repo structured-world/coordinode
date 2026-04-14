@@ -39,8 +39,9 @@ use coordinode_raft::cluster::{JoinPhase, JoinProgressEvent, NodeRole, RaftNode}
 
 use crate::proto::admin::cluster::{
     cluster_service_server::ClusterService, AddNodeRequest, ClusterNode, ClusterStatus,
-    GetClusterStatusRequest, JoinNodeRequest, JoinNodeResponse, JoinProgressRequest, JoinStatus,
-    NodeRole as ProtoNodeRole, NodeState as ProtoNodeState, RemoveNodeRequest, RemoveNodeResponse,
+    DecommissionNodeRequest, DecommissionNodeResponse, GetClusterStatusRequest, JoinNodeRequest,
+    JoinNodeResponse, JoinProgressRequest, JoinStatus, NodeRole as ProtoNodeRole,
+    NodeState as ProtoNodeState, RemoveNodeRequest, RemoveNodeResponse,
 };
 
 // ── Join state registry ────────────────────────────────────────────────────────
@@ -322,5 +323,168 @@ impl ClusterService for ClusterServiceImpl {
         tracing::info!(node_id, "RemoveNode: node removed from cluster membership");
 
         Ok(Response::new(RemoveNodeResponse {}))
+    }
+
+    // ── Decommission lifecycle ──────────────────────────────────────────────
+
+    async fn decommission_node(
+        &self,
+        req: Request<DecommissionNodeRequest>,
+    ) -> Result<Response<DecommissionNodeResponse>, Status> {
+        let r = req.into_inner();
+        let node_id = r.node_id;
+        let pruning = r.pruning;
+        let force = r.force;
+        let skip_confirmation = r.skip_confirmation;
+
+        // Guard: --force requires explicit confirmation to prevent accidental data loss.
+        if force && !skip_confirmation {
+            return Err(Status::failed_precondition(
+                "Emergency decommission (force=true) requires skip_confirmation=true. \
+                 This acknowledges that permanent data loss may occur if the node held \
+                 the only copy of any shard. Re-run with --skip-confirmation to proceed.",
+            ));
+        }
+
+        tracing::info!(
+            node_id,
+            pruning,
+            force,
+            "DecommissionNode: initiating decommission lifecycle"
+        );
+
+        // Self-decommission path (this node is the leader and is being decommissioned):
+        //   1. Transfer leadership to a peer.
+        //   2. Forward DecommissionNode to the new leader, which executes Phases 0-2.
+        let is_self = node_id == self.raft_node.node_id();
+        let is_leader = self.raft_node.is_leader().await;
+
+        if is_self && is_leader && !force {
+            return self
+                .decommission_self(node_id, pruning, skip_confirmation)
+                .await;
+        }
+
+        // Normal path: Phase 0 (quorum gate) + Phase 2 (membership remove).
+        // Phase 0 is embedded in RaftNode::decommission_node().
+        // The current node must be the Raft leader for change_membership to succeed.
+        let result = self
+            .raft_node
+            .decommission_node(node_id, pruning, force)
+            .await
+            .map_err(|e| {
+                // Map quorum/not-voter errors to FailedPrecondition; others to Internal.
+                let msg = e.to_string();
+                if msg.contains("voter set") || msg.contains("quorum") {
+                    Status::failed_precondition(msg)
+                } else {
+                    Status::internal(msg)
+                }
+            })?;
+
+        Ok(Response::new(DecommissionNodeResponse {
+            node_id: result.node_id,
+            message: result.message,
+            operator_cleanup_required: result.operator_cleanup_required,
+        }))
+    }
+}
+
+// ── Self-decommission helper ───────────────────────────────────────────────────
+
+impl ClusterServiceImpl {
+    /// Handle the self-decommission case: this node is the leader being removed.
+    ///
+    /// Steps:
+    /// 1. Find a peer voter to transfer leadership to.
+    /// 2. Transfer leadership via openraft TimeoutNow.
+    /// 3. Forward DecommissionNode to the new leader via gRPC (using the peer's address
+    ///    from openraft membership config).
+    /// 4. Return the forwarded response to the original caller.
+    ///
+    /// This keeps the service layer responsible for cross-node coordination,
+    /// leaving `RaftNode::decommission_node()` to handle only local Raft operations.
+    async fn decommission_self(
+        &self,
+        node_id: u64,
+        pruning: bool,
+        skip_confirmation: bool,
+    ) -> Result<Response<DecommissionNodeResponse>, Status> {
+        // Find a peer to transfer leadership to.
+        let peer_id = self.raft_node.find_transfer_target().ok_or_else(|| {
+            Status::failed_precondition(
+                "self-decommission: no peer voter available for leadership transfer — \
+                 cannot decommission the only cluster member",
+            )
+        })?;
+
+        // Get peer's gRPC address from openraft membership config.
+        let peer_addr = self.raft_node.node_address(peer_id).ok_or_else(|| {
+            Status::internal(format!(
+                "self-decommission: peer node {peer_id} has no advertise address in membership \
+                 config. Cluster may have been bootstrapped without --addr flags."
+            ))
+        })?;
+
+        tracing::info!(
+            node_id,
+            peer_id,
+            peer_addr,
+            "DecommissionNode self: transferring leadership before membership remove"
+        );
+
+        // Phase 1: Transfer leadership. Returns after 500ms or when transfer is confirmed.
+        self.raft_node
+            .transfer_leadership_to(peer_id)
+            .await
+            .map_err(|e| Status::internal(format!("leadership transfer failed: {e}")))?;
+
+        tracing::info!(
+            node_id,
+            peer_id,
+            "DecommissionNode self: leadership transferred, forwarding to new leader"
+        );
+
+        // Forward DecommissionNode to the new leader (the peer we transferred to).
+        // The peer now executes Phases 0-2 and returns the result.
+        let endpoint = if peer_addr.starts_with("http://") || peer_addr.starts_with("https://") {
+            peer_addr.clone()
+        } else {
+            format!("http://{peer_addr}")
+        };
+
+        let mut client =
+            crate::proto::admin::cluster::cluster_service_client::ClusterServiceClient::connect(
+                endpoint,
+            )
+            .await
+            .map_err(|e| {
+                Status::unavailable(format!(
+                    "self-decommission: could not connect to new leader at {peer_addr}: {e}"
+                ))
+            })?;
+
+        let resp = client
+            .decommission_node(DecommissionNodeRequest {
+                node_id,
+                pruning,
+                force: false,
+                skip_confirmation,
+            })
+            .await
+            .map_err(|e| {
+                Status::internal(format!(
+                    "self-decommission: forwarded DecommissionNode to {peer_addr} failed: {e}"
+                ))
+            })?
+            .into_inner();
+
+        tracing::info!(
+            node_id,
+            message = resp.message,
+            "DecommissionNode self: complete"
+        );
+
+        Ok(Response::new(resp))
     }
 }
