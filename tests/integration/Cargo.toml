@@ -1,0 +1,38 @@
+[package]
+name = "coordinode-integration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# Integration tests run via `cargo nextest run -p coordinode-integration`.
+# Each test file under tests/ is a separate test binary.
+
+[[test]]
+name = "restart"
+path = "tests/restart.rs"
+
+[[test]]
+name = "vector"
+path = "tests/vector.rs"
+
+[dependencies]
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[lints]
+workspace = true
