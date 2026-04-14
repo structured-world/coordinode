@@ -1,5 +1,6 @@
 [package]
 name = "coordinode-integration"
+description = "Integration test suite for CoordiNode — spawns the server binary and exercises gRPC APIs end-to-end"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
