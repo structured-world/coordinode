@@ -2135,4 +2135,96 @@ mod tests {
             );
         }
     }
+
+    /// Regression: DETACH DELETE must actually remove the node from storage.
+    ///
+    /// Bug: DETACH DELETE returns Ok but leaves the node in place.
+    /// After `MATCH (n:BugTest {id: "dt-1"}) DETACH DELETE n`, a subsequent
+    /// MATCH for the same node must return 0 rows.
+    #[test]
+    fn detach_delete_removes_node() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = Database::open(dir.path()).expect("open");
+
+        db.execute_cypher("CREATE (:BugTest {id: 'dt-1', val: 'hello'})")
+            .expect("create");
+
+        // Confirm node exists.
+        let before = db
+            .execute_cypher("MATCH (n:BugTest {id: 'dt-1'}) RETURN n.id")
+            .expect("match before delete");
+        assert_eq!(before.len(), 1, "node must exist before delete");
+
+        // Delete the node.
+        db.execute_cypher("MATCH (n:BugTest {id: 'dt-1'}) DETACH DELETE n")
+            .expect("detach delete");
+
+        // Node must be gone.
+        let after = db
+            .execute_cypher("MATCH (n:BugTest {id: 'dt-1'}) RETURN n.id")
+            .expect("match after delete");
+        assert_eq!(
+            after.len(),
+            0,
+            "DETACH DELETE must remove the node; got {} rows instead of 0",
+            after.len()
+        );
+    }
+
+    /// Regression: SET on a VECTOR property must update the HNSW index position.
+    ///
+    /// Bug: after `SET n.embedding = [new_vec]`, vector_distance queries still
+    /// use the original embedding from CREATE, silently returning stale results.
+    #[test]
+    fn vector_set_updates_hnsw_index() {
+        use coordinode_core::graph::types::VectorMetric;
+        use coordinode_query::index::VectorIndexConfig;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = Database::open(dir.path()).expect("open");
+
+        // Create a vector index on :VecTest(embedding).
+        db.create_vector_index(
+            "vec_test_idx",
+            "VecTest",
+            "embedding",
+            VectorIndexConfig {
+                dimensions: 4,
+                metric: VectorMetric::L2,
+                ..VectorIndexConfig::default()
+            },
+        );
+
+        // Insert a node with embedding A = [1,0,0,0].
+        db.execute_cypher("CREATE (:VecTest {id: 'v-1', embedding: [1.0, 0.0, 0.0, 0.0]})")
+            .expect("create");
+
+        // Update embedding to B = [0,1,0,0] (orthogonal to A).
+        db.execute_cypher("MATCH (n:VecTest {id: 'v-1'}) SET n.embedding = [0.0, 1.0, 0.0, 0.0]")
+            .expect("set embedding");
+
+        // Confirm storage reflects the update.
+        let stored = db
+            .execute_cypher("MATCH (n:VecTest {id: 'v-1'}) RETURN n.embedding")
+            .expect("read back");
+        assert_eq!(stored.len(), 1, "node must still exist after SET");
+
+        // Vector search with query ≈ B must find the node (distance < 0.1).
+        // Bug: HNSW still has the original A position → 0 rows returned.
+        let results = db
+            .execute_cypher(
+                "MATCH (n:VecTest) \
+                 WHERE vector_distance(n.embedding, [0.0, 1.0, 0.0, 0.0]) < 0.1 \
+                 RETURN n.id",
+            )
+            .expect("vector search after SET");
+
+        assert_eq!(
+            results.len(),
+            1,
+            "HNSW must reflect the updated embedding; \
+             expected 1 result for query ≈ B, got {}",
+            results.len()
+        );
+    }
 }

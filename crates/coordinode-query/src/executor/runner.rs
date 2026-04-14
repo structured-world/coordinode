@@ -6052,12 +6052,36 @@ fn execute_delete(
             }
 
             // Delete the node record.
-            // Notify vector and text index registries of deleted properties.
+            // Notify all index registries (B-tree, vector, text) of deleted
+            // properties so their entries are cleaned up before the node is
+            // removed from primary storage.
             let key = encode_node_key(ctx.shard_id, node_id);
-            if ctx.vector_index_registry.is_some() || ctx.text_index_registry.is_some() {
+            let needs_index_cleanup = ctx.btree_index_registry.is_some()
+                || ctx.vector_index_registry.is_some()
+                || ctx.text_index_registry.is_some();
+            if needs_index_cleanup {
                 if let Some(node_bytes) = ctx.mvcc_get(Partition::Node, &key)? {
                     if let Ok(record) = NodeRecord::from_msgpack(&node_bytes) {
                         let label = record.primary_label().to_string();
+
+                        // B-tree index cleanup: remove all indexed property
+                        // entries so unique constraints don't block re-creation
+                        // of a node with the same property values.
+                        if let Some(btree_reg) = ctx.btree_index_registry {
+                            let props: Vec<(String, Value)> = record
+                                .props
+                                .iter()
+                                .filter_map(|(&field_id, value)| {
+                                    ctx.interner
+                                        .resolve(field_id)
+                                        .map(|name| (name.to_string(), value.clone()))
+                                })
+                                .collect();
+                            btree_reg
+                                .on_node_deleted(ctx.engine, node_id, &label, &props)
+                                .map_err(ExecutionError::Storage)?;
+                        }
+
                         for (&field_id, value) in &record.props {
                             if let Some(prop_name) = ctx.interner.resolve(field_id) {
                                 if let Some(registry) = ctx.vector_index_registry {

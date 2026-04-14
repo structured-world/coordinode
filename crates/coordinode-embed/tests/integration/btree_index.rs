@@ -283,3 +283,75 @@ fn drop_index_then_duplicate_insert_succeeds() {
         result.err()
     );
 }
+
+// ── DETACH DELETE index cleanup regression ────────────────────────────
+
+#[test]
+fn detach_delete_cleans_unique_btree_index() {
+    // Regression: DETACH DELETE must remove B-tree index entries for the
+    // deleted node. Without this cleanup, re-creating a node with the same
+    // unique property value fails with "unique constraint violated" even
+    // though the original node no longer exists.
+    //
+    // Root cause: execute_delete() in runner.rs notified vector/text index
+    // registries but never called btree_index_registry.on_node_deleted().
+    let (mut db, _dir) = open_db();
+
+    // Create a unique index.
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :User(email)")
+        .expect("CREATE UNIQUE INDEX");
+
+    // Insert a node that is covered by the unique index.
+    db.execute_cypher("CREATE (:User {email: 'alice@example.com', name: 'Alice'})")
+        .expect("initial CREATE");
+
+    // Delete the node with DETACH DELETE.
+    db.execute_cypher("MATCH (n:User {email: 'alice@example.com'}) DETACH DELETE n")
+        .expect("DETACH DELETE");
+
+    // The node must be gone from MATCH results.
+    let after_delete = db
+        .execute_cypher("MATCH (n:User {email: 'alice@example.com'}) RETURN n.email")
+        .expect("MATCH after delete");
+    assert_eq!(
+        after_delete.len(),
+        0,
+        "node must not exist after DETACH DELETE"
+    );
+
+    // Re-create a node with the SAME unique property value.
+    // Without proper index cleanup this fails with "unique constraint violated".
+    let result = db.execute_cypher("CREATE (:User {email: 'alice@example.com', name: 'Alice2'})");
+    assert!(
+        result.is_ok(),
+        "re-CREATE with same unique value after DETACH DELETE must succeed; \
+         unique index entry must have been cleaned up on delete. \
+         Got error: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn plain_delete_cleans_unique_btree_index() {
+    // Same regression as detach_delete_cleans_unique_btree_index but for
+    // plain DELETE on a disconnected node (no edges to DETACH).
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher("CREATE UNIQUE INDEX u_sku ON :Product(sku)")
+        .expect("CREATE UNIQUE INDEX");
+
+    db.execute_cypher("CREATE (:Product {sku: 'P-999'})")
+        .expect("initial CREATE");
+
+    // Plain DELETE (node has no edges, so this is valid without DETACH).
+    db.execute_cypher("MATCH (n:Product {sku: 'P-999'}) DELETE n")
+        .expect("DELETE");
+
+    let result = db.execute_cypher("CREATE (:Product {sku: 'P-999'})");
+    assert!(
+        result.is_ok(),
+        "re-CREATE with same unique value after DELETE must succeed; \
+         got error: {:?}",
+        result.err()
+    );
+}
