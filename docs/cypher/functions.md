@@ -18,14 +18,11 @@ Functions that compute a single value from their arguments.
 |----------|-----------|---------|-------|
 | `coalesce` | `coalesce(expr, ...)` | first non-null | Any number of arguments |
 | `toString` | `toString(x)` | String | Converts Int, Float, Bool, String |
-| `size` | `size(x)` | Integer | String → char count; Array → element count |
+| `size` | `size(x)` | Integer | String → **byte count** (UTF-8 bytes, not characters); Array → element count |
 | `type` | `type(r)` | String | Relationship type (e.g. `"KNOWS"`) |
-| `labels` | `labels(n)` | List\<String\> | Returns list with one label string |
+| `labels` | `labels(n)` | List\<String\> | Returns list with one label string. Subscript access `labels(n)[0]` is supported |
 | `now` | `now()` | Timestamp | Current timestamp (microseconds since epoch) |
 
-::: tip labels() indexing
-`labels(n)` returns a list. Direct subscript access `labels(n)[0]` is not supported by the parser in this release. To get the first label, use `RETURN labels(n)` and read index 0 in the client.
-:::
 
 ### Vector Functions ✅ 🔷
 
@@ -36,9 +33,9 @@ CoordiNode extensions. Operate on `Vector` or `Array` of Float/Int values.
 | `vector_distance` | `vector_distance(a, b)` | Float | Euclidean (L2) distance |
 | `vector_similarity` | `vector_similarity(a, b)` | Float | Cosine similarity. Range [0, 1] |
 | `vector_dot` | `vector_dot(a, b)` | Float | Dot product |
-| `vector_manhattan` | `vector_manhattan(a, b)` | Float | Manhattan (L1) distance |
+| `vector_manhattan` | `vector_manhattan(a, b)` | Float | Manhattan (L1) distance. Only accepts `Vector` values — not `Array` |
 
-Both arguments must have identical dimensionality; mismatched lengths return `null`.
+`vector_distance`, `vector_similarity`, and `vector_dot` accept both `Vector` and `Array` of Float/Int. `vector_manhattan` requires native `Vector` values; passing plain arrays returns `null`. Both arguments must have identical dimensionality.
 
 ```cypher
 MATCH (p:Product)
@@ -185,8 +182,12 @@ Aggregation functions require a GROUP BY context (explicit or implicit via non-a
 | `collect` | `collect(DISTINCT x)` | List | Distinct non-null values |
 | `stDev` | `stDev(x)` | Float | Sample standard deviation |
 | `stDevP` | `stDevP(x)` | Float | Population standard deviation |
-| `percentileCont` | `percentileCont(x, p)` | Float | Interpolated percentile (0.0–1.0) |
-| `percentileDisc` | `percentileDisc(x, p)` | Float | Discrete percentile (nearest rank) |
+| `percentileCont` | `percentileCont(x, p)` | Float | Interpolated percentile. ⚠️ Percentile argument `p` ignored — always returns median (0.5) |
+| `percentileDisc` | `percentileDisc(x, p)` | Float | Discrete percentile. ⚠️ Percentile argument `p` ignored — always returns median (0.5) |
+
+::: warning percentileCont / percentileDisc
+The percentile argument `p` is accepted by the parser but currently ignored — both functions always return the **median (p=0.5)**. Use `percentileCont(x, 0.5)` or `percentileDisc(x, 0.5)` to document the intent; any other value will silently produce median. Full percentile support is planned.
+:::
 
 ```cypher
 MATCH (dept:Department)<-[:WORKS_IN]-(emp:Employee)
