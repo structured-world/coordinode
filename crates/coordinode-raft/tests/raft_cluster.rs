@@ -2642,16 +2642,15 @@ async fn decommission_non_voter_fails() {
     })
     .await;
 
-    assert!(
-        result.is_ok(),
-        "TIMED OUT — decommission_non_voter_fails"
-    );
+    assert!(result.is_ok(), "TIMED OUT — decommission_non_voter_fails");
 }
 
 /// Force decommission skips quorum gate and voter check.
 ///
 /// Even in a 2-node cluster, force=true removes the node unconditionally.
 /// Used for emergency removal of an unreachable node.
+///
+/// Uses 2 nodes — cheaper than full 3-node bootstrap.
 #[tokio::test(flavor = "multi_thread")]
 async fn decommission_force_skips_quorum_gate() {
     let _ = tracing_subscriber::fmt()
@@ -2704,5 +2703,82 @@ async fn decommission_force_skips_quorum_gate() {
     assert!(
         result.is_ok(),
         "TIMED OUT — decommission_force_skips_quorum_gate"
+    );
+}
+
+/// Decommission with pruning=true signals operator_cleanup_required in the result.
+///
+/// CE does not automatically wipe the data directory of a decommissioned node —
+/// that is a destructive operation that requires operator confirmation.  Instead,
+/// the DecommissionResult carries `operator_cleanup_required = true` so that
+/// the CLI and any orchestration layer can surface the advisory to the operator.
+///
+/// ORDERING: This test MUST remain LAST in the R091c decommission section.
+/// It bootstraps a full 3-node cluster — the most expensive setup in this suite.
+/// All edge-case tests above use cheaper 2-node clusters or single-node fast paths
+/// and must finish before the GC pressure of this test is introduced.
+#[tokio::test(flavor = "multi_thread")]
+async fn decommission_pruning_flag_sets_operator_cleanup_required() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=debug,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let p1 = alloc_port();
+        let p2 = alloc_port();
+        let p3 = alloc_port();
+
+        let n1 = create_leader(1, p1).await;
+        let n2 = create_follower(2, p2).await;
+        let n3 = create_follower(3, p3).await;
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(n1.node.is_leader().await, "n1 must be leader");
+
+        n1.node
+            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add node 2");
+        n1.node
+            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .await
+            .expect("add node 3");
+        n1.node
+            .change_membership(vec![1, 2, 3])
+            .await
+            .expect("change membership to 3 nodes");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // pruning=true → operator_cleanup_required must be true in result.
+        // force=false — quorum gate allows removal (3 nodes → 2 voters remain).
+        let result = n1
+            .node
+            .decommission_node(3, true, false) // pruning=true, force=false
+            .await
+            .expect("decommission node 3 with pruning");
+
+        assert_eq!(result.node_id, 3, "result must reference decommissioned node");
+        assert!(
+            result.operator_cleanup_required,
+            "pruning=true must set operator_cleanup_required"
+        );
+
+        tracing::info!(
+            "R091c: pruning flag sets operator_cleanup_required — verified (node_id={}, cleanup={})",
+            result.node_id,
+            result.operator_cleanup_required
+        );
+
+        n1.node.shutdown().await.expect("n1 shutdown");
+        n2.node.shutdown().await.expect("n2 shutdown");
+        let _ = n3.node.shutdown().await; // may fail — decommissioned
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — decommission_pruning_flag_sets_operator_cleanup_required"
     );
 }
