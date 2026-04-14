@@ -53,6 +53,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
+      - name: Build coordinode binary (required by integration tests)
+        run: cargo build -p coordinode-server --all-features
       - name: Run unit + integration tests (nextest)
         run: cargo nextest run --all-features --workspace
       - name: Run doc tests
