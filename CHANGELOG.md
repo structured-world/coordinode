@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.3.13 — 2026-04-14
+
+### coordinode-embed
+## [0.3.13](https://github.com/structured-world/coordinode/compare/v0.3.12...v0.3.13) - 2026-04-14
+
+#### Fixed
+
+- *(query)* clean up B-tree index entry on REMOVE property
+- *(query)* update B-tree index on SET property
+- *(query)* clean up B-tree index entries on node DELETE/DETACH DELETE
+
+### coordinode-query
+## [0.3.13](https://github.com/structured-world/coordinode/compare/v0.3.12...v0.3.13) - 2026-04-14
+
+#### Fixed
+
+- *(query)* clean up B-tree index entry on REMOVE property
+- *(query)* update B-tree index on SET property
+- *(query)* clean up B-tree index entries on node DELETE/DETACH DELETE
+
+---
+
 ## v0.3.12 — 2026-04-14
 
 ### coordinode-raft
