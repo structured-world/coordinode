@@ -4,11 +4,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // From this crate (tests/integration/) that's ../../proto.
     let proto_root_path = std::path::Path::new(&manifest_dir).join("../../proto");
 
+    // Guard against un-initialised proto submodule (release-plz temp worktrees,
+    // shallow clones without --recurse-submodules, CI without submodule init, etc.).
     let sentinel = proto_root_path.join("coordinode/v1/query/cypher.proto");
     if !sentinel.exists() {
-        eprintln!(
-            "cargo:warning=Proto submodule not initialised — integration tests will not compile"
-        );
+        // Copy pre-generated files (committed in proto_gen/) to OUT_DIR so that
+        // the `include!()` macros in proto.rs compile without a live proto submodule.
+        // Regenerate when proto changes: cargo build -p coordinode-integration and copy
+        // target/debug/build/coordinode-integration-*/out/coordinode.v1.*.rs to proto_gen/.
+        let out_dir = std::env::var("OUT_DIR")?;
+        let fallback_dir = std::path::Path::new(&manifest_dir).join("proto_gen");
+        for entry in std::fs::read_dir(&fallback_dir)? {
+            let entry = entry?;
+            let dest = std::path::Path::new(&out_dir).join(entry.file_name());
+            std::fs::copy(entry.path(), dest)?;
+        }
         return Ok(());
     }
 
