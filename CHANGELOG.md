@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.3.12 — 2026-04-14
+
+### coordinode-raft
+## [0.3.12](https://github.com/structured-world/coordinode/compare/v0.3.11...v0.3.12) - 2026-04-14
+
+#### Added
+
+- *(cluster)* node decommission protocol + unified Raft write path
+
+#### Testing
+
+- *(raft)* add 3-node pruning decommission test as final R091c entry
+- *(cluster)* R091c decommission protocol test suite
+
+### coordinode-server
+## [0.3.12](https://github.com/structured-world/coordinode/compare/v0.3.11...v0.3.12) - 2026-04-14
+
+#### Added
+
+- *(cluster)* node decommission protocol + unified Raft write path
+
+---
+
 ## v0.3.11 — 2026-04-14
 
 ### coordinode-core
