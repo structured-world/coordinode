@@ -2452,3 +2452,257 @@ async fn cluster_join_monitor_and_promote() {
         "TIMED OUT — cluster_join_monitor_and_promote"
     );
 }
+
+// ── R091c: Node Decommission Protocol ─────────────────────────────────────────
+
+/// Quorum gate: decommissioning a node in a 2-node cluster must fail.
+///
+/// With 2 voters, removing one leaves 1 voter which cannot form a majority.
+/// Phase 0b must reject this with a clear error.
+#[tokio::test(flavor = "multi_thread")]
+async fn decommission_quorum_gate_blocks_2_node_cluster() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=debug,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let p1 = alloc_port();
+        let p2 = alloc_port();
+
+        let n1 = create_leader(1, p1).await;
+        let n2 = create_follower(2, p2).await;
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(n1.node.is_leader().await, "n1 must be leader");
+
+        // Add node 2 as voter.
+        n1.node
+            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add node 2");
+        n1.node
+            .change_membership(vec![1, 2])
+            .await
+            .expect("change membership to 2 nodes");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Attempt to decommission node 2 — must fail (would leave 1 voter).
+        let err = n1.node.decommission_node(2, false, false).await;
+        assert!(
+            err.is_err(),
+            "decommission on 2-node cluster must fail (quorum gate)"
+        );
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("voter") || msg.contains("quorum"),
+            "error must mention voter/quorum, got: {msg}"
+        );
+
+        tracing::info!("R091c: quorum gate blocks 2-node decommission — verified");
+
+        n1.node.shutdown().await.expect("n1 shutdown");
+        n2.node.shutdown().await.expect("n2 shutdown");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — decommission_quorum_gate_blocks_2_node_cluster"
+    );
+}
+
+/// Decommissioning a follower from a 3-node cluster must succeed.
+///
+/// Phase 0: quorum gate passes (3 - 1 = 2 voters remaining).
+/// Phase 2: change_membership removes node 3 from voter set.
+/// After decommission, the cluster continues with nodes 1 + 2.
+#[tokio::test(flavor = "multi_thread")]
+async fn decommission_follower_succeeds_in_3_node_cluster() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=debug,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let p1 = alloc_port();
+        let p2 = alloc_port();
+        let p3 = alloc_port();
+
+        let n1 = create_leader(1, p1).await;
+        let n2 = create_follower(2, p2).await;
+        let n3 = create_follower(3, p3).await;
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(n1.node.is_leader().await, "n1 must be leader");
+
+        // Build 3-node cluster.
+        n1.node
+            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add node 2");
+        n1.node
+            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .await
+            .expect("add node 3");
+        n1.node
+            .change_membership(vec![1, 2, 3])
+            .await
+            .expect("change membership to 3 nodes");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Decommission node 3 (follower) — must succeed.
+        let result = n1
+            .node
+            .decommission_node(3, false, false)
+            .await
+            .expect("decommission node 3");
+
+        assert_eq!(result.node_id, 3);
+        assert!(!result.operator_cleanup_required);
+        assert!(
+            result.message.contains("gracefully decommissioned"),
+            "unexpected message: {}",
+            result.message
+        );
+
+        // Cluster must still be operational (n1 is leader, n2 is voter).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(n1.node.is_leader().await, "n1 must still be leader");
+
+        tracing::info!("R091c: follower decommission in 3-node cluster — verified");
+
+        n1.node.shutdown().await.expect("n1 shutdown");
+        n2.node.shutdown().await.expect("n2 shutdown");
+        // n3 is decommissioned — shutdown may return an error (no longer in membership).
+        let _ = n3.node.shutdown().await;
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — decommission_follower_succeeds_in_3_node_cluster"
+    );
+}
+
+/// Decommissioning a non-voter node must fail with a clear error.
+///
+/// Phase 0a: the node must be in the current voter set.
+/// Node 99 was never added — must fail.
+#[tokio::test(flavor = "multi_thread")]
+async fn decommission_non_voter_fails() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=debug,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let p1 = alloc_port();
+        let p2 = alloc_port();
+        let p3 = alloc_port();
+
+        let n1 = create_leader(1, p1).await;
+        let n2 = create_follower(2, p2).await;
+        let n3 = create_follower(3, p3).await;
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(n1.node.is_leader().await, "n1 must be leader");
+
+        n1.node
+            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add node 2");
+        n1.node
+            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .await
+            .expect("add node 3");
+        n1.node
+            .change_membership(vec![1, 2, 3])
+            .await
+            .expect("change membership to 3 nodes");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Decommission node 99 — must fail (not in voter set).
+        let err = n1.node.decommission_node(99, false, false).await;
+        assert!(err.is_err(), "decommission of non-voter must fail");
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("not in the current voter set"),
+            "error must mention voter set, got: {msg}"
+        );
+
+        tracing::info!("R091c: non-voter decommission rejected — verified");
+
+        n1.node.shutdown().await.expect("n1 shutdown");
+        n2.node.shutdown().await.expect("n2 shutdown");
+        n3.node.shutdown().await.expect("n3 shutdown");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — decommission_non_voter_fails"
+    );
+}
+
+/// Force decommission skips quorum gate and voter check.
+///
+/// Even in a 2-node cluster, force=true removes the node unconditionally.
+/// Used for emergency removal of an unreachable node.
+#[tokio::test(flavor = "multi_thread")]
+async fn decommission_force_skips_quorum_gate() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=debug,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let p1 = alloc_port();
+        let p2 = alloc_port();
+
+        let n1 = create_leader(1, p1).await;
+        let n2 = create_follower(2, p2).await;
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(n1.node.is_leader().await, "n1 must be leader");
+
+        n1.node
+            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add node 2");
+        n1.node
+            .change_membership(vec![1, 2])
+            .await
+            .expect("change membership to 2 nodes");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Force decommission node 2 — bypasses quorum gate.
+        let result = n1
+            .node
+            .decommission_node(2, false, true) // force=true
+            .await
+            .expect("force decommission node 2");
+
+        assert_eq!(result.node_id, 2);
+        assert!(
+            result.message.contains("forcibly removed") || result.message.contains("emergency"),
+            "unexpected message: {}",
+            result.message
+        );
+
+        tracing::info!("R091c: force decommission skips quorum gate — verified");
+
+        n1.node.shutdown().await.expect("n1 shutdown");
+        let _ = n2.node.shutdown().await; // may fail — decommissioned
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — decommission_force_skips_quorum_gate"
+    );
+}
