@@ -5,7 +5,7 @@ description: Official TypeScript SDK for CoordiNode — gRPC client with source 
 
 # TypeScript / Node.js SDK
 
-The official CoordiNode TypeScript SDK wraps the gRPC API with a typed client and optional source-location tracking that feeds the server's [Query Advisor](/guide/query-advisor).
+The official CoordiNode TypeScript SDK wraps the gRPC API with a typed client and optional source-location tracking that feeds the server's [EXPLAIN SUGGEST](/CYPHER_EXTENSIONS#explain-suggest) query advisor.
 
 ```bash
 npm install coordinode
