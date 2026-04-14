@@ -30,7 +30,7 @@ Expected response:
 | Port | Protocol | Purpose |
 |------|----------|---------|
 | `7080` | gRPC | Native API — high-throughput clients |
-| `7081` | HTTP/REST | JSON API via gRPC transcoding |
+| `7081` | HTTP/REST | JSON API via `structured-proxy` (REST transcoding, separate container) |
 | `7084` | HTTP | `/health`, `/ready`, Prometheus `/metrics` |
 
 ## Data Persistence

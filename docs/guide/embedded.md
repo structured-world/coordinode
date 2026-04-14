@@ -7,42 +7,45 @@
 ```toml
 [dependencies]
 coordinode-embed = "0.3"
-tokio = { version = "1", features = ["full"] }
 ```
 
 ## Minimal Example
 
 ```rust
-use coordinode_embed::{CoordinodeEmbed, Config};
+use coordinode_embed::Database;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let db = CoordinodeEmbed::open(Config::in_memory()).await?;
+fn main() -> anyhow::Result<()> {
+    let mut db = Database::open("/tmp/my-graph")?;
 
     // Execute Cypher directly — no gRPC
-    let result = db
-        .query("CREATE (n:Person {name: $name}) RETURN n")
-        .param("name", "Alice")
-        .run()
-        .await?;
+    db.execute_cypher("CREATE (n:Person {name: 'Alice'}) RETURN n")?;
 
-    println!("{result:?}");
+    let rows = db.execute_cypher("MATCH (n:Person) RETURN n.name")?;
+    println!("{rows:?}");
     Ok(())
 }
 ```
 
-## Configuration
+## API Reference
 
 ```rust
-// In-memory (data lost on drop — good for tests)
-let config = Config::in_memory();
+use coordinode_embed::{Database, DatabaseError};
+use coordinode_core::graph::types::Value;
+use std::collections::HashMap;
 
-// Persistent on-disk
-let config = Config::builder()
-    .data_dir("/var/lib/myapp/graph")
-    .build();
+// Open (creates directory if absent)
+let mut db = Database::open("/path/to/data")?;
 
-let db = CoordinodeEmbed::open(config).await?;
+// Execute Cypher — no parameters
+let rows = db.execute_cypher("MATCH (n:Person) RETURN n.name")?;
+
+// Execute with parameters
+let mut params = HashMap::new();
+params.insert("name".to_string(), Value::String("Alice".into()));
+let rows = db.execute_cypher_with_params(
+    "MATCH (n:Person {name: $name}) RETURN n",
+    params,
+)?;
 ```
 
 ## What Is and Isn't Available
@@ -51,23 +54,33 @@ The embedded API exposes the full query engine — graph, vector, full-text, tim
 
 ## Testing with the Embedded Engine
 
-`Config::in_memory()` is the recommended approach for integration tests. Each test gets an isolated, zero-cleanup instance:
+Use `tempfile::tempdir()` for isolated per-test databases that clean up automatically on drop:
 
 ```rust
-#[tokio::test]
-async fn test_find_related_concepts() -> anyhow::Result<()> {
-    let db = CoordinodeEmbed::open(Config::in_memory()).await?;
+use coordinode_embed::Database;
 
-    db.query("CREATE (:Concept {name: 'ML'})-[:RELATED_TO]->(:Concept {name: 'AI'})")
-        .run().await?;
+#[test]
+fn test_find_related_concepts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
 
-    let result = db
-        .query("MATCH (a:Concept)-[:RELATED_TO]->(b) RETURN b.name")
-        .run().await?;
+    db.execute_cypher(
+        "CREATE (:Concept {name: 'ML'})-[:RELATED_TO]->(:Concept {name: 'AI'})"
+    ).expect("create");
 
-    assert_eq!(result.rows[0]["b.name"], "AI");
-    Ok(())
+    let rows = db
+        .execute_cypher("MATCH (a:Concept)-[:RELATED_TO]->(b) RETURN b.name")
+        .expect("match");
+
+    assert_eq!(rows.len(), 1);
 }
+```
+
+Add `tempfile` to `[dev-dependencies]`:
+
+```toml
+[dev-dependencies]
+tempfile = "3"
 ```
 
 ## Next Step

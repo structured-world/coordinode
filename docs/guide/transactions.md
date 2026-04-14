@@ -35,22 +35,19 @@ The retry is transparent for single-statement writes via the REST/gRPC API.
 
 ## Multi-Statement Transactions
 
-For multi-statement transactions, use the transaction API:
+Multi-statement explicit transactions are available via the **embedded API** (`coordinode-embed`) and via **gRPC** (native clients). A dedicated REST transaction endpoint is not yet implemented.
 
-```bash
-# Begin
-curl -X POST http://localhost:7081/v1/tx/begin
-# → {"txId": "tx-abc123", "snapshotTs": "..."}
+For the embedded API:
 
-# Execute statements within the transaction
-curl -X POST http://localhost:7081/v1/tx/tx-abc123/query \
-  -d '{"query": "CREATE (n:Person {name: $name})", "parameters": {"name": "Bob"}}'
-
-# Commit
-curl -X POST http://localhost:7081/v1/tx/tx-abc123/commit
+```rust
+// Each execute_cypher call runs in its own auto-committed transaction.
+// For multi-statement atomicity, use the batch Cypher approach:
+db.execute_cypher("
+  CREATE (alice:Person {name: 'Alice'})
+  CREATE (bob:Person {name: 'Bob'})
+  CREATE (alice)-[:KNOWS]->(bob)
+")?;
 ```
-
-If you do not commit within the transaction timeout (default: 30 s), it is automatically rolled back.
 
 ## Time-Travel Queries
 

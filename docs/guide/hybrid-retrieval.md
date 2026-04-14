@@ -37,14 +37,15 @@ All three filters apply within a single MVCC snapshot — consistent by construc
 
 | Function | Description | Example |
 |----------|-------------|---------|
-| `vector_distance(prop, $vec)` | L2 (Euclidean) distance between a stored vector and a query vector | `WHERE vector_distance(n.emb, $q) < 0.5` |
-| `vector_cosine(prop, $vec)` | Cosine similarity (higher = more similar) | `ORDER BY vector_cosine(n.emb, $q) DESC` |
+| `vector_distance(a, b)` | L2 (Euclidean) distance | `WHERE vector_distance(n.emb, $q) < 0.5` |
+| `vector_similarity(a, b)` | Cosine similarity (higher = more similar) | `ORDER BY vector_similarity(n.emb, $q) DESC` |
+| `vector_dot(a, b)` | Dot product | `RETURN vector_dot(n.emb, $q) AS score` |
+| `vector_manhattan(a, b)` | Manhattan distance | `WHERE vector_manhattan(n.emb, $q) < 2.0` |
 | `text_match(prop, "query")` | Full-text BM25 match | `WHERE text_match(n.body, "attention transformer")` |
 | `text_score(prop, "query")` | BM25 relevance score (0.0–1.0) | `RETURN text_score(n.body, "attention") AS score` |
-| `geo_distance(prop, $point)` | Haversine distance in metres | `WHERE geo_distance(n.location, $pt) < 1000` |
-| `geo_within(prop, $polygon)` | Point-in-polygon test | `WHERE geo_within(n.location, $bbox)` |
+| `point.distance(p1, p2)` | Haversine distance in metres | `WHERE point.distance(n.location, $pt) < 1000` |
 
-See [Cypher Extensions](../CYPHER_EXTENSIONS) for the full reference.
+See [Cypher Extensions](../CYPHER_EXTENSIONS) for the full syntax reference including spatial predicates and encrypted search.
 
 ## Execution Plan
 

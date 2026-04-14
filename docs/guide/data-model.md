@@ -88,7 +88,7 @@ CREATE INDEX person_email ON Person(email)
 
 -- Vector index (HNSW, in-memory at alpha)
 CREATE VECTOR INDEX doc_embedding ON Document(embedding)
-  OPTIONS {dims: 384, metric: "cosine"}
+  OPTIONS {dimensions: 384, metric: "cosine"}
 
 -- Full-text index (Tantivy)
 CREATE TEXT INDEX doc_body ON Document(body)

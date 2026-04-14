@@ -47,9 +47,11 @@ Key flags:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--addr` | `[::]:7080` | gRPC listen address |
-| `--http-addr` | `[::]:7081` | REST/HTTP listen address |
 | `--ops-addr` | `[::]:7084` | Health + metrics endpoint |
 | `--data` | `./data` | Data directory |
+| `--peers` | (none) | Peer addresses for cluster mode |
+
+The binary exposes **gRPC only** on port 7080. For REST/JSON, run [structured-proxy](https://github.com/structured-world/structured-proxy) in front of it (see `docker-compose.yml` for a reference setup).
 
 ## Verify
 
