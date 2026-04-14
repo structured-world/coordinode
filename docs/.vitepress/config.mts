@@ -163,6 +163,7 @@ export default defineConfig({
           { text: "LangChain", link: "/sdk/langchain" },
         ],
       },
+      { text: "API Reference", link: "/api/" },
       { text: "Roadmap", link: "/ROADMAP" },
       {
         text: "GitHub",
@@ -204,6 +205,40 @@ export default defineConfig({
             { text: "LlamaIndex", link: "/sdk/llama-index" },
             { text: "LangChain", link: "/sdk/langchain" },
           ],
+        },
+      ],
+      "/api/": [
+        {
+          text: "gRPC API Reference",
+          items: [{ text: "Overview", link: "/api/" }],
+        },
+        {
+          text: "Query",
+          items: [
+            { text: "CypherService", link: "/api/cypher" },
+            { text: "VectorService", link: "/api/vector" },
+            { text: "TextService", link: "/api/text" },
+          ],
+        },
+        {
+          text: "Graph",
+          items: [
+            { text: "GraphService", link: "/api/graph" },
+            { text: "SchemaService", link: "/api/schema" },
+            { text: "BlobService", link: "/api/blob" },
+          ],
+        },
+        {
+          text: "Operations",
+          items: [
+            { text: "HealthService", link: "/api/health" },
+            { text: "ClusterService", link: "/api/cluster" },
+            { text: "ChangeStreamService", link: "/api/change-stream" },
+          ],
+        },
+        {
+          text: "Reference",
+          items: [{ text: "Common Types", link: "/api/common-types" }],
         },
       ],
     },

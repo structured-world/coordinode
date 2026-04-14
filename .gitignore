@@ -77,5 +77,6 @@ data/
 node_modules/
 docs/.vitepress/dist/
 docs/.vitepress/cache/
+docs/api/
 .yarn/cache/
 .yarn/install-state.gz
