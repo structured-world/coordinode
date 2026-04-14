@@ -361,4 +361,47 @@ mod tests {
         let cmd = parse_args_from(&args("coordinode version"));
         assert!(matches!(cmd, Command::Version));
     }
+
+    #[test]
+    fn admin_node_join_required_flags() {
+        let cmd = parse_args_from(&args(
+            "coordinode admin node join --node http://leader:7080 --id 3 --addr node3:7080",
+        ));
+        match cmd {
+            Command::AdminNodeJoin {
+                cluster_addr,
+                node_id,
+                node_addr,
+                pre_seeded,
+                follow,
+            } => {
+                assert_eq!(cluster_addr, "http://leader:7080");
+                assert_eq!(node_id, 3);
+                assert_eq!(node_addr, "node3:7080");
+                assert!(!pre_seeded);
+                assert!(!follow);
+            }
+            _ => panic!("expected AdminNodeJoin"),
+        }
+    }
+
+    #[test]
+    fn admin_node_join_with_flags() {
+        let cmd = parse_args_from(&args(
+            "coordinode admin node join --node http://n1:7080 --id 5 --addr n5:7080 --pre-seeded --follow",
+        ));
+        match cmd {
+            Command::AdminNodeJoin {
+                node_id,
+                pre_seeded,
+                follow,
+                ..
+            } => {
+                assert_eq!(node_id, 5);
+                assert!(pre_seeded);
+                assert!(follow);
+            }
+            _ => panic!("expected AdminNodeJoin"),
+        }
+    }
 }
