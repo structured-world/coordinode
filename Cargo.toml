@@ -12,6 +12,7 @@ members = [
     "crates/coordinode-s3",
     "crates/coordinode-embed",
     "crates/coordinode-client",
+    "tests/integration",
 ]
 
 [workspace.package]
@@ -74,6 +75,9 @@ rand = "0.10"
 
 # Parallelism
 rayon = "1.10"
+
+# Async utilities
+futures-util = "0.3"
 
 # Utilities
 bytes = "1"

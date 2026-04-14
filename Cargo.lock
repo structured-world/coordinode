@@ -888,6 +888,7 @@ dependencies = [
  "coordinode-search",
  "coordinode-storage",
  "coordinode-vector",
+ "futures-util",
  "hex",
  "metrics",
  "metrics-exporter-prometheus",
@@ -4580,6 +4581,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

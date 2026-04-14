@@ -558,6 +558,20 @@ impl RaftNode {
             .unwrap_or(0)
     }
 
+    /// Get the current Raft term.
+    pub fn current_term(&self) -> u64 {
+        use openraft::async_runtime::watch::WatchReceiver;
+        self.raft.metrics().borrow_watched().current_term
+    }
+
+    /// Get the current leader node ID, if known.
+    ///
+    /// Returns `None` if the cluster has no leader (e.g. election in progress).
+    pub fn current_leader(&self) -> Option<u64> {
+        use openraft::async_runtime::watch::WatchReceiver;
+        self.raft.metrics().borrow_watched().current_leader
+    }
+
     /// Subscribe to applied index updates.
     ///
     /// Returns a clone of the applied watermark receiver. The receiver
@@ -874,6 +888,194 @@ pub enum NodeRole {
     Follower,
     /// Non-voting learner (receives replication but doesn't vote).
     Learner,
+}
+
+// ── Join Protocol ─────────────────────────────────────────────────────────────
+
+/// Phase progression for a node join lifecycle.
+///
+/// Emitted as part of [`JoinProgressEvent`] during [`RaftNode::monitor_and_promote`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinPhase {
+    /// Node added as Learner — receiving log replication, lag closing.
+    Learner,
+    /// Lag below readiness threshold — about to promote to Voter.
+    ReadyCheck,
+    /// `change_membership` in progress — node becoming a Voter.
+    Promoting,
+    /// Node is now a Voter. Join complete.
+    Complete,
+    /// Join failed (see `message` field for details).
+    Failed,
+}
+
+/// Progress event emitted during a node join lifecycle.
+///
+/// Broadcast via `tokio::sync::broadcast` from [`RaftNode::monitor_and_promote`].
+/// Consumers (e.g., the `JoinProgress` gRPC stream) subscribe and map these
+/// to proto `JoinStatus` messages.
+#[derive(Debug, Clone)]
+pub struct JoinProgressEvent {
+    /// Node ID of the joining node.
+    pub node_id: u64,
+    /// Current join phase.
+    pub phase: JoinPhase,
+    /// Number of Raft log entries behind the leader. `u64::MAX` means "not yet known".
+    pub lag_entries: u64,
+    /// Estimated completion percentage (0–100).
+    pub percent: u8,
+    /// Human-readable status message.
+    pub message: String,
+}
+
+impl RaftNode {
+    /// Monitor replication lag for a Learner node and promote it to Voter when ready.
+    ///
+    /// Called after the node has been added as a Learner via [`add_node`]. Polls
+    /// replication metrics every 500ms until lag drops below
+    /// `READINESS_LAG_THRESHOLD` (1 000 entries), then calls
+    /// [`change_membership`] to promote the node to a Voter.
+    ///
+    /// Broadcasts [`JoinProgressEvent`] at each phase transition and every lag
+    /// poll iteration so callers can stream progress to operators.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RaftNodeError::Membership`] if `change_membership` fails.
+    /// The node remains a Learner on failure (no automatic rollback — caller
+    /// should call [`remove_node`] to clean up).
+    ///
+    /// # Timeout
+    ///
+    /// Aborts with an error after 30 minutes if the node has not caught up.
+    /// This protects against permanently stale nodes blocking the join lifecycle.
+    pub async fn monitor_and_promote(
+        &self,
+        node_id: u64,
+        progress_tx: tokio::sync::broadcast::Sender<JoinProgressEvent>,
+    ) -> Result<(), RaftNodeError> {
+        // Number of entries a Learner may be behind before it is considered
+        // ready for Voter promotion (arch/distribution/consensus.md:242).
+        const READINESS_LAG_THRESHOLD: u64 = 1_000;
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60); // 30 min
+
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        let mut initial_lag: Option<u64> = None;
+
+        // Phase 1: poll until lag ≤ READINESS_LAG_THRESHOLD.
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                let _ = progress_tx.send(JoinProgressEvent {
+                    node_id,
+                    phase: JoinPhase::Failed,
+                    lag_entries: 0,
+                    percent: 0,
+                    message: "Join timed out after 30 minutes — node failed to catch up".into(),
+                });
+                return Err(RaftNodeError::Membership(
+                    "join timed out: node did not catch up within 30 minutes".into(),
+                ));
+            }
+
+            tokio::time::sleep(POLL_INTERVAL).await;
+
+            let lag = match self.lag_for_node(node_id) {
+                Some(l) => l,
+                None => {
+                    // Node not in replication metrics yet — still initializing.
+                    let _ = progress_tx.send(JoinProgressEvent {
+                        node_id,
+                        phase: JoinPhase::Learner,
+                        lag_entries: u64::MAX,
+                        percent: 0,
+                        message: "Waiting for replication to start on joining node".into(),
+                    });
+                    continue;
+                }
+            };
+
+            // Record initial lag for percentage calculation (set once, on first measurement).
+            let start = *initial_lag.get_or_insert(lag.max(1));
+
+            if lag <= READINESS_LAG_THRESHOLD {
+                let _ = progress_tx.send(JoinProgressEvent {
+                    node_id,
+                    phase: JoinPhase::ReadyCheck,
+                    lag_entries: lag,
+                    percent: 99,
+                    message: format!(
+                        "Lag {lag} entries — below threshold ({READINESS_LAG_THRESHOLD}), promoting to Voter"
+                    ),
+                });
+                break;
+            }
+
+            let done = start.saturating_sub(lag);
+            let percent = ((done * 98 / start) as u8).min(98);
+
+            let _ = progress_tx.send(JoinProgressEvent {
+                node_id,
+                phase: JoinPhase::Learner,
+                lag_entries: lag,
+                percent,
+                message: format!("Catching up: {lag} entries behind leader"),
+            });
+        }
+
+        // Phase 2: promote to Voter.
+        let _ = progress_tx.send(JoinProgressEvent {
+            node_id,
+            phase: JoinPhase::Promoting,
+            lag_entries: 0,
+            percent: 99,
+            message: "Promoting node to Voter via change_membership".into(),
+        });
+
+        // Collect current voters and include the new node.
+        let mut new_members: Vec<u64> = {
+            use openraft::async_runtime::watch::WatchReceiver;
+            let rx = self.raft.metrics();
+            let m = rx.borrow_watched();
+            m.membership_config.membership().voter_ids().collect()
+        };
+        if !new_members.contains(&node_id) {
+            new_members.push(node_id);
+        }
+
+        self.change_membership(new_members).await.map_err(|e| {
+            let _ = progress_tx.send(JoinProgressEvent {
+                node_id,
+                phase: JoinPhase::Failed,
+                lag_entries: 0,
+                percent: 99,
+                message: format!("change_membership failed: {e}"),
+            });
+            e
+        })?;
+
+        let _ = progress_tx.send(JoinProgressEvent {
+            node_id,
+            phase: JoinPhase::Complete,
+            lag_entries: 0,
+            percent: 100,
+            message: "Node is now a Voter — join complete".into(),
+        });
+
+        Ok(())
+    }
+
+    /// Replication lag for a specific node ID, if available in leader metrics.
+    ///
+    /// Returns `None` if this node is not the leader or if the target node is
+    /// not yet in the replication metrics (still initializing).
+    fn lag_for_node(&self, node_id: u64) -> Option<u64> {
+        let statuses = self.replication_status()?;
+        statuses
+            .into_iter()
+            .find(|s| s.node_id == node_id)
+            .map(|s| s.lag_entries)
+    }
 }
 
 /// Spawn a background task that periodically checks snapshot triggers.

@@ -1,5 +1,6 @@
 pub mod blob;
 pub mod cdc;
+pub mod cluster;
 pub mod cypher;
 pub mod graph;
 pub mod health;

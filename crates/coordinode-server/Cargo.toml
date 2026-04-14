@@ -40,7 +40,8 @@ thiserror = { workspace = true }
 rmpv = { workspace = true }
 sha2 = { workspace = true }
 hex = "0.4"
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = "0.14"
@@ -48,7 +49,7 @@ tonic-prost-build = "0.14"
 [dev-dependencies]
 tempfile = { workspace = true }
 coordinode-client = { workspace = true }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 [lints]
 workspace = true

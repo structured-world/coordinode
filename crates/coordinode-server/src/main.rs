@@ -41,6 +41,11 @@ pub mod proto {
         pub use cdc::ReadConcernLevel;
         pub use cdc::ReadPreference;
     }
+    pub mod admin {
+        pub mod cluster {
+            tonic::include_proto!("coordinode.v1.admin");
+        }
+    }
 }
 
 mod cli;
@@ -89,6 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         cli::Command::Serve {
             grpc_addr,
+            ops_addr,
             data_dir,
             peers,
         } => {
@@ -192,6 +198,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cdc_service =
                 services::cdc::ChangeEventServiceImpl::new(std::path::PathBuf::from(&data_dir));
 
+            // ClusterService: cluster join/leave lifecycle.
+            // Available only in cluster mode (requires a RaftNode).
+            let cluster_service = raft_node_shared
+                .as_ref()
+                .map(|rn| services::cluster::ClusterServiceImpl::new(Arc::clone(rn)));
+
             // BlobService shares the same storage engine as the Database.
             let blob_engine = database
                 .lock()
@@ -199,17 +211,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .engine_shared();
             let blob_service = services::blob::BlobServiceImpl::new(blob_engine);
 
-            // Spawn operational HTTP server on :7084
-            let ops_addr: SocketAddr = "[::]:7084".parse()?;
+            // Spawn operational HTTP server (default :7084, configurable via --ops-addr).
+            let ops_sock: SocketAddr = ops_addr.parse()?;
             tokio::spawn(async move {
-                if let Err(e) = ops::start_ops_server(ops_addr).await {
+                if let Err(e) = ops::start_ops_server(ops_sock).await {
                     tracing::error!("ops server error: {e}");
                 }
             });
 
             info!(port = addr.port(), "gRPC server listening");
 
-            Server::builder()
+            // Graceful shutdown: wait for SIGTERM (Docker / test harness) or Ctrl+C.
+            // When the signal fires, `serve_with_shutdown` stops accepting new
+            // connections and waits for in-flight RPCs to complete before returning.
+            // The returned future resolves → all Arc<Database> / Arc<RaftNode> drop
+            // → StorageEngine::Drop flushes all memtables to SST files.
+            #[cfg(unix)]
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .map_err(|e| format!("failed to install SIGTERM handler: {e}"))?;
+
+            let shutdown = async move {
+                #[cfg(unix)]
+                tokio::select! {
+                    _ = sigterm.recv() => {
+                        info!("SIGTERM received — initiating graceful shutdown");
+                    }
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("Ctrl+C received — initiating graceful shutdown");
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = tokio::signal::ctrl_c().await;
+                    info!("Ctrl+C received — initiating graceful shutdown");
+                }
+            };
+
+            let mut builder = Server::builder();
+            let mut router = builder
                 .add_service(proto::graph::graph_service_server::GraphServiceServer::new(
                     graph_service,
                 ))
@@ -235,9 +275,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     proto::replication::cdc::change_stream_service_server::ChangeStreamServiceServer::new(
                         cdc_service,
                     ),
-                )
-                .serve(addr)
-                .await?;
+                );
+
+            // Register ClusterService only in cluster mode (requires Raft node).
+            if let Some(cs) = cluster_service {
+                router = router.add_service(
+                    proto::admin::cluster::cluster_service_server::ClusterServiceServer::new(cs),
+                );
+                info!("ClusterService registered — cluster join/leave management available");
+            }
+
+            router.serve_with_shutdown(addr, shutdown).await?;
         }
 
         cli::Command::Backup {
@@ -364,6 +412,118 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+        }
+
+        cli::Command::AdminNodeJoin {
+            cluster_addr,
+            node_id,
+            node_addr,
+            pre_seeded,
+            follow,
+        } => {
+            admin_node_join(cluster_addr, node_id, node_addr, pre_seeded, follow).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Execute `coordinode admin node join` — connect to a running cluster and initiate
+/// the full join lifecycle for a new node.
+///
+/// Steps:
+/// 1. Connect to any cluster member via gRPC.
+/// 2. Call `ClusterService.JoinNode` — adds node as Learner, starts background promotion.
+/// 3. If `--follow`, subscribe to `JoinProgress` stream until COMPLETE/FAILED.
+async fn admin_node_join(
+    cluster_addr: String,
+    node_id: u64,
+    node_addr: String,
+    pre_seeded: bool,
+    follow: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use proto::admin::cluster::{
+        cluster_service_client::ClusterServiceClient, JoinNodeRequest, JoinPhase,
+        JoinProgressRequest,
+    };
+
+    // Normalize cluster_addr to include http:// scheme for tonic.
+    let endpoint = if cluster_addr.starts_with("http://") || cluster_addr.starts_with("https://") {
+        cluster_addr.clone()
+    } else {
+        format!("http://{cluster_addr}")
+    };
+
+    eprintln!("Connecting to cluster at {endpoint} ...");
+
+    let mut client = ClusterServiceClient::connect(endpoint)
+        .await
+        .map_err(|e| format!("failed to connect to cluster: {e}"))?;
+
+    eprintln!("Initiating join for node {node_id} at {node_addr} ...");
+
+    let resp = client
+        .join_node(JoinNodeRequest {
+            node_id,
+            address: node_addr.clone(),
+            pre_seeded,
+        })
+        .await
+        .map_err(|e| format!("JoinNode failed: {e}"))?
+        .into_inner();
+
+    eprintln!("JoinNode: {} (node_id={})", resp.status, resp.node_id);
+
+    if !follow {
+        eprintln!(
+            "Join initiated. Use `--follow` to stream progress, \
+             or poll `GetClusterStatus` to monitor lag."
+        );
+        return Ok(());
+    }
+
+    // Stream JoinProgress until COMPLETE or FAILED.
+    eprintln!("Streaming join progress (Ctrl+C to detach) ...");
+
+    let mut stream = client
+        .join_progress(JoinProgressRequest { node_id })
+        .await
+        .map_err(|e| format!("JoinProgress failed: {e}"))?
+        .into_inner();
+
+    use tokio_stream::StreamExt as _;
+
+    while let Some(status) = stream.next().await {
+        let s = status.map_err(|e| format!("stream error: {e}"))?;
+
+        let phase_name = match s.phase {
+            p if p == JoinPhase::Learner as i32 => "LEARNER",
+            p if p == JoinPhase::ReadyCheck as i32 => "READY_CHECK",
+            p if p == JoinPhase::Promoting as i32 => "PROMOTING",
+            p if p == JoinPhase::Complete as i32 => "COMPLETE",
+            p if p == JoinPhase::Failed as i32 => "FAILED",
+            _ => "UNKNOWN",
+        };
+
+        if s.lag_entries == 0 && s.phase == JoinPhase::Learner as i32 {
+            // lag_entries=0 in LEARNER phase means "not yet known"
+            eprintln!("[{phase_name}] {}% — {}", s.percent, s.message);
+        } else {
+            eprintln!(
+                "[{phase_name}] {}% lag={} — {}",
+                s.percent, s.lag_entries, s.message
+            );
+        }
+
+        match s.phase {
+            p if p == JoinPhase::Complete as i32 => {
+                eprintln!("Node {node_id} successfully joined as Voter.");
+                break;
+            }
+            p if p == JoinPhase::Failed as i32 => {
+                return Err(format!("Node {node_id} join failed: {}", s.message).into());
+            }
+            _ => {}
         }
     }
 

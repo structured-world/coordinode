@@ -25,6 +25,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Compile admin/cluster.proto with both server and client stubs.
+    // Server stub: ClusterServiceServer (registered in main.rs).
+    // Client stub: ClusterServiceClient (used by `coordinode admin node join` CLI subcommand).
+    tonic_prost_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .compile_protos(
+            &[format!(
+                "{proto_root_str}/coordinode/v1/admin/cluster.proto"
+            )],
+            &includes,
+        )?;
+
+    // Compile remaining service protos (server-only stubs).
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(false)

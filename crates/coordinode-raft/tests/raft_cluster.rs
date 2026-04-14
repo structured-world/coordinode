@@ -2346,3 +2346,111 @@ async fn cluster_write_concern_w0_vs_majority() {
         "TIMED OUT — cluster_write_concern_w0_vs_majority"
     );
 }
+
+// ── R091b: monitor_and_promote join lifecycle ──────────────────────────────────
+
+/// Regression test for the join protocol (R091b).
+///
+/// Verifies that `monitor_and_promote` drives a Learner node to Voter status
+/// and emits the expected phase progression: Learner → ReadyCheck → Promoting → Complete.
+///
+/// Test topology: 2-node cluster (leader + joining node).
+/// On an empty cluster the Learner catches up immediately (0 entries lag),
+/// so the promotion path is exercised without artificial delays.
+#[tokio::test(flavor = "multi_thread")]
+async fn cluster_join_monitor_and_promote() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=debug,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let p1 = alloc_port();
+        let p2 = alloc_port();
+
+        let n1 = create_leader(1, p1).await;
+        let n2 = create_follower(2, p2).await;
+
+        // Wait for leader election
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(n1.node.is_leader().await, "n1 must be leader");
+
+        // Step 1: add node 2 as Learner
+        n1.node
+            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add_node");
+
+        // Step 2: run monitor_and_promote with a broadcast channel.
+        // Collect all emitted events.
+        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+
+        let promote_handle = {
+            let arc = std::sync::Arc::new(n1.node);
+            let arc2 = std::sync::Arc::clone(&arc);
+            let tx_clone = tx.clone();
+            let handle = tokio::spawn(async move {
+                arc2.monitor_and_promote(2, tx_clone).await
+            });
+            // Keep the original Arc alive for shutdown
+            (arc, handle)
+        };
+
+        // Collect events until Complete or Failed (channel drops when task finishes)
+        let mut phases_seen = Vec::new();
+        loop {
+            match rx.recv().await {
+                Ok(ev) => {
+                    phases_seen.push(ev.phase);
+                    if ev.phase == coordinode_raft::cluster::JoinPhase::Complete
+                        || ev.phase == coordinode_raft::cluster::JoinPhase::Failed
+                    {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+
+        let result = promote_handle.1.await.expect("task panicked");
+        assert!(result.is_ok(), "monitor_and_promote failed: {result:?}");
+
+        // Must have seen Complete phase
+        assert!(
+            phases_seen.contains(&coordinode_raft::cluster::JoinPhase::Complete),
+            "expected Complete phase in progression, got: {phases_seen:?}"
+        );
+
+        // Must NOT have seen Failed
+        assert!(
+            !phases_seen.contains(&coordinode_raft::cluster::JoinPhase::Failed),
+            "unexpected Failed phase in progression: {phases_seen:?}"
+        );
+
+        // Node 2 must now be a voter in the membership
+        let status = promote_handle.0.replication_status();
+        assert!(status.is_some(), "leader must report replication status");
+        let statuses = status.unwrap();
+        let node2 = statuses.iter().find(|s| s.node_id == 2);
+        assert!(node2.is_some(), "node 2 must appear in replication status");
+        let node2 = node2.unwrap();
+        assert_eq!(
+            node2.role,
+            coordinode_raft::cluster::NodeRole::Follower,
+            "node 2 must be Follower (voter) after promotion, got: {:?}",
+            node2.role
+        );
+
+        tracing::info!("R091b: monitor_and_promote join lifecycle verified");
+
+        promote_handle.0.shutdown().await.expect("leader shutdown");
+        n2.node.shutdown().await.expect("n2 shutdown");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — cluster_join_monitor_and_promote"
+    );
+}

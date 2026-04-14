@@ -15,6 +15,9 @@ pub enum Command {
     Serve {
         /// gRPC listen address (default: [::]:7080).
         grpc_addr: String,
+        /// Operational HTTP server address for /metrics and /health (default: [::]:7084).
+        /// Pass port 0 to let the OS assign an ephemeral port (useful in tests).
+        ops_addr: String,
         /// Data directory (default: ./data).
         data_dir: String,
         /// Peer addresses for cluster mode (comma-separated).
@@ -56,6 +59,21 @@ pub enum Command {
         /// Optional target namespace (restore into this namespace).
         namespace: Option<String>,
     },
+    /// Admin commands for a running cluster.
+    AdminNodeJoin {
+        /// gRPC address of any cluster member (usually the leader).
+        /// Example: "http://node1:7080"
+        cluster_addr: String,
+        /// Numeric node ID to assign to the new node. Must be unique in the cluster.
+        node_id: u64,
+        /// gRPC address of the new node (host:port). The node must be running.
+        node_addr: String,
+        /// If set, the new node has pre-seeded data from an offline snapshot backup.
+        /// Three-tier recovery skips Tier 3 (full resync) and starts from Tier 1/2.
+        pre_seeded: bool,
+        /// If set, stream join progress until COMPLETE or FAILED.
+        follow: bool,
+    },
 }
 
 /// Parse command line arguments.
@@ -73,6 +91,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
     match args[1].as_str() {
         "serve" => {
             let grpc_addr = find_flag(args, "--addr").unwrap_or_else(|| "[::]:7080".to_string());
+            let ops_addr = find_flag(args, "--ops-addr").unwrap_or_else(|| "[::]:7084".to_string());
             let data_dir = find_flag(args, "--data").unwrap_or_else(|| "./data".to_string());
             let peers = find_flag(args, "--peers").map(|p| {
                 p.split(',')
@@ -82,6 +101,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
             });
             Command::Serve {
                 grpc_addr,
+                ops_addr,
                 data_dir,
                 peers,
             }
@@ -128,6 +148,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
                 namespace,
             }
         }
+        "admin" => parse_admin_args(args),
         _ => {
             eprintln!(
                 "coordinode v{}\n\n\
@@ -136,8 +157,68 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  coordinode backup --output FILE [--data DIR] [--format json|cypher|binary] [--namespace NS]\n  \
                  coordinode restore --input FILE [--data DIR] [--format json|cypher|binary] [--namespace NS]\n  \
                  coordinode verify [--data DIR] [--deep]\n  \
-                 coordinode version\n",
+                 coordinode version\n  \
+                 coordinode admin node join --node CLUSTER_ADDR --id NODE_ID --addr NODE_ADDR [--pre-seeded] [--follow]\n",
                 env!("CARGO_PKG_VERSION")
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Parse `coordinode admin <subcommand> ...` arguments.
+///
+/// Currently supports: `coordinode admin node join --node ADDR --id ID --addr ADDR`
+fn parse_admin_args(args: &[String]) -> Command {
+    // args[1] = "admin", args[2] should be the admin object
+    let object = args.get(2).map(|s| s.as_str()).unwrap_or("");
+    let subcommand = args.get(3).map(|s| s.as_str()).unwrap_or("");
+
+    match (object, subcommand) {
+        ("node", "join") => {
+            let cluster_addr = match find_flag(args, "--node") {
+                Some(a) => a,
+                None => {
+                    eprintln!("error: --node CLUSTER_ADDR is required for admin node join");
+                    std::process::exit(1);
+                }
+            };
+            let node_id_str = match find_flag(args, "--id") {
+                Some(s) => s,
+                None => {
+                    eprintln!("error: --id NODE_ID is required for admin node join");
+                    std::process::exit(1);
+                }
+            };
+            let node_id: u64 = match node_id_str.parse() {
+                Ok(id) => id,
+                Err(_) => {
+                    eprintln!("error: --id must be a positive integer, got '{node_id_str}'");
+                    std::process::exit(1);
+                }
+            };
+            let node_addr = match find_flag(args, "--addr") {
+                Some(a) => a,
+                None => {
+                    eprintln!("error: --addr NODE_ADDR is required for admin node join");
+                    std::process::exit(1);
+                }
+            };
+            let pre_seeded = args.iter().any(|a| a == "--pre-seeded");
+            let follow = args.iter().any(|a| a == "--follow");
+            Command::AdminNodeJoin {
+                cluster_addr,
+                node_id,
+                node_addr,
+                pre_seeded,
+                follow,
+            }
+        }
+        _ => {
+            eprintln!(
+                "coordinode admin: unknown subcommand '{object} {subcommand}'\n\n\
+                 Admin commands:\n  \
+                 coordinode admin node join --node CLUSTER_ADDR --id NODE_ID --addr NODE_ADDR [--pre-seeded] [--follow]\n"
             );
             std::process::exit(1);
         }
@@ -147,6 +228,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
 fn default_serve() -> Command {
     Command::Serve {
         grpc_addr: "[::]:7080".to_string(),
+        ops_addr: "[::]:7084".to_string(),
         data_dir: "./data".to_string(),
         peers: None,
     }
