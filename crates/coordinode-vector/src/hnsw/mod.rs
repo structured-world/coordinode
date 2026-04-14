@@ -350,9 +350,16 @@ impl HnswIndex {
     }
 
     /// Insert a vector into the index.
+    ///
+    /// If the node `id` is already in the index, its vector is updated and its
+    /// graph position is rebuilt (G082 fix). This handles the `MATCH (n) SET
+    /// n.emb = $new_vec` path where `on_vector_written` calls `insert()` for
+    /// both CREATE and SET.
     pub fn insert(&mut self, id: u64, vector: Vec<f32>) {
-        if self.id_to_idx.contains_key(&id) {
-            return; // Already indexed
+        if let Some(&idx) = self.id_to_idx.get(&id) {
+            // Node already indexed — update vector and reconnect in graph.
+            self.update_existing_node(idx, vector);
+            return;
         }
 
         let new_level = self.random_level();
@@ -800,6 +807,119 @@ impl HnswIndex {
 
         let uniform = (state >> 33) as f64 / (1u64 << 31) as f64;
         (-uniform.ln() * self.level_mult).floor() as usize
+    }
+
+    /// Update an already-indexed node's vector and rebuild its graph connections.
+    ///
+    /// Called by `insert()` when the node ID already exists.  Implements the
+    /// G082 fix: prior code returned early ("Already indexed"), leaving the
+    /// node at its old position after a SET operation.
+    ///
+    /// Algorithm:
+    /// 1. Remove this node from all neighbors' connection lists.
+    /// 2. Clear this node's outgoing connections (preserving layer slots).
+    /// 3. Replace the stored vector (and update quantized representation).
+    /// 4. Re-run the HNSW insertion neighbourhood search from a valid entry point.
+    /// 5. Re-connect bidirectionally at each layer.
+    fn update_existing_node(&mut self, idx: usize, vector: Vec<f32>) {
+        let id = self.nodes[idx].id;
+        let n_levels = self.nodes[idx].connections.len();
+
+        // Step 1: Remove this node from every neighbour's connection list.
+        // Clone neighbour IDs first to avoid simultaneous mutable + immutable borrows.
+        for level in 0..n_levels {
+            let neighbours: Vec<u64> = self.nodes[idx].connections[level].clone();
+            for neighbour_id in neighbours {
+                if let Some(&neighbour_idx) = self.id_to_idx.get(&neighbour_id) {
+                    if level < self.nodes[neighbour_idx].connections.len() {
+                        self.nodes[neighbour_idx].connections[level].retain(|&nid| nid != id);
+                    }
+                }
+            }
+        }
+
+        // Step 2: Clear this node's outgoing connections (keep layer slot count).
+        for level in 0..n_levels {
+            self.nodes[idx].connections[level].clear();
+        }
+
+        // Step 3: Update vector and quantized representation.
+        let quantized = self.sq8_params.as_ref().map(|p| p.quantize(&vector));
+        self.nodes[idx].vector = Some(vector);
+        self.nodes[idx].quantized = quantized;
+
+        // Step 4: Re-insert into the graph from a valid entry point.
+        // A single-node index has no connections to rebuild.
+        if self.nodes.len() == 1 {
+            if self.is_offloaded() {
+                self.nodes[idx].vector = None;
+            }
+            return;
+        }
+
+        // Choose entry point: if the current entry_point IS this node, use any
+        // other node (the graph is connected, so any peer suffices).
+        let ep_idx = if self.entry_point == Some(idx) {
+            // Find first node that is not `idx`.
+            self.id_to_idx
+                .values()
+                .find(|&&i| i != idx)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            self.entry_point.unwrap_or(0)
+        };
+
+        let node_level = self.nodes[idx]._max_layer;
+        let top_level = self.max_level;
+        let mut current_ep = ep_idx;
+
+        // Phase 1: Greedy descent from top layer down to node_level+1.
+        for level in (node_level + 1..=top_level).rev() {
+            current_ep = self.search_layer_greedy(idx, current_ep, level);
+        }
+
+        // Phase 2: Reconnect at layers node_level down to 0.
+        for level in (0..=node_level.min(top_level)).rev() {
+            let ef = self.config.ef_construction;
+            let neighbours = self.search_layer(idx, current_ep, ef, level);
+
+            let max_conn = if level == 0 {
+                self.config.m_max0
+            } else {
+                self.config.m
+            };
+
+            let selected: Vec<usize> = neighbours
+                .into_iter()
+                .take(max_conn)
+                .map(|c| c.idx)
+                .collect();
+
+            // Connect this node to its new neighbours.
+            self.nodes[idx].connections[level] =
+                selected.iter().map(|&n| self.nodes[n].id).collect();
+
+            // Connect neighbours back (bi-directional).
+            for &neighbour_idx in &selected {
+                if level < self.nodes[neighbour_idx].connections.len() {
+                    self.nodes[neighbour_idx].connections[level].push(id);
+
+                    if self.nodes[neighbour_idx].connections[level].len() > max_conn {
+                        self.prune_connections(neighbour_idx, level, max_conn);
+                    }
+                }
+            }
+
+            if !selected.is_empty() {
+                current_ep = selected[0];
+            }
+        }
+
+        // Step 5: Offload f32 if offloading is active (calibration already done).
+        if self.is_offloaded() {
+            self.nodes[idx].vector = None;
+        }
     }
 
     /// Greedy search on a single layer (for traversal from top layers).
@@ -2053,6 +2173,56 @@ mod tests {
             retained_f32_bytes,
             n as usize * dims * 4,
             "retained should have all f32 bytes"
+        );
+    }
+
+    /// Regression test for G082: HNSW must update the graph when a vector
+    /// property is overwritten via SET (e.g. `MATCH (n) SET n.emb = $new_vec`).
+    ///
+    /// Previously `insert()` returned early ("Already indexed") so the node
+    /// kept its old position in the graph. Vector similarity searches then
+    /// returned garbage results because the search used the stale HNSW graph.
+    #[test]
+    fn insert_updates_existing_node_vector_and_graph_position() {
+        // Build an index with a clear directional layout:
+        //   node 1: "up"    [0.0, 1.0]
+        //   node 2: "right" [1.0, 0.0]  (decoy)
+        //   node 3: "down"  [0.0, -1.0]  (decoy)
+        let mut index = HnswIndex::new(make_config(VectorMetric::Cosine));
+        index.insert(2, vec![1.0, 0.0]);
+        index.insert(3, vec![0.0, -1.0]);
+        index.insert(1, vec![0.0, 1.0]);
+
+        // Verify initial state: query "up" → node 1 wins.
+        let before = index.search(&[0.0, 1.0], 1);
+        assert_eq!(
+            before.first().map(|r| r.id),
+            Some(1),
+            "before update: 'up' query should find node 1"
+        );
+
+        // Update node 1 from "up" [0.0, 1.0] to "right" [1.0, 0.0].
+        // This simulates: MATCH (n) SET n.emb = [1.0, 0.0]
+        index.insert(1, vec![1.0, 0.0]);
+
+        // After update, query "right" → node 1 must now be among top-2 results
+        // (node 2 also points "right", so both should score high).
+        let after_right = index.search(&[1.0, 0.0], 2);
+        let ids_right: Vec<u64> = after_right.iter().map(|r| r.id).collect();
+        assert!(
+            ids_right.contains(&1),
+            "after update: 'right' query must include node 1 (updated vector). Got: {:?}",
+            ids_right
+        );
+
+        // Query "up" → node 1 must NO LONGER be the top result (its vector changed).
+        // Node 2 or 3 should win for "up" now.
+        let after_up = index.search(&[0.0, 1.0], 1);
+        assert_ne!(
+            after_up.first().map(|r| r.id),
+            Some(1),
+            "after update: 'up' query must NOT return node 1 (its vector is now 'right'). Got: {:?}",
+            after_up
         );
     }
 }
