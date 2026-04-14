@@ -77,6 +77,12 @@ mod proto {
     pub mod graph {
         include!(concat!(env!("OUT_DIR"), "/coordinode.v1.graph.rs"));
     }
+    // Replication types (ReadPreference, ReadConcern, WriteConcern).
+    // Required because cypher.proto imports consistency.proto and the generated
+    // query code resolves ReadConcern/ReadPreference via `super::replication::`.
+    pub mod replication {
+        include!(concat!(env!("OUT_DIR"), "/coordinode.v1.replication.rs"));
+    }
     pub mod query {
         include!(concat!(env!("OUT_DIR"), "/coordinode.v1.query.rs"));
     }
@@ -205,6 +211,12 @@ impl CoordinodeClient {
         let mut request = tonic::Request::new(ExecuteCypherRequest {
             query,
             parameters: proto_params,
+            // read_preference = 0 → PRIMARY (leader-only, always consistent).
+            // read_concern = None → LOCAL (serve whatever the node has applied).
+            // Both are left at proto defaults — clients that need follower reads
+            // or causal consistency will set these explicitly once R142 is done.
+            read_preference: 0,
+            read_concern: None,
         });
 
         if let Some(loc) = location {
