@@ -5895,11 +5895,29 @@ fn execute_remove(
                         })?;
 
                         if let Some(field_id) = ctx.interner.lookup(property) {
+                            let old_value: Option<Value> = record.props.get(&field_id).cloned();
+
+                            // Remove B-tree index entry for the old value so
+                            // unique constraints don't block future nodes with
+                            // the same property value.
+                            if let Some(btree_reg) = ctx.btree_index_registry {
+                                if let Some(ref old_val) = old_value {
+                                    let label = record.primary_label().to_string();
+                                    btree_reg
+                                        .on_node_deleted(
+                                            ctx.engine,
+                                            node_id,
+                                            &label,
+                                            &[(property.to_string(), old_val.clone())],
+                                        )
+                                        .map_err(ExecutionError::Storage)?;
+                                }
+                            }
+
                             // Notify vector index if removing a vector property.
                             if let Some(registry) = ctx.vector_index_registry {
-                                if record
-                                    .props
-                                    .get(&field_id)
+                                if old_value
+                                    .as_ref()
                                     .is_some_and(|v| try_extract_vector(v).is_some())
                                 {
                                     let label = record.primary_label().to_string();

@@ -356,6 +356,35 @@ fn plain_delete_cleans_unique_btree_index() {
     );
 }
 
+// ── REMOVE property B-tree index cleanup regression ───────────────────
+
+#[test]
+fn remove_property_cleans_unique_btree_index() {
+    // Regression: REMOVE n.prop must remove the B-tree index entry for that
+    // property. Without cleanup, another node cannot be created with the
+    // same value because the stale unique entry still exists.
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :User(email)")
+        .expect("CREATE UNIQUE INDEX");
+
+    db.execute_cypher("CREATE (:User {email: 'alice@example.com', name: 'Alice'})")
+        .expect("initial CREATE");
+
+    // Remove the indexed property from the node.
+    db.execute_cypher("MATCH (n:User {email: 'alice@example.com'}) REMOVE n.email")
+        .expect("REMOVE email");
+
+    // Now another node should be creatable with the same email value.
+    let result = db.execute_cypher("CREATE (:User {email: 'alice@example.com', name: 'Alice2'})");
+    assert!(
+        result.is_ok(),
+        "CREATE with previously-removed unique value must succeed; \
+         stale index entry must be removed on REMOVE. Got error: {:?}",
+        result.err()
+    );
+}
+
 // ── SET property B-tree index update regression ───────────────────────
 
 #[test]
