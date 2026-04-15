@@ -35,6 +35,9 @@ tokio = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = "0.14"
 prost = { workspace = true }
+tower = "0.5"
+http = "1"
+pin-project-lite = "0.2"
 serde = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }

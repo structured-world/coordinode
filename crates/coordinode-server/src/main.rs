@@ -51,6 +51,8 @@ pub mod proto {
 }
 
 mod cli;
+mod config;
+mod grpc;
 mod logging;
 mod metrics_catalog;
 mod ops;
@@ -95,7 +97,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         cli::Command::Serve {
+            mode,
+            node_id,
             grpc_addr,
+            advertise_addr,
             #[cfg(feature = "rest-proxy")]
             rest_addr,
             ops_addr,
@@ -105,10 +110,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             logging::init_logging();
 
             let addr: SocketAddr = grpc_addr.parse()?;
+            // Advertise address is what peers use to connect to this node.
+            // Falls back to grpc_addr when not explicitly set.
+            let effective_advertise = advertise_addr.unwrap_or_else(|| grpc_addr.clone());
             let cluster_mode = peers.is_some();
             info!(
                 data_dir = %data_dir,
+                mode = %mode,
+                node_id = node_id,
                 cluster = cluster_mode,
+                advertise = %effective_advertise,
                 "coordinode v{} starting on {addr}",
                 env!("CARGO_PKG_VERSION")
             );
@@ -136,53 +147,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let engine = Arc::new(engine);
 
             // Open Raft node and build database — both modes use RaftProposalPipeline.
-            let (database, raft_node_shared) = {
-                let (mode_label, peer_count) = if peers.is_some() {
-                    (
-                        "cluster mode: RaftProposalPipeline (multi-node Raft)",
-                        peers.as_ref().map(|p| p.len()).unwrap_or(0),
+            //
+            // Three construction paths:
+            //
+            // 1. Standalone (no --peers): single-node Raft via StubNetworkFactory.
+            //    No gRPC Raft handler needed — no peers can connect.
+            //
+            // 2. Cluster, node_id == 1 (bootstrap leader): open_cluster_embedded().
+            //    Calls initialize(), returns a RaftGrpcHandler for the main router.
+            //
+            // 3. Cluster, node_id > 1 (joining node): open_joining_embedded().
+            //    Does NOT call initialize(). Waits for leader to add it via
+            //    `coordinode admin node join`. Returns a RaftGrpcHandler for the
+            //    main router.
+            //
+            // In cases 2 and 3, RaftServiceServer is registered at the end of
+            // router construction so inter-node Raft RPCs share the :7080 port.
+            let (raft_node, raft_grpc_handler) = if let Some(ref peers_list) = peers {
+                let peer_count = peers_list.len();
+                if node_id == 1 {
+                    info!(
+                        peers = peer_count,
+                        node_id, "cluster mode: bootstrap leader (open_cluster_embedded)"
+                    );
+                    let (rn, handler) = coordinode_raft::cluster::RaftNode::open_cluster_embedded(
+                        node_id,
+                        Arc::clone(&engine),
+                        effective_advertise,
                     )
+                    .await
+                    .map_err(|e| format!("failed to open cluster Raft node: {e}"))?;
+                    (rn, Some(handler))
                 } else {
-                    (
-                        "standalone mode: RaftProposalPipeline (single-node Raft)",
-                        0,
+                    info!(
+                        peers = peer_count,
+                        node_id, "cluster mode: joining node (open_joining_embedded)"
+                    );
+                    let (rn, handler) = coordinode_raft::cluster::RaftNode::open_joining_embedded(
+                        node_id,
+                        Arc::clone(&engine),
                     )
-                };
-                if peer_count > 0 {
-                    info!(peers = peer_count, "{mode_label}");
-                } else {
-                    info!("{mode_label}");
+                    .await
+                    .map_err(|e| format!("failed to open joining Raft node: {e}"))?;
+                    (rn, Some(handler))
                 }
-
-                // Node ID 1 for single-node or bootstrap; peer discovery wiring
-                // is deferred to R150 (monolithic binary --mode selection).
-                let raft_node = coordinode_raft::cluster::RaftNode::open_with_oracle(
-                    1,
+            } else {
+                info!(node_id, "standalone mode: single-node Raft (StubNetwork)");
+                let rn = coordinode_raft::cluster::RaftNode::open_with_oracle(
+                    node_id,
                     Arc::clone(&engine),
                     Some(Arc::clone(&oracle)),
                 )
                 .await
                 .map_err(|e| format!("failed to open Raft node: {e}"))?;
-                let raft_node = Arc::new(raft_node);
-
-                let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
-                    Arc::new(coordinode_raft::proposal::RaftProposalPipeline::new(
-                        Arc::clone(raft_node.raft()),
-                    ));
-
-                let db = Arc::new(std::sync::Mutex::new(
-                    coordinode_embed::Database::from_engine(
-                        &data_dir,
-                        Arc::clone(&engine),
-                        oracle.clone(),
-                        pipeline,
-                    )
-                    .map_err(|e| format!("failed to open database: {e}"))?,
-                ));
-                (db, Arc::clone(&raft_node))
+                (rn, None)
             };
+
+            let raft_node = Arc::new(raft_node);
+
+            let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> = Arc::new(
+                coordinode_raft::proposal::RaftProposalPipeline::new(Arc::clone(raft_node.raft())),
+            );
+
+            let database = Arc::new(std::sync::Mutex::new(
+                coordinode_embed::Database::from_engine(
+                    &data_dir,
+                    Arc::clone(&engine),
+                    oracle.clone(),
+                    pipeline,
+                )
+                .map_err(|e| format!("failed to open database: {e}"))?,
+            ));
+
             let raft_node_shared: Option<Arc<coordinode_raft::cluster::RaftNode>> =
-                Some(raft_node_shared);
+                Some(Arc::clone(&raft_node));
 
             let query_registry = Arc::new(coordinode_query::advisor::QueryRegistry::new());
             let nplus1_detector =
@@ -280,7 +318,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
 
-            info!(port = addr.port(), "gRPC server listening");
+            info!(
+                port = addr.port(),
+                node_id,
+                mode = %mode,
+                "gRPC server listening"
+            );
 
             // Graceful shutdown: wait for SIGTERM (Docker / test harness) or Ctrl+C.
             // When the signal fires, `serve_with_shutdown` stops accepting new
@@ -309,7 +352,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            let mut builder = Server::builder();
+            // NodeInfoLayer: inject x-coordinode-node / x-coordinode-hops /
+            // x-coordinode-load response headers on every gRPC response.
+            let mut builder = Server::builder().layer(grpc::NodeInfoLayer::new(node_id));
             let mut router = builder
                 .add_service(proto::graph::graph_service_server::GraphServiceServer::new(
                     graph_service,
@@ -344,6 +389,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     proto::admin::cluster::cluster_service_server::ClusterServiceServer::new(cs),
                 );
                 info!("ClusterService registered — cluster join/leave management available");
+            }
+
+            // Register RaftService in cluster mode — embedded into :7080 so
+            // inter-node Raft RPCs share the main gRPC port (no separate server).
+            if let Some(handler) = raft_grpc_handler {
+                use coordinode_raft::proto::replication::raft_service_server::RaftServiceServer;
+                router = router.add_service(RaftServiceServer::new(handler));
+                info!(node_id, "RaftService registered on :7080 (shared port)");
             }
 
             router.serve_with_shutdown(addr, shutdown).await?;

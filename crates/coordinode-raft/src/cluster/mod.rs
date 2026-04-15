@@ -15,7 +15,7 @@
 //! `RaftNode::join()` (not yet implemented). The network layer handles
 //! AppendEntries, Vote, and Snapshot RPCs between nodes.
 
-pub(crate) mod grpc_server;
+pub mod grpc_server;
 pub(crate) mod network;
 
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use crate::proposal::{RaftProposalPipeline, RateLimiter};
 use crate::storage::{default_raft_config, CoordinodeStateMachine, LogStore, TypeConfig};
 use crate::wait_majority::{BatchConfig, WaitForMajorityService};
 
-use grpc_server::RaftGrpcHandler;
+pub use grpc_server::RaftGrpcHandler;
 use network::{GrpcNetworkFactory, StubNetworkFactory};
 
 use crate::proto::replication::raft_service_server::RaftServiceServer;
@@ -291,6 +291,179 @@ impl RaftNode {
             _grpc_shutdown: Some(shutdown_tx),
             _snapshot_trigger: Some(snap_handle),
         })
+    }
+
+    /// Open a cluster-mode bootstrap node for embedding into an existing tonic server.
+    ///
+    /// Unlike [`open_cluster`], this constructor does **not** start a dedicated
+    /// internal gRPC server. Instead it returns the [`RaftGrpcHandler`] for the
+    /// caller to register into the main tonic router on `:7080`.
+    ///
+    /// This is the correct path for `coordinode --mode=full` where `:7080`
+    /// serves both client-facing gRPC (CypherService, GraphService, …) and
+    /// inter-node Raft RPCs on the same port and the same tonic server instance.
+    ///
+    /// ## Usage
+    ///
+    /// ```rust,ignore
+    /// let (raft_node, raft_handler) = RaftNode::open_cluster_embedded(
+    ///     node_id, engine, advertise_addr,
+    /// ).await?;
+    ///
+    /// // Register Raft RPC handler into the main tonic router:
+    /// Server::builder()
+    ///     .add_service(CypherServiceServer::new(cypher_svc))
+    ///     .add_service(RaftServiceServer::new(raft_handler))
+    ///     .serve_with_shutdown(addr, shutdown)
+    ///     .await?;
+    /// ```
+    pub async fn open_cluster_embedded(
+        node_id: u64,
+        engine: Arc<StorageEngine>,
+        advertise_addr: String,
+    ) -> Result<(Self, RaftGrpcHandler), RaftNodeError> {
+        Self::open_cluster_embedded_with_snapshot_config(
+            node_id,
+            engine,
+            advertise_addr,
+            SnapshotTriggerConfig::default(),
+        )
+        .await
+    }
+
+    /// Like `open_cluster_embedded` but with custom snapshot trigger configuration.
+    pub async fn open_cluster_embedded_with_snapshot_config(
+        node_id: u64,
+        engine: Arc<StorageEngine>,
+        advertise_addr: String,
+        snap_config: SnapshotTriggerConfig,
+    ) -> Result<(Self, RaftGrpcHandler), RaftNodeError> {
+        let config = Arc::new(default_raft_config());
+        let log_store =
+            LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
+        let state_machine = CoordinodeStateMachine::new(Arc::clone(&engine));
+        let applied_rx = state_machine.subscribe_applied();
+
+        let network = GrpcNetworkFactory;
+
+        let raft: RaftInstance =
+            openraft::Raft::new(node_id, config, network, log_store, state_machine)
+                .await
+                .map_err(|e: openraft::error::Fatal<TypeConfig>| {
+                    RaftNodeError::Init(e.to_string())
+                })?;
+
+        let raft = Arc::new(raft);
+
+        // Try initialize — succeeds on fresh start, NotAllowed on restart.
+        let mut members = std::collections::BTreeMap::new();
+        members.insert(
+            node_id,
+            openraft::impls::BasicNode {
+                addr: advertise_addr,
+            },
+        );
+
+        match raft.initialize(members).await {
+            Ok(_) => {
+                tracing::info!(node_id, "fresh cluster node initialized as leader");
+            }
+            Err(openraft::error::RaftError::APIError(
+                openraft::error::InitializeError::NotAllowed(_),
+            )) => {
+                tracing::debug!(
+                    node_id,
+                    "raft already initialized, resuming from existing state"
+                );
+            }
+            Err(e) => {
+                return Err(RaftNodeError::Init(format!("initialize failed: {e}")));
+            }
+        }
+
+        // Build the gRPC handler — caller registers it into the main tonic router.
+        // No internal gRPC server is started here.
+        let handler = RaftGrpcHandler::new(Arc::clone(&raft), Arc::clone(&engine));
+
+        let snap_handle =
+            spawn_snapshot_trigger(Arc::clone(&raft), Arc::clone(&engine), snap_config);
+
+        let node = Self {
+            raft,
+            applied_rx,
+            node_id,
+            engine,
+            _grpc_shutdown: None, // no internal server — caller manages the router
+            _snapshot_trigger: Some(snap_handle),
+        };
+
+        Ok((node, handler))
+    }
+
+    /// Open a joining node for embedding into an existing tonic server.
+    ///
+    /// Like `open_cluster_embedded` but does **not** call `initialize()` — the
+    /// node waits for the cluster leader to add it via `add_learner`.
+    ///
+    /// Use this for nodes 2+ in a multi-node cluster when `--mode=full` is active
+    /// (i.e., the Raft handler is embedded into the main tonic router at `:7080`
+    /// rather than running in a separate internal gRPC server).
+    pub async fn open_joining_embedded(
+        node_id: u64,
+        engine: Arc<StorageEngine>,
+    ) -> Result<(Self, RaftGrpcHandler), RaftNodeError> {
+        Self::open_joining_embedded_with_snapshot_config(
+            node_id,
+            engine,
+            SnapshotTriggerConfig::default(),
+        )
+        .await
+    }
+
+    /// Like `open_joining_embedded` but with custom snapshot trigger configuration.
+    pub async fn open_joining_embedded_with_snapshot_config(
+        node_id: u64,
+        engine: Arc<StorageEngine>,
+        snap_config: SnapshotTriggerConfig,
+    ) -> Result<(Self, RaftGrpcHandler), RaftNodeError> {
+        let config = Arc::new(default_raft_config());
+        let log_store =
+            LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
+        let state_machine = CoordinodeStateMachine::new(Arc::clone(&engine));
+        let applied_rx = state_machine.subscribe_applied();
+
+        let network = GrpcNetworkFactory;
+
+        let raft: RaftInstance =
+            openraft::Raft::new(node_id, config, network, log_store, state_machine)
+                .await
+                .map_err(|e: openraft::error::Fatal<TypeConfig>| {
+                    RaftNodeError::Init(e.to_string())
+                })?;
+
+        let raft = Arc::new(raft);
+
+        // Build the gRPC handler — caller registers it into the main tonic router.
+        let handler = RaftGrpcHandler::new(Arc::clone(&raft), Arc::clone(&engine));
+
+        let snap_handle =
+            spawn_snapshot_trigger(Arc::clone(&raft), Arc::clone(&engine), snap_config);
+
+        tracing::info!(
+            node_id,
+            "joining node started (waiting for leader to add via add_node)"
+        );
+
+        let node = Self {
+            raft,
+            applied_rx,
+            node_id,
+            engine,
+            _grpc_shutdown: None, // no internal server — caller manages the router
+            _snapshot_trigger: Some(snap_handle),
+        };
+
+        Ok((node, handler))
     }
 
     /// Open a Raft node that joins an existing cluster.

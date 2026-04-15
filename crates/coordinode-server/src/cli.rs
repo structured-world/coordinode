@@ -9,12 +9,26 @@
 
 use coordinode_embed::backup::BackupFormat;
 
+use crate::config::ServeMode;
+
 /// Parsed CLI command.
 pub enum Command {
     /// Start the database server (default).
     Serve {
+        /// Operational mode (CE supports only "full").
+        /// --mode=compute and --mode=storage require coordinode-ee.
+        mode: ServeMode,
+        /// Numeric node ID for this instance (default: 1).
+        /// Must be unique within the cluster. In single-node deployments
+        /// the default of 1 is always correct.
+        node_id: u64,
         /// gRPC listen address (default: [::]:7080).
         grpc_addr: String,
+        /// Advertise address for intra-cluster gRPC (default: same as --addr).
+        /// Other nodes use this address to send Raft RPCs to this node.
+        /// Set this when the listen address is 0.0.0.0 or [::] so peers
+        /// know the actual hostname/IP.
+        advertise_addr: Option<String>,
         /// REST/JSON proxy listen address (default: [::]:7081).
         /// Transcodes HTTP/JSON requests to gRPC via embedded structured-proxy.
         /// Only present when compiled with the `rest-proxy` feature.
@@ -112,7 +126,28 @@ pub fn parse_args_from(args: &[String]) -> Command {
 
     match args[1].as_str() {
         "serve" => {
+            let mode = match find_flag(args, "--mode") {
+                None => ServeMode::Full,
+                Some(s) => match ServeMode::parse(&s) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                },
+            };
+            let node_id: u64 = match find_flag(args, "--node-id") {
+                None => 1,
+                Some(s) => match s.parse() {
+                    Ok(id) if id > 0 => id,
+                    _ => {
+                        eprintln!("error: --node-id must be a positive integer, got '{s}'");
+                        std::process::exit(1);
+                    }
+                },
+            };
             let grpc_addr = find_flag(args, "--addr").unwrap_or_else(|| "[::]:7080".to_string());
+            let advertise_addr = find_flag(args, "--advertise-addr");
             #[cfg(feature = "rest-proxy")]
             let rest_addr =
                 find_flag(args, "--rest-addr").unwrap_or_else(|| "[::]:7081".to_string());
@@ -124,8 +159,19 @@ pub fn parse_args_from(args: &[String]) -> Command {
                     .filter(|s| !s.is_empty())
                     .collect()
             });
+            // Validate: --node-id > 1 without --peers makes no sense.
+            if node_id > 1 && peers.is_none() {
+                eprintln!(
+                    "error: --node-id={node_id} requires --peers. \
+                     Single-node deployments always use node-id=1."
+                );
+                std::process::exit(1);
+            }
             Command::Serve {
+                mode,
+                node_id,
                 grpc_addr,
+                advertise_addr,
                 #[cfg(feature = "rest-proxy")]
                 rest_addr,
                 ops_addr,
@@ -180,7 +226,8 @@ pub fn parse_args_from(args: &[String]) -> Command {
             eprintln!(
                 "coordinode v{}\n\n\
                  Usage:\n  \
-                 coordinode serve [--addr ADDR] [--rest-addr ADDR] [--ops-addr ADDR] [--data DIR] [--peers PEERS]\n  \
+                 coordinode serve [--mode full] [--node-id N] [--addr ADDR] [--advertise-addr ADDR]\n          \
+                 [--rest-addr ADDR] [--ops-addr ADDR] [--data DIR] [--peers PEERS]\n  \
                  coordinode backup --output FILE [--data DIR] [--format json|cypher|binary] [--namespace NS]\n  \
                  coordinode restore --input FILE [--data DIR] [--format json|cypher|binary] [--namespace NS]\n  \
                  coordinode verify [--data DIR] [--deep]\n  \
@@ -291,7 +338,10 @@ fn parse_admin_args(args: &[String]) -> Command {
 
 fn default_serve() -> Command {
     Command::Serve {
+        mode: ServeMode::Full,
+        node_id: 1,
         grpc_addr: "[::]:7080".to_string(),
+        advertise_addr: None,
         #[cfg(feature = "rest-proxy")]
         rest_addr: "[::]:7081".to_string(),
         ops_addr: "[::]:7084".to_string(),
@@ -420,6 +470,59 @@ mod tests {
     fn default_is_serve() {
         let cmd = parse_args_from(&args("coordinode"));
         assert!(matches!(cmd, Command::Serve { .. }));
+    }
+
+    #[test]
+    fn serve_default_mode_is_full() {
+        let cmd = parse_args_from(&args("coordinode serve"));
+        match cmd {
+            Command::Serve {
+                mode,
+                node_id,
+                advertise_addr,
+                ..
+            } => {
+                assert_eq!(mode, ServeMode::Full);
+                assert_eq!(node_id, 1);
+                assert!(advertise_addr.is_none());
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn serve_explicit_mode_full() {
+        let cmd = parse_args_from(&args("coordinode serve --mode full"));
+        match cmd {
+            Command::Serve { mode, .. } => assert_eq!(mode, ServeMode::Full),
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn serve_node_id() {
+        let cmd = parse_args_from(&args(
+            "coordinode serve --node-id 3 --peers node1:7080,node2:7080",
+        ));
+        match cmd {
+            Command::Serve { node_id, peers, .. } => {
+                assert_eq!(node_id, 3);
+                let p = peers.unwrap_or_default();
+                assert_eq!(p.len(), 2);
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn serve_advertise_addr() {
+        let cmd = parse_args_from(&args("coordinode serve --advertise-addr node1:7080"));
+        match cmd {
+            Command::Serve { advertise_addr, .. } => {
+                assert_eq!(advertise_addr.as_deref(), Some("node1:7080"));
+            }
+            _ => panic!("expected Serve command"),
+        }
     }
 
     #[cfg(feature = "rest-proxy")]

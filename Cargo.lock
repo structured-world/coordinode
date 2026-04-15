@@ -967,8 +967,10 @@ dependencies = [
  "coordinode-vector",
  "futures-util",
  "hex",
+ "http",
  "metrics",
  "metrics-exporter-prometheus",
+ "pin-project-lite",
  "prost",
  "rmpv",
  "serde",
@@ -981,6 +983,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
 ]
