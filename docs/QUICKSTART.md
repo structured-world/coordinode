@@ -174,7 +174,7 @@ SUGGESTIONS (1):
 
 ## Next Steps
 
-- [Cypher Extensions](CYPHER_EXTENSIONS.md) — vector, full-text, spatial, time-travel, encrypted search syntax
+- [Cypher Extensions](/cypher/extensions) — vector, full-text, spatial, time-travel, encrypted search syntax
 - [Compatibility](COMPATIBILITY.md) — what works from the Neo4j ecosystem
 
 ## Known Limitations (alpha)

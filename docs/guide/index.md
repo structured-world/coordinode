@@ -32,7 +32,7 @@ One query language (OpenCypher-compatible), one transaction model (MVCC, Snapsho
 ## Next Steps
 
 - **[Quick Start](/QUICKSTART)** — Docker → seed data → first hybrid query in 5 minutes
-- **[OpenCypher Extensions](/CYPHER_EXTENSIONS)** — vector_distance(), text_match(), point.distance(), EXPLAIN SUGGEST
+- **[OpenCypher Extensions](/cypher/extensions)** — vector_distance(), text_match(), point.distance(), EXPLAIN SUGGEST
 - **[Python SDK](/sdk/python)** — `pip install coordinode`
 - **[LlamaIndex integration](/sdk/llama-index)** — PropertyGraphIndex with CoordiNode backend
 - **[LangChain integration](/sdk/langchain)** — GraphCypherQAChain
