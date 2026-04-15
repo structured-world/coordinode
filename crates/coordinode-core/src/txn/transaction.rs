@@ -212,9 +212,25 @@ mod tests {
 
     #[test]
     fn begin_allocates_start_ts() {
+        // `begin()` must call `oracle.next()` to allocate start_ts.
+        // The exact value is wall-clock-based (HLC), so we verify:
+        //   1. start_ts > 0 (non-zero — not ZERO sentinel)
+        //   2. oracle has advanced after begin (start_ts was consumed)
+        //   3. start_ts equals oracle.current() right after begin
         let oracle = test_oracle();
+        let before = oracle.current();
         let txn = Transaction::begin(&oracle);
-        assert_eq!(txn.start_ts().as_raw(), 101);
+        let after = oracle.current();
+
+        assert!(!txn.start_ts().is_zero(), "start_ts must be non-zero");
+        // Oracle must have advanced by exactly 1 call to next().
+        assert!(after >= before, "oracle must not go backward");
+        // start_ts was the value returned by next(), so current() == start_ts.
+        assert_eq!(
+            txn.start_ts(),
+            after,
+            "start_ts must equal oracle.current() after begin"
+        );
     }
 
     #[test]
