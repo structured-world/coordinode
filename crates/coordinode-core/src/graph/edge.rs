@@ -18,23 +18,61 @@ use super::node::{NodeId, PropertyValue};
 
 // -- Key encoding --
 
+/// Write a forward adjacency key into `buf`, clearing it first.
+///
+/// Use this in tight loops to avoid repeated heap allocations:
+/// ```no_run
+/// # use coordinode_core::graph::edge::write_adj_key_forward;
+/// # use coordinode_core::graph::node::NodeId;
+/// let mut buf = Vec::with_capacity(64);
+/// write_adj_key_forward("KNOWS", NodeId::from_raw(42), &mut buf);
+/// // use buf as &[u8]
+/// ```
+pub fn write_adj_key_forward(edge_type: &str, source_id: NodeId, buf: &mut Vec<u8>) {
+    buf.clear();
+    buf.reserve(4 + edge_type.len() + 5 + 8);
+    buf.extend_from_slice(b"adj:");
+    buf.extend_from_slice(edge_type.as_bytes());
+    buf.extend_from_slice(b":out:");
+    buf.extend_from_slice(&source_id.as_raw().to_be_bytes());
+}
+
+/// Write a reverse adjacency key into `buf`, clearing it first.
+///
+/// Use this in tight loops to avoid repeated heap allocations:
+/// ```no_run
+/// # use coordinode_core::graph::edge::write_adj_key_reverse;
+/// # use coordinode_core::graph::node::NodeId;
+/// let mut buf = Vec::with_capacity(64);
+/// write_adj_key_reverse("KNOWS", NodeId::from_raw(99), &mut buf);
+/// // use buf as &[u8]
+/// ```
+pub fn write_adj_key_reverse(edge_type: &str, target_id: NodeId, buf: &mut Vec<u8>) {
+    buf.clear();
+    buf.reserve(4 + edge_type.len() + 4 + 8);
+    buf.extend_from_slice(b"adj:");
+    buf.extend_from_slice(edge_type.as_bytes());
+    buf.extend_from_slice(b":in:");
+    buf.extend_from_slice(&target_id.as_raw().to_be_bytes());
+}
+
 /// Encode a forward adjacency key: `adj:<edge_type>:out:<source_id BE>`.
+///
+/// Allocates a new `Vec<u8>`. In tight traversal loops, prefer [`write_adj_key_forward`]
+/// with a reused buffer to avoid repeated allocations.
 pub fn encode_adj_key_forward(edge_type: &str, source_id: NodeId) -> Vec<u8> {
-    let mut key = Vec::with_capacity(4 + edge_type.len() + 5 + 8);
-    key.extend_from_slice(b"adj:");
-    key.extend_from_slice(edge_type.as_bytes());
-    key.extend_from_slice(b":out:");
-    key.extend_from_slice(&source_id.as_raw().to_be_bytes());
+    let mut key = Vec::new();
+    write_adj_key_forward(edge_type, source_id, &mut key);
     key
 }
 
 /// Encode a reverse adjacency key: `adj:<edge_type>:in:<target_id BE>`.
+///
+/// Allocates a new `Vec<u8>`. In tight traversal loops, prefer [`write_adj_key_reverse`]
+/// with a reused buffer to avoid repeated allocations.
 pub fn encode_adj_key_reverse(edge_type: &str, target_id: NodeId) -> Vec<u8> {
-    let mut key = Vec::with_capacity(4 + edge_type.len() + 4 + 8);
-    key.extend_from_slice(b"adj:");
-    key.extend_from_slice(edge_type.as_bytes());
-    key.extend_from_slice(b":in:");
-    key.extend_from_slice(&target_id.as_raw().to_be_bytes());
+    let mut key = Vec::new();
+    write_adj_key_reverse(edge_type, target_id, &mut key);
     key
 }
 
@@ -353,6 +391,50 @@ mod tests {
     fn encode_reverse_key() {
         let key = encode_adj_key_reverse("FOLLOWS", NodeId::from_raw(99));
         assert!(key.starts_with(b"adj:FOLLOWS:in:"));
+    }
+
+    #[test]
+    fn write_forward_key_matches_encode() {
+        // write_ variant must produce identical bytes as encode_ variant
+        let mut buf = Vec::new();
+        write_adj_key_forward("KNOWS", NodeId::from_raw(7), &mut buf);
+        assert_eq!(buf, encode_adj_key_forward("KNOWS", NodeId::from_raw(7)));
+    }
+
+    #[test]
+    fn write_reverse_key_matches_encode() {
+        let mut buf = Vec::new();
+        write_adj_key_reverse("LIKES", NodeId::from_raw(13), &mut buf);
+        assert_eq!(buf, encode_adj_key_reverse("LIKES", NodeId::from_raw(13)));
+    }
+
+    #[test]
+    fn write_key_reuses_buffer_across_calls() {
+        // Buffer grows to fit largest key and does not reallocate on smaller subsequent writes.
+        let mut buf = Vec::new();
+
+        write_adj_key_forward("VERY_LONG_EDGE_TYPE_NAME", NodeId::from_raw(1), &mut buf);
+        let cap_after_first = buf.capacity();
+        assert!(
+            cap_after_first >= 4 + 24 + 5 + 8,
+            "buffer must fit first key"
+        );
+
+        write_adj_key_forward("KNOWS", NodeId::from_raw(2), &mut buf);
+        // Capacity must not decrease (no reallocation for shorter key)
+        assert_eq!(buf.capacity(), cap_after_first);
+        assert_eq!(buf, encode_adj_key_forward("KNOWS", NodeId::from_raw(2)));
+    }
+
+    #[test]
+    fn write_key_clears_before_write() {
+        let mut buf = Vec::new();
+        write_adj_key_forward("FOLLOWS", NodeId::from_raw(1), &mut buf);
+        let first = buf.clone();
+        write_adj_key_forward("KNOWS", NodeId::from_raw(2), &mut buf);
+        // Buffer must contain only the second key, not a concatenation
+        assert_ne!(buf, first);
+        assert_eq!(buf, encode_adj_key_forward("KNOWS", NodeId::from_raw(2)));
     }
 
     #[test]

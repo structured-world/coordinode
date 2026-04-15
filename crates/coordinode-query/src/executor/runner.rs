@@ -10,7 +10,7 @@ use rayon::prelude::*;
 
 use coordinode_core::graph::edge::{
     decode_adj_key, encode_adj_key_forward, encode_adj_key_reverse, encode_edgeprop_key,
-    AdjDirection, PostingList,
+    write_adj_key_forward, write_adj_key_reverse, AdjDirection, PostingList,
 };
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::NodeIdAllocator;
@@ -2015,12 +2015,19 @@ fn expand_one_hop(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<(u64, usize)>, ExecutionError> {
     let mut neighbors = Vec::new();
+    // Single buffer reused for all key constructions in this call.
+    // Avoids N_edge_types × N_directions heap allocations per traversal step.
+    let mut adj_key = Vec::with_capacity(64);
 
     for (et_idx, edge_type) in edge_types.iter().enumerate() {
-        let adj_key = match direction {
-            Direction::Outgoing | Direction::Both => encode_adj_key_forward(edge_type, src_id),
-            Direction::Incoming => encode_adj_key_reverse(edge_type, src_id),
-        };
+        match direction {
+            Direction::Outgoing | Direction::Both => {
+                write_adj_key_forward(edge_type, src_id, &mut adj_key);
+            }
+            Direction::Incoming => {
+                write_adj_key_reverse(edge_type, src_id, &mut adj_key);
+            }
+        }
 
         if let Some(posting_list) = ctx.adj_get(&adj_key)? {
             let fan_out = posting_list.len();
@@ -2043,8 +2050,8 @@ fn expand_one_hop(
         }
 
         if direction == Direction::Both {
-            let rev_key = encode_adj_key_reverse(edge_type, src_id);
-            if let Some(posting_list) = ctx.adj_get(&rev_key)? {
+            write_adj_key_reverse(edge_type, src_id, &mut adj_key);
+            if let Some(posting_list) = ctx.adj_get(&adj_key)? {
                 for tgt_uid in posting_list.iter() {
                     neighbors.push((tgt_uid, et_idx));
                 }
@@ -4827,6 +4834,8 @@ fn execute_upsert(
 
             // Pass 2: create edges (all node IDs now in row)
             let mut edge_results = Vec::new();
+            // Single buffer reused across all relationship patterns in this pass.
+            let mut edge_key_buf = Vec::with_capacity(64);
             for row in &new_results {
                 let mut current_row = row.clone();
                 for (i, element) in elements.iter().enumerate() {
@@ -4867,12 +4876,12 @@ fn execute_upsert(
                         let edge_type = rp.rel_types.first().cloned().unwrap_or_default();
 
                         // Forward posting list (merge operator, no read needed).
-                        let fwd_key = encode_adj_key_forward(&edge_type, source_id);
-                        ctx.adj_merge_add(&fwd_key, target_id.as_raw());
+                        write_adj_key_forward(&edge_type, source_id, &mut edge_key_buf);
+                        ctx.adj_merge_add(&edge_key_buf, target_id.as_raw());
 
                         // Reverse posting list (merge operator, no read needed).
-                        let rev_key = encode_adj_key_reverse(&edge_type, target_id);
-                        ctx.adj_merge_add(&rev_key, source_id.as_raw());
+                        write_adj_key_reverse(&edge_type, target_id, &mut edge_key_buf);
+                        ctx.adj_merge_add(&edge_key_buf, source_id.as_raw());
                         ctx.write_stats.edges_created += 1;
 
                         if let Some(ev) = &rp.variable {
@@ -5185,6 +5194,8 @@ fn execute_create_edge(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let mut results = Vec::new();
+    // Single buffer reused for forward and reverse key writes across all rows.
+    let mut edge_key = Vec::with_capacity(64);
 
     for row in input_rows {
         // Get source and target node IDs from the row
@@ -5198,12 +5209,12 @@ fn execute_create_edge(
         };
 
         // Forward posting list: source -> targets (merge operator, no read needed).
-        let fwd_key = encode_adj_key_forward(edge_type, source_id);
-        ctx.adj_merge_add(&fwd_key, target_id.as_raw());
+        write_adj_key_forward(edge_type, source_id, &mut edge_key);
+        ctx.adj_merge_add(&edge_key, target_id.as_raw());
 
         // Reverse posting list: target <- sources (merge operator, no read needed).
-        let rev_key = encode_adj_key_reverse(edge_type, target_id);
-        ctx.adj_merge_add(&rev_key, source_id.as_raw());
+        write_adj_key_reverse(edge_type, target_id, &mut edge_key);
+        ctx.adj_merge_add(&edge_key, source_id.as_raw());
         ctx.write_stats.edges_created += 1;
 
         // Register edge type in schema (idempotent marker).
