@@ -182,8 +182,20 @@ Aggregation functions require a GROUP BY context (explicit or implicit via non-a
 | `collect` | `collect(DISTINCT x)` | List | Distinct non-null values |
 | `stDev` | `stDev(x)` | Float | Sample standard deviation |
 | `stDevP` | `stDevP(x)` | Float | Population standard deviation |
-| `percentileCont` | `percentileCont(x, p)` | Float | Interpolated percentile (linear interpolation). `p` must be in [0.0, 1.0] |
-| `percentileDisc` | `percentileDisc(x, p)` | Float | Discrete percentile (nearest rank). `p` must be in [0.0, 1.0] |
+| `percentileCont` | `percentileCont(x, p)` | Float | Interpolated percentile (linear interpolation). `p` in [0.0, 1.0] — literal or query parameter |
+| `percentileDisc` | `percentileDisc(x, p)` | Float | Discrete percentile (nearest rank). `p` in [0.0, 1.0] — literal or query parameter |
+
+Both functions accept a literal (`0.9`) or a named query parameter (`$p`) as the percentile argument. Out-of-range values are clamped to `[0.0, 1.0]`.
+
+```cypher
+// Literal percentile
+MATCH (emp:Employee)
+RETURN percentileCont(emp.salary, 0.9) AS p90_salary
+
+// Query parameter — pass { p: 0.95 } from the driver
+MATCH (emp:Employee)
+RETURN percentileCont(emp.salary, $p) AS salary_percentile
+```
 
 ```cypher
 MATCH (dept:Department)<-[:WORKS_IN]-(emp:Employee)
