@@ -94,6 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         cli::Command::Serve {
             grpc_addr,
+            #[cfg(feature = "rest-proxy")]
             rest_addr,
             ops_addr,
             data_dir,
@@ -230,13 +231,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Spawn embedded REST/JSON proxy (default :7081, configurable via --rest-addr).
             // Transcodes HTTP/JSON requests to gRPC via google.api.http annotations.
-            // Uses an embedded proto descriptor compiled into the binary — no external
-            // descriptor file or separate container required.
-            static DESCRIPTOR_BYTES: &[u8] = include_bytes!("../../../coordinode.descriptor.bin");
+            // Compiled only when the `rest-proxy` feature is enabled (default).
+            // Disable for embedded/mobile builds: --no-default-features --features vector,full-text
+            #[cfg(feature = "rest-proxy")]
             {
                 use structured_proxy::config::{
                     DescriptorSource, ListenConfig, ProxyConfig, ServiceConfig, UpstreamConfig,
                 };
+                static DESCRIPTOR_BYTES: &[u8] =
+                    include_bytes!("../../../coordinode.descriptor.bin");
                 let grpc_upstream = format!("http://127.0.0.1:{}", addr.port());
                 let config = ProxyConfig {
                     upstream: UpstreamConfig {
