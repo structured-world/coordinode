@@ -16,6 +16,7 @@ services:
     container_name: coordinode
     ports:
       - "7080:7080"   # gRPC
+      - "7081:7081"   # REST/JSON (via rest-proxy, shares network namespace)
       - "7084:7084"   # Prometheus /metrics, /health
     volumes:
       - coordinode-data:/data
@@ -35,8 +36,9 @@ services:
     container_name: coordinode-rest
     entrypoint: ["/structured-proxy"]
     command: ["--config", "/etc/proxy/coordinode-proxy.yaml"]
-    ports:
-      - "7081:7081"   # REST/JSON
+    # Share the network namespace with coordinode so that upstream
+    # http://127.0.0.1:7080 in coordinode-proxy.yaml resolves correctly.
+    network_mode: "service:coordinode"
     volumes:
       - ./coordinode-proxy.yaml:/etc/proxy/coordinode-proxy.yaml:ro
       - ./coordinode.descriptor.bin:/etc/proxy/coordinode.descriptor.bin:ro
