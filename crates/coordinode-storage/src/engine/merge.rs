@@ -183,6 +183,16 @@ impl MergeOperator for DocumentMerge {
             _ => None,
         };
 
+        // Lazily-initialized rmpv representation of rec.extra for batching.
+        //
+        // Extra-targeting path deltas (SetPath, DeletePath, ArrayPush, Increment)
+        // all require HashMap → rmpv → HashMap conversion. Processing them one by one
+        // costs one full round-trip per delta. By accumulating changes in an in-progress
+        // rmpv::Value, consecutive Extra deltas share a single extra_to_rmpv + rmpv_to_extra
+        // pair regardless of count. The doc is lazily created on first Extra delta and
+        // flushed back to rec.extra only when the record base resets or at the end.
+        let mut extra_doc: Option<rmpv::Value> = None;
+
         // Apply each operand in chronological (seqno) order.
         for operand in operands {
             if operand.is_empty() {
@@ -191,6 +201,10 @@ impl MergeOperator for DocumentMerge {
 
             match operand[0] {
                 PREFIX_NODE_RECORD => {
+                    // Flush pending Extra doc into the current record before reset.
+                    if let (Some(doc), Some(rec)) = (extra_doc.take(), &mut record) {
+                        rmpv_to_extra(rec, &doc);
+                    }
                     // Pre-merged NodeRecord from a previous compaction or a new PUT.
                     // This supersedes the current base — use it as the new base.
                     record = Some(decode_node_record(operand)?);
@@ -198,27 +212,28 @@ impl MergeOperator for DocumentMerge {
                 PREFIX_DOC_DELTA => {
                     let delta =
                         DocDelta::decode(&operand[1..]).map_err(|_| LsmError::MergeOperator)?;
-                    match &mut record {
-                        Some(rec) => apply_delta_to_record(rec, &delta),
-                        None => {
-                            // Delta without a base record — create minimal record.
-                            // This can happen if the original PUT was compacted away
-                            // but merge operands remain. Create an empty record and
-                            // apply the delta.
-                            let mut rec = NodeRecord::new("");
-                            apply_delta_to_record(&mut rec, &delta);
-                            record = Some(rec);
-                        }
-                    }
+
+                    // Ensure we have a base record. If the original PUT was compacted
+                    // away but merge operands remain, create a minimal empty record.
+                    let rec = record.get_or_insert_with(|| NodeRecord::new(""));
+
+                    apply_delta_to_record_batched(rec, &delta, &mut extra_doc);
                 }
                 _ => {
-                    // Unknown prefix — treat as legacy NodeRecord without prefix.
-                    // Pre-prefix era data: attempt to decode as bare NodeRecord.
+                    // Unknown prefix — flush and treat as legacy NodeRecord.
+                    if let (Some(doc), Some(rec)) = (extra_doc.take(), &mut record) {
+                        rmpv_to_extra(rec, &doc);
+                    }
                     let rec =
                         NodeRecord::from_msgpack(operand).map_err(|_| LsmError::MergeOperator)?;
                     record = Some(rec);
                 }
             }
+        }
+
+        // Final flush: write accumulated Extra doc back to rec.extra.
+        if let (Some(doc), Some(rec)) = (extra_doc, &mut record) {
+            rmpv_to_extra(rec, &doc);
         }
 
         // Encode the merged result with the 0x00 prefix.
@@ -252,43 +267,64 @@ fn encode_node_record(rec: &NodeRecord) -> Result<UserValue, LsmError> {
     Ok(buf.into())
 }
 
-/// Apply a DocDelta to a NodeRecord.
+/// Apply a DocDelta to a NodeRecord, accumulating Extra-targeting deltas into
+/// an in-progress rmpv document to avoid redundant round-trips.
 ///
-/// DocDelta targets DOCUMENT-typed properties within the node. The first path
-/// segment identifies the property (by name, resolved to field ID for props
-/// or string key for extra). Remaining path segments navigate the nested doc.
+/// `extra_doc` is the caller-owned lazy representation of `rec.extra` as an
+/// `rmpv::Value::Map`. When `Some`, Extra-targeting deltas are applied directly
+/// to it without re-serializing `rec.extra`. When `None`, it is lazily created
+/// on the first Extra delta via `extra_to_rmpv`.
 ///
-/// Since we're in the merge operator (no field interner access), we work
-/// with `extra` map (string keys). The field interner resolution happens at
-/// the query/executor layer, not in the merge function.
+/// **The caller is responsible for flushing `extra_doc` back to `rec.extra`**
+/// (via `rmpv_to_extra`) after all deltas are processed and before any base
+/// record reset. A typical call site looks like:
 ///
-/// For the merge operator, all DocDelta paths target properties by string name
-/// in the `extra` overflow map. This is because merge operands are generated
-/// by the executor which resolves field IDs before emitting the delta — but
-/// the merge function itself operates on serialized NodeRecord where `props`
-/// uses u32 keys. To avoid requiring the field interner in the merge path,
-/// DocDelta operands store the property as an rmpv::Value document in `extra`.
+/// ```ignore
+/// let mut extra_doc = None;
+/// for delta in deltas {
+///     apply_delta_to_record_batched(rec, delta, &mut extra_doc);
+/// }
+/// if let Some(doc) = extra_doc.take() {
+///     rmpv_to_extra(rec, &doc);
+/// }
+/// ```
 ///
-/// Alternative design: DocDelta could target a specific field_id in `props`.
-/// This would require passing the field_id in the DocDelta. For now, we use
-/// a simpler approach: the delta carries a document-level path and applies
-/// to a single DOCUMENT-typed property identified by the first path segment
-/// stored in the `extra` map.
+/// ## Batch effect
 ///
-/// In practice, the executor stores the full DOCUMENT property value in `extra`
-/// with a known string key, and DocDelta paths operate within that value.
-fn apply_delta_to_record(rec: &mut NodeRecord, delta: &DocDelta) {
-    // RemoveProperty operates on the NodeRecord directly, not on a Document.
+/// With N Extra-targeting deltas, the cost is:
+/// - **Before**: N × (extra_to_rmpv + delta.apply + rmpv_to_extra)
+/// - **After**: 1 × extra_to_rmpv + N × delta.apply + 1 × rmpv_to_extra
+///
+/// PropField and RemoveProperty deltas are always applied immediately and
+/// do not interact with `extra_doc`.
+fn apply_delta_to_record_batched(
+    rec: &mut NodeRecord,
+    delta: &DocDelta,
+    extra_doc: &mut Option<rmpv::Value>,
+) {
+    // RemoveProperty operates on the NodeRecord or in-progress doc directly.
     if let DocDelta::RemoveProperty { target, key } = delta {
         match target {
             PathTarget::PropField(field_id) => {
                 rec.props.remove(field_id);
             }
             PathTarget::Extra => {
-                if let (Some(extra), Some(k)) = (&mut rec.extra, key) {
-                    extra.remove(k);
-                    if extra.is_empty() {
-                        rec.extra = None;
+                match extra_doc {
+                    Some(doc) => {
+                        // Apply removal to the in-progress rmpv doc to preserve order.
+                        if let (rmpv::Value::Map(entries), Some(k)) = (doc, key) {
+                            let rmpv_key = rmpv::Value::String(rmpv::Utf8String::from(k.as_str()));
+                            entries.retain(|(ek, _)| ek != &rmpv_key);
+                        }
+                    }
+                    None => {
+                        // No pending doc — apply directly to rec.extra.
+                        if let (Some(extra), Some(k)) = (&mut rec.extra, key) {
+                            extra.remove(k);
+                            if extra.is_empty() {
+                                rec.extra = None;
+                            }
+                        }
                     }
                 }
             }
@@ -298,14 +334,14 @@ fn apply_delta_to_record(rec: &mut NodeRecord, delta: &DocDelta) {
 
     match delta.target() {
         PathTarget::Extra => {
-            // Targets `rec.extra` overflow map (string keys).
-            let mut doc = extra_to_rmpv(rec);
-            delta.apply(&mut doc);
-            rmpv_to_extra(rec, &doc);
+            // Lazily initialize the rmpv doc from rec.extra on first Extra delta.
+            // Subsequent Extra deltas reuse the same doc — no redundant round-trip.
+            let doc = extra_doc.get_or_insert_with(|| extra_to_rmpv(rec));
+            delta.apply(doc);
         }
         PathTarget::PropField(field_id) => {
-            // Targets `rec.props[field_id]` — extract or create Document,
-            // apply delta sub-path, write back.
+            // PropField deltas operate on rec.props and don't interact with
+            // rec.extra or extra_doc — no flush needed.
             let mut doc = match rec.props.get(field_id) {
                 Some(v) => value_to_rmpv(v),
                 None => rmpv::Value::Map(Vec::new()),
@@ -1442,6 +1478,261 @@ mod doc_merge_tests {
         let merged = decode_node_record(&result).expect("decode");
 
         assert_eq!(merged.props.get(&1), Some(&Value::Int(100)));
+    }
+
+    // ── R099: Extra-delta batching (batch rmpv round-trips) ──────────────────
+
+    #[test]
+    fn doc_merge_multiple_extra_deltas_batched_same_result() {
+        // Multiple consecutive Extra-targeting deltas must produce the same
+        // result whether applied one at a time (old code) or via the batching
+        // path (new code). Tests that extra_doc accumulation is correct.
+        let op = DocumentMerge;
+
+        let initial = make_rmpv_map(vec![("x", rmpv::Value::Integer(0.into()))]);
+        let rec = make_record_with_doc("counters", initial);
+        let base = encode_rec(&rec);
+
+        // Three consecutive SetPath deltas, all targeting PathTarget::Extra.
+        let d1 = DocDelta::SetPath {
+            target: PathTarget::Extra,
+            path: vec!["counters".into(), "x".into()],
+            value: rmpv::Value::Integer(1.into()),
+        };
+        let d2 = DocDelta::SetPath {
+            target: PathTarget::Extra,
+            path: vec!["counters".into(), "y".into()],
+            value: rmpv::Value::Integer(2.into()),
+        };
+        let d3 = DocDelta::SetPath {
+            target: PathTarget::Extra,
+            path: vec!["counters".into(), "z".into()],
+            value: rmpv::Value::Integer(3.into()),
+        };
+
+        let op1 = d1.encode().expect("encode d1");
+        let op2 = d2.encode().expect("encode d2");
+        let op3 = d3.encode().expect("encode d3");
+
+        let result = op
+            .merge(b"node:0:1", Some(&base), &[&op1, &op2, &op3])
+            .expect("merge");
+        let merged = decode_node_record(&result).expect("decode");
+
+        let doc_val = merged.get_extra("counters").expect("counters key");
+        let Value::Document(doc) = doc_val else {
+            panic!("expected Document, got {doc_val:?}");
+        };
+        use coordinode_core::graph::document::extract_at_path;
+        assert_eq!(
+            extract_at_path(doc, &["x"]),
+            rmpv::Value::Integer(1.into()),
+            "x should be 1"
+        );
+        assert_eq!(
+            extract_at_path(doc, &["y"]),
+            rmpv::Value::Integer(2.into()),
+            "y should be 2"
+        );
+        assert_eq!(
+            extract_at_path(doc, &["z"]),
+            rmpv::Value::Integer(3.into()),
+            "z should be 3"
+        );
+    }
+
+    #[test]
+    fn doc_merge_mixed_extra_and_propfield_deltas() {
+        // Mixed Extra and PropField deltas. PropField must apply correctly
+        // regardless of pending extra_doc state (they don't interact — PropField
+        // operates on rec.props, not rec.extra / extra_doc accumulator).
+        let op = DocumentMerge;
+
+        // Field 7 stores a Document-typed property (PropField target requires Document).
+        let field7_doc = make_rmpv_map(vec![("inner", rmpv::Value::Integer(10.into()))]);
+        let mut base_rec = NodeRecord::new("Mixed");
+        base_rec.set(7, Value::Document(field7_doc));
+        let initial_meta = make_rmpv_map(vec![("a", rmpv::Value::Integer(0.into()))]);
+        base_rec.set_extra("meta", Value::Document(initial_meta));
+        let base = encode_rec(&base_rec);
+
+        // Extra delta — sets meta.a = 42.
+        let d_extra = DocDelta::SetPath {
+            target: PathTarget::Extra,
+            path: vec!["meta".into(), "a".into()],
+            value: rmpv::Value::Integer(42.into()),
+        };
+        // PropField delta — sets field 7's "inner" key to 99.
+        let d_prop = DocDelta::SetPath {
+            target: PathTarget::PropField(7),
+            path: vec!["inner".into()],
+            value: rmpv::Value::Integer(99.into()),
+        };
+        // Another Extra delta — sets meta.b = 7.
+        let d_extra2 = DocDelta::SetPath {
+            target: PathTarget::Extra,
+            path: vec!["meta".into(), "b".into()],
+            value: rmpv::Value::Integer(7.into()),
+        };
+
+        let op1 = d_extra.encode().expect("encode d_extra");
+        let op2 = d_prop.encode().expect("encode d_prop");
+        let op3 = d_extra2.encode().expect("encode d_extra2");
+
+        let result = op
+            .merge(b"node:0:1", Some(&base), &[&op1, &op2, &op3])
+            .expect("merge");
+        let merged = decode_node_record(&result).expect("decode");
+
+        // PropField 7's "inner" key should be updated to 99.
+        let field7 = merged.props.get(&7).expect("field 7 must exist");
+        let Value::Document(f7_doc) = field7 else {
+            panic!("expected Document for field 7, got {field7:?}");
+        };
+        use coordinode_core::graph::document::extract_at_path;
+        assert_eq!(
+            extract_at_path(f7_doc, &["inner"]),
+            rmpv::Value::Integer(99.into()),
+            "field7.inner = 99"
+        );
+
+        // Extra "meta" should have both changes from d_extra and d_extra2.
+        let doc_val = merged.get_extra("meta").expect("meta key");
+        let Value::Document(doc) = doc_val else {
+            panic!("expected Document, got {doc_val:?}");
+        };
+        assert_eq!(
+            extract_at_path(doc, &["a"]),
+            rmpv::Value::Integer(42.into()),
+            "meta.a = 42"
+        );
+        assert_eq!(
+            extract_at_path(doc, &["b"]),
+            rmpv::Value::Integer(7.into()),
+            "meta.b = 7"
+        );
+    }
+
+    #[test]
+    fn doc_merge_setpath_then_remove_property_extra() {
+        // SetPath (Extra) followed by RemoveProperty (Extra) — the removal must
+        // be applied AFTER the set. Both deltas are applied to the same extra_doc
+        // accumulator so ordering is preserved.
+        let op = DocumentMerge;
+
+        let initial = make_rmpv_map(vec![
+            ("keep", rmpv::Value::Integer(1.into())),
+            ("drop", rmpv::Value::Integer(2.into())),
+        ]);
+        let rec = make_record_with_doc("data", initial);
+        let base = encode_rec(&rec);
+
+        // Set "data.new_field" first.
+        let d_set = DocDelta::SetPath {
+            target: PathTarget::Extra,
+            path: vec!["data".into(), "new_field".into()],
+            value: rmpv::Value::Boolean(true),
+        };
+        // Then remove the entire "drop" top-level extra key.
+        let d_remove = DocDelta::RemoveProperty {
+            target: PathTarget::Extra,
+            key: Some("drop".into()),
+        };
+
+        let op1 = d_set.encode().expect("encode d_set");
+        let op2 = d_remove.encode().expect("encode d_remove");
+
+        let result = op
+            .merge(b"node:0:1", Some(&base), &[&op1, &op2])
+            .expect("merge");
+        let merged = decode_node_record(&result).expect("decode");
+
+        // "drop" was a top-level extra key and should be gone.
+        assert!(
+            merged.get_extra("drop").is_none(),
+            "'drop' key should have been removed"
+        );
+
+        // "data" with its nested values (keep + new_field) should remain.
+        let doc_val = merged.get_extra("data").expect("data key");
+        let Value::Document(doc) = doc_val else {
+            panic!("expected Document, got {doc_val:?}");
+        };
+        use coordinode_core::graph::document::extract_at_path;
+        assert_eq!(
+            extract_at_path(doc, &["new_field"]),
+            rmpv::Value::Boolean(true),
+            "data.new_field should be true"
+        );
+        assert_eq!(
+            extract_at_path(doc, &["keep"]),
+            rmpv::Value::Integer(1.into()),
+            "data.keep should be 1"
+        );
+    }
+
+    #[test]
+    fn doc_merge_base_reset_flushes_extra_doc() {
+        // When a PREFIX_NODE_RECORD operand appears mid-stream (base reset),
+        // the pending extra_doc must be flushed into the previous record before
+        // the reset, then the new base starts fresh. This tests the flush-before-reset
+        // invariant in DocumentMerge::merge.
+        let op = DocumentMerge;
+
+        // First base: node with "score" = 0 in extra.
+        let initial = make_rmpv_map(vec![("value", rmpv::Value::Integer(0.into()))]);
+        let base1_rec = make_record_with_doc("score", initial);
+        let base1 = encode_rec(&base1_rec);
+
+        // Delta applied to base1 (sets score.value = 10).
+        let d1 = DocDelta::SetPath {
+            target: PathTarget::Extra,
+            path: vec!["score".into(), "value".into()],
+            value: rmpv::Value::Integer(10.into()),
+        };
+
+        // Second base reset (new full NodeRecord with different label).
+        let mut base2_rec = NodeRecord::new("Replacement");
+        base2_rec.set_extra("flag", Value::Bool(true));
+        let base2 = encode_rec(&base2_rec);
+
+        // Delta applied to base2 (sets a new extra key).
+        let d2 = DocDelta::SetPath {
+            target: PathTarget::Extra,
+            path: vec!["note".into()],
+            value: rmpv::Value::String("after reset".into()),
+        };
+
+        let op1 = d1.encode().expect("encode d1");
+        let op2 = d2.encode().expect("encode d2");
+
+        // Operands: delta1, then a full NodeRecord (base reset), then delta2.
+        let result = op
+            .merge(b"node:0:1", Some(&base1), &[&op1, &base2, &op2])
+            .expect("merge");
+        let merged = decode_node_record(&result).expect("decode");
+
+        // Final state should be base2 + d2 applied ("Replacement" label, flag=true, note="after reset").
+        // d1's effect should be gone (applied to base1 which was replaced).
+        assert!(
+            merged.has_label("Replacement"),
+            "label should be from base2 (Replacement)"
+        );
+        assert_eq!(
+            merged.get_extra("flag"),
+            Some(&Value::Bool(true)),
+            "flag from base2 should be present"
+        );
+        assert_eq!(
+            merged.get_extra("note"),
+            Some(&Value::String("after reset".into())),
+            "note from d2 should be set"
+        );
+        // score from base1 is gone — the reset wiped it.
+        assert!(
+            merged.get_extra("score").is_none(),
+            "score from base1 should be gone after reset"
+        );
     }
 }
 
