@@ -5420,9 +5420,14 @@ fn execute_update(
                                 registry.on_text_written(&label, node_id, property, text);
                             }
                         }
-                    }
 
-                    out_row.insert(format!("{variable}.{property}"), val);
+                        // Reflect the new value in the output row only when the
+                        // write was actually applied. If mvcc_get returned None
+                        // (e.g. node was DELETEd earlier in the same query), the
+                        // `if let Some` block above is skipped and we must not
+                        // expose the unapplied value through RETURN.
+                        out_row.insert(format!("{variable}.{property}"), val);
+                    }
                 }
                 crate::cypher::ast::SetItem::PropertyPath {
                     variable,

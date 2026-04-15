@@ -1473,6 +1473,99 @@ mod tests {
         assert!(matches!(result, Err(DatabaseError::Semantic(_))));
     }
 
+    /// Regression test: MATCH+SET property changes must be visible in subsequent queries.
+    ///
+    /// Reproduces the snapshot isolation bug where MATCH+SET appears to succeed
+    /// (the change is visible via RETURN in the same query) but the updated value
+    /// is NOT visible in a subsequent MATCH query — the property reverts to its
+    /// pre-SET value across query boundaries.
+    ///
+    /// Root cause hypothesis: the MVCC write buffer is flushed correctly but
+    /// the next query's snapshot is taken at a seqno that precedes the write.
+    #[test]
+    fn match_set_property_change_persists_across_queries() {
+        use coordinode_core::graph::types::Value;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = Database::open(dir.path()).expect("open");
+
+        // Step 1: create node via MERGE+SET (confirmed working per bug report)
+        db.execute_cypher("MERGE (p:Project {id: 'x'}) SET p.status = 'active'")
+            .expect("MERGE+SET must succeed");
+
+        // Step 2: update via MATCH+SET — returns 'removed' in the same query
+        let step2 = db
+            .execute_cypher(
+                "MATCH (p:Project {id: 'x'}) SET p.status = 'removed' RETURN p.status AS s",
+            )
+            .expect("MATCH+SET must succeed");
+        assert_eq!(step2.len(), 1, "MATCH+SET must return one row");
+        assert_eq!(
+            step2[0].get("s"),
+            Some(&Value::String("removed".into())),
+            "SET must be visible within the same query"
+        );
+
+        // Step 3: read in a SEPARATE query — must show the persisted value
+        let step3 = db
+            .execute_cypher("MATCH (p:Project {id: 'x'}) RETURN p.status AS s")
+            .expect("MATCH RETURN must succeed");
+        assert_eq!(step3.len(), 1, "node must still exist in step 3");
+        assert_eq!(
+            step3[0].get("s"),
+            Some(&Value::String("removed".into())),
+            "MATCH+SET must persist across query boundaries: expected 'removed', got {:?}",
+            step3[0].get("s")
+        );
+    }
+
+    /// Regression test: MATCH+SET property changes must persist when a B-tree index
+    /// is present on the lookup property, causing the planner to use IndexScan.
+    ///
+    /// IndexScan reads from the engine directly (not MVCC snapshot) for the index
+    /// lookup. The node read in execute_update goes through mvcc_get (snapshot-based).
+    /// This test verifies the two-phase read (IndexScan → execute_update mvcc_get)
+    /// correctly commits the write to storage.
+    #[test]
+    fn match_set_persists_with_btree_index() {
+        use coordinode_core::graph::types::Value;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = Database::open(dir.path()).expect("open");
+
+        // Create a B-tree index on :Project.id so that MATCH uses IndexScan
+        db.execute_cypher("CREATE INDEX idx_project_id ON :Project(id)")
+            .expect("CREATE INDEX");
+
+        // Step 1: create node
+        db.execute_cypher("MERGE (p:Project {id: 'x'}) SET p.status = 'active'")
+            .expect("MERGE+SET");
+
+        // Step 2: update via MATCH+SET — IndexScan path
+        let step2 = db
+            .execute_cypher(
+                "MATCH (p:Project {id: 'x'}) SET p.status = 'removed' RETURN p.status AS s",
+            )
+            .expect("MATCH+SET with index");
+        assert_eq!(
+            step2[0].get("s"),
+            Some(&Value::String("removed".into())),
+            "SET visible in same query"
+        );
+
+        // Step 3: new query — must see 'removed'
+        let step3 = db
+            .execute_cypher("MATCH (p:Project {id: 'x'}) RETURN p.status AS s")
+            .expect("MATCH RETURN");
+        assert_eq!(step3.len(), 1);
+        assert_eq!(
+            step3[0].get("s"),
+            Some(&Value::String("removed".into())),
+            "MATCH+SET with IndexScan must persist: expected 'removed', got {:?}",
+            step3[0].get("s")
+        );
+    }
+
     #[test]
     fn data_persists_across_reopen() {
         let dir = tempfile::tempdir().expect("tempdir");
