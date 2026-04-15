@@ -94,6 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         cli::Command::Serve {
             grpc_addr,
+            rest_addr,
             ops_addr,
             data_dir,
             peers,
@@ -226,6 +227,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::error!("ops server error: {e}");
                 }
             });
+
+            // Spawn embedded REST/JSON proxy (default :7081, configurable via --rest-addr).
+            // Transcodes HTTP/JSON requests to gRPC via google.api.http annotations.
+            // Uses an embedded proto descriptor compiled into the binary — no external
+            // descriptor file or separate container required.
+            static DESCRIPTOR_BYTES: &[u8] = include_bytes!("../../../coordinode.descriptor.bin");
+            {
+                use structured_proxy::config::{
+                    DescriptorSource, ListenConfig, ProxyConfig, ServiceConfig, UpstreamConfig,
+                };
+                let grpc_upstream = format!("http://127.0.0.1:{}", addr.port());
+                let config = ProxyConfig {
+                    upstream: UpstreamConfig {
+                        default: grpc_upstream,
+                    },
+                    descriptors: vec![DescriptorSource::Embedded {
+                        bytes: DESCRIPTOR_BYTES,
+                    }],
+                    listen: ListenConfig { http: rest_addr },
+                    service: ServiceConfig {
+                        name: "coordinode".into(),
+                    },
+                    aliases: vec![],
+                    openapi: None,
+                    auth: None,
+                    shield: None,
+                    oidc_discovery: None,
+                    maintenance: Default::default(),
+                    cors: Default::default(),
+                    logging: Default::default(),
+                    metrics_classes: vec![],
+                    forwarded_headers: vec![
+                        "authorization".into(),
+                        "x-request-id".into(),
+                        "x-forwarded-for".into(),
+                        "x-real-ip".into(),
+                        "user-agent".into(),
+                        "accept-language".into(),
+                    ],
+                };
+                let proxy = structured_proxy::ProxyServer::from_config(config);
+                tokio::spawn(async move {
+                    if let Err(e) = proxy.serve().await {
+                        tracing::error!("REST proxy error: {e}");
+                    }
+                });
+            }
 
             info!(port = addr.port(), "gRPC server listening");
 

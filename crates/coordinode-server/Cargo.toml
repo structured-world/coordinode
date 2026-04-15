@@ -27,6 +27,7 @@ coordinode-search = { workspace = true, optional = true }
 coordinode-storage = { workspace = true }
 coordinode-raft = { workspace = true }
 coordinode-auth = { workspace = true }
+structured-proxy = "1"
 tokio = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = "0.14"

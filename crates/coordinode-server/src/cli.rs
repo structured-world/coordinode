@@ -15,6 +15,9 @@ pub enum Command {
     Serve {
         /// gRPC listen address (default: [::]:7080).
         grpc_addr: String,
+        /// REST/JSON proxy listen address (default: [::]:7081).
+        /// Transcodes HTTP/JSON requests to gRPC via embedded structured-proxy.
+        rest_addr: String,
         /// Operational HTTP server address for /metrics and /health (default: [::]:7084).
         /// Pass port 0 to let the OS assign an ephemeral port (useful in tests).
         ops_addr: String,
@@ -108,6 +111,8 @@ pub fn parse_args_from(args: &[String]) -> Command {
     match args[1].as_str() {
         "serve" => {
             let grpc_addr = find_flag(args, "--addr").unwrap_or_else(|| "[::]:7080".to_string());
+            let rest_addr =
+                find_flag(args, "--rest-addr").unwrap_or_else(|| "[::]:7081".to_string());
             let ops_addr = find_flag(args, "--ops-addr").unwrap_or_else(|| "[::]:7084".to_string());
             let data_dir = find_flag(args, "--data").unwrap_or_else(|| "./data".to_string());
             let peers = find_flag(args, "--peers").map(|p| {
@@ -118,6 +123,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
             });
             Command::Serve {
                 grpc_addr,
+                rest_addr,
                 ops_addr,
                 data_dir,
                 peers,
@@ -170,7 +176,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
             eprintln!(
                 "coordinode v{}\n\n\
                  Usage:\n  \
-                 coordinode serve [--addr ADDR] [--data DIR] [--peers PEERS]\n  \
+                 coordinode serve [--addr ADDR] [--rest-addr ADDR] [--ops-addr ADDR] [--data DIR] [--peers PEERS]\n  \
                  coordinode backup --output FILE [--data DIR] [--format json|cypher|binary] [--namespace NS]\n  \
                  coordinode restore --input FILE [--data DIR] [--format json|cypher|binary] [--namespace NS]\n  \
                  coordinode verify [--data DIR] [--deep]\n  \
@@ -282,6 +288,7 @@ fn parse_admin_args(args: &[String]) -> Command {
 fn default_serve() -> Command {
     Command::Serve {
         grpc_addr: "[::]:7080".to_string(),
+        rest_addr: "[::]:7081".to_string(),
         ops_addr: "[::]:7084".to_string(),
         data_dir: "./data".to_string(),
         peers: None,
@@ -408,6 +415,24 @@ mod tests {
     fn default_is_serve() {
         let cmd = parse_args_from(&args("coordinode"));
         assert!(matches!(cmd, Command::Serve { .. }));
+    }
+
+    #[test]
+    fn serve_custom_rest_addr() {
+        let cmd = parse_args_from(&args("coordinode serve --rest-addr 0.0.0.0:8081"));
+        match cmd {
+            Command::Serve { rest_addr, .. } => assert_eq!(rest_addr, "0.0.0.0:8081"),
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn serve_default_rest_addr() {
+        let cmd = parse_args_from(&args("coordinode serve"));
+        match cmd {
+            Command::Serve { rest_addr, .. } => assert_eq!(rest_addr, "[::]:7081"),
+            _ => panic!("expected Serve command"),
+        }
     }
 
     #[test]

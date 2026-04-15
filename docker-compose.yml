@@ -6,7 +6,7 @@
 #
 # Ports:
 #   7080 — gRPC (native API)
-#   7081 — REST/JSON (gRPC-to-REST transcoding via structured-proxy)
+#   7081 — REST/JSON (embedded structured-proxy inside coordinode binary)
 #   7084 — Prometheus /metrics, /health, /ready
 
 services:
@@ -16,7 +16,7 @@ services:
     container_name: coordinode
     ports:
       - "7080:7080"   # gRPC
-      - "7081:7081"   # REST/JSON (via rest-proxy, shares network namespace)
+      - "7081:7081"   # REST/JSON (embedded proxy, same binary)
       - "7084:7084"   # Prometheus /metrics, /health
     volumes:
       - coordinode-data:/data
@@ -29,23 +29,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
-
-  rest-proxy:
-    build: .
-    image: coordinode:latest
-    container_name: coordinode-rest
-    entrypoint: ["/structured-proxy"]
-    command: ["--config", "/etc/proxy/coordinode-proxy.yaml"]
-    # Share the network namespace with coordinode so that upstream
-    # http://127.0.0.1:7080 in coordinode-proxy.yaml resolves correctly.
-    network_mode: "service:coordinode"
-    volumes:
-      - ./coordinode-proxy.yaml:/etc/proxy/coordinode-proxy.yaml:ro
-      - ./coordinode.descriptor.bin:/etc/proxy/coordinode.descriptor.bin:ro
-    depends_on:
-      coordinode:
-        condition: service_healthy
-    restart: unless-stopped
 
 volumes:
   coordinode-data:
