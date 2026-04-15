@@ -12,6 +12,9 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
+
 use crate::proto::{
     admin::cluster_service_client::ClusterServiceClient,
     graph::schema_service_client::SchemaServiceClient,
@@ -239,8 +242,8 @@ pub fn binary_path() -> PathBuf {
 /// processes run concurrently (each would otherwise fight over the default :7084).
 fn spawn_binary(port: u16, data_dir: PathBuf) -> Child {
     let bin = binary_path();
-    Command::new(&bin)
-        .arg("serve")
+    let mut cmd = Command::new(&bin);
+    cmd.arg("serve")
         .arg("--addr")
         .arg(format!("[::1]:{port}"))
         .arg("--ops-addr")
@@ -251,8 +254,22 @@ fn spawn_binary(port: u16, data_dir: PathBuf) -> Child {
         .env(
             "RUST_LOG",
             std::env::var("RUST_LOG").unwrap_or_else(|_| "error".into()),
-        )
-        .spawn()
+        );
+
+    // Place the child in its own process group (Unix only).
+    //
+    // nextest marks a test LEAKY when processes in the test's process group
+    // are still alive after the test exits.  Under parallel test execution the
+    // coordinode shutdown window (SIGTERM → WAL flush → exit) can exceed the
+    // 5-second Drop deadline, leaving the process alive and triggering LEAKY.
+    //
+    // `process_group(0)` makes the spawned process the leader of a NEW group,
+    // so nextest's group-tracking never sees it.  The Drop impl kills it by PID
+    // directly, which is group-independent and still works correctly.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    cmd.spawn()
         .unwrap_or_else(|e| panic!("failed to spawn {}: {}", bin.display(), e))
 }
 
