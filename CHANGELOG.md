@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.3.17 — 2026-04-15
+
+### coordinode-core
+## [0.3.17](https://github.com/structured-world/coordinode/compare/v0.3.16...v0.3.17) - 2026-04-15
+
+#### Added
+
+- *(core)* implement HybridLogicalClock for CE timestamps (R143)
+
+### coordinode-embed
+## [0.3.17](https://github.com/structured-world/coordinode/compare/v0.3.16...v0.3.17) - 2026-04-15
+
+#### Fixed
+
+- *(executor)* RETURN must not expose SET value when write was not applied
+
+### coordinode-query
+## [0.3.17](https://github.com/structured-world/coordinode/compare/v0.3.16...v0.3.17) - 2026-04-15
+
+#### Added
+
+- *(causal)* enforce writeConcern=MAJORITY in causal write sessions (G088)
+
+#### Fixed
+
+- *(executor)* RETURN must not expose SET value when write was not applied
+
+#### Testing
+
+- *(query)* verify is_write() classifies all DDL clause variants
+- *(query)* add unit tests for Query::is_write() AST predicate
+
+### coordinode-server
+## [0.3.17](https://github.com/structured-world/coordinode/compare/v0.3.16...v0.3.17) - 2026-04-15
+
+#### Added
+
+- *(causal)* enforce writeConcern=MAJORITY in causal write sessions (G088)
+- *(consistency)* implement R142 causal consistency sessions
+
+---
+
 ## v0.3.16 — 2026-04-15
 
 ### coordinode-server
