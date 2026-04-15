@@ -12,11 +12,14 @@ name = "coordinode"
 path = "src/main.rs"
 
 [features]
-default = ["bolt", "graphql", "vector", "full-text"]
+default = ["bolt", "graphql", "vector", "full-text", "rest-proxy"]
 bolt = []
 graphql = []
 vector = ["dep:coordinode-vector"]
 full-text = ["dep:coordinode-search"]
+# Embed structured-proxy for REST/JSON transcoding (disable for embedded/iOS builds
+# to reduce binary size — the gRPC API on :7080 remains fully functional).
+rest-proxy = ["dep:structured-proxy"]
 
 [dependencies]
 coordinode-core = { workspace = true }
@@ -27,7 +30,7 @@ coordinode-search = { workspace = true, optional = true }
 coordinode-storage = { workspace = true }
 coordinode-raft = { workspace = true }
 coordinode-auth = { workspace = true }
-structured-proxy = "1"
+structured-proxy = { version = "1", optional = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = "0.14"

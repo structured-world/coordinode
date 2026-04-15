@@ -17,6 +17,8 @@ pub enum Command {
         grpc_addr: String,
         /// REST/JSON proxy listen address (default: [::]:7081).
         /// Transcodes HTTP/JSON requests to gRPC via embedded structured-proxy.
+        /// Only present when compiled with the `rest-proxy` feature.
+        #[cfg(feature = "rest-proxy")]
         rest_addr: String,
         /// Operational HTTP server address for /metrics and /health (default: [::]:7084).
         /// Pass port 0 to let the OS assign an ephemeral port (useful in tests).
@@ -111,6 +113,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
     match args[1].as_str() {
         "serve" => {
             let grpc_addr = find_flag(args, "--addr").unwrap_or_else(|| "[::]:7080".to_string());
+            #[cfg(feature = "rest-proxy")]
             let rest_addr =
                 find_flag(args, "--rest-addr").unwrap_or_else(|| "[::]:7081".to_string());
             let ops_addr = find_flag(args, "--ops-addr").unwrap_or_else(|| "[::]:7084".to_string());
@@ -123,6 +126,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
             });
             Command::Serve {
                 grpc_addr,
+                #[cfg(feature = "rest-proxy")]
                 rest_addr,
                 ops_addr,
                 data_dir,
@@ -288,6 +292,7 @@ fn parse_admin_args(args: &[String]) -> Command {
 fn default_serve() -> Command {
     Command::Serve {
         grpc_addr: "[::]:7080".to_string(),
+        #[cfg(feature = "rest-proxy")]
         rest_addr: "[::]:7081".to_string(),
         ops_addr: "[::]:7084".to_string(),
         data_dir: "./data".to_string(),
@@ -417,6 +422,7 @@ mod tests {
         assert!(matches!(cmd, Command::Serve { .. }));
     }
 
+    #[cfg(feature = "rest-proxy")]
     #[test]
     fn serve_custom_rest_addr() {
         let cmd = parse_args_from(&args("coordinode serve --rest-addr 0.0.0.0:8081"));
@@ -426,6 +432,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "rest-proxy")]
     #[test]
     fn serve_default_rest_addr() {
         let cmd = parse_args_from(&args("coordinode serve"));
