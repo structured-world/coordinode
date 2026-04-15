@@ -63,6 +63,7 @@ pub fn make_ctx_legacy<'a>(
         correlated_row: None,
         feedback_cache: None,
         schema_label_cache: HashMap::new(),
+        params: HashMap::new(),
     }
 }
 
@@ -114,6 +115,7 @@ pub fn make_ctx_mvcc<'a>(
         correlated_row: None,
         feedback_cache: None,
         schema_label_cache: HashMap::new(),
+        params: HashMap::new(),
     }
 }
 
@@ -166,5 +168,6 @@ pub fn make_ctx_with_pipeline<'a>(
         correlated_row: None,
         feedback_cache: None,
         schema_label_cache: HashMap::new(),
+        params: HashMap::new(),
     }
 }

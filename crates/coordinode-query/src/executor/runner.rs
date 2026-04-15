@@ -379,6 +379,12 @@ pub struct ExecutionContext<'a> {
     /// changes the primary label after node creation), so the cache is always
     /// valid for the lifetime of the statement. No invalidation required.
     pub schema_label_cache: HashMap<NodeId, String>,
+    /// Named query parameters bound to this statement.
+    ///
+    /// Populated before `execute()` is called. Accessible inside aggregate
+    /// functions such as `percentileCont(x, $p)` where `$p` is a bound parameter.
+    /// Keys omit the `$` prefix (e.g., `"p"` for `$p`).
+    pub params: HashMap<String, coordinode_core::graph::types::Value>,
 }
 
 /// Convert storage `Partition` to serializable `PartitionId`.
@@ -1363,7 +1369,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             aggregates,
         } => {
             let rows = execute_op(input, ctx)?;
-            execute_aggregate(&rows, group_by, aggregates)
+            execute_aggregate(&rows, group_by, aggregates, &ctx.params)
         }
 
         LogicalOp::Sort { input, items } => {
@@ -3722,11 +3728,33 @@ fn execute_shortest_path(
     Ok(results)
 }
 
+/// Evaluate a scalar expression that may be a literal or a query parameter.
+///
+/// Used for aggregate function arguments (e.g., the `p` in `percentileCont(x, p)`)
+/// where the value is expected to be a numeric constant or a bound parameter (`$p`).
+/// Returns `None` for complex expressions or unresolvable/non-numeric values.
+fn eval_scalar_expr(
+    expr: &Expr,
+    params: &HashMap<String, coordinode_core::graph::types::Value>,
+) -> Option<f64> {
+    match expr {
+        Expr::Literal(Value::Float(f)) => Some(*f),
+        Expr::Literal(Value::Int(i)) => Some(*i as f64),
+        Expr::Parameter(name) => params.get(name).and_then(|v| match v {
+            Value::Float(f) => Some(*f),
+            Value::Int(i) => Some(*i as f64),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
 /// Execute aggregation: group rows and compute aggregate functions.
 fn execute_aggregate(
     rows: &[Row],
     group_by: &[Expr],
     aggregates: &[AggregateItem],
+    params: &HashMap<String, coordinode_core::graph::types::Value>,
 ) -> Result<Vec<Row>, ExecutionError> {
     // Group rows by group-by key
     // Group rows by group-by key.
@@ -3763,7 +3791,7 @@ fn execute_aggregate(
 
         // Compute aggregates
         for agg in aggregates {
-            let val = compute_aggregate(agg, group_rows);
+            let val = compute_aggregate(agg, group_rows, params);
             let col = agg.alias.clone().unwrap_or_else(|| agg.function.clone());
             out.insert(col, val);
         }
@@ -3798,7 +3826,11 @@ fn eval_aggregate_values(agg: &AggregateItem, rows: &[&Row]) -> Vec<Value> {
 }
 
 /// Compute a single aggregate function over a group of rows.
-fn compute_aggregate(agg: &AggregateItem, rows: &[&Row]) -> Value {
+fn compute_aggregate(
+    agg: &AggregateItem,
+    rows: &[&Row],
+    params: &HashMap<String, coordinode_core::graph::types::Value>,
+) -> Value {
     match agg.function.as_str() {
         "count" => {
             if agg.arg == Expr::Star {
@@ -3908,8 +3940,14 @@ fn compute_aggregate(agg: &AggregateItem, rows: &[&Row]) -> Value {
 
             values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-            // Percentile from the second argument; default to 0.5 (median) if not specified.
-            let percentile = agg.percentile.unwrap_or(0.5).clamp(0.0, 1.0);
+            // Percentile from the second argument expression; supports literals and $params.
+            // Falls back to 0.5 (median) when the argument is absent or not a numeric scalar.
+            let percentile = agg
+                .percentile_expr
+                .as_ref()
+                .and_then(|e| eval_scalar_expr(e, params))
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0);
 
             if agg.function == "percentileDisc" {
                 // Nearest rank method: ceil(p * n) gives 1-based index; clamp to [0, n-1].
@@ -7047,6 +7085,7 @@ mod tests {
             correlated_row: None,
             feedback_cache: None,
             schema_label_cache: std::collections::HashMap::new(),
+            params: std::collections::HashMap::new(),
         }
     }
 
@@ -7258,7 +7297,7 @@ mod tests {
                         arg: Expr::Star,
                         distinct: false,
                         alias: Some("cnt".into()),
-                        percentile: None,
+                        percentile_expr: None,
                     }],
                 }),
                 items: vec![crate::planner::logical::ProjectItem {
@@ -7301,7 +7340,7 @@ mod tests {
                             },
                             distinct: false,
                             alias: Some("total".into()),
-                            percentile: None,
+                            percentile_expr: None,
                         },
                         AggregateItem {
                             function: "avg".into(),
@@ -7311,7 +7350,7 @@ mod tests {
                             },
                             distinct: false,
                             alias: Some("average".into()),
-                            percentile: None,
+                            percentile_expr: None,
                         },
                     ],
                 }),
@@ -7360,7 +7399,7 @@ mod tests {
                         },
                         distinct: false,
                         alias: Some("youngest".into()),
-                        percentile: None,
+                        percentile_expr: None,
                     },
                     AggregateItem {
                         function: "max".into(),
@@ -7370,7 +7409,7 @@ mod tests {
                         },
                         distinct: false,
                         alias: Some("oldest".into()),
-                        percentile: None,
+                        percentile_expr: None,
                     },
                 ],
             },
@@ -7406,7 +7445,7 @@ mod tests {
                     },
                     distinct: false,
                     alias: Some("names".into()),
-                    percentile: None,
+                    percentile_expr: None,
                 }],
             },
         };
@@ -7450,7 +7489,7 @@ mod tests {
                     },
                     distinct: false,
                     alias: Some("median".into()),
-                    percentile: None,
+                    percentile_expr: None,
                 }],
             },
         };
@@ -7488,7 +7527,7 @@ mod tests {
                     },
                     distinct: false,
                     alias: Some("p100".into()),
-                    percentile: Some(1.0),
+                    percentile_expr: Some(Expr::Literal(Value::Float(1.0))),
                 }],
             },
         };
@@ -7517,7 +7556,7 @@ mod tests {
                     },
                     distinct: false,
                     alias: Some("p0".into()),
-                    percentile: Some(0.0),
+                    percentile_expr: Some(Expr::Literal(Value::Float(0.0))),
                 }],
             },
         };
@@ -7552,7 +7591,7 @@ mod tests {
                     },
                     distinct: false,
                     alias: Some("sd".into()),
-                    percentile: None,
+                    percentile_expr: None,
                 }],
             },
         };
@@ -7593,14 +7632,14 @@ mod tests {
                         },
                         distinct: false,
                         alias: Some("total".into()),
-                        percentile: None,
+                        percentile_expr: None,
                     },
                     AggregateItem {
                         function: "count".into(),
                         arg: Expr::Star,
                         distinct: false,
                         alias: Some("cnt".into()),
-                        percentile: None,
+                        percentile_expr: None,
                     },
                 ],
             },
@@ -9208,7 +9247,7 @@ mod tests {
                         },
                         distinct: true,
                         alias: Some("unique_ages".into()),
-                        percentile: None,
+                        percentile_expr: None,
                     },
                     AggregateItem {
                         function: "count".into(),
@@ -9218,7 +9257,7 @@ mod tests {
                         },
                         distinct: false,
                         alias: Some("total_ages".into()),
-                        percentile: None,
+                        percentile_expr: None,
                     },
                 ],
             },
@@ -9268,7 +9307,7 @@ mod tests {
                     },
                     distinct: true,
                     alias: Some("ages".into()),
-                    percentile: None,
+                    percentile_expr: None,
                 }],
             },
         };
@@ -9307,7 +9346,7 @@ mod tests {
                     },
                     distinct: false,
                     alias: Some("total".into()),
-                    percentile: None,
+                    percentile_expr: None,
                 }],
             },
         };
@@ -9371,7 +9410,7 @@ mod tests {
                     arg: Expr::Star,
                     distinct: false,
                     alias: Some("cnt".into()),
-                    percentile: None,
+                    percentile_expr: None,
                 }],
             },
         };
@@ -9404,21 +9443,21 @@ mod tests {
                         arg: Expr::Star,
                         distinct: false,
                         alias: Some("cnt".into()),
-                        percentile: None,
+                        percentile_expr: None,
                     },
                     AggregateItem {
                         function: "sum".into(),
                         arg: Expr::Literal(Value::Int(1)),
                         distinct: false,
                         alias: Some("total".into()),
-                        percentile: None,
+                        percentile_expr: None,
                     },
                     AggregateItem {
                         function: "avg".into(),
                         arg: Expr::Literal(Value::Int(1)),
                         distinct: false,
                         alias: Some("mean".into()),
-                        percentile: None,
+                        percentile_expr: None,
                     },
                 ],
             },
@@ -9457,7 +9496,7 @@ mod tests {
                             arg: Expr::Star,
                             distinct: false,
                             alias: Some("cnt".into()),
-                            percentile: None,
+                            percentile_expr: None,
                         }],
                     }),
                     items: vec![ProjectItem {

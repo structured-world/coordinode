@@ -65,6 +65,7 @@ fn make_test_ctx<'a>(
         correlated_row: None,
         feedback_cache: None,
         schema_label_cache: std::collections::HashMap::new(),
+        params: std::collections::HashMap::new(),
     }
 }
 
@@ -166,6 +167,25 @@ fn run_cypher(
 ) -> Vec<coordinode_query::executor::Row> {
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
     run_cypher_with_alloc(query, engine, interner, &allocator)
+}
+
+/// Execute with bound query parameters (e.g., `$p → 0.9`).
+fn run_cypher_with_params(
+    query: &str,
+    engine: &StorageEngine,
+    interner: &mut FieldInterner,
+    params: std::collections::HashMap<String, Value>,
+) -> Vec<coordinode_query::executor::Row> {
+    use coordinode_query::cypher::parse;
+    use coordinode_query::executor::execute;
+    use coordinode_query::planner::build_logical_plan;
+
+    let ast = parse(query).unwrap_or_else(|e| panic!("parse error: {e}"));
+    let plan = build_logical_plan(&ast).unwrap_or_else(|e| panic!("plan error: {e}"));
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+    let mut ctx = make_test_ctx(engine, interner, &allocator);
+    ctx.params = params;
+    execute(&plan, &mut ctx).unwrap_or_else(|e| panic!("execute error: {e}"))
 }
 
 /// Build the social graph:
@@ -900,6 +920,105 @@ fn aggregate_collect_end_to_end() {
     } else {
         panic!("collect() should return an Array");
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// percentileCont / percentileDisc — end-to-end through full Cypher pipeline
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn aggregate_percentile_cont_respects_argument() {
+    // Regression: before the fix, percentileCont always returned the median
+    // regardless of the p argument. This test runs through the full pipeline
+    // (parse → plan builder → executor) to verify p is propagated.
+    //
+    // Person ages: [25, 30, 30, 35, 40]. Sorted.
+    // percentileCont(age, 0.0) → 25.0  (min)
+    // percentileCont(age, 1.0) → 40.0  (max)
+    // percentileCont(age, 0.5) → 30.0  (median — also correct at p=0.5)
+    let (_dir, engine, mut interner) = setup_social_graph();
+
+    let min_result = run_cypher(
+        "MATCH (n:Person) RETURN percentileCont(n.age, 0.0) AS p0",
+        &engine,
+        &mut interner,
+    );
+    assert_eq!(min_result.len(), 1);
+    assert_eq!(
+        min_result[0].get("p0"),
+        Some(&Value::Float(25.0)),
+        "percentileCont(age, 0.0) should return the minimum, not the median"
+    );
+
+    let max_result = run_cypher(
+        "MATCH (n:Person) RETURN percentileCont(n.age, 1.0) AS p100",
+        &engine,
+        &mut interner,
+    );
+    assert_eq!(max_result.len(), 1);
+    assert_eq!(
+        max_result[0].get("p100"),
+        Some(&Value::Float(40.0)),
+        "percentileCont(age, 1.0) should return the maximum, not the median"
+    );
+}
+
+#[test]
+fn aggregate_percentile_disc_respects_argument() {
+    // Same regression check for percentileDisc (nearest-rank variant).
+    // Person ages: [25, 30, 30, 35, 40]. Sorted.
+    // percentileDisc(age, 0.0) → 25.0  (saturating_sub(1) from ceil(0) = 0)
+    // percentileDisc(age, 1.0) → 40.0  (ceil(1.0 * 5) - 1 = index 4)
+    let (_dir, engine, mut interner) = setup_social_graph();
+
+    let low_result = run_cypher(
+        "MATCH (n:Person) RETURN percentileDisc(n.age, 0.0) AS p0",
+        &engine,
+        &mut interner,
+    );
+    assert_eq!(low_result.len(), 1);
+    assert_eq!(
+        low_result[0].get("p0"),
+        Some(&Value::Float(25.0)),
+        "percentileDisc(age, 0.0) should return the minimum, not the median"
+    );
+
+    let high_result = run_cypher(
+        "MATCH (n:Person) RETURN percentileDisc(n.age, 1.0) AS p100",
+        &engine,
+        &mut interner,
+    );
+    assert_eq!(high_result.len(), 1);
+    assert_eq!(
+        high_result[0].get("p100"),
+        Some(&Value::Float(40.0)),
+        "percentileDisc(age, 1.0) should return the maximum, not the median"
+    );
+}
+
+#[test]
+fn aggregate_percentile_cont_with_query_parameter() {
+    // Verify that percentileCont(x, $p) reads the percentile from the query
+    // parameter map in ExecutionContext, matching Neo4j's behavior.
+    // Person ages: [25, 30, 30, 35, 40]. percentileCont(age, $p) with $p=1.0 → 40.0.
+    let (_dir, engine, mut interner) = setup_social_graph();
+
+    let mut params = std::collections::HashMap::new();
+    params.insert("p".into(), Value::Float(1.0));
+
+    let result = run_cypher_with_params(
+        "MATCH (n:Person) RETURN percentileCont(n.age, $p) AS result",
+        &engine,
+        &mut interner,
+        params,
+    );
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result[0].get("result"),
+        Some(&Value::Float(40.0)),
+        "percentileCont(age, $p) with $p=1.0 should return the maximum (40.0)"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════

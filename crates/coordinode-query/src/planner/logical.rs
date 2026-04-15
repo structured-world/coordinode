@@ -720,9 +720,11 @@ pub struct AggregateItem {
     pub distinct: bool,
     /// Output alias.
     pub alias: Option<String>,
-    /// Percentile value for percentileCont / percentileDisc (second argument).
-    /// Valid range: [0.0, 1.0]. None = use default (0.5, median).
-    pub percentile: Option<f64>,
+    /// Second argument expression for percentileCont / percentileDisc.
+    /// Must evaluate to a Float or Int in [0.0, 1.0].
+    /// Accepts literal values (`0.9`) and query parameters (`$p`).
+    /// `None` means the argument was absent or not a scalar expression — executor falls back to 0.5.
+    pub percentile_expr: Option<Expr>,
 }
 
 /// Query cost estimation result.

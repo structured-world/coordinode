@@ -919,6 +919,7 @@ impl Database {
             correlated_row: None,
             feedback_cache: Some(self.feedback_cache.clone()),
             schema_label_cache: std::collections::HashMap::new(),
+            params: std::collections::HashMap::new(),
         };
 
         let start = Instant::now();
