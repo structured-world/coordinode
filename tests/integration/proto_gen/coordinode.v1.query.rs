@@ -6,10 +6,8 @@ pub struct ExecuteCypherRequest {
     pub query: ::prost::alloc::string::String,
     /// Named query parameters bound at execution time.
     #[prost(map = "string, message", tag = "2")]
-    pub parameters: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        super::common::PropertyValue,
-    >,
+    pub parameters:
+        ::std::collections::HashMap<::prost::alloc::string::String, super::common::PropertyValue>,
     /// Which cluster node may serve this read.
     /// UNSPECIFIED defaults to PRIMARY (leader-only reads).
     /// Use SECONDARY_PREFERRED for read scale-out in 3-node CE cluster.
@@ -21,6 +19,18 @@ pub struct ExecuteCypherRequest {
     /// Use LINEARIZABLE for strictest freshness (leader only, adds ~1 RTT).
     #[prost(message, optional, tag = "4")]
     pub read_concern: ::core::option::Option<super::replication::ReadConcern>,
+    /// Durability guarantee for write statements (CREATE / MERGE / SET / DELETE).
+    ///
+    /// UNSPECIFIED / omitted defaults to W1 (leader-acknowledged, not replicated).
+    /// Use MAJORITY for production writes that must survive a single node failure.
+    ///
+    /// Causal sessions (read_concern.after_index > 0) require write_concern.level
+    /// >= MAJORITY. The server rejects writes with lower durability in causal
+    /// sessions.
+    ///
+    /// Read-only queries ignore this field.
+    #[prost(message, optional, tag = "5")]
+    pub write_concern: ::core::option::Option<super::replication::WriteConcern>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecuteCypherResponse {
@@ -65,10 +75,8 @@ pub struct ExplainCypherRequest {
     #[prost(string, tag = "1")]
     pub query: ::prost::alloc::string::String,
     #[prost(map = "string, message", tag = "2")]
-    pub parameters: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        super::common::PropertyValue,
-    >,
+    pub parameters:
+        ::std::collections::HashMap<::prost::alloc::string::String, super::common::PropertyValue>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExplainCypherResponse {
@@ -80,10 +88,8 @@ pub struct QueryPlan {
     #[prost(string, tag = "1")]
     pub operator: ::prost::alloc::string::String,
     #[prost(map = "string, string", tag = "2")]
-    pub details: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub details:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     #[prost(message, repeated, tag = "3")]
     pub children: ::prost::alloc::vec::Vec<QueryPlan>,
     #[prost(double, tag = "4")]
@@ -96,10 +102,10 @@ pub mod cypher_service_client {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
-    use tonic::codegen::*;
     use tonic::codegen::http::Uri;
+    use tonic::codegen::*;
     /// OpenCypher-compatible query execution service.
     #[derive(Debug, Clone)]
     pub struct CypherServiceClient<T> {
@@ -144,9 +150,8 @@ pub mod cypher_service_client {
                     <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
                 >,
             >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
+                Into<StdError> + std::marker::Send + std::marker::Sync,
         {
             CypherServiceClient::new(InterceptedService::new(inner, interceptor))
         }
@@ -185,54 +190,40 @@ pub mod cypher_service_client {
         pub async fn execute_cypher(
             &mut self,
             request: impl tonic::IntoRequest<super::ExecuteCypherRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ExecuteCypherResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+        ) -> std::result::Result<tonic::Response<super::ExecuteCypherResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/coordinode.v1.query.CypherService/ExecuteCypher",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new("coordinode.v1.query.CypherService", "ExecuteCypher"),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "coordinode.v1.query.CypherService",
+                "ExecuteCypher",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Explain an OpenCypher query plan without executing.
         pub async fn explain_cypher(
             &mut self,
             request: impl tonic::IntoRequest<super::ExplainCypherRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ExplainCypherResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+        ) -> std::result::Result<tonic::Response<super::ExplainCypherResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/coordinode.v1.query.CypherService/ExplainCypher",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new("coordinode.v1.query.CypherService", "ExplainCypher"),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "coordinode.v1.query.CypherService",
+                "ExplainCypher",
+            ));
             self.inner.unary(req, path, codec).await
         }
     }
@@ -335,10 +326,10 @@ pub mod vector_service_client {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
-    use tonic::codegen::*;
     use tonic::codegen::http::Uri;
+    use tonic::codegen::*;
     /// Vector search operations.
     #[derive(Debug, Clone)]
     pub struct VectorServiceClient<T> {
@@ -383,9 +374,8 @@ pub mod vector_service_client {
                     <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
                 >,
             >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
+                Into<StdError> + std::marker::Send + std::marker::Sync,
         {
             VectorServiceClient::new(InterceptedService::new(inner, interceptor))
         }
@@ -424,54 +414,40 @@ pub mod vector_service_client {
         pub async fn vector_search(
             &mut self,
             request: impl tonic::IntoRequest<super::VectorSearchRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::VectorSearchResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+        ) -> std::result::Result<tonic::Response<super::VectorSearchResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/coordinode.v1.query.VectorService/VectorSearch",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new("coordinode.v1.query.VectorService", "VectorSearch"),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "coordinode.v1.query.VectorService",
+                "VectorSearch",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Hybrid search combining graph traversal and vector similarity.
         pub async fn hybrid_search(
             &mut self,
             request: impl tonic::IntoRequest<super::HybridSearchRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::HybridSearchResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+        ) -> std::result::Result<tonic::Response<super::HybridSearchResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/coordinode.v1.query.VectorService/HybridSearch",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new("coordinode.v1.query.VectorService", "HybridSearch"),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "coordinode.v1.query.VectorService",
+                "HybridSearch",
+            ));
             self.inner.unary(req, path, codec).await
         }
     }
@@ -600,10 +576,10 @@ pub mod text_service_client {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
-    use tonic::codegen::*;
     use tonic::codegen::http::Uri;
+    use tonic::codegen::*;
     /// Full-text search operations backed by tantivy (BM25 scoring, 30+ languages).
     #[derive(Debug, Clone)]
     pub struct TextServiceClient<T> {
@@ -648,9 +624,8 @@ pub mod text_service_client {
                     <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
                 >,
             >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
+                Into<StdError> + std::marker::Send + std::marker::Sync,
         {
             TextServiceClient::new(InterceptedService::new(inner, interceptor))
         }
@@ -696,27 +671,19 @@ pub mod text_service_client {
         pub async fn text_search(
             &mut self,
             request: impl tonic::IntoRequest<super::TextSearchRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TextSearchResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+        ) -> std::result::Result<tonic::Response<super::TextSearchResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/coordinode.v1.query.TextService/TextSearch",
-            );
+            let path =
+                http::uri::PathAndQuery::from_static("/coordinode.v1.query.TextService/TextSearch");
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new("coordinode.v1.query.TextService", "TextSearch"),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "coordinode.v1.query.TextService",
+                "TextSearch",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Fuse BM25 text search and cosine vector search using Reciprocal Rank Fusion (RRF).
@@ -734,26 +701,18 @@ pub mod text_service_client {
             tonic::Response<super::HybridTextVectorSearchResponse>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/coordinode.v1.query.TextService/HybridTextVectorSearch",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "coordinode.v1.query.TextService",
-                        "HybridTextVectorSearch",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "coordinode.v1.query.TextService",
+                "HybridTextVectorSearch",
+            ));
             self.inner.unary(req, path, codec).await
         }
     }

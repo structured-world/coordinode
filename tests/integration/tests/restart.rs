@@ -50,6 +50,7 @@ async fn cypher(
             // PRIMARY / LOCAL defaults — sufficient for regression tests.
             read_preference: 0,
             read_concern: None,
+            write_concern: None,
         })
         .await?
         .into_inner();

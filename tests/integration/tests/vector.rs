@@ -39,6 +39,7 @@ async fn cypher(
             parameters: params,
             read_preference: 0,
             read_concern: None,
+            write_concern: None,
         })
         .await?
         .into_inner();

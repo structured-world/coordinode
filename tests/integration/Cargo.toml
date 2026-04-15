@@ -20,6 +20,14 @@ path = "tests/restart.rs"
 name = "vector"
 path = "tests/vector.rs"
 
+[[test]]
+name = "cluster"
+path = "tests/cluster.rs"
+
+[[test]]
+name = "cypher"
+path = "tests/cypher.rs"
+
 [dependencies]
 tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
