@@ -36,17 +36,16 @@ COPY crates/ /build/crates/
 # for workspace resolution even when building only the server binary.
 # The test code itself is not compiled during Docker build.
 COPY tests/ /build/tests/
+# Proto file descriptor set — embedded into the coordinode binary at compile time
+# via include_bytes! for the REST/JSON proxy (structured-proxy, rest-proxy feature).
+COPY coordinode.descriptor.bin /build/coordinode.descriptor.bin
 
-# Build the coordinode binary (static musl link, release profile with LTO)
+# Build the coordinode binary (static musl link, release profile with LTO).
+# REST/JSON proxy (port 7081) is embedded via the rest-proxy feature (default).
 RUN MUSL_TARGET="$(uname -m)-unknown-linux-musl" \
     && cargo build --release --target "$MUSL_TARGET" --bin coordinode \
     && strip "target/$MUSL_TARGET/release/coordinode" \
     && cp "target/$MUSL_TARGET/release/coordinode" /coordinode-bin
-
-# Build structured-proxy (gRPC→REST transcoding)
-RUN MUSL_TARGET="$(uname -m)-unknown-linux-musl" \
-    && cargo install structured-proxy --target "$MUSL_TARGET" --root /proxy-out \
-    && strip /proxy-out/bin/structured-proxy
 
 # ─── Stage 2: Runtime (scratch, static binary) ──────────────────────
 FROM scratch
@@ -58,9 +57,8 @@ LABEL org.opencontainers.image.vendor="structured.world"
 LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 LABEL org.opencontainers.image.source="https://github.com/structured-world/coordinode"
 
-# Copy static binaries
+# Copy static binary (REST proxy is embedded, no separate structured-proxy binary needed)
 COPY --from=builder /coordinode-bin /coordinode
-COPY --from=builder /proxy-out/bin/structured-proxy /structured-proxy
 
 # Default data directory
 VOLUME ["/data"]

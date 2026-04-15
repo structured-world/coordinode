@@ -13,7 +13,7 @@ curl http://localhost:7084/health
 
 Expected response:
 ```json
-{"status": "serving"}
+{"status":"ok"}
 ```
 
 ## 2. Seed the Knowledge Graph
@@ -155,20 +155,21 @@ curl -s -X POST http://localhost:7081/v1/query/cypher/explain \
   | python3 -m json.tool
 ```
 
-Response (suggestions are in `plan.details.explain`):
+Response (suggestions are in `plan.details.suggestions`, logical plan in `plan.details.explain`):
 
 ```json
 {
   "plan": {
     "operator": "LogicalPlan",
+    "children": [],
     "details": {
-      "explain": "SUGGESTIONS (1):\n  1. [CRITICAL] CREATE INDEX: Full label scan on User.email —\n     filtering User nodes by 'email' without an index\n     DDL: CREATE INDEX user_email ON User(email)",
-      "cost": "1000",
-      "estimated_time_ms": "50.0",
-      "suggestions": "[CRITICAL] CREATE INDEX: Full label scan on User.email — ...",
+      "explain": "Cost: 4 | Estimated rows: 1 | Est. time: 0.0ms\n\nProject(Variable(\"u\"))\n  Filter(BinaryOp { left: PropertyAccess { expr: Variable(\"u\"), property: \"email\" }, op: Eq, right: Parameter(\"email\") })\n    NodeScan(u:User)\n",
+      "cost": "4",
+      "estimated_time_ms": "0.0",
+      "suggestions": "[CRITICAL] CREATE INDEX: Full label scan on User.email — filtering User nodes by 'email' without an index requires scanning all User nodes\n  DDL: CREATE INDEX user_email ON User(email)",
       "suggestion_count": "1"
     },
-    "estimatedRows": 1000.0
+    "estimatedRows": 1.32
   }
 }
 ```
