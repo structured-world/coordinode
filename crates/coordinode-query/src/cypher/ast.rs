@@ -818,4 +818,53 @@ mod tests {
         expr.substitute_params(&HashMap::from([("n".to_string(), Value::Int(99))]));
         assert_eq!(expr, Expr::Variable("n".to_string()));
     }
+
+    // ── is_write ─────────────────────────────────────────────────────────────
+
+    /// Pure read queries (MATCH/RETURN) must NOT be classified as writes.
+    #[test]
+    fn is_write_read_only_queries() {
+        let read_queries = [
+            "MATCH (n) RETURN n",
+            "MATCH (n:Person) WHERE n.age > 18 RETURN n.name",
+            "MATCH (a)-[:KNOWS]->(b) RETURN a, b",
+        ];
+        for q in &read_queries {
+            let ast = crate::cypher::parse(q).expect("parse");
+            assert!(!ast.is_write(), "MATCH query must NOT be write: {q}");
+        }
+    }
+
+    /// CREATE, MERGE, SET, DELETE, REMOVE must all be classified as writes.
+    #[test]
+    fn is_write_mutating_clauses() {
+        let write_queries = [
+            "CREATE (n:Person {name: 'Alice'})",
+            "MERGE (n:Person {id: 1})",
+            "MATCH (n) SET n.x = 1",
+            "MATCH (n) DELETE n",
+            "MATCH (n) REMOVE n.x",
+        ];
+        for q in &write_queries {
+            let ast = crate::cypher::parse(q).expect("parse");
+            assert!(ast.is_write(), "mutating query must be write: {q}");
+        }
+    }
+
+    /// MATCH followed by a write clause must be classified as a write.
+    #[test]
+    fn is_write_match_then_write() {
+        let queries = [
+            "MATCH (n:Person {id: 1}) SET n.updated = true",
+            "MATCH (n) WHERE n.active = false DELETE n",
+            "MATCH (a), (b) MERGE (a)-[:KNOWS]->(b)",
+        ];
+        for q in &queries {
+            let ast = crate::cypher::parse(q).expect("parse");
+            assert!(
+                ast.is_write(),
+                "MATCH+write must be classified as write: {q}"
+            );
+        }
+    }
 }
