@@ -1214,6 +1214,20 @@ pub fn execute(
         }
     }
 
+    // Substitute query parameters ($name → literal value) before execution.
+    // Cloned only when params are present to avoid heap allocation in the common case.
+    let plan_owned;
+    let plan = if ctx.params.is_empty() {
+        plan
+    } else {
+        plan_owned = {
+            let mut p = plan.clone();
+            p.substitute_params(&ctx.params);
+            p
+        };
+        &plan_owned
+    };
+
     let result = execute_op(&plan.root, ctx)?;
 
     // Flush MVCC write buffer: assign commit_ts and persist all buffered writes.
