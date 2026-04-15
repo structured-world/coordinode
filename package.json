@@ -1,7 +1,7 @@
 {
   "name": "coordinode-docs",
   "private": true,
-  "packageManager": "yarn@4.12.0",
+  "packageManager": "yarn@4.13.0",
   "scripts": {
     "gen-api-docs": "python3 scripts/gen-api-docs.py",
     "docs:dev": "DOCS_BASE=/ vitepress dev docs",
