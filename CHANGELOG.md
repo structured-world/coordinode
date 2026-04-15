@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.3.15 — 2026-04-15
+
+### coordinode-core
+## [0.3.15](https://github.com/structured-world/coordinode/compare/v0.3.14...v0.3.15) - 2026-04-15
+
+#### Performance
+
+- *(codec)* switch UidEncoder/Decoder to StreamVByte Coder1234
+- *(query)* reuse adjacency key buffer in graph traversal hot path
+
+### coordinode-embed
+## [0.3.15](https://github.com/structured-world/coordinode/compare/v0.3.14...v0.3.15) - 2026-04-15
+
+#### Fixed
+
+- *(query)* support query parameters in percentileCont/percentileDisc
+
+### coordinode-query
+## [0.3.15](https://github.com/structured-world/coordinode/compare/v0.3.14...v0.3.15) - 2026-04-15
+
+#### Fixed
+
+- *(query)* wire parameter substitution into execute() + expand tests
+- *(query)* support query parameters in percentileCont/percentileDisc
+- *(query)* implement percentileCont/percentileDisc with correct percentile arg
+
+#### Performance
+
+- *(query)* reuse adjacency key buffer in graph traversal hot path
+
+### coordinode-storage
+## [0.3.15](https://github.com/structured-world/coordinode/compare/v0.3.14...v0.3.15) - 2026-04-15
+
+#### Performance
+
+- *(storage)* batch Extra-targeting deltas in DocumentMerge
+
+---
+
 ## v0.3.13 — 2026-04-14
 
 ### coordinode-embed
