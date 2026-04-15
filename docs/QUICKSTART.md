@@ -1,5 +1,16 @@
 # Quick Start: From Zero to Hybrid Query in 5 Minutes
 
+## 0. Clone the Repository
+
+The seed script and example queries live in the repo:
+
+```bash
+git clone https://github.com/structured-world/coordinode.git
+cd coordinode
+```
+
+The Docker image is published at `ghcr.io/structured-world/coordinode:latest`.
+
 ## 1. Start CoordiNode
 
 ```bash

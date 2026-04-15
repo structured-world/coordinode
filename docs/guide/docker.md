@@ -7,6 +7,37 @@ The fastest way to run CoordiNode — no build tools required.
 - [Docker](https://docs.docker.com/get-docker/) 24+
 - [Docker Compose](https://docs.docker.com/compose/install/) v2
 
+## Get the Compose File
+
+Clone the repository to get `docker-compose.yml` and the bundled examples:
+
+```bash
+git clone https://github.com/structured-world/coordinode.git
+cd coordinode
+```
+
+The pre-built image is published at `ghcr.io/structured-world/coordinode`. If you prefer to use it directly without cloning, create a minimal `docker-compose.yml`:
+
+```yaml
+services:
+  coordinode:
+    image: ghcr.io/structured-world/coordinode:latest
+    container_name: coordinode
+    ports:
+      - "7080:7080"
+      - "7081:7081"
+      - "7084:7084"
+    volumes:
+      - coordinode-data:/data
+    environment:
+      - COORDINODE_LOG_FORMAT=json
+    restart: unless-stopped
+
+volumes:
+  coordinode-data:
+    driver: local
+```
+
 ## Start CoordiNode
 
 ```bash
@@ -22,7 +53,7 @@ curl http://localhost:7084/health
 Expected response:
 
 ```json
-{"status": "serving"}
+{"status":"ok"}
 ```
 
 ## Ports
