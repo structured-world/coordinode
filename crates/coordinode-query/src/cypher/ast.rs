@@ -851,6 +851,24 @@ mod tests {
         }
     }
 
+    /// DDL statements (CREATE/DROP INDEX, ALTER LABEL) must be classified as writes.
+    #[test]
+    fn is_write_ddl_clauses() {
+        let ddl_queries = [
+            "CREATE TEXT INDEX article_body ON :Article(body)",
+            "DROP TEXT INDEX article_body",
+            "CREATE INDEX email_idx ON :User(email)",
+            "DROP INDEX email_idx",
+            "CREATE VECTOR INDEX emb_idx ON :Doc(embedding) OPTIONS {metric: \"cosine\"}",
+            "DROP VECTOR INDEX emb_idx",
+            "ALTER LABEL User SET SCHEMA VALIDATED",
+        ];
+        for q in &ddl_queries {
+            let ast = crate::cypher::parse(q).expect("parse");
+            assert!(ast.is_write(), "DDL query must be write: {q}");
+        }
+    }
+
     /// MATCH followed by a write clause must be classified as a write.
     #[test]
     fn is_write_match_then_write() {
