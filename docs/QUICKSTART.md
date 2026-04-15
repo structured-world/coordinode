@@ -155,13 +155,22 @@ curl -s -X POST http://localhost:7081/v1/query/cypher/explain \
   | python3 -m json.tool
 ```
 
-Response includes suggestions like:
+Response (suggestions are in `plan.details.explain`):
 
-```
-SUGGESTIONS (1):
-  1. [CRITICAL] CREATE INDEX: Full label scan on User.email —
-     filtering User nodes by 'email' without an index
-     DDL: CREATE INDEX user_email ON User(email)
+```json
+{
+  "plan": {
+    "operator": "LogicalPlan",
+    "details": {
+      "explain": "SUGGESTIONS (1):\n  1. [CRITICAL] CREATE INDEX: Full label scan on User.email —\n     filtering User nodes by 'email' without an index\n     DDL: CREATE INDEX user_email ON User(email)",
+      "cost": "1000",
+      "estimated_time_ms": "50.0",
+      "suggestions": "[CRITICAL] CREATE INDEX: Full label scan on User.email — ...",
+      "suggestion_count": "1"
+    },
+    "estimatedRows": 1000.0
+  }
+}
 ```
 
 ## 5. Explore the API
