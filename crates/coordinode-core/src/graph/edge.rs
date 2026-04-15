@@ -357,10 +357,11 @@ impl PostingList {
         &self.uids
     }
 
-    /// Serialize to compact binary format (group-varint UidPack encoding).
+    /// Serialize to compact binary format (StreamVByte UidPack encoding, V5).
     ///
-    /// UIDs are delta-encoded in 256-UID blocks with LEB128 varint deltas,
-    /// achieving 2-4x compression compared to raw u64 encoding.
+    /// UIDs are delta-encoded in 256-UID blocks with StreamVByte Coder1234,
+    /// achieving 2-4x compression compared to raw u64 encoding with
+    /// SIMD-accelerated batch decode.
     pub fn to_bytes(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
         let pack = super::codec::encode_uids(&self.uids);
         rmp_serde::to_vec(&pack)

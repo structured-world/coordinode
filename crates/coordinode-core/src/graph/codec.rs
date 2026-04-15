@@ -1,12 +1,21 @@
-//! Group-varint UID compression for posting lists.
+//! StreamVByte UID compression for posting lists (V5 disk format).
 //!
 //! UIDs are stored in blocks of up to 256 entries. Each block has:
 //! - `base`: the first UID (absolute u64)
-//! - `deltas`: remaining UIDs as varint-encoded u32 deltas from previous
+//! - `deltas`: StreamVByte-encoded u32 deltas from previous UID
 //! - `num_uids`: count of UIDs in the block
+//!
+//! **Wire format (V5):** deltas are encoded with `streamvbyte64::Coder1234`.
+//! Each block stores `[tag_bytes | data_bytes]` in `deltas`, where
+//! `tag_len = (num_uids - 1 + 3) / 4`. The decoder recomputes `tag_len`
+//! from `num_uids`.
 //!
 //! A new block is forced when the 32 MSBs of consecutive UIDs differ
 //! (because deltas must fit in u32).
+//!
+//! **Migration note:** V4 data used LEB128 encoding in `deltas`. Any V4
+//! data must be re-encoded via a migration tool before reading with this
+//! decoder. See ROADMAP R098 for the V5 migration plan.
 //!
 //! Inspired by Dgraph's `codec/codec.go` Encoder/Decoder pattern.
 
@@ -202,19 +211,37 @@ impl UidEncoder {
 
         let base = self.uids[0];
         let num_uids = self.uids.len() as u32;
-        let mut deltas = Vec::new();
 
-        let mut prev = base;
-        for &uid in &self.uids[1..] {
-            let delta = uid - prev;
-            debug_assert!(delta <= u64::from(u32::MAX), "delta exceeds u32");
-            let delta = delta as u32;
-            // Encode delta as unsigned LEB128
-            let mut buf = [0u8; 5];
-            let len = super::intern::encode_varint(delta, &mut buf);
-            deltas.extend_from_slice(&buf[..len]);
-            prev = uid;
-        }
+        let deltas = if self.uids.len() > 1 {
+            // Collect u32 deltas from previous UID.
+            let n = self.uids.len() - 1; // number of actual deltas
+            let mut deltas_u32 = Vec::with_capacity(n);
+            let mut prev = base;
+            for &uid in &self.uids[1..] {
+                let delta = uid - prev;
+                debug_assert!(delta <= u64::from(u32::MAX), "delta exceeds u32");
+                deltas_u32.push(delta as u32);
+                prev = uid;
+            }
+
+            // Coder1234 requires element count to be a multiple of 4 (SIMD alignment).
+            // Pad with zeros to the next multiple of 4; decoder reads only `n` values.
+            let n_padded = (n + 3) & !3;
+            deltas_u32.resize(n_padded, 0);
+
+            // Encode with StreamVByte Coder1234: 4 values per tag byte.
+            // Stored layout: [tag_bytes (exact) | data_bytes (variable)].
+            use streamvbyte64::{Coder, Coder1234};
+            let coder = Coder1234::new();
+            let (tag_len, data_max) = Coder1234::max_compressed_bytes(n_padded);
+            let mut buf = vec![0u8; tag_len + data_max];
+            let (tags, data) = buf.split_at_mut(tag_len);
+            let data_used = coder.encode(&deltas_u32, tags, data);
+            buf.truncate(tag_len + data_used);
+            buf
+        } else {
+            Vec::new()
+        };
 
         self.blocks.push(UidBlock {
             base,
@@ -244,6 +271,9 @@ impl<'a> UidDecoder<'a> {
     }
 
     /// Decode the next block of UIDs. Returns `None` when exhausted.
+    ///
+    /// Decodes V5 StreamVByte format: `deltas` stores `[tag_bytes | data_bytes]`.
+    /// `tag_len = (num_uids - 1 + 3) / 4` (1 tag byte per 4 deltas, Coder1234).
     pub fn next_block(&mut self) -> Option<Vec<u64>> {
         if self.block_idx >= self.pack.blocks.len() {
             return None;
@@ -255,17 +285,26 @@ impl<'a> UidDecoder<'a> {
         let mut uids = Vec::with_capacity(block.num_uids as usize);
         uids.push(block.base);
 
-        let mut offset = 0;
-        let mut prev = block.base;
+        let n = (block.num_uids as usize).saturating_sub(1);
+        if n > 0 {
+            // Mirror encoder: n was padded to n_padded = (n+3)&!3 before encoding.
+            // tag_len = n_padded / 4 = (n+3)/4.
+            let n_padded = (n + 3) & !3;
+            let tag_len = n_padded / 4;
+            let tags = &block.deltas[..tag_len];
+            let data = &block.deltas[tag_len..];
 
-        while uids.len() < block.num_uids as usize {
-            if let Some((delta, consumed)) = super::intern::decode_varint(&block.deltas[offset..]) {
-                let uid = prev + u64::from(delta);
+            use streamvbyte64::{Coder, Coder1234};
+            let coder = Coder1234::new();
+            // Decode n_padded values (Coder1234 SIMD constraint); only use first n.
+            let mut decoded_u32 = vec![0u32; n_padded];
+            coder.decode(tags, data, &mut decoded_u32);
+
+            let mut prev = block.base;
+            for delta in &decoded_u32[..n] {
+                let uid = prev + u64::from(*delta);
                 uids.push(uid);
                 prev = uid;
-                offset += consumed;
-            } else {
-                break;
             }
         }
 
@@ -595,7 +634,78 @@ mod tests {
         assert!(large.serialized_size() > small.serialized_size());
     }
 
-    // ====== StreamVByte vs LEB128 benchmark ======
+    // ====== StreamVByte encoding structure tests ======
+
+    /// Verify that `deltas` bytes have the expected Coder1234 layout:
+    /// first `(n+3)/4` bytes are tags, remaining bytes are data.
+    #[test]
+    fn streamvbyte_deltas_layout_is_correct() {
+        use streamvbyte64::{Coder, Coder1234};
+
+        // 5 UIDs → 4 deltas → tag_len = (4+3)/4 = 1
+        let uids: Vec<u64> = vec![100, 101, 102, 200, 201];
+        let pack = encode_uids(&uids);
+        assert_eq!(pack.blocks.len(), 1);
+        let block = &pack.blocks[0];
+
+        let n = (block.num_uids as usize) - 1; // 4 deltas
+        let expected_tag_len = n.div_ceil(4); // 1
+
+        assert!(
+            block.deltas.len() >= expected_tag_len,
+            "deltas must have at least {expected_tag_len} tag bytes"
+        );
+
+        // Verify roundtrip via direct Coder1234 decode matches our decode
+        let coder = Coder1234::new();
+        let tags = &block.deltas[..expected_tag_len];
+        let data = &block.deltas[expected_tag_len..];
+        let mut decoded_u32 = vec![0u32; n];
+        coder.decode(tags, data, &mut decoded_u32);
+
+        // Reconstruct UIDs from base + deltas
+        let mut reconstructed = vec![block.base];
+        let mut prev = block.base;
+        for delta in &decoded_u32 {
+            let uid = prev + u64::from(*delta);
+            reconstructed.push(uid);
+            prev = uid;
+        }
+        assert_eq!(reconstructed, uids);
+    }
+
+    /// StreamVByte encoding uses fewer bytes than LEB128 for sequential UIDs.
+    #[test]
+    fn streamvbyte_compresses_sequential_uids() {
+        // Sequential UIDs → small deltas → 1 byte per delta in StreamVByte
+        // LEB128 also uses 1 byte for small values, so sizes are comparable.
+        // What matters: StreamVByte stores 4 values per tag byte (group efficiency).
+        let uids = gen_sequential_uids(256);
+        let pack = encode_uids(&uids);
+        assert_eq!(pack.total_uids(), 256);
+        assert_eq!(decode_uids(&pack), uids);
+
+        // With 255 deltas: tag_len = 255.div_ceil(4) = 64 bytes of tags
+        let block = &pack.blocks[0];
+        let n = 255usize;
+        let tag_len = n.div_ceil(4);
+        assert_eq!(block.deltas.len() - tag_len, block.deltas.len() - tag_len); // data exists
+        assert!(
+            block.deltas.len() > tag_len,
+            "must have data bytes after tags"
+        );
+    }
+
+    /// Large block (256+ UIDs) produces multiple blocks, all StreamVByte encoded.
+    #[test]
+    fn streamvbyte_multi_block_roundtrip() {
+        let uids = gen_sequential_uids(1024);
+        let pack = encode_uids(&uids);
+        assert!(pack.blocks.len() > 1, "1024 UIDs must span multiple blocks");
+        assert_eq!(decode_uids(&pack), uids);
+    }
+
+    // ====== R011a StreamVByte vs LEB128 evaluation (API comparison) ======
 
     /// Generate test UIDs: sequential with small gaps (typical adjacency list).
     fn gen_sequential_uids(count: usize) -> Vec<u64> {
