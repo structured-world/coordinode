@@ -12,7 +12,7 @@ use coordinode_raft::read_fence::{
     ReadConcern, ReadFenceError, ReadPreference, READ_FENCE_TIMEOUT,
 };
 
-use crate::proto::{common, query};
+use crate::proto::{common, query, replication};
 
 /// Extract source location context from gRPC request metadata.
 ///
@@ -217,6 +217,45 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                     ));
                 }
                 _ => {} // Majority, Snapshot: OK for causal sessions
+            }
+        }
+
+        // Causal session write-concern validation (G088).
+        //
+        // Writes in a causal session (after_index > 0) MUST use writeConcern >=
+        // majority. A sub-majority write (w:1, w:0) may be acknowledged to the
+        // client before it is replicated. If the leader crashes before replication,
+        // the write is lost — but the client already received an `applied_index` from
+        // the response. Any subsequent causal read with that `after_index` will wait
+        // forever on a follower (the entry was never committed) or observe a missing
+        // write (violating read-your-writes). This is a hard rejection, not a silent
+        // upgrade: the client must explicitly choose between volatile + non-causal or
+        // durable + causal.
+        //
+        // We detect write queries via AST inspection BEFORE execution to avoid
+        // executing a write that we would then reject.
+        if after_idx > 0 {
+            // Parse the query to determine if it contains any mutating clauses.
+            // On parse failure we let execution proceed and fail with a richer error.
+            if let Ok(ast) = coordinode_query::cypher::parse(&req.query) {
+                if ast.is_write() {
+                    let level = req
+                        .write_concern
+                        .as_ref()
+                        .map(|wc| wc.level)
+                        .unwrap_or(replication::WriteConcernLevel::Unspecified as i32);
+                    let is_majority = level == replication::WriteConcernLevel::Majority as i32;
+                    if !is_majority {
+                        return Err(Status::failed_precondition(
+                            "Causal sessions require writeConcern=MAJORITY for write \
+                             statements. A sub-majority write (w:1, w:0) may be lost \
+                             before replication: the resulting applied_index would be a \
+                             dangling causal dependency that followers can never satisfy. \
+                             Use a non-causal session for volatile writes, or upgrade to \
+                             writeConcern=MAJORITY.",
+                        ));
+                    }
+                }
             }
         }
 
@@ -511,8 +550,9 @@ mod tests {
         Request::new(query::ExecuteCypherRequest {
             query: q.to_string(),
             parameters: std::collections::HashMap::new(),
-            read_preference: 0, // UNSPECIFIED → Primary
-            read_concern: None, // UNSPECIFIED → Local
+            read_preference: 0,  // UNSPECIFIED → Primary
+            read_concern: None,  // UNSPECIFIED → Local
+            write_concern: None, // UNSPECIFIED → W1
         })
     }
 
@@ -872,6 +912,7 @@ mod tests {
                     level: 1, // READ_CONCERN_LEVEL_LOCAL
                     after_index: 42,
                 }),
+                write_concern: None,
             }))
             .await;
 
@@ -899,6 +940,7 @@ mod tests {
                     level: 3, // READ_CONCERN_LEVEL_LINEARIZABLE
                     after_index: 1,
                 }),
+                write_concern: None,
             }))
             .await;
 
@@ -932,6 +974,7 @@ mod tests {
                     level: 2, // READ_CONCERN_LEVEL_MAJORITY
                     after_index: 999,
                 }),
+                write_concern: None,
             }))
             .await;
 
@@ -976,6 +1019,7 @@ mod tests {
                     level: 2, // MAJORITY
                     after_index: operation_time,
                 }),
+                write_concern: None,
             }))
             .await;
 
@@ -1008,6 +1052,7 @@ mod tests {
                         level: level as i32,
                         after_index: 0,
                     }),
+                    write_concern: None,
                 }))
                 .await;
             assert!(
@@ -1016,5 +1061,134 @@ mod tests {
                 result.err()
             );
         }
+    }
+
+    // ── G088: write-concern validation in causal sessions ─────────────────────
+
+    /// Causal write without write_concern is rejected with FailedPrecondition.
+    ///
+    /// after_index > 0 signals a causal session. A write statement without an
+    /// explicit MAJORITY write_concern risks producing a dangling applied_index
+    /// that no follower can ever satisfy. The server must hard-reject it.
+    #[tokio::test]
+    async fn causal_write_without_concern_rejected() {
+        let (svc, _dir) = test_service();
+
+        let result = svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "CREATE (n:CausalWrite {x: 1})".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: Some(crate::proto::replication::ReadConcern {
+                    level: 2, // MAJORITY
+                    after_index: 1,
+                }),
+                write_concern: None, // omitted → treated as UNSPECIFIED (w:1)
+            }))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "causal write without write_concern must be rejected"
+        );
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::FailedPrecondition,
+            "must be FailedPrecondition"
+        );
+    }
+
+    /// Causal write with WriteConcern=W1 is rejected with FailedPrecondition.
+    ///
+    /// W1 (leader-acknowledged) is insufficient for causal sessions: the leader
+    /// may crash before the write is replicated, making the applied_index a
+    /// dangling dependency that followers can never satisfy.
+    #[tokio::test]
+    async fn causal_write_with_w1_rejected() {
+        let (svc, _dir) = test_service();
+
+        let result = svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "CREATE (n:CausalWrite {x: 2})".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: Some(crate::proto::replication::ReadConcern {
+                    level: 2, // MAJORITY
+                    after_index: 5,
+                }),
+                write_concern: Some(crate::proto::replication::WriteConcern {
+                    level: crate::proto::replication::WriteConcernLevel::W1 as i32,
+                    timeout_ms: 0,
+                    journal: false,
+                }),
+            }))
+            .await;
+
+        assert!(result.is_err(), "causal write with W1 must be rejected");
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::FailedPrecondition,
+            "must be FailedPrecondition"
+        );
+    }
+
+    /// Causal write with WriteConcern=MAJORITY is accepted in standalone mode.
+    ///
+    /// MAJORITY is the minimum required durability for writes in a causal session.
+    /// In standalone mode the write proceeds normally (no Raft replication).
+    #[tokio::test]
+    async fn causal_write_with_majority_accepted() {
+        let (svc, _dir) = test_service();
+
+        let result = svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "CREATE (n:CausalWrite {x: 3})".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: Some(crate::proto::replication::ReadConcern {
+                    level: 2, // MAJORITY
+                    after_index: 7,
+                }),
+                write_concern: Some(crate::proto::replication::WriteConcern {
+                    level: crate::proto::replication::WriteConcernLevel::Majority as i32,
+                    timeout_ms: 0,
+                    journal: false,
+                }),
+            }))
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "causal write with MAJORITY must succeed in standalone, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Read queries in causal sessions do not require write_concern.
+    ///
+    /// The write-concern gate is skipped entirely for read-only queries; only
+    /// mutating statements (CREATE, MERGE, SET, DELETE, …) are subject to it.
+    #[tokio::test]
+    async fn causal_read_without_write_concern_accepted() {
+        let (svc, _dir) = test_service();
+
+        let result = svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "MATCH (n:CausalWrite) RETURN n".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: Some(crate::proto::replication::ReadConcern {
+                    level: 2, // MAJORITY
+                    after_index: 10,
+                }),
+                write_concern: None, // read-only — write_concern irrelevant
+            }))
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "causal read without write_concern must succeed, got: {:?}",
+            result.err()
+        );
     }
 }

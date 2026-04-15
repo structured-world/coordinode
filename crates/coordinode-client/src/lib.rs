@@ -213,10 +213,12 @@ impl CoordinodeClient {
             parameters: proto_params,
             // read_preference = 0 → PRIMARY (leader-only, always consistent).
             // read_concern = None → LOCAL (serve whatever the node has applied).
-            // Both are left at proto defaults — clients that need follower reads
-            // or causal consistency will set these explicitly once R142 is done.
+            // write_concern = None → W1 (leader-acknowledged, default).
+            // These are left at proto defaults — clients that need follower reads,
+            // causal consistency, or custom write concerns set them explicitly.
             read_preference: 0,
             read_concern: None,
+            write_concern: None,
         });
 
         if let Some(loc) = location {
