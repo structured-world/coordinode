@@ -8,7 +8,9 @@ use coordinode_query::advisor::nplus1::NPlus1Detector;
 use coordinode_query::advisor::source::{self, grpc_keys, SourceContext};
 use coordinode_query::advisor::QueryRegistry;
 use coordinode_raft::cluster::RaftNode;
-use coordinode_raft::read_fence::{ReadConcern, ReadFenceError, ReadPreference};
+use coordinode_raft::read_fence::{
+    ReadConcern, ReadFenceError, ReadPreference, READ_FENCE_TIMEOUT,
+};
 
 use crate::proto::{common, query};
 
@@ -185,21 +187,62 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
 
         let start = std::time::Instant::now();
 
+        // Extract causal fence parameters before entering the Raft block so that
+        // validation can run in both cluster and standalone modes.
+        let concern_level = req.read_concern.as_ref().map(|rc| rc.level).unwrap_or(0);
+        let concern = ReadConcern::from_proto(concern_level);
+        let after_idx = req
+            .read_concern
+            .as_ref()
+            .map(|rc| rc.after_index)
+            .unwrap_or(0);
+
+        // Causal session validation: after_index requires readConcern >= MAJORITY.
+        //
+        // A LOCAL read offers no majority-commit guarantee, so a causal fence on top
+        // of it would be logically unsound. LINEARIZABLE is incompatible per
+        // arch/distribution/consistency.md ("afterClusterTime + linearizable = reject").
+        if after_idx > 0 {
+            match concern {
+                ReadConcern::Local => {
+                    return Err(Status::failed_precondition(
+                        "readConcern=LOCAL is incompatible with afterClusterTime. \
+                         Causal reads require readConcern=MAJORITY.",
+                    ));
+                }
+                ReadConcern::Linearizable => {
+                    return Err(Status::failed_precondition(
+                        "readConcern=LINEARIZABLE is incompatible with afterClusterTime. \
+                         Use readConcern=MAJORITY for causal reads.",
+                    ));
+                }
+                _ => {} // Majority, Snapshot: OK for causal sessions
+            }
+        }
+
         // --- Read fence: enforce readPreference and readConcern before query ---
         //
-        // In cluster mode, apply the fence before touching the database.
-        // In standalone mode (raft_node = None), skip — always serves locally.
+        // In cluster mode, apply the preference/concern fence, then the causal
+        // after_index fence if the client supplied one.
+        // In standalone mode (raft_node = None), all writes are immediately visible
+        // and applied_index is always 0 — causal fences are trivially satisfied.
         let (applied_index, served_by_leader) = if let Some(ref raft) = self.raft_node {
             let preference = ReadPreference::from_proto(req.read_preference);
-            // ReadConcern is a proto message with a `level: ReadConcernLevel` field.
-            // Extract the level (i32) and convert to our enum.
-            let concern_level = req.read_concern.as_ref().map(|rc| rc.level).unwrap_or(0);
-            let concern = ReadConcern::from_proto(concern_level);
             let mut fence = raft.read_fence();
             fence
                 .apply_default(preference, concern)
                 .await
                 .map_err(fence_error_to_status)?;
+
+            // Causal fence: block until applied_index >= after_idx.
+            // after_idx = 0 means no fence (default).
+            if after_idx > 0 {
+                fence
+                    .wait_for_index(after_idx, READ_FENCE_TIMEOUT)
+                    .await
+                    .map_err(fence_error_to_status)?;
+            }
+
             let idx = fence.applied_index();
             let is_leader = raft.is_leader().await;
             (idx, is_leader)
@@ -806,6 +849,171 @@ mod tests {
             assert_eq!(
                 &back, original,
                 "roundtrip failed for {original:?}: got {back:?}"
+            );
+        }
+    }
+
+    // --- Causal consistency (R142) tests ---
+
+    /// after_index > 0 with readConcern=LOCAL is rejected with FailedPrecondition.
+    ///
+    /// A LOCAL read offers no majority-commit guarantee; combining it with an
+    /// afterClusterTime fence is logically unsound and hard-rejected by the server.
+    #[tokio::test]
+    async fn causal_after_index_with_local_concern_rejected() {
+        let (svc, _dir) = test_service();
+
+        let result = svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "MATCH (n) RETURN n".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: Some(crate::proto::replication::ReadConcern {
+                    level: 1, // READ_CONCERN_LEVEL_LOCAL
+                    after_index: 42,
+                }),
+            }))
+            .await;
+
+        assert!(result.is_err(), "after_index + LOCAL should return error");
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::FailedPrecondition,
+            "should be FailedPrecondition"
+        );
+    }
+
+    /// after_index > 0 with readConcern=LINEARIZABLE is rejected with FailedPrecondition.
+    ///
+    /// LINEARIZABLE is incompatible with afterClusterTime per the consistency spec.
+    #[tokio::test]
+    async fn causal_after_index_with_linearizable_rejected() {
+        let (svc, _dir) = test_service();
+
+        let result = svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "MATCH (n) RETURN n".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: Some(crate::proto::replication::ReadConcern {
+                    level: 3, // READ_CONCERN_LEVEL_LINEARIZABLE
+                    after_index: 1,
+                }),
+            }))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "after_index + LINEARIZABLE should return error"
+        );
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::FailedPrecondition,
+            "should be FailedPrecondition"
+        );
+    }
+
+    /// after_index > 0 with readConcern=MAJORITY succeeds in standalone mode.
+    ///
+    /// In standalone (no Raft), after_index is trivially satisfied because all
+    /// writes are immediately visible. The fence is skipped; the query executes.
+    #[tokio::test]
+    async fn causal_after_index_with_majority_standalone_succeeds() {
+        let (svc, _dir) = test_service();
+
+        // Even a large after_index is fine in standalone — no Raft means the
+        // fence block is never entered, so the read proceeds immediately.
+        let result = svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "MATCH (n) RETURN n".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: Some(crate::proto::replication::ReadConcern {
+                    level: 2, // READ_CONCERN_LEVEL_MAJORITY
+                    after_index: 999,
+                }),
+            }))
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "after_index + MAJORITY in standalone should succeed, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Write followed by causal read: applied_index in stats is 0 (standalone).
+    ///
+    /// Verifies the round-trip: write returns applied_index=0 in standalone mode,
+    /// and a read with after_index=0 (= value from write response) succeeds.
+    /// This is the simplest causal session: no fence needed in standalone.
+    #[tokio::test]
+    async fn causal_write_read_roundtrip_standalone() {
+        let (svc, _dir) = test_service();
+
+        // Write
+        let write_resp = svc
+            .execute_cypher(cypher_request("CREATE (n:CausalTest {val: 1}) RETURN n"))
+            .await
+            .expect("write should succeed");
+
+        let stats = write_resp
+            .into_inner()
+            .stats
+            .expect("stats must be present");
+        let operation_time = stats.applied_index;
+        // In standalone mode, applied_index is always 0.
+        assert_eq!(operation_time, 0, "standalone applied_index must be 0");
+
+        // Subsequent causal read with after_index = operation_time (= 0).
+        // after_index = 0 means no fence — trivially satisfied everywhere.
+        let read_result = svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "MATCH (n:CausalTest) RETURN n.val".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: Some(crate::proto::replication::ReadConcern {
+                    level: 2, // MAJORITY
+                    after_index: operation_time,
+                }),
+            }))
+            .await;
+
+        assert!(
+            read_result.is_ok(),
+            "causal read after write must succeed: {:?}",
+            read_result.err()
+        );
+        let body = read_result.unwrap().into_inner();
+        assert_eq!(
+            body.rows.len(),
+            1,
+            "causal read must return the written node"
+        );
+    }
+
+    /// after_index = 0 with any readConcern level is always valid (no fence).
+    #[tokio::test]
+    async fn causal_after_index_zero_always_valid() {
+        let (svc, _dir) = test_service();
+
+        for level in [0u32, 1, 2, 4] {
+            // 0=UNSPECIFIED, 1=LOCAL, 2=MAJORITY, 4=SNAPSHOT
+            let result = svc
+                .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                    query: "MATCH (n) RETURN n".to_string(),
+                    parameters: std::collections::HashMap::new(),
+                    read_preference: 0,
+                    read_concern: Some(crate::proto::replication::ReadConcern {
+                        level: level as i32,
+                        after_index: 0,
+                    }),
+                }))
+                .await;
+            assert!(
+                result.is_ok(),
+                "level={level} with after_index=0 should succeed, got: {:?}",
+                result.err()
             );
         }
     }
