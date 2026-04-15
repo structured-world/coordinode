@@ -45,7 +45,7 @@ All three filters apply within a single MVCC snapshot — consistent by construc
 | `text_score(prop, "query")` | BM25 relevance score (0.0–1.0) | `RETURN text_score(n.body, "attention") AS score` |
 | `point.distance(p1, p2)` | Haversine distance in metres | `WHERE point.distance(n.location, $pt) < 1000` |
 
-See [Cypher Extensions](../CYPHER_EXTENSIONS) for the full syntax reference including spatial predicates and encrypted search.
+See [Cypher Extensions](/cypher/extensions) for the full syntax reference including spatial predicates and encrypted search.
 
 ## Execution Plan
 
@@ -85,4 +85,4 @@ The retrieved documents plus their graph neighbourhood form the context window f
 
 - [Data Model](./data-model) — how nodes carry vector and text properties
 - [MVCC Transactions](./transactions) — consistency guarantees
-- [Cypher Extensions](../CYPHER_EXTENSIONS) — full syntax reference
+- [Cypher Extensions](/cypher/extensions) — full syntax reference
