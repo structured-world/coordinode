@@ -200,7 +200,10 @@ impl Drop for CoordinodeProcess {
 ///
 /// Uses `COORDINODE_BIN` env var first (CI / explicit override), then falls
 /// back to the Cargo debug build in the workspace target directory.
-fn binary_path() -> PathBuf {
+///
+/// Exposed `pub` so integration tests can directly `Command::new(binary_path())`
+/// for non-standard startup scenarios (e.g. checking `--mode=compute` is rejected).
+pub fn binary_path() -> PathBuf {
     if let Ok(path) = std::env::var("COORDINODE_BIN") {
         return PathBuf::from(path);
     }
