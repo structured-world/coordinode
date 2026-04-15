@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.3.16 — 2026-04-15
+
+### coordinode-server
+## [0.3.16](https://github.com/structured-world/coordinode/compare/v0.3.15...v0.3.16) - 2026-04-15
+
+#### Added
+
+- *(server)* gate REST proxy behind rest-proxy feature flag
+- *(server)* embed REST proxy in coordinode binary
+
+---
+
 ## v0.3.15 — 2026-04-15
 
 ### coordinode-core
