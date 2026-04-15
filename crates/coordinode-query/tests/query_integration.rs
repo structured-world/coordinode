@@ -1021,6 +1021,59 @@ fn aggregate_percentile_cont_with_query_parameter() {
     );
 }
 
+#[test]
+fn aggregate_percentile_disc_with_query_parameter() {
+    // Same as above but for percentileDisc (nearest-rank variant).
+    // Person ages: [25, 30, 30, 35, 40]. percentileDisc(age, $p) with $p=0.0 → 25.0.
+    let (_dir, engine, mut interner) = setup_social_graph();
+
+    let mut params = std::collections::HashMap::new();
+    params.insert("p".into(), Value::Float(0.0));
+
+    let result = run_cypher_with_params(
+        "MATCH (n:Person) RETURN percentileDisc(n.age, $p) AS result",
+        &engine,
+        &mut interner,
+        params,
+    );
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result[0].get("result"),
+        Some(&Value::Float(25.0)),
+        "percentileDisc(age, $p) with $p=0.0 should return the minimum (25.0)"
+    );
+}
+
+#[test]
+fn query_parameter_in_where_clause() {
+    // Verify that $params in WHERE predicates are substituted before execution.
+    // Uses the plan-level substitute_params() rewriter called inside execute().
+    // Person ages: [25, 30, 30, 35, 40]. $min_age=35 → Dave (40) and Eve (35).
+    let (_dir, engine, mut interner) = setup_social_graph();
+
+    let mut params = std::collections::HashMap::new();
+    params.insert("min_age".into(), Value::Int(35));
+
+    let result = run_cypher_with_params(
+        "MATCH (n:Person) WHERE n.age >= $min_age RETURN n.name AS name ORDER BY n.age",
+        &engine,
+        &mut interner,
+        params,
+    );
+
+    assert_eq!(result.len(), 2, "should match Eve (35) and Dave (40)");
+    let names: Vec<_> = result.iter().filter_map(|r| r.get("name")).collect();
+    assert!(
+        names.contains(&&Value::String("Eve".into())),
+        "Eve (age 35) should be in results"
+    );
+    assert!(
+        names.contains(&&Value::String("Dave".into())),
+        "Dave (age 40) should be in results"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // AS OF TIMESTAMP (basic time travel)
 // ═══════════════════════════════════════════════════════════════════════
