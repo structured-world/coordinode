@@ -40,6 +40,8 @@ pub mod proto {
         pub use cdc::ReadConcern;
         pub use cdc::ReadConcernLevel;
         pub use cdc::ReadPreference;
+        pub use cdc::WriteConcern;
+        pub use cdc::WriteConcernLevel;
     }
     pub mod admin {
         pub mod cluster {

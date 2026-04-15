@@ -21,6 +21,17 @@ pub struct ExecuteCypherRequest {
     /// Use LINEARIZABLE for strictest freshness (leader only, adds ~1 RTT).
     #[prost(message, optional, tag = "4")]
     pub read_concern: ::core::option::Option<super::replication::ReadConcern>,
+    /// Durability guarantee for write statements (CREATE / MERGE / SET / DELETE).
+    /// UNSPECIFIED / omitted defaults to W1 (leader-acknowledged, not replicated).
+    /// Use MAJORITY for production writes that must survive a single node failure.
+    /// Causal sessions (read_concern.after_index > 0) require write_concern.level
+    /// >= MAJORITY. The server rejects writes with lower durability in causal
+    /// sessions because a non-majority write may never be replicated: if the leader
+    /// crashes before drain, the returned applied_index becomes a dangling causal
+    /// dependency that can never be satisfied by a follower read.
+    /// Read-only queries ignore this field.
+    #[prost(message, optional, tag = "5")]
+    pub write_concern: ::core::option::Option<super::replication::WriteConcern>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecuteCypherResponse {

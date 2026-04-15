@@ -16,6 +16,41 @@ pub struct Query {
     pub hints: Vec<QueryHint>,
 }
 
+impl Query {
+    /// Returns `true` if this query contains any write (mutating) clauses.
+    ///
+    /// Write clauses: CREATE, MERGE, MERGE ALL, UPSERT, DELETE, SET, REMOVE,
+    /// and DDL operations (CREATE INDEX / DROP INDEX / ALTER LABEL / etc.).
+    ///
+    /// Used by the CypherService handler to enforce write-concern validation
+    /// in causal sessions: a write in a causal session requires
+    /// `writeConcern >= majority` to avoid dangling `operationTime` references
+    /// when the leader crashes before replicating.
+    pub fn is_write(&self) -> bool {
+        self.clauses.iter().any(|c| {
+            matches!(
+                c,
+                Clause::Create(_)
+                    | Clause::Merge(_)
+                    | Clause::MergeMany(_)
+                    | Clause::Upsert(_)
+                    | Clause::Delete(_)
+                    | Clause::Set(_, _)
+                    | Clause::Remove(_)
+                    | Clause::AlterLabel(_)
+                    | Clause::CreateTextIndex(_)
+                    | Clause::DropTextIndex(_)
+                    | Clause::CreateEncryptedIndex(_)
+                    | Clause::DropEncryptedIndex(_)
+                    | Clause::CreateIndex(_)
+                    | Clause::DropIndex(_)
+                    | Clause::CreateVectorIndex(_)
+                    | Clause::DropVectorIndex(_)
+            )
+        })
+    }
+}
+
 /// Per-query optimizer hint from `/*+ key('value') */` syntax.
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryHint {

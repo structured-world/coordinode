@@ -557,6 +557,7 @@ mod tests {
                 parameters: std::collections::HashMap::new(),
                 read_preference: 0, // UNSPECIFIED → Primary
                 read_concern: None, // UNSPECIFIED → Local
+                write_concern: None,
             }))
             .await
             .expect("execute_cypher should succeed")
