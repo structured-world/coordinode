@@ -832,6 +832,7 @@ dependencies = [
 name = "coordinode-integration"
 version = "0.3.17"
 dependencies = [
+ "coordinode-client",
  "prost",
  "rand 0.10.1",
  "tempfile",

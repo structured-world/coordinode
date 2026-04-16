@@ -63,6 +63,39 @@ pub use config::{ClientConfig, CoordinodeClientBuilder};
 pub use error::ClientError;
 pub use value::Value;
 
+/// Opaque causal consistency token.
+///
+/// Returned by [`CoordinodeClient::execute_causal_write`] and consumed by
+/// [`CoordinodeClient::execute_causal_read`] to enforce read-your-writes
+/// ordering in a cluster.
+///
+/// The token wraps the Raft log index (`applied_index`) that the write was
+/// committed at on the serving leader. Passing it to a subsequent read
+/// guarantees that read will not be served until the replica has applied at
+/// least that log entry — even if the request is routed to a follower.
+///
+/// ## Standalone / embedded mode
+///
+/// In non-cluster deployments the server always returns `applied_index = 0`.
+/// Reads with a zero-valued token have no fence effect — they succeed
+/// immediately. You can safely use the causal API in standalone mode; it just
+/// has no observable effect on ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CausalToken(u64);
+
+impl CausalToken {
+    /// The underlying Raft log index.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for CausalToken {
+    fn from(index: u64) -> Self {
+        Self(index)
+    }
+}
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::panic::Location;
@@ -88,7 +121,10 @@ mod proto {
     }
 }
 
-use proto::query::{cypher_service_client::CypherServiceClient, ExecuteCypherRequest};
+use proto::{
+    query::{cypher_service_client::CypherServiceClient, ExecuteCypherRequest},
+    replication::{ReadConcern, ReadConcernLevel, WriteConcern, WriteConcernLevel},
+};
 
 /// A single result row: column name → property value.
 pub type Row = HashMap<String, Value>;
@@ -188,6 +224,106 @@ impl CoordinodeClient {
         self.execute_cypher_inner(query.into(), params, location)
     }
 
+    // ── Causal consistency ────────────────────────────────────────────────────
+
+    /// Execute a write with **majority durability**, returning a causal token.
+    ///
+    /// The write is acknowledged only after a quorum of replicas has applied
+    /// it to their Raft log. The returned [`CausalToken`] wraps the committed
+    /// log index and can be passed to [`execute_causal_read`] to enforce
+    /// read-your-writes ordering — even when the read is served by a follower.
+    ///
+    /// **Standalone / embedded mode:** the token is always `0` (the server
+    /// operates without Raft). Passing it to a causal read has no fence effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ClientError::Grpc` if the server rejects the request (e.g. the
+    /// node is not the Raft leader, or `read_concern.after_index` is set with
+    /// a non-majority write concern).
+    ///
+    /// [`execute_causal_read`]: CoordinodeClient::execute_causal_read
+    #[track_caller]
+    pub fn execute_causal_write(
+        &mut self,
+        query: impl Into<String>,
+    ) -> impl Future<Output = Result<(Vec<Row>, CausalToken), ClientError>> + '_ {
+        let location = if self.config.debug_source_tracking {
+            Some(Location::caller())
+        } else {
+            None
+        };
+        self.execute_causal_write_inner(query.into(), HashMap::new(), location)
+    }
+
+    /// Execute a write with **majority durability** and named parameters.
+    ///
+    /// Identical to [`execute_causal_write`] but accepts query parameters.
+    ///
+    /// [`execute_causal_write`]: CoordinodeClient::execute_causal_write
+    #[track_caller]
+    pub fn execute_causal_write_with_params(
+        &mut self,
+        query: impl Into<String>,
+        params: HashMap<String, Value>,
+    ) -> impl Future<Output = Result<(Vec<Row>, CausalToken), ClientError>> + '_ {
+        let location = if self.config.debug_source_tracking {
+            Some(Location::caller())
+        } else {
+            None
+        };
+        self.execute_causal_write_inner(query.into(), params, location)
+    }
+
+    /// Execute a read that is guaranteed to observe the write identified by
+    /// `after`.
+    ///
+    /// The serving node waits until its applied log index is ≥ `after.as_u64()`
+    /// before executing the read. This guarantees **read-your-writes** and
+    /// **monotonic reads** when the write was issued with
+    /// [`execute_causal_write`].
+    ///
+    /// Use `ReadPreference::SECONDARY_PREFERRED` in combination with this
+    /// method to scale out reads while preserving causal ordering.
+    ///
+    /// **Standalone / embedded mode:** the fence has no effect (the server
+    /// returns immediately).
+    ///
+    /// [`execute_causal_write`]: CoordinodeClient::execute_causal_write
+    #[track_caller]
+    pub fn execute_causal_read(
+        &mut self,
+        query: impl Into<String>,
+        after: CausalToken,
+    ) -> impl Future<Output = Result<Vec<Row>, ClientError>> + '_ {
+        let location = if self.config.debug_source_tracking {
+            Some(Location::caller())
+        } else {
+            None
+        };
+        self.execute_causal_read_inner(query.into(), HashMap::new(), after, location)
+    }
+
+    /// Execute a causal read with named parameters.
+    ///
+    /// Identical to [`execute_causal_read`] but accepts query parameters.
+    ///
+    /// [`execute_causal_read`]: CoordinodeClient::execute_causal_read
+    #[track_caller]
+    pub fn execute_causal_read_with_params(
+        &mut self,
+        query: impl Into<String>,
+        params: HashMap<String, Value>,
+        after: CausalToken,
+    ) -> impl Future<Output = Result<Vec<Row>, ClientError>> + '_ {
+        let location = if self.config.debug_source_tracking {
+            Some(Location::caller())
+        } else {
+            None
+        };
+        self.execute_causal_read_inner(query.into(), params, after, location)
+    }
+
     // ── Config access ─────────────────────────────────────────────────────────
 
     /// Returns `true` when source location tracking is enabled.
@@ -203,6 +339,64 @@ impl CoordinodeClient {
         params: HashMap<String, Value>,
         location: Option<&'static Location<'static>>,
     ) -> Result<Vec<Row>, ClientError> {
+        let (rows, _applied_index) = self
+            .execute_request(
+                query, params, 0,    // read_preference = PRIMARY
+                None, // read_concern = LOCAL (default)
+                None, // write_concern = W1 (default)
+                location,
+            )
+            .await?;
+        Ok(rows)
+    }
+
+    async fn execute_causal_write_inner(
+        &mut self,
+        query: String,
+        params: HashMap<String, Value>,
+        location: Option<&'static Location<'static>>,
+    ) -> Result<(Vec<Row>, CausalToken), ClientError> {
+        let write_concern = Some(WriteConcern {
+            level: WriteConcernLevel::Majority as i32,
+            journal: false,
+            timeout_ms: 0,
+        });
+        let (rows, applied_index) = self
+            .execute_request(query, params, 0, None, write_concern, location)
+            .await?;
+        Ok((rows, CausalToken(applied_index)))
+    }
+
+    async fn execute_causal_read_inner(
+        &mut self,
+        query: String,
+        params: HashMap<String, Value>,
+        after: CausalToken,
+        location: Option<&'static Location<'static>>,
+    ) -> Result<Vec<Row>, ClientError> {
+        let read_concern = Some(ReadConcern {
+            level: ReadConcernLevel::Majority as i32,
+            after_index: after.as_u64(),
+        });
+        let (rows, _applied_index) = self
+            .execute_request(query, params, 0, read_concern, None, location)
+            .await?;
+        Ok(rows)
+    }
+
+    /// Low-level request executor shared by all public methods.
+    ///
+    /// Returns the decoded rows **and** the `applied_index` from `QueryStats`
+    /// so causal methods can wrap it in a [`CausalToken`].
+    async fn execute_request(
+        &mut self,
+        query: String,
+        params: HashMap<String, Value>,
+        read_preference: i32,
+        read_concern: Option<ReadConcern>,
+        write_concern: Option<WriteConcern>,
+        location: Option<&'static Location<'static>>,
+    ) -> Result<(Vec<Row>, u64), ClientError> {
         let proto_params = params
             .into_iter()
             .map(|(k, v)| (k, value::to_proto(v)))
@@ -211,14 +405,9 @@ impl CoordinodeClient {
         let mut request = tonic::Request::new(ExecuteCypherRequest {
             query,
             parameters: proto_params,
-            // read_preference = 0 → PRIMARY (leader-only, always consistent).
-            // read_concern = None → LOCAL (serve whatever the node has applied).
-            // write_concern = None → W1 (leader-acknowledged, default).
-            // These are left at proto defaults — clients that need follower reads,
-            // causal consistency, or custom write concerns set them explicitly.
-            read_preference: 0,
-            read_concern: None,
-            write_concern: None,
+            read_preference,
+            read_concern,
+            write_concern,
         });
 
         if let Some(loc) = location {
@@ -227,6 +416,8 @@ impl CoordinodeClient {
 
         let response = self.cypher.execute_cypher(request).await?;
         let body = response.into_inner();
+
+        let applied_index = body.stats.as_ref().map_or(0, |s| s.applied_index);
 
         let columns = body.columns;
         let rows = body
@@ -241,7 +432,7 @@ impl CoordinodeClient {
             })
             .collect();
 
-        Ok(rows)
+        Ok((rows, applied_index))
     }
 }
 
@@ -367,5 +558,48 @@ mod tests {
             matches!(result, Err(ClientError::InvalidEndpoint(_))),
             "expected InvalidEndpoint error"
         );
+    }
+
+    // ── CausalToken tests ─────────────────────────────────────────────────────
+
+    /// CausalToken wraps the log index and exposes it via as_u64.
+    #[test]
+    fn causal_token_as_u64() {
+        let token = CausalToken(42);
+        assert_eq!(token.as_u64(), 42);
+    }
+
+    /// CausalToken::from(u64) round-trips through as_u64.
+    #[test]
+    fn causal_token_from_u64() {
+        let token = CausalToken::from(100);
+        assert_eq!(token.as_u64(), 100);
+    }
+
+    /// Zero token (standalone mode) is a valid value.
+    #[test]
+    fn causal_token_zero() {
+        let token = CausalToken::from(0);
+        assert_eq!(token.as_u64(), 0);
+    }
+
+    /// CausalToken ordering: higher index = happens-after.
+    #[test]
+    fn causal_token_ordering() {
+        let earlier = CausalToken(10);
+        let later = CausalToken(20);
+        assert!(later > earlier);
+        assert!(earlier < later);
+        assert_eq!(earlier, CausalToken(10));
+    }
+
+    /// CausalToken is Copy: can be used multiple times without moving.
+    #[test]
+    fn causal_token_is_copy() {
+        let token = CausalToken(7);
+        // If CausalToken were not Copy, the second line would fail to compile.
+        let _a = token;
+        let _b = token;
+        assert_eq!(_a, _b);
     }
 }
