@@ -195,7 +195,43 @@ impl LogStore {
 
         // Load persisted caches from Partition::Raft — O(1) recovery.
         let last_purged = Self::load_log_id_from_partition(&engine, KEY_PURGED);
-        let last_log_id = Self::load_log_id_from_partition(&engine, KEY_LAST_LOG_ID);
+        let mut last_log_id = Self::load_log_id_from_partition(&engine, KEY_LAST_LOG_ID);
+
+        // Crash-recovery path: if the LSM key was not flushed before process
+        // death but oplog segment files exist, reconstruct last_log_id by
+        // scanning the last segment (which may lack a footer).
+        //
+        // Without this, openraft sees an empty log state and calls initialize(),
+        // which tries to create oplog segment 0 — but the file already exists
+        // → I/O error "File exists (os error 17)".
+        if last_log_id.is_none() && oplog.has_segments() {
+            match Self::recover_last_log_id_from_oplog(&oplog) {
+                Ok(Some(recovered_id)) => {
+                    tracing::warn!(
+                        recovered_index = recovered_id.index,
+                        "raft: last_log_id missing from LSM — recovered from oplog segment"
+                    );
+                    // Persist to avoid O(N) re-scan on the next restart.
+                    if let Ok(bytes) = rmp_serde::to_vec(&recovered_id) {
+                        let _ = engine.put(Partition::Raft, KEY_LAST_LOG_ID, &bytes);
+                    }
+                    last_log_id = Some(recovered_id);
+                }
+                Ok(None) => {
+                    // Segments exist but contain no valid entries — leave last_log_id as None.
+                    // openraft will re-initialize the Raft group cleanly.
+                    tracing::warn!(
+                        "raft: oplog segments found but no valid entries readable — treating log as empty"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "raft: failed to recover last_log_id from oplog — treating log as empty"
+                    );
+                }
+            }
+        }
 
         Ok(Self {
             engine,
@@ -203,6 +239,28 @@ impl LogStore {
             last_log_id: Arc::new(Mutex::new(last_log_id)),
             last_purged: Arc::new(Mutex::new(last_purged)),
         })
+    }
+
+    /// Reconstruct `last_log_id` from oplog segment files.
+    ///
+    /// Delegates the segment scan to `OplogManager::recover_last_entry`, which
+    /// handles both properly sealed segments (footer present) and unsealed
+    /// segments that survived an unclean shutdown (entries fsynced, no footer).
+    ///
+    /// Returns `Ok(Some(log_id))` if at least one valid entry is found,
+    /// `Ok(None)` if all segments are empty, or `Err` on I/O failure.
+    fn recover_last_log_id_from_oplog(oplog: &OplogManager) -> Result<Option<LogId>, io::Error> {
+        let last_oplog_entry = oplog
+            .recover_last_entry()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        match last_oplog_entry {
+            Some(entry) => {
+                let raft_entry = Self::oplog_to_entry(entry)?;
+                Ok(Some(raft_entry.log_id))
+            }
+            None => Ok(None),
+        }
     }
 
     fn load_log_id_from_partition(engine: &StorageEngine, key: &[u8]) -> Option<LogId> {
@@ -1843,5 +1901,120 @@ mod tests {
             "oracle should be past 700, got {}",
             final_ts.as_raw()
         );
+    }
+
+    // ── Regression: unclean shutdown restart ─────────────────────────────────
+    //
+    // Bug: CoordiNode 0.3.17 crashed on restart with:
+    //   "create segment /data/raft_oplog/oplog-00000000000000000000.bin: File exists (os error 17)"
+    //
+    // Root cause: after crash between oplog.flush() and put(KEY_LAST_LOG_ID),
+    // the LSM key was absent but the segment file existed. On restart,
+    // last_log_id=None → openraft called initialize() → SegmentWriter::create
+    // with create_new(true) on the existing segment → EEXIST.
+    //
+    // Fix: LogStore::open() now recovers last_log_id from oplog segments when
+    // the LSM key is missing.
+
+    /// Simulate crash between fsync and LSM key write: segment file exists but
+    /// KEY_LAST_LOG_ID was never persisted.  On re-open, last_log_id must be
+    /// reconstructed from the segment (not None), preventing the EEXIST crash.
+    #[tokio::test]
+    async fn restart_after_crash_recovers_last_log_id_from_oplog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = StorageConfig::new(dir.path());
+
+        // ── First "run": write entries, then simulate crash (delete LSM key) ──
+        {
+            let engine = Arc::new(StorageEngine::open(&config).expect("open engine"));
+            let mut store = LogStore::open(Arc::clone(&engine)).expect("open store");
+
+            let entries = vec![
+                make_entry(1, 1, "alpha"),
+                make_entry(2, 1, "beta"),
+                make_entry(3, 1, "gamma"),
+            ];
+            store
+                .append(entries, IOFlushed::noop())
+                .await
+                .expect("append");
+
+            // State should have last_log_id=3 after a normal append.
+            let state = store.get_log_state().await.expect("get_log_state");
+            assert_eq!(
+                state.last_log_id.expect("last_log_id after append").index,
+                3
+            );
+
+            // Simulate crash: remove the LSM key that was persisted by append().
+            // The oplog segment files (in data_dir/raft_oplog/) remain on disk.
+            engine
+                .delete(Partition::Raft, KEY_LAST_LOG_ID)
+                .expect("delete LSM key to simulate crash");
+
+            // engine and store drop here — on a real crash the process dies instead.
+        }
+
+        // ── Restart: re-open the same data directory ──────────────────────────
+        {
+            let engine = Arc::new(StorageEngine::open(&config).expect("re-open engine"));
+            let mut store = LogStore::open(engine).expect("re-open store");
+
+            let state = store
+                .get_log_state()
+                .await
+                .expect("get_log_state after restart");
+
+            // last_log_id must be recovered from the oplog segment, not None.
+            // Without the fix this would be None → openraft calls initialize() →
+            // SegmentWriter::create on existing segment → EEXIST crash.
+            let recovered = state.last_log_id.expect(
+                "last_log_id must be recovered from oplog after simulated crash; \
+                 None would cause EEXIST crash on restart",
+            );
+            assert_eq!(
+                recovered.index, 3,
+                "recovered index must match last appended entry"
+            );
+        }
+    }
+
+    /// Variant: crash on a sealed segment (proper footer present).
+    /// After normal rotation the last segment has a footer → SegmentReader::open
+    /// succeeds on the fast path.  Recovery must still work.
+    #[tokio::test]
+    async fn restart_after_crash_with_sealed_segment_recovers_last_log_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = StorageConfig::new(dir.path());
+
+        {
+            let engine = Arc::new(StorageEngine::open(&config).expect("open engine"));
+            let mut store = LogStore::open(Arc::clone(&engine)).expect("open store");
+
+            let entries = vec![make_entry(1, 1, "x"), make_entry(2, 1, "y")];
+            store
+                .append(entries, IOFlushed::noop())
+                .await
+                .expect("append");
+
+            // Force segment rotation so the active writer gets a footer.
+            store.oplog.lock().expect("lock").rotate().expect("rotate");
+
+            // Simulate crash: delete LSM key after rotation.
+            engine
+                .delete(Partition::Raft, KEY_LAST_LOG_ID)
+                .expect("delete LSM key");
+        }
+
+        {
+            let engine = Arc::new(StorageEngine::open(&config).expect("re-open engine"));
+            let mut store = LogStore::open(engine).expect("re-open store");
+
+            let state = store.get_log_state().await.expect("get_log_state");
+            let recovered = state
+                .last_log_id
+                .expect("last_log_id must be recovered from sealed segment");
+            assert_eq!(recovered.index, 2);
+        }
     }
 }

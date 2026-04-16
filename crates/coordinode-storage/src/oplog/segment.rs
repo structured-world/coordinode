@@ -438,6 +438,92 @@ impl SegmentReader {
     pub fn into_entries(self) -> Vec<OplogEntry> {
         self.entries
     }
+
+    /// Best-effort forward scan of a segment file that may lack a valid footer.
+    ///
+    /// Used during crash recovery: after an unclean shutdown the active segment
+    /// was fsynced but never sealed (no footer written).  [`open`](Self::open)
+    /// would fail because the footer is missing, so this method performs a raw
+    /// forward scan and stops at the first parse or checksum error.
+    ///
+    /// Only entries whose CRC32 matches are returned; any trailing partial
+    /// write is silently discarded — it was not durable.
+    ///
+    /// Returns an error only for I/O failures (file unreadable, wrong magic,
+    /// unsupported version, wrong `shard_id`).  An empty `Vec` is returned for
+    /// a segment that contains no valid entries (e.g., only a header).
+    pub fn scan_without_footer(path: &Path, shard_id: u32) -> StorageResult<Vec<OplogEntry>> {
+        let data = std::fs::read(path)
+            .map_err(|e| StorageError::Io(format!("read segment {:?}: {e}", path)))?;
+
+        if (data.len() as u64) < HEADER_SIZE {
+            // File is too short even for the header — treat as empty.
+            return Ok(Vec::new());
+        }
+
+        let mut cursor = Cursor::new(&data);
+        let header = read_header(&mut cursor)?;
+
+        if header.version != FORMAT_VERSION {
+            return Err(StorageError::Io(format!(
+                "unsupported oplog version {} in {:?}",
+                header.version, path
+            )));
+        }
+        if header.shard_id != shard_id {
+            return Ok(Vec::new());
+        }
+
+        // Scan forward, collecting entries with valid CRC32.  Stop at the
+        // first parse error — that marks the boundary of durable data.
+        let mut entries = Vec::new();
+        loop {
+            let pos_before = cursor.position() as usize;
+
+            // Try to read varint length prefix.
+            let payload_len = match decode_varint(&mut cursor) {
+                Ok(n) => n as usize,
+                Err(_) => break, // EOF or partial varint → done
+            };
+
+            let pos_after_varint = cursor.position() as usize;
+            let remaining = data.len().saturating_sub(pos_after_varint);
+
+            // Need payload_len bytes + 4 bytes CRC32.
+            if remaining < payload_len + 4 {
+                // Partial frame — not durable.
+                break;
+            }
+
+            let payload = &data[pos_after_varint..pos_after_varint + payload_len];
+            let crc_bytes =
+                &data[pos_after_varint + payload_len..pos_after_varint + payload_len + 4];
+
+            let expected = crc32fast::hash(payload);
+            let actual =
+                u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+
+            if expected != actual {
+                // Checksum mismatch → partial / corrupt tail, stop here.
+                break;
+            }
+
+            match OplogEntry::decode(payload) {
+                Ok(entry) => {
+                    entries.push(entry);
+                    // Advance cursor past payload + CRC32.
+                    cursor.set_position((pos_after_varint + payload_len + 4) as u64);
+                }
+                Err(_) => {
+                    // Deserialization error → corrupt entry, rewind and stop.
+                    cursor.set_position(pos_before as u64);
+                    break;
+                }
+            }
+        }
+
+        Ok(entries)
+    }
 }
 
 #[cfg(test)]

@@ -233,6 +233,37 @@ impl OplogManager {
         Ok(purged)
     }
 
+    /// `true` if any segments (sealed or partial) are present on disk.
+    pub fn has_segments(&self) -> bool {
+        !self.sealed.is_empty()
+    }
+
+    /// Scan all segments from last to first and return the last valid
+    /// [`OplogEntry`] found.
+    ///
+    /// Used during crash recovery: when the persisted `last_log_id` LSM key is
+    /// missing (process died after fsync but before the LSM write), this method
+    /// reconstructs the last entry from the segment files — including segments
+    /// that were never sealed (no footer) but whose entries were fsynced.
+    ///
+    /// Returns `Ok(None)` if no valid entries are found in any segment.
+    pub fn recover_last_entry(&self) -> StorageResult<Option<OplogEntry>> {
+        for (_, path) in self.sealed.iter().rev() {
+            // Fast path: normal sealed segment with a valid footer.
+            let entries = match SegmentReader::open(path) {
+                Ok(r) => r.into_entries(),
+                // Slow path: unsealed/partial segment (crashed before seal).
+                Err(_) => {
+                    SegmentReader::scan_without_footer(path, self.shard_id).unwrap_or_default()
+                }
+            };
+            if let Some(last) = entries.into_iter().last() {
+                return Ok(Some(last));
+            }
+        }
+        Ok(None)
+    }
+
     /// Number of sealed segments on disk.
     pub fn sealed_segment_count(&self) -> usize {
         self.sealed.len()
