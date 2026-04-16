@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.3.18 — 2026-04-16
+
+### coordinode-raft
+## [0.3.18](https://github.com/structured-world/coordinode/compare/v0.3.17...v0.3.18) - 2026-04-16
+
+#### Added
+
+- *(server)* R150 — monolithic binary --mode=full, shared :7080, NodeInfoLayer
+
+#### Fixed
+
+- *(raft)* recover last_log_id from oplog on unclean shutdown restart
+
+### coordinode-server
+## [0.3.18](https://github.com/structured-world/coordinode/compare/v0.3.17...v0.3.18) - 2026-04-16
+
+#### Added
+
+- *(server)* R150 — monolithic binary --mode=full, shared :7080, NodeInfoLayer
+
+### coordinode-storage
+## [0.3.18](https://github.com/structured-world/coordinode/compare/v0.3.17...v0.3.18) - 2026-04-16
+
+#### Fixed
+
+- *(raft)* recover last_log_id from oplog on unclean shutdown restart
+
+---
+
 ## v0.3.17 — 2026-04-15
 
 ### coordinode-core
