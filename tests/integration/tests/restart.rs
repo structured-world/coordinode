@@ -391,6 +391,49 @@ async fn bug3_hnsw_flexible_rebuilt_after_restart() {
 
 // ── Bug4: MATCH invisible after restart in FLEXIBLE mode ──────────────────────
 
+// ── SIGKILL restart: crash recovery (no graceful shutdown) ───────────────────
+
+/// Verify that CoordiNode survives an unclean shutdown (SIGKILL) and restarts
+/// without crashing.
+///
+/// Root cause of the crash: after an unclean shutdown the Raft oplog segment
+/// file exists on disk but the LSM key `raft:oplog:last_log_id` was not
+/// flushed before process death.  On restart, `LogStore::open()` saw
+/// `last_log_id = None`, openraft treated the log as empty, called
+/// `initialize()`, and tried to create `oplog-0000.bin` with `create_new`
+/// semantics — failing with EEXIST (os error 17).
+///
+/// Fix: `LogStore::open()` now reconstructs `last_log_id` from existing oplog
+/// segment files when the LSM key is absent.
+///
+/// This test exercises the end-to-end path: write data → SIGKILL → restart.
+/// Because SIGKILL may lose in-flight memtable data, we don't assert on the
+/// node count after restart — only that the server starts and accepts queries.
+#[tokio::test]
+async fn bug5_sigkill_restart_survives_without_crash() {
+    let proc = CoordinodeProcess::start().await;
+
+    // Write several nodes to ensure the Raft log has entries fsynced.
+    for i in 0u32..5 {
+        let mut params = HashMap::new();
+        params.insert("i".to_string(), pv_string(&format!("crash-{i}")));
+        let _ = cypher(&proc, "CREATE (n:CrashTest {id: $i})", params).await;
+    }
+
+    // Unclean shutdown — SIGKILL, no graceful flush.
+    let proc = proc.restart_unclean().await;
+
+    // The server must start and accept a query (not crash with EEXIST).
+    // We don't assert node count because memtable may not have been flushed.
+    let result = cypher_q(&proc, "MATCH (n:CrashTest) RETURN count(n) AS cnt").await;
+    assert!(
+        result.is_ok(),
+        "crash recovery: server must start after SIGKILL and accept queries; \
+         got error: {:?}",
+        result.err()
+    );
+}
+
 /// Bug4 — after restart, `MATCH (n:Label {prop: $val})` returns 0 results in
 /// FLEXIBLE schema mode, even though the node demonstrably exists.
 ///

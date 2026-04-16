@@ -50,6 +50,43 @@ impl CoordinodeProcess {
         proc
     }
 
+    /// Crash the running process with SIGKILL then re-spawn against the same
+    /// data directory.
+    ///
+    /// Unlike [`restart`](Self::restart) (which uses SIGTERM for graceful
+    /// shutdown), this method simulates an unclean shutdown: no memtable flush,
+    /// no WAL seal, no LSM key writes that happen after fsync.
+    ///
+    /// The server must be able to restart cleanly from the on-disk state even
+    /// after SIGKILL — this is what crash-recovery tests verify.
+    pub async fn restart_unclean(mut self) -> Self {
+        // SIGKILL: immediate termination, no cleanup, no Drop.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+
+        // Take the TempDir out before self is dropped.
+        let data_dir = self
+            .data_dir
+            .take()
+            .expect("data_dir missing — restart called twice?");
+
+        let port = free_port();
+        let data_path = data_dir.path().to_path_buf();
+        // `self` drops here: child already waited, data_dir is None.
+
+        let child = spawn_binary(port, data_path);
+        let proc = Self {
+            child,
+            port,
+            data_dir: Some(data_dir),
+        };
+        proc.wait_for_grpc(Duration::from_secs(15)).await;
+        // After SIGKILL the Raft node must re-elect itself as leader.
+        // wait_for_leader retries PRIMARY reads until election completes.
+        proc.wait_for_leader(Duration::from_secs(10)).await;
+        proc
+    }
+
     /// Kill the running process then re-spawn against the same data directory.
     ///
     /// This simulates a server restart while keeping persisted data intact.
@@ -158,6 +195,45 @@ impl CoordinodeProcess {
                 );
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Block (async) until this node is the Raft leader and accepts PRIMARY reads.
+    ///
+    /// After an unclean shutdown (SIGKILL) the single-node Raft instance must
+    /// re-elect itself as leader.  TCP connectivity is available before leader
+    /// election completes, so this method retries a trivial PRIMARY read until
+    /// it succeeds or `timeout` elapses.
+    pub async fn wait_for_leader(&self, timeout: Duration) {
+        use crate::proto::query::{
+            cypher_service_client::CypherServiceClient, ExecuteCypherRequest,
+        };
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let channel = tonic::transport::Endpoint::from_shared(self.endpoint())
+                .expect("valid endpoint")
+                .connect_lazy();
+            let mut client = CypherServiceClient::new(channel);
+            let result = client
+                .execute_cypher(ExecuteCypherRequest {
+                    query: "RETURN 1".to_string(),
+                    parameters: Default::default(),
+                    read_preference: 0, // PRIMARY
+                    read_concern: None,
+                    write_concern: None,
+                })
+                .await;
+            if result.is_ok() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "coordinode on port {} did not become Raft leader within {:?}",
+                    self.port, timeout
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
         }
     }
 }
