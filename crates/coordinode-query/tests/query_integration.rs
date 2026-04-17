@@ -3255,17 +3255,67 @@ fn text_score_returns_bm25() {
     }
 }
 
+// R-HYB1b regression: `text_match()` against a property with NO full-text
+// index must error at execute time, not silently pass every row through
+// (the old graceful-degradation returned all rows — a semantic bug that made
+// `MATCH (n:Chunk) WHERE text_match(n.body, "foo") RETURN n` return every
+// Chunk when no index existed, the opposite of what the caller asked for).
+// Consistent with R-HYB1 `text_score()` guard and R-HYB2b RankFuse guard.
 #[test]
-fn text_match_no_index_graceful() {
+fn text_match_no_index_errors() {
     let (_dir, engine, mut interner) = setup_social_graph();
-    let results = run_cypher(
-        "MATCH (n:Person) WHERE text_match(n.name, \"Alice\") RETURN n",
+    let ast = parse("MATCH (n:Person) WHERE text_match(n.name, \"Alice\") RETURN n").unwrap();
+    let plan = build_logical_plan(&ast).unwrap();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let err = execute(&plan, &mut ctx)
+        .expect_err("text_match() without any text index must error, not pass rows through");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("text_match()") && msg.contains("CREATE TEXT INDEX"),
+        "error must name text_match() and tell the user how to fix it, got: {msg}"
+    );
+}
+
+// R-HYB1b regression: when a `TextIndexRegistry` is wired but has no entry
+// for the specific (label, property), the error must name BOTH the label
+// and the property so the user can create the right index.
+#[test]
+fn text_match_registry_missing_entry_errors_with_label_and_property() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    insert_node(
         &engine,
+        1,
+        1,
+        "Article",
+        &[("body", Value::String("rust rust rust".into()))],
         &mut interner,
     );
+
+    // Registry exists but has NO index for (Article, body).
+    let text_reg_dir = dir.path().join("empty_text_reg");
+    std::fs::create_dir_all(&text_reg_dir).unwrap();
+    let text_reg = TextIndexRegistry::new(&text_reg_dir);
+
+    let ast = parse("MATCH (a:Article) WHERE text_match(a.body, \"rust\") RETURN a").unwrap();
+    let plan = build_logical_plan(&ast).unwrap();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    ctx.text_index_registry = Some(&text_reg);
+
+    let err = execute(&plan, &mut ctx).expect_err(
+        "text_match() with registry but no matching index must error (not pass rows through)",
+    );
+    let msg = err.to_string();
     assert!(
-        !results.is_empty(),
-        "without text index, all rows should pass (graceful)"
+        msg.contains("text_match()")
+            && msg.contains("Article")
+            && msg.contains("body")
+            && msg.contains("CREATE TEXT INDEX"),
+        "error must name the missing (Article, body) pair and the remedy, got: {msg}"
     );
 }
 
