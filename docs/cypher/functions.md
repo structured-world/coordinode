@@ -99,7 +99,48 @@ MATCH (d:Doc) WHERE text_match(d.body, "rust")
 RETURN hybrid_score(d, "rust") AS score    // text-only, returns text_score
 ```
 
-`hybrid_score` requires at least one of `text_match(...)` or `vector_distance(...)` / `vector_similarity(...)` in `WHERE` against the same node — calling it on a plan with neither filter is a query-time error (no silent zeros). See [`arch/search/document-scoring.md`](../arch/search/document-scoring.md#scoring-functions-in-opencypher) for the full scoring surface (the `rrf_score` and `doc_score` helpers land with R-HYB2b / R-HYB2c).
+`hybrid_score` requires at least one of `text_match(...)` or `vector_distance(...)` / `vector_similarity(...)` in `WHERE` against the same node — calling it on a plan with neither filter is a query-time error (no silent zeros).
+
+### Reciprocal Rank Fusion ✅ 🔷
+
+| Function | Signature | Returns | Notes |
+|----------|-----------|---------|-------|
+| `rrf_score` | `rrf_score([method_exprs...], {vector: ..., text: ...})` | Float | Reciprocal Rank Fusion over N scoring methods |
+
+`rrf_score` fuses multiple scoring methods (vector similarity, BM25 text match, edge vector) into one ranking by summing `1 / (60 + rank_i)` across methods. Rank is positional over the full result set, so this is a materialising operator — the planner inserts a `RankFuse` stage that scores every row, sorts per method, assigns 1-based competition ranks (ties share a rank), and writes the fused score to the row. The constant `k = 60` is the IR standard from Cormack et al. 2009 and is deliberately non-tunable — freezing `k` is part of the stable API contract.
+
+```cypher
+// Rank-fuse vector + text on the same chunks
+MATCH (c:Chunk)
+RETURN c.text,
+       rrf_score([c.embedding, c.body], {vector: $query_vec, text: "raft consensus"}) AS score
+ORDER BY score DESC
+LIMIT 20
+```
+
+```cypher
+// Node vector + edge vector + text in a single RRF
+MATCH (u:User {id: $me})-[r:RATED]->(m:Movie)
+RETURN m.title,
+       rrf_score([m.embedding, r.context_emb, m.summary],
+                 {vector: $query_vec, text: $query_text}) AS score
+ORDER BY score DESC LIMIT 10
+```
+
+**Signature rules:**
+
+- First argument is a non-empty list of property expressions. Each expression must resolve to either a vector property (HNSW index on `(Label, property)`, or an edge vector property) or a text property (full-text index on `(Label, property)`).
+- Second argument is a map literal with the keys the methods need: `vector` when any method is a vector expression, `text` when any method is a text expression. Map parameters (`$q`) are accepted and shape-checked at execution time.
+- Any third argument (including attempts to override `k`) is rejected at plan time.
+
+**When RRF beats weighted sum:** vector similarity lives in `[0, 1]` while BM25 scores are unbounded, so a naïve weighted sum is dominated by whichever method has larger raw scores. RRF uses only ranks, so scale mismatches across methods cancel out — a document that is top-K on every method wins regardless of raw-score magnitude.
+
+**Error conditions** (plan-time where possible):
+- `rrf_score([...], query, {k: N})` — 3+ arguments rejected.
+- `rrf_score([], ...)` — empty method list rejected.
+- `rrf_score(..., {unknown: ...})` — map keys other than `vector` / `text` rejected.
+- `rrf_score` inside a `WHERE` clause — rejected (rank is not defined pre-materialisation).
+- Method `var.prop` with no HNSW vector index and no full-text index and no vector values — rejected at execute time with a message naming the offending method.
 
 ### Encrypted Search Function ✅ 🔷
 

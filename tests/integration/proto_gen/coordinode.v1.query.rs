@@ -6,8 +6,10 @@ pub struct ExecuteCypherRequest {
     pub query: ::prost::alloc::string::String,
     /// Named query parameters bound at execution time.
     #[prost(map = "string, message", tag = "2")]
-    pub parameters:
-        ::std::collections::HashMap<::prost::alloc::string::String, super::common::PropertyValue>,
+    pub parameters: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        super::common::PropertyValue,
+    >,
     /// Which cluster node may serve this read.
     /// UNSPECIFIED defaults to PRIMARY (leader-only reads).
     /// Use SECONDARY_PREFERRED for read scale-out in 3-node CE cluster.
@@ -25,8 +27,12 @@ pub struct ExecuteCypherRequest {
     /// Use MAJORITY for production writes that must survive a single node failure.
     ///
     /// Causal sessions (read_concern.after_index > 0) require write_concern.level
-    /// >= MAJORITY. The server rejects writes with lower durability in causal
-    /// sessions.
+    ///
+    /// >
+    /// > = MAJORITY. The server rejects writes with lower durability in causal
+    /// > sessions because a non-majority write may never be replicated: if the leader
+    /// > crashes before drain, the returned applied_index becomes a dangling causal
+    /// > dependency that can never be satisfied by a follower read.
     ///
     /// Read-only queries ignore this field.
     #[prost(message, optional, tag = "5")]
@@ -75,8 +81,10 @@ pub struct ExplainCypherRequest {
     #[prost(string, tag = "1")]
     pub query: ::prost::alloc::string::String,
     #[prost(map = "string, message", tag = "2")]
-    pub parameters:
-        ::std::collections::HashMap<::prost::alloc::string::String, super::common::PropertyValue>,
+    pub parameters: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        super::common::PropertyValue,
+    >,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExplainCypherResponse {
@@ -88,8 +96,10 @@ pub struct QueryPlan {
     #[prost(string, tag = "1")]
     pub operator: ::prost::alloc::string::String,
     #[prost(map = "string, string", tag = "2")]
-    pub details:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub details: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     #[prost(message, repeated, tag = "3")]
     pub children: ::prost::alloc::vec::Vec<QueryPlan>,
     #[prost(double, tag = "4")]
@@ -102,10 +112,10 @@ pub mod cypher_service_client {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value
+        clippy::let_unit_value,
     )]
-    use tonic::codegen::http::Uri;
     use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
     /// OpenCypher-compatible query execution service.
     #[derive(Debug, Clone)]
     pub struct CypherServiceClient<T> {
@@ -150,8 +160,9 @@ pub mod cypher_service_client {
                     <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
                 >,
             >,
-            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
-                Into<StdError> + std::marker::Send + std::marker::Sync,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
         {
             CypherServiceClient::new(InterceptedService::new(inner, interceptor))
         }
@@ -190,529 +201,54 @@ pub mod cypher_service_client {
         pub async fn execute_cypher(
             &mut self,
             request: impl tonic::IntoRequest<super::ExecuteCypherRequest>,
-        ) -> std::result::Result<tonic::Response<super::ExecuteCypherResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::ExecuteCypherResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/coordinode.v1.query.CypherService/ExecuteCypher",
             );
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "coordinode.v1.query.CypherService",
-                "ExecuteCypher",
-            ));
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("coordinode.v1.query.CypherService", "ExecuteCypher"),
+                );
             self.inner.unary(req, path, codec).await
         }
         /// Explain an OpenCypher query plan without executing.
         pub async fn explain_cypher(
             &mut self,
             request: impl tonic::IntoRequest<super::ExplainCypherRequest>,
-        ) -> std::result::Result<tonic::Response<super::ExplainCypherResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::ExplainCypherResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/coordinode.v1.query.CypherService/ExplainCypher",
             );
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "coordinode.v1.query.CypherService",
-                "ExplainCypher",
-            ));
-            self.inner.unary(req, path, codec).await
-        }
-    }
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct VectorSearchRequest {
-    /// Label to search within.
-    #[prost(string, tag = "1")]
-    pub label: ::prost::alloc::string::String,
-    /// Property name containing vectors.
-    #[prost(string, tag = "2")]
-    pub property: ::prost::alloc::string::String,
-    /// Query vector.
-    #[prost(message, optional, tag = "3")]
-    pub query_vector: ::core::option::Option<super::common::Vector>,
-    /// Number of nearest neighbors to return.
-    #[prost(uint32, tag = "4")]
-    pub top_k: u32,
-    /// Distance metric (cosine, l2, dot, l1).
-    #[prost(enumeration = "DistanceMetric", tag = "5")]
-    pub metric: i32,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct VectorSearchResponse {
-    #[prost(message, repeated, tag = "1")]
-    pub results: ::prost::alloc::vec::Vec<VectorResult>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct VectorResult {
-    #[prost(message, optional, tag = "1")]
-    pub node: ::core::option::Option<super::graph::Node>,
-    #[prost(float, tag = "2")]
-    pub distance: f32,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct HybridSearchRequest {
-    /// Starting node for graph traversal.
-    #[prost(uint64, tag = "1")]
-    pub start_node_id: u64,
-    /// Edge type to traverse.
-    #[prost(string, tag = "2")]
-    pub edge_type: ::prost::alloc::string::String,
-    /// Max traversal depth.
-    #[prost(uint32, tag = "3")]
-    pub max_depth: u32,
-    /// Vector search parameters applied after traversal.
-    #[prost(string, tag = "4")]
-    pub vector_property: ::prost::alloc::string::String,
-    #[prost(message, optional, tag = "5")]
-    pub query_vector: ::core::option::Option<super::common::Vector>,
-    #[prost(uint32, tag = "6")]
-    pub top_k: u32,
-    #[prost(enumeration = "DistanceMetric", tag = "7")]
-    pub metric: i32,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct HybridSearchResponse {
-    #[prost(message, repeated, tag = "1")]
-    pub results: ::prost::alloc::vec::Vec<VectorResult>,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum DistanceMetric {
-    Unspecified = 0,
-    Cosine = 1,
-    L2 = 2,
-    Dot = 3,
-    L1 = 4,
-}
-impl DistanceMetric {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "DISTANCE_METRIC_UNSPECIFIED",
-            Self::Cosine => "DISTANCE_METRIC_COSINE",
-            Self::L2 => "DISTANCE_METRIC_L2",
-            Self::Dot => "DISTANCE_METRIC_DOT",
-            Self::L1 => "DISTANCE_METRIC_L1",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "DISTANCE_METRIC_UNSPECIFIED" => Some(Self::Unspecified),
-            "DISTANCE_METRIC_COSINE" => Some(Self::Cosine),
-            "DISTANCE_METRIC_L2" => Some(Self::L2),
-            "DISTANCE_METRIC_DOT" => Some(Self::Dot),
-            "DISTANCE_METRIC_L1" => Some(Self::L1),
-            _ => None,
-        }
-    }
-}
-/// Generated client implementations.
-pub mod vector_service_client {
-    #![allow(
-        unused_variables,
-        dead_code,
-        missing_docs,
-        clippy::wildcard_imports,
-        clippy::let_unit_value
-    )]
-    use tonic::codegen::http::Uri;
-    use tonic::codegen::*;
-    /// Vector search operations.
-    #[derive(Debug, Clone)]
-    pub struct VectorServiceClient<T> {
-        inner: tonic::client::Grpc<T>,
-    }
-    impl VectorServiceClient<tonic::transport::Channel> {
-        /// Attempt to create a new client by connecting to a given endpoint.
-        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
-        where
-            D: TryInto<tonic::transport::Endpoint>,
-            D::Error: Into<StdError>,
-        {
-            let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
-            Ok(Self::new(conn))
-        }
-    }
-    impl<T> VectorServiceClient<T>
-    where
-        T: tonic::client::GrpcService<tonic::body::Body>,
-        T::Error: Into<StdError>,
-        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
-        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
-    {
-        pub fn new(inner: T) -> Self {
-            let inner = tonic::client::Grpc::new(inner);
-            Self { inner }
-        }
-        pub fn with_origin(inner: T, origin: Uri) -> Self {
-            let inner = tonic::client::Grpc::with_origin(inner, origin);
-            Self { inner }
-        }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> VectorServiceClient<InterceptedService<T, F>>
-        where
-            F: tonic::service::Interceptor,
-            T::ResponseBody: Default,
-            T: tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-                Response = http::Response<
-                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
-                >,
-            >,
-            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
-                Into<StdError> + std::marker::Send + std::marker::Sync,
-        {
-            VectorServiceClient::new(InterceptedService::new(inner, interceptor))
-        }
-        /// Compress requests with the given encoding.
-        ///
-        /// This requires the server to support it otherwise it might respond with an
-        /// error.
-        #[must_use]
-        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.inner = self.inner.send_compressed(encoding);
-            self
-        }
-        /// Enable decompressing responses.
-        #[must_use]
-        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.inner = self.inner.accept_compressed(encoding);
-            self
-        }
-        /// Limits the maximum size of a decoded message.
-        ///
-        /// Default: `4MB`
-        #[must_use]
-        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
-            self.inner = self.inner.max_decoding_message_size(limit);
-            self
-        }
-        /// Limits the maximum size of an encoded message.
-        ///
-        /// Default: `usize::MAX`
-        #[must_use]
-        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
-            self.inner = self.inner.max_encoding_message_size(limit);
-            self
-        }
-        /// Search for nearest neighbors by vector similarity.
-        pub async fn vector_search(
-            &mut self,
-            request: impl tonic::IntoRequest<super::VectorSearchRequest>,
-        ) -> std::result::Result<tonic::Response<super::VectorSearchResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
-            })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/coordinode.v1.query.VectorService/VectorSearch",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "coordinode.v1.query.VectorService",
-                "VectorSearch",
-            ));
-            self.inner.unary(req, path, codec).await
-        }
-        /// Hybrid search combining graph traversal and vector similarity.
-        pub async fn hybrid_search(
-            &mut self,
-            request: impl tonic::IntoRequest<super::HybridSearchRequest>,
-        ) -> std::result::Result<tonic::Response<super::HybridSearchResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
-            })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/coordinode.v1.query.VectorService/HybridSearch",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "coordinode.v1.query.VectorService",
-                "HybridSearch",
-            ));
-            self.inner.unary(req, path, codec).await
-        }
-    }
-}
-/// Request to search indexed text properties across a node label.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TextSearchRequest {
-    /// Label to search within (e.g., "Article", "Document"). Must have at least
-    /// one text index registered; returns empty results otherwise.
-    #[prost(string, tag = "1")]
-    pub label: ::prost::alloc::string::String,
-    /// Full-text query string. Supports boolean operators (AND, OR, NOT),
-    /// phrase search ("exact phrase"), prefix wildcards (term\*), and
-    /// per-term boosting (term^N). Examples:
-    /// "rust AND graph"
-    /// "machine learning"
-    /// "data\*"
-    /// "name^3 OR description^1"
-    #[prost(string, tag = "2")]
-    pub query: ::prost::alloc::string::String,
-    /// Maximum number of results to return. 0 = default (10). Capped at 1000.
-    #[prost(uint32, tag = "3")]
-    pub limit: u32,
-    /// If true, enable Levenshtein-1 fuzzy matching for individual query terms.
-    /// Increases recall at the cost of precision. Not applied to quoted phrases
-    /// or terms that already contain operators.
-    #[prost(bool, tag = "4")]
-    pub fuzzy: bool,
-    /// Language for query tokenization and stemming (e.g., "english", "russian",
-    /// "chinese_jieba", "japanese_lindera", "none"). Empty string = use the
-    /// index's default language (typically "english" unless overridden at index
-    /// creation time).
-    #[prost(string, tag = "5")]
-    pub language: ::prost::alloc::string::String,
-}
-/// Response containing BM25-scored text search results.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TextSearchResponse {
-    /// Results ordered by BM25 score descending (most relevant first).
-    #[prost(message, repeated, tag = "1")]
-    pub results: ::prost::alloc::vec::Vec<TextResult>,
-}
-/// A single text search result with BM25 score and optional highlighted snippet.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TextResult {
-    /// Node ID of the matching node.
-    #[prost(uint64, tag = "1")]
-    pub node_id: u64,
-    /// BM25 relevance score. Higher = more relevant to the query. Not normalized;
-    /// values depend on corpus size and per-field weights.
-    #[prost(float, tag = "2")]
-    pub score: f32,
-    /// HTML-tagged snippet of matching text with <b> tags around matched terms.
-    /// Derived from the indexed field text using tantivy's SnippetGenerator.
-    /// Empty when language-specific search is used (highlight requires default
-    /// language tokenization) or when the indexed field has no stored content.
-    /// Strip <b> and </b> tags for plain-text display.
-    #[prost(string, tag = "3")]
-    pub snippet: ::prost::alloc::string::String,
-}
-/// Request for server-side hybrid text + vector search with RRF ranking.
-///
-/// Fuses two independent ranked lists via Reciprocal Rank Fusion:
-/// rrf_score(node) = text_weight / (60 + rank_text) + vector_weight / (60 + rank_vec)
-///
-/// Standard RRF constant k=60 ensures robustness against score distribution
-/// differences between BM25 and cosine similarity.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct HybridTextVectorSearchRequest {
-    /// Label to search within (e.g., "Article", "Document"). Must have at least
-    /// one text index registered; if none, the text ranking is empty and only
-    /// vector results contribute.
-    #[prost(string, tag = "1")]
-    pub label: ::prost::alloc::string::String,
-    /// Full-text query string. Supports the same syntax as TextSearchRequest.query —
-    /// boolean operators (AND, OR, NOT), phrase search ("..."), prefix wildcards
-    /// (term\*), and per-term boosting (term^N).
-    #[prost(string, tag = "2")]
-    pub text_query: ::prost::alloc::string::String,
-    /// Query embedding vector for the vector search component. Must match the
-    /// dimensionality of vectors stored in vector_property on the target nodes.
-    #[prost(float, repeated, tag = "3")]
-    pub vector: ::prost::alloc::vec::Vec<f32>,
-    /// Maximum number of fused results to return. 0 = default (10). Capped at 1000.
-    #[prost(uint32, tag = "4")]
-    pub limit: u32,
-    /// Weight applied to the text (BM25) component in the RRF formula.
-    /// Effective range: (0, ∞). 0.0 = use default (0.5). Equal weights = standard RRF.
-    /// Higher text_weight biases ranking toward text relevance.
-    #[prost(float, tag = "5")]
-    pub text_weight: f32,
-    /// Weight applied to the vector (cosine) component in the RRF formula.
-    /// Effective range: (0, ∞). 0.0 = use default (0.5). Equal weights = standard RRF.
-    /// Higher vector_weight biases ranking toward semantic similarity.
-    #[prost(float, tag = "6")]
-    pub vector_weight: f32,
-    /// Name of the node property containing the embedding vectors.
-    /// Empty = default "embedding". Must match the property used at ingest time.
-    #[prost(string, tag = "7")]
-    pub vector_property: ::prost::alloc::string::String,
-}
-/// Response containing RRF-ranked hybrid search results.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct HybridTextVectorSearchResponse {
-    /// Results ordered by RRF score descending (most relevant first).
-    #[prost(message, repeated, tag = "1")]
-    pub results: ::prost::alloc::vec::Vec<HybridResult>,
-}
-/// A single hybrid search result with the combined RRF score.
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct HybridResult {
-    /// Node ID of the matching node.
-    #[prost(uint64, tag = "1")]
-    pub node_id: u64,
-    /// Combined RRF score: text_weight/(60+rank_text) + vector_weight/(60+rank_vec).
-    /// Higher = more relevant. A node in rank 1 of both lists with default weights
-    /// scores 2 × (0.5/(60+1)) ≈ 0.0164. Useful for relative ordering within a
-    /// result set; not comparable across queries or weight configurations.
-    #[prost(float, tag = "2")]
-    pub score: f32,
-}
-/// Generated client implementations.
-pub mod text_service_client {
-    #![allow(
-        unused_variables,
-        dead_code,
-        missing_docs,
-        clippy::wildcard_imports,
-        clippy::let_unit_value
-    )]
-    use tonic::codegen::http::Uri;
-    use tonic::codegen::*;
-    /// Full-text search operations backed by tantivy (BM25 scoring, 30+ languages).
-    #[derive(Debug, Clone)]
-    pub struct TextServiceClient<T> {
-        inner: tonic::client::Grpc<T>,
-    }
-    impl TextServiceClient<tonic::transport::Channel> {
-        /// Attempt to create a new client by connecting to a given endpoint.
-        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
-        where
-            D: TryInto<tonic::transport::Endpoint>,
-            D::Error: Into<StdError>,
-        {
-            let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
-            Ok(Self::new(conn))
-        }
-    }
-    impl<T> TextServiceClient<T>
-    where
-        T: tonic::client::GrpcService<tonic::body::Body>,
-        T::Error: Into<StdError>,
-        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
-        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
-    {
-        pub fn new(inner: T) -> Self {
-            let inner = tonic::client::Grpc::new(inner);
-            Self { inner }
-        }
-        pub fn with_origin(inner: T, origin: Uri) -> Self {
-            let inner = tonic::client::Grpc::with_origin(inner, origin);
-            Self { inner }
-        }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> TextServiceClient<InterceptedService<T, F>>
-        where
-            F: tonic::service::Interceptor,
-            T::ResponseBody: Default,
-            T: tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-                Response = http::Response<
-                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
-                >,
-            >,
-            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
-                Into<StdError> + std::marker::Send + std::marker::Sync,
-        {
-            TextServiceClient::new(InterceptedService::new(inner, interceptor))
-        }
-        /// Compress requests with the given encoding.
-        ///
-        /// This requires the server to support it otherwise it might respond with an
-        /// error.
-        #[must_use]
-        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.inner = self.inner.send_compressed(encoding);
-            self
-        }
-        /// Enable decompressing responses.
-        #[must_use]
-        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.inner = self.inner.accept_compressed(encoding);
-            self
-        }
-        /// Limits the maximum size of a decoded message.
-        ///
-        /// Default: `4MB`
-        #[must_use]
-        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
-            self.inner = self.inner.max_decoding_message_size(limit);
-            self
-        }
-        /// Limits the maximum size of an encoded message.
-        ///
-        /// Default: `usize::MAX`
-        #[must_use]
-        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
-            self.inner = self.inner.max_encoding_message_size(limit);
-            self
-        }
-        /// Search nodes matching a full-text query within a label.
-        ///
-        /// Searches all text-indexed properties for the label and returns BM25-scored
-        /// results with optional HTML-highlighted snippets. If no text index is
-        /// registered for the label, returns an empty result set (no error).
-        ///
-        /// Query syntax: boolean (AND, OR, NOT), phrase ("exact phrase"),
-        /// prefix wildcard (term\*), per-term boosting (term^N).
-        pub async fn text_search(
-            &mut self,
-            request: impl tonic::IntoRequest<super::TextSearchRequest>,
-        ) -> std::result::Result<tonic::Response<super::TextSearchResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
-            })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/coordinode.v1.query.TextService/TextSearch");
-            let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "coordinode.v1.query.TextService",
-                "TextSearch",
-            ));
-            self.inner.unary(req, path, codec).await
-        }
-        /// Fuse BM25 text search and cosine vector search using Reciprocal Rank Fusion (RRF).
-        ///
-        /// Runs text and vector searches independently, then combines the ranked lists:
-        /// rrf_score(node) = text_weight / (60 + rank_text) + vector_weight / (60 + rank_vec)
-        ///
-        /// Nodes appearing in both rankings score higher than those in only one.
-        /// If no text index exists for the label, text_weight contributes nothing.
-        /// Returns results ordered by RRF score descending.
-        pub async fn hybrid_text_vector_search(
-            &mut self,
-            request: impl tonic::IntoRequest<super::HybridTextVectorSearchRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::HybridTextVectorSearchResponse>,
-            tonic::Status,
-        > {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
-            })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/coordinode.v1.query.TextService/HybridTextVectorSearch",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "coordinode.v1.query.TextService",
-                "HybridTextVectorSearch",
-            ));
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("coordinode.v1.query.CypherService", "ExplainCypher"),
+                );
             self.inner.unary(req, path, codec).await
         }
     }

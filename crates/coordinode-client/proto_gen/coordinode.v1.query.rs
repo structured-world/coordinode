@@ -22,13 +22,18 @@ pub struct ExecuteCypherRequest {
     #[prost(message, optional, tag = "4")]
     pub read_concern: ::core::option::Option<super::replication::ReadConcern>,
     /// Durability guarantee for write statements (CREATE / MERGE / SET / DELETE).
+    ///
     /// UNSPECIFIED / omitted defaults to W1 (leader-acknowledged, not replicated).
     /// Use MAJORITY for production writes that must survive a single node failure.
+    ///
     /// Causal sessions (read_concern.after_index > 0) require write_concern.level
-    /// >= MAJORITY. The server rejects writes with lower durability in causal
-    /// sessions because a non-majority write may never be replicated: if the leader
-    /// crashes before drain, the returned applied_index becomes a dangling causal
-    /// dependency that can never be satisfied by a follower read.
+    ///
+    /// >
+    /// > = MAJORITY. The server rejects writes with lower durability in causal
+    /// > sessions because a non-majority write may never be replicated: if the leader
+    /// > crashes before drain, the returned applied_index becomes a dangling causal
+    /// > dependency that can never be satisfied by a follower read.
+    ///
     /// Read-only queries ignore this field.
     #[prost(message, optional, tag = "5")]
     pub write_concern: ::core::option::Option<super::replication::WriteConcern>,
@@ -543,67 +548,6 @@ pub struct TextResult {
     #[prost(string, tag = "3")]
     pub snippet: ::prost::alloc::string::String,
 }
-/// Request for server-side hybrid text + vector search with RRF ranking.
-///
-/// Fuses two independent ranked lists via Reciprocal Rank Fusion:
-/// rrf_score(node) = text_weight / (60 + rank_text) + vector_weight / (60 + rank_vec)
-///
-/// Standard RRF constant k=60 ensures robustness against score distribution
-/// differences between BM25 and cosine similarity.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct HybridTextVectorSearchRequest {
-    /// Label to search within (e.g., "Article", "Document"). Must have at least
-    /// one text index registered; if none, the text ranking is empty and only
-    /// vector results contribute.
-    #[prost(string, tag = "1")]
-    pub label: ::prost::alloc::string::String,
-    /// Full-text query string. Supports the same syntax as TextSearchRequest.query —
-    /// boolean operators (AND, OR, NOT), phrase search ("..."), prefix wildcards
-    /// (term\*), and per-term boosting (term^N).
-    #[prost(string, tag = "2")]
-    pub text_query: ::prost::alloc::string::String,
-    /// Query embedding vector for the vector search component. Must match the
-    /// dimensionality of vectors stored in vector_property on the target nodes.
-    #[prost(float, repeated, tag = "3")]
-    pub vector: ::prost::alloc::vec::Vec<f32>,
-    /// Maximum number of fused results to return. 0 = default (10). Capped at 1000.
-    #[prost(uint32, tag = "4")]
-    pub limit: u32,
-    /// Weight applied to the text (BM25) component in the RRF formula.
-    /// Effective range: (0, ∞). 0.0 = use default (0.5). Equal weights = standard RRF.
-    /// Higher text_weight biases ranking toward text relevance.
-    #[prost(float, tag = "5")]
-    pub text_weight: f32,
-    /// Weight applied to the vector (cosine) component in the RRF formula.
-    /// Effective range: (0, ∞). 0.0 = use default (0.5). Equal weights = standard RRF.
-    /// Higher vector_weight biases ranking toward semantic similarity.
-    #[prost(float, tag = "6")]
-    pub vector_weight: f32,
-    /// Name of the node property containing the embedding vectors.
-    /// Empty = default "embedding". Must match the property used at ingest time.
-    #[prost(string, tag = "7")]
-    pub vector_property: ::prost::alloc::string::String,
-}
-/// Response containing RRF-ranked hybrid search results.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct HybridTextVectorSearchResponse {
-    /// Results ordered by RRF score descending (most relevant first).
-    #[prost(message, repeated, tag = "1")]
-    pub results: ::prost::alloc::vec::Vec<HybridResult>,
-}
-/// A single hybrid search result with the combined RRF score.
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct HybridResult {
-    /// Node ID of the matching node.
-    #[prost(uint64, tag = "1")]
-    pub node_id: u64,
-    /// Combined RRF score: text_weight/(60+rank_text) + vector_weight/(60+rank_vec).
-    /// Higher = more relevant. A node in rank 1 of both lists with default weights
-    /// scores 2 × (0.5/(60+1)) ≈ 0.0164. Useful for relative ordering within a
-    /// result set; not comparable across queries or weight configurations.
-    #[prost(float, tag = "2")]
-    pub score: f32,
-}
 /// Generated client implementations.
 pub mod text_service_client {
     #![allow(
@@ -727,43 +671,6 @@ pub mod text_service_client {
             req.extensions_mut()
                 .insert(
                     GrpcMethod::new("coordinode.v1.query.TextService", "TextSearch"),
-                );
-            self.inner.unary(req, path, codec).await
-        }
-        /// Fuse BM25 text search and cosine vector search using Reciprocal Rank Fusion (RRF).
-        ///
-        /// Runs text and vector searches independently, then combines the ranked lists:
-        /// rrf_score(node) = text_weight / (60 + rank_text) + vector_weight / (60 + rank_vec)
-        ///
-        /// Nodes appearing in both rankings score higher than those in only one.
-        /// If no text index exists for the label, text_weight contributes nothing.
-        /// Returns results ordered by RRF score descending.
-        pub async fn hybrid_text_vector_search(
-            &mut self,
-            request: impl tonic::IntoRequest<super::HybridTextVectorSearchRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::HybridTextVectorSearchResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/coordinode.v1.query.TextService/HybridTextVectorSearch",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "coordinode.v1.query.TextService",
-                        "HybridTextVectorSearch",
-                    ),
                 );
             self.inner.unary(req, path, codec).await
         }

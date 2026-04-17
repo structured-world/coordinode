@@ -14,8 +14,24 @@ pub struct WriteConcern {
 /// Read concern configuration.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReadConcern {
+    /// Consistency level for this read. UNSPECIFIED defaults to LOCAL.
     #[prost(enumeration = "ReadConcernLevel", tag = "1")]
     pub level: i32,
+    /// Causal fence: wait until the serving node has applied log entries up to
+    /// at least this Raft log index before executing the read.
+    ///
+    /// Set to the `QueryStats.applied_index` value from a prior write response
+    /// to guarantee read-your-writes: the read is guaranteed to observe all
+    /// mutations up to and including that write.
+    ///
+    /// 0 = no fence (default). Only valid with level = MAJORITY or SNAPSHOT;
+    /// returns FAILED_PRECONDITION if level = LOCAL or LINEARIZABLE.
+    ///
+    /// Has no effect in standalone (non-Raft) mode — all writes are immediately
+    /// visible. The returned applied_index will always be 0 in standalone mode,
+    /// so clients should not set after_index unless operating in cluster mode.
+    #[prost(uint64, tag = "2")]
+    pub after_index: u64,
 }
 /// Write concern levels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]

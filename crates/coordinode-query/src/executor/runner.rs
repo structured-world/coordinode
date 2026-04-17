@@ -1352,11 +1352,13 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 .fold(Default::default(), |mut acc, r| {
                     acc.needs_text_score |= r.needs_text_score;
                     acc.needs_hybrid_score |= r.needs_hybrid_score;
+                    acc.needs_rrf_score |= r.needs_rrf_score;
                     acc
                 });
             if let Some(first) = rows.first() {
                 let has_text = first.contains_key("__text_score__");
                 let has_vec = first.contains_key("__vector_score__");
+                let has_rrf = first.contains_key("__rrf_score__");
                 if score_reqs.needs_text_score && !has_text {
                     return Err(ExecutionError::Unsupported(
                         "text_score() requires a paired text_match(...) predicate in WHERE \
@@ -1369,6 +1371,14 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                         "hybrid_score() requires at least one of text_match(...) or \
                          vector_distance(...)/vector_similarity(...) in WHERE against \
                          the same node; none found in the plan"
+                            .to_string(),
+                    ));
+                }
+                if score_reqs.needs_rrf_score && !has_rrf {
+                    return Err(ExecutionError::Unsupported(
+                        "rrf_score() requires a RankFuse upstream operator to populate \
+                         ranks — this typically means the planner failed to detect the \
+                         rrf_score call-site; please file a bug with the query"
                             .to_string(),
                     ));
                 }
@@ -1433,11 +1443,13 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 .fold(Default::default(), |mut acc, r| {
                     acc.needs_text_score |= r.needs_text_score;
                     acc.needs_hybrid_score |= r.needs_hybrid_score;
+                    acc.needs_rrf_score |= r.needs_rrf_score;
                     acc
                 });
             if let Some(first) = rows.first() {
                 let has_text = first.contains_key("__text_score__");
                 let has_vec = first.contains_key("__vector_score__");
+                let has_rrf = first.contains_key("__rrf_score__");
                 if score_reqs.needs_text_score && !has_text {
                     return Err(ExecutionError::Unsupported(
                         "text_score() requires a paired text_match(...) predicate in WHERE \
@@ -1450,6 +1462,14 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                         "hybrid_score() requires at least one of text_match(...) or \
                          vector_distance(...)/vector_similarity(...) in WHERE against \
                          the same node; none found in the plan"
+                            .to_string(),
+                    ));
+                }
+                if score_reqs.needs_rrf_score && !has_rrf {
+                    return Err(ExecutionError::Unsupported(
+                        "rrf_score() requires a RankFuse upstream operator to populate \
+                         ranks — this typically means the planner failed to detect the \
+                         rrf_score call-site; please file a bug with the query"
                             .to_string(),
                     ));
                 }
@@ -1930,6 +1950,24 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 transfer.as_ref(),
                 *on_conflict_replace,
                 *on_remaining_fail,
+                ctx,
+            )
+        }
+
+        LogicalOp::RankFuse {
+            input,
+            methods,
+            query_vector,
+            query_text,
+            shard_overfetch_cap,
+        } => {
+            let rows = execute_op(input, ctx)?;
+            execute_rank_fuse(
+                rows,
+                methods,
+                query_vector.as_ref(),
+                query_text.as_ref(),
+                *shard_overfetch_cap,
                 ctx,
             )
         }
@@ -3205,6 +3243,482 @@ fn execute_vector_filter(
     }
 
     Ok(results)
+}
+
+/// RRF constant `k`: the industry standard from Cormack et al. 2009.
+/// Deliberately NOT a tunable — freezing k is a core contract of `rrf_score`.
+const RRF_K: f64 = 60.0;
+
+/// Resolved scoring mode for a single `rrf_score` method expression.
+///
+/// Classified on-demand during `execute_rank_fuse` from the first row that
+/// carries a label for the referenced variable and the available registries.
+#[derive(Debug, Clone)]
+enum RankFuseMethodKind {
+    /// Node vector property backed by HNSW index (metric from index config).
+    /// Direction: `desc = true` for similarity/dot, `false` for distance metrics.
+    VectorHnsw {
+        // Kept for future EXPLAIN annotations / HNSW-accelerated scoring.
+        #[allow(dead_code)]
+        label: String,
+        #[allow(dead_code)]
+        property: String,
+        metric: coordinode_core::graph::types::VectorMetric,
+    },
+    /// Vector property without an HNSW index (e.g. edge vector property).
+    /// Always scored via cosine similarity (DESC direction).
+    VectorBruteForce,
+    /// Text property backed by `TextIndexRegistry` — BM25 scoring, DESC direction.
+    TextBm25 { label: String, property: String },
+}
+
+impl RankFuseMethodKind {
+    /// Higher score = better (for rank assignment). `true` → sort DESC, rank 1
+    /// to the largest score. `false` → sort ASC, rank 1 to the smallest score.
+    fn desc(&self) -> bool {
+        match self {
+            // Similarity: larger is better. Dot product: larger is better.
+            // Cosine distance / L2 / L1: smaller is better.
+            Self::VectorHnsw { metric, .. } => matches!(
+                metric,
+                coordinode_core::graph::types::VectorMetric::Cosine
+                    | coordinode_core::graph::types::VectorMetric::DotProduct
+            ),
+            // Cosine similarity brute-force: larger is better.
+            Self::VectorBruteForce => true,
+            // BM25: larger is better.
+            Self::TextBm25 { .. } => true,
+        }
+    }
+}
+
+/// Extract `(variable, property)` from a method expression.
+///
+/// RRF methods are always property accesses on a variable —
+/// `n.embedding`, `r.context_emb`, `c.body`, etc. Any other shape is rejected.
+fn extract_method_ident(expr: &Expr) -> Option<(String, String)> {
+    match expr {
+        Expr::PropertyAccess { expr, property } => {
+            if let Expr::Variable(var) = expr.as_ref() {
+                return Some((var.clone(), property.clone()));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Resolve `(label, property)` for a variable by consulting `row[{var}.__label__]`.
+/// Returns the first non-empty label found across the given rows.
+fn resolve_label_for_var(rows: &[Row], variable: &str) -> Option<String> {
+    let key = format!("{variable}.__label__");
+    for row in rows {
+        if let Some(Value::String(s)) = row.get(&key) {
+            if !s.is_empty() {
+                return Some(s.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Extract the `NodeId` bound to a variable from a row. Rows produced by
+/// `execute_node_scan` bind the raw id under `row[variable]` as `Value::Int`.
+fn row_node_id(row: &Row, variable: &str) -> Option<u64> {
+    match row.get(variable)? {
+        Value::Int(id) => Some(*id as u64),
+        _ => None,
+    }
+}
+
+/// Classify a single RRF method. Queries both registries; if neither matches
+/// and at least one row has `Value::Vector` for the method expression, treat
+/// it as brute-force vector (edge vector property or schemaless vector).
+/// Returns `Err` with a user-facing message when the method cannot be scored.
+fn resolve_rank_fuse_method(
+    method_expr: &Expr,
+    rows: &[Row],
+    ctx: &ExecutionContext<'_>,
+) -> Result<RankFuseMethodKind, ExecutionError> {
+    let (variable, property) = extract_method_ident(method_expr).ok_or_else(|| {
+        ExecutionError::Unsupported(
+            "rrf_score(): method expressions must be property accesses \
+                 (e.g. n.embedding, r.context_emb, c.body); \
+                 complex expressions are not scorable"
+                .to_string(),
+        )
+    })?;
+
+    let label_opt = resolve_label_for_var(rows, &variable);
+
+    // Prefer typed registry hits keyed by the variable's label.
+    if let Some(label) = label_opt.as_deref() {
+        if let Some(reg) = ctx.vector_index_registry {
+            if let Some(def) = reg.get_definition(label, &property) {
+                if let Some(cfg) = def.vector_config.as_ref() {
+                    return Ok(RankFuseMethodKind::VectorHnsw {
+                        label: label.to_string(),
+                        property,
+                        metric: cfg.metric,
+                    });
+                }
+            }
+        }
+        if let Some(reg) = ctx.text_index_registry {
+            if reg.get(label, &property).is_some() {
+                return Ok(RankFuseMethodKind::TextBm25 {
+                    label: label.to_string(),
+                    property,
+                });
+            }
+        }
+    }
+
+    // Fallback: brute-force vector if any row evaluates the method to a Vector.
+    // Covers edge vector properties (no query-time edge HNSW registry yet) and
+    // schemaless vectors. Text fields MUST have a full-text index — no fallback.
+    let any_vector = rows
+        .iter()
+        .any(|row| matches!(eval_expr(method_expr, row), Value::Vector(_)));
+    if any_vector {
+        return Ok(RankFuseMethodKind::VectorBruteForce);
+    }
+
+    // Unscorable.
+    let label_part = label_opt.map(|l| format!(":{l}")).unwrap_or_default();
+    Err(ExecutionError::Unsupported(format!(
+        "rrf_score(): method {variable}.{property} on ({variable}{label_part}) \
+         cannot be scored — no HNSW vector index, no full-text index, and no \
+         vector values observed in input. Create a CREATE VECTOR INDEX or \
+         CREATE TEXT INDEX on the property, or remove this method from the list."
+    )))
+}
+
+/// Execute `LogicalOp::RankFuse`: materialize input, score each method,
+/// assign competition ranks (1-based, ties broken by node_id ASC), compute
+/// `Σ 1/(60 + rank_i)` and write it to `__rrf_score__` on every output row.
+#[allow(clippy::too_many_arguments)]
+fn execute_rank_fuse(
+    rows: Vec<Row>,
+    methods: &[Expr],
+    query_vector: Option<&Expr>,
+    query_text: Option<&Expr>,
+    shard_overfetch_cap: Option<usize>,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    if methods.is_empty() {
+        return Err(ExecutionError::Unsupported(
+            "rrf_score(): method list is empty; \
+             provide at least one vector or text property expression"
+                .to_string(),
+        ));
+    }
+    if rows.is_empty() {
+        return Ok(rows);
+    }
+
+    // Resolve all methods up-front so we fail fast on a single bad method.
+    let mut kinds = Vec::with_capacity(methods.len());
+    let mut needs_vec = false;
+    let mut needs_text = false;
+    for m in methods {
+        let kind = resolve_rank_fuse_method(m, &rows, ctx)?;
+        match &kind {
+            RankFuseMethodKind::VectorHnsw { .. } | RankFuseMethodKind::VectorBruteForce => {
+                needs_vec = true;
+            }
+            RankFuseMethodKind::TextBm25 { .. } => {
+                needs_text = true;
+            }
+        }
+        kinds.push(kind);
+    }
+
+    // Evaluate query once — it may be a Parameter resolved elsewhere, so a
+    // zero-row eval against an empty Row is sufficient for literal / parameter
+    // shapes. Params have already been substituted by `substitute_params`.
+    let qv_value = query_vector
+        .map(|e| eval_expr(e, &Row::new()))
+        .unwrap_or(Value::Null);
+    let qt_value = query_text
+        .map(|e| eval_expr(e, &Row::new()))
+        .unwrap_or(Value::Null);
+
+    let query_vec: Option<Vec<f32>> = coerce_value_to_vec(&qv_value);
+    let query_text_str: Option<String> = match &qt_value {
+        Value::String(s) => Some(s.clone()),
+        _ => None,
+    };
+
+    if needs_vec && query_vec.is_none() {
+        return Err(ExecutionError::Unsupported(
+            "rrf_score(): at least one method is a vector property but the \
+             query map has no `vector` key (or it is not a vector value)"
+                .to_string(),
+        ));
+    }
+    if needs_text && query_text_str.is_none() {
+        return Err(ExecutionError::Unsupported(
+            "rrf_score(): at least one method is a text property but the \
+             query map has no `text` key (or it is not a string value)"
+                .to_string(),
+        ));
+    }
+
+    let n = rows.len();
+    // ranks[method_i][row_idx] = Some(rank) if matched, None → penalty = matched+1.
+    let mut ranks: Vec<Vec<Option<usize>>> = Vec::with_capacity(methods.len());
+
+    // Defensive: the needs_vec / needs_text guards above already rejected
+    // missing-query cases with user-facing errors. These `ok_or_else` checks
+    // convert any drift in the guard logic into a regular ExecutionError
+    // rather than an internal panic.
+    let qv_slice: &[f32] = match query_vec.as_deref() {
+        Some(v) => v,
+        None if needs_vec => {
+            return Err(ExecutionError::Unsupported(
+                "rrf_score(): internal invariant violated — vector query missing after guard"
+                    .into(),
+            ));
+        }
+        None => &[],
+    };
+    let qt_slice: &str = match query_text_str.as_deref() {
+        Some(s) => s,
+        None if needs_text => {
+            return Err(ExecutionError::Unsupported(
+                "rrf_score(): internal invariant violated — text query missing after guard".into(),
+            ));
+        }
+        None => "",
+    };
+
+    for (method_expr, kind) in methods.iter().zip(kinds.iter()) {
+        let row_ranks = match kind {
+            RankFuseMethodKind::VectorHnsw { metric, .. } => score_vector_method(
+                &rows,
+                method_expr,
+                qv_slice,
+                Some(*metric),
+                kind.desc(),
+                &variable_for_method(method_expr),
+            ),
+            RankFuseMethodKind::VectorBruteForce => score_vector_method(
+                &rows,
+                method_expr,
+                qv_slice,
+                None, // default: cosine similarity
+                kind.desc(),
+                &variable_for_method(method_expr),
+            ),
+            RankFuseMethodKind::TextBm25 { label, property } => score_text_method(
+                &rows,
+                method_expr,
+                qt_slice,
+                label,
+                property,
+                &variable_for_method(method_expr),
+                ctx,
+            )?,
+        };
+        ranks.push(row_ranks);
+    }
+
+    // Per-method matched counts → penalty rank = matched + 1.
+    let penalties: Vec<usize> = ranks
+        .iter()
+        .map(|mr| mr.iter().filter(|r| r.is_some()).count() + 1)
+        .collect();
+
+    // Compute RRF score per row.
+    let mut out_rows: Vec<Row> = Vec::with_capacity(n);
+    for (i, row) in rows.into_iter().enumerate() {
+        let mut score = 0.0_f64;
+        for (m, method_ranks) in ranks.iter().enumerate() {
+            let rank = method_ranks[i].unwrap_or(penalties[m]);
+            score += 1.0 / (RRF_K + rank as f64);
+        }
+        let mut out = row;
+        out.insert("__rrf_score__".to_string(), Value::Float(score));
+        out_rows.push(out);
+    }
+
+    // Apply shard overfetch cap (R-HYB5 future path; None in CE).
+    if let Some(cap) = shard_overfetch_cap {
+        if out_rows.len() > cap {
+            // Sort by __rrf_score__ DESC and truncate to keep best candidates.
+            out_rows.sort_by(|a, b| {
+                let sa = a.get("__rrf_score__").and_then(|v| match v {
+                    Value::Float(f) => Some(*f),
+                    _ => None,
+                });
+                let sb = b.get("__rrf_score__").and_then(|v| match v {
+                    Value::Float(f) => Some(*f),
+                    _ => None,
+                });
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            out_rows.truncate(cap);
+        }
+    }
+
+    Ok(out_rows)
+}
+
+fn variable_for_method(expr: &Expr) -> String {
+    match expr {
+        Expr::PropertyAccess { expr: inner, .. } => {
+            if let Expr::Variable(v) = inner.as_ref() {
+                return v.clone();
+            }
+            String::new()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Score rows by a vector method, returning `row_ranks[i]` = competition rank
+/// (1-based) when the row has a usable vector for this method, `None` when
+/// the value was missing/wrong-type (→ penalty rank applied later).
+///
+/// When `metric` is `None`, uses cosine similarity (brute-force default).
+fn score_vector_method(
+    rows: &[Row],
+    method_expr: &Expr,
+    query_vec: &[f32],
+    metric: Option<coordinode_core::graph::types::VectorMetric>,
+    desc: bool,
+    variable: &str,
+) -> Vec<Option<usize>> {
+    // (row_idx, score, node_id) for matched rows.
+    let mut scored: Vec<(usize, f64, u64)> = Vec::with_capacity(rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        let val = eval_expr(method_expr, row);
+        let Some(v) = coerce_value_to_vec(&val) else {
+            continue;
+        };
+        if v.len() != query_vec.len() {
+            continue;
+        }
+        let s = match metric {
+            Some(coordinode_core::graph::types::VectorMetric::Cosine) | None => {
+                coordinode_vector::metrics::cosine_similarity(&v, query_vec) as f64
+            }
+            Some(coordinode_core::graph::types::VectorMetric::L2) => {
+                coordinode_vector::metrics::euclidean_distance(&v, query_vec) as f64
+            }
+            Some(coordinode_core::graph::types::VectorMetric::DotProduct) => {
+                coordinode_vector::metrics::dot_product(&v, query_vec) as f64
+            }
+            Some(coordinode_core::graph::types::VectorMetric::L1) => {
+                coordinode_vector::metrics::manhattan_distance(&v, query_vec) as f64
+            }
+        };
+        let nid = row_node_id(row, variable).unwrap_or(u64::MAX);
+        scored.push((i, s, nid));
+    }
+
+    assign_competition_ranks(rows.len(), &mut scored, desc)
+}
+
+/// Score rows by a text (BM25) method via `TextIndexRegistry`. Missing FT-index
+/// for the (label, property) is a hard error (matches R-HYB1 guard spirit).
+fn score_text_method(
+    rows: &[Row],
+    method_expr: &Expr,
+    query_text: &str,
+    label: &str,
+    property: &str,
+    variable: &str,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Vec<Option<usize>>, ExecutionError> {
+    let _ = method_expr; // kept for symmetry + future column inspection
+    let registry = ctx.text_index_registry.ok_or_else(|| {
+        ExecutionError::Unsupported(
+            "rrf_score(): text method requires a TextIndexRegistry; \
+             none is wired into the execution context"
+                .to_string(),
+        )
+    })?;
+    let handle = registry.get(label, property).ok_or_else(|| {
+        ExecutionError::Unsupported(format!(
+            "rrf_score(): text method {variable}.{property} on :{label} requires a \
+             full-text index; create one with `CREATE TEXT INDEX … ON :{label}({property})`"
+        ))
+    })?;
+    let idx = handle
+        .read()
+        .map_err(|_| ExecutionError::Unsupported("rrf_score(): text index lock poisoned".into()))?;
+    // Overfetch 3× to catch boundary matches; at least 1000.
+    let limit = (rows.len() * 3).max(1000);
+    let results = idx
+        .search(query_text, limit)
+        .map_err(|e| ExecutionError::Unsupported(format!("rrf_score(): text search error: {e}")))?;
+    drop(idx);
+
+    let scores: std::collections::HashMap<u64, f32> =
+        results.into_iter().map(|r| (r.node_id, r.score)).collect();
+
+    let mut scored: Vec<(usize, f64, u64)> = Vec::with_capacity(rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        let Some(nid) = row_node_id(row, variable) else {
+            continue;
+        };
+        let Some(&s) = scores.get(&nid) else {
+            continue;
+        };
+        scored.push((i, s as f64, nid));
+    }
+
+    Ok(assign_competition_ranks(rows.len(), &mut scored, true))
+}
+
+/// Competition ranking (1,2,2,4). Sort `scored` by score in the requested
+/// direction, ties broken deterministically by ascending `node_id`. Assign
+/// rank 1 to the best row; tied rows receive the same rank; the next
+/// distinct score receives `previous_rank + group_size`.
+///
+/// Returns `row_ranks[i]` for `i in 0..n_rows`: `Some(rank)` when row i was
+/// in `scored`, `None` otherwise (penalty applied by the caller).
+fn assign_competition_ranks(
+    n_rows: usize,
+    scored: &mut [(usize, f64, u64)],
+    desc: bool,
+) -> Vec<Option<usize>> {
+    // Sort by primary score (direction-aware), tiebreak by node_id ASC for
+    // determinism. Tied rows get the SAME rank — node_id is only used to
+    // stabilise iteration order, not to break the competition tie.
+    scored.sort_by(|a, b| {
+        let ord = a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal);
+        let ord = if desc { ord.reverse() } else { ord };
+        if ord != std::cmp::Ordering::Equal {
+            ord
+        } else {
+            a.2.cmp(&b.2)
+        }
+    });
+
+    let mut ranks = vec![None; n_rows];
+    let mut i = 0;
+    while i < scored.len() {
+        let group_start_rank = i + 1;
+        let mut j = i;
+        while j < scored.len() && float_bits_eq(scored[j].1, scored[i].1) {
+            ranks[scored[j].0] = Some(group_start_rank);
+            j += 1;
+        }
+        i = j;
+    }
+    ranks
+}
+
+/// Equality check that treats NaN as not equal to anything (standard IEEE
+/// semantics); required because `f64` does not implement `Eq`.
+fn float_bits_eq(a: f64, b: f64) -> bool {
+    if a.is_nan() || b.is_nan() {
+        return false;
+    }
+    a == b
 }
 
 /// Coerce a Value to Vec<f32> for vector operations in VectorFilter.
