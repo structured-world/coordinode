@@ -1,7 +1,7 @@
 [package]
 name = "coordinode-client"
 description = "Official Rust client for CoordiNode — gRPC driver with source location tracking"
-version = "0.3.19"
+version = "0.3.20"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

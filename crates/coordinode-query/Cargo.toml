@@ -1,7 +1,7 @@
 [package]
 name = "coordinode-query"
 description = "Query layer: OpenCypher parser, query planner, GraphQL auto-generation"
-version = "0.3.19"
+version = "0.3.20"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -91,17 +91,17 @@ criterion = { version = "0.8", features = ["html_reports"] }
 # Internal crates — path + version. All crates are publish = false, so cargo
 # does not hit crates.io for them. Versions are required for native release-plz
 # to track per-crate baselines independently (each crate versions on its own cadence).
-coordinode-core = { path = "crates/coordinode-core", version = "0.3.19" }
-coordinode-query = { path = "crates/coordinode-query", version = "0.3.19" }
-coordinode-vector = { path = "crates/coordinode-vector", version = "0.3.19" }
-coordinode-search = { path = "crates/coordinode-search", version = "0.3.19" }
-coordinode-storage = { path = "crates/coordinode-storage", version = "0.3.19" }
-coordinode-raft = { path = "crates/coordinode-raft", version = "0.3.19" }
-coordinode-auth = { path = "crates/coordinode-auth", version = "0.3.19" }
-coordinode-server = { path = "crates/coordinode-server", version = "0.3.19" }
-coordinode-s3 = { path = "crates/coordinode-s3", version = "0.3.19" }
-coordinode-embed = { path = "crates/coordinode-embed", version = "0.3.19" }
-coordinode-client = { path = "crates/coordinode-client", version = "0.3.19" }
+coordinode-core = { path = "crates/coordinode-core", version = "0.3.20" }
+coordinode-query = { path = "crates/coordinode-query", version = "0.3.20" }
+coordinode-vector = { path = "crates/coordinode-vector", version = "0.3.20" }
+coordinode-search = { path = "crates/coordinode-search", version = "0.3.20" }
+coordinode-storage = { path = "crates/coordinode-storage", version = "0.3.20" }
+coordinode-raft = { path = "crates/coordinode-raft", version = "0.3.20" }
+coordinode-auth = { path = "crates/coordinode-auth", version = "0.3.20" }
+coordinode-server = { path = "crates/coordinode-server", version = "0.3.20" }
+coordinode-s3 = { path = "crates/coordinode-s3", version = "0.3.20" }
+coordinode-embed = { path = "crates/coordinode-embed", version = "0.3.20" }
+coordinode-client = { path = "crates/coordinode-client", version = "0.3.20" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

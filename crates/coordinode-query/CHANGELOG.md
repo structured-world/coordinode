@@ -3,6 +3,13 @@
 All notable changes to this crate are documented in this file.
 This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
+## [0.3.20](https://github.com/structured-world/coordinode/compare/coordinode-query-v0.3.19...coordinode-query-v0.3.20) - 2026-04-17
+
+### Added
+
+- *(query)* ATTACH DOCUMENT — demote graph node to nested DOCUMENT property
+- *(query)* DETACH DOCUMENT — promote nested property to graph node + edge
+
 ## [0.3.9](https://github.com/structured-world/coordinode/compare/v0.3.8...v0.3.9) - 2026-04-13
 
 #### Performance
