@@ -219,11 +219,7 @@ fn exec_query_stats(ctx: &ProcedureContext) -> Result<Vec<ProcedureRow>, String>
     let rows = top
         .into_iter()
         .map(|stats| {
-            let avg_time = if stats.count > 0 {
-                stats.total_time_us / stats.count
-            } else {
-                0
-            };
+            let avg_time = stats.total_time_us.checked_div(stats.count).unwrap_or(0);
             vec![
                 (
                     "fingerprint".to_string(),

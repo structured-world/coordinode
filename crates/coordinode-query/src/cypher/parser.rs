@@ -612,10 +612,8 @@ fn build_call_clause(pair: Pair<'_, Rule>) -> Result<CallClause, ParseError> {
                                 let mut alias = None;
                                 for yi in item.into_inner() {
                                     match yi.as_rule() {
-                                        Rule::identifier => {
-                                            if name.is_empty() {
-                                                name = extract_identifier(yi);
-                                            }
+                                        Rule::identifier if name.is_empty() => {
+                                            name = extract_identifier(yi);
                                         }
                                         Rule::alias => {
                                             for a in yi.into_inner() {
@@ -1275,10 +1273,8 @@ fn build_set_item(pair: Pair<'_, Rule>) -> Result<SetItem, ParseError> {
             let mut labels = Vec::new();
             for child in inner.into_inner() {
                 match child.as_rule() {
-                    Rule::identifier => {
-                        if variable.is_none() {
-                            variable = Some(extract_identifier(child));
-                        }
+                    Rule::identifier if variable.is_none() => {
+                        variable = Some(extract_identifier(child));
                     }
                     Rule::label_list => {
                         for label in child.into_inner() {
@@ -1359,10 +1355,8 @@ fn build_remove_item(pair: Pair<'_, Rule>) -> Result<RemoveItem, ParseError> {
             let mut labels = Vec::new();
             for child in inner.into_inner() {
                 match child.as_rule() {
-                    Rule::identifier => {
-                        if variable.is_none() {
-                            variable = Some(extract_identifier(child));
-                        }
+                    Rule::identifier if variable.is_none() => {
+                        variable = Some(extract_identifier(child));
                     }
                     Rule::label_list => {
                         for label in child.into_inner() {

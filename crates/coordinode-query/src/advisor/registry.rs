@@ -289,7 +289,7 @@ impl QueryRegistry {
     pub fn top_by_count(&self, n: usize) -> Vec<QueryStats> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut stats: Vec<QueryStats> = inner.entries.values().map(|e| e.snapshot()).collect();
-        stats.sort_by(|a, b| b.count.cmp(&a.count));
+        stats.sort_by_key(|s| std::cmp::Reverse(s.count));
         stats.truncate(n);
         stats
     }
@@ -303,7 +303,7 @@ impl QueryRegistry {
             .map(|e| e.snapshot())
             .filter(|s| s.p99_time_us >= min_p99_us)
             .collect();
-        stats.sort_by(|a, b| b.p99_time_us.cmp(&a.p99_time_us));
+        stats.sort_by_key(|s| std::cmp::Reverse(s.p99_time_us));
         stats.truncate(n);
         stats
     }

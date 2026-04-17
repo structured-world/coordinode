@@ -30,7 +30,7 @@ pub fn detect_suggestions(plan: &LogicalPlan, registry: Option<&IndexRegistry>) 
     detect_vector_without_prefilter(&plan.root, &mut suggestions);
 
     // Sort by severity descending (Critical > Warning > Info)
-    suggestions.sort_by(|a, b| b.severity.cmp(&a.severity));
+    suggestions.sort_by_key(|s| std::cmp::Reverse(s.severity));
 
     suggestions
 }
@@ -477,17 +477,13 @@ fn collect_variables(op: &LogicalOp) -> Vec<String> {
 
 fn collect_vars_recursive(op: &LogicalOp, vars: &mut Vec<String>) {
     match op {
-        LogicalOp::NodeScan { variable, .. } => {
-            if !vars.contains(variable) {
-                vars.push(variable.clone());
-            }
+        LogicalOp::NodeScan { variable, .. } if !vars.contains(variable) => {
+            vars.push(variable.clone());
         }
         LogicalOp::Traverse {
             target_variable, ..
-        } => {
-            if !vars.contains(target_variable) {
-                vars.push(target_variable.clone());
-            }
+        } if !vars.contains(target_variable) => {
+            vars.push(target_variable.clone());
         }
         _ => {}
     }

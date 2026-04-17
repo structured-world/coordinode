@@ -1161,12 +1161,13 @@ fn project_preserves_vector_expr(vector_expr: &Expr, items: &[ProjectItem]) -> b
     for item in items {
         match &item.expr {
             Expr::Star => return true,
-            Expr::Variable(v) if v == var_name => {
-                // Only a passthrough if the alias is either None or same as var.
-                // An aliased variable (`n AS m`) would rename the row key.
-                if item.alias.is_none() || item.alias.as_ref() == Some(v) {
-                    return true;
-                }
+            Expr::Variable(v)
+                if v == var_name
+                    // Only a passthrough if the alias is either None or same as var.
+                    // An aliased variable (`n AS m`) would rename the row key.
+                    && (item.alias.is_none() || item.alias.as_ref() == Some(v)) =>
+            {
+                return true;
             }
             Expr::PropertyAccess {
                 expr: item_inner,

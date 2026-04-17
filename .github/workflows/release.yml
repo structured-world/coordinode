@@ -84,7 +84,7 @@ jobs:
       - name: Install Rust + musl target
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.94"
+          toolchain: "1.95"
           targets: ${{ matrix.target }}
 
       - name: Install musl tools + protobuf

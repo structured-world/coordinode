@@ -275,7 +275,7 @@ impl SourceTracker {
     pub(crate) fn snapshot(&self) -> Vec<SourceLocationSnapshot> {
         let mut snaps: Vec<SourceLocationSnapshot> =
             self.sources.iter().map(|s| s.snapshot()).collect();
-        snaps.sort_by(|a, b| b.call_count.cmp(&a.call_count));
+        snaps.sort_by_key(|s| std::cmp::Reverse(s.call_count));
         snaps
     }
 
