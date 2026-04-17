@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.3.19 — 2026-04-17
+
+### coordinode-query
+## [0.3.19](https://github.com/structured-world/coordinode/compare/v0.3.18...v0.3.19) - 2026-04-17
+
+#### Fixed
+
+- *(clippy)* resolve 11 warnings on Rust 1.95
+
+---
+
 ## v0.3.18 — 2026-04-16
 
 ### coordinode-raft
