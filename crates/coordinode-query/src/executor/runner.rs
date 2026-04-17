@@ -1339,6 +1339,27 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             distinct,
         } => {
             let rows = execute_op(input, ctx)?;
+
+            // R-HYB1 guard: `text_score()` relies on `__text_score__` populated
+            // by an upstream `TextFilter`. If a projection references `text_score`
+            // but TextFilter never ran (missing FT index, or no paired
+            // `text_match(...)` in WHERE), we must fail with a clear error rather
+            // than silently returning 0.0. See ADR-020 and regression test
+            // `text_score_without_text_match_errors`.
+            let missing_text_score = rows
+                .first()
+                .is_some_and(|r| !r.contains_key("__text_score__"));
+            let uses_text_score = items
+                .iter()
+                .any(|it| crate::executor::eval::expr_contains_text_score(&it.expr));
+            if missing_text_score && uses_text_score {
+                return Err(ExecutionError::Unsupported(
+                    "text_score() requires a paired text_match(...) predicate in WHERE \
+                     against a full-text-indexed field; none found in the plan"
+                        .to_string(),
+                ));
+            }
+
             let mut result: Vec<Row> = rows
                 .into_iter()
                 .map(|row| {
@@ -1388,6 +1409,24 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
 
         LogicalOp::Sort { input, items } => {
             let mut rows = execute_op(input, ctx)?;
+
+            // Same R-HYB1 guard as Project: an `ORDER BY text_score(...)` (bare
+            // or inside arithmetic) without an upstream TextFilter would sort
+            // by silent zeros. Error instead.
+            let missing_text_score = rows
+                .first()
+                .is_some_and(|r| !r.contains_key("__text_score__"));
+            let uses_text_score = items
+                .iter()
+                .any(|it| crate::executor::eval::expr_contains_text_score(&it.expr));
+            if missing_text_score && uses_text_score {
+                return Err(ExecutionError::Unsupported(
+                    "text_score() requires a paired text_match(...) predicate in WHERE \
+                     against a full-text-indexed field; none found in the plan"
+                        .to_string(),
+                ));
+            }
+
             rows.sort_by(|a, b| {
                 for item in items {
                     let va = eval_expr(&item.expr, a);

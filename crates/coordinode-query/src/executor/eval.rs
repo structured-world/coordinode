@@ -5,6 +5,50 @@ use coordinode_core::graph::types::Value;
 use super::row::Row;
 use crate::cypher::ast::*;
 
+/// Returns `true` when the expression tree references `text_score(...)` anywhere.
+///
+/// Used by executor guards to detect projections / sort keys that require the
+/// `__text_score__` column populated by `TextFilter`. When such a reference
+/// exists but no TextFilter ran (e.g. no FT index configured, or `text_match`
+/// omitted from WHERE), the executor fails with a clear error instead of
+/// silently returning `0.0` — see R-HYB1 regression test #3 and ADR-020.
+pub fn expr_contains_text_score(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { name, args, .. } => {
+            name == "text_score" || args.iter().any(expr_contains_text_score)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_text_score(left) || expr_contains_text_score(right)
+        }
+        Expr::UnaryOp { expr: inner, .. } => expr_contains_text_score(inner),
+        Expr::PropertyAccess { expr: inner, .. } => expr_contains_text_score(inner),
+        Expr::List(items) => items.iter().any(expr_contains_text_score),
+        Expr::MapLiteral(fields) => fields.iter().any(|(_, v)| expr_contains_text_score(v)),
+        Expr::In { expr: e, list } => expr_contains_text_score(e) || expr_contains_text_score(list),
+        Expr::IsNull { expr: inner, .. } => expr_contains_text_score(inner),
+        Expr::StringMatch {
+            expr: inner,
+            pattern,
+            ..
+        } => expr_contains_text_score(inner) || expr_contains_text_score(pattern),
+        Expr::Subscript { expr: inner, index } => {
+            expr_contains_text_score(inner) || expr_contains_text_score(index)
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            operand.as_deref().is_some_and(expr_contains_text_score)
+                || when_clauses
+                    .iter()
+                    .any(|(c, v)| expr_contains_text_score(c) || expr_contains_text_score(v))
+                || else_clause.as_deref().is_some_and(expr_contains_text_score)
+        }
+        _ => false,
+    }
+}
+
 /// Evaluate an expression against a row, producing a Value.
 pub fn eval_expr(expr: &Expr, row: &Row) -> Value {
     match expr {
