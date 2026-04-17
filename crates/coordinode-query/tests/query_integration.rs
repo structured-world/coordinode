@@ -9751,3 +9751,414 @@ fn rrf_score_vector_only_multiple_methods() {
     };
     assert_eq!(top_id, 1, "doc closest to [1, 0] ranks first");
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// R-HYB2c: doc_score(doc, query [, α, β, γ]) — document-level aggregate
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Seed `n_chunks` Chunk nodes connected to a Document via HAS_CHUNK.
+/// Returns the document node id. `chunk_embeds` entries with `None` leave
+/// the chunk's `embedding` property unset (simulates a chunk that never
+/// got embedded); `Some(vec)` stores a vector embedding.
+fn seed_doc_with_chunks(
+    engine: &StorageEngine,
+    interner: &mut FieldInterner,
+    doc_id: u64,
+    chunk_embeds: &[Option<Vec<f32>>],
+) {
+    insert_node(engine, 1, doc_id, "Document", &[], interner);
+    for (i, emb) in chunk_embeds.iter().enumerate() {
+        let chunk_id = doc_id * 1000 + (i as u64) + 1;
+        let props: Vec<(&str, Value)> = match emb {
+            Some(v) => vec![("embedding", Value::Vector(v.clone()))],
+            None => vec![],
+        };
+        insert_node(engine, 1, chunk_id, "Chunk", &props, interner);
+        insert_edge(engine, "HAS_CHUNK", doc_id, chunk_id);
+    }
+}
+
+/// R-HYB2c regression #1: `doc_score(d, q)` with default weights (0.5/0.3/0.2)
+/// must equal `0.5·max + 0.3·avg + 0.2·coverage` computed independently by
+/// hand over the HAS_CHUNK children.
+#[test]
+fn doc_score_matches_manual_aggregate() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    // Doc 1: three chunks, all with embeddings.
+    //   similarities to [1.0, 0.0]: cos([1,0])=1, cos([0.8,0.6])≈0.8, cos([0.6,0.8])≈0.6
+    //   max = 1.0, avg = 0.8, matching (sim>0) = 3, total = 3, coverage = 1.0
+    //   expected = 0.5*1.0 + 0.3*0.8 + 0.2*1.0 = 0.94
+    seed_doc_with_chunks(
+        &engine,
+        &mut interner,
+        1,
+        &[
+            Some(vec![1.0, 0.0]),
+            Some(vec![0.8, 0.6]),
+            Some(vec![0.6, 0.8]),
+        ],
+    );
+
+    let results = run_cypher(
+        "MATCH (d:Document) \
+         RETURN d, doc_score(d, [1.0, 0.0]) AS score",
+        &engine,
+        &mut interner,
+    );
+    assert_eq!(results.len(), 1);
+    let score = match results[0].get("score") {
+        Some(Value::Float(f)) => *f,
+        other => panic!("expected Float score, got {other:?}"),
+    };
+
+    // Manual: 0.5 * 1.0 + 0.3 * avg + 0.2 * 1.0.
+    let s1 = 1.0_f32;
+    let s2 = coordinode_vector::metrics::cosine_similarity(&[0.8, 0.6], &[1.0, 0.0]);
+    let s3 = coordinode_vector::metrics::cosine_similarity(&[0.6, 0.8], &[1.0, 0.0]);
+    let avg = (s1 + s2 + s3) as f64 / 3.0;
+    let expected = 0.5 * 1.0 + 0.3 * avg + 0.2 * 1.0;
+    assert!(
+        (score - expected).abs() < 1e-5,
+        "doc_score must match α·max + β·avg + γ·coverage: got {score}, expected {expected}"
+    );
+}
+
+/// R-HYB2c regression #2a: positional overrides α/β/γ.
+#[test]
+fn doc_score_custom_weights_positional() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    seed_doc_with_chunks(
+        &engine,
+        &mut interner,
+        1,
+        &[Some(vec![1.0, 0.0]), Some(vec![0.6, 0.8])],
+    );
+
+    // Max-only weighting: α=1.0, β=0, γ=0 → score = max(sim) = 1.0
+    let results = run_cypher(
+        "MATCH (d:Document) \
+         RETURN doc_score(d, [1.0, 0.0], 1.0, 0.0, 0.0) AS score",
+        &engine,
+        &mut interner,
+    );
+    let score = match results[0].get("score") {
+        Some(Value::Float(f)) => *f,
+        other => panic!("expected Float, got {other:?}"),
+    };
+    assert!(
+        (score - 1.0).abs() < 1e-5,
+        "max-only positional weights must yield 1.0, got {score}"
+    );
+}
+
+/// R-HYB2c regression #2b: weights map overrides α/β/γ.
+#[test]
+fn doc_score_custom_weights_map() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    seed_doc_with_chunks(
+        &engine,
+        &mut interner,
+        1,
+        &[Some(vec![1.0, 0.0]), Some(vec![0.6, 0.8])],
+    );
+
+    // Coverage-only: α=0, β=0, γ=1.0 → score = matching/total = 2/2 = 1.0
+    let results = run_cypher(
+        "MATCH (d:Document) \
+         RETURN doc_score(d, [1.0, 0.0], {alpha: 0.0, beta: 0.0, gamma: 1.0}) AS score",
+        &engine,
+        &mut interner,
+    );
+    let score = match results[0].get("score") {
+        Some(Value::Float(f)) => *f,
+        other => panic!("expected Float, got {other:?}"),
+    };
+    assert!(
+        (score - 1.0).abs() < 1e-5,
+        "coverage-only map weights must yield 1.0, got {score}"
+    );
+}
+
+/// R-HYB2c regression #3: document with zero HAS_CHUNK children returns 0
+/// (not an error, not null). Required by the task spec.
+#[test]
+fn doc_score_zero_chunks_returns_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    // Insert Document with NO HAS_CHUNK edges.
+    insert_node(&engine, 1, 1, "Document", &[], &mut interner);
+
+    let results = run_cypher(
+        "MATCH (d:Document) \
+         RETURN doc_score(d, [1.0, 0.0]) AS score",
+        &engine,
+        &mut interner,
+    );
+    assert_eq!(results.len(), 1);
+    let score = match results[0].get("score") {
+        Some(Value::Float(f)) => *f,
+        other => panic!("expected Float, got {other:?}"),
+    };
+    assert!(
+        (score - 0.0).abs() < 1e-9,
+        "doc with zero HAS_CHUNK children must return 0, got {score}"
+    );
+}
+
+/// R-HYB2c: chunks without embedding reduce coverage (they count toward total
+/// but not toward matching). Formula: max/avg only over valid embeddings,
+/// coverage = matching / total where total includes all HAS_CHUNK children.
+#[test]
+fn doc_score_missing_embeddings_reduce_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    // 4 chunks: 2 with embedding (both aligned with query), 2 without.
+    seed_doc_with_chunks(
+        &engine,
+        &mut interner,
+        1,
+        &[Some(vec![1.0, 0.0]), Some(vec![0.8, 0.6]), None, None],
+    );
+
+    let results = run_cypher(
+        "MATCH (d:Document) \
+         RETURN doc_score(d, [1.0, 0.0]) AS score",
+        &engine,
+        &mut interner,
+    );
+    let score = match results[0].get("score") {
+        Some(Value::Float(f)) => *f,
+        other => panic!("expected Float, got {other:?}"),
+    };
+
+    let s1 = 1.0_f32;
+    let s2 = coordinode_vector::metrics::cosine_similarity(&[0.8, 0.6], &[1.0, 0.0]);
+    let avg = (s1 + s2) as f64 / 2.0;
+    // matching = 2 (both scored chunks have sim > 0); total = 4 (all HAS_CHUNK).
+    let coverage = 2.0_f64 / 4.0;
+    let expected = 0.5 * 1.0 + 0.3 * avg + 0.2 * coverage;
+    assert!(
+        (score - expected).abs() < 1e-5,
+        "coverage must use total (including chunks without embedding): got {score}, expected {expected}"
+    );
+}
+
+/// R-HYB2c: chunks with orthogonal / negatively-correlated embeddings must
+/// count toward `total` but NOT toward `matching`. Max and avg use the
+/// actual chunk similarities (which may be zero/negative); coverage drops.
+#[test]
+fn doc_score_negative_similarity_chunks_excluded_from_matching() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    // 3 chunks, all with embedding; none aligned with query [1,0]:
+    //   [0.0, 1.0] → cos = 0
+    //   [-1.0, 0.0] → cos = -1
+    //   [-0.5, 0.5] → cos ≈ -0.707
+    seed_doc_with_chunks(
+        &engine,
+        &mut interner,
+        1,
+        &[
+            Some(vec![0.0, 1.0]),
+            Some(vec![-1.0, 0.0]),
+            Some(vec![-0.5, 0.5]),
+        ],
+    );
+
+    let results = run_cypher(
+        "MATCH (d:Document) \
+         RETURN doc_score(d, [1.0, 0.0]) AS score",
+        &engine,
+        &mut interner,
+    );
+    let score = match results[0].get("score") {
+        Some(Value::Float(f)) => *f,
+        other => panic!("expected Float, got {other:?}"),
+    };
+
+    // matching = 0 (no chunk has sim > 0); coverage = 0/3 = 0.
+    // max is computed over all scored chunks so it's 0 (the best non-negative).
+    // Actually per implementation max is max over all scored similarities;
+    // with 0, -1, -0.707 the max is 0.
+    // avg = (0 + -1 + -0.707) / 3 ≈ -0.569
+    // score = 0.5*0 + 0.3*(-0.569) + 0.2*0 ≈ -0.171
+    let s1 = 0.0_f32;
+    let s2 = coordinode_vector::metrics::cosine_similarity(&[-1.0, 0.0], &[1.0, 0.0]);
+    let s3 = coordinode_vector::metrics::cosine_similarity(&[-0.5, 0.5], &[1.0, 0.0]);
+    let avg = (s1 + s2 + s3) as f64 / 3.0;
+    let max = 0.0_f64.max(s2 as f64).max(s3 as f64); // 0
+    let coverage = 0.0_f64;
+    let expected = 0.5 * max + 0.3 * avg + 0.2 * coverage;
+    assert!(
+        (score - expected).abs() < 1e-5,
+        "negative-sim chunks must be excluded from matching (coverage=0); got {score}, expected {expected}"
+    );
+}
+
+/// R-HYB2c: doc_score composes with ORDER BY and LIMIT to pick top docs.
+#[test]
+fn doc_score_orders_documents_by_relevance() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    // Doc 1: all chunks aligned with query → high score
+    seed_doc_with_chunks(
+        &engine,
+        &mut interner,
+        1,
+        &[Some(vec![1.0, 0.0]), Some(vec![0.9, 0.1])],
+    );
+    // Doc 2: mixed — one aligned, one orthogonal → mid score
+    seed_doc_with_chunks(
+        &engine,
+        &mut interner,
+        2,
+        &[Some(vec![1.0, 0.0]), Some(vec![0.0, 1.0])],
+    );
+    // Doc 3: all orthogonal → low score
+    seed_doc_with_chunks(
+        &engine,
+        &mut interner,
+        3,
+        &[Some(vec![0.0, 1.0]), Some(vec![0.0, 1.0])],
+    );
+
+    let results = run_cypher(
+        "MATCH (d:Document) \
+         RETURN d, doc_score(d, [1.0, 0.0]) AS score \
+         ORDER BY score DESC",
+        &engine,
+        &mut interner,
+    );
+    assert_eq!(results.len(), 3);
+    let top_id = match results[0].get("d") {
+        Some(Value::Int(v)) => *v as u64,
+        other => panic!("expected Int, got {other:?}"),
+    };
+    assert_eq!(top_id, 1, "fully-aligned doc must rank first");
+    let bottom_id = match results[2].get("d") {
+        Some(Value::Int(v)) => *v as u64,
+        other => panic!("expected Int, got {other:?}"),
+    };
+    assert_eq!(bottom_id, 3, "fully-orthogonal doc must rank last");
+
+    // Scores must be non-increasing.
+    let scores: Vec<f64> = results
+        .iter()
+        .map(|r| match r.get("score") {
+            Some(Value::Float(f)) => *f,
+            other => panic!("expected Float, got {other:?}"),
+        })
+        .collect();
+    for w in scores.windows(2) {
+        assert!(
+            w[0] >= w[1],
+            "scores must be non-increasing under ORDER BY DESC: {scores:?}"
+        );
+    }
+}
+
+/// R-HYB2c: plan-time guards — arity outside 2/3/5 rejected.
+#[test]
+fn doc_score_rejects_wrong_arity() {
+    let cases = [
+        ("RETURN doc_score(d) AS s", "1 argument"),
+        ("RETURN doc_score(d, $q, $a, $b) AS s", "4 arguments"),
+        (
+            "RETURN doc_score(d, $q, 0.1, 0.2, 0.3, 0.4) AS s",
+            "6 arguments",
+        ),
+    ];
+    for (frag, desc) in cases {
+        let q = format!("MATCH (d:Document) {frag}");
+        let ast = parse(&q).expect("parse");
+        let err = build_logical_plan(&ast).expect_err(&format!("{desc} must be rejected"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("doc_score()") && msg.contains("argument"),
+            "error must name doc_score and the arity problem ({desc}), got: {msg}"
+        );
+    }
+}
+
+/// R-HYB2c: first arg must be a bound variable, not a literal or expression.
+#[test]
+fn doc_score_rejects_non_variable_doc() {
+    let ast = parse(
+        "MATCH (d:Document) \
+         RETURN doc_score(123, [1.0, 0.0]) AS s",
+    )
+    .unwrap();
+    let err = build_logical_plan(&ast).expect_err("literal doc must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("doc_score()") && msg.contains("variable"),
+        "error must explain the variable requirement, got: {msg}"
+    );
+}
+
+/// R-HYB2c: weights map with unknown key rejected.
+#[test]
+fn doc_score_rejects_unknown_weight_key() {
+    let ast = parse(
+        "MATCH (d:Document) \
+         RETURN doc_score(d, [1.0, 0.0], {delta: 0.5}) AS s",
+    )
+    .unwrap();
+    let err = build_logical_plan(&ast).expect_err("unknown weight key must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("doc_score()") && msg.contains("unknown") && msg.contains("alpha"),
+        "error must name doc_score, the unknown key, and the allowed keys, got: {msg}"
+    );
+}
+
+/// R-HYB2c: doc_score in WHERE is rejected (correlated aggregate, not filter).
+#[test]
+fn doc_score_rejects_where_placement() {
+    let ast = parse(
+        "MATCH (d:Document) \
+         WHERE doc_score(d, [1.0, 0.0]) > 0.5 \
+         RETURN d",
+    )
+    .unwrap();
+    let err = build_logical_plan(&ast).expect_err("doc_score in WHERE must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("WHERE"),
+        "error must name the illegal position, got: {msg}"
+    );
+}
+
+/// R-HYB2c: EXPLAIN surfaces the DocScore operator under the innermost Project.
+#[test]
+fn doc_score_plan_contains_doc_score_operator() {
+    let ast = parse(
+        "MATCH (d:Document) \
+         RETURN d, doc_score(d, [1.0, 0.0]) AS s \
+         ORDER BY s DESC LIMIT 10",
+    )
+    .unwrap();
+    let plan = build_logical_plan(&ast).expect("plan");
+    let explain = plan.explain();
+    assert!(
+        explain.contains("DocScore(") && explain.contains("HAS_CHUNK"),
+        "EXPLAIN must show DocScore with HAS_CHUNK traversal; got:\n{explain}"
+    );
+}

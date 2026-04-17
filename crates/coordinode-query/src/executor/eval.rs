@@ -23,11 +23,18 @@ pub struct ScoreRequirements {
     /// `RankFuse` operator. If the builder did not insert one (shouldn't
     /// happen in a correctly-built plan), the Project/Sort guard errors.
     pub needs_rrf_score: bool,
+    /// `doc_score(...)` relies on `__doc_score__` populated by an upstream
+    /// `DocScore` operator. If the builder did not insert one, the
+    /// Project/Sort guard errors.
+    pub needs_doc_score: bool,
 }
 
 impl ScoreRequirements {
     pub fn any(&self) -> bool {
-        self.needs_text_score || self.needs_hybrid_score || self.needs_rrf_score
+        self.needs_text_score
+            || self.needs_hybrid_score
+            || self.needs_rrf_score
+            || self.needs_doc_score
     }
 }
 
@@ -46,6 +53,7 @@ fn collect_score_requirements(expr: &Expr, out: &mut ScoreRequirements) {
                 "text_score" => out.needs_text_score = true,
                 "hybrid_score" => out.needs_hybrid_score = true,
                 "rrf_score" => out.needs_rrf_score = true,
+                "doc_score" => out.needs_doc_score = true,
                 _ => {}
             }
             for a in args {
@@ -694,6 +702,10 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
         // reference for well-formed plans, so this branch only runs as a
         // defensive fallback (guarded by Project/Sort checks).
         "rrf_score" => row.get("__rrf_score__").cloned().unwrap_or(Value::Null),
+        // doc_score(doc, query [, α, β, γ]) → document-level aggregate cached
+        // on the row by `DocScore`. Defensive lookup — well-formed plans get
+        // the call rewritten to `Variable("__doc_score__")` before eval.
+        "doc_score" => row.get("__doc_score__").cloned().unwrap_or(Value::Null),
         // text_match(field, query) → boolean. Used in WHERE clause.
         // When used in RETURN, checks if __text_score__ was set by TextFilter.
         "text_match" => {

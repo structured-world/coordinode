@@ -503,6 +503,34 @@ pub enum LogicalOp {
         shard_overfetch_cap: Option<usize>,
     },
 
+    /// Document-level aggregate score (R-HYB2c).
+    ///
+    /// For each input row that binds `doc_variable` to a Document node,
+    /// traverse outward `HAS_CHUNK` edges, score each chunk against the
+    /// query vector (cosine similarity), and compute
+    /// `α·max_chunk + β·avg_chunk + γ·coverage` into the `__doc_score__`
+    /// column, where `coverage = matching_chunks / total_chunks` and a
+    /// chunk is "matching" when its embedding is present and cosine
+    /// similarity is non-negative.
+    ///
+    /// Produced by the planner when `doc_score(doc, query [, α, β, γ])` or
+    /// `doc_score(doc, query, {alpha, beta, gamma})` is detected in a
+    /// Project / Sort expression. Correlated per input row — not a single
+    /// materialising pass like `RankFuse`.
+    DocScore {
+        input: Box<LogicalOp>,
+        /// Variable bound to a Document node whose HAS_CHUNK children get scored.
+        doc_variable: String,
+        /// Query vector (or expression resolving to Vec<f32>).
+        query_vector: Expr,
+        /// α weight on max_chunk_score. Default 0.5.
+        alpha: Expr,
+        /// β weight on avg_chunk_score. Default 0.3.
+        beta: Expr,
+        /// γ weight on coverage (matching / total). Default 0.2.
+        gamma: Expr,
+    },
+
     /// Empty input (no rows, used as leaf for standalone CREATE).
     Empty,
 }
@@ -721,6 +749,20 @@ impl LogicalOp {
                 if let Some(qt) = query_text {
                     qt.substitute_params(params);
                 }
+            }
+            LogicalOp::DocScore {
+                input,
+                query_vector,
+                alpha,
+                beta,
+                gamma,
+                ..
+            } => {
+                input.substitute_params(params);
+                query_vector.substitute_params(params);
+                alpha.substitute_params(params);
+                beta.substitute_params(params);
+                gamma.substitute_params(params);
             }
             LogicalOp::AlterLabel { .. }
             | LogicalOp::CreateTextIndex { .. }
@@ -1258,6 +1300,15 @@ fn estimate_op_cost(
             (input_cost + score_cost + sort_cost * 0.01, output_rows)
         }
 
+        LogicalOp::DocScore { input, .. } => {
+            let (input_cost, input_rows) = estimate_op_cost(input, defaults, stats, hints);
+            // Per input row: one adjacency read + one chunk-node read per HAS_CHUNK
+            // child + one cosine computation per chunk. Estimate avg_fan_out chunks
+            // per document, each costing roughly one vector-score unit.
+            let per_row_cost = defaults.avg_fan_out;
+            (input_cost + input_rows * per_row_cost, input_rows)
+        }
+
         LogicalOp::ProcedureCall { .. } => (1.0, 10.0),
         LogicalOp::AlterLabel { .. }
         | LogicalOp::CreateTextIndex { .. }
@@ -1344,7 +1395,8 @@ fn op_contains_vector_filter(op: &LogicalOp) -> bool {
         | LogicalOp::TextFilter { input, .. }
         | LogicalOp::EncryptedFilter { input, .. }
         | LogicalOp::ShortestPath { input, .. }
-        | LogicalOp::RankFuse { input, .. } => op_contains_vector_filter(input),
+        | LogicalOp::RankFuse { input, .. }
+        | LogicalOp::DocScore { input, .. } => op_contains_vector_filter(input),
         LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
             op_contains_vector_filter(left) || op_contains_vector_filter(right)
         }
@@ -1735,6 +1787,19 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
                 "{prefix}RankFuse(methods=[{}], query={{{}}}, k=60{cap_str})\n",
                 method_strs.join(", "),
                 query_parts.join(", "),
+            ));
+            explain_op(input, indent + 1, output);
+        }
+        LogicalOp::DocScore {
+            input,
+            doc_variable,
+            alpha,
+            beta,
+            gamma,
+            ..
+        } => {
+            output.push_str(&format!(
+                "{prefix}DocScore({doc_variable} -[:HAS_CHUNK]-> chunks, α={alpha:?}, β={beta:?}, γ={gamma:?})\n",
             ));
             explain_op(input, indent + 1, output);
         }

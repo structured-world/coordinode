@@ -1353,6 +1353,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                     acc.needs_text_score |= r.needs_text_score;
                     acc.needs_hybrid_score |= r.needs_hybrid_score;
                     acc.needs_rrf_score |= r.needs_rrf_score;
+                    acc.needs_doc_score |= r.needs_doc_score;
                     acc
                 });
             if let Some(first) = rows.first() {
@@ -1379,6 +1380,15 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                         "rrf_score() requires a RankFuse upstream operator to populate \
                          ranks — this typically means the planner failed to detect the \
                          rrf_score call-site; please file a bug with the query"
+                            .to_string(),
+                    ));
+                }
+                let has_doc = first.contains_key("__doc_score__");
+                if score_reqs.needs_doc_score && !has_doc {
+                    return Err(ExecutionError::Unsupported(
+                        "doc_score() requires a DocScore upstream operator — this typically \
+                         means the planner failed to detect the doc_score call-site; please \
+                         file a bug with the query"
                             .to_string(),
                     ));
                 }
@@ -1444,6 +1454,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                     acc.needs_text_score |= r.needs_text_score;
                     acc.needs_hybrid_score |= r.needs_hybrid_score;
                     acc.needs_rrf_score |= r.needs_rrf_score;
+                    acc.needs_doc_score |= r.needs_doc_score;
                     acc
                 });
             if let Some(first) = rows.first() {
@@ -1470,6 +1481,15 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                         "rrf_score() requires a RankFuse upstream operator to populate \
                          ranks — this typically means the planner failed to detect the \
                          rrf_score call-site; please file a bug with the query"
+                            .to_string(),
+                    ));
+                }
+                let has_doc = first.contains_key("__doc_score__");
+                if score_reqs.needs_doc_score && !has_doc {
+                    return Err(ExecutionError::Unsupported(
+                        "doc_score() requires a DocScore upstream operator — this typically \
+                         means the planner failed to detect the doc_score call-site; please \
+                         file a bug with the query"
                             .to_string(),
                     ));
                 }
@@ -1970,6 +1990,18 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 *shard_overfetch_cap,
                 ctx,
             )
+        }
+
+        LogicalOp::DocScore {
+            input,
+            doc_variable,
+            query_vector,
+            alpha,
+            beta,
+            gamma,
+        } => {
+            let rows = execute_op(input, ctx)?;
+            execute_doc_score(rows, doc_variable, query_vector, alpha, beta, gamma, ctx)
         }
     }
 }
@@ -3719,6 +3751,148 @@ fn float_bits_eq(a: f64, b: f64) -> bool {
         return false;
     }
     a == b
+}
+
+/// Eval an α/β/γ weight expression to f64 with a fallback default.
+///
+/// `doc_score` weights are literal Floats / Ints in the AST after builder
+/// normalisation; Parameters are substituted before execute time. Anything
+/// that does not resolve to a finite number falls back to the default.
+fn eval_weight(expr: &Expr, default: f64) -> f64 {
+    let v = eval_expr(expr, &Row::new());
+    match v {
+        Value::Float(f) if f.is_finite() => f,
+        Value::Int(i) => i as f64,
+        _ => default,
+    }
+}
+
+/// Execute `LogicalOp::DocScore`: per doc row, traverse outward HAS_CHUNK,
+/// read chunk nodes, score each chunk against the query vector via cosine
+/// similarity, compute `α·max + β·avg + γ·coverage`, write it to
+/// `__doc_score__` on the output row.
+#[allow(clippy::too_many_arguments)]
+fn execute_doc_score(
+    rows: Vec<Row>,
+    doc_variable: &str,
+    query_vector: &Expr,
+    alpha: &Expr,
+    beta: &Expr,
+    gamma: &Expr,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    let alpha_f = eval_weight(alpha, 0.5);
+    let beta_f = eval_weight(beta, 0.3);
+    let gamma_f = eval_weight(gamma, 0.2);
+    let query_val = eval_expr(query_vector, &Row::new());
+    let query_vec = coerce_value_to_vec(&query_val).ok_or_else(|| {
+        ExecutionError::Unsupported(
+            "doc_score(): query argument must be a vector (Vec<f32>) — resolve the parameter \
+             to a vector literal at call time"
+                .to_string(),
+        )
+    })?;
+    if query_vec.is_empty() {
+        return Err(ExecutionError::Unsupported(
+            "doc_score(): query vector is empty".to_string(),
+        ));
+    }
+
+    let has_chunk = "HAS_CHUNK".to_string();
+    let embedding_fid = ctx.interner.lookup("embedding");
+
+    let mut out_rows: Vec<Row> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let doc_id = match row.get(doc_variable) {
+            Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+            _ => {
+                // Not a bound node — emit 0 and move on; matches "zero
+                // matching chunks returns 0" spirit rather than erroring.
+                let mut out = row;
+                out.insert("__doc_score__".to_string(), Value::Float(0.0));
+                out_rows.push(out);
+                continue;
+            }
+        };
+
+        // Traverse outward HAS_CHUNK edges; each neighbour is a chunk node id.
+        let neighbours = expand_one_hop(
+            doc_id,
+            std::slice::from_ref(&has_chunk),
+            Direction::Outgoing,
+            ctx,
+        )?;
+
+        if neighbours.is_empty() {
+            let mut out = row;
+            out.insert("__doc_score__".to_string(), Value::Float(0.0));
+            out_rows.push(out);
+            continue;
+        }
+
+        let total = neighbours.len() as f64;
+        let mut max_score: f64 = 0.0;
+        let mut sum_score: f64 = 0.0;
+        let mut scored_count: usize = 0;
+        let mut matching: usize = 0;
+
+        for (chunk_uid, _et_idx) in &neighbours {
+            let chunk_key = encode_node_key(ctx.shard_id, NodeId::from_raw(*chunk_uid));
+            let chunk_bytes = match ctx.mvcc_get(Partition::Node, &chunk_key)? {
+                Some(b) => b,
+                None => continue,
+            };
+            let chunk = NodeRecord::from_msgpack(&chunk_bytes).map_err(|e| {
+                ExecutionError::Serialization(format!("chunk deserialization error: {e}"))
+            })?;
+            let emb = embedding_fid.and_then(|fid| chunk.get(fid)).or_else(|| {
+                // Fallback: linear search by interned name (handles cases where
+                // the writer interned "embedding" under a different id than
+                // the reader has seen yet).
+                chunk.props.iter().find_map(|(fid, v)| {
+                    if ctx.interner.resolve(*fid) == Some("embedding") {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                })
+            });
+            let vec_val = match emb {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            let Some(chunk_vec) = coerce_value_to_vec(&vec_val) else {
+                continue;
+            };
+            if chunk_vec.len() != query_vec.len() {
+                continue;
+            }
+            let sim = coordinode_vector::metrics::cosine_similarity(&chunk_vec, &query_vec) as f64;
+            if scored_count == 0 || sim > max_score {
+                max_score = sim;
+            }
+            sum_score += sim;
+            scored_count += 1;
+            if sim > 0.0 {
+                matching += 1;
+            }
+        }
+
+        let avg_score = if scored_count > 0 {
+            sum_score / scored_count as f64
+        } else {
+            0.0
+        };
+        let coverage = matching as f64 / total;
+        let effective_max = if scored_count > 0 { max_score } else { 0.0 };
+        let score = alpha_f * effective_max + beta_f * avg_score + gamma_f * coverage;
+
+        let mut out = row;
+        out.insert("__doc_score__".to_string(), Value::Float(score));
+        out_rows.push(out);
+    }
+
+    Ok(out_rows)
 }
 
 /// Coerce a Value to Vec<f32> for vector operations in VectorFilter.

@@ -103,6 +103,45 @@ RETURN hybrid_score(d, "rust") AS score    // text-only, returns text_score
 
 `hybrid_score` requires at least one of `text_match(...)` or `vector_distance(...)` / `vector_similarity(...)` in `WHERE` against the same node — calling it on a plan with neither filter is a query-time error (no silent zeros).
 
+### Document-Level Aggregate ✅ 🔷
+
+| Function | Signature | Returns | Notes |
+|----------|-----------|---------|-------|
+| `doc_score` | `doc_score(doc, query [, α, β, γ])` or `doc_score(doc, query, {alpha, beta, gamma})` | Float | Document-level aggregate over `HAS_CHUNK` children |
+
+`doc_score` computes `α·max_chunk + β·avg_chunk + γ·coverage` for a Document by traversing its outward `HAS_CHUNK` edges and scoring each Chunk's `embedding` property against the query vector with cosine similarity. Defaults: `α=0.5`, `β=0.3`, `γ=0.2`.
+
+```cypher
+// Rank documents by relevance to a query embedding
+MATCH (d:Document)
+RETURN d.title, doc_score(d, $query_vec) AS score
+ORDER BY score DESC LIMIT 20
+```
+
+```cypher
+// Override weights — pure max_chunk (peak relevance), ignore breadth and coverage
+RETURN doc_score(d, $query_vec, 1.0, 0.0, 0.0) AS score
+```
+
+```cypher
+// Override via map — equivalent, keyword form
+RETURN doc_score(d, $query_vec, {alpha: 0.7, beta: 0.2, gamma: 0.1}) AS score
+```
+
+**Semantics:**
+- `max_chunk` and `avg_chunk` are over chunks whose `embedding` property is a valid vector of the query's dimension. Chunks without an embedding are ignored in the aggregate.
+- `coverage = matching_chunks / total_chunks` where `total_chunks` counts **all** `HAS_CHUNK` children (including those without an embedding) and `matching_chunks` counts only chunks with a non-negative cosine similarity to the query (topically aligned). Chunks with negative cosine — pointing away from the query — are not "matching".
+- If the document has zero `HAS_CHUNK` children, `doc_score` returns `0.0` (not `null`, not an error).
+- If none of the scored chunks are "matching" (all have `sim ≤ 0`), `coverage = 0` and only the max/avg terms contribute.
+
+**Error conditions** (plan-time where possible):
+- `doc_score(d)` — fewer than 2 arguments rejected.
+- `doc_score(d, q, a, b)` — 4 arguments rejected (use 2, 3, or 5).
+- `doc_score(d, q, a, b, c, d2)` — 6+ arguments rejected.
+- `doc_score(42, q)` — first argument must be a bound variable, not a literal.
+- `doc_score(d, q, {delta: 0.5})` — map keys other than `alpha`, `beta`, `gamma` rejected.
+- `doc_score` inside a `WHERE` clause — rejected (it is a correlated aggregate, not a filter predicate).
+
 ### Reciprocal Rank Fusion ✅ 🔷
 
 | Function | Signature | Returns | Notes |

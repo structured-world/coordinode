@@ -50,6 +50,34 @@ pub enum PlanError {
 
     #[error("rrf_score() cannot appear in {location} — it requires materialised rank assignment")]
     RrfScoreIllegalPosition { location: String },
+
+    #[error(
+        "doc_score() takes 2-5 arguments: doc_score(doc, query [, α, β, γ]) or \
+         doc_score(doc, query, {{alpha, beta, gamma}}); got {got} argument(s)"
+    )]
+    DocScoreArity { got: usize },
+
+    #[error(
+        "doc_score(): first argument must be a variable bound to a Document node (e.g. `d`); got {got}"
+    )]
+    DocScoreDocShape { got: String },
+
+    #[error(
+        "doc_score(): weights argument must be a map with keys `alpha`, `beta`, `gamma` \
+         (e.g. {{alpha: 0.4, beta: 0.4, gamma: 0.2}}) or three positional numeric arguments; \
+         got {got}"
+    )]
+    DocScoreWeightsShape { got: String },
+
+    #[error(
+        "doc_score(): multiple doc_score() calls with differing doc / query / weights are \
+         not supported in a single query (detected at {location}). Use WITH to materialise \
+         the first call before invoking the second"
+    )]
+    DocScoreMultipleCalls { location: String },
+
+    #[error("doc_score() cannot appear in {location} — it is a correlated aggregate over HAS_CHUNK children")]
+    DocScoreIllegalPosition { location: String },
 }
 
 /// Build a logical plan from a validated Cypher AST.
@@ -81,6 +109,10 @@ pub fn build_logical_plan(query: &Query) -> Result<LogicalPlan, PlanError> {
     // Planner pass: detect `rrf_score([methods…], query)` in Project / Sort items
     // and lift it into a `LogicalOp::RankFuse` below the innermost Project.
     let root = rewrite_rrf_score(root)?;
+
+    // Planner pass: detect `doc_score(doc, query [,α,β,γ])` in Project / Sort
+    // items and lift it into a `LogicalOp::DocScore` below the innermost Project.
+    let root = rewrite_doc_score(root)?;
 
     // Extract vector_consistency from per-query hints (overrides session default).
     let vector_consistency = query
@@ -2801,6 +2833,492 @@ fn ensure_rrf_passthrough(op: LogicalOp) -> LogicalOp {
         },
         other => other,
     }
+}
+
+// =============================================================================
+// R-HYB2c: doc_score planner post-pass
+// =============================================================================
+
+/// Canonical signature captured from a `doc_score(...)` call-site. Multiple
+/// call-sites in one plan must all produce the same signature.
+#[derive(Debug, Clone, PartialEq)]
+struct DocScoreSig {
+    doc_variable: String,
+    query_vector: Expr,
+    alpha: Expr,
+    beta: Expr,
+    gamma: Expr,
+}
+
+fn match_doc_score(expr: &Expr) -> Option<&[Expr]> {
+    if let Expr::FunctionCall { name, args, .. } = expr {
+        if name == "doc_score" {
+            return Some(args);
+        }
+    }
+    None
+}
+
+fn expr_contains_doc_score(expr: &Expr) -> bool {
+    let mut hit = false;
+    collect_doc_presence(expr, &mut hit);
+    hit
+}
+
+fn collect_doc_presence(expr: &Expr, hit: &mut bool) {
+    if *hit {
+        return;
+    }
+    match expr {
+        Expr::FunctionCall { name, args, .. } => {
+            if name == "doc_score" {
+                *hit = true;
+                return;
+            }
+            for a in args {
+                collect_doc_presence(a, hit);
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_doc_presence(left, hit);
+            collect_doc_presence(right, hit);
+        }
+        Expr::UnaryOp { expr, .. } => collect_doc_presence(expr, hit),
+        Expr::PropertyAccess { expr, .. } => collect_doc_presence(expr, hit),
+        Expr::List(items) => items.iter().for_each(|e| collect_doc_presence(e, hit)),
+        Expr::MapLiteral(fields) => fields
+            .iter()
+            .for_each(|(_, v)| collect_doc_presence(v, hit)),
+        Expr::In { expr, list } => {
+            collect_doc_presence(expr, hit);
+            collect_doc_presence(list, hit);
+        }
+        Expr::IsNull { expr, .. } => collect_doc_presence(expr, hit),
+        Expr::StringMatch { expr, pattern, .. } => {
+            collect_doc_presence(expr, hit);
+            collect_doc_presence(pattern, hit);
+        }
+        Expr::Subscript { expr, index } => {
+            collect_doc_presence(expr, hit);
+            collect_doc_presence(index, hit);
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(o) = operand.as_deref() {
+                collect_doc_presence(o, hit);
+            }
+            for (c, v) in when_clauses {
+                collect_doc_presence(c, hit);
+                collect_doc_presence(v, hit);
+            }
+            if let Some(e) = else_clause.as_deref() {
+                collect_doc_presence(e, hit);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Canonical default weight expressions for doc_score.
+fn default_doc_weight(value: f64) -> Expr {
+    Expr::Literal(Value::Float(value))
+}
+
+/// Parse and validate a single `doc_score(args...)` call.
+fn parse_doc_signature(args: &[Expr]) -> Result<DocScoreSig, PlanError> {
+    if args.len() < 2 || args.len() > 5 || args.len() == 4 {
+        return Err(PlanError::DocScoreArity { got: args.len() });
+    }
+
+    let doc_variable = match &args[0] {
+        Expr::Variable(v) => v.clone(),
+        other => {
+            return Err(PlanError::DocScoreDocShape {
+                got: format!("{other:?}"),
+            });
+        }
+    };
+
+    let query_vector = args[1].clone();
+
+    let (alpha, beta, gamma) = match args.len() {
+        2 => (
+            default_doc_weight(0.5),
+            default_doc_weight(0.3),
+            default_doc_weight(0.2),
+        ),
+        3 => match &args[2] {
+            Expr::MapLiteral(fields) => {
+                let mut a = default_doc_weight(0.5);
+                let mut b = default_doc_weight(0.3);
+                let mut g = default_doc_weight(0.2);
+                for (k, v) in fields {
+                    match k.as_str() {
+                        "alpha" => a = v.clone(),
+                        "beta" => b = v.clone(),
+                        "gamma" => g = v.clone(),
+                        other => {
+                            return Err(PlanError::DocScoreWeightsShape {
+                                got: format!(
+                                    "map with unknown key `{other}` (expected `alpha`, `beta`, `gamma`)"
+                                ),
+                            });
+                        }
+                    }
+                }
+                (a, b, g)
+            }
+            other => {
+                return Err(PlanError::DocScoreWeightsShape {
+                    got: format!("single-arg weights must be a map literal, got {other:?}"),
+                });
+            }
+        },
+        5 => (args[2].clone(), args[3].clone(), args[4].clone()),
+        _ => unreachable!("arity guard above excludes other lengths"),
+    };
+
+    Ok(DocScoreSig {
+        doc_variable,
+        query_vector,
+        alpha,
+        beta,
+        gamma,
+    })
+}
+
+fn collect_doc_sig_in_expr(
+    expr: &Expr,
+    found: &mut Option<DocScoreSig>,
+    location: &str,
+) -> Result<(), PlanError> {
+    if let Some(args) = match_doc_score(expr) {
+        let sig = parse_doc_signature(args)?;
+        match found {
+            None => *found = Some(sig),
+            Some(existing) if *existing == sig => {}
+            Some(_) => {
+                return Err(PlanError::DocScoreMultipleCalls {
+                    location: location.to_string(),
+                });
+            }
+        }
+        return Ok(());
+    }
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            collect_doc_sig_in_expr(left, found, location)?;
+            collect_doc_sig_in_expr(right, found, location)?;
+        }
+        Expr::UnaryOp { expr, .. } => collect_doc_sig_in_expr(expr, found, location)?,
+        Expr::PropertyAccess { expr, .. } => collect_doc_sig_in_expr(expr, found, location)?,
+        Expr::List(items) => {
+            for it in items {
+                collect_doc_sig_in_expr(it, found, location)?;
+            }
+        }
+        Expr::MapLiteral(fields) => {
+            for (_, v) in fields {
+                collect_doc_sig_in_expr(v, found, location)?;
+            }
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_doc_sig_in_expr(a, found, location)?;
+            }
+        }
+        Expr::In { expr, list } => {
+            collect_doc_sig_in_expr(expr, found, location)?;
+            collect_doc_sig_in_expr(list, found, location)?;
+        }
+        Expr::IsNull { expr, .. } => collect_doc_sig_in_expr(expr, found, location)?,
+        Expr::StringMatch { expr, pattern, .. } => {
+            collect_doc_sig_in_expr(expr, found, location)?;
+            collect_doc_sig_in_expr(pattern, found, location)?;
+        }
+        Expr::Subscript { expr, index } => {
+            collect_doc_sig_in_expr(expr, found, location)?;
+            collect_doc_sig_in_expr(index, found, location)?;
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(o) = operand.as_deref() {
+                collect_doc_sig_in_expr(o, found, location)?;
+            }
+            for (c, v) in when_clauses {
+                collect_doc_sig_in_expr(c, found, location)?;
+                collect_doc_sig_in_expr(v, found, location)?;
+            }
+            if let Some(e) = else_clause.as_deref() {
+                collect_doc_sig_in_expr(e, found, location)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn rewrite_doc_in_expr(expr: &mut Expr) {
+    if let Expr::FunctionCall { name, .. } = expr {
+        if name == "doc_score" {
+            *expr = Expr::Variable("__doc_score__".to_string());
+            return;
+        }
+    }
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_doc_in_expr(left);
+            rewrite_doc_in_expr(right);
+        }
+        Expr::UnaryOp { expr, .. } => rewrite_doc_in_expr(expr),
+        Expr::PropertyAccess { expr, .. } => rewrite_doc_in_expr(expr),
+        Expr::List(items) => items.iter_mut().for_each(rewrite_doc_in_expr),
+        Expr::MapLiteral(fields) => fields.iter_mut().for_each(|(_, v)| rewrite_doc_in_expr(v)),
+        Expr::FunctionCall { args, .. } => args.iter_mut().for_each(rewrite_doc_in_expr),
+        Expr::In { expr, list } => {
+            rewrite_doc_in_expr(expr);
+            rewrite_doc_in_expr(list);
+        }
+        Expr::IsNull { expr, .. } => rewrite_doc_in_expr(expr),
+        Expr::StringMatch { expr, pattern, .. } => {
+            rewrite_doc_in_expr(expr);
+            rewrite_doc_in_expr(pattern);
+        }
+        Expr::Subscript { expr, index } => {
+            rewrite_doc_in_expr(expr);
+            rewrite_doc_in_expr(index);
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(o) = operand.as_deref_mut() {
+                rewrite_doc_in_expr(o);
+            }
+            for (c, v) in when_clauses {
+                rewrite_doc_in_expr(c);
+                rewrite_doc_in_expr(v);
+            }
+            if let Some(e) = else_clause.as_deref_mut() {
+                rewrite_doc_in_expr(e);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Verify no `doc_score(...)` appears in an illegal position (WHERE, GROUP BY,
+/// aggregate args, etc.). Only Project items and Sort items are legal sites.
+fn validate_doc_placement(op: &LogicalOp) -> Result<(), PlanError> {
+    match op {
+        LogicalOp::Filter { input, predicate } => {
+            if expr_contains_doc_score(predicate) {
+                return Err(PlanError::DocScoreIllegalPosition {
+                    location: "WHERE clause".to_string(),
+                });
+            }
+            validate_doc_placement(input)
+        }
+        LogicalOp::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
+            for e in group_by {
+                if expr_contains_doc_score(e) {
+                    return Err(PlanError::DocScoreIllegalPosition {
+                        location: "GROUP BY key".to_string(),
+                    });
+                }
+            }
+            for a in aggregates {
+                if expr_contains_doc_score(&a.arg) {
+                    return Err(PlanError::DocScoreIllegalPosition {
+                        location: "aggregate function argument".to_string(),
+                    });
+                }
+            }
+            validate_doc_placement(input)
+        }
+        LogicalOp::Project { input, .. } | LogicalOp::Sort { input, .. } => {
+            validate_doc_placement(input)
+        }
+        LogicalOp::Limit { input, count } | LogicalOp::Skip { input, count } => {
+            if expr_contains_doc_score(count) {
+                return Err(PlanError::DocScoreIllegalPosition {
+                    location: "LIMIT/SKIP expression".to_string(),
+                });
+            }
+            validate_doc_placement(input)
+        }
+        LogicalOp::Traverse { input, .. }
+        | LogicalOp::VectorFilter { input, .. }
+        | LogicalOp::VectorTopK { input, .. }
+        | LogicalOp::EdgeVectorSearch { input, .. }
+        | LogicalOp::TextFilter { input, .. }
+        | LogicalOp::EncryptedFilter { input, .. }
+        | LogicalOp::Unwind { input, .. }
+        | LogicalOp::ShortestPath { input, .. }
+        | LogicalOp::Update { input, .. }
+        | LogicalOp::RemoveOp { input, .. }
+        | LogicalOp::Delete { input, .. }
+        | LogicalOp::DetachDocument { input, .. }
+        | LogicalOp::AttachDocument { input, .. } => validate_doc_placement(input),
+        LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
+            validate_doc_placement(left)?;
+            validate_doc_placement(right)
+        }
+        LogicalOp::CreateNode { input, .. } => {
+            if let Some(inp) = input {
+                validate_doc_placement(inp)?;
+            }
+            Ok(())
+        }
+        LogicalOp::CreateEdge { input, .. } => validate_doc_placement(input),
+        LogicalOp::Merge { pattern, .. } | LogicalOp::Upsert { pattern, .. } => {
+            validate_doc_placement(pattern)
+        }
+        LogicalOp::RankFuse { input, .. } | LogicalOp::DocScore { input, .. } => {
+            validate_doc_placement(input)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn collect_doc_sig(op: &LogicalOp, sig: &mut Option<DocScoreSig>) -> Result<(), PlanError> {
+    match op {
+        LogicalOp::Project { input, items, .. } => {
+            for it in items {
+                collect_doc_sig_in_expr(&it.expr, sig, "RETURN")?;
+            }
+            collect_doc_sig(input, sig)
+        }
+        LogicalOp::Sort { input, items } => {
+            for it in items {
+                collect_doc_sig_in_expr(&it.expr, sig, "ORDER BY")?;
+            }
+            collect_doc_sig(input, sig)
+        }
+        LogicalOp::Limit { input, .. } | LogicalOp::Skip { input, .. } => {
+            collect_doc_sig(input, sig)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn wrap_doc_score(op: LogicalOp, sig: &DocScoreSig, sort_touches_doc: &mut bool) -> LogicalOp {
+    match op {
+        LogicalOp::Project {
+            input,
+            mut items,
+            distinct,
+        } => {
+            for it in items.iter_mut() {
+                rewrite_doc_in_expr(&mut it.expr);
+            }
+            let fused_input = LogicalOp::DocScore {
+                input,
+                doc_variable: sig.doc_variable.clone(),
+                query_vector: sig.query_vector.clone(),
+                alpha: sig.alpha.clone(),
+                beta: sig.beta.clone(),
+                gamma: sig.gamma.clone(),
+            };
+            LogicalOp::Project {
+                input: Box::new(fused_input),
+                items,
+                distinct,
+            }
+        }
+        LogicalOp::Sort { input, mut items } => {
+            for it in items.iter_mut() {
+                if expr_contains_doc_score(&it.expr) {
+                    *sort_touches_doc = true;
+                }
+                rewrite_doc_in_expr(&mut it.expr);
+            }
+            LogicalOp::Sort {
+                input: Box::new(wrap_doc_score(*input, sig, sort_touches_doc)),
+                items,
+            }
+        }
+        LogicalOp::Limit { input, count } => LogicalOp::Limit {
+            input: Box::new(wrap_doc_score(*input, sig, sort_touches_doc)),
+            count,
+        },
+        LogicalOp::Skip { input, count } => LogicalOp::Skip {
+            input: Box::new(wrap_doc_score(*input, sig, sort_touches_doc)),
+            count,
+        },
+        other => other,
+    }
+}
+
+fn ensure_doc_passthrough(op: LogicalOp) -> LogicalOp {
+    match op {
+        LogicalOp::Project {
+            input,
+            mut items,
+            distinct,
+        } => {
+            let already_present = items.iter().any(|it| {
+                it.alias.as_deref() == Some("__doc_score__")
+                    || matches!(&it.expr, Expr::Variable(v) if v == "__doc_score__")
+            });
+            if !already_present {
+                items.push(ProjectItem {
+                    expr: Expr::Variable("__doc_score__".to_string()),
+                    alias: Some("__doc_score__".to_string()),
+                });
+            }
+            LogicalOp::Project {
+                input,
+                items,
+                distinct,
+            }
+        }
+        LogicalOp::Sort { input, items } => LogicalOp::Sort {
+            input: Box::new(ensure_doc_passthrough(*input)),
+            items,
+        },
+        LogicalOp::Limit { input, count } => LogicalOp::Limit {
+            input: Box::new(ensure_doc_passthrough(*input)),
+            count,
+        },
+        LogicalOp::Skip { input, count } => LogicalOp::Skip {
+            input: Box::new(ensure_doc_passthrough(*input)),
+            count,
+        },
+        other => other,
+    }
+}
+
+fn rewrite_doc_score(op: LogicalOp) -> Result<LogicalOp, PlanError> {
+    validate_doc_placement(&op)?;
+
+    let mut sig: Option<DocScoreSig> = None;
+    collect_doc_sig(&op, &mut sig)?;
+
+    let Some(sig) = sig else {
+        return Ok(op);
+    };
+
+    let mut sort_touches_doc = false;
+    let op = wrap_doc_score(op, &sig, &mut sort_touches_doc);
+    let op = if sort_touches_doc {
+        ensure_doc_passthrough(op)
+    } else {
+        op
+    };
+
+    Ok(op)
 }
 
 #[cfg(test)]
