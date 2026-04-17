@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.4.0 — 2026-04-17
+
+### coordinode-embed
+## [0.4.0](https://github.com/structured-world/coordinode/compare/v0.3.20...v0.4.0) - 2026-04-17
+
+#### Fixed
+
+- *(query)* text_match() hard-fails on missing FT-index
+
+### coordinode-query
+## [0.4.0](https://github.com/structured-world/coordinode/compare/v0.3.20...v0.4.0) - 2026-04-17
+
+#### Added
+
+- *(query)* add doc_score Cypher function for document-level aggregate
+- *(query)* [**breaking**] add rrf_score Cypher function with RankFuse operator
+- *(query)* hybrid_score() scoring helper (R-HYB2 part 1/3)
+- *(query)* text_score() composition + guard against silent-0 on missing FT index
+
+#### Fixed
+
+- *(query)* text_match() hard-fails on missing FT-index
+
+#### Testing
+
+- *(query)* cover R-HYB2c edge cases missed in the initial PR
+- *(query)* cover R-HYB1b empty-input shortcut and document text_match guard
+- *(query)* add regression tests for text_match hard-fail on missing FT-index
+- *(query)* cover rrf_score edge cases missed in the initial PR
+
+### coordinode-server
+## [0.4.0](https://github.com/structured-world/coordinode/compare/v0.3.20...v0.4.0) - 2026-04-17
+
+#### Added
+
+- *(query)* [**breaking**] add rrf_score Cypher function with RankFuse operator
+
+---
+
 ## Unreleased
 
 ### coordinode-query
