@@ -3277,6 +3277,33 @@ fn text_match_no_index_errors() {
     );
 }
 
+// R-HYB1b regression: if the input row set is empty (e.g. MATCH matched no
+// nodes after DETACH DELETE), `text_match()` must return an empty result
+// rather than erroring on a missing index. There is nothing to filter, and
+// failing here would turn a legitimately empty upstream into a spurious
+// "missing FT-index" error. Covers the empty-rows short-circuit in
+// `execute_text_filter`.
+#[test]
+fn text_match_empty_input_short_circuits_without_index_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    // No Article nodes inserted — MATCH will produce 0 rows.
+
+    // No text index registered — if we reached the index lookup, this would
+    // error. The empty-input shortcut must fire first and return an empty
+    // result cleanly.
+    let results = run_cypher(
+        "MATCH (a:Article) WHERE text_match(a.body, \"rust\") RETURN a.body",
+        &engine,
+        &mut interner,
+    );
+    assert!(
+        results.is_empty(),
+        "empty upstream must produce empty output without hitting the FT-index guard"
+    );
+}
+
 // R-HYB1b regression: when a `TextIndexRegistry` is wired but has no entry
 // for the specific (label, property), the error must name BOTH the label
 // and the property so the user can create the right index.
