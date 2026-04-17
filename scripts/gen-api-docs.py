@@ -563,10 +563,49 @@ def generate_service_page(
     if has_http and svc.name not in INTERNAL_SERVICES:
         lines.append(
             "::: info Transport\n"
-            "All methods are available via **gRPC on port 7080**. "
-            "HTTP/JSON transcoding paths shown below are annotations planned for port 7081 "
-            "and are **not yet available** in this release.\n"
+            "All methods are available via:\n"
+            "- **gRPC** on port **7080** — native high-performance API\n"
+            "- **REST/JSON** on port **7081** — HTTP/JSON transcoding via embedded structured-proxy\n"
             ":::\n"
+        )
+
+    # CypherService: add query parameters reference
+    if svc.name == "CypherService":
+        lines.append(
+            "## Query Parameters (REST)\n"
+            "\n"
+            "Named parameters are passed in the `parameters` map. "
+            "Each value is a JSON object with a single key matching the `PropertyValue` proto field name:\n"
+            "\n"
+            "```json\n"
+            "{\n"
+            '  "query": "MATCH (n:Concept {name: $name}) RETURN n",\n'
+            '  "parameters": {\n'
+            '    "name":            { "stringValue": "machine learning" },\n'
+            '    "limit":           { "intValue": "10" },\n'
+            '    "threshold":       { "floatValue": 0.4 },\n'
+            '    "active":          { "boolValue": true },\n'
+            '    "question_vector": { "vectorValue": { "values": [0.1, 0.2, 0.3] } },\n'
+            '    "tags":            { "listValue": { "values": [{"stringValue": "ml"}, {"stringValue": "ai"}] } }\n'
+            "  }\n"
+            "}\n"
+            "```\n"
+            "\n"
+            "Available parameter types:\n"
+            "\n"
+            "| JSON key | Proto field | Example |\n"
+            "|----------|-------------|---------|\n"
+            '| `stringValue` | `string` | `{ "stringValue": "alice" }` |\n'
+            '| `intValue` | `int64` | `{ "intValue": "42" }` |\n'
+            '| `floatValue` | `double` | `{ "floatValue": 0.95 }` |\n'
+            '| `boolValue` | `bool` | `{ "boolValue": true }` |\n'
+            '| `vectorValue` | `Vector` | `{ "vectorValue": { "values": [0.1, 0.2] } }` |\n'
+            '| `listValue` | `PropertyList` | `{ "listValue": { "values": [...] } }` |\n'
+            '| `bytesValue` | `bytes` | `{ "bytesValue": "&lt;base64&gt;" }` |\n'
+            "\n"
+            "> **Vector parameters:** use `vectorValue`, not `listValue`. "
+            "`vectorValue` maps to the dedicated `Vector` proto type and enables "
+            "vector index pushdown in the query planner.\n"
         )
 
     # Methods
@@ -579,7 +618,7 @@ def generate_service_page(
 
             if rpc.http_method and rpc.http_path:
                 lines.append(
-                    f"**HTTP** _(planned, port 7081)_: `{rpc.http_method} {rpc.http_path}`\n"
+                    f"**HTTP**: `{rpc.http_method} {rpc.http_path}`\n"
                 )
             elif rpc.streaming_response and not rpc.http_path:
                 lines.append("**Transport:** Server-streaming gRPC only (no HTTP transcoding)\n")
@@ -669,6 +708,28 @@ def generate_service_page(
     return "\n".join(lines)
 
 
+PROPERTY_VALUE_JSON_NOTE = """\
+**JSON encoding (REST API)**
+
+`PropertyValue` is a `oneof` — in JSON, encode it as an object with exactly one key
+matching the camelCase proto field name:
+
+```json
+{ "stringValue": "hello" }
+{ "intValue": "42" }
+{ "floatValue": 0.95 }
+{ "boolValue": true }
+{ "bytesValue": "aGVsbG8=" }
+{ "vectorValue": { "values": [0.1, 0.2, 0.3] } }
+{ "listValue": { "values": [{"stringValue": "a"}, {"stringValue": "b"}] } }
+{ "mapValue": { "entries": { "key": {"intValue": "1"} } } }
+```
+
+> **Vector parameters:** use `vectorValue`, not `listValue`. `vectorValue` maps to the
+> dedicated `Vector` proto type and enables vector index pushdown in the query planner.
+"""
+
+
 def generate_common_types_page(all_messages: dict, all_enums: dict) -> str:
     """Generate the common types reference page."""
     lines: list[str] = []
@@ -685,6 +746,8 @@ def generate_common_types_page(all_messages: dict, all_enums: dict) -> str:
     for name in sorted(COMMON_MESSAGES):
         if name in all_messages:
             lines.append(_message_section(all_messages[name], all_messages))
+            if name == "PropertyValue":
+                lines.append(PROPERTY_VALUE_JSON_NOTE)
             lines.append("")
 
     # Common enums (those in types.proto / shared files)
@@ -708,14 +771,13 @@ def generate_index_page(services: list[ProtoService]) -> str:
     """Generate docs/api/index.md."""
     lines: list[str] = []
     lines.append("---")
-    lines.append('description: "CoordiNode gRPC API Reference — all services"')
+    lines.append('description: "CoordiNode API Reference — gRPC and REST"')
     lines.append("---\n")
     lines.append("# API Reference\n")
     lines.append(
-        "CoordiNode exposes a native gRPC API on port **7080**. "
-        "All services documented here are available via gRPC (HTTP/2). "
-        "HTTP/JSON transcoding (port 7081), Bolt protocol (7082), and WebSocket subscriptions (7083) "
-        "are planned for a future release.\n"
+        "CoordiNode exposes services via **gRPC on port 7080** and "
+        "**REST/JSON on port 7081** (HTTP/JSON transcoding via embedded structured-proxy). "
+        "Bolt protocol (7082) and WebSocket subscriptions (7083) are planned for a future release.\n"
     )
     lines.append("## Services\n")
     lines.append("| Service | Description | Proto |")
@@ -736,7 +798,7 @@ def generate_index_page(services: list[ProtoService]) -> str:
     lines.append("| Port | Protocol | Status | Purpose |")
     lines.append("|------|----------|--------|---------|")
     lines.append("| 7080 | gRPC (HTTP/2) | **Active** | Native gRPC API, inter-node communication |")
-    lines.append("| 7081 | HTTP/1.1 + JSON | Planned | REST/JSON transcoding of gRPC endpoints |")
+    lines.append("| 7081 | HTTP/1.1 + JSON | **Active** | REST/JSON transcoding via structured-proxy |")
     lines.append("| 7082 | Bolt | Planned | Neo4j wire protocol compatibility |")
     lines.append("| 7083 | WebSocket | Planned | Subscriptions, live queries |")
     lines.append("| 7084 | HTTP | **Active** | Prometheus `/metrics`, `/health`, `/ready` |")
