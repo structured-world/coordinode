@@ -9472,6 +9472,158 @@ fn rrf_score_brute_force_vector_without_hnsw() {
     assert_eq!(bottom_id, 3, "node 3 (orthogonal + no text) must rank last");
 }
 
+/// R-HYB2b: method expression that isn't a `var.property` access is rejected
+/// at execute time with a message naming the problem.
+#[test]
+fn rrf_score_non_property_method_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Doc",
+        &[("embedding", Value::Vector(vec![1.0, 0.0]))],
+        &mut interner,
+    );
+    let vec_reg = VectorIndexRegistry::new();
+    let text_dir = dir.path().join("rrf_nonprop");
+    std::fs::create_dir_all(&text_dir).unwrap();
+    let text_reg = TextIndexRegistry::new(&text_dir);
+
+    // Method is `d.embedding + 0` — a BinaryOp, not a PropertyAccess.
+    let err = run_cypher_with_registries(
+        "MATCH (d:Doc) \
+         RETURN rrf_score([d.embedding + 0], {vector: [1.0, 0.0]}) AS score",
+        &engine,
+        &mut interner,
+        Some(&vec_reg),
+        Some(&text_reg),
+    )
+    .expect_err("non-property method must error");
+    assert!(
+        err.contains("rrf_score()") && err.contains("property accesses"),
+        "error must explain the shape requirement, got: {err}"
+    );
+}
+
+/// R-HYB2b: two `rrf_score(...)` calls with differing method lists in the
+/// same query are rejected at plan time. Same signature is fine (redundant
+/// reads of `__rrf_score__`).
+#[test]
+fn rrf_score_multiple_differing_calls_rejected() {
+    let ast = parse(
+        "MATCH (d:Doc) \
+         RETURN rrf_score([d.embedding], {vector: [1.0, 0.0]}) AS a, \
+                rrf_score([d.body], {text: \"rust\"}) AS b",
+    )
+    .expect("parse");
+    let err = build_logical_plan(&ast).expect_err("multi-signature rrf_score must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("rrf_score()") && msg.contains("WITH"),
+        "error must point at the multi-call issue and suggest WITH, got: {msg}"
+    );
+}
+
+/// R-HYB2b: if all methods are vector but the query map omits the `vector`
+/// key, execution errors with a clear message.
+#[test]
+fn rrf_score_missing_vector_key_when_needed_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    let rows: Vec<(u64, Vec<f32>, &str)> = vec![(1, vec![1.0, 0.0], "placeholder")];
+    for (id, v, body) in &rows {
+        insert_node(
+            &engine,
+            1,
+            *id,
+            "Doc",
+            &[
+                ("embedding", Value::Vector(v.clone())),
+                ("body", Value::String((*body).to_string())),
+            ],
+            &mut interner,
+        );
+    }
+    let (vec_reg, text_reg) = setup_rrf_indices(dir.path(), "Doc", "embedding", "body", 2, &rows);
+
+    // Method needs vector but the map has only `text`.
+    let err = run_cypher_with_registries(
+        "MATCH (d:Doc) \
+         RETURN rrf_score([d.embedding], {text: \"placeholder\"}) AS score",
+        &engine,
+        &mut interner,
+        Some(&vec_reg),
+        Some(&text_reg),
+    )
+    .expect_err("vector-method without vector-key must error");
+    assert!(
+        err.contains("rrf_score()") && err.contains("vector"),
+        "error must name the missing vector key, got: {err}"
+    );
+}
+
+/// R-HYB2b: `ORDER BY rrf_score(...) DESC` as a direct call (not via alias)
+/// must work. Exercises the `ensure_rrf_passthrough` code path that injects
+/// a synthetic `__rrf_score__` Project item so Sort (above Project) still
+/// sees the score column.
+#[test]
+fn rrf_score_order_by_direct_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    let rows: Vec<(u64, Vec<f32>, &str)> = vec![
+        (1, vec![1.0, 0.0], "rust rust rust programming"),
+        (2, vec![0.9, 0.1], "rust async"),
+        (3, vec![0.0, 1.0], "python notebook"),
+    ];
+    for (id, v, body) in &rows {
+        insert_node(
+            &engine,
+            1,
+            *id,
+            "Doc",
+            &[
+                ("embedding", Value::Vector(v.clone())),
+                ("body", Value::String((*body).to_string())),
+            ],
+            &mut interner,
+        );
+    }
+    let (vec_reg, text_reg) = setup_rrf_indices(dir.path(), "Doc", "embedding", "body", 2, &rows);
+
+    // ORDER BY references the FUNCTION CALL directly, not an alias. This
+    // forces the Sort → Project → RankFuse chain where Project must pass
+    // __rrf_score__ through for Sort to evaluate it.
+    let results = run_cypher_with_registries(
+        "MATCH (d:Doc) \
+         RETURN d.body AS body \
+         ORDER BY rrf_score([d.embedding, d.body], {vector: [1.0, 0.0], text: \"rust\"}) DESC",
+        &engine,
+        &mut interner,
+        Some(&vec_reg),
+        Some(&text_reg),
+    )
+    .expect("ORDER BY direct rrf_score call must work");
+
+    assert_eq!(results.len(), 3);
+    // Doc 1 is top-1 on both methods → must appear first.
+    let top_body = match results[0].get("body") {
+        Some(Value::String(s)) => s.clone(),
+        other => panic!("expected String body, got {other:?}"),
+    };
+    assert_eq!(
+        top_body, "rust rust rust programming",
+        "direct ORDER BY rrf_score(...) DESC must rank the best doc first"
+    );
+}
+
 /// R-HYB2b: vector-only RRF on two orthogonal vector methods (no text).
 /// Exercises the degenerate query map `{vector: ...}` (no `text` key).
 #[test]
