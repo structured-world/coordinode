@@ -28,15 +28,34 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Run release-plz release
-        # Creates git tags + GitHub Releases for crates whose version bump was
-        # merged to main. No-op on feature pushes. Runs first so the tag exists
-        # before release-pr computes the next version (avoids duplicate PRs).
-        continue-on-error: true
-        uses: release-plz/action@v0.5
+      - uses: Swatinem/rust-cache@v2
         with:
-          command: release
-          config: .release-plz.toml
+          key: release-plz-fork
+
+      # Forked release-plz: patches the `cargo package` fallback for baseline
+      # checkouts whose `[workspace.dependencies]` entries lack a `version`
+      # field (upstream issue #2595). Without this, release-pr fails on the
+      # first run after any workspace refactor that changes dep declarations.
+      #
+      # When upstream ships the fix, swap this step for `release-plz/action@v0.5`.
+      - name: Install forked release-plz
+        run: |
+          cargo install --git https://github.com/structured-world/release-plz.git \
+            --branch 'feat/#2791-workspace-changelog' \
+            --locked \
+            release-plz
+
+      - name: Run release-plz release
+        # Runs first so the git tag exists before release-pr computes the next
+        # version. Running release-pr first caused duplicate release PRs: it saw
+        # the old tag and proposed the same version again.
+        # No-op on feature pushes; expected to exit 0 before a release PR is merged.
+        continue-on-error: true
+        run: |
+          release-plz release \
+            --git-token "${GITHUB_TOKEN}" \
+            --config .release-plz.toml \
+            --verbose
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
@@ -48,9 +67,10 @@ jobs:
         run: git fetch --tags
 
       - name: Run release-plz release-pr
-        uses: release-plz/action@v0.5
-        with:
-          command: release-pr
-          config: .release-plz.toml
+        run: |
+          release-plz release-pr \
+            --git-token "${GITHUB_TOKEN}" \
+            --config .release-plz.toml \
+            --verbose
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
