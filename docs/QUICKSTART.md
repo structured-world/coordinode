@@ -105,12 +105,25 @@ curl -s -X POST http://localhost:7081/v1/query/cypher \
 The query (from `hybrid-query.json`):
 
 ```cypher
-MATCH (topic:Concept {name: "machine learning"})-[:RELATED_TO*1..2]->(related)
+MATCH (topic:Concept {name: "machine learning"})-[:RELATED_TO*1..3]->(related)
 MATCH (related)<-[:ABOUT]-(doc:Document)
-WHERE vector_distance(doc.embedding, $query_vec) < 0.4
-RETURN doc.title, vector_distance(doc.embedding, $query_vec) AS relevance
-ORDER BY relevance LIMIT 5
+WHERE vector_distance(doc.embedding, $question_vector) < 0.4
+RETURN DISTINCT doc.title, vector_distance(doc.embedding, $question_vector) AS relevance
+LIMIT 5
 ```
+
+The vector is passed as a named parameter using `vectorValue`:
+
+```json
+{
+  "query": "...",
+  "parameters": {
+    "question_vector": { "vectorValue": { "values": [0.1, 0.2, ...] } }
+  }
+}
+```
+
+See [Query Parameters](/api/cypher#query-parameters-rest) for the full parameter type reference.
 
 Expected response — 2 documents pass the vector filter (L2 distance < 0.4). "Deep Residual Learning" and "Language Models" are filtered out (distance > 0.4):
 
@@ -121,21 +134,21 @@ Expected response — 2 documents pass the vector filter (L2 distance < 0.4). "D
     {
       "values": [
         {"stringValue": "Attention Is All You Need"},
-        {"floatValue": 0.386}
+        {"floatValue": 0.3856}
       ]
     },
     {
       "values": [
         {"stringValue": "BERT Pre-training of Deep Bidirectional Transformers"},
-        {"floatValue": 0.387}
+        {"floatValue": 0.3872}
       ]
     }
   ],
-  "stats": { "executionTimeMs": "..." }
+  "stats": { "executionTimeMs": "3" }
 }
 ```
 
-**What just happened:** CoordiNode traversed the knowledge graph (2 hops from "machine learning"), filtered documents by vector similarity (L2 distance < 0.4), sorted by relevance, and returned results — all in one atomic query.
+**What just happened:** CoordiNode traversed the knowledge graph (up to 3 hops from "machine learning"), filtered documents by vector similarity (L2 distance < 0.4), deduplicated results with `DISTINCT` (the same document can be reached via multiple paths), and returned results — all in one atomic query.
 
 You can also add **full-text search** to the same query with `text_match()`:
 
