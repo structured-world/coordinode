@@ -174,6 +174,30 @@ pub enum LogicalOp {
         detach: bool,
     },
 
+    /// `ATTACH DOCUMENT`: demote a graph node to a nested DOCUMENT property on
+    /// another node within a single MVCC transaction. `input` produces rows
+    /// with `source_variable` and `target_variable` bound (built by the
+    /// planner from the ATTACH pattern as a MATCH + Traverse chain).
+    ///
+    /// Semantics:
+    ///   1. Read all properties from the source node.
+    ///   2. Write them as a DOCUMENT into `target_property_path` on the target.
+    ///   3. Delete the connecting edge.
+    ///   4. Optional `TRANSFER EDGES` re-points matching edges from source to target.
+    ///   5. Cascade-delete the source node and its remaining edges, or fail if
+    ///      `on_remaining_fail` is true and any untransferred edges remain.
+    AttachDocument {
+        input: Box<LogicalOp>,
+        source_variable: String,
+        target_variable: String,
+        edge_type: String,
+        edge_direction: crate::cypher::ast::EdgeFromSource,
+        target_property_path: Vec<String>,
+        transfer: Option<crate::cypher::ast::TransferEdgesSpec>,
+        on_conflict_replace: bool,
+        on_remaining_fail: bool,
+    },
+
     /// `DETACH DOCUMENT`: promote a nested DOCUMENT property to a graph node +
     /// edge within a single MVCC transaction. Optionally re-points existing
     /// edges on the source node to the new target via `TRANSFER EDGES`.
@@ -550,6 +574,14 @@ impl LogicalOp {
                 input.substitute_params(params);
             }
             LogicalOp::DetachDocument {
+                input, transfer, ..
+            } => {
+                input.substitute_params(params);
+                if let Some(ref mut t) = transfer {
+                    t.predicate.substitute_params(params);
+                }
+            }
+            LogicalOp::AttachDocument {
                 input, transfer, ..
             } => {
                 input.substitute_params(params);
@@ -1111,6 +1143,15 @@ fn estimate_op_cost(
             let transfer_cost = if transfer.is_some() { 5.0 } else { 0.0 };
             (input_cost + input_rows * (base + transfer_cost), input_rows)
         }
+        LogicalOp::AttachDocument {
+            input, transfer, ..
+        } => {
+            let (input_cost, input_rows) = estimate_op_cost(input, defaults, stats, hints);
+            // Per row: read node, write delta, delete edge, delete node + cascade = ~5.
+            let base = 5.0;
+            let transfer_cost = if transfer.is_some() { 5.0 } else { 0.0 };
+            (input_cost + input_rows * (base + transfer_cost), input_rows)
+        }
 
         LogicalOp::Merge { pattern, .. } | LogicalOp::Upsert { pattern, .. } => {
             let (pat_cost, pat_rows) = estimate_op_cost(pattern, defaults, stats, hints);
@@ -1400,6 +1441,33 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
         } => {
             let d = if *detach { "DETACH " } else { "" };
             output.push_str(&format!("{prefix}{d}Delete({})\n", variables.join(", ")));
+            explain_op(input, indent + 1, output);
+        }
+        LogicalOp::AttachDocument {
+            input,
+            source_variable,
+            target_variable,
+            edge_type,
+            target_property_path,
+            transfer,
+            on_conflict_replace,
+            on_remaining_fail,
+            ..
+        } => {
+            let path = target_property_path.join(".");
+            let mut flags = String::new();
+            if transfer.is_some() {
+                flags.push_str(" TRANSFER");
+            }
+            if *on_conflict_replace {
+                flags.push_str(" REPLACE");
+            }
+            if *on_remaining_fail {
+                flags.push_str(" REMAINING-FAIL");
+            }
+            output.push_str(&format!(
+                "{prefix}AttachDocument(({source_variable})-[:{edge_type}]->({target_variable}) INTO {target_variable}.{path}{flags})\n",
+            ));
             explain_op(input, indent + 1, output);
         }
         LogicalOp::DetachDocument {

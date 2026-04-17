@@ -371,6 +371,7 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::RemoveOp { input, .. }
         | LogicalOp::Delete { input, .. }
         | LogicalOp::DetachDocument { input, .. }
+        | LogicalOp::AttachDocument { input, .. }
         | LogicalOp::Unwind { input, .. }
         | LogicalOp::VectorFilter { input, .. }
         | LogicalOp::VectorTopK { input, .. }

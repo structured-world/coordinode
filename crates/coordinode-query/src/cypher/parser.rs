@@ -232,6 +232,10 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let dd = build_detach_document_clause(pair)?;
             clauses.push(Clause::DetachDocument(dd));
         }
+        Rule::attach_document_clause => {
+            let ad = build_attach_document_clause(pair)?;
+            clauses.push(Clause::AttachDocument(ad));
+        }
         Rule::set_clause => {
             let (items, violation_mode) = build_set_clause(pair)?;
             clauses.push(Clause::Set(items, violation_mode));
@@ -1277,6 +1281,160 @@ fn build_detach_document_clause(pair: Pair<'_, Rule>) -> Result<DetachDocumentCl
         edge_direction,
         edge_variable,
         transfer,
+    })
+}
+
+fn build_attach_document_clause(pair: Pair<'_, Rule>) -> Result<AttachDocumentClause, ParseError> {
+    let mut pattern: Option<(NodePattern, RelationshipPattern, NodePattern)> = None;
+    let mut target_var: Option<String> = None;
+    let mut target_path: Vec<String> = Vec::new();
+    let mut transfer: Option<TransferEdgesSpec> = None;
+    let mut on_conflict_replace = false;
+    let mut on_remaining_fail = false;
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::attach_doc_pattern => {
+                let mut nodes: Vec<NodePattern> = Vec::new();
+                let mut rel: Option<RelationshipPattern> = None;
+                for part in inner.into_inner() {
+                    match part.as_rule() {
+                        Rule::node_pattern => nodes.push(build_node_pattern(part)?),
+                        Rule::relationship_pattern => rel = Some(build_relationship_pattern(part)?),
+                        _ => {}
+                    }
+                }
+                let rel_value = rel.ok_or_else(|| {
+                    ParseError::Invalid("ATTACH pattern missing relationship".to_string())
+                })?;
+                if nodes.len() != 2 {
+                    return Err(ParseError::Invalid(
+                        "ATTACH pattern must be `(a)-[:TYPE]->(u)`".to_string(),
+                    ));
+                }
+                let tgt = nodes.pop().ok_or_else(|| {
+                    ParseError::Invalid("ATTACH: missing target node".to_string())
+                })?;
+                let src = nodes.pop().ok_or_else(|| {
+                    ParseError::Invalid("ATTACH: missing source node".to_string())
+                })?;
+                pattern = Some((src, rel_value, tgt));
+            }
+            Rule::attach_doc_target => {
+                let mut segs: Vec<String> = inner
+                    .into_inner()
+                    .filter(|p| p.as_rule() == Rule::identifier)
+                    .map(extract_identifier)
+                    .collect();
+                if segs.len() < 2 {
+                    return Err(ParseError::Invalid(
+                        "ATTACH INTO must be a property path (e.g. u.address)".to_string(),
+                    ));
+                }
+                target_var = Some(segs.remove(0));
+                target_path = segs;
+            }
+            Rule::attach_doc_option => {
+                for opt in inner.into_inner() {
+                    match opt.as_rule() {
+                        Rule::attach_doc_transfer => {
+                            let mut node_var: Option<String> = None;
+                            let mut tgt_var: Option<String> = None;
+                            let mut predicate: Option<Expr> = None;
+                            for part in opt.into_inner() {
+                                match part.as_rule() {
+                                    Rule::identifier => {
+                                        let ident = extract_identifier(part);
+                                        if node_var.is_none() {
+                                            node_var = Some(ident);
+                                        } else if tgt_var.is_none() {
+                                            tgt_var = Some(ident);
+                                        }
+                                    }
+                                    Rule::where_inline => {
+                                        predicate = Some(find_expression(part)?);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            transfer = Some(TransferEdgesSpec {
+                                node_variable: node_var.ok_or_else(|| {
+                                    ParseError::Invalid(
+                                        "TRANSFER EDGES requires ON <node_var>".to_string(),
+                                    )
+                                })?,
+                                target_variable: tgt_var.ok_or_else(|| {
+                                    ParseError::Invalid(
+                                        "TRANSFER EDGES requires TO <target_var>".to_string(),
+                                    )
+                                })?,
+                                predicate: predicate.ok_or_else(|| {
+                                    ParseError::Invalid(
+                                        "TRANSFER EDGES requires a WHERE predicate".to_string(),
+                                    )
+                                })?,
+                            });
+                        }
+                        Rule::attach_doc_on_conflict => {
+                            on_conflict_replace = true;
+                        }
+                        Rule::attach_doc_on_remaining => {
+                            on_remaining_fail = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let (src_np, rel, tgt_np) =
+        pattern.ok_or_else(|| ParseError::Invalid("ATTACH missing pattern".to_string()))?;
+    let source_variable = src_np
+        .variable
+        .clone()
+        .ok_or_else(|| ParseError::Invalid("ATTACH: source node must be named".to_string()))?;
+    let target_variable = tgt_np
+        .variable
+        .clone()
+        .ok_or_else(|| ParseError::Invalid("ATTACH: target node must be named".to_string()))?;
+
+    let target_property_variable =
+        target_var.ok_or_else(|| ParseError::Invalid("ATTACH missing INTO target".to_string()))?;
+    if target_property_variable != target_variable {
+        return Err(ParseError::Invalid(format!(
+            "ATTACH INTO variable `{target_property_variable}` must match pattern target \
+             node variable `{target_variable}`"
+        )));
+    }
+
+    // Edge direction relative to the source. Grammar is `(a)...(u)` with the
+    // relationship between them; `rel.direction` already reflects arrow orientation.
+    let edge_direction = match rel.direction {
+        Direction::Outgoing => EdgeFromSource::Outgoing,
+        Direction::Incoming => EdgeFromSource::Incoming,
+        Direction::Both => EdgeFromSource::Outgoing,
+    };
+    let edge_type = rel
+        .rel_types
+        .into_iter()
+        .next()
+        .ok_or_else(|| ParseError::Invalid("ATTACH edge type must be specified".to_string()))?;
+
+    Ok(AttachDocumentClause {
+        source_variable,
+        source_labels: src_np.labels,
+        target_variable,
+        target_labels: tgt_np.labels,
+        edge_type,
+        edge_direction,
+        edge_variable: rel.variable,
+        target_property_variable,
+        target_property_path: target_path,
+        transfer,
+        on_conflict_replace,
+        on_remaining_fail,
     })
 }
 
@@ -3873,6 +4031,71 @@ mod tests {
         assert_eq!(dd.target_labels, vec!["Address"]);
         // (n)<-[:HAS_ADDRESS]-(a): edge goes a → n, still Incoming for n.
         assert_eq!(dd.edge_direction, EdgeFromSource::Incoming);
+    }
+
+    // ====== ATTACH DOCUMENT (R168) ======
+
+    #[test]
+    fn attach_document_basic() {
+        let q = parse_ok("ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address");
+        let Clause::AttachDocument(ref ad) = q.clauses[0] else {
+            panic!("expected AttachDocument, got {:?}", q.clauses[0]);
+        };
+        assert_eq!(ad.source_variable, "a");
+        assert_eq!(ad.source_labels, vec!["Address"]);
+        assert_eq!(ad.target_variable, "u");
+        assert_eq!(ad.target_labels, vec!["User"]);
+        assert_eq!(ad.edge_type, "HAS_ADDRESS");
+        assert_eq!(ad.edge_direction, EdgeFromSource::Outgoing);
+        assert_eq!(ad.target_property_variable, "u");
+        assert_eq!(ad.target_property_path, vec!["address"]);
+        assert!(ad.transfer.is_none());
+        assert!(!ad.on_conflict_replace);
+        assert!(!ad.on_remaining_fail);
+    }
+
+    #[test]
+    fn attach_document_with_transfer_and_options() {
+        let q = parse_ok(
+            "ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address \
+             TRANSFER EDGES ON a TO u WHERE type(r) = 'SHIPS_TO' \
+             ON CONFLICT REPLACE \
+             ON REMAINING FAIL",
+        );
+        let Clause::AttachDocument(ref ad) = q.clauses[0] else {
+            panic!("expected AttachDocument");
+        };
+        assert!(ad.transfer.is_some());
+        assert!(ad.on_conflict_replace);
+        assert!(ad.on_remaining_fail);
+    }
+
+    #[test]
+    fn attach_document_nested_target_path() {
+        let q = parse_ok("ATTACH (a:Shipping)-[:HAS_SHIPPING]->(u:User) INTO u.meta.shipping");
+        let Clause::AttachDocument(ref ad) = q.clauses[0] else {
+            panic!("expected AttachDocument");
+        };
+        assert_eq!(ad.target_property_path, vec!["meta", "shipping"]);
+    }
+
+    #[test]
+    fn attach_document_target_var_must_match_pattern() {
+        // INTO target variable `x` doesn't match pattern target `u` → parse error.
+        let err = parse_err("ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO x.address");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("match pattern target") || msg.contains("target node variable"),
+            "error should mention mismatch: {msg}"
+        );
+    }
+
+    #[test]
+    fn attach_document_requires_edge_type() {
+        // Anonymous relationship `-[]->` has no type → build error (ATTACH
+        // requires an explicit type for targeted adjacency delete).
+        let err = parse_err("ATTACH (a:Address)-[]->(u:User) INTO u.address");
+        let _ = err;
     }
 
     #[test]

@@ -124,7 +124,7 @@ ORDER BY similarity LIMIT 25
 | Query advisor | **Stable** | EXPLAIN SUGGEST with 5 detectors, N+1 detection |
 | Spatial queries | **Stable** | `point()`, `point.distance()` (Haversine), WHERE filter |
 | Document properties | **Stable** | Nested DOCUMENT type, dot-notation access, 3 schema modes |
-| Document ↔ graph transformations | **Stable** | `DETACH DOCUMENT` promotes a nested property to a node + edge atomically; optional `TRANSFER EDGES` |
+| Document ↔ graph transformations | **Stable** | `DETACH DOCUMENT` promotes a nested property to a node + edge atomically; `ATTACH DOCUMENT` demotes a node back into a nested DOCUMENT property; optional `TRANSFER EDGES`, `ON CONFLICT REPLACE`, `ON REMAINING FAIL` |
 | REST API | **Stable** | HTTP/JSON on port 7081 via gRPC-to-REST transcoding |
 | Read/write concerns | **Stable** | local, majority, linearizable, causal sessions |
 

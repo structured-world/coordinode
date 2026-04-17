@@ -1,7 +1,7 @@
 // OpenCypher PEG grammar for CoordiNode (read + write operations)
 // Read: MATCH, OPTIONAL MATCH, WHERE, RETURN, WITH, UNWIND,
 //       ORDER BY, SKIP, LIMIT, AS OF TIMESTAMP
-// Write: CREATE, MERGE, DELETE, DETACH DELETE, DETACH DOCUMENT, SET, REMOVE
+// Write: CREATE, MERGE, DELETE, DETACH DELETE, DETACH DOCUMENT, ATTACH DOCUMENT, SET, REMOVE
 // Extensions: UPSERT MATCH, vector functions, parameters
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
@@ -30,6 +30,7 @@ clause = {
   | merge_clause
   | upsert_clause
   | detach_document_clause
+  | attach_document_clause
   | detach_delete_clause
   | drop_encrypted_index_clause
   | drop_text_index_clause
@@ -247,6 +248,37 @@ detach_doc_target = { node_pattern ~ relationship_pattern ~ node_pattern }
 detach_doc_transfer = {
     kw_transfer ~ kw_edges ~ kw_on ~ identifier ~ kw_to ~ identifier ~ where_inline
 }
+
+// --- ATTACH DOCUMENT (demote graph node to nested DOCUMENT property) ---
+//
+//   ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address
+//     [TRANSFER EDGES ON a TO u WHERE type(r) = 'SHIPS_TO']
+//     [ON CONFLICT REPLACE]
+//     [ON REMAINING FAIL]
+//
+attach_document_clause = {
+    kw_attach ~ attach_doc_pattern ~ kw_into ~ attach_doc_target
+    ~ attach_doc_option*
+}
+
+attach_doc_pattern = { node_pattern ~ relationship_pattern ~ node_pattern }
+
+// Target path (where the promoted node becomes a nested DOCUMENT):
+//   identifier "." identifier ("." identifier)*
+attach_doc_target = { identifier ~ ("." ~ identifier)+ }
+
+attach_doc_option = {
+    attach_doc_transfer
+  | attach_doc_on_conflict
+  | attach_doc_on_remaining
+}
+
+attach_doc_transfer = {
+    kw_transfer ~ kw_edges ~ kw_on ~ identifier ~ kw_to ~ identifier ~ where_inline
+}
+
+attach_doc_on_conflict = { kw_on ~ kw_conflict ~ kw_replace }
+attach_doc_on_remaining = { kw_on ~ kw_remaining ~ kw_fail }
 delete_clause = { kw_delete ~ expression_list }
 expression_list = { expression ~ ("," ~ expression)* }
 
@@ -470,6 +502,12 @@ kw_document   = @{ ^"document" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_transfer   = @{ ^"transfer" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_edges      = @{ ^"edges" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_to         = @{ ^"to" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_attach     = @{ ^"attach" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_into       = @{ ^"into" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_conflict   = @{ ^"conflict" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_replace    = @{ ^"replace" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_remaining  = @{ ^"remaining" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_fail       = @{ ^"fail" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // --- Identifiers ---
 

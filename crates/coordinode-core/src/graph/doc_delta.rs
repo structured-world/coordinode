@@ -156,9 +156,15 @@ impl DocDelta {
 // --- Path manipulation helpers ---
 
 /// Set a value at a dotted path, creating intermediate maps if needed.
+///
+/// Empty path = replace the entire document at the root. Combined with
+/// `PathTarget::PropField(fid)`, this lets callers replace `props[fid]`
+/// wholesale with a new value (used by e.g. ATTACH DOCUMENT when promoting
+/// a graph node back into a single-segment nested property).
 fn set_at_path(doc: &mut rmpv::Value, path: &[String], value: rmpv::Value) -> bool {
     if path.is_empty() {
-        return false;
+        *doc = value;
+        return true;
     }
 
     if path.len() == 1 {
@@ -400,6 +406,25 @@ mod tests {
     }
 
     #[test]
+    fn set_path_empty_path_replaces_root() {
+        // SetPath with an empty path replaces the entire document at the root.
+        // Used by e.g. ATTACH DOCUMENT when promoting a graph node back into a
+        // single-segment nested property (`PropField(fid)` + empty subpath).
+        let mut doc = make_map(vec![("old", rmpv::Value::Boolean(true))]);
+        let replacement = make_map(vec![
+            ("city", rmpv::Value::String("Prague".into())),
+            ("zip", rmpv::Value::String("11000".into())),
+        ]);
+        let delta = DocDelta::SetPath {
+            target: PathTarget::Extra,
+            path: vec![],
+            value: replacement.clone(),
+        };
+        assert!(delta.apply(&mut doc));
+        assert_eq!(doc, replacement);
+    }
+
+    #[test]
     fn set_path_creates_intermediates() {
         let mut doc = make_map(vec![]);
         let delta = DocDelta::SetPath {
@@ -432,14 +457,28 @@ mod tests {
     }
 
     #[test]
-    fn set_path_empty_path_noop() {
+    fn set_path_empty_path_replaces_any_root_value() {
+        // Empty path replaces the root regardless of its prior shape —
+        // nil, scalar, map, or array. Used by ATTACH DOCUMENT to promote
+        // a graph node's properties into a single-segment nested field.
         let mut doc = rmpv::Value::Nil;
         let delta = DocDelta::SetPath {
             target: PathTarget::Extra,
             path: vec![],
             value: rmpv::Value::Integer(1.into()),
         };
-        assert!(!delta.apply(&mut doc));
+        assert!(delta.apply(&mut doc));
+        assert_eq!(doc, rmpv::Value::Integer(1.into()));
+
+        // And it replaces scalar roots just as well.
+        let mut doc = rmpv::Value::String("stale".into());
+        let delta = DocDelta::SetPath {
+            target: PathTarget::Extra,
+            path: vec![],
+            value: rmpv::Value::Boolean(true),
+        };
+        assert!(delta.apply(&mut doc));
+        assert_eq!(doc, rmpv::Value::Boolean(true));
     }
 
     // --- DeletePath tests ---

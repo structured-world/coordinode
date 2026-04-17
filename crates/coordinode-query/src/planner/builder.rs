@@ -332,6 +332,63 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
         Clause::DropVectorIndex(c) => Ok(LogicalOp::DropVectorIndex {
             name: c.name.clone(),
         }),
+        Clause::AttachDocument(ad) => {
+            // Synthesize a MATCH for the ATTACH pattern `(a)-[:T]->(u)` so that
+            // the executor receives pre-bound `source_variable` / `target_variable`
+            // columns in each row (reuses existing NodeScan + Traverse machinery).
+            let source_node = NodePattern {
+                variable: Some(ad.source_variable.clone()),
+                labels: ad.source_labels.clone(),
+                properties: Vec::new(),
+            };
+            let target_node = NodePattern {
+                variable: Some(ad.target_variable.clone()),
+                labels: ad.target_labels.clone(),
+                properties: Vec::new(),
+            };
+            let rel = RelationshipPattern {
+                variable: ad.edge_variable.clone(),
+                rel_types: vec![ad.edge_type.clone()],
+                direction: match ad.edge_direction {
+                    crate::cypher::ast::EdgeFromSource::Outgoing => Direction::Outgoing,
+                    crate::cypher::ast::EdgeFromSource::Incoming => Direction::Incoming,
+                },
+                length: None,
+                properties: Vec::new(),
+            };
+            let pattern = Pattern {
+                elements: vec![
+                    PatternElement::Node(source_node),
+                    PatternElement::Relationship(rel),
+                    PatternElement::Node(target_node),
+                ],
+            };
+            let match_clause = MatchClause {
+                patterns: vec![pattern],
+                where_clause: None,
+            };
+            let scan = build_match_op(&match_clause)?;
+            // Compose with the prior plan if present (e.g. user wrote
+            // `MATCH ... ATTACH ...`), otherwise use the synthesized scan alone.
+            let input = match current {
+                Some(existing) => LogicalOp::CartesianProduct {
+                    left: Box::new(existing),
+                    right: Box::new(scan),
+                },
+                None => scan,
+            };
+            Ok(LogicalOp::AttachDocument {
+                input: Box::new(input),
+                source_variable: ad.source_variable.clone(),
+                target_variable: ad.target_variable.clone(),
+                edge_type: ad.edge_type.clone(),
+                edge_direction: ad.edge_direction,
+                target_property_path: ad.target_property_path.clone(),
+                transfer: ad.transfer.clone(),
+                on_conflict_replace: ad.on_conflict_replace,
+                on_remaining_fail: ad.on_remaining_fail,
+            })
+        }
         Clause::DetachDocument(dd) => {
             let input = current.unwrap_or(LogicalOp::Empty);
             Ok(LogicalOp::DetachDocument {

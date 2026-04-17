@@ -167,6 +167,17 @@ MATCH (n:User)
 DETACH DOCUMENT n.address AS (a:Address)-[:HAS_ADDRESS]->(n)
 ```
 
+#### ATTACH DOCUMENT ✅ 🔷
+
+CoordiNode extension. The inverse of `DETACH DOCUMENT`: demote a graph node
+back into a nested DOCUMENT property on another node. See
+[Cypher Extensions — ATTACH DOCUMENT](extensions.md#attach-document) for
+`TRANSFER EDGES`, `ON CONFLICT REPLACE`, `ON REMAINING FAIL`, and error cases.
+
+```cypher
+ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address
+```
+
 #### SET ✅
 
 Sets properties and labels.

@@ -362,6 +362,61 @@ or `type(r) = '...'` (single type). More complex predicates are rejected.
 - property value is `null` or not a DOCUMENT/MAP
 - source variable not bound by a prior `MATCH`
 
+### ATTACH DOCUMENT ✅ 🔷
+
+The inverse of `DETACH DOCUMENT`: demote a graph node back into a nested
+DOCUMENT property on another node, atomically and in a single transaction.
+
+```cypher
+-- Simple form: the whole Address node becomes u.address
+ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address
+
+-- Nested target path
+ATTACH (a:Shipping)-[:HAS_SHIPPING]->(u:User) INTO u.meta.shipping
+
+-- Transfer out-of-band edges before the source node is deleted
+ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address
+  TRANSFER EDGES ON a TO u WHERE type(r) = 'SHIPS_TO'
+
+-- Overwrite an existing target property
+ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address
+  ON CONFLICT REPLACE
+
+-- Abort if any edges on the source would otherwise be cascade-deleted
+ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address
+  TRANSFER EDGES ON a TO u WHERE type(r) IN ['SHIPS_TO', 'LIVES_AT']
+  ON REMAINING FAIL
+```
+
+**Semantics (single MVCC transaction):**
+
+1. Match the inline pattern — builds its own `MATCH` (no prior `MATCH` needed).
+2. Read all of the source node's properties and package them as a DOCUMENT map.
+3. Write the DOCUMENT onto the target's property path via a `DocDelta::SetPath`
+   merge operand — O(1) write, no read-modify-write. Single-segment target
+   paths replace `props[root]` wholesale; multi-segment paths navigate into
+   the existing DOCUMENT.
+4. Delete the connecting edge (both adjacency halves + edge properties).
+5. If `TRANSFER EDGES` is given, selected edges are re-pointed from source
+   to target via posting-list merges before the source is removed.
+6. Cascade-delete the source node and any untransferred edges — unless
+   `ON REMAINING FAIL` was specified, in which case the query aborts when
+   any untransferred edges remain.
+
+**Options:**
+
+| Clause | Default | With clause |
+|--------|---------|-------------|
+| `ON CONFLICT` | error if `target.path` already exists | `ON CONFLICT REPLACE` overwrites |
+| `ON REMAINING` | cascade-delete remaining edges | `ON REMAINING FAIL` errors if any remain |
+| `TRANSFER EDGES WHERE` | none — no edges are moved | supports `type(r) IN [...]` / `type(r) = '...'` |
+
+**Errors:**
+- source or target node not found
+- target property exists and `ON CONFLICT REPLACE` was not specified
+- `TRANSFER EDGES` predicate uses an unsupported shape
+- `ON REMAINING FAIL` with untransferred edges
+
 ---
 
 ## Atomic Operations

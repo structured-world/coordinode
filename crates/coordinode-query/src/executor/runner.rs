@@ -1840,6 +1840,32 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 ctx,
             )
         }
+
+        LogicalOp::AttachDocument {
+            input,
+            source_variable,
+            target_variable,
+            edge_type,
+            edge_direction,
+            target_property_path,
+            transfer,
+            on_conflict_replace,
+            on_remaining_fail,
+        } => {
+            let input_rows = execute_op(input, ctx)?;
+            execute_attach_document(
+                &input_rows,
+                source_variable,
+                target_variable,
+                edge_type,
+                *edge_direction,
+                target_property_path,
+                transfer.as_ref(),
+                *on_conflict_replace,
+                *on_remaining_fail,
+                ctx,
+            )
+        }
     }
 }
 
@@ -6733,6 +6759,358 @@ fn transfer_edges_on_node(
             }
         }
     }
+    Ok(())
+}
+
+// =====================================================================
+// ATTACH DOCUMENT (R168)
+// =====================================================================
+
+/// Execute an ATTACH DOCUMENT clause for each input row.
+///
+/// For each (source, target) row produced by the ATTACH pattern:
+///  1. Verify the target property is absent (unless `on_conflict_replace`).
+///  2. Read all properties from the source node.
+///  3. Write them as a DOCUMENT into `target_property_path` on the target
+///     via a `DocDelta::SetPath` merge operand (O(1) write, no read).
+///  4. Delete the connecting edge (a → u): adj forward + reverse + edgeprop.
+///  5. Optional `TRANSFER EDGES ON source TO target WHERE ...` — re-points
+///     matching edges via posting-list merges (reuses R167 helper).
+///  6. Cascade-delete remaining edges on the source node, unless
+///     `on_remaining_fail` is true and any untransferred edges remain — in
+///     which case abort with an error. Delete the source node record.
+///
+/// All writes land in the current MVCC transaction's buffer.
+#[allow(clippy::too_many_arguments)]
+fn execute_attach_document(
+    input_rows: &[Row],
+    source_variable: &str,
+    target_variable: &str,
+    edge_type: &str,
+    edge_direction: crate::cypher::ast::EdgeFromSource,
+    target_property_path: &[String],
+    transfer: Option<&crate::cypher::ast::TransferEdgesSpec>,
+    on_conflict_replace: bool,
+    on_remaining_fail: bool,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    if target_property_path.is_empty() {
+        return Err(ExecutionError::Unsupported(
+            "ATTACH DOCUMENT requires a non-empty target property path".to_string(),
+        ));
+    }
+
+    let transfer_types: Option<Vec<String>> = match transfer {
+        Some(t) => Some(extract_transfer_edge_types(&t.predicate)?),
+        None => None,
+    };
+
+    let mut results: Vec<Row> = Vec::new();
+
+    for input_row in input_rows {
+        let source_id = match input_row.get(source_variable) {
+            Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+            _ => {
+                return Err(ExecutionError::Unsupported(format!(
+                    "ATTACH DOCUMENT: variable `{source_variable}` is not a bound node"
+                )));
+            }
+        };
+        let target_id = match input_row.get(target_variable) {
+            Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+            _ => {
+                return Err(ExecutionError::Unsupported(format!(
+                    "ATTACH DOCUMENT: variable `{target_variable}` is not a bound node"
+                )));
+            }
+        };
+
+        // --- 1. Conflict check on the target property ---
+        let target_key = encode_node_key(ctx.shard_id, target_id);
+        let target_bytes = ctx.mvcc_get(Partition::Node, &target_key)?.ok_or_else(|| {
+            ExecutionError::Unsupported(format!(
+                "ATTACH DOCUMENT: target node {target_id} not found"
+            ))
+        })?;
+        let target_record = NodeRecord::from_msgpack(&target_bytes)
+            .map_err(|e| ExecutionError::Serialization(format!("node decode: {e}")))?;
+        if !on_conflict_replace
+            && target_property_exists(&target_record, target_property_path, ctx.interner)
+        {
+            return Err(ExecutionError::Unsupported(format!(
+                "ATTACH DOCUMENT: property `{}.{}` already exists (use ON CONFLICT REPLACE to overwrite)",
+                target_variable,
+                target_property_path.join(".")
+            )));
+        }
+
+        // --- 2. Read source node ---
+        let source_key = encode_node_key(ctx.shard_id, source_id);
+        let source_bytes = ctx.mvcc_get(Partition::Node, &source_key)?.ok_or_else(|| {
+            ExecutionError::Unsupported(format!(
+                "ATTACH DOCUMENT: source node {source_id} not found"
+            ))
+        })?;
+        let source_record = NodeRecord::from_msgpack(&source_bytes)
+            .map_err(|e| ExecutionError::Serialization(format!("node decode: {e}")))?;
+
+        // --- 3. Package source properties as a DOCUMENT ---
+        let doc = source_record_to_document(&source_record, ctx.interner);
+
+        // Emit a `DocDelta::SetPath` merge operand at the target. For a
+        // single-segment target path (e.g. `u.address`) the subpath is empty
+        // — `set_at_path` treats that as "replace the root", which maps to
+        // `props[address_fid] := doc`. Multi-segment paths navigate inside
+        // the existing DOCUMENT. Either way it's an O(1) write with no
+        // read-modify-write.
+        emit_attach_set_path(target_id, target_property_path, doc, ctx)?;
+
+        // --- 4. Delete the connecting edge (both directions) ---
+        let (edge_src, edge_tgt) = match edge_direction {
+            crate::cypher::ast::EdgeFromSource::Outgoing => (source_id, target_id),
+            crate::cypher::ast::EdgeFromSource::Incoming => (target_id, source_id),
+        };
+        delete_single_edge(edge_src, edge_tgt, edge_type, ctx)?;
+
+        // --- 5. Optional TRANSFER EDGES (before we delete source) ---
+        if let Some(ref types) = transfer_types {
+            transfer_edges_on_node(source_id, target_id, types, ctx)?;
+        }
+
+        // --- 6. Delete the source node (cascade or fail) ---
+        cascade_delete_source_node(source_id, on_remaining_fail, ctx)?;
+
+        // --- 7. Emit output row: preserve bindings, drop stale source row cols ---
+        let mut out = input_row.clone();
+        // Source is gone — remove its binding so downstream clauses cannot
+        // reference deleted data.
+        out.remove(source_variable);
+        // Target is still live; its property bindings may be stale.
+        out.remove(&format!(
+            "{target_variable}.{}",
+            target_property_path.join(".")
+        ));
+        results.push(out);
+    }
+
+    Ok(results)
+}
+
+/// Check whether a property path is already present on a node record.
+///
+/// For single-segment paths: looks in `props` (interned) or `extra` map.
+/// For multi-segment paths: navigates into the nested Document/Map.
+fn target_property_exists(record: &NodeRecord, path: &[String], interner: &FieldInterner) -> bool {
+    let first = &path[0];
+    let root: Option<rmpv::Value> = match interner.lookup(first) {
+        Some(fid) => record.props.get(&fid).map(value_to_rmpv),
+        None => record
+            .extra
+            .as_ref()
+            .and_then(|m| m.get(first))
+            .map(value_to_rmpv),
+    };
+    let Some(mut current) = root else {
+        return false;
+    };
+    for seg in &path[1..] {
+        current = match current {
+            rmpv::Value::Map(entries) => {
+                let hit = entries
+                    .into_iter()
+                    .find(|(k, _)| k.as_str() == Some(seg.as_str()))
+                    .map(|(_, v)| v);
+                match hit {
+                    Some(v) => v,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        };
+    }
+    // Final value must be non-nil to count as "exists".
+    !matches!(current, rmpv::Value::Nil)
+}
+
+/// Package a source node's properties into a single `rmpv::Value::Map` for
+/// nesting into a target node. Interned props contribute their resolved
+/// string names; `extra` entries contribute their string keys verbatim.
+fn source_record_to_document(record: &NodeRecord, interner: &FieldInterner) -> rmpv::Value {
+    let mut entries: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
+    for (&fid, value) in &record.props {
+        if let Some(name) = interner.resolve(fid) {
+            entries.push((rmpv::Value::String(name.into()), value_to_rmpv(value)));
+        }
+    }
+    if let Some(extra) = record.extra.as_ref() {
+        for (name, value) in extra {
+            entries.push((
+                rmpv::Value::String(name.clone().into()),
+                value_to_rmpv(value),
+            ));
+        }
+    }
+    rmpv::Value::Map(entries)
+}
+
+/// Emit a `DocDelta::SetPath` merge operand placing `doc` at
+/// `target_property_path` on `target_id`.
+fn emit_attach_set_path(
+    target_id: NodeId,
+    path: &[String],
+    doc: rmpv::Value,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    use coordinode_core::graph::doc_delta::{DocDelta, PathTarget};
+
+    let key = encode_node_key(ctx.shard_id, target_id);
+    // First segment → interned field id (matches the write-path used by
+    // `SET n.address.x = y`).
+    let first = &path[0];
+    let field_id = ctx.interner.intern(first);
+    let sub: Vec<String> = path[1..].to_vec();
+
+    let delta = DocDelta::SetPath {
+        target: PathTarget::PropField(field_id),
+        path: sub,
+        value: doc,
+    };
+    let operand = delta
+        .encode()
+        .map_err(|e| ExecutionError::Serialization(format!("DocDelta encode: {e}")))?;
+    ctx.merge_node_deltas.push((key, operand));
+    ctx.write_stats.properties_set += 1;
+    Ok(())
+}
+
+/// Delete one edge `(src → tgt)` of `edge_type` by issuing merge_remove
+/// operations on both adjacency halves and removing the edge-property entry.
+fn delete_single_edge(
+    src: NodeId,
+    tgt: NodeId,
+    edge_type: &str,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    let fwd = encode_adj_key_forward(edge_type, src);
+    ctx.adj_merge_remove(&fwd, tgt.as_raw());
+
+    let rev = encode_adj_key_reverse(edge_type, tgt);
+    ctx.adj_merge_remove(&rev, src.as_raw());
+
+    let ep_key = encode_edgeprop_key(edge_type, src, tgt);
+    ctx.mvcc_delete(Partition::EdgeProp, &ep_key)?;
+
+    ctx.write_stats.edges_deleted += 1;
+    Ok(())
+}
+
+/// Delete the source node and its remaining edges. If `on_remaining_fail` is
+/// true and the node still has any edges (after TRANSFER), error out.
+fn cascade_delete_source_node(
+    source_id: NodeId,
+    on_remaining_fail: bool,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    let edge_types = ctx.list_edge_types()?;
+    let mut remaining_edges: Vec<Vec<u8>> = Vec::new();
+    let mut remaining_count: u64 = 0;
+
+    for et in &edge_types {
+        for adj_key in [
+            encode_adj_key_forward(et, source_id),
+            encode_adj_key_reverse(et, source_id),
+        ] {
+            if ctx.adj_get(&adj_key)?.is_some() {
+                remaining_count += 1;
+                remaining_edges.push(adj_key);
+            }
+        }
+    }
+
+    if on_remaining_fail && remaining_count > 0 {
+        return Err(ExecutionError::Unsupported(format!(
+            "ATTACH DOCUMENT with ON REMAINING FAIL: source node {source_id} \
+             still has {remaining_count} untransferred edge(s)"
+        )));
+    }
+
+    // Cascade-delete: mirror `execute_delete` DETACH path logic.
+    for edge_key in &remaining_edges {
+        if let Some(parts) = decode_adj_key(edge_key) {
+            if let Some(plist) = ctx.adj_get(edge_key)? {
+                for peer_uid in plist.iter() {
+                    let peer_id = NodeId::from_raw(peer_uid);
+                    let counterpart_key = match parts.direction {
+                        AdjDirection::Out => encode_adj_key_reverse(&parts.edge_type, peer_id),
+                        AdjDirection::In => encode_adj_key_forward(&parts.edge_type, peer_id),
+                    };
+                    ctx.adj_merge_remove(&counterpart_key, source_id.as_raw());
+
+                    let (ep_src, ep_tgt) = match parts.direction {
+                        AdjDirection::Out => (source_id, peer_id),
+                        AdjDirection::In => (peer_id, source_id),
+                    };
+                    let ep_key = encode_edgeprop_key(&parts.edge_type, ep_src, ep_tgt);
+                    ctx.mvcc_delete(Partition::EdgeProp, &ep_key)?;
+                }
+            }
+        }
+        ctx.engine
+            .delete(Partition::Adj, edge_key)
+            .map_err(ExecutionError::Storage)?;
+        ctx.write_stats.edges_deleted += 1;
+    }
+    // Clear any pending merges targeting deleted adj keys.
+    for edge_key in &remaining_edges {
+        ctx.merge_adj_adds.remove(edge_key);
+        ctx.merge_adj_removes.remove(edge_key);
+    }
+
+    // Delete the node record itself (B-tree / vector / text indexes left to
+    // the standard delete path; ATTACH DOCUMENT's source is typically a
+    // short-lived node so we keep this tight — cleanup mirrors DETACH DELETE
+    // behaviour in `execute_delete`).
+    let key = encode_node_key(ctx.shard_id, source_id);
+    let needs_index_cleanup = ctx.btree_index_registry.is_some()
+        || ctx.vector_index_registry.is_some()
+        || ctx.text_index_registry.is_some();
+    if needs_index_cleanup {
+        if let Some(node_bytes) = ctx.mvcc_get(Partition::Node, &key)? {
+            if let Ok(record) = NodeRecord::from_msgpack(&node_bytes) {
+                let label = record.primary_label().to_string();
+                if let Some(btree_reg) = ctx.btree_index_registry {
+                    let props: Vec<(String, Value)> = record
+                        .props
+                        .iter()
+                        .filter_map(|(&fid, v)| {
+                            ctx.interner
+                                .resolve(fid)
+                                .map(|name| (name.to_string(), v.clone()))
+                        })
+                        .collect();
+                    btree_reg
+                        .on_node_deleted(ctx.engine, source_id, &label, &props)
+                        .map_err(ExecutionError::Storage)?;
+                }
+                for (&fid, value) in &record.props {
+                    if let Some(prop_name) = ctx.interner.resolve(fid) {
+                        if let Some(registry) = ctx.vector_index_registry {
+                            if try_extract_vector(value).is_some() {
+                                registry.on_vector_deleted(&label, source_id, prop_name);
+                            }
+                        }
+                        if let Some(registry) = ctx.text_index_registry {
+                            if value.as_str().is_some() {
+                                registry.on_text_deleted(&label, source_id, prop_name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ctx.mvcc_delete(Partition::Node, &key)?;
+    ctx.write_stats.nodes_deleted += 1;
     Ok(())
 }
 

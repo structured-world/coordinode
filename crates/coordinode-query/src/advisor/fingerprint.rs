@@ -183,6 +183,29 @@ fn write_clause(buf: &mut String, clause: &Clause) {
                 buf.push_str(" TRANSFER EDGES");
             }
         }
+        Clause::AttachDocument(ad) => {
+            buf.push_str("ATTACH (");
+            buf.push_str(&ad.source_variable);
+            buf.push_str(")-[:");
+            buf.push_str(&ad.edge_type);
+            buf.push_str("]->(");
+            buf.push_str(&ad.target_variable);
+            buf.push_str(") INTO ");
+            buf.push_str(&ad.target_property_variable);
+            for seg in &ad.target_property_path {
+                buf.push('.');
+                buf.push_str(seg);
+            }
+            if ad.transfer.is_some() {
+                buf.push_str(" TRANSFER EDGES");
+            }
+            if ad.on_conflict_replace {
+                buf.push_str(" ON CONFLICT REPLACE");
+            }
+            if ad.on_remaining_fail {
+                buf.push_str(" ON REMAINING FAIL");
+            }
+        }
         Clause::Set(items, _violation_mode) => {
             buf.push_str("SET ");
             write_set_items(buf, items);

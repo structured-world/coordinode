@@ -186,6 +186,18 @@ impl<'a> Analyzer<'a> {
                     self.check_expr(&t.predicate);
                 }
             }
+            Clause::AttachDocument(ad) => {
+                // ATTACH introduces its own pattern — bind both source and
+                // target variables into scope for downstream clauses (mirrors
+                // MATCH semantics).
+                self.scope
+                    .insert(ad.source_variable.clone(), ad.source_labels.clone());
+                self.scope
+                    .insert(ad.target_variable.clone(), ad.target_labels.clone());
+                if let Some(ref t) = ad.transfer {
+                    self.check_expr(&t.predicate);
+                }
+            }
             Clause::Set(items, _violation_mode) => {
                 for item in items {
                     self.check_set_item(item);

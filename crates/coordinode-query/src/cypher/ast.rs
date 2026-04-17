@@ -38,6 +38,7 @@ impl Query {
                     | Clause::Set(_, _)
                     | Clause::Remove(_)
                     | Clause::DetachDocument(_)
+                    | Clause::AttachDocument(_)
                     | Clause::AlterLabel(_)
                     | Clause::CreateTextIndex(_)
                     | Clause::DropTextIndex(_)
@@ -100,6 +101,10 @@ pub enum Clause {
     ///
     /// Promotes a nested DOCUMENT property to a new graph node + edge.
     DetachDocument(DetachDocumentClause),
+    /// `ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address [TRANSFER EDGES ...] [ON CONFLICT REPLACE] [ON REMAINING FAIL]`
+    ///
+    /// Demotes a graph node back to a nested DOCUMENT property on another node.
+    AttachDocument(AttachDocumentClause),
     /// SET clause with optional ON VIOLATION SKIP modifier.
     ///
     /// Syntax: `SET n.prop = val [ON VIOLATION SKIP]`
@@ -676,6 +681,52 @@ pub struct TransferEdgesSpec {
     /// Predicate filtering which edges to transfer. The edge variable in the
     /// predicate is always named `r`.
     pub predicate: Expr,
+}
+
+/// ATTACH DOCUMENT clause: demote a graph node to a nested DOCUMENT property.
+///
+/// Example:
+/// ```cypher
+/// ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address
+///   TRANSFER EDGES ON a TO u WHERE type(r) = 'SHIPS_TO'
+///   ON CONFLICT REPLACE
+///   ON REMAINING FAIL
+/// ```
+///
+/// The `source_variable` node's properties are read and written to the
+/// `target_variable`'s property at `target_property_path` as a DOCUMENT.
+/// The pattern's edge (a→u) is deleted. Any TRANSFER-matching edges on the
+/// source are re-pointed onto the target before the source node is deleted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttachDocumentClause {
+    /// Source node variable (the node being demoted). From pattern `(a:L)-...->(u)`.
+    pub source_variable: String,
+    /// Optional labels on the source node (used to filter the match).
+    pub source_labels: Vec<String>,
+    /// Target node variable (the node receiving the new DOCUMENT property).
+    pub target_variable: String,
+    /// Optional labels on the target node.
+    pub target_labels: Vec<String>,
+    /// The edge type between source and target.
+    pub edge_type: String,
+    /// Direction of the edge relative to the source. `Outgoing` ⇒ `(a)-[:T]->(u)`;
+    /// `Incoming` ⇒ `(a)<-[:T]-(u)`.
+    pub edge_direction: EdgeFromSource,
+    /// Optional edge variable (for downstream reference; not bound into row output).
+    pub edge_variable: Option<String>,
+    /// Target-path variable. Must equal `target_variable` per the arch spec
+    /// (the nested property lives on the target node).
+    pub target_property_variable: String,
+    /// Property path where the promoted DOCUMENT is written (non-empty, e.g. `["address"]`).
+    pub target_property_path: Vec<String>,
+    /// Optional TRANSFER EDGES spec. Re-points edges before the source node is deleted.
+    pub transfer: Option<TransferEdgesSpec>,
+    /// If true, overwrite the target property when it already exists
+    /// (`ON CONFLICT REPLACE`). Default false — existing target errors.
+    pub on_conflict_replace: bool,
+    /// If true, error when any untransferred edges remain on the source node
+    /// (`ON REMAINING FAIL`). Default false — cascade-delete remaining edges.
+    pub on_remaining_fail: bool,
 }
 
 /// A single SET operation.
