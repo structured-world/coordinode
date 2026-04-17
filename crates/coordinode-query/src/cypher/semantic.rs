@@ -173,6 +173,19 @@ impl<'a> Analyzer<'a> {
             Clause::Delete(dc) => {
                 self.analyze_delete(dc);
             }
+            Clause::DetachDocument(dd) => {
+                if !self.scope.contains_key(&dd.source_variable) {
+                    self.errors.push(SemanticError::UndefinedVariable {
+                        name: dd.source_variable.clone(),
+                    });
+                }
+                // Bind the new target variable for subsequent clauses.
+                self.scope
+                    .insert(dd.target_variable.clone(), dd.target_labels.clone());
+                if let Some(ref t) = dd.transfer {
+                    self.check_expr(&t.predicate);
+                }
+            }
             Clause::Set(items, _violation_mode) => {
                 for item in items {
                     self.check_set_item(item);

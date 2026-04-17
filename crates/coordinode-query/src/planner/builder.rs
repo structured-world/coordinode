@@ -332,7 +332,52 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
         Clause::DropVectorIndex(c) => Ok(LogicalOp::DropVectorIndex {
             name: c.name.clone(),
         }),
+        Clause::DetachDocument(dd) => {
+            let input = current.unwrap_or(LogicalOp::Empty);
+            Ok(LogicalOp::DetachDocument {
+                input: Box::new(input),
+                source_variable: dd.source_variable.clone(),
+                property_path: dd.property_path.clone(),
+                target_variable: dd.target_variable.clone(),
+                target_labels: dd.target_labels.clone(),
+                edge_type: dd
+                    .edge_type
+                    .clone()
+                    .unwrap_or_else(|| default_edge_type(&dd.property_path)),
+                edge_direction: dd.edge_direction,
+                edge_variable: dd.edge_variable.clone(),
+                transfer: dd.transfer.clone(),
+            })
+        }
     }
+}
+
+/// Derive a default edge type from a property path: `HAS_<UPPER_SNAKE(last)>`.
+fn default_edge_type(path: &[String]) -> String {
+    let last = path.last().map(String::as_str).unwrap_or("DOCUMENT");
+    // Convert camelCase / snake_case to UPPER_SNAKE.
+    let mut out = String::from("HAS_");
+    let mut prev_lower = false;
+    for ch in last.chars() {
+        if ch == '_' {
+            out.push('_');
+            prev_lower = false;
+            continue;
+        }
+        if ch.is_uppercase() {
+            if prev_lower {
+                out.push('_');
+            }
+            out.push(ch);
+            prev_lower = false;
+        } else {
+            for upper in ch.to_uppercase() {
+                out.push(upper);
+            }
+            prev_lower = true;
+        }
+    }
+    out
 }
 
 /// Parse a metric string into a `VectorMetric`.

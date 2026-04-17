@@ -171,6 +171,18 @@ fn write_clause(buf: &mut String, clause: &Clause) {
                 write_expr(buf, expr);
             }
         }
+        Clause::DetachDocument(dd) => {
+            buf.push_str("DETACH DOCUMENT ");
+            buf.push_str(&dd.source_variable);
+            for seg in &dd.property_path {
+                buf.push('.');
+                buf.push_str(seg);
+            }
+            buf.push_str(" AS ...");
+            if dd.transfer.is_some() {
+                buf.push_str(" TRANSFER EDGES");
+            }
+        }
         Clause::Set(items, _violation_mode) => {
             buf.push_str("SET ");
             write_set_items(buf, items);

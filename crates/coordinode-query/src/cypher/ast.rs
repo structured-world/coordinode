@@ -37,6 +37,7 @@ impl Query {
                     | Clause::Delete(_)
                     | Clause::Set(_, _)
                     | Clause::Remove(_)
+                    | Clause::DetachDocument(_)
                     | Clause::AlterLabel(_)
                     | Clause::CreateTextIndex(_)
                     | Clause::DropTextIndex(_)
@@ -95,6 +96,10 @@ pub enum Clause {
     MergeMany(MergeClause),
     Upsert(UpsertClause),
     Delete(DeleteClause),
+    /// `DETACH DOCUMENT n.address AS (a:Address)-[:HAS_ADDRESS]->(n) [TRANSFER EDGES ...]`
+    ///
+    /// Promotes a nested DOCUMENT property to a new graph node + edge.
+    DetachDocument(DetachDocumentClause),
     /// SET clause with optional ON VIOLATION SKIP modifier.
     ///
     /// Syntax: `SET n.prop = val [ON VIOLATION SKIP]`
@@ -611,6 +616,66 @@ pub struct UpsertClause {
 pub struct DeleteClause {
     pub detach: bool,
     pub exprs: Vec<Expr>,
+}
+
+/// DETACH DOCUMENT clause: promote a nested DOCUMENT property to a graph node.
+///
+/// Example:
+/// ```cypher
+/// DETACH DOCUMENT n.address AS (a:Address)-[:HAS_ADDRESS]->(n)
+///   TRANSFER EDGES ON n TO a WHERE type(r) IN ['SHIPS_TO', 'LIVES_AT']
+/// ```
+///
+/// The new node receives the document's top-level keys as properties (shallow
+/// promotion). Any nested maps remain as DOCUMENT properties on the new node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetachDocumentClause {
+    /// Source node variable (e.g. `n` in `n.address`). Must resolve to a bound
+    /// row column produced by a preceding MATCH.
+    pub source_variable: String,
+    /// Property path on the source node (e.g. `["address"]` or `["meta", "shipping"]`).
+    /// Must be non-empty.
+    pub property_path: Vec<String>,
+    /// Target node variable from the AS pattern (e.g. `a` in `(a:Address)`).
+    pub target_variable: String,
+    /// Labels applied to the new target node.
+    pub target_labels: Vec<String>,
+    /// Edge type connecting the target node to the source. If `None`, derive
+    /// `HAS_<UPPER_SNAKE(property_path.last())>` at plan time.
+    pub edge_type: Option<String>,
+    /// Edge direction from the perspective of `source_variable`. `Outgoing`
+    /// means `(source)-[:TYPE]->(target)`; `Incoming` means `(source)<-[:TYPE]-(target)`;
+    /// the canonical form in the arch doc is `(a:Address)-[:HAS_ADDRESS]->(n)`
+    /// which stores as `Incoming` from `n`'s perspective.
+    pub edge_direction: EdgeFromSource,
+    /// Optional variable name bound to the new edge (not yet used by executor).
+    pub edge_variable: Option<String>,
+    /// Optional TRANSFER EDGES clause.
+    pub transfer: Option<TransferEdgesSpec>,
+}
+
+/// Direction of the edge created by DETACH DOCUMENT relative to the source node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeFromSource {
+    /// `(source)-[:TYPE]->(target)` — source is the edge's source.
+    Outgoing,
+    /// `(source)<-[:TYPE]-(target)` — source is the edge's target (canonical form).
+    Incoming,
+}
+
+/// `TRANSFER EDGES ON <node> TO <target> WHERE <predicate>` clause.
+///
+/// Re-points edges on `node_variable` to `target_variable` when the predicate
+/// (typically `type(r) IN [...]`) matches.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransferEdgesSpec {
+    /// The node whose edges are being re-pointed (usually the source of DETACH).
+    pub node_variable: String,
+    /// The node that will receive the re-pointed edges (usually the new target).
+    pub target_variable: String,
+    /// Predicate filtering which edges to transfer. The edge variable in the
+    /// predicate is always named `r`.
+    pub predicate: Expr,
 }
 
 /// A single SET operation.

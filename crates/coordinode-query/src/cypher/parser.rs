@@ -228,6 +228,10 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let dc = build_delete_clause(pair, true)?;
             clauses.push(Clause::Delete(dc));
         }
+        Rule::detach_document_clause => {
+            let dd = build_detach_document_clause(pair)?;
+            clauses.push(Clause::DetachDocument(dd));
+        }
         Rule::set_clause => {
             let (items, violation_mode) = build_set_clause(pair)?;
             clauses.push(Clause::Set(items, violation_mode));
@@ -1133,6 +1137,147 @@ fn build_delete_clause(pair: Pair<'_, Rule>, detach: bool) -> Result<DeleteClaus
     }
 
     Ok(DeleteClause { detach, exprs })
+}
+
+fn build_detach_document_clause(pair: Pair<'_, Rule>) -> Result<DetachDocumentClause, ParseError> {
+    let mut source_variable = String::new();
+    let mut property_path: Vec<String> = Vec::new();
+    let mut target_pattern: Option<(NodePattern, RelationshipPattern, NodePattern)> = None;
+    let mut transfer: Option<TransferEdgesSpec> = None;
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::detach_doc_source => {
+                let mut segs: Vec<String> = inner
+                    .into_inner()
+                    .filter(|p| p.as_rule() == Rule::identifier)
+                    .map(extract_identifier)
+                    .collect();
+                if segs.len() < 2 {
+                    return Err(ParseError::Invalid(
+                        "DETACH DOCUMENT source must be a property path (e.g. n.address)"
+                            .to_string(),
+                    ));
+                }
+                source_variable = segs.remove(0);
+                property_path = segs;
+            }
+            Rule::detach_doc_target => {
+                let mut nodes: Vec<NodePattern> = Vec::new();
+                let mut rel: Option<RelationshipPattern> = None;
+                for part in inner.into_inner() {
+                    match part.as_rule() {
+                        Rule::node_pattern => nodes.push(build_node_pattern(part)?),
+                        Rule::relationship_pattern => rel = Some(build_relationship_pattern(part)?),
+                        _ => {}
+                    }
+                }
+                let rel_value = rel.ok_or_else(|| {
+                    ParseError::Invalid(
+                        "DETACH DOCUMENT target must be (a:Label)-[:TYPE]->(n)".to_string(),
+                    )
+                })?;
+                if nodes.len() != 2 {
+                    return Err(ParseError::Invalid(
+                        "DETACH DOCUMENT target must be (a:Label)-[:TYPE]->(n)".to_string(),
+                    ));
+                }
+                let tgt = nodes.pop().ok_or_else(|| {
+                    ParseError::Invalid("DETACH DOCUMENT: missing target node".to_string())
+                })?;
+                let src_in_pattern = nodes.pop().ok_or_else(|| {
+                    ParseError::Invalid("DETACH DOCUMENT: missing anchor node".to_string())
+                })?;
+                target_pattern = Some((src_in_pattern, rel_value, tgt));
+            }
+            Rule::detach_doc_transfer => {
+                let mut node_var: Option<String> = None;
+                let mut target_var: Option<String> = None;
+                let mut predicate: Option<Expr> = None;
+                for part in inner.into_inner() {
+                    match part.as_rule() {
+                        Rule::identifier => {
+                            let ident = extract_identifier(part);
+                            if node_var.is_none() {
+                                node_var = Some(ident);
+                            } else if target_var.is_none() {
+                                target_var = Some(ident);
+                            }
+                        }
+                        Rule::where_inline => {
+                            predicate = Some(find_expression(part)?);
+                        }
+                        _ => {}
+                    }
+                }
+                let node_variable = node_var.ok_or_else(|| {
+                    ParseError::Invalid("TRANSFER EDGES requires ON <node_var>".to_string())
+                })?;
+                let target_variable = target_var.ok_or_else(|| {
+                    ParseError::Invalid("TRANSFER EDGES requires TO <target_var>".to_string())
+                })?;
+                let predicate = predicate.ok_or_else(|| {
+                    ParseError::Invalid("TRANSFER EDGES requires a WHERE predicate".to_string())
+                })?;
+                transfer = Some(TransferEdgesSpec {
+                    node_variable,
+                    target_variable,
+                    predicate,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let (pattern_src, rel, pattern_tgt) = target_pattern
+        .ok_or_else(|| ParseError::Invalid("DETACH DOCUMENT missing target pattern".to_string()))?;
+
+    // Identify which node in the pattern is the existing source (`source_variable`)
+    // and which is the new target.
+    let (target_node, edge_direction) =
+        if pattern_tgt.variable.as_deref() == Some(source_variable.as_str()) {
+            // (a:Label)-[:TYPE]->(n)   → n is pattern_tgt, `a` is pattern_src.
+            //   Direction: edge goes a → n, i.e. relative to `n` (source), edge is Incoming.
+            //   BUT: with `dash ~ right_arrow` (->) dir=Outgoing relative to the LEFT node.
+            //   Relative to `source_variable` (right side = n), that edge is Incoming.
+            let dir = match rel.direction {
+                Direction::Outgoing => EdgeFromSource::Incoming, // (a)-[:T]->(n): from n's view, incoming
+                Direction::Incoming => EdgeFromSource::Outgoing, // (a)<-[:T]-(n): from n's view, outgoing
+                Direction::Both => EdgeFromSource::Incoming,
+            };
+            (pattern_src, dir)
+        } else if pattern_src.variable.as_deref() == Some(source_variable.as_str()) {
+            // (n)-[:TYPE]->(a:Label) — source is on the left.
+            let dir = match rel.direction {
+                Direction::Outgoing => EdgeFromSource::Outgoing,
+                Direction::Incoming => EdgeFromSource::Incoming,
+                Direction::Both => EdgeFromSource::Outgoing,
+            };
+            (pattern_tgt, dir)
+        } else {
+            return Err(ParseError::Invalid(format!(
+                "DETACH DOCUMENT AS pattern must reference source variable `{}`",
+                source_variable
+            )));
+        };
+
+    let target_variable = target_node
+        .variable
+        .ok_or_else(|| ParseError::Invalid("DETACH DOCUMENT target must be named".to_string()))?;
+    let target_labels = target_node.labels;
+    let edge_type = rel.rel_types.into_iter().next();
+    let edge_variable = rel.variable;
+
+    Ok(DetachDocumentClause {
+        source_variable,
+        property_path,
+        target_variable,
+        target_labels,
+        edge_type,
+        edge_direction,
+        edge_variable,
+        transfer,
+    })
 }
 
 fn build_set_clause(pair: Pair<'_, Rule>) -> Result<(Vec<SetItem>, ViolationMode), ParseError> {
@@ -3648,6 +3793,86 @@ mod tests {
                 panic!("expected outer Subscript, got {:?}", rc.items[0].expr);
             }
         }
+    }
+
+    // ====== DETACH DOCUMENT (R167) ======
+
+    #[test]
+    fn detach_document_basic() {
+        let q = parse_ok(
+            "MATCH (n:User) \
+             DETACH DOCUMENT n.address AS (a:Address)-[:HAS_ADDRESS]->(n)",
+        );
+        let Clause::DetachDocument(ref dd) = q.clauses[1] else {
+            panic!("expected DetachDocument, got {:?}", q.clauses[1]);
+        };
+        assert_eq!(dd.source_variable, "n");
+        assert_eq!(dd.property_path, vec!["address"]);
+        assert_eq!(dd.target_variable, "a");
+        assert_eq!(dd.target_labels, vec!["Address"]);
+        assert_eq!(dd.edge_type.as_deref(), Some("HAS_ADDRESS"));
+        // (a:Address)-[:HAS_ADDRESS]->(n): edge goes a → n, so from `n`'s
+        // perspective it is incoming.
+        assert_eq!(dd.edge_direction, EdgeFromSource::Incoming);
+        assert!(dd.transfer.is_none());
+    }
+
+    #[test]
+    fn detach_document_nested_path() {
+        let q = parse_ok(
+            "MATCH (n:User) \
+             DETACH DOCUMENT n.meta.shipping AS (s:ShippingAddress)-[:HAS_SHIPPING]->(n)",
+        );
+        let Clause::DetachDocument(ref dd) = q.clauses[1] else {
+            panic!("expected DetachDocument");
+        };
+        assert_eq!(dd.property_path, vec!["meta", "shipping"]);
+        assert_eq!(dd.target_variable, "s");
+    }
+
+    #[test]
+    fn detach_document_with_transfer_edges_in_list() {
+        let q = parse_ok(
+            "MATCH (n:User) \
+             DETACH DOCUMENT n.address AS (a:Address)-[:HAS_ADDRESS]->(n) \
+             TRANSFER EDGES ON n TO a WHERE type(r) IN ['SHIPS_TO', 'LIVES_AT']",
+        );
+        let Clause::DetachDocument(ref dd) = q.clauses[1] else {
+            panic!("expected DetachDocument");
+        };
+        let t = dd.transfer.as_ref().expect("transfer spec");
+        assert_eq!(t.node_variable, "n");
+        assert_eq!(t.target_variable, "a");
+        // predicate must be `type(r) IN [...]`.
+        assert!(matches!(t.predicate, Expr::In { .. }));
+    }
+
+    #[test]
+    fn detach_document_requires_property_path() {
+        // Just `n` alone — grammar requires at least one `.segment`.
+        let err = parse_err(
+            "MATCH (n:User) \
+             DETACH DOCUMENT n AS (a:Address)-[:HAS_ADDRESS]->(n)",
+        );
+        // Any parse error is acceptable — the important part is that the query
+        // does not parse successfully.
+        let _ = err;
+    }
+
+    #[test]
+    fn detach_document_reverse_relationship() {
+        // Mirror form: (n)<-[:HAS_ADDRESS]-(a:Address) — same semantics.
+        let q = parse_ok(
+            "MATCH (n:User) \
+             DETACH DOCUMENT n.address AS (n)<-[:HAS_ADDRESS]-(a:Address)",
+        );
+        let Clause::DetachDocument(ref dd) = q.clauses[1] else {
+            panic!("expected DetachDocument");
+        };
+        assert_eq!(dd.target_variable, "a");
+        assert_eq!(dd.target_labels, vec!["Address"]);
+        // (n)<-[:HAS_ADDRESS]-(a): edge goes a → n, still Incoming for n.
+        assert_eq!(dd.edge_direction, EdgeFromSource::Incoming);
     }
 
     #[test]

@@ -1815,6 +1815,31 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             on_match,
             on_create_patterns,
         } => execute_upsert(pattern, on_match, on_create_patterns, ctx),
+
+        LogicalOp::DetachDocument {
+            input,
+            source_variable,
+            property_path,
+            target_variable,
+            target_labels,
+            edge_type,
+            edge_direction,
+            edge_variable: _,
+            transfer,
+        } => {
+            let input_rows = execute_op(input, ctx)?;
+            execute_detach_document(
+                &input_rows,
+                source_variable,
+                property_path,
+                target_variable,
+                target_labels,
+                edge_type,
+                *edge_direction,
+                transfer.as_ref(),
+                ctx,
+            )
+        }
     }
 }
 
@@ -6222,6 +6247,493 @@ fn execute_delete(
 
     // DELETE returns the input rows (so downstream RETURN can reference them)
     Ok(input_rows.to_vec())
+}
+
+// =====================================================================
+// DETACH DOCUMENT (R167)
+// =====================================================================
+
+/// Execute a DETACH DOCUMENT clause for each input row.
+///
+/// For each bound source node:
+///  1. Read the node record.
+///  2. Extract the DOCUMENT value at `property_path` (shallow).
+///  3. CREATE a new node with `target_labels`, populated from the document's
+///     top-level keys.
+///  4. CREATE an edge of `edge_type` between source and target. The canonical
+///     form is `(a:Label)-[:TYPE]->(n)` i.e. target → source, so when
+///     `edge_direction == Incoming` (from the source's view) we use
+///     (target → source); otherwise (source → target).
+///  5. Remove `property_path` from the source node via a `DocDelta` merge
+///     operand (O(1), no read).
+///  6. If `TRANSFER EDGES ON source TO target WHERE type(r) IN [...]` was
+///     given, re-point each matching edge on the source to the new target
+///     via merge operators on adjacency posting lists.
+///
+/// All writes happen within the current MVCC transaction — the executor
+/// batches them and commits atomically at the end of the query.
+#[allow(clippy::too_many_arguments)]
+fn execute_detach_document(
+    input_rows: &[Row],
+    source_variable: &str,
+    property_path: &[String],
+    target_variable: &str,
+    target_labels: &[String],
+    edge_type: &str,
+    edge_direction: crate::cypher::ast::EdgeFromSource,
+    transfer: Option<&crate::cypher::ast::TransferEdgesSpec>,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    if property_path.is_empty() {
+        return Err(ExecutionError::Unsupported(
+            "DETACH DOCUMENT requires a non-empty property path".to_string(),
+        ));
+    }
+
+    let transfer_types: Option<Vec<String>> = match transfer {
+        Some(t) => Some(extract_transfer_edge_types(&t.predicate)?),
+        None => None,
+    };
+
+    let mut results: Vec<Row> = Vec::new();
+
+    for input_row in input_rows {
+        let source_id = match input_row.get(source_variable) {
+            Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+            _ => {
+                return Err(ExecutionError::Unsupported(format!(
+                    "DETACH DOCUMENT: variable `{source_variable}` is not a bound node"
+                )));
+            }
+        };
+
+        // 1. Read the source node.
+        let node_key = encode_node_key(ctx.shard_id, source_id);
+        let Some(bytes) = ctx.mvcc_get(Partition::Node, &node_key)? else {
+            return Err(ExecutionError::Unsupported(format!(
+                "DETACH DOCUMENT: node {source_id} not found"
+            )));
+        };
+        let record = NodeRecord::from_msgpack(&bytes)
+            .map_err(|e| ExecutionError::Serialization(format!("node decode: {e}")))?;
+
+        // 2. Resolve the property value at `property_path`.
+        let (field_id_opt, doc_value) =
+            resolve_document_property(&record, property_path, ctx.interner)?;
+
+        // 3. Extract the document's top-level (key, Value) pairs for the new node.
+        let props = document_top_level_to_props(&doc_value)?;
+
+        // 4. Allocate the new node ID and build its record. We go through
+        //    `execute_create_node` via literal-expression properties so that
+        //    schema validation / index registries fire identically to a
+        //    hand-written CREATE. Build a minimal single-row input so the
+        //    executor allocates exactly one new node per detach.
+        let literal_props: Vec<(String, Expr)> = props
+            .iter()
+            .map(|(k, v)| (k.clone(), Expr::Literal(v.clone())))
+            .collect();
+        let create_rows = execute_create_node(
+            std::slice::from_ref(input_row),
+            Some(target_variable),
+            target_labels,
+            &literal_props,
+            ctx,
+        )?;
+        let Some(created) = create_rows.into_iter().next() else {
+            return Err(ExecutionError::Unsupported(
+                "DETACH DOCUMENT: failed to create target node".to_string(),
+            ));
+        };
+        let target_id = match created.get(target_variable) {
+            Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+            _ => {
+                return Err(ExecutionError::Unsupported(
+                    "DETACH DOCUMENT: created node missing id".to_string(),
+                ));
+            }
+        };
+
+        // 5. Create the connecting edge.
+        //
+        //   canonical: `(a:Address)-[:HAS_ADDRESS]->(n)` — a is target, n is source,
+        //   edge flows target → source.
+        let (edge_src, edge_tgt) = match edge_direction {
+            crate::cypher::ast::EdgeFromSource::Incoming => (target_id, source_id),
+            crate::cypher::ast::EdgeFromSource::Outgoing => (source_id, target_id),
+        };
+        create_single_edge(edge_src, edge_tgt, edge_type, ctx)?;
+
+        // 6. Remove the property from the source node via merge operand.
+        emit_property_removal(source_id, property_path, field_id_opt, ctx)?;
+
+        // 7. Optional TRANSFER EDGES.
+        if let Some(ref types) = transfer_types {
+            transfer_edges_on_node(source_id, target_id, types, ctx)?;
+        }
+
+        // 8. Produce output row: preserve source row bindings, add the new
+        //    target variable (mirroring `execute_create_node`).
+        let mut out = created.clone();
+        // The source variable should still reference the (still-existing) source node.
+        out.insert(
+            source_variable.to_string(),
+            Value::Int(source_id.as_raw() as i64),
+        );
+        // Invalidate the removed property in the row cache.
+        let path_str = property_path.join(".");
+        out.remove(&format!("{source_variable}.{path_str}"));
+        results.push(out);
+    }
+
+    Ok(results)
+}
+
+/// Resolve a property value on a node record by path.
+///
+/// Returns `(field_id, value)` where `field_id` is `Some(fid)` if the first
+/// path segment corresponds to an interned property (i.e. `PathTarget::PropField`
+/// removal is possible) or `None` if the value was found in the `extra`
+/// overflow map.
+fn resolve_document_property(
+    record: &NodeRecord,
+    path: &[String],
+    interner: &FieldInterner,
+) -> Result<(Option<u32>, rmpv::Value), ExecutionError> {
+    let first = &path[0];
+    let (field_id, root): (Option<u32>, Value) = match interner.lookup(first) {
+        Some(fid) => match record.props.get(&fid) {
+            Some(v) => (Some(fid), v.clone()),
+            None => {
+                return Err(ExecutionError::Unsupported(format!(
+                    "DETACH DOCUMENT: property `{first}` not found on node"
+                )));
+            }
+        },
+        None => {
+            // Try the overflow map.
+            let extra = record.extra.as_ref().and_then(|m| m.get(first));
+            match extra {
+                Some(v) => (None, v.clone()),
+                None => {
+                    return Err(ExecutionError::Unsupported(format!(
+                        "DETACH DOCUMENT: property `{first}` not found on node"
+                    )));
+                }
+            }
+        }
+    };
+
+    // Descend remaining path segments (rmpv navigation).
+    let mut current = value_to_rmpv(&root);
+    for seg in &path[1..] {
+        current = match current {
+            rmpv::Value::Map(entries) => {
+                let hit = entries
+                    .into_iter()
+                    .find(|(k, _)| k.as_str() == Some(seg.as_str()))
+                    .map(|(_, v)| v);
+                match hit {
+                    Some(v) => v,
+                    None => {
+                        return Err(ExecutionError::Unsupported(format!(
+                            "DETACH DOCUMENT: path segment `{seg}` not found"
+                        )));
+                    }
+                }
+            }
+            _ => {
+                return Err(ExecutionError::Unsupported(format!(
+                    "DETACH DOCUMENT: path segment `{seg}` traverses a non-map value"
+                )));
+            }
+        };
+    }
+
+    // The resolved value must be a document/map (Nil is treated as absent).
+    match &current {
+        rmpv::Value::Nil => Err(ExecutionError::Unsupported(
+            "DETACH DOCUMENT: property value is NULL".to_string(),
+        )),
+        rmpv::Value::Map(_) => Ok((field_id, current)),
+        _ => Err(ExecutionError::Unsupported(format!(
+            "DETACH DOCUMENT: property at `{}` is not a DOCUMENT/MAP",
+            path.join(".")
+        ))),
+    }
+}
+
+/// Lift a `Value` to an `rmpv::Value` for document path navigation.
+fn value_to_rmpv(v: &Value) -> rmpv::Value {
+    match v {
+        Value::Document(doc) => doc.clone(),
+        other => other.to_rmpv(),
+    }
+}
+
+/// Decompose a document (top level must be a map) into (String, Value) pairs
+/// suitable for property assignment on the new target node. Nested maps become
+/// `Value::Document`, preserving the arch doc's shallow-promotion semantics.
+fn document_top_level_to_props(doc: &rmpv::Value) -> Result<Vec<(String, Value)>, ExecutionError> {
+    let rmpv::Value::Map(entries) = doc else {
+        return Err(ExecutionError::Unsupported(
+            "DETACH DOCUMENT: document value is not a map".to_string(),
+        ));
+    };
+
+    let mut out = Vec::with_capacity(entries.len());
+    for (k, v) in entries {
+        let Some(key) = k.as_str() else {
+            return Err(ExecutionError::Unsupported(
+                "DETACH DOCUMENT: non-string key in document".to_string(),
+            ));
+        };
+        // Nested maps/arrays stay as documents (shallow promotion per arch
+        // doc); scalars become the matching typed Value.
+        out.push((key.to_string(), rmpv_scalar_to_value(v)));
+    }
+    Ok(out)
+}
+
+/// Convert an `rmpv::Value` into the corresponding `Value` variant.
+///
+/// Scalars map to their typed equivalents; maps and arrays are preserved
+/// as `Value::Document(...)` so that nested document structure survives
+/// a DETACH DOCUMENT promotion (arch: shallow — nested documents become
+/// DOCUMENT properties on the new node).
+fn rmpv_scalar_to_value(v: &rmpv::Value) -> Value {
+    match v {
+        rmpv::Value::Nil => Value::Null,
+        rmpv::Value::Boolean(b) => Value::Bool(*b),
+        rmpv::Value::Integer(i) => {
+            if let Some(n) = i.as_i64() {
+                Value::Int(n)
+            } else if let Some(n) = i.as_u64() {
+                // Saturate unsigned values larger than i64::MAX — keep the bits,
+                // accept wraparound for the rare out-of-range case.
+                Value::Int(n as i64)
+            } else {
+                Value::Null
+            }
+        }
+        rmpv::Value::F32(f) => Value::Float(*f as f64),
+        rmpv::Value::F64(f) => Value::Float(*f),
+        rmpv::Value::String(s) => s
+            .as_str()
+            .map(|s| Value::String(s.to_string()))
+            .unwrap_or(Value::Null),
+        rmpv::Value::Binary(b) => Value::Binary(b.clone()),
+        rmpv::Value::Array(_) | rmpv::Value::Map(_) | rmpv::Value::Ext(_, _) => {
+            Value::Document(v.clone())
+        }
+    }
+}
+
+/// Create a single edge (`src → tgt`) of `edge_type`, mirroring the logic
+/// in `execute_create_edge` but without requiring row bindings.
+fn create_single_edge(
+    src: NodeId,
+    tgt: NodeId,
+    edge_type: &str,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    let mut edge_key = Vec::with_capacity(64);
+
+    write_adj_key_forward(edge_type, src, &mut edge_key);
+    ctx.adj_merge_add(&edge_key, tgt.as_raw());
+
+    write_adj_key_reverse(edge_type, tgt, &mut edge_key);
+    ctx.adj_merge_add(&edge_key, src.as_raw());
+
+    ctx.write_stats.edges_created += 1;
+
+    // Register edge type in schema (idempotent).
+    let et_key = edge_type_schema_key(edge_type);
+    if !ctx
+        .mvcc_write_buffer
+        .contains_key(&(Partition::Schema, et_key.clone()))
+    {
+        ctx.mvcc_put(Partition::Schema, &et_key, b"")?;
+    }
+    Ok(())
+}
+
+/// Emit a `DocDelta::RemoveProperty` (for single-segment paths on an interned
+/// field) or `DocDelta::DeletePath` (for nested paths / extra properties).
+fn emit_property_removal(
+    node_id: NodeId,
+    path: &[String],
+    field_id_opt: Option<u32>,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    use coordinode_core::graph::doc_delta::{DocDelta, PathTarget};
+
+    let key = encode_node_key(ctx.shard_id, node_id);
+
+    let delta = if path.len() == 1 {
+        match field_id_opt {
+            Some(fid) => DocDelta::RemoveProperty {
+                target: PathTarget::PropField(fid),
+                key: None,
+            },
+            None => DocDelta::RemoveProperty {
+                target: PathTarget::Extra,
+                key: Some(path[0].clone()),
+            },
+        }
+    } else {
+        // Nested path: `DeletePath` on either an interned prop or extra key.
+        let target = match field_id_opt {
+            Some(fid) => PathTarget::PropField(fid),
+            None => PathTarget::Extra,
+        };
+        let sub = if field_id_opt.is_some() {
+            path[1..].to_vec()
+        } else {
+            // For extra: the first segment is the extra-map key; remaining are sub-path.
+            path[1..].to_vec()
+        };
+        DocDelta::DeletePath { target, path: sub }
+    };
+
+    let operand = delta
+        .encode()
+        .map_err(|e| ExecutionError::Serialization(format!("DocDelta encode: {e}")))?;
+    ctx.merge_node_deltas.push((key, operand));
+    ctx.write_stats.properties_removed += 1;
+    Ok(())
+}
+
+/// Attempt to extract the edge-type list from a `TRANSFER EDGES WHERE` predicate.
+///
+/// Supported shapes (enough for the spec in arch/core/document-operations.md):
+///   - `type(r) IN ['T1', 'T2', ...]`
+///   - `type(r) = 'T1'`
+///
+/// Anything more complex returns an error; we prefer explicit scope to a
+/// misinterpreted transfer.
+fn extract_transfer_edge_types(predicate: &Expr) -> Result<Vec<String>, ExecutionError> {
+    fn is_type_of_r(expr: &Expr) -> bool {
+        matches!(
+            expr,
+            Expr::FunctionCall { name, args, .. }
+                if name.eq_ignore_ascii_case("type")
+                    && args.len() == 1
+                    && matches!(&args[0], Expr::Variable(v) if v == "r")
+        )
+    }
+
+    fn lit_string(e: &Expr) -> Option<String> {
+        if let Expr::Literal(Value::String(s)) = e {
+            Some(s.clone())
+        } else {
+            None
+        }
+    }
+
+    match predicate {
+        Expr::In { expr, list } if is_type_of_r(expr) => {
+            let Expr::List(items) = list.as_ref() else {
+                return Err(ExecutionError::Unsupported(
+                    "TRANSFER EDGES WHERE: `IN` requires a list literal".to_string(),
+                ));
+            };
+            let mut types = Vec::with_capacity(items.len());
+            for it in items {
+                let Some(s) = lit_string(it) else {
+                    return Err(ExecutionError::Unsupported(
+                        "TRANSFER EDGES WHERE: list must contain string literals".to_string(),
+                    ));
+                };
+                types.push(s);
+            }
+            Ok(types)
+        }
+        Expr::BinaryOp {
+            left,
+            op: crate::cypher::ast::BinaryOperator::Eq,
+            right,
+        } if is_type_of_r(left) => {
+            let Some(s) = lit_string(right) else {
+                return Err(ExecutionError::Unsupported(
+                    "TRANSFER EDGES WHERE: `=` requires a string literal".to_string(),
+                ));
+            };
+            Ok(vec![s])
+        }
+        _ => Err(ExecutionError::Unsupported(
+            "TRANSFER EDGES WHERE supports only `type(r) IN [...]` or `type(r) = '...'`"
+                .to_string(),
+        )),
+    }
+}
+
+/// Re-point all edges of the listed types on `source_id` to `target_id`.
+///
+/// For each edge type T, both directions are scanned:
+///  - `adj:T:out:source` — edges where source is the edge's source
+///    → counterpart key `adj:T:in:peer` is already `source`; rewrite to `target`
+///  - `adj:T:in:source` — edges where source is the edge's target
+///    → symmetric
+///
+/// Implementation uses posting-list merge operators (`adj_merge_add`/`remove`)
+/// so there are no OCC conflicts even on high-degree vertices. Edge properties
+/// (edgeprop: partition) are physically rewritten via delete+put.
+fn transfer_edges_on_node(
+    source_id: NodeId,
+    target_id: NodeId,
+    edge_types: &[String],
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    for edge_type in edge_types {
+        // Forward: source is the edge source.
+        let fwd = encode_adj_key_forward(edge_type, source_id);
+        if let Some(plist) = ctx.adj_get(&fwd)? {
+            let peers: Vec<u64> = plist.iter().collect();
+            for peer_uid in peers {
+                let peer_id = NodeId::from_raw(peer_uid);
+                // Remove source → peer
+                ctx.adj_merge_remove(&fwd, peer_uid);
+                let peer_in = encode_adj_key_reverse(edge_type, peer_id);
+                ctx.adj_merge_remove(&peer_in, source_id.as_raw());
+                // Add target → peer
+                let tgt_out = encode_adj_key_forward(edge_type, target_id);
+                ctx.adj_merge_add(&tgt_out, peer_uid);
+                ctx.adj_merge_add(&peer_in, target_id.as_raw());
+
+                // Move edge properties.
+                let old_ep = encode_edgeprop_key(edge_type, source_id, peer_id);
+                if let Some(ep_bytes) = ctx.mvcc_get(Partition::EdgeProp, &old_ep)? {
+                    let new_ep = encode_edgeprop_key(edge_type, target_id, peer_id);
+                    ctx.mvcc_put(Partition::EdgeProp, &new_ep, &ep_bytes)?;
+                    ctx.mvcc_delete(Partition::EdgeProp, &old_ep)?;
+                }
+            }
+        }
+
+        // Reverse: source is the edge target.
+        let rev = encode_adj_key_reverse(edge_type, source_id);
+        if let Some(plist) = ctx.adj_get(&rev)? {
+            let peers: Vec<u64> = plist.iter().collect();
+            for peer_uid in peers {
+                let peer_id = NodeId::from_raw(peer_uid);
+                ctx.adj_merge_remove(&rev, peer_uid);
+                let peer_out = encode_adj_key_forward(edge_type, peer_id);
+                ctx.adj_merge_remove(&peer_out, source_id.as_raw());
+                let tgt_in = encode_adj_key_reverse(edge_type, target_id);
+                ctx.adj_merge_add(&tgt_in, peer_uid);
+                ctx.adj_merge_add(&peer_out, target_id.as_raw());
+
+                let old_ep = encode_edgeprop_key(edge_type, peer_id, source_id);
+                if let Some(ep_bytes) = ctx.mvcc_get(Partition::EdgeProp, &old_ep)? {
+                    let new_ep = encode_edgeprop_key(edge_type, peer_id, target_id);
+                    ctx.mvcc_put(Partition::EdgeProp, &new_ep, &ep_bytes)?;
+                    ctx.mvcc_delete(Partition::EdgeProp, &old_ep)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build the Schema-partition key for a given edge type name.

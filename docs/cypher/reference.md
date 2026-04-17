@@ -155,6 +155,18 @@ MATCH (n:Temp) DETACH DELETE n            -- removes edges first
 MATCH (a)-[r:KNOWS]->(b) DELETE r         -- delete relationship only
 ```
 
+#### DETACH DOCUMENT ✅ 🔷
+
+CoordiNode extension. Promotes a nested DOCUMENT property to a separate graph
+node + edge atomically. See
+[Cypher Extensions — DETACH DOCUMENT](extensions.md#detach-document) for
+semantics, `TRANSFER EDGES`, default edge-type derivation, and error cases.
+
+```cypher
+MATCH (n:User)
+DETACH DOCUMENT n.address AS (a:Address)-[:HAS_ADDRESS]->(n)
+```
+
 #### SET ✅
 
 Sets properties and labels.

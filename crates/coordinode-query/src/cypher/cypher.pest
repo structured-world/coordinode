@@ -1,7 +1,7 @@
 // OpenCypher PEG grammar for CoordiNode (read + write operations)
 // Read: MATCH, OPTIONAL MATCH, WHERE, RETURN, WITH, UNWIND,
 //       ORDER BY, SKIP, LIMIT, AS OF TIMESTAMP
-// Write: CREATE, MERGE, DELETE, DETACH DELETE, SET, REMOVE
+// Write: CREATE, MERGE, DELETE, DETACH DELETE, DETACH DOCUMENT, SET, REMOVE
 // Extensions: UPSERT MATCH, vector functions, parameters
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
@@ -29,6 +29,7 @@ clause = {
   | merge_all_clause
   | merge_clause
   | upsert_clause
+  | detach_document_clause
   | detach_delete_clause
   | drop_encrypted_index_clause
   | drop_text_index_clause
@@ -223,6 +224,29 @@ upsert_on_create = { kw_on ~ kw_create ~ kw_create ~ pattern_list }
 // --- DELETE ---
 
 detach_delete_clause = { kw_detach ~ kw_delete ~ expression_list }
+
+// --- DETACH DOCUMENT (promote nested DOCUMENT property to graph node) ---
+//
+//   DETACH DOCUMENT n.address AS (a:Address)-[:HAS_ADDRESS]->(n)
+//     [TRANSFER EDGES ON n TO a WHERE type(r) IN ['SHIPS_TO']]
+//
+// The AS target reuses the standard relationship pattern syntax.
+detach_document_clause = {
+    kw_detach ~ kw_document ~ detach_doc_source
+    ~ kw_as ~ detach_doc_target ~ detach_doc_transfer?
+}
+
+// Source path: identifier "." identifier ("." identifier)*  (e.g. n.address, n.a.b)
+detach_doc_source = { identifier ~ ("." ~ identifier)+ }
+
+// Target: (a:Label)-[:TYPE]->(n) or (n)<-[:TYPE]-(a) (mirror form)
+// One relationship between two node patterns.
+detach_doc_target = { node_pattern ~ relationship_pattern ~ node_pattern }
+
+// TRANSFER EDGES ON <src_var> TO <dst_var> WHERE <predicate>
+detach_doc_transfer = {
+    kw_transfer ~ kw_edges ~ kw_on ~ identifier ~ kw_to ~ identifier ~ where_inline
+}
 delete_clause = { kw_delete ~ expression_list }
 expression_list = { expression ~ ("," ~ expression)* }
 
@@ -442,6 +466,10 @@ kw_unique     = @{ ^"unique" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_sparse     = @{ ^"sparse" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_vector     = @{ ^"vector" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_options    = @{ ^"options" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_document   = @{ ^"document" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_transfer   = @{ ^"transfer" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_edges      = @{ ^"edges" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_to         = @{ ^"to" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // --- Identifiers ---
 

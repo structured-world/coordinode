@@ -314,6 +314,54 @@ MATCH (n:Stats) SET doc_inc(n.data.score, -0.5)
 | `doc_add_to_set` | `SET doc_add_to_set(n.path, value)` | Append if not present |
 | `doc_inc` | `SET doc_inc(n.path, delta)` | Add delta to numeric value |
 
+### DETACH DOCUMENT ✅ 🔷
+
+Promote a nested document property to a separate graph node + edge in a single
+atomic transaction. Useful when previously-embedded data outgrows its container
+and needs its own relationships.
+
+```cypher
+-- Simple form: `n.address` → a new :Address node, linked back to n
+MATCH (n:User {id: $uid})
+DETACH DOCUMENT n.address AS (a:Address)-[:HAS_ADDRESS]->(n)
+RETURN a
+
+-- Multi-segment path: promote a nested key
+MATCH (n:User)
+DETACH DOCUMENT n.meta.shipping AS (s:ShippingAddress)-[:HAS_SHIPPING]->(n)
+
+-- Re-point existing edges onto the new node in the same transaction
+MATCH (n:User {id: $uid})
+DETACH DOCUMENT n.address AS (a:Address)-[:HAS_ADDRESS]->(n)
+  TRANSFER EDGES ON n TO a WHERE type(r) IN ['SHIPS_TO', 'LIVES_AT']
+```
+
+**Semantics (single MVCC transaction):**
+
+1. Read the DOCUMENT value at the given path.
+2. `CREATE` the target node with the document's top-level keys as properties
+   (shallow — nested maps/arrays remain as DOCUMENT on the new node).
+3. `CREATE` the connecting edge. The canonical form
+   `(a:Label)-[:TYPE]->(n)` stores the edge as `target → source`; the mirror
+   form `(n)<-[:TYPE]-(a:Label)` is equivalent.
+4. Remove the source property via a document merge operand — O(1) write, no
+   read-modify-write.
+5. If `TRANSFER EDGES` is specified, each matching edge on the source node is
+   atomically re-pointed onto the new target via posting-list merge operators
+   (no OCC conflicts, even on high-degree vertices).
+
+**Default edge type:** if the relationship pattern omits a type (e.g. `-[]->`),
+the engine derives `HAS_<UPPER_SNAKE(last_path_segment)>` — so
+`n.sensorConfig` defaults to `HAS_SENSOR_CONFIG`.
+
+**TRANSFER EDGES WHERE:** supports `type(r) IN [...]` (list of string literals)
+or `type(r) = '...'` (single type). More complex predicates are rejected.
+
+**Errors:**
+- property does not exist on the source node
+- property value is `null` or not a DOCUMENT/MAP
+- source variable not bound by a prior `MATCH`
+
 ---
 
 ## Atomic Operations

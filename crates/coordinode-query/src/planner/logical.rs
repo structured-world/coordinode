@@ -174,6 +174,30 @@ pub enum LogicalOp {
         detach: bool,
     },
 
+    /// `DETACH DOCUMENT`: promote a nested DOCUMENT property to a graph node +
+    /// edge within a single MVCC transaction. Optionally re-points existing
+    /// edges on the source node to the new target via `TRANSFER EDGES`.
+    DetachDocument {
+        input: Box<LogicalOp>,
+        /// Bound source-node variable from prior MATCH.
+        source_variable: String,
+        /// Non-empty property path into the source node (e.g. `["address"]`).
+        property_path: Vec<String>,
+        /// Variable name for the new target node.
+        target_variable: String,
+        /// Labels to apply to the new target node.
+        target_labels: Vec<String>,
+        /// Edge type connecting target to source. Already resolved (defaults
+        /// derived at build time via `HAS_<UPPER_SNAKE(last_path_segment)>`).
+        edge_type: String,
+        /// Direction of the edge relative to the source node.
+        edge_direction: crate::cypher::ast::EdgeFromSource,
+        /// Optional edge variable (not yet exposed downstream).
+        edge_variable: Option<String>,
+        /// Optional `TRANSFER EDGES` specification.
+        transfer: Option<crate::cypher::ast::TransferEdgesSpec>,
+    },
+
     /// MERGE / MERGE ALL: match-or-create with optional ON MATCH SET / ON CREATE SET.
     ///
     /// When `multi = false` (MERGE): unique match — errors if >1 src OR >1 tgt matches.
@@ -524,6 +548,14 @@ impl LogicalOp {
             }
             LogicalOp::Delete { input, .. } => {
                 input.substitute_params(params);
+            }
+            LogicalOp::DetachDocument {
+                input, transfer, ..
+            } => {
+                input.substitute_params(params);
+                if let Some(ref mut t) = transfer {
+                    t.predicate.substitute_params(params);
+                }
             }
             LogicalOp::Merge {
                 pattern,
@@ -1069,6 +1101,16 @@ fn estimate_op_cost(
             let (input_cost, input_rows) = estimate_op_cost(input, defaults, stats, hints);
             (input_cost + input_rows * 2.0, input_rows)
         }
+        LogicalOp::DetachDocument {
+            input, transfer, ..
+        } => {
+            let (input_cost, input_rows) = estimate_op_cost(input, defaults, stats, hints);
+            // Per row: read node, create node, create edge, remove property =
+            // ~4 storage ops. +5x if TRANSFER EDGES (scan all edge types).
+            let base = 4.0;
+            let transfer_cost = if transfer.is_some() { 5.0 } else { 0.0 };
+            (input_cost + input_rows * (base + transfer_cost), input_rows)
+        }
 
         LogicalOp::Merge { pattern, .. } | LogicalOp::Upsert { pattern, .. } => {
             let (pat_cost, pat_rows) = estimate_op_cost(pattern, defaults, stats, hints);
@@ -1358,6 +1400,28 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
         } => {
             let d = if *detach { "DETACH " } else { "" };
             output.push_str(&format!("{prefix}{d}Delete({})\n", variables.join(", ")));
+            explain_op(input, indent + 1, output);
+        }
+        LogicalOp::DetachDocument {
+            input,
+            source_variable,
+            property_path,
+            target_variable,
+            target_labels,
+            edge_type,
+            transfer,
+            ..
+        } => {
+            let labels = if target_labels.is_empty() {
+                String::new()
+            } else {
+                format!(":{}", target_labels.join(":"))
+            };
+            let path = property_path.join(".");
+            let transfer_str = if transfer.is_some() { " TRANSFER" } else { "" };
+            output.push_str(&format!(
+                "{prefix}DetachDocument({source_variable}.{path} AS ({target_variable}{labels})-[:{edge_type}]->{source_variable}{transfer_str})\n",
+            ));
             explain_op(input, indent + 1, output);
         }
         LogicalOp::Merge {
