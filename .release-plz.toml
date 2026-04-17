@@ -1,6 +1,12 @@
 [workspace]
 # No crates.io publishing — coordinode is a server binary, not a library.
 # Releases produce musl binaries + Docker image pushed to ghcr.io.
+#
+# Because every crate has `publish = false`, our forked release-plz
+# auto-disables cascade version bumps for them (see release-plz/release-plz#2799).
+# Only crates with direct conventional commits since the last tag appear in
+# the release PR — so a change touching only `crates/coordinode-query/` no
+# longer drags every transitive dependent into the PR with a fake bump.
 semver_check = false
 git_only = true
 publish = false
