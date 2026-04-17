@@ -10162,3 +10162,98 @@ fn doc_score_plan_contains_doc_score_operator() {
         "EXPLAIN must show DocScore with HAS_CHUNK traversal; got:\n{explain}"
     );
 }
+
+/// R-HYB2c: two `doc_score(...)` calls with differing args in one plan are
+/// rejected at plan time. Same-signature repetition is allowed (both resolve
+/// to `__doc_score__`) but different signatures would require two operators.
+#[test]
+fn doc_score_multiple_differing_calls_rejected() {
+    let ast = parse(
+        "MATCH (d:Document) \
+         RETURN doc_score(d, [1.0, 0.0]) AS a, \
+                doc_score(d, [0.0, 1.0]) AS b",
+    )
+    .unwrap();
+    let err = build_logical_plan(&ast).expect_err("multi-signature doc_score must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("doc_score()") && msg.contains("WITH"),
+        "error must point at the multi-call issue and suggest WITH, got: {msg}"
+    );
+}
+
+/// R-HYB2c: `ORDER BY doc_score(...) DESC` used as a bare function call (not
+/// via alias) exercises the `ensure_doc_passthrough` code path that injects
+/// `__doc_score__` as a synthetic Project item so Sort (above Project) can
+/// read it.
+#[test]
+fn doc_score_order_by_direct_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    seed_doc_with_chunks(&engine, &mut interner, 1, &[Some(vec![1.0, 0.0])]);
+    seed_doc_with_chunks(&engine, &mut interner, 2, &[Some(vec![0.0, 1.0])]);
+
+    let results = run_cypher(
+        "MATCH (d:Document) \
+         RETURN d.id AS id \
+         ORDER BY doc_score(d, [1.0, 0.0]) DESC",
+        &engine,
+        &mut interner,
+    );
+
+    assert_eq!(results.len(), 2);
+    // Doc 1 (aligned chunk) must rank ahead of Doc 2 (orthogonal chunk).
+    // We can't read `d` directly because RETURN projected only `d.id`, but
+    // since the seed sets no `id` property, both rows will have Null — verify
+    // instead that the SYNTHETIC `__doc_score__` column shows correct order.
+    let scores: Vec<f64> = results
+        .iter()
+        .map(|r| match r.get("__doc_score__") {
+            Some(Value::Float(f)) => *f,
+            other => panic!("passthrough must expose __doc_score__ as Float, got {other:?}"),
+        })
+        .collect();
+    assert!(
+        scores[0] > scores[1],
+        "direct ORDER BY doc_score(...) DESC must produce non-increasing scores \
+         through the passthrough path; got {scores:?}"
+    );
+}
+
+/// R-HYB2c: query can be supplied as a Cypher parameter `$q` and is resolved
+/// to a vector before execution.
+#[test]
+fn doc_score_query_as_parameter() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    seed_doc_with_chunks(
+        &engine,
+        &mut interner,
+        1,
+        &[Some(vec![1.0, 0.0]), Some(vec![0.9, 0.1])],
+    );
+
+    let mut params = std::collections::HashMap::new();
+    params.insert("q".to_string(), Value::Vector(vec![1.0, 0.0]));
+    let results = run_cypher_with_params(
+        "MATCH (d:Document) \
+         RETURN doc_score(d, $q) AS score",
+        &engine,
+        &mut interner,
+        params,
+    );
+
+    assert_eq!(results.len(), 1);
+    let score = match results[0].get("score") {
+        Some(Value::Float(f)) => *f,
+        other => panic!("expected Float score, got {other:?}"),
+    };
+    assert!(
+        score > 0.9,
+        "doc_score with parameter query must produce a high score on aligned chunks, got {score}"
+    );
+}
