@@ -16,7 +16,6 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.19"
 edition = "2021"
 rust-version = "1.90"
 license = "AGPL-3.0-only"
@@ -89,20 +88,20 @@ proptest = "1"
 # Benchmarks
 criterion = { version = "0.8", features = ["html_reports"] }
 
-# Internal crates — path-only (no version). All crates are publish = false so
-# cargo does not need a crates.io version. Adding `version` causes `cargo package`
-# to replace path deps with registry deps and fail with "not found on crates.io".
-coordinode-core = { path = "crates/coordinode-core" }
-coordinode-query = { path = "crates/coordinode-query" }
-coordinode-vector = { path = "crates/coordinode-vector" }
-coordinode-search = { path = "crates/coordinode-search" }
-coordinode-storage = { path = "crates/coordinode-storage" }
-coordinode-raft = { path = "crates/coordinode-raft" }
-coordinode-auth = { path = "crates/coordinode-auth" }
-coordinode-server = { path = "crates/coordinode-server" }
-coordinode-s3 = { path = "crates/coordinode-s3" }
-coordinode-embed = { path = "crates/coordinode-embed" }
-coordinode-client = { path = "crates/coordinode-client" }
+# Internal crates — path + version. All crates are publish = false, so cargo
+# does not hit crates.io for them. Versions are required for native release-plz
+# to track per-crate baselines independently (each crate versions on its own cadence).
+coordinode-core = { path = "crates/coordinode-core", version = "0.3.19" }
+coordinode-query = { path = "crates/coordinode-query", version = "0.3.19" }
+coordinode-vector = { path = "crates/coordinode-vector", version = "0.3.19" }
+coordinode-search = { path = "crates/coordinode-search", version = "0.3.19" }
+coordinode-storage = { path = "crates/coordinode-storage", version = "0.3.19" }
+coordinode-raft = { path = "crates/coordinode-raft", version = "0.3.19" }
+coordinode-auth = { path = "crates/coordinode-auth", version = "0.3.19" }
+coordinode-server = { path = "crates/coordinode-server", version = "0.3.19" }
+coordinode-s3 = { path = "crates/coordinode-s3", version = "0.3.19" }
+coordinode-embed = { path = "crates/coordinode-embed", version = "0.3.19" }
+coordinode-client = { path = "crates/coordinode-client", version = "0.3.19" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

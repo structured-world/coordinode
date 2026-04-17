@@ -1,7 +1,7 @@
 [package]
 name = "coordinode-search"
 description = "Full-text search, multilingual stemming, CJK, encrypted search (SSE)"
-version.workspace = true
+version = "0.3.19"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

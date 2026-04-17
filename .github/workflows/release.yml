@@ -21,8 +21,9 @@ permissions:
   packages: write
 
 jobs:
-  # Extract release notes for this version from CHANGELOG.md (written by release-plz)
-  # and update the GitHub Release body. Runs before binary builds so notes are ready early.
+  # Extract release notes for this version from crates/coordinode-server/CHANGELOG.md
+  # (written by release-plz) and update the GitHub Release body. Runs before binary
+  # builds so notes are ready early.
   update-changelog:
     name: Update release notes
     runs-on: ubuntu-latest
@@ -33,22 +34,26 @@ jobs:
           fetch-depth: 1
 
       - name: Extract release notes for ${{ env.TAG_NAME }}
+        # The product tag `vX.Y.Z` is owned by coordinode-server, so release
+        # notes live in that crate's CHANGELOG.md. release-plz writes sections
+        # as `## [X.Y.Z](compare-url) - YYYY-MM-DD`.
         run: |
           python3 - <<'PYEOF'
           import os, re
 
           tag = os.environ['TAG_NAME']
+          version = tag.lstrip('v')
+          path = 'crates/coordinode-server/CHANGELOG.md'
           try:
-              with open('CHANGELOG.md') as f:
+              with open(path) as f:
                   content = f.read()
           except FileNotFoundError:
               with open('/tmp/release-notes.md', 'w') as out:
                   out.write(f'Release {tag}\n')
               raise SystemExit(0)
 
-          # Sections are separated by "---" lines or by the next "## v" header.
-          escaped = re.escape(tag)
-          pattern = rf'^## {escaped}[^\n]*\n(.*?)(?=\n---|\n## v|\Z)'
+          escaped = re.escape(version)
+          pattern = rf'^## \[{escaped}\][^\n]*\n(.*?)(?=\n## \[|\Z)'
           m = re.search(pattern, content, re.MULTILINE | re.DOTALL)
 
           with open('/tmp/release-notes.md', 'w') as out:

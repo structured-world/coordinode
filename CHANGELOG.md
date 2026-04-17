@@ -1,4 +1,8 @@
-# Changelog
+# Changelog (archived)
+
+> Frozen at v0.3.19. Subsequent releases are tracked per-crate under
+> `crates/<name>/CHANGELOG.md`. The product version (tag `vX.Y.Z`) follows
+> `coordinode-server`.
 
 ## v0.3.19 — 2026-04-17
 

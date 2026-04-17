@@ -1,7 +1,7 @@
 [package]
 name = "coordinode-server"
 description = "CoordiNode server binary: gRPC, HTTP/REST, Bolt, WebSocket, metrics"
-version.workspace = true
+version = "0.3.19"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
