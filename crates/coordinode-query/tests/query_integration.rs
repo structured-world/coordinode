@@ -3457,6 +3457,170 @@ fn text_score_composes_with_vector_distance_in_order_by() {
     );
 }
 
+// R-HYB2 hybrid_score regression #1:
+// hybrid_score(c, $q) with default weights (0.65 vector / 0.35 text) must match
+// the manual arithmetic blend `(1.0 - vector_distance) * 0.65 + text_score * 0.35`
+// for every row when both filter operators run in the same plan.
+#[test]
+fn hybrid_score_matches_manual_arithmetic() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Doc",
+        &[
+            ("body", Value::String("rust programming".into())),
+            ("embedding", Value::Vector(vec![1.0, 0.0, 0.0])),
+        ],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        2,
+        "Doc",
+        &[
+            ("body", Value::String("rust rust rust".into())),
+            ("embedding", Value::Vector(vec![0.5, 0.5, 0.0])),
+        ],
+        &mut interner,
+    );
+
+    let text_dir = dir.path().join("text_idx");
+    let mut text_idx = TextIndex::open_or_create(&text_dir, 15_000_000, None).unwrap();
+    text_idx.add_document(1, "rust programming").unwrap();
+    text_idx.add_document(2, "rust rust rust").unwrap();
+    let multi_idx = MultiLanguageTextIndex::wrap(text_idx, MultiLangConfig::default());
+
+    // Both TextFilter (from text_match) and VectorFilter (from vector_distance)
+    // run against every surviving row, so __text_score__ and __vector_score__
+    // are populated; hybrid_score reads both and blends with default weights.
+    let results_hybrid = run_cypher_with_text_index(
+        "MATCH (d:Doc) \
+         WHERE text_match(d.body, \"rust\") \
+           AND vector_distance(d.embedding, [1.0, 0.0, 0.0]) < 1.0 \
+         RETURN d.body AS body, hybrid_score(d, \"rust\") AS score",
+        &engine,
+        &mut interner,
+        &multi_idx,
+    );
+
+    let results_manual = run_cypher_with_text_index(
+        "MATCH (d:Doc) \
+         WHERE text_match(d.body, \"rust\") \
+           AND vector_distance(d.embedding, [1.0, 0.0, 0.0]) < 1.0 \
+         RETURN d.body AS body, \
+                (1.0 - vector_distance(d.embedding, [1.0, 0.0, 0.0])) * 0.65 \
+                + text_score(d.body, \"rust\") * 0.35 AS score",
+        &engine,
+        &mut interner,
+        &multi_idx,
+    );
+
+    assert_eq!(
+        results_hybrid.len(),
+        results_manual.len(),
+        "hybrid_score() must return the same row count as the manual blend"
+    );
+    assert!(
+        !results_hybrid.is_empty(),
+        "expected at least one matching doc"
+    );
+
+    // Row order is determined by MATCH traversal + filter; assume same order since
+    // the underlying plan is identical (only RETURN projection differs).
+    for (rh, rm) in results_hybrid.iter().zip(results_manual.iter()) {
+        let s_hyb = match rh.get("score") {
+            Some(Value::Float(f)) => *f,
+            other => panic!("hybrid row score must be Float, got {other:?}"),
+        };
+        let s_man = match rm.get("score") {
+            Some(Value::Float(f)) => *f,
+            other => panic!("manual row score must be Float, got {other:?}"),
+        };
+        assert!(
+            (s_hyb - s_man).abs() < 1e-6,
+            "hybrid_score default blend must match manual arithmetic: \
+             hybrid={s_hyb} manual={s_man} (body={:?})",
+            rh.get("body")
+        );
+    }
+}
+
+// R-HYB2 hybrid_score: the weights map `{vector: 1.0, text: 0.0}` must yield
+// the pure vector component (equivalent to `1.0 - vector_distance` under the
+// L2 normalization). Verifies weight overriding end to end.
+#[test]
+fn hybrid_score_custom_weights_override_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Doc",
+        &[
+            ("body", Value::String("rust rust rust".into())),
+            ("embedding", Value::Vector(vec![1.0, 0.0, 0.0])),
+        ],
+        &mut interner,
+    );
+
+    let text_dir = dir.path().join("text_idx");
+    let mut text_idx = TextIndex::open_or_create(&text_dir, 15_000_000, None).unwrap();
+    text_idx.add_document(1, "rust rust rust").unwrap();
+    let multi_idx = MultiLanguageTextIndex::wrap(text_idx, MultiLangConfig::default());
+
+    let results = run_cypher_with_text_index(
+        "MATCH (d:Doc) \
+         WHERE text_match(d.body, \"rust\") \
+           AND vector_distance(d.embedding, [1.0, 0.0, 0.0]) < 1.0 \
+         RETURN hybrid_score(d, \"rust\", {vector: 1.0, text: 0.0}) AS score",
+        &engine,
+        &mut interner,
+        &multi_idx,
+    );
+
+    assert_eq!(results.len(), 1);
+    let s = match results[0].get("score") {
+        Some(Value::Float(f)) => *f,
+        other => panic!("score must be Float, got {other:?}"),
+    };
+    // Pure vector, exact match (distance=0) normalized to 1.0 → score = 1.0.
+    assert!(
+        (s - 1.0).abs() < 1e-6,
+        "vector-only weights on exact-match row must yield 1.0, got {s}"
+    );
+}
+
+// R-HYB2 hybrid_score: without any text_match / vector_distance in WHERE, the
+// row has neither cache column populated → fail with a clear error naming the
+// required predicates, not silently return 0.0 / Null.
+#[test]
+fn hybrid_score_without_filters_errors() {
+    let (_dir, engine, mut interner) = setup_social_graph();
+    let ast = parse("MATCH (n:Person) RETURN hybrid_score(n, \"Alice\") AS score").unwrap();
+    let plan = build_logical_plan(&ast).unwrap();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let err = execute(&plan, &mut ctx).expect_err(
+        "hybrid_score() without paired text_match / vector_distance must error at execute time",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("hybrid_score()")
+            && (msg.contains("text_match") || msg.contains("vector_"))
+            && msg.contains("WHERE"),
+        "error message must name hybrid_score and point at the missing predicates, got: {msg}"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // CJK text_match() — full pipeline: OpenCypher → planner → executor → TextIndex
 // ═══════════════════════════════════════════════════════════════════════

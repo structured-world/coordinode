@@ -1346,18 +1346,32 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             // `text_match(...)` in WHERE), we must fail with a clear error rather
             // than silently returning 0.0. See ADR-020 and regression test
             // `text_score_without_text_match_errors`.
-            let missing_text_score = rows
-                .first()
-                .is_some_and(|r| !r.contains_key("__text_score__"));
-            let uses_text_score = items
+            let score_reqs: crate::executor::eval::ScoreRequirements = items
                 .iter()
-                .any(|it| crate::executor::eval::expr_contains_text_score(&it.expr));
-            if missing_text_score && uses_text_score {
-                return Err(ExecutionError::Unsupported(
-                    "text_score() requires a paired text_match(...) predicate in WHERE \
-                     against a full-text-indexed field; none found in the plan"
-                        .to_string(),
-                ));
+                .map(|it| crate::executor::eval::expr_score_requirements(&it.expr))
+                .fold(Default::default(), |mut acc, r| {
+                    acc.needs_text_score |= r.needs_text_score;
+                    acc.needs_hybrid_score |= r.needs_hybrid_score;
+                    acc
+                });
+            if let Some(first) = rows.first() {
+                let has_text = first.contains_key("__text_score__");
+                let has_vec = first.contains_key("__vector_score__");
+                if score_reqs.needs_text_score && !has_text {
+                    return Err(ExecutionError::Unsupported(
+                        "text_score() requires a paired text_match(...) predicate in WHERE \
+                         against a full-text-indexed field; none found in the plan"
+                            .to_string(),
+                    ));
+                }
+                if score_reqs.needs_hybrid_score && !has_text && !has_vec {
+                    return Err(ExecutionError::Unsupported(
+                        "hybrid_score() requires at least one of text_match(...) or \
+                         vector_distance(...)/vector_similarity(...) in WHERE against \
+                         the same node; none found in the plan"
+                            .to_string(),
+                    ));
+                }
             }
 
             let mut result: Vec<Row> = rows
@@ -1413,18 +1427,32 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             // Same R-HYB1 guard as Project: an `ORDER BY text_score(...)` (bare
             // or inside arithmetic) without an upstream TextFilter would sort
             // by silent zeros. Error instead.
-            let missing_text_score = rows
-                .first()
-                .is_some_and(|r| !r.contains_key("__text_score__"));
-            let uses_text_score = items
+            let score_reqs: crate::executor::eval::ScoreRequirements = items
                 .iter()
-                .any(|it| crate::executor::eval::expr_contains_text_score(&it.expr));
-            if missing_text_score && uses_text_score {
-                return Err(ExecutionError::Unsupported(
-                    "text_score() requires a paired text_match(...) predicate in WHERE \
-                     against a full-text-indexed field; none found in the plan"
-                        .to_string(),
-                ));
+                .map(|it| crate::executor::eval::expr_score_requirements(&it.expr))
+                .fold(Default::default(), |mut acc, r| {
+                    acc.needs_text_score |= r.needs_text_score;
+                    acc.needs_hybrid_score |= r.needs_hybrid_score;
+                    acc
+                });
+            if let Some(first) = rows.first() {
+                let has_text = first.contains_key("__text_score__");
+                let has_vec = first.contains_key("__vector_score__");
+                if score_reqs.needs_text_score && !has_text {
+                    return Err(ExecutionError::Unsupported(
+                        "text_score() requires a paired text_match(...) predicate in WHERE \
+                         against a full-text-indexed field; none found in the plan"
+                            .to_string(),
+                    ));
+                }
+                if score_reqs.needs_hybrid_score && !has_text && !has_vec {
+                    return Err(ExecutionError::Unsupported(
+                        "hybrid_score() requires at least one of text_match(...) or \
+                         vector_distance(...)/vector_similarity(...) in WHERE against \
+                         the same node; none found in the plan"
+                            .to_string(),
+                    ));
+                }
             }
 
             rows.sort_by(|a, b| {
@@ -3162,7 +3190,17 @@ fn execute_vector_filter(
         };
 
         if passes {
-            results.push(row.clone());
+            // Cache the raw (pre-decay) vector score + function name so downstream
+            // scalars like `hybrid_score(node, query)` can normalize and blend it
+            // with `__text_score__`. Raw (not decay-adjusted) because hybrid_score
+            // is an orthogonal scoring surface and must not double-apply decay.
+            let mut out_row = row.clone();
+            out_row.insert("__vector_score__".to_string(), Value::Float(raw_score));
+            out_row.insert(
+                "__vector_function__".to_string(),
+                Value::String(params.function.to_string()),
+            );
+            results.push(out_row);
         }
     }
 

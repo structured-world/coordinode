@@ -5,48 +5,107 @@ use coordinode_core::graph::types::Value;
 use super::row::Row;
 use crate::cypher::ast::*;
 
-/// Returns `true` when the expression tree references `text_score(...)` anywhere.
+/// Classifies what cached row columns a projection / sort-key expression
+/// needs. Used by `LogicalOp::Project` and `LogicalOp::Sort` executor guards
+/// to reject plans that reference scoring helpers without the paired upstream
+/// filter operator populating their cache columns.
 ///
-/// Used by executor guards to detect projections / sort keys that require the
-/// `__text_score__` column populated by `TextFilter`. When such a reference
-/// exists but no TextFilter ran (e.g. no FT index configured, or `text_match`
-/// omitted from WHERE), the executor fails with a clear error instead of
-/// silently returning `0.0` — see R-HYB1 regression test #3 and ADR-020.
-pub fn expr_contains_text_score(expr: &Expr) -> bool {
+/// - `text_score(...)` needs `__text_score__` from `TextFilter`.
+/// - `hybrid_score(...)` needs at least one of `__text_score__` / `__vector_score__`
+///   from `TextFilter` / `VectorFilter` — the fully-degenerate case where neither
+///   is present indicates the user paired it with no `text_match` /
+///   `vector_distance` anywhere, and the guards reject such plans.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ScoreRequirements {
+    pub needs_text_score: bool,
+    pub needs_hybrid_score: bool,
+}
+
+impl ScoreRequirements {
+    pub fn any(&self) -> bool {
+        self.needs_text_score || self.needs_hybrid_score
+    }
+}
+
+/// Walks an expression tree collecting which cached score columns the
+/// evaluator will read. See [`ScoreRequirements`].
+pub fn expr_score_requirements(expr: &Expr) -> ScoreRequirements {
+    let mut out = ScoreRequirements::default();
+    collect_score_requirements(expr, &mut out);
+    out
+}
+
+fn collect_score_requirements(expr: &Expr, out: &mut ScoreRequirements) {
     match expr {
         Expr::FunctionCall { name, args, .. } => {
-            name == "text_score" || args.iter().any(expr_contains_text_score)
+            match name.as_str() {
+                "text_score" => out.needs_text_score = true,
+                "hybrid_score" => out.needs_hybrid_score = true,
+                _ => {}
+            }
+            for a in args {
+                collect_score_requirements(a, out);
+            }
         }
         Expr::BinaryOp { left, right, .. } => {
-            expr_contains_text_score(left) || expr_contains_text_score(right)
+            collect_score_requirements(left, out);
+            collect_score_requirements(right, out);
         }
-        Expr::UnaryOp { expr: inner, .. } => expr_contains_text_score(inner),
-        Expr::PropertyAccess { expr: inner, .. } => expr_contains_text_score(inner),
-        Expr::List(items) => items.iter().any(expr_contains_text_score),
-        Expr::MapLiteral(fields) => fields.iter().any(|(_, v)| expr_contains_text_score(v)),
-        Expr::In { expr: e, list } => expr_contains_text_score(e) || expr_contains_text_score(list),
-        Expr::IsNull { expr: inner, .. } => expr_contains_text_score(inner),
+        Expr::UnaryOp { expr: inner, .. } => collect_score_requirements(inner, out),
+        Expr::PropertyAccess { expr: inner, .. } => collect_score_requirements(inner, out),
+        Expr::List(items) => {
+            for it in items {
+                collect_score_requirements(it, out);
+            }
+        }
+        Expr::MapLiteral(fields) => {
+            for (_, v) in fields {
+                collect_score_requirements(v, out);
+            }
+        }
+        Expr::In { expr: e, list } => {
+            collect_score_requirements(e, out);
+            collect_score_requirements(list, out);
+        }
+        Expr::IsNull { expr: inner, .. } => collect_score_requirements(inner, out),
         Expr::StringMatch {
             expr: inner,
             pattern,
             ..
-        } => expr_contains_text_score(inner) || expr_contains_text_score(pattern),
+        } => {
+            collect_score_requirements(inner, out);
+            collect_score_requirements(pattern, out);
+        }
         Expr::Subscript { expr: inner, index } => {
-            expr_contains_text_score(inner) || expr_contains_text_score(index)
+            collect_score_requirements(inner, out);
+            collect_score_requirements(index, out);
         }
         Expr::Case {
             operand,
             when_clauses,
             else_clause,
         } => {
-            operand.as_deref().is_some_and(expr_contains_text_score)
-                || when_clauses
-                    .iter()
-                    .any(|(c, v)| expr_contains_text_score(c) || expr_contains_text_score(v))
-                || else_clause.as_deref().is_some_and(expr_contains_text_score)
+            if let Some(o) = operand.as_deref() {
+                collect_score_requirements(o, out);
+            }
+            for (c, v) in when_clauses {
+                collect_score_requirements(c, out);
+                collect_score_requirements(v, out);
+            }
+            if let Some(e) = else_clause.as_deref() {
+                collect_score_requirements(e, out);
+            }
         }
-        _ => false,
+        _ => {}
     }
+}
+
+/// Returns `true` when the expression tree references `text_score(...)` anywhere.
+/// Back-compatible wrapper used prior to R-HYB2; new callers should prefer
+/// [`expr_score_requirements`] to get both `text_score` and `hybrid_score`
+/// detection in one pass.
+pub fn expr_contains_text_score(expr: &Expr) -> bool {
+    expr_score_requirements(expr).needs_text_score
 }
 
 /// Evaluate an expression against a row, producing a Value.
@@ -553,6 +612,75 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
             row.get("__text_score__")
                 .cloned()
                 .unwrap_or(Value::Float(0.0))
+        }
+        // hybrid_score(node, query [, weights]) → opinionated blend of vector + text scores
+        // cached on the row by VectorFilter / TextFilter. Signature position args are
+        // currently unused (node and query are for semantics / future introspection);
+        // the third optional arg is a map of weights:
+        //   {vector: f32, text: f32}  — defaults 0.65 / 0.35
+        // Semantics match arch/search/document-scoring.md § Document-Level Scoring Formula:
+        //   hybrid_score(c, q) = w_vec × vec_similarity(c, q) + w_bm25 × text_score(c, q)
+        // Vector normalization:
+        //   "vector_similarity" (cosine, already [0,1] or [-1,1]) → use raw value
+        //   "vector_distance"   (L2, lower is better)            → `1 - min(raw, 1)`
+        //   "vector_manhattan"  (L1)                             → `1 / (1 + raw)`
+        //   "vector_dot"        (unbounded)                      → use raw value (user-beware)
+        // Degenerate cases:
+        //   only vector cached, no text → returns the normalized vector score
+        //   only text cached, no vector → returns text_score
+        //   neither cached → caller error (caught by Project/Sort guards)
+        "hybrid_score" => {
+            let mut w_vec = 0.65_f64;
+            let mut w_text = 0.35_f64;
+            if let Some(Value::Map(weights)) = evaluated.get(2) {
+                if let Some(Value::Float(v)) = weights.get("vector") {
+                    w_vec = *v;
+                }
+                if let Some(Value::Float(v)) = weights.get("text") {
+                    w_text = *v;
+                }
+            }
+
+            let text_score = row.get("__text_score__").and_then(|v| {
+                if let Value::Float(f) = v {
+                    Some(*f)
+                } else {
+                    None
+                }
+            });
+            let raw_vec = row.get("__vector_score__").and_then(|v| {
+                if let Value::Float(f) = v {
+                    Some(*f)
+                } else {
+                    None
+                }
+            });
+            let vec_fn = row.get("__vector_function__").and_then(|v| {
+                if let Value::String(s) = v {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            });
+
+            let normalized_vec = match (raw_vec, vec_fn.as_deref()) {
+                (Some(raw), Some("vector_similarity")) => Some(raw),
+                (Some(raw), Some("vector_distance")) => Some(1.0 - raw.clamp(0.0, 1.0)),
+                (Some(raw), Some("vector_manhattan")) => Some(1.0 / (1.0 + raw)),
+                (Some(raw), Some("vector_dot")) => Some(raw),
+                _ => None,
+            };
+
+            match (normalized_vec, text_score) {
+                (Some(v), Some(t)) => Value::Float(w_vec * v + w_text * t),
+                (Some(v), None) => Value::Float(v),
+                (None, Some(t)) => Value::Float(t),
+                (None, None) => {
+                    // Neither score cached — degenerate. Project/Sort guard should
+                    // have caught this before we got here, but be defensive.
+                    Value::Null
+                }
+            }
         }
         // text_match(field, query) → boolean. Used in WHERE clause.
         // When used in RETURN, checks if __text_score__ was set by TextFilter.
