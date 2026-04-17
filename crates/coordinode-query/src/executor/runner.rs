@@ -3745,6 +3745,29 @@ fn coerce_value_to_vec(val: &Value) -> Option<Vec<f32>> {
 /// For each row, evaluates `text_expr` to get the text content of a node field,
 /// then searches the TextIndex for matches. Keeps rows whose node_id appears
 /// in the search results.
+/// Build the R-HYB1b hard-fail error message for a missing full-text index.
+///
+/// Consistent with R-HYB1 `text_score()` guard and R-HYB2b RankFuse text-method
+/// guard — `text_match()` no longer silently passes every row when the index
+/// is missing (that was the old graceful-degradation bug that turned
+/// `WHERE text_match(...)` into a no-op filter). Tells the user how to fix it.
+fn text_match_missing_index_error(label: Option<&str>, property: Option<&str>) -> ExecutionError {
+    let msg = match (label, property) {
+        (Some(l), Some(p)) => format!(
+            "text_match() requires a full-text index on (:{l}, {p}); \
+             create one with CREATE TEXT INDEX idx_name ON :{l}({p})"
+        ),
+        (None, Some(p)) => format!(
+            "text_match() requires a full-text index on the property `{p}`; \
+             create one with CREATE TEXT INDEX idx_name ON :Label({p})"
+        ),
+        _ => "text_match() requires a full-text index on the text field; \
+              create one with CREATE TEXT INDEX idx_name ON :Label(property)"
+            .to_string(),
+    };
+    ExecutionError::Unsupported(msg)
+}
+
 fn execute_text_filter(
     rows: &[Row],
     text_expr: &Expr,
@@ -3752,35 +3775,37 @@ fn execute_text_filter(
     language: Option<&str>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
+    // Empty input — nothing to filter; skip the index lookup entirely so an
+    // earlier operator that produced zero rows (e.g. DETACH DELETE'd the
+    // whole label) does not turn into a spurious "missing FT-index" error.
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
     // Try text_index_registry first (automatic mode), fallback to legacy text_index.
     // The registry is keyed by (label, property) — extract property from text_expr.
     let limit = rows.len().max(1000);
-    let search_results = if let Some(registry) = ctx.text_index_registry {
-        // Extract property name from text_expr (PropertyAccess { var, property }).
-        let property = match text_expr {
-            Expr::PropertyAccess { property, .. } => Some(property.as_str()),
+    // Extract property name from text_expr (PropertyAccess { var, property }).
+    let property = match text_expr {
+        Expr::PropertyAccess { property, .. } => Some(property.as_str()),
+        _ => None,
+    };
+    // Extract label from the first row's __label__ field, if the variable is
+    // bound and carries its label.
+    let label_owned: Option<String> = match text_expr {
+        Expr::PropertyAccess { expr, .. } => match expr.as_ref() {
+            Expr::Variable(var) => rows.first().and_then(|r| {
+                r.get(&format!("{var}.__label__"))
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+            }),
             _ => None,
-        };
-        // Extract label from the first row's __label__ field.
-        let label = if property.is_some() {
-            if let Expr::PropertyAccess { expr, .. } = text_expr {
-                if let Expr::Variable(var) = expr.as_ref() {
-                    rows.first().and_then(|r| {
-                        r.get(&format!("{var}.__label__"))
-                            .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        },
+        _ => None,
+    };
+    let label = label_owned.as_deref();
 
-        if let (Some(label), Some(property)) = (&label, property) {
-            if let Some(handle) = registry.get(label, property) {
+    let search_results = if let Some(registry) = ctx.text_index_registry {
+        if let (Some(l), Some(p)) = (label, property) {
+            if let Some(handle) = registry.get(l, p) {
                 let idx = handle
                     .read()
                     .map_err(|_| ExecutionError::Unsupported("text index lock poisoned".into()))?;
@@ -3795,32 +3820,26 @@ fn execute_text_filter(
                     })?
                 }
             } else {
-                // No index for this (label, property) — graceful degradation.
-                ctx.warnings.push(format!(
-                    "text_match() called but no text index for ({label}, {property}). \
-                     Create one with CREATE TEXT INDEX."
-                ));
-                return Ok(rows.to_vec());
+                // R-HYB1b: registry is wired but has no index for (label, property) —
+                // hard-fail, don't silently pass every row through.
+                return Err(text_match_missing_index_error(Some(l), Some(p)));
+            }
+        } else if let Some(text_index) = ctx.text_index {
+            // Registry present but we couldn't determine (label, property) from
+            // the text_expr shape — fall back to the legacy single text_index
+            // for back-compat with tests that wire one directly.
+            if let Some(lang) = language {
+                text_index
+                    .search_with_language(query_string, limit, lang)
+                    .map_err(|e| ExecutionError::Unsupported(format!("text search error: {e}")))?
+            } else {
+                text_index
+                    .search(query_string, limit)
+                    .map_err(|e| ExecutionError::Unsupported(format!("text search error: {e}")))?
             }
         } else {
-            // Could not determine label/property — fall through to legacy.
-            if let Some(text_index) = ctx.text_index {
-                if let Some(lang) = language {
-                    text_index
-                        .search_with_language(query_string, limit, lang)
-                        .map_err(|e| {
-                            ExecutionError::Unsupported(format!("text search error: {e}"))
-                        })?
-                } else {
-                    text_index.search(query_string, limit).map_err(|e| {
-                        ExecutionError::Unsupported(format!("text search error: {e}"))
-                    })?
-                }
-            } else {
-                ctx.warnings
-                    .push("text_match() called but no text index available.".to_string());
-                return Ok(rows.to_vec());
-            }
+            // R-HYB1b: neither registry lookup worked nor legacy index present.
+            return Err(text_match_missing_index_error(label, property));
         }
     } else if let Some(text_index) = ctx.text_index {
         // Legacy path: single text_index passed directly.
@@ -3834,13 +3853,8 @@ fn execute_text_filter(
                 .map_err(|e| ExecutionError::Unsupported(format!("text search error: {e}")))?
         }
     } else {
-        // No text index available — all rows pass (graceful degradation).
-        ctx.warnings.push(
-            "text_match() called but no text index available. \
-             Create a text index with CREATE TEXT INDEX."
-                .to_string(),
-        );
-        return Ok(rows.to_vec());
+        // R-HYB1b: no registry and no legacy index — hard-fail.
+        return Err(text_match_missing_index_error(label, property));
     };
 
     // Build a map of matching node IDs → BM25 scores

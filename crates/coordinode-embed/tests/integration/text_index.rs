@@ -161,12 +161,18 @@ fn drop_text_index() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("dropped"), Some(&Value::Bool(true)));
 
-    // After drop, text_match should degrade gracefully (return all rows with warning).
-    let rows = db
+    // R-HYB1b: after DROP, text_match() must hard-fail with a clear message
+    // rather than silently passing every row through. The old graceful-
+    // degradation behaviour was a semantic bug (the opposite of what the
+    // filter asked for).
+    let err = db
         .execute_cypher("MATCH (a:Article) WHERE text_match(a.body, 'rust') RETURN a.body")
-        .expect("search after drop");
-    // Graceful degradation: all rows pass when no index.
-    assert!(!rows.is_empty());
+        .expect_err("text_match() after DROP must error, not pass rows through");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("text_match()") && msg.contains("CREATE TEXT INDEX"),
+        "error must name text_match() and point at the remedy, got: {msg}"
+    );
 }
 
 // ── Persistence across reopen ──────────────────────────────────────
