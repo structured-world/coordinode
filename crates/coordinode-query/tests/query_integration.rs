@@ -3266,6 +3266,197 @@ fn text_match_no_index_graceful() {
     );
 }
 
+// R-HYB1 regression #3: using text_score() without a paired text_match() in
+// WHERE (no FT index configured) must return an explicit executor error, not
+// silently yield 0.0 scores. Prior behavior returned 0 which misleads the
+// caller into thinking the document has zero BM25 relevance.
+#[test]
+fn text_score_without_text_match_errors() {
+    let (_dir, engine, mut interner) = setup_social_graph();
+    // Plan builds fine (valid Cypher); executor detects the missing TextFilter
+    // at runtime and aborts with ExecutionError::Unsupported.
+    let ast = parse("MATCH (n:Person) RETURN text_score(n.name, \"Alice\") AS score").unwrap();
+    let plan = build_logical_plan(&ast).unwrap();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let err = execute(&plan, &mut ctx).expect_err(
+        "text_score() without paired text_match() must error at execute time, not return 0.0",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("text_score()") && msg.contains("text_match"),
+        "error message must name both functions to guide the user to the fix, got: {msg}"
+    );
+}
+
+// R-HYB1: text_score() usable in ORDER BY — verifies the BM25 score streamed
+// from TextFilter drives result ordering. Doc with more term occurrences must
+// rank higher (BM25 = monotonic in term frequency when docs are similar length).
+#[test]
+fn text_score_orders_results_by_bm25() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    // Doc 1: "rust rust rust" — term frequency 3
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Doc",
+        &[("body", Value::String("rust rust rust".into()))],
+        &mut interner,
+    );
+    // Doc 2: "rust" — term frequency 1
+    insert_node(
+        &engine,
+        1,
+        2,
+        "Doc",
+        &[("body", Value::String("rust".into()))],
+        &mut interner,
+    );
+    // Doc 3: "rust programming language" — term frequency 1 in longer doc
+    insert_node(
+        &engine,
+        1,
+        3,
+        "Doc",
+        &[("body", Value::String("rust programming language".into()))],
+        &mut interner,
+    );
+
+    let text_dir = dir.path().join("text_idx");
+    let mut text_idx = TextIndex::open_or_create(&text_dir, 15_000_000, None).unwrap();
+    text_idx.add_document(1, "rust rust rust").unwrap();
+    text_idx.add_document(2, "rust").unwrap();
+    text_idx
+        .add_document(3, "rust programming language")
+        .unwrap();
+
+    let multi_idx = MultiLanguageTextIndex::wrap(text_idx, MultiLangConfig::default());
+    let results = run_cypher_with_text_index(
+        "MATCH (d:Doc) WHERE text_match(d.body, \"rust\") \
+         RETURN d.body AS body, text_score(d.body, \"rust\") AS score \
+         ORDER BY score DESC",
+        &engine,
+        &mut interner,
+        &multi_idx,
+    );
+
+    assert_eq!(results.len(), 3, "all three docs match 'rust'");
+
+    let scores: Vec<f64> = results
+        .iter()
+        .map(|r| match r.get("score") {
+            Some(Value::Float(f)) => *f,
+            other => panic!("expected Float score, got {other:?}"),
+        })
+        .collect();
+
+    for window in scores.windows(2) {
+        assert!(
+            window[0] >= window[1],
+            "scores must be non-increasing under ORDER BY score DESC: {scores:?}"
+        );
+    }
+
+    // Doc 1 (three 'rust' in a short body) should outrank doc 2 and doc 3.
+    let first_body = match results[0].get("body") {
+        Some(Value::String(s)) => s.clone(),
+        other => panic!("expected String body, got {other:?}"),
+    };
+    assert_eq!(
+        first_body, "rust rust rust",
+        "highest BM25 score must belong to the triple-term doc, not to {first_body:?}"
+    );
+}
+
+// R-HYB1: text_score() composes arithmetically with vector_distance() inside
+// ORDER BY / RETURN. This is the canonical arch doc example
+// (arch/search/document-scoring.md §Arithmetic Composition):
+// a weighted blend of vector similarity and BM25 drives ordering.
+#[test]
+fn text_score_composes_with_vector_distance_in_order_by() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    // Two docs. Doc 1: vector matches exactly, text weakly matches.
+    // Doc 2: vector distant, text strongly matches (multiple occurrences).
+    // With a vector-heavy blend, doc 1 wins; pure text would reverse it.
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Doc",
+        &[
+            ("body", Value::String("rust".into())),
+            ("embedding", Value::Vector(vec![1.0, 0.0, 0.0])),
+        ],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        2,
+        "Doc",
+        &[
+            ("body", Value::String("rust rust rust rust".into())),
+            ("embedding", Value::Vector(vec![0.0, 1.0, 0.0])),
+        ],
+        &mut interner,
+    );
+
+    let text_dir = dir.path().join("text_idx");
+    let mut text_idx = TextIndex::open_or_create(&text_dir, 15_000_000, None).unwrap();
+    text_idx.add_document(1, "rust").unwrap();
+    text_idx.add_document(2, "rust rust rust rust").unwrap();
+
+    let multi_idx = MultiLanguageTextIndex::wrap(text_idx, MultiLangConfig::default());
+
+    // Vector-heavy blend: 0.9 * (1 - vec_dist) + 0.1 * text_score.
+    // Doc 1: (1 - 0) * 0.9 + small_bm25 * 0.1 ≈ 0.9 + ε
+    // Doc 2: (1 - √2) * 0.9 + larger_bm25 * 0.1 ≈ negative + small positive
+    let results = run_cypher_with_text_index(
+        "MATCH (d:Doc) \
+         WHERE text_match(d.body, \"rust\") \
+         RETURN d.body AS body, \
+                (1.0 - vector_distance(d.embedding, [1.0, 0.0, 0.0])) * 0.9 \
+                + text_score(d.body, \"rust\") * 0.1 AS score \
+         ORDER BY score DESC",
+        &engine,
+        &mut interner,
+        &multi_idx,
+    );
+
+    assert_eq!(results.len(), 2, "both docs text-match 'rust'");
+
+    let first_body = match results[0].get("body") {
+        Some(Value::String(s)) => s.clone(),
+        other => panic!("expected String body, got {other:?}"),
+    };
+    assert_eq!(
+        first_body, "rust",
+        "vector-heavy blend must rank the exact-vector doc first, \
+         not the frequent-term doc; got {first_body:?}"
+    );
+
+    // Sanity: top score strictly greater than bottom score.
+    let s0 = match results[0].get("score") {
+        Some(Value::Float(f)) => *f,
+        other => panic!("expected Float score, got {other:?}"),
+    };
+    let s1 = match results[1].get("score") {
+        Some(Value::Float(f)) => *f,
+        other => panic!("expected Float score, got {other:?}"),
+    };
+    assert!(
+        s0 > s1,
+        "blended score must strictly order the two docs: top={s0}, bottom={s1}"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // CJK text_match() — full pipeline: OpenCypher → planner → executor → TextIndex
 // ═══════════════════════════════════════════════════════════════════════
