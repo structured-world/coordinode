@@ -32,12 +32,14 @@ jobs:
         with:
           key: release-plz-fork
 
-      # Forked release-plz: patches the `cargo package` fallback for baseline
-      # checkouts whose `[workspace.dependencies]` entries lack a `version`
-      # field (upstream issue #2595). Without this, release-pr fails on the
-      # first run after any workspace refactor that changes dep declarations.
+      # We build release-plz from our own fork which patches the git_only cargo
+      # package fallback bug (upstream issue #2595). Upstream v0.3.157 runs
+      # `cargo package --workspace` against the baseline tag checkout and fails
+      # when `[workspace.dependencies]` path entries don't have a version field
+      # at that commit. Our fork falls back to a source-directory comparator.
       #
-      # When upstream ships the fix, swap this step for `release-plz/action@v0.5`.
+      # When upstream release-plz ships a proper fix, this step should be
+      # replaced with `uses: release-plz/action@v0.5` again.
       - name: Install forked release-plz
         run: |
           cargo install --git https://github.com/structured-world/release-plz.git \
@@ -48,7 +50,7 @@ jobs:
       - name: Run release-plz release
         # Runs first so the git tag exists before release-pr computes the next
         # version. Running release-pr first caused duplicate release PRs: it saw
-        # the old tag and proposed the same version again.
+        # the old tag and proposed the same version again (e.g. 0.3.3→0.3.4 twice).
         # No-op on feature pushes; expected to exit 0 before a release PR is merged.
         continue-on-error: true
         run: |
@@ -63,7 +65,7 @@ jobs:
         # release-plz release creates tags via GitHub API (not git tag + push),
         # so the local git clone does not see the new tag after the previous step.
         # Without this fetch, release-pr queries local tags, finds the old tag,
-        # and generates a duplicate release PR.
+        # and generates a duplicate release PR (e.g. 0.3.4→0.3.5 when already at 0.3.5).
         run: git fetch --tags
 
       - name: Run release-plz release-pr
@@ -72,5 +74,24 @@ jobs:
             --git-token "${GITHUB_TOKEN}" \
             --config .release-plz.toml \
             --verbose
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Split workspace changelog into per-crate files
+        # Regenerates crates/*/CHANGELOG.md from the workspace CHANGELOG.md.
+        # Library crates have release=false so release-plz never updates their
+        # per-crate files. This step derives them from the workspace changelog
+        # (which release-plz keeps current) and commits the result to main.
+        # The commit uses "chore:" prefix so release-plz skips it.
+        # No-op on non-release pushes (git diff --quiet exits 0, step skipped).
+        continue-on-error: true
+        run: |
+          python3 scripts/split-changelog.py
+          git diff --quiet && exit 0
+          git config user.name "sw-release-bot[bot]"
+          git config user.email "255865126+sw-release-bot[bot]@users.noreply.github.com"
+          git add crates/*/CHANGELOG.md scripts/split-changelog.py
+          git commit -m "chore(changelog): regenerate per-crate changelogs from workspace"
+          git push
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
