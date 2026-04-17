@@ -125,12 +125,12 @@ ORDER BY similarity LIMIT 25
 | Spatial queries | **Stable** | `point()`, `point.distance()` (Haversine), WHERE filter |
 | Document properties | **Stable** | Nested DOCUMENT type, dot-notation access, 3 schema modes |
 | REST API | **Stable** | HTTP/JSON on port 7081 via gRPC-to-REST transcoding |
+| Read/write concerns | **Stable** | local, majority, linearizable, causal sessions |
 
 | Planned | Target | Notes |
 |---------|--------|-------|
 | GraphQL API | v0.3.1 | Auto-generated schema on port 7083 |
 | 3-node Raft clustering | v0.4 | Free in CE (no per-node licensing) |
-| Read/write concerns | v0.5 | local, majority, linearizable, causal sessions |
 | Bolt protocol | v1.2 | Neo4j drivers connect without code changes |
 
 ## What Makes CoordiNode Different
@@ -160,6 +160,8 @@ Auto-detection of document language with per-field analyzer configuration.
 
 ```bash
 # Option 1: Docker
+git clone https://github.com/structured-world/coordinode.git
+cd coordinode
 docker compose up -d
 curl http://localhost:7084/health
 
@@ -201,12 +203,12 @@ Source: [structured-world/coordinode-python](https://github.com/structured-world
                     └─────────────────────────────────────────┘
 ```
 
-10 Rust crates, ~53K lines of code.
+10 Rust crates, ~119K lines of code.
 
 ## Documentation
 
 - [Quick Start](docs/QUICKSTART.md) — from zero to hybrid query in 5 minutes
-- [Cypher Extensions](docs/CYPHER_EXTENSIONS.md) — vector, full-text, spatial, time-travel, encrypted search syntax
+- [Cypher Extensions](docs/cypher/extensions.md) — vector, full-text, spatial, time-travel, encrypted search syntax
 - [Compatibility](docs/COMPATIBILITY.md) — Neo4j ecosystem compatibility matrix
 
 ## Known Limitations (alpha)
