@@ -52,7 +52,9 @@ LIMIT 10
 | `text_match` | `text_match(field, query)` | Boolean | True if node passed text filter in WHERE |
 | `text_score` | `text_score(field, query)` | Float | BM25 score from the WHERE filter pass |
 
-Both functions work by reading metadata set during WHERE evaluation. They are only meaningful after a `WHERE text_match(...)` clause in the same query.
+Both functions work by reading metadata set during WHERE evaluation. They are only meaningful after a `WHERE text_match(...)` clause in the same query; using `text_score` on a field without a full-text index (or without a paired `text_match`) is a query-time error, not a silent zero.
+
+BM25 uses tantivy's default parameters (`k1 = 1.2`, `b = 0.75`) and is not runtime-configurable (see [ADR-020](../arch/decisions.md) for rationale).
 
 ```cypher
 MATCH (doc:Document)
@@ -60,6 +62,44 @@ WHERE text_match(doc.body, "raft consensus")
 RETURN doc.title, text_score(doc.body, "raft consensus") AS relevance
 ORDER BY relevance DESC
 ```
+
+### Hybrid Scoring Helper ✅ 🔷
+
+| Function | Signature | Returns | Notes |
+|----------|-----------|---------|-------|
+| `hybrid_score` | `hybrid_score(node, query [, weights])` | Float | Opinionated blend of vector + text scores cached on the row |
+
+`hybrid_score` is sugar for the arithmetic pattern `w_vec · (1 - vector_distance) + w_text · text_score`. It reads the vector score cached by `VectorFilter` (from `WHERE vector_distance(...) < X` / `vector_similarity(...) > X`) and the BM25 score cached by `TextFilter` (from `WHERE text_match(...)`), then blends them with default weights `{vector: 0.65, text: 0.35}` or an override map passed as the third argument.
+
+Vector normalisation is automatic based on the metric used in `WHERE`:
+- `vector_similarity` (cosine) → used raw (already bounded to `[-1, 1]` / `[0, 1]`)
+- `vector_distance` (L2) → `1 - clamp(raw, 0, 1)` (lower distance ⇒ higher similarity)
+- `vector_manhattan` (L1) → `1 / (1 + raw)` (asymptotic, always in `(0, 1]`)
+- `vector_dot` → used raw (unbounded — verify your data is normalised)
+
+```cypher
+// Default blend — equivalent to (1 - vector_distance) * 0.65 + text_score * 0.35
+MATCH (c:Chunk)
+WHERE text_match(c.body, "rust consensus")
+  AND vector_distance(c.embedding, $query_vec) < 0.6
+RETURN c.text, hybrid_score(c, "rust consensus") AS score
+ORDER BY score DESC
+LIMIT 20
+```
+
+```cypher
+// Vector-heavy blend — override via weights map
+RETURN hybrid_score(c, $q, {vector: 0.9, text: 0.1}) AS score
+```
+
+```cypher
+// Single-modality degenerate cases are supported — if only one filter ran,
+// hybrid_score returns that side's normalised score alone (no blend).
+MATCH (d:Doc) WHERE text_match(d.body, "rust")
+RETURN hybrid_score(d, "rust") AS score    // text-only, returns text_score
+```
+
+`hybrid_score` requires at least one of `text_match(...)` or `vector_distance(...)` / `vector_similarity(...)` in `WHERE` against the same node — calling it on a plan with neither filter is a query-time error (no silent zeros). See [`arch/search/document-scoring.md`](../arch/search/document-scoring.md#scoring-functions-in-opencypher) for the full scoring surface (the `rrf_score` and `doc_score` helpers land with R-HYB2b / R-HYB2c).
 
 ### Encrypted Search Function ✅ 🔷
 
