@@ -114,7 +114,7 @@ ORDER BY similarity LIMIT 25
 | MVCC transactions | **Stable** | Snapshot Isolation, write conflict detection (OCC) |
 | HNSW vector search | **Stable** | Up to 65536 dims, SQ8 quantization, cosine/L2/dot/L1 |
 | Full-text search | **Stable** | BM25, fuzzy, phrase, 23+ languages, CJK via feature flags |
-| Hybrid graph+vector+text | **Stable** | Compound WHERE predicates split into optimized pipeline |
+| Hybrid graph+vector+text | **Stable** | Compound WHERE predicates split into optimized pipeline; `hybrid_score(node, query [,weights])` opinionated blend helper (default 0.65·vector + 0.35·text) |
 | B-tree indexes | **Stable** | Single, compound, unique, partial, TTL, sparse |
 | Edge properties | **Stable** | CREATE with props, WHERE filter, inline pattern filter |
 | gRPC API | **Stable** | Port 7080, tonic-based, all services |
