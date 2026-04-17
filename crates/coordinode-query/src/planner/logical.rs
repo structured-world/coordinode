@@ -469,6 +469,40 @@ pub enum LogicalOp {
         yield_items: Vec<String>,
     },
 
+    /// Rank Fusion (Reciprocal Rank Fusion) operator — materializes the input
+    /// row set, scores each row against every method expression, assigns
+    /// 1-based competition ranks per method (ties broken by node_id), then
+    /// writes `Σ 1/(k + rank_i)` with `k = 60` into the `__rrf_score__`
+    /// column on every output row.
+    ///
+    /// Produced by the planner when `rrf_score([methods…], {vector:…, text:…})`
+    /// is detected in a `Project` or `Sort` expression. Rank assignment is
+    /// positional over the full input — this is a materializing operator, not
+    /// a per-row scalar.
+    ///
+    /// `shard_overfetch_cap` is `None` for single-node CE. For the distributed
+    /// plan (R-HYB5) the shard-local stage sets this to `Some(K * 3)` so
+    /// each shard emits its top-K×3 rows with per-method ranks, and the
+    /// coordinator stage re-ranks the union without a cap.
+    RankFuse {
+        input: Box<LogicalOp>,
+        /// Non-empty list of method expressions (e.g. `n.embedding`, `r.ctx_emb`,
+        /// `n.body`). Each is resolved at execution time to either a vector
+        /// (HNSW index or edge vector property, metric from index config) or
+        /// text (BM25 via `TextIndexRegistry`).
+        methods: Vec<Expr>,
+        /// Query vector component (from Map key `vector`). Required when at
+        /// least one method resolves to a vector.
+        query_vector: Option<Expr>,
+        /// Query text component (from Map key `text`). Required when at least
+        /// one method resolves to text.
+        query_text: Option<Expr>,
+        /// Per-shard overfetch cap (distributed RankFuse). `None` in CE /
+        /// single-node — always processes the full input. Shape ready for
+        /// R-HYB5 without call-site changes.
+        shard_overfetch_cap: Option<usize>,
+    },
+
     /// Empty input (no rows, used as leaf for standalone CREATE).
     Empty,
 }
@@ -668,6 +702,24 @@ impl LogicalOp {
             LogicalOp::ProcedureCall { args, .. } => {
                 for arg in args {
                     arg.substitute_params(params);
+                }
+            }
+            LogicalOp::RankFuse {
+                input,
+                methods,
+                query_vector,
+                query_text,
+                ..
+            } => {
+                input.substitute_params(params);
+                for m in methods {
+                    m.substitute_params(params);
+                }
+                if let Some(qv) = query_vector {
+                    qv.substitute_params(params);
+                }
+                if let Some(qt) = query_text {
+                    qt.substitute_params(params);
                 }
             }
             LogicalOp::AlterLabel { .. }
@@ -1181,6 +1233,31 @@ fn estimate_op_cost(
             )
         }
 
+        LogicalOp::RankFuse {
+            input,
+            methods,
+            shard_overfetch_cap,
+            ..
+        } => {
+            let (input_cost, input_rows) = estimate_op_cost(input, defaults, stats, hints);
+            // RankFuse materializes input; per-method scoring cost is O(N) for
+            // vector similarity and O(log N) + O(matched) for text BM25 lookup.
+            // Treat each method as roughly 1 cost unit per input row (similar to
+            // VectorFilter). Ranks assignment is O(N log N) sort per method.
+            let methods_n = methods.len() as f64;
+            let score_cost = input_rows * methods_n;
+            let sort_cost = if input_rows > 1.0 {
+                input_rows * input_rows.log2() * methods_n
+            } else {
+                0.0
+            };
+            let output_rows = match shard_overfetch_cap {
+                Some(cap) => input_rows.min(*cap as f64),
+                None => input_rows,
+            };
+            (input_cost + score_cost + sort_cost * 0.01, output_rows)
+        }
+
         LogicalOp::ProcedureCall { .. } => (1.0, 10.0),
         LogicalOp::AlterLabel { .. }
         | LogicalOp::CreateTextIndex { .. }
@@ -1266,7 +1343,8 @@ fn op_contains_vector_filter(op: &LogicalOp) -> bool {
         | LogicalOp::Unwind { input, .. }
         | LogicalOp::TextFilter { input, .. }
         | LogicalOp::EncryptedFilter { input, .. }
-        | LogicalOp::ShortestPath { input, .. } => op_contains_vector_filter(input),
+        | LogicalOp::ShortestPath { input, .. }
+        | LogicalOp::RankFuse { input, .. } => op_contains_vector_filter(input),
         LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
             op_contains_vector_filter(left) || op_contains_vector_filter(right)
         }
@@ -1633,6 +1711,32 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
                 "{prefix}ProcedureCall ({procedure}, {} args)\n",
                 args.len()
             ));
+        }
+        LogicalOp::RankFuse {
+            input,
+            methods,
+            query_vector,
+            query_text,
+            shard_overfetch_cap,
+        } => {
+            let method_strs: Vec<String> = methods.iter().map(|m| format!("{m:?}")).collect();
+            let mut query_parts = Vec::new();
+            if query_vector.is_some() {
+                query_parts.push("vector");
+            }
+            if query_text.is_some() {
+                query_parts.push("text");
+            }
+            let cap_str = match shard_overfetch_cap {
+                Some(cap) => format!(", cap={cap}"),
+                None => String::new(),
+            };
+            output.push_str(&format!(
+                "{prefix}RankFuse(methods=[{}], query={{{}}}, k=60{cap_str})\n",
+                method_strs.join(", "),
+                query_parts.join(", "),
+            ));
+            explain_op(input, indent + 1, output);
         }
         LogicalOp::AlterLabel { label, mode } => {
             output.push_str(&format!("{prefix}AlterLabel({label}, SET SCHEMA {mode})\n"));

@@ -22,6 +22,34 @@ pub enum PlanError {
 
     #[error("unsupported pattern structure")]
     UnsupportedPattern,
+
+    #[error(
+        "rrf_score() takes exactly 2 arguments: rrf_score([method_exprs...], {{vector: ..., text: ...}}); \
+         k=60 is the IR standard (Cormack et al. 2009) and is not tunable"
+    )]
+    RrfScoreArity,
+
+    #[error(
+        "rrf_score(): first argument must be a non-empty list of method expressions \
+         (e.g. [n.embedding, c.body]); got {got}"
+    )]
+    RrfScoreMethodsShape { got: String },
+
+    #[error(
+        "rrf_score(): second argument must be a map literal with `vector` and/or `text` keys \
+         (e.g. {{vector: $qv, text: $qt}}) or a parameter resolving to such a map; got {got}"
+    )]
+    RrfScoreQueryShape { got: String },
+
+    #[error(
+        "rrf_score(): multiple rrf_score() calls with differing method / query arguments are \
+         not supported in a single query (detected at {location}). Use WITH to materialise \
+         the first call before invoking the second"
+    )]
+    RrfScoreMultipleCalls { location: String },
+
+    #[error("rrf_score() cannot appear in {location} — it requires materialised rank assignment")]
+    RrfScoreIllegalPosition { location: String },
 }
 
 /// Build a logical plan from a validated Cypher AST.
@@ -49,6 +77,10 @@ pub fn build_logical_plan(query: &Query) -> Result<LogicalPlan, PlanError> {
     // Optimization pass: detect `Sort(vector_distance) + Limit(K)` and rewrite
     // to VectorTopK for HNSW-accelerated top-K search.
     let root = optimize_vector_top_k(root);
+
+    // Planner pass: detect `rrf_score([methods…], query)` in Project / Sort items
+    // and lift it into a `LogicalOp::RankFuse` below the innermost Project.
+    let root = rewrite_rrf_score(root)?;
 
     // Extract vector_consistency from per-query hints (overrides session default).
     let vector_consistency = query
@@ -2201,6 +2233,573 @@ fn find_last_variable(op: &LogicalOp) -> String {
         | LogicalOp::Limit { input, .. }
         | LogicalOp::Skip { input, .. } => find_last_variable(input),
         _ => String::new(),
+    }
+}
+
+// =============================================================================
+// R-HYB2b: rrf_score planner post-pass
+// =============================================================================
+
+/// Signature captured from the first `rrf_score(...)` call-site encountered.
+/// Multiple call-sites must all produce identical signatures.
+#[derive(Debug, Clone, PartialEq)]
+struct RrfCallSig {
+    methods: Vec<Expr>,
+    query_vector: Option<Expr>,
+    query_text: Option<Expr>,
+}
+
+/// Recognise a top-level `rrf_score(args...)` FunctionCall expression.
+fn match_rrf_score(expr: &Expr) -> Option<&[Expr]> {
+    if let Expr::FunctionCall { name, args, .. } = expr {
+        if name == "rrf_score" {
+            return Some(args);
+        }
+    }
+    None
+}
+
+/// Walk an expression tree and return `true` if any subexpression is a
+/// `rrf_score(...)` call. Used to fail-fast on illegal placements (e.g. WHERE).
+fn expr_contains_rrf_score(expr: &Expr) -> bool {
+    let mut hit = false;
+    collect_rrf_presence(expr, &mut hit);
+    hit
+}
+
+fn collect_rrf_presence(expr: &Expr, hit: &mut bool) {
+    if *hit {
+        return;
+    }
+    match expr {
+        Expr::FunctionCall { name, args, .. } => {
+            if name == "rrf_score" {
+                *hit = true;
+                return;
+            }
+            for a in args {
+                collect_rrf_presence(a, hit);
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_rrf_presence(left, hit);
+            collect_rrf_presence(right, hit);
+        }
+        Expr::UnaryOp { expr, .. } => collect_rrf_presence(expr, hit),
+        Expr::PropertyAccess { expr, .. } => collect_rrf_presence(expr, hit),
+        Expr::List(items) => {
+            for it in items {
+                collect_rrf_presence(it, hit);
+            }
+        }
+        Expr::MapLiteral(fields) => {
+            for (_, v) in fields {
+                collect_rrf_presence(v, hit);
+            }
+        }
+        Expr::In { expr, list } => {
+            collect_rrf_presence(expr, hit);
+            collect_rrf_presence(list, hit);
+        }
+        Expr::IsNull { expr, .. } => collect_rrf_presence(expr, hit),
+        Expr::StringMatch { expr, pattern, .. } => {
+            collect_rrf_presence(expr, hit);
+            collect_rrf_presence(pattern, hit);
+        }
+        Expr::Subscript { expr, index } => {
+            collect_rrf_presence(expr, hit);
+            collect_rrf_presence(index, hit);
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(o) = operand.as_deref() {
+                collect_rrf_presence(o, hit);
+            }
+            for (c, v) in when_clauses {
+                collect_rrf_presence(c, hit);
+                collect_rrf_presence(v, hit);
+            }
+            if let Some(e) = else_clause.as_deref() {
+                collect_rrf_presence(e, hit);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parse and validate a single `rrf_score(args...)` call, producing a
+/// canonical signature. Rejects arity != 2, non-list first arg, and
+/// non-map-literal second arg.
+fn parse_rrf_signature(args: &[Expr]) -> Result<RrfCallSig, PlanError> {
+    if args.len() != 2 {
+        return Err(PlanError::RrfScoreArity);
+    }
+    let methods_expr = &args[0];
+    let query_expr = &args[1];
+
+    // Methods: Expr::List of at least one element.
+    let methods = match methods_expr {
+        Expr::List(items) if !items.is_empty() => items.clone(),
+        Expr::List(_) => {
+            return Err(PlanError::RrfScoreMethodsShape {
+                got: "empty list".to_string(),
+            });
+        }
+        other => {
+            return Err(PlanError::RrfScoreMethodsShape {
+                got: format!("{other:?}"),
+            });
+        }
+    };
+
+    // Query: MapLiteral (post-substitute, parameters resolved to Literal(Map))
+    // or Literal(Value::Map). Extract `vector` and `text` keys.
+    let (query_vector, query_text) = match query_expr {
+        Expr::MapLiteral(fields) => {
+            let mut qv = None;
+            let mut qt = None;
+            for (k, v) in fields {
+                match k.as_str() {
+                    "vector" => qv = Some(v.clone()),
+                    "text" => qt = Some(v.clone()),
+                    other => {
+                        return Err(PlanError::RrfScoreQueryShape {
+                            got: format!(
+                                "map with unknown key `{other}` (expected `vector` and/or `text`)"
+                            ),
+                        });
+                    }
+                }
+            }
+            if qv.is_none() && qt.is_none() {
+                return Err(PlanError::RrfScoreQueryShape {
+                    got: "empty map (needs at least one of `vector`, `text`)".to_string(),
+                });
+            }
+            (qv, qt)
+        }
+        // Parameter / Variable: defer shape validation to executor.
+        // The executor will evaluate and reject non-map values at runtime.
+        Expr::Parameter(_) | Expr::Variable(_) => {
+            (Some(query_expr.clone()), Some(query_expr.clone()))
+        }
+        other => {
+            return Err(PlanError::RrfScoreQueryShape {
+                got: format!("{other:?}"),
+            });
+        }
+    };
+
+    Ok(RrfCallSig {
+        methods,
+        query_vector,
+        query_text,
+    })
+}
+
+/// Collect the RRF signature (if any) from an expression. Errors if multiple
+/// differing signatures are found within a single expression.
+fn collect_rrf_sig_in_expr(
+    expr: &Expr,
+    found: &mut Option<RrfCallSig>,
+    location: &str,
+) -> Result<(), PlanError> {
+    if let Some(args) = match_rrf_score(expr) {
+        let sig = parse_rrf_signature(args)?;
+        match found {
+            None => *found = Some(sig),
+            Some(existing) if *existing == sig => {}
+            Some(_) => {
+                return Err(PlanError::RrfScoreMultipleCalls {
+                    location: location.to_string(),
+                });
+            }
+        }
+        // Do not recurse into the args; nested rrf_score inside an rrf_score
+        // list is pathological and will hit the arity/shape guard.
+        return Ok(());
+    }
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            collect_rrf_sig_in_expr(left, found, location)?;
+            collect_rrf_sig_in_expr(right, found, location)?;
+        }
+        Expr::UnaryOp { expr, .. } => collect_rrf_sig_in_expr(expr, found, location)?,
+        Expr::PropertyAccess { expr, .. } => collect_rrf_sig_in_expr(expr, found, location)?,
+        Expr::List(items) => {
+            for it in items {
+                collect_rrf_sig_in_expr(it, found, location)?;
+            }
+        }
+        Expr::MapLiteral(fields) => {
+            for (_, v) in fields {
+                collect_rrf_sig_in_expr(v, found, location)?;
+            }
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_rrf_sig_in_expr(a, found, location)?;
+            }
+        }
+        Expr::In { expr, list } => {
+            collect_rrf_sig_in_expr(expr, found, location)?;
+            collect_rrf_sig_in_expr(list, found, location)?;
+        }
+        Expr::IsNull { expr, .. } => collect_rrf_sig_in_expr(expr, found, location)?,
+        Expr::StringMatch { expr, pattern, .. } => {
+            collect_rrf_sig_in_expr(expr, found, location)?;
+            collect_rrf_sig_in_expr(pattern, found, location)?;
+        }
+        Expr::Subscript { expr, index } => {
+            collect_rrf_sig_in_expr(expr, found, location)?;
+            collect_rrf_sig_in_expr(index, found, location)?;
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(o) = operand.as_deref() {
+                collect_rrf_sig_in_expr(o, found, location)?;
+            }
+            for (c, v) in when_clauses {
+                collect_rrf_sig_in_expr(c, found, location)?;
+                collect_rrf_sig_in_expr(v, found, location)?;
+            }
+            if let Some(e) = else_clause.as_deref() {
+                collect_rrf_sig_in_expr(e, found, location)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Substitute every `rrf_score(...)` FunctionCall in `expr` with
+/// `Variable("__rrf_score__")`.
+fn rewrite_rrf_in_expr(expr: &mut Expr) {
+    if let Expr::FunctionCall { name, .. } = expr {
+        if name == "rrf_score" {
+            *expr = Expr::Variable("__rrf_score__".to_string());
+            return;
+        }
+    }
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_rrf_in_expr(left);
+            rewrite_rrf_in_expr(right);
+        }
+        Expr::UnaryOp { expr, .. } => rewrite_rrf_in_expr(expr),
+        Expr::PropertyAccess { expr, .. } => rewrite_rrf_in_expr(expr),
+        Expr::List(items) => {
+            for it in items {
+                rewrite_rrf_in_expr(it);
+            }
+        }
+        Expr::MapLiteral(fields) => {
+            for (_, v) in fields {
+                rewrite_rrf_in_expr(v);
+            }
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                rewrite_rrf_in_expr(a);
+            }
+        }
+        Expr::In { expr, list } => {
+            rewrite_rrf_in_expr(expr);
+            rewrite_rrf_in_expr(list);
+        }
+        Expr::IsNull { expr, .. } => rewrite_rrf_in_expr(expr),
+        Expr::StringMatch { expr, pattern, .. } => {
+            rewrite_rrf_in_expr(expr);
+            rewrite_rrf_in_expr(pattern);
+        }
+        Expr::Subscript { expr, index } => {
+            rewrite_rrf_in_expr(expr);
+            rewrite_rrf_in_expr(index);
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(o) = operand.as_deref_mut() {
+                rewrite_rrf_in_expr(o);
+            }
+            for (c, v) in when_clauses {
+                rewrite_rrf_in_expr(c);
+                rewrite_rrf_in_expr(v);
+            }
+            if let Some(e) = else_clause.as_deref_mut() {
+                rewrite_rrf_in_expr(e);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Wrap the input of the topmost Project with a RankFuse operator, rewrite
+/// rrf_score call-sites, and (if Sort references `__rrf_score__` directly)
+/// inject a pass-through projection item so the score survives into Sort.
+///
+/// Expected plan shapes after this transform:
+/// - `Limit → Sort → Project(rewritten, may include pass-through) → RankFuse → rest`
+/// - `Sort → Project(rewritten, with pass-through) → RankFuse → rest`
+/// - `Project(rewritten) → RankFuse → rest`
+fn rewrite_rrf_score(op: LogicalOp) -> Result<LogicalOp, PlanError> {
+    // First pass: detect illegal placements (any RRF reference in Filter/WHERE,
+    // Aggregate group_by, Merge ON MATCH, etc.) — anywhere that isn't Project
+    // items or Sort items.
+    validate_rrf_placement(&op)?;
+
+    // Collect the RRF signature from Project / Sort items only.
+    let mut sig: Option<RrfCallSig> = None;
+    collect_rrf_sig(&op, &mut sig)?;
+
+    let Some(sig) = sig else {
+        // No rrf_score usage — return unchanged.
+        return Ok(op);
+    };
+
+    // Wrap the topmost Project.input with RankFuse and rewrite items.
+    let mut sort_touches_rrf = false;
+    let op = wrap_rank_fuse(op, &sig, &mut sort_touches_rrf);
+
+    // If Sort (or any op ABOVE Project) referenced __rrf_score__ directly, the
+    // Project must pass __rrf_score__ through.
+    let op = if sort_touches_rrf {
+        ensure_rrf_passthrough(op)
+    } else {
+        op
+    };
+
+    Ok(op)
+}
+
+/// Verify no `rrf_score(...)` appears in an illegal position (WHERE,
+/// aggregate args, pattern filters, etc.). Only Project items and Sort items
+/// are legal sites.
+fn validate_rrf_placement(op: &LogicalOp) -> Result<(), PlanError> {
+    match op {
+        LogicalOp::Filter { input, predicate } => {
+            if expr_contains_rrf_score(predicate) {
+                return Err(PlanError::RrfScoreIllegalPosition {
+                    location: "WHERE clause".to_string(),
+                });
+            }
+            validate_rrf_placement(input)
+        }
+        LogicalOp::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
+            for e in group_by {
+                if expr_contains_rrf_score(e) {
+                    return Err(PlanError::RrfScoreIllegalPosition {
+                        location: "GROUP BY key".to_string(),
+                    });
+                }
+            }
+            for a in aggregates {
+                if expr_contains_rrf_score(&a.arg) {
+                    return Err(PlanError::RrfScoreIllegalPosition {
+                        location: "aggregate function argument".to_string(),
+                    });
+                }
+            }
+            validate_rrf_placement(input)
+        }
+        LogicalOp::Project { input, items, .. } => {
+            for it in items {
+                // rrf_score is legal here; don't recurse into its args —
+                // they're structural (method list + query map), not expressions
+                // evaluated in the normal sense.
+                if match_rrf_score(&it.expr).is_some() {
+                    continue;
+                }
+                // Any OTHER rrf_score inside a nested expression is legal too
+                // (we handle blends like `rrf_score(...) * 0.5 + x`).
+            }
+            validate_rrf_placement(input)
+        }
+        LogicalOp::Sort { input, items } => {
+            for _it in items {
+                // rrf_score legal in ORDER BY.
+            }
+            validate_rrf_placement(input)
+        }
+        LogicalOp::Limit { input, count } => {
+            if expr_contains_rrf_score(count) {
+                return Err(PlanError::RrfScoreIllegalPosition {
+                    location: "LIMIT expression".to_string(),
+                });
+            }
+            validate_rrf_placement(input)
+        }
+        LogicalOp::Skip { input, count } => {
+            if expr_contains_rrf_score(count) {
+                return Err(PlanError::RrfScoreIllegalPosition {
+                    location: "SKIP expression".to_string(),
+                });
+            }
+            validate_rrf_placement(input)
+        }
+        LogicalOp::Traverse { input, .. }
+        | LogicalOp::VectorFilter { input, .. }
+        | LogicalOp::VectorTopK { input, .. }
+        | LogicalOp::EdgeVectorSearch { input, .. }
+        | LogicalOp::TextFilter { input, .. }
+        | LogicalOp::EncryptedFilter { input, .. }
+        | LogicalOp::Unwind { input, .. }
+        | LogicalOp::ShortestPath { input, .. }
+        | LogicalOp::Update { input, .. }
+        | LogicalOp::RemoveOp { input, .. }
+        | LogicalOp::Delete { input, .. }
+        | LogicalOp::DetachDocument { input, .. }
+        | LogicalOp::AttachDocument { input, .. } => validate_rrf_placement(input),
+        LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
+            validate_rrf_placement(left)?;
+            validate_rrf_placement(right)
+        }
+        LogicalOp::CreateNode { input, .. } => {
+            if let Some(inp) = input {
+                validate_rrf_placement(inp)?;
+            }
+            Ok(())
+        }
+        LogicalOp::CreateEdge { input, .. } => validate_rrf_placement(input),
+        LogicalOp::Merge { pattern, .. } | LogicalOp::Upsert { pattern, .. } => {
+            validate_rrf_placement(pattern)
+        }
+        LogicalOp::RankFuse { input, .. } => validate_rrf_placement(input),
+        _ => Ok(()),
+    }
+}
+
+/// Traverse Project / Sort operators and collect the (single) RRF signature.
+fn collect_rrf_sig(op: &LogicalOp, sig: &mut Option<RrfCallSig>) -> Result<(), PlanError> {
+    match op {
+        LogicalOp::Project { input, items, .. } => {
+            for it in items {
+                collect_rrf_sig_in_expr(&it.expr, sig, "RETURN")?;
+            }
+            collect_rrf_sig(input, sig)
+        }
+        LogicalOp::Sort { input, items } => {
+            for it in items {
+                collect_rrf_sig_in_expr(&it.expr, sig, "ORDER BY")?;
+            }
+            collect_rrf_sig(input, sig)
+        }
+        LogicalOp::Limit { input, .. } | LogicalOp::Skip { input, .. } => {
+            collect_rrf_sig(input, sig)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Walk to the innermost Project and wrap its input with RankFuse. Rewrite all
+/// `rrf_score(...)` usages to `Variable("__rrf_score__")` in Project / Sort
+/// items along the way. Sets `sort_touches_rrf` if a Sort item directly
+/// references rrf_score (which, after rewrite, becomes a Variable ref that
+/// Project must preserve).
+fn wrap_rank_fuse(op: LogicalOp, sig: &RrfCallSig, sort_touches_rrf: &mut bool) -> LogicalOp {
+    match op {
+        LogicalOp::Project {
+            input,
+            mut items,
+            distinct,
+        } => {
+            // Rewrite items first.
+            for it in items.iter_mut() {
+                rewrite_rrf_in_expr(&mut it.expr);
+            }
+            // Project.input is where we place RankFuse. Don't recurse further
+            // into Project.input — RankFuse wraps whatever match/filter/traverse
+            // subtree sits below Project.
+            let fused_input = LogicalOp::RankFuse {
+                input,
+                methods: sig.methods.clone(),
+                query_vector: sig.query_vector.clone(),
+                query_text: sig.query_text.clone(),
+                shard_overfetch_cap: None,
+            };
+            LogicalOp::Project {
+                input: Box::new(fused_input),
+                items,
+                distinct,
+            }
+        }
+        LogicalOp::Sort { input, mut items } => {
+            for it in items.iter_mut() {
+                if expr_contains_rrf_score(&it.expr) {
+                    *sort_touches_rrf = true;
+                }
+                rewrite_rrf_in_expr(&mut it.expr);
+            }
+            LogicalOp::Sort {
+                input: Box::new(wrap_rank_fuse(*input, sig, sort_touches_rrf)),
+                items,
+            }
+        }
+        LogicalOp::Limit { input, count } => LogicalOp::Limit {
+            input: Box::new(wrap_rank_fuse(*input, sig, sort_touches_rrf)),
+            count,
+        },
+        LogicalOp::Skip { input, count } => LogicalOp::Skip {
+            input: Box::new(wrap_rank_fuse(*input, sig, sort_touches_rrf)),
+            count,
+        },
+        // No Project found along the Sort/Limit/Skip spine — just return as-is.
+        // (A plan with Sort referencing rrf_score() but NO Project is ill-formed,
+        // but we let the executor guard handle it.)
+        other => other,
+    }
+}
+
+/// If Project's items don't already include `__rrf_score__`, inject a
+/// pass-through so Sort (above Project) can read it via `Variable("__rrf_score__")`.
+fn ensure_rrf_passthrough(op: LogicalOp) -> LogicalOp {
+    match op {
+        LogicalOp::Project {
+            input,
+            mut items,
+            distinct,
+        } => {
+            let already_present = items.iter().any(|it| {
+                it.alias.as_deref() == Some("__rrf_score__")
+                    || matches!(&it.expr, Expr::Variable(v) if v == "__rrf_score__")
+            });
+            if !already_present {
+                items.push(ProjectItem {
+                    expr: Expr::Variable("__rrf_score__".to_string()),
+                    alias: Some("__rrf_score__".to_string()),
+                });
+            }
+            LogicalOp::Project {
+                input,
+                items,
+                distinct,
+            }
+        }
+        LogicalOp::Sort { input, items } => LogicalOp::Sort {
+            input: Box::new(ensure_rrf_passthrough(*input)),
+            items,
+        },
+        LogicalOp::Limit { input, count } => LogicalOp::Limit {
+            input: Box::new(ensure_rrf_passthrough(*input)),
+            count,
+        },
+        LogicalOp::Skip { input, count } => LogicalOp::Skip {
+            input: Box::new(ensure_rrf_passthrough(*input)),
+            count,
+        },
+        other => other,
     }
 }
 

@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### coordinode-query
+
+#### Added
+
+- *(query)* `rrf_score([method_exprs…], {vector: …, text: …})` — Reciprocal Rank Fusion Cypher function. N-method rank fusion with competition ranks, `k=60` (IR standard, non-tunable), per-method direction from HNSW metric config. Supports node vectors, edge vectors (brute-force), and BM25 text methods.
+
+### coordinode-server
+
+#### Removed (BREAKING)
+
+- *(proto)* `TextService.HybridTextVectorSearch` RPC, `HybridTextVectorSearchRequest` / `HybridTextVectorSearchResponse` / `HybridResult` messages, `POST /v1/query/text/hybrid` HTTP endpoint. Superseded by the general-purpose Cypher function `rrf_score([methods…], {vector, text})` invoked via `CypherService.ExecuteCypher`. The Cypher form supports N methods (not 2), edge vectors, configurable HNSW metrics, and composes with MATCH / WHERE / ORDER BY / LIMIT in a single plan. Callers: replace the RPC with an equivalent Cypher query.
+
 ## v0.3.20 — 2026-04-17
 
 ### coordinode-core

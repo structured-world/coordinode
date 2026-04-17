@@ -19,11 +19,15 @@ use crate::cypher::ast::*;
 pub struct ScoreRequirements {
     pub needs_text_score: bool,
     pub needs_hybrid_score: bool,
+    /// `rrf_score(...)` relies on `__rrf_score__` populated by an upstream
+    /// `RankFuse` operator. If the builder did not insert one (shouldn't
+    /// happen in a correctly-built plan), the Project/Sort guard errors.
+    pub needs_rrf_score: bool,
 }
 
 impl ScoreRequirements {
     pub fn any(&self) -> bool {
-        self.needs_text_score || self.needs_hybrid_score
+        self.needs_text_score || self.needs_hybrid_score || self.needs_rrf_score
     }
 }
 
@@ -41,6 +45,7 @@ fn collect_score_requirements(expr: &Expr, out: &mut ScoreRequirements) {
             match name.as_str() {
                 "text_score" => out.needs_text_score = true,
                 "hybrid_score" => out.needs_hybrid_score = true,
+                "rrf_score" => out.needs_rrf_score = true,
                 _ => {}
             }
             for a in args {
@@ -682,6 +687,13 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
                 }
             }
         }
+        // rrf_score([methods…], query) → Reciprocal Rank Fusion score computed
+        // by the `RankFuse` planner operator and cached on the row under the
+        // `__rrf_score__` column. When invoked here the value is a pure lookup —
+        // the builder rewrote this FunctionCall to a Variable("__rrf_score__")
+        // reference for well-formed plans, so this branch only runs as a
+        // defensive fallback (guarded by Project/Sort checks).
+        "rrf_score" => row.get("__rrf_score__").cloned().unwrap_or(Value::Null),
         // text_match(field, query) → boolean. Used in WHERE clause.
         // When used in RETURN, checks if __text_score__ was set by TextFilter.
         "text_match" => {

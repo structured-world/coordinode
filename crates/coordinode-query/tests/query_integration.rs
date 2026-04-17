@@ -12,6 +12,9 @@ use coordinode_core::graph::node::{encode_node_key, NodeId, NodeIdAllocator, Nod
 use coordinode_core::graph::types::Value;
 use coordinode_query::cypher::parse;
 use coordinode_query::executor::{execute, AdaptiveConfig, ExecutionContext, WriteStats};
+use coordinode_query::index::{
+    IndexDefinition, TextIndexConfig, TextIndexRegistry, VectorIndexRegistry,
+};
 use coordinode_query::planner::{build_logical_plan, estimate_cost};
 use coordinode_search::tantivy::multi_lang::{MultiLangConfig, MultiLanguageTextIndex};
 use coordinode_search::tantivy::TextIndex;
@@ -8857,4 +8860,665 @@ fn test_merge_all_on_match_set() {
         2,
         "2 hosts × 1 service = 2 existing edges, ON MATCH fires"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// R-HYB2b: rrf_score([methods…], {vector:…, text:…}) — RankFuse operator
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Run a Cypher query with both a vector index registry and a text index
+/// registry wired into the execution context. Used by rrf_score tests.
+fn run_cypher_with_registries(
+    query: &str,
+    engine: &StorageEngine,
+    interner: &mut FieldInterner,
+    vector_reg: Option<&VectorIndexRegistry>,
+    text_reg: Option<&TextIndexRegistry>,
+) -> Result<Vec<coordinode_query::executor::Row>, String> {
+    let ast = parse(query).map_err(|e| format!("parse error: {e}"))?;
+    let plan = build_logical_plan(&ast).map_err(|e| format!("plan error: {e}"))?;
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+    let mut ctx = make_test_ctx(engine, interner, &allocator);
+    ctx.vector_index_registry = vector_reg;
+    ctx.text_index_registry = text_reg;
+    execute(&plan, &mut ctx).map_err(|e| format!("execute error: {e}"))
+}
+
+/// Build a `(VectorIndexRegistry, TextIndexRegistry)` for the given
+/// `(label, vector_property, text_property)` triple, populated from `rows`.
+/// Returns the registries and the temp dir that owns tantivy files.
+fn setup_rrf_indices(
+    base_dir: &std::path::Path,
+    label: &str,
+    vector_prop: &str,
+    text_prop: &str,
+    dims: u32,
+    rows: &[(u64, Vec<f32>, &str)],
+) -> (VectorIndexRegistry, TextIndexRegistry) {
+    // Vector index.
+    let vec_reg = VectorIndexRegistry::new();
+    let vec_cfg = coordinode_query::index::VectorIndexConfig {
+        dimensions: dims,
+        metric: coordinode_core::graph::types::VectorMetric::Cosine,
+        m: 16,
+        ef_construction: 200,
+        quantization: false,
+        offload_vectors: false,
+    };
+    let vec_def = IndexDefinition::hnsw(
+        format!("{label}_{vector_prop}_idx"),
+        label,
+        vector_prop,
+        vec_cfg,
+    );
+    vec_reg.register(vec_def);
+    // Populate HNSW directly via the handle.
+    if let Some(handle) = vec_reg.get(label, vector_prop) {
+        let mut idx = handle.write().unwrap();
+        for (id, v, _text) in rows {
+            idx.insert(*id, v.clone());
+        }
+    }
+
+    // Text index.
+    let text_reg_dir = base_dir.join("rrf_text_reg");
+    std::fs::create_dir_all(&text_reg_dir).unwrap();
+    let text_reg = TextIndexRegistry::new(&text_reg_dir);
+    let text_cfg = TextIndexConfig::default();
+    let text_def = IndexDefinition::text(
+        format!("{label}_{text_prop}_idx"),
+        label,
+        vec![text_prop.to_string()],
+        text_cfg,
+    );
+    text_reg.register(text_def).unwrap();
+    for (id, _v, text) in rows {
+        text_reg.on_text_written(label, NodeId::from_raw(*id), text_prop, text);
+    }
+
+    (vec_reg, text_reg)
+}
+
+/// R-HYB2b regression #2: parser/planner rejects any 3rd argument to
+/// `rrf_score(...)`. `k=60` is the IR standard (Cormack 2009) and not tunable.
+#[test]
+fn rrf_score_rejects_k_override() {
+    let ast = parse(
+        "MATCH (d:Doc) \
+         RETURN rrf_score([d.embedding, d.body], {vector: [1.0, 0.0], text: \"rust\"}, {k: 100}) AS s",
+    )
+    .expect("parse");
+    let err = build_logical_plan(&ast).expect_err("3rd arg must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("rrf_score()") && msg.contains("k=60") && msg.contains("not tunable"),
+        "error must explain k is frozen, got: {msg}"
+    );
+}
+
+/// R-HYB2b: empty method list is rejected at plan time.
+#[test]
+fn rrf_score_rejects_empty_methods() {
+    let ast = parse(
+        "MATCH (d:Doc) \
+         RETURN rrf_score([], {vector: [1.0, 0.0], text: \"rust\"}) AS s",
+    )
+    .expect("parse");
+    let err = build_logical_plan(&ast).expect_err("empty methods must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("non-empty list") && msg.contains("rrf_score()"),
+        "error must name rrf_score and require non-empty list, got: {msg}"
+    );
+}
+
+/// R-HYB2b: query map with an unknown key is rejected.
+#[test]
+fn rrf_score_rejects_unknown_query_key() {
+    let ast = parse(
+        "MATCH (d:Doc) \
+         RETURN rrf_score([d.embedding], {unknown: 123}) AS s",
+    )
+    .expect("parse");
+    let err = build_logical_plan(&ast).expect_err("unknown key must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown") && msg.contains("vector") && msg.contains("text"),
+        "error must list allowed keys, got: {msg}"
+    );
+}
+
+/// R-HYB2b: rrf_score in WHERE is rejected (materialised rank assignment
+/// is impossible at filter-time).
+#[test]
+fn rrf_score_rejects_where_placement() {
+    let ast = parse(
+        "MATCH (d:Doc) \
+         WHERE rrf_score([d.embedding, d.body], {vector: [1.0, 0.0], text: \"rust\"}) > 0.0 \
+         RETURN d",
+    )
+    .expect("parse");
+    let err = build_logical_plan(&ast).expect_err("rrf_score in WHERE must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("WHERE"),
+        "error must name the illegal position, got: {msg}"
+    );
+}
+
+/// R-HYB2b: plan shape — a valid rrf_score produces a RankFuse operator below
+/// the topmost Project. Verified via EXPLAIN text.
+#[test]
+fn rrf_score_plan_contains_rank_fuse() {
+    let ast = parse(
+        "MATCH (d:Doc) \
+         RETURN d, rrf_score([d.embedding, d.body], {vector: [1.0, 0.0], text: \"rust\"}) AS s \
+         ORDER BY s DESC LIMIT 5",
+    )
+    .expect("parse");
+    let plan = build_logical_plan(&ast).expect("plan");
+    let explain = plan.explain();
+    assert!(
+        explain.contains("RankFuse(methods="),
+        "EXPLAIN must show the RankFuse operator; got:\n{explain}"
+    );
+    assert!(
+        explain.contains("k=60"),
+        "EXPLAIN must show k=60 constant; got:\n{explain}"
+    );
+}
+
+/// R-HYB2b regression #1: RRF ranking handles methods with divergent score
+/// distributions. One doc is top-1 on BOTH methods (balanced) and must win
+/// regardless of raw-score scale. A naïve weighted-sum with equal weights
+/// would be dominated by whichever method has larger raw scores (here BM25,
+/// which is unbounded vs cos-sim in [0,1]) — RRF's rank-only fusion protects
+/// against that scale mismatch.
+#[test]
+fn rrf_score_handles_divergent_distributions() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    // 4 docs. Node 6 is top-1 on vector (tied with node 1 at cos=1.0) AND
+    // top-1 on BM25 (6 "rust" tokens dominates node 2's 3 tokens). Specialists
+    // (1 = vector-only, 2 = text-only) each miss one axis and take a
+    // penalty rank there.
+    let rows: Vec<(u64, Vec<f32>, &str)> = vec![
+        (1, vec![1.0, 0.0], "literature review draft"),
+        (2, vec![0.0, 1.0], "rust rust rust async runtime"),
+        (3, vec![0.1, 0.9], "python machine learning framework"),
+        (
+            6,
+            vec![1.0, 0.0],
+            "rust rust rust rust rust rust programming language tokio async",
+        ),
+    ];
+    for (id, v, body) in &rows {
+        insert_node(
+            &engine,
+            1,
+            *id,
+            "Chunk",
+            &[
+                ("embedding", Value::Vector(v.clone())),
+                ("body", Value::String((*body).to_string())),
+            ],
+            &mut interner,
+        );
+    }
+
+    let (vec_reg, text_reg) = setup_rrf_indices(dir.path(), "Chunk", "embedding", "body", 2, &rows);
+
+    let rrf_results = run_cypher_with_registries(
+        "MATCH (c:Chunk) \
+         RETURN c, \
+                rrf_score([c.embedding, c.body], {vector: [1.0, 0.0], text: \"rust\"}) AS score \
+         ORDER BY score DESC",
+        &engine,
+        &mut interner,
+        Some(&vec_reg),
+        Some(&text_reg),
+    )
+    .expect("rrf execute");
+
+    assert_eq!(rrf_results.len(), rows.len(), "all rows participate in RRF");
+
+    let rank_of = |id: u64| -> usize {
+        rrf_results
+            .iter()
+            .position(|r| matches!(r.get("c"), Some(Value::Int(v)) if *v as u64 == id))
+            .expect("id present")
+    };
+    let score_of = |id: u64| -> f64 {
+        match rrf_results
+            .iter()
+            .find(|r| matches!(r.get("c"), Some(Value::Int(v)) if *v as u64 == id))
+            .and_then(|r| r.get("score"))
+        {
+            Some(Value::Float(f)) => *f,
+            other => panic!("expected Float, got {other:?}"),
+        }
+    };
+
+    // Node 6: vec rank 1 (tied with node 1, competition rank = 1) AND text
+    // rank 1 (more "rust" tokens than node 2) → score = 1/61 + 1/61.
+    // Node 1: vec rank 1 + text penalty → strictly less than node 6.
+    // Node 2: text rank 2 + vec penalty → strictly less than node 6.
+    let top_id = match rrf_results[0].get("c") {
+        Some(Value::Int(id)) => *id as u64,
+        other => panic!("expected Int node id, got {other:?}"),
+    };
+    assert_eq!(
+        top_id, 6,
+        "RRF top must be node 6 (balanced across vector + text); \
+         weighted-sum with equal weights would let BM25's larger absolute \
+         scale dominate (picking node 2) — RRF's rank fusion protects against that"
+    );
+
+    // Scores must be non-increasing under ORDER BY DESC.
+    let scores: Vec<f64> = rrf_results
+        .iter()
+        .map(|r| match r.get("score") {
+            Some(Value::Float(f)) => *f,
+            other => panic!("expected Float score, got {other:?}"),
+        })
+        .collect();
+    for w in scores.windows(2) {
+        assert!(
+            w[0] >= w[1],
+            "ORDER BY score DESC produced non-monotonic scores: {scores:?}"
+        );
+    }
+
+    assert!(
+        rank_of(6) < rank_of(1),
+        "node 6 (top on both) must outrank node 1 (vector-only): \
+         ranks 6={} 1={}; scores 6={} 1={}",
+        rank_of(6),
+        rank_of(1),
+        score_of(6),
+        score_of(1),
+    );
+    assert!(
+        rank_of(6) < rank_of(2),
+        "node 6 (top on both) must outrank node 2 (text-only): \
+         ranks 6={} 2={}; scores 6={} 2={}",
+        rank_of(6),
+        rank_of(2),
+        score_of(6),
+        score_of(2),
+    );
+}
+
+/// R-HYB2b: penalty-rank semantics. A row missing one method entirely still
+/// receives a score from the other methods — proof that RRF is additive,
+/// not short-circuit.
+#[test]
+fn rrf_score_missing_method_uses_penalty_rank() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    // Two docs — only doc #1 has text that matches "rust"; both have vectors.
+    let rows: Vec<(u64, Vec<f32>, &str)> = vec![
+        (1, vec![1.0, 0.0], "rust programming"),
+        (2, vec![0.5, 0.5], "python notebook"),
+    ];
+    for (id, v, body) in &rows {
+        insert_node(
+            &engine,
+            1,
+            *id,
+            "Doc",
+            &[
+                ("embedding", Value::Vector(v.clone())),
+                ("body", Value::String((*body).to_string())),
+            ],
+            &mut interner,
+        );
+    }
+
+    let (vec_reg, text_reg) = setup_rrf_indices(dir.path(), "Doc", "embedding", "body", 2, &rows);
+
+    let results = run_cypher_with_registries(
+        "MATCH (d:Doc) \
+         RETURN d, \
+                rrf_score([d.embedding, d.body], {vector: [1.0, 0.0], text: \"rust\"}) AS score",
+        &engine,
+        &mut interner,
+        Some(&vec_reg),
+        Some(&text_reg),
+    )
+    .expect("rrf execute");
+
+    assert_eq!(results.len(), 2);
+    // Doc #2 has no text match → text rank = penalty (matched+1=2). It still
+    // has a valid vector rank, so its score is non-zero.
+    let score_of = |id: u64| -> f64 {
+        let row = results
+            .iter()
+            .find(|r| matches!(r.get("d"), Some(Value::Int(v)) if *v as u64 == id))
+            .expect("id present");
+        match row.get("score") {
+            Some(Value::Float(f)) => *f,
+            other => panic!("expected Float, got {other:?}"),
+        }
+    };
+    assert!(
+        score_of(2) > 0.0,
+        "penalty rank still contributes a small positive term, got 0 for doc without text match"
+    );
+    assert!(
+        score_of(1) > score_of(2),
+        "doc with both methods matched must outrank doc missing text"
+    );
+}
+
+/// R-HYB2b: unscorable method (no HNSW index, no FT index, and no vector
+/// values) errors with a clear message.
+#[test]
+fn rrf_score_unscorable_method_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Item",
+        &[("name", Value::String("alpha".into()))],
+        &mut interner,
+    );
+    insert_node(
+        &engine,
+        1,
+        2,
+        "Item",
+        &[("name", Value::String("beta".into()))],
+        &mut interner,
+    );
+
+    // Empty registries — `name` has neither a vector index nor a text index,
+    // and it isn't a vector value → method is genuinely unscorable.
+    let vec_reg = VectorIndexRegistry::new();
+    let text_dir = dir.path().join("rrf_empty");
+    std::fs::create_dir_all(&text_dir).unwrap();
+    let text_reg = TextIndexRegistry::new(&text_dir);
+
+    let err = run_cypher_with_registries(
+        "MATCH (i:Item) \
+         RETURN rrf_score([i.name], {vector: [1.0]}) AS score",
+        &engine,
+        &mut interner,
+        Some(&vec_reg),
+        Some(&text_reg),
+    )
+    .expect_err("unscorable method must error");
+    assert!(
+        err.contains("rrf_score()") && err.contains("i.name") && err.contains("cannot be scored"),
+        "error must name the offending method, got: {err}"
+    );
+}
+
+/// R-HYB2b: competition ranking — rows with identical vector scores receive
+/// the SAME rank, so their RRF contribution for that method is equal. We
+/// seed two rows with identical vectors + identical text to force a tie,
+/// then verify their scores are identical.
+#[test]
+fn rrf_score_competition_rank_ties() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    // Three docs: #1 and #2 are identical (guaranteed tie on both methods),
+    // #3 is a distinct baseline.
+    let rows: Vec<(u64, Vec<f32>, &str)> = vec![
+        (1, vec![1.0, 0.0], "rust programming"),
+        (2, vec![1.0, 0.0], "rust programming"),
+        (3, vec![0.0, 1.0], "python notebook"),
+    ];
+    for (id, v, body) in &rows {
+        insert_node(
+            &engine,
+            1,
+            *id,
+            "Doc",
+            &[
+                ("embedding", Value::Vector(v.clone())),
+                ("body", Value::String((*body).to_string())),
+            ],
+            &mut interner,
+        );
+    }
+
+    let (vec_reg, text_reg) = setup_rrf_indices(dir.path(), "Doc", "embedding", "body", 2, &rows);
+
+    let results = run_cypher_with_registries(
+        "MATCH (d:Doc) \
+         RETURN d, \
+                rrf_score([d.embedding, d.body], {vector: [1.0, 0.0], text: \"rust\"}) AS score \
+         ORDER BY score DESC",
+        &engine,
+        &mut interner,
+        Some(&vec_reg),
+        Some(&text_reg),
+    )
+    .expect("rrf execute");
+
+    assert_eq!(results.len(), 3);
+    let score_of = |id: u64| -> f64 {
+        let row = results
+            .iter()
+            .find(|r| matches!(r.get("d"), Some(Value::Int(v)) if *v as u64 == id))
+            .expect("id present");
+        match row.get("score") {
+            Some(Value::Float(f)) => *f,
+            other => panic!("expected Float, got {other:?}"),
+        }
+    };
+    let s1 = score_of(1);
+    let s2 = score_of(2);
+    assert!(
+        (s1 - s2).abs() < 1e-12,
+        "tied rows must receive identical RRF score: s1={s1} s2={s2}"
+    );
+}
+
+/// R-HYB2b: full pipeline — `MATCH → RETURN rrf_score AS s → ORDER BY s DESC
+/// → LIMIT K`. Verifies that LIMIT applies AFTER RankFuse ranks the full set
+/// (if LIMIT clipped before RankFuse, ranks would be wrong).
+#[test]
+fn rrf_score_pipeline_with_order_by_and_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    let rows: Vec<(u64, Vec<f32>, &str)> = vec![
+        (1, vec![1.0, 0.0], "rust alpha"),
+        (2, vec![0.9, 0.1], "rust beta"),
+        (3, vec![0.8, 0.2], "rust gamma"),
+        (4, vec![0.2, 0.8], "python delta"),
+        (5, vec![0.1, 0.9], "python epsilon"),
+    ];
+    for (id, v, body) in &rows {
+        insert_node(
+            &engine,
+            1,
+            *id,
+            "Doc",
+            &[
+                ("embedding", Value::Vector(v.clone())),
+                ("body", Value::String((*body).to_string())),
+            ],
+            &mut interner,
+        );
+    }
+
+    let (vec_reg, text_reg) = setup_rrf_indices(dir.path(), "Doc", "embedding", "body", 2, &rows);
+
+    let results = run_cypher_with_registries(
+        "MATCH (d:Doc) \
+         RETURN d, \
+                rrf_score([d.embedding, d.body], {vector: [1.0, 0.0], text: \"rust\"}) AS score \
+         ORDER BY score DESC LIMIT 3",
+        &engine,
+        &mut interner,
+        Some(&vec_reg),
+        Some(&text_reg),
+    )
+    .expect("rrf execute");
+
+    assert_eq!(results.len(), 3, "LIMIT 3 must cap output to 3 rows");
+
+    // Top 3 must be the "rust" nodes 1, 2, 3 (each combines both methods well).
+    let top_ids: std::collections::HashSet<u64> = results
+        .iter()
+        .map(|r| match r.get("d") {
+            Some(Value::Int(v)) => *v as u64,
+            other => panic!("expected Int, got {other:?}"),
+        })
+        .collect();
+    let expected: std::collections::HashSet<u64> = [1, 2, 3].into_iter().collect();
+    assert_eq!(
+        top_ids, expected,
+        "top-3 under RRF should be the rust docs (1,2,3); got {top_ids:?}"
+    );
+}
+
+/// R-HYB2b: brute-force vector scoring path — when a vector property has NO
+/// HNSW index registered, RankFuse falls back to in-memory cosine similarity
+/// (same code path used for edge vector properties in `VectorBruteForce`).
+/// Proves the full edge-vector scope of R-HYB2b — the resolver correctly
+/// classifies an indexless vector property as brute-force and scores all
+/// rows, rather than erroring out.
+#[test]
+fn rrf_score_brute_force_vector_without_hnsw() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    let rows: Vec<(u64, Vec<f32>, &str)> = vec![
+        (1, vec![1.0, 0.0], "rust rust rust programming"),
+        (2, vec![0.9, 0.1], "rust async runtime"),
+        (3, vec![0.0, 1.0], "python notebook"),
+    ];
+    for (id, v, body) in &rows {
+        insert_node(
+            &engine,
+            1,
+            *id,
+            "Item",
+            &[
+                ("ctx_emb", Value::Vector(v.clone())),
+                ("body", Value::String((*body).to_string())),
+            ],
+            &mut interner,
+        );
+    }
+
+    // Only register the TEXT index — the vector property `ctx_emb` has NO
+    // HNSW index and no vector_registry entry. RankFuse must fall through
+    // to `VectorBruteForce` and still produce correct ranks.
+    let text_reg_dir = dir.path().join("brute_text_reg");
+    std::fs::create_dir_all(&text_reg_dir).unwrap();
+    let text_reg = TextIndexRegistry::new(&text_reg_dir);
+    text_reg
+        .register(IndexDefinition::text(
+            "Item_body_idx",
+            "Item",
+            vec!["body".into()],
+            TextIndexConfig::default(),
+        ))
+        .unwrap();
+    for (id, _v, body) in &rows {
+        text_reg.on_text_written("Item", NodeId::from_raw(*id), "body", body);
+    }
+
+    // Empty vector registry — ctx_emb scoring MUST use brute-force cosine
+    // against the Vector values in the rows.
+    let vec_reg = VectorIndexRegistry::new();
+
+    let results = run_cypher_with_registries(
+        "MATCH (i:Item) \
+         RETURN i, \
+                rrf_score([i.ctx_emb, i.body], {vector: [1.0, 0.0], text: \"rust\"}) AS score \
+         ORDER BY score DESC",
+        &engine,
+        &mut interner,
+        Some(&vec_reg),
+        Some(&text_reg),
+    )
+    .expect("brute-force vector path must succeed without HNSW");
+
+    assert_eq!(results.len(), 3);
+
+    // Node 1: best on both methods (perfect vector + most "rust" tokens).
+    let top_id = match results[0].get("i") {
+        Some(Value::Int(id)) => *id as u64,
+        other => panic!("expected Int, got {other:?}"),
+    };
+    assert_eq!(
+        top_id, 1,
+        "brute-force cosine must correctly rank [1,0]-vs-[1,0] as top"
+    );
+
+    // Node 3: worst on both (orthogonal vector, no text match) — must be last.
+    let bottom_id = match results[2].get("i") {
+        Some(Value::Int(id)) => *id as u64,
+        other => panic!("expected Int, got {other:?}"),
+    };
+    assert_eq!(bottom_id, 3, "node 3 (orthogonal + no text) must rank last");
+}
+
+/// R-HYB2b: vector-only RRF on two orthogonal vector methods (no text).
+/// Exercises the degenerate query map `{vector: ...}` (no `text` key).
+#[test]
+fn rrf_score_vector_only_multiple_methods() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+
+    let rows: Vec<(u64, Vec<f32>, &str)> = vec![
+        (1, vec![1.0, 0.0], "_"),
+        (2, vec![0.0, 1.0], "_"),
+        (3, vec![0.7, 0.7], "_"),
+    ];
+    for (id, v, body) in &rows {
+        insert_node(
+            &engine,
+            1,
+            *id,
+            "Doc",
+            &[
+                ("embedding", Value::Vector(v.clone())),
+                ("body", Value::String((*body).to_string())),
+            ],
+            &mut interner,
+        );
+    }
+
+    let (vec_reg, text_reg) = setup_rrf_indices(dir.path(), "Doc", "embedding", "body", 2, &rows);
+
+    // Two vector "methods" — in this synthetic case both point at the same
+    // property, but it exercises the N-method wiring end-to-end.
+    let results = run_cypher_with_registries(
+        "MATCH (d:Doc) \
+         RETURN d, \
+                rrf_score([d.embedding, d.embedding], {vector: [1.0, 0.0]}) AS score \
+         ORDER BY score DESC",
+        &engine,
+        &mut interner,
+        Some(&vec_reg),
+        Some(&text_reg),
+    )
+    .expect("rrf execute");
+
+    assert_eq!(results.len(), 3);
+    let top_id = match results[0].get("d") {
+        Some(Value::Int(v)) => *v as u64,
+        other => panic!("expected Int, got {other:?}"),
+    };
+    assert_eq!(top_id, 1, "doc closest to [1, 0] ranks first");
 }

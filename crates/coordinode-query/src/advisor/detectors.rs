@@ -378,7 +378,8 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::EdgeVectorSearch { input, .. }
         | LogicalOp::TextFilter { input, .. }
         | LogicalOp::EncryptedFilter { input, .. }
-        | LogicalOp::ShortestPath { input, .. } => vec![input],
+        | LogicalOp::ShortestPath { input, .. }
+        | LogicalOp::RankFuse { input, .. } => vec![input],
 
         LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
             vec![left, right]
