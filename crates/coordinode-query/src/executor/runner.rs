@@ -247,6 +247,17 @@ pub struct ExecutionContext<'a> {
     pub vector_loader: Option<&'a dyn coordinode_vector::VectorLoader>,
     /// MVCC timestamp oracle. When set, enables MVCC-versioned reads/writes.
     pub mvcc_oracle: Option<&'a TimestampOracle>,
+    /// R-SNAP2: per-shard `maxAssigned` watermark handle.
+    ///
+    /// Readers under `read_consistency = 'snapshot'` call
+    /// `applied_watermark.wait_for(snapshot_ts, read_timeout)` before
+    /// dispatching the read, so every modality on this shard observes the
+    /// fully-applied state at `snapshot_ts`. `None` in legacy /
+    /// single-writer test contexts — the executor then skips the wait and
+    /// reads "current" state. Wired in by `R-SNAP1` at the planner
+    /// auto-promotion site.
+    pub applied_watermark:
+        Option<std::sync::Arc<coordinode_core::txn::watermark::MaxAssignedWatermark>>,
     /// MVCC read timestamp (start_ts). Allocated from oracle at statement start.
     /// All reads see a consistent snapshot at this timestamp.
     pub mvcc_read_ts: Timestamp,
@@ -8784,6 +8795,7 @@ mod tests {
             correlated_row: None,
             feedback_cache: None,
             schema_label_cache: std::collections::HashMap::new(),
+            applied_watermark: None,
             params: std::collections::HashMap::new(),
         }
     }

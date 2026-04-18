@@ -68,6 +68,7 @@ fn make_test_ctx<'a>(
         correlated_row: None,
         feedback_cache: None,
         schema_label_cache: HashMap::new(),
+        applied_watermark: None,
         params: HashMap::new(),
     }
 }
