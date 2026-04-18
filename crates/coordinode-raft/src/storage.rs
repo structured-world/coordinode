@@ -704,6 +704,15 @@ pub struct CoordinodeStateMachine {
     applied_tx: tokio::sync::watch::Sender<u64>,
     /// Receiver side kept to prevent channel closure.
     applied_rx: tokio::sync::watch::Receiver<u64>,
+    /// R-SNAP2: per-shard `maxAssigned` watermark over HLC commit_ts.
+    /// Distinct from `applied_tx` (Raft log index). Advanced after every
+    /// successful proposal apply so snapshot readers can `WaitForTs(T)`
+    /// until every write with `commit_ts ≤ T` has been applied to every
+    /// modality on this shard.
+    ///
+    /// Optional so legacy paths that don't need cross-modality snapshot
+    /// semantics can leave it `None` (e.g. embedded-mode fast tests).
+    max_assigned: Option<Arc<coordinode_core::txn::watermark::MaxAssignedWatermark>>,
 }
 
 impl CoordinodeStateMachine {
@@ -718,6 +727,21 @@ impl CoordinodeStateMachine {
     pub fn with_oracle(
         engine: Arc<StorageEngine>,
         oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
+    ) -> Self {
+        Self::with_oracle_and_watermark(engine, oracle, None)
+    }
+
+    /// R-SNAP2: create with a timestamp oracle AND a `MaxAssignedWatermark`.
+    ///
+    /// When the watermark is set, `apply_proposal()` advances it to the
+    /// proposal's `commit_ts` AFTER every mutation in that proposal has
+    /// been persisted to the storage engine. Readers at snapshot_ts T can
+    /// then `watermark.wait_for(T, timeout)` to block until every write
+    /// with `commit_ts ≤ T` is visible on this shard.
+    pub fn with_oracle_and_watermark(
+        engine: Arc<StorageEngine>,
+        oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
+        max_assigned: Option<Arc<coordinode_core::txn::watermark::MaxAssignedWatermark>>,
     ) -> Self {
         // Load persisted state
         let last_applied = Self::load_log_id(&engine, KEY_SM_APPLIED);
@@ -736,7 +760,17 @@ impl CoordinodeStateMachine {
             last_dedup_gc: Mutex::new(Instant::now()),
             applied_tx,
             applied_rx,
+            max_assigned,
         }
+    }
+
+    /// Handle to the per-shard `maxAssigned` watermark, if one was wired
+    /// in at construction. Query executors hold this to drive
+    /// `read_consistency='snapshot'` waits.
+    pub fn max_assigned(
+        &self,
+    ) -> Option<Arc<coordinode_core::txn::watermark::MaxAssignedWatermark>> {
+        self.max_assigned.clone()
     }
 
     /// Subscribe to the applied watermark.
@@ -905,6 +939,18 @@ impl CoordinodeStateMachine {
 
         // Periodic dedup GC (every DEDUP_GC_INTERVAL_SECS)
         self.maybe_gc_dedup();
+
+        // R-SNAP2: advance the per-shard `maxAssigned` watermark AFTER every
+        // mutation in this proposal has been persisted. Snapshot readers at
+        // T ≤ commit_ts now see a fully-applied state on this shard.
+        // Monotonic — a proposal whose commit_ts is below the current
+        // watermark is a no-op (shouldn't happen in a healthy cluster; HLC
+        // guarantees per-shard monotonicity — but defensive).
+        if let Some(ref wm) = self.max_assigned {
+            if proposal.commit_ts.as_raw() > 0 {
+                wm.advance(proposal.commit_ts);
+            }
+        }
 
         Ok(Response {
             mutations_applied: count,
@@ -2015,6 +2061,200 @@ mod tests {
                 .last_log_id
                 .expect("last_log_id must be recovered from sealed segment");
             assert_eq!(recovered.index, 2);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // R-SNAP2: MaxAssignedWatermark integration with apply_proposal.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[allow(clippy::panic)]
+    mod snap2_watermark_integration {
+        use super::*;
+        use coordinode_core::txn::watermark::{MaxAssignedWatermark, WaitError};
+        use std::time::Duration;
+
+        fn make_proposal(id: u64, commit_ts: u64) -> RaftProposal {
+            RaftProposal {
+                id: coordinode_core::txn::proposal::ProposalId::from_raw(id),
+                mutations: vec![Mutation::Put {
+                    partition: coordinode_core::txn::proposal::PartitionId::Node,
+                    key: format!("node:1:{id}").into_bytes(),
+                    value: b"data".to_vec(),
+                }],
+                commit_ts: Timestamp::from_raw(commit_ts),
+                start_ts: Timestamp::from_raw(commit_ts - 1),
+                bypass_rate_limiter: false,
+            }
+        }
+
+        #[tokio::test]
+        async fn advance_applies_after_successful_proposal() {
+            // R-SNAP2 regression #1: writer bursts commit_ts=1000, reader at
+            // T=800 returns immediately after the apply has advanced the
+            // watermark past T.
+            let (_dir, engine) = test_engine();
+            let wm = MaxAssignedWatermark::new(Timestamp::ZERO);
+            let sm = CoordinodeStateMachine::with_oracle_and_watermark(
+                engine,
+                None,
+                Some(Arc::clone(&wm)),
+            );
+
+            // Apply a single proposal with commit_ts = 1000.
+            let proposal = make_proposal(42, 1000);
+            sm.apply_proposal(&proposal).expect("apply ok");
+
+            // Watermark must have advanced to commit_ts.
+            assert_eq!(wm.current().as_raw(), 1000);
+
+            // A wait at T=800 returns immediately.
+            let got = wm
+                .wait_for(Timestamp::from_raw(800), Duration::from_millis(50))
+                .await
+                .expect("fast path");
+            assert_eq!(got.as_raw(), 1000);
+        }
+
+        #[tokio::test]
+        async fn multiple_proposals_advance_to_latest() {
+            // Applying proposals in increasing commit_ts order — watermark
+            // always equals the latest.
+            let (_dir, engine) = test_engine();
+            let wm = MaxAssignedWatermark::new(Timestamp::ZERO);
+            let sm = CoordinodeStateMachine::with_oracle_and_watermark(
+                engine,
+                None,
+                Some(Arc::clone(&wm)),
+            );
+
+            for (i, ts) in [(1u64, 100u64), (2, 200), (3, 350)] {
+                let p = make_proposal(i, ts);
+                sm.apply_proposal(&p).expect("apply ok");
+                assert_eq!(wm.current().as_raw(), ts);
+            }
+        }
+
+        #[tokio::test]
+        async fn out_of_order_commit_ts_is_monotonic_no_regression() {
+            // Defensive: HLC guarantees monotonic commit_ts per shard, but
+            // if a stale proposal somehow arrives (e.g. test, or replay
+            // edge case), the watermark must not regress.
+            let (_dir, engine) = test_engine();
+            let wm = MaxAssignedWatermark::new(Timestamp::ZERO);
+            let sm = CoordinodeStateMachine::with_oracle_and_watermark(
+                engine,
+                None,
+                Some(Arc::clone(&wm)),
+            );
+
+            sm.apply_proposal(&make_proposal(1, 500)).expect("ok");
+            assert_eq!(wm.current().as_raw(), 500);
+
+            // Older commit_ts proposal — watermark must NOT go back.
+            sm.apply_proposal(&make_proposal(2, 300)).expect("ok");
+            assert_eq!(wm.current().as_raw(), 500);
+        }
+
+        #[tokio::test]
+        async fn no_watermark_configured_is_noop() {
+            // The watermark is optional — legacy paths that don't need
+            // cross-modality snapshots still work without one.
+            let (_dir, engine) = test_engine();
+            let sm = CoordinodeStateMachine::new(engine);
+
+            // Apply should succeed even without a watermark wired in.
+            sm.apply_proposal(&make_proposal(1, 100))
+                .expect("apply ok without watermark");
+
+            // max_assigned() getter returns None.
+            assert!(sm.max_assigned().is_none());
+        }
+
+        #[tokio::test]
+        async fn reader_unblocks_when_applier_catches_up() {
+            // R-SNAP2 regression #2: reader at latest T blocks, applier
+            // advances watermark, reader unblocks promptly.
+            let (_dir, engine) = test_engine();
+            let wm = MaxAssignedWatermark::new(Timestamp::ZERO);
+            let sm = Arc::new(CoordinodeStateMachine::with_oracle_and_watermark(
+                engine,
+                None,
+                Some(Arc::clone(&wm)),
+            ));
+
+            let wm_reader = Arc::clone(&wm);
+            let reader = tokio::spawn(async move {
+                wm_reader
+                    .wait_for(Timestamp::from_raw(777), Duration::from_millis(500))
+                    .await
+            });
+
+            // Applier delay — ensure reader is actually blocked.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            sm.apply_proposal(&make_proposal(1, 777)).expect("apply");
+
+            let got = reader.await.expect("task").expect("reader unblocks");
+            assert_eq!(got.as_raw(), 777);
+        }
+
+        #[tokio::test]
+        async fn reader_times_out_when_no_apply_arrives() {
+            // R-SNAP2 regression #3: timeout path returns ErrReadTimeout
+            // (not stale Ok). Apply never happens; reader must time out
+            // with the final observed watermark value.
+            let (_dir, engine) = test_engine();
+            let wm = MaxAssignedWatermark::new(Timestamp::from_raw(100));
+            let _sm = CoordinodeStateMachine::with_oracle_and_watermark(
+                engine,
+                None,
+                Some(Arc::clone(&wm)),
+            );
+
+            let err = wm
+                .wait_for(Timestamp::from_raw(500), Duration::from_millis(50))
+                .await
+                .expect_err("must time out");
+            match err {
+                WaitError::Timeout {
+                    target, current, ..
+                } => {
+                    assert_eq!(target, 500);
+                    assert_eq!(current, 100);
+                }
+                other => panic!("expected Timeout, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn commit_ts_zero_proposal_does_not_advance() {
+            // Defensive: commit_ts=0 is a sentinel for "no timestamp"
+            // (shouldn't happen in practice) — must not advance the
+            // watermark away from its initial value.
+            let (_dir, engine) = test_engine();
+            let wm = MaxAssignedWatermark::new(Timestamp::from_raw(50));
+            let sm = CoordinodeStateMachine::with_oracle_and_watermark(
+                engine,
+                None,
+                Some(Arc::clone(&wm)),
+            );
+
+            // commit_ts = 0 — should be ignored by the guard.
+            let proposal = RaftProposal {
+                id: coordinode_core::txn::proposal::ProposalId::from_raw(1),
+                mutations: vec![Mutation::Put {
+                    partition: coordinode_core::txn::proposal::PartitionId::Node,
+                    key: b"x".to_vec(),
+                    value: b"y".to_vec(),
+                }],
+                commit_ts: Timestamp::ZERO,
+                start_ts: Timestamp::ZERO,
+                bypass_rate_limiter: false,
+            };
+            sm.apply_proposal(&proposal).expect("apply");
+
+            // Watermark unchanged.
+            assert_eq!(wm.current().as_raw(), 50);
         }
     }
 }
