@@ -21,7 +21,7 @@ PROTO_DIR = ROOT / "proto" / "coordinode" / "v1"
 DOCS_API_DIR = ROOT / "docs" / "api"
 
 GITHUB_PROTO_BASE = (
-    "https://github.com/structured-world/coordinode/blob/main/proto/coordinode/v1"
+    "https://github.com/structured-world/coordinode-proto-ce/blob/main/coordinode/v1"
 )
 
 # Services to document with their display order and page slug
