@@ -10,11 +10,13 @@
 //! Segment merging happens asynchronously in tantivy's background thread.
 
 pub mod multi_lang;
+pub mod segment_registry;
 pub mod tokenize;
 
 use std::path::Path;
+use std::sync::RwLock;
 
-use tantivy::collector::TopDocs;
+use tantivy::collector::{FilterCollector, TopDocs};
 use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
 use tantivy::schema::{
     document::Value as TantivyValue, Field, IndexRecordOption, NumericOptions, OwnedValue, Schema,
@@ -25,6 +27,13 @@ use tantivy::tokenizer::{
     LowerCaser, PreTokenizedString, SimpleTokenizer, TextAnalyzer, Token, TokenFilter, Tokenizer,
 };
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
+
+use self::segment_registry::SegmentRegistry;
+
+/// Fast-field name storing each document's originating Raft proposal commit_ts.
+/// Used by `search_at` for MVCC snapshot filtering and by `SegmentRegistry`
+/// for per-segment min/max reconciliation.
+pub const COMMIT_TS_FIELD: &str = "commit_ts";
 
 #[cfg(any(feature = "cjk-zh", feature = "cjk-ja", feature = "cjk-ko"))]
 use crate::cjk;
@@ -145,6 +154,14 @@ pub struct TextIndex {
     node_id_field: Field,
     /// Schema field for the text body (indexed + stored).
     body_field: Field,
+    /// Fast field carrying each document's originating Raft proposal commit_ts.
+    /// Legacy `add_document` paths write 0, which is ≤ any valid snapshot T
+    /// so such documents remain visible to all snapshot readers.
+    commit_ts_field: Field,
+    /// Per-segment `(min_ts, max_ts)` cache, reconciled after every reader
+    /// reload. Used to partition segments on `search_at(T)` into fully-visible,
+    /// fully-hidden, and straddle buckets.
+    registry: RwLock<SegmentRegistry>,
 }
 
 impl TextIndex {
@@ -174,6 +191,11 @@ impl TextIndex {
             .set_indexing_options(text_indexing)
             .set_stored();
         let body_field = schema_builder.add_text_field("body", text_opts);
+        // MVCC snapshot support: commit_ts as u64 fast field per document.
+        // Default value 0 for legacy writers makes untagged docs visible to
+        // every snapshot reader (0 ≤ any T).
+        let commit_ts_opts = NumericOptions::default().set_fast().set_stored();
+        let commit_ts_field = schema_builder.add_u64_field(COMMIT_TS_FIELD, commit_ts_opts);
         let schema = schema_builder.build();
 
         let index = if dir.join("meta.json").exists() {
@@ -205,7 +227,38 @@ impl TextIndex {
             schema,
             node_id_field,
             body_field,
+            commit_ts_field,
+            registry: RwLock::new(SegmentRegistry::new()),
         })
+    }
+
+    /// Reconcile per-segment commit_ts ranges from the current searcher state.
+    /// Called after every write path that commits and reloads the reader.
+    fn reconcile_registry(&self) -> Result<(), TextSearchError> {
+        let searcher = self.reader.searcher();
+        let mut reg = self
+            .registry
+            .write()
+            .map_err(|e| TextSearchError::IndexCorrupted(format!("registry poisoned: {e}")))?;
+        reg.reconcile(&searcher, COMMIT_TS_FIELD)?;
+        Ok(())
+    }
+
+    /// Snapshot of the per-segment registry — for tests and observability.
+    #[doc(hidden)]
+    pub fn registry_snapshot(
+        &self,
+    ) -> Vec<(tantivy::index::SegmentId, segment_registry::SegmentTsRange)> {
+        let searcher = self.reader.searcher();
+        let reg = match self.registry.read() {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        searcher
+            .segment_readers()
+            .iter()
+            .filter_map(|sr| reg.get(&sr.segment_id()).map(|r| (sr.segment_id(), r)))
+            .collect()
     }
 
     /// Add (or replace) a document in the index.
@@ -215,18 +268,34 @@ impl TextIndex {
     /// semantics.
     ///
     /// Commits synchronously — the document is searchable after return.
+    ///
+    /// Equivalent to `add_document_at(node_id, text, 0)`. Commit_ts 0 means
+    /// the document is visible to every snapshot reader (0 ≤ any T).
     pub fn add_document(&mut self, node_id: u64, text: &str) -> Result<(), TextSearchError> {
-        // Delete existing document with this node_id (upsert)
+        self.add_document_at(node_id, text, 0)
+    }
+
+    /// MVCC-aware single-document add. `commit_ts` is the originating Raft
+    /// proposal's commit timestamp; stored as a fast field so that
+    /// `search_at(T)` can filter documents with `commit_ts > T`.
+    pub fn add_document_at(
+        &mut self,
+        node_id: u64,
+        text: &str,
+        commit_ts: u64,
+    ) -> Result<(), TextSearchError> {
         let node_id_term = tantivy::Term::from_field_u64(self.node_id_field, node_id);
         self.writer.delete_term(node_id_term);
 
         self.writer.add_document(doc!(
             self.node_id_field => node_id,
             self.body_field => text,
+            self.commit_ts_field => commit_ts,
         ))?;
 
         self.writer.commit()?;
         self.reader.reload()?;
+        self.reconcile_registry()?;
         Ok(())
     }
 
@@ -234,6 +303,16 @@ impl TextIndex {
     ///
     /// More efficient than individual add_document calls for bulk inserts.
     pub fn add_documents_batch(&mut self, docs: &[(u64, &str)]) -> Result<(), TextSearchError> {
+        self.add_documents_batch_at_uniform(docs, 0)
+    }
+
+    /// MVCC-aware batch add: all documents share a single `commit_ts`.
+    /// Matches the Raft proposal model — one proposal → one batch → one ts.
+    pub fn add_documents_batch_at_uniform(
+        &mut self,
+        docs: &[(u64, &str)],
+        commit_ts: u64,
+    ) -> Result<(), TextSearchError> {
         for &(node_id, text) in docs {
             let node_id_term = tantivy::Term::from_field_u64(self.node_id_field, node_id);
             self.writer.delete_term(node_id_term);
@@ -241,11 +320,13 @@ impl TextIndex {
             self.writer.add_document(doc!(
                 self.node_id_field => node_id,
                 self.body_field => text,
+                self.commit_ts_field => commit_ts,
             ))?;
         }
 
         self.writer.commit()?;
         self.reader.reload()?;
+        self.reconcile_registry()?;
         Ok(())
     }
 
@@ -257,6 +338,7 @@ impl TextIndex {
         self.writer.delete_term(node_id_term);
         self.writer.commit()?;
         self.reader.reload()?;
+        self.reconcile_registry()?;
         Ok(())
     }
 
@@ -571,6 +653,18 @@ impl TextIndex {
         text: &str,
         language: &str,
     ) -> Result<(), TextSearchError> {
+        self.add_document_with_language_at(node_id, text, language, 0)
+    }
+
+    /// MVCC-aware variant of `add_document_with_language`. See
+    /// [`add_document_at`] for `commit_ts` semantics.
+    pub fn add_document_with_language_at(
+        &mut self,
+        node_id: u64,
+        text: &str,
+        language: &str,
+        commit_ts: u64,
+    ) -> Result<(), TextSearchError> {
         let node_id_term = tantivy::Term::from_field_u64(self.node_id_field, node_id);
         self.writer.delete_term(node_id_term);
 
@@ -583,10 +677,12 @@ impl TextIndex {
         let mut doc = TantivyDocument::new();
         doc.add_field_value(self.node_id_field, &OwnedValue::U64(node_id));
         doc.add_field_value(self.body_field, &OwnedValue::PreTokStr(pretokenized));
+        doc.add_field_value(self.commit_ts_field, &OwnedValue::U64(commit_ts));
         self.writer.add_document(doc)?;
 
         self.writer.commit()?;
         self.reader.reload()?;
+        self.reconcile_registry()?;
         Ok(())
     }
 
@@ -597,6 +693,15 @@ impl TextIndex {
     pub fn add_documents_batch_with_language(
         &mut self,
         docs: &[(u64, &str, &str)],
+    ) -> Result<(), TextSearchError> {
+        self.add_documents_batch_with_language_at_uniform(docs, 0)
+    }
+
+    /// MVCC-aware multi-language batch: all documents share one `commit_ts`.
+    pub fn add_documents_batch_with_language_at_uniform(
+        &mut self,
+        docs: &[(u64, &str, &str)],
+        commit_ts: u64,
     ) -> Result<(), TextSearchError> {
         for &(node_id, text, language) in docs {
             let node_id_term = tantivy::Term::from_field_u64(self.node_id_field, node_id);
@@ -611,11 +716,13 @@ impl TextIndex {
             let mut doc = TantivyDocument::new();
             doc.add_field_value(self.node_id_field, &OwnedValue::U64(node_id));
             doc.add_field_value(self.body_field, &OwnedValue::PreTokStr(pretokenized));
+            doc.add_field_value(self.commit_ts_field, &OwnedValue::U64(commit_ts));
             self.writer.add_document(doc)?;
         }
 
         self.writer.commit()?;
         self.reader.reload()?;
+        self.reconcile_registry()?;
         Ok(())
     }
 
@@ -741,6 +848,53 @@ impl TextIndex {
                         score,
                         snippet_html: snippet.to_html(),
                     });
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// MVCC snapshot search: returns only documents whose originating Raft
+    /// proposal `commit_ts ≤ snapshot_ts`.
+    ///
+    /// Correctness: every document carries its `commit_ts` as a fast field
+    /// (set at write time by the MVCC-aware write path; legacy writers use 0
+    /// which is ≤ any valid T). A `FilterCollector` wrapping the standard
+    /// `TopDocs` collector applies the predicate during BM25 scoring.
+    ///
+    /// Merge safety: tantivy merges preserve per-doc fast-field values, so
+    /// a merged segment's documents retain their original `commit_ts` — no
+    /// manual merge-lineage tracking is required for correctness. The
+    /// per-segment `SegmentRegistry` tracks `(min_ts, max_ts)` as observability
+    /// and as the hook for a future whole-segment fast path (skip segments
+    /// with `min_ts > T` without opening their term dictionaries).
+    ///
+    /// Query syntax matches `search`.
+    pub fn search_at(
+        &self,
+        query_str: &str,
+        limit: usize,
+        snapshot_ts: u64,
+    ) -> Result<Vec<TextSearchResult>, TextSearchError> {
+        let searcher = self.reader.searcher();
+        let query = self.build_query(query_str, None)?;
+
+        let inner = TopDocs::with_limit(limit).order_by_score();
+        let filter = FilterCollector::new(
+            COMMIT_TS_FIELD.to_string(),
+            move |ts: u64| ts <= snapshot_ts,
+            inner,
+        );
+
+        let top_docs = searcher.search(&*query, &filter)?;
+
+        let mut results = Vec::with_capacity(top_docs.len());
+        for (score, doc_address) in top_docs {
+            let doc: TantivyDocument = searcher.doc(doc_address)?;
+            if let Some(node_id_val) = doc.get_first(self.node_id_field) {
+                if let Some(node_id) = node_id_val.as_u64() {
+                    results.push(TextSearchResult { node_id, score });
                 }
             }
         }
