@@ -64,6 +64,8 @@ pub fn make_ctx_legacy<'a>(
         feedback_cache: None,
         schema_label_cache: HashMap::new(),
         applied_watermark: None,
+        read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
+        read_timeout: std::time::Duration::from_millis(2000),
         params: HashMap::new(),
     }
 }
@@ -117,6 +119,8 @@ pub fn make_ctx_mvcc<'a>(
         feedback_cache: None,
         schema_label_cache: HashMap::new(),
         applied_watermark: None,
+        read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
+        read_timeout: std::time::Duration::from_millis(2000),
         params: HashMap::new(),
     }
 }
@@ -171,6 +175,8 @@ pub fn make_ctx_with_pipeline<'a>(
         feedback_cache: None,
         schema_label_cache: HashMap::new(),
         applied_watermark: None,
+        read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
+        read_timeout: std::time::Duration::from_millis(2000),
         params: HashMap::new(),
     }
 }

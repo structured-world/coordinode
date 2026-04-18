@@ -258,6 +258,15 @@ pub struct ExecutionContext<'a> {
     /// auto-promotion site.
     pub applied_watermark:
         Option<std::sync::Arc<coordinode_core::txn::watermark::MaxAssignedWatermark>>,
+    /// R-SNAP1: cross-modality read consistency mode for this statement.
+    /// Set by the planner from `LogicalPlan::read_consistency` (hint or
+    /// auto-promotion). Default `Current` preserves the single-modality
+    /// fast path.
+    pub read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode,
+    /// R-SNAP1: timeout for `applied_watermark.wait_for(snapshot_ts, …)`
+    /// under `Snapshot` / `Exact` consistency. Default 2s matches
+    /// `arch/core/transactions.md § Cross-Modality Snapshot Protocol`.
+    pub read_timeout: std::time::Duration,
     /// MVCC read timestamp (start_ts). Allocated from oracle at statement start.
     /// All reads see a consistent snapshot at this timestamp.
     pub mvcc_read_ts: Timestamp,
@@ -1238,6 +1247,48 @@ pub fn execute(
         };
         &plan_owned
     };
+
+    // R-SNAP1: propagate the plan's cross-modality consistency decision into
+    // the execution context so downstream operators (VectorFilter, etc.)
+    // observe it without a separate parameter. The planner has already
+    // applied auto-promotion and the narrower `vector_consistency` override.
+    ctx.read_consistency = plan.read_consistency;
+    ctx.vector_consistency = plan.vector_consistency;
+
+    // R-SNAP1: cross-modality snapshot wait. When `read_consistency` is
+    // `Snapshot` or `Exact`, every modality on this shard must observe the
+    // fully-applied state at a single HLC timestamp T. Block on the
+    // `MaxAssignedWatermark` until the applier has persisted every write
+    // with `commit_ts ≤ T`; timeout returns `ErrReadTimeout` so the client
+    // can retry or fall back to `Current`.
+    //
+    // Target ts: prefer the explicit `AS OF TIMESTAMP` value when present,
+    // otherwise `mvcc_read_ts` (statement start_ts). If the watermark is not
+    // wired into this context (legacy / single-writer test), skip the wait —
+    // the test is responsible for sequencing reads after writes itself.
+    if plan.read_consistency.requires_snapshot_wait() {
+        if let Some(ref wm) = ctx.applied_watermark.clone() {
+            let target_raw = ctx
+                .snapshot_ts
+                .map(|t| t.max(0) as u64)
+                .unwrap_or_else(|| ctx.mvcc_read_ts.as_raw());
+            if target_raw > 0 {
+                let target = coordinode_core::txn::timestamp::Timestamp::from_raw(target_raw);
+                let timeout = ctx.read_timeout;
+                // The executor is sync; use the blocking helper that builds
+                // a private current-thread runtime per call. `wait_for` is
+                // typically sub-millisecond, so this is cheap.
+                if let Err(err) = wm.wait_for_blocking(target, timeout) {
+                    return Err(ExecutionError::Unsupported(format!(
+                        "read_consistency='{}' timed out waiting for applier \
+                         to reach commit_ts={target_raw}: {err}. Retry or fall \
+                         back to read_consistency='current'.",
+                        plan.read_consistency
+                    )));
+                }
+            }
+        }
+    }
 
     let result = execute_op(&plan.root, ctx)?;
 
@@ -8796,6 +8847,9 @@ mod tests {
             feedback_cache: None,
             schema_label_cache: std::collections::HashMap::new(),
             applied_watermark: None,
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
+            read_timeout: std::time::Duration::from_millis(2000),
             params: std::collections::HashMap::new(),
         }
     }
@@ -8811,6 +8865,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Project {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -8838,6 +8894,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Project {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -8865,6 +8923,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Project {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -8902,6 +8962,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Project {
                 input: Box::new(LogicalOp::Traverse {
                     input: Box::new(LogicalOp::NodeScan {
@@ -8953,6 +9015,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Project {
                 input: Box::new(LogicalOp::Filter {
                     input: Box::new(LogicalOp::NodeScan {
@@ -8995,6 +9059,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Project {
                 input: Box::new(LogicalOp::Aggregate {
                     input: Box::new(LogicalOp::NodeScan {
@@ -9034,6 +9100,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Project {
                 input: Box::new(LogicalOp::Aggregate {
                     input: Box::new(LogicalOp::NodeScan {
@@ -9094,6 +9162,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Aggregate {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -9141,6 +9211,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Aggregate {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -9185,6 +9257,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Aggregate {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -9223,6 +9297,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Aggregate {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -9252,6 +9328,8 @@ mod tests {
         let plan2 = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Aggregate {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -9287,6 +9365,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Aggregate {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -9327,6 +9407,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Aggregate {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -9375,6 +9457,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Limit {
                 input: Box::new(LogicalOp::Sort {
                     input: Box::new(LogicalOp::Project {
@@ -9431,6 +9515,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Project {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -9462,6 +9548,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::CreateNode {
                 input: None,
                 variable: Some("n".into()),
@@ -9502,6 +9590,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Project {
                 input: Box::new(LogicalOp::CreateNode {
                     input: None,
@@ -9535,6 +9625,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Update {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -9582,6 +9674,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Delete {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -9612,6 +9706,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::RemoveOp {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -9655,6 +9751,8 @@ mod tests {
         let plan1 = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::CreateNode {
                 input: None,
                 variable: Some("a".into()),
@@ -9668,6 +9766,8 @@ mod tests {
         let plan2 = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::CreateNode {
                 input: None,
                 variable: Some("b".into()),
@@ -9695,6 +9795,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Merge {
                 pattern: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -9730,6 +9832,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Merge {
                 pattern: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -9774,6 +9878,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Merge {
                 pattern: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -9808,6 +9914,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Upsert {
                 pattern: Box::new(LogicalOp::NodeScan {
                     variable: "u".into(),
@@ -9850,6 +9958,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Upsert {
                 pattern: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -9908,6 +10018,8 @@ mod tests {
             let plan = LogicalPlan {
                 snapshot_ts: None,
                 vector_consistency: VectorConsistencyMode::default(),
+                read_consistency:
+                    coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
                 root: LogicalOp::Upsert {
                     pattern: Box::new(LogicalOp::NodeScan {
                         variable: "n".into(),
@@ -9950,6 +10062,8 @@ mod tests {
             let plan = LogicalPlan {
                 snapshot_ts: None,
                 vector_consistency: VectorConsistencyMode::default(),
+                read_consistency:
+                    coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
                 root: LogicalOp::Upsert {
                     pattern: Box::new(LogicalOp::NodeScan {
                         variable: "n".into(),
@@ -10026,6 +10140,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Project {
                 input: Box::new(LogicalOp::Traverse {
                     input: Box::new(LogicalOp::NodeScan {
@@ -10098,6 +10214,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Traverse {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "a".into(),
@@ -10135,6 +10253,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Traverse {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "a".into(),
@@ -10230,6 +10350,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Traverse {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "a".into(),
@@ -10311,6 +10433,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: Some(Expr::Literal(Value::Int(recent_ts))),
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Project {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -10347,6 +10471,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: Some(Expr::Literal(Value::Timestamp(old_ts))),
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Project {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -10376,6 +10502,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: Some(Expr::Literal(Value::String("2025-06-15T10:00:00Z".into()))),
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Project {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -10405,6 +10533,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Project {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -10466,6 +10596,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Traverse {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "a".into(),
@@ -10513,6 +10645,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Traverse {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "a".into(),
@@ -10595,6 +10729,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Traverse {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "a".into(),
@@ -10637,6 +10773,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Traverse {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "a".into(),
@@ -10677,6 +10815,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Unwind {
                 input: Box::new(LogicalOp::Empty),
                 expr: Expr::List(vec![
@@ -10704,6 +10844,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Unwind {
                 input: Box::new(LogicalOp::Empty),
                 expr: Expr::Literal(Value::Null),
@@ -10724,6 +10866,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Unwind {
                 input: Box::new(LogicalOp::Empty),
                 expr: Expr::Literal(Value::Int(42)),
@@ -10748,6 +10892,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::LeftOuterJoin {
                 left: Box::new(LogicalOp::NodeScan {
                     variable: "a".into(),
@@ -10782,6 +10928,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::LeftOuterJoin {
                 left: Box::new(LogicalOp::NodeScan {
                     variable: "a".into(),
@@ -10942,6 +11090,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Aggregate {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -11003,6 +11153,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Aggregate {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -11042,6 +11194,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Aggregate {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -11106,6 +11260,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Aggregate {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -11141,6 +11297,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Aggregate {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -11193,6 +11351,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Project {
                 input: Box::new(LogicalOp::Project {
                     input: Box::new(LogicalOp::Aggregate {
@@ -11277,6 +11437,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Delete {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -11392,6 +11554,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Delete {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -11535,6 +11699,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Delete {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "n".into(),
@@ -11760,6 +11926,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Traverse {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "a".into(),
@@ -11867,6 +12035,8 @@ mod tests {
         let plan = LogicalPlan {
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
             root: LogicalOp::Traverse {
                 input: Box::new(LogicalOp::NodeScan {
                     variable: "a".into(),
@@ -12178,6 +12348,8 @@ mod tests {
             root: filter_plan.clone(),
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
         };
         let baseline_explain = baseline.explain();
         assert!(
@@ -12191,6 +12363,8 @@ mod tests {
             root: optimized_root,
             snapshot_ts: None,
             vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
         };
 
         let explain = optimized_plan.explain();

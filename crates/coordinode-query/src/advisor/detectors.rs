@@ -594,6 +594,8 @@ mod tests {
             root,
             snapshot_ts: None,
             vector_consistency: coordinode_core::graph::types::VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
         }
     }
 

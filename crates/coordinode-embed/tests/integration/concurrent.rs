@@ -24,6 +24,7 @@ fn upsert_plan(name: &str, age: i64) -> LogicalPlan {
     LogicalPlan {
         snapshot_ts: None,
         vector_consistency: coordinode_core::graph::types::VectorConsistencyMode::default(),
+        read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
         root: LogicalOp::Upsert {
             pattern: Box::new(LogicalOp::NodeScan {
                 variable: "n".into(),
@@ -48,6 +49,7 @@ fn create_user_plan(name: &str, age: i64) -> LogicalPlan {
     LogicalPlan {
         snapshot_ts: None,
         vector_consistency: coordinode_core::graph::types::VectorConsistencyMode::default(),
+        read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
         root: LogicalOp::CreateNode {
             input: None,
             variable: Some("n".into()),
@@ -73,6 +75,7 @@ fn read_user_age(
     let plan = LogicalPlan {
         snapshot_ts: None,
         vector_consistency: coordinode_core::graph::types::VectorConsistencyMode::default(),
+        read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
         root: LogicalOp::Project {
             input: Box::new(LogicalOp::NodeScan {
                 variable: "n".into(),

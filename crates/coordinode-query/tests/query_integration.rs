@@ -69,6 +69,8 @@ fn make_test_ctx<'a>(
         feedback_cache: None,
         schema_label_cache: std::collections::HashMap::new(),
         applied_watermark: None,
+        read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
+        read_timeout: std::time::Duration::from_millis(2000),
         params: std::collections::HashMap::new(),
     }
 }
@@ -10256,5 +10258,284 @@ fn doc_score_query_as_parameter() {
     assert!(
         score > 0.9,
         "doc_score with parameter query must produce a high score on aligned chunks, got {score}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// R-SNAP1: read_consistency knob + planner auto-promotion
+// ═══════════════════════════════════════════════════════════════════════
+
+use coordinode_core::txn::read_consistency::ReadConsistencyMode;
+use coordinode_core::txn::watermark::MaxAssignedWatermark;
+
+/// R-SNAP1 regression #1: cross-modality query with NO hint is auto-promoted
+/// to `snapshot` by the planner. Here the query touches graph + vector +
+/// text — three modalities, so promotion must fire.
+#[test]
+fn read_consistency_auto_promote_cross_modality_to_snapshot() {
+    let ast = parse(
+        "MATCH (c:Chunk) \
+         WHERE text_match(c.body, \"rust\") \
+           AND vector_distance(c.embedding, [1.0, 0.0]) < 0.5 \
+         RETURN c",
+    )
+    .unwrap();
+    let plan = build_logical_plan(&ast).expect("plan");
+    assert_eq!(
+        plan.read_consistency,
+        ReadConsistencyMode::Snapshot,
+        "planner must auto-promote cross-modality read to snapshot"
+    );
+    // Narrower `vector_consistency` follows the promoted mode (no explicit hint).
+    assert_eq!(
+        plan.vector_consistency,
+        coordinode_core::graph::types::VectorConsistencyMode::Snapshot,
+        "vector_consistency follows read_consistency when no explicit hint"
+    );
+}
+
+/// R-SNAP1 regression #2: single-modality query stays on `current` — no
+/// auto-promotion. A pure vector KNN touches graph + vector (graph is
+/// always implicit via NodeScan), but that's a fundamental building-block
+/// pair, not a cross-modality query. We count vector as triggering the
+/// cross-modality rule only when paired with text / doc.
+///
+/// Test the canonical single-modality cases that should NOT promote:
+/// - pure graph traversal (no vector, no text)
+/// - pure graph + where on a scalar property
+#[test]
+fn read_consistency_single_modality_stays_current() {
+    // Pure graph — one modality only.
+    let ast = parse("MATCH (n:Person) WHERE n.age > 18 RETURN n").unwrap();
+    let plan = build_logical_plan(&ast).expect("plan");
+    assert_eq!(
+        plan.read_consistency,
+        ReadConsistencyMode::Current,
+        "pure graph query must stay on current, got {}",
+        plan.read_consistency
+    );
+    assert_eq!(
+        plan.vector_consistency,
+        coordinode_core::graph::types::VectorConsistencyMode::Current,
+        "vector_consistency follows when read_consistency = current"
+    );
+}
+
+/// R-SNAP1 regression #3: explicit `vector_consistency('exact')` overrides
+/// the promotion for the vector modality ONLY. `read_consistency` stays at
+/// `snapshot` (auto-promoted because the query crosses modalities), so FTS
+/// and graph reads still align at a single HLC T; the vector path goes
+/// through the brute-force exact scan instead.
+#[test]
+fn read_consistency_vector_consistency_narrower_override() {
+    let ast = parse(
+        "MATCH (c:Chunk) \
+         WHERE text_match(c.body, \"rust\") \
+           AND vector_distance(c.embedding, [1.0, 0.0]) < 0.5 \
+         RETURN c /*+ vector_consistency('exact') */",
+    )
+    .unwrap();
+    let plan = build_logical_plan(&ast).expect("plan");
+    assert_eq!(
+        plan.read_consistency,
+        ReadConsistencyMode::Snapshot,
+        "cross-modality auto-promotion still fires for the non-vector modalities"
+    );
+    assert_eq!(
+        plan.vector_consistency,
+        coordinode_core::graph::types::VectorConsistencyMode::Exact,
+        "explicit vector_consistency hint wins for the vector modality"
+    );
+}
+
+/// R-SNAP1: an explicit `read_consistency('snapshot')` hint promotes even a
+/// single-modality query. User knows something the planner doesn't.
+#[test]
+fn read_consistency_explicit_hint_overrides_single_modality_default() {
+    let ast = parse(
+        "MATCH (n:Person) WHERE n.age > 18 \
+         RETURN n /*+ read_consistency('snapshot') */",
+    )
+    .unwrap();
+    let plan = build_logical_plan(&ast).expect("plan");
+    assert_eq!(
+        plan.read_consistency,
+        ReadConsistencyMode::Snapshot,
+        "explicit hint must beat the single-modality default"
+    );
+}
+
+/// R-SNAP1: an explicit `read_consistency('current')` hint overrides
+/// auto-promotion (rare but valid — caller accepts potential
+/// cross-modality skew for latency).
+#[test]
+fn read_consistency_explicit_current_hint_defeats_auto_promotion() {
+    let ast = parse(
+        "MATCH (c:Chunk) \
+         WHERE text_match(c.body, \"rust\") \
+           AND vector_distance(c.embedding, [1.0, 0.0]) < 0.5 \
+         RETURN c /*+ read_consistency('current') */",
+    )
+    .unwrap();
+    let plan = build_logical_plan(&ast).expect("plan");
+    assert_eq!(
+        plan.read_consistency,
+        ReadConsistencyMode::Current,
+        "explicit read_consistency('current') must override auto-promotion"
+    );
+}
+
+/// R-SNAP1: `read_consistency = 'current'` skips the watermark wait entirely —
+/// even when `applied_watermark` is wired, `Current` mode does not invoke
+/// `wait_for`. Verify by wiring a watermark that is permanently behind the
+/// `mvcc_read_ts`; in `Current` mode the query succeeds immediately.
+#[test]
+fn read_consistency_current_does_not_block_on_watermark() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    insert_node(&engine, 1, 1, "Person", &[], &mut interner);
+
+    // Watermark stuck at 0; mvcc_read_ts = 1000. In `Snapshot` mode this
+    // would time out; in `Current` it doesn't consult the watermark at all.
+    let wm = MaxAssignedWatermark::new(coordinode_core::txn::timestamp::Timestamp::ZERO);
+
+    let ast = parse("MATCH (p:Person) RETURN p").unwrap();
+    let plan = build_logical_plan(&ast).unwrap();
+    assert_eq!(plan.read_consistency, ReadConsistencyMode::Current);
+
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    ctx.mvcc_read_ts = coordinode_core::txn::timestamp::Timestamp::from_raw(1000);
+    ctx.applied_watermark = Some(std::sync::Arc::clone(&wm));
+    ctx.read_timeout = std::time::Duration::from_millis(50);
+
+    let before = std::time::Instant::now();
+    let rows = execute(&plan, &mut ctx).expect("current mode must not block");
+    let elapsed = before.elapsed();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        elapsed < std::time::Duration::from_millis(40),
+        "Current mode must not hit wait_for (stale watermark ignored), elapsed={elapsed:?}"
+    );
+}
+
+/// R-SNAP1: `read_consistency = 'snapshot'` with an explicit hint on a
+/// single-modality query blocks on the watermark and returns an error
+/// when the applier never catches up. Direct test of the timeout path.
+#[test]
+fn read_consistency_snapshot_times_out_on_stale_watermark() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    insert_node(&engine, 1, 1, "Person", &[], &mut interner);
+
+    // Watermark stuck at 0; mvcc_read_ts = 1000; timeout = 50ms → must error.
+    let wm = MaxAssignedWatermark::new(coordinode_core::txn::timestamp::Timestamp::ZERO);
+
+    let ast = parse("MATCH (p:Person) RETURN p /*+ read_consistency('snapshot') */").unwrap();
+    let plan = build_logical_plan(&ast).unwrap();
+    assert_eq!(plan.read_consistency, ReadConsistencyMode::Snapshot);
+
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    ctx.mvcc_read_ts = coordinode_core::txn::timestamp::Timestamp::from_raw(1000);
+    ctx.applied_watermark = Some(std::sync::Arc::clone(&wm));
+    ctx.read_timeout = std::time::Duration::from_millis(50);
+
+    let err = execute(&plan, &mut ctx)
+        .expect_err("snapshot mode must error when watermark never catches up");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read_consistency='snapshot'")
+            && msg.contains("timed out")
+            && msg.contains("commit_ts=1000"),
+        "error must name read_consistency, timeout, and target commit_ts; got: {msg}"
+    );
+}
+
+/// R-SNAP1: `read_consistency = 'snapshot'` unblocks when the applier
+/// catches up before the timeout. Full integration: reader blocks, we
+/// advance the watermark from a spawned thread, reader unblocks and
+/// returns rows.
+#[test]
+fn read_consistency_snapshot_unblocks_on_watermark_advance() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    insert_node(&engine, 1, 1, "Person", &[], &mut interner);
+
+    let wm = MaxAssignedWatermark::new(coordinode_core::txn::timestamp::Timestamp::ZERO);
+    let wm_advancer = std::sync::Arc::clone(&wm);
+    let advancer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        wm_advancer.advance(coordinode_core::txn::timestamp::Timestamp::from_raw(500));
+    });
+
+    let ast = parse("MATCH (p:Person) RETURN p /*+ read_consistency('snapshot') */").unwrap();
+    let plan = build_logical_plan(&ast).unwrap();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    ctx.mvcc_read_ts = coordinode_core::txn::timestamp::Timestamp::from_raw(500);
+    ctx.applied_watermark = Some(std::sync::Arc::clone(&wm));
+    ctx.read_timeout = std::time::Duration::from_millis(500);
+
+    let before = std::time::Instant::now();
+    let rows = execute(&plan, &mut ctx).expect("must unblock on advance");
+    let elapsed = before.elapsed();
+    advancer.join().unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert!(
+        elapsed >= std::time::Duration::from_millis(25),
+        "must actually wait for advance (~30ms), elapsed={elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(200),
+        "must unblock promptly after advance, elapsed={elapsed:?}"
+    );
+}
+
+/// R-SNAP1: `read_consistency = 'snapshot'` with NO watermark wired (legacy
+/// context) executes without blocking — mode applies only when a watermark
+/// is available.
+#[test]
+fn read_consistency_snapshot_without_watermark_is_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    insert_node(&engine, 1, 1, "Person", &[], &mut interner);
+
+    let ast = parse("MATCH (p:Person) RETURN p /*+ read_consistency('snapshot') */").unwrap();
+    let plan = build_logical_plan(&ast).unwrap();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    // No applied_watermark. Would be an error if watermark were required.
+    assert!(ctx.applied_watermark.is_none());
+    ctx.mvcc_read_ts = coordinode_core::txn::timestamp::Timestamp::from_raw(1000);
+
+    let rows = execute(&plan, &mut ctx).expect("legacy context must succeed");
+    assert_eq!(rows.len(), 1);
+}
+
+/// R-SNAP1: EXPLAIN output shows the effective `vector_consistency` when
+/// VectorFilter operators are present. The `read_consistency` → plan
+/// propagation drives this display.
+#[test]
+fn read_consistency_drives_explain_vector_consistency_label() {
+    let ast = parse(
+        "MATCH (c:Chunk) \
+         WHERE text_match(c.body, \"rust\") \
+           AND vector_distance(c.embedding, [1.0, 0.0]) < 0.5 \
+         RETURN c",
+    )
+    .unwrap();
+    let plan = build_logical_plan(&ast).unwrap();
+    let explain = plan.explain();
+    // Auto-promoted to snapshot → vector_consistency also snapshot →
+    // EXPLAIN should reflect that.
+    assert!(
+        explain.contains("Vector consistency: snapshot"),
+        "EXPLAIN must show effective vector_consistency; got:\n{explain}"
     );
 }

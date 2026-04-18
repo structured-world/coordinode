@@ -4,6 +4,7 @@
 pub mod drain;
 pub mod proposal;
 pub mod read_concern;
+pub mod read_consistency;
 pub mod snapshot;
 pub mod timestamp;
 pub mod transaction;

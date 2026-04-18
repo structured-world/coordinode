@@ -95,6 +95,12 @@ fn parse_single_hint(body: &str) -> Option<QueryHint> {
                 coordinode_core::graph::types::VectorConsistencyMode::from_str_opt(unquoted)?;
             Some(QueryHint::VectorConsistency(mode))
         }
+        "read_consistency" => {
+            let mode = coordinode_core::txn::read_consistency::ReadConsistencyMode::from_str_opt(
+                unquoted,
+            )?;
+            Some(QueryHint::ReadConsistency(mode))
+        }
         _ => None, // Unknown hint — silently ignored
     }
 }

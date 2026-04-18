@@ -58,7 +58,17 @@ impl Query {
 pub enum QueryHint {
     /// Override vector consistency mode for this query only.
     /// Syntax: `/*+ vector_consistency('snapshot') */`
+    ///
+    /// Narrower than `ReadConsistency` — applies to the vector modality
+    /// only. When both `ReadConsistency` and `VectorConsistency` are set,
+    /// `VectorConsistency` wins for vector operators; other modalities
+    /// follow `ReadConsistency`.
     VectorConsistency(coordinode_core::graph::types::VectorConsistencyMode),
+
+    /// Override read consistency mode (cross-modality snapshot alignment)
+    /// for this query only. Syntax: `/*+ read_consistency('snapshot') */`.
+    /// An explicit hint always beats the planner's auto-promotion rule.
+    ReadConsistency(coordinode_core::txn::read_consistency::ReadConsistencyMode),
 }
 
 /// A single clause in a Cypher query.

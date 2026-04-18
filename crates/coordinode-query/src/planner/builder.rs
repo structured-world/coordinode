@@ -6,7 +6,7 @@
 
 use super::logical::*;
 use crate::cypher::ast::*;
-use coordinode_core::graph::types::Value;
+use coordinode_core::graph::types::{Value, VectorConsistencyMode};
 
 /// Error during logical plan construction.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -114,22 +114,169 @@ pub fn build_logical_plan(query: &Query) -> Result<LogicalPlan, PlanError> {
     // items and lift it into a `LogicalOp::DocScore` below the innermost Project.
     let root = rewrite_doc_score(root)?;
 
-    // Extract vector_consistency from per-query hints (overrides session default).
-    let vector_consistency = query
-        .hints
-        .iter()
-        .map(|h| {
-            let crate::cypher::ast::QueryHint::VectorConsistency(mode) = h;
-            *mode
-        })
-        .next()
-        .unwrap_or_default();
+    // Extract per-query hints. Both hints are optional; an explicit hint
+    // always overrides the planner default or auto-promotion.
+    let mut vector_consistency_hint: Option<VectorConsistencyMode> = None;
+    let mut read_consistency_hint: Option<
+        coordinode_core::txn::read_consistency::ReadConsistencyMode,
+    > = None;
+    for hint in &query.hints {
+        match hint {
+            crate::cypher::ast::QueryHint::VectorConsistency(mode) => {
+                vector_consistency_hint = Some(*mode);
+            }
+            crate::cypher::ast::QueryHint::ReadConsistency(mode) => {
+                read_consistency_hint = Some(*mode);
+            }
+        }
+    }
+
+    // R-SNAP1: auto-promote `read_consistency` to `snapshot` when the query
+    // touches >1 modality. An explicit hint always wins — even a hint that
+    // sets `current` on a cross-modality query is honoured (user knows
+    // something the planner doesn't).
+    let read_consistency = read_consistency_hint.unwrap_or_else(|| {
+        if modality_count(&root) > 1 {
+            coordinode_core::txn::read_consistency::ReadConsistencyMode::Snapshot
+        } else {
+            coordinode_core::txn::read_consistency::ReadConsistencyMode::Current
+        }
+    });
+
+    // R-SNAP1 vector-consistency narrower override: if the user explicitly
+    // set `vector_consistency`, it wins for the vector modality. Otherwise
+    // `vector_consistency` follows `read_consistency` (Current → Current,
+    // Snapshot → Snapshot, Exact → Exact) — the three variants map 1:1.
+    let vector_consistency = vector_consistency_hint.unwrap_or_else(|| {
+        use coordinode_core::txn::read_consistency::ReadConsistencyMode as RC;
+        match read_consistency {
+            RC::Current => VectorConsistencyMode::Current,
+            RC::Snapshot => VectorConsistencyMode::Snapshot,
+            RC::Exact => VectorConsistencyMode::Exact,
+        }
+    });
 
     Ok(LogicalPlan {
         root,
         snapshot_ts,
         vector_consistency,
+        read_consistency,
     })
+}
+
+/// R-SNAP1: count the number of distinct modalities a logical plan touches.
+///
+/// The auto-promotion rule (arch/core/transactions.md § Read Consistency)
+/// says:
+/// > IF query touches >1 modality (graph + vector, vector + text, etc.):
+/// >     read_consistency = 'snapshot'
+/// > ELSE IF query is single-modality:
+/// >     read_consistency = 'current'
+///
+/// Modalities recognised here:
+/// - **graph** — every read touches the graph (NodeScan / Traverse /
+///   IndexScan). A pure graph-only query still counts as one modality.
+/// - **vector** — `VectorFilter`, `VectorTopK`, `EdgeVectorSearch`, or a
+///   `RankFuse` that carries a vector method.
+/// - **text** — `TextFilter`, `EncryptedFilter`, or a `RankFuse` with a
+///   text method.
+/// - **doc** — `DocScore` (correlated HAS_CHUNK aggregate). Still counts
+///   as its own modality for the cross-modality promotion rule, since it
+///   mixes graph traversal + vector scoring with a distinct cache column.
+fn modality_count(root: &LogicalOp) -> usize {
+    #[derive(Default)]
+    struct Mods {
+        graph: bool,
+        vector: bool,
+        text: bool,
+        doc: bool,
+    }
+    fn walk(op: &LogicalOp, m: &mut Mods) {
+        match op {
+            LogicalOp::NodeScan { .. }
+            | LogicalOp::IndexScan { .. }
+            | LogicalOp::Traverse { .. }
+            | LogicalOp::ShortestPath { .. } => {
+                m.graph = true;
+            }
+            LogicalOp::VectorFilter { .. }
+            | LogicalOp::VectorTopK { .. }
+            | LogicalOp::EdgeVectorSearch { .. } => {
+                m.vector = true;
+                m.graph = true; // vector always rides on top of a graph scan
+            }
+            LogicalOp::TextFilter { .. } => {
+                m.text = true;
+                m.graph = true;
+            }
+            LogicalOp::EncryptedFilter { .. } => {
+                m.text = true; // encrypted search is the same modality as FTS for consistency purposes
+                m.graph = true;
+            }
+            LogicalOp::RankFuse {
+                query_vector,
+                query_text,
+                ..
+            } => {
+                if query_vector.is_some() {
+                    m.vector = true;
+                }
+                if query_text.is_some() {
+                    m.text = true;
+                }
+                m.graph = true;
+            }
+            LogicalOp::DocScore { .. } => {
+                m.doc = true;
+                m.vector = true; // doc_score scores chunk embeddings against a query vector
+                m.graph = true; // traverses HAS_CHUNK
+            }
+            _ => {}
+        }
+        for child in op_children(op) {
+            walk(child, m);
+        }
+    }
+    let mut m = Mods::default();
+    walk(root, &mut m);
+    [m.graph, m.vector, m.text, m.doc]
+        .iter()
+        .filter(|b| **b)
+        .count()
+}
+
+/// Direct children of a logical operator for modality-walk recursion.
+fn op_children(op: &LogicalOp) -> Vec<&LogicalOp> {
+    match op {
+        LogicalOp::Filter { input, .. }
+        | LogicalOp::Project { input, .. }
+        | LogicalOp::Aggregate { input, .. }
+        | LogicalOp::Sort { input, .. }
+        | LogicalOp::Limit { input, .. }
+        | LogicalOp::Skip { input, .. }
+        | LogicalOp::Traverse { input, .. }
+        | LogicalOp::Unwind { input, .. }
+        | LogicalOp::VectorFilter { input, .. }
+        | LogicalOp::VectorTopK { input, .. }
+        | LogicalOp::EdgeVectorSearch { input, .. }
+        | LogicalOp::TextFilter { input, .. }
+        | LogicalOp::EncryptedFilter { input, .. }
+        | LogicalOp::ShortestPath { input, .. }
+        | LogicalOp::RankFuse { input, .. }
+        | LogicalOp::DocScore { input, .. }
+        | LogicalOp::Update { input, .. }
+        | LogicalOp::RemoveOp { input, .. }
+        | LogicalOp::Delete { input, .. }
+        | LogicalOp::DetachDocument { input, .. }
+        | LogicalOp::AttachDocument { input, .. }
+        | LogicalOp::CreateEdge { input, .. } => vec![input],
+        LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
+            vec![left, right]
+        }
+        LogicalOp::CreateNode { input, .. } => input.as_deref().into_iter().collect(),
+        LogicalOp::Merge { pattern, .. } | LogicalOp::Upsert { pattern, .. } => vec![pattern],
+        _ => Vec::new(),
+    }
 }
 
 /// Apply a single clause to the current plan, producing a new operator.

@@ -19,6 +19,13 @@ pub struct LogicalPlan {
     /// Set from session state or per-query hint. Shown in EXPLAIN output
     /// when the plan contains VectorFilter operators.
     pub vector_consistency: VectorConsistencyMode,
+    /// R-SNAP1: cross-modality read-consistency mode for this plan.
+    ///
+    /// Set from an explicit `/*+ read_consistency('mode') */` hint or
+    /// auto-promoted by the planner when the query touches >1 modality.
+    /// Drives `applied_watermark.wait_for(snapshot_ts, timeout)` at the
+    /// executor boundary when it is `Snapshot` or `Exact`.
+    pub read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode,
 }
 
 impl LogicalPlan {
