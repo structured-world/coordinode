@@ -17,10 +17,15 @@ bytes = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 streamvbyte64 = "0.2"
+# Async primitives for MaxAssignedWatermark (tokio::sync::watch + timeout).
+# Minimal feature set — no runtime dependency dragged in; downstream crates
+# that drive the watermark (raft, query) provide their own runtime.
+tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "time", "sync"] }
 
 [[bench]]
 name = "document_projection"
