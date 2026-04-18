@@ -7,4 +7,5 @@ pub mod read_concern;
 pub mod snapshot;
 pub mod timestamp;
 pub mod transaction;
+pub mod watermark;
 pub mod write_concern;
