@@ -493,8 +493,12 @@ fn snapshot_mode_emits_stats_warning() {
     // Query with snapshot mode
     {
         let read_ts = oracle.next();
+        // Pure vector KNN is single-modality (post-R-SNAP6) — no auto-promotion.
+        // Explicit `read_consistency('snapshot')` hint forces snapshot mode so
+        // the HNSW post-filter path emits MVCC stats this test asserts.
         let ast = cypher::parse(
-            "MATCH (m:Movie) WHERE vector_distance(m.embedding, [0.9, 0.1, 0.0]) < 2.0 RETURN m.title",
+            "MATCH (m:Movie) WHERE vector_distance(m.embedding, [0.9, 0.1, 0.0]) < 2.0 \
+             RETURN m.title /*+ read_consistency('snapshot') */",
         )
         .expect("parse");
         let plan = planner::build_logical_plan(&ast).expect("plan");
@@ -509,7 +513,6 @@ fn snapshot_mode_emits_stats_warning() {
             &allocator,
         );
         ctx.shard_id = 1;
-        ctx.vector_consistency = VectorConsistencyMode::Snapshot;
         let results = execute(&plan, &mut ctx).expect("execute");
         assert!(!results.is_empty(), "should find the movie");
 

@@ -184,34 +184,47 @@ pub fn build_logical_plan(query: &Query) -> Result<LogicalPlan, PlanError> {
 ///   as its own modality for the cross-modality promotion rule, since it
 ///   mixes graph traversal + vector scoring with a distinct cache column.
 fn modality_count(root: &LogicalOp) -> usize {
+    // Per `arch/core/transactions.md § Read Consistency`: the auto-promotion
+    // rule fires when a query touches MORE THAN ONE modality from the set
+    // {graph, vector, text, doc}. Arch doc explicitly names "pure vector KNN"
+    // and "pure graph traversal" as single-modality examples.
+    //
+    // The subtlety: every query begins with a NodeScan / IndexScan — that's
+    // the row source, not a distinct "graph modality". A VectorTopK riding on
+    // a NodeScan is a single-modality vector query, NOT graph + vector.
+    //
+    // Graph counts as a distinct modality only when the query actually does
+    // graph work — Traverse (multi-hop pattern matching) or ShortestPath. A
+    // bare NodeScan/IndexScan is treated as a carrier for whatever modality
+    // sits on top; if nothing else is present, the query is graph-only with
+    // count = 1.
+    //
+    // RankFuse/DocScore operate on vector+text / chunk+vector respectively;
+    // they do NOT mark graph because the underlying scan is again just the
+    // carrier.
     #[derive(Default)]
     struct Mods {
-        graph: bool,
+        graph_carrier: bool,  // NodeScan / IndexScan present — not a modality by itself
+        graph_explicit: bool, // Traverse / ShortestPath — genuine graph work
         vector: bool,
         text: bool,
         doc: bool,
     }
     fn walk(op: &LogicalOp, m: &mut Mods) {
         match op {
-            LogicalOp::NodeScan { .. }
-            | LogicalOp::IndexScan { .. }
-            | LogicalOp::Traverse { .. }
-            | LogicalOp::ShortestPath { .. } => {
-                m.graph = true;
+            LogicalOp::NodeScan { .. } | LogicalOp::IndexScan { .. } => {
+                m.graph_carrier = true;
+            }
+            LogicalOp::Traverse { .. } | LogicalOp::ShortestPath { .. } => {
+                m.graph_explicit = true;
             }
             LogicalOp::VectorFilter { .. }
             | LogicalOp::VectorTopK { .. }
             | LogicalOp::EdgeVectorSearch { .. } => {
                 m.vector = true;
-                m.graph = true; // vector always rides on top of a graph scan
             }
-            LogicalOp::TextFilter { .. } => {
+            LogicalOp::TextFilter { .. } | LogicalOp::EncryptedFilter { .. } => {
                 m.text = true;
-                m.graph = true;
-            }
-            LogicalOp::EncryptedFilter { .. } => {
-                m.text = true; // encrypted search is the same modality as FTS for consistency purposes
-                m.graph = true;
             }
             LogicalOp::RankFuse {
                 query_vector,
@@ -224,12 +237,9 @@ fn modality_count(root: &LogicalOp) -> usize {
                 if query_text.is_some() {
                     m.text = true;
                 }
-                m.graph = true;
             }
             LogicalOp::DocScore { .. } => {
                 m.doc = true;
-                m.vector = true; // doc_score scores chunk embeddings against a query vector
-                m.graph = true; // traverses HAS_CHUNK
             }
             _ => {}
         }
@@ -239,10 +249,18 @@ fn modality_count(root: &LogicalOp) -> usize {
     }
     let mut m = Mods::default();
     walk(root, &mut m);
-    [m.graph, m.vector, m.text, m.doc]
+
+    let explicit = [m.graph_explicit, m.vector, m.text, m.doc]
         .iter()
         .filter(|b| **b)
-        .count()
+        .count();
+
+    if explicit == 0 && m.graph_carrier {
+        // Pure NodeScan/IndexScan query — single graph modality.
+        1
+    } else {
+        explicit
+    }
 }
 
 /// Direct children of a logical operator for modality-walk recursion.

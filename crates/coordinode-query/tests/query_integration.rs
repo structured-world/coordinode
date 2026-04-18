@@ -10295,14 +10295,14 @@ fn read_consistency_auto_promote_cross_modality_to_snapshot() {
 }
 
 /// R-SNAP1 regression #2: single-modality query stays on `current` — no
-/// auto-promotion. A pure vector KNN touches graph + vector (graph is
-/// always implicit via NodeScan), but that's a fundamental building-block
-/// pair, not a cross-modality query. We count vector as triggering the
-/// cross-modality rule only when paired with text / doc.
+/// auto-promotion.
 ///
-/// Test the canonical single-modality cases that should NOT promote:
-/// - pure graph traversal (no vector, no text)
-/// - pure graph + where on a scalar property
+/// Modality counting (see `planner::builder::modality_count` and
+/// `arch/core/transactions.md § Read Consistency`): a bare `NodeScan` or
+/// `IndexScan` is a carrier, not a distinct modality. Genuine graph work
+/// requires `Traverse` or `ShortestPath`. Pure vector KNN, pure text
+/// search, and pure graph traversal are each single-modality and stay on
+/// `current`. See `tests/snapshot_api_contract.rs` for the full enumeration.
 #[test]
 fn read_consistency_single_modality_stays_current() {
     // Pure graph — one modality only.

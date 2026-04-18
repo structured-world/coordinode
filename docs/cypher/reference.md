@@ -503,6 +503,19 @@ Governs whether graph, vector, full-text, document, and time-series reads inside
 | `snapshot` | All modalities align at a single HLC `T` via `MaxAssignedWatermark::wait_for(T, read_timeout)`. HNSW post-filtered, tantivy segment-filtered by `commit_ts ≤ T`. **Auto-selected** when a query touches >1 modality. |
 | `exact` | As `snapshot`, plus HNSW is bypassed (brute-force scan with MVCC filter). 100% recall, 10–100× slower vector path; use for audit / correctness-critical reads. |
 
+**What counts as a "modality" for the auto-promotion rule:**
+
+| Query shape | Modalities | Promoted? |
+|-------------|-----------|-----------|
+| `MATCH (n:T) WHERE n.prop = ... RETURN n` | graph | No — count = 1 |
+| `MATCH (n:T) RETURN n ORDER BY vector_distance(n.emb, $q) LIMIT k` | vector | No — count = 1 (pure vector KNN, `NodeScan` is the row source, not a distinct modality) |
+| `MATCH (n:T) WHERE text_match(n.body, 'q') RETURN n` | text | No — count = 1 |
+| `MATCH (a)-[:R]->(b) WHERE vector_distance(b.emb, $q) < 0.3 RETURN a, b` | graph + vector | Yes — multi-hop traversal is genuine graph work |
+| `... WHERE text_match(...) AND vector_distance(...) < ... ...` | text + vector | Yes |
+| `... RETURN rrf_score([n.emb, n.body], {vector: $qv, text: $qt}) ...` | vector + text (via `RankFuse`) | Yes |
+
+A bare `NodeScan`/`IndexScan` is treated as a carrier, not a distinct modality — so pure vector KNN and pure text search stay on the fast `current` default. Multi-hop graph patterns (`Traverse`, `ShortestPath`) count as genuine graph modality. Use an explicit `/*+ read_consistency('snapshot') */` hint to opt in to snapshot semantics on a single-modality query.
+
 ```cypher
 -- Cross-modality auto-promotion: this query touches graph + text + vector,
 -- so the planner picks read_consistency='snapshot' automatically.
