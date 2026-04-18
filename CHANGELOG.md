@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.4.1 — 2026-04-18
+
+### coordinode-core
+## [0.4.1](https://github.com/structured-world/coordinode/compare/v0.4.0...v0.4.1) - 2026-04-18
+
+#### Added
+
+- *(query)* add read_consistency knob + planner auto-promotion (R-SNAP1)
+- *(txn)* add per-shard MaxAssignedWatermark + WaitForTs primitive
+
+### coordinode-embed
+## [0.4.1](https://github.com/structured-world/coordinode/compare/v0.4.0...v0.4.1) - 2026-04-18
+
+#### Added
+
+- *(query)* snapshot API contract tests + fix modality_count over-promotion
+- *(query)* add read_consistency knob + planner auto-promotion (R-SNAP1)
+- *(query)* expose applied_watermark handle on ExecutionContext
+
+### coordinode-query
+## [0.4.1](https://github.com/structured-world/coordinode/compare/v0.4.0...v0.4.1) - 2026-04-18
+
+#### Added
+
+- *(query)* snapshot API contract tests + fix modality_count over-promotion
+- *(query)* add read_consistency knob + planner auto-promotion (R-SNAP1)
+- *(query)* expose applied_watermark handle on ExecutionContext
+
+#### Testing
+
+- *(query)* R-SNAP1 exact mode + AS OF target + hint docs
+
+### coordinode-raft
+## [0.4.1](https://github.com/structured-world/coordinode/compare/v0.4.0...v0.4.1) - 2026-04-18
+
+#### Added
+
+- *(raft)* wire MaxAssignedWatermark into apply_proposal path
+
+### coordinode-search
+## [0.4.1](https://github.com/structured-world/coordinode/compare/v0.4.0...v0.4.1) - 2026-04-18
+
+#### Added
+
+- *(search)* FTS MVCC snapshot filter via per-doc commit_ts + segment registry
+
+---
+
 ## v0.4.0 — 2026-04-17
 
 ### coordinode-embed
