@@ -56,7 +56,7 @@ Both functions work by reading metadata set during WHERE evaluation. They are on
 
 `text_match(field, query)` itself also hard-fails when the `(Label, property)` has no full-text index — it does **not** silently pass every row through. Earlier versions returned all rows with a warning, which turned `WHERE text_match(...)` into an unintentional no-op filter; the current behaviour is `ExecutionError: text_match() requires a full-text index on (:Label, property); create one with CREATE TEXT INDEX idx_name ON :Label(property)`. Create the index before invoking the filter.
 
-BM25 uses tantivy's default parameters (`k1 = 1.2`, `b = 0.75`) and is not runtime-configurable (see [ADR-020](../arch/decisions.md) for rationale).
+BM25 uses tantivy's default parameters (`k1 = 1.2`, `b = 0.75`) and is not runtime-configurable — the tantivy defaults are the accepted baseline for BM25 and avoid per-query tuning traps.
 
 ```cypher
 MATCH (doc:Document)
