@@ -195,10 +195,15 @@ impl MultiLanguageTextIndex {
             self.inner.body_field,
             &tantivy::schema::OwnedValue::PreTokStr(pretokenized),
         );
+        doc.add_field_value(
+            self.inner.commit_ts_field,
+            &tantivy::schema::OwnedValue::U64(0),
+        );
         self.inner.writer.add_document(doc)?;
 
         self.inner.writer.commit()?;
         self.inner.reader.reload()?;
+        self.inner.reconcile_registry()?;
         Ok(())
     }
 
@@ -271,11 +276,16 @@ impl MultiLanguageTextIndex {
                 self.inner.body_field,
                 &tantivy::schema::OwnedValue::PreTokStr(pretokenized),
             );
+            doc.add_field_value(
+                self.inner.commit_ts_field,
+                &tantivy::schema::OwnedValue::U64(0),
+            );
             self.inner.writer.add_document(doc)?;
         }
 
         self.inner.writer.commit()?;
         self.inner.reader.reload()?;
+        self.inner.reconcile_registry()?;
         Ok(())
     }
 
