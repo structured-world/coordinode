@@ -490,4 +490,53 @@ RETURN n
 
 | Hint | Values | Default |
 |------|--------|---------|
-| `vector_consistency` | `'snapshot'`, `'eventual'` | `'snapshot'` |
+| `vector_consistency` | `'current'`, `'snapshot'`, `'exact'` | follows `read_consistency` |
+| `read_consistency` | `'current'`, `'snapshot'`, `'exact'` | `'current'` single-modality, auto-promoted to `'snapshot'` for cross-modality |
+
+### `read_consistency`
+
+Governs whether graph, vector, full-text, document, and time-series reads inside a single query resolve against the **same HLC timestamp** `T`. Every modality on the serving shard waits until every write with `commit_ts ≤ T` has been applied to every index before the read dispatches. Orthogonal to `read_concern` (which governs replication durability).
+
+| Mode | Behaviour |
+|------|-----------|
+| `current` | Each modality reads its latest state independently. No watermark wait. Lowest latency. Default for single-modality reads. |
+| `snapshot` | All modalities align at a single HLC `T` via `MaxAssignedWatermark::wait_for(T, read_timeout)`. HNSW post-filtered, tantivy segment-filtered by `commit_ts ≤ T`. **Auto-selected** when a query touches >1 modality. |
+| `exact` | As `snapshot`, plus HNSW is bypassed (brute-force scan with MVCC filter). 100% recall, 10–100× slower vector path; use for audit / correctness-critical reads. |
+
+```cypher
+-- Cross-modality auto-promotion: this query touches graph + text + vector,
+-- so the planner picks read_consistency='snapshot' automatically.
+MATCH (c:Chunk)
+WHERE text_match(c.body, 'rust')
+  AND vector_distance(c.embedding, $q) < 0.5
+RETURN c
+
+-- Explicit override of an auto-decision — e.g. accept potential
+-- cross-modality skew to shave latency:
+MATCH (c:Chunk)
+WHERE text_match(c.body, 'rust')
+  AND vector_distance(c.embedding, $q) < 0.5
+RETURN c /*+ read_consistency('current') */
+
+-- Force snapshot on a single-modality query (rare; usually for causal reads):
+MATCH (n:Product)
+WHERE vector_distance(n.embedding, $q) < 0.3
+RETURN n /*+ read_consistency('snapshot') */
+```
+
+### `vector_consistency` as narrower override
+
+When `read_consistency` and `vector_consistency` are both set, `vector_consistency` wins for the vector modality only — every other modality still follows `read_consistency`. This lets power users pin the vector path to `exact` (brute-force) while keeping FTS + graph aligned via snapshot:
+
+```cypher
+MATCH (c:Chunk)
+WHERE text_match(c.body, 'rust')
+  AND vector_distance(c.embedding, $q) < 0.5
+RETURN c /*+ vector_consistency('exact') */
+-- planner still auto-promotes read_consistency='snapshot'; vector goes exact,
+-- text + graph align at the same HLC T.
+```
+
+### Timeout behaviour
+
+Under `snapshot` or `exact` the executor blocks on the shard's applied-watermark. If the applier is stuck (replication lag, network partition), the wait times out after `read_timeout` (default 2s) and the query returns an error naming the mode, the target `commit_ts`, and a retry/fallback hint. Callers that prefer latency over cross-modality alignment can retry with `/*+ read_consistency('current') */`.
