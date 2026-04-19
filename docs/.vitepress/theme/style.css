@@ -31,6 +31,19 @@
   }
 }
 
+/* Hero image sizing */
+.VPHero .image-container .image-src {
+  max-width: 320px;
+  max-height: 320px;
+}
+
+@media (min-width: 960px) {
+  .VPHero .image-container .image-src {
+    max-width: 400px;
+    max-height: 400px;
+  }
+}
+
 /* Brand colors */
 :root {
   --vp-c-brand-1: #e85d2c;
