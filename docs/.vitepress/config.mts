@@ -6,6 +6,35 @@ const hostname = "https://docs.coordinode.com";
 const siteDescription =
   "Graph + Vector + Full-Text retrieval in a single MVCC transaction. OpenCypher-compatible. Built in Rust.";
 
+const guideSidebar = [
+  {
+    text: "Getting Started",
+    items: [
+      { text: "Introduction", link: "/guide/" },
+      { text: "Quick Start", link: "/QUICKSTART" },
+      { text: "Roadmap", link: "/ROADMAP" },
+    ],
+  },
+  {
+    text: "Installation",
+    collapsed: false,
+    items: [
+      { text: "Docker", link: "/guide/docker" },
+      { text: "Binary", link: "/guide/binary" },
+      { text: "Embedded (Rust)", link: "/guide/embedded" },
+    ],
+  },
+  {
+    text: "Concepts",
+    collapsed: false,
+    items: [
+      { text: "Data Model", link: "/guide/data-model" },
+      { text: "MVCC Transactions", link: "/guide/transactions" },
+      { text: "Hybrid Retrieval", link: "/guide/hybrid-retrieval" },
+    ],
+  },
+];
+
 interface PageData {
   relativePath: string;
   title?: string;
@@ -148,33 +177,19 @@ export default defineConfig({
 
     nav: [
       { text: "Guide", link: "/guide/" },
-      {
-        text: "OpenCypher",
-        items: [
-          { text: "Overview", link: "/cypher/" },
-          { text: "Language Reference", link: "/cypher/reference" },
-          { text: "Functions", link: "/cypher/functions" },
-          { text: "Extensions", link: "/cypher/extensions" },
-          { text: "Neo4j Compatibility", link: "/cypher/compatibility" },
-        ],
-      },
-      {
-        text: "SDK",
-        items: [
-          { text: "Python SDK", link: "/sdk/python" },
-          { text: "LlamaIndex", link: "/sdk/llama-index" },
-          { text: "LangChain", link: "/sdk/langchain" },
-        ],
-      },
-      { text: "API Reference", link: "/api/" },
+      { text: "Cypher", link: "/cypher/" },
+      { text: "API", link: "/api/" },
+      { text: "SDK", link: "/sdk/python" },
       { text: "Roadmap", link: "/ROADMAP" },
-      {
-        text: "GitHub",
-        link: "https://github.com/structured-world/coordinode",
-      },
     ],
 
     sidebar: {
+      // Root-level pages (docs/QUICKSTART.md, docs/ROADMAP.md) live outside
+      // any section prefix; without explicit mapping their left drawer
+      // collapses. Reuse the guide sidebar so navigation stays consistent.
+      "/QUICKSTART": guideSidebar,
+      "/ROADMAP": guideSidebar,
+      "/guide/": guideSidebar,
       "/cypher/": [
         {
           text: "OpenCypher",
@@ -182,51 +197,16 @@ export default defineConfig({
             { text: "Overview", link: "/cypher/" },
             { text: "Language Reference", link: "/cypher/reference" },
             { text: "Functions", link: "/cypher/functions" },
-          ],
-        },
-        {
-          text: "Extensions",
-          items: [
-            { text: "Extensions Overview", link: "/cypher/extensions" },
-          ],
-        },
-        {
-          text: "Compatibility",
-          items: [
+            { text: "Extensions", link: "/cypher/extensions" },
             { text: "Neo4j Compatibility", link: "/cypher/compatibility" },
-          ],
-        },
-      ],
-      "/guide/": [
-        {
-          text: "Getting Started",
-          items: [
-            { text: "Introduction", link: "/guide/" },
-            { text: "Quick Start", link: "/QUICKSTART" },
-          ],
-        },
-        {
-          text: "Installation",
-          items: [
-            { text: "Docker", link: "/guide/docker" },
-            { text: "Binary", link: "/guide/binary" },
-            { text: "Embedded (Rust)", link: "/guide/embedded" },
-          ],
-        },
-        {
-          text: "Concepts",
-          items: [
-            { text: "Data Model", link: "/guide/data-model" },
-            { text: "MVCC Transactions", link: "/guide/transactions" },
-            { text: "Hybrid Retrieval", link: "/guide/hybrid-retrieval" },
           ],
         },
       ],
       "/sdk/": [
         {
-          text: "Python SDK",
+          text: "SDKs",
           items: [
-            { text: "Overview", link: "/sdk/python" },
+            { text: "Python", link: "/sdk/python" },
             { text: "LlamaIndex", link: "/sdk/llama-index" },
             { text: "LangChain", link: "/sdk/langchain" },
           ],
@@ -234,11 +214,15 @@ export default defineConfig({
       ],
       "/api/": [
         {
-          text: "gRPC API Reference",
-          items: [{ text: "Overview", link: "/api/" }],
+          text: "gRPC API",
+          items: [
+            { text: "Overview", link: "/api/" },
+            { text: "Common Types", link: "/api/common-types" },
+          ],
         },
         {
           text: "Query",
+          collapsed: false,
           items: [
             { text: "CypherService", link: "/api/cypher" },
             { text: "VectorService", link: "/api/vector" },
@@ -247,6 +231,7 @@ export default defineConfig({
         },
         {
           text: "Graph",
+          collapsed: false,
           items: [
             { text: "GraphService", link: "/api/graph" },
             { text: "SchemaService", link: "/api/schema" },
@@ -255,15 +240,12 @@ export default defineConfig({
         },
         {
           text: "Operations",
+          collapsed: false,
           items: [
             { text: "HealthService", link: "/api/health" },
             { text: "ClusterService", link: "/api/cluster" },
             { text: "ChangeStreamService", link: "/api/change-stream" },
           ],
-        },
-        {
-          text: "Reference",
-          items: [{ text: "Common Types", link: "/api/common-types" }],
         },
       ],
     },
