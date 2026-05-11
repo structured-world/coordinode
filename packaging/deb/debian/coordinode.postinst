@@ -1,0 +1,23 @@
+#!/bin/sh
+set -e
+
+# Debian/Ubuntu does not auto-process /usr/lib/sysusers.d on package install
+# (unlike Fedora). Create the system user explicitly so the subsequent
+# systemd-tmpfiles run can chown /var/lib/coordinode.
+if ! getent passwd coordinode >/dev/null; then
+    adduser --system --group --no-create-home \
+            --home /var/lib/coordinode \
+            --shell /sbin/nologin \
+            --gecos "CoordiNode database server" \
+            coordinode >/dev/null
+fi
+
+# Now that the user exists, apply the tmpfiles snippet to create
+# /var/lib/coordinode with the right ownership.
+if [ -x /bin/systemd-tmpfiles ] || command -v systemd-tmpfiles >/dev/null 2>&1; then
+    systemd-tmpfiles --create /usr/lib/tmpfiles.d/coordinode.conf || true
+fi
+
+#DEBHELPER#
+
+exit 0

@@ -1,0 +1,6 @@
+# Declarative user/group creation for CoordiNode.
+# Processed by systemd-sysusers on first boot and on package install/upgrade.
+# Reference: sysusers.d(5).
+#
+# Type User  Name        ID   GECOS                            Home                 Shell
+u     coordinode  -    "CoordiNode database server"     /var/lib/coordinode  /sbin/nologin
