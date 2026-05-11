@@ -274,8 +274,11 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           apt-get update
+          # build-essential satisfies the implicit Build-Depends pulled in by
+          # debhelper-compat (= 13); without it dpkg-checkbuilddeps aborts.
           apt-get install -y --no-install-recommends \
-            debhelper dpkg-dev dh-make ca-certificates findutils
+            debhelper dpkg-dev dh-make ca-certificates findutils \
+            build-essential adduser
 
       - uses: actions/checkout@v6
 
