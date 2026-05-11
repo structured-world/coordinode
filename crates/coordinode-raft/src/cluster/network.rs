@@ -136,10 +136,10 @@ impl GrpcNetwork {
 }
 
 impl NetBackoff<C> for GrpcNetwork {
-    fn backoff(&self) -> Backoff {
+    fn backoff(&self) -> Option<Backoff> {
         // Infinite 200ms backoff (matches openraft default).
         // openraft enables backoff after 20 consecutive errors.
-        Backoff::new(std::iter::repeat(Duration::from_millis(200)))
+        Some(Backoff::new(std::iter::repeat(Duration::from_millis(200))))
     }
 }
 
@@ -327,8 +327,8 @@ impl NetTransferLeader<C> for GrpcNetwork {
 pub struct StubNetwork;
 
 impl NetBackoff<C> for StubNetwork {
-    fn backoff(&self) -> Backoff {
-        Backoff::new(std::iter::repeat(Duration::from_millis(200)))
+    fn backoff(&self) -> Option<Backoff> {
+        Some(Backoff::new(std::iter::repeat(Duration::from_millis(200))))
     }
 }
 
