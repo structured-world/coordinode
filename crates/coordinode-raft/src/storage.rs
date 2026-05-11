@@ -624,12 +624,19 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         &mut self,
         log_id: openraft::type_config::alias::LogIdOf<TypeConfig>,
     ) -> Result<(), io::Error> {
-        // Delete sealed segments whose last entry index < log_id.index + 1.
+        // Cross-partition flush watermark gates the purge: keep oplog segments
+        // until every LSM partition has an SST covering their mutations.
+        // Without this gate, openraft's "applied_index advanced ⇒ safe to
+        // forget the oplog entry" assumption breaks for partitions whose
+        // memtable has not yet flushed when applied_index moves on.
+        let safe_ts = self.engine.min_partition_flushed_seqno();
+
+        // Two-gate purge: entry must be both applied and SST-durable.
         let purged_segments = self
             .oplog
             .lock()
             .map_err(|_| io::Error::other("oplog mutex poisoned"))?
-            .purge_before(log_id.index + 1)
+            .purge_before(log_id.index + 1, safe_ts)
             .map_err(|e| io::Error::other(e.to_string()))?;
 
         // Update and persist the last_purged cache.

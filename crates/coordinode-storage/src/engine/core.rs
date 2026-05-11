@@ -511,6 +511,45 @@ impl StorageEngine {
         Ok(self.trees.values().map(|t| t.disk_space()).sum())
     }
 
+    /// Smallest "data durably on disk" watermark across partitions that
+    /// currently have un-flushed memtable mutations.
+    ///
+    /// For each partition we compare the highest seqno that touched it at all
+    /// (memtable + SST) against the highest seqno that has actually been
+    /// flushed to an SST file:
+    ///
+    /// - If a partition has never been written, it is excluded from the min.
+    /// - If a partition's memtable is fully persisted (`persisted >= highest`),
+    ///   it is excluded from the min — it cannot lose data on crash.
+    /// - Otherwise the partition is "lagging": its persisted seqno is the
+    ///   ceiling beyond which mutations sit in volatile memory only.
+    ///
+    /// The min across all lagging partitions is the largest commit_ts T such
+    /// that every mutation with `commit_ts ≤ T` is guaranteed to survive an
+    /// unclean shutdown. When no partition is lagging the engine has no
+    /// in-memory state to protect and `u64::MAX` is returned — the oplog
+    /// purge gate is effectively open.
+    ///
+    /// Used by the Raft log store to gate oplog purging: an entry whose
+    /// commit_ts exceeds this watermark must be retained because replay from
+    /// the oplog is still the only way to reconstruct mutations sitting in
+    /// some partition's memtable.
+    pub fn min_partition_flushed_seqno(&self) -> u64 {
+        self.trees
+            .values()
+            .filter_map(|t| {
+                let highest = t.get_highest_seqno()?;
+                let persisted = t.get_highest_persisted_seqno().unwrap_or(0);
+                if persisted >= highest {
+                    None
+                } else {
+                    Some(persisted)
+                }
+            })
+            .min()
+            .unwrap_or(u64::MAX)
+    }
+
     /// Get the configured flush policy.
     pub fn flush_policy(&self) -> FlushPolicy {
         self.flush_policy
