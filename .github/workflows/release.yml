@@ -71,8 +71,9 @@ jobs:
 
   build-musl:
     name: Build musl (${{ matrix.target }})
-    needs: update-changelog
-    if: ${{ !cancelled() }}
+    # Release-notes update is cosmetic and independent — don't gate
+    # binary builds on it. docker-build / docker-manifest already run
+    # in parallel for the same reason.
     runs-on: ${{ matrix.runs-on }}
     strategy:
       matrix:
