@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.4.2 — 2026-05-11
+
+### coordinode-raft
+## [0.4.2](https://github.com/structured-world/coordinode/compare/v0.4.1...v0.4.2) - 2026-05-11
+
+#### Fixed
+
+- *(storage)* gate oplog purge on cross-partition flush watermark
+
+### coordinode-storage
+## [0.4.2](https://github.com/structured-world/coordinode/compare/v0.4.1...v0.4.2) - 2026-05-11
+
+#### Added
+
+- *(storage)* time-based memtable flush trigger to bound oplog retention
+
+#### Fixed
+
+- *(storage)* gate oplog purge on cross-partition flush watermark
+
+---
+
 ## v0.4.1 — 2026-04-18
 
 ### coordinode-core
