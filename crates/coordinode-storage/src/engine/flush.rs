@@ -16,6 +16,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
+use std::time::{Duration, Instant};
 
 use lsm_tree::AbstractTree;
 
@@ -62,6 +63,7 @@ impl FlushManager {
         max_sealed: usize,
         num_workers: usize,
         poll_interval_ms: u64,
+        max_memtable_age_secs: u64,
     ) -> StorageResult<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -93,12 +95,15 @@ impl FlushManager {
             .spawn(move || {
                 flush_monitor_loop(
                     monitored,
-                    tx,
-                    gc_watermark,
-                    flush_threshold_bytes,
-                    max_sealed,
-                    poll_interval_ms,
-                    shutdown_m,
+                    FlushMonitorConfig {
+                        sender: tx,
+                        gc_watermark,
+                        flush_threshold_bytes,
+                        max_sealed,
+                        poll_interval_ms,
+                        max_memtable_age_secs,
+                        shutdown: shutdown_m,
+                    },
                 );
             })
             .map_err(|e| StorageError::InvalidConfig(format!("flush monitor spawn: {e}")))?;
@@ -134,29 +139,58 @@ impl Drop for FlushManager {
     }
 }
 
-/// Monitor loop: polls all partition trees and submits flush requests when needed.
-fn flush_monitor_loop(
-    trees: Vec<(Partition, lsm_tree::AnyTree)>,
+/// Parameters bundled to keep the monitor signature within clippy's
+/// `too_many_arguments` budget. Pure data — borrowed only by the spawned thread.
+struct FlushMonitorConfig {
     sender: flume::Sender<FlushRequest>,
     gc_watermark: Arc<AtomicU64>,
     flush_threshold_bytes: u64,
     max_sealed: usize,
     poll_interval_ms: u64,
+    max_memtable_age_secs: u64,
     shutdown: Arc<AtomicBool>,
-) {
-    while !shutdown.load(Ordering::Relaxed) {
-        let watermark = gc_watermark.load(Ordering::Relaxed);
+}
+
+/// Monitor loop: polls all partition trees and submits flush requests when needed.
+///
+/// Three independent triggers can rotate a partition's active memtable:
+///
+/// 1. **Size threshold:** `active_memtable.size() > flush_threshold_bytes`.
+///    Caps memory use under sustained write load.
+/// 2. **Sealed backlog:** `sealed_memtable_count() > max_sealed`. Prevents
+///    a slow flush worker from accumulating an unbounded queue.
+/// 3. **Memtable age:** any non-empty memtable older than
+///    `max_memtable_age_secs` (default 30s; `0` disables the trigger).
+///    Without this, light or bursty workloads can leave mutations in the
+///    memtable for hours; combined with R076a's purge gate that would
+///    grow the oplog unbounded waiting for size-based flush to fire.
+///    The clock starts at startup and resets on every rotation; an empty
+///    active memtable is never rotated (no data to lose).
+fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMonitorConfig) {
+    let max_age = Duration::from_secs(cfg.max_memtable_age_secs);
+    let start = Instant::now();
+    let mut last_rotate: HashMap<Partition, Instant> =
+        trees.iter().map(|(p, _)| (*p, start)).collect();
+
+    while !cfg.shutdown.load(Ordering::Relaxed) {
+        let watermark = cfg.gc_watermark.load(Ordering::Relaxed);
+        let now = Instant::now();
 
         for (partition, tree) in &trees {
             let active_bytes = tree.active_memtable().size();
             let sealed_count = tree.sealed_memtable_count();
+            let age = now.saturating_duration_since(*last_rotate.get(partition).unwrap_or(&start));
+            let age_triggered = cfg.max_memtable_age_secs > 0 && active_bytes > 0 && age >= max_age;
 
-            let needs_flush = active_bytes > flush_threshold_bytes || sealed_count > max_sealed;
+            let needs_flush = active_bytes > cfg.flush_threshold_bytes
+                || sealed_count > cfg.max_sealed
+                || age_triggered;
 
             if needs_flush {
                 // Rotate: atomically seal the active memtable → it joins the sealed list.
                 // A fresh empty memtable becomes the new active.
                 tree.rotate_memtable();
+                last_rotate.insert(*partition, now);
 
                 let req = FlushRequest {
                     tree: tree.clone(),
@@ -166,11 +200,11 @@ fn flush_monitor_loop(
 
                 // Non-blocking: if channel is full, workers are busy.
                 // The sealed memtable stays in the sealed list until the next flush call.
-                let _ = sender.try_send(req);
+                let _ = cfg.sender.try_send(req);
             }
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(poll_interval_ms));
+        std::thread::sleep(std::time::Duration::from_millis(cfg.poll_interval_ms));
     }
 }
 
@@ -255,8 +289,9 @@ mod tests {
             Arc::clone(&gc_watermark),
             64 * 1024 * 1024, // 64MB threshold (won't trigger in this test)
             4,
-            1, // 1 worker
-            50,
+            1,  // 1 worker
+            50, // poll interval
+            0,  // age trigger disabled
         )
         .expect("start FlushManager");
 
@@ -291,6 +326,7 @@ mod tests {
             0,        // max_sealed=0: flush immediately when any sealed memtable exists
             1,
             20, // fast poll for test
+            0,  // age trigger disabled — isolating the sealed-count gate
         )
         .expect("start FlushManager");
 
@@ -331,6 +367,7 @@ mod tests {
             100, // high sealed count so only size trigger fires
             1,
             20,
+            0, // age trigger disabled — isolating the size gate
         )
         .expect("start FlushManager");
 
@@ -365,10 +402,97 @@ mod tests {
             0,  // max_sealed=0: always trigger
             4,  // 4 workers
             10, // fast poll
+            0,  // age trigger disabled — concurrency comes from size+sealed
         )
         .expect("start FlushManager");
 
         std::thread::sleep(Duration::from_millis(150));
         drop(mgr); // must not panic or deadlock
+    }
+
+    #[test]
+    fn flush_manager_age_trigger_rotates_idle_memtable() {
+        // R076b: a memtable with even one byte of data must roll over to SST
+        // after `max_memtable_age_secs`, independent of the size threshold.
+        // Without this, light-load workloads could sit in volatile memory
+        // for hours; combined with the R076a oplog purge gate, oplog
+        // retention would grow without bound waiting for size-based flush.
+        let (trees, _dir) = make_test_trees();
+        let gc_watermark = Arc::new(AtomicU64::new(0));
+
+        let seqno: lsm_tree::SharedSequenceNumberGenerator =
+            Arc::new(lsm_tree::SequenceNumberCounter::default());
+        let tree = trees.get(&Partition::Node).expect("node tree").clone();
+
+        // One tiny write — nowhere near the 64MB size threshold.
+        tree.insert(b"k", b"v", seqno.next());
+        assert!(
+            tree.active_memtable().size() > 0,
+            "precondition: data lives in the active memtable"
+        );
+
+        // age trigger = 1 second, size & sealed thresholds effectively off.
+        let mgr = FlushManager::start(
+            &trees,
+            Arc::clone(&gc_watermark),
+            u64::MAX, // size: never triggers
+            usize::MAX,
+            1,
+            20, // poll every 20ms
+            1,  // age trigger after 1s
+        )
+        .expect("start FlushManager");
+
+        // The age trigger needs both wall time AND a poll tick to fire. Give
+        // it 2× the age budget; flush worker then handles the sealed memtable.
+        let mut flushed = false;
+        for _ in 0..150 {
+            std::thread::sleep(Duration::from_millis(20));
+            if tree.sealed_memtable_count() == 0 && tree.active_memtable().size() == 0 {
+                flushed = true;
+                break;
+            }
+        }
+
+        drop(mgr);
+        assert!(
+            flushed,
+            "age trigger should have rotated the lone memtable entry to SST"
+        );
+    }
+
+    #[test]
+    fn flush_manager_age_zero_disables_time_based_trigger() {
+        // max_memtable_age_secs == 0 must preserve the pre-R076b behavior:
+        // size and sealed-count gates alone, no implicit time rotation.
+        let (trees, _dir) = make_test_trees();
+        let gc_watermark = Arc::new(AtomicU64::new(0));
+
+        let seqno: lsm_tree::SharedSequenceNumberGenerator =
+            Arc::new(lsm_tree::SequenceNumberCounter::default());
+        let tree = trees.get(&Partition::Node).expect("node tree").clone();
+
+        tree.insert(b"k", b"v", seqno.next());
+
+        let mgr = FlushManager::start(
+            &trees,
+            Arc::clone(&gc_watermark),
+            u64::MAX, // size: never triggers
+            usize::MAX,
+            1,
+            20,
+            0, // age trigger DISABLED
+        )
+        .expect("start FlushManager");
+
+        // Even after several poll cycles the active memtable must still hold
+        // its byte — nothing else has been touched to push it out.
+        std::thread::sleep(Duration::from_millis(400));
+        let stayed = tree.active_memtable().size() > 0 && tree.sealed_memtable_count() == 0;
+        drop(mgr);
+        assert!(
+            stayed,
+            "with age trigger off, idle memtable must remain in memory"
+        );
     }
 }

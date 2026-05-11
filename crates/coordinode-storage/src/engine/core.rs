@@ -209,6 +209,7 @@ impl StorageEngine {
             config.max_sealed_memtables,
             config.flush_workers,
             config.flush_poll_interval_ms,
+            config.max_memtable_age_secs,
         )?;
 
         // Start background compaction scheduler.

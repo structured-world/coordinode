@@ -142,6 +142,18 @@ pub struct StorageConfig {
     /// Flush monitor polling interval in milliseconds. Default: 50ms.
     pub flush_poll_interval_ms: u64,
 
+    /// Maximum age (in seconds) of a non-empty active memtable before it is
+    /// rotated regardless of size. Bounds the worst-case window during which
+    /// committed mutations may live in volatile memory only — critical at low
+    /// or bursty load where the size threshold (`max_write_buffer_bytes`) may
+    /// never fire on the larger partitions. Pairs with the cross-partition
+    /// oplog purge gate (see `OplogManager::purge_before`) to keep oplog
+    /// retention bounded while preserving crash safety.
+    ///
+    /// Set to `0` to disable the time-based trigger (size-based only — the
+    /// pre-R076b behavior). Default: 30.
+    pub max_memtable_age_secs: u64,
+
     /// Number of background compaction worker threads. Default: 2.
     pub compaction_workers: usize,
 
@@ -222,6 +234,7 @@ impl StorageConfig {
             flush_workers: 2,
             max_sealed_memtables: 4,
             flush_poll_interval_ms: 50,
+            max_memtable_age_secs: 30,
             compaction_workers: 2,
             compaction_l0_urgent_threshold: 8,
             compaction_poll_interval_ms: 200,
