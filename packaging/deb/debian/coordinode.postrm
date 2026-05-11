@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+# Drop the system user on purge only. `remove` keeps the user (and the data
+# in /var/lib/coordinode) so a subsequent reinstall finds its state.
+case "$1" in
+    purge)
+        if getent passwd coordinode >/dev/null; then
+            deluser --quiet --system coordinode 2>/dev/null || true
+        fi
+        if getent group coordinode >/dev/null; then
+            delgroup --quiet --system coordinode 2>/dev/null || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

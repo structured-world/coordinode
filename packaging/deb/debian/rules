@@ -1,0 +1,31 @@
+#!/usr/bin/make -f
+# CoordiNode Debian rules.
+#
+# We do NOT compile from this rules file. The CI release pipeline produces a
+# musl-static binary via cargo, drops it into the build tree as `coordinode`,
+# then calls `dpkg-buildpackage -us -uc -b`. This rules file only stages
+# pre-built artefacts into debian/coordinode/.
+
+%:
+	dh $@
+
+# Skip configure/build/test — the binary is pre-compiled by CI.
+override_dh_auto_configure:
+override_dh_auto_build:
+override_dh_auto_test:
+override_dh_auto_install:
+
+# Don't strip again: the upstream binary is already stripped post-link.
+override_dh_strip:
+
+override_dh_install:
+	install -D -m 0755 coordinode                                 debian/coordinode/usr/bin/coordinode
+	install -D -m 0644 packaging/coordinode.service               debian/coordinode/lib/systemd/system/coordinode.service
+	install -D -m 0644 packaging/coordinode.conf                  debian/coordinode/etc/coordinode/coordinode.conf
+	install -D -m 0644 packaging/coordinode.sysusers              debian/coordinode/usr/lib/sysusers.d/coordinode.conf
+	install -D -m 0644 packaging/coordinode.tmpfiles              debian/coordinode/usr/lib/tmpfiles.d/coordinode.conf
+	install -d -m 0750                                            debian/coordinode/var/lib/coordinode
+
+# Tell dh_installsystemd to handle the unit (preset, enable, restart on upgrade).
+override_dh_installsystemd:
+	dh_installsystemd --name=coordinode --no-start coordinode.service

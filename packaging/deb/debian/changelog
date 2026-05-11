@@ -1,0 +1,6 @@
+coordinode (0.0.0) unstable; urgency=medium
+
+  * Placeholder. CI overwrites this file with the real changelog entry
+    generated from the release tag before invoking dpkg-buildpackage.
+
+ -- Release Bot <oss@sw.foundation>  Mon, 11 May 2026 00:00:00 +0000

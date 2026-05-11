@@ -1,0 +1,15 @@
+Source: coordinode
+Section: database
+Priority: optional
+Maintainer: Structured World Foundation <oss@sw.foundation>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/structured-world/coordinode
+
+Package: coordinode
+Architecture: amd64 arm64
+Depends: ${misc:Depends}, systemd, adduser
+Description: Unified database for AI-native applications
+ CoordiNode is a unified database combining graph, vector, full-text,
+ document and time-series modalities in one engine. Queries use OpenCypher;
+ writes commit atomically across modalities.

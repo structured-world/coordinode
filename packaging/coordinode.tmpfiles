@@ -1,0 +1,9 @@
+# Declarative state-directory management for CoordiNode.
+# Processed by systemd-tmpfiles on boot and on package install/upgrade.
+# Reference: tmpfiles.d(5).
+#
+# Type Path                       Mode UID         GID         Age Argument
+# Top-level state dir; the data/ subdirectory is created lazily by systemd
+# (StateDirectory= in coordinode.service) so it stays out of the package
+# file list and tracks the unit's lifecycle on uninstall.
+d     /var/lib/coordinode         0750 coordinode  coordinode  -   -

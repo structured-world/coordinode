@@ -1,0 +1,38 @@
+[Unit]
+Description=CoordiNode database server
+Documentation=https://github.com/structured-world/coordinode
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=coordinode
+Group=coordinode
+EnvironmentFile=/etc/coordinode/coordinode.conf
+StateDirectory=coordinode coordinode/data
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/coordinode
+ExecStart=/usr/bin/coordinode serve --addr ${COORDINODE_ADDR} --rest-addr ${COORDINODE_REST_ADDR} --ops-addr ${COORDINODE_OPS_ADDR} --data ${COORDINODE_DATA}
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+# Sandboxing
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/coordinode
+
+[Install]
+WantedBy=multi-user.target

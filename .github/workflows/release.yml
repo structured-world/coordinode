@@ -132,127 +132,230 @@ jobs:
           tag_name: ${{ env.TAG_NAME }}
           files: coordinode-${{ env.TAG_NAME }}-${{ matrix.artifact }}
 
-  package:
-    name: Build deb/rpm packages
-    runs-on: ubuntu-latest
+  build-rpm:
+    name: Build RPM (${{ matrix.fedora }}/${{ matrix.arch }})
+    runs-on: ${{ matrix.runs-on }}
     needs: build-musl
+    container:
+      image: registry.fedoraproject.org/fedora:${{ matrix.fedora }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fedora: "42"
+            arch: x86_64
+            runs-on: ubuntu-latest
+            bin_artifact: coordinode-linux-amd64
+          - fedora: "42"
+            arch: aarch64
+            runs-on: ubuntu-24.04-arm
+            bin_artifact: coordinode-linux-arm64
+          - fedora: "43"
+            arch: x86_64
+            runs-on: ubuntu-latest
+            bin_artifact: coordinode-linux-amd64
+          - fedora: "43"
+            arch: aarch64
+            runs-on: ubuntu-24.04-arm
+            bin_artifact: coordinode-linux-arm64
+          - fedora: "44"
+            arch: x86_64
+            runs-on: ubuntu-latest
+            bin_artifact: coordinode-linux-amd64
+          - fedora: "44"
+            arch: aarch64
+            runs-on: ubuntu-24.04-arm
+            bin_artifact: coordinode-linux-arm64
     steps:
+      - name: Install rpmbuild + helpers
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            rpm-build rpmdevtools systemd-rpm-macros findutils tar
+          rpmdev-setuptree
+
       - uses: actions/checkout@v6
 
-      - name: Download amd64 binary
+      - name: Download prebuilt binary
         uses: actions/download-artifact@v4
         with:
-          name: coordinode-linux-amd64
-          path: /tmp/bins/amd64/
+          name: ${{ matrix.bin_artifact }}
+          path: /tmp/bin/
 
-      - name: Download arm64 binary
-        uses: actions/download-artifact@v4
-        with:
-          name: coordinode-linux-arm64
-          path: /tmp/bins/arm64/
-
-      - name: Install nfpm
-        run: |
-          curl -sLo /tmp/nfpm.deb \
-            https://github.com/goreleaser/nfpm/releases/download/v2.40.0/nfpm_2.40.0_amd64.deb
-          sudo dpkg -i /tmp/nfpm.deb
-
-      - name: Prepare binaries
+      - name: Stage sources
         run: |
           VERSION=$(echo "${{ env.TAG_NAME }}" | sed 's/^v//')
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          # Rename artifact files to plain 'coordinode' for nfpm
-          mv /tmp/bins/amd64/coordinode-*-coordinode-linux-amd64 /tmp/bins/amd64/coordinode || \
-            cp /tmp/bins/amd64/* /tmp/bins/amd64/coordinode 2>/dev/null || true
-          mv /tmp/bins/arm64/coordinode-*-coordinode-linux-arm64 /tmp/bins/arm64/coordinode || \
-            cp /tmp/bins/arm64/* /tmp/bins/arm64/coordinode 2>/dev/null || true
-          chmod +x /tmp/bins/amd64/coordinode /tmp/bins/arm64/coordinode
-          ls -la /tmp/bins/amd64/ /tmp/bins/arm64/
+          # Strip the version-prefixed name produced by build-musl down to plain `coordinode`.
+          BIN=$(find /tmp/bin -type f -name 'coordinode-*' | head -1)
+          install -m 0755 "$BIN" ~/rpmbuild/SOURCES/coordinode
+          install -m 0644 packaging/coordinode.service   ~/rpmbuild/SOURCES/coordinode.service
+          install -m 0644 packaging/coordinode.conf      ~/rpmbuild/SOURCES/coordinode.conf
+          install -m 0644 packaging/coordinode.sysusers  ~/rpmbuild/SOURCES/coordinode.sysusers
+          install -m 0644 packaging/coordinode.tmpfiles  ~/rpmbuild/SOURCES/coordinode.tmpfiles
+          install -m 0644 LICENSE                        ~/rpmbuild/SOURCES/LICENSE
+          install -m 0644 README.md                      ~/rpmbuild/SOURCES/README.md
 
-      - name: Build DEB packages
+      - name: Build RPM
         run: |
-          mkdir -p /tmp/pkgs/deb
-          for arch in amd64 arm64; do
-            # nfpm uses GOARCH-style names; copy binary to fixed path (env vars not expanded in src)
-            cp /tmp/bins/$arch/coordinode /tmp/coordinode-current
-            GOARCH=$arch VERSION="$VERSION" \
-              nfpm package --config packaging/nfpm.yaml --packager deb --target /tmp/pkgs/deb/
-          done
-          ls -la /tmp/pkgs/deb/
+          rpmbuild -bb \
+            --define "_topdir $HOME/rpmbuild" \
+            --define "version $VERSION" \
+            --target ${{ matrix.arch }} \
+            packaging/rpm/coordinode.spec
+          find ~/rpmbuild/RPMS -name '*.rpm' -print
 
-      - name: Build RPM packages (x86_64)
+      - name: Lint with rpmlint (advisory)
+        continue-on-error: true
         run: |
-          mkdir -p /tmp/pkgs/rpm-base
-          cp /tmp/bins/amd64/coordinode /tmp/coordinode-current
-          GOARCH=amd64 VERSION="$VERSION" \
-            nfpm package --config packaging/nfpm.yaml --packager rpm --target /tmp/pkgs/rpm-base/
-          # Extract the base RPM name and create per-Fedora-version copies
-          BASE_RPM=$(ls /tmp/pkgs/rpm-base/*.rpm | head -1)
-          BASE_NAME=$(basename "$BASE_RPM" .rpm)
-          for FC in 42 43 44; do
-            mkdir -p "/tmp/pkgs/rpm-fc${FC}"
-            cp "$BASE_RPM" "/tmp/pkgs/rpm-fc${FC}/${BASE_NAME}.fc${FC}.x86_64.rpm"
-          done
-          ls -la /tmp/pkgs/rpm-fc*/
+          dnf install -y --setopt=install_weak_deps=False rpmlint || true
+          rpmlint $(find ~/rpmbuild/RPMS -name '*.rpm') || true
 
-      - name: Stage artifacts by distro
+      - name: Stage artifact
         run: |
-          # DEB: same binary works on all distros — one dir per codename
-          for codename in jammy noble bookworm; do
-            mkdir -p "/tmp/artifacts/deb-${codename}"
-            cp /tmp/pkgs/deb/*_amd64.deb "/tmp/artifacts/deb-${codename}/" 2>/dev/null || true
-            cp /tmp/pkgs/deb/*_arm64.deb "/tmp/artifacts/deb-${codename}/" 2>/dev/null || true
-          done
-          # RPM: per-Fedora-version directories
-          for FC in 42 43 44; do
-            mkdir -p "/tmp/artifacts/rpm-fc${FC}"
-            cp "/tmp/pkgs/rpm-fc${FC}/"*.rpm "/tmp/artifacts/rpm-fc${FC}/"
-          done
-          # Manifest for repo.sw.foundation docs
-          mkdir -p /tmp/artifacts/repo-meta-coordinode
-          cp packaging/manifest.json /tmp/artifacts/repo-meta-coordinode/
+          mkdir -p /tmp/artifacts
+          cp ~/rpmbuild/RPMS/${{ matrix.arch }}/*.rpm /tmp/artifacts/
 
-      - name: Upload deb artifacts
+      - name: Upload RPM artifact
         uses: actions/upload-artifact@v4
         with:
-          name: deb-jammy
-          path: /tmp/artifacts/deb-jammy/
+          name: rpm-fc${{ matrix.fedora }}-${{ matrix.arch }}
+          path: /tmp/artifacts/*.rpm
+          if-no-files-found: error
 
-      - name: Upload deb-noble artifact
+      - name: Attach RPM to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          files: /tmp/artifacts/*.rpm
+
+  build-deb:
+    name: Build DEB (${{ matrix.codename }}/${{ matrix.arch }})
+    runs-on: ${{ matrix.runs-on }}
+    needs: build-musl
+    container:
+      image: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - codename: bookworm
+            image: debian:bookworm
+            arch: amd64
+            runs-on: ubuntu-latest
+            bin_artifact: coordinode-linux-amd64
+          - codename: bookworm
+            image: debian:bookworm
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
+            bin_artifact: coordinode-linux-arm64
+          - codename: jammy
+            image: ubuntu:jammy
+            arch: amd64
+            runs-on: ubuntu-latest
+            bin_artifact: coordinode-linux-amd64
+          - codename: jammy
+            image: ubuntu:jammy
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
+            bin_artifact: coordinode-linux-arm64
+          - codename: noble
+            image: ubuntu:noble
+            arch: amd64
+            runs-on: ubuntu-latest
+            bin_artifact: coordinode-linux-amd64
+          - codename: noble
+            image: ubuntu:noble
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
+            bin_artifact: coordinode-linux-arm64
+    steps:
+      - name: Install debhelper + dpkg-dev
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            debhelper dpkg-dev dh-make ca-certificates findutils
+
+      - uses: actions/checkout@v6
+
+      - name: Download prebuilt binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.bin_artifact }}
+          path: /tmp/bin/
+
+      - name: Assemble source tree
+        run: |
+          VERSION=$(echo "${{ env.TAG_NAME }}" | sed 's/^v//')
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          BUILD=/tmp/coordinode-$VERSION
+          mkdir -p "$BUILD/packaging"
+          # Stage the prebuilt binary as the canonical name expected by debian/rules.
+          BIN=$(find /tmp/bin -type f -name 'coordinode-*' | head -1)
+          install -m 0755 "$BIN" "$BUILD/coordinode"
+          cp -r packaging/coordinode.service packaging/coordinode.conf \
+                packaging/coordinode.sysusers packaging/coordinode.tmpfiles \
+                "$BUILD/packaging/"
+          cp -r packaging/deb/debian "$BUILD/"
+          cp LICENSE README.md "$BUILD/"
+          # Rewrite the placeholder changelog with the actual version.
+          cat > "$BUILD/debian/changelog" <<CHANGELOG
+          coordinode ($VERSION) unstable; urgency=medium
+
+            * Automated release $VERSION; see CHANGELOG.md upstream.
+
+           -- Release Bot <oss@sw.foundation>  $(date -R)
+          CHANGELOG
+          echo "BUILD_DIR=$BUILD" >> "$GITHUB_ENV"
+
+      - name: Build DEB
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          dpkg-buildpackage -us -uc -b -a${{ matrix.arch }}
+          ls -la ..
+
+      - name: Lint with lintian (advisory)
+        continue-on-error: true
+        run: |
+          apt-get install -y --no-install-recommends lintian || true
+          lintian /tmp/coordinode_*_${{ matrix.arch }}.deb || true
+
+      - name: Stage artifact
+        run: |
+          mkdir -p /tmp/artifacts
+          cp /tmp/coordinode_${VERSION}_${{ matrix.arch }}.deb /tmp/artifacts/
+
+      - name: Upload DEB artifact
         uses: actions/upload-artifact@v4
         with:
-          name: deb-noble
-          path: /tmp/artifacts/deb-noble/
+          name: deb-${{ matrix.codename }}-${{ matrix.arch }}
+          path: /tmp/artifacts/*.deb
+          if-no-files-found: error
 
-      - name: Upload deb-bookworm artifact
-        uses: actions/upload-artifact@v4
+      - name: Attach DEB to release
+        uses: softprops/action-gh-release@v2
         with:
-          name: deb-bookworm
-          path: /tmp/artifacts/deb-bookworm/
+          tag_name: ${{ env.TAG_NAME }}
+          files: /tmp/artifacts/*.deb
 
-      - name: Upload rpm-fc42 artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rpm-fc42
-          path: /tmp/artifacts/rpm-fc42/
+  publish-repo:
+    name: Publish to repo.sw.foundation
+    runs-on: ubuntu-latest
+    needs: [build-rpm, build-deb]
+    steps:
+      - uses: actions/checkout@v6
 
-      - name: Upload rpm-fc43 artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rpm-fc43
-          path: /tmp/artifacts/rpm-fc43/
-
-      - name: Upload rpm-fc44 artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rpm-fc44
-          path: /tmp/artifacts/rpm-fc44/
+      - name: Repo metadata
+        run: |
+          mkdir -p /tmp/repo-meta
+          cp packaging/manifest.json /tmp/repo-meta/
 
       - name: Upload repo-meta artifact
         uses: actions/upload-artifact@v4
         with:
           name: repo-meta-coordinode
-          path: /tmp/artifacts/repo-meta-coordinode/
+          path: /tmp/repo-meta/
 
       - name: Generate release bot token
         id: app-token
