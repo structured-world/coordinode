@@ -181,7 +181,7 @@ jobs:
           # Extract the base RPM name and create per-Fedora-version copies
           BASE_RPM=$(ls /tmp/pkgs/rpm-base/*.rpm | head -1)
           BASE_NAME=$(basename "$BASE_RPM" .rpm)
-          for FC in 40 41 42; do
+          for FC in 42 43 44; do
             mkdir -p "/tmp/pkgs/rpm-fc${FC}"
             cp "$BASE_RPM" "/tmp/pkgs/rpm-fc${FC}/${BASE_NAME}.fc${FC}.x86_64.rpm"
           done
@@ -196,7 +196,7 @@ jobs:
             cp /tmp/pkgs/deb/*_arm64.deb "/tmp/artifacts/deb-${codename}/" 2>/dev/null || true
           done
           # RPM: per-Fedora-version directories
-          for FC in 40 41 42; do
+          for FC in 42 43 44; do
             mkdir -p "/tmp/artifacts/rpm-fc${FC}"
             cp "/tmp/pkgs/rpm-fc${FC}/"*.rpm "/tmp/artifacts/rpm-fc${FC}/"
           done
@@ -222,23 +222,23 @@ jobs:
           name: deb-bookworm
           path: /tmp/artifacts/deb-bookworm/
 
-      - name: Upload rpm-fc40 artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rpm-fc40
-          path: /tmp/artifacts/rpm-fc40/
-
-      - name: Upload rpm-fc41 artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rpm-fc41
-          path: /tmp/artifacts/rpm-fc41/
-
       - name: Upload rpm-fc42 artifact
         uses: actions/upload-artifact@v4
         with:
           name: rpm-fc42
           path: /tmp/artifacts/rpm-fc42/
+
+      - name: Upload rpm-fc43 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-fc43
+          path: /tmp/artifacts/rpm-fc43/
+
+      - name: Upload rpm-fc44 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-fc44
+          path: /tmp/artifacts/rpm-fc44/
 
       - name: Upload repo-meta artifact
         uses: actions/upload-artifact@v4

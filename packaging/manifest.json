@@ -23,7 +23,7 @@
         {
           "id": "fedora",
           "name": "Fedora",
-          "versions": ["40", "41", "42"],
+          "versions": ["42", "43", "44"],
           "prefix": "fc",
           "arch": "x86_64"
         }
