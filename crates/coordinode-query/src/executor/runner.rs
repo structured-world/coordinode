@@ -10,13 +10,17 @@ use rayon::prelude::*;
 
 use coordinode_core::graph::edge::{
     decode_adj_key, encode_adj_key_forward, encode_adj_key_reverse, encode_edgeprop_key,
-    write_adj_key_forward, write_adj_key_reverse, AdjDirection, PostingList,
+    encode_temporal_edgeprop_key, temporal_edgeprop_pair_prefix, write_adj_key_forward,
+    write_adj_key_reverse, AdjDirection, PostingList,
 };
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::NodeIdAllocator;
 use coordinode_core::graph::node::{encode_node_key, NodeId, NodeRecord};
 use coordinode_core::graph::types::{Value, VectorConsistencyMode, VectorMvccStats};
-use coordinode_core::schema::definition::{encode_label_schema_key, LabelSchema, SchemaMode};
+use coordinode_core::schema::definition::{
+    encode_edge_type_schema_key, encode_label_schema_key, EdgeTypeSchema, LabelSchema, PropertyDef,
+    PropertyType, SchemaMode,
+};
 use coordinode_core::schema::validation::validate_one;
 use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline, RaftProposal,
@@ -1243,6 +1247,12 @@ pub fn execute(
         plan_owned = {
             let mut p = plan.clone();
             p.substitute_params(&ctx.params);
+            // Re-run the temporal-filter lift pass: it ran once at plan build
+            // time, but parameter expressions weren't literals yet. Now that
+            // substitution turned them into Literal values, push-down is
+            // possible. Idempotent on plans where the lift already happened
+            // (the matched arm requires `temporal_filter.is_none()`).
+            p.root = crate::planner::builder::lift_temporal_filter(p.root);
             p
         };
         &plan_owned
@@ -1327,6 +1337,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             edge_variable,
             target_filters,
             edge_filters,
+            temporal_filter,
         } => {
             let input_rows = execute_op(input, ctx)?;
 
@@ -1342,6 +1353,12 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 edge_types
             };
 
+            // Hoist temporal flag per edge type once per traversal.
+            let mut edge_temporal: Vec<bool> = Vec::with_capacity(effective_types.len());
+            for et in effective_types {
+                edge_temporal.push(lookup_edge_type_temporal(et, ctx)?);
+            }
+
             let params = TraverseParams {
                 source,
                 edge_types: effective_types,
@@ -1352,6 +1369,8 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 edge_variable: edge_variable.as_deref(),
                 target_filters,
                 edge_filters,
+                edge_temporal: &edge_temporal,
+                temporal_filter: temporal_filter.as_ref(),
             };
             execute_traverse(&input_rows, &params, ctx)
         }
@@ -1913,6 +1932,12 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
 
         LogicalOp::DropVectorIndex { name } => execute_drop_vector_index(name, ctx),
 
+        LogicalOp::CreateEdgeType {
+            name,
+            temporal,
+            properties,
+        } => execute_create_edge_type(name, *temporal, properties, ctx),
+
         LogicalOp::Empty => Ok(vec![Row::new()]),
 
         LogicalOp::CreateNode {
@@ -2236,6 +2261,12 @@ struct TraverseParams<'a> {
     target_filters: &'a [(String, Expr)],
     /// Inline edge property filters from pattern (e.g., `[r:TYPE {prop: val}]`).
     edge_filters: &'a [(String, Expr)],
+    /// Parallel to `edge_types`: `true` if the type was declared TEMPORAL.
+    /// Hoisted once per traversal so the inner loop never re-queries the
+    /// schema partition.
+    edge_temporal: &'a [bool],
+    /// Optional pushed-down time-slice filter for temporal edges.
+    temporal_filter: Option<&'a crate::planner::logical::TemporalFilter>,
 }
 
 /// Traverse edges from source nodes to target nodes.
@@ -2317,16 +2348,20 @@ struct TargetRowParams<'a> {
     input_row: &'a Row,
     target_uid: u64,
     edge_type: Option<&'a str>,
+    /// Whether the edge type is declared TEMPORAL. When true, the row builder
+    /// emits one row per `(src, tgt)` edgeprop version; when false it emits at
+    /// most one row using the legacy single edgeprop entry.
+    edge_is_temporal: bool,
 }
 
-/// Fetch a target node and build an output row if it passes label/property filters.
-///
-/// Returns `None` if the node doesn't exist or fails filters.
-fn build_target_row(
+/// Fetch a target node and build output rows. Returns `Vec` because temporal
+/// edges fan out across versions: a single neighbor pair contributes one row
+/// per stored `valid_from`. Non-temporal edges still emit 0 or 1 rows.
+fn build_target_rows(
     trp: &TargetRowParams<'_>,
     params: &TraverseParams<'_>,
     ctx: &mut ExecutionContext<'_>,
-) -> Result<Option<Row>, ExecutionError> {
+) -> Result<Vec<Row>, ExecutionError> {
     let target_uid = trp.target_uid;
     let target_variable = params.target_variable;
     let target_labels = params.target_labels;
@@ -2340,12 +2375,12 @@ fn build_target_row(
         Some(bytes) => NodeRecord::from_msgpack(&bytes).map_err(|e| {
             ExecutionError::Serialization(format!("target node deserialization error: {e}"))
         })?,
-        None => return Ok(None),
+        None => return Ok(Vec::new()),
     };
 
     // Label filter
     if !target_labels.is_empty() && !target_labels.iter().any(|l| target_record.has_label(l)) {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     let mut out_row = trp.input_row.clone();
@@ -2373,71 +2408,131 @@ fn build_target_row(
     // Inject COMPUTED property values from schema (R082).
     inject_computed_properties(&mut out_row, target_variable, &target_label, ctx);
 
-    if let Some(ev) = edge_variable {
-        if let Some(et) = edge_type {
-            out_row.insert(format!("{ev}.__type__"), Value::String(et.to_string()));
-            // G070: also store the relationship variable itself (not only `r.__type__`)
-            // so that aggregate expressions like `count(r)` evaluate to a non-null value.
-            // Without this, eval_expr("r") returns Null → eval_aggregate_values filters it
-            // out → count(r) = 0. Storing the edge type string as the variable value makes
-            // count(r) behave identically to count(r.__type__).
-            out_row.insert(ev.to_string(), Value::String(et.to_string()));
+    // Edge variable bindings: type marker + per-version property fan-out for
+    // temporal edges. For non-temporal types this resolves to a single optional
+    // edgeprop blob, exactly as before.
+    let edge_property_rows: Vec<Row> = if let (Some(ev), Some(et)) = (edge_variable, edge_type) {
+        out_row.insert(format!("{ev}.__type__"), Value::String(et.to_string()));
+        // G070: also store the relationship variable itself (not only `r.__type__`)
+        // so that aggregate expressions like `count(r)` evaluate to a non-null value.
+        out_row.insert(ev.to_string(), Value::String(et.to_string()));
 
-            // Load edge properties from EdgeProp partition.
-            // Source ID comes from the input row (the node we traversed from).
-            let source_id_raw = trp.input_row.get(params.source).and_then(|v| {
-                if let Value::Int(id) = v {
-                    Some(*id as u64)
+        let source_id_raw = trp.input_row.get(params.source).and_then(|v| {
+            if let Value::Int(id) = v {
+                Some(*id as u64)
+            } else {
+                None
+            }
+        });
+        let Some(src_raw) = source_id_raw else {
+            return Ok(vec![out_row]);
+        };
+        let (ep_src, ep_tgt) = match params.direction {
+            Direction::Outgoing | Direction::Both => (NodeId::from_raw(src_raw), target_id),
+            Direction::Incoming => (target_id, NodeId::from_raw(src_raw)),
+        };
+
+        // Hidden metadata columns let downstream SET / DELETE on the edge
+        // variable resolve identity without re-parsing the pattern: the source
+        // / target nodes the edge connects, in canonical edgeprop-key order
+        // (source first regardless of arrow direction).
+        out_row.insert(format!("{ev}.__src__"), Value::Int(ep_src.as_raw() as i64));
+        out_row.insert(format!("{ev}.__tgt__"), Value::Int(ep_tgt.as_raw() as i64));
+
+        if trp.edge_is_temporal {
+            // Prefix-scan every version of this (src, tgt) edge and emit a
+            // dedicated row for each. valid_from is reconstructed from the key
+            // suffix so callers always see a non-null valid_from even if the
+            // stored property map happens to omit it (defensive — write path
+            // requires it, but readers should never depend on storage layout).
+            //
+            // When the planner pushed down a `temporal_filter.upper_ms`, we
+            // narrow the scan to keys whose `valid_from <= upper_ms`. Versions
+            // exceeding the bound aren't materialized.
+            let prefix = temporal_edgeprop_pair_prefix(et, ep_src, ep_tgt);
+            let scanned = ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)?;
+            let versions: Vec<_> =
+                if let Some(upper_ms) = params.temporal_filter.and_then(|tf| tf.upper_ms) {
+                    let bound = coordinode_core::graph::edge::valid_from_upper_bound_key(
+                        et, ep_src, ep_tgt, upper_ms,
+                    );
+                    scanned.into_iter().filter(|(k, _)| k < &bound).collect()
                 } else {
-                    None
-                }
-            });
-            if let Some(src_raw) = source_id_raw {
-                let (ep_src, ep_tgt) = match params.direction {
-                    Direction::Outgoing | Direction::Both => (NodeId::from_raw(src_raw), target_id),
-                    Direction::Incoming => (target_id, NodeId::from_raw(src_raw)),
+                    scanned
                 };
-                let ep_key = encode_edgeprop_key(et, ep_src, ep_tgt);
-                if let Some(ep_bytes) = ctx.mvcc_get(Partition::EdgeProp, &ep_key)? {
+            if versions.is_empty() {
+                // Temporal pair with zero stored versions: treat as no edge.
+                // Surfaces after hard DELETE — adj-posting may briefly survive
+                // the delete window; without this guard the traversal would
+                // emit a ghost row for the now-empty pair.
+                Vec::new()
+            } else {
+                let mut rows = Vec::with_capacity(versions.len());
+                for (key, ep_bytes) in versions {
+                    let mut version_row = out_row.clone();
+                    if let Some((_, _, _, vf)) =
+                        coordinode_core::graph::edge::decode_temporal_edgeprop_key(&key)
+                    {
+                        version_row.insert(format!("{ev}.valid_from"), Value::Int(vf));
+                    }
                     if let Ok(prop_map) = rmp_serde::from_slice::<Vec<(u32, Value)>>(&ep_bytes) {
                         for (field_id, value) in prop_map {
                             if let Some(field_name) = ctx.interner.resolve(field_id) {
-                                out_row.insert(format!("{ev}.{field_name}"), value);
+                                version_row.insert(format!("{ev}.{field_name}"), value);
                             }
+                        }
+                    }
+                    rows.push(version_row);
+                }
+                rows
+            }
+        } else {
+            let ep_key = encode_edgeprop_key(et, ep_src, ep_tgt);
+            if let Some(ep_bytes) = ctx.mvcc_get(Partition::EdgeProp, &ep_key)? {
+                if let Ok(prop_map) = rmp_serde::from_slice::<Vec<(u32, Value)>>(&ep_bytes) {
+                    for (field_id, value) in prop_map {
+                        if let Some(field_name) = ctx.interner.resolve(field_id) {
+                            out_row.insert(format!("{ev}.{field_name}"), value);
                         }
                     }
                 }
             }
+            vec![out_row]
         }
-    }
+    } else {
+        vec![out_row]
+    };
 
-    // Apply target inline property filters
-    for (prop_name, filter_expr) in target_filters {
-        let actual = out_row
-            .get(&format!("{target_variable}.{prop_name}"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        let expected = eval_expr(filter_expr, &out_row);
-        if actual != expected {
-            return Ok(None);
-        }
-    }
-
-    // Apply inline edge property filters (e.g., [r:TYPE {rating: 5}])
-    if let Some(ev) = edge_variable {
-        for (prop_name, filter_expr) in params.edge_filters {
-            let actual = out_row
-                .get(&format!("{ev}.{prop_name}"))
+    // Apply target / edge inline filters to each candidate row. Filters drop
+    // rows individually, so a temporal pair may keep some versions and shed
+    // others.
+    let mut kept: Vec<Row> = Vec::with_capacity(edge_property_rows.len());
+    'each_row: for row in edge_property_rows {
+        for (prop_name, filter_expr) in target_filters {
+            let actual = row
+                .get(&format!("{target_variable}.{prop_name}"))
                 .cloned()
                 .unwrap_or(Value::Null);
-            let expected = eval_expr(filter_expr, &out_row);
+            let expected = eval_expr(filter_expr, &row);
             if actual != expected {
-                return Ok(None);
+                continue 'each_row;
             }
         }
+        if let Some(ev) = edge_variable {
+            for (prop_name, filter_expr) in params.edge_filters {
+                let actual = row
+                    .get(&format!("{ev}.{prop_name}"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let expected = eval_expr(filter_expr, &row);
+                if actual != expected {
+                    continue 'each_row;
+                }
+            }
+        }
+        kept.push(row);
     }
-
-    Ok(Some(out_row))
+    Ok(kept)
 }
 
 /// Collected OCC read-set keys from parallel processing (G067).
@@ -2563,6 +2658,15 @@ fn process_targets_parallel(
                                 }
                                 Direction::Incoming => (target_id, NodeId::from_raw(*src_uid)),
                             };
+                            // Hidden metadata for downstream SET / DELETE on r.
+                            out_row.insert(
+                                format!("{ev}.__src__"),
+                                Value::Int(ep_src.as_raw() as i64),
+                            );
+                            out_row.insert(
+                                format!("{ev}.__tgt__"),
+                                Value::Int(ep_tgt.as_raw() as i64),
+                            );
                             let ep_key = encode_edgeprop_key(et, ep_src, ep_tgt);
                             let ep_bytes = if let Some(snap) = pctx.mvcc_snapshot {
                                 pctx.engine
@@ -2642,8 +2746,14 @@ fn execute_single_hop_traverse(
 
         let neighbors = expand_one_hop(source_id, params.edge_types, params.direction, ctx)?;
 
+        // Parallel path doesn't yet support temporal version fan-out (it bypasses
+        // ExecutionContext and prefix scans), so any temporal edge type in the
+        // traversal forces the sequential path. Non-temporal queries keep the
+        // parallel optimization.
+        let has_temporal = params.edge_temporal.iter().any(|t| *t);
+
         // Switch to parallel when fan-out exceeds threshold
-        if use_parallel && neighbors.len() >= ctx.adaptive.parallel_threshold {
+        if use_parallel && !has_temporal && neighbors.len() >= ctx.adaptive.parallel_threshold {
             ctx.warnings.push(format!(
                 "adaptive: parallel processing activated for node {} ({} edges, threshold {})",
                 source_id.as_raw(),
@@ -2679,14 +2789,14 @@ fn execute_single_hop_traverse(
             // Sequential path for normal fan-out
             for (target_uid, et_idx) in neighbors {
                 let edge_type = params.edge_types.get(et_idx).map(|s| s.as_str());
+                let edge_is_temporal = params.edge_temporal.get(et_idx).copied().unwrap_or(false);
                 let trp = TargetRowParams {
                     input_row: row,
                     target_uid,
                     edge_type,
+                    edge_is_temporal,
                 };
-                if let Some(out_row) = build_target_row(&trp, params, ctx)? {
-                    results.push(out_row);
-                }
+                results.extend(build_target_rows(&trp, params, ctx)?);
             }
         }
     }
@@ -2800,9 +2910,13 @@ fn execute_varlen_traverse(
                 }
             }
 
-            // Build result rows: parallel if enough neighbors, sequential otherwise
-            let use_parallel =
-                ctx.adaptive.enabled && depth_neighbors.len() >= ctx.adaptive.parallel_threshold;
+            // Build result rows: parallel if enough neighbors, sequential otherwise.
+            // Temporal edges force sequential because the parallel path doesn't yet
+            // know how to fan out across stored versions.
+            let has_temporal = params.edge_temporal.iter().any(|t| *t);
+            let use_parallel = ctx.adaptive.enabled
+                && !has_temporal
+                && depth_neighbors.len() >= ctx.adaptive.parallel_threshold;
 
             if use_parallel {
                 // depth_neighbors already has (src, tgt, et_idx) — pass directly
@@ -2834,14 +2948,15 @@ fn execute_varlen_traverse(
                     hop_row.insert(params.source.to_string(), Value::Int(src_uid as i64));
 
                     let edge_type = params.edge_types.get(et_idx).map(|s| s.as_str());
+                    let edge_is_temporal =
+                        params.edge_temporal.get(et_idx).copied().unwrap_or(false);
                     let trp = TargetRowParams {
                         input_row: &hop_row,
                         target_uid: tgt_uid,
                         edge_type,
+                        edge_is_temporal,
                     };
-                    if let Some(out_row) = build_target_row(&trp, params, ctx)? {
-                        results.push(out_row);
-                    }
+                    results.extend(build_target_rows(&trp, params, ctx)?);
                 }
             }
 
@@ -5177,6 +5292,22 @@ fn execute_merge_relationship_check(
     };
 
     let target_raw = target_id.as_raw();
+    // Reject MERGE on temporal edge types: the (src, tgt) pair can carry many
+    // versions, and MERGE's "match by adj-posting existence" semantics would
+    // either silently no-op when versions exist (wrong for new-version intent)
+    // or duplicate-create (wrong for idempotent intent). Until per-version
+    // MERGE semantics ship, force users to pick a concrete operation.
+    for et in effective_types {
+        if lookup_edge_type_temporal(et, ctx)? {
+            return Err(ExecutionError::Unsupported(format!(
+                "MERGE on temporal edge type '{et}' is not supported: temporal \
+                 edges have multiple versions per (src, tgt) pair, so MERGE's \
+                 single-existence semantics don't apply. Use CREATE to add a \
+                 new version, or MATCH + SET / DELETE to update / remove an \
+                 existing one."
+            )));
+        }
+    }
     for et in effective_types {
         let neighbors = expand_one_hop(source_id, std::slice::from_ref(et), *direction, ctx)?;
         if !neighbors.iter().any(|(tgt, _)| *tgt == target_raw) {
@@ -5473,12 +5604,14 @@ fn execute_merge_relationship_create(
     ctx.adj_merge_add(&rev_key, from_id.as_raw());
     ctx.write_stats.edges_created += 1;
 
-    // Register edge type in schema (idempotent).
+    // Register edge type in schema (idempotent — never clobber an existing
+    // EdgeTypeSchema written by `CREATE EDGE TYPE`).
     let et_key = edge_type_schema_key(et);
-    if !ctx
+    let already_registered = ctx
         .mvcc_write_buffer
         .contains_key(&(Partition::Schema, et_key.clone()))
-    {
+        || ctx.mvcc_get(Partition::Schema, &et_key)?.is_some();
+    if !already_registered {
         ctx.mvcc_put(Partition::Schema, &et_key, b"")?;
     }
 
@@ -6089,6 +6222,21 @@ fn execute_create_edge(
     // Single buffer reused for forward and reverse key writes across all rows.
     let mut edge_key = Vec::with_capacity(64);
 
+    // Check if the edge type is registered as temporal. Temporal edges require
+    // a `valid_from` property at write time so every version can be keyed by
+    // its validity start. Per-version storage layout lands in a follow-up step;
+    // here we only enforce the API contract.
+    let is_temporal = lookup_edge_type_temporal(edge_type, ctx)?;
+    if is_temporal {
+        let has_valid_from = properties.iter().any(|(name, _)| name == "valid_from");
+        if !has_valid_from {
+            return Err(ExecutionError::Unsupported(format!(
+                "edge type '{edge_type}' is TEMPORAL: CREATE requires a 'valid_from' \
+                 timestamp property on every instance"
+            )));
+        }
+    }
+
     for row in input_rows {
         // Get source and target node IDs from the row
         let source_id = match row.get(source) {
@@ -6109,30 +6257,91 @@ fn execute_create_edge(
         ctx.adj_merge_add(&edge_key, source_id.as_raw());
         ctx.write_stats.edges_created += 1;
 
-        // Register edge type in schema (idempotent marker).
-        // This enables O(edge_types) targeted lookup in DETACH DELETE instead of
-        // O(all_edges) full scan. Deduplicated within this transaction via write buffer.
+        // Register edge type in schema (idempotent marker) ONLY if no entry
+        // already exists. Overwriting would clobber an `EdgeTypeSchema` written
+        // by `CREATE EDGE TYPE` (msgpack body carrying `temporal: true`) with
+        // an empty marker — breaking subsequent temporal lookups for this type.
+        // This enables O(edge_types) targeted lookup in DETACH DELETE instead
+        // of O(all_edges) full scan.
         let et_key = edge_type_schema_key(edge_type);
-        if !ctx
+        let already_registered = ctx
             .mvcc_write_buffer
             .contains_key(&(Partition::Schema, et_key.clone()))
-        {
+            || ctx.mvcc_get(Partition::Schema, &et_key)?.is_some();
+        if !already_registered {
             ctx.mvcc_put(Partition::Schema, &et_key, b"")?;
         }
 
         // Store edge properties (facets) in EdgeProp partition.
-        // Key: edgeprop:<TYPE>:<src BE>:<tgt BE>
+        // Non-temporal: key = edgeprop:<TYPE>:<src BE>:<tgt BE>
+        // Temporal:     key = edgeprop:<TYPE>:<src BE>:<tgt BE>:<valid_from BE>
         // Value: MessagePack map of field_id → Value (same as node properties)
         if !properties.is_empty() {
             let mut prop_map: Vec<(u32, Value)> = Vec::with_capacity(properties.len());
+            let mut valid_from_value: Option<i64> = None;
+            let mut valid_to_value: Option<i64> = None;
             for (prop_name, expr) in properties {
+                // Reject writes to reserved metadata field names that would
+                // otherwise collide with engine-internal row columns.
+                if matches!(prop_name.as_str(), "__src__" | "__tgt__" | "__type__") {
+                    return Err(ExecutionError::Unsupported(format!(
+                        "edge property name '{prop_name}' is reserved for engine-internal \
+                         metadata; choose a different name"
+                    )));
+                }
                 let field_id = ctx.interner.intern(prop_name);
                 let value = eval_expr(expr, row).map_to_document();
+                if is_temporal && prop_name == "valid_from" {
+                    // Accept both Int (epoch ms) and Timestamp (engine native).
+                    // Reject Null (explicit null violates the temporal contract)
+                    // and any other type.
+                    valid_from_value = match &value {
+                        Value::Int(ms) => Some(*ms),
+                        Value::Timestamp(ms) => Some(*ms),
+                        Value::Null => {
+                            return Err(ExecutionError::Unsupported(format!(
+                                "temporal edge '{edge_type}': valid_from must not be NULL"
+                            )));
+                        }
+                        other => {
+                            return Err(ExecutionError::Unsupported(format!(
+                                "temporal edge '{edge_type}': valid_from must be INT or \
+                                 TIMESTAMP (epoch milliseconds), got {other:?}"
+                            )));
+                        }
+                    };
+                }
+                if is_temporal && prop_name == "valid_to" {
+                    valid_to_value = match &value {
+                        Value::Int(ms) => Some(*ms),
+                        Value::Timestamp(ms) => Some(*ms),
+                        Value::Null => None,
+                        other => {
+                            return Err(ExecutionError::Unsupported(format!(
+                                "temporal edge '{edge_type}': valid_to must be INT, \
+                                 TIMESTAMP, or NULL, got {other:?}"
+                            )));
+                        }
+                    };
+                }
                 prop_map.push((field_id, value));
+            }
+            // Interval sanity check: valid_to (if set) must be > valid_from.
+            // A zero-duration version (valid_to == valid_from) is rejected too
+            // — temporal_active_at would never return true for it, so it is
+            // never a useful piece of data and almost certainly a bug.
+            if let (Some(vf), Some(vt)) = (valid_from_value, valid_to_value) {
+                if vt <= vf {
+                    return Err(ExecutionError::Unsupported(format!(
+                        "temporal edge '{edge_type}': valid_to ({vt}) must be strictly \
+                         greater than valid_from ({vf})"
+                    )));
+                }
             }
             let prop_bytes = rmp_serde::to_vec(&prop_map)
                 .map_err(|e| ExecutionError::Serialization(format!("edge prop encode: {e}")))?;
-            let ep_key = encode_edgeprop_key(edge_type, source_id, target_id);
+            let valid_from_for_key = if is_temporal { valid_from_value } else { None };
+            let ep_key = edgeprop_write_key(edge_type, source_id, target_id, valid_from_for_key);
             ctx.mvcc_put(Partition::EdgeProp, &ep_key, &prop_bytes)?;
             ctx.write_stats.properties_set += properties.len() as u64;
         }
@@ -6186,6 +6395,25 @@ fn execute_update(
                 } => {
                     // Map literals → Document for nested property storage.
                     let val = eval_expr(expr, &out_row).map_to_document();
+
+                    // Edge variable bindings carry Value::String(edge_type),
+                    // not Value::Int. Route to the edge-prop update path,
+                    // which preserves the existing edgeprop key (non-temporal
+                    // single key OR temporal per-version key keyed on the
+                    // matched valid_from).
+                    if let Some(Value::String(edge_type)) = out_row.get(variable).cloned() {
+                        update_edge_property(
+                            variable,
+                            &edge_type,
+                            property,
+                            val,
+                            &mut out_row,
+                            ctx,
+                        )?;
+                        out_row.insert(format!("{variable}.{property}"), eval_expr(expr, row));
+                        continue;
+                    }
+
                     let node_id = match out_row.get(variable) {
                         Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                         _ => continue,
@@ -6973,6 +7201,30 @@ fn execute_delete(
 ) -> Result<Vec<Row>, ExecutionError> {
     for row in input_rows {
         for var in variables {
+            // Edge variable bindings carry the edge type as a String value,
+            // not a node id. DELETE on an edge variable hard-deletes that
+            // logical edge: non-temporal types remove the one edgeprop entry
+            // and clear adj-posting; temporal types remove every version
+            // under the (src, tgt) prefix and clear adj-posting once the
+            // version count drops to zero.
+            if let Some(Value::String(edge_type)) = row.get(var).cloned() {
+                let src_raw = match row.get(&format!("{var}.__src__")) {
+                    Some(Value::Int(n)) => *n as u64,
+                    _ => continue,
+                };
+                let tgt_raw = match row.get(&format!("{var}.__tgt__")) {
+                    Some(Value::Int(n)) => *n as u64,
+                    _ => continue,
+                };
+                delete_single_edge(
+                    NodeId::from_raw(src_raw),
+                    NodeId::from_raw(tgt_raw),
+                    &edge_type,
+                    ctx,
+                )?;
+                continue;
+            }
+
             let node_id = match row.get(var) {
                 Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                 _ => continue,
@@ -7037,13 +7289,27 @@ fn execute_delete(
                             };
                             ctx.adj_merge_remove(&counterpart_key, node_id.as_raw());
 
-                            // Clean up edge properties for this edge
+                            // Clean up edge properties for this edge. Temporal
+                            // edge types keep one edgeprop entry per version
+                            // (keyed on valid_from), so a single-key delete
+                            // would leak N-1 orphan entries. Prefix-scan the
+                            // pair and tombstone every version.
                             let (ep_src, ep_tgt) = match parts.direction {
                                 AdjDirection::Out => (node_id, peer_id),
                                 AdjDirection::In => (peer_id, node_id),
                             };
-                            let ep_key = encode_edgeprop_key(&parts.edge_type, ep_src, ep_tgt);
-                            ctx.mvcc_delete(Partition::EdgeProp, &ep_key)?;
+                            if lookup_edge_type_temporal(&parts.edge_type, ctx)? {
+                                let prefix =
+                                    temporal_edgeprop_pair_prefix(&parts.edge_type, ep_src, ep_tgt);
+                                let versions =
+                                    ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)?;
+                                for (vkey, _) in versions {
+                                    ctx.mvcc_delete(Partition::EdgeProp, &vkey)?;
+                                }
+                            } else {
+                                let ep_key = encode_edgeprop_key(&parts.edge_type, ep_src, ep_tgt);
+                                ctx.mvcc_delete(Partition::EdgeProp, &ep_key)?;
+                            }
                         }
                     }
                 }
@@ -7414,12 +7680,13 @@ fn create_single_edge(
 
     ctx.write_stats.edges_created += 1;
 
-    // Register edge type in schema (idempotent).
+    // Register edge type in schema (idempotent — never clobber existing schema).
     let et_key = edge_type_schema_key(edge_type);
-    if !ctx
+    let already_registered = ctx
         .mvcc_write_buffer
         .contains_key(&(Partition::Schema, et_key.clone()))
-    {
+        || ctx.mvcc_get(Partition::Schema, &et_key)?.is_some();
+    if !already_registered {
         ctx.mvcc_put(Partition::Schema, &et_key, b"")?;
     }
     Ok(())
@@ -7824,22 +8091,49 @@ fn emit_attach_set_path(
     Ok(())
 }
 
-/// Delete one edge `(src → tgt)` of `edge_type` by issuing merge_remove
-/// operations on both adjacency halves and removing the edge-property entry.
+/// Delete one edge `(src → tgt)` of `edge_type`.
+///
+/// Non-temporal: issue merge_remove on both adjacency halves and delete the
+/// single edgeprop entry.
+///
+/// Temporal: `DELETE r` is a hard delete of the logical edge — every version
+/// of the pair is removed, then adj-posting is cleared. The "soft-close one
+/// version" workflow is `SET r.valid_to = <now>`, not DELETE. Hard deletes are
+/// rare (GDPR erase, mistaken insert) but must be supported.
 fn delete_single_edge(
     src: NodeId,
     tgt: NodeId,
     edge_type: &str,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<(), ExecutionError> {
-    let fwd = encode_adj_key_forward(edge_type, src);
-    ctx.adj_merge_remove(&fwd, tgt.as_raw());
+    let is_temporal = lookup_edge_type_temporal(edge_type, ctx)?;
 
-    let rev = encode_adj_key_reverse(edge_type, tgt);
-    ctx.adj_merge_remove(&rev, src.as_raw());
+    if is_temporal {
+        // Snapshot every version key under the pair prefix, then delete each.
+        let prefix = temporal_edgeprop_pair_prefix(edge_type, src, tgt);
+        let versions = ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)?;
+        for (key, _) in versions {
+            ctx.mvcc_delete(Partition::EdgeProp, &key)?;
+        }
+    } else {
+        let ep_key = encode_edgeprop_key(edge_type, src, tgt);
+        ctx.mvcc_delete(Partition::EdgeProp, &ep_key)?;
+    }
 
-    let ep_key = encode_edgeprop_key(edge_type, src, tgt);
-    ctx.mvcc_delete(Partition::EdgeProp, &ep_key)?;
+    // Adj-posting tracks pair existence, not version count, so once all
+    // versions are gone we clear it. For non-temporal this is the only
+    // version, so the post-delete count is trivially zero.
+    let remaining = if is_temporal {
+        temporal_pair_remaining_versions(edge_type, src, tgt, ctx)?
+    } else {
+        0
+    };
+    if remaining == 0 {
+        let fwd = encode_adj_key_forward(edge_type, src);
+        ctx.adj_merge_remove(&fwd, tgt.as_raw());
+        let rev = encode_adj_key_reverse(edge_type, tgt);
+        ctx.adj_merge_remove(&rev, src.as_raw());
+    }
 
     ctx.write_stats.edges_deleted += 1;
     Ok(())
@@ -7964,6 +8258,172 @@ fn edge_type_schema_key(edge_type: &str) -> Vec<u8> {
     k.extend_from_slice(PREFIX);
     k.extend_from_slice(edge_type.as_bytes());
     k
+}
+
+/// Look up whether an edge type was declared with the TEMPORAL modifier.
+///
+/// Reads `schema:edge_type:<name>` and attempts to decode the body as an
+/// `EdgeTypeSchema`. A zero-length body is a legacy idempotent marker written
+/// on first CREATE for the type (predates DDL) — treated as non-temporal.
+/// Missing key also returns `false`: an edge type used without a prior
+/// `CREATE EDGE TYPE` is implicitly non-temporal.
+fn lookup_edge_type_temporal(
+    edge_type: &str,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<bool, ExecutionError> {
+    let key = edge_type_schema_key(edge_type);
+    let bytes = match ctx.mvcc_get(Partition::Schema, &key) {
+        Ok(Some(b)) => b,
+        Ok(None) => return Ok(false),
+        Err(e) => {
+            return Err(ExecutionError::Unsupported(format!(
+                "storage error reading edge type schema: {e}"
+            )));
+        }
+    };
+    if bytes.is_empty() {
+        return Ok(false);
+    }
+    match EdgeTypeSchema::from_msgpack(&bytes) {
+        Ok(schema) => Ok(schema.temporal),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Apply `SET r.<property> = <value>` to the matched edge.
+///
+/// Locates the edgeprop entry via the hidden `__src__` / `__tgt__` row columns
+/// written by `build_target_rows`. For temporal edges, also reads
+/// `<ev>.valid_from` from the row so the per-version key resolves to the
+/// SAME row that was matched (no new version is created). Reads the current
+/// MessagePack-encoded property map, replaces or inserts the named field,
+/// writes it back.
+fn update_edge_property(
+    edge_variable: &str,
+    edge_type: &str,
+    property: &str,
+    value: Value,
+    row: &mut Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    let src_raw = match row.get(&format!("{edge_variable}.__src__")) {
+        Some(Value::Int(n)) => *n as u64,
+        _ => return Ok(()),
+    };
+    let tgt_raw = match row.get(&format!("{edge_variable}.__tgt__")) {
+        Some(Value::Int(n)) => *n as u64,
+        _ => return Ok(()),
+    };
+    let src = NodeId::from_raw(src_raw);
+    let tgt = NodeId::from_raw(tgt_raw);
+
+    let is_temporal = lookup_edge_type_temporal(edge_type, ctx)?;
+
+    // Reject mutation of key-immutable fields and reserved metadata columns.
+    // valid_from is part of the storage key — rewriting it would either
+    // create a phantom version (insert at new key without removing the old)
+    // or corrupt the value/key invariant. Workflow: DELETE + CREATE.
+    if is_temporal && property == "valid_from" {
+        return Err(ExecutionError::Unsupported(format!(
+            "SET {edge_variable}.valid_from is not allowed on temporal edges: \
+             valid_from is part of the storage key. DELETE the version and \
+             CREATE a new one with the updated timestamp."
+        )));
+    }
+    if matches!(property, "__src__" | "__tgt__" | "__type__") {
+        return Err(ExecutionError::Unsupported(format!(
+            "SET {edge_variable}.{property} is reserved: '{property}' is \
+             engine-internal row metadata and cannot be assigned"
+        )));
+    }
+
+    let ep_key = if is_temporal {
+        let valid_from = match row.get(&format!("{edge_variable}.valid_from")) {
+            Some(Value::Int(ms)) => *ms,
+            _ => {
+                return Err(ExecutionError::Unsupported(format!(
+                    "SET on temporal edge '{edge_variable}': matched row is missing valid_from"
+                )));
+            }
+        };
+        encode_temporal_edgeprop_key(edge_type, src, tgt, valid_from)
+    } else {
+        encode_edgeprop_key(edge_type, src, tgt)
+    };
+
+    let mut prop_map: Vec<(u32, Value)> = match ctx.mvcc_get(Partition::EdgeProp, &ep_key)? {
+        Some(bytes) => rmp_serde::from_slice(&bytes).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let field_id = ctx.interner.intern(property);
+    let mut replaced = false;
+    for entry in &mut prop_map {
+        if entry.0 == field_id {
+            entry.1 = value.clone();
+            replaced = true;
+            break;
+        }
+    }
+    if !replaced {
+        prop_map.push((field_id, value));
+    }
+    let prop_bytes = rmp_serde::to_vec(&prop_map)
+        .map_err(|e| ExecutionError::Serialization(format!("edge prop encode: {e}")))?;
+    ctx.mvcc_put(Partition::EdgeProp, &ep_key, &prop_bytes)?;
+    ctx.write_stats.properties_set += 1;
+    Ok(())
+}
+
+/// Count remaining edgeprop versions for a temporal `(type, src, tgt)` pair.
+///
+/// Used after a temporal DELETE to decide whether the adj-posting forward and
+/// reverse entries for the pair must also be removed. While at least one
+/// version of the edge exists between `src` and `tgt`, the adj-posting entry
+/// stays. When the count drops to zero the caller fires `adj_merge_remove`
+/// on both directions; otherwise it leaves adj-posting alone.
+///
+/// `mvcc_prefix_scan` returns snapshot entries even when a tombstone exists
+/// in the write buffer for the same key (the buffer filter only adds `Some(_)`
+/// writes). To get an accurate post-delete count within a single transaction
+/// we walk the scan result and subtract any key that has a `None` tombstone
+/// in the write buffer.
+pub(crate) fn temporal_pair_remaining_versions(
+    edge_type: &str,
+    source_id: NodeId,
+    target_id: NodeId,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<usize, ExecutionError> {
+    let prefix = temporal_edgeprop_pair_prefix(edge_type, source_id, target_id);
+    let scan = ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)?;
+    let mut remaining = 0_usize;
+    for (key, _) in scan {
+        let tombstoned = matches!(
+            ctx.mvcc_write_buffer
+                .get(&(Partition::EdgeProp, key.clone())),
+            Some(None)
+        );
+        if !tombstoned {
+            remaining += 1;
+        }
+    }
+    Ok(remaining)
+}
+
+/// Build the write key for an edgeprop entry given the temporal context.
+///
+/// `valid_from_ms` MUST be `Some(_)` when the edge type is declared temporal
+/// (callers enforce this earlier via the write-time guard) and `None` for
+/// non-temporal types. Mixing the two is a logic error in the caller.
+pub(crate) fn edgeprop_write_key(
+    edge_type: &str,
+    source_id: NodeId,
+    target_id: NodeId,
+    valid_from_ms: Option<i64>,
+) -> Vec<u8> {
+    match valid_from_ms {
+        Some(vf) => encode_temporal_edgeprop_key(edge_type, source_id, target_id, vf),
+        None => encode_edgeprop_key(edge_type, source_id, target_id),
+    }
 }
 
 /// Extract node ID from a node key (after the "node:XXXX:" prefix).
@@ -8155,6 +8615,73 @@ fn execute_alter_label(
     row.insert("label".to_string(), Value::String(label.to_string()));
     row.insert("mode".to_string(), Value::String(format!("{mode}")));
     row.insert("version".to_string(), Value::Int(schema.version as i64));
+    Ok(vec![row])
+}
+
+/// Execute CREATE EDGE TYPE: register an edge-type schema in the Schema partition.
+///
+/// Persists an `EdgeTypeSchema` keyed by `schema:edge_type:<name>` via the MVCC
+/// write buffer. Subsequent edge writes that name this type can be validated
+/// against the declared properties; if `temporal == true`, the write path
+/// requires `valid_from` and stores per-version edgeprop entries.
+///
+/// Returns one row: `{ name, temporal, version, properties }`.
+fn execute_create_edge_type(
+    name: &str,
+    temporal: bool,
+    properties: &[crate::cypher::ast::EdgePropertyDecl],
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    let key = encode_edge_type_schema_key(name);
+
+    if let Ok(Some(_)) = ctx.mvcc_get(Partition::Schema, &key) {
+        return Err(ExecutionError::Unsupported(format!(
+            "edge type '{name}' already exists"
+        )));
+    }
+
+    let mut schema = EdgeTypeSchema::new(name);
+    schema.set_temporal(temporal);
+
+    for decl in properties {
+        let ptype = match decl.type_name.as_str() {
+            "STRING" => PropertyType::String,
+            "INT" => PropertyType::Int,
+            "FLOAT" => PropertyType::Float,
+            "BOOL" => PropertyType::Bool,
+            "TIMESTAMP" => PropertyType::Timestamp,
+            "BLOB" => PropertyType::Blob,
+            "MAP" => PropertyType::Map,
+            "GEO" => PropertyType::Geo,
+            "BINARY" => PropertyType::Binary,
+            "DOCUMENT" => PropertyType::Document,
+            other => {
+                return Err(ExecutionError::Unsupported(format!(
+                    "unsupported property type '{other}' for edge type '{name}'"
+                )));
+            }
+        };
+        let mut prop = PropertyDef::new(&decl.name, ptype);
+        if decl.not_null {
+            prop = prop.not_null();
+        }
+        schema.add_property(prop);
+    }
+
+    let value = schema.to_msgpack().map_err(|e| {
+        ExecutionError::Unsupported(format!("failed to serialize edge type schema: {e}"))
+    })?;
+    ctx.mvcc_write_buffer
+        .insert((Partition::Schema, key), Some(value));
+
+    let mut row = Row::new();
+    row.insert("name".to_string(), Value::String(name.to_string()));
+    row.insert("temporal".to_string(), Value::Bool(temporal));
+    row.insert("version".to_string(), Value::Int(schema.version as i64));
+    row.insert(
+        "properties".to_string(),
+        Value::Int(properties.len() as i64),
+    );
     Ok(vec![row])
 }
 
@@ -8983,6 +9510,7 @@ mod tests {
                     edge_variable: None,
                     target_filters: vec![],
                     edge_filters: vec![],
+                    temporal_filter: None,
                 }),
                 items: vec![crate::planner::logical::ProjectItem {
                     expr: Expr::PropertyAccess {
@@ -10161,6 +10689,7 @@ mod tests {
                     edge_variable: None,
                     target_filters: vec![],
                     edge_filters: vec![],
+                    temporal_filter: None,
                 }),
                 items: vec![crate::planner::logical::ProjectItem {
                     expr: Expr::Star,
@@ -10234,6 +10763,7 @@ mod tests {
                 edge_variable: None,
                 target_filters: vec![],
                 edge_filters: vec![],
+                temporal_filter: None,
             },
         };
 
@@ -10273,6 +10803,7 @@ mod tests {
                 edge_variable: None,
                 target_filters: vec![],
                 edge_filters: vec![],
+                temporal_filter: None,
             },
         };
 
@@ -10370,6 +10901,7 @@ mod tests {
                 edge_variable: None,
                 target_filters: vec![],
                 edge_filters: vec![],
+                temporal_filter: None,
             },
         };
 
@@ -10619,6 +11151,7 @@ mod tests {
                 edge_variable: None,
                 target_filters: vec![],
                 edge_filters: vec![],
+                temporal_filter: None,
             },
         };
 
@@ -10668,6 +11201,7 @@ mod tests {
                 edge_variable: None,
                 target_filters: vec![],
                 edge_filters: vec![],
+                temporal_filter: None,
             },
         };
 
@@ -10752,6 +11286,7 @@ mod tests {
                 edge_variable: None,
                 target_filters: vec![],
                 edge_filters: vec![],
+                temporal_filter: None,
             },
         };
 
@@ -10796,6 +11331,7 @@ mod tests {
                 edge_variable: None,
                 target_filters: vec![],
                 edge_filters: vec![],
+                temporal_filter: None,
             },
         };
 
@@ -11771,6 +12307,7 @@ mod tests {
                 length: None,
                 target_filters: vec![],
                 edge_filters: vec![],
+                temporal_filter: None,
             }),
             predicate: Expr::BinaryOp {
                 left: Box::new(Expr::PropertyAccess {
@@ -11835,6 +12372,7 @@ mod tests {
             length: None,
             target_filters: vec![],
             edge_filters: vec![],
+            temporal_filter: None,
         };
         assert!(
             !super::needs_correlated_execution(&right),
@@ -11946,6 +12484,7 @@ mod tests {
                 edge_variable: None,
                 target_filters: vec![],
                 edge_filters: vec![],
+                temporal_filter: None,
             },
         };
 
@@ -12055,6 +12594,7 @@ mod tests {
                 edge_variable: None,
                 target_filters: vec![],
                 edge_filters: vec![],
+                temporal_filter: None,
             },
         };
 
@@ -12441,5 +12981,45 @@ mod tests {
             Some(&coordinode_core::graph::types::Value::String("Bob".into())),
             "row should have n.name = Bob, got {name_val:?}"
         );
+    }
+
+    // -- R171: edgeprop_write_key routing --
+
+    #[test]
+    fn edgeprop_write_key_non_temporal_uses_legacy_shape() {
+        let key = edgeprop_write_key("KNOWS", NodeId::from_raw(1), NodeId::from_raw(2), None);
+        // Legacy shape: `edgeprop:KNOWS:<src 8B>:<tgt 8B>` — 9 + 5 + 1 + 8 + 1 + 8 = 32 bytes.
+        assert_eq!(key.len(), 9 + "KNOWS".len() + 1 + 8 + 1 + 8);
+        assert!(key.starts_with(b"edgeprop:KNOWS:"));
+    }
+
+    #[test]
+    fn edgeprop_write_key_temporal_appends_valid_from() {
+        let key = edgeprop_write_key(
+            "WORKS_AT",
+            NodeId::from_raw(1),
+            NodeId::from_raw(2),
+            Some(1_700_000_000_000),
+        );
+        // Temporal shape adds `:<valid_from 8B>` (9 more bytes).
+        let legacy_len = 9 + "WORKS_AT".len() + 1 + 8 + 1 + 8;
+        assert_eq!(key.len(), legacy_len + 1 + 8);
+    }
+
+    #[test]
+    fn edgeprop_write_key_temporal_keys_sort_by_valid_from() {
+        let early = edgeprop_write_key(
+            "WORKS_AT",
+            NodeId::from_raw(1),
+            NodeId::from_raw(2),
+            Some(1_000),
+        );
+        let late = edgeprop_write_key(
+            "WORKS_AT",
+            NodeId::from_raw(1),
+            NodeId::from_raw(2),
+            Some(2_000),
+        );
+        assert!(early < late, "earlier valid_from must sort first");
     }
 }

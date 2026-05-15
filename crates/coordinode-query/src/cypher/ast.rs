@@ -48,6 +48,7 @@ impl Query {
                     | Clause::DropIndex(_)
                     | Clause::CreateVectorIndex(_)
                     | Clause::DropVectorIndex(_)
+                    | Clause::CreateEdgeType(_)
             )
         })
     }
@@ -99,6 +100,7 @@ pub enum Clause {
     DropIndex(DropIndexClause),
     CreateVectorIndex(CreateVectorIndexClause),
     DropVectorIndex(DropVectorIndexClause),
+    CreateEdgeType(CreateEdgeTypeClause),
 
     // Write clauses
     Create(CreateClause),
@@ -268,6 +270,34 @@ pub struct CreateVectorIndexClause {
     pub metric: Option<String>,
     /// Vector dimensionality (required unless inferrable from data).
     pub dimensions: Option<u32>,
+}
+
+/// CREATE EDGE TYPE clause.
+///
+/// Syntax: `CREATE EDGE TYPE <name> [TEMPORAL] [WITH ( <decl>, ... )]`
+///
+/// Declares an edge type schema. When `temporal = true`, every edge instance
+/// must carry a `valid_from` timestamp at write time and the storage layer
+/// stores per-version edgeprop entries keyed on `(src, tgt, valid_from)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateEdgeTypeClause {
+    /// Edge type name (e.g., "WORKS_AT").
+    pub name: String,
+    /// Whether the edge type carries bitemporal `(valid_from, valid_to)` fields.
+    pub temporal: bool,
+    /// User-declared edge properties from the optional `WITH (...)` block.
+    pub properties: Vec<EdgePropertyDecl>,
+}
+
+/// Single edge-type property declaration: `name : TYPE [NOT NULL]`.
+///
+/// `type_name` is the lexical type identifier (e.g., "STRING", "TIMESTAMP")
+/// — resolved against `coordinode_core::schema::PropertyType` in semantic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgePropertyDecl {
+    pub name: String,
+    pub type_name: String,
+    pub not_null: bool,
 }
 
 /// DROP VECTOR INDEX clause.

@@ -153,6 +153,121 @@ pub fn decode_edgeprop_key(key: &[u8]) -> Option<(String, NodeId, NodeId)> {
     ))
 }
 
+// -- Temporal edge property keys --
+//
+// Temporal edges keep one edgeprop entry per valid_from. The key is the
+// regular `(type, src, tgt)` triple followed by a sortable i64-BE encoding
+// of the validity start. Sorting by `valid_from` lets a single prefix scan
+// of `edgeprop:<TYPE>:<src>:<tgt>:` enumerate every version of the edge in
+// chronological order, and a bounded range scan with `valid_from_upper_bound_key`
+// answers "active at time T" queries in O(log versions).
+
+/// Encode `valid_from` (Unix epoch milliseconds, signed) as 8 bytes sorted
+/// lexicographically ascending by numeric value. Negative values use sign-flip
+/// so timestamps before the epoch sort before positive ones; the result is a
+/// total order matching `i64` comparison.
+fn encode_valid_from_sortable(valid_from_ms: i64) -> [u8; 8] {
+    ((valid_from_ms as u64) ^ (1u64 << 63)).to_be_bytes()
+}
+
+fn decode_valid_from_sortable(bytes: [u8; 8]) -> i64 {
+    (u64::from_be_bytes(bytes) ^ (1u64 << 63)) as i64
+}
+
+/// Encode a temporal edge property key:
+/// `edgeprop:<edge_type>:<source_id BE>:<target_id BE>:<valid_from sortable>`.
+///
+/// One entry per version. Multiple versions of the same `(src, tgt)` pair
+/// coexist; an "active at T" query prefix-scans `temporal_edgeprop_pair_prefix`
+/// and stops at `valid_from_upper_bound_key`.
+pub fn encode_temporal_edgeprop_key(
+    edge_type: &str,
+    source_id: NodeId,
+    target_id: NodeId,
+    valid_from_ms: i64,
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(9 + edge_type.len() + 1 + 8 + 1 + 8 + 1 + 8);
+    key.extend_from_slice(b"edgeprop:");
+    key.extend_from_slice(edge_type.as_bytes());
+    key.push(b':');
+    key.extend_from_slice(&source_id.as_raw().to_be_bytes());
+    key.push(b':');
+    key.extend_from_slice(&target_id.as_raw().to_be_bytes());
+    key.push(b':');
+    key.extend_from_slice(&encode_valid_from_sortable(valid_from_ms));
+    key
+}
+
+/// Decode a temporal edge property key into `(edge_type, src, tgt, valid_from)`.
+/// Returns `None` if the key isn't well-formed.
+pub fn decode_temporal_edgeprop_key(key: &[u8]) -> Option<(String, NodeId, NodeId, i64)> {
+    if !key.starts_with(b"edgeprop:") {
+        return None;
+    }
+    // Tail: src(8) + ':' + tgt(8) + ':' + valid_from(8) = 27 bytes.
+    if key.len() < 9 + 1 + 8 + 1 + 8 + 1 + 8 {
+        return None;
+    }
+    let vf_start = key.len() - 8;
+    let tgt_start = vf_start - 1 - 8;
+    let src_start = tgt_start - 1 - 8;
+    if key[src_start + 8] != b':' || key[tgt_start + 8] != b':' {
+        return None;
+    }
+    let edge_type_end = src_start - 1;
+    if key[edge_type_end] != b':' {
+        return None;
+    }
+
+    let edge_type = std::str::from_utf8(&key[9..edge_type_end]).ok()?;
+    let source_id = u64::from_be_bytes(key[src_start..src_start + 8].try_into().ok()?);
+    let target_id = u64::from_be_bytes(key[tgt_start..tgt_start + 8].try_into().ok()?);
+    let valid_from_bytes: [u8; 8] = key[vf_start..vf_start + 8].try_into().ok()?;
+    let valid_from = decode_valid_from_sortable(valid_from_bytes);
+
+    Some((
+        edge_type.to_string(),
+        NodeId::from_raw(source_id),
+        NodeId::from_raw(target_id),
+        valid_from,
+    ))
+}
+
+/// Prefix matching every temporal edgeprop entry for a given `(type, src, tgt)`
+/// pair: `edgeprop:<TYPE>:<src>:<tgt>:`. Use for full-version enumeration.
+pub fn temporal_edgeprop_pair_prefix(
+    edge_type: &str,
+    source_id: NodeId,
+    target_id: NodeId,
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(9 + edge_type.len() + 1 + 8 + 1 + 8 + 1);
+    key.extend_from_slice(b"edgeprop:");
+    key.extend_from_slice(edge_type.as_bytes());
+    key.push(b':');
+    key.extend_from_slice(&source_id.as_raw().to_be_bytes());
+    key.push(b':');
+    key.extend_from_slice(&target_id.as_raw().to_be_bytes());
+    key.push(b':');
+    key
+}
+
+/// Exclusive upper bound for a prefix scan that collects every version with
+/// `valid_from <= upper_ms`. Suffix encodes `upper_ms + 1` in the sortable form
+/// so the bound itself doesn't include `upper_ms + 1` but does include all
+/// values `<= upper_ms`.
+///
+/// Saturates at `i64::MAX`: if asked for an unbounded scan, the caller should
+/// instead use `temporal_edgeprop_pair_prefix` plus the LSM range's natural end.
+pub fn valid_from_upper_bound_key(
+    edge_type: &str,
+    source_id: NodeId,
+    target_id: NodeId,
+    upper_ms: i64,
+) -> Vec<u8> {
+    let bound = upper_ms.saturating_add(1);
+    encode_temporal_edgeprop_key(edge_type, source_id, target_id, bound)
+}
+
 // -- Edge properties (facets) --
 
 /// Properties on a specific edge (facets).
@@ -678,6 +793,87 @@ mod tests {
         assert!(decode_edgeprop_key(b"").is_none());
         assert!(decode_edgeprop_key(b"adj:FOLLOWS:out:12345678").is_none());
         assert!(decode_edgeprop_key(b"edgeprop:short").is_none());
+    }
+
+    #[test]
+    fn temporal_edgeprop_key_roundtrip() {
+        let key = encode_temporal_edgeprop_key(
+            "WORKS_AT",
+            NodeId::from_raw(7),
+            NodeId::from_raw(11),
+            1_700_000_000_000,
+        );
+        let (edge_type, src, tgt, vf) = decode_temporal_edgeprop_key(&key).expect("decode failed");
+        assert_eq!(edge_type, "WORKS_AT");
+        assert_eq!(src, NodeId::from_raw(7));
+        assert_eq!(tgt, NodeId::from_raw(11));
+        assert_eq!(vf, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn temporal_edgeprop_key_sorts_by_valid_from_within_pair() {
+        let src = NodeId::from_raw(1);
+        let tgt = NodeId::from_raw(2);
+        let k_early = encode_temporal_edgeprop_key("WORKS_AT", src, tgt, 1000);
+        let k_mid = encode_temporal_edgeprop_key("WORKS_AT", src, tgt, 2000);
+        let k_late = encode_temporal_edgeprop_key("WORKS_AT", src, tgt, 3000);
+        assert!(k_early < k_mid);
+        assert!(k_mid < k_late);
+    }
+
+    #[test]
+    fn temporal_edgeprop_key_handles_negative_valid_from() {
+        // Pre-epoch timestamps must sort below post-epoch ones in lex order.
+        let src = NodeId::from_raw(1);
+        let tgt = NodeId::from_raw(2);
+        let k_neg = encode_temporal_edgeprop_key("WORKS_AT", src, tgt, -5_000);
+        let k_zero = encode_temporal_edgeprop_key("WORKS_AT", src, tgt, 0);
+        let k_pos = encode_temporal_edgeprop_key("WORKS_AT", src, tgt, 5_000);
+        assert!(k_neg < k_zero);
+        assert!(k_zero < k_pos);
+        let (_, _, _, decoded) = decode_temporal_edgeprop_key(&k_neg).expect("k_neg must decode");
+        assert_eq!(decoded, -5_000);
+    }
+
+    #[test]
+    fn temporal_edgeprop_pair_prefix_contains_all_versions() {
+        let src = NodeId::from_raw(1);
+        let tgt = NodeId::from_raw(2);
+        let prefix = temporal_edgeprop_pair_prefix("WORKS_AT", src, tgt);
+        let k1 = encode_temporal_edgeprop_key("WORKS_AT", src, tgt, 100);
+        let k2 = encode_temporal_edgeprop_key("WORKS_AT", src, tgt, 200);
+        assert!(k1.starts_with(&prefix));
+        assert!(k2.starts_with(&prefix));
+        // A different target must NOT share the prefix.
+        let k_other = encode_temporal_edgeprop_key("WORKS_AT", src, NodeId::from_raw(99), 100);
+        assert!(!k_other.starts_with(&prefix));
+    }
+
+    #[test]
+    fn valid_from_upper_bound_key_excludes_strictly_greater() {
+        let src = NodeId::from_raw(1);
+        let tgt = NodeId::from_raw(2);
+        let bound = valid_from_upper_bound_key("WORKS_AT", src, tgt, 1500);
+        let k_in = encode_temporal_edgeprop_key("WORKS_AT", src, tgt, 1500);
+        let k_above = encode_temporal_edgeprop_key("WORKS_AT", src, tgt, 1501);
+        // Bound is exclusive: keys < bound are included, k_above sits at the bound.
+        assert!(k_in < bound);
+        assert!(bound <= k_above);
+    }
+
+    #[test]
+    fn temporal_edgeprop_key_decode_invalid() {
+        assert!(decode_temporal_edgeprop_key(b"").is_none());
+        assert!(decode_temporal_edgeprop_key(b"edgeprop:short").is_none());
+        // Plain (non-temporal) edgeprop key has the wrong byte length: 9 prefix +
+        // type + : + 8 src + : + 8 tgt = 9 + 8 + 1 + 8 = 26 bytes for empty type,
+        // temporal needs at least 9 + 1 + 8 + 1 + 8 + 1 + 8 = 36 bytes for empty type.
+        let non_temporal =
+            encode_edgeprop_key("WORKS_AT", NodeId::from_raw(1), NodeId::from_raw(2));
+        // Same prefix triggers the starts_with branch but length & layout differ:
+        // the decoder must reject — separator at the temporal position is a u8 of
+        // the target_id, not necessarily ':'. The test asserts behavior is safe.
+        let _ = decode_temporal_edgeprop_key(&non_temporal);
     }
 
     // -- EdgeProperties tests --

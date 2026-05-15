@@ -222,8 +222,11 @@ impl<'a> Analyzer<'a> {
             | Clause::CreateIndex(_)
             | Clause::DropIndex(_)
             | Clause::CreateVectorIndex(_)
-            | Clause::DropVectorIndex(_) => {
+            | Clause::DropVectorIndex(_)
+            | Clause::CreateEdgeType(_) => {
                 // DDL — no variable references to validate.
+                // Edge-type property type names are validated at execution time
+                // against `PropertyType` enum in the DDL executor.
             }
         }
     }

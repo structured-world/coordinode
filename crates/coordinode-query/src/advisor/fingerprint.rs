@@ -308,6 +308,28 @@ fn write_clause(buf: &mut String, clause: &Clause) {
             buf.push_str("DROP VECTOR INDEX ");
             buf.push_str(&c.name);
         }
+        Clause::CreateEdgeType(c) => {
+            buf.push_str("CREATE EDGE TYPE ");
+            buf.push_str(&c.name);
+            if c.temporal {
+                buf.push_str(" TEMPORAL");
+            }
+            if !c.properties.is_empty() {
+                buf.push_str(" WITH (");
+                for (i, p) in c.properties.iter().enumerate() {
+                    if i > 0 {
+                        buf.push_str(", ");
+                    }
+                    buf.push_str(&p.name);
+                    buf.push(':');
+                    buf.push_str(&p.type_name);
+                    if p.not_null {
+                        buf.push_str(" NOT NULL");
+                    }
+                }
+                buf.push(')');
+            }
+        }
     }
 }
 
