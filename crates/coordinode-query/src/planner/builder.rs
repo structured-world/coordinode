@@ -114,6 +114,11 @@ pub fn build_logical_plan(query: &Query) -> Result<LogicalPlan, PlanError> {
     // items and lift it into a `LogicalOp::DocScore` below the innermost Project.
     let root = rewrite_doc_score(root)?;
 
+    // Planner pass: lift `temporal_active_at(r, $T)` predicates from Filter into
+    // the parent Traverse's `temporal_filter`. Bounds the per-version edgeprop
+    // scan in the executor instead of materializing every stored version.
+    let root = lift_temporal_filter(root);
+
     // Extract per-query hints. Both hints are optional; an explicit hint
     // always overrides the planner default or auto-promotion.
     let mut vector_consistency_hint: Option<VectorConsistencyMode> = None;
@@ -561,6 +566,11 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
         Clause::DropVectorIndex(c) => Ok(LogicalOp::DropVectorIndex {
             name: c.name.clone(),
         }),
+        Clause::CreateEdgeType(c) => Ok(LogicalOp::CreateEdgeType {
+            name: c.name.clone(),
+            temporal: c.temporal,
+            properties: c.properties.clone(),
+        }),
         Clause::AttachDocument(ad) => {
             // Synthesize a MATCH for the ATTACH pattern `(a)-[:T]->(u)` so that
             // the executor receives pre-bound `source_variable` / `target_variable`
@@ -832,6 +842,7 @@ pub fn optimize_index_selection(
             edge_variable,
             target_filters,
             edge_filters,
+            temporal_filter,
         } => LogicalOp::Traverse {
             input: Box::new(optimize_index_selection(*input, registry)),
             source,
@@ -843,6 +854,7 @@ pub fn optimize_index_selection(
             edge_variable,
             target_filters,
             edge_filters,
+            temporal_filter,
         },
         LogicalOp::Aggregate {
             input,
@@ -1156,6 +1168,7 @@ fn optimize_edge_vector_search(op: LogicalOp) -> LogicalOp {
             edge_variable,
             target_filters,
             edge_filters,
+            temporal_filter,
         } => LogicalOp::Traverse {
             input: Box::new(optimize_edge_vector_search(*input)),
             source,
@@ -1167,6 +1180,7 @@ fn optimize_edge_vector_search(op: LogicalOp) -> LogicalOp {
             edge_variable,
             target_filters,
             edge_filters,
+            temporal_filter,
         },
         LogicalOp::TextFilter {
             input,
@@ -1646,6 +1660,7 @@ fn build_pattern_scan(pattern: &Pattern) -> Result<LogicalOp, PlanError> {
                     edge_variable: rp.variable.clone(),
                     target_filters: Vec::new(),
                     edge_filters: rp.properties.clone(),
+                    temporal_filter: None,
                 });
             }
         }
@@ -1715,6 +1730,7 @@ fn build_pattern_chain(elements: &[PatternElement]) -> Result<LogicalOp, PlanErr
             edge_variable: rel.variable.clone(),
             target_filters: target_node.properties.clone(),
             edge_filters: rel.properties.clone(),
+            temporal_filter: None,
         };
 
         last_var = target_var;
@@ -3465,6 +3481,137 @@ fn ensure_doc_passthrough(op: LogicalOp) -> LogicalOp {
     }
 }
 
+/// Planner pass: detect a temporal time-slice predicate in a Filter and lift
+/// it into the immediately-below Traverse's `temporal_filter` field.
+///
+/// Recognises `temporal_active_at(r, $T)` (or with literal/Int argument):
+/// → sets `upper_ms = T` (for bounded prefix scan) and `lower_ms = T`
+///   (server-side `valid_to > T OR NULL` check after key decode).
+///
+/// Walks the tree recursively; only the immediate `Filter { Traverse }` pair
+/// is rewritten. Other shapes fall through unchanged. The original Filter is
+/// kept as a safety net for correctness — the predicate is evaluated again
+/// against materialized rows. Eliminating it is a future optimization.
+pub(crate) fn lift_temporal_filter(op: LogicalOp) -> LogicalOp {
+    match op {
+        LogicalOp::Filter { input, predicate } => {
+            // Try to extract a temporal slice from this predicate.
+            let candidate = extract_temporal_slice(&predicate);
+            let lifted_input = match (candidate, *input) {
+                (
+                    Some((edge_var, upper_ms, lower_ms)),
+                    LogicalOp::Traverse {
+                        input: t_input,
+                        source,
+                        edge_types,
+                        direction,
+                        target_variable,
+                        target_labels,
+                        length,
+                        edge_variable,
+                        target_filters,
+                        edge_filters,
+                        temporal_filter,
+                    },
+                ) if edge_variable.as_deref() == Some(edge_var.as_str())
+                    && temporal_filter.is_none() =>
+                {
+                    LogicalOp::Traverse {
+                        input: Box::new(lift_temporal_filter(*t_input)),
+                        source,
+                        edge_types,
+                        direction,
+                        target_variable,
+                        target_labels,
+                        length,
+                        edge_variable,
+                        target_filters,
+                        edge_filters,
+                        temporal_filter: Some(crate::planner::logical::TemporalFilter {
+                            edge_variable: edge_var,
+                            upper_ms: Some(upper_ms),
+                            lower_ms: Some(lower_ms),
+                        }),
+                    }
+                }
+                (_, other) => lift_temporal_filter(other),
+            };
+            LogicalOp::Filter {
+                input: Box::new(lifted_input),
+                predicate,
+            }
+        }
+        // Recursive descent for everything else (preserves shape).
+        LogicalOp::Project {
+            input,
+            items,
+            distinct,
+        } => LogicalOp::Project {
+            input: Box::new(lift_temporal_filter(*input)),
+            items,
+            distinct,
+        },
+        LogicalOp::Sort { input, items } => LogicalOp::Sort {
+            input: Box::new(lift_temporal_filter(*input)),
+            items,
+        },
+        LogicalOp::Limit { input, count } => LogicalOp::Limit {
+            input: Box::new(lift_temporal_filter(*input)),
+            count,
+        },
+        LogicalOp::Skip { input, count } => LogicalOp::Skip {
+            input: Box::new(lift_temporal_filter(*input)),
+            count,
+        },
+        other => other,
+    }
+}
+
+/// Inspect a Filter predicate and, if it is a literal-argument temporal
+/// helper call, extract the edge variable name + the upper / lower millisecond
+/// bounds that should be propagated as a `TemporalFilter` on the Traverse.
+///
+/// Recognises:
+/// - `temporal_active_at(r, T)`  → `(r, upper=T,    lower=T)`
+/// - `temporal_overlaps(r, T0, T1)` → `(r, upper=T1-1, lower=T0)` (strict end)
+///
+/// Parameter expressions are NOT lifted here — the planner runs before
+/// parameter substitution. A second pass (`lift_temporal_filter`) is invoked
+/// AFTER substitution in `execute()` to catch the bound-parameter case.
+fn extract_temporal_slice(predicate: &Expr) -> Option<(String, i64, i64)> {
+    let Expr::FunctionCall { name, args, .. } = predicate else {
+        return None;
+    };
+    let literal_ts = |e: &Expr| -> Option<i64> {
+        match e {
+            Expr::Literal(Value::Int(n)) => Some(*n),
+            Expr::Literal(Value::Timestamp(n)) => Some(*n),
+            _ => None,
+        }
+    };
+    match name.as_str() {
+        "temporal_active_at" if args.len() == 2 => {
+            let Expr::Variable(var) = &args[0] else {
+                return None;
+            };
+            let t = literal_ts(&args[1])?;
+            Some((var.clone(), t, t))
+        }
+        "temporal_overlaps" if args.len() == 3 => {
+            let Expr::Variable(var) = &args[0] else {
+                return None;
+            };
+            let t0 = literal_ts(&args[1])?;
+            let t1 = literal_ts(&args[2])?;
+            // Overlaps semantics: valid_from < t1. Express as upper bound on
+            // valid_from of `t1 - 1` (inclusive) so existing prefix-scan
+            // bounded-key logic gives the correct half-open interval.
+            Some((var.clone(), t1.saturating_sub(1), t0))
+        }
+        _ => None,
+    }
+}
+
 fn rewrite_doc_score(op: LogicalOp) -> Result<LogicalOp, PlanError> {
     validate_doc_placement(&op)?;
 
@@ -4314,6 +4461,94 @@ mod tests {
         } else {
             panic!("expected VectorTopK");
         }
+    }
+
+    // -- R171: lift_temporal_filter --
+
+    /// Finds the `temporal_filter` field on the innermost Traverse, if any.
+    fn first_temporal_filter(op: &LogicalOp) -> Option<&TemporalFilter> {
+        match op {
+            LogicalOp::Traverse {
+                temporal_filter,
+                input,
+                ..
+            } => temporal_filter
+                .as_ref()
+                .or_else(|| first_temporal_filter(input)),
+            LogicalOp::Filter { input, .. }
+            | LogicalOp::Project { input, .. }
+            | LogicalOp::Limit { input, .. }
+            | LogicalOp::Skip { input, .. }
+            | LogicalOp::Sort { input, .. } => first_temporal_filter(input),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn lift_temporal_filter_recognises_active_at_with_int_literal() {
+        let root = plan_root(
+            "MATCH (a)-[r:WORKS_AT]->(b) WHERE temporal_active_at(r, 1700000000000) RETURN b",
+        );
+        let tf = first_temporal_filter(&root)
+            .expect("planner must lift temporal_active_at into Traverse");
+        assert_eq!(tf.edge_variable, "r");
+        assert_eq!(tf.upper_ms, Some(1_700_000_000_000));
+        assert_eq!(tf.lower_ms, Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn lift_temporal_filter_leaves_unrelated_filters_alone() {
+        // No temporal_active_at → temporal_filter must stay None.
+        let root = plan_root("MATCH (a)-[r:WORKS_AT]->(b:Company) WHERE b.name = 'Acme' RETURN b");
+        assert!(
+            first_temporal_filter(&root).is_none(),
+            "non-temporal predicate must not produce a temporal_filter"
+        );
+    }
+
+    #[test]
+    fn temporal_filter_renders_in_explain_output() {
+        let p =
+            plan("MATCH (a)-[r:WORKS_AT]->(b) WHERE temporal_active_at(r, 1700000000000) RETURN b");
+        let explain = p.explain();
+        assert!(
+            explain.contains("temporal_filter"),
+            "EXPLAIN must surface temporal_filter block: {explain}"
+        );
+        assert!(
+            explain.contains("r=r"),
+            "EXPLAIN must name the edge variable: {explain}"
+        );
+        assert!(
+            explain.contains("valid_from<=1700000000000"),
+            "EXPLAIN must show the upper bound: {explain}"
+        );
+    }
+
+    #[test]
+    fn lift_temporal_filter_ignores_parameter_argument_at_build_time() {
+        // Plan-build time: parameter expressions aren't literals yet.
+        // The second lift pass runs in `execute()` after `substitute_params`,
+        // so production queries with bound `$t` still get push-down at runtime.
+        let root =
+            plan_root("MATCH (a)-[r:WORKS_AT]->(b) WHERE temporal_active_at(r, $t) RETURN b");
+        assert!(
+            first_temporal_filter(&root).is_none(),
+            "parameter argument must not produce a temporal_filter at plan-build time"
+        );
+    }
+
+    #[test]
+    fn lift_temporal_filter_recognises_overlaps_with_literals() {
+        let root = plan_root(
+            "MATCH (a)-[r:WORKS_AT]->(b) WHERE temporal_overlaps(r, 1000, 2000) RETURN b",
+        );
+        let tf = first_temporal_filter(&root)
+            .expect("planner must lift temporal_overlaps into Traverse");
+        assert_eq!(tf.edge_variable, "r");
+        // Overlap upper bound is exclusive on t_end → encode as t_end - 1.
+        assert_eq!(tf.upper_ms, Some(1999));
+        assert_eq!(tf.lower_ms, Some(1000));
     }
 
     /// EXPLAIN output for VectorTopK shows function and k.

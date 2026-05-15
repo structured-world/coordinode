@@ -195,6 +195,25 @@ WHERE encrypted_match(p.ssn, $encrypted_token)
 RETURN p.id, p.name
 ```
 
+### Temporal Edge Functions ✅ 🔷
+
+For edge types declared `TEMPORAL` (see [Temporal edges](./temporal-edges)). Both take a bound edge variable `r` and timestamps in epoch milliseconds.
+
+| Function | Signature | Returns | Notes |
+|----------|-----------|---------|-------|
+| `temporal_active_at` | `temporal_active_at(r, t)` | Bool | True iff `r.valid_from <= t AND (r.valid_to IS NULL OR r.valid_to > t)` |
+| `temporal_overlaps`  | `temporal_overlaps(r, t0, t1)` | Bool | True iff the version's validity interval overlaps `[t0, t1)` |
+
+```cypher
+MATCH (a:Person {name: 'Alice'})-[r:WORKS_AT]->(c:Company)
+WHERE temporal_active_at(r, 1710460800000)
+RETURN c.name
+```
+
+A literal-argument call to `temporal_active_at` is pushed down by the planner into a bounded prefix scan; see EXPLAIN output for the `temporal_filter` block.
+
+---
+
 ### Spatial Functions ✅ 🔷
 
 | Function | Signature | Returns | Notes |

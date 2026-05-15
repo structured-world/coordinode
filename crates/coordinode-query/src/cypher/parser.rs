@@ -210,6 +210,10 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let c = build_drop_vector_index_clause(pair)?;
             clauses.push(Clause::DropVectorIndex(c));
         }
+        Rule::create_edge_type_clause => {
+            let c = build_create_edge_type_clause(pair)?;
+            clauses.push(Clause::CreateEdgeType(c));
+        }
         Rule::create_clause => {
             let cc = build_create_clause(pair)?;
             clauses.push(Clause::Create(cc));
@@ -937,6 +941,64 @@ fn build_create_index_clause(pair: Pair<'_, Rule>) -> Result<CreateIndexClause, 
         unique,
         sparse,
         filter_expr,
+    })
+}
+
+fn build_create_edge_type_clause(pair: Pair<'_, Rule>) -> Result<CreateEdgeTypeClause, ParseError> {
+    let mut name = String::new();
+    let mut temporal = false;
+    let mut properties: Vec<EdgePropertyDecl> = Vec::new();
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::identifier if name.is_empty() => {
+                name = inner.as_str().to_string();
+            }
+            Rule::kw_temporal => temporal = true,
+            Rule::property_decl_list => {
+                for decl in inner.into_inner() {
+                    if decl.as_rule() == Rule::property_decl {
+                        let mut prop_name = String::new();
+                        let mut prop_type = String::new();
+                        let mut not_null = false;
+                        for part in decl.into_inner() {
+                            match part.as_rule() {
+                                Rule::identifier if prop_name.is_empty() => {
+                                    prop_name = part.as_str().to_string();
+                                }
+                                Rule::property_type_name => {
+                                    prop_type = part.as_str().to_uppercase();
+                                }
+                                Rule::property_decl_modifier => {
+                                    not_null = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !prop_name.is_empty() && !prop_type.is_empty() {
+                            properties.push(EdgePropertyDecl {
+                                name: prop_name,
+                                type_name: prop_type,
+                                not_null,
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if name.is_empty() {
+        return Err(ParseError::Invalid(
+            "CREATE EDGE TYPE requires a type name".into(),
+        ));
+    }
+
+    Ok(CreateEdgeTypeClause {
+        name,
+        temporal,
+        properties,
     })
 }
 
@@ -4102,6 +4164,77 @@ mod tests {
         // requires an explicit type for targeted adjacency delete).
         let err = parse_err("ATTACH (a:Address)-[]->(u:User) INTO u.address");
         let _ = err;
+    }
+
+    #[test]
+    fn create_edge_type_minimal() {
+        let q = parse_ok("CREATE EDGE TYPE WORKS_AT");
+        match &q.clauses[0] {
+            Clause::CreateEdgeType(c) => {
+                assert_eq!(c.name, "WORKS_AT");
+                assert!(!c.temporal);
+                assert!(c.properties.is_empty());
+            }
+            other => panic!("expected CreateEdgeType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_edge_type_temporal_no_properties() {
+        let q = parse_ok("CREATE EDGE TYPE WORKS_AT TEMPORAL");
+        match &q.clauses[0] {
+            Clause::CreateEdgeType(c) => {
+                assert_eq!(c.name, "WORKS_AT");
+                assert!(c.temporal);
+                assert!(c.properties.is_empty());
+            }
+            other => panic!("expected CreateEdgeType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_edge_type_temporal_with_properties() {
+        let q = parse_ok(
+            "CREATE EDGE TYPE WORKS_AT TEMPORAL WITH (role: STRING, valid_from: TIMESTAMP NOT NULL, valid_to: TIMESTAMP)",
+        );
+        match &q.clauses[0] {
+            Clause::CreateEdgeType(c) => {
+                assert_eq!(c.name, "WORKS_AT");
+                assert!(c.temporal);
+                assert_eq!(c.properties.len(), 3);
+                assert_eq!(c.properties[0].name, "role");
+                assert_eq!(c.properties[0].type_name, "STRING");
+                assert!(!c.properties[0].not_null);
+                assert_eq!(c.properties[1].name, "valid_from");
+                assert_eq!(c.properties[1].type_name, "TIMESTAMP");
+                assert!(c.properties[1].not_null);
+                assert_eq!(c.properties[2].name, "valid_to");
+                assert_eq!(c.properties[2].type_name, "TIMESTAMP");
+                assert!(!c.properties[2].not_null);
+            }
+            other => panic!("expected CreateEdgeType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_edge_type_non_temporal_with_properties() {
+        // TEMPORAL is optional — non-temporal edge types may still declare props.
+        let q = parse_ok("CREATE EDGE TYPE LIKES WITH (weight: FLOAT)");
+        match &q.clauses[0] {
+            Clause::CreateEdgeType(c) => {
+                assert!(!c.temporal);
+                assert_eq!(c.properties.len(), 1);
+                assert_eq!(c.properties[0].name, "weight");
+                assert_eq!(c.properties[0].type_name, "FLOAT");
+            }
+            other => panic!("expected CreateEdgeType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_edge_type_rejects_unknown_type() {
+        // QUATERNION isn't in the property_type_name keyword set → parse error.
+        let _ = parse_err("CREATE EDGE TYPE WORKS_AT WITH (foo: QUATERNION)");
     }
 
     #[test]

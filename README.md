@@ -125,6 +125,7 @@ ORDER BY similarity LIMIT 25
 | Spatial queries | **Stable** | `point()`, `point.distance()` (Haversine), WHERE filter |
 | Document properties | **Stable** | Nested DOCUMENT type, dot-notation access, 3 schema modes |
 | Document ↔ graph transformations | **Stable** | `DETACH DOCUMENT` promotes a nested property to a node + edge atomically; `ATTACH DOCUMENT` demotes a node back into a nested DOCUMENT property; optional `TRANSFER EDGES`, `ON CONFLICT REPLACE`, `ON REMAINING FAIL` |
+| Bitemporal edges | **Stable** | `CREATE EDGE TYPE … TEMPORAL` declares an edge type whose instances carry a `(valid_from, valid_to)` interval. Multiple versions coexist per `(src, tgt)` pair. Helpers: `temporal_active_at(r, t)`, `temporal_overlaps(r, t0, t1)`. Planner pushes time-slice predicates into a bounded prefix scan |
 | REST API | **Stable** | HTTP/JSON on port 7081 via gRPC-to-REST transcoding |
 | Read/write concerns | **Stable** | local, majority, linearizable, causal sessions |
 
@@ -144,6 +145,7 @@ ORDER BY similarity LIMIT 25
 | Spatial queries | **Yes** | Via APOC | Yes | No | No |
 | Encrypted search | **Yes** | No | No | No | No |
 | Time-travel queries | **Yes** | No | No | No | No |
+| Bitemporal edges (per-version valid_from / valid_to) | **Yes** | No | No | No | No |
 | Built-in query advisor | **Yes** | No | Yes (explain) | No | No |
 | OpenCypher queries | **Yes** | Yes | No | SurrealQL | No |
 | Language | Rust (zero GC) | Java (JVM) | C++ | Rust | Cloud-only |

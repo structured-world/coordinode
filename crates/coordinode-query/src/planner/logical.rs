@@ -44,6 +44,24 @@ impl LogicalPlan {
     }
 }
 
+/// Pushed-down time-slice filter for a temporal edge traversal.
+///
+/// Bounds the per-version edgeprop prefix scan: only versions whose
+/// `valid_from <= upper_ms` (when set) are read. `lower_ms` is a value-side
+/// filter applied after decode — `valid_to` lives in the row, not in the key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TemporalFilter {
+    /// Edge variable this filter applies to (matches `edge_variable` on Traverse).
+    pub edge_variable: String,
+    /// Inclusive upper bound on `valid_from` (epoch ms). `None` means open
+    /// upward.
+    pub upper_ms: Option<i64>,
+    /// Strict lower bound on `valid_to` (epoch ms). A version qualifies if
+    /// `valid_to > lower_ms` OR `valid_to IS NULL`. `None` means no `valid_to`
+    /// constraint.
+    pub lower_ms: Option<i64>,
+}
+
 /// A logical operator in the query plan tree.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalOp {
@@ -78,6 +96,13 @@ pub enum LogicalOp {
         target_filters: Vec<(String, Expr)>,
         /// Inline property filters on the edge.
         edge_filters: Vec<(String, Expr)>,
+        /// Pushed-down time-slice filter for temporal edges. When set, the
+        /// executor bounds the per-version edgeprop prefix scan instead of
+        /// loading every stored version and filtering above. Inferred by
+        /// `lift_temporal_filter` from a `temporal_active_at` or canonical
+        /// `valid_from <= $T AND (valid_to IS NULL OR valid_to > $T)`
+        /// predicate elsewhere in the query.
+        temporal_filter: Option<TemporalFilter>,
     },
 
     /// B-tree index point-lookup: replaces `Filter { input: NodeScan }` when a matching index exists.
@@ -314,6 +339,18 @@ pub enum LogicalOp {
 
     /// DROP VECTOR INDEX: remove an HNSW vector index by name.
     DropVectorIndex { name: String },
+
+    /// CREATE EDGE TYPE: declare an edge-type schema entry.
+    ///
+    /// When `temporal = true`, instances of this edge type carry a
+    /// `(valid_from, valid_to)` time interval and the storage layer
+    /// keeps one edgeprop entry per `valid_from`, allowing multiple
+    /// versions of the edge to coexist between the same source/target.
+    CreateEdgeType {
+        name: String,
+        temporal: bool,
+        properties: Vec<crate::cypher::ast::EdgePropertyDecl>,
+    },
 
     /// UNWIND: expand a list expression into individual rows.
     /// Produced from UNWIND expr AS variable.
@@ -780,6 +817,7 @@ impl LogicalOp {
             | LogicalOp::DropIndex { .. }
             | LogicalOp::CreateVectorIndex { .. }
             | LogicalOp::DropVectorIndex { .. }
+            | LogicalOp::CreateEdgeType { .. }
             | LogicalOp::Empty => {}
         }
     }
@@ -1325,7 +1363,8 @@ fn estimate_op_cost(
         | LogicalOp::CreateIndex { .. }
         | LogicalOp::DropIndex { .. }
         | LogicalOp::CreateVectorIndex { .. }
-        | LogicalOp::DropVectorIndex { .. } => (1.0, 1.0),
+        | LogicalOp::DropVectorIndex { .. }
+        | LogicalOp::CreateEdgeType { .. } => (1.0, 1.0),
         LogicalOp::Empty => (0.0, 1.0),
     }
 }
@@ -1445,6 +1484,7 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             direction,
             target_variable,
             length,
+            temporal_filter,
             ..
         } => {
             let arrow = match direction {
@@ -1467,6 +1507,15 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             output.push_str(&format!(
                 "{prefix}Traverse({source} {arrow}[{types}{len}]{arrow} {target_variable})\n"
             ));
+            if let Some(tf) = temporal_filter {
+                let upper = tf.upper_ms.map_or("∞".to_string(), |t| t.to_string());
+                let lower = tf.lower_ms.map_or("-∞".to_string(), |t| t.to_string());
+                let nested = "  ".repeat(indent + 1);
+                output.push_str(&format!(
+                    "{nested}temporal_filter(r={}, valid_from<={}, valid_to>{})\n",
+                    tf.edge_variable, upper, lower
+                ));
+            }
             explain_op(input, indent + 1, output);
         }
         LogicalOp::Filter { input, predicate } => {
@@ -1884,6 +1933,17 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
         }
         LogicalOp::DropVectorIndex { name } => {
             output.push_str(&format!("{prefix}DropVectorIndex({name})\n"));
+        }
+        LogicalOp::CreateEdgeType {
+            name,
+            temporal,
+            properties,
+        } => {
+            let temporal_marker = if *temporal { " TEMPORAL" } else { "" };
+            output.push_str(&format!(
+                "{prefix}CreateEdgeType({name}{temporal_marker}, props={})\n",
+                properties.len()
+            ));
         }
         LogicalOp::Empty => {
             output.push_str(&format!("{prefix}Empty\n"));

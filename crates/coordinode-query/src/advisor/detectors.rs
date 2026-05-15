@@ -357,7 +357,8 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::CreateEncryptedIndex { .. }
         | LogicalOp::DropEncryptedIndex { .. }
         | LogicalOp::CreateVectorIndex { .. }
-        | LogicalOp::DropVectorIndex { .. } => vec![],
+        | LogicalOp::DropVectorIndex { .. }
+        | LogicalOp::CreateEdgeType { .. } => vec![],
 
         LogicalOp::Filter { input, .. }
         | LogicalOp::Project { input, .. }
@@ -568,6 +569,7 @@ mod tests {
             edge_variable: None,
             target_filters: vec![],
             edge_filters: vec![],
+            temporal_filter: None,
         }
     }
 
@@ -586,6 +588,7 @@ mod tests {
             edge_variable: None,
             target_filters: vec![],
             edge_filters: vec![],
+            temporal_filter: None,
         }
     }
 
@@ -739,6 +742,7 @@ mod tests {
             edge_variable: None,
             target_filters: vec![],
             edge_filters: vec![],
+            temporal_filter: None,
         };
         let suggestions = detect_suggestions(&plan(op), None);
         assert!(suggestions.is_empty());
@@ -851,6 +855,7 @@ mod tests {
             edge_variable: None,
             target_filters: vec![],
             edge_filters: vec![],
+            temporal_filter: None,
         };
         let p = plan(LogicalOp::VectorFilter {
             input: Box::new(traverse),

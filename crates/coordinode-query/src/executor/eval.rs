@@ -569,6 +569,61 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
                 Value::Array(vec![])
             }
         }
+        "temporal_active_at" => {
+            // temporal_active_at(r, t) → bool
+            // True iff the temporal edge `r` was active at time `t` (epoch ms),
+            // i.e. `r.valid_from <= t AND (r.valid_to IS NULL OR r.valid_to > t)`.
+            let Some(Expr::Variable(var)) = args.first() else {
+                return Value::Bool(false);
+            };
+            let t = match evaluated.get(1) {
+                Some(Value::Int(t)) => *t,
+                Some(Value::Timestamp(t)) => *t,
+                _ => return Value::Bool(false),
+            };
+            let vf = match row.get(&format!("{var}.valid_from")) {
+                Some(Value::Int(v)) => *v,
+                Some(Value::Timestamp(v)) => *v,
+                _ => return Value::Bool(false),
+            };
+            let vt = match row.get(&format!("{var}.valid_to")) {
+                Some(Value::Int(v)) => Some(*v),
+                Some(Value::Timestamp(v)) => Some(*v),
+                Some(Value::Null) | None => None,
+                _ => return Value::Bool(false),
+            };
+            Value::Bool(vf <= t && vt.is_none_or(|to| to > t))
+        }
+        "temporal_overlaps" => {
+            // temporal_overlaps(r, t_start, t_end) → bool
+            // True iff the temporal edge's validity interval overlaps `[t_start, t_end)`,
+            // i.e. `r.valid_from < t_end AND (r.valid_to IS NULL OR r.valid_to > t_start)`.
+            let Some(Expr::Variable(var)) = args.first() else {
+                return Value::Bool(false);
+            };
+            let t_start = match evaluated.get(1) {
+                Some(Value::Int(t)) => *t,
+                Some(Value::Timestamp(t)) => *t,
+                _ => return Value::Bool(false),
+            };
+            let t_end = match evaluated.get(2) {
+                Some(Value::Int(t)) => *t,
+                Some(Value::Timestamp(t)) => *t,
+                _ => return Value::Bool(false),
+            };
+            let vf = match row.get(&format!("{var}.valid_from")) {
+                Some(Value::Int(v)) => *v,
+                Some(Value::Timestamp(v)) => *v,
+                _ => return Value::Bool(false),
+            };
+            let vt = match row.get(&format!("{var}.valid_to")) {
+                Some(Value::Int(v)) => Some(*v),
+                Some(Value::Timestamp(v)) => Some(*v),
+                Some(Value::Null) | None => None,
+                _ => return Value::Bool(false),
+            };
+            Value::Bool(vf < t_end && vt.is_none_or(|to| to > t_start))
+        }
         "now" => {
             // Return current timestamp in microseconds
             Value::Timestamp(

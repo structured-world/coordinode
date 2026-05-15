@@ -25,6 +25,7 @@ clause = {
   | create_text_index_clause
   | create_vector_index_clause
   | create_index_clause
+  | create_edge_type_clause
   | create_clause
   | merge_all_clause
   | merge_clause
@@ -199,6 +200,30 @@ create_index_clause = {
 
 // DROP INDEX idx_name
 drop_index_clause = { kw_drop ~ kw_index ~ identifier }
+
+// --- CREATE EDGE TYPE ---
+
+// CREATE EDGE TYPE <name> [TEMPORAL] [WITH ( <property_decl_list> )]
+//
+// TEMPORAL marks the edge type as bitemporal: every instance carries
+// (valid_from, valid_to) fields and multiple versions can coexist for the
+// same (source, target) pair. WITH (...) declares user-defined edge
+// properties.
+create_edge_type_clause = {
+    kw_create ~ kw_edge ~ kw_type ~ identifier ~ kw_temporal?
+    ~ (kw_with ~ "(" ~ property_decl_list ~ ")")?
+}
+
+property_decl_list = { property_decl ~ ("," ~ property_decl)* ~ ","? }
+property_decl      = { identifier ~ ":" ~ property_type_name ~ property_decl_modifier* }
+
+property_type_name = @{
+    ( ^"string" | ^"int" | ^"float" | ^"bool" | ^"timestamp"
+    | ^"blob" | ^"map" | ^"geo" | ^"binary" | ^"document" )
+    ~ !(ASCII_ALPHANUMERIC | "_")
+}
+
+property_decl_modifier = { kw_not ~ kw_null }
 
 // --- CREATE ---
 
@@ -508,6 +533,9 @@ kw_conflict   = @{ ^"conflict" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_replace    = @{ ^"replace" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_remaining  = @{ ^"remaining" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_fail       = @{ ^"fail" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_edge       = @{ ^"edge" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_type       = @{ ^"type" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_temporal   = @{ ^"temporal" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // --- Identifiers ---
 
