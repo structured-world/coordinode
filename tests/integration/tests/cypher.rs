@@ -99,6 +99,7 @@ async fn g088_causal_write_without_majority_rejected() {
             read_concern: Some(ReadConcern {
                 level: 2, // MAJORITY
                 after_index: 1,
+                at_timestamp: 0,
             }),
             write_concern: None, // omitted → treated as UNSPECIFIED (w:1)
         })
@@ -136,6 +137,7 @@ async fn g088_causal_write_with_w1_rejected() {
             read_concern: Some(ReadConcern {
                 level: 2, // MAJORITY
                 after_index: 5,
+                at_timestamp: 0,
             }),
             write_concern: Some(WriteConcern {
                 level: WriteConcernLevel::W1 as i32,
@@ -174,6 +176,7 @@ async fn g088_causal_write_with_majority_accepted() {
             read_concern: Some(ReadConcern {
                 level: 2, // MAJORITY
                 after_index: 1,
+                at_timestamp: 0,
             }),
             write_concern: Some(WriteConcern {
                 level: WriteConcernLevel::Majority as i32,
@@ -209,6 +212,7 @@ async fn g088_causal_read_without_majority_accepted() {
             read_concern: Some(ReadConcern {
                 level: 2, // MAJORITY
                 after_index: 1,
+                at_timestamp: 0,
             }),
             write_concern: None, // read-only — write_concern irrelevant
         })
