@@ -12,7 +12,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-/// A unique 64-bit node identifier.
+/// Width of the `origin_shard_hint` field in the NodeId u64.
+///
+/// Layout: `[20 bits origin_shard_hint][44 bits sequence]`. The hint records
+/// the shard where the node was originally created — it is immutable and
+/// never rewritten, even across re-shards. CE single-shard deployments use
+/// hint = 0 (reserved sentinel meaning "consult the routing layer").
+pub const NODE_ID_HINT_BITS: u32 = 20;
+
+/// Width of the `sequence` field in the NodeId u64.
+pub const NODE_ID_SEQUENCE_BITS: u32 = 64 - NODE_ID_HINT_BITS;
+
+/// Inclusive maximum value for the `sequence` field — wrap into hint bits is
+/// a hard panic in the allocator (would corrupt routing).
+pub const NODE_ID_MAX_SEQUENCE: u64 = (1u64 << NODE_ID_SEQUENCE_BITS) - 1;
+
+/// Inclusive maximum value for the `shard_hint` field.
+pub const NODE_ID_MAX_HINT: u32 = (1u32 << NODE_ID_HINT_BITS) - 1;
+
+/// A unique 64-bit node identifier with embedded origin-shard hint.
+///
+/// Layout: `[20 bits origin_shard_hint][44 bits sequence]`. The hint records
+/// the shard where the node was originally created (immutable for the
+/// lifetime of the node); the sequence is per-shard monotonic. CE uses
+/// hint = 0; EE uses coordinator-assigned hints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(u64);
 
@@ -22,9 +45,39 @@ impl NodeId {
         Self(raw)
     }
 
+    /// Compose a NodeId from `(shard_hint, sequence)`.
+    ///
+    /// Panics if `shard_hint > NODE_ID_MAX_HINT` or `sequence > NODE_ID_MAX_SEQUENCE`
+    /// — both are architectural invariants and a violation indicates a bug in
+    /// the caller (coordinator misconfiguration or allocator wrap).
+    pub fn compose(shard_hint: u32, sequence: u64) -> Self {
+        assert!(
+            shard_hint <= NODE_ID_MAX_HINT,
+            "shard_hint {shard_hint} exceeds 20-bit ceiling {NODE_ID_MAX_HINT}"
+        );
+        assert!(
+            sequence <= NODE_ID_MAX_SEQUENCE,
+            "sequence {sequence} exceeds 44-bit ceiling {NODE_ID_MAX_SEQUENCE}"
+        );
+        Self((u64::from(shard_hint) << NODE_ID_SEQUENCE_BITS) | sequence)
+    }
+
     /// Get the raw u64 value.
     pub fn as_raw(self) -> u64 {
         self.0
+    }
+
+    /// Extract the origin shard hint (top 20 bits).
+    ///
+    /// In CE this is always 0. In EE it identifies the shard on which the
+    /// node was originally created. Re-sharding does not rewrite this value.
+    pub fn origin_shard_hint(self) -> u32 {
+        (self.0 >> NODE_ID_SEQUENCE_BITS) as u32
+    }
+
+    /// Extract the per-shard sequence (bottom 44 bits).
+    pub fn sequence(self) -> u64 {
+        self.0 & NODE_ID_MAX_SEQUENCE
     }
 }
 
@@ -34,50 +87,171 @@ impl std::fmt::Display for NodeId {
     }
 }
 
-/// Monotonic node ID allocator.
+/// Crockford base32 alphabet — 32 characters, no `I`, `L`, `O`, `U`
+/// (visually ambiguous or potentially obscene). Chosen for external
+/// identifiers because case-insensitive, URL-safe, and copy-paste robust.
+const CROCKFORD_BASE32: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+impl NodeId {
+    /// Encode the NodeId as a Crockford base32 string for external (`elementId`)
+    /// use. 13 ASCII characters, bijective with the underlying u64.
+    ///
+    /// Encoding splits the 64-bit value into 13 × 5-bit groups (the top group
+    /// uses 4 bits; the high bit is always zero by construction since u64 has
+    /// 64 bits = 12 × 5 + 4). The result is time-sortable within a shard
+    /// (sequence grows monotonically) and stable across re-shards (since NodeId
+    /// is immutable). No mapping table is required — the inverse is computed
+    /// directly from the characters.
+    pub fn to_element_id(self) -> String {
+        let raw = self.0;
+        // 64 bits → 13 characters, MSB first. Use 4 bits for the top character
+        // (highest nibble) and 5 bits for the remaining 12. Every byte we
+        // write is a Crockford base32 digit (ASCII subset of UTF-8), so
+        // `from_utf8` is guaranteed to succeed and `expect` documents the
+        // invariant for readers.
+        let mut out = String::with_capacity(13);
+        out.push(CROCKFORD_BASE32[((raw >> 60) & 0xF) as usize] as char);
+        for i in 0..12 {
+            let shift = 55 - (i as u32) * 5;
+            let idx = ((raw >> shift) & 0x1F) as usize;
+            out.push(CROCKFORD_BASE32[idx] as char);
+        }
+        out
+    }
+
+    /// Decode a Crockford base32 `elementId` back into a NodeId.
+    ///
+    /// Returns `None` if the input is not exactly 13 valid Crockford base32
+    /// characters. Case-insensitive — `I`, `L` are normalised to `1`, `O` to
+    /// `0` (Crockford's tolerance rules), other invalid characters fail.
+    pub fn from_element_id(s: &str) -> Option<Self> {
+        let bytes = s.as_bytes();
+        if bytes.len() != 13 {
+            return None;
+        }
+        // First character carries 4 bits (top nibble of the u64).
+        let v0 = decode_crockford_char(bytes[0])?;
+        if v0 > 0xF {
+            return None;
+        }
+        let mut raw: u64 = u64::from(v0) << 60;
+        for i in 0..12 {
+            let v = decode_crockford_char(bytes[i + 1])?;
+            let shift = 55 - (i as u32) * 5;
+            raw |= u64::from(v) << shift;
+        }
+        Some(Self(raw))
+    }
+}
+
+/// Decode a single Crockford base32 character to its 5-bit value.
 ///
-/// Thread-safe, lock-free. Each call to `next()` returns a unique,
-/// monotonically increasing ID. The allocator can be seeded from
-/// a starting value (e.g., after recovery).
+/// Accepts case-insensitive `0-9`, `A-H`, `J`, `K`, `M`, `N`, `P-T`, `V-Z`
+/// plus Crockford normalisations: `I`/`L` → `1`, `O` → `0`.
+fn decode_crockford_char(c: u8) -> Option<u8> {
+    match c {
+        b'0' | b'O' | b'o' => Some(0),
+        b'1' | b'I' | b'i' | b'L' | b'l' => Some(1),
+        b'2'..=b'9' => Some(c - b'0'),
+        b'A'..=b'H' => Some(c - b'A' + 10),
+        b'a'..=b'h' => Some(c - b'a' + 10),
+        b'J' | b'j' => Some(18),
+        b'K' | b'k' => Some(19),
+        b'M' | b'm' => Some(20),
+        b'N' | b'n' => Some(21),
+        b'P'..=b'T' => Some(c - b'P' + 22),
+        b'p'..=b't' => Some(c - b'p' + 22),
+        b'V'..=b'Z' => Some(c - b'V' + 27),
+        b'v'..=b'z' => Some(c - b'v' + 27),
+        _ => None,
+    }
+}
+
+/// Monotonic per-shard node ID allocator.
+///
+/// Thread-safe, lock-free. Each call to `next()` increments the local
+/// sequence counter and composes it with the configured `shard_hint` into a
+/// NodeId. CE constructs with `shard_hint = 0`; EE shard leaders construct
+/// with their coordinator-assigned hint.
+///
+/// Sequence is constrained to `[1, NODE_ID_MAX_SEQUENCE]` — wrap is a hard
+/// panic. At 1M writes/sec on a single shard the 44-bit space exhausts in
+/// ~540 days; at 10K writes/sec (typical enterprise) in ~55 years — so
+/// exhaustion is not a steady-state concern, but the check is mandatory
+/// because wrap would corrupt routing (sequence bits leaking into hint bits
+/// would map nodes to phantom shards).
 pub struct NodeIdAllocator {
+    shard_hint: u32,
     counter: AtomicU64,
 }
 
 impl NodeIdAllocator {
-    /// Create a new allocator starting from 0.
-    pub fn new() -> Self {
+    /// Create a new allocator for a given shard hint, starting from sequence 0.
+    ///
+    /// The `shard_hint` must fit in `NODE_ID_HINT_BITS` (≤ 2^20 - 1). CE
+    /// callers pass `0`; EE shard leaders pass their coordinator-assigned
+    /// hint. The hint is fixed for the allocator's lifetime — changing it
+    /// requires creating a new allocator (which never happens in practice —
+    /// shards do not change their hint after the coordinator assigns it).
+    pub fn new(shard_hint: u32) -> Self {
+        assert!(
+            shard_hint <= NODE_ID_MAX_HINT,
+            "shard_hint {shard_hint} exceeds 20-bit ceiling {NODE_ID_MAX_HINT}"
+        );
         Self {
+            shard_hint,
             counter: AtomicU64::new(0),
         }
     }
 
     /// Create an allocator resuming from the last allocated ID.
+    ///
+    /// The shard hint is inferred from `last_id` so persisted high-water
+    /// marks round-trip across restarts without separate bookkeeping.
     pub fn resume_from(last_id: NodeId) -> Self {
         Self {
-            counter: AtomicU64::new(last_id.as_raw()),
+            shard_hint: last_id.origin_shard_hint(),
+            counter: AtomicU64::new(last_id.sequence()),
         }
     }
 
-    /// Allocate the next node ID.
+    /// Allocate the next node ID for this shard.
+    ///
+    /// Increments the per-shard sequence counter and composes it with the
+    /// fixed hint. Panics on wrap into the hint range — see struct docs.
     pub fn next(&self) -> NodeId {
-        let id = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        NodeId(id)
+        let sequence = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(
+            sequence <= NODE_ID_MAX_SEQUENCE,
+            "NodeIdAllocator sequence wrap for shard_hint {}: {sequence} > {NODE_ID_MAX_SEQUENCE}",
+            self.shard_hint
+        );
+        NodeId::compose(self.shard_hint, sequence)
     }
 
-    /// Get the current high-water mark without advancing.
+    /// Get the current sequence high-water mark composed with the hint.
     pub fn current(&self) -> NodeId {
-        NodeId(self.counter.load(Ordering::SeqCst))
+        NodeId::compose(self.shard_hint, self.counter.load(Ordering::SeqCst))
     }
 
-    /// Advance to at least the given ID (for recovery).
+    /// Advance to at least the given ID's sequence (for recovery).
+    ///
+    /// The hint must match — advancing across hints is a logic error
+    /// (sequence space is per-shard).
     pub fn advance_to(&self, id: NodeId) {
-        self.counter.fetch_max(id.as_raw(), Ordering::SeqCst);
+        assert_eq!(
+            id.origin_shard_hint(),
+            self.shard_hint,
+            "advance_to received NodeId from shard_hint {} but allocator is for {}",
+            id.origin_shard_hint(),
+            self.shard_hint,
+        );
+        self.counter.fetch_max(id.sequence(), Ordering::SeqCst);
     }
-}
 
-impl Default for NodeIdAllocator {
-    fn default() -> Self {
-        Self::new()
+    /// The shard hint this allocator is configured for.
+    pub fn shard_hint(&self) -> u32 {
+        self.shard_hint
     }
 }
 
@@ -282,7 +456,7 @@ mod tests {
 
     #[test]
     fn allocator_starts_from_one() {
-        let alloc = NodeIdAllocator::new();
+        let alloc = NodeIdAllocator::new(0);
         assert_eq!(alloc.next().as_raw(), 1);
         assert_eq!(alloc.next().as_raw(), 2);
     }
@@ -312,7 +486,7 @@ mod tests {
         use std::collections::BTreeSet;
         use std::sync::Arc;
 
-        let alloc = Arc::new(NodeIdAllocator::new());
+        let alloc = Arc::new(NodeIdAllocator::new(0));
         let mut handles = Vec::new();
 
         for _ in 0..8 {
@@ -329,6 +503,179 @@ mod tests {
             }
         }
         assert_eq!(all.len(), 4000);
+    }
+
+    // -- u20/u44 layout tests --
+
+    #[test]
+    fn node_id_compose_extracts_hint_and_sequence() {
+        let id = NodeId::compose(42, 1_000_000);
+        assert_eq!(id.origin_shard_hint(), 42);
+        assert_eq!(id.sequence(), 1_000_000);
+    }
+
+    #[test]
+    fn node_id_compose_handles_max_hint() {
+        let id = NodeId::compose(NODE_ID_MAX_HINT, 1);
+        assert_eq!(id.origin_shard_hint(), NODE_ID_MAX_HINT);
+        assert_eq!(id.sequence(), 1);
+    }
+
+    #[test]
+    fn node_id_compose_handles_max_sequence() {
+        let id = NodeId::compose(0, NODE_ID_MAX_SEQUENCE);
+        assert_eq!(id.origin_shard_hint(), 0);
+        assert_eq!(id.sequence(), NODE_ID_MAX_SEQUENCE);
+    }
+
+    #[test]
+    #[should_panic(expected = "shard_hint")]
+    fn node_id_compose_panics_on_oversized_hint() {
+        NodeId::compose(NODE_ID_MAX_HINT + 1, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "sequence")]
+    fn node_id_compose_panics_on_oversized_sequence() {
+        NodeId::compose(0, NODE_ID_MAX_SEQUENCE + 1);
+    }
+
+    #[test]
+    fn allocator_ce_default_uses_hint_zero() {
+        let alloc = NodeIdAllocator::new(0);
+        assert_eq!(alloc.shard_hint(), 0);
+        let id = alloc.next();
+        assert_eq!(id.origin_shard_hint(), 0);
+        assert_eq!(id.sequence(), 1);
+    }
+
+    #[test]
+    fn allocator_ee_hint_carried_in_emitted_ids() {
+        let alloc = NodeIdAllocator::new(42);
+        let id1 = alloc.next();
+        let id2 = alloc.next();
+        assert_eq!(id1.origin_shard_hint(), 42);
+        assert_eq!(id2.origin_shard_hint(), 42);
+        assert_eq!(id1.sequence(), 1);
+        assert_eq!(id2.sequence(), 2);
+    }
+
+    #[test]
+    fn allocator_resume_from_preserves_hint() {
+        // EE shard 7 persisted a high-water mark at sequence 1000.
+        let persisted = NodeId::compose(7, 1000);
+        let alloc = NodeIdAllocator::resume_from(persisted);
+        assert_eq!(alloc.shard_hint(), 7);
+        let next = alloc.next();
+        assert_eq!(next.origin_shard_hint(), 7);
+        assert_eq!(next.sequence(), 1001);
+    }
+
+    #[test]
+    #[should_panic(expected = "advance_to received NodeId from shard_hint")]
+    fn allocator_advance_to_rejects_cross_hint_id() {
+        let alloc = NodeIdAllocator::new(3);
+        // Trying to advance against an id from a different shard is a logic
+        // bug — sequence space is per-shard.
+        alloc.advance_to(NodeId::compose(5, 100));
+    }
+
+    #[test]
+    #[should_panic(expected = "sequence wrap")]
+    fn allocator_panics_on_sequence_wrap() {
+        // Resume from the last possible sequence value in the 44-bit window.
+        // The next `next()` call should detect wrap and panic — without this
+        // guard sequence bits would leak into the 20-bit hint window and
+        // corrupt routing (phantom shards).
+        let alloc = NodeIdAllocator::resume_from(NodeId::compose(0, NODE_ID_MAX_SEQUENCE));
+        let _ = alloc.next();
+    }
+
+    #[test]
+    fn element_id_rejects_too_long_string() {
+        // 14 chars — must be rejected (canonical is exactly 13).
+        assert!(NodeId::from_element_id("0000000000000X").is_none());
+    }
+
+    #[test]
+    fn element_id_rejects_one_char_short() {
+        // 12 chars — must be rejected.
+        assert!(NodeId::from_element_id("000000000000").is_none());
+    }
+
+    #[test]
+    fn element_id_roundtrips_extreme_combined() {
+        // Both fields at their respective maxima — exercises the bit-packing
+        // boundary between sequence and hint windows simultaneously.
+        let id = NodeId::compose(NODE_ID_MAX_HINT, NODE_ID_MAX_SEQUENCE);
+        let s = id.to_element_id();
+        assert_eq!(s.len(), 13);
+        assert_eq!(NodeId::from_element_id(&s), Some(id));
+        assert_eq!(id.origin_shard_hint(), NODE_ID_MAX_HINT);
+        assert_eq!(id.sequence(), NODE_ID_MAX_SEQUENCE);
+    }
+
+    // -- elementId base32 encoding tests --
+
+    #[test]
+    fn element_id_roundtrips_zero() {
+        let id = NodeId::from_raw(0);
+        let s = id.to_element_id();
+        assert_eq!(s.len(), 13);
+        assert_eq!(NodeId::from_element_id(&s), Some(id));
+    }
+
+    #[test]
+    fn element_id_roundtrips_max() {
+        let id = NodeId::from_raw(u64::MAX);
+        let s = id.to_element_id();
+        assert_eq!(s.len(), 13);
+        assert_eq!(NodeId::from_element_id(&s), Some(id));
+    }
+
+    #[test]
+    fn element_id_roundtrips_composed_id() {
+        let id = NodeId::compose(NODE_ID_MAX_HINT, NODE_ID_MAX_SEQUENCE);
+        let s = id.to_element_id();
+        let decoded = NodeId::from_element_id(&s).expect("decode");
+        assert_eq!(decoded.origin_shard_hint(), NODE_ID_MAX_HINT);
+        assert_eq!(decoded.sequence(), NODE_ID_MAX_SEQUENCE);
+    }
+
+    #[test]
+    fn element_id_within_shard_is_time_sortable() {
+        // Within one shard, growing sequence ⇒ growing elementId string.
+        let early = NodeId::compose(5, 1).to_element_id();
+        let later = NodeId::compose(5, 1_000_000).to_element_id();
+        assert!(early < later, "expected {early} < {later}");
+    }
+
+    #[test]
+    fn element_id_rejects_invalid_input() {
+        assert!(NodeId::from_element_id("").is_none());
+        assert!(NodeId::from_element_id("TOO_SHORT").is_none());
+        assert!(NodeId::from_element_id("INVALID!CHARS").is_none()); // 13 chars but '!' invalid
+    }
+
+    #[test]
+    fn element_id_normalises_crockford_aliases() {
+        // I/L → 1 and O → 0 per Crockford spec.
+        let canonical = NodeId::compose(0, 1).to_element_id();
+        let with_alias_l = canonical.replace('1', "L");
+        let with_alias_i = canonical.replace('1', "I");
+        let with_alias_o = canonical.replace('0', "O");
+        assert_eq!(
+            NodeId::from_element_id(&with_alias_l),
+            Some(NodeId::compose(0, 1))
+        );
+        assert_eq!(
+            NodeId::from_element_id(&with_alias_i),
+            Some(NodeId::compose(0, 1))
+        );
+        assert_eq!(
+            NodeId::from_element_id(&with_alias_o),
+            Some(NodeId::compose(0, 1))
+        );
     }
 
     // -- Key encoding tests --

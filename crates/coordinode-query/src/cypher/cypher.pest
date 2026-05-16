@@ -225,6 +225,8 @@ property_type_name = @{
 
 property_decl_modifier = { kw_not ~ kw_null }
 
+// --- CREATE LABEL ---
+
 // --- CREATE ---
 
 create_clause = { kw_create ~ pattern_list }

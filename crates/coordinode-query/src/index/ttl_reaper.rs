@@ -218,8 +218,14 @@ fn discover_ttl_targets(
             }
         };
 
+        // Versioned schema keys are `schema:label:<name>:<version>`. Strip
+        // the trailing `:<version>` suffix to recover the label name. Labels
+        // cannot contain ':' (DDL grammar restricts identifiers).
         let label_name = match std::str::from_utf8(&key[prefix.len()..]) {
-            Ok(s) => s.to_string(),
+            Ok(s) => match s.rsplit_once(':') {
+                Some((name, _version)) => name.to_string(),
+                None => continue,
+            },
             Err(_) => continue,
         };
 
@@ -259,7 +265,8 @@ fn discover_ttl_targets(
     Ok(targets)
 }
 
-/// List all registered edge types from schema partition.
+/// List all registered edge types from schema partition. Versioned keys
+/// (`schema:edge_type:<name>:<version>`) dedup to one entry per name.
 fn list_edge_types(engine: &StorageEngine) -> Vec<String> {
     let prefix = b"schema:edge_type:";
     let iter = match engine.prefix_scan(Partition::Schema, prefix) {
@@ -267,11 +274,19 @@ fn list_edge_types(engine: &StorageEngine) -> Vec<String> {
         Err(_) => return Vec::new(),
     };
 
-    let mut types = Vec::new();
+    let mut types: Vec<String> = Vec::new();
     for guard in iter {
         if let Ok((key, _)) = guard.into_inner() {
-            if let Ok(name) = std::str::from_utf8(&key[prefix.len()..]) {
-                types.push(name.to_string());
+            let suffix = match std::str::from_utf8(&key[prefix.len()..]) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let name = match suffix.rsplit_once(':') {
+                Some((name, _version)) => name.to_string(),
+                None => continue,
+            };
+            if !types.contains(&name) {
+                types.push(name);
             }
         }
     }
@@ -925,7 +940,10 @@ mod tests {
     }
 
     fn persist_schema(engine: &StorageEngine, schema: &LabelSchema) {
-        let key = coordinode_core::schema::definition::encode_label_schema_key(&schema.name);
+        let key = coordinode_core::schema::definition::encode_label_schema_key(
+            &schema.name,
+            schema.schema_revision,
+        );
         let bytes = schema.to_msgpack().expect("serialize schema");
         engine
             .put(Partition::Schema, &key, &bytes)
@@ -954,7 +972,7 @@ mod tests {
     }
 
     fn make_ttl_schema(label: &str, duration_secs: u64, scope: TtlScope) -> LabelSchema {
-        let mut schema = LabelSchema::new(label);
+        let mut schema = LabelSchema::new_node_id(label);
         schema.add_property(PropertyDef::new("content", PropertyType::String));
         schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
         schema.add_property(PropertyDef::computed(
@@ -999,7 +1017,7 @@ mod tests {
         let engine = test_engine(dir.path());
 
         // Schema without COMPUTED TTL.
-        let mut schema = LabelSchema::new("User");
+        let mut schema = LabelSchema::new_node_id("User");
         schema.add_property(PropertyDef::new("name", PropertyType::String));
         persist_schema(&engine, &schema);
 
@@ -1130,7 +1148,7 @@ mod tests {
         let mut interner = FieldInterner::new();
 
         // Schema: anchor = created_at (TIMESTAMP), target = profile_data (String).
-        let mut schema = LabelSchema::new("Profile");
+        let mut schema = LabelSchema::new_node_id("Profile");
         schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
         schema.add_property(PropertyDef::new("profile_data", PropertyType::String));
         schema.add_property(PropertyDef::computed(
@@ -1198,7 +1216,7 @@ mod tests {
         let interner = FieldInterner::new();
 
         // Schema with target_field = "payload", but "payload" is not in the interner.
-        let mut schema = LabelSchema::new("Cache");
+        let mut schema = LabelSchema::new_node_id("Cache");
         schema.add_property(PropertyDef::new("cached_at", PropertyType::Timestamp));
         schema.add_property(PropertyDef::new("payload", PropertyType::String));
         schema.add_property(PropertyDef::computed(
@@ -1269,7 +1287,7 @@ mod tests {
         let engine = test_engine(dir.path());
         let mut interner = FieldInterner::new();
 
-        let mut schema = LabelSchema::new("Profile");
+        let mut schema = LabelSchema::new_node_id("Profile");
         schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
         schema.add_property(PropertyDef::new("bio", PropertyType::String));
         schema.add_property(PropertyDef::computed(
@@ -1352,7 +1370,7 @@ mod tests {
         persist_schema(&engine, &schema);
 
         // Register edge type.
-        let et_key = coordinode_core::schema::definition::encode_edge_type_schema_key("OWNS");
+        let et_key = coordinode_core::schema::definition::encode_edge_type_schema_key("OWNS", 1);
         engine
             .put(Partition::Schema, &et_key, &[])
             .expect("put edge type");

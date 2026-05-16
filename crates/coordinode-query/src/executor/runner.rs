@@ -18,8 +18,9 @@ use coordinode_core::graph::node::NodeIdAllocator;
 use coordinode_core::graph::node::{encode_node_key, NodeId, NodeRecord};
 use coordinode_core::graph::types::{Value, VectorConsistencyMode, VectorMvccStats};
 use coordinode_core::schema::definition::{
-    encode_edge_type_schema_key, encode_label_schema_key, EdgeTypeSchema, LabelSchema, PropertyDef,
-    PropertyType, SchemaMode,
+    encode_edge_type_current_revision_key, encode_edge_type_schema_key,
+    encode_label_current_revision_key, encode_label_schema_key, EdgeTypeSchema, LabelSchema,
+    PropertyDef, PropertyType, SchemaMode,
 };
 use coordinode_core::schema::validation::validate_one;
 use coordinode_core::txn::proposal::{
@@ -537,6 +538,134 @@ impl<'a> ExecutionContext<'a> {
         } else {
             Ok(self.engine.put(part, key, value)?)
         }
+    }
+
+    /// Read the current label schema by name. Returns `None` if the label
+    /// has no schema declared.
+    ///
+    /// Resolves the indirection through `schema:current_revision:label:<name>`
+    /// to find the active schema revision, then loads
+    /// `schema:label:<name>:<revision>`. Per ADR-023 the schema partition is
+    /// revision-prefixed from day one; CE deployments only ever see revision 1
+    /// (no `ALTER LABEL SHARD BY` in CE), but the read path traverses the
+    /// pointer regardless so the same code handles future multi-revision EE.
+    pub fn load_current_label_schema(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<LabelSchema>, ExecutionError> {
+        let pointer_key = encode_label_current_revision_key(name);
+        let Some(pointer_bytes) = self.mvcc_get(Partition::Schema, &pointer_key)? else {
+            return Ok(None);
+        };
+        let revision_array: [u8; 8] = match pointer_bytes.as_slice().try_into() {
+            Ok(arr) => arr,
+            Err(_) => {
+                return Err(ExecutionError::Unsupported(format!(
+                    "corrupt current_revision pointer for label '{name}': expected 8 bytes, got {}",
+                    pointer_bytes.len()
+                )));
+            }
+        };
+        let revision = u64::from_be_bytes(revision_array);
+        let schema_key = encode_label_schema_key(name, revision);
+        let Some(schema_bytes) = self.mvcc_get(Partition::Schema, &schema_key)? else {
+            return Err(ExecutionError::Unsupported(format!(
+                "label '{name}' pointer references missing revision {revision}"
+            )));
+        };
+        LabelSchema::from_msgpack(&schema_bytes)
+            .map(Some)
+            .map_err(|e| {
+                ExecutionError::Unsupported(format!("corrupt schema for label '{name}': {e}"))
+            })
+    }
+
+    /// Read the current edge type schema by name. Returns `None` if no schema
+    /// is declared for this edge type.
+    ///
+    /// Symmetric to [`Self::load_current_label_schema`]: resolves the indirection
+    /// through `schema:current_revision:edge_type:<name>` to find the active
+    /// revision, then loads `schema:edge_type:<name>:<revision>`. Handles legacy
+    /// zero-length idempotent existence markers (predates DDL) by returning
+    /// `None` rather than erroring.
+    pub fn load_current_edge_type_schema(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<EdgeTypeSchema>, ExecutionError> {
+        let pointer_key = encode_edge_type_current_revision_key(name);
+        let Some(pointer_bytes) = self.mvcc_get(Partition::Schema, &pointer_key)? else {
+            return Ok(None);
+        };
+        let revision_array: [u8; 8] = match pointer_bytes.as_slice().try_into() {
+            Ok(arr) => arr,
+            Err(_) => {
+                return Err(ExecutionError::Unsupported(format!(
+                    "corrupt current_revision pointer for edge type '{name}': expected 8 bytes, got {}",
+                    pointer_bytes.len()
+                )));
+            }
+        };
+        let revision = u64::from_be_bytes(revision_array);
+        let schema_key = encode_edge_type_schema_key(name, revision);
+        let Some(schema_bytes) = self.mvcc_get(Partition::Schema, &schema_key)? else {
+            return Err(ExecutionError::Unsupported(format!(
+                "edge type '{name}' pointer references missing revision {revision}"
+            )));
+        };
+        if schema_bytes.is_empty() {
+            return Ok(None);
+        }
+        EdgeTypeSchema::from_msgpack(&schema_bytes)
+            .map(Some)
+            .map_err(|e| {
+                ExecutionError::Unsupported(format!("corrupt schema for edge type '{name}': {e}"))
+            })
+    }
+
+    /// Write an edge type schema as the current revision: writes the schema body
+    /// at `schema:edge_type:<name>:<schema.schema_revision>` and updates the pointer
+    /// `schema:current_revision:edge_type:<name>` to that revision.
+    pub fn save_current_edge_type_schema(
+        &mut self,
+        schema: &EdgeTypeSchema,
+    ) -> Result<(), ExecutionError> {
+        let schema_bytes = schema.to_msgpack().map_err(|e| {
+            ExecutionError::Unsupported(format!(
+                "edge type schema encode for '{}': {e}",
+                schema.name
+            ))
+        })?;
+        let schema_key = encode_edge_type_schema_key(&schema.name, schema.schema_revision);
+        self.mvcc_put(Partition::Schema, &schema_key, &schema_bytes)?;
+        let pointer_key = encode_edge_type_current_revision_key(&schema.name);
+        self.mvcc_put(
+            Partition::Schema,
+            &pointer_key,
+            &schema.schema_revision.to_be_bytes(),
+        )?;
+        Ok(())
+    }
+
+    /// Write a label schema as the current revision: writes the schema body
+    /// at `schema:label:<name>:<schema.schema_revision>` and updates the pointer
+    /// `schema:current_revision:label:<name>` to that revision. Use this for
+    /// the canonical "create or update current schema" operation.
+    pub fn save_current_label_schema(
+        &mut self,
+        schema: &LabelSchema,
+    ) -> Result<(), ExecutionError> {
+        let schema_bytes = schema.to_msgpack().map_err(|e| {
+            ExecutionError::Unsupported(format!("schema encode for '{}': {e}", schema.name))
+        })?;
+        let schema_key = encode_label_schema_key(&schema.name, schema.schema_revision);
+        self.mvcc_put(Partition::Schema, &schema_key, &schema_bytes)?;
+        let pointer_key = encode_label_current_revision_key(&schema.name);
+        self.mvcc_put(
+            Partition::Schema,
+            &pointer_key,
+            &schema.schema_revision.to_be_bytes(),
+        )?;
+        Ok(())
     }
 
     /// MVCC-aware delete: buffers tombstone in write_buffer for atomic flush.
@@ -1133,26 +1262,37 @@ impl<'a> ExecutionContext<'a> {
     /// Used by DETACH DELETE to build targeted adj key lookups instead of
     /// scanning every adj: key in the database.
     pub(crate) fn list_edge_types(&self) -> Result<Vec<String>, ExecutionError> {
+        // The schema partition now holds version-prefixed keys
+        // `schema:edge_type:<name>:<version>`. To enumerate distinct edge
+        // types we strip the trailing `:<version>` suffix and dedup.
+        // Names cannot contain `:` (DDL grammar restricts identifiers), so
+        // the rightmost ':' delimiter is unambiguous.
         const PREFIX: &[u8] = b"schema:edge_type:";
         let iter = self.engine.prefix_scan(Partition::Schema, PREFIX)?;
-        let mut types = Vec::new();
+        let mut types: Vec<String> = Vec::new();
+        let extract_name = |key: &[u8]| -> Option<String> {
+            let suffix = key.get(PREFIX.len()..)?;
+            let suffix_str = std::str::from_utf8(suffix).ok()?;
+            let (name, _version) = suffix_str.rsplit_once(':')?;
+            Some(name.to_string())
+        };
         for guard in iter {
             let (k, _) = guard
                 .into_inner()
                 .map_err(|e| ExecutionError::Storage(e.into()))?;
-            // Also include any buffered (uncommitted) edge type registrations from
-            // this transaction, so DETACH DELETE sees same-tx edge creations.
-            if let Ok(name) = std::str::from_utf8(&k[PREFIX.len()..]) {
-                types.push(name.to_string());
+            if let Some(name) = extract_name(&k) {
+                if !types.contains(&name) {
+                    types.push(name);
+                }
             }
         }
         // Include edge types registered in this transaction's write buffer
         // (not yet flushed to the engine — covers same-tx CREATE + DETACH DELETE).
         for (part, key) in self.mvcc_write_buffer.keys() {
             if *part == Partition::Schema && key.starts_with(PREFIX) {
-                if let Ok(name) = std::str::from_utf8(&key[PREFIX.len()..]) {
-                    if !types.contains(&name.to_string()) {
-                        types.push(name.to_string());
+                if let Some(name) = extract_name(key) {
+                    if !types.contains(&name) {
+                        types.push(name);
                     }
                 }
             }
@@ -6036,11 +6176,7 @@ fn execute_create_node(
     // Load schema for the primary label (if any) to determine property routing.
     // In VALIDATED mode, undeclared properties go to `extra` (string keys).
     let schema = if let Some(primary) = labels.first() {
-        let schema_key = encode_label_schema_key(primary);
-        match ctx.mvcc_get(Partition::Schema, &schema_key) {
-            Ok(Some(bytes)) => LabelSchema::from_msgpack(&bytes).ok(),
-            _ => None,
-        }
+        ctx.load_current_label_schema(primary).ok().flatten()
     } else {
         None
     };
@@ -6431,11 +6567,7 @@ fn execute_update(
                         // check STRICT/VALIDATED constraints on the property name.
                         // Returns None if no schema exists (schemaless node → always allowed).
                         let label = record.primary_label().to_string();
-                        let schema_key = encode_label_schema_key(&label);
-                        let label_schema = match ctx.mvcc_get(Partition::Schema, &schema_key)? {
-                            Some(s_bytes) => LabelSchema::from_msgpack(&s_bytes).ok(),
-                            None => None,
-                        };
+                        let label_schema = ctx.load_current_label_schema(&label)?;
 
                         // Collect potential schema violation into Option<ExecutionError> so we can
                         // choose between skip (ON VIOLATION SKIP) and fail (default) after the check.
@@ -6572,45 +6704,35 @@ fn execute_update(
                     // SET n.a.x=1, n.a.y=2, n.a.z=3 on 100 nodes = 100 reads (not 300).
                     let schema_err: Option<ExecutionError> = {
                         if let Some(label) = ctx.schema_label_for_node(node_id, &key)? {
-                            let schema_key = encode_label_schema_key(&label);
-                            match ctx.mvcc_get(Partition::Schema, &schema_key)? {
-                                Some(s_bytes) => {
-                                    match LabelSchema::from_msgpack(&s_bytes).ok() {
-                                        Some(ls) => {
-                                            let root = &path[0];
-                                            match ls.mode {
-                                                SchemaMode::Strict => {
-                                                    match ls.get_property(root) {
-                                                        None => Some(
-                                                            ExecutionError::SchemaViolation(
-                                                                format!("unknown property '{root}' for strict label '{label}'"),
-                                                            ),
-                                                        ),
-                                                        Some(def) if def.is_computed() => Some(
-                                                            ExecutionError::SchemaViolation(format!(
-                                                                "cannot SET computed property '{root}'"
-                                                            )),
-                                                        ),
-                                                        Some(_) => None,
-                                                    }
+                            match ctx.load_current_label_schema(&label)? {
+                                Some(ls) => {
+                                    let root = &path[0];
+                                    match ls.mode {
+                                        SchemaMode::Strict => match ls.get_property(root) {
+                                            None => Some(ExecutionError::SchemaViolation(format!(
+                                                "unknown property '{root}' for strict label '{label}'"
+                                            ))),
+                                            Some(def) if def.is_computed() => {
+                                                Some(ExecutionError::SchemaViolation(format!(
+                                                    "cannot SET computed property '{root}'"
+                                                )))
+                                            }
+                                            Some(_) => None,
+                                        },
+                                        SchemaMode::Validated => {
+                                            if let Some(def) = ls.get_property(root) {
+                                                if def.is_computed() {
+                                                    Some(ExecutionError::SchemaViolation(format!(
+                                                        "cannot SET computed property '{root}'"
+                                                    )))
+                                                } else {
+                                                    None
                                                 }
-                                                SchemaMode::Validated => {
-                                                    if let Some(def) = ls.get_property(root) {
-                                                        if def.is_computed() {
-                                                            Some(ExecutionError::SchemaViolation(
-                                                                format!("cannot SET computed property '{root}'"),
-                                                            ))
-                                                        } else {
-                                                            None
-                                                        }
-                                                    } else {
-                                                        None // unknown root prop allowed in VALIDATED
-                                                    }
-                                                }
-                                                SchemaMode::Flexible => None,
+                                            } else {
+                                                None
                                             }
                                         }
-                                        None => None,
+                                        SchemaMode::Flexible => None,
                                     }
                                 }
                                 None => None,
@@ -6671,37 +6793,33 @@ fn execute_update(
                     let schema_err: Option<ExecutionError> = {
                         let key = encode_node_key(ctx.shard_id, node_id);
                         if let Some(label) = ctx.schema_label_for_node(node_id, &key)? {
-                            let schema_key = encode_label_schema_key(&label);
-                            match ctx.mvcc_get(Partition::Schema, &schema_key)? {
-                                Some(s_bytes) => match LabelSchema::from_msgpack(&s_bytes).ok() {
-                                    Some(ls) => match ls.mode {
-                                        SchemaMode::Strict => match ls.get_property(root_prop) {
-                                            None => Some(ExecutionError::SchemaViolation(format!(
-                                                "unknown property '{root_prop}' for strict label '{label}'"
-                                            ))),
-                                            Some(def) if def.is_computed() => {
+                            match ctx.load_current_label_schema(&label)? {
+                                Some(ls) => match ls.mode {
+                                    SchemaMode::Strict => match ls.get_property(root_prop) {
+                                        None => Some(ExecutionError::SchemaViolation(format!(
+                                            "unknown property '{root_prop}' for strict label '{label}'"
+                                        ))),
+                                        Some(def) if def.is_computed() => {
+                                            Some(ExecutionError::SchemaViolation(format!(
+                                                "cannot SET computed property '{root_prop}'"
+                                            )))
+                                        }
+                                        Some(_) => None,
+                                    },
+                                    SchemaMode::Validated => {
+                                        if let Some(def) = ls.get_property(root_prop) {
+                                            if def.is_computed() {
                                                 Some(ExecutionError::SchemaViolation(format!(
                                                     "cannot SET computed property '{root_prop}'"
                                                 )))
-                                            }
-                                            Some(_) => None,
-                                        },
-                                        SchemaMode::Validated => {
-                                            if let Some(def) = ls.get_property(root_prop) {
-                                                if def.is_computed() {
-                                                    Some(ExecutionError::SchemaViolation(format!(
-                                                        "cannot SET computed property '{root_prop}'"
-                                                    )))
-                                                } else {
-                                                    None
-                                                }
                                             } else {
-                                                None // unknown root prop allowed in VALIDATED
+                                                None
                                             }
+                                        } else {
+                                            None
                                         }
-                                        SchemaMode::Flexible => None,
-                                    },
-                                    None => None,
+                                    }
+                                    SchemaMode::Flexible => None,
                                 },
                                 None => None,
                             }
@@ -6790,11 +6908,7 @@ fn execute_update(
                         // Schema validation: SET n = {map} replaces ALL properties.
                         // In STRICT mode every key must be declared; VALIDATED checks declared keys only.
                         let label = record.primary_label().to_string();
-                        let schema_key = encode_label_schema_key(&label);
-                        let label_schema = match ctx.mvcc_get(Partition::Schema, &schema_key)? {
-                            Some(s_bytes) => LabelSchema::from_msgpack(&s_bytes).ok(),
-                            None => None,
-                        };
+                        let label_schema = ctx.load_current_label_schema(&label)?;
                         if let (Some(ref ls), Value::Map(ref map)) = (&label_schema, &map_val) {
                             let schema_err: Option<ExecutionError> = 'schema: {
                                 for (k, v) in map {
@@ -6917,11 +7031,7 @@ fn execute_update(
                         // Schema validation: SET n += {map} merges new properties.
                         // STRICT: every key in map must be declared; VALIDATED: checks declared keys.
                         let label = record.primary_label().to_string();
-                        let schema_key = encode_label_schema_key(&label);
-                        let label_schema = match ctx.mvcc_get(Partition::Schema, &schema_key)? {
-                            Some(s_bytes) => LabelSchema::from_msgpack(&s_bytes).ok(),
-                            None => None,
-                        };
+                        let label_schema = ctx.load_current_label_schema(&label)?;
                         if let (Some(ref ls), Value::Map(ref map)) = (&label_schema, &map_val) {
                             let schema_err: Option<ExecutionError> = 'schema: {
                                 for (k, v) in map {
@@ -8249,15 +8359,40 @@ fn cascade_delete_source_node(
     Ok(())
 }
 
+/// Load the current `LabelSchema` for `name` via the schema partition pointer
+/// (`schema:current_revision:label:<name>` → `schema:label:<name>:<revision>`),
+/// directly through a `StorageEngine` handle without MVCC visibility.
+///
+/// Used by code paths that only have engine access (parallel scans, background
+/// helpers) and don't need RYOW semantics. MVCC-aware callers should use
+/// [`ExecutionContext::load_current_label_schema`] instead.
+///
+/// Returns `None` for missing pointer, missing schema body, corrupt pointer,
+/// or msgpack decode error — never errors. This is a best-effort read used
+/// for non-blocking schema enrichment (computed properties, vector index
+/// dispatch). Hard failures show up at the next MVCC read.
+fn load_current_label_schema_from_engine(
+    engine: &StorageEngine,
+    name: &str,
+) -> Option<LabelSchema> {
+    let pointer_key = encode_label_current_revision_key(name);
+    let pointer = engine.get(Partition::Schema, &pointer_key).ok().flatten()?;
+    let revision_array: [u8; 8] = pointer.as_ref().try_into().ok()?;
+    let revision = u64::from_be_bytes(revision_array);
+    let schema_key = encode_label_schema_key(name, revision);
+    let bytes = engine.get(Partition::Schema, &schema_key).ok().flatten()?;
+    LabelSchema::from_msgpack(&bytes).ok()
+}
+
 /// Build the Schema-partition key for a given edge type name.
 ///
 /// Format: `schema:edge_type:<name>`
 fn edge_type_schema_key(edge_type: &str) -> Vec<u8> {
-    const PREFIX: &[u8] = b"schema:edge_type:";
-    let mut k = Vec::with_capacity(PREFIX.len() + edge_type.len());
-    k.extend_from_slice(PREFIX);
-    k.extend_from_slice(edge_type.as_bytes());
-    k
+    // Aligns with the canonical version-prefixed key (`schema:edge_type:<name>:<version>`)
+    // — see `encode_edge_type_schema_key`. CE deployments only ever have
+    // version 1; the existence marker pattern used by `list_edge_types`
+    // expects this format so prefix scans match real schemas.
+    encode_edge_type_schema_key(edge_type, 1)
 }
 
 /// Look up whether an edge type was declared with the TEMPORAL modifier.
@@ -8271,23 +8406,10 @@ fn lookup_edge_type_temporal(
     edge_type: &str,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<bool, ExecutionError> {
-    let key = edge_type_schema_key(edge_type);
-    let bytes = match ctx.mvcc_get(Partition::Schema, &key) {
-        Ok(Some(b)) => b,
-        Ok(None) => return Ok(false),
-        Err(e) => {
-            return Err(ExecutionError::Unsupported(format!(
-                "storage error reading edge type schema: {e}"
-            )));
-        }
-    };
-    if bytes.is_empty() {
-        return Ok(false);
-    }
-    match EdgeTypeSchema::from_msgpack(&bytes) {
-        Ok(schema) => Ok(schema.temporal),
-        Err(_) => Ok(false),
-    }
+    Ok(ctx
+        .load_current_edge_type_schema(edge_type)?
+        .map(|s| s.temporal)
+        .unwrap_or(false))
 }
 
 /// Apply `SET r.<property> = <value>` to the matched edge.
@@ -8447,13 +8569,9 @@ fn inject_computed_properties(
 /// Used by both the sequential path (via inject_computed_properties) and the
 /// parallel path (process_targets_parallel).
 fn inject_computed_from_engine(row: &mut Row, variable: &str, label: &str, engine: &StorageEngine) {
-    let schema_key = encode_label_schema_key(label);
-    let schema = match engine.get(Partition::Schema, &schema_key) {
-        Ok(Some(bytes)) => match LabelSchema::from_msgpack(&bytes) {
-            Ok(s) => s,
-            Err(_) => return,
-        },
-        _ => return,
+    let schema = match load_current_label_schema_from_engine(engine, label) {
+        Some(s) => s,
+        None => return,
     };
 
     let now_us = std::time::SystemTime::now()
@@ -8585,36 +8703,25 @@ fn execute_alter_label(
         }
     };
 
-    let key = encode_label_schema_key(label);
-
-    // Load existing schema or create a new one.
-    let mut schema = match ctx.mvcc_get(Partition::Schema, &key) {
-        Ok(Some(bytes)) => LabelSchema::from_msgpack(&bytes).map_err(|e| {
-            ExecutionError::Unsupported(format!("corrupt schema for label '{label}': {e}"))
-        })?,
-        Ok(None) => LabelSchema::new(label),
-        Err(e) => {
-            return Err(ExecutionError::Unsupported(format!(
-                "storage error reading schema: {e}"
-            )));
-        }
-    };
+    // Load existing schema via pointer or create a new one.
+    let mut schema = ctx
+        .load_current_label_schema(label)?
+        .unwrap_or_else(|| LabelSchema::new_node_id(label));
 
     schema.set_mode(mode);
-    schema.version += 1;
+    schema.schema_revision += 1;
 
-    // Persist via MVCC write buffer → proposal pipeline.
-    let value = schema
-        .to_msgpack()
-        .map_err(|e| ExecutionError::Unsupported(format!("failed to serialize schema: {e}")))?;
-    ctx.mvcc_write_buffer
-        .insert((Partition::Schema, key.clone()), Some(value));
+    // Persist new version + pointer atomically via save helper.
+    ctx.save_current_label_schema(&schema)?;
 
     // Return result row with label info.
     let mut row = Row::new();
     row.insert("label".to_string(), Value::String(label.to_string()));
     row.insert("mode".to_string(), Value::String(format!("{mode}")));
-    row.insert("version".to_string(), Value::Int(schema.version as i64));
+    row.insert(
+        "version".to_string(),
+        Value::Int(schema.schema_revision as i64),
+    );
     Ok(vec![row])
 }
 
@@ -8632,9 +8739,17 @@ fn execute_create_edge_type(
     properties: &[crate::cypher::ast::EdgePropertyDecl],
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    let key = encode_edge_type_schema_key(name);
-
-    if let Ok(Some(_)) = ctx.mvcc_get(Partition::Schema, &key) {
+    // Reject if the edge type was registered before (either via explicit DDL,
+    // which writes a pointer, or implicitly by a prior edge create, which
+    // writes a revisioned existence marker). Probe both:
+    //  1. current_revision pointer → set by explicit CREATE EDGE TYPE
+    //  2. legacy unparametrised existence marker at revision 1 → set by
+    //     implicit edge registration in `create_edges_for_correlated_row`.
+    let pointer_key = encode_edge_type_current_revision_key(name);
+    let marker_key = encode_edge_type_schema_key(name, 1);
+    let already_exists = ctx.mvcc_get(Partition::Schema, &pointer_key)?.is_some()
+        || ctx.mvcc_get(Partition::Schema, &marker_key)?.is_some();
+    if already_exists {
         return Err(ExecutionError::Unsupported(format!(
             "edge type '{name}' already exists"
         )));
@@ -8668,16 +8783,16 @@ fn execute_create_edge_type(
         schema.add_property(prop);
     }
 
-    let value = schema.to_msgpack().map_err(|e| {
-        ExecutionError::Unsupported(format!("failed to serialize edge type schema: {e}"))
-    })?;
-    ctx.mvcc_write_buffer
-        .insert((Partition::Schema, key), Some(value));
+    // Persist new version + pointer atomically.
+    ctx.save_current_edge_type_schema(&schema)?;
 
     let mut row = Row::new();
     row.insert("name".to_string(), Value::String(name.to_string()));
     row.insert("temporal".to_string(), Value::Bool(temporal));
-    row.insert("version".to_string(), Value::Int(schema.version as i64));
+    row.insert(
+        "version".to_string(),
+        Value::Int(schema.schema_revision as i64),
+    );
     row.insert(
         "properties".to_string(),
         Value::Int(properties.len() as i64),
@@ -10070,7 +10185,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
         let mut interner = FieldInterner::new();
-        let allocator = NodeIdAllocator::new();
+        let allocator = NodeIdAllocator::new(0);
         let mut ctx = make_ctx(&engine, &mut interner, &allocator);
 
         let plan = LogicalPlan {
@@ -10112,7 +10227,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
         let mut interner = FieldInterner::new();
-        let allocator = NodeIdAllocator::new();
+        let allocator = NodeIdAllocator::new(0);
         let mut ctx = make_ctx(&engine, &mut interner, &allocator);
 
         let plan = LogicalPlan {
@@ -10272,7 +10387,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
         let mut interner = FieldInterner::new();
-        let allocator = NodeIdAllocator::new();
+        let allocator = NodeIdAllocator::new(0);
         let mut ctx = make_ctx(&engine, &mut interner, &allocator);
 
         // Create first node
@@ -10316,7 +10431,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
         let mut interner = FieldInterner::new();
-        let allocator = NodeIdAllocator::new();
+        let allocator = NodeIdAllocator::new(0);
         let mut ctx = make_ctx(&engine, &mut interner, &allocator);
 
         // MERGE (n:User {email: 'alice@test.com'}) ON CREATE SET n.name = 'Alice'
@@ -10434,7 +10549,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
         let mut interner = FieldInterner::new();
-        let allocator = NodeIdAllocator::new();
+        let allocator = NodeIdAllocator::new(0);
         let mut ctx = make_ctx(&engine, &mut interner, &allocator);
 
         // UPSERT MATCH (u:User {email: 'bob@test.com'})
@@ -10636,7 +10751,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
         let mut interner = FieldInterner::new();
-        let allocator = NodeIdAllocator::new();
+        let allocator = NodeIdAllocator::new(0);
 
         // Create source node
         insert_node(
@@ -10715,7 +10830,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
         let mut interner = FieldInterner::new();
-        let allocator = NodeIdAllocator::new();
+        let allocator = NodeIdAllocator::new(0);
 
         insert_node(
             &engine,
@@ -10852,7 +10967,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
         let mut interner = FieldInterner::new();
-        let allocator = NodeIdAllocator::new();
+        let allocator = NodeIdAllocator::new(0);
 
         insert_node(
             &engine,
@@ -12428,7 +12543,7 @@ mod tests {
         )
         .expect("open with oracle");
         let mut interner = FieldInterner::new();
-        let allocator = NodeIdAllocator::new();
+        let allocator = NodeIdAllocator::new(0);
 
         // Hub node with 10 targets (threshold=5 triggers parallel)
         insert_node(
@@ -12538,7 +12653,7 @@ mod tests {
         )
         .expect("open with oracle");
         let mut interner = FieldInterner::new();
-        let allocator = NodeIdAllocator::new();
+        let allocator = NodeIdAllocator::new(0);
 
         // Hub + 10 targets
         insert_node(

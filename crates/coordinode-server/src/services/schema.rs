@@ -257,7 +257,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
     ) -> Result<Response<graph::Label>, Status> {
         let req = request.into_inner();
         // Build internal LabelSchema from the proto request.
-        let mut schema = LabelSchema::new(&req.name);
+        let mut schema = LabelSchema::new_node_id(&req.name);
 
         // Apply schema mode (defaults to STRICT when unspecified).
         let mode = proto_to_schema_mode(req.schema_mode);
@@ -286,7 +286,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
             echo_computed.push(cp.clone());
         }
 
-        let version = {
+        let schema_revision = {
             let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
             db.create_label_schema(schema)
                 .map_err(|e| Status::internal(format!("create_label error: {e}")))?
@@ -295,7 +295,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
         Ok(Response::new(graph::Label {
             name: req.name,
             properties: req.properties,
-            version,
+            schema_revision,
             computed_properties: echo_computed,
             schema_mode: schema_mode_to_proto(mode),
         }))
@@ -321,7 +321,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
             schema.add_property(prop);
         }
 
-        let version = {
+        let schema_revision = {
             let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
             db.create_edge_type_schema(schema)
                 .map_err(|e| Status::internal(format!("create_edge_type error: {e}")))?
@@ -330,7 +330,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
         Ok(Response::new(graph::EdgeType {
             name: req.name,
             properties: req.properties,
-            version,
+            schema_revision,
         }))
     }
 
@@ -387,7 +387,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
                         graph::Label {
                             name: schema.name.clone(),
                             properties,
-                            version: schema.version,
+                            schema_revision: schema.schema_revision,
                             computed_properties,
                             schema_mode: schema_mode_to_proto(schema.mode),
                         },
@@ -397,7 +397,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
                     map.entry(name.to_string()).or_insert_with(|| graph::Label {
                         name: name.to_string(),
                         properties: vec![],
-                        version: 0,
+                        schema_revision: 0,
                         computed_properties: vec![],
                         schema_mode: schema_mode_to_proto(SchemaMode::Strict),
                     });
@@ -420,7 +420,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
                         .or_insert_with(|| graph::Label {
                             name: name.clone(),
                             properties: vec![],
-                            version: 0,
+                            schema_revision: 0,
                             computed_properties: vec![],
                             schema_mode: 0, // UNSPECIFIED — no declared schema
                         });
@@ -442,6 +442,8 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
         // `schema:edge_type:<name>` whenever an edge is created. Read directly
         // from there — wildcard MATCH ()-[r]->() won't work because the executor
         // only traverses explicitly-typed edges (empty edge_types slice = no-op).
+        // Versioned schema keys are `schema:edge_type:<name>:<version>`.
+        // Strip the trailing `:<version>` suffix and dedup by name.
         const PREFIX: &[u8] = b"schema:edge_type:";
         let names: Vec<String> = {
             let db = self.database.lock().unwrap_or_else(|e| e.into_inner());
@@ -450,13 +452,19 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
                 .prefix_scan(Partition::Schema, PREFIX)
                 .map_err(|e| Status::internal(format!("list_edge_types scan error: {e}")))?;
 
-            let mut types = Vec::new();
+            let mut types: Vec<String> = Vec::new();
             for guard in iter {
                 if let Ok((key, _)) = guard.into_inner() {
-                    if let Ok(name) = std::str::from_utf8(&key[PREFIX.len()..]) {
-                        if !name.is_empty() {
-                            types.push(name.to_string());
-                        }
+                    let suffix = match std::str::from_utf8(&key[PREFIX.len()..]) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let name = match suffix.rsplit_once(':') {
+                        Some((name, _version)) if !name.is_empty() => name.to_string(),
+                        _ => continue,
+                    };
+                    if !types.contains(&name) {
+                        types.push(name);
                     }
                 }
             }
@@ -469,7 +477,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
             .map(|name| graph::EdgeType {
                 name,
                 properties: vec![],
-                version: 0,
+                schema_revision: 0,
             })
             .collect();
 
@@ -616,13 +624,16 @@ mod tests {
 
         let label = resp.into_inner();
         assert_eq!(label.name, "Article");
-        assert!(label.version > 0, "version must be positive after persist");
+        assert!(
+            label.schema_revision > 0,
+            "schema_revision must be positive after persist"
+        );
         assert_eq!(label.properties.len(), 2);
 
         // Verify schema is in storage.
         use coordinode_storage::engine::partition::Partition;
         let db = svc.database.lock().unwrap();
-        let key = coordinode_core::schema::definition::encode_label_schema_key("Article");
+        let key = coordinode_core::schema::definition::encode_label_schema_key("Article", 1);
         let bytes = db
             .engine()
             .get(Partition::Schema, &key)
@@ -743,12 +754,12 @@ mod tests {
 
         let et = resp.into_inner();
         assert_eq!(et.name, "FOLLOWS");
-        assert!(et.version > 0);
+        assert!(et.schema_revision > 0);
 
         // Verify in storage.
         use coordinode_storage::engine::partition::Partition;
         let db = svc.database.lock().unwrap();
-        let key = coordinode_core::schema::definition::encode_edge_type_schema_key("FOLLOWS");
+        let key = coordinode_core::schema::definition::encode_edge_type_schema_key("FOLLOWS", 1);
         let bytes = db
             .engine()
             .get(Partition::Schema, &key)
@@ -894,7 +905,7 @@ mod tests {
             use coordinode_storage::engine::partition::Partition;
 
             let db = svc.database.lock().unwrap();
-            let key = coordinode_core::schema::definition::encode_label_schema_key("Session");
+            let key = coordinode_core::schema::definition::encode_label_schema_key("Session", 1);
             let bytes = db
                 .engine()
                 .get(Partition::Schema, &key)
@@ -1110,7 +1121,7 @@ mod tests {
             use coordinode_storage::engine::partition::Partition;
 
             let db = svc.database.lock().unwrap();
-            let key = coordinode_core::schema::definition::encode_label_schema_key("User");
+            let key = coordinode_core::schema::definition::encode_label_schema_key("User", 1);
             let bytes = db
                 .engine()
                 .get(Partition::Schema, &key)

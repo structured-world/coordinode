@@ -26,6 +26,7 @@ Several standard OpenCypher functions (`toInteger`, `toLower`, `length`, `abs`, 
 - **[Functions](./functions)** — All scalar, aggregation, and extension functions with status
 - **[Extensions](./extensions)** — Vector search, full-text, spatial, document ops, time-travel
 - **[Temporal edges (bitemporal)](./temporal-edges)** — `CREATE EDGE TYPE … TEMPORAL`, point-in-time and window queries
+- **[Node identity](./identity)** — `elementId()` vs `id()`, encoding, stability guarantees
 - **[Neo4j Compatibility](./compatibility)** — What works with Neo4j tooling and what doesn't
 
 ## Quick Example

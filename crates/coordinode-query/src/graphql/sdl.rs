@@ -412,7 +412,7 @@ mod tests {
     use coordinode_core::schema::definition::PropertyDef;
 
     fn make_user_schema() -> LabelSchema {
-        let mut schema = LabelSchema::new("User");
+        let mut schema = LabelSchema::new_node_id("User");
         schema.add_property(PropertyDef::new("name", PropertyType::String).not_null());
         schema.add_property(
             PropertyDef::new("email", PropertyType::String)
@@ -424,7 +424,7 @@ mod tests {
     }
 
     fn make_movie_schema() -> LabelSchema {
-        let mut schema = LabelSchema::new("Movie");
+        let mut schema = LabelSchema::new_node_id("Movie");
         schema.add_property(PropertyDef::new("title", PropertyType::String).not_null());
         schema.add_property(PropertyDef::new("rating", PropertyType::Float));
         schema
@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn vector_fields_excluded_from_type() {
-        let mut schema = LabelSchema::new("Document");
+        let mut schema = LabelSchema::new_node_id("Document");
         schema.add_property(PropertyDef::new("title", PropertyType::String));
         schema.add_property(PropertyDef::new(
             "embedding",

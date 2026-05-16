@@ -22,6 +22,8 @@ Functions that compute a single value from their arguments.
 | `type` | `type(r)` | String | Relationship type (e.g. `"KNOWS"`) |
 | `labels` | `labels(n)` | List\<String\> | Returns list with one label string. Subscript access `labels(n)[0]` is supported |
 | `now` | `now()` | Timestamp | Current timestamp (microseconds since epoch) |
+| `id` | `id(n)` | Integer | Raw 64-bit node identifier. **Neo4j v4 driver compatibility only** — use `elementId` for new code |
+| `elementId` | `elementId(n)` | String | 13-character Crockford base32 encoding of the node ID. Stable across schema changes; case-insensitive on input |
 
 
 ### Vector Functions ✅ 🔷

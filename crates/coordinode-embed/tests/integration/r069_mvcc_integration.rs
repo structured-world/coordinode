@@ -133,7 +133,7 @@ fn occ_conflict_concurrent_threads() {
     let read_ts = oracle.next(); // ts=1001
     let txn_snapshot = engine.snapshot();
     let mut interner = FieldInterner::new();
-    let allocator = NodeIdAllocator::new();
+    let allocator = NodeIdAllocator::new(0);
     let mut ctx = super::helpers::make_ctx_mvcc(
         &engine,
         &oracle,

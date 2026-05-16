@@ -69,7 +69,7 @@ impl std::error::Error for EvolutionError {}
 /// Apply a schema change to a label schema.
 ///
 /// Returns the updated schema or an error if the change is rejected.
-/// The schema version is incremented on success.
+/// The schema revision is incremented on success.
 pub fn apply_change(schema: &mut LabelSchema, change: SchemaChange) -> Result<(), EvolutionError> {
     match change {
         SchemaChange::AddProperty(prop) => {
@@ -135,7 +135,7 @@ mod tests {
     use crate::graph::types::VectorMetric;
 
     fn base_schema() -> LabelSchema {
-        let mut schema = LabelSchema::new("User");
+        let mut schema = LabelSchema::new_node_id("User");
         schema.add_property(PropertyDef::new("name", PropertyType::String).not_null());
         schema.add_property(PropertyDef::new("age", PropertyType::Int));
         schema
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn add_property_simple() {
         let mut schema = base_schema();
-        let v_before = schema.version;
+        let v_before = schema.schema_revision;
 
         let result = apply_change(
             &mut schema,
@@ -152,7 +152,9 @@ mod tests {
         );
         assert!(result.is_ok());
         assert!(schema.get_property("bio").is_some());
-        assert!(schema.version > v_before);
+        // Per ADR-023, property additions do not bump the schema revision —
+        // version tracks placement/shard_keys changes via `ALTER LABEL`.
+        assert_eq!(schema.schema_revision, v_before);
     }
 
     #[test]
@@ -230,12 +232,13 @@ mod tests {
     #[test]
     fn remove_property() {
         let mut schema = base_schema();
-        let v_before = schema.version;
+        let v_before = schema.schema_revision;
 
         let result = apply_change(&mut schema, SchemaChange::RemoveProperty("age".to_string()));
         assert!(result.is_ok());
         assert!(schema.get_property("age").is_none());
-        assert!(schema.version > v_before);
+        // Per ADR-023, property removals do not bump the schema revision.
+        assert_eq!(schema.schema_revision, v_before);
     }
 
     #[test]

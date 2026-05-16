@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use tonic::{Request, Response, Status};
 
+use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
 use coordinode_embed::Database;
 
@@ -74,6 +75,7 @@ fn row_to_vector_result(
             node_id,
             labels,
             properties,
+            element_id: NodeId::from_raw(node_id).to_element_id(),
         }),
         distance,
     })
@@ -322,6 +324,47 @@ mod tests {
             "distance from [1,0,0] to [1,0,0] should be near zero, got {}",
             top.distance
         );
+    }
+
+    /// vector_search results carry a well-formed element_id on the embedded
+    /// Node — closes the gRPC wiring audit gap for VectorService (the search
+    /// handler builds a Node from raw node_id via NodeId::from_raw().to_element_id()).
+    #[tokio::test]
+    async fn vector_search_result_node_has_well_formed_element_id() {
+        let (svc, _dir) = test_service();
+        {
+            let mut db = svc.database.lock().unwrap();
+            db.execute_cypher("CREATE (n:VecEid {embedding: [1.0, 0.0, 0.0]})")
+                .expect("seed");
+        }
+        let result = svc
+            .vector_search(Request::new(query::VectorSearchRequest {
+                label: "VecEid".to_string(),
+                property: "embedding".to_string(),
+                query_vector: Some(crate::proto::common::Vector {
+                    values: vec![1.0, 0.0, 0.0],
+                }),
+                top_k: 1,
+                metric: 0,
+            }))
+            .await
+            .expect("vector search");
+        let node = result
+            .into_inner()
+            .results
+            .into_iter()
+            .next()
+            .and_then(|r| r.node)
+            .expect("result node");
+        assert_eq!(
+            node.element_id.len(),
+            13,
+            "VectorResult.node.element_id must be 13-char Crockford, got {:?}",
+            node.element_id
+        );
+        let decoded = coordinode_core::graph::node::NodeId::from_element_id(&node.element_id)
+            .expect("decode");
+        assert_eq!(decoded.as_raw(), node.node_id);
     }
 
     /// cypher_ident escapes backticks in label/property names.

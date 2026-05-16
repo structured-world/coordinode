@@ -109,3 +109,59 @@ fn alter_label_invalid_mode_parse_error() {
     let result = db.execute_cypher("ALTER LABEL User SET SCHEMA UNKNOWN");
     assert!(result.is_err(), "invalid mode should fail");
 }
+
+// ── ADR-023 C-decision regression: revision-bump semantics ──────────
+
+/// ALTER LABEL ... SET SCHEMA <mode> must bump `schema_revision` (mode change is
+/// a write-path mutation per ADR-023). Adding a property via `Database::
+/// create_label_schema` (or implicit declaration on first node insert) must
+/// NOT bump `schema_revision` (properties mutate the current snapshot in
+/// place). Together these enforce the lexicon decision: revisions track DDL
+/// snapshot identity, not arbitrary field changes.
+#[test]
+fn alter_label_mode_bumps_revision_but_property_add_does_not() {
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
+
+    let (mut db, _dir) = open_db();
+
+    // Create label via the typed API — revision should be 1 with one property.
+    let mut schema = LabelSchema::new_node_id("Doc");
+    schema.add_property(PropertyDef::new("title", PropertyType::String));
+    let rev_after_create = db.create_label_schema(schema).expect("create");
+    assert_eq!(
+        rev_after_create, 1,
+        "fresh label must start at schema_revision=1"
+    );
+
+    // Adding another property through a fresh create with the same name is
+    // idempotent and must NOT advance the revision — property mutations are
+    // snapshot edits, not new revisions (ADR-023).
+    let mut schema_v2 = LabelSchema::new_node_id("Doc");
+    schema_v2.add_property(PropertyDef::new("title", PropertyType::String));
+    schema_v2.add_property(PropertyDef::new("body", PropertyType::String));
+    let rev_after_property_add = db.create_label_schema(schema_v2).expect("re-create");
+    assert_eq!(
+        rev_after_property_add, 1,
+        "adding a property must NOT bump schema_revision (per ADR-023)"
+    );
+
+    // ALTER LABEL SET SCHEMA <mode> mutates write-path semantics → MUST bump.
+    let rows = db
+        .execute_cypher("ALTER LABEL Doc SET SCHEMA FLEXIBLE")
+        .expect("alter mode");
+    let version_after_mode = rows[0].get("version");
+    assert!(
+        matches!(version_after_mode, Some(Value::Int(v)) if *v >= 2),
+        "ALTER LABEL SET SCHEMA must bump schema_revision to >= 2, got: {version_after_mode:?}"
+    );
+
+    // A subsequent mode change bumps again.
+    let rows2 = db
+        .execute_cypher("ALTER LABEL Doc SET SCHEMA VALIDATED")
+        .expect("alter mode again");
+    let version_after_second = rows2[0].get("version");
+    assert!(
+        matches!(version_after_second, Some(Value::Int(v)) if *v >= 3),
+        "second ALTER LABEL SET SCHEMA must bump again to >= 3, got: {version_after_second:?}"
+    );
+}

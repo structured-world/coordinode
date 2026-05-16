@@ -132,7 +132,7 @@ fn create_label_schema_persists_across_reopen() {
     // Create schema and persist it.
     {
         let mut db = Database::open(dir.path()).expect("open");
-        let mut schema = LabelSchema::new("Member");
+        let mut schema = LabelSchema::new_node_id("Member");
         schema.add_property(PropertyDef::new("handle", PropertyType::String).not_null());
         schema.add_property(PropertyDef::new("score", PropertyType::Int));
         let version = db.create_label_schema(schema).expect("create schema");
@@ -143,7 +143,7 @@ fn create_label_schema_persists_across_reopen() {
     {
         let db2 = Database::open(dir.path()).expect("reopen");
         use coordinode_storage::engine::partition::Partition;
-        let key = coordinode_core::schema::definition::encode_label_schema_key("Member");
+        let key = coordinode_core::schema::definition::encode_label_schema_key("Member", 1);
         let bytes = db2
             .engine()
             .get(Partition::Schema, &key)
@@ -169,7 +169,7 @@ fn create_label_schema_unique_constraint_enforced_after_reopen() {
     // Create schema with unique email, insert first node.
     {
         let mut db = Database::open(dir.path()).expect("open");
-        let mut schema = LabelSchema::new("Account");
+        let mut schema = LabelSchema::new_node_id("Account");
         schema.add_property(PropertyDef::new("email", PropertyType::String).unique());
         db.create_label_schema(schema).expect("create schema");
         db.execute_cypher("CREATE (u:Account {email: 'bob@test.com'})")
@@ -201,7 +201,7 @@ fn create_label_schema_unique_constraint_enforced() {
     let (mut db, _dir) = open_db();
 
     // Declare User label with unique email.
-    let mut schema = LabelSchema::new("User");
+    let mut schema = LabelSchema::new_node_id("User");
     schema.add_property(PropertyDef::new("email", PropertyType::String).unique());
     db.create_label_schema(schema).expect("create schema");
 
@@ -238,7 +238,7 @@ fn create_label_schema_unique_backfills_existing_nodes() {
         .expect("create B2");
 
     // Now declare schema with unique sku — must backfill without error.
-    let mut schema = LabelSchema::new("Product");
+    let mut schema = LabelSchema::new_node_id("Product");
     schema.add_property(PropertyDef::new("sku", PropertyType::String).unique());
     db.create_label_schema(schema)
         .expect("backfill should succeed");
@@ -272,7 +272,7 @@ fn create_edge_type_schema_persists() {
     {
         let db2 = Database::open(dir.path()).expect("reopen");
         use coordinode_storage::engine::partition::Partition;
-        let key = coordinode_core::schema::definition::encode_edge_type_schema_key("WORKS_AT");
+        let key = coordinode_core::schema::definition::encode_edge_type_schema_key("WORKS_AT", 1);
         let bytes = db2
             .engine()
             .get(Partition::Schema, &key)
@@ -286,22 +286,344 @@ fn create_edge_type_schema_persists() {
 }
 
 /// create_label_schema is idempotent — calling it twice with the same name updates
-/// the schema (schema version increases) without error.
+/// the schema (schema revision increases) without error.
 #[test]
 fn create_label_schema_idempotent() {
     use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
 
     let (mut db, _dir) = open_db();
 
-    let mut schema_v1 = LabelSchema::new("Tag");
+    let mut schema_v1 = LabelSchema::new_node_id("Tag");
     schema_v1.add_property(PropertyDef::new("name", PropertyType::String));
     let v1 = db.create_label_schema(schema_v1).expect("first create");
 
-    let mut schema_v2 = LabelSchema::new("Tag");
+    let mut schema_v2 = LabelSchema::new_node_id("Tag");
     schema_v2.add_property(PropertyDef::new("name", PropertyType::String));
     schema_v2.add_property(PropertyDef::new("count", PropertyType::Int));
     let v2 = db.create_label_schema(schema_v2).expect("second create");
 
-    // Second schema has more properties → higher version.
-    assert!(v2 > v1, "updated schema must have higher version");
+    // Per ADR-023, schema revision (the key suffix) is bumped only by
+    // ALTER LABEL operations affecting placement/shard_keys — not by
+    // property-set differences across idempotent calls to
+    // `create_label_schema`. Both writes overwrite the same versioned key.
+    assert_eq!(v1, v2);
+}
+
+/// Current-revision pointer is written together with the schema body on
+/// `create_label_schema` (per ADR-023). Reading via the pointer yields the
+/// same schema as reading the versioned key directly.
+#[test]
+fn current_revision_pointer_written_alongside_label_schema() {
+    use coordinode_core::schema::definition::{
+        encode_label_current_revision_key, encode_label_schema_key, LabelSchema, PropertyDef,
+        PropertyType,
+    };
+    use coordinode_storage::engine::partition::Partition;
+
+    let (mut db, _dir) = open_db();
+
+    let mut schema = LabelSchema::new_node_id("Project");
+    schema.add_property(PropertyDef::new("name", PropertyType::String));
+    let version = db.create_label_schema(schema).expect("create");
+
+    // Pointer must exist and decode to the same version.
+    let pointer_bytes = db
+        .engine()
+        .get(
+            Partition::Schema,
+            &encode_label_current_revision_key("Project"),
+        )
+        .expect("pointer get")
+        .expect("pointer must be present");
+    let pointer_arr: [u8; 8] = pointer_bytes.as_ref().try_into().expect("u64 BE");
+    assert_eq!(u64::from_be_bytes(pointer_arr), version);
+
+    // Direct read of the versioned key returns the schema body.
+    let body = db
+        .engine()
+        .get(
+            Partition::Schema,
+            &encode_label_schema_key("Project", version),
+        )
+        .expect("body get")
+        .expect("body must be present");
+    let decoded = LabelSchema::from_msgpack(&body).expect("decode");
+    assert_eq!(decoded.name, "Project");
+    assert_eq!(decoded.properties.len(), 1);
+}
+
+/// Current-revision pointer is written for edge types as well.
+#[test]
+fn current_revision_pointer_written_alongside_edge_type_schema() {
+    use coordinode_core::schema::definition::{
+        encode_edge_type_current_revision_key, encode_edge_type_schema_key, EdgeTypeSchema,
+    };
+    use coordinode_storage::engine::partition::Partition;
+
+    let (mut db, _dir) = open_db();
+
+    let schema = EdgeTypeSchema::new("OWNED_BY");
+    let version = db
+        .create_edge_type_schema(schema)
+        .expect("create edge type");
+
+    let pointer_bytes = db
+        .engine()
+        .get(
+            Partition::Schema,
+            &encode_edge_type_current_revision_key("OWNED_BY"),
+        )
+        .expect("pointer get")
+        .expect("pointer must be present");
+    let pointer_arr: [u8; 8] = pointer_bytes.as_ref().try_into().expect("u64 BE");
+    assert_eq!(u64::from_be_bytes(pointer_arr), version);
+
+    let body = db
+        .engine()
+        .get(
+            Partition::Schema,
+            &encode_edge_type_schema_key("OWNED_BY", version),
+        )
+        .expect("body get")
+        .expect("body must be present");
+    let decoded = EdgeTypeSchema::from_msgpack(&body).expect("decode");
+    assert_eq!(decoded.name, "OWNED_BY");
+}
+
+/// Hash placement labels round-trip through the schema partition.
+#[test]
+fn hash_placement_label_roundtrips() {
+    use coordinode_core::schema::definition::{
+        encode_label_schema_key, LabelSchema, PlacementKind, PlacementPolicy, PropertyDef,
+        PropertyType, ShardKeyState,
+    };
+    use coordinode_storage::engine::partition::Partition;
+
+    let (mut db, _dir) = open_db();
+
+    let mut schema = LabelSchema::new("Order", PlacementPolicy::Hash("customer_id".to_string()));
+    schema.add_property(PropertyDef::new("customer_id", PropertyType::String));
+    schema.add_property(PropertyDef::new("total", PropertyType::Float));
+    let version = db.create_label_schema(schema).expect("create");
+
+    let body = db
+        .engine()
+        .get(
+            Partition::Schema,
+            &encode_label_schema_key("Order", version),
+        )
+        .expect("get")
+        .expect("body");
+    let decoded = LabelSchema::from_msgpack(&body).expect("decode");
+
+    assert!(matches!(
+        decoded.placement,
+        PlacementPolicy::Hash(ref p) if p == "customer_id"
+    ));
+    assert_eq!(decoded.shard_keys.len(), 1);
+    assert_eq!(decoded.shard_keys[0].state, ShardKeyState::Primary);
+    assert_eq!(decoded.shard_keys[0].kind, PlacementKind::Hash);
+    assert_eq!(decoded.shard_keys[0].property, "customer_id");
+}
+
+/// Range placement labels round-trip through the schema partition.
+#[test]
+fn range_placement_label_roundtrips() {
+    use coordinode_core::schema::definition::{
+        encode_label_schema_key, LabelSchema, PlacementKind, PlacementPolicy, PropertyDef,
+        PropertyType,
+    };
+    use coordinode_storage::engine::partition::Partition;
+
+    let (mut db, _dir) = open_db();
+
+    let mut schema = LabelSchema::new("Event", PlacementPolicy::Range("timestamp".to_string()));
+    schema.add_property(PropertyDef::new("timestamp", PropertyType::Timestamp));
+    let version = db.create_label_schema(schema).expect("create");
+
+    let body = db
+        .engine()
+        .get(
+            Partition::Schema,
+            &encode_label_schema_key("Event", version),
+        )
+        .expect("get")
+        .expect("body");
+    let decoded = LabelSchema::from_msgpack(&body).expect("decode");
+
+    assert!(matches!(
+        decoded.placement,
+        PlacementPolicy::Range(ref p) if p == "timestamp"
+    ));
+    assert_eq!(decoded.shard_keys[0].kind, PlacementKind::Range);
+}
+
+/// Schema with all three placement kinds in the same database — they coexist
+/// in the schema partition without key collisions.
+#[test]
+fn three_placement_kinds_coexist_in_schema_partition() {
+    use coordinode_core::schema::definition::{LabelSchema, PlacementPolicy};
+
+    let (mut db, _dir) = open_db();
+
+    db.create_label_schema(LabelSchema::new("User", PlacementPolicy::NodeId))
+        .expect("user");
+    db.create_label_schema(LabelSchema::new(
+        "Order",
+        PlacementPolicy::Hash("customer_id".to_string()),
+    ))
+    .expect("order");
+    db.create_label_schema(LabelSchema::new(
+        "Event",
+        PlacementPolicy::Range("timestamp".to_string()),
+    ))
+    .expect("event");
+    // No panic, no error → coexistence verified.
+}
+
+/// Schema lookup surfaces an error (not a silent miss) when the
+/// `current_revision` pointer exists but is corrupted — i.e. not a clean 8-byte
+/// u64. Silently treating corrupt pointers as "no schema" would cause STRICT
+/// labels to drop validation and accept arbitrary property writes.
+#[test]
+fn corrupt_label_pointer_surfaces_error() {
+    use coordinode_core::schema::definition::{
+        encode_label_current_revision_key, LabelSchema, PropertyDef, PropertyType,
+    };
+    use coordinode_storage::engine::partition::Partition;
+
+    let (mut db, _dir) = open_db();
+
+    // Create a real STRICT label so SET routes through schema validation.
+    let mut schema = LabelSchema::new_node_id("Strict");
+    schema.set_mode(coordinode_core::schema::definition::SchemaMode::Strict);
+    schema.add_property(PropertyDef::new("name", PropertyType::String).not_null());
+    db.create_label_schema(schema).expect("create schema");
+    db.execute_cypher("CREATE (s:Strict {name: 'a'})")
+        .expect("seed node");
+
+    // Overwrite the pointer with 4 bytes (instead of 8) — torn write simulation.
+    db.engine_shared()
+        .put(
+            Partition::Schema,
+            &encode_label_current_revision_key("Strict"),
+            &[0u8, 0, 0, 1],
+        )
+        .expect("corrupt pointer");
+
+    // Operations that must consult the schema should now fail loudly. A bare
+    // MATCH/RETURN can dodge the schema path; mutating with `SET n += {map}`
+    // forces schema mode resolution on every row.
+    let result = db.execute_cypher("MATCH (s:Strict) SET s += {extra: 'x'} RETURN s");
+    assert!(
+        result.is_err(),
+        "corrupt pointer must surface as an error, not pass through silently"
+    );
+}
+
+/// Same invariant for edge type pointers — corrupt bytes must not be silently
+/// treated as "edge type unknown".
+#[test]
+fn corrupt_edge_type_pointer_surfaces_error() {
+    use coordinode_core::schema::definition::{
+        encode_edge_type_current_revision_key, EdgeTypeSchema,
+    };
+    use coordinode_storage::engine::partition::Partition;
+
+    let (mut db, _dir) = open_db();
+
+    let schema = EdgeTypeSchema::new("KNOWS");
+    db.create_edge_type_schema(schema)
+        .expect("create edge type");
+
+    // Seed BEFORE corruption so the seed itself doesn't traverse the bad pointer.
+    db.execute_cypher(
+        "CREATE (a:Person {name: 'A'})-[:KNOWS {since: 2020}]->(b:Person {name: 'B'})",
+    )
+    .expect("seed edge");
+
+    db.engine_shared()
+        .put(
+            Partition::Schema,
+            &encode_edge_type_current_revision_key("KNOWS"),
+            &[0xFFu8; 3],
+        )
+        .expect("corrupt pointer");
+
+    // Any code path that inspects edge-type-temporality through the pointer
+    // (e.g. `SET r.<prop>` on a matched edge) must error rather than silently
+    // returning "non-temporal".
+    let result = db.execute_cypher("MATCH (a)-[r:KNOWS]->(b) SET r.note = 'x' RETURN r");
+    assert!(
+        result.is_err(),
+        "corrupt edge-type pointer must surface as an error"
+    );
+}
+
+/// Dangling pointer: pointer survives but the versioned schema body does not
+/// (impossible by construction in CE, but EE migrations + manual storage
+/// surgery can produce it). The load path must error rather than report
+/// "no schema".
+#[test]
+fn dangling_label_pointer_surfaces_error() {
+    use coordinode_core::schema::definition::{
+        encode_label_current_revision_key, encode_label_schema_key, LabelSchema, PropertyDef,
+        PropertyType, SchemaMode,
+    };
+    use coordinode_storage::engine::partition::Partition;
+
+    let (mut db, _dir) = open_db();
+
+    let mut schema = LabelSchema::new_node_id("Acct");
+    schema.set_mode(SchemaMode::Strict);
+    schema.add_property(PropertyDef::new("name", PropertyType::String).not_null());
+    let version = db.create_label_schema(schema).expect("create");
+
+    db.execute_cypher("CREATE (a:Acct {name: 'first'})")
+        .expect("seed");
+
+    // Delete the schema body but keep the pointer — leaves a dangling pointer.
+    db.engine_shared()
+        .delete(Partition::Schema, &encode_label_schema_key("Acct", version))
+        .expect("drop schema body");
+    // Confirm pointer is still in place.
+    let _present = db
+        .engine_shared()
+        .get(
+            Partition::Schema,
+            &encode_label_current_revision_key("Acct"),
+        )
+        .expect("get pointer")
+        .expect("pointer must remain");
+
+    let result = db.execute_cypher("MATCH (a:Acct) SET a += {note: 'x'} RETURN a");
+    assert!(
+        result.is_err(),
+        "dangling pointer (body missing) must surface as an error"
+    );
+}
+
+/// elementId derivation is bijective: encoding then decoding any NodeId
+/// returns the original value.
+#[test]
+fn element_id_roundtrip_for_real_database_node_ids() {
+    use coordinode_core::graph::node::NodeId;
+
+    // Sample sequence values spanning the 44-bit range.
+    for sequence in [
+        1u64,
+        42,
+        1_000,
+        u32::MAX as u64,
+        (1u64 << 40),
+        (1u64 << 44) - 1,
+    ] {
+        let id = NodeId::compose(0, sequence);
+        let encoded = id.to_element_id();
+        let decoded = NodeId::from_element_id(&encoded).expect("decode");
+        assert_eq!(
+            decoded, id,
+            "elementId round-trip failed for sequence={sequence}"
+        );
+    }
 }

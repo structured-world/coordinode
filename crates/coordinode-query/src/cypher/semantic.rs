@@ -641,14 +641,14 @@ mod tests {
     fn make_schema() -> MapSchemaProvider {
         let mut schema = MapSchemaProvider::new();
 
-        let mut user = LabelSchema::new("User");
+        let mut user = LabelSchema::new_node_id("User");
         user.add_property(PropertyDef::new("name", PropertyType::String));
         user.add_property(PropertyDef::new("age", PropertyType::Int));
         user.add_property(PropertyDef::new("email", PropertyType::String));
-        user.set_strict(true);
+        user.set_mode(coordinode_core::schema::definition::SchemaMode::Strict);
         schema.add_label(user);
 
-        let mut movie = LabelSchema::new("Movie");
+        let mut movie = LabelSchema::new_node_id("Movie");
         movie.add_property(PropertyDef::new("title", PropertyType::String));
         schema.add_label(movie);
 
