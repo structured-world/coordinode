@@ -172,7 +172,7 @@ fn parallel_traversal_injects_computed_properties() {
 
     // Create schema with COMPUTED Decay property.
     // FLEXIBLE: test exercises computed property semantics, not schema enforcement.
-    let mut schema = LabelSchema::new("Memory");
+    let mut schema = LabelSchema::new_node_id("Memory");
     schema.set_mode(SchemaMode::Flexible);
     schema.add_property(PropertyDef::new("content", PropertyType::String));
     schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
@@ -187,16 +187,28 @@ fn parallel_traversal_injects_computed_properties() {
         },
     ));
 
-    // Persist schema
-    let schema_key = coordinode_core::schema::definition::encode_label_schema_key("Memory");
-    let bytes = schema.to_msgpack().expect("serialize schema");
-    db.engine_shared()
-        .put(
-            coordinode_storage::engine::partition::Partition::Schema,
-            &schema_key,
-            &bytes,
-        )
-        .expect("persist schema");
+    // Persist schema body + current_revision pointer so pointer-based readers
+    // (`load_current_label_schema_from_engine`) can find it.
+    {
+        use coordinode_core::schema::definition::{
+            encode_label_current_revision_key, encode_label_schema_key,
+        };
+        use coordinode_storage::engine::partition::Partition;
+        let schema_key = encode_label_schema_key(&schema.name, schema.schema_revision);
+        let pointer_key = encode_label_current_revision_key(&schema.name);
+        let bytes = schema.to_msgpack().expect("serialize schema");
+        let engine = db.engine_shared();
+        engine
+            .put(Partition::Schema, &schema_key, &bytes)
+            .expect("persist schema body");
+        engine
+            .put(
+                Partition::Schema,
+                &pointer_key,
+                &schema.schema_revision.to_be_bytes(),
+            )
+            .expect("persist current_revision pointer");
+    }
 
     // Create hub node
     db.execute_cypher("CREATE (h:Hub {name: 'source'})")

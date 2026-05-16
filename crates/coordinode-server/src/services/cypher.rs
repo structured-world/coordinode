@@ -3,6 +3,10 @@ use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status};
 
 use coordinode_core::graph::types::Value;
+use coordinode_core::txn::read_concern::{
+    ReadConcern as ExecutorReadConcern, ReadConcernLevel as ExecutorReadConcernLevel,
+};
+use coordinode_core::txn::write_concern::{WriteConcern, WriteConcernLevel};
 use coordinode_embed::{Database, DatabaseError};
 use coordinode_query::advisor::nplus1::NPlus1Detector;
 use coordinode_query::advisor::source::{self, grpc_keys, SourceContext};
@@ -132,6 +136,38 @@ fn db_error_to_status(err: DatabaseError) -> Status {
         DatabaseError::Execution(e) => Status::internal(format!("Execution error: {e}")),
         DatabaseError::Storage(e) => Status::internal(format!("Storage error: {e}")),
         DatabaseError::Other(e) => Status::internal(format!("Error: {e}")),
+    }
+}
+
+/// Translate the proto `ReadConcernLevel` integer to the executor enum. The
+/// proto module's `ReadConcern` (used by the read fence) is distinct from
+/// `coordinode_core::txn::read_concern::ReadConcern` (used by the executor for
+/// snapshot timestamp selection) — both are populated from the same proto
+/// field but consumed independently.
+fn read_concern_level_to_executor(level: i32) -> ExecutorReadConcernLevel {
+    match replication::ReadConcernLevel::try_from(level)
+        .unwrap_or(replication::ReadConcernLevel::Unspecified)
+    {
+        replication::ReadConcernLevel::Majority => ExecutorReadConcernLevel::Majority,
+        replication::ReadConcernLevel::Snapshot => ExecutorReadConcernLevel::Snapshot,
+        replication::ReadConcernLevel::Linearizable => ExecutorReadConcernLevel::Linearizable,
+        _ => ExecutorReadConcernLevel::Local,
+    }
+}
+
+/// Translate the proto `WriteConcernLevel` integer to the executor enum.
+/// Unspecified maps to W1 (single-node leader-acknowledged) — matches the
+/// previous silent default before write_concern propagation landed.
+fn write_concern_level_to_executor(level: i32) -> WriteConcernLevel {
+    match replication::WriteConcernLevel::try_from(level)
+        .unwrap_or(replication::WriteConcernLevel::Unspecified)
+    {
+        replication::WriteConcernLevel::W0 => WriteConcernLevel::W0,
+        replication::WriteConcernLevel::Memory => WriteConcernLevel::Memory,
+        replication::WriteConcernLevel::Cache => WriteConcernLevel::Cache,
+        replication::WriteConcernLevel::Majority => WriteConcernLevel::Majority,
+        // W1 and Unspecified both map to W1 — the silent default.
+        _ => WriteConcernLevel::W1,
     }
 }
 
@@ -289,30 +325,59 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             (0u64, false)
         };
 
-        // Execute query through the embedded Database engine.
-        // Convert proto parameters to Value map for parameter binding.
-        let result_rows = {
-            let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
+        // Build executor-level concerns from the proto request, then execute
+        // through the unified entry point so they actually reach the executor
+        // (the previous handler validated write_concern for causal sessions but
+        // silently dropped it before calling the engine, downgrading every
+        // MAJORITY write to W1).
+        let at_ts_raw = req
+            .read_concern
+            .as_ref()
+            .map(|rc| rc.at_timestamp)
+            .unwrap_or(0);
+        // at_timestamp only meaningful with SNAPSHOT level (see proto doc).
+        // Reject misuse at the boundary rather than letting it silently slide
+        // through to a non-snapshot read which would ignore the timestamp.
+        if at_ts_raw > 0
+            && !matches!(
+                read_concern_level_to_executor(concern_level),
+                ExecutorReadConcernLevel::Snapshot
+            )
+        {
+            return Err(Status::failed_precondition(
+                "readConcern.at_timestamp is only valid with level=SNAPSHOT",
+            ));
+        }
+        let executor_read_concern = ExecutorReadConcern {
+            level: read_concern_level_to_executor(concern_level),
+            after_index: if after_idx > 0 { Some(after_idx) } else { None },
+            at_timestamp: if at_ts_raw > 0 { Some(at_ts_raw) } else { None },
+        };
+        let executor_write_concern = req.write_concern.as_ref().map(|wc| WriteConcern {
+            level: write_concern_level_to_executor(wc.level),
+            journal: wc.journal,
+            timeout_ms: wc.timeout_ms,
+        });
 
-            let has_params = !req.parameters.is_empty();
-            match (&source_ctx, has_params) {
-                (Some(src), true) => {
-                    let params = convert_params(&req.parameters);
-                    db.execute_cypher_with_params_and_source(&req.query, params, src)
-                        .map_err(db_error_to_status)?
-                }
-                (Some(src), false) => db
-                    .execute_cypher_with_source(&req.query, src)
-                    .map_err(db_error_to_status)?,
-                (None, true) => {
-                    let params = convert_params(&req.parameters);
-                    db.execute_cypher_with_params(&req.query, params)
-                        .map_err(db_error_to_status)?
-                }
-                (None, false) => db.execute_cypher(&req.query).map_err(db_error_to_status)?,
-            }
+        let exec_result = {
+            let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
+            let params = if req.parameters.is_empty() {
+                None
+            } else {
+                Some(convert_params(&req.parameters))
+            };
+            db.execute_cypher_full(
+                &req.query,
+                params,
+                source_ctx.as_ref(),
+                Some(executor_read_concern),
+                executor_write_concern,
+            )
+            .map_err(db_error_to_status)?
         };
         // Mutex released here — held only during query execution.
+        let result_rows = exec_result.rows;
+        let write_stats = exec_result.write_stats;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -369,11 +434,11 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             columns,
             rows: proto_rows,
             stats: Some(query::QueryStats {
-                nodes_created: 0, // TODO: wire from WriteStats when available
-                nodes_deleted: 0,
-                edges_created: 0,
-                edges_deleted: 0,
-                properties_set: 0,
+                nodes_created: write_stats.nodes_created as i64,
+                nodes_deleted: write_stats.nodes_deleted as i64,
+                edges_created: write_stats.edges_created as i64,
+                edges_deleted: write_stats.edges_deleted as i64,
+                properties_set: write_stats.properties_set as i64,
                 execution_time_ms: duration_ms as i64,
                 applied_index,
                 served_by_leader,
@@ -911,6 +976,7 @@ mod tests {
                 read_concern: Some(crate::proto::replication::ReadConcern {
                     level: 1, // READ_CONCERN_LEVEL_LOCAL
                     after_index: 42,
+                    at_timestamp: 0,
                 }),
                 write_concern: None,
             }))
@@ -939,6 +1005,7 @@ mod tests {
                 read_concern: Some(crate::proto::replication::ReadConcern {
                     level: 3, // READ_CONCERN_LEVEL_LINEARIZABLE
                     after_index: 1,
+                    at_timestamp: 0,
                 }),
                 write_concern: None,
             }))
@@ -973,6 +1040,7 @@ mod tests {
                 read_concern: Some(crate::proto::replication::ReadConcern {
                     level: 2, // READ_CONCERN_LEVEL_MAJORITY
                     after_index: 999,
+                    at_timestamp: 0,
                 }),
                 write_concern: None,
             }))
@@ -1018,6 +1086,7 @@ mod tests {
                 read_concern: Some(crate::proto::replication::ReadConcern {
                     level: 2, // MAJORITY
                     after_index: operation_time,
+                    at_timestamp: 0,
                 }),
                 write_concern: None,
             }))
@@ -1051,6 +1120,7 @@ mod tests {
                     read_concern: Some(crate::proto::replication::ReadConcern {
                         level: level as i32,
                         after_index: 0,
+                        at_timestamp: 0,
                     }),
                     write_concern: None,
                 }))
@@ -1082,6 +1152,7 @@ mod tests {
                 read_concern: Some(crate::proto::replication::ReadConcern {
                     level: 2, // MAJORITY
                     after_index: 1,
+                    at_timestamp: 0,
                 }),
                 write_concern: None, // omitted → treated as UNSPECIFIED (w:1)
             }))
@@ -1115,6 +1186,7 @@ mod tests {
                 read_concern: Some(crate::proto::replication::ReadConcern {
                     level: 2, // MAJORITY
                     after_index: 5,
+                    at_timestamp: 0,
                 }),
                 write_concern: Some(crate::proto::replication::WriteConcern {
                     level: crate::proto::replication::WriteConcernLevel::W1 as i32,
@@ -1148,6 +1220,7 @@ mod tests {
                 read_concern: Some(crate::proto::replication::ReadConcern {
                     level: 2, // MAJORITY
                     after_index: 7,
+                    at_timestamp: 0,
                 }),
                 write_concern: Some(crate::proto::replication::WriteConcern {
                     level: crate::proto::replication::WriteConcernLevel::Majority as i32,
@@ -1180,6 +1253,7 @@ mod tests {
                 read_concern: Some(crate::proto::replication::ReadConcern {
                     level: 2, // MAJORITY
                     after_index: 10,
+                    at_timestamp: 0,
                 }),
                 write_concern: None, // read-only — write_concern irrelevant
             }))
@@ -1190,5 +1264,355 @@ mod tests {
             "causal read without write_concern must succeed, got: {:?}",
             result.err()
         );
+    }
+
+    // --- Audit gap closures: gRPC wiring of write_concern, WriteStats, and
+    //     ALTER LABEL schema_revision visibility (see DEVLOG audit) ---
+
+    /// Regression: WriteStats must propagate from executor to QueryStats.
+    /// Previously hardcoded to zero — clients had no way to see mutation
+    /// counts even when CREATE/SET/DELETE ran successfully.
+    #[tokio::test]
+    async fn grpc_query_stats_reports_actual_mutation_counts() {
+        let (svc, _dir) = test_service();
+
+        let resp = svc
+            .execute_cypher(cypher_request(
+                "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), \
+                 (a)-[:KNOWS]->(b)",
+            ))
+            .await
+            .expect("create chain");
+
+        let stats = resp.into_inner().stats.expect("stats present");
+        assert_eq!(stats.nodes_created, 2, "two nodes created");
+        assert_eq!(stats.edges_created, 1, "one edge created");
+        assert_eq!(stats.nodes_deleted, 0);
+        assert_eq!(stats.edges_deleted, 0);
+    }
+
+    /// Regression: SET clause increments `properties_set` in QueryStats.
+    /// Same wiring gap as nodes_created — verifies the full path through
+    /// execute_cypher_full → CypherResult → proto QueryStats.
+    #[tokio::test]
+    async fn grpc_query_stats_reports_property_set_count() {
+        let (svc, _dir) = test_service();
+
+        svc.execute_cypher(cypher_request("CREATE (n:Doc {id: 1})"))
+            .await
+            .expect("create");
+
+        let resp = svc
+            .execute_cypher(cypher_request(
+                "MATCH (n:Doc {id: 1}) SET n.title = 'hello' RETURN n",
+            ))
+            .await
+            .expect("set");
+
+        let stats = resp.into_inner().stats.expect("stats present");
+        assert!(
+            stats.properties_set >= 1,
+            "SET must increment properties_set, got {}",
+            stats.properties_set
+        );
+    }
+
+    /// Regression: client-supplied write_concern is not silently ignored.
+    /// Previously the handler validated write_concern only for causal sessions
+    /// but never propagated it to the executor — every MAJORITY write was
+    /// downgraded to W1. With propagation, MAJORITY in standalone mode (no
+    /// Raft) is accepted: WriteConcern::effective_level() downgrades to W1
+    /// internally, but no error surfaces to the client.
+    #[tokio::test]
+    async fn grpc_write_concern_majority_accepted_in_standalone() {
+        let (svc, _dir) = test_service();
+
+        let resp = svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "CREATE (n:Durable {id: 1})".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: None,
+                write_concern: Some(crate::proto::replication::WriteConcern {
+                    level: 3, // MAJORITY
+                    journal: false,
+                    timeout_ms: 0,
+                }),
+            }))
+            .await
+            .expect("write should succeed");
+        let stats = resp.into_inner().stats.expect("stats");
+        assert_eq!(stats.nodes_created, 1);
+    }
+
+    /// gRPC ALTER LABEL through Cypher bumps `schema_revision` visible via
+    /// the subsequent SchemaService.list_labels response. This regression test
+    /// closes the C-decision wiring gap: ALTER LABEL was bumping
+    /// `schema_revision` on the persisted LabelSchema, but no gRPC integration
+    /// test verified the response value crossed the proto boundary correctly
+    /// after the rename.
+    #[tokio::test]
+    async fn grpc_alter_label_bumps_schema_revision_visible_via_list_labels() {
+        use crate::proto::graph as graph_proto;
+        use crate::proto::graph::schema_service_server::SchemaService;
+        use crate::services::schema::SchemaServiceImpl;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database = Arc::new(Mutex::new(
+            Database::open(dir.path()).expect("open database"),
+        ));
+        let registry = Arc::new(QueryRegistry::new());
+        let detector = Arc::new(NPlus1Detector::new());
+
+        let cypher_svc = CypherServiceImpl::new(database.clone(), registry, detector);
+        let schema_svc = SchemaServiceImpl::new(database);
+
+        // Seed a node so the label exists in the catalog scan path.
+        cypher_svc
+            .execute_cypher(cypher_request("CREATE (n:RevisionTarget {id: 1})"))
+            .await
+            .expect("seed");
+
+        // Capture the initial schema_revision via ListLabels (implicit label
+        // declared on first node create → revision 0 in the catalog response;
+        // revision becomes positive once ALTER LABEL writes a schema body).
+        let list1 = schema_svc
+            .list_labels(Request::new(graph_proto::ListLabelsRequest {}))
+            .await
+            .expect("list 1")
+            .into_inner();
+        let initial = list1
+            .labels
+            .iter()
+            .find(|l| l.name == "RevisionTarget")
+            .map(|l| l.schema_revision)
+            .unwrap_or(0);
+
+        // ALTER LABEL via Cypher — should bump schema_revision on the
+        // persisted snapshot.
+        cypher_svc
+            .execute_cypher(cypher_request(
+                "ALTER LABEL RevisionTarget SET SCHEMA VALIDATED",
+            ))
+            .await
+            .expect("alter");
+
+        let list2 = schema_svc
+            .list_labels(Request::new(graph_proto::ListLabelsRequest {}))
+            .await
+            .expect("list 2")
+            .into_inner();
+        let after_alter = list2
+            .labels
+            .iter()
+            .find(|l| l.name == "RevisionTarget")
+            .expect("label present")
+            .schema_revision;
+        assert!(
+            after_alter > initial,
+            "ALTER LABEL must bump schema_revision visible via gRPC ListLabels: \
+             initial={initial}, after_alter={after_alter}"
+        );
+    }
+
+    // --- ReadConcern.at_timestamp time-travel + WriteConcern Memory/Cache ---
+
+    /// at_timestamp set on a non-SNAPSHOT read concern is rejected at the
+    /// gRPC boundary with FAILED_PRECONDITION (the executor would otherwise
+    /// ignore the pin silently, defeating the time-travel contract).
+    #[tokio::test]
+    async fn grpc_at_timestamp_rejected_without_snapshot_level() {
+        let (svc, _dir) = test_service();
+        let result = svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "MATCH (n) RETURN n".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: Some(crate::proto::replication::ReadConcern {
+                    level: 2, // MAJORITY, not SNAPSHOT
+                    after_index: 0,
+                    at_timestamp: 1_700_000_000_000_000,
+                }),
+                write_concern: None,
+            }))
+            .await;
+        let err = result.expect_err("must reject");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("at_timestamp")
+                && err.message().to_lowercase().contains("snapshot"),
+            "error must mention at_timestamp + SNAPSHOT, got: {}",
+            err.message()
+        );
+    }
+
+    /// SNAPSHOT read with `at_timestamp = 1` (an HLC value far in the past,
+    /// before any writes happened) sees an empty database — proves the pin
+    /// actually reaches the executor and constrains the snapshot.
+    #[tokio::test]
+    async fn grpc_at_timestamp_snapshot_pins_to_past_returns_empty() {
+        let (svc, _dir) = test_service();
+
+        // Write something.
+        svc.execute_cypher(cypher_request("CREATE (n:Past {id: 1})"))
+            .await
+            .expect("create");
+
+        // Read pinned to ts=1 (epoch + 1µs, before any HLC stamps).
+        let result = svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "MATCH (n:Past) RETURN n.id".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: Some(crate::proto::replication::ReadConcern {
+                    level: 4, // SNAPSHOT
+                    after_index: 0,
+                    at_timestamp: 1,
+                }),
+                write_concern: None,
+            }))
+            .await
+            .expect("snapshot read should succeed");
+        let resp = result.into_inner();
+        assert!(
+            resp.rows.is_empty(),
+            "snapshot at ts=1 (pre-history) must return empty, got {} rows",
+            resp.rows.len()
+        );
+    }
+
+    /// SNAPSHOT read without `at_timestamp` (omitted / 0) falls back to the
+    /// latest oracle.next() — sees all writes — proving the absence-of-pin
+    /// path is also wired through the new field.
+    #[tokio::test]
+    async fn grpc_snapshot_without_at_timestamp_returns_latest() {
+        let (svc, _dir) = test_service();
+        svc.execute_cypher(cypher_request("CREATE (n:Now {id: 1})"))
+            .await
+            .expect("create");
+        let result = svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "MATCH (n:Now) RETURN n.id".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: Some(crate::proto::replication::ReadConcern {
+                    level: 4, // SNAPSHOT
+                    after_index: 0,
+                    at_timestamp: 0, // no pin → latest
+                }),
+                write_concern: None,
+            }))
+            .await
+            .expect("snapshot read");
+        let resp = result.into_inner();
+        assert_eq!(
+            resp.rows.len(),
+            1,
+            "snapshot without at_timestamp must see latest writes"
+        );
+    }
+
+    /// WriteConcernLevel::MEMORY (proto = 4) reaches the executor without
+    /// silent downgrade. In standalone mode the volatile drain path falls
+    /// back to W1 internally (effective_level), so the operation succeeds —
+    /// but the proto value must NOT be coerced to W1 on entry, otherwise
+    /// MEMORY-specific drain behaviour would never engage in cluster mode.
+    #[tokio::test]
+    async fn grpc_write_concern_memory_accepted() {
+        let (svc, _dir) = test_service();
+        let resp = svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "CREATE (n:Telemetry {id: 1})".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: None,
+                write_concern: Some(crate::proto::replication::WriteConcern {
+                    level: 4, // MEMORY
+                    journal: false,
+                    timeout_ms: 0,
+                }),
+            }))
+            .await
+            .expect("memory write should succeed");
+        let stats = resp.into_inner().stats.expect("stats");
+        assert_eq!(stats.nodes_created, 1);
+    }
+
+    /// after_index + at_timestamp are mutually exclusive: a snapshot pin is
+    /// incompatible with a causal fence. The executor's `ReadConcern::validate`
+    /// catches this, but the boundary should surface it as a semantic error
+    /// (InvalidArgument) rather than letting the executor produce a generic
+    /// internal error.
+    #[tokio::test]
+    async fn grpc_after_index_and_at_timestamp_mutually_exclusive() {
+        let (svc, _dir) = test_service();
+        let result = svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "MATCH (n) RETURN n".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: Some(crate::proto::replication::ReadConcern {
+                    level: 4, // SNAPSHOT — only level where both fields are individually accepted
+                    after_index: 42,
+                    at_timestamp: 1_700_000_000_000_000,
+                }),
+                write_concern: None,
+            }))
+            .await;
+        let err = result.expect_err("must reject combination");
+        assert!(
+            err.message().to_lowercase().contains("mutually exclusive")
+                || err.message().to_lowercase().contains("after_index"),
+            "error must mention the conflict, got: {}",
+            err.message()
+        );
+    }
+
+    /// WriteConcern.journal flag (separate from level) reaches the executor.
+    /// The flag forces WAL fsync regardless of level; in standalone single-
+    /// node mode that converges with W1 behaviour, but the field must NOT be
+    /// dropped at the boundary — otherwise cluster deployments would silently
+    /// lose durability when callers set `journal: true`.
+    #[tokio::test]
+    async fn grpc_write_concern_journal_flag_accepted() {
+        let (svc, _dir) = test_service();
+        let resp = svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "CREATE (n:Durable {id: 1})".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: None,
+                write_concern: Some(crate::proto::replication::WriteConcern {
+                    level: 2, // W1 with journal forces fsync
+                    journal: true,
+                    timeout_ms: 5_000,
+                }),
+            }))
+            .await
+            .expect("journaled write should succeed");
+        let stats = resp.into_inner().stats.expect("stats");
+        assert_eq!(stats.nodes_created, 1);
+    }
+
+    /// WriteConcernLevel::CACHE (proto = 5) — same wire-through invariant.
+    #[tokio::test]
+    async fn grpc_write_concern_cache_accepted() {
+        let (svc, _dir) = test_service();
+        let resp = svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "CREATE (n:Analytics {id: 1})".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: None,
+                write_concern: Some(crate::proto::replication::WriteConcern {
+                    level: 5, // CACHE
+                    journal: false,
+                    timeout_ms: 0,
+                }),
+            }))
+            .await
+            .expect("cache write should succeed");
+        let stats = resp.into_inner().stats.expect("stats");
+        assert_eq!(stats.nodes_created, 1);
     }
 }

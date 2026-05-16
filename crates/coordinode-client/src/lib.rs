@@ -377,6 +377,7 @@ impl CoordinodeClient {
         let read_concern = Some(ReadConcern {
             level: ReadConcernLevel::Majority as i32,
             after_index: after.as_u64(),
+            at_timestamp: 0, // causal read uses fence, not snapshot pin
         });
         let (rows, _applied_index) = self
             .execute_request(query, params, 0, read_concern, None, location)

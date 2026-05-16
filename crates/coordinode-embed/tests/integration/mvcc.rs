@@ -178,7 +178,7 @@ fn occ_conflict_on_concurrent_write() {
     let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1000)));
     let config = StorageConfig::new(dir.path());
     let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open");
-    let allocator = NodeIdAllocator::new();
+    let allocator = NodeIdAllocator::new(0);
 
     // Setup: write initial version with plain key
     engine
@@ -230,7 +230,7 @@ fn occ_no_false_positive() {
     let config = StorageConfig::new(dir.path());
     let engine = StorageEngine::open(&config).expect("open");
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1000));
-    let allocator = NodeIdAllocator::new();
+    let allocator = NodeIdAllocator::new(0);
 
     // Setup: write initial value (uses auto-incremented seqno)
     engine
@@ -263,7 +263,7 @@ fn occ_adj_partition_excluded() {
     let config = StorageConfig::new(dir.path());
     let engine = StorageEngine::open(&config).expect("open");
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1000));
-    let allocator = NodeIdAllocator::new();
+    let allocator = NodeIdAllocator::new(0);
 
     // Write adj: key
     engine
@@ -317,7 +317,7 @@ fn occ_conflict_via_prefix_scan() {
     let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1000)));
     let config = StorageConfig::new(dir.path());
     let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open");
-    let allocator = NodeIdAllocator::new();
+    let allocator = NodeIdAllocator::new(0);
 
     // Setup: write a node with plain key
     engine
@@ -629,7 +629,7 @@ fn executor_occ_conflict_with_pipeline() {
     let config = StorageConfig::new(dir.path());
     let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open");
     let id_gen = ProposalIdGenerator::new();
-    let allocator = NodeIdAllocator::new();
+    let allocator = NodeIdAllocator::new(0);
 
     // Setup: write initial version with plain key
     engine
@@ -689,7 +689,7 @@ fn executor_adj_excluded_from_occ_with_pipeline() {
     let engine = StorageEngine::open(&config).expect("open");
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1000));
     let id_gen = ProposalIdGenerator::new();
-    let allocator = NodeIdAllocator::new();
+    let allocator = NodeIdAllocator::new(0);
 
     // Setup: write adj key
     engine
@@ -813,7 +813,7 @@ fn executor_pipeline_read_only_no_proposal() {
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1000));
     let id_gen = ProposalIdGenerator::new();
     let mut interner = FieldInterner::new();
-    let allocator = NodeIdAllocator::new();
+    let allocator = NodeIdAllocator::new(0);
 
     // Pre-populate
     engine

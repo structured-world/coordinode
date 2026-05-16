@@ -291,7 +291,7 @@ mod tests {
     }
 
     fn user_schema() -> LabelSchema {
-        let mut schema = LabelSchema::new("User");
+        let mut schema = LabelSchema::new_node_id("User");
         schema.add_property(PropertyDef::new("name", PropertyType::String).not_null());
         schema.add_property(PropertyDef::new("age", PropertyType::Int));
         schema.add_property(
@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn vector_dims_match() {
-        let mut schema = LabelSchema::new("Movie");
+        let mut schema = LabelSchema::new_node_id("Movie");
         schema.add_property(PropertyDef::new(
             "embedding",
             PropertyType::Vector {
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn vector_dims_mismatch() {
-        let mut schema = LabelSchema::new("Movie");
+        let mut schema = LabelSchema::new_node_id("Movie");
         schema.add_property(PropertyDef::new(
             "embedding",
             PropertyType::Vector {
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn array_homogeneous() {
-        let mut schema = LabelSchema::new("User");
+        let mut schema = LabelSchema::new_node_id("User");
         schema.add_property(PropertyDef::new(
             "tags",
             PropertyType::Array(Box::new(PropertyType::String)),
@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn array_not_homogeneous() {
-        let mut schema = LabelSchema::new("User");
+        let mut schema = LabelSchema::new_node_id("User");
         schema.add_property(PropertyDef::new(
             "tags",
             PropertyType::Array(Box::new(PropertyType::String)),
@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn array_nulls_allowed() {
-        let mut schema = LabelSchema::new("User");
+        let mut schema = LabelSchema::new_node_id("User");
         schema.add_property(PropertyDef::new(
             "tags",
             PropertyType::Array(Box::new(PropertyType::String)),
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn strict_mode_rejects_unknown() {
         let mut schema = user_schema();
-        schema.set_strict(true);
+        schema.set_mode(SchemaMode::Strict);
 
         let field_names = make_field_names(&[("name", 1), ("unknown_field", 99)]);
         let mut props = HashMap::new();
@@ -537,7 +537,7 @@ mod tests {
 
     #[test]
     fn document_type_matches() {
-        let mut schema = LabelSchema::new("Config");
+        let mut schema = LabelSchema::new_node_id("Config");
         schema.add_property(PropertyDef::new("data", PropertyType::Document));
 
         let field_names = make_field_names(&[("data", 1)]);
@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn document_type_mismatch() {
-        let mut schema = LabelSchema::new("Config");
+        let mut schema = LabelSchema::new_node_id("Config");
         schema.add_property(PropertyDef::new("data", PropertyType::Document));
 
         let field_names = make_field_names(&[("data", 1)]);
@@ -575,7 +575,7 @@ mod tests {
 
     #[test]
     fn document_size_limit_rejected() {
-        let mut schema = LabelSchema::new("Config");
+        let mut schema = LabelSchema::new_node_id("Config");
         schema.add_property(PropertyDef::new("data", PropertyType::Document));
 
         let field_names = make_field_names(&[("data", 1)]);
@@ -599,7 +599,7 @@ mod tests {
 
     #[test]
     fn document_null_valid() {
-        let mut schema = LabelSchema::new("Config");
+        let mut schema = LabelSchema::new_node_id("Config");
         schema.add_property(PropertyDef::new("data", PropertyType::Document));
 
         let field_names = make_field_names(&[("data", 1)]);
@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn validated_mode_accepts_unknown_properties() {
-        let mut schema = LabelSchema::new("Device");
+        let mut schema = LabelSchema::new_node_id("Device");
         schema.set_mode(SchemaMode::Validated);
         schema.add_property(PropertyDef::new("name", PropertyType::String));
 
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn validated_mode_still_validates_declared() {
-        let mut schema = LabelSchema::new("Device");
+        let mut schema = LabelSchema::new_node_id("Device");
         schema.set_mode(SchemaMode::Validated);
         schema.add_property(PropertyDef::new("age", PropertyType::Int));
 
@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn flexible_mode_accepts_all() {
-        let mut schema = LabelSchema::new("Raw");
+        let mut schema = LabelSchema::new_node_id("Raw");
         schema.set_mode(SchemaMode::Flexible);
 
         let field_names = make_field_names(&[("anything", 1), ("whatever", 2)]);
@@ -668,7 +668,7 @@ mod tests {
 
     #[test]
     fn flexible_mode_skips_type_validation_for_declared() {
-        let mut schema = LabelSchema::new("Raw");
+        let mut schema = LabelSchema::new_node_id("Raw");
         schema.set_mode(SchemaMode::Flexible);
         schema.add_property(PropertyDef::new("count", PropertyType::Int));
 
@@ -682,7 +682,7 @@ mod tests {
 
     #[test]
     fn strict_mode_rejects_unknown_via_schema_mode() {
-        let mut schema = LabelSchema::new("User");
+        let mut schema = LabelSchema::new_node_id("User");
         schema.set_mode(SchemaMode::Strict);
         schema.add_property(PropertyDef::new("name", PropertyType::String));
 
@@ -702,7 +702,7 @@ mod tests {
     fn computed_property_rejects_set() {
         use crate::schema::computed::{ComputedSpec, DecayFormula};
 
-        let mut schema = LabelSchema::new("Memory");
+        let mut schema = LabelSchema::new_node_id("Memory");
         schema.set_mode(SchemaMode::Strict);
         schema.add_property(PropertyDef::new("content", PropertyType::String));
         schema.add_property(PropertyDef::computed(

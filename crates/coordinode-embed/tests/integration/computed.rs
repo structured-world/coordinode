@@ -17,10 +17,36 @@ fn open_db() -> (Database, tempfile::TempDir) {
     (db, dir)
 }
 
+/// Persist a `LabelSchema` directly through the shared engine, writing both
+/// the versioned key and the current_revision pointer. Required for any test
+/// that bypasses `Database::create_label_schema` — pointer-based readers
+/// (computed-property injection, schema-mode enforcement) won't find the
+/// schema without the pointer.
+fn persist_label_schema(db: &Database, schema: &LabelSchema) {
+    use coordinode_core::schema::definition::{
+        encode_label_current_revision_key, encode_label_schema_key,
+    };
+    use coordinode_storage::engine::partition::Partition;
+    let schema_key = encode_label_schema_key(&schema.name, schema.schema_revision);
+    let pointer_key = encode_label_current_revision_key(&schema.name);
+    let bytes = schema.to_msgpack().expect("serialize schema");
+    let engine = db.engine_shared();
+    engine
+        .put(Partition::Schema, &schema_key, &bytes)
+        .expect("persist schema body");
+    engine
+        .put(
+            Partition::Schema,
+            &pointer_key,
+            &schema.schema_revision.to_be_bytes(),
+        )
+        .expect("persist current_revision pointer");
+}
+
 /// Helper: create a schema with COMPUTED properties and persist it.
 fn setup_memory_schema(db: &mut Database) {
     // FLEXIBLE: tests exercise computed property semantics, not schema enforcement.
-    let mut schema = LabelSchema::new("Memory");
+    let mut schema = LabelSchema::new_node_id("Memory");
     schema.set_mode(SchemaMode::Flexible);
     schema.add_property(PropertyDef::new("content", PropertyType::String).not_null());
     schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
@@ -44,16 +70,7 @@ fn setup_memory_schema(db: &mut Database) {
         },
     ));
 
-    // Persist schema directly to storage.
-    let schema_key = coordinode_core::schema::definition::encode_label_schema_key("Memory");
-    let bytes = schema.to_msgpack().expect("serialize schema");
-    db.engine_shared()
-        .put(
-            coordinode_storage::engine::partition::Partition::Schema,
-            &schema_key,
-            &bytes,
-        )
-        .expect("persist schema");
+    persist_label_schema(db, &schema);
 }
 
 // ── COMPUTED Decay in RETURN ──────────────────────────────────────
@@ -346,7 +363,7 @@ fn computed_ttl_field_removal_survives_reopen() {
 
         // TTL schema with Field scope, 1-second TTL.
         // FLEXIBLE: test exercises TTL semantics, not schema enforcement.
-        let mut schema = LabelSchema::new("CacheEntry");
+        let mut schema = LabelSchema::new_node_id("CacheEntry");
         schema.set_mode(SchemaMode::Flexible);
         schema.add_property(PropertyDef::new("data", PropertyType::String));
         schema.add_property(PropertyDef::new("cached_at", PropertyType::Timestamp));
@@ -360,15 +377,7 @@ fn computed_ttl_field_removal_survives_reopen() {
             },
         ));
 
-        let schema_key = coordinode_core::schema::definition::encode_label_schema_key("CacheEntry");
-        let bytes = schema.to_msgpack().expect("serialize schema");
-        db.engine_shared()
-            .put(
-                coordinode_storage::engine::partition::Partition::Schema,
-                &schema_key,
-                &bytes,
-            )
-            .expect("persist schema");
+        persist_label_schema(&db, &schema);
 
         // 2 seconds ago → expired with 1s TTL.
         let old_us = std::time::SystemTime::now()
@@ -505,7 +514,7 @@ fn computed_ttl_reaper_via_pipeline() {
 /// Helper: create a schema with VECTOR_DECAY + embedding for decay-weighted vector tests.
 fn setup_vector_decay_schema(db: &mut Database) {
     // FLEXIBLE: test exercises vector decay semantics, not schema enforcement.
-    let mut schema = LabelSchema::new("Article");
+    let mut schema = LabelSchema::new_node_id("Article");
     schema.set_mode(SchemaMode::Flexible);
     schema.add_property(PropertyDef::new("title", PropertyType::String));
     schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
@@ -525,15 +534,7 @@ fn setup_vector_decay_schema(db: &mut Database) {
         },
     ));
 
-    let schema_key = coordinode_core::schema::definition::encode_label_schema_key("Article");
-    let bytes = schema.to_msgpack().expect("serialize schema");
-    db.engine_shared()
-        .put(
-            coordinode_storage::engine::partition::Partition::Schema,
-            &schema_key,
-            &bytes,
-        )
-        .expect("persist schema");
+    persist_label_schema(db, &schema);
 }
 
 /// Planner detects `vector_similarity() * _recency > threshold` and applies
@@ -742,7 +743,7 @@ fn vector_decay_exponential_formula() {
 
     // Exponential with lambda = ln(2) ≈ 0.693 → half-life at t=1.0 gives e^(-0.693) ≈ 0.5
     // FLEXIBLE: test exercises exponential decay formula, not schema enforcement.
-    let mut schema = LabelSchema::new("ExpArticle");
+    let mut schema = LabelSchema::new_node_id("ExpArticle");
     schema.set_mode(SchemaMode::Flexible);
     schema.add_property(PropertyDef::new("title", PropertyType::String));
     schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
@@ -764,15 +765,7 @@ fn vector_decay_exponential_formula() {
         },
     ));
 
-    let schema_key = coordinode_core::schema::definition::encode_label_schema_key("ExpArticle");
-    let bytes = schema.to_msgpack().expect("serialize");
-    db.engine_shared()
-        .put(
-            coordinode_storage::engine::partition::Partition::Schema,
-            &schema_key,
-            &bytes,
-        )
-        .expect("persist schema");
+    persist_label_schema(&db, &schema);
 
     let now_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -931,7 +924,7 @@ fn vector_decay_step_formula() {
     let (mut db, _dir) = open_db();
 
     // FLEXIBLE: test exercises step formula semantics, not schema enforcement.
-    let mut schema = LabelSchema::new("StepArticle");
+    let mut schema = LabelSchema::new_node_id("StepArticle");
     schema.set_mode(SchemaMode::Flexible);
     schema.add_property(PropertyDef::new("title", PropertyType::String));
     schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
@@ -951,15 +944,7 @@ fn vector_decay_step_formula() {
         },
     ));
 
-    let schema_key = coordinode_core::schema::definition::encode_label_schema_key("StepArticle");
-    let bytes = schema.to_msgpack().expect("serialize");
-    db.engine_shared()
-        .put(
-            coordinode_storage::engine::partition::Partition::Schema,
-            &schema_key,
-            &bytes,
-        )
-        .expect("persist schema");
+    persist_label_schema(&db, &schema);
 
     let now_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -999,7 +984,7 @@ fn vector_decay_power_law_formula() {
     // PowerLaw: (1 + t/0.5)^(-1.0)
     // At t=1.0 (full duration): (1 + 1.0/0.5)^(-1) = (3)^(-1) = 0.333
     // FLEXIBLE: test exercises power-law formula semantics, not schema enforcement.
-    let mut schema = LabelSchema::new("PLArticle");
+    let mut schema = LabelSchema::new_node_id("PLArticle");
     schema.set_mode(SchemaMode::Flexible);
     schema.add_property(PropertyDef::new("title", PropertyType::String));
     schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
@@ -1022,15 +1007,7 @@ fn vector_decay_power_law_formula() {
         },
     ));
 
-    let schema_key = coordinode_core::schema::definition::encode_label_schema_key("PLArticle");
-    let bytes = schema.to_msgpack().expect("serialize");
-    db.engine_shared()
-        .put(
-            coordinode_storage::engine::partition::Partition::Schema,
-            &schema_key,
-            &bytes,
-        )
-        .expect("persist schema");
+    persist_label_schema(&db, &schema);
 
     let now_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1241,7 +1218,7 @@ fn computed_ttl_subtree_removes_anchor_preserves_document() {
 
     // Schema with TTL scope=Subtree and short duration.
     // FLEXIBLE: test exercises TTL subtree semantics, not schema enforcement.
-    let mut schema = LabelSchema::new("CachedDoc");
+    let mut schema = LabelSchema::new_node_id("CachedDoc");
     schema.set_mode(SchemaMode::Flexible);
     schema.add_property(PropertyDef::new("title", PropertyType::String).not_null());
     schema.add_property(PropertyDef::new("cached_at", PropertyType::Timestamp));
@@ -1256,15 +1233,7 @@ fn computed_ttl_subtree_removes_anchor_preserves_document() {
         },
     ));
 
-    let schema_key = coordinode_core::schema::definition::encode_label_schema_key("CachedDoc");
-    let bytes = schema.to_msgpack().expect("serialize schema");
-    db.engine_shared()
-        .put(
-            coordinode_storage::engine::partition::Partition::Schema,
-            &schema_key,
-            &bytes,
-        )
-        .expect("persist schema");
+    persist_label_schema(&db, &schema);
 
     // Create expired node with nested DOCUMENT via inline map literal.
     let old_us = std::time::SystemTime::now()
@@ -1386,7 +1355,7 @@ fn computed_ttl_subtree_target_field_deletes_target_not_anchor() {
 
     // Schema: TTL triggers on cached_at, but expires the payload DOCUMENT field.
     // FLEXIBLE: test exercises TTL subtree target_field semantics, not schema enforcement.
-    let mut schema = LabelSchema::new("PrivateDoc");
+    let mut schema = LabelSchema::new_node_id("PrivateDoc");
     schema.set_mode(SchemaMode::Flexible);
     schema.add_property(PropertyDef::new("title", PropertyType::String).not_null());
     schema.add_property(PropertyDef::new("cached_at", PropertyType::Timestamp));
@@ -1401,15 +1370,7 @@ fn computed_ttl_subtree_target_field_deletes_target_not_anchor() {
         },
     ));
 
-    let schema_key = coordinode_core::schema::definition::encode_label_schema_key("PrivateDoc");
-    let bytes = schema.to_msgpack().expect("serialize schema");
-    db.engine_shared()
-        .put(
-            coordinode_storage::engine::partition::Partition::Schema,
-            &schema_key,
-            &bytes,
-        )
-        .expect("persist schema");
+    persist_label_schema(&db, &schema);
 
     // Create expired node (cached_at = 2 min ago, TTL = 60s → expired).
     let old_us = std::time::SystemTime::now()

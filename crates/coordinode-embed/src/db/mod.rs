@@ -29,6 +29,15 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::Guard;
 
+/// Outcome of a Cypher execution: result rows plus mutation statistics. Used
+/// by [`Database::execute_cypher_full`] so callers (notably the gRPC server)
+/// can surface real mutation counts in their response stats.
+#[derive(Debug, Clone)]
+pub struct CypherResult {
+    pub rows: Vec<Row>,
+    pub write_stats: WriteStats,
+}
+
 /// Default TTL for cached storage statistics (seconds).
 ///
 /// EXPLAIN / EXPLAIN SUGGEST recompute statistics from storage on every call.
@@ -682,6 +691,7 @@ impl Database {
         source: &SourceContext,
     ) -> Result<Vec<Row>, DatabaseError> {
         self.execute_cypher_impl(query, Some(source), None)
+            .map(|(rows, _)| rows)
     }
 
     /// Execute a Cypher query with both source context and bound parameters.
@@ -700,6 +710,7 @@ impl Database {
             Some(params)
         };
         self.execute_cypher_impl(query, Some(source), params)
+            .map(|(rows, _)| rows)
     }
 
     /// Execute a Cypher query and return result rows.
@@ -708,6 +719,7 @@ impl Database {
     /// query advisor registry for performance analysis.
     pub fn execute_cypher(&mut self, query: &str) -> Result<Vec<Row>, DatabaseError> {
         self.execute_cypher_impl(query, None, None)
+            .map(|(rows, _)| rows)
     }
 
     /// Execute a Cypher query with bound parameters.
@@ -725,6 +737,48 @@ impl Database {
             Some(params)
         };
         self.execute_cypher_impl(query, None, params)
+            .map(|(rows, _)| rows)
+    }
+
+    /// Execute a Cypher query end-to-end with full session-level overrides and
+    /// observable mutation statistics. The single entry point used by the gRPC
+    /// `CypherService.execute_cypher` handler — propagates the client's
+    /// `read_concern` and `write_concern` to the executor (replacing the
+    /// previous behaviour where they were validated but silently ignored) and
+    /// returns [`CypherResult`] with [`WriteStats`] so gRPC `QueryStats` can
+    /// surface real mutation counts instead of hardcoded zeros.
+    ///
+    /// `read_concern` and `write_concern` are one-shot overrides: prior
+    /// session-level values are restored on exit.
+    pub fn execute_cypher_full(
+        &mut self,
+        query: &str,
+        params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
+        source: Option<&SourceContext>,
+        read_concern: Option<coordinode_core::txn::read_concern::ReadConcern>,
+        write_concern: Option<coordinode_core::txn::write_concern::WriteConcern>,
+    ) -> Result<CypherResult, DatabaseError> {
+        let prev_read_level = self.read_concern;
+        let prev_write_concern = self.write_concern.clone();
+
+        if let Some(ref rc) = read_concern {
+            rc.validate()
+                .map_err(|e| DatabaseError::Semantic(e.to_string()))?;
+            self.read_concern = rc.level;
+            self.snapshot_read_ts = rc.at_timestamp;
+        }
+        if let Some(ref wc) = write_concern {
+            self.write_concern = wc.clone();
+        }
+
+        let params = params.and_then(|p| if p.is_empty() { None } else { Some(p) });
+        let result = self.execute_cypher_impl(query, source, params);
+
+        self.read_concern = prev_read_level;
+        self.write_concern = prev_write_concern;
+        self.snapshot_read_ts = None;
+
+        result.map(|(rows, write_stats)| CypherResult { rows, write_stats })
     }
 
     /// Set session-level vector consistency mode.
@@ -792,7 +846,7 @@ impl Database {
         self.read_concern = read_concern.level;
         self.snapshot_read_ts = read_concern.at_timestamp;
 
-        let result = self.execute_cypher_impl(query, None, None);
+        let result = self.execute_cypher_impl(query, None, None).map(|(r, _)| r);
 
         // Restore session level (one-shot override)
         self.read_concern = prev_level;
@@ -806,12 +860,12 @@ impl Database {
         query: &str,
         source: Option<&SourceContext>,
         params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
-    ) -> Result<Vec<Row>, DatabaseError> {
+    ) -> Result<(Vec<Row>, WriteStats), DatabaseError> {
         // Handle session SET commands before parsing as regular Cypher.
         // Pattern: SET vector_consistency = 'mode'
         if let Some(mode) = Self::try_parse_session_set(query) {
             self.vector_consistency = mode;
-            return Ok(vec![]);
+            return Ok((vec![], WriteStats::default()));
         }
 
         let ast = cypher::parse(query)?;
@@ -948,9 +1002,10 @@ impl Database {
             }
         }
 
-        // Capture mutation flags before dropping ctx (which borrows &mut self.interner).
-        let nodes_created = ctx.write_stats.nodes_created;
-        let had_mutations = ctx.write_stats.has_mutations();
+        // Capture write_stats before dropping ctx (which borrows &mut self.interner).
+        let write_stats = ctx.write_stats.clone();
+        let nodes_created = write_stats.nodes_created;
+        let had_mutations = write_stats.has_mutations();
         // Drop ctx to release &mut self.interner borrow.
         drop(ctx);
 
@@ -974,7 +1029,7 @@ impl Database {
             self.invalidate_stats_cache();
         }
 
-        Ok(results)
+        Ok((results, write_stats))
     }
 
     /// Ensure the allocator has a persisted batch reservation.
@@ -1137,21 +1192,31 @@ impl Database {
     /// with `unique = true`, a B-tree unique index is created (if not already
     /// present) and existing nodes are backfilled into the index.
     ///
-    /// Returns the schema version after persistence.
+    /// Returns the schema revision after persistence.
     pub fn create_label_schema(
         &mut self,
         schema: coordinode_core::schema::definition::LabelSchema,
     ) -> Result<u64, DatabaseError> {
-        use coordinode_core::schema::definition::encode_label_schema_key;
+        use coordinode_core::schema::definition::{
+            encode_label_current_revision_key, encode_label_schema_key,
+        };
 
-        // 1. Persist the schema to storage.
-        let key = encode_label_schema_key(&schema.name);
+        // 1. Persist the schema to storage. Version-prefixed key carries the
+        //    immutable snapshot; the current_revision pointer names the active
+        //    one. Both writes are part of this commit (ADR-023).
+        let key = encode_label_schema_key(&schema.name, schema.schema_revision);
         let bytes = schema
             .to_msgpack()
             .map_err(|e| DatabaseError::Other(format!("serialize label schema: {e}")))?;
         self.engine.put(Partition::Schema, &key, &bytes)?;
+        let pointer_key = encode_label_current_revision_key(&schema.name);
+        self.engine.put(
+            Partition::Schema,
+            &pointer_key,
+            &schema.schema_revision.to_be_bytes(),
+        )?;
 
-        let version = schema.version;
+        let version = schema.schema_revision;
         let label_name = schema.name.clone();
 
         // 2. For each unique property, register a B-tree unique index.
@@ -1248,19 +1313,27 @@ impl Database {
     /// Persist an edge type schema to storage.
     ///
     /// Idempotent: existing schema for this edge type is replaced.
-    /// Returns the schema version after persistence.
+    /// Returns the schema revision after persistence.
     pub fn create_edge_type_schema(
         &mut self,
         schema: coordinode_core::schema::definition::EdgeTypeSchema,
     ) -> Result<u64, DatabaseError> {
-        use coordinode_core::schema::definition::encode_edge_type_schema_key;
+        use coordinode_core::schema::definition::{
+            encode_edge_type_current_revision_key, encode_edge_type_schema_key,
+        };
 
-        let key = encode_edge_type_schema_key(&schema.name);
+        let key = encode_edge_type_schema_key(&schema.name, schema.schema_revision);
         let bytes = schema
             .to_msgpack()
             .map_err(|e| DatabaseError::Other(format!("serialize edge type schema: {e}")))?;
         self.engine.put(Partition::Schema, &key, &bytes)?;
-        Ok(schema.version)
+        let pointer_key = encode_edge_type_current_revision_key(&schema.name);
+        self.engine.put(
+            Partition::Schema,
+            &pointer_key,
+            &schema.schema_revision.to_be_bytes(),
+        )?;
+        Ok(schema.schema_revision)
     }
 
     /// Get a reference to the vector index registry.
@@ -1862,7 +1935,7 @@ mod tests {
         let mut db = Database::open(dir.path()).expect("open");
 
         // Create label with a unique segment_id property.
-        let mut schema = LabelSchema::new("Segment");
+        let mut schema = LabelSchema::new_node_id("Segment");
         schema.add_property(PropertyDef::new("segment_id", PropertyType::Int).unique());
         schema.add_property(PropertyDef::new("name", PropertyType::String));
         db.create_label_schema(schema).expect("create schema");
@@ -1910,7 +1983,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut db = Database::open(dir.path()).expect("open");
 
-        let mut schema = LabelSchema::new("Segment");
+        let mut schema = LabelSchema::new_node_id("Segment");
         schema.add_property(PropertyDef::new("segment_id", PropertyType::Int).unique());
         schema.add_property(PropertyDef::new("name", PropertyType::String));
         db.create_label_schema(schema).expect("create schema");
@@ -1972,7 +2045,7 @@ mod tests {
         let mut db = Database::open(dir.path()).expect("open");
 
         // STRICT mode, unique id property (INT).
-        let mut schema = LabelSchema::new("TestNode");
+        let mut schema = LabelSchema::new_node_id("TestNode");
         schema.add_property(
             PropertyDef::new("id", PropertyType::String)
                 .unique()
@@ -2015,7 +2088,7 @@ mod tests {
         {
             let mut db = Database::open(dir.path()).expect("open");
 
-            let mut schema = LabelSchema::new("TestNode");
+            let mut schema = LabelSchema::new_node_id("TestNode");
             schema.add_property(
                 PropertyDef::new("id", PropertyType::String)
                     .unique()
@@ -2075,7 +2148,7 @@ mod tests {
         {
             let mut db = Database::open(dir.path()).expect("open");
 
-            let mut schema = LabelSchema::new("Doc");
+            let mut schema = LabelSchema::new_node_id("Doc");
             schema.add_property(PropertyDef::new(
                 "embedding",
                 PropertyType::Vector {
@@ -2138,7 +2211,7 @@ mod tests {
         let mut db = Database::open(dir.path()).expect("open");
 
         // Simulate what gRPC SchemaService does: dimensions=0 because proto has no field.
-        let mut schema = LabelSchema::new("VecTest");
+        let mut schema = LabelSchema::new_node_id("VecTest");
         schema.add_property(PropertyDef::new(
             "emb",
             PropertyType::Vector {
@@ -2181,7 +2254,7 @@ mod tests {
             let mut db = Database::open(dir.path()).expect("open");
 
             // Flexible label — no declared properties, all stored as overflow.
-            let mut schema = LabelSchema::new("Article");
+            let mut schema = LabelSchema::new_node_id("Article");
             schema.set_mode(SchemaMode::Flexible);
             db.create_label_schema(schema).expect("create schema");
 

@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use tonic::{Request, Response, Status};
 
+use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
 use coordinode_embed::Database;
 
@@ -77,6 +78,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             node_id,
             labels: req.labels,
             properties: req.properties,
+            element_id: NodeId::from_raw(node_id).to_element_id(),
         }))
     }
 
@@ -135,6 +137,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             node_id,
             labels,
             properties,
+            element_id: NodeId::from_raw(node_id).to_element_id(),
         }))
     }
 
@@ -206,6 +209,11 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             source_node_id: src_id,
             target_node_id: dst_id,
             properties: req.properties,
+            element_id: format!(
+                "{}:{}",
+                NodeId::from_raw(src_id).to_element_id(),
+                NodeId::from_raw(dst_id).to_element_id()
+            ),
         }))
     }
 
@@ -302,6 +310,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
                     node_id,
                     labels,
                     properties,
+                    element_id: NodeId::from_raw(node_id).to_element_id(),
                 })
             })
             .collect();
@@ -342,6 +351,85 @@ mod tests {
             .expect("create_node should succeed");
 
         assert!(resp.into_inner().node_id > 0, "node_id must be > 0");
+    }
+
+    /// create_node populates element_id with a valid Crockford base32 encoding
+    /// that roundtrips back to the same node_id. Regression: previously the
+    /// field did not exist on proto Node; clients had no canonical identifier
+    /// per ADR-022.
+    #[tokio::test]
+    async fn create_node_returns_well_formed_element_id() {
+        let (svc, _dir) = test_service();
+
+        let resp = svc
+            .create_node(Request::new(graph::CreateNodeRequest {
+                labels: vec!["Member".to_string()],
+                properties: std::collections::HashMap::new(),
+            }))
+            .await
+            .expect("create_node");
+        let node = resp.into_inner();
+
+        assert_eq!(
+            node.element_id.len(),
+            13,
+            "element_id must be a 13-char Crockford base32 token, got {:?}",
+            node.element_id
+        );
+
+        let decoded = coordinode_core::graph::node::NodeId::from_element_id(&node.element_id)
+            .expect("element_id must decode");
+        assert_eq!(
+            decoded.as_raw(),
+            node.node_id,
+            "element_id must roundtrip to the same node_id"
+        );
+    }
+
+    /// create_edge populates element_id with the source:target form (two
+    /// Crockford tokens joined by ":"). The ordering is canonical (always
+    /// src:tgt) so callers can compare endpoint identity.
+    #[tokio::test]
+    async fn create_edge_returns_well_formed_element_id() {
+        let (svc, _dir) = test_service();
+
+        let src = svc
+            .create_node(Request::new(graph::CreateNodeRequest {
+                labels: vec!["Person".to_string()],
+                properties: std::collections::HashMap::new(),
+            }))
+            .await
+            .expect("src")
+            .into_inner();
+        let dst = svc
+            .create_node(Request::new(graph::CreateNodeRequest {
+                labels: vec!["Person".to_string()],
+                properties: std::collections::HashMap::new(),
+            }))
+            .await
+            .expect("dst")
+            .into_inner();
+
+        let edge = svc
+            .create_edge(Request::new(graph::CreateEdgeRequest {
+                edge_type: "KNOWS".to_string(),
+                source_node_id: src.node_id,
+                target_node_id: dst.node_id,
+                properties: std::collections::HashMap::new(),
+            }))
+            .await
+            .expect("edge")
+            .into_inner();
+
+        let parts: Vec<&str> = edge.element_id.split(':').collect();
+        assert_eq!(
+            parts.len(),
+            2,
+            "element_id must be src:tgt, got {:?}",
+            edge.element_id
+        );
+        assert_eq!(parts[0], src.element_id);
+        assert_eq!(parts[1], dst.element_id);
     }
 
     /// create_node persists the node so it is findable via Cypher.

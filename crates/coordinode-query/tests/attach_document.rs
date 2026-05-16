@@ -123,9 +123,7 @@ fn insert_node(
 }
 
 fn register_schema_edge_type(engine: &StorageEngine, edge_type: &str) {
-    const PREFIX: &[u8] = b"schema:edge_type:";
-    let mut key = PREFIX.to_vec();
-    key.extend_from_slice(edge_type.as_bytes());
+    let key = coordinode_core::schema::definition::encode_edge_type_schema_key(edge_type, 1);
     engine
         .put(Partition::Schema, &key, b"")
         .expect("put schema edge");

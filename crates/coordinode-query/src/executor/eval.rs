@@ -555,6 +555,36 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
                 Value::Null
             }
         }
+        "elementId" => {
+            // elementId(n) → 13-character Crockford base32 string derived
+            // bijectively from the node's u64 NodeId. The variable binds to
+            // Value::Int (the raw NodeId) for node patterns; for edge
+            // patterns it returns NULL (edges are addressed by `(src, tgt)`
+            // pairs in our model, not by a single id).
+            if let Some(Expr::Variable(var)) = args.first() {
+                match row.get(var) {
+                    Some(Value::Int(raw)) => {
+                        let node_id = coordinode_core::graph::node::NodeId::from_raw(*raw as u64);
+                        Value::String(node_id.to_element_id())
+                    }
+                    _ => Value::Null,
+                }
+            } else {
+                Value::Null
+            }
+        }
+        "id" => {
+            // id(n) → raw NodeId u64 (deprecated; prefer elementId).
+            // Kept for Neo4j v4 driver compatibility per arch/compatibility/neo4j.md.
+            if let Some(Expr::Variable(var)) = args.first() {
+                match row.get(var) {
+                    Some(Value::Int(raw)) => Value::Int(*raw),
+                    _ => Value::Null,
+                }
+            } else {
+                Value::Null
+            }
+        }
         "labels" => {
             // labels(n) → list of label strings for a node.
             // The executor stores primary label as `n.__label__` in the row.
