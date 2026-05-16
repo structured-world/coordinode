@@ -27,4 +27,31 @@ pub trait StorageStats {
 
     /// Number of distinct labels in the database.
     fn label_count(&self) -> u64;
+
+    // ── Vector index statistics (R-PUSH1) ──────────────────────────────
+    //
+    // The graph predicate push-down rule (`arch/core/query-engine.md`
+    // § Graph Predicate Push-Down) compares candidate-set size `|C|` against
+    // the vector index size `|V|` to pick a strategy. These methods expose
+    // the index parameters that the rule depends on. All return `None` when
+    // the index is not registered or statistics are unavailable; callers
+    // must handle absence gracefully (fall back to safe defaults).
+
+    /// Number of vectors in the HNSW index for `(label, property)`.
+    fn vector_index_size(&self, _label: &str, _property: &str) -> Option<u64> {
+        None
+    }
+
+    /// Vector dimensionality of the HNSW index for `(label, property)`.
+    fn vector_index_dim(&self, _label: &str, _property: &str) -> Option<u32> {
+        None
+    }
+
+    /// Per-index crossover threshold: `|C|` below this triggers graph-first.
+    /// Returns `None` when no index is registered. Per `arch`, default is
+    /// 500 for node-typed indexes, 200 for edge-typed indexes; the planner
+    /// applies that default when this method returns `None`.
+    fn vector_index_crossover(&self, _label: &str, _property: &str) -> Option<usize> {
+        None
+    }
 }
