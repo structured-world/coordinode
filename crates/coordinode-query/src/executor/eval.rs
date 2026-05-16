@@ -370,29 +370,47 @@ pub(crate) fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) ->
             _ => Value::Null,
         },
 
-        // Comparison
-        BinaryOperator::Eq => Value::Bool(left == right),
-        BinaryOperator::Neq => Value::Bool(left != right),
-        BinaryOperator::Lt => {
-            Value::Bool(compare_values(left, right) == Some(std::cmp::Ordering::Less))
-        }
-        BinaryOperator::Lte => {
-            let cmp = compare_values(left, right);
-            Value::Bool(matches!(
-                cmp,
-                Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
-            ))
-        }
-        BinaryOperator::Gt => {
-            Value::Bool(compare_values(left, right) == Some(std::cmp::Ordering::Greater))
-        }
-        BinaryOperator::Gte => {
-            let cmp = compare_values(left, right);
-            Value::Bool(matches!(
-                cmp,
-                Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
-            ))
-        }
+        // Comparison — Cypher three-valued logic: any comparison involving
+        // NULL yields NULL (which WHERE treats as "row filtered out"). This
+        // is mandatory per the openCypher spec — `n.prop = NULL` MUST NEVER
+        // match, even when `n.prop` itself is NULL. Use `IS NULL` to test
+        // for absent values.
+        BinaryOperator::Eq => match (left, right) {
+            (Value::Null, _) | (_, Value::Null) => Value::Null,
+            _ => Value::Bool(left == right),
+        },
+        BinaryOperator::Neq => match (left, right) {
+            (Value::Null, _) | (_, Value::Null) => Value::Null,
+            _ => Value::Bool(left != right),
+        },
+        BinaryOperator::Lt => match (left, right) {
+            (Value::Null, _) | (_, Value::Null) => Value::Null,
+            _ => Value::Bool(compare_values(left, right) == Some(std::cmp::Ordering::Less)),
+        },
+        BinaryOperator::Lte => match (left, right) {
+            (Value::Null, _) | (_, Value::Null) => Value::Null,
+            _ => {
+                let cmp = compare_values(left, right);
+                Value::Bool(matches!(
+                    cmp,
+                    Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                ))
+            }
+        },
+        BinaryOperator::Gt => match (left, right) {
+            (Value::Null, _) | (_, Value::Null) => Value::Null,
+            _ => Value::Bool(compare_values(left, right) == Some(std::cmp::Ordering::Greater)),
+        },
+        BinaryOperator::Gte => match (left, right) {
+            (Value::Null, _) | (_, Value::Null) => Value::Null,
+            _ => {
+                let cmp = compare_values(left, right);
+                Value::Bool(matches!(
+                    cmp,
+                    Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                ))
+            }
+        },
 
         // Logical
         BinaryOperator::And => match (left, right) {

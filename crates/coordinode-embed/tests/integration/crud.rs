@@ -578,3 +578,233 @@ fn write_concern_journal_and_full_api() {
         .expect("read upgraded");
     assert!(!rows2.is_empty(), "j:true upgraded W0→W1 write visible");
 }
+
+// ── #51 Edge-case audit: non-temporal modalities ──────────────────────
+
+/// DETACH DELETE on a node with a self-loop must remove both the node
+/// and its self-edge without leaving orphaned adjacency entries.
+/// Regression: self-edges where source == target are easy to miss in
+/// cleanup loops that treat in/out edges as separate sets.
+#[test]
+fn detach_delete_node_with_self_loop() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:Person {name: 'narcissist'})-[:LIKES]->(a)")
+        .expect("create self-loop");
+
+    let pre = db
+        .execute_cypher("MATCH (n:Person) RETURN n.name")
+        .expect("pre count");
+    assert_eq!(pre.len(), 1, "self-loop creates exactly one node");
+
+    db.execute_cypher("MATCH (n:Person {name: 'narcissist'}) DETACH DELETE n")
+        .expect("detach delete self-loop");
+
+    let post_nodes = db
+        .execute_cypher("MATCH (n:Person) RETURN n")
+        .expect("post nodes");
+    assert!(
+        post_nodes.is_empty(),
+        "node must be gone after DETACH DELETE"
+    );
+
+    let post_edges = db
+        .execute_cypher("MATCH ()-[r:LIKES]->() RETURN r")
+        .expect("post edges");
+    assert!(
+        post_edges.is_empty(),
+        "self-edge must be removed alongside the node, got {} dangling edges",
+        post_edges.len()
+    );
+}
+
+/// DETACH DELETE on a middle node in a chain removes incoming and
+/// outgoing adjacency from both endpoints.
+#[test]
+fn detach_delete_node_with_both_directions() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})\
+                  -[:KNOWS]->(c:Person {name: 'Charlie'})",
+    )
+    .expect("seed chain");
+
+    db.execute_cypher("MATCH (b:Person {name: 'Bob'}) DETACH DELETE b")
+        .expect("detach delete middle node");
+
+    let remaining = db
+        .execute_cypher("MATCH (n:Person) RETURN n.name")
+        .expect("remaining");
+    assert_eq!(remaining.len(), 2, "Alice and Charlie remain; Bob is gone");
+
+    let alice_out = db
+        .execute_cypher("MATCH (:Person {name: 'Alice'})-[:KNOWS]->(x) RETURN x.name")
+        .expect("alice out");
+    assert!(
+        alice_out.is_empty(),
+        "Alice's outgoing edge to Bob must be gone, got {alice_out:?}"
+    );
+    let charlie_in = db
+        .execute_cypher("MATCH (x)-[:KNOWS]->(:Person {name: 'Charlie'}) RETURN x.name")
+        .expect("charlie in");
+    assert!(
+        charlie_in.is_empty(),
+        "Charlie's incoming edge from Bob must be gone, got {charlie_in:?}"
+    );
+}
+
+/// DETACH DELETE on a hub clears every outgoing adjacency entry. Targets
+/// are unaffected.
+#[test]
+fn detach_delete_source_node_clears_all_outgoing_edges() {
+    let (mut db, _dir) = open_db();
+    // Multi-statement seeding: create hub then attach 3 targets one by one.
+    // Our Cypher impl may not support the multi-path comma CREATE syntax
+    // for back-references to the same variable; this form avoids that.
+    db.execute_cypher("CREATE (h:Hub {id: 'h1'})").expect("hub");
+    for n in 1..=3 {
+        db.execute_cypher(&format!(
+            "MATCH (h:Hub {{id: 'h1'}}) CREATE (h)-[:LINKS]->(:Target {{n: {n}}})"
+        ))
+        .expect("link");
+    }
+
+    db.execute_cypher("MATCH (h:Hub {id: 'h1'}) DETACH DELETE h")
+        .expect("detach delete hub");
+
+    let targets = db
+        .execute_cypher("MATCH (t:Target) RETURN t.n")
+        .expect("targets remain");
+    assert_eq!(targets.len(), 3, "targets unaffected");
+
+    let orphan_edges = db
+        .execute_cypher("MATCH ()-[r:LINKS]->() RETURN r")
+        .expect("orphan check");
+    assert!(
+        orphan_edges.is_empty(),
+        "all LINKS edges must be removed when hub is detach-deleted, got {} dangling",
+        orphan_edges.len()
+    );
+}
+
+/// MERGE on a node with an empty property pattern (just label) matches
+/// any existing node with that label.
+#[test]
+fn merge_empty_property_pattern_matches_existing() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (n:Singleton {id: 1})")
+        .expect("seed");
+    db.execute_cypher("MERGE (s:Singleton)")
+        .expect("merge empty");
+    let rows = db
+        .execute_cypher("MATCH (s:Singleton) RETURN s.id")
+        .expect("count");
+    assert_eq!(
+        rows.len(),
+        1,
+        "MERGE with empty property pattern must NOT create a second node; \
+         got {} Singleton nodes",
+        rows.len()
+    );
+}
+
+/// `WHERE n.prop = NULL` must NEVER match anything per Cypher semantics.
+#[test]
+fn where_equals_null_never_matches_per_cypher_spec() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (n:Item {name: 'a', tag: 'red'})")
+        .expect("seed a");
+    db.execute_cypher("CREATE (n:Item {name: 'b'})")
+        .expect("seed b without tag");
+
+    let eq_null = db
+        .execute_cypher("MATCH (i:Item) WHERE i.tag = NULL RETURN i.name")
+        .expect("eq null query");
+    assert!(
+        eq_null.is_empty(),
+        "n.tag = NULL must match zero rows per Cypher spec, got {eq_null:?}"
+    );
+
+    let is_null = db
+        .execute_cypher("MATCH (i:Item) WHERE i.tag IS NULL RETURN i.name")
+        .expect("is null query");
+    assert_eq!(
+        is_null.len(),
+        1,
+        "IS NULL must match exactly the node missing tag, got {is_null:?}"
+    );
+}
+
+/// Dot-notation access on a missing nested document path returns Null
+/// without erroring. Application code routinely chains property
+/// accesses through optional structures; a crash here would propagate
+/// to every UI doing `n.user.profile.avatar`.
+#[test]
+fn dot_notation_missing_path_returns_null() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (n:Doc {title: 't', config: {a: 1}})")
+        .expect("create");
+
+    let rows = db
+        .execute_cypher("MATCH (n:Doc) RETURN n.config.b.c AS missing")
+        .expect("missing path");
+    assert_eq!(rows.len(), 1);
+    use coordinode_core::graph::types::Value;
+    assert!(
+        matches!(rows[0].get("missing"), Some(Value::Null) | None),
+        "deep miss must yield Null, got {:?}",
+        rows[0].get("missing")
+    );
+
+    let rows2 = db
+        .execute_cypher("MATCH (n:Doc) RETURN n.no_such_field AS missing")
+        .expect("missing top-level");
+    assert!(matches!(rows2[0].get("missing"), Some(Value::Null) | None));
+}
+
+/// SET on a nested document path preserves sibling keys (partial update
+/// semantics). Regression: confusing path-set with whole-replace breaks
+/// every workflow that uses dot-notation to update one field.
+#[test]
+fn document_path_set_preserves_sibling_keys() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (n:Doc {id: 1, config: {host: 'a', port: 80, tls: true}})")
+        .expect("seed");
+
+    db.execute_cypher("MATCH (n:Doc {id: 1}) SET n.config.port = 443")
+        .expect("path set");
+    let after = db
+        .execute_cypher(
+            "MATCH (n:Doc {id: 1}) RETURN n.config.host AS h, \
+             n.config.port AS p, n.config.tls AS t",
+        )
+        .expect("read after path set");
+    assert_eq!(after.len(), 1);
+    use coordinode_core::graph::types::Value;
+    assert_eq!(after[0].get("h"), Some(&Value::String("a".into())));
+    assert_eq!(after[0].get("p"), Some(&Value::Int(443)));
+    assert_eq!(after[0].get("t"), Some(&Value::Bool(true)));
+}
+
+/// Bare MERGE — no ON CREATE / ON MATCH — must not touch the existing
+/// node's properties even when extra properties appear in the pattern.
+/// (Per Cypher spec: MERGE with properties means "match a node where
+/// these properties equal these values", not "set them".)
+#[test]
+fn merge_match_does_not_silently_overwrite_existing_properties() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (u:User {email: 'a@x.com', age: 30})")
+        .expect("seed");
+    db.execute_cypher("MERGE (u:User {email: 'a@x.com'})")
+        .expect("merge match");
+
+    let rows = db
+        .execute_cypher("MATCH (u:User {email: 'a@x.com'}) RETURN u.age AS a")
+        .expect("read");
+    assert_eq!(rows.len(), 1);
+    use coordinode_core::graph::types::Value;
+    assert_eq!(
+        rows[0].get("a"),
+        Some(&Value::Int(30)),
+        "MERGE without SET must not touch existing properties"
+    );
+}
