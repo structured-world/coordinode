@@ -1794,6 +1794,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             less_than,
             threshold,
             decay_field,
+            push_down: _,
         } => {
             let rows = execute_op(input, ctx)?;
             let mode = ctx.vector_consistency;

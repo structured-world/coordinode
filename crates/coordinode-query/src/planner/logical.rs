@@ -383,6 +383,15 @@ pub enum LogicalOp {
         /// When present, the effective score is `vector_score * decay_value`.
         /// Detected from `vector_similarity(...) * decay_field > threshold` pattern.
         decay_field: Option<Expr>,
+        /// Graph predicate push-down decision (R-PUSH1). Populated by the
+        /// `optimize_push_down` planner pass when the upstream input contains
+        /// a `Traverse`. `None` means either the input does not contain a
+        /// traversal (no push-down applicable) or the optimizer pass was not
+        /// invoked. The invariant contract test asserts that any plan with
+        /// a `Traverse` directly preceding a `VectorFilter` carries
+        /// `Some(_)` here — see [`optimize_push_down`] and the regression
+        /// test `vector_filter_after_traverse_is_always_annotated`.
+        push_down: Option<crate::planner::push_down::PushDownDecision>,
     },
 
     /// Edge vector search: vector-first strategy for edge HNSW indexes.

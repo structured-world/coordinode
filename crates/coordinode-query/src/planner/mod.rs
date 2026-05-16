@@ -6,9 +6,18 @@
 
 pub mod builder;
 pub mod logical;
+pub mod push_down;
 
-pub use builder::{annotate_vector_top_k, build_logical_plan, optimize_index_selection, PlanError};
+pub use builder::{
+    annotate_vector_top_k, build_logical_plan, optimize_index_selection, optimize_push_down,
+    PlanError,
+};
 pub use logical::{
     estimate_cost, estimate_cost_with_stats, AggregateItem, CostEstimate, LogicalOp, LogicalPlan,
     ProjectItem,
+};
+pub use push_down::{
+    alpha_from_selectivity, cost_acorn_filtered, cost_graph_first, cost_vector_first,
+    select_push_down_strategy, PushDownDecision, PushDownReason, PushDownStrategy,
+    VectorIndexParams,
 };
