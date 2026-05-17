@@ -1,5 +1,66 @@
 # Changelog
 
+## v0.4.3 — 2026-05-17
+
+### coordinode-core
+## [0.4.3](https://github.com/structured-world/coordinode/compare/v0.4.2...v0.4.3) - 2026-05-17
+
+#### Added
+
+- *(planner)* graph predicate push-down rule (R-PUSH1)
+- *(identity,placement,consistency)* u20/u44 NodeId, schema_revision, gRPC concern wire-through
+- *(temporal)* bitemporal edge types with valid-time semantics
+
+### coordinode-embed
+## [0.4.3](https://github.com/structured-world/coordinode/compare/v0.4.2...v0.4.3) - 2026-05-17
+
+#### Added
+
+- *(cypher)* native MERGE NODES (a, b) INTO target
+- *(planner)* graph predicate push-down rule (R-PUSH1)
+- *(identity,placement,consistency)* u20/u44 NodeId, schema_revision, gRPC concern wire-through
+
+#### Documentation
+
+- *(merge-nodes)* close coverage of reference, index, compatibility, README + 3 tests
+
+#### Fixed
+
+- *(executor)* Cypher three-valued logic for NULL comparisons + edge-case audit
+
+#### Testing
+
+- *(merge-nodes)* STRICT happy-path + mixed self-loop and peers
+- *(merge-nodes)* cover no-transfer drop, temporal edges, multi-type, composability
+- *(merge-nodes)* close STRICT extra-map gap + composability/index coverage
+
+### coordinode-query
+## [0.4.3](https://github.com/structured-world/coordinode/compare/v0.4.2...v0.4.3) - 2026-05-17
+
+#### Added
+
+- *(cypher)* native MERGE NODES (a, b) INTO target
+- *(planner)* graph predicate push-down rule (R-PUSH1)
+- *(identity,placement,consistency)* u20/u44 NodeId, schema_revision, gRPC concern wire-through
+- *(temporal)* bitemporal edge types with valid-time semantics
+
+#### Fixed
+
+- *(executor)* Cypher three-valued logic for NULL comparisons + edge-case audit
+
+#### Testing
+
+- *(merge-nodes)* close STRICT extra-map gap + composability/index coverage
+
+### coordinode-server
+## [0.4.3](https://github.com/structured-world/coordinode/compare/v0.4.2...v0.4.3) - 2026-05-17
+
+#### Added
+
+- *(identity,placement,consistency)* u20/u44 NodeId, schema_revision, gRPC concern wire-through
+
+---
+
 ## v0.4.2 — 2026-05-11
 
 ### coordinode-raft

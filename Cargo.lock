@@ -788,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-auth"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "serde",
  "tempfile",
@@ -798,7 +798,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-client"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "prost",
  "thiserror 2.0.18",
@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-core"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "bytes",
  "criterion",
@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-embed"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "coordinode-core",
  "coordinode-lsm-tree",
@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-integration"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "coordinode-client",
  "prost",
@@ -888,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-query"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "coordinode-core",
  "coordinode-embed",
@@ -910,7 +910,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-raft"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "bytes",
  "coordinode-core",
@@ -933,7 +933,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-s3"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "bytes",
  "coordinode-core",
@@ -954,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-search"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "aes-gcm",
  "coordinode-storage",
@@ -974,7 +974,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-server"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "coordinode-auth",
  "coordinode-client",
@@ -1010,7 +1010,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-storage"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "byteorder-lite",
  "bytes",
@@ -1042,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-vector"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "coordinode-core",
  "coordinode-storage",
