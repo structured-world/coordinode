@@ -275,7 +275,9 @@ pub fn encode_node_key(shard_id: u16, node_id: NodeId) -> Vec<u8> {
 
 /// Decode a node key back into (shard_id, node_id).
 ///
-/// Returns `None` if the key doesn't match the expected format.
+/// Returns `None` if the key doesn't match the expected non-temporal format.
+/// For temporal node keys (with the 9-byte valid_from suffix), use
+/// [`decode_temporal_node_key`].
 pub fn decode_node_key(key: &[u8]) -> Option<(u16, NodeId)> {
     let prefix_len = NODE_KEY_PREFIX.len();
     // node: (5) + shard (2) + : (1) + id (8) = 16
@@ -291,6 +293,80 @@ pub fn decode_node_key(key: &[u8]) -> Option<(u16, NodeId)> {
     let shard_id = u16::from_be_bytes(key[prefix_len..prefix_len + 2].try_into().ok()?);
     let node_id = u64::from_be_bytes(key[prefix_len + 3..prefix_len + 11].try_into().ok()?);
     Some((shard_id, NodeId(node_id)))
+}
+
+/// Encode a temporal node key:
+/// `node:<shard_id u16 BE>:<node_id u64 BE>:<valid_from sortable u64 BE>`.
+///
+/// One entry per version. Multiple versions of the same `node_id` coexist
+/// on a temporal label; an "active at valid-time T" query prefix-scans
+/// [`temporal_node_id_prefix`] and stops at the upper bound. Symmetric with
+/// the temporal-edge layout (ADR-021).
+///
+/// 17-byte suffix total: `node:` (5) + shard (2) + `:` (1) + id (8) + `:` (1) + valid_from (8).
+pub fn encode_temporal_node_key(shard_id: u16, node_id: NodeId, valid_from_ms: i64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(NODE_KEY_PREFIX.len() + 2 + 1 + 8 + 1 + 8);
+    key.extend_from_slice(NODE_KEY_PREFIX);
+    key.extend_from_slice(&shard_id.to_be_bytes());
+    key.push(b':');
+    key.extend_from_slice(&node_id.as_raw().to_be_bytes());
+    key.push(b':');
+    key.extend_from_slice(&crate::graph::edge::encode_valid_from_sortable(
+        valid_from_ms,
+    ));
+    key
+}
+
+/// Decode a temporal node key into `(shard_id, node_id, valid_from)`.
+///
+/// Returns `None` if the key isn't well-formed. The temporal form is
+/// 25 bytes total (8 more than the non-temporal 16-byte form).
+pub fn decode_temporal_node_key(key: &[u8]) -> Option<(u16, NodeId, i64)> {
+    let prefix_len = NODE_KEY_PREFIX.len();
+    // node: (5) + shard (2) + : (1) + id (8) + : (1) + valid_from (8) = 25
+    if key.len() != prefix_len + 2 + 1 + 8 + 1 + 8 {
+        return None;
+    }
+    if &key[..prefix_len] != NODE_KEY_PREFIX {
+        return None;
+    }
+    if key[prefix_len + 2] != b':' || key[prefix_len + 11] != b':' {
+        return None;
+    }
+    let shard_id = u16::from_be_bytes(key[prefix_len..prefix_len + 2].try_into().ok()?);
+    let node_id = u64::from_be_bytes(key[prefix_len + 3..prefix_len + 11].try_into().ok()?);
+    let vf_bytes: [u8; 8] = key[prefix_len + 12..prefix_len + 20].try_into().ok()?;
+    let valid_from = crate::graph::edge::decode_valid_from_sortable(vf_bytes);
+    Some((shard_id, NodeId(node_id), valid_from))
+}
+
+/// Prefix matching every version of a given temporal `node_id` within a
+/// shard: `node:<shard>:<node_id>:`. Use for full-version enumeration on a
+/// temporal label (e.g. AS-OF reads, version history, post-delete invariant
+/// checks).
+pub fn temporal_node_id_prefix(shard_id: u16, node_id: NodeId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(NODE_KEY_PREFIX.len() + 2 + 1 + 8 + 1);
+    key.extend_from_slice(NODE_KEY_PREFIX);
+    key.extend_from_slice(&shard_id.to_be_bytes());
+    key.push(b':');
+    key.extend_from_slice(&node_id.as_raw().to_be_bytes());
+    key.push(b':');
+    key
+}
+
+/// Pick the right node-key format for a write: temporal labels supply
+/// `Some(valid_from_ms)` and get the per-version key; non-temporal labels
+/// pass `None` and get the standard 16-byte key.
+///
+/// Mirror of `edgeprop_write_key` in the executor — the key-format choice
+/// is centralised here so call sites stay declarative ("does this write
+/// belong to a temporal label?" → pass the option) and never see the
+/// 8-vs-17-byte branch directly.
+pub fn node_write_key(shard_id: u16, node_id: NodeId, valid_from_ms: Option<i64>) -> Vec<u8> {
+    match valid_from_ms {
+        Some(vf) => encode_temporal_node_key(shard_id, node_id, vf),
+        None => encode_node_key(shard_id, node_id),
+    }
 }
 
 // -- Node record --
@@ -889,5 +965,88 @@ mod tests {
         let bytes = rec.to_msgpack().expect("serialize");
         let decoded = NodeRecord::from_msgpack(&bytes).expect("deserialize");
         assert_eq!(rec, decoded);
+    }
+
+    // ─── R172b: temporal node key encoding (ADR-027) ──────────────────────
+
+    #[test]
+    fn temporal_node_key_roundtrip() {
+        let nid = NodeId(0x0123_4567_89ab_cdef);
+        let key = encode_temporal_node_key(42, nid, 1577836800000);
+        // 5 + 2 + 1 + 8 + 1 + 8 = 25
+        assert_eq!(key.len(), 25);
+        let (shard, decoded_nid, vf) =
+            decode_temporal_node_key(&key).expect("temporal key must decode");
+        assert_eq!(shard, 42);
+        assert_eq!(decoded_nid, nid);
+        assert_eq!(vf, 1577836800000);
+    }
+
+    #[test]
+    fn temporal_node_key_versions_sort_chronologically() {
+        // Two versions of the same node, different valid_from. Lexicographic
+        // byte order over keys must match numeric order over valid_from.
+        let nid = NodeId(100);
+        let k_early = encode_temporal_node_key(0, nid, 1000);
+        let k_late = encode_temporal_node_key(0, nid, 2000);
+        assert!(
+            k_early < k_late,
+            "earlier valid_from must sort before later"
+        );
+
+        // Negative valid_from (pre-epoch) must sort before positive.
+        let k_neg = encode_temporal_node_key(0, nid, -1);
+        let k_zero = encode_temporal_node_key(0, nid, 0);
+        assert!(k_neg < k_zero, "negative valid_from must sort first");
+        assert!(k_zero < k_early);
+    }
+
+    #[test]
+    fn temporal_node_id_prefix_is_proper_prefix() {
+        // The prefix must be a strict prefix of every per-version key for
+        // the same (shard, node_id), and not match any other node_id's keys.
+        let prefix = temporal_node_id_prefix(7, NodeId(42));
+        // 5 + 2 + 1 + 8 + 1 = 17
+        assert_eq!(prefix.len(), 17);
+
+        let k_v1 = encode_temporal_node_key(7, NodeId(42), 100);
+        let k_v2 = encode_temporal_node_key(7, NodeId(42), 200);
+        let k_other = encode_temporal_node_key(7, NodeId(43), 100);
+
+        assert!(k_v1.starts_with(&prefix));
+        assert!(k_v2.starts_with(&prefix));
+        assert!(!k_other.starts_with(&prefix));
+    }
+
+    #[test]
+    fn temporal_node_key_disjoint_from_non_temporal() {
+        // The 16-byte non-temporal key and the 25-byte temporal key must
+        // never alias — `decode_node_key` rejects the temporal form and
+        // `decode_temporal_node_key` rejects the non-temporal form.
+        let nid = NodeId(99);
+        let non_temp = encode_node_key(5, nid);
+        let temp = encode_temporal_node_key(5, nid, 100);
+
+        assert_eq!(non_temp.len(), 16);
+        assert_eq!(temp.len(), 25);
+        assert!(decode_node_key(&non_temp).is_some());
+        assert!(
+            decode_node_key(&temp).is_none(),
+            "decode_node_key must reject temporal key"
+        );
+        assert!(decode_temporal_node_key(&temp).is_some());
+        assert!(
+            decode_temporal_node_key(&non_temp).is_none(),
+            "decode_temporal_node_key must reject non-temporal key"
+        );
+    }
+
+    #[test]
+    fn node_write_key_picks_correct_form() {
+        let nid = NodeId(42);
+        let non_temp = node_write_key(3, nid, None);
+        let temp = node_write_key(3, nid, Some(1234));
+        assert_eq!(non_temp, encode_node_key(3, nid));
+        assert_eq!(temp, encode_temporal_node_key(3, nid, 1234));
     }
 }

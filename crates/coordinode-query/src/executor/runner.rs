@@ -6574,7 +6574,7 @@ fn execute_create_node(
             }
         }
     }
-    if let Some(tlabel) = temporal_label {
+    if let Some(ref tlabel) = temporal_label {
         let has_valid_from = properties.iter().any(|(name, _)| name == "valid_from");
         if !has_valid_from {
             return Err(ExecutionError::Unsupported(format!(
@@ -6666,7 +6666,85 @@ fn execute_create_node(
             }
         }
 
-        let key = encode_node_key(ctx.shard_id, node_id);
+        // R172b temporal storage path: when the (primary or any) label is
+        // TEMPORAL, extract `valid_from` from the supplied properties and
+        // emit the per-version key. Auto-populate `__ingestion_ts__` from
+        // the current HLC commit timestamp so the bitemporal system-axis is
+        // queryable without an additional lookup. Mirror of the temporal-
+        // edge write path in `execute_create_edge`.
+        let valid_from_for_key: Option<i64> = if let Some(ref tlabel) = temporal_label {
+            let mut vf: Option<i64> = None;
+            for (prop_name, expr) in properties {
+                if prop_name == "valid_from" {
+                    let val = eval_expr(expr, input_row);
+                    vf = match &val {
+                        Value::Int(ms) => Some(*ms),
+                        Value::Timestamp(ms) => Some(*ms),
+                        Value::Null => {
+                            return Err(ExecutionError::Unsupported(format!(
+                                "label '{tlabel}' is TEMPORAL: valid_from must not be NULL"
+                            )));
+                        }
+                        other => {
+                            return Err(ExecutionError::Unsupported(format!(
+                                "label '{tlabel}' is TEMPORAL: valid_from must be INT or \
+                                 TIMESTAMP (epoch milliseconds), got {other:?}"
+                            )));
+                        }
+                    };
+                    break;
+                }
+            }
+            // The earlier guard ensured a valid_from property was supplied;
+            // an absent value here would be a programmer error.
+            vf
+        } else {
+            None
+        };
+
+        // Optional `valid_to` interval invariant: when both ends present,
+        // `valid_to` must be strictly greater than `valid_from`. Same rule
+        // as temporal edges — a zero-duration version is never useful and
+        // almost certainly a user mistake.
+        if let (Some(ref tlabel), Some(vf)) = (&temporal_label, valid_from_for_key) {
+            for (prop_name, expr) in properties {
+                if prop_name == "valid_to" {
+                    let val = eval_expr(expr, input_row);
+                    let vt_opt: Option<i64> = match &val {
+                        Value::Int(ms) => Some(*ms),
+                        Value::Timestamp(ms) => Some(*ms),
+                        Value::Null => None,
+                        other => {
+                            return Err(ExecutionError::Unsupported(format!(
+                                "label '{tlabel}' is TEMPORAL: valid_to must be INT, TIMESTAMP, \
+                                 or NULL, got {other:?}"
+                            )));
+                        }
+                    };
+                    if let Some(vt) = vt_opt {
+                        if vt <= vf {
+                            return Err(ExecutionError::Unsupported(format!(
+                                "label '{tlabel}' is TEMPORAL: valid_to ({vt}) must be strictly \
+                                 greater than valid_from ({vf})"
+                            )));
+                        }
+                    }
+                    break;
+                }
+            }
+
+            // Auto-populate `__ingestion_ts__` from current HLC commit time.
+            // The field is engine-owned, user-immutable, and lets bitemporal
+            // AS-OF queries resolve the system-time axis without an extra
+            // lookup. Microseconds (HLC native unit) — same precision as
+            // `current_hlc_us` used by the trigger machinery.
+            let ingestion_us = current_hlc_us() as i64;
+            let field_id = ctx.interner.intern("__ingestion_ts__");
+            record.set(field_id, Value::Int(ingestion_us));
+        }
+
+        let key =
+            coordinode_core::graph::node::node_write_key(ctx.shard_id, node_id, valid_from_for_key);
         let bytes = record
             .to_msgpack()
             .map_err(|e| ExecutionError::Serialization(format!("node serialization: {e}")))?;
@@ -6958,6 +7036,45 @@ fn execute_update(
     let skip_on_violation = matches!(violation_mode, ViolationMode::Skip);
 
     let mut results = Vec::new();
+
+    // R172b safe-reject for temporal nodes: SET on a temporal node would
+    // write through `encode_node_key` (16-byte form) and silently bypass
+    // the per-version 25-byte key the record actually lives under,
+    // corrupting the bitemporal storage layer. Look at every node variable
+    // touched by this SET clause and consult its bound `__label__` column
+    // (populated by MATCH / NodeScan). If any matched node belongs to a
+    // temporal label, reject the SET. Full per-version SET semantics
+    // (close-version via `SET n.valid_to = ...`, immutability of
+    // `valid_from`, per-version key write) lands in R172c.
+    for row in input_rows {
+        for item in items {
+            let var = match item {
+                crate::cypher::ast::SetItem::Property { variable, .. }
+                | crate::cypher::ast::SetItem::PropertyPath { variable, .. }
+                | crate::cypher::ast::SetItem::DocFunction { variable, .. }
+                | crate::cypher::ast::SetItem::ReplaceProperties { variable, .. }
+                | crate::cypher::ast::SetItem::MergeProperties { variable, .. }
+                | crate::cypher::ast::SetItem::AddLabel { variable, .. } => variable,
+            };
+            // Skip edge variables (Value::String binding); they have their
+            // own temporal handling in `update_edge_property`.
+            if !matches!(row.get(var), Some(Value::Int(_))) {
+                continue;
+            }
+            let Some(Value::String(primary)) = row.get(&format!("{var}.__label__")) else {
+                continue;
+            };
+            if let Ok(Some(s)) = ctx.load_current_label_schema(primary) {
+                if s.temporal {
+                    return Err(ExecutionError::Unsupported(format!(
+                        "SET on temporal label '{primary}' is not yet supported \
+                         (lands in R172c — per-version write executor). The current \
+                         R172b scope is CREATE + read on temporal labels only."
+                    )));
+                }
+            }
+        }
+    }
 
     // 'row_loop label: when violation_mode == Skip, `continue 'row_loop` silently
     // drops the row instead of propagating the schema error.
@@ -8012,6 +8129,35 @@ fn execute_delete(
     // processed exactly once per DELETE statement.
     let mut deleted_edges: std::collections::HashSet<(String, u64, u64)> =
         std::collections::HashSet::new();
+
+    // R172b safe-reject for temporal nodes: DELETE on a temporal node
+    // would call `mvcc_delete` on the 16-byte non-temporal key, silently
+    // missing the per-version 25-byte storage entry. Mirror of the SET
+    // guard in `execute_update`. Full per-version DELETE semantics
+    // (positive bitemporal fact tombstone per ADR-027, `WITH GDPR_ERASURE`
+    // hard-delete escape hatch) lands in R172c.
+    for row in input_rows {
+        for var in variables {
+            if !matches!(row.get(var), Some(Value::Int(_))) {
+                continue;
+            }
+            let Some(Value::String(primary)) = row.get(&format!("{var}.__label__")) else {
+                continue;
+            };
+            if let Ok(Some(s)) = ctx.load_current_label_schema(primary) {
+                if s.temporal {
+                    return Err(ExecutionError::Unsupported(format!(
+                        "DELETE on temporal label '{primary}' is not yet supported \
+                         (lands in R172c — per-version write executor with the \
+                         positive-bitemporal-fact tombstone model per ADR-027). \
+                         The current R172b scope is CREATE + read on temporal \
+                         labels only."
+                    )));
+                }
+            }
+        }
+    }
+
     for row in input_rows {
         for var in variables {
             // Edge variable bindings carry the edge type as a String value,
