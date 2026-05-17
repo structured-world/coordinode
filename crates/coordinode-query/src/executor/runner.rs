@@ -6760,6 +6760,24 @@ fn execute_create_edge(
             ctx.write_stats.properties_set += properties.len() as u64;
         }
 
+        // Fire BEFORE COMMIT CREATE triggers registered on this edge type.
+        // The trigger sees `$event = "CREATE"`, `$src` / `$tgt` as endpoint
+        // NodeIds, `$edge_type` as the type name, and `$after` as the edge
+        // property map.
+        let resolved_props: Vec<(String, Value)> = properties
+            .iter()
+            .map(|(name, expr)| (name.clone(), eval_expr(expr, row).map_to_document()))
+            .collect();
+        let trigger_params =
+            trigger_params_for_edge_create(edge_type, source_id, target_id, &resolved_props);
+        let target_segment =
+            coordinode_core::schema::triggers::TriggerTargetSchema::edge_type(edge_type)
+                .index_key_segment();
+        let matched = ctx.lookup_matching_triggers(&target_segment, "c")?;
+        if !matched.is_empty() {
+            fire_before_commit_triggers(&matched, &trigger_params, ctx)?;
+        }
+
         let mut out_row = row.clone();
         if let Some(ev) = edge_variable {
             out_row.insert(
@@ -6799,6 +6817,46 @@ fn execute_update(
     // drops the row instead of propagating the schema error.
     'row_loop: for row in input_rows {
         let mut out_row = row.clone();
+
+        // Snapshot the pre-mutation state of each node variable referenced
+        // by the SET items in this row, so we can fire UPDATE triggers
+        // with `$before` after all items apply. Edge variables (which
+        // bind to a String edge type, not a NodeId) are skipped — edge
+        // triggers will fire through a separate probe in the edge-update
+        // path once that wiring lands.
+        let mut update_snapshots: std::collections::HashMap<
+            NodeId,
+            (Vec<String>, std::collections::BTreeMap<String, Value>),
+        > = std::collections::HashMap::new();
+        for item in items {
+            let variable = match item {
+                crate::cypher::ast::SetItem::Property { variable, .. }
+                | crate::cypher::ast::SetItem::PropertyPath { variable, .. }
+                | crate::cypher::ast::SetItem::DocFunction { variable, .. }
+                | crate::cypher::ast::SetItem::ReplaceProperties { variable, .. }
+                | crate::cypher::ast::SetItem::MergeProperties { variable, .. }
+                | crate::cypher::ast::SetItem::AddLabel { variable, .. } => variable,
+            };
+            let node_id = match out_row.get(variable) {
+                Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+                _ => continue,
+            };
+            if update_snapshots.contains_key(&node_id) {
+                continue;
+            }
+            let key = encode_node_key(ctx.shard_id, node_id);
+            // Use schema_peek_node (the same delta-non-materialising read
+            // used by SET's own schema checks) to avoid consuming any
+            // pending merge_node_deltas from a preceding REMOVE clause in
+            // the same query. mvcc_get would materialise those deltas
+            // into the write buffer, and in legacy (no-oracle) mode
+            // mvcc_flush ignores the buffer — the deltas would be lost.
+            if let Some(bytes) = ctx.schema_peek_node(&key)? {
+                if let Ok(record) = NodeRecord::from_msgpack(&bytes) {
+                    update_snapshots.insert(node_id, snapshot_node_record(&record, ctx));
+                }
+            }
+        }
 
         for item in items {
             match item {
@@ -7440,6 +7498,44 @@ fn execute_update(
             }
         }
 
+        // After all SET items applied for this row, fire BEFORE COMMIT
+        // UPDATE triggers per touched node — once per node, not once per
+        // item.
+        //
+        // IMPORTANT: probe the trigger index BEFORE materialising the
+        // post-state via `mvcc_get`. The Node-partition mvcc_get has a
+        // side-effect (it materialises pending `merge_node_deltas` into
+        // the write buffer) which is harmless in MVCC mode but in legacy
+        // (no-oracle) mode loses the deltas — they would otherwise be
+        // re-applied by `mvcc_flush` as MERGE operands. Reading post-state
+        // only when at least one trigger matches keeps the happy path
+        // (no triggers registered) free of that side-effect.
+        for (node_id, (pre_labels, before_props)) in &update_snapshots {
+            let mut all_matched: Vec<coordinode_core::schema::triggers::TriggerSchema> = Vec::new();
+            for label in pre_labels {
+                let target_segment =
+                    coordinode_core::schema::triggers::TriggerTargetSchema::label(label.clone())
+                        .index_key_segment();
+                let matched = ctx.lookup_matching_triggers(&target_segment, "u")?;
+                all_matched.extend(matched);
+            }
+            if all_matched.is_empty() {
+                continue;
+            }
+
+            let key = encode_node_key(ctx.shard_id, *node_id);
+            let Some(post_bytes) = ctx.mvcc_get(Partition::Node, &key)? else {
+                continue;
+            };
+            let Ok(post_record) = NodeRecord::from_msgpack(&post_bytes) else {
+                continue;
+            };
+            let (_post_labels, after_props) = snapshot_node_record(&post_record, ctx);
+            let trigger_params =
+                trigger_params_for_node_update(*node_id, before_props, &after_props);
+            fire_before_commit_triggers(&all_matched, &trigger_params, ctx)?;
+        }
+
         results.push(out_row);
     }
 
@@ -7714,10 +7810,17 @@ fn execute_delete(
             }
 
             // Delete the node record.
-            // Notify all index registries (B-tree, vector, text) of deleted
-            // properties so their entries are cleaned up before the node is
-            // removed from primary storage.
+            // First snapshot the pre-mutation state so we can both clean up
+            // index entries AND build the `$before` map for any BEFORE
+            // COMMIT DELETE trigger that fires on the node's labels.
             let key = encode_node_key(ctx.shard_id, node_id);
+            let pre_snapshot: Option<(Vec<String>, std::collections::BTreeMap<String, Value>)> =
+                ctx.mvcc_get(Partition::Node, &key)?.and_then(|bytes| {
+                    NodeRecord::from_msgpack(&bytes)
+                        .ok()
+                        .map(|rec| snapshot_node_record(&rec, ctx))
+                });
+
             let needs_index_cleanup = ctx.btree_index_registry.is_some()
                 || ctx.vector_index_registry.is_some()
                 || ctx.text_index_registry.is_some();
@@ -7763,6 +7866,27 @@ fn execute_delete(
             }
             ctx.mvcc_delete(Partition::Node, &key)?;
             ctx.write_stats.nodes_deleted += 1;
+
+            // Fire BEFORE COMMIT DELETE triggers on each of the deleted
+            // node's labels. The probe runs AFTER mvcc_delete so the
+            // trigger body's MATCH against the deleted node returns
+            // empty via RYOW — correct semantics: the node is gone for
+            // any read inside the trigger. `$before` carries the
+            // snapshot taken above; `$after` is NULL.
+            if let Some((labels, before_props)) = pre_snapshot {
+                let trigger_params = trigger_params_for_node_delete(node_id, &before_props);
+                for label in &labels {
+                    let target_segment =
+                        coordinode_core::schema::triggers::TriggerTargetSchema::label(
+                            label.clone(),
+                        )
+                        .index_key_segment();
+                    let matched = ctx.lookup_matching_triggers(&target_segment, "d")?;
+                    if !matched.is_empty() {
+                        fire_before_commit_triggers(&matched, &trigger_params, ctx)?;
+                    }
+                }
+            }
         }
     }
 
@@ -10296,6 +10420,82 @@ fn trigger_params_for_node_create(
     params.insert("after".into(), Value::Map(after));
     params.insert("node".into(), Value::Int(node_id.as_raw() as i64));
     params
+}
+
+/// Build the parameter map for a node-DELETE trigger firing.
+/// `$event = "DELETE"`, `$before = props as Map`, `$after = NULL`,
+/// `$node = NodeId`.
+fn trigger_params_for_node_delete(
+    node_id: NodeId,
+    pre_props: &std::collections::BTreeMap<String, Value>,
+) -> std::collections::HashMap<String, Value> {
+    let mut params = std::collections::HashMap::with_capacity(4);
+    params.insert("event".into(), Value::String("DELETE".into()));
+    params.insert("before".into(), Value::Map(pre_props.clone()));
+    params.insert("after".into(), Value::Null);
+    params.insert("node".into(), Value::Int(node_id.as_raw() as i64));
+    params
+}
+
+/// Build the parameter map for an edge-CREATE trigger firing.
+/// `$event = "CREATE"`, `$before = NULL`, `$after = props as Map`,
+/// `$src` / `$tgt` = endpoint NodeIds, `$edge_type` = edge type name.
+fn trigger_params_for_edge_create(
+    edge_type: &str,
+    source_id: NodeId,
+    target_id: NodeId,
+    props: &[(String, Value)],
+) -> std::collections::HashMap<String, Value> {
+    let mut after: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    for (k, v) in props {
+        after.insert(k.clone(), v.clone());
+    }
+    let mut params = std::collections::HashMap::with_capacity(6);
+    params.insert("event".into(), Value::String("CREATE".into()));
+    params.insert("before".into(), Value::Null);
+    params.insert("after".into(), Value::Map(after));
+    params.insert("src".into(), Value::Int(source_id.as_raw() as i64));
+    params.insert("tgt".into(), Value::Int(target_id.as_raw() as i64));
+    params.insert("edge_type".into(), Value::String(edge_type.to_string()));
+    params
+}
+
+/// Build the parameter map for a node-UPDATE trigger firing.
+/// `$event = "UPDATE"`, `$before = pre-mutation props`,
+/// `$after = post-mutation props`, `$node = NodeId`.
+fn trigger_params_for_node_update(
+    node_id: NodeId,
+    before_props: &std::collections::BTreeMap<String, Value>,
+    after_props: &std::collections::BTreeMap<String, Value>,
+) -> std::collections::HashMap<String, Value> {
+    let mut params = std::collections::HashMap::with_capacity(4);
+    params.insert("event".into(), Value::String("UPDATE".into()));
+    params.insert("before".into(), Value::Map(before_props.clone()));
+    params.insert("after".into(), Value::Map(after_props.clone()));
+    params.insert("node".into(), Value::Int(node_id.as_raw() as i64));
+    params
+}
+
+/// Extract `(labels, props_map)` from a NodeRecord using the interner to
+/// resolve field IDs to property names. Used when building trigger
+/// parameter snapshots for UPDATE / DELETE events.
+fn snapshot_node_record(
+    record: &NodeRecord,
+    ctx: &ExecutionContext<'_>,
+) -> (Vec<String>, std::collections::BTreeMap<String, Value>) {
+    let labels = record.labels.clone();
+    let mut props: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    for (&field_id, value) in &record.props {
+        if let Some(name) = ctx.interner.resolve(field_id) {
+            props.insert(name.to_string(), value.clone());
+        }
+    }
+    if let Some(extra) = &record.extra {
+        for (name, value) in extra {
+            props.insert(name.clone(), value.clone());
+        }
+    }
+    (labels, props)
 }
 
 /// Execute CREATE TEXT INDEX: creates a text index definition and registers it.
