@@ -1199,13 +1199,34 @@ impl<'a> ExecutionContext<'a> {
     /// pending adds/removes from this transaction's merge buffer
     /// (read-your-own-writes).
     pub fn adj_get(&self, adj_key: &[u8]) -> Result<Option<PostingList>, ExecutionError> {
-        // Read base posting list from storage (raw key, merge-resolved).
-        // When adj_snapshot is set (AS OF TIMESTAMP), read through the snapshot
-        // so merge operands written after the snapshot are invisible.
-        let raw = if let Some(snap) = &self.adj_snapshot {
-            self.engine.snapshot_get(snap, Partition::Adj, adj_key)?
-        } else {
-            self.engine.get(Partition::Adj, adj_key)?
+        // RYOW for buffered tombstones / puts on the adj key. When a prior
+        // operation in this transaction wrote (`mvcc_put`) or deleted
+        // (`mvcc_delete`) the same adj key, the buffered effect must win over
+        // the on-disk base — otherwise reads return stale data and a
+        // transaction abort would leave partial mutations applied.
+        let buf_key = (Partition::Adj, adj_key.to_vec());
+        let buffered = self.mvcc_write_buffer.get(&buf_key);
+
+        let raw = match buffered {
+            // Buffered tombstone wins over on-disk state. Merge operands
+            // accumulated AFTER the tombstone still apply (start from empty).
+            Some(None) => None,
+            Some(Some(bytes)) => Some(bytes.clone()),
+            None => {
+                // No buffered overlay — read base posting list from storage.
+                // When adj_snapshot is set (AS OF TIMESTAMP), read through the
+                // snapshot so merge operands written after the snapshot are
+                // invisible.
+                if let Some(snap) = &self.adj_snapshot {
+                    self.engine
+                        .snapshot_get(snap, Partition::Adj, adj_key)?
+                        .map(|b| b.to_vec())
+                } else {
+                    self.engine
+                        .get(Partition::Adj, adj_key)?
+                        .map(|b| b.to_vec())
+                }
+            }
         };
         let mut plist = match raw {
             Some(bytes) => PostingList::from_bytes(&bytes)
@@ -2198,6 +2219,30 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 transfer.as_ref(),
                 *on_conflict_replace,
                 *on_remaining_fail,
+                ctx,
+            )
+        }
+
+        LogicalOp::MergeNodes {
+            input,
+            source_a,
+            source_b,
+            target,
+            conflict,
+            transfer_edges,
+            duplicate,
+            transfer_edge_properties,
+        } => {
+            let input_rows = execute_op(input, ctx)?;
+            execute_merge_nodes(
+                &input_rows,
+                source_a,
+                source_b,
+                target,
+                conflict,
+                transfer_edges.as_ref(),
+                duplicate,
+                *transfer_edge_properties,
                 ctx,
             )
         }
@@ -7491,6 +7536,797 @@ fn execute_delete(
 
     // DELETE returns the input rows (so downstream RETURN can reference them)
     Ok(input_rows.to_vec())
+}
+
+// =====================================================================
+// MERGE NODES (R180)
+// =====================================================================
+
+/// Execute a `MERGE NODES (a, b) INTO target` clause for each input row.
+///
+/// Collapses the non-surviving source into the surviving target within a
+/// single MVCC transaction. See arch/compatibility/native-procedures.md for
+/// the full semantic contract.
+#[allow(clippy::too_many_arguments)]
+fn execute_merge_nodes(
+    input_rows: &[Row],
+    source_a: &str,
+    source_b: &str,
+    target: &str,
+    conflict: &crate::cypher::ast::MergeNodesConflictStrategy,
+    transfer_edges: Option<&crate::cypher::ast::TransferEdgesEndpoints>,
+    duplicate: &crate::cypher::ast::MergeNodesDuplicateStrategy,
+    transfer_edge_properties: bool,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    // Semantic validation deferred to here so we have a concrete error path
+    // when the planner skipped it (e.g. direct LogicalOp construction in tests).
+    if target != source_a && target != source_b {
+        return Err(ExecutionError::Unsupported(format!(
+            "MERGE NODES target `{target}` must be one of `{source_a}`, `{source_b}`"
+        )));
+    }
+    if let Some(t) = transfer_edges {
+        if t.dst != target {
+            return Err(ExecutionError::Unsupported(format!(
+                "TRANSFER EDGES TO `{}` must match INTO target `{target}`",
+                t.dst
+            )));
+        }
+        let expected_src = if target == source_a {
+            source_b
+        } else {
+            source_a
+        };
+        if t.src != expected_src {
+            return Err(ExecutionError::Unsupported(format!(
+                "TRANSFER EDGES FROM `{}` must be the non-surviving source `{expected_src}`",
+                t.src
+            )));
+        }
+    }
+
+    let mut out = Vec::with_capacity(input_rows.len());
+
+    for row in input_rows {
+        let a_id = match row.get(source_a) {
+            Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+            _ => continue,
+        };
+        let b_id = match row.get(source_b) {
+            Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+            _ => continue,
+        };
+
+        let (target_id, source_id) = if target == source_a {
+            (a_id, b_id)
+        } else {
+            (b_id, a_id)
+        };
+
+        // Idempotent no-op: same node on both sides (already merged previously).
+        if target_id == source_id {
+            out.push(row.clone());
+            continue;
+        }
+
+        let target_key = encode_node_key(ctx.shard_id, target_id);
+        let source_key = encode_node_key(ctx.shard_id, source_id);
+
+        // Source missing → no-op (idempotent: already merged in a prior attempt).
+        let source_bytes = match ctx.mvcc_get(Partition::Node, &source_key)? {
+            Some(b) => b,
+            None => {
+                out.push(row.clone());
+                continue;
+            }
+        };
+        // Target missing → hard error (the surviving node must exist).
+        let target_bytes = ctx.mvcc_get(Partition::Node, &target_key)?.ok_or_else(|| {
+            ExecutionError::Unsupported(format!("MERGE NODES target node {target_id} not found"))
+        })?;
+
+        let mut target_rec = NodeRecord::from_msgpack(&target_bytes)
+            .map_err(|e| ExecutionError::Serialization(format!("target decode: {e}")))?;
+        let source_rec = NodeRecord::from_msgpack(&source_bytes)
+            .map_err(|e| ExecutionError::Serialization(format!("source decode: {e}")))?;
+
+        // Capture target's properties BEFORE merge so we can issue per-property
+        // index notifications afterwards (delete-old / insert-new).
+        let target_props_before = target_rec.props.clone();
+        let target_label = target_rec.primary_label().to_string();
+
+        merge_node_properties(&mut target_rec, &source_rec, conflict, row, ctx)?;
+
+        // STRICT / VALIDATED schema enforcement: a merged record may carry
+        // properties that the target's label doesn't accept (source-only
+        // declared props, type mismatches). Reject before mutating storage —
+        // otherwise the merge would commit invalid records that violate the
+        // schema contract.
+        if let Some(schema) = ctx.load_current_label_schema(&target_label)? {
+            for (&field_id, val) in &target_rec.props {
+                let Some(prop_name) = ctx.interner.resolve(field_id) else {
+                    continue;
+                };
+                let prop_name = prop_name.to_string();
+                // Skip properties that already existed on target before the
+                // merge — they were valid then, still valid now.
+                if target_props_before.get(&field_id) == Some(val) {
+                    continue;
+                }
+                match schema.mode {
+                    SchemaMode::Strict => match schema.get_property(&prop_name) {
+                        None => {
+                            return Err(ExecutionError::SchemaViolation(format!(
+                                "MERGE NODES would set unknown property '{prop_name}' \
+                                 on strict label '{target_label}'"
+                            )));
+                        }
+                        Some(def) if def.is_computed() => {
+                            return Err(ExecutionError::SchemaViolation(format!(
+                                "MERGE NODES cannot SET computed property '{prop_name}' \
+                                 on label '{target_label}'"
+                            )));
+                        }
+                        Some(def) => {
+                            validate_one(&prop_name, val, def)
+                                .map_err(|e| ExecutionError::SchemaViolation(e.to_string()))?;
+                        }
+                    },
+                    SchemaMode::Validated => {
+                        if let Some(def) = schema.get_property(&prop_name) {
+                            if def.is_computed() {
+                                return Err(ExecutionError::SchemaViolation(format!(
+                                    "MERGE NODES cannot SET computed property '{prop_name}' \
+                                     on label '{target_label}'"
+                                )));
+                            }
+                            validate_one(&prop_name, val, def)
+                                .map_err(|e| ExecutionError::SchemaViolation(e.to_string()))?;
+                        }
+                    }
+                    SchemaMode::Flexible => {}
+                }
+            }
+        }
+
+        // Edge transfer first — needs source's adj entries intact.
+        if transfer_edges.is_some() {
+            transfer_node_edges(
+                source_id,
+                target_id,
+                duplicate,
+                transfer_edge_properties,
+                ctx,
+            )?;
+        }
+
+        // Delete source SECOND, before issuing target's index updates. Unique
+        // B-tree indexes on shared properties would otherwise reject the
+        // target's new value because the source still holds the old key.
+        detach_delete_node(source_id, ctx)?;
+
+        // Now safe to register target's merged property changes with the
+        // index registries — any colliding source entries are gone.
+        notify_indexes_for_target_change(
+            target_id,
+            &target_label,
+            &target_props_before,
+            &target_rec.props,
+            ctx,
+        )?;
+
+        // Persist merged target record.
+        let new_bytes = target_rec
+            .to_msgpack()
+            .map_err(|e| ExecutionError::Serialization(format!("target encode: {e}")))?;
+        ctx.mvcc_put(Partition::Node, &target_key, &new_bytes)?;
+        ctx.write_stats.properties_set += 1;
+
+        // Refresh the row's pre-bound property columns for the target variable
+        // so downstream RETURN / WITH / WHERE expressions see merged values
+        // without having to re-read storage. Property access in the executor
+        // is row-column-first.
+        let target_var = target;
+        let mut row_with_refresh = row.clone();
+        // Remove all stale columns for the target var first (handles drops via
+        // ON CONFLICT SET — currently impossible, but defensive).
+        let stale_keys: Vec<String> = row_with_refresh
+            .iter()
+            .filter(|(k, _)| k.starts_with(&format!("{target_var}.")))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in stale_keys {
+            row_with_refresh.remove(&k);
+        }
+        for (&field_id, value) in &target_rec.props {
+            if let Some(field_name) = ctx.interner.resolve(field_id) {
+                row_with_refresh.insert(format!("{target_var}.{field_name}"), value.clone());
+            }
+        }
+        if let Some(extra) = &target_rec.extra {
+            for (name, value) in extra {
+                row_with_refresh.insert(format!("{target_var}.{name}"), value.clone());
+            }
+        }
+        row_with_refresh.insert(
+            format!("{target_var}.__label__"),
+            Value::String(target_label.clone()),
+        );
+
+        // The non-surviving variable's columns refer to a deleted node — drop
+        // them so RETURN/WITH/WHERE never resolve them to stale values.
+        let source_var = if target == source_a {
+            source_b
+        } else {
+            source_a
+        };
+        let drop_keys: Vec<String> = row_with_refresh
+            .iter()
+            .filter(|(k, _)| k == &source_var || k.starts_with(&format!("{source_var}.")))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in drop_keys {
+            row_with_refresh.remove(&k);
+        }
+
+        out.push(row_with_refresh);
+    }
+
+    Ok(out)
+}
+
+/// Merge `source.props` into `target.props` per the chosen conflict strategy.
+/// `extra` overflow maps are merged with the same policy.
+fn merge_node_properties(
+    target: &mut NodeRecord,
+    source: &NodeRecord,
+    conflict: &crate::cypher::ast::MergeNodesConflictStrategy,
+    row: &Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    use crate::cypher::ast::MergeNodesConflictStrategy as S;
+    match conflict {
+        S::KeepFirst => {
+            // Target wins on collision; source fills only missing keys.
+            for (k, v) in &source.props {
+                target.props.entry(*k).or_insert_with(|| v.clone());
+            }
+            if let Some(src_extra) = &source.extra {
+                let tgt_extra = target.extra.get_or_insert_with(HashMap::new);
+                for (k, v) in src_extra {
+                    tgt_extra.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
+        S::KeepLast => {
+            for (k, v) in &source.props {
+                target.props.insert(*k, v.clone());
+            }
+            if let Some(src_extra) = &source.extra {
+                let tgt_extra = target.extra.get_or_insert_with(HashMap::new);
+                for (k, v) in src_extra {
+                    tgt_extra.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        S::Coalesce => {
+            // Non-null source fills nulls on target (or missing keys).
+            for (k, v) in &source.props {
+                let existing = target.props.get(k);
+                let target_is_null_or_missing = matches!(existing, None | Some(Value::Null));
+                if target_is_null_or_missing && !matches!(v, Value::Null) {
+                    target.props.insert(*k, v.clone());
+                }
+            }
+            if let Some(src_extra) = &source.extra {
+                let tgt_extra = target.extra.get_or_insert_with(HashMap::new);
+                for (k, v) in src_extra {
+                    let existing = tgt_extra.get(k);
+                    let null_or_missing = matches!(existing, None | Some(Value::Null));
+                    if null_or_missing && !matches!(v, Value::Null) {
+                        tgt_extra.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        S::SetExpressions(items) => {
+            // SET expressions are evaluated against the input row, which already
+            // binds both source variable names → node ids. The SET items target
+            // the surviving node's variable; we apply each one to `target` here.
+            for item in items {
+                apply_merge_nodes_set_item(target, item, row, ctx)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply a single `SET` item against an in-memory `NodeRecord` during MERGE NODES.
+///
+/// This is a thin wrapper that evaluates the expression value against the input
+/// row and writes it into `target.props` (resolving the property name via the
+/// field interner). Unlike `execute_update`, no schema enforcement runs here:
+/// MERGE NODES consolidates already-present data, so we trust the user-supplied
+/// strategy — explicit downstream SET clauses still go through `execute_update`.
+fn apply_merge_nodes_set_item(
+    target: &mut NodeRecord,
+    item: &crate::cypher::ast::SetItem,
+    row: &Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    use crate::cypher::ast::SetItem;
+    match item {
+        SetItem::Property { property, expr, .. } => {
+            let val = eval_expr(expr, row).map_to_document();
+            let field_id = ctx.interner.intern(property);
+            target.set(field_id, val);
+        }
+        SetItem::PropertyPath { path, expr, .. } => {
+            // Nested path SET: walk into `extra` (top-level path segment as
+            // string key), creating a document along the way. For first
+            // implementation, only support single-segment paths via the
+            // declared props path. Multi-segment paths fall through to extra
+            // with a dotted string key — matches existing executor behavior.
+            let val = eval_expr(expr, row).map_to_document();
+            if path.len() == 1 {
+                let field_id = ctx.interner.intern(&path[0]);
+                target.set(field_id, val);
+            } else {
+                target.set_extra(path.join("."), val);
+            }
+        }
+        SetItem::AddLabel { label, .. } => {
+            target.add_label(label.clone());
+        }
+        SetItem::MergeProperties { .. }
+        | SetItem::ReplaceProperties { .. }
+        | SetItem::DocFunction { .. } => {
+            return Err(ExecutionError::Unsupported(
+                "bulk map assignment (n = {..} / n += {..}) and document mutation \
+                 functions (doc_push/doc_pull/...) are not supported inside \
+                 MERGE NODES ON CONFLICT SET — express per-property: a.prop = expr"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Propagate property-level changes on the surviving target node to every
+/// index registry (B-tree / vector / text). Treats added/replaced properties
+/// as `delete(old) + insert(new)` so unique constraints, vector neighbour
+/// lists, and inverted indexes stay in sync.
+///
+/// `old` is the property map snapshotted BEFORE the merge; `new` is the same
+/// map after `merge_node_properties` ran. Properties that were dropped
+/// entirely (which the current merge strategies don't produce, but we handle
+/// for completeness) emit a delete with no follow-up insert.
+fn notify_indexes_for_target_change(
+    target_id: NodeId,
+    label: &str,
+    old: &HashMap<u32, Value>,
+    new: &HashMap<u32, Value>,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    // Collect old entries that changed/disappeared, and the full new set
+    // (insert is idempotent on the registries — re-inserting an unchanged
+    // value is a no-op cost-wise but no-harm semantically).
+    for (field_id, old_val) in old {
+        let unchanged = new.get(field_id) == Some(old_val);
+        if unchanged {
+            continue;
+        }
+        let Some(name) = ctx.interner.resolve(*field_id) else {
+            continue;
+        };
+        let name = name.to_string();
+        if let Some(btree_reg) = ctx.btree_index_registry {
+            btree_reg
+                .on_node_deleted(
+                    ctx.engine,
+                    target_id,
+                    label,
+                    &[(name.clone(), old_val.clone())],
+                )
+                .map_err(ExecutionError::Storage)?;
+        }
+        if let Some(registry) = ctx.vector_index_registry {
+            if try_extract_vector(old_val).is_some() {
+                registry.on_vector_deleted(label, target_id, &name);
+            }
+        }
+        if let Some(registry) = ctx.text_index_registry {
+            if old_val.as_str().is_some() {
+                registry.on_text_deleted(label, target_id, &name);
+            }
+        }
+    }
+    for (field_id, new_val) in new {
+        let unchanged = old.get(field_id) == Some(new_val);
+        if unchanged {
+            continue;
+        }
+        let Some(name) = ctx.interner.resolve(*field_id) else {
+            continue;
+        };
+        let name = name.to_string();
+        if let Some(btree_reg) = ctx.btree_index_registry {
+            btree_reg
+                .on_node_created(
+                    ctx.engine,
+                    target_id,
+                    label,
+                    &[(name.clone(), new_val.clone())],
+                )
+                .map_err(|v| {
+                    ExecutionError::Conflict(format!(
+                        "MERGE NODES would violate unique constraint on `{}`: \
+                         property `{}` already has value {:?}",
+                        v.index_name, v.property, v.value
+                    ))
+                })?;
+        }
+        if let Some(registry) = ctx.vector_index_registry {
+            if let Some(vec_data) = try_extract_vector(new_val) {
+                registry.on_vector_written(label, target_id, &name, &vec_data);
+            }
+        }
+        if let Some(registry) = ctx.text_index_registry {
+            if let Some(text) = new_val.as_str() {
+                registry.on_text_written(label, target_id, &name, text);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Transfer every edge of `source_id` onto `target_id`.
+///
+/// For each registered edge type, re-points both outgoing and incoming posting
+/// lists via merge operators (conflict-free with concurrent writes). When the
+/// edge has properties, the edgeprop record is renamed by writing the new key
+/// and deleting the old one. Duplicate edges (target↔peer already present) are
+/// handled per `duplicate`.
+fn transfer_node_edges(
+    source_id: NodeId,
+    target_id: NodeId,
+    duplicate: &crate::cypher::ast::MergeNodesDuplicateStrategy,
+    transfer_edge_properties: bool,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    use crate::cypher::ast::MergeNodesDuplicateStrategy as D;
+
+    let edge_types = ctx.list_edge_types()?;
+    for edge_type in &edge_types {
+        let temporal = lookup_edge_type_temporal(edge_type, ctx)?;
+        for direction in [AdjDirection::Out, AdjDirection::In] {
+            let source_adj = match direction {
+                AdjDirection::Out => encode_adj_key_forward(edge_type, source_id),
+                AdjDirection::In => encode_adj_key_reverse(edge_type, source_id),
+            };
+            let Some(plist) = ctx.adj_get(&source_adj)? else {
+                continue;
+            };
+
+            // Snapshot peers — iterating the live posting list while issuing
+            // merge_remove on it during the loop would be safe (deferred) but
+            // collecting up-front keeps the loop body simpler.
+            let peers: Vec<u64> = plist.iter().collect();
+            let target_adj = match direction {
+                AdjDirection::Out => encode_adj_key_forward(edge_type, target_id),
+                AdjDirection::In => encode_adj_key_reverse(edge_type, target_id),
+            };
+            let target_plist = ctx.adj_get(&target_adj)?;
+
+            for peer_uid in peers {
+                let mut peer_id = NodeId::from_raw(peer_uid);
+                // Self-loop b→b becomes target→target.
+                if peer_id == source_id {
+                    peer_id = target_id;
+                }
+
+                let already_on_target = target_plist
+                    .as_ref()
+                    .is_some_and(|p| p.iter().any(|u| u == peer_id.as_raw()));
+
+                // Edge endpoints in the canonical (src, tgt) order used by edgeprop.
+                let (old_src, old_tgt) = match direction {
+                    AdjDirection::Out => (source_id, NodeId::from_raw(peer_uid)),
+                    AdjDirection::In => (NodeId::from_raw(peer_uid), source_id),
+                };
+                let (new_src, new_tgt) = match direction {
+                    AdjDirection::Out => (target_id, peer_id),
+                    AdjDirection::In => (peer_id, target_id),
+                };
+
+                let is_duplicate = already_on_target;
+                let keep_old_edge = matches!(duplicate, D::KeepTarget) && is_duplicate;
+
+                if keep_old_edge {
+                    // Drop the source-side edge entirely (no transfer).
+                    // Remove from source's posting list + counterpart, and
+                    // delete edgeprop for the old endpoints.
+                    let counterpart_key = match direction {
+                        AdjDirection::Out => {
+                            encode_adj_key_reverse(edge_type, NodeId::from_raw(peer_uid))
+                        }
+                        AdjDirection::In => {
+                            encode_adj_key_forward(edge_type, NodeId::from_raw(peer_uid))
+                        }
+                    };
+                    ctx.adj_merge_remove(&counterpart_key, source_id.as_raw());
+                    delete_edgeprop_for_pair(edge_type, old_src, old_tgt, temporal, ctx)?;
+                    ctx.write_stats.edges_deleted += 1;
+                    continue;
+                }
+
+                // Re-point this edge.
+                // 1. Adjacency rewrite: remove source from posting lists; add target.
+                let source_counterpart = match direction {
+                    AdjDirection::Out => {
+                        encode_adj_key_reverse(edge_type, NodeId::from_raw(peer_uid))
+                    }
+                    AdjDirection::In => {
+                        encode_adj_key_forward(edge_type, NodeId::from_raw(peer_uid))
+                    }
+                };
+                ctx.adj_merge_remove(&source_counterpart, source_id.as_raw());
+
+                let target_counterpart = match direction {
+                    AdjDirection::Out => encode_adj_key_reverse(edge_type, peer_id),
+                    AdjDirection::In => encode_adj_key_forward(edge_type, peer_id),
+                };
+                // For KeepBoth duplicate strategy: add even if duplicate (parallel edge).
+                // For MergeProperties/KeepTarget where edge persists, also add — uniqueness
+                // is enforced by posting list de-dup on the key value.
+                ctx.adj_merge_add(&target_counterpart, target_id.as_raw());
+
+                // Target's own posting list also has to learn about the new
+                // peer (otherwise traversals starting from target won't see it
+                // — only inverse traversals would). The source's own posting
+                // list is deleted wholesale after the peer loop completes.
+                let target_own_side = match direction {
+                    AdjDirection::Out => encode_adj_key_forward(edge_type, target_id),
+                    AdjDirection::In => encode_adj_key_reverse(edge_type, target_id),
+                };
+                ctx.adj_merge_add(&target_own_side, peer_id.as_raw());
+
+                // 2. Edge-property transfer. Per spec, edge properties always
+                // move with the edge; `transfer_edge_properties` is a redundant
+                // syntactic ack. The flag is consulted only so future opt-out
+                // policies can be encoded without re-shaping the call site.
+                let _ = transfer_edge_properties;
+                transfer_edgeprop_record(
+                    edge_type,
+                    old_src,
+                    old_tgt,
+                    new_src,
+                    new_tgt,
+                    temporal,
+                    is_duplicate && matches!(duplicate, D::MergeProperties),
+                    ctx,
+                )?;
+                // For non-duplicate transfers, edge count is preserved
+                // (one source-side edge becomes one target-side edge).
+                // For duplicate with MergeProperties, source-side edge is
+                // collapsed onto target → count drops by one.
+                if is_duplicate && matches!(duplicate, D::MergeProperties) {
+                    ctx.write_stats.edges_deleted += 1;
+                }
+            }
+
+            // Drop the source-side posting list — every entry was either
+            // re-pointed onto target or dropped per KEEP_TARGET. Goes through
+            // the MVCC buffer so that an error later in the merge (STRICT
+            // schema violation on the next input row, OCC conflict on flush,
+            // etc.) rolls back this drop together with all other writes.
+            ctx.mvcc_delete(Partition::Adj, &source_adj)?;
+        }
+    }
+    Ok(())
+}
+
+/// Move the edge-property record for an edge from `(old_src, old_tgt)` to `(new_src, new_tgt)`.
+///
+/// When `merge_with_existing` is true, the source-side edgeprop is merged into
+/// any existing target-side record using COALESCE semantics (non-null source
+/// fills null target), then deleted.
+#[allow(clippy::too_many_arguments)]
+fn transfer_edgeprop_record(
+    edge_type: &str,
+    old_src: NodeId,
+    old_tgt: NodeId,
+    new_src: NodeId,
+    new_tgt: NodeId,
+    temporal: bool,
+    merge_with_existing: bool,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    if temporal {
+        // Temporal edge type: prefix-scan every version, copy, then delete.
+        let old_prefix = temporal_edgeprop_pair_prefix(edge_type, old_src, old_tgt);
+        let versions = ctx.mvcc_prefix_scan(Partition::EdgeProp, &old_prefix)?;
+        for (old_key, bytes) in versions {
+            // Suffix after pair prefix encodes the version timestamp; preserve it.
+            let suffix = &old_key[old_prefix.len()..];
+            let mut new_key = temporal_edgeprop_pair_prefix(edge_type, new_src, new_tgt);
+            new_key.extend_from_slice(suffix);
+            // Skip if a record with the new key already exists — temporal
+            // duplicates at the same version-ts collapse to the existing one.
+            if ctx.mvcc_get(Partition::EdgeProp, &new_key)?.is_none() {
+                ctx.mvcc_put(Partition::EdgeProp, &new_key, &bytes)?;
+            }
+            ctx.mvcc_delete(Partition::EdgeProp, &old_key)?;
+        }
+        return Ok(());
+    }
+
+    let old_key = encode_edgeprop_key(edge_type, old_src, old_tgt);
+    let new_key = encode_edgeprop_key(edge_type, new_src, new_tgt);
+
+    let Some(old_bytes) = ctx.mvcc_get(Partition::EdgeProp, &old_key)? else {
+        return Ok(());
+    };
+
+    if merge_with_existing {
+        if let Some(existing) = ctx.mvcc_get(Partition::EdgeProp, &new_key)? {
+            // Edgeprop records are encoded as `Vec<(u32, Value)>` of interned
+            // (field_id, value) pairs — NOT NodeRecord. Decode both, COALESCE
+            // (non-null source fills missing/null target keys), re-encode.
+            let mut tgt: Vec<(u32, Value)> = rmp_serde::from_slice(&existing)
+                .map_err(|e| ExecutionError::Serialization(format!("edgeprop decode: {e}")))?;
+            let src: Vec<(u32, Value)> = rmp_serde::from_slice(&old_bytes)
+                .map_err(|e| ExecutionError::Serialization(format!("edgeprop decode: {e}")))?;
+            let mut tgt_index: HashMap<u32, usize> =
+                tgt.iter().enumerate().map(|(i, (k, _))| (*k, i)).collect();
+            for (k, v) in src {
+                if matches!(v, Value::Null) {
+                    continue;
+                }
+                match tgt_index.get(&k) {
+                    Some(&idx) => {
+                        if matches!(tgt[idx].1, Value::Null) {
+                            tgt[idx].1 = v;
+                        }
+                    }
+                    None => {
+                        tgt_index.insert(k, tgt.len());
+                        tgt.push((k, v));
+                    }
+                }
+            }
+            let bytes = rmp_serde::to_vec(&tgt)
+                .map_err(|e| ExecutionError::Serialization(format!("edgeprop encode: {e}")))?;
+            ctx.mvcc_put(Partition::EdgeProp, &new_key, &bytes)?;
+            ctx.mvcc_delete(Partition::EdgeProp, &old_key)?;
+            return Ok(());
+        }
+    }
+
+    // No collision (or merge not requested): simple rename.
+    ctx.mvcc_put(Partition::EdgeProp, &new_key, &old_bytes)?;
+    ctx.mvcc_delete(Partition::EdgeProp, &old_key)?;
+    Ok(())
+}
+
+/// Delete every edgeprop entry for an edge — single key (non-temporal) or
+/// prefix-scan (temporal).
+fn delete_edgeprop_for_pair(
+    edge_type: &str,
+    src: NodeId,
+    tgt: NodeId,
+    temporal: bool,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    if temporal {
+        let prefix = temporal_edgeprop_pair_prefix(edge_type, src, tgt);
+        let versions = ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)?;
+        for (k, _) in versions {
+            ctx.mvcc_delete(Partition::EdgeProp, &k)?;
+        }
+    } else {
+        let key = encode_edgeprop_key(edge_type, src, tgt);
+        ctx.mvcc_delete(Partition::EdgeProp, &key)?;
+    }
+    Ok(())
+}
+
+/// Hard-delete a node and all of its remaining adjacency entries.
+///
+/// Called from `execute_merge_nodes` after edge transfer (or directly when
+/// `TRANSFER EDGES` was omitted, in which case all of the source's edges are
+/// dropped). Mirrors the DETACH branch of `execute_delete`.
+fn detach_delete_node(
+    node_id: NodeId,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    // Notify all index registries (B-tree, vector, text) of the soon-to-be-deleted
+    // properties so their entries are cleaned up before primary storage drops
+    // the node. Without this, indexes leak: unique constraints would still
+    // reject re-creation with the same value, vector/text searches would
+    // return stale UIDs.
+    let node_key = encode_node_key(ctx.shard_id, node_id);
+    if let Some(node_bytes) = ctx.mvcc_get(Partition::Node, &node_key)? {
+        if let Ok(record) = NodeRecord::from_msgpack(&node_bytes) {
+            let label = record.primary_label().to_string();
+            if let Some(btree_reg) = ctx.btree_index_registry {
+                let props: Vec<(String, Value)> = record
+                    .props
+                    .iter()
+                    .filter_map(|(&field_id, value)| {
+                        ctx.interner
+                            .resolve(field_id)
+                            .map(|name| (name.to_string(), value.clone()))
+                    })
+                    .collect();
+                btree_reg
+                    .on_node_deleted(ctx.engine, node_id, &label, &props)
+                    .map_err(ExecutionError::Storage)?;
+            }
+            for (&field_id, value) in &record.props {
+                if let Some(prop_name) = ctx.interner.resolve(field_id) {
+                    if let Some(registry) = ctx.vector_index_registry {
+                        if try_extract_vector(value).is_some() {
+                            registry.on_vector_deleted(&label, node_id, prop_name);
+                        }
+                    }
+                    if let Some(registry) = ctx.text_index_registry {
+                        if value.as_str().is_some() {
+                            registry.on_text_deleted(&label, node_id, prop_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let edge_types = ctx.list_edge_types()?;
+    let mut adj_keys = Vec::new();
+    for edge_type in &edge_types {
+        for adj_key in [
+            encode_adj_key_forward(edge_type, node_id),
+            encode_adj_key_reverse(edge_type, node_id),
+        ] {
+            if ctx.adj_get(&adj_key)?.is_some() {
+                adj_keys.push(adj_key);
+            }
+        }
+    }
+    for edge_key in &adj_keys {
+        if let Some(parts) = decode_adj_key(edge_key) {
+            if let Some(plist) = ctx.adj_get(edge_key)? {
+                let temporal = lookup_edge_type_temporal(&parts.edge_type, ctx)?;
+                for peer_uid in plist.iter() {
+                    let peer_id = NodeId::from_raw(peer_uid);
+                    let counterpart_key = match parts.direction {
+                        AdjDirection::Out => encode_adj_key_reverse(&parts.edge_type, peer_id),
+                        AdjDirection::In => encode_adj_key_forward(&parts.edge_type, peer_id),
+                    };
+                    ctx.adj_merge_remove(&counterpart_key, node_id.as_raw());
+
+                    let (ep_src, ep_tgt) = match parts.direction {
+                        AdjDirection::Out => (node_id, peer_id),
+                        AdjDirection::In => (peer_id, node_id),
+                    };
+                    delete_edgeprop_for_pair(&parts.edge_type, ep_src, ep_tgt, temporal, ctx)?;
+                }
+            }
+        }
+        // MVCC-buffered delete: rolled back atomically with the surrounding
+        // transaction on any later error.
+        ctx.mvcc_delete(Partition::Adj, edge_key)?;
+        ctx.write_stats.edges_deleted += 1;
+    }
+    for edge_key in &adj_keys {
+        ctx.merge_adj_adds.remove(edge_key);
+        ctx.merge_adj_removes.remove(edge_key);
+    }
+    // node_key already computed at the top of this function for the index
+    // cleanup pass; reuse it to drop the primary node record.
+    ctx.mvcc_delete(Partition::Node, &node_key)?;
+    ctx.write_stats.nodes_deleted += 1;
+    Ok(())
 }
 
 // =====================================================================

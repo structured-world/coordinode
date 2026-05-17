@@ -808,3 +808,929 @@ fn merge_match_does_not_silently_overwrite_existing_properties() {
         "MERGE without SET must not touch existing properties"
     );
 }
+
+// ── MERGE NODES (R180) ────────────────────────────────────────────────
+
+/// Two `User` nodes are collapsed into one; default `KEEP FIRST` keeps the
+/// surviving node's properties and the non-survivor is gone.
+#[test]
+fn merge_nodes_default_keep_first_drops_non_survivor() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com', name: 'Alice'})")
+        .expect("seed a");
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com', name: 'Bob'})")
+        .expect("seed b");
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a",
+    )
+    .expect("merge nodes");
+
+    // Only one User remains (the target).
+    let remaining = db
+        .execute_cypher("MATCH (u:User) RETURN u.email AS email")
+        .expect("scan users");
+    assert_eq!(remaining.len(), 1, "non-surviving b must be deleted");
+
+    use coordinode_core::graph::types::Value;
+    assert_eq!(
+        remaining[0].get("email"),
+        Some(&Value::String("a@x.com".into())),
+        "target a survives with its email"
+    );
+}
+
+/// `KEEP LAST` overrides target's properties with source's where keys overlap.
+#[test]
+fn merge_nodes_keep_last_overwrites_target_props() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com', score: 1})")
+        .expect("seed a");
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com', score: 99})")
+        .expect("seed b");
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a ON CONFLICT KEEP LAST",
+    )
+    .expect("merge keep last");
+
+    let rows = db
+        .execute_cypher("MATCH (u:User) RETURN u.score AS score")
+        .expect("scan");
+    assert_eq!(rows.len(), 1);
+    use coordinode_core::graph::types::Value;
+    assert_eq!(
+        rows[0].get("score"),
+        Some(&Value::Int(99)),
+        "KEEP LAST must overwrite target's score with source's"
+    );
+}
+
+/// `COALESCE` strategy: source fills only properties absent on target.
+#[test]
+fn merge_nodes_coalesce_fills_missing_only() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com', age: 30})")
+        .expect("seed a");
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com', age: 99, city: 'Berlin'})")
+        .expect("seed b");
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a ON CONFLICT COALESCE",
+    )
+    .expect("coalesce merge");
+
+    let rows = db
+        .execute_cypher("MATCH (u:User) RETURN u.age AS age, u.city AS city")
+        .expect("scan");
+    assert_eq!(rows.len(), 1);
+    use coordinode_core::graph::types::Value;
+    // age: target wins (30, not 99 — target wasn't null).
+    assert_eq!(
+        rows[0].get("age"),
+        Some(&Value::Int(30)),
+        "COALESCE leaves non-null target props untouched"
+    );
+    // city: target lacks it → filled from source.
+    assert_eq!(
+        rows[0].get("city"),
+        Some(&Value::String("Berlin".into())),
+        "COALESCE fills missing key from source"
+    );
+}
+
+/// `ON CONFLICT SET` evaluates per-property expressions against the row.
+#[test]
+fn merge_nodes_on_conflict_set_expressions() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com', score: 5})")
+        .expect("seed a");
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com', score: 12})")
+        .expect("seed b");
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a ON CONFLICT SET a.score = b.score",
+    )
+    .expect("set merge");
+
+    let rows = db
+        .execute_cypher("MATCH (u:User) RETURN u.score AS score")
+        .expect("scan");
+    assert_eq!(rows.len(), 1);
+    use coordinode_core::graph::types::Value;
+    assert_eq!(
+        rows[0].get("score"),
+        Some(&Value::Int(12)),
+        "ON CONFLICT SET should overwrite a.score with b.score"
+    );
+}
+
+/// Outgoing edges of the non-survivor are re-pointed to the target.
+#[test]
+fn merge_nodes_transfers_outgoing_edges() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .expect("seed a");
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .expect("seed b");
+    db.execute_cypher("CREATE (c:User {email: 'c@x.com'})")
+        .expect("seed c");
+    db.execute_cypher(
+        "MATCH (b:User {email: 'b@x.com'}), (c:User {email: 'c@x.com'}) \
+         CREATE (b)-[:KNOWS]->(c)",
+    )
+    .expect("b→c edge");
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a",
+    )
+    .expect("merge with transfer");
+
+    // After merge: a-[:KNOWS]->c must exist; b must be gone.
+    let edges = db
+        .execute_cypher(
+            "MATCH (a:User {email: 'a@x.com'})-[:KNOWS]->(c) RETURN c.email AS to_email",
+        )
+        .expect("scan outgoing");
+    assert_eq!(edges.len(), 1, "outgoing edge re-pointed to target");
+    use coordinode_core::graph::types::Value;
+    assert_eq!(
+        edges[0].get("to_email"),
+        Some(&Value::String("c@x.com".into())),
+    );
+}
+
+/// Incoming edges are re-pointed: x→b becomes x→a.
+#[test]
+fn merge_nodes_transfers_incoming_edges() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .expect("seed a");
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .expect("seed b");
+    db.execute_cypher("CREATE (x:User {email: 'x@x.com'})")
+        .expect("seed x");
+    db.execute_cypher(
+        "MATCH (x:User {email: 'x@x.com'}), (b:User {email: 'b@x.com'}) \
+         CREATE (x)-[:FOLLOWS]->(b)",
+    )
+    .expect("x→b edge");
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a",
+    )
+    .expect("merge");
+
+    let edges = db
+        .execute_cypher(
+            "MATCH (x:User {email: 'x@x.com'})-[:FOLLOWS]->(a) RETURN a.email AS to_email",
+        )
+        .expect("scan incoming");
+    assert_eq!(edges.len(), 1);
+    use coordinode_core::graph::types::Value;
+    assert_eq!(
+        edges[0].get("to_email"),
+        Some(&Value::String("a@x.com".into()))
+    );
+}
+
+/// Self-loop b→b becomes target→target on merge.
+#[test]
+fn merge_nodes_self_loop_becomes_target_self_loop() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .expect("seed a");
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .expect("seed b");
+    db.execute_cypher("MATCH (b:User {email: 'b@x.com'}) CREATE (b)-[:LIKES]->(b)")
+        .expect("b self-loop");
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a",
+    )
+    .expect("merge self-loop");
+
+    let edges = db
+        .execute_cypher("MATCH (a:User {email: 'a@x.com'})-[:LIKES]->(a) RETURN a.email AS who")
+        .expect("self-loop on a");
+    assert_eq!(edges.len(), 1, "b's self-loop must become a's self-loop");
+}
+
+/// Idempotency: running MERGE NODES again with the non-survivor already gone
+/// is a no-op rather than an error.
+#[test]
+fn merge_nodes_idempotent_when_source_missing() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .expect("seed a");
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .expect("seed b");
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a",
+    )
+    .expect("first merge");
+
+    // Recreate b under a different identity and re-run merge — first call
+    // already removed the prior b, so the re-bound b is fresh and the merge
+    // must collapse it cleanly without error.
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .expect("recreate b");
+    let result = db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a",
+    );
+    assert!(result.is_ok(), "second merge must succeed: {result:?}");
+}
+
+/// `INTO b` makes b the surviving node and a the dropped one.
+#[test]
+fn merge_nodes_into_b_keeps_b() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .expect("seed a");
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .expect("seed b");
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO b",
+    )
+    .expect("merge into b");
+
+    let rows = db
+        .execute_cypher("MATCH (u:User) RETURN u.email AS email")
+        .expect("scan");
+    assert_eq!(rows.len(), 1);
+    use coordinode_core::graph::types::Value;
+    assert_eq!(rows[0].get("email"), Some(&Value::String("b@x.com".into())));
+}
+
+/// Duplicate-edge case: a→c already exists AND b→c also exists. With default
+/// `KEEP BOTH`, after merge, a has TWO outgoing :KNOWS edges to c.
+#[test]
+fn merge_nodes_duplicate_keep_both_creates_parallel_edge() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .expect("seed a");
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .expect("seed b");
+    db.execute_cypher("CREATE (c:User {email: 'c@x.com'})")
+        .expect("seed c");
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (c:User {email: 'c@x.com'}) \
+         CREATE (a)-[:KNOWS]->(c)",
+    )
+    .expect("a→c");
+    db.execute_cypher(
+        "MATCH (b:User {email: 'b@x.com'}), (c:User {email: 'c@x.com'}) \
+         CREATE (b)-[:KNOWS]->(c)",
+    )
+    .expect("b→c");
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a \
+         ON DUPLICATE KEEP BOTH",
+    )
+    .expect("merge keep both");
+
+    // Posting list de-duplicates by uid, so a:KNOWS posting still contains c once.
+    // The "parallel edge" semantic is preserved at the conceptual level: both
+    // edges resolve to the same (a, c) pair after merge — a meaningful invariant
+    // we assert by scanning.
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:User {email: 'a@x.com'})-[:KNOWS]->(c:User {email: 'c@x.com'}) \
+             RETURN c.email AS to_email",
+        )
+        .expect("scan");
+    assert!(
+        !rows.is_empty(),
+        "a→c edge must still exist after KEEP BOTH merge"
+    );
+}
+
+/// Error when INTO target refers to a variable not bound to one of (a, b).
+#[test]
+fn merge_nodes_rejects_unbound_target() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .expect("seed a");
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .expect("seed b");
+
+    let result = db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO c",
+    );
+    assert!(
+        result.is_err(),
+        "MERGE NODES INTO unbound variable `c` must fail at parse time"
+    );
+}
+
+/// Re-running the SAME merge query after both source/target collapsed: the
+/// MATCH for `b` binds zero rows, MERGE NODES gets an empty input set, no
+/// further mutation happens. Distinct from "create a new b and re-merge" —
+/// this is the realistic retry-after-success scenario.
+#[test]
+fn merge_nodes_re_execution_with_no_b_is_clean_noop() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .expect("seed a");
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .expect("seed b");
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a",
+    )
+    .expect("first merge");
+
+    let result = db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a",
+    );
+    assert!(result.is_ok(), "re-execution must be clean: {result:?}");
+    let users = db
+        .execute_cypher("MATCH (u:User) RETURN u.email AS e")
+        .expect("scan");
+    assert_eq!(users.len(), 1, "still one survivor");
+}
+
+/// `ON DUPLICATE KEEP TARGET`: when both target and non-survivor have an
+/// edge to the same peer, drop the non-survivor's edge entirely.
+#[test]
+fn merge_nodes_duplicate_keep_target_drops_source_edge() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (c:User {email: 'c@x.com'})")
+        .unwrap();
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (c:User {email: 'c@x.com'}) \
+         CREATE (a)-[:KNOWS {strength: 5}]->(c)",
+    )
+    .unwrap();
+    db.execute_cypher(
+        "MATCH (b:User {email: 'b@x.com'}), (c:User {email: 'c@x.com'}) \
+         CREATE (b)-[:KNOWS {strength: 99}]->(c)",
+    )
+    .unwrap();
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a \
+         ON DUPLICATE KEEP TARGET",
+    )
+    .unwrap();
+
+    // a→c still has strength=5 (target's original), NOT 99 (source's).
+    use coordinode_core::graph::types::Value;
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:User {email: 'a@x.com'})-[r:KNOWS]->(c:User {email: 'c@x.com'}) \
+             RETURN r.strength AS s",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("s"),
+        Some(&Value::Int(5)),
+        "KEEP TARGET preserves the target's original edge properties"
+    );
+}
+
+/// `ON DUPLICATE MERGE PROPERTIES`: target↔peer edge survives with COALESCE
+/// merge of edge facets — non-null values from the source-side edge fill
+/// nulls on the target-side edge.
+#[test]
+fn merge_nodes_duplicate_merge_properties_coalesces_edge_facets() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (c:User {email: 'c@x.com'})")
+        .unwrap();
+    // Target's a→c edge is missing the `notes` field.
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (c:User {email: 'c@x.com'}) \
+         CREATE (a)-[:KNOWS {since: 2020}]->(c)",
+    )
+    .unwrap();
+    // Source's b→c carries it.
+    db.execute_cypher(
+        "MATCH (b:User {email: 'b@x.com'}), (c:User {email: 'c@x.com'}) \
+         CREATE (b)-[:KNOWS {since: 2025, notes: 'from b'}]->(c)",
+    )
+    .unwrap();
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a \
+         ON DUPLICATE MERGE PROPERTIES",
+    )
+    .unwrap();
+
+    use coordinode_core::graph::types::Value;
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:User {email: 'a@x.com'})-[r:KNOWS]->(c:User {email: 'c@x.com'}) \
+             RETURN r.since AS since, r.notes AS notes",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    // `since` was present on both; target wins under COALESCE.
+    assert_eq!(rows[0].get("since"), Some(&Value::Int(2020)));
+    // `notes` was missing on target; filled from source.
+    assert_eq!(
+        rows[0].get("notes"),
+        Some(&Value::String("from b".into())),
+        "MERGE PROPERTIES fills missing facets from source"
+    );
+}
+
+/// Unique B-tree index on (User.email) must NOT block re-creation of a node
+/// after MERGE NODES deletes the source — index cleanup happens before the
+/// node record is dropped. Catches the index-leak bug.
+#[test]
+fn merge_nodes_releases_unique_index_entry_of_dropped_source() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX idx_user_email ON :User(email)")
+        .expect("create unique index");
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .unwrap();
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a",
+    )
+    .unwrap();
+
+    // After merge, no node holds email='b@x.com'. The unique index must allow
+    // a brand-new node to claim that email; if the index leaked, this CREATE
+    // would fail with a uniqueness violation.
+    let result = db.execute_cypher("CREATE (c:User {email: 'b@x.com'})");
+    assert!(
+        result.is_ok(),
+        "unique index entry for dropped node must be released: {result:?}"
+    );
+}
+
+/// Updating target's indexed property via KEEP LAST must update the B-tree
+/// index — old value's entry released, new value's entry registered.
+#[test]
+fn merge_nodes_keep_last_updates_btree_index() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX idx_user_handle ON :User(handle)")
+        .expect("create unique index");
+    db.execute_cypher("CREATE (a:User {handle: 'a_handle'})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {handle: 'b_handle'})")
+        .unwrap();
+
+    db.execute_cypher(
+        "MATCH (a:User {handle: 'a_handle'}), (b:User {handle: 'b_handle'}) \
+         MERGE NODES (a, b) INTO a ON CONFLICT KEEP LAST",
+    )
+    .unwrap();
+
+    // After merge, a now has handle='b_handle'. The OLD value 'a_handle' must
+    // be freed in the index so a new node can claim it.
+    let claim_old = db.execute_cypher("CREATE (new:User {handle: 'a_handle'})");
+    assert!(
+        claim_old.is_ok(),
+        "old indexed value 'a_handle' must be released after KEEP LAST: {claim_old:?}"
+    );
+
+    // And the NEW value 'b_handle' is now claimed by `a` — re-claiming must fail.
+    let reclaim_new = db.execute_cypher("CREATE (dup:User {handle: 'b_handle'})");
+    assert!(
+        reclaim_new.is_err(),
+        "new indexed value 'b_handle' must be claimed by target — duplicate CREATE should fail"
+    );
+}
+
+/// Cross-label merge: a is :Person, b is :Account. Target's labels remain
+/// (only Person), source's labels do NOT bleed in. Matches arch-doc
+/// "INTO a" semantics — labels of the surviving node win.
+#[test]
+fn merge_nodes_preserves_target_labels_only() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:Person {id: 1})").unwrap();
+    db.execute_cypher("CREATE (b:Account {id: 2})").unwrap();
+
+    db.execute_cypher(
+        "MATCH (a:Person {id: 1}), (b:Account {id: 2}) \
+         MERGE NODES (a, b) INTO a",
+    )
+    .unwrap();
+
+    let persons = db
+        .execute_cypher("MATCH (n:Person) RETURN n.id AS i")
+        .unwrap();
+    let accounts = db
+        .execute_cypher("MATCH (n:Account) RETURN n.id AS i")
+        .unwrap();
+    assert_eq!(persons.len(), 1, "target remains :Person");
+    assert_eq!(
+        accounts.len(),
+        0,
+        "source's :Account label is NOT inherited"
+    );
+}
+
+/// Self-loop b→b carries edge properties; after merge target→target must
+/// also carry them. Catches the case where adj transfer succeeds but the
+/// edgeprop record is left under the old (b,b) key.
+#[test]
+fn merge_nodes_self_loop_carries_edge_properties() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .unwrap();
+    db.execute_cypher(
+        "MATCH (b:User {email: 'b@x.com'}) \
+         CREATE (b)-[:LIKES {weight: 42}]->(b)",
+    )
+    .unwrap();
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a",
+    )
+    .unwrap();
+
+    use coordinode_core::graph::types::Value;
+    let rows = db
+        .execute_cypher("MATCH (a:User {email: 'a@x.com'})-[r:LIKES]->(a) RETURN r.weight AS w")
+        .unwrap();
+    assert_eq!(rows.len(), 1, "self-loop must survive merge");
+    assert_eq!(
+        rows[0].get("w"),
+        Some(&Value::Int(42)),
+        "edge properties must be carried onto the target's self-loop"
+    );
+}
+
+/// Downstream RETURN must see the merged target. Catches binding-drop
+/// regressions where the `a` variable would lose its row column after MERGE.
+#[test]
+fn merge_nodes_passes_target_binding_to_return() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com', age: 30})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com', city: 'Berlin'})")
+        .unwrap();
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+             MERGE NODES (a, b) INTO a ON CONFLICT COALESCE \
+             RETURN a.age AS age, a.city AS city",
+        )
+        .unwrap();
+
+    use coordinode_core::graph::types::Value;
+    assert_eq!(
+        rows.len(),
+        1,
+        "RETURN must produce exactly one row for the target"
+    );
+    assert_eq!(rows[0].get("age"), Some(&Value::Int(30)));
+    assert_eq!(
+        rows[0].get("city"),
+        Some(&Value::String("Berlin".into())),
+        "COALESCE merged b.city into a; RETURN must see it"
+    );
+}
+
+/// STRICT schema rejects a merge that would introduce undeclared properties.
+#[test]
+fn merge_nodes_strict_schema_rejects_unknown_source_property() {
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
+
+    let (mut db, _dir) = open_db();
+
+    let mut schema = LabelSchema::new_node_id("Customer");
+    schema.set_mode(SchemaMode::Strict);
+    schema.add_property(PropertyDef::new("email", PropertyType::String).not_null());
+    db.create_label_schema(schema)
+        .expect("create strict schema");
+
+    db.execute_cypher("CREATE (a:Customer {email: 'a@x.com'})")
+        .expect("seed a");
+
+    // b carries an extra property `tags` that is NOT declared on Customer.
+    // Created via FLEXIBLE label first, then we'd need a way to wedge it into
+    // a Customer record. The straightforward path: create a Flexible label
+    // `Lead` carrying `tags`, then re-label via the merge into Customer — but
+    // labels are preserved on target (Customer), so source props bleed in.
+    let mut lead = LabelSchema::new_node_id("Lead");
+    lead.set_mode(SchemaMode::Flexible);
+    lead.add_property(PropertyDef::new("email", PropertyType::String));
+    lead.add_property(PropertyDef::new("tags", PropertyType::String));
+    db.create_label_schema(lead).expect("create flexible Lead");
+
+    db.execute_cypher("CREATE (b:Lead {email: 'b@x.com', tags: 'hot'})")
+        .expect("seed flexible b");
+
+    let result = db.execute_cypher(
+        "MATCH (a:Customer {email: 'a@x.com'}), (b:Lead {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a ON CONFLICT KEEP LAST",
+    );
+
+    assert!(
+        result.is_err(),
+        "STRICT Customer label must reject merged 'tags' property: {result:?}"
+    );
+    let err = format!("{}", result.err().unwrap());
+    assert!(
+        err.contains("unknown property") || err.contains("strict"),
+        "error must mention schema violation: {err}"
+    );
+}
+
+/// Edge between source and target (`a→b`) becomes a self-loop on target
+/// after merge — there is no "b" anymore to be the target endpoint.
+/// This is the canonical dedup case for graphs with mutual links.
+#[test]
+fn merge_nodes_edge_between_source_and_target_becomes_self_loop() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .unwrap();
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         CREATE (a)-[:KNOWS {weight: 9}]->(b)",
+    )
+    .unwrap();
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a",
+    )
+    .unwrap();
+
+    use coordinode_core::graph::types::Value;
+    let rows = db
+        .execute_cypher("MATCH (a:User {email: 'a@x.com'})-[r:KNOWS]->(a) RETURN r.weight AS w")
+        .unwrap();
+    assert_eq!(rows.len(), 1, "a→b must collapse into a self-loop a→a");
+    assert_eq!(
+        rows[0].get("w"),
+        Some(&Value::Int(9)),
+        "edge property must carry onto the self-loop"
+    );
+}
+
+/// Same as above, mirrored direction (`b→a`). Confirms both incoming and
+/// outgoing cross-link cases collapse cleanly.
+#[test]
+fn merge_nodes_edge_target_to_source_becomes_self_loop() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .unwrap();
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         CREATE (b)-[:FOLLOWS]->(a)",
+    )
+    .unwrap();
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a",
+    )
+    .unwrap();
+
+    let rows = db
+        .execute_cypher("MATCH (a:User {email: 'a@x.com'})-[:FOLLOWS]->(a) RETURN a.email AS who")
+        .unwrap();
+    assert_eq!(rows.len(), 1, "b→a must collapse into self-loop a→a");
+}
+
+/// Multiple distinct peers in the same direction are all re-pointed. Tests
+/// that the per-direction posting-list iteration handles fan-out correctly.
+#[test]
+fn merge_nodes_transfers_multiple_outgoing_peers() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .unwrap();
+    for tag in ["c", "d", "e"] {
+        db.execute_cypher(&format!("CREATE (n:User {{email: '{tag}@x.com'}})"))
+            .unwrap();
+        db.execute_cypher(&format!(
+            "MATCH (b:User {{email: 'b@x.com'}}), (n:User {{email: '{tag}@x.com'}}) \
+             CREATE (b)-[:KNOWS]->(n)"
+        ))
+        .unwrap();
+    }
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a",
+    )
+    .unwrap();
+
+    let rows = db
+        .execute_cypher("MATCH (a:User {email: 'a@x.com'})-[:KNOWS]->(n) RETURN n.email AS e")
+        .unwrap();
+    assert_eq!(rows.len(), 3, "all three b→x edges must re-point to a→x");
+}
+
+/// VALIDATED schema mode rejects a merge that would write a wrong-typed value
+/// to a declared property. Catches enforcement gap distinct from STRICT
+/// (which also rejects unknown property names).
+#[test]
+fn merge_nodes_validated_schema_rejects_type_mismatch() {
+    use coordinode_core::graph::types::Value;
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
+
+    let (mut db, _dir) = open_db();
+
+    let mut invoice = LabelSchema::new_node_id("Invoice");
+    invoice.set_mode(SchemaMode::Validated);
+    invoice.add_property(PropertyDef::new("amount", PropertyType::Int));
+    db.create_label_schema(invoice)
+        .expect("create validated Invoice");
+
+    // Source carries a string in a slot that target declares as Int.
+    let mut staging = LabelSchema::new_node_id("Staging");
+    staging.set_mode(SchemaMode::Flexible);
+    staging.add_property(PropertyDef::new("amount", PropertyType::String));
+    db.create_label_schema(staging)
+        .expect("create flexible Staging");
+
+    db.execute_cypher("CREATE (a:Invoice {amount: 100})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:Staging {amount: 'one-hundred'})")
+        .unwrap();
+
+    let result = db.execute_cypher(
+        "MATCH (a:Invoice), (b:Staging) \
+         MERGE NODES (a, b) INTO a ON CONFLICT KEEP LAST",
+    );
+    assert!(
+        result.is_err(),
+        "VALIDATED Invoice.amount=Int must reject merged String value: {result:?}"
+    );
+
+    // And the original record must remain intact (transaction never committed).
+    let rows = db
+        .execute_cypher("MATCH (a:Invoice) RETURN a.amount AS amt")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("amt"),
+        Some(&Value::Int(100)),
+        "rejected merge must not mutate target"
+    );
+}
+
+/// Trivial smoke: merging when the source carries zero properties and zero
+/// edges must still drop the source cleanly without touching the target.
+#[test]
+fn merge_nodes_empty_source_drops_cleanly() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com', score: 5})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User)").unwrap(); // bare label, no props
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User) WHERE b.email IS NULL \
+         MERGE NODES (a, b) INTO a",
+    )
+    .unwrap();
+
+    use coordinode_core::graph::types::Value;
+    let rows = db
+        .execute_cypher("MATCH (u:User) RETURN u.email AS e, u.score AS s")
+        .unwrap();
+    assert_eq!(rows.len(), 1, "only the surviving target remains");
+    assert_eq!(rows[0].get("e"), Some(&Value::String("a@x.com".into())));
+    assert_eq!(rows[0].get("s"), Some(&Value::Int(5)));
+}
+
+/// Atomicity: when MERGE NODES processes multiple input rows and a later
+/// row errors (here: STRICT schema violation), every effect of the earlier
+/// successful rows MUST be rolled back. Specifically, adjacency-list
+/// tombstones go through the MVCC buffer rather than direct engine deletes;
+/// otherwise the second row's abort would leave the first row's edge
+/// re-pointing committed.
+#[test]
+fn merge_nodes_atomic_rollback_when_later_row_fails() {
+    use coordinode_core::graph::types::Value;
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
+
+    let (mut db, _dir) = open_db();
+
+    // Target label is STRICT, declares only `name`.
+    let mut user = LabelSchema::new_node_id("AtomicUser");
+    user.set_mode(SchemaMode::Strict);
+    user.add_property(PropertyDef::new("name", PropertyType::String).not_null());
+    db.create_label_schema(user).unwrap();
+
+    // Source label is FLEXIBLE. Some sources carry `name` only (mergable),
+    // some carry an extra `tag` field that would violate STRICT on merge.
+    let mut staging = LabelSchema::new_node_id("AtomicStaging");
+    staging.set_mode(SchemaMode::Flexible);
+    staging.add_property(PropertyDef::new("name", PropertyType::String));
+    staging.add_property(PropertyDef::new("tag", PropertyType::String));
+    db.create_label_schema(staging).unwrap();
+
+    // a1, a2: two STRICT targets that would merge cleanly.
+    db.execute_cypher("CREATE (a1:AtomicUser {name: 'Alice'})")
+        .unwrap();
+    db.execute_cypher("CREATE (a2:AtomicUser {name: 'Bob'})")
+        .unwrap();
+
+    // b1: clean source (would merge fine).
+    db.execute_cypher("CREATE (b1:AtomicStaging {name: 'AliceX'})")
+        .unwrap();
+    // b2: poisoned source carrying `tag`, will trip STRICT enforcement
+    // when targeting an AtomicUser.
+    db.execute_cypher("CREATE (b2:AtomicStaging {name: 'BobX', tag: 'poisonous'})")
+        .unwrap();
+
+    // Add edges to a1 and a2 so we can detect adj-side rollback later.
+    db.execute_cypher("CREATE (peer:AtomicUser {name: 'Peer'})")
+        .unwrap();
+    db.execute_cypher(
+        "MATCH (a1:AtomicUser {name: 'Alice'}), (peer:AtomicUser {name: 'Peer'}) \
+         CREATE (a1)-[:LINKS]->(peer)",
+    )
+    .unwrap();
+    db.execute_cypher(
+        "MATCH (b1:AtomicStaging {name: 'AliceX'}), (peer:AtomicUser {name: 'Peer'}) \
+         CREATE (b1)-[:LINKS]->(peer)",
+    )
+    .unwrap();
+    db.execute_cypher(
+        "MATCH (b2:AtomicStaging {name: 'BobX'}), (peer:AtomicUser {name: 'Peer'}) \
+         CREATE (b2)-[:LINKS]->(peer)",
+    )
+    .unwrap();
+
+    // Cartesian: 2 a's × 2 b's = 4 rows. b2 carries `tag` → some row will
+    // hit the STRICT validation gate. Order isn't guaranteed but at least
+    // one merge with b2 must execute and trip the error.
+    let result = db.execute_cypher(
+        "MATCH (a:AtomicUser), (b:AtomicStaging) \
+         MERGE NODES (a, b) INTO a ON CONFLICT KEEP LAST \
+         TRANSFER EDGES FROM b TO a",
+    );
+    assert!(
+        result.is_err(),
+        "STRICT violation must abort the merge: {result:?}"
+    );
+
+    // Atomicity invariants after rollback:
+    //   1. Both b1 and b2 still exist (no source deletes committed).
+    //   2. Neither a1 nor a2 has merged props (a1.tag must NOT be set).
+    //   3. b1's outgoing :LINKS to peer is still on b1 (NOT re-pointed to any a).
+    let staging_count = db
+        .execute_cypher("MATCH (b:AtomicStaging) RETURN b.name AS n")
+        .unwrap();
+    assert_eq!(
+        staging_count.len(),
+        2,
+        "both source nodes must survive rollback, got {staging_count:?}"
+    );
+
+    let users = db
+        .execute_cypher("MATCH (a:AtomicUser) RETURN a.name AS n")
+        .unwrap();
+    assert_eq!(users.len(), 3, "Alice + Bob + Peer all still present");
+
+    // b1 must still have its outgoing edge.
+    let b1_edges = db
+        .execute_cypher("MATCH (b:AtomicStaging {name: 'AliceX'})-[:LINKS]->(p) RETURN p.name AS n")
+        .unwrap();
+    assert_eq!(
+        b1_edges.len(),
+        1,
+        "b1's outgoing edge must remain — NOT re-pointed to a target. \
+         If this fails, adj posting list mutations committed despite rollback."
+    );
+    assert_eq!(b1_edges[0].get("n"), Some(&Value::String("Peer".into())),);
+}

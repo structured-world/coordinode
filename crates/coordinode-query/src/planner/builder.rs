@@ -292,6 +292,7 @@ fn op_children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::Delete { input, .. }
         | LogicalOp::DetachDocument { input, .. }
         | LogicalOp::AttachDocument { input, .. }
+        | LogicalOp::MergeNodes { input, .. }
         | LogicalOp::CreateEdge { input, .. } => vec![input],
         LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
             vec![left, right]
@@ -493,6 +494,19 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 input: Box::new(input),
                 variables,
                 detach: dc.detach,
+            })
+        }
+        Clause::MergeNodes(mn) => {
+            let input = current.unwrap_or(LogicalOp::Empty);
+            Ok(LogicalOp::MergeNodes {
+                input: Box::new(input),
+                source_a: mn.source_a.clone(),
+                source_b: mn.source_b.clone(),
+                target: mn.target.clone(),
+                conflict: mn.conflict.clone(),
+                transfer_edges: mn.transfer_edges.clone(),
+                duplicate: mn.duplicate.clone(),
+                transfer_edge_properties: mn.transfer_edge_properties,
             })
         }
         Clause::Set(items, violation_mode) => {
@@ -5298,5 +5312,28 @@ mod tests {
             assert!(d.estimated_selectivity >= 0.0 && d.estimated_selectivity <= 1.0);
             assert!(d.cost_chosen.is_finite() && d.cost_chosen >= 0.0);
         }
+    }
+
+    #[test]
+    fn merge_nodes_explain_renders_all_metadata() {
+        let plan = plan(
+            "MATCH (a:User {id: 1}), (b:User {id: 2}) \
+             MERGE NODES (a, b) INTO a \
+             ON CONFLICT KEEP LAST \
+             TRANSFER EDGES FROM b TO a \
+             ON DUPLICATE MERGE PROPERTIES \
+             TRANSFER EDGE PROPERTIES",
+        );
+        let explain = plan.explain();
+        // Every distinguishing field of the clause must surface in EXPLAIN —
+        // without this, operators reading EXPLAIN can't see what merge will do.
+        assert!(
+            explain.contains("MergeNodes(a,b) INTO a"),
+            "explain: {explain}"
+        );
+        assert!(explain.contains("KEEP_LAST"), "explain: {explain}");
+        assert!(explain.contains("TRANSFER b→a"), "explain: {explain}");
+        assert!(explain.contains("DUP_MERGE"), "explain: {explain}");
+        assert!(explain.contains("+EDGE_PROPS"), "explain: {explain}");
     }
 }

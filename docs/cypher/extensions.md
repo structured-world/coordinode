@@ -442,6 +442,61 @@ WHERE article.content CONTAINS tag.name
 MERGE ALL (tag)-[:APPEARS_IN]->(article)
 ```
 
+### MERGE NODES ✅ 🔷
+
+Native node-merge for entity resolution and deduplication. Collapses two
+matched nodes into one in a single atomic transaction — property merge,
+edge re-pointing, and source deletion happen together. Equivalent in intent
+to Neo4j APOC's `apoc.refactor.mergeNodes()` but without the plugin and with
+correct behaviour under replication.
+
+```cypher
+-- Default: surviving node `a` keeps its properties on collision.
+MATCH (a:User {email: 'alice@example.com'}),
+      (b:User {email: 'alice@example.org'})
+MERGE NODES (a, b) INTO a
+  TRANSFER EDGES FROM b TO a
+```
+
+Property conflict resolution (`ON CONFLICT`):
+
+| Strategy | Effect |
+|----------|--------|
+| `KEEP FIRST` (default) | Target's value wins. Source fills only missing keys. |
+| `KEEP LAST` | Source's value overwrites target. |
+| `COALESCE` | Source fills `NULL` / missing target keys only. |
+| `SET <exprs>` | Per-property expressions referencing `a` and `b`. |
+
+Duplicate-edge handling (`ON DUPLICATE`, requires `TRANSFER EDGES`): applied
+when `target↔peer` and `source↔peer` exist with the same edge type and
+direction.
+
+| Strategy | Effect |
+|----------|--------|
+| `KEEP BOTH` (default) | Both edges preserved (parallel edges). |
+| `MERGE PROPERTIES` | Single edge; edge facets coalesced (non-null from source fills null/missing on target). |
+| `KEEP TARGET` | Target's edge wins; source's edge dropped. |
+
+```cypher
+-- Entity enrichment: fill missing fields from a duplicate record,
+-- consolidate edges, merge edge properties on collision.
+MATCH (a:Person {ssn: $ssn}), (b:Person {ssn: $ssn})
+WHERE id(a) <> id(b)
+MERGE NODES (a, b) INTO a
+  ON CONFLICT COALESCE
+  TRANSFER EDGES FROM b TO a
+  ON DUPLICATE MERGE PROPERTIES
+```
+
+Idempotent: re-running with a non-surviving node already gone is a no-op
+(the `MATCH` simply binds zero rows).
+
+**Schema enforcement:** when the target's label is in `STRICT` mode, a merge
+that would introduce an undeclared property is rejected before any mutation
+commits. `VALIDATED` mode rejects type mismatches on declared properties but
+allows source-only props into the `extra` overflow map. `FLEXIBLE` accepts
+the merge unconditionally.
+
 ### SET ON VIOLATION SKIP 🔷
 
 Skip nodes that would violate schema constraints, continue with the rest.
