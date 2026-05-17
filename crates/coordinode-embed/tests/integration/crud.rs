@@ -4147,6 +4147,207 @@ fn trigger_before_commit_attach_document_cascades_orphan_edge_deletes() {
     assert_eq!(link_logs[0].get("t"), Some(&Value::String("LINK".into())));
 }
 
+/// `REMOVE n.prop` fires the UPDATE trigger — REMOVE is logically a
+/// mutation just like SET, and a registered UPDATE trigger must observe
+/// the property disappearing.
+#[test]
+fn trigger_before_commit_remove_property_fires_update() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER on_user_update ON :User UPDATE BEFORE COMMIT \
+         EXECUTE CREATE (e:ChangeLog {action: $event, b: $before, a: $after})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (u:User {name: 'Alice', score: 99})")
+        .unwrap();
+    db.execute_cypher("MATCH (u:User) REMOVE u.score").unwrap();
+
+    let logs = db
+        .execute_cypher("MATCH (e:ChangeLog) RETURN e.action AS act, e.b AS b, e.a AS a")
+        .unwrap();
+    assert_eq!(logs.len(), 1, "REMOVE must fire UPDATE trigger");
+    assert_eq!(logs[0].get("act"), Some(&Value::String("UPDATE".into())));
+    assert!(matches!(
+        logs[0].get("b"),
+        Some(Value::Map(_) | Value::Document(_))
+    ));
+    assert!(matches!(
+        logs[0].get("a"),
+        Some(Value::Map(_) | Value::Document(_))
+    ));
+}
+
+/// `REMOVE n:Label` fires the UPDATE trigger — labels are part of the
+/// node's identity surface and a registered UPDATE trigger should be
+/// notified before the label-set change becomes visible.
+#[test]
+fn trigger_before_commit_remove_label_fires_update() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER on_user_update ON :User UPDATE BEFORE COMMIT \
+         EXECUTE CREATE (e:ChangeLog {action: $event})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (n:User:Admin {id: 1})").unwrap();
+    db.execute_cypher("MATCH (n:User) REMOVE n:Admin").unwrap();
+
+    let logs = db
+        .execute_cypher("MATCH (e:ChangeLog) RETURN e.action AS a")
+        .unwrap();
+    assert_eq!(logs.len(), 1, "REMOVE label must fire UPDATE trigger");
+    assert_eq!(logs[0].get("a"), Some(&Value::String("UPDATE".into())));
+}
+
+/// Multiple REMOVE items in one clause fire the UPDATE trigger ONCE per
+/// node, not once per item — mirrors SET's once-per-node-per-statement
+/// invariant.
+#[test]
+fn trigger_before_commit_remove_fires_once_per_node_per_statement() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER count_fires ON :Item UPDATE BEFORE COMMIT \
+         EXECUTE CREATE (e:FireMark)",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (i:Item {a: 1, b: 2, c: 3})")
+        .unwrap();
+    db.execute_cypher("MATCH (i:Item) REMOVE i.a, i.b, i.c")
+        .unwrap();
+
+    let marks = db
+        .execute_cypher("MATCH (m:FireMark) RETURN count(m) AS n")
+        .unwrap();
+    assert_eq!(marks.len(), 1);
+    assert_eq!(
+        marks[0].get("n"),
+        Some(&Value::Int(1)),
+        "3 REMOVE items must produce exactly 1 trigger firing"
+    );
+}
+
+/// UPSERT MATCH ON CREATE: when the MATCH misses, the ON CREATE pattern
+/// is materialised. CREATE triggers on the created node's label must
+/// fire.
+#[test]
+fn trigger_before_commit_upsert_on_create_fires_node_create() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER user_create ON :User CREATE BEFORE COMMIT \
+         EXECUTE CREATE (e:UserLog {action: $event})",
+    )
+    .unwrap();
+
+    db.execute_cypher(
+        "UPSERT MATCH (u:User {name: 'Bob'}) \
+         ON CREATE CREATE (u:User {name: 'Bob', score: 1})",
+    )
+    .unwrap();
+
+    let logs = db
+        .execute_cypher("MATCH (e:UserLog) RETURN e.action AS a")
+        .unwrap();
+    assert_eq!(logs.len(), 1, "UPSERT ON CREATE must fire CREATE trigger");
+    assert_eq!(logs[0].get("a"), Some(&Value::String("CREATE".into())));
+}
+
+/// UPSERT MATCH ON CREATE: relationship patterns also fire edge CREATE
+/// triggers.
+#[test]
+fn trigger_before_commit_upsert_on_create_fires_edge_create() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER follow_create ON [:FOLLOWS] CREATE BEFORE COMMIT \
+         EXECUTE CREATE (e:FollowLog {action: $event, t: $edge_type})",
+    )
+    .unwrap();
+
+    db.execute_cypher(
+        "UPSERT MATCH (a:User {id: 1})-[r:FOLLOWS]->(b:User {id: 2}) \
+         ON CREATE CREATE (a:User {id: 1})-[:FOLLOWS]->(b:User {id: 2})",
+    )
+    .unwrap();
+
+    let logs = db
+        .execute_cypher("MATCH (e:FollowLog) RETURN e.action AS act, e.t AS t")
+        .unwrap();
+    assert_eq!(
+        logs.len(),
+        1,
+        "UPSERT ON CREATE must fire edge CREATE trigger"
+    );
+    assert_eq!(logs[0].get("act"), Some(&Value::String("CREATE".into())));
+    assert_eq!(logs[0].get("t"), Some(&Value::String("FOLLOWS".into())));
+}
+
+/// DETACH DOCUMENT promotes a nested document back to a graph node and
+/// inserts a connecting edge. CREATE triggers on both the new node's
+/// label and the new edge's type must fire.
+#[test]
+fn trigger_before_commit_detach_document_fires_node_and_edge_create() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER addr_create ON :Address CREATE BEFORE COMMIT \
+         EXECUTE CREATE (e:AddrLog {action: $event})",
+    )
+    .unwrap();
+    db.execute_cypher(
+        "CREATE TRIGGER edge_create ON [:HAS_ADDRESS] CREATE BEFORE COMMIT \
+         EXECUTE CREATE (e:EdgeLog {action: $event, t: $edge_type})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (u:User {id: 1, address: {city: 'NYC', zip: '10001'}})")
+        .unwrap();
+
+    db.execute_cypher(
+        "MATCH (u:User {id: 1}) \
+         DETACH DOCUMENT u.address AS (a:Address)-[:HAS_ADDRESS]->(u)",
+    )
+    .unwrap();
+
+    let addr_logs = db
+        .execute_cypher("MATCH (e:AddrLog) RETURN e.action AS a")
+        .unwrap();
+    assert_eq!(
+        addr_logs.len(),
+        1,
+        "DETACH DOCUMENT must fire CREATE on the new :Address node"
+    );
+    assert_eq!(addr_logs[0].get("a"), Some(&Value::String("CREATE".into())));
+
+    let edge_logs = db
+        .execute_cypher("MATCH (e:EdgeLog) RETURN e.action AS act, e.t AS t")
+        .unwrap();
+    assert_eq!(
+        edge_logs.len(),
+        1,
+        "DETACH DOCUMENT must fire CREATE on the new :HAS_ADDRESS edge"
+    );
+    assert_eq!(
+        edge_logs[0].get("act"),
+        Some(&Value::String("CREATE".into()))
+    );
+    assert_eq!(
+        edge_logs[0].get("t"),
+        Some(&Value::String("HAS_ADDRESS".into()))
+    );
+}
+
 /// Edge UPDATE trigger with `ON ERROR PROPAGATE` aborts the originating
 /// SET — the edge property must NOT be modified after rollback.
 #[test]
