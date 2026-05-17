@@ -3232,3 +3232,104 @@ fn trigger_before_commit_disabled_does_not_fire() {
         .unwrap();
     assert_eq!(evidence.len(), 1, "re-enabled trigger must fire");
 }
+
+/// Multi-label node `(n:User:Admin)` must fire BEFORE COMMIT triggers
+/// registered on EITHER label. The probe iterates each label in turn,
+/// so a node carrying both labels fires both triggers exactly once.
+#[test]
+fn trigger_before_commit_multi_label_fires_each_label_trigger() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER on_user ON :User CREATE BEFORE COMMIT \
+         EXECUTE CREATE (l:UserLog {action: $event})",
+    )
+    .unwrap();
+    db.execute_cypher(
+        "CREATE TRIGGER on_admin ON :Admin CREATE BEFORE COMMIT \
+         EXECUTE CREATE (l:AdminLog {action: $event})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (n:User:Admin {name: 'Alice'})")
+        .unwrap();
+
+    let user_logs = db
+        .execute_cypher("MATCH (l:UserLog) RETURN l.action AS a")
+        .unwrap();
+    assert_eq!(user_logs.len(), 1, ":User trigger must fire");
+    assert_eq!(user_logs[0].get("a"), Some(&Value::String("CREATE".into())));
+
+    let admin_logs = db
+        .execute_cypher("MATCH (l:AdminLog) RETURN l.action AS a")
+        .unwrap();
+    assert_eq!(admin_logs.len(), 1, ":Admin trigger must fire");
+    assert_eq!(
+        admin_logs[0].get("a"),
+        Some(&Value::String("CREATE".into()))
+    );
+}
+
+/// `$after` parameter is available as a Map in the trigger body.
+///
+/// Note: the parser does not currently accept `$after.field` dot-notation
+/// (parameter-as-base for PropertyAccess is a pre-existing limitation —
+/// the same restriction that prevents `$node.x = …` in SET clauses).
+/// This test confirms the whole `$after` map round-trips through the
+/// parameter substitution path; a follow-up parser fix can then enable
+/// `$after.name` resolution end-to-end with a dedicated test.
+#[test]
+fn trigger_before_commit_after_param_is_available_as_map() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER capture ON :Person CREATE BEFORE COMMIT \
+         EXECUTE CREATE (e:Capture {props: $after, event_kind: $event})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (p:Person {name: 'Bob', age: 30})")
+        .unwrap();
+
+    let logs = db
+        .execute_cypher("MATCH (e:Capture) RETURN e.event_kind AS k, e.props AS p")
+        .unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(
+        logs[0].get("k"),
+        Some(&Value::String("CREATE".into())),
+        "$event must propagate as String literal"
+    );
+    let props = logs[0].get("p").cloned().expect("props column present");
+    // $after lands as a Map; nested storage may serialise it as Document.
+    assert!(
+        matches!(props, Value::Map(_) | Value::Document(_)),
+        "$after must be a Map (or Document after storage round-trip); got {props:?}"
+    );
+}
+
+/// Multiple triggers registered on the same `(label, event)` pair —
+/// every enabled one must fire on each matching mutation.
+#[test]
+fn trigger_before_commit_multiple_triggers_same_label_all_fire() {
+    let (mut db, _dir) = open_db();
+
+    for i in 0..3u32 {
+        db.execute_cypher(&format!(
+            "CREATE TRIGGER witness_{i} ON :Person CREATE BEFORE COMMIT \
+             EXECUTE CREATE (w:Witness_{i})"
+        ))
+        .unwrap();
+    }
+
+    db.execute_cypher("CREATE (p:Person {id: 1})").unwrap();
+
+    for i in 0..3u32 {
+        let rows = db
+            .execute_cypher(&format!("MATCH (w:Witness_{i}) RETURN w"))
+            .unwrap();
+        assert_eq!(rows.len(), 1, "Witness_{i} trigger must have fired");
+    }
+}
