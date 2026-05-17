@@ -125,6 +125,7 @@ ORDER BY similarity LIMIT 25
 | Spatial queries | **Stable** | `point()`, `point.distance()` (Haversine), WHERE filter |
 | Document properties | **Stable** | Nested DOCUMENT type, dot-notation access, 3 schema modes |
 | Document ↔ graph transformations | **Stable** | `DETACH DOCUMENT` promotes a nested property to a node + edge atomically; `ATTACH DOCUMENT` demotes a node back into a nested DOCUMENT property; optional `TRANSFER EDGES`, `ON CONFLICT REPLACE`, `ON REMAINING FAIL` |
+| Native entity-resolution | **Stable** | `MERGE NODES (a, b) INTO a` collapses two matched nodes in a single MVCC transaction — property merge (`KEEP FIRST` / `KEEP LAST` / `COALESCE` / `SET <exprs>`), edge re-pointing with `TRANSFER EDGES`, and duplicate-edge handling (`KEEP BOTH` / `MERGE PROPERTIES` / `KEEP TARGET`). Replaces Neo4j's APOC `mergeNodes()` with cluster-safe semantics |
 | Bitemporal edges | **Stable** | `CREATE EDGE TYPE … TEMPORAL` declares an edge type whose instances carry a `(valid_from, valid_to)` interval. Multiple versions coexist per `(src, tgt)` pair. Helpers: `temporal_active_at(r, t)`, `temporal_overlaps(r, t0, t1)`. Planner pushes time-slice predicates into a bounded prefix scan |
 | REST API | **Stable** | HTTP/JSON on port 7081 via gRPC-to-REST transcoding |
 | Read/write concerns | **Stable** | local, majority, linearizable, causal sessions |
