@@ -166,11 +166,11 @@ pub fn decode_edgeprop_key(key: &[u8]) -> Option<(String, NodeId, NodeId)> {
 /// lexicographically ascending by numeric value. Negative values use sign-flip
 /// so timestamps before the epoch sort before positive ones; the result is a
 /// total order matching `i64` comparison.
-fn encode_valid_from_sortable(valid_from_ms: i64) -> [u8; 8] {
+pub(crate) fn encode_valid_from_sortable(valid_from_ms: i64) -> [u8; 8] {
     ((valid_from_ms as u64) ^ (1u64 << 63)).to_be_bytes()
 }
 
-fn decode_valid_from_sortable(bytes: [u8; 8]) -> i64 {
+pub(crate) fn decode_valid_from_sortable(bytes: [u8; 8]) -> i64 {
     (u64::from_be_bytes(bytes) ^ (1u64 << 63)) as i64
 }
 

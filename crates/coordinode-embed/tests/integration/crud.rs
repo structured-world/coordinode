@@ -4851,3 +4851,212 @@ fn create_node_type_temporal_flag_persists_across_restart() {
         .expect_err("label must still be detected as existing after restart");
     assert!(format!("{err}").contains("already exists"));
 }
+
+// =====================================================================
+// R172b — Per-version temporal node storage (per ADR-027). Phase B: end-
+// to-end CREATE + MATCH on temporal labels (Phase A scaffold validation).
+// =====================================================================
+
+/// CREATE 3 versions of the same logical node on a temporal label — each
+/// CREATE allocates a fresh node_id today (R172c will introduce identity-
+/// preserving multi-version writes). MATCH still returns 3 rows because
+/// they all share the prefix-scan, and each row carries its own
+/// `valid_from` so downstream queries can differentiate.
+#[test]
+fn create_temporal_nodes_three_versions_then_match_returns_all() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
+        .expect("CREATE NODE TYPE Person TEMPORAL");
+
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
+        .expect("v1");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 200})")
+        .expect("v2");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 300})")
+        .expect("v3");
+
+    let rows = db
+        .execute_cypher("MATCH (p:Person) RETURN p.name AS name, p.valid_from AS vf")
+        .expect("MATCH temporal");
+    assert_eq!(rows.len(), 3, "every version must be returned: {rows:?}");
+
+    let mut vfs: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match r.get("vf") {
+            Some(Value::Int(i)) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    vfs.sort();
+    assert_eq!(vfs, vec![100, 200, 300]);
+}
+
+/// `__ingestion_ts__` is auto-populated on temporal CREATE and queryable
+/// as a regular property. Non-temporal nodes do not carry it. Validates
+/// the engine-managed system-time axis (ADR-027 consequence (0)).
+#[test]
+fn temporal_create_populates_ingestion_ts() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
+        .expect("CREATE NODE TYPE Person TEMPORAL");
+
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
+        .expect("create temporal");
+    db.execute_cypher("CREATE NODE TYPE Plain WITH (name: STRING)")
+        .expect("CREATE NODE TYPE Plain");
+    db.execute_cypher("CREATE (p:Plain {name: 'Bob'})")
+        .expect("create non-temporal");
+
+    let temp_rows = db
+        .execute_cypher("MATCH (p:Person) RETURN p.__ingestion_ts__ AS its")
+        .expect("MATCH Person");
+    assert_eq!(temp_rows.len(), 1);
+    let its = temp_rows[0].get("its");
+    assert!(
+        matches!(its, Some(Value::Int(i)) if *i > 0),
+        "temporal nodes must carry positive __ingestion_ts__: got {its:?}"
+    );
+
+    let plain_rows = db
+        .execute_cypher("MATCH (p:Plain) RETURN p.__ingestion_ts__ AS its")
+        .expect("MATCH Plain");
+    assert_eq!(plain_rows.len(), 1);
+    // Non-temporal nodes do NOT have __ingestion_ts__ — the column is
+    // absent (Cypher returns NULL for missing properties).
+    assert!(
+        !matches!(plain_rows[0].get("its"), Some(Value::Int(_))),
+        "non-temporal nodes must NOT carry __ingestion_ts__: got {:?}",
+        plain_rows[0].get("its")
+    );
+}
+
+/// `valid_to <= valid_from` is rejected at write time (interval invariant
+/// mirror of the temporal-edge guard). Zero-duration versions are bugs.
+#[test]
+fn temporal_create_rejects_inverted_or_zero_interval() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("CREATE NODE TYPE Person TEMPORAL");
+
+    // Inverted (valid_to < valid_from) — rejected.
+    let err = db
+        .execute_cypher("CREATE (p:Person {name: 'X', valid_from: 200, valid_to: 100})")
+        .expect_err("inverted interval must be rejected");
+    assert!(format!("{err}").contains("valid_to"));
+
+    // Zero-duration (valid_to == valid_from) — rejected.
+    let err = db
+        .execute_cypher("CREATE (p:Person {name: 'X', valid_from: 100, valid_to: 100})")
+        .expect_err("zero-duration interval must be rejected");
+    assert!(format!("{err}").contains("valid_to"));
+
+    // Open-ended (valid_to absent) — accepted.
+    db.execute_cypher("CREATE (p:Person {name: 'X', valid_from: 100})")
+        .expect("open-ended interval accepted");
+
+    // Proper closed interval — accepted.
+    db.execute_cypher("CREATE (p:Person {name: 'Y', valid_from: 100, valid_to: 200})")
+        .expect("proper closed interval accepted");
+}
+
+/// Non-temporal nodes coexist with temporal — same DB, same shard. Verify
+/// MATCH on a non-temporal label is unaffected by the presence of
+/// temporal records (zero-overhead invariant — non-temporal scan does
+/// not see temporal records of OTHER labels).
+#[test]
+fn temporal_and_non_temporal_coexist_in_same_db() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
+        .expect("Person TEMPORAL");
+    db.execute_cypher("CREATE NODE TYPE Company WITH (name: STRING)")
+        .expect("Company plain");
+
+    // Create across both labels.
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
+        .expect("Person v1");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 200})")
+        .expect("Person v2");
+    db.execute_cypher("CREATE (c:Company {name: 'Acme'})")
+        .expect("Company");
+
+    // Person MATCH returns 2 versions.
+    let people = db
+        .execute_cypher("MATCH (p:Person) RETURN p.name AS name")
+        .expect("MATCH Person");
+    assert_eq!(people.len(), 2, "two Person versions: {people:?}");
+
+    // Company MATCH returns the single non-temporal node — temporal
+    // Person versions do NOT bleed into the Company scan.
+    let companies = db
+        .execute_cypher("MATCH (c:Company) RETURN c.name AS name")
+        .expect("MATCH Company");
+    assert_eq!(companies.len(), 1, "single Company: {companies:?}");
+    assert_eq!(
+        companies[0].get("name"),
+        Some(&Value::String("Acme".into()))
+    );
+}
+
+/// SET on a temporal node is currently rejected — full per-version SET
+/// semantics land in R172c. Without this guard, SET would write through
+/// the 16-byte non-temporal key and silently bypass the 25-byte temporal
+/// record (data corruption). Better to fail loudly until R172c ships.
+#[test]
+fn set_on_temporal_node_rejected_until_r172c() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
+        .expect("CREATE NODE TYPE");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
+        .expect("CREATE temporal");
+
+    let err = db
+        .execute_cypher("MATCH (p:Person) SET p.name = 'Bob'")
+        .expect_err("SET on temporal node must reject in R172b scope");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("temporal") && msg.contains("R172c"),
+        "error must mention temporal + R172c: {msg}"
+    );
+
+    // SET on a non-temporal label is unaffected.
+    db.execute_cypher("CREATE NODE TYPE Plain WITH (name: STRING)")
+        .expect("CREATE NODE TYPE Plain");
+    db.execute_cypher("CREATE (n:Plain {name: 'X'})")
+        .expect("create plain");
+    db.execute_cypher("MATCH (n:Plain) SET n.name = 'Y'")
+        .expect("SET on non-temporal unaffected");
+}
+
+/// DELETE on a temporal node is rejected for the same reason — R172c is
+/// where the positive-bitemporal-fact tombstone model lands.
+#[test]
+fn delete_on_temporal_node_rejected_until_r172c() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
+        .expect("CREATE NODE TYPE");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
+        .expect("CREATE temporal");
+
+    let err = db
+        .execute_cypher("MATCH (p:Person) DELETE p")
+        .expect_err("DELETE on temporal node must reject in R172b scope");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("temporal") && msg.contains("R172c"),
+        "error must mention temporal + R172c: {msg}"
+    );
+
+    // DELETE on non-temporal node is unaffected.
+    db.execute_cypher("CREATE NODE TYPE Plain WITH (name: STRING)")
+        .expect("CREATE NODE TYPE Plain");
+    db.execute_cypher("CREATE (n:Plain {name: 'X'})")
+        .expect("create plain");
+    db.execute_cypher("MATCH (n:Plain) DELETE n")
+        .expect("DELETE on non-temporal unaffected");
+}
