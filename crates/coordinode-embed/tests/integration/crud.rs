@@ -3333,3 +3333,167 @@ fn trigger_before_commit_multiple_triggers_same_label_all_fire() {
         assert_eq!(rows.len(), 1, "Witness_{i} trigger must have fired");
     }
 }
+
+/// DELETE-event trigger fires on DETACH DELETE; `$before` carries the
+/// deleted node's properties so the audit body can capture them.
+#[test]
+fn trigger_before_commit_delete_fires_and_carries_before() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER on_delete ON :User DELETE BEFORE COMMIT \
+         EXECUTE CREATE (e:DeletionLog {action: $event, snapshot: $before})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (u:User {name: 'Carol', id: 7})")
+        .unwrap();
+    db.execute_cypher("MATCH (u:User) DETACH DELETE u").unwrap();
+
+    // User is gone, deletion log exists with $event = "DELETE" and a
+    // captured snapshot containing the user's pre-delete props.
+    let users = db.execute_cypher("MATCH (u:User) RETURN u").unwrap();
+    assert!(users.is_empty(), "User must be deleted; got {users:?}");
+
+    let logs = db
+        .execute_cypher("MATCH (e:DeletionLog) RETURN e.action AS act, e.snapshot AS snap")
+        .unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].get("act"), Some(&Value::String("DELETE".into())));
+    let snap = logs[0].get("snap").cloned().expect("snapshot recorded");
+    // $before lands as a Map of the deleted node's props; storage may
+    // serialise it as Document.
+    assert!(
+        matches!(snap, Value::Map(_) | Value::Document(_)),
+        "$before must be a Map (or Document after storage round-trip); got {snap:?}"
+    );
+}
+
+/// UPDATE-event trigger fires on SET; `$before` and `$after` carry the
+/// pre/post snapshots respectively.
+#[test]
+fn trigger_before_commit_update_fires_with_before_and_after() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER on_update ON :Counter UPDATE BEFORE COMMIT \
+         EXECUTE CREATE (e:ChangeLog {action: $event, old: $before, new: $after})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (c:Counter {value: 10})").unwrap();
+    db.execute_cypher("MATCH (c:Counter) SET c.value = 99")
+        .unwrap();
+
+    let logs = db
+        .execute_cypher("MATCH (e:ChangeLog) RETURN e.action AS act, e.old AS old, e.new AS new")
+        .unwrap();
+    assert_eq!(logs.len(), 1, "UPDATE trigger must have fired once");
+    assert_eq!(logs[0].get("act"), Some(&Value::String("UPDATE".into())));
+    // Both $before and $after present as Map / Document.
+    assert!(matches!(
+        logs[0].get("old"),
+        Some(Value::Map(_) | Value::Document(_))
+    ));
+    assert!(matches!(
+        logs[0].get("new"),
+        Some(Value::Map(_) | Value::Document(_))
+    ));
+}
+
+/// Multiple SET items in one row fire the UPDATE trigger ONCE per node,
+/// not once per item — `$before` is the snapshot taken at start of the
+/// SET clause, `$after` is the cumulative result.
+#[test]
+fn trigger_before_commit_update_fires_once_per_node_per_statement() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER count_fires ON :Item UPDATE BEFORE COMMIT \
+         EXECUTE CREATE (e:FireMark)",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (i:Item {a: 0, b: 0, c: 0})")
+        .unwrap();
+    db.execute_cypher("MATCH (i:Item) SET i.a = 1, i.b = 2, i.c = 3")
+        .unwrap();
+
+    let marks = db
+        .execute_cypher("MATCH (m:FireMark) RETURN count(m) AS n")
+        .unwrap();
+    assert_eq!(marks.len(), 1);
+    assert_eq!(
+        marks[0].get("n"),
+        Some(&Value::Int(1)),
+        "3 SET items must produce exactly 1 trigger firing, not 3: {marks:?}"
+    );
+}
+
+/// Edge-CREATE trigger fires on `CREATE (a)-[:TYPE {…}]->(b)`. Trigger
+/// is registered on the edge type and receives `$src` / `$tgt` /
+/// `$edge_type` / `$after` parameters.
+#[test]
+fn trigger_before_commit_edge_create_fires_with_endpoints() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER on_follow ON [:FOLLOWS] CREATE BEFORE COMMIT \
+         EXECUTE CREATE (e:FollowLog {action: $event, type_name: $edge_type, src_id: $src, tgt_id: $tgt})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (a:User {id: 1})").unwrap();
+    db.execute_cypher("CREATE (b:User {id: 2})").unwrap();
+    db.execute_cypher(
+        "MATCH (a:User {id: 1}), (b:User {id: 2}) CREATE (a)-[:FOLLOWS {weight: 5}]->(b)",
+    )
+    .unwrap();
+
+    let logs = db
+        .execute_cypher(
+            "MATCH (e:FollowLog) \
+             RETURN e.action AS act, e.type_name AS t, e.src_id AS s, e.tgt_id AS d",
+        )
+        .unwrap();
+    assert_eq!(logs.len(), 1, "edge-create trigger must have fired");
+    assert_eq!(logs[0].get("act"), Some(&Value::String("CREATE".into())));
+    assert_eq!(
+        logs[0].get("t"),
+        Some(&Value::String("FOLLOWS".into())),
+        "edge_type must be the type name"
+    );
+    assert!(matches!(logs[0].get("s"), Some(Value::Int(_))));
+    assert!(matches!(logs[0].get("d"), Some(Value::Int(_))));
+}
+
+/// A trigger registered on a node label MUST NOT fire on edge creation
+/// even if the edge type happens to share the label's name (the index
+/// segments `n:X` vs `e:X` are disjoint per ADR but this guards the wiring).
+#[test]
+fn trigger_node_label_does_not_fire_on_same_named_edge_type() {
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER node_only ON :SharedName CREATE BEFORE COMMIT \
+         EXECUTE CREATE (e:WronglyFired)",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (a:User {id: 1})").unwrap();
+    db.execute_cypher("CREATE (b:User {id: 2})").unwrap();
+    db.execute_cypher("MATCH (a:User {id: 1}), (b:User {id: 2}) CREATE (a)-[:SharedName]->(b)")
+        .unwrap();
+
+    let wrongly = db
+        .execute_cypher("MATCH (e:WronglyFired) RETURN e")
+        .unwrap();
+    assert!(
+        wrongly.is_empty(),
+        "node-label trigger must not fire on same-named edge type: {wrongly:?}"
+    );
+}
