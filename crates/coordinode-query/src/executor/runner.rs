@@ -7634,6 +7634,8 @@ fn execute_merge_nodes(
         // Capture target's properties BEFORE merge so we can issue per-property
         // index notifications afterwards (delete-old / insert-new).
         let target_props_before = target_rec.props.clone();
+        let target_extra_before: HashMap<String, Value> =
+            target_rec.extra.clone().unwrap_or_default();
         let target_label = target_rec.primary_label().to_string();
 
         merge_node_properties(&mut target_rec, &source_rec, conflict, row, ctx)?;
@@ -7686,6 +7688,23 @@ fn execute_merge_nodes(
                         }
                     }
                     SchemaMode::Flexible => {}
+                }
+            }
+            // The overflow `extra` map carries undeclared properties; under
+            // STRICT this slot must be empty. Catch source-only fields that
+            // were merged into the target's extra and bail rather than
+            // committing an out-of-schema record.
+            if matches!(schema.mode, SchemaMode::Strict) {
+                if let Some(extra) = &target_rec.extra {
+                    for (name, val) in extra {
+                        if target_extra_before.get(name) == Some(val) {
+                            continue;
+                        }
+                        return Err(ExecutionError::SchemaViolation(format!(
+                            "MERGE NODES would set unknown property '{name}' \
+                             on strict label '{target_label}'"
+                        )));
+                    }
                 }
             }
         }
