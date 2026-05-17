@@ -9751,9 +9751,20 @@ fn cascade_delete_source_node(
         )));
     }
 
-    // Cascade-delete: mirror `execute_delete` DETACH path logic.
+    // Cascade-delete: mirror `execute_delete` DETACH path logic, including
+    // BEFORE COMMIT DELETE trigger firings for each cascaded edge and for
+    // the source node itself. Without this, ATTACH DOCUMENT silently bypasses
+    // any DELETE trigger registered on the source's label or on its connected
+    // edges' types — asymmetric with DETACH DELETE and a real correctness
+    // gap for audit/compliance workloads.
     for edge_key in &remaining_edges {
         if let Some(parts) = decode_adj_key(edge_key) {
+            let edge_target_segment =
+                coordinode_core::schema::triggers::TriggerTargetSchema::edge_type(&parts.edge_type)
+                    .index_key_segment();
+            let matched_edge_delete = ctx.lookup_matching_triggers(&edge_target_segment, "d")?;
+            let is_temporal = lookup_edge_type_temporal(&parts.edge_type, ctx)?;
+
             if let Some(plist) = ctx.adj_get(edge_key)? {
                 for peer_uid in plist.iter() {
                     let peer_id = NodeId::from_raw(peer_uid);
@@ -9767,8 +9778,56 @@ fn cascade_delete_source_node(
                         AdjDirection::Out => (source_id, peer_id),
                         AdjDirection::In => (peer_id, source_id),
                     };
-                    let ep_key = encode_edgeprop_key(&parts.edge_type, ep_src, ep_tgt);
-                    ctx.mvcc_delete(Partition::EdgeProp, &ep_key)?;
+
+                    // Pre-snapshot edge props for trigger firing — same as
+                    // DETACH DELETE: captured before mvcc_delete so the body's
+                    // RYOW reads see the edge as deleted.
+                    let mut edge_delete_snapshots: Vec<std::collections::BTreeMap<String, Value>> =
+                        Vec::new();
+                    if !matched_edge_delete.is_empty() {
+                        if is_temporal {
+                            let prefix =
+                                temporal_edgeprop_pair_prefix(&parts.edge_type, ep_src, ep_tgt);
+                            for (_k, bytes) in ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)? {
+                                edge_delete_snapshots.push(decode_edgeprop_into_map(&bytes, ctx));
+                            }
+                        } else {
+                            let ep_key = encode_edgeprop_key(&parts.edge_type, ep_src, ep_tgt);
+                            if let Some(bytes) = ctx.mvcc_get(Partition::EdgeProp, &ep_key)? {
+                                edge_delete_snapshots.push(decode_edgeprop_into_map(&bytes, ctx));
+                            } else {
+                                edge_delete_snapshots.push(std::collections::BTreeMap::new());
+                            }
+                        }
+                    }
+
+                    if is_temporal {
+                        let prefix =
+                            temporal_edgeprop_pair_prefix(&parts.edge_type, ep_src, ep_tgt);
+                        let versions = ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)?;
+                        for (vkey, _) in versions {
+                            ctx.mvcc_delete(Partition::EdgeProp, &vkey)?;
+                        }
+                    } else {
+                        let ep_key = encode_edgeprop_key(&parts.edge_type, ep_src, ep_tgt);
+                        ctx.mvcc_delete(Partition::EdgeProp, &ep_key)?;
+                    }
+
+                    if !matched_edge_delete.is_empty() {
+                        for before in &edge_delete_snapshots {
+                            let trigger_params = trigger_params_for_edge_delete(
+                                &parts.edge_type,
+                                ep_src,
+                                ep_tgt,
+                                before,
+                            );
+                            fire_before_commit_triggers(
+                                &matched_edge_delete,
+                                &trigger_params,
+                                ctx,
+                            )?;
+                        }
+                    }
                 }
             }
         }
@@ -9787,7 +9846,15 @@ fn cascade_delete_source_node(
     // the standard delete path; ATTACH DOCUMENT's source is typically a
     // short-lived node so we keep this tight — cleanup mirrors DETACH DELETE
     // behaviour in `execute_delete`).
+    // Snapshot the pre-mutation node record once: re-used for both the
+    // BEFORE COMMIT DELETE trigger firing and (where present) index cleanup.
     let key = encode_node_key(ctx.shard_id, source_id);
+    let pre_snapshot: Option<(Vec<String>, std::collections::BTreeMap<String, Value>)> =
+        ctx.mvcc_get(Partition::Node, &key)?.and_then(|bytes| {
+            NodeRecord::from_msgpack(&bytes)
+                .ok()
+                .map(|rec| snapshot_node_record(&rec, ctx))
+        });
     let needs_index_cleanup = ctx.btree_index_registry.is_some()
         || ctx.vector_index_registry.is_some()
         || ctx.text_index_registry.is_some();
@@ -9828,6 +9895,23 @@ fn cascade_delete_source_node(
     }
     ctx.mvcc_delete(Partition::Node, &key)?;
     ctx.write_stats.nodes_deleted += 1;
+
+    // Fire BEFORE COMMIT DELETE triggers on the source node's labels —
+    // mirrors the DETACH DELETE behaviour in `execute_delete`. Probe runs
+    // AFTER mvcc_delete so the trigger body's MATCH against the deleted
+    // node returns empty via RYOW.
+    if let Some((labels, before_props)) = pre_snapshot {
+        let trigger_params = trigger_params_for_node_delete(source_id, &before_props);
+        for label in &labels {
+            let target_segment =
+                coordinode_core::schema::triggers::TriggerTargetSchema::label(label.clone())
+                    .index_key_segment();
+            let matched = ctx.lookup_matching_triggers(&target_segment, "d")?;
+            if !matched.is_empty() {
+                fire_before_commit_triggers(&matched, &trigger_params, ctx)?;
+            }
+        }
+    }
     Ok(())
 }
 
