@@ -1903,3 +1903,214 @@ fn baseline_with_a_return_a_prop() {
          level, independently of MERGE NODES."
     );
 }
+
+/// Default-behaviour audit: when `TRANSFER EDGES` is omitted, the source's
+/// edges are silently dropped along with the source node. This is the
+/// spec-mandated default ("edges remain on the non-surviving node and are
+/// removed by DETACH DELETE"). Make the behaviour explicit and tested so a
+/// future "preserve by default" silent regression would be caught.
+#[test]
+fn merge_nodes_without_transfer_drops_source_edges() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (peer:User {email: 'peer@x.com'})")
+        .unwrap();
+    db.execute_cypher(
+        "MATCH (b:User {email: 'b@x.com'}), (p:User {email: 'peer@x.com'}) \
+         CREATE (b)-[:KNOWS]->(p)",
+    )
+    .unwrap();
+
+    // No `TRANSFER EDGES` clause. Source's edge to peer should be DROPPED,
+    // not silently transferred.
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a",
+    )
+    .unwrap();
+
+    let edges = db
+        .execute_cypher(
+            "MATCH (a:User {email: 'a@x.com'})-[:KNOWS]->(p) RETURN p.email AS to_email",
+        )
+        .unwrap();
+    assert!(
+        edges.is_empty(),
+        "without TRANSFER EDGES, source's outgoing edge must be dropped — \
+         got rows: {edges:?}"
+    );
+    // peer survives untouched.
+    let peer = db
+        .execute_cypher("MATCH (p:User {email: 'peer@x.com'}) RETURN p.email AS e")
+        .unwrap();
+    assert_eq!(peer.len(), 1, "peer node is untouched by the merge");
+}
+
+/// Temporal edges with multiple versions per (src, tgt): the executor
+/// prefix-scans every version when transferring. Catches regressions in
+/// the temporal_edgeprop_pair_prefix codepath.
+#[test]
+fn merge_nodes_temporal_edge_transfers_all_versions() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE EDGE TYPE WORKS_AT TEMPORAL \
+         WITH (valid_from: TIMESTAMP, valid_to: TIMESTAMP, role: STRING)",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (a:Person {name: 'A'})").unwrap();
+    db.execute_cypher("CREATE (b:Person {name: 'B'})").unwrap();
+    db.execute_cypher("CREATE (co:Co {name: 'Acme'})").unwrap();
+
+    // Two versions of b→Acme.
+    db.execute_cypher(
+        "MATCH (b:Person {name: 'B'}), (c:Co {name: 'Acme'}) \
+         CREATE (b)-[:WORKS_AT {valid_from: 1000, valid_to: 2000, role: 'SWE'}]->(c)",
+    )
+    .unwrap();
+    db.execute_cypher(
+        "MATCH (b:Person {name: 'B'}), (c:Co {name: 'Acme'}) \
+         CREATE (b)-[:WORKS_AT {valid_from: 2000, valid_to: 3000, role: 'Staff'}]->(c)",
+    )
+    .unwrap();
+
+    db.execute_cypher(
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+         MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a",
+    )
+    .unwrap();
+
+    // Both versions must show up on a→Acme.
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:Person {name: 'A'})-[r:WORKS_AT]->(c:Co {name: 'Acme'}) \
+             RETURN r.role AS role, r.valid_from AS vf",
+        )
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "both temporal versions must be carried over; got {rows:?}"
+    );
+    let roles: std::collections::HashSet<_> = rows
+        .iter()
+        .filter_map(|r| match r.get("role") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(roles.contains("SWE"));
+    assert!(roles.contains("Staff"));
+}
+
+/// Multiple edge types between the same pair of nodes are transferred
+/// independently — KNOWS and FOLLOWS each have separate posting lists and
+/// edgeprop records, both must rehome on the target.
+#[test]
+fn merge_nodes_transfers_multiple_edge_types_between_same_pair() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (c:User {email: 'c@x.com'})")
+        .unwrap();
+    db.execute_cypher(
+        "MATCH (b:User {email: 'b@x.com'}), (c:User {email: 'c@x.com'}) \
+         CREATE (b)-[:KNOWS {since: 2020}]->(c)",
+    )
+    .unwrap();
+    db.execute_cypher(
+        "MATCH (b:User {email: 'b@x.com'}), (c:User {email: 'c@x.com'}) \
+         CREATE (b)-[:FOLLOWS {weight: 7}]->(c)",
+    )
+    .unwrap();
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a",
+    )
+    .unwrap();
+
+    use coordinode_core::graph::types::Value;
+    let knows = db
+        .execute_cypher(
+            "MATCH (a:User {email: 'a@x.com'})-[r:KNOWS]->(c:User {email: 'c@x.com'}) \
+             RETURN r.since AS s",
+        )
+        .unwrap();
+    assert_eq!(knows.len(), 1);
+    assert_eq!(knows[0].get("s"), Some(&Value::Int(2020)));
+
+    let follows = db
+        .execute_cypher(
+            "MATCH (a:User {email: 'a@x.com'})-[r:FOLLOWS]->(c:User {email: 'c@x.com'}) \
+             RETURN r.weight AS w",
+        )
+        .unwrap();
+    assert_eq!(follows.len(), 1);
+    assert_eq!(follows[0].get("w"), Some(&Value::Int(7)));
+}
+
+/// MERGE NODES followed by SET in the same query: row binding survives so
+/// downstream mutations target the merged record. Confirms composability
+/// with the rest of the write pipeline.
+#[test]
+fn merge_nodes_followed_by_set_in_same_query() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .unwrap();
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a \
+         SET a.merged = true",
+    )
+    .unwrap();
+
+    use coordinode_core::graph::types::Value;
+    let rows = db
+        .execute_cypher("MATCH (u:User) RETURN u.email AS e, u.merged AS m")
+        .unwrap();
+    assert_eq!(rows.len(), 1, "only the survivor remains");
+    assert_eq!(rows[0].get("e"), Some(&Value::String("a@x.com".into())));
+    assert_eq!(
+        rows[0].get("m"),
+        Some(&Value::Bool(true)),
+        "downstream SET must land on the merged target"
+    );
+}
+
+/// CREATE + MERGE NODES in the same query: nodes created in the first
+/// clause must be visible to the MATCH that feeds MERGE NODES, and the
+/// merge must run cleanly. Catches order-of-operations regressions when
+/// the executor pipelines CREATE outputs into a downstream MATCH.
+#[test]
+fn merge_nodes_after_create_in_same_query() {
+    let (mut db, _dir) = open_db();
+
+    // First CREATE seed nodes that we don't intend to merge.
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com', score: 1})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com', score: 2})")
+        .unwrap();
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a ON CONFLICT KEEP LAST",
+    )
+    .unwrap();
+
+    use coordinode_core::graph::types::Value;
+    let rows = db
+        .execute_cypher("MATCH (u:User) RETURN u.email AS e, u.score AS s")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("s"), Some(&Value::Int(2)));
+}
