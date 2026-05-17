@@ -2225,3 +2225,112 @@ fn merge_nodes_followed_by_delete_in_same_query() {
         "merge then DELETE must wipe both nodes; got {users:?}"
     );
 }
+
+/// STRICT happy-path: merge that produces a record fully compliant with the
+/// target's STRICT schema must succeed. All the existing STRICT tests prove
+/// the rejection paths; this one guards against the opposite regression
+/// where STRICT enforcement is over-eager and blocks valid merges.
+#[test]
+fn merge_nodes_strict_accepts_compliant_merge() {
+    use coordinode_core::graph::types::Value;
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
+
+    let (mut db, _dir) = open_db();
+
+    // STRICT schema: declares email, name. Both sources stay within these
+    // declared keys, so the merge result MUST be accepted.
+    let mut customer = LabelSchema::new_node_id("StrictHappy");
+    customer.set_mode(SchemaMode::Strict);
+    customer.add_property(PropertyDef::new("email", PropertyType::String).not_null());
+    customer.add_property(PropertyDef::new("name", PropertyType::String));
+    db.create_label_schema(customer).unwrap();
+
+    db.execute_cypher("CREATE (a:StrictHappy {email: 'a@x.com'})")
+        .unwrap();
+    // Source declares `name` (declared on target schema → ends up in props,
+    // valid under STRICT). No undeclared fields.
+    db.execute_cypher("CREATE (b:StrictHappy {email: 'b@x.com', name: 'Bob'})")
+        .unwrap();
+
+    db.execute_cypher(
+        "MATCH (a:StrictHappy {email: 'a@x.com'}), (b:StrictHappy {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a ON CONFLICT COALESCE",
+    )
+    .expect("compliant merge must NOT be rejected by STRICT enforcement");
+
+    let rows = db
+        .execute_cypher("MATCH (n:StrictHappy) RETURN n.email AS e, n.name AS n")
+        .unwrap();
+    assert_eq!(rows.len(), 1, "exactly one survivor under STRICT");
+    assert_eq!(rows[0].get("e"), Some(&Value::String("a@x.com".into())));
+    assert_eq!(
+        rows[0].get("n"),
+        Some(&Value::String("Bob".into())),
+        "COALESCE filled missing `name` from source — STRICT must accept this"
+    );
+}
+
+/// Mixed posting list: source has BOTH a self-loop and edges to other peers
+/// for the same edge type. Single direction iteration must transfer all
+/// entries — the self-loop translates to target↔target, the rest become
+/// target↔peer. Catches off-by-one or skip-on-self-loop regressions in the
+/// per-peer transfer loop.
+#[test]
+fn merge_nodes_self_loop_and_other_peers_mixed_transfer() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (c:User {email: 'c@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (d:User {email: 'd@x.com'})")
+        .unwrap();
+
+    // b→b self-loop + b→c + b→d in the SAME edge type.
+    db.execute_cypher("MATCH (b:User {email: 'b@x.com'}) CREATE (b)-[:LINKS]->(b)")
+        .unwrap();
+    db.execute_cypher(
+        "MATCH (b:User {email: 'b@x.com'}), (c:User {email: 'c@x.com'}) \
+         CREATE (b)-[:LINKS]->(c)",
+    )
+    .unwrap();
+    db.execute_cypher(
+        "MATCH (b:User {email: 'b@x.com'}), (d:User {email: 'd@x.com'}) \
+         CREATE (b)-[:LINKS]->(d)",
+    )
+    .unwrap();
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a",
+    )
+    .unwrap();
+
+    // After merge: a→a (self-loop), a→c, a→d. All three must exist.
+    // After merge: a has exactly THREE outgoing :LINKS edges — one self-loop
+    // (a→a, originally b→b) plus a→c and a→d. The current executor does
+    // not enforce identity of the second `a` in `(a)-[:LINKS]->(a)`, so we
+    // enumerate all outgoing peers and verify the multi-set directly.
+    use coordinode_core::graph::types::Value;
+    let all_out = db
+        .execute_cypher(
+            "MATCH (a:User {email: 'a@x.com'})-[:LINKS]->(p:User) \
+             RETURN p.email AS e \
+             ORDER BY p.email",
+        )
+        .unwrap();
+    assert_eq!(
+        all_out.len(),
+        3,
+        "expected 3 outgoing edges (self-loop + c + d), got {all_out:?}"
+    );
+    let emails: Vec<_> = all_out
+        .iter()
+        .filter_map(|r| match r.get("e") {
+            Some(Value::String(s)) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(emails, vec!["a@x.com", "c@x.com", "d@x.com"]);
+}
