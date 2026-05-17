@@ -6573,6 +6573,35 @@ fn execute_create_node(
             }
         }
 
+        // Fire BEFORE COMMIT triggers registered on any of the new node's
+        // labels for the CREATE event. Triggers fire after the node write
+        // is staged in the MVCC buffer so a trigger body can MATCH the new
+        // node via read-your-own-writes. On a trigger error (ON ERROR
+        // PROPAGATE — the BEFORE-COMMIT default) the surrounding error
+        // path drops the buffer and the node is never persisted. AFTER
+        // COMMIT triggers are skipped here; they fire through the async
+        // oplog-consumer path once that lands.
+        if !labels.is_empty() {
+            let props_map: std::collections::HashMap<String, Value> = properties
+                .iter()
+                .map(|(name, expr)| {
+                    let val = eval_expr(expr, input_row).map_to_document();
+                    (name.clone(), val)
+                })
+                .collect();
+            let trigger_params = trigger_params_for_node_create(node_id, &props_map);
+
+            for label in labels {
+                let target_segment =
+                    coordinode_core::schema::triggers::TriggerTargetSchema::label(label.clone())
+                        .index_key_segment();
+                let matched = ctx.lookup_matching_triggers(&target_segment, "c")?;
+                if !matched.is_empty() {
+                    fire_before_commit_triggers(&matched, &trigger_params, ctx)?;
+                }
+            }
+        }
+
         // Build output row
         let mut row = input_row.clone();
         let var_name = variable.unwrap_or("_");
@@ -10183,6 +10212,90 @@ fn execute_alter_trigger(
     row.insert("name".into(), Value::String(c.name.clone()));
     row.insert("status".into(), Value::String(status.into()));
     Ok(vec![row])
+}
+
+// ======================================================================
+// Trigger firing engine (BEFORE COMMIT, synchronous, leader-only)
+// ======================================================================
+
+/// Fire all matching BEFORE COMMIT triggers for a mutation. Caller probes
+/// `ctx.lookup_matching_triggers(target_segment, event)` to get the
+/// candidate list, then passes the list here along with the event params.
+///
+/// Each trigger body is parsed, parameterised with `params` (which must
+/// contain `$event`, `$node` or `$edge`, and `$before` / `$after` per the
+/// trigger contract), planned, and executed in the same MVCC transaction
+/// as the originating mutation. L1/L2 cascade counters are enforced.
+///
+/// `ON ERROR PROPAGATE` (the BEFORE COMMIT default) bubbles errors up to
+/// abort the originating transaction. `RETRY` and `DEAD_LETTER` on
+/// BEFORE COMMIT are simplified to PROPAGATE for now — synchronous retry
+/// inside the same transaction would deadlock against write locks, and
+/// dead-lettering inside an aborting transaction is paradoxical (the
+/// dead-letter write would itself be rolled back). The doc comment in
+/// the trigger architecture document spells out this constraint.
+///
+/// AFTER COMMIT triggers in the matched list are silently skipped — the
+/// async-trigger executor consumes them via the oplog instead.
+pub(crate) fn fire_before_commit_triggers(
+    matched: &[coordinode_core::schema::triggers::TriggerSchema],
+    params: &std::collections::HashMap<String, Value>,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    use coordinode_core::schema::triggers::TriggerTimingSchema;
+    for trigger in matched {
+        if !matches!(trigger.timing, TriggerTimingSchema::BeforeCommit) {
+            continue;
+        }
+        ctx.cascade_enter(&trigger.name, trigger.cascade_limit, trigger.cascade_fanout)?;
+        let result = execute_trigger_body_inline(trigger, params, ctx);
+        ctx.cascade_exit();
+        result?;
+    }
+    Ok(())
+}
+
+/// Parse the trigger body source, substitute params, plan, and execute
+/// against `ctx`. Body writes land in the same `mvcc_write_buffer` as
+/// the originating mutation — succeeding triggers commit together with
+/// the user's transaction; a failing trigger aborts the whole batch via
+/// the standard error-propagation path.
+fn execute_trigger_body_inline(
+    trigger: &coordinode_core::schema::triggers::TriggerSchema,
+    params: &std::collections::HashMap<String, Value>,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    let query = crate::cypher::parser::parse(&trigger.body_source).map_err(|e| {
+        ExecutionError::Unsupported(format!(
+            "trigger `{}` body re-parse failed at fire time: {e}",
+            trigger.name
+        ))
+    })?;
+    let mut plan = crate::planner::builder::build_logical_plan(&query).map_err(|e| {
+        ExecutionError::Unsupported(format!("trigger `{}` body plan failed: {e}", trigger.name))
+    })?;
+    plan.root.substitute_params(params);
+    let _ = execute_op(&plan.root, ctx)?;
+    Ok(())
+}
+
+/// Build the parameter map for a node-CREATE trigger firing.
+/// `$event = "CREATE"`, `$before = NULL`, `$after = props as Map`,
+/// `$node = NodeId`.
+fn trigger_params_for_node_create(
+    node_id: NodeId,
+    props: &std::collections::HashMap<String, Value>,
+) -> std::collections::HashMap<String, Value> {
+    let mut after: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    for (k, v) in props {
+        after.insert(k.clone(), v.clone());
+    }
+    let mut params = std::collections::HashMap::with_capacity(4);
+    params.insert("event".into(), Value::String("CREATE".into()));
+    params.insert("before".into(), Value::Null);
+    params.insert("after".into(), Value::Map(after));
+    params.insert("node".into(), Value::Int(node_id.as_raw() as i64));
+    params
 }
 
 /// Execute CREATE TEXT INDEX: creates a text index definition and registers it.
