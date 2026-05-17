@@ -67,6 +67,28 @@ pub enum ExecutionError {
     /// a write attempted to SET a COMPUTED (read-only) property.
     #[error("schema violation: {0}")]
     SchemaViolation(String),
+
+    /// L1 cycle protection trip (ADR-026A): cumulative trigger cascade depth
+    /// for the current originating mutation exceeded its limit. `chain` lists
+    /// the trigger names that fired, in firing order, to help diagnose the
+    /// runaway cascade.
+    #[error("trigger cascade depth exceeded: current={current}, limit={limit}, chain={chain:?}")]
+    CascadeOverflow {
+        current: u32,
+        limit: u32,
+        chain: Vec<String>,
+    },
+
+    /// L2 cycle protection trip (ADR-026A): a single trigger fired more times
+    /// than its `CASCADE_FANOUT` allows within one cascade root. Wide-but-
+    /// shallow runaways (one trigger re-firing per row of a batch) trip this
+    /// well before L1.
+    #[error("trigger cascade fanout exceeded for `{trigger}`: count={count}, limit={limit}")]
+    CascadeFanoutOverflow {
+        trigger: String,
+        count: u32,
+        limit: u32,
+    },
 }
 
 /// Configuration for adaptive query plan behavior.
@@ -382,6 +404,33 @@ pub struct ExecutionContext<'a> {
     /// Each entry: (node_key, encoded DocDelta with PathTarget::PropField).
     /// At flush, each becomes `Mutation::Merge` on `Partition::Node`.
     pub merge_node_deltas: Vec<(Vec<u8>, Vec<u8>)>,
+    /// L1 cascade depth counter (ADR-026A). Shared across all triggers in
+    /// one originating user mutation. Incremented before each trigger body
+    /// is executed, decremented (RAII-style) when the body returns. When
+    /// `cascade_depth > cascade_depth_limit` the firing is rejected with
+    /// `ExecutionError::CascadeOverflow`.
+    ///
+    /// Wired by R190-6 probe; enforced by R191/R192 executors.
+    pub cascade_depth: u32,
+    /// Cluster-default cap on `cascade_depth`. Per-trigger `CASCADE_LIMIT n`
+    /// in the trigger definition tightens this further when present.
+    /// Source: cluster setting `triggers.max_cascade_depth` (default 10).
+    pub cascade_depth_limit: u32,
+    /// L2 unique-trigger fanout map (ADR-026A). Keyed by trigger name; value
+    /// is the number of times that trigger has fired within the current
+    /// cascade root. When `cascade_fire_counts[name] > cascade_fanout_limit`
+    /// the firing is rejected with `ExecutionError::CascadeFanoutOverflow`.
+    ///
+    /// Wired by R190-6 probe; enforced by R191/R192 executors.
+    pub cascade_fire_counts: HashMap<String, u32>,
+    /// Cluster-default cap on per-trigger fanout. Per-trigger `CASCADE_FANOUT n`
+    /// tightens this further when present. Source: cluster setting
+    /// `triggers.max_cascade_fanout` (default 100).
+    pub cascade_fanout_limit: u32,
+    /// Ordered chain of trigger names that have fired within the current
+    /// cascade — used to populate the `cascade_chain` diagnostic field in
+    /// dead-letter records when L1/L2 trip.
+    pub cascade_chain: Vec<String>,
     /// Outer-scope row for correlated OPTIONAL MATCH execution.
     ///
     /// When set, the Filter operator merges these variables into each row
@@ -428,6 +477,89 @@ fn partition_to_id(p: Partition) -> PartitionId {
 }
 
 impl<'a> ExecutionContext<'a> {
+    /// L1+L2 cascade entry (ADR-026A). Call before executing a trigger body.
+    /// Increments depth + per-trigger fire count, appends to chain, and trips
+    /// `CascadeOverflow` / `CascadeFanoutOverflow` when limits are exceeded.
+    ///
+    /// `per_trigger_depth_limit` / `per_trigger_fanout_limit` are the per-trigger
+    /// `CASCADE_LIMIT` / `CASCADE_FANOUT` overrides parsed from DDL; `None` means
+    /// "use the context-wide cluster default". The effective limit is the MIN of
+    /// the cluster default and the per-trigger override (tighter wins).
+    ///
+    /// **Caller must pair every successful `cascade_enter` with one
+    /// `cascade_exit`, in LIFO order matching firings, on both success and
+    /// error paths of the trigger body.** RAII via a guard returning `&'g mut
+    /// Self` would lock the context for the entire body execution, but the
+    /// body itself needs `&mut ctx` for nested mutations — so the explicit
+    /// enter/exit pairing keeps the borrow window tight.
+    ///
+    /// The L2 fanout counter is intentionally NOT decremented by
+    /// `cascade_exit` — it tracks total firings of a given trigger across the
+    /// entire cascade root, which is what L2 wants to bound.
+    pub fn cascade_enter(
+        &mut self,
+        trigger_name: &str,
+        per_trigger_depth_limit: Option<u32>,
+        per_trigger_fanout_limit: Option<u32>,
+    ) -> Result<(), ExecutionError> {
+        let depth_limit = match per_trigger_depth_limit {
+            Some(v) => v.min(self.cascade_depth_limit),
+            None => self.cascade_depth_limit,
+        };
+        let fanout_limit = match per_trigger_fanout_limit {
+            Some(v) => v.min(self.cascade_fanout_limit),
+            None => self.cascade_fanout_limit,
+        };
+
+        // L1: cumulative depth across all triggers.
+        let next_depth = self.cascade_depth.saturating_add(1);
+        if next_depth > depth_limit {
+            let mut chain = self.cascade_chain.clone();
+            chain.push(trigger_name.to_string());
+            return Err(ExecutionError::CascadeOverflow {
+                current: next_depth,
+                limit: depth_limit,
+                chain,
+            });
+        }
+
+        // L2: per-trigger fanout in this cascade root.
+        let entry = self
+            .cascade_fire_counts
+            .entry(trigger_name.to_string())
+            .or_insert(0);
+        let next_count = (*entry).saturating_add(1);
+        if next_count > fanout_limit {
+            return Err(ExecutionError::CascadeFanoutOverflow {
+                trigger: trigger_name.to_string(),
+                count: next_count,
+                limit: fanout_limit,
+            });
+        }
+        *entry = next_count;
+
+        self.cascade_depth = next_depth;
+        self.cascade_chain.push(trigger_name.to_string());
+        Ok(())
+    }
+
+    /// Paired with a successful `cascade_enter`. Decrements `cascade_depth`
+    /// and pops the trailing chain entry. The L2 fanout counter is preserved
+    /// — see `cascade_enter` doc.
+    pub fn cascade_exit(&mut self) {
+        self.cascade_depth = self.cascade_depth.saturating_sub(1);
+        self.cascade_chain.pop();
+    }
+
+    /// Reset all L1/L2 cascade tracking. Called at the start of each user
+    /// mutation root so trigger chains from a prior statement do not leak
+    /// into the next one.
+    pub fn cascade_reset(&mut self) {
+        self.cascade_depth = 0;
+        self.cascade_fire_counts.clear();
+        self.cascade_chain.clear();
+    }
+
     /// Read a Node key for schema checks without triggering RYOW merge-delta materialization.
     ///
     /// Schema checks in PropertyPath and DocFunction SET items need the node's primary
@@ -2099,6 +2231,17 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             temporal,
             properties,
         } => execute_create_edge_type(name, *temporal, properties, ctx),
+
+        // R190 trigger DDL — full executors land in R190-5. For now the
+        // operator typechecks and surfaces a clear "not yet wired" error so
+        // grammar + planner can ship independently and the integration test
+        // gating R190-5 has something to fail against.
+        LogicalOp::CreateTrigger { .. }
+        | LogicalOp::DropTrigger { .. }
+        | LogicalOp::ShowTriggers
+        | LogicalOp::AlterTrigger { .. } => Err(ExecutionError::Unsupported(
+            "trigger DDL executor pending R190-5 (grammar/AST/planner complete)".to_string(),
+        )),
 
         LogicalOp::Empty => Ok(vec![Row::new()]),
 
@@ -10341,6 +10484,14 @@ mod tests {
             mvcc_snapshot: None,
             adj_snapshot: None,
             merge_node_deltas: Vec::new(),
+            // L1/L2 cascade tracking (ADR-026A) — counters start at zero per
+            // originating user mutation; defaults match cluster setting
+            // defaults documented in ADR-026A.
+            cascade_depth: 0,
+            cascade_depth_limit: 10,
+            cascade_fire_counts: std::collections::HashMap::new(),
+            cascade_fanout_limit: 100,
+            cascade_chain: Vec::new(),
             correlated_row: None,
             feedback_cache: None,
             schema_label_cache: std::collections::HashMap::new(),
@@ -13992,5 +14143,148 @@ mod tests {
             Some(2_000),
         );
         assert!(early < late, "earlier valid_from must sort first");
+    }
+
+    // ── R190 / ADR-026A: L1+L2 cascade tracking ────────────────────────────
+
+    /// L1 trip: nesting deeper than the depth limit returns `CascadeOverflow`
+    /// with the full chain attached for diagnostics.
+    #[test]
+    fn cascade_l1_depth_trips_with_chain() {
+        let (_dir, engine, mut interner) = setup_test_graph();
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.cascade_depth_limit = 2;
+        ctx.cascade_fanout_limit = 100;
+
+        ctx.cascade_enter("audit_a", None, None).expect("depth 1");
+        ctx.cascade_enter("audit_b", None, None).expect("depth 2");
+        let err = ctx.cascade_enter("audit_c", None, None).unwrap_err();
+        match err {
+            ExecutionError::CascadeOverflow {
+                current,
+                limit,
+                chain,
+            } => {
+                assert_eq!(current, 3);
+                assert_eq!(limit, 2);
+                assert_eq!(chain, vec!["audit_a", "audit_b", "audit_c"]);
+            }
+            other => panic!("expected CascadeOverflow, got {other:?}"),
+        }
+        ctx.cascade_exit();
+        ctx.cascade_exit();
+    }
+
+    /// L2 trip: a single trigger firing more than `cascade_fanout_limit`
+    /// times within one cascade root returns `CascadeFanoutOverflow`.
+    #[test]
+    fn cascade_l2_fanout_trips_for_repeated_trigger() {
+        let (_dir, engine, mut interner) = setup_test_graph();
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.cascade_depth_limit = 100;
+        ctx.cascade_fanout_limit = 3;
+
+        for _ in 0..3 {
+            ctx.cascade_enter("counter", None, None)
+                .expect("fanout within limit");
+            ctx.cascade_exit();
+        }
+        let err = ctx.cascade_enter("counter", None, None).unwrap_err();
+        match err {
+            ExecutionError::CascadeFanoutOverflow {
+                trigger,
+                count,
+                limit,
+            } => {
+                assert_eq!(trigger, "counter");
+                assert_eq!(count, 4);
+                assert_eq!(limit, 3);
+            }
+            other => panic!("expected CascadeFanoutOverflow, got {other:?}"),
+        }
+    }
+
+    /// Per-trigger `CASCADE_LIMIT n` tightens the cluster default; effective limit = min.
+    #[test]
+    fn cascade_per_trigger_override_takes_min() {
+        let (_dir, engine, mut interner) = setup_test_graph();
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.cascade_depth_limit = 5;
+
+        ctx.cascade_enter("t", Some(2), None)
+            .expect("depth 1 within tight override");
+        ctx.cascade_enter("t", Some(2), None)
+            .expect("depth 2 within tight override");
+        let err = ctx.cascade_enter("t", Some(2), None).unwrap_err();
+        assert!(matches!(
+            err,
+            ExecutionError::CascadeOverflow { limit: 2, .. }
+        ));
+        ctx.cascade_exit();
+        ctx.cascade_exit();
+    }
+
+    /// Per-trigger override cannot raise the limit above the cluster cap.
+    #[test]
+    fn cascade_per_trigger_override_cannot_exceed_cluster() {
+        let (_dir, engine, mut interner) = setup_test_graph();
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.cascade_depth_limit = 3;
+
+        ctx.cascade_enter("t", Some(100), None).expect("depth 1");
+        ctx.cascade_enter("t", Some(100), None).expect("depth 2");
+        ctx.cascade_enter("t", Some(100), None).expect("depth 3");
+        let err = ctx.cascade_enter("t", Some(100), None).unwrap_err();
+        assert!(matches!(
+            err,
+            ExecutionError::CascadeOverflow { limit: 3, .. }
+        ));
+        ctx.cascade_exit();
+        ctx.cascade_exit();
+        ctx.cascade_exit();
+    }
+
+    /// `cascade_exit` decrements depth so sibling cascades start fresh.
+    #[test]
+    fn cascade_exit_decrements_depth_for_siblings() {
+        let (_dir, engine, mut interner) = setup_test_graph();
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.cascade_depth_limit = 2;
+
+        ctx.cascade_enter("a", None, None).unwrap();
+        ctx.cascade_enter("b", None, None).unwrap();
+        ctx.cascade_exit();
+        ctx.cascade_exit();
+        assert_eq!(ctx.cascade_depth, 0);
+
+        ctx.cascade_enter("c", None, None).expect("fresh cascade");
+        ctx.cascade_enter("d", None, None).expect("nested");
+        ctx.cascade_exit();
+        ctx.cascade_exit();
+    }
+
+    /// `cascade_reset()` wipes per-trigger fanout counts.
+    #[test]
+    fn cascade_reset_clears_fanout_counts() {
+        let (_dir, engine, mut interner) = setup_test_graph();
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.cascade_fanout_limit = 2;
+        ctx.cascade_depth_limit = 100;
+
+        ctx.cascade_enter("t", None, None).unwrap();
+        ctx.cascade_exit();
+        ctx.cascade_enter("t", None, None).unwrap();
+        ctx.cascade_exit();
+
+        ctx.cascade_reset();
+        ctx.cascade_enter("t", None, None)
+            .expect("fanout counter cleared");
+        ctx.cascade_exit();
     }
 }

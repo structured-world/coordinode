@@ -237,10 +237,16 @@ impl<'a> Analyzer<'a> {
             | Clause::DropIndex(_)
             | Clause::CreateVectorIndex(_)
             | Clause::DropVectorIndex(_)
-            | Clause::CreateEdgeType(_) => {
+            | Clause::CreateEdgeType(_)
+            | Clause::CreateTrigger(_)
+            | Clause::DropTrigger(_)
+            | Clause::ShowTriggers
+            | Clause::AlterTrigger(_) => {
                 // DDL — no variable references to validate.
                 // Edge-type property type names are validated at execution time
-                // against `PropertyType` enum in the DDL executor.
+                // against `PropertyType` enum in the DDL executor. Trigger body
+                // re-parses and validates at execution time too (the body is a
+                // raw Cypher string captured by the parser).
             }
         }
     }

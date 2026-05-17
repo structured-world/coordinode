@@ -369,6 +369,22 @@ pub enum LogicalOp {
         properties: Vec<crate::cypher::ast::EdgePropertyDecl>,
     },
 
+    /// CREATE TRIGGER — R190 / ADR-026. Registers a trigger definition in the
+    /// schema partition, updates the `(target, event)` index, and (in EE)
+    /// notifies trigger workers of the new subscription.
+    CreateTrigger {
+        clause: crate::cypher::ast::CreateTriggerClause,
+    },
+    /// DROP TRIGGER — R190.
+    DropTrigger { name: String },
+    /// SHOW TRIGGERS — R190. Reads schema partition and returns one row per
+    /// registered trigger.
+    ShowTriggers,
+    /// ALTER TRIGGER — R190.
+    AlterTrigger {
+        clause: crate::cypher::ast::AlterTriggerClause,
+    },
+
     /// UNWIND: expand a list expression into individual rows.
     /// Produced from UNWIND expr AS variable.
     Unwind {
@@ -856,6 +872,10 @@ impl LogicalOp {
             | LogicalOp::CreateVectorIndex { .. }
             | LogicalOp::DropVectorIndex { .. }
             | LogicalOp::CreateEdgeType { .. }
+            | LogicalOp::CreateTrigger { .. }
+            | LogicalOp::DropTrigger { .. }
+            | LogicalOp::ShowTriggers
+            | LogicalOp::AlterTrigger { .. }
             | LogicalOp::Empty => {}
         }
     }
@@ -1402,7 +1422,11 @@ fn estimate_op_cost(
         | LogicalOp::DropIndex { .. }
         | LogicalOp::CreateVectorIndex { .. }
         | LogicalOp::DropVectorIndex { .. }
-        | LogicalOp::CreateEdgeType { .. } => (1.0, 1.0),
+        | LogicalOp::CreateEdgeType { .. }
+        | LogicalOp::CreateTrigger { .. }
+        | LogicalOp::DropTrigger { .. }
+        | LogicalOp::ShowTriggers
+        | LogicalOp::AlterTrigger { .. } => (1.0, 1.0),
         LogicalOp::MergeNodes { input, .. } => {
             // Cost ≈ input cost + per-row (property merge + edge transfer over avg_fan_out).
             // Edge transfer dominates: ~2 × avg_fan_out posting-list ops per merge.
@@ -2024,6 +2048,24 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
                 "{prefix}MergeNodes({source_a},{source_b}) INTO {target} {conflict_tag}{transfer_tag}{dup_tag}{props_tag}\n"
             ));
             explain_op(input, indent + 1, output);
+        }
+        LogicalOp::CreateTrigger { clause } => {
+            output.push_str(&format!(
+                "{prefix}CreateTrigger({}, target={:?}, timing={:?})\n",
+                clause.name, clause.target, clause.timing
+            ));
+        }
+        LogicalOp::DropTrigger { name } => {
+            output.push_str(&format!("{prefix}DropTrigger({name})\n"));
+        }
+        LogicalOp::ShowTriggers => {
+            output.push_str(&format!("{prefix}ShowTriggers\n"));
+        }
+        LogicalOp::AlterTrigger { clause } => {
+            output.push_str(&format!(
+                "{prefix}AlterTrigger({}, action={:?})\n",
+                clause.name, clause.action
+            ));
         }
         LogicalOp::Empty => {
             output.push_str(&format!("{prefix}Empty\n"));

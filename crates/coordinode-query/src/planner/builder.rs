@@ -585,6 +585,12 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             temporal: c.temporal,
             properties: c.properties.clone(),
         }),
+        Clause::CreateTrigger(c) => Ok(LogicalOp::CreateTrigger { clause: c.clone() }),
+        Clause::DropTrigger(c) => Ok(LogicalOp::DropTrigger {
+            name: c.name.clone(),
+        }),
+        Clause::ShowTriggers => Ok(LogicalOp::ShowTriggers),
+        Clause::AlterTrigger(c) => Ok(LogicalOp::AlterTrigger { clause: c.clone() }),
         Clause::AttachDocument(ad) => {
             // Synthesize a MATCH for the ATTACH pattern `(a)-[:T]->(u)` so that
             // the executor receives pre-bound `source_variable` / `target_variable`

@@ -102,6 +102,15 @@ pub enum Clause {
     DropVectorIndex(DropVectorIndexClause),
     CreateEdgeType(CreateEdgeTypeClause),
 
+    /// `CREATE TRIGGER … ON :Label CREATE|UPDATE|DELETE BEFORE|AFTER COMMIT EXECUTE … [ON ERROR …]` (R190 / ADR-026).
+    CreateTrigger(CreateTriggerClause),
+    /// `DROP TRIGGER <name>` (R190 / ADR-026).
+    DropTrigger(DropTriggerClause),
+    /// `SHOW TRIGGERS` (R190 / ADR-026).
+    ShowTriggers,
+    /// `ALTER TRIGGER <name> { DISABLE | ENABLE | SET EXECUTE … | SET ON ERROR … }` (R190 / ADR-026).
+    AlterTrigger(AlterTriggerClause),
+
     // Write clauses
     Create(CreateClause),
     Merge(MergeClause),
@@ -313,6 +322,130 @@ pub struct EdgePropertyDecl {
 pub struct DropVectorIndexClause {
     /// Index name to drop.
     pub name: String,
+}
+
+/// `CREATE TRIGGER` — defines a reactive Cypher body that fires on graph
+/// mutations. See [arch/core/triggers.md] and ADR-026.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTriggerClause {
+    /// Unique trigger name (used as DROP / ALTER / SHOW handle).
+    pub name: String,
+    /// Target: `:Label` or `[:EdgeType]` — narrows which mutations fire the trigger.
+    pub target: TriggerTarget,
+    /// Event kinds that fire the trigger (CREATE / UPDATE / DELETE; multiple allowed via `|`).
+    pub events: TriggerEvents,
+    /// Synchronous (`BEFORE COMMIT`) or asynchronous (`AFTER COMMIT`).
+    pub timing: TriggerTiming,
+    /// Trigger body — captured as a raw Cypher source string at parse time;
+    /// re-parsed and executed when the trigger fires. The grammar guarantees
+    /// the source is at least one syntactically valid clause sequence.
+    pub body_source: String,
+    /// L1 cascade-depth limit per-trigger override (ADR-026A).
+    /// Counter is shared across all triggers in one originating mutation;
+    /// this field overrides the cluster default (`triggers.max_cascade_depth`,
+    /// 10). Parsed from `CASCADE_LIMIT n` or its deprecated alias `MAXDEPTH n`.
+    pub cascade_limit: Option<u32>,
+    /// L2 unique-trigger fanout limit per-trigger override (ADR-026A).
+    /// Counter is per-trigger within one cascade; this field overrides the
+    /// cluster default (`triggers.max_cascade_fanout`, 100). Parsed from
+    /// `CASCADE_FANOUT n`.
+    pub cascade_fanout: Option<u32>,
+    /// Error-handling policy. `None` here means "use default for the timing":
+    /// `BEFORE COMMIT` → `Propagate`, `AFTER COMMIT` → `Retry { n: 3, backoff_ms: 1000 }`.
+    pub on_error: Option<OnErrorPolicy>,
+}
+
+/// `DROP TRIGGER <name>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropTriggerClause {
+    /// Trigger name to drop.
+    pub name: String,
+}
+
+/// `ALTER TRIGGER <name> { DISABLE | ENABLE | SET EXECUTE … | SET ON ERROR … }`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTriggerClause {
+    /// Target trigger name.
+    pub name: String,
+    /// What to change.
+    pub action: AlterTriggerAction,
+}
+
+/// Concrete change applied by `ALTER TRIGGER`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterTriggerAction {
+    /// Stop firing without forgetting the definition.
+    Disable,
+    /// Resume firing after a prior `DISABLE`.
+    Enable,
+    /// Replace the body. Body source captured verbatim at parse time.
+    SetBody(String),
+    /// Replace the on-error policy.
+    SetOnError(OnErrorPolicy),
+}
+
+/// Trigger filter — which graph elements activate the trigger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriggerTarget {
+    /// `:Label` — fires on node mutations of the given label.
+    Label(String),
+    /// `[:EdgeType]` — fires on edge mutations of the given type.
+    EdgeType(String),
+}
+
+/// Event-kind bitset (a single trigger can subscribe to any subset).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TriggerEvents {
+    pub on_create: bool,
+    pub on_update: bool,
+    pub on_delete: bool,
+}
+
+impl TriggerEvents {
+    /// Returns `true` if at least one event kind is enabled.
+    pub fn any(self) -> bool {
+        self.on_create || self.on_update || self.on_delete
+    }
+}
+
+/// Execution timing relative to the originating Raft proposal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerTiming {
+    /// Leader-only, inline with the Raft proposal — can abort the transaction.
+    BeforeCommit,
+    /// Oplog-consumer driven, post-commit — at-least-once execution.
+    AfterCommit,
+}
+
+/// Per-trigger error handling policy (ADR-026).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnErrorPolicy {
+    /// `BEFORE COMMIT`: aborts the originating transaction.
+    /// `AFTER COMMIT`: writes the failure to `trigger_failures` immediately, no retries.
+    Propagate,
+    /// Durable retry queue with exponential backoff. Falls through to dead-letter on exhaustion.
+    Retry {
+        /// Maximum retry attempts before dead-lettering.
+        n: u32,
+        /// Backoff base in milliseconds; doubles each attempt. Default 1000 if omitted in DDL.
+        backoff_ms: u32,
+    },
+    /// Skip retries — first failure lands directly in `trigger_failures`.
+    DeadLetter,
+}
+
+impl OnErrorPolicy {
+    /// Default policy when a `CREATE TRIGGER` statement omits `ON ERROR`.
+    /// Spec'd in ADR-026: BEFORE → Propagate; AFTER → Retry 3 with 1s backoff.
+    pub fn default_for(timing: TriggerTiming) -> Self {
+        match timing {
+            TriggerTiming::BeforeCommit => Self::Propagate,
+            TriggerTiming::AfterCommit => Self::Retry {
+                n: 3,
+                backoff_ms: 1000,
+            },
+        }
+    }
 }
 
 /// MATCH clause: one or more patterns.

@@ -26,6 +26,10 @@ clause = {
   | create_vector_index_clause
   | create_index_clause
   | create_edge_type_clause
+  | create_trigger_clause
+  | drop_trigger_clause
+  | show_triggers_clause
+  | alter_trigger_clause
   | create_clause
   | merge_all_clause
   | merge_nodes_clause
@@ -225,6 +229,111 @@ property_type_name = @{
 }
 
 property_decl_modifier = { kw_not ~ kw_null }
+
+// --- TRIGGER DDL (R190 — per ADR-026) ---
+//
+//   CREATE TRIGGER name
+//     ON :Label CREATE | UPDATE | DELETE              (or [:EdgeType])
+//     BEFORE COMMIT | AFTER COMMIT
+//     EXECUTE <clauses>
+//     [MAXDEPTH n]
+//     [ON ERROR PROPAGATE | RETRY n [WITH BACKOFF ms] | DEAD_LETTER]
+//
+// The EXECUTE body is one or more clauses; the body is terminated by either
+// MAXDEPTH, ON ERROR, or the end of the query. Negative lookahead in
+// `trigger_body_clause` keeps the chain from swallowing those terminators.
+
+create_trigger_clause = {
+    kw_create ~ kw_trigger ~ identifier
+    ~ kw_on ~ trigger_target ~ trigger_event_list
+    ~ trigger_timing ~ kw_commit
+    ~ kw_execute ~ trigger_body
+    ~ trigger_option*
+}
+
+// CASCADE_LIMIT / CASCADE_FANOUT / MAXDEPTH (deprecated alias) / ON ERROR
+// — order-independent option list parsed after the body. See ADR-026A.
+trigger_option = {
+    trigger_cascade_limit
+  | trigger_cascade_fanout
+  | trigger_maxdepth
+  | on_error_clause
+}
+
+trigger_target = {
+    label_list                    // :Label  (reuse existing rule)
+  | "[" ~ ":" ~ identifier ~ "]"  // [:EdgeType]
+}
+
+trigger_event_list = { trigger_event ~ ("|" ~ trigger_event)* }
+trigger_event = {
+    kw_create
+  | kw_update
+  | kw_delete
+}
+
+trigger_timing = { kw_before | kw_after }
+
+trigger_body = { trigger_body_clause+ }
+
+trigger_body_clause = {
+    !(kw_on ~ kw_error)
+  ~ !kw_maxdepth
+  ~ !kw_cascade_limit
+  ~ !kw_cascade_fanout
+  ~ (
+        optional_match_clause
+      | match_clause
+      | where_clause
+      | return_clause
+      | with_clause
+      | unwind_clause
+      | create_clause
+      | merge_all_clause
+      | merge_nodes_clause
+      | merge_clause
+      | upsert_clause
+      | detach_delete_clause
+      | delete_clause
+      | set_clause
+      | remove_clause
+    )
+}
+
+// CASCADE_LIMIT n — L1 cascade depth override (ADR-026A).
+trigger_cascade_limit = { kw_cascade_limit ~ integer_literal }
+// CASCADE_FANOUT n — L2 per-trigger fanout override (ADR-026A).
+trigger_cascade_fanout = { kw_cascade_fanout ~ integer_literal }
+// Deprecated: MAXDEPTH n — alias for CASCADE_LIMIT n.
+trigger_maxdepth = { kw_maxdepth ~ integer_literal }
+
+on_error_clause = {
+    kw_on ~ kw_error ~ (
+        on_error_propagate
+      | on_error_retry
+      | on_error_dead_letter
+    )
+}
+
+on_error_propagate   = { kw_propagate }
+on_error_retry       = { kw_retry ~ integer_literal ~ (kw_with ~ kw_backoff ~ integer_literal)? }
+on_error_dead_letter = { kw_dead_letter }
+
+drop_trigger_clause   = { kw_drop ~ kw_trigger ~ identifier }
+show_triggers_clause  = { kw_show ~ kw_triggers }
+
+alter_trigger_clause = {
+    kw_alter ~ kw_trigger ~ identifier ~ (
+        alter_trigger_disable
+      | alter_trigger_enable
+      | alter_trigger_set_body
+      | alter_trigger_set_on_error
+    )
+}
+alter_trigger_disable       = { kw_disable }
+alter_trigger_enable        = { kw_enable }
+alter_trigger_set_body      = { kw_set ~ kw_execute ~ trigger_body }
+alter_trigger_set_on_error  = { kw_set ~ on_error_clause }
 
 // --- CREATE LABEL ---
 
@@ -602,6 +711,26 @@ kw_both       = @{ ^"both" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_target     = @{ ^"target" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_properties = @{ ^"properties" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_duplicate  = @{ ^"duplicate" ~ !(ASCII_ALPHANUMERIC | "_") }
+// TRIGGER DDL (R190) — context keywords (NOT in reserved_word, so they
+// remain valid identifiers in user data).
+kw_trigger     = @{ ^"trigger" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_triggers    = @{ ^"triggers" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_before      = @{ ^"before" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_after       = @{ ^"after" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_commit      = @{ ^"commit" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_execute     = @{ ^"execute" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_error       = @{ ^"error" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_propagate   = @{ ^"propagate" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_retry       = @{ ^"retry" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_backoff     = @{ ^"backoff" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_dead_letter = @{ ^"dead_letter" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_maxdepth        = @{ ^"maxdepth" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_cascade_limit   = @{ ^"cascade_limit" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_cascade_fanout  = @{ ^"cascade_fanout" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_update      = @{ ^"update" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_show        = @{ ^"show" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_enable      = @{ ^"enable" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_disable     = @{ ^"disable" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // --- Identifiers ---
 
