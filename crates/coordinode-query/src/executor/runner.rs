@@ -9976,6 +9976,21 @@ fn remove_from_trigger_index(
     Ok(())
 }
 
+/// Reject a trigger body whose Cypher source does not parse. Without this
+/// gate, an invalid body would install cleanly and only error at firing
+/// time — by which point dropping the bad trigger requires manual
+/// intervention. The parsed AST is discarded; the executor re-parses on
+/// firing so the AST shape can evolve independently of stored definitions.
+fn validate_trigger_body_source(name: &str, source: &str) -> Result<(), ExecutionError> {
+    crate::cypher::parser::parse(source).map_err(|e| {
+        ExecutionError::Unsupported(format!(
+            "trigger `{name}` body fails to parse — refusing to install. \
+             Cypher parser error: {e}"
+        ))
+    })?;
+    Ok(())
+}
+
 fn execute_create_trigger(
     c: &crate::cypher::ast::CreateTriggerClause,
     ctx: &mut ExecutionContext<'_>,
@@ -9989,6 +10004,8 @@ fn execute_create_trigger(
             c.name
         )));
     }
+
+    validate_trigger_body_source(&c.name, &c.body_source)?;
 
     let target_schema = trigger_target_to_schema(&c.target);
     let target_segment = target_schema.index_key_segment();
@@ -10145,6 +10162,10 @@ fn execute_alter_trigger(
             "enabled"
         }
         AlterTriggerAction::SetBody(src) => {
+            // Parse the replacement body up-front: a syntactically broken
+            // body must not silently overwrite a working one, leaving the
+            // trigger fire-broken until the next ALTER.
+            validate_trigger_body_source(&c.name, src)?;
             schema.body_source = src.clone();
             "body_replaced"
         }
