@@ -2950,3 +2950,93 @@ fn with_multi_variable_passthrough() {
         "both variables must keep their property bindings through WITH"
     );
 }
+
+/// WITH `a` followed by `WHERE a.prop > N` — the passthrough fix carries
+/// `a.prop` into the projected row, so WHERE can filter on it.
+#[test]
+fn with_passthrough_followed_by_where() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {age: 18})").unwrap();
+    db.execute_cypher("CREATE (b:User {age: 25})").unwrap();
+    db.execute_cypher("CREATE (c:User {age: 40})").unwrap();
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (u:User) \
+             WITH u \
+             WHERE u.age > 20 \
+             RETURN u.age AS age \
+             ORDER BY age",
+        )
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "WHERE after WITH must filter on passed-through property: {rows:?}"
+    );
+    assert_eq!(rows[0].get("age"), Some(&Value::Int(25)));
+    assert_eq!(rows[1].get("age"), Some(&Value::Int(40)));
+}
+
+/// `WITH DISTINCT a` — dedup must operate on the merged row (including
+/// `a.*` columns). Two rows of the same node collapse to one.
+#[test]
+fn with_distinct_passthrough() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {id: 1, name: 'Alice'})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {id: 1, name: 'Alice'})")
+        .unwrap();
+
+    // Two User nodes — DISTINCT u by binding identity should produce 2
+    // (different NodeIds even though property values match).
+    let rows = db
+        .execute_cypher("MATCH (u:User) WITH DISTINCT u RETURN u.name AS name ORDER BY name")
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Alice".into())));
+    assert_eq!(rows[1].get("name"), Some(&Value::String("Alice".into())));
+}
+
+/// Disabled triggers persist their `enabled = false` flag across DB
+/// restart. Just confirming `enabled` is persisted at all isn't enough —
+/// only `true` is the default, so a silent encoder bug that always wrote
+/// `true` would still pass the existing restart test.
+#[test]
+fn disabled_trigger_persists_across_restart() {
+    use coordinode_core::graph::types::Value;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.execute_cypher(
+            "CREATE TRIGGER off_one ON :User CREATE AFTER COMMIT \
+             EXECUTE CREATE (a:L)",
+        )
+        .unwrap();
+        db.execute_cypher("ALTER TRIGGER off_one DISABLE").unwrap();
+    }
+
+    let mut db = Database::open(dir.path()).expect("reopen");
+    let rows = db.execute_cypher("SHOW TRIGGERS").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("enabled"),
+        Some(&Value::Bool(false)),
+        "disabled state must persist across restart"
+    );
+}
+
+/// `CREATE TRIGGER ... EXECUTE` with no body clauses must fail at parse
+/// time — the grammar requires `trigger_body_clause+` (one or more).
+#[test]
+fn trigger_create_rejects_empty_body() {
+    let (mut db, _dir) = open_db();
+    let result = db.execute_cypher("CREATE TRIGGER empty ON :User CREATE AFTER COMMIT EXECUTE");
+    assert!(
+        result.is_err(),
+        "empty body must fail at parser level: {result:?}"
+    );
+}
