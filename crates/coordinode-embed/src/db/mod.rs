@@ -1053,7 +1053,7 @@ impl Database {
             mvcc_snapshot: None,
             adj_snapshot: None,
             merge_node_deltas: Vec::new(),
-            // R190 / ADR-026A cascade tracking — cluster defaults.
+            // Cascade tracking — cluster defaults for trigger cycle protection.
             cascade_depth: 0,
             cascade_depth_limit: 10,
             cascade_fire_counts: std::collections::HashMap::new(),

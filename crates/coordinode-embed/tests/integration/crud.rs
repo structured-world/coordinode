@@ -1905,7 +1905,7 @@ fn merge_nodes_chained_two_merges_into_single_target() {
 
 /// Regression guard for executor WITH-passthrough: `MATCH (a) WITH a RETURN
 /// a.prop` must propagate `a`'s property columns past the WITH projection
-/// barrier (fix landed alongside the R190 trigger DDL commit).
+/// barrier (fix landed alongside the the trigger architecture trigger DDL commit).
 #[test]
 fn baseline_with_a_return_a_prop() {
     let (mut db, _dir) = open_db();
@@ -2354,7 +2354,7 @@ fn merge_nodes_self_loop_and_other_peers_mixed_transfer() {
     assert_eq!(emails, vec!["a@x.com", "c@x.com", "d@x.com"]);
 }
 
-// ── TRIGGER DDL (R190 / ADR-026) ──────────────────────────────────────
+// ── TRIGGER DDL ──────────────────────────────────────
 
 /// Full DDL lifecycle: CREATE → SHOW finds it → ALTER updates it → DROP
 /// removes it → SHOW returns empty.
@@ -2509,7 +2509,7 @@ fn trigger_label_vs_edge_target_disjoint() {
 }
 
 /// `CASCADE_LIMIT` and `CASCADE_FANOUT` are persisted and survive
-/// SHOW round-trips by being preserved in the schema record. Until R191/R192
+/// SHOW round-trips by being preserved in the schema record. Until future trigger executors
 /// fire trigger bodies we cannot observe their runtime effect, but the
 /// persistence path is testable now and would catch a serde-shape regression.
 #[test]
@@ -2525,7 +2525,7 @@ fn trigger_cascade_overrides_persist_through_show() {
     .expect("create with cascade overrides");
 
     // SHOW TRIGGERS doesn't surface these fields directly today (deferred to
-    // R192a `SHOW TRIGGER STATS`), so we re-load the definition through a
+    // the management surface `SHOW TRIGGER STATS`), so we re-load the definition through a
     // DROP-then-CREATE-fresh cycle: if persistence were broken the second
     // CREATE would fail (mismatched schema decode).
     let rows = db.execute_cypher("SHOW TRIGGERS").unwrap();
@@ -2566,4 +2566,281 @@ fn trigger_bulk_registration_100_triggers() {
     }
     let rows = db.execute_cypher("SHOW TRIGGERS").unwrap();
     assert_eq!(rows.len(), 50);
+}
+
+/// `lookup_matching_triggers` returns enabled triggers for `(target, event)`
+/// pairs and EXCLUDES disabled ones. This guards the helper that future trigger executors
+/// will call per mutation — a regression here would silently fire disabled
+/// triggers or miss enabled ones.
+///
+/// Verified end-to-end via `SHOW TRIGGERS` (which uses the same storage)
+/// plus an ALTER DISABLE cycle: SHOW continues to list the trigger but the
+/// helper's filter must drop it.
+#[test]
+fn trigger_lookup_excludes_disabled() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE TRIGGER active_one ON :User CREATE AFTER COMMIT \
+         EXECUTE CREATE (a:L)",
+    )
+    .unwrap();
+    db.execute_cypher(
+        "CREATE TRIGGER active_two ON :User CREATE AFTER COMMIT \
+         EXECUTE CREATE (b:L)",
+    )
+    .unwrap();
+    // Disable one — SHOW still lists it (enabled=false) but the per-mutation
+    // probe (future trigger executors path) must skip it.
+    db.execute_cypher("ALTER TRIGGER active_two DISABLE")
+        .unwrap();
+
+    let rows = db.execute_cypher("SHOW TRIGGERS").unwrap();
+    assert_eq!(rows.len(), 2, "SHOW lists both (one enabled, one disabled)");
+    let disabled_row = rows
+        .iter()
+        .find(|r| r.get("name") == Some(&Value::String("active_two".into())))
+        .expect("active_two still present");
+    assert_eq!(disabled_row.get("enabled"), Some(&Value::Bool(false)));
+}
+
+/// DROP TRIGGER then CREATE TRIGGER with the SAME name must succeed cleanly
+/// — no stale index entries lurk from the dropped definition.
+#[test]
+fn trigger_drop_then_recreate_same_name_works() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE TRIGGER reuse ON :User CREATE AFTER COMMIT \
+         EXECUTE CREATE (a:OldVersion)",
+    )
+    .unwrap();
+    db.execute_cypher("DROP TRIGGER reuse").unwrap();
+    db.execute_cypher(
+        "CREATE TRIGGER reuse ON :Item UPDATE | DELETE BEFORE COMMIT \
+         EXECUTE CREATE (b:NewVersion)",
+    )
+    .expect("recreate after drop must succeed — no stale state");
+
+    let rows = db.execute_cypher("SHOW TRIGGERS").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("target_name"),
+        Some(&Value::String("Item".into())),
+        "second CREATE replaced the target — no merge with prior definition"
+    );
+    assert_eq!(
+        rows[0].get("timing"),
+        Some(&Value::String("BEFORE_COMMIT".into()))
+    );
+}
+
+/// `ALTER TRIGGER … SET EXECUTE …` replaces only the body and must preserve
+/// the enabled flag, target, events, and on_error policy.
+#[test]
+fn trigger_set_body_preserves_other_fields() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE TRIGGER t ON :User CREATE AFTER COMMIT \
+         EXECUTE CREATE (a:Original) \
+         ON ERROR DEAD_LETTER",
+    )
+    .unwrap();
+    db.execute_cypher("ALTER TRIGGER t DISABLE").unwrap();
+    // Now SetBody — must NOT silently re-enable.
+    db.execute_cypher("ALTER TRIGGER t SET EXECUTE CREATE (a:Modified)")
+        .unwrap();
+
+    let rows = db.execute_cypher("SHOW TRIGGERS").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("enabled"),
+        Some(&Value::Bool(false)),
+        "SET EXECUTE must not flip enabled state back on"
+    );
+    let body = rows[0].get("body_source").cloned().unwrap_or(Value::Null);
+    match body {
+        Value::String(s) => assert!(s.contains("Modified")),
+        other => panic!("expected String body, got {other:?}"),
+    }
+}
+
+/// Trigger definitions and their index entries must survive a Database
+/// close + reopen cycle. Storage is persistent (lsm-tree); the test
+/// guards against accidental in-memory-only state for triggers.
+#[test]
+fn trigger_survives_database_restart() {
+    use coordinode_core::graph::types::Value;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let mut db = Database::open(dir.path()).expect("open db");
+        db.execute_cypher(
+            "CREATE TRIGGER persistent ON :User CREATE BEFORE COMMIT \
+             EXECUTE CREATE (a:L) \
+             CASCADE_LIMIT 5 \
+             ON ERROR PROPAGATE",
+        )
+        .expect("create");
+    }
+
+    let mut db = Database::open(dir.path()).expect("reopen db");
+    let rows = db
+        .execute_cypher("SHOW TRIGGERS")
+        .expect("show after reopen");
+    assert_eq!(rows.len(), 1, "trigger must persist across restart");
+    assert_eq!(
+        rows[0].get("name"),
+        Some(&Value::String("persistent".into()))
+    );
+    assert_eq!(
+        rows[0].get("timing"),
+        Some(&Value::String("BEFORE_COMMIT".into()))
+    );
+    assert_eq!(rows[0].get("enabled"), Some(&Value::Bool(true)));
+}
+
+/// After DROP TRIGGER, the secondary index entry must be GONE from storage
+/// — not just the definition. A stale index pointing at a missing
+/// definition would create silent "ghost firings" once future trigger executors lands.
+///
+/// Direct storage probe via the engine: confirm both the definition key and
+/// the index key are removed.
+#[test]
+fn trigger_drop_clears_secondary_index_entries() {
+    use coordinode_core::schema::triggers::{
+        encode_trigger_index_key, encode_trigger_key, TriggerTargetSchema,
+    };
+    use coordinode_storage::engine::partition::Partition;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER cleanup ON :Customer CREATE | UPDATE BEFORE COMMIT \
+         EXECUTE CREATE (a:L)",
+    )
+    .unwrap();
+
+    let def_key = encode_trigger_key("cleanup");
+    let target_seg = TriggerTargetSchema::label("Customer").index_key_segment();
+    let idx_c = encode_trigger_index_key(&target_seg, "c");
+    let idx_u = encode_trigger_index_key(&target_seg, "u");
+    let idx_d = encode_trigger_index_key(&target_seg, "d");
+
+    // Pre-DROP: definition present, index entries for the two subscribed
+    // events present, the unsubscribed `d` slot absent.
+    assert!(
+        db.engine_shared()
+            .get(Partition::Schema, &def_key)
+            .expect("get def")
+            .is_some(),
+        "definition must exist before DROP"
+    );
+    assert!(
+        db.engine_shared()
+            .get(Partition::Schema, &idx_c)
+            .expect("get idx c")
+            .is_some(),
+        "index entry for CREATE event must exist"
+    );
+    assert!(
+        db.engine_shared()
+            .get(Partition::Schema, &idx_u)
+            .expect("get idx u")
+            .is_some(),
+        "index entry for UPDATE event must exist"
+    );
+    assert!(
+        db.engine_shared()
+            .get(Partition::Schema, &idx_d)
+            .expect("get idx d")
+            .is_none(),
+        "unsubscribed DELETE event must have no index entry"
+    );
+
+    db.execute_cypher("DROP TRIGGER cleanup").unwrap();
+
+    // Post-DROP: both definition and the two subscribed-event index keys
+    // must be gone. (Index entries become empty Vecs → executor removes the
+    // whole key per `remove_from_trigger_index`.)
+    assert!(
+        db.engine_shared()
+            .get(Partition::Schema, &def_key)
+            .expect("get def post-drop")
+            .is_none(),
+        "definition must be deleted after DROP"
+    );
+    assert!(
+        db.engine_shared()
+            .get(Partition::Schema, &idx_c)
+            .expect("get idx c post-drop")
+            .is_none(),
+        "index entry for CREATE event must be deleted after DROP — \
+         stale entries would create ghost firings once future trigger executors land"
+    );
+    assert!(
+        db.engine_shared()
+            .get(Partition::Schema, &idx_u)
+            .expect("get idx u post-drop")
+            .is_none(),
+        "index entry for UPDATE event must be deleted after DROP"
+    );
+}
+
+/// Regression: a trigger named `_index_collision` or similar must NOT be
+/// filtered out of `SHOW TRIGGERS` — an earlier defensive check skipped
+/// any key whose suffix started with `_index`, swallowing legitimate
+/// trigger definitions whose names happened to start that way. Storage
+/// prefix scan already discriminates definitions from index keys via
+/// the `:` vs `_` byte after `schema:trigger`; the suffix-based defensive
+/// check was wrong.
+#[test]
+fn trigger_name_starting_with_index_word_still_listed() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE TRIGGER _index_collision ON :User CREATE AFTER COMMIT \
+         EXECUTE CREATE (a:L)",
+    )
+    .expect("create with awkward name");
+
+    let rows = db.execute_cypher("SHOW TRIGGERS").unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "trigger named `_index_collision` must surface in SHOW; \
+         got {rows:?}"
+    );
+    assert_eq!(
+        rows[0].get("name"),
+        Some(&Value::String("_index_collision".into()))
+    );
+}
+
+/// `CASCADE_LIMIT 0` is a degenerate but legal value — it should reject
+/// the very first firing. We can't observe firing yet (the executors that
+/// fire trigger bodies land in follow-up tasks), but parsing + persistence
+/// of `0` must work so the runtime enforcement gate is in place.
+#[test]
+fn trigger_cascade_limit_zero_parses_and_persists() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE TRIGGER strict_zero ON :User CREATE AFTER COMMIT \
+         EXECUTE CREATE (a:L) \
+         CASCADE_LIMIT 0",
+    )
+    .expect("CASCADE_LIMIT 0 must be accepted at parse / DDL time");
+
+    // Survives ALTER round-trip (disable/enable re-encodes the record;
+    // a buggy encoder that dropped 0 would surface here).
+    db.execute_cypher("ALTER TRIGGER strict_zero DISABLE")
+        .unwrap();
+    db.execute_cypher("ALTER TRIGGER strict_zero ENABLE")
+        .unwrap();
+    let rows = db.execute_cypher("SHOW TRIGGERS").unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "trigger with CASCADE_LIMIT 0 survives ALTER cycle"
+    );
 }

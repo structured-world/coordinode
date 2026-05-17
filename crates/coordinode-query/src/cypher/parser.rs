@@ -1021,7 +1021,7 @@ fn build_create_edge_type_clause(pair: Pair<'_, Rule>) -> Result<CreateEdgeTypeC
     })
 }
 
-// ----- Trigger DDL builders (R190 / ADR-026) -----
+// ----- Trigger DDL builders -----
 
 fn build_create_trigger_clause(pair: Pair<'_, Rule>) -> Result<CreateTriggerClause, ParseError> {
     let mut name: Option<String> = None;
@@ -1049,7 +1049,7 @@ fn build_create_trigger_clause(pair: Pair<'_, Rule>) -> Result<CreateTriggerClau
                     .ok_or_else(|| ParseError::Invalid("trigger_option: missing inner".into()))?;
                 match opt.as_rule() {
                     Rule::trigger_cascade_limit | Rule::trigger_maxdepth => {
-                        // MAXDEPTH is a deprecated alias for CASCADE_LIMIT (ADR-026A).
+                        // MAXDEPTH is a deprecated alias for CASCADE_LIMIT (the trigger architecture).
                         if let Some(v) = parse_trigger_integer_option(opt)? {
                             cascade_limit = Some(v);
                         }
@@ -3801,7 +3801,7 @@ mod tests {
         );
     }
 
-    // -- TRIGGER DDL (R190 / ADR-026) --
+    // -- TRIGGER DDL --
 
     #[test]
     fn create_trigger_minimal_before_commit() {
@@ -3856,7 +3856,7 @@ mod tests {
 
     #[test]
     fn create_trigger_with_maxdepth_and_on_error_propagate() {
-        // `MAXDEPTH n` is the deprecated alias for `CASCADE_LIMIT n` (ADR-026A).
+        // `MAXDEPTH n` is the deprecated alias for `CASCADE_LIMIT n` (the trigger architecture).
         let q = parse_ok(
             "CREATE TRIGGER t4 ON :User CREATE BEFORE COMMIT \
              EXECUTE CREATE (a:L) \
@@ -3975,7 +3975,7 @@ mod tests {
 
     #[test]
     fn create_trigger_default_on_error_per_timing() {
-        // ADR-026 defaults: BEFORE → Propagate, AFTER → Retry 3 / 1000ms
+        // the trigger architecture defaults: BEFORE → Propagate, AFTER → Retry 3 / 1000ms
         assert_eq!(
             OnErrorPolicy::default_for(TriggerTiming::BeforeCommit),
             OnErrorPolicy::Propagate

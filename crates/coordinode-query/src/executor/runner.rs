@@ -68,7 +68,7 @@ pub enum ExecutionError {
     #[error("schema violation: {0}")]
     SchemaViolation(String),
 
-    /// L1 cycle protection trip (ADR-026A): cumulative trigger cascade depth
+    /// L1 cycle protection trip (the trigger architecture): cumulative trigger cascade depth
     /// for the current originating mutation exceeded its limit. `chain` lists
     /// the trigger names that fired, in firing order, to help diagnose the
     /// runaway cascade.
@@ -79,7 +79,7 @@ pub enum ExecutionError {
         chain: Vec<String>,
     },
 
-    /// L2 cycle protection trip (ADR-026A): a single trigger fired more times
+    /// L2 cycle protection trip (the trigger architecture): a single trigger fired more times
     /// than its `CASCADE_FANOUT` allows within one cascade root. Wide-but-
     /// shallow runaways (one trigger re-firing per row of a batch) trip this
     /// well before L1.
@@ -404,24 +404,24 @@ pub struct ExecutionContext<'a> {
     /// Each entry: (node_key, encoded DocDelta with PathTarget::PropField).
     /// At flush, each becomes `Mutation::Merge` on `Partition::Node`.
     pub merge_node_deltas: Vec<(Vec<u8>, Vec<u8>)>,
-    /// L1 cascade depth counter (ADR-026A). Shared across all triggers in
+    /// L1 cascade depth counter (the trigger architecture). Shared across all triggers in
     /// one originating user mutation. Incremented before each trigger body
     /// is executed, decremented (RAII-style) when the body returns. When
     /// `cascade_depth > cascade_depth_limit` the firing is rejected with
     /// `ExecutionError::CascadeOverflow`.
     ///
-    /// Wired by R190-6 probe; enforced by R191/R192 executors.
+    /// Wired by the trigger architecture probe; enforced by future trigger executors executors.
     pub cascade_depth: u32,
     /// Cluster-default cap on `cascade_depth`. Per-trigger `CASCADE_LIMIT n`
     /// in the trigger definition tightens this further when present.
     /// Source: cluster setting `triggers.max_cascade_depth` (default 10).
     pub cascade_depth_limit: u32,
-    /// L2 unique-trigger fanout map (ADR-026A). Keyed by trigger name; value
+    /// L2 unique-trigger fanout map (the trigger architecture). Keyed by trigger name; value
     /// is the number of times that trigger has fired within the current
     /// cascade root. When `cascade_fire_counts[name] > cascade_fanout_limit`
     /// the firing is rejected with `ExecutionError::CascadeFanoutOverflow`.
     ///
-    /// Wired by R190-6 probe; enforced by R191/R192 executors.
+    /// Wired by the trigger architecture probe; enforced by future trigger executors executors.
     pub cascade_fire_counts: HashMap<String, u32>,
     /// Cluster-default cap on per-trigger fanout. Per-trigger `CASCADE_FANOUT n`
     /// tightens this further when present. Source: cluster setting
@@ -477,7 +477,7 @@ fn partition_to_id(p: Partition) -> PartitionId {
 }
 
 impl<'a> ExecutionContext<'a> {
-    /// L1+L2 cascade entry (ADR-026A). Call before executing a trigger body.
+    /// L1+L2 cascade entry (the trigger architecture). Call before executing a trigger body.
     /// Increments depth + per-trigger fire count, appends to chain, and trips
     /// `CascadeOverflow` / `CascadeFanoutOverflow` when limits are exceeded.
     ///
@@ -560,10 +560,10 @@ impl<'a> ExecutionContext<'a> {
         self.cascade_chain.clear();
     }
 
-    /// R190-6 / ADR-026 §3: load all enabled triggers that match a single
+    /// load all enabled triggers that match a single
     /// `(target_segment, event)` mutation. The lookup is O(matching_triggers)
     /// — it reads exactly one index key + N definition keys, never scans the
-    /// trigger table. R191 / R192 call this at trigger firing time; R190
+    /// trigger table. future trigger executors call this at trigger firing time; the trigger architecture
     /// itself only ships the helper + tests.
     ///
     /// `target_segment` must come from
@@ -9860,7 +9860,7 @@ fn execute_create_edge_type(
 }
 
 // ======================================================================
-// R190 / ADR-026: Trigger DDL executors
+// the trigger architecture: Trigger DDL executors
 // ======================================================================
 
 fn current_hlc_us() -> u64 {
@@ -10057,15 +10057,13 @@ fn execute_show_triggers(ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>, Exe
 
     let mut rows: Vec<Row> = Vec::new();
     for (k, v) in scanned {
-        // Skip index keys: they share the `schema:trigger` prefix only up to
-        // the trailing colon; full prefix `schema:trigger:` discriminates.
-        if !k.starts_with(prefix) {
-            continue;
-        }
-        // Defensive: ensure the next byte after the prefix is part of a
-        // trigger name, not the index sub-prefix `_index:`.
-        let suffix = &k[prefix.len()..];
-        if suffix.starts_with(b"_index") || suffix.is_empty() {
+        // Defensive: `mvcc_prefix_scan` with `schema:trigger:` (15 bytes with
+        // trailing colon) already excludes the index family
+        // `schema:trigger_index:…` because the byte after `schema:trigger` is
+        // `_` there vs `:` for definitions. Skip anything that does not start
+        // with our exact prefix anyway in case the underlying scan ever
+        // changes its semantics.
+        if !k.starts_with(prefix) || k.len() == prefix.len() {
             continue;
         }
         let schema: TriggerSchema = match rmp_serde::from_slice(&v) {
@@ -10851,9 +10849,9 @@ mod tests {
             mvcc_snapshot: None,
             adj_snapshot: None,
             merge_node_deltas: Vec::new(),
-            // L1/L2 cascade tracking (ADR-026A) — counters start at zero per
+            // L1/L2 cascade tracking (the trigger architecture) — counters start at zero per
             // originating user mutation; defaults match cluster setting
-            // defaults documented in ADR-026A.
+            // defaults documented in the trigger architecture.
             cascade_depth: 0,
             cascade_depth_limit: 10,
             cascade_fire_counts: std::collections::HashMap::new(),
@@ -14512,7 +14510,7 @@ mod tests {
         assert!(early < late, "earlier valid_from must sort first");
     }
 
-    // ── R190 / ADR-026A: L1+L2 cascade tracking ────────────────────────────
+    // ── the trigger architecture: L1+L2 cascade tracking ────────────────────────────
 
     /// L1 trip: nesting deeper than the depth limit returns `CascadeOverflow`
     /// with the full chain attached for diagnostics.

@@ -119,6 +119,7 @@ Most Neo4j scalar functions are not yet implemented. See [Functions reference](.
 - **Vectors on edges** — SIMILAR edges can store embeddings.
 - **SET ON VIOLATION SKIP** — skip constraint-violating nodes without aborting the query.
 - **MERGE NODES** — native first-class entity-resolution / deduplication. `MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a` collapses two nodes in a single transaction with property merge (KEEP FIRST / KEEP LAST / COALESCE / SET) and duplicate-edge handling (KEEP BOTH / MERGE PROPERTIES / KEEP TARGET). Neo4j requires the APOC plugin (`apoc.refactor.mergeNodes()`), which is fragile under clustering.
+- **Native triggers** — `CREATE / DROP / SHOW / ALTER TRIGGER` as first-class Cypher clauses (not a plugin). Definitions persist in the schema partition, replicate through Raft, survive backups. BEFORE / AFTER COMMIT timing, per-trigger `ON ERROR PROPAGATE | RETRY n [WITH BACKOFF ms] | DEAD_LETTER`, plus four-layer cycle protection: L1 cascade depth + L2 unique-trigger fanout (per-trigger overrides `CASCADE_LIMIT` / `CASCADE_FANOUT`), L3 static cycle detection at DDL (planned), L4 auto-disable circuit breaker (planned). Neo4j's equivalent is APOC's `apoc.trigger.add()` — a JAR that breaks under clustering, doesn't survive `neo4j-admin restore`, and has no cycle protection beyond per-trigger MAXDEPTH.
 
 ### Neo4j has, CoordiNode doesn't (yet):
 
