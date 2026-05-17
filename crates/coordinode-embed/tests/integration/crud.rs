@@ -4051,6 +4051,102 @@ fn trigger_merge_on_match_set_fires_update_only() {
     assert_eq!(actions[0], Value::String("UPDATE".into()));
 }
 
+/// ATTACH DOCUMENT cascade fires the node-DELETE trigger on the source
+/// node's labels. The source node is folded into the target, then deleted
+/// — semantically the same as DETACH DELETE on the source.
+#[test]
+fn trigger_before_commit_attach_document_fires_source_node_delete() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER on_addr_delete ON :Address DELETE BEFORE COMMIT \
+         EXECUTE CREATE (e:DeletionLog {action: $event, b: $before})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (a:Address {city: 'NYC', zip: '10001'})")
+        .unwrap();
+    db.execute_cypher("CREATE (u:User {id: 1})").unwrap();
+    db.execute_cypher("MATCH (a:Address), (u:User) CREATE (a)-[:HAS_ADDRESS]->(u)")
+        .unwrap();
+
+    db.execute_cypher("ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address")
+        .unwrap();
+
+    let logs = db
+        .execute_cypher("MATCH (e:DeletionLog) RETURN e.action AS act, e.b AS b")
+        .unwrap();
+    assert_eq!(logs.len(), 1, "ATTACH must fire :Address DELETE trigger");
+    assert_eq!(logs[0].get("act"), Some(&Value::String("DELETE".into())));
+    assert!(matches!(
+        logs[0].get("b"),
+        Some(Value::Map(_) | Value::Document(_))
+    ));
+}
+
+/// ATTACH DOCUMENT fires the edge-DELETE trigger for the connecting edge
+/// (`delete_single_edge` path) AND for any remaining edges on the source
+/// that are cascade-deleted (`cascade_delete_source_node` path) — both
+/// must be symmetric with DETACH DELETE.
+#[test]
+fn trigger_before_commit_attach_document_cascades_orphan_edge_deletes() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER on_link_delete ON [:LINK] DELETE BEFORE COMMIT \
+         EXECUTE CREATE (e:LinkDeletion {action: $event, t: $edge_type})",
+    )
+    .unwrap();
+    db.execute_cypher(
+        "CREATE TRIGGER on_attach_delete ON [:HAS_ADDRESS] DELETE BEFORE COMMIT \
+         EXECUTE CREATE (e:AttachDeletion {action: $event, t: $edge_type})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (a:Address {city: 'NYC'})")
+        .unwrap();
+    db.execute_cypher("CREATE (u:User {id: 1})").unwrap();
+    db.execute_cypher("CREATE (other:Tag {id: 99})").unwrap();
+    // Connecting edge (will be deleted by ATTACH's explicit delete_single_edge).
+    db.execute_cypher("MATCH (a:Address), (u:User) CREATE (a)-[:HAS_ADDRESS]->(u)")
+        .unwrap();
+    // Orphan edge on source (will be cascade-deleted with the source).
+    db.execute_cypher("MATCH (a:Address), (t:Tag) CREATE (a)-[:LINK {kind: 'orphan'}]->(t)")
+        .unwrap();
+
+    db.execute_cypher("ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address")
+        .unwrap();
+
+    let attach_logs = db
+        .execute_cypher("MATCH (e:AttachDeletion) RETURN e.action AS act, e.t AS t")
+        .unwrap();
+    assert_eq!(
+        attach_logs.len(),
+        1,
+        "connecting edge must fire :HAS_ADDRESS DELETE trigger"
+    );
+    assert_eq!(
+        attach_logs[0].get("act"),
+        Some(&Value::String("DELETE".into()))
+    );
+
+    let link_logs = db
+        .execute_cypher("MATCH (e:LinkDeletion) RETURN e.action AS act, e.t AS t")
+        .unwrap();
+    assert_eq!(
+        link_logs.len(),
+        1,
+        "orphan edge cascade-delete must fire :LINK DELETE trigger"
+    );
+    assert_eq!(
+        link_logs[0].get("act"),
+        Some(&Value::String("DELETE".into()))
+    );
+    assert_eq!(link_logs[0].get("t"), Some(&Value::String("LINK".into())));
+}
+
 /// Edge UPDATE trigger with `ON ERROR PROPAGATE` aborts the originating
 /// SET — the edge property must NOT be modified after rollback.
 #[test]
