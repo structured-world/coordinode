@@ -2582,6 +2582,20 @@ fn execute_btree_index_scan(
     value_expr: &Expr,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
+    // R172b safe-reject: B-tree index lookup returns node ids, then reads
+    // node records via 16-byte `encode_node_key` to project. Temporal
+    // records live at the 25-byte per-version key — would silently return
+    // None and the row is dropped. Version-aware index entries
+    // (`(node_id, valid_from)` point identity) land in R172d.
+    if let Ok(Some(s)) = ctx.load_current_label_schema(label) {
+        if s.temporal {
+            return Err(ExecutionError::Unsupported(format!(
+                "B-tree index scan on temporal label '{label}' is not yet \
+                 supported (lands in R172d — version-aware index entries)."
+            )));
+        }
+    }
+
     // Evaluate the lookup value from the expression.
     let lookup_val = eval_expr(value_expr, &Row::new());
 
