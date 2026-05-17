@@ -6015,12 +6015,14 @@ fn execute_merge_relationship_create(
     // Value: MessagePack Vec<(field_id, Value)>.
     // Note: if this edge already existed with different properties, the new values
     // overwrite the old (upsert semantics within a single-edge-per-type data model).
+    let mut resolved_props: Vec<(String, Value)> = Vec::with_capacity(edge_filters.len());
     if !edge_filters.is_empty() {
         let mut prop_map: Vec<(u32, Value)> = Vec::with_capacity(edge_filters.len());
         for (prop_name, expr) in edge_filters {
             let field_id = ctx.interner.intern(prop_name);
             let value = eval_expr(expr, correlated);
             prop_map.push((field_id, value.clone()));
+            resolved_props.push((prop_name.clone(), value.clone()));
             if let Some(ev) = edge_variable {
                 row.insert(format!("{ev}.{prop_name}"), value);
             }
@@ -6030,6 +6032,18 @@ fn execute_merge_relationship_create(
         let ep_key = encode_edgeprop_key(et, from_id, to_id);
         ctx.mvcc_put(Partition::EdgeProp, &ep_key, &prop_bytes)?;
         ctx.write_stats.properties_set += edge_filters.len() as u64;
+    }
+
+    // Fire BEFORE COMMIT CREATE triggers registered on this edge type. Same
+    // semantics as `execute_create_edge`: `$src` / `$tgt` / `$edge_type` /
+    // `$after` describe the freshly-created edge. Runs after the edgeprop
+    // write so the trigger body sees the edge via RYOW.
+    let trigger_params = trigger_params_for_edge_create(et, from_id, to_id, &resolved_props);
+    let target_segment =
+        coordinode_core::schema::triggers::TriggerTargetSchema::edge_type(et).index_key_segment();
+    let matched = ctx.lookup_matching_triggers(&target_segment, "c")?;
+    if !matched.is_empty() {
+        fire_before_commit_triggers(&matched, &trigger_params, ctx)?;
     }
 
     Ok(vec![row])
@@ -6365,6 +6379,29 @@ fn execute_create_from_pattern(
             }
 
             ctx.mvcc_put(Partition::Node, &key, &bytes)?;
+
+            // Fire BEFORE COMMIT CREATE triggers registered on the new
+            // node's label. This path is reached from MERGE (create branch)
+            // and from standalone MERGE relationship create when the
+            // endpoint node has to be invented; both must fire the same
+            // CREATE trigger as `execute_create_node`.
+            if !label.is_empty() {
+                let props_map: std::collections::HashMap<String, Value> = property_filters
+                    .iter()
+                    .map(|(name, expr)| {
+                        let val = eval_expr(expr, &empty_row).map_to_document();
+                        (name.clone(), val)
+                    })
+                    .collect();
+                let trigger_params = trigger_params_for_node_create(node_id, &props_map);
+                let target_segment =
+                    coordinode_core::schema::triggers::TriggerTargetSchema::label(label.clone())
+                        .index_key_segment();
+                let matched = ctx.lookup_matching_triggers(&target_segment, "c")?;
+                if !matched.is_empty() {
+                    fire_before_commit_triggers(&matched, &trigger_params, ctx)?;
+                }
+            }
 
             let mut row = Row::new();
             row.insert(variable.to_string(), Value::Int(node_id.as_raw() as i64));
@@ -6820,14 +6857,25 @@ fn execute_update(
 
         // Snapshot the pre-mutation state of each node variable referenced
         // by the SET items in this row, so we can fire UPDATE triggers
-        // with `$before` after all items apply. Edge variables (which
-        // bind to a String edge type, not a NodeId) are skipped — edge
-        // triggers will fire through a separate probe in the edge-update
-        // path once that wiring lands.
+        // with `$before` after all items apply.
         let mut update_snapshots: std::collections::HashMap<
             NodeId,
             (Vec<String>, std::collections::BTreeMap<String, Value>),
         > = std::collections::HashMap::new();
+        // Edge UPDATE snapshots: pre-mutation property map keyed by the edge
+        // variable name (one logical edge per variable per row). Carries the
+        // resolved key so we can read the post-state through the same key
+        // after the SET items apply. Temporal edges resolve to a per-version
+        // key (keyed on `valid_from`); non-temporal resolve to a single key.
+        struct EdgeUpdateSnapshot {
+            edge_type: String,
+            src: NodeId,
+            tgt: NodeId,
+            ep_key: Vec<u8>,
+            before: std::collections::BTreeMap<String, Value>,
+        }
+        let mut edge_update_snapshots: std::collections::HashMap<String, EdgeUpdateSnapshot> =
+            std::collections::HashMap::new();
         for item in items {
             let variable = match item {
                 crate::cypher::ast::SetItem::Property { variable, .. }
@@ -6837,6 +6885,52 @@ fn execute_update(
                 | crate::cypher::ast::SetItem::MergeProperties { variable, .. }
                 | crate::cypher::ast::SetItem::AddLabel { variable, .. } => variable,
             };
+            // Edge variable: bound to Value::String(edge_type). Snapshot the
+            // current edge property map so we can fire UPDATE triggers with
+            // `$before` / `$after` after the mutation lands. We probe the
+            // trigger index lazily after applying SET — but the snapshot
+            // must be taken BEFORE, since `update_edge_property` overwrites
+            // the edgeprop value in the same key.
+            if let Some(Value::String(edge_type)) = out_row.get(variable).cloned() {
+                if edge_update_snapshots.contains_key(variable) {
+                    continue;
+                }
+                let src_raw = match out_row.get(&format!("{variable}.__src__")) {
+                    Some(Value::Int(n)) => *n as u64,
+                    _ => continue,
+                };
+                let tgt_raw = match out_row.get(&format!("{variable}.__tgt__")) {
+                    Some(Value::Int(n)) => *n as u64,
+                    _ => continue,
+                };
+                let src = NodeId::from_raw(src_raw);
+                let tgt = NodeId::from_raw(tgt_raw);
+                let is_temporal = lookup_edge_type_temporal(&edge_type, ctx)?;
+                let ep_key = if is_temporal {
+                    let valid_from = match out_row.get(&format!("{variable}.valid_from")) {
+                        Some(Value::Int(ms)) => *ms,
+                        _ => continue,
+                    };
+                    encode_temporal_edgeprop_key(&edge_type, src, tgt, valid_from)
+                } else {
+                    encode_edgeprop_key(&edge_type, src, tgt)
+                };
+                let before = match ctx.mvcc_get(Partition::EdgeProp, &ep_key)? {
+                    Some(bytes) => decode_edgeprop_into_map(&bytes, ctx),
+                    None => std::collections::BTreeMap::new(),
+                };
+                edge_update_snapshots.insert(
+                    variable.clone(),
+                    EdgeUpdateSnapshot {
+                        edge_type,
+                        src,
+                        tgt,
+                        ep_key,
+                        before,
+                    },
+                );
+                continue;
+            }
             let node_id = match out_row.get(variable) {
                 Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                 _ => continue,
@@ -7536,6 +7630,33 @@ fn execute_update(
             fire_before_commit_triggers(&all_matched, &trigger_params, ctx)?;
         }
 
+        // Edge UPDATE triggers: same "probe index first, materialize after"
+        // pattern. The probe-before-read invariant doesn't apply to the
+        // EdgeProp partition (no merge_node_deltas equivalent), but we
+        // keep the index lookup first to avoid the materialise cost on
+        // the happy path (no triggers).
+        for snap in edge_update_snapshots.values() {
+            let target_segment =
+                coordinode_core::schema::triggers::TriggerTargetSchema::edge_type(&snap.edge_type)
+                    .index_key_segment();
+            let matched = ctx.lookup_matching_triggers(&target_segment, "u")?;
+            if matched.is_empty() {
+                continue;
+            }
+            let after = match ctx.mvcc_get(Partition::EdgeProp, &snap.ep_key)? {
+                Some(bytes) => decode_edgeprop_into_map(&bytes, ctx),
+                None => std::collections::BTreeMap::new(),
+            };
+            let trigger_params = trigger_params_for_edge_update(
+                &snap.edge_type,
+                snap.src,
+                snap.tgt,
+                &snap.before,
+                &after,
+            );
+            fire_before_commit_triggers(&matched, &trigger_params, ctx)?;
+        }
+
         results.push(out_row);
     }
 
@@ -7683,6 +7804,16 @@ fn execute_delete(
     detach: bool,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
+    // Temporal edge matching produces one row per stored version of the
+    // same `(src, tgt, edge_type)` pair. `DELETE r` removes every version
+    // of the pair in one call, so the second pass would be a no-op on
+    // storage — but would still re-fire BEFORE COMMIT DELETE triggers,
+    // because the pre-snapshot in `delete_single_edge` reads from the
+    // engine snapshot (tombstones in the write buffer don't suppress the
+    // snapshot rows). Dedupe at this layer so each logical edge is
+    // processed exactly once per DELETE statement.
+    let mut deleted_edges: std::collections::HashSet<(String, u64, u64)> =
+        std::collections::HashSet::new();
     for row in input_rows {
         for var in variables {
             // Edge variable bindings carry the edge type as a String value,
@@ -7700,6 +7831,9 @@ fn execute_delete(
                     Some(Value::Int(n)) => *n as u64,
                     _ => continue,
                 };
+                if !deleted_edges.insert((edge_type.clone(), src_raw, tgt_raw)) {
+                    continue;
+                }
                 delete_single_edge(
                     NodeId::from_raw(src_raw),
                     NodeId::from_raw(tgt_raw),
@@ -7755,8 +7889,27 @@ fn execute_delete(
             //    so the deleted node's UID is removed from OTHER nodes' posting lists.
             // 2. Clean up edge properties (edgeprop:) for each edge.
             // 3. Delete the adj: key itself.
+            //
+            // Cascaded edges fire BEFORE COMMIT DELETE triggers registered on
+            // their edge types — `$before` carries the deleted edge's props
+            // (one firing per temporal version). The trigger probe runs once
+            // per `(edge_type)` and is reused across every (src, tgt) pair on
+            // that key; we snapshot per-pair *before* deletion so the body
+            // reading the same key returns empty (RYOW).
             for edge_key in &edges_to_delete {
                 if let Some(parts) = decode_adj_key(edge_key) {
+                    // Look up BEFORE COMMIT DELETE triggers for this edge type
+                    // once per adj key. Re-used across every (node, peer) pair
+                    // walked from the posting list.
+                    let edge_target_segment =
+                        coordinode_core::schema::triggers::TriggerTargetSchema::edge_type(
+                            &parts.edge_type,
+                        )
+                        .index_key_segment();
+                    let matched_edge_delete =
+                        ctx.lookup_matching_triggers(&edge_target_segment, "d")?;
+                    let is_temporal = lookup_edge_type_temporal(&parts.edge_type, ctx)?;
+
                     // Read posting list to find connected nodes
                     if let Some(plist) = ctx.adj_get(edge_key)? {
                         for peer_uid in plist.iter() {
@@ -7782,7 +7935,43 @@ fn execute_delete(
                                 AdjDirection::Out => (node_id, peer_id),
                                 AdjDirection::In => (peer_id, node_id),
                             };
-                            if lookup_edge_type_temporal(&parts.edge_type, ctx)? {
+
+                            // Pre-snapshot edge props for trigger firing (if
+                            // any trigger registered). Captured *before*
+                            // mvcc_delete so the body's RYOW reads see the
+                            // edge as deleted.
+                            let mut edge_delete_snapshots: Vec<
+                                std::collections::BTreeMap<String, Value>,
+                            > = Vec::new();
+                            if !matched_edge_delete.is_empty() {
+                                if is_temporal {
+                                    let prefix = temporal_edgeprop_pair_prefix(
+                                        &parts.edge_type,
+                                        ep_src,
+                                        ep_tgt,
+                                    );
+                                    for (_k, bytes) in
+                                        ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)?
+                                    {
+                                        edge_delete_snapshots
+                                            .push(decode_edgeprop_into_map(&bytes, ctx));
+                                    }
+                                } else {
+                                    let ep_key =
+                                        encode_edgeprop_key(&parts.edge_type, ep_src, ep_tgt);
+                                    if let Some(bytes) =
+                                        ctx.mvcc_get(Partition::EdgeProp, &ep_key)?
+                                    {
+                                        edge_delete_snapshots
+                                            .push(decode_edgeprop_into_map(&bytes, ctx));
+                                    } else {
+                                        edge_delete_snapshots
+                                            .push(std::collections::BTreeMap::new());
+                                    }
+                                }
+                            }
+
+                            if is_temporal {
                                 let prefix =
                                     temporal_edgeprop_pair_prefix(&parts.edge_type, ep_src, ep_tgt);
                                 let versions =
@@ -7793,6 +7982,23 @@ fn execute_delete(
                             } else {
                                 let ep_key = encode_edgeprop_key(&parts.edge_type, ep_src, ep_tgt);
                                 ctx.mvcc_delete(Partition::EdgeProp, &ep_key)?;
+                            }
+
+                            // Fire edge-DELETE triggers per snapshotted version.
+                            if !matched_edge_delete.is_empty() {
+                                for before in &edge_delete_snapshots {
+                                    let trigger_params = trigger_params_for_edge_delete(
+                                        &parts.edge_type,
+                                        ep_src,
+                                        ep_tgt,
+                                        before,
+                                    );
+                                    fire_before_commit_triggers(
+                                        &matched_edge_delete,
+                                        &trigger_params,
+                                        ctx,
+                                    )?;
+                                }
                             }
                         }
                     }
@@ -9430,6 +9636,35 @@ fn delete_single_edge(
 ) -> Result<(), ExecutionError> {
     let is_temporal = lookup_edge_type_temporal(edge_type, ctx)?;
 
+    // Probe BEFORE COMMIT DELETE triggers for this edge type up front. If at
+    // least one trigger is registered, snapshot every version's property map
+    // before deletion so the trigger body can read `$before`. For temporal
+    // edges this is one snapshot per version (same number of trigger firings);
+    // for non-temporal it is the single edgeprop entry.
+    let target_segment =
+        coordinode_core::schema::triggers::TriggerTargetSchema::edge_type(edge_type)
+            .index_key_segment();
+    let matched_delete = ctx.lookup_matching_triggers(&target_segment, "d")?;
+    let mut delete_snapshots: Vec<std::collections::BTreeMap<String, Value>> = Vec::new();
+    if !matched_delete.is_empty() {
+        if is_temporal {
+            let prefix = temporal_edgeprop_pair_prefix(edge_type, src, tgt);
+            for (_k, bytes) in ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)? {
+                delete_snapshots.push(decode_edgeprop_into_map(&bytes, ctx));
+            }
+        } else {
+            let ep_key = encode_edgeprop_key(edge_type, src, tgt);
+            if let Some(bytes) = ctx.mvcc_get(Partition::EdgeProp, &ep_key)? {
+                delete_snapshots.push(decode_edgeprop_into_map(&bytes, ctx));
+            } else {
+                // The pair has no edgeprop entry (e.g. propertyless edge);
+                // still fire once with an empty `$before` map so the trigger
+                // observes the deletion event.
+                delete_snapshots.push(std::collections::BTreeMap::new());
+            }
+        }
+    }
+
     if is_temporal {
         // Snapshot every version key under the pair prefix, then delete each.
         let prefix = temporal_edgeprop_pair_prefix(edge_type, src, tgt);
@@ -9458,6 +9693,18 @@ fn delete_single_edge(
     }
 
     ctx.write_stats.edges_deleted += 1;
+
+    // Fire BEFORE COMMIT DELETE triggers AFTER the deletion so the trigger
+    // body's MATCH against the edge returns empty via RYOW (correct semantics:
+    // the edge is gone for any read inside the trigger). One firing per
+    // snapshotted version, with `$before` carrying that version's properties.
+    if !matched_delete.is_empty() {
+        for before in &delete_snapshots {
+            let trigger_params = trigger_params_for_edge_delete(edge_type, src, tgt, before);
+            fire_before_commit_triggers(&matched_delete, &trigger_params, ctx)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -10474,6 +10721,67 @@ fn trigger_params_for_node_update(
     params.insert("after".into(), Value::Map(after_props.clone()));
     params.insert("node".into(), Value::Int(node_id.as_raw() as i64));
     params
+}
+
+/// Build the parameter map for an edge-UPDATE trigger firing.
+/// `$event = "UPDATE"`, `$before` / `$after` carry the edge's property maps
+/// before and after the mutation, `$src` / `$tgt` are the endpoint NodeIds,
+/// and `$edge_type` is the type name.
+fn trigger_params_for_edge_update(
+    edge_type: &str,
+    src: NodeId,
+    tgt: NodeId,
+    before: &std::collections::BTreeMap<String, Value>,
+    after: &std::collections::BTreeMap<String, Value>,
+) -> std::collections::HashMap<String, Value> {
+    let mut params = std::collections::HashMap::with_capacity(6);
+    params.insert("event".into(), Value::String("UPDATE".into()));
+    params.insert("before".into(), Value::Map(before.clone()));
+    params.insert("after".into(), Value::Map(after.clone()));
+    params.insert("src".into(), Value::Int(src.as_raw() as i64));
+    params.insert("tgt".into(), Value::Int(tgt.as_raw() as i64));
+    params.insert("edge_type".into(), Value::String(edge_type.to_string()));
+    params
+}
+
+/// Build the parameter map for an edge-DELETE trigger firing.
+/// `$event = "DELETE"`, `$before` carries the deleted edge's property map,
+/// `$after = NULL`. `$src` / `$tgt` are the endpoint NodeIds and
+/// `$edge_type` is the type name.
+fn trigger_params_for_edge_delete(
+    edge_type: &str,
+    src: NodeId,
+    tgt: NodeId,
+    before: &std::collections::BTreeMap<String, Value>,
+) -> std::collections::HashMap<String, Value> {
+    let mut params = std::collections::HashMap::with_capacity(6);
+    params.insert("event".into(), Value::String("DELETE".into()));
+    params.insert("before".into(), Value::Map(before.clone()));
+    params.insert("after".into(), Value::Null);
+    params.insert("src".into(), Value::Int(src.as_raw() as i64));
+    params.insert("tgt".into(), Value::Int(tgt.as_raw() as i64));
+    params.insert("edge_type".into(), Value::String(edge_type.to_string()));
+    params
+}
+
+/// Decode an edgeprop value (msgpack `Vec<(field_id, Value)>`) into a name→
+/// value BTreeMap by resolving each interned field id back to its string name.
+/// Field ids not in the interner are silently skipped — they cannot have been
+/// produced by this engine's writes, so their presence indicates a corrupt
+/// blob and we prefer a partial-but-consistent snapshot to an error.
+fn decode_edgeprop_into_map(
+    bytes: &[u8],
+    ctx: &ExecutionContext<'_>,
+) -> std::collections::BTreeMap<String, Value> {
+    let mut out: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    if let Ok(prop_map) = rmp_serde::from_slice::<Vec<(u32, Value)>>(bytes) {
+        for (field_id, value) in prop_map {
+            if let Some(name) = ctx.interner.resolve(field_id) {
+                out.insert(name.to_string(), value);
+            }
+        }
+    }
+    out
 }
 
 /// Extract `(labels, props_map)` from a NodeRecord using the interner to
