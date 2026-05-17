@@ -4348,6 +4348,135 @@ fn trigger_before_commit_detach_document_fires_node_and_edge_create() {
     );
 }
 
+/// MERGE NODES fires the DELETE trigger on the non-surviving (source)
+/// node's labels — symmetric with DETACH DELETE on the same node.
+#[test]
+fn trigger_before_commit_merge_nodes_fires_source_delete() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER user_delete ON :User DELETE BEFORE COMMIT \
+         EXECUTE CREATE (e:UserDeletion {action: $event, b: $before})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .unwrap();
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a",
+    )
+    .unwrap();
+
+    let logs = db
+        .execute_cypher("MATCH (e:UserDeletion) RETURN e.action AS act, e.b AS b")
+        .unwrap();
+    assert_eq!(
+        logs.len(),
+        1,
+        "MERGE NODES must fire DELETE trigger for the non-survivor"
+    );
+    assert_eq!(logs[0].get("act"), Some(&Value::String("DELETE".into())));
+    assert!(matches!(
+        logs[0].get("b"),
+        Some(Value::Map(_) | Value::Document(_))
+    ));
+}
+
+/// MERGE NODES fires UPDATE trigger on the surviving target node — its
+/// property set changed as a result of the merge, so a registered UPDATE
+/// trigger must observe `$before` / `$after`.
+#[test]
+fn trigger_before_commit_merge_nodes_fires_target_update() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER user_update ON :User UPDATE BEFORE COMMIT \
+         EXECUTE CREATE (e:UserChange {action: $event, old: $before, new: $after})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com', score: 1})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com', score: 99})")
+        .unwrap();
+
+    // KEEP LAST overrides target's score with source's.
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a ON CONFLICT KEEP LAST",
+    )
+    .unwrap();
+
+    let logs = db
+        .execute_cypher("MATCH (e:UserChange) RETURN e.action AS act, e.old AS old, e.new AS new")
+        .unwrap();
+    assert_eq!(
+        logs.len(),
+        1,
+        "MERGE NODES must fire UPDATE trigger on the surviving target"
+    );
+    assert_eq!(logs[0].get("act"), Some(&Value::String("UPDATE".into())));
+    assert!(matches!(
+        logs[0].get("old"),
+        Some(Value::Map(_) | Value::Document(_))
+    ));
+    assert!(matches!(
+        logs[0].get("new"),
+        Some(Value::Map(_) | Value::Document(_))
+    ));
+}
+
+/// MERGE NODES on a source that has connecting edges cascades into
+/// edge-DELETE triggers, same as DETACH DELETE on the source.
+#[test]
+fn trigger_before_commit_merge_nodes_cascades_orphan_edge_deletes() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER edge_delete ON [:FOLLOWS] DELETE BEFORE COMMIT \
+         EXECUTE CREATE (e:EdgeDeletion {action: $event, t: $edge_type})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
+        .unwrap();
+    db.execute_cypher("CREATE (c:User {email: 'c@x.com'})")
+        .unwrap();
+    // b has an outgoing FOLLOWS to c — when b is merged into a, that edge
+    // is cascade-deleted (TRANSFER EDGES not specified).
+    db.execute_cypher(
+        "MATCH (b:User {email: 'b@x.com'}), (c:User {email: 'c@x.com'}) \
+         CREATE (b)-[:FOLLOWS]->(c)",
+    )
+    .unwrap();
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+         MERGE NODES (a, b) INTO a",
+    )
+    .unwrap();
+
+    let logs = db
+        .execute_cypher("MATCH (e:EdgeDeletion) RETURN e.action AS act, e.t AS t")
+        .unwrap();
+    assert_eq!(
+        logs.len(),
+        1,
+        "MERGE NODES must fire edge DELETE trigger for orphan-cascade"
+    );
+    assert_eq!(logs[0].get("act"), Some(&Value::String("DELETE".into())));
+    assert_eq!(logs[0].get("t"), Some(&Value::String("FOLLOWS".into())));
+}
+
 /// Edge UPDATE trigger with `ON ERROR PROPAGATE` aborts the originating
 /// SET — the edge property must NOT be modified after rollback.
 #[test]

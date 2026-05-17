@@ -8431,6 +8431,33 @@ fn execute_merge_nodes(
         ctx.mvcc_put(Partition::Node, &target_key, &new_bytes)?;
         ctx.write_stats.properties_set += 1;
 
+        // Fire BEFORE COMMIT UPDATE triggers on the merged target node's
+        // labels. MERGE NODES logically rewrites the target's prop set —
+        // `$before` is the target's pre-merge property map (resolved via the
+        // interner, plus pre-merge `extra`); `$after` is the post-merge
+        // prop map. Symmetric with SET-driven UPDATE firing.
+        let mut before_props: std::collections::BTreeMap<String, Value> =
+            std::collections::BTreeMap::new();
+        for (&fid, v) in &target_props_before {
+            if let Some(name) = ctx.interner.resolve(fid) {
+                before_props.insert(name.to_string(), v.clone());
+            }
+        }
+        for (name, v) in &target_extra_before {
+            before_props.insert(name.clone(), v.clone());
+        }
+        let (target_labels_now, after_props) = snapshot_node_record(&target_rec, ctx);
+        let trigger_params = trigger_params_for_node_update(target_id, &before_props, &after_props);
+        for label in &target_labels_now {
+            let target_segment =
+                coordinode_core::schema::triggers::TriggerTargetSchema::label(label.clone())
+                    .index_key_segment();
+            let matched = ctx.lookup_matching_triggers(&target_segment, "u")?;
+            if !matched.is_empty() {
+                fire_before_commit_triggers(&matched, &trigger_params, ctx)?;
+            }
+        }
+
         // Refresh the row's pre-bound property columns for the target variable
         // so downstream RETURN / WITH / WHERE expressions see merged values
         // without having to re-read storage. Property access in the executor
@@ -8955,6 +8982,17 @@ fn detach_delete_node(
     // reject re-creation with the same value, vector/text searches would
     // return stale UIDs.
     let node_key = encode_node_key(ctx.shard_id, node_id);
+    // Snapshot pre-mutation node state once for trigger firing — re-used after
+    // the node is deleted to populate `$before` for the BEFORE COMMIT DELETE
+    // trigger. Mirrors the `execute_delete` / `cascade_delete_source_node`
+    // wiring so that MERGE NODES' source-cleanup fires the same triggers as
+    // DETACH DELETE on the same node.
+    let node_pre_snapshot: Option<(Vec<String>, std::collections::BTreeMap<String, Value>)> =
+        ctx.mvcc_get(Partition::Node, &node_key)?.and_then(|bytes| {
+            NodeRecord::from_msgpack(&bytes)
+                .ok()
+                .map(|rec| snapshot_node_record(&rec, ctx))
+        });
     if let Some(node_bytes) = ctx.mvcc_get(Partition::Node, &node_key)? {
         if let Ok(record) = NodeRecord::from_msgpack(&node_bytes) {
             let label = record.primary_label().to_string();
@@ -9003,6 +9041,13 @@ fn detach_delete_node(
     }
     for edge_key in &adj_keys {
         if let Some(parts) = decode_adj_key(edge_key) {
+            // Probe edge DELETE triggers once per adj key. Re-used across all
+            // peer pairs walked from the posting list. Mirrors the wiring in
+            // `execute_delete` DETACH branch and `cascade_delete_source_node`.
+            let edge_target_segment =
+                coordinode_core::schema::triggers::TriggerTargetSchema::edge_type(&parts.edge_type)
+                    .index_key_segment();
+            let matched_edge_delete = ctx.lookup_matching_triggers(&edge_target_segment, "d")?;
             if let Some(plist) = ctx.adj_get(edge_key)? {
                 let temporal = lookup_edge_type_temporal(&parts.edge_type, ctx)?;
                 for peer_uid in plist.iter() {
@@ -9017,7 +9062,47 @@ fn detach_delete_node(
                         AdjDirection::Out => (node_id, peer_id),
                         AdjDirection::In => (peer_id, node_id),
                     };
+
+                    // Pre-snapshot edge prop maps for trigger firing — one per
+                    // version for temporal edges, single entry for non-temporal.
+                    // Captured before edgeprop deletion so the body's RYOW
+                    // reads see the edge as gone.
+                    let mut edge_delete_snapshots: Vec<std::collections::BTreeMap<String, Value>> =
+                        Vec::new();
+                    if !matched_edge_delete.is_empty() {
+                        if temporal {
+                            let prefix =
+                                temporal_edgeprop_pair_prefix(&parts.edge_type, ep_src, ep_tgt);
+                            for (_k, bytes) in ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)? {
+                                edge_delete_snapshots.push(decode_edgeprop_into_map(&bytes, ctx));
+                            }
+                        } else {
+                            let ep_key = encode_edgeprop_key(&parts.edge_type, ep_src, ep_tgt);
+                            if let Some(bytes) = ctx.mvcc_get(Partition::EdgeProp, &ep_key)? {
+                                edge_delete_snapshots.push(decode_edgeprop_into_map(&bytes, ctx));
+                            } else {
+                                edge_delete_snapshots.push(std::collections::BTreeMap::new());
+                            }
+                        }
+                    }
+
                     delete_edgeprop_for_pair(&parts.edge_type, ep_src, ep_tgt, temporal, ctx)?;
+
+                    if !matched_edge_delete.is_empty() {
+                        for before in &edge_delete_snapshots {
+                            let trigger_params = trigger_params_for_edge_delete(
+                                &parts.edge_type,
+                                ep_src,
+                                ep_tgt,
+                                before,
+                            );
+                            fire_before_commit_triggers(
+                                &matched_edge_delete,
+                                &trigger_params,
+                                ctx,
+                            )?;
+                        }
+                    }
                 }
             }
         }
@@ -9034,6 +9119,22 @@ fn detach_delete_node(
     // cleanup pass; reuse it to drop the primary node record.
     ctx.mvcc_delete(Partition::Node, &node_key)?;
     ctx.write_stats.nodes_deleted += 1;
+
+    // Fire BEFORE COMMIT DELETE triggers on the deleted node's labels —
+    // mirrors `execute_delete` / `cascade_delete_source_node`. Probe runs
+    // AFTER mvcc_delete so the trigger body's MATCH returns empty via RYOW.
+    if let Some((labels, before_props)) = node_pre_snapshot {
+        let trigger_params = trigger_params_for_node_delete(node_id, &before_props);
+        for label in &labels {
+            let target_segment =
+                coordinode_core::schema::triggers::TriggerTargetSchema::label(label.clone())
+                    .index_key_segment();
+            let matched = ctx.lookup_matching_triggers(&target_segment, "d")?;
+            if !matched.is_empty() {
+                fire_before_commit_triggers(&matched, &trigger_params, ctx)?;
+            }
+        }
+    }
     Ok(())
 }
 

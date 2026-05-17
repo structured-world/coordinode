@@ -555,8 +555,8 @@ Edge triggers and node triggers occupy separate index namespaces:
 | Event | Node — fires on | Edge — fires on |
 |-------|-----------------|-----------------|
 | `CREATE` | `CREATE (n:Label ...)`, `MERGE (n:Label)` create branch, `UPSERT MATCH ... ON CREATE`, `DETACH DOCUMENT` (promoted node) | `CREATE (a)-[:TYPE ...]->(b)`, `MERGE (a)-[:TYPE]->(b)` create branch, `UPSERT MATCH ... ON CREATE`, `DETACH DOCUMENT` (connecting edge) |
-| `UPDATE` | `SET n.prop = ...`, `REMOVE n.prop`, `REMOVE n:Label` (one firing per node per statement, regardless of how many items) | `SET r.prop = ...` (one firing per matched edge per statement; `SET r += {...}` is a no-op in the current executor and does NOT fire) |
-| `DELETE` | `DELETE n` / `DETACH DELETE n`, source node of `ATTACH DOCUMENT` | `DELETE r`, every edge removed by `DETACH DELETE` on an endpoint, every orphan edge removed by `ATTACH DOCUMENT` source cleanup |
+| `UPDATE` | `SET n.prop = ...`, `REMOVE n.prop`, `REMOVE n:Label`, `MERGE NODES (a, b) INTO target` (target's merged record) (one firing per node per statement, regardless of how many items) | `SET r.prop = ...` (one firing per matched edge per statement; `SET r += {...}` is a no-op in the current executor and does NOT fire) |
+| `DELETE` | `DELETE n` / `DETACH DELETE n`, source node of `ATTACH DOCUMENT`, non-surviving node of `MERGE NODES` | `DELETE r`, every edge removed by `DETACH DELETE` on an endpoint, every orphan edge removed by `ATTACH DOCUMENT` source cleanup, every orphan edge on `MERGE NODES` non-survivor |
 
 **Trigger body parameters:**
 
