@@ -145,6 +145,23 @@ WHERE b.tags CONTAINS 'rust'
 MERGE ALL (a)-[:TAGS]->(b)
 ```
 
+#### MERGE NODES ✅ 🔷
+
+CoordiNode extension. Collapses two matched nodes into one in a single MVCC
+transaction — property merge, edge re-pointing, and source deletion together.
+Replaces Neo4j's `apoc.refactor.mergeNodes()` with a native, cluster-safe
+clause. See [Cypher Extensions — MERGE NODES](extensions.md#merge-nodes-)
+for the full strategy matrix.
+
+```cypher
+MATCH (a:User {email: 'alice@example.com'}),
+      (b:User {email: 'alice@example.org'})
+MERGE NODES (a, b) INTO a
+  ON CONFLICT COALESCE
+  TRANSFER EDGES FROM b TO a
+  ON DUPLICATE MERGE PROPERTIES
+```
+
 #### DELETE / DETACH DELETE ✅
 
 Deletes nodes or relationships. `DETACH DELETE` removes all connected edges before deleting the node.

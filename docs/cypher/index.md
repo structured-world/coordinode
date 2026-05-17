@@ -51,6 +51,7 @@ LIMIT 10
 | Read clauses (MATCH, RETURN, WITH, UNWIND, ORDER BY, SKIP, LIMIT) | ✅ |
 | Write clauses (CREATE, MERGE, DELETE, DETACH DELETE, SET, REMOVE) | ✅ |
 | UPSERT MATCH (atomic upsert) | 🔷 |
+| MERGE NODES (entity-resolution / dedup, replaces APOC) | ✅ 🔷 |
 | Variable-length paths `*min..max` | ✅ |
 | Pattern predicates in WHERE | ✅ |
 | CASE WHEN expressions | ✅ |
