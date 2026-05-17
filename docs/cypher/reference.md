@@ -275,6 +275,59 @@ CREATE ENCRYPTED INDEX patient_ssn ON :Patient(ssn)
 DROP ENCRYPTED INDEX patient_ssn
 ```
 
+#### CREATE / DROP / SHOW / ALTER TRIGGER ✅ 🔷
+
+CoordiNode extension. First-class trigger DDL — definitions live in the
+schema partition, replicate via Raft, and survive backups. Replaces Neo4j
+APOC triggers (which break in clusters) with cluster-safe native semantics.
+
+```cypher
+-- Audit log every User mutation, retry transient errors, dead-letter on exhaustion
+CREATE TRIGGER audit
+  ON :User CREATE | UPDATE | DELETE
+  AFTER COMMIT
+  EXECUTE
+    CREATE (e:AuditEntry {action: $event, ts: datetime()})
+  ON ERROR RETRY 3 WITH BACKOFF 1000
+
+-- Validation trigger — aborts the originating transaction if it errors
+CREATE TRIGGER validate_email
+  ON :User CREATE | UPDATE
+  BEFORE COMMIT
+  EXECUTE
+    MATCH (u:User {id: $after.id}) SET u.valid = true
+  ON ERROR PROPAGATE
+  CASCADE_LIMIT 3
+
+SHOW TRIGGERS
+ALTER TRIGGER audit DISABLE
+ALTER TRIGGER audit ENABLE
+ALTER TRIGGER audit SET EXECUTE CREATE (e:NewAuditEntry)
+ALTER TRIGGER audit SET ON ERROR DEAD_LETTER
+DROP TRIGGER audit
+```
+
+| Clause / option | Effect |
+|-----------------|--------|
+| `ON :Label` | Fire on node mutations of the given label |
+| `ON [:EdgeType]` | Fire on edge mutations of the given type |
+| `CREATE \| UPDATE \| DELETE` | Event filter — any subset, joined by `\|` |
+| `BEFORE COMMIT` | Synchronous on Raft leader; failure can abort the transaction |
+| `AFTER COMMIT` | Asynchronous via oplog consumers; runs on any cluster node |
+| `EXECUTE <clauses>` | Cypher body (single or multi-clause); re-parsed on firing |
+| `CASCADE_LIMIT n` | Per-trigger override of L1 cascade depth (default 10) |
+| `CASCADE_FANOUT n` | Per-trigger override of L2 unique-trigger fanout (default 100) |
+| `MAXDEPTH n` | Deprecated alias for `CASCADE_LIMIT n` |
+| `ON ERROR PROPAGATE` | Error aborts the transaction (BEFORE) or dead-letters (AFTER) |
+| `ON ERROR RETRY n [WITH BACKOFF ms]` | Durable retry queue, exponential backoff |
+| `ON ERROR DEAD_LETTER` | First failure lands in `trigger_failures` partition |
+
+Cycle protection layers:
+- **L1** cascade depth — cumulative across all triggers in one mutation root
+- **L2** unique-trigger fanout — per-trigger fire count within one root
+- **L3** static cycle detection at DDL time *(planned)*
+- **L4** auto-disable circuit breaker *(planned)*
+
 #### ALTER LABEL ✅
 
 Change the schema mode of a label.

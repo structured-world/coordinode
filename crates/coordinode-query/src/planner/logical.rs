@@ -369,18 +369,18 @@ pub enum LogicalOp {
         properties: Vec<crate::cypher::ast::EdgePropertyDecl>,
     },
 
-    /// CREATE TRIGGER — R190 / ADR-026. Registers a trigger definition in the
+    /// CREATE TRIGGER — the trigger architecture. Registers a trigger definition in the
     /// schema partition, updates the `(target, event)` index, and (in EE)
     /// notifies trigger workers of the new subscription.
     CreateTrigger {
         clause: crate::cypher::ast::CreateTriggerClause,
     },
-    /// DROP TRIGGER — R190.
+    /// DROP TRIGGER — the trigger architecture.
     DropTrigger { name: String },
-    /// SHOW TRIGGERS — R190. Reads schema partition and returns one row per
+    /// SHOW TRIGGERS — the trigger architecture. Reads schema partition and returns one row per
     /// registered trigger.
     ShowTriggers,
-    /// ALTER TRIGGER — R190.
+    /// ALTER TRIGGER — the trigger architecture.
     AlterTrigger {
         clause: crate::cypher::ast::AlterTriggerClause,
     },

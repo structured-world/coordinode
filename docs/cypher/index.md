@@ -52,6 +52,7 @@ LIMIT 10
 | Write clauses (CREATE, MERGE, DELETE, DETACH DELETE, SET, REMOVE) | ✅ |
 | UPSERT MATCH (atomic upsert) | 🔷 |
 | MERGE NODES (entity-resolution / dedup, replaces APOC) | ✅ 🔷 |
+| Native triggers — CREATE/DROP/SHOW/ALTER TRIGGER DDL + ON ERROR + cycle protection (firing in v0.4.x) | ✅ 🔷 |
 | Variable-length paths `*min..max` | ✅ |
 | Pattern predicates in WHERE | ✅ |
 | CASE WHEN expressions | ✅ |

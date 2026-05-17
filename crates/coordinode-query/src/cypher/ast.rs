@@ -102,13 +102,13 @@ pub enum Clause {
     DropVectorIndex(DropVectorIndexClause),
     CreateEdgeType(CreateEdgeTypeClause),
 
-    /// `CREATE TRIGGER … ON :Label CREATE|UPDATE|DELETE BEFORE|AFTER COMMIT EXECUTE … [ON ERROR …]` (R190 / ADR-026).
+    /// `CREATE TRIGGER … ON :Label CREATE|UPDATE|DELETE BEFORE|AFTER COMMIT EXECUTE … [ON ERROR …]`.
     CreateTrigger(CreateTriggerClause),
-    /// `DROP TRIGGER <name>` (R190 / ADR-026).
+    /// `DROP TRIGGER <name>`.
     DropTrigger(DropTriggerClause),
-    /// `SHOW TRIGGERS` (R190 / ADR-026).
+    /// `SHOW TRIGGERS`.
     ShowTriggers,
-    /// `ALTER TRIGGER <name> { DISABLE | ENABLE | SET EXECUTE … | SET ON ERROR … }` (R190 / ADR-026).
+    /// `ALTER TRIGGER <name> { DISABLE | ENABLE | SET EXECUTE … | SET ON ERROR … }`.
     AlterTrigger(AlterTriggerClause),
 
     // Write clauses
@@ -325,7 +325,7 @@ pub struct DropVectorIndexClause {
 }
 
 /// `CREATE TRIGGER` — defines a reactive Cypher body that fires on graph
-/// mutations. See [arch/core/triggers.md] and ADR-026.
+/// mutations.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateTriggerClause {
     /// Unique trigger name (used as DROP / ALTER / SHOW handle).
@@ -340,12 +340,12 @@ pub struct CreateTriggerClause {
     /// re-parsed and executed when the trigger fires. The grammar guarantees
     /// the source is at least one syntactically valid clause sequence.
     pub body_source: String,
-    /// L1 cascade-depth limit per-trigger override (ADR-026A).
+    /// L1 cascade-depth limit per-trigger override (the trigger architecture).
     /// Counter is shared across all triggers in one originating mutation;
     /// this field overrides the cluster default (`triggers.max_cascade_depth`,
     /// 10). Parsed from `CASCADE_LIMIT n` or its deprecated alias `MAXDEPTH n`.
     pub cascade_limit: Option<u32>,
-    /// L2 unique-trigger fanout limit per-trigger override (ADR-026A).
+    /// L2 unique-trigger fanout limit per-trigger override (the trigger architecture).
     /// Counter is per-trigger within one cascade; this field overrides the
     /// cluster default (`triggers.max_cascade_fanout`, 100). Parsed from
     /// `CASCADE_FANOUT n`.
@@ -417,7 +417,7 @@ pub enum TriggerTiming {
     AfterCommit,
 }
 
-/// Per-trigger error handling policy (ADR-026).
+/// Per-trigger error handling policy (the trigger architecture).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OnErrorPolicy {
     /// `BEFORE COMMIT`: aborts the originating transaction.
@@ -436,7 +436,7 @@ pub enum OnErrorPolicy {
 
 impl OnErrorPolicy {
     /// Default policy when a `CREATE TRIGGER` statement omits `ON ERROR`.
-    /// Spec'd in ADR-026: BEFORE → Propagate; AFTER → Retry 3 with 1s backoff.
+    /// Spec'd in the trigger architecture: BEFORE → Propagate; AFTER → Retry 3 with 1s backoff.
     pub fn default_for(timing: TriggerTiming) -> Self {
         match timing {
             TriggerTiming::BeforeCommit => Self::Propagate,

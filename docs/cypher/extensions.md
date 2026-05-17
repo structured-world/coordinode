@@ -497,6 +497,79 @@ commits. `VALIDATED` mode rejects type mismatches on declared properties but
 allows source-only props into the `extra` overflow map. `FLEXIBLE` accepts
 the merge unconditionally.
 
+### Native Triggers ✅ 🔷
+
+CoordiNode extension. Triggers are a first-class Cypher clause, not a
+plugin — definitions persist in the schema partition, replicate via Raft,
+and survive backups. Neo4j's equivalent (APOC) ships as a separate JAR and
+breaks under clustering (eventually-consistent propagation, no failover
+guarantees, doesn't survive `neo4j-admin restore`).
+
+```cypher
+-- Audit log without writing a single line of application code
+CREATE TRIGGER audit
+  ON :User CREATE | UPDATE | DELETE
+  AFTER COMMIT
+  EXECUTE
+    CREATE (e:AuditEntry {
+      action: $event,
+      node_id: $after.id,
+      ts: datetime(),
+      before: $before,
+      after: $after
+    })
+  ON ERROR RETRY 3 WITH BACKOFF 1000
+
+-- Validation that rejects bad writes synchronously
+CREATE TRIGGER reject_anonymous_user
+  ON :User CREATE
+  BEFORE COMMIT
+  EXECUTE
+    MATCH (u:User {id: $after.id})
+    WHERE u.email IS NULL
+    SET u.__rejected__ = true
+  ON ERROR PROPAGATE
+
+SHOW TRIGGERS
+ALTER TRIGGER audit DISABLE        -- pause without losing the definition
+ALTER TRIGGER audit ENABLE
+ALTER TRIGGER audit SET EXECUTE …  -- replace body without re-registering
+DROP TRIGGER audit
+```
+
+**Execution model:**
+
+| Timing | Where it runs | Failure default | Failure mode |
+|--------|---------------|-----------------|--------------|
+| `BEFORE COMMIT` | Raft leader, synchronous within the mutation's proposal | `PROPAGATE` | Aborts the originating transaction (caller sees the error) |
+| `AFTER COMMIT` | Oplog consumer pool, any cluster node | `RETRY 3 WITH BACKOFF 1000` | Durable retry queue → dead-letter partition on exhaustion |
+
+**Cycle protection (4 layers):**
+
+- **L1** `CASCADE_LIMIT` — cumulative cascade depth across all triggers
+  triggered by one originating user mutation. Per-trigger override; cluster
+  default 10. Trips with the trigger chain attached for diagnostics.
+- **L2** `CASCADE_FANOUT` — per-trigger fire count within one cascade root.
+  Cluster default 100. Catches wide-but-shallow runaways (one trigger
+  re-firing per row of a batch).
+- **L3** Static cycle detection at `CREATE TRIGGER` *(planned)*.
+  DFS over the `trigger.target_label → labels written by trigger body`
+  graph; default warns, `WITH CYCLE_CHECK STRICT` rejects.
+- **L4** Per-trigger auto-disable circuit breaker *(planned)*.
+  When `trigger_errors_per_minute` or `cascade_overflow_count` exceeds
+  thresholds, the trigger is automatically disabled until an operator
+  re-enables it.
+
+**Error handling — `ON ERROR { PROPAGATE | RETRY n [WITH BACKOFF ms] | DEAD_LETTER }`.**
+Silent failure is impossible: every failed event lands in either
+`trigger_pending:<name>:<seq>` (in-flight retry) or
+`trigger_failures:<name>:<seq>` (dead-letter), inspectable via
+`SHOW TRIGGER FAILURES` (planned).
+
+**Replaces:** Neo4j APOC trigger plugin. CoordiNode's triggers are
+native, replicated, and cluster-safe; CoordiNode's `CASCADE_LIMIT` /
+`CASCADE_FANOUT` defaults catch runaways APOC silently lets through.
+
 ### SET ON VIOLATION SKIP 🔷
 
 Skip nodes that would violate schema constraints, continue with the rest.

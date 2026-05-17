@@ -1,4 +1,4 @@
-//! Trigger schema partition layout (R190 / ADR-026 / ADR-026A).
+//! Trigger schema partition layout (the trigger architecture).
 //!
 //! Triggers are stored under two key families in the schema partition:
 //!
@@ -12,7 +12,7 @@
 //!   trigger subscribes to. `DROP TRIGGER` removes them. The probe in the
 //!   executor reads this index by `(label_or_edge_type, event)` so the
 //!   per-mutation cost is `O(matching_triggers)`, never
-//!   `O(total_trigger_count)`. ADR-026 §3.
+//!   `O(total_trigger_count)`. the trigger architecture §3.
 //!
 //! `target` in the index key is prefixed with `n:` for node labels and
 //! `e:` for edge types so the two namespaces never collide on the same
@@ -20,7 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Persisted form of a trigger registered via `CREATE TRIGGER` (ADR-026).
+/// Persisted form of a trigger registered via `CREATE TRIGGER` (the trigger architecture).
 ///
 /// The body is stored as a raw Cypher source string captured by the parser;
 /// the executor re-parses on each firing (cheap relative to body execution,
@@ -37,14 +37,14 @@ pub struct TriggerSchema {
     pub timing: TriggerTimingSchema,
     /// Raw Cypher source of the trigger body — re-parsed on firing.
     pub body_source: String,
-    /// `MAXDEPTH n` / `CASCADE_LIMIT n` per-trigger override (ADR-026A L1).
+    /// `MAXDEPTH n` / `CASCADE_LIMIT n` per-trigger override (the trigger architecture L1).
     /// `None` = use cluster default `triggers.max_cascade_depth`.
     pub cascade_limit: Option<u32>,
-    /// `CASCADE_FANOUT n` per-trigger override (ADR-026A L2).
+    /// `CASCADE_FANOUT n` per-trigger override (the trigger architecture L2).
     /// `None` = use cluster default `triggers.max_cascade_fanout`.
     pub cascade_fanout: Option<u32>,
     /// Error-handling policy. `None` = use the default for `timing`
-    /// (`BEFORE` → Propagate, `AFTER` → Retry 3 / 1000ms) per ADR-026.
+    /// (`BEFORE` → Propagate, `AFTER` → Retry 3 / 1000ms) per the trigger architecture.
     pub on_error: Option<OnErrorPolicySchema>,
     /// Whether the trigger is currently firing. Flipped by
     /// `ALTER TRIGGER … DISABLE / ENABLE`.
@@ -135,7 +135,7 @@ pub enum TriggerTimingSchema {
     AfterCommit,
 }
 
-/// Per-trigger error policy (persisted form, ADR-026).
+/// Per-trigger error policy (persisted form, the trigger architecture).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OnErrorPolicySchema {
