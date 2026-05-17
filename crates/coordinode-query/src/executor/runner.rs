@@ -6885,6 +6885,15 @@ fn execute_update(
                 | crate::cypher::ast::SetItem::MergeProperties { variable, .. }
                 | crate::cypher::ast::SetItem::AddLabel { variable, .. } => variable,
             };
+            // Edge mutation only flows through `SetItem::Property` —
+            // `update_edge_property` is the single edgeprop-writing path.
+            // The other variants (`PropertyPath`, `DocFunction`,
+            // `MergeProperties`, `ReplaceProperties`, `AddLabel`) require
+            // `Value::Int` and silently no-op on edge variables. Snapshotting
+            // for those would fire an UPDATE trigger with `$before == $after`
+            // — semantically wrong (no mutation happened) and a needless
+            // round trip through the trigger body.
+            let is_property_mutation = matches!(item, crate::cypher::ast::SetItem::Property { .. });
             // Edge variable: bound to Value::String(edge_type). Snapshot the
             // current edge property map so we can fire UPDATE triggers with
             // `$before` / `$after` after the mutation lands. We probe the
@@ -6892,6 +6901,10 @@ fn execute_update(
             // must be taken BEFORE, since `update_edge_property` overwrites
             // the edgeprop value in the same key.
             if let Some(Value::String(edge_type)) = out_row.get(variable).cloned() {
+                if !is_property_mutation {
+                    // No mutation path exists for this variant on an edge.
+                    continue;
+                }
                 if edge_update_snapshots.contains_key(variable) {
                     continue;
                 }

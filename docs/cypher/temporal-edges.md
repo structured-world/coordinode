@@ -2,6 +2,8 @@
 
 Temporal edges let you store **multiple versions of the same relationship** between the same two nodes, each tagged with a validity interval `(valid_from, valid_to)`. CoordiNode keeps every version on disk, returns all of them on a normal `MATCH`, and lets you filter to a point or window in time with helper functions.
 
+Temporal edges are **bitemporal end-to-end**: the valid-time axis (`valid_from` / `valid_to` on the edge, *when was this fact true in the modeled world*) and the system-time axis (MVCC commit-timestamp, *when did the database know this fact*) are both queryable and compose by stacking. A valid-time predicate inside `AS OF TIMESTAMP <commit_ts>` is the textbook bitemporal pattern — "what did the database believe at commit-time `ts` was true at valid-time `T`" — and resolves correctly: the snapshot reader applies the historical adjacency state, and the per-version edgeprop scan runs against the state visible at that commit.
+
 This is the model behind:
 
 - **Regulated industries** answering "what did the graph know at time T" for audit / compliance (MiFID II, SOX, HIPAA, GDPR).
