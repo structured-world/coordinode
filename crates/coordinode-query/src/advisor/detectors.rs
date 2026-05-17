@@ -358,7 +358,11 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::DropEncryptedIndex { .. }
         | LogicalOp::CreateVectorIndex { .. }
         | LogicalOp::DropVectorIndex { .. }
-        | LogicalOp::CreateEdgeType { .. } => vec![],
+        | LogicalOp::CreateEdgeType { .. }
+        | LogicalOp::CreateTrigger { .. }
+        | LogicalOp::DropTrigger { .. }
+        | LogicalOp::ShowTriggers
+        | LogicalOp::AlterTrigger { .. } => vec![],
 
         LogicalOp::Filter { input, .. }
         | LogicalOp::Project { input, .. }

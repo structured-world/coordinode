@@ -214,6 +214,21 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let c = build_create_edge_type_clause(pair)?;
             clauses.push(Clause::CreateEdgeType(c));
         }
+        Rule::create_trigger_clause => {
+            let c = build_create_trigger_clause(pair)?;
+            clauses.push(Clause::CreateTrigger(c));
+        }
+        Rule::drop_trigger_clause => {
+            let c = build_drop_trigger_clause(pair)?;
+            clauses.push(Clause::DropTrigger(c));
+        }
+        Rule::show_triggers_clause => {
+            clauses.push(Clause::ShowTriggers);
+        }
+        Rule::alter_trigger_clause => {
+            let c = build_alter_trigger_clause(pair)?;
+            clauses.push(Clause::AlterTrigger(c));
+        }
         Rule::create_clause => {
             let cc = build_create_clause(pair)?;
             clauses.push(Clause::Create(cc));
@@ -1004,6 +1019,258 @@ fn build_create_edge_type_clause(pair: Pair<'_, Rule>) -> Result<CreateEdgeTypeC
         temporal,
         properties,
     })
+}
+
+// ----- Trigger DDL builders (R190 / ADR-026) -----
+
+fn build_create_trigger_clause(pair: Pair<'_, Rule>) -> Result<CreateTriggerClause, ParseError> {
+    let mut name: Option<String> = None;
+    let mut target: Option<TriggerTarget> = None;
+    let mut events = TriggerEvents::default();
+    let mut timing: Option<TriggerTiming> = None;
+    let mut body_source: Option<String> = None;
+    let mut cascade_limit: Option<u32> = None;
+    let mut cascade_fanout: Option<u32> = None;
+    let mut on_error: Option<OnErrorPolicy> = None;
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::identifier if name.is_none() => {
+                name = Some(inner.as_str().to_string());
+            }
+            Rule::trigger_target => {
+                target = Some(parse_trigger_target(inner)?);
+            }
+            Rule::trigger_option => {
+                // Unwrap the option's single inner alternative.
+                let opt = inner
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| ParseError::Invalid("trigger_option: missing inner".into()))?;
+                match opt.as_rule() {
+                    Rule::trigger_cascade_limit | Rule::trigger_maxdepth => {
+                        // MAXDEPTH is a deprecated alias for CASCADE_LIMIT (ADR-026A).
+                        if let Some(v) = parse_trigger_integer_option(opt)? {
+                            cascade_limit = Some(v);
+                        }
+                    }
+                    Rule::trigger_cascade_fanout => {
+                        if let Some(v) = parse_trigger_integer_option(opt)? {
+                            cascade_fanout = Some(v);
+                        }
+                    }
+                    Rule::on_error_clause => {
+                        on_error = Some(parse_on_error_clause(opt)?);
+                    }
+                    other => {
+                        return Err(ParseError::Invalid(format!(
+                            "trigger_option: unexpected node {other:?}"
+                        )));
+                    }
+                }
+            }
+            Rule::trigger_event_list => {
+                for ev in inner.into_inner() {
+                    if ev.as_rule() == Rule::trigger_event {
+                        for tok in ev.into_inner() {
+                            match tok.as_rule() {
+                                Rule::kw_create => events.on_create = true,
+                                Rule::kw_update => events.on_update = true,
+                                Rule::kw_delete => events.on_delete = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            Rule::trigger_timing => {
+                for tok in inner.into_inner() {
+                    match tok.as_rule() {
+                        Rule::kw_before => timing = Some(TriggerTiming::BeforeCommit),
+                        Rule::kw_after => timing = Some(TriggerTiming::AfterCommit),
+                        _ => {}
+                    }
+                }
+            }
+            Rule::trigger_body => {
+                body_source = Some(inner.as_str().trim().to_string());
+            }
+            _ => {}
+        }
+    }
+
+    let name = name.ok_or_else(|| ParseError::Invalid("CREATE TRIGGER requires a name".into()))?;
+    let target = target.ok_or_else(|| {
+        ParseError::Invalid("CREATE TRIGGER requires ON :Label or [:EdgeType]".into())
+    })?;
+    if !events.any() {
+        return Err(ParseError::Invalid(
+            "CREATE TRIGGER requires at least one event (CREATE | UPDATE | DELETE)".into(),
+        ));
+    }
+    let timing = timing.ok_or_else(|| {
+        ParseError::Invalid("CREATE TRIGGER requires BEFORE COMMIT or AFTER COMMIT".into())
+    })?;
+    let body_source = body_source
+        .ok_or_else(|| ParseError::Invalid("CREATE TRIGGER requires EXECUTE <clauses>".into()))?;
+
+    Ok(CreateTriggerClause {
+        name,
+        target,
+        events,
+        timing,
+        body_source,
+        cascade_limit,
+        cascade_fanout,
+        on_error,
+    })
+}
+
+fn parse_trigger_target(pair: Pair<'_, Rule>) -> Result<TriggerTarget, ParseError> {
+    // Two grammar shapes:
+    //   - label_list      (single ":Label" — multiple labels rejected here)
+    //   - "[" ":" identifier "]"  (edge type)
+    let mut iter = pair.into_inner();
+    let first = iter.next().ok_or_else(|| {
+        ParseError::Invalid("trigger target: expected :Label or [:EdgeType]".into())
+    })?;
+    match first.as_rule() {
+        Rule::label_list => {
+            let labels: Vec<String> = first
+                .into_inner()
+                .filter(|p| p.as_rule() == Rule::identifier)
+                .map(|p| p.as_str().to_string())
+                .collect();
+            if labels.len() != 1 {
+                return Err(ParseError::Invalid(format!(
+                    "trigger target expects exactly one label, got {} ({:?})",
+                    labels.len(),
+                    labels
+                )));
+            }
+            Ok(TriggerTarget::Label(
+                labels.into_iter().next().unwrap_or_default(),
+            ))
+        }
+        Rule::identifier => Ok(TriggerTarget::EdgeType(first.as_str().to_string())),
+        other => Err(ParseError::Invalid(format!(
+            "trigger target: unexpected node {other:?}"
+        ))),
+    }
+}
+
+/// Parse the integer argument of `MAXDEPTH n`, `CASCADE_LIMIT n`, or
+/// `CASCADE_FANOUT n`. The rule's first numeric child is returned.
+fn parse_trigger_integer_option(pair: Pair<'_, Rule>) -> Result<Option<u32>, ParseError> {
+    let rule = pair.as_rule();
+    for inner in pair.into_inner() {
+        if inner.as_rule() == Rule::integer_literal {
+            let v: u32 = inner.as_str().parse().map_err(|e| {
+                ParseError::Invalid(format!(
+                    "{rule:?}: invalid integer `{}`: {e}",
+                    inner.as_str()
+                ))
+            })?;
+            return Ok(Some(v));
+        }
+    }
+    Err(ParseError::Invalid(format!("{rule:?} requires an integer")))
+}
+
+fn parse_on_error_clause(pair: Pair<'_, Rule>) -> Result<OnErrorPolicy, ParseError> {
+    let policy = pair
+        .into_inner()
+        .find(|p| {
+            matches!(
+                p.as_rule(),
+                Rule::on_error_propagate | Rule::on_error_retry | Rule::on_error_dead_letter
+            )
+        })
+        .ok_or_else(|| ParseError::Invalid("ON ERROR: missing policy".into()))?;
+    match policy.as_rule() {
+        Rule::on_error_propagate => Ok(OnErrorPolicy::Propagate),
+        Rule::on_error_dead_letter => Ok(OnErrorPolicy::DeadLetter),
+        Rule::on_error_retry => {
+            let mut nums: Vec<u32> = Vec::new();
+            for tok in policy.into_inner() {
+                if tok.as_rule() == Rule::integer_literal {
+                    let v: u32 = tok.as_str().parse().map_err(|e| {
+                        ParseError::Invalid(format!(
+                            "ON ERROR RETRY: invalid integer `{}`: {e}",
+                            tok.as_str()
+                        ))
+                    })?;
+                    nums.push(v);
+                }
+            }
+            if nums.is_empty() {
+                return Err(ParseError::Invalid(
+                    "ON ERROR RETRY requires a retry count".into(),
+                ));
+            }
+            let n = nums[0];
+            // Default backoff base = 1000ms when WITH BACKOFF is omitted.
+            let backoff_ms = nums.get(1).copied().unwrap_or(1000);
+            Ok(OnErrorPolicy::Retry { n, backoff_ms })
+        }
+        other => Err(ParseError::Invalid(format!(
+            "ON ERROR: unexpected policy node {other:?}"
+        ))),
+    }
+}
+
+fn build_drop_trigger_clause(pair: Pair<'_, Rule>) -> Result<DropTriggerClause, ParseError> {
+    let name = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::identifier)
+        .map(|p| p.as_str().to_string())
+        .ok_or_else(|| ParseError::Invalid("DROP TRIGGER requires a name".into()))?;
+    Ok(DropTriggerClause { name })
+}
+
+fn build_alter_trigger_clause(pair: Pair<'_, Rule>) -> Result<AlterTriggerClause, ParseError> {
+    let mut name: Option<String> = None;
+    let mut action: Option<AlterTriggerAction> = None;
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::identifier if name.is_none() => {
+                name = Some(inner.as_str().to_string());
+            }
+            Rule::alter_trigger_disable => action = Some(AlterTriggerAction::Disable),
+            Rule::alter_trigger_enable => action = Some(AlterTriggerAction::Enable),
+            Rule::alter_trigger_set_body => {
+                let body = inner
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::trigger_body)
+                    .map(|p| p.as_str().trim().to_string())
+                    .ok_or_else(|| {
+                        ParseError::Invalid("ALTER TRIGGER SET EXECUTE: missing body".into())
+                    })?;
+                action = Some(AlterTriggerAction::SetBody(body));
+            }
+            Rule::alter_trigger_set_on_error => {
+                let policy_pair = inner
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::on_error_clause)
+                    .ok_or_else(|| {
+                        ParseError::Invalid(
+                            "ALTER TRIGGER SET ON ERROR: missing on_error clause".into(),
+                        )
+                    })?;
+                action = Some(AlterTriggerAction::SetOnError(parse_on_error_clause(
+                    policy_pair,
+                )?));
+            }
+            _ => {}
+        }
+    }
+
+    let name = name.ok_or_else(|| ParseError::Invalid("ALTER TRIGGER requires a name".into()))?;
+    let action = action.ok_or_else(|| {
+        ParseError::Invalid("ALTER TRIGGER requires DISABLE | ENABLE | SET ...".into())
+    })?;
+    Ok(AlterTriggerClause { name, action })
 }
 
 fn build_drop_index_clause(pair: Pair<'_, Rule>) -> Result<DropIndexClause, ParseError> {
@@ -3532,6 +3799,285 @@ mod tests {
             msg.contains("ON DUPLICATE requires a TRANSFER EDGES clause"),
             "expected requires-transfer error, got: {msg}"
         );
+    }
+
+    // -- TRIGGER DDL (R190 / ADR-026) --
+
+    #[test]
+    fn create_trigger_minimal_before_commit() {
+        let q = parse_ok(
+            "CREATE TRIGGER t1 ON :User CREATE BEFORE COMMIT \
+             EXECUTE CREATE (e:AuditEntry {action: $event})",
+        );
+        let c = match &q.clauses[0] {
+            Clause::CreateTrigger(c) => c,
+            other => panic!("expected CreateTrigger, got {other:?}"),
+        };
+        assert_eq!(c.name, "t1");
+        assert_eq!(c.target, TriggerTarget::Label("User".into()));
+        assert!(c.events.on_create && !c.events.on_update && !c.events.on_delete);
+        assert_eq!(c.timing, TriggerTiming::BeforeCommit);
+        assert!(c.body_source.starts_with("CREATE"));
+        assert!(c.cascade_limit.is_none());
+        assert!(c.cascade_fanout.is_none());
+        assert!(
+            c.on_error.is_none(),
+            "no explicit ON ERROR → defaults at executor"
+        );
+    }
+
+    #[test]
+    fn create_trigger_edge_type_target() {
+        let q = parse_ok(
+            "CREATE TRIGGER t2 ON [:FOLLOWS] UPDATE | DELETE AFTER COMMIT \
+             EXECUTE SET n.touched = true",
+        );
+        let c = match &q.clauses[0] {
+            Clause::CreateTrigger(c) => c,
+            _ => panic!(),
+        };
+        assert_eq!(c.target, TriggerTarget::EdgeType("FOLLOWS".into()));
+        assert!(c.events.on_update && c.events.on_delete && !c.events.on_create);
+        assert_eq!(c.timing, TriggerTiming::AfterCommit);
+    }
+
+    #[test]
+    fn create_trigger_all_event_kinds() {
+        let q = parse_ok(
+            "CREATE TRIGGER t3 ON :Post CREATE | UPDATE | DELETE AFTER COMMIT \
+             EXECUTE CREATE (a:Log)",
+        );
+        let c = match &q.clauses[0] {
+            Clause::CreateTrigger(c) => c,
+            _ => panic!(),
+        };
+        assert!(c.events.on_create && c.events.on_update && c.events.on_delete);
+    }
+
+    #[test]
+    fn create_trigger_with_maxdepth_and_on_error_propagate() {
+        // `MAXDEPTH n` is the deprecated alias for `CASCADE_LIMIT n` (ADR-026A).
+        let q = parse_ok(
+            "CREATE TRIGGER t4 ON :User CREATE BEFORE COMMIT \
+             EXECUTE CREATE (a:L) \
+             MAXDEPTH 5 \
+             ON ERROR PROPAGATE",
+        );
+        let c = match &q.clauses[0] {
+            Clause::CreateTrigger(c) => c,
+            _ => panic!(),
+        };
+        assert_eq!(
+            c.cascade_limit,
+            Some(5),
+            "MAXDEPTH must alias CASCADE_LIMIT"
+        );
+        assert!(c.cascade_fanout.is_none());
+        assert_eq!(c.on_error, Some(OnErrorPolicy::Propagate));
+    }
+
+    #[test]
+    fn create_trigger_with_cascade_limit_and_fanout() {
+        let q = parse_ok(
+            "CREATE TRIGGER t8 ON :User CREATE AFTER COMMIT \
+             EXECUTE CREATE (a:L) \
+             CASCADE_LIMIT 7 \
+             CASCADE_FANOUT 250 \
+             ON ERROR RETRY 5 WITH BACKOFF 200",
+        );
+        let c = match &q.clauses[0] {
+            Clause::CreateTrigger(c) => c,
+            _ => panic!(),
+        };
+        assert_eq!(c.cascade_limit, Some(7));
+        assert_eq!(c.cascade_fanout, Some(250));
+        assert_eq!(
+            c.on_error,
+            Some(OnErrorPolicy::Retry {
+                n: 5,
+                backoff_ms: 200
+            })
+        );
+    }
+
+    #[test]
+    fn create_trigger_options_order_independent() {
+        // Order of CASCADE_LIMIT / CASCADE_FANOUT / ON ERROR shouldn't matter.
+        let q = parse_ok(
+            "CREATE TRIGGER t9 ON :User CREATE AFTER COMMIT \
+             EXECUTE CREATE (a:L) \
+             ON ERROR DEAD_LETTER \
+             CASCADE_FANOUT 42 \
+             CASCADE_LIMIT 3",
+        );
+        let c = match &q.clauses[0] {
+            Clause::CreateTrigger(c) => c,
+            _ => panic!(),
+        };
+        assert_eq!(c.cascade_limit, Some(3));
+        assert_eq!(c.cascade_fanout, Some(42));
+        assert_eq!(c.on_error, Some(OnErrorPolicy::DeadLetter));
+    }
+
+    #[test]
+    fn create_trigger_on_error_retry_with_backoff() {
+        let q = parse_ok(
+            "CREATE TRIGGER t5 ON :User CREATE AFTER COMMIT \
+             EXECUTE CREATE (a:L) \
+             ON ERROR RETRY 7 WITH BACKOFF 500",
+        );
+        let c = match &q.clauses[0] {
+            Clause::CreateTrigger(c) => c,
+            _ => panic!(),
+        };
+        assert_eq!(
+            c.on_error,
+            Some(OnErrorPolicy::Retry {
+                n: 7,
+                backoff_ms: 500
+            })
+        );
+    }
+
+    #[test]
+    fn create_trigger_on_error_retry_default_backoff() {
+        let q = parse_ok(
+            "CREATE TRIGGER t6 ON :User CREATE AFTER COMMIT \
+             EXECUTE CREATE (a:L) \
+             ON ERROR RETRY 3",
+        );
+        let c = match &q.clauses[0] {
+            Clause::CreateTrigger(c) => c,
+            _ => panic!(),
+        };
+        assert_eq!(
+            c.on_error,
+            Some(OnErrorPolicy::Retry {
+                n: 3,
+                backoff_ms: 1000
+            })
+        );
+    }
+
+    #[test]
+    fn create_trigger_on_error_dead_letter() {
+        let q = parse_ok(
+            "CREATE TRIGGER t7 ON :User CREATE AFTER COMMIT \
+             EXECUTE CREATE (a:L) \
+             ON ERROR DEAD_LETTER",
+        );
+        let c = match &q.clauses[0] {
+            Clause::CreateTrigger(c) => c,
+            _ => panic!(),
+        };
+        assert_eq!(c.on_error, Some(OnErrorPolicy::DeadLetter));
+    }
+
+    #[test]
+    fn create_trigger_default_on_error_per_timing() {
+        // ADR-026 defaults: BEFORE → Propagate, AFTER → Retry 3 / 1000ms
+        assert_eq!(
+            OnErrorPolicy::default_for(TriggerTiming::BeforeCommit),
+            OnErrorPolicy::Propagate
+        );
+        assert_eq!(
+            OnErrorPolicy::default_for(TriggerTiming::AfterCommit),
+            OnErrorPolicy::Retry {
+                n: 3,
+                backoff_ms: 1000
+            }
+        );
+    }
+
+    #[test]
+    fn create_trigger_multi_clause_body() {
+        let q = parse_ok(
+            "CREATE TRIGGER counter ON :Post CREATE AFTER COMMIT \
+             EXECUTE MATCH (u:User) \
+                     SET u.post_count = u.post_count + 1",
+        );
+        let c = match &q.clauses[0] {
+            Clause::CreateTrigger(c) => c,
+            _ => panic!(),
+        };
+        assert!(c.body_source.contains("MATCH"));
+        assert!(c.body_source.contains("SET"));
+    }
+
+    #[test]
+    fn create_trigger_rejects_empty_event_list() {
+        let err = parse("CREATE TRIGGER bad ON :User BEFORE COMMIT EXECUTE CREATE (a:L)");
+        assert!(err.is_err(), "missing event list must fail: {err:?}");
+    }
+
+    #[test]
+    fn create_trigger_rejects_multi_label_target() {
+        let err =
+            parse("CREATE TRIGGER bad ON :User:Admin CREATE BEFORE COMMIT EXECUTE CREATE (a:L)");
+        assert!(err.is_err(), "multi-label target must fail: {err:?}");
+        let msg = format!("{}", err.err().unwrap());
+        assert!(
+            msg.contains("exactly one label"),
+            "error must mention single-label constraint: {msg}"
+        );
+    }
+
+    #[test]
+    fn drop_trigger_basic() {
+        let q = parse_ok("DROP TRIGGER my_trigger");
+        match &q.clauses[0] {
+            Clause::DropTrigger(c) => assert_eq!(c.name, "my_trigger"),
+            other => panic!("expected DropTrigger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn show_triggers() {
+        let q = parse_ok("SHOW TRIGGERS");
+        assert!(matches!(&q.clauses[0], Clause::ShowTriggers));
+    }
+
+    #[test]
+    fn alter_trigger_disable_enable() {
+        let q1 = parse_ok("ALTER TRIGGER t DISABLE");
+        let q2 = parse_ok("ALTER TRIGGER t ENABLE");
+        match &q1.clauses[0] {
+            Clause::AlterTrigger(c) => {
+                assert_eq!(c.name, "t");
+                assert_eq!(c.action, AlterTriggerAction::Disable);
+            }
+            _ => panic!(),
+        }
+        match &q2.clauses[0] {
+            Clause::AlterTrigger(c) => {
+                assert_eq!(c.action, AlterTriggerAction::Enable);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn alter_trigger_set_body() {
+        let q = parse_ok("ALTER TRIGGER t SET EXECUTE CREATE (a:Replacement)");
+        match &q.clauses[0] {
+            Clause::AlterTrigger(c) => match &c.action {
+                AlterTriggerAction::SetBody(s) => assert!(s.contains("Replacement")),
+                other => panic!("expected SetBody, got {other:?}"),
+            },
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn alter_trigger_set_on_error() {
+        let q = parse_ok("ALTER TRIGGER t SET ON ERROR DEAD_LETTER");
+        match &q.clauses[0] {
+            Clause::AlterTrigger(c) => assert_eq!(
+                c.action,
+                AlterTriggerAction::SetOnError(OnErrorPolicy::DeadLetter)
+            ),
+            _ => panic!(),
+        }
     }
 
     // -- SET --

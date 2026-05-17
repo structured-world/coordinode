@@ -1053,6 +1053,12 @@ impl Database {
             mvcc_snapshot: None,
             adj_snapshot: None,
             merge_node_deltas: Vec::new(),
+            // R190 / ADR-026A cascade tracking — cluster defaults.
+            cascade_depth: 0,
+            cascade_depth_limit: 10,
+            cascade_fire_counts: std::collections::HashMap::new(),
+            cascade_fanout_limit: 100,
+            cascade_chain: Vec::new(),
             correlated_row: None,
             feedback_cache: Some(self.feedback_cache.clone()),
             schema_label_cache: std::collections::HashMap::new(),

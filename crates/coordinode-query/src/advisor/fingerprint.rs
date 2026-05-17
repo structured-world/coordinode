@@ -206,6 +206,21 @@ fn write_clause(buf: &mut String, clause: &Clause) {
                 buf.push_str(" ON REMAINING FAIL");
             }
         }
+        Clause::CreateTrigger(c) => {
+            buf.push_str("CREATE TRIGGER ");
+            buf.push_str(&c.name);
+        }
+        Clause::DropTrigger(c) => {
+            buf.push_str("DROP TRIGGER ");
+            buf.push_str(&c.name);
+        }
+        Clause::ShowTriggers => {
+            buf.push_str("SHOW TRIGGERS");
+        }
+        Clause::AlterTrigger(c) => {
+            buf.push_str("ALTER TRIGGER ");
+            buf.push_str(&c.name);
+        }
         Clause::MergeNodes(mn) => {
             buf.push_str("MERGE NODES (");
             buf.push_str(&mn.source_a);
