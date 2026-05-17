@@ -291,6 +291,17 @@ pub struct LabelSchema {
     /// Kubernetes `metadata.generation` convention — "revision" = DDL,
     /// "version" = data.
     pub schema_revision: u64,
+
+    /// Bitemporal flag (ADR-027, R172a). When `true`, every node of this
+    /// label carries the `(valid_from, valid_to)` valid-time interval and
+    /// the engine-assigned `__ingestion_ts__` (HLC commit-ts), and the
+    /// storage layer keeps one node record per `(node_id, valid_from)` so
+    /// multiple versions of the same logical node coexist. Immutable for
+    /// the lifetime of the label — toggling on an existing label is
+    /// rejected at DDL time; re-creation via a new label is the migration
+    /// path. Default: `false` (point-in-time only — current MVCC-only
+    /// behaviour for all pre-ADR-027 labels).
+    pub temporal: bool,
 }
 
 impl LabelSchema {
@@ -321,12 +332,21 @@ impl LabelSchema {
             placement,
             shard_keys: vec![primary],
             schema_revision: 1,
+            temporal: false,
         }
     }
 
     /// Convenience for CE call sites and tests: graph-default placement.
     pub fn new_node_id(name: impl Into<String>) -> Self {
         Self::new(name, PlacementPolicy::NodeId)
+    }
+
+    /// Set the bitemporal flag (ADR-027, R172a). The flag is immutable for
+    /// the lifetime of an installed label — this setter is only for fresh
+    /// schemas constructed in-memory by the DDL executor before the first
+    /// `save_current_label_schema` call.
+    pub fn set_temporal(&mut self, temporal: bool) {
+        self.temporal = temporal;
     }
 
     /// Add a property definition. Mutates the current snapshot; does not

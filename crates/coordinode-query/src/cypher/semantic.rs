@@ -238,6 +238,7 @@ impl<'a> Analyzer<'a> {
             | Clause::CreateVectorIndex(_)
             | Clause::DropVectorIndex(_)
             | Clause::CreateEdgeType(_)
+            | Clause::CreateNodeType(_)
             | Clause::CreateTrigger(_)
             | Clause::DropTrigger(_)
             | Clause::ShowTriggers

@@ -4525,3 +4525,329 @@ fn trigger_edge_update_propagate_aborts_set() {
         "edge prop must remain unchanged after PROPAGATE abort"
     );
 }
+
+// =====================================================================
+// R172a — CREATE NODE TYPE DDL (per ADR-027, bitemporal nodes scaffold).
+// Only the DDL surface is verified here; per-version storage layout +
+// write/read executor support land in R172b-e.
+// =====================================================================
+
+/// `CREATE NODE TYPE Foo` persists a `LabelSchema` with `temporal=false`
+/// and zero declared properties. The label is retrievable via the schema
+/// service.
+#[test]
+fn create_node_type_minimal_persists_schema() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    let rows = db
+        .execute_cypher("CREATE NODE TYPE Widget")
+        .expect("CREATE NODE TYPE Widget");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Widget".into())));
+    assert_eq!(rows[0].get("temporal"), Some(&Value::Bool(false)));
+}
+
+/// `CREATE NODE TYPE Foo TEMPORAL` sets the bitemporal flag on the
+/// persisted `LabelSchema`. The flag is exposed via the row returned by
+/// the DDL executor.
+#[test]
+fn create_node_type_temporal_sets_flag() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    let rows = db
+        .execute_cypher("CREATE NODE TYPE Person TEMPORAL")
+        .expect("CREATE NODE TYPE Person TEMPORAL");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("temporal"), Some(&Value::Bool(true)));
+}
+
+/// `CREATE NODE TYPE Foo WITH (...)` accepts property declarations.
+#[test]
+fn create_node_type_with_properties() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    let rows = db
+        .execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING NOT NULL, age: INT)")
+        .expect("CREATE NODE TYPE Person TEMPORAL WITH props");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("properties"), Some(&Value::Int(2)));
+}
+
+/// Creating the same label twice is rejected — TEMPORAL flag is
+/// immutable, so re-CREATE is the only path to flip it, which would
+/// silently violate ADR-027's immutability invariant.
+#[test]
+fn create_node_type_rejects_duplicate() {
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher("CREATE NODE TYPE Widget")
+        .expect("first CREATE");
+    let err = db
+        .execute_cypher("CREATE NODE TYPE Widget TEMPORAL")
+        .expect_err("duplicate CREATE must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("already exists"),
+        "duplicate CREATE NODE TYPE error must mention existence: {msg}"
+    );
+}
+
+/// `__ingestion_ts__` is reserved for engine use (ADR-027). Declaring
+/// it as a user property must be rejected at DDL time.
+#[test]
+fn create_node_type_rejects_reserved_ingestion_ts() {
+    let (mut db, _dir) = open_db();
+    let err = db
+        .execute_cypher("CREATE NODE TYPE Foo TEMPORAL WITH (__ingestion_ts__: TIMESTAMP)")
+        .expect_err("reserved name must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("reserved") && msg.contains("__ingestion_ts__"),
+        "error must mention reserved name __ingestion_ts__: {msg}"
+    );
+}
+
+/// `valid_from` / `valid_to` are user-supplied bitemporal interval fields
+/// on TEMPORAL labels (per arch/core/temporal-edges.md). They are NOT
+/// reserved — users declare them in `WITH (...)` to lock the type contract,
+/// mirror of `CREATE EDGE TYPE … TEMPORAL WITH (valid_from: TIMESTAMP NOT NULL)`.
+/// This test verifies the declaration is accepted on a temporal node label.
+#[test]
+fn create_node_type_allows_valid_from_to_declaration() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Person TEMPORAL WITH (valid_from: TIMESTAMP NOT NULL, valid_to: TIMESTAMP)",
+    )
+    .expect("valid_from / valid_to are user-supplied bitemporal fields, not reserved");
+}
+
+/// Other engine-internal row metadata names (`__src__`, `__tgt__`,
+/// `__type__`) are reserved on node labels too — they're edge row
+/// metadata names but accidental shadowing on a node should also be
+/// rejected at DDL time for consistency.
+#[test]
+fn create_node_type_rejects_other_reserved_names() {
+    let (mut db, _dir) = open_db();
+    for reserved in ["__src__", "__tgt__", "__type__"] {
+        let cypher = format!("CREATE NODE TYPE Foo_{reserved} WITH ({reserved}: STRING)");
+        let result = db.execute_cypher(&cypher);
+        assert!(
+            result.is_err(),
+            "reserved name '{reserved}' must be rejected; got OK for q={cypher}"
+        );
+    }
+}
+
+/// CREATE on a TEMPORAL label must require `valid_from` — symmetric with
+/// `execute_create_edge`'s rejection for temporal edge types without
+/// `valid_from`. The mechanical per-version storage layout lands in R172b;
+/// this guard locks the write contract in from R172a so future writes can
+/// rely on the invariant.
+#[test]
+fn create_node_on_temporal_label_without_valid_from_rejected() {
+    let (mut db, _dir) = open_db();
+
+    // Declare `name` and `valid_from` so STRICT schema mode (default) does
+    // not reject undeclared properties — we want to isolate the TEMPORAL
+    // valid_from check, not the schema-mode property check.
+    db.execute_cypher(
+        "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: TIMESTAMP)",
+    )
+    .expect("CREATE NODE TYPE Person TEMPORAL");
+
+    let err = db
+        .execute_cypher("CREATE (p:Person {name: 'Alice'})")
+        .expect_err("CREATE on TEMPORAL label without valid_from must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("TEMPORAL") && msg.contains("valid_from"),
+        "error must mention TEMPORAL and valid_from: {msg}"
+    );
+}
+
+/// CREATE on a TEMPORAL label WITH `valid_from` is accepted (mechanical
+/// per-version key writing still lands in R172b, but the write-time
+/// contract is satisfied here). `valid_from` declared as INT to sidestep
+/// TIMESTAMP↔INT coercion (which is the temporal write executor's job in
+/// R172c — see the analogous edge path in `execute_create_edge` for the
+/// final coercion semantics).
+#[test]
+fn create_node_on_temporal_label_with_valid_from_accepted() {
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
+        .expect("CREATE NODE TYPE Person TEMPORAL");
+
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 1577836800000})")
+        .expect("CREATE on TEMPORAL label with valid_from must succeed");
+}
+
+/// CREATE on a non-temporal label is unaffected by the new write-time
+/// guard — a plain `CREATE (n:User {name: 'X'})` continues to work for
+/// labels declared without TEMPORAL.
+#[test]
+fn create_node_on_non_temporal_label_does_not_require_valid_from() {
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher("CREATE NODE TYPE User WITH (name: STRING)")
+        .expect("CREATE NODE TYPE User");
+
+    db.execute_cypher("CREATE (u:User {name: 'Bob'})")
+        .expect("CREATE on non-temporal label needs no valid_from");
+}
+
+/// CREATE on a label that was never declared via DDL is unaffected — the
+/// temporal-write guard only kicks in when a schema exists with
+/// `temporal=true`. Implicit-label CREATEs continue to work as before.
+#[test]
+fn create_node_on_undeclared_label_does_not_require_valid_from() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (u:NeverDeclared {x: 1})")
+        .expect("undeclared label without TEMPORAL: no valid_from required");
+}
+
+/// Multi-label CREATE `(n:Foo:Bar)` where ANY label is TEMPORAL requires
+/// `valid_from`. The write-time guard scans every declared label rather
+/// than only the primary — a temporal label in any position locks the
+/// bitemporal contract for the whole node.
+///
+/// `Foo` here is left undeclared (implicit FLEXIBLE) so STRICT schema-mode
+/// noise doesn't bleed into the test — we isolate the multi-label TEMPORAL
+/// guard semantics, not schema-mode property filtering.
+#[test]
+fn create_node_multi_label_with_any_temporal_requires_valid_from() {
+    let (mut db, _dir) = open_db();
+    // Bar is TEMPORAL; Foo is left undeclared (implicit FLEXIBLE) so the
+    // STRICT mode default does not reject undeclared `valid_from`.
+    db.execute_cypher("CREATE NODE TYPE Bar TEMPORAL WITH (valid_from: INT)")
+        .expect("CREATE NODE TYPE Bar TEMPORAL");
+
+    // Primary-label-only logic would miss the temporal flag on the
+    // secondary label `Bar`. The multi-label guard must catch it.
+    let err = db
+        .execute_cypher("CREATE (n:Foo:Bar)")
+        .expect_err("multi-label with TEMPORAL secondary must require valid_from");
+    assert!(
+        format!("{err}").contains("Bar") && format!("{err}").contains("TEMPORAL"),
+        "error must point to the temporal label: {err}"
+    );
+
+    // Reverse position — `:Bar:Foo` with TEMPORAL as primary — also caught.
+    let err = db
+        .execute_cypher("CREATE (n:Bar:Foo)")
+        .expect_err("primary TEMPORAL label must require valid_from");
+    assert!(format!("{err}").contains("TEMPORAL"));
+
+    // Providing `valid_from` satisfies the guard regardless of position.
+    db.execute_cypher("CREATE (n:Foo:Bar {valid_from: 100})")
+        .expect("valid_from satisfies multi-label TEMPORAL guard");
+}
+
+/// Multi-label CREATE where ALL labels are TEMPORAL still requires
+/// `valid_from`. The guard short-circuits on the first temporal label
+/// found; both-temporal must behave consistently with one-temporal.
+#[test]
+fn create_node_multi_label_both_temporal_requires_valid_from() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE TempA TEMPORAL WITH (valid_from: INT)")
+        .expect("CREATE TempA");
+    db.execute_cypher("CREATE NODE TYPE TempB TEMPORAL WITH (valid_from: INT)")
+        .expect("CREATE TempB");
+
+    let err = db
+        .execute_cypher("CREATE (n:TempA:TempB)")
+        .expect_err("both-temporal multi-label must require valid_from");
+    assert!(format!("{err}").contains("TEMPORAL"));
+
+    db.execute_cypher("CREATE (n:TempA:TempB {valid_from: 100})")
+        .expect("both-temporal with valid_from accepted");
+}
+
+/// `SET n.__ingestion_ts__ = X` on a node is rejected — engine-owned field
+/// on temporal labels, user-immutable. Mirror of edge-side reject for
+/// `__src__` / `__tgt__` / `__type__`.
+#[test]
+fn set_node_ingestion_ts_rejected() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (n:Foo {x: 1})")
+        .expect("seed node");
+    let err = db
+        .execute_cypher("MATCH (n:Foo) SET n.__ingestion_ts__ = 999")
+        .expect_err("SET __ingestion_ts__ must be rejected at runtime");
+    assert!(
+        format!("{err}").contains("__ingestion_ts__"),
+        "error must mention reserved name: {err}"
+    );
+}
+
+/// `CREATE (n:Foo {__ingestion_ts__: X})` is rejected at write time —
+/// reserved-name guard applies to property literals, not just SET. This
+/// is symmetric with the DDL-time reject in `execute_create_node_type`.
+#[test]
+fn create_node_with_ingestion_ts_literal_rejected() {
+    let (mut db, _dir) = open_db();
+    let err = db
+        .execute_cypher("CREATE (n:Foo {__ingestion_ts__: 999, x: 1})")
+        .expect_err("CREATE with __ingestion_ts__ literal must be rejected");
+    assert!(format!("{err}").contains("__ingestion_ts__"));
+}
+
+/// `CREATE NODE TYPE Foo WITH (a: STRING NOT NULL, b: INT)` correctly
+/// persists the NOT NULL modifier — verified by attempting to CREATE a
+/// node without the required property (STRICT mode + NOT NULL → reject).
+#[test]
+fn create_node_type_not_null_modifier_persists() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Item WITH (name: STRING NOT NULL, qty: INT)")
+        .expect("CREATE NODE TYPE Item with NOT NULL");
+
+    // Without `name` — must fail (STRICT + NOT NULL).
+    let err = db
+        .execute_cypher("CREATE (i:Item {qty: 5})")
+        .expect_err("missing NOT NULL property must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("name") || msg.contains("NOT NULL") || msg.contains("required"),
+        "error must point to the NOT NULL violation: {msg}"
+    );
+
+    // With `name` — accepted.
+    db.execute_cypher("CREATE (i:Item {name: 'Widget', qty: 5})")
+        .expect("NOT NULL satisfied with property present");
+}
+
+/// The `LabelSchema.temporal` flag persists across DB restarts. Mirror of
+/// `trigger_survives_database_restart` for the TEMPORAL flag. After
+/// reopening the DB, a CREATE on the TEMPORAL label still requires
+/// `valid_from` — proves the flag round-tripped through storage.
+#[test]
+fn create_node_type_temporal_flag_persists_across_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let mut db = Database::open(dir.path()).expect("open db");
+        db.execute_cypher(
+            "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: TIMESTAMP)",
+        )
+        .expect("first CREATE NODE TYPE");
+    }
+
+    // Reopen — the schema must survive.
+    let mut db = Database::open(dir.path()).expect("reopen db");
+
+    // The TEMPORAL flag is enforced on first CREATE: missing valid_from
+    // must still be rejected, proving the flag survived restart.
+    let err = db
+        .execute_cypher("CREATE (p:Person {name: 'Alice'})")
+        .expect_err("TEMPORAL flag must persist — CREATE without valid_from must fail");
+    assert!(format!("{err}").contains("TEMPORAL"));
+
+    // And duplicate CREATE NODE TYPE must still be rejected (label exists).
+    let err = db
+        .execute_cypher("CREATE NODE TYPE Person")
+        .expect_err("label must still be detected as existing after restart");
+    assert!(format!("{err}").contains("already exists"));
+}

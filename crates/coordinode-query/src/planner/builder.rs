@@ -585,6 +585,11 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             temporal: c.temporal,
             properties: c.properties.clone(),
         }),
+        Clause::CreateNodeType(c) => Ok(LogicalOp::CreateNodeType {
+            name: c.name.clone(),
+            temporal: c.temporal,
+            properties: c.properties.clone(),
+        }),
         Clause::CreateTrigger(c) => Ok(LogicalOp::CreateTrigger { clause: c.clone() }),
         Clause::DropTrigger(c) => Ok(LogicalOp::DropTrigger {
             name: c.name.clone(),

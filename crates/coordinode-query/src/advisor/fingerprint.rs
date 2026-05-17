@@ -361,6 +361,28 @@ fn write_clause(buf: &mut String, clause: &Clause) {
                 buf.push(')');
             }
         }
+        Clause::CreateNodeType(c) => {
+            buf.push_str("CREATE NODE TYPE ");
+            buf.push_str(&c.name);
+            if c.temporal {
+                buf.push_str(" TEMPORAL");
+            }
+            if !c.properties.is_empty() {
+                buf.push_str(" WITH (");
+                for (i, p) in c.properties.iter().enumerate() {
+                    if i > 0 {
+                        buf.push_str(", ");
+                    }
+                    buf.push_str(&p.name);
+                    buf.push(':');
+                    buf.push_str(&p.type_name);
+                    if p.not_null {
+                        buf.push_str(" NOT NULL");
+                    }
+                }
+                buf.push(')');
+            }
+        }
     }
 }
 

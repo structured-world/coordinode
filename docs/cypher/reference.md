@@ -222,6 +222,36 @@ REMOVE n:Pending                          -- remove label
 
 ### DDL Clauses
 
+#### CREATE NODE TYPE / CREATE EDGE TYPE ✅ 🔷
+
+CoordiNode extension. Declares a label or edge-type schema upfront so the engine knows the property contract (and, for `TEMPORAL` types, the bitemporal storage layout). Both forms accept an optional `TEMPORAL` modifier and an optional `WITH (...)` property declaration block.
+
+```cypher
+-- Non-temporal: point-in-time label, current MVCC-only semantics.
+CREATE NODE TYPE User WITH (name: STRING NOT NULL, email: STRING)
+
+-- Bitemporal: per-version storage keyed on valid_from, full AS OF
+-- queries on both valid-time and system-time axes.
+CREATE NODE TYPE Person TEMPORAL WITH (
+  name:       STRING NOT NULL,
+  valid_from: TIMESTAMP NOT NULL,
+  valid_to:   TIMESTAMP
+)
+
+-- Edge counterpart, established earlier (R171a).
+CREATE EDGE TYPE WORKS_AT TEMPORAL WITH (
+  role: STRING,
+  valid_from: TIMESTAMP NOT NULL,
+  valid_to:   TIMESTAMP
+)
+```
+
+- `TEMPORAL` opts the type into bitemporal semantics. On `CREATE`, every instance must supply `valid_from`. The engine auto-populates `__ingestion_ts__` (HLC commit-ts, user-readable, immutable). See [Temporal Edges](./temporal-edges.md) for the full bitemporal model.
+- Non-temporal and temporal labels coexist in the same database out of the box — non-temporal pays zero per-node storage overhead.
+- The `TEMPORAL` flag is immutable: re-`CREATE` of an existing label/type is rejected. Migration path is "create new type, copy data, drop old".
+- Reserved engine-managed property names rejected at DDL time: `__ingestion_ts__`, `__src__`, `__tgt__`, `__type__`. `valid_from` and `valid_to` are user-supplied bitemporal axis fields (declarable, not reserved).
+- Property types in `WITH (...)`: `STRING`, `INT`, `FLOAT`, `BOOL`, `TIMESTAMP`, `BLOB`, `MAP`, `GEO`, `BINARY`, `DOCUMENT`. Modifier `NOT NULL`.
+
 #### CREATE INDEX / DROP INDEX ✅
 
 B-tree index on a single property. Optional: `UNIQUE`, `SPARSE` (skip nulls), `WHERE` predicate (partial index).

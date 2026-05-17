@@ -26,6 +26,7 @@ clause = {
   | create_vector_index_clause
   | create_index_clause
   | create_edge_type_clause
+  | create_node_type_clause
   | create_trigger_clause
   | drop_trigger_clause
   | show_triggers_clause
@@ -216,6 +217,22 @@ drop_index_clause = { kw_drop ~ kw_index ~ identifier }
 // properties.
 create_edge_type_clause = {
     kw_create ~ kw_edge ~ kw_type ~ identifier ~ kw_temporal?
+    ~ (kw_with ~ "(" ~ property_decl_list ~ ")")?
+}
+
+// --- CREATE NODE TYPE (R172a per ADR-027) ---
+//
+// CREATE NODE TYPE <name> [TEMPORAL] [WITH ( <property_decl_list> )]
+//
+// TEMPORAL marks the node label as bitemporal: every node record carries
+// (valid_from, valid_to) fields and multiple versions can coexist per node_id.
+// The valid-time axis (user-supplied) composes with the system-time axis
+// (MVCC commit-timestamp + auto `__ingestion_ts__`) for full two-axis AS-OF
+// queries. WITH (...) declares user-defined node properties. The TEMPORAL
+// flag is immutable per label — toggling on an existing label is rejected
+// at DDL time; re-creation via a new label is required.
+create_node_type_clause = {
+    kw_create ~ kw_node ~ kw_type ~ identifier ~ kw_temporal?
     ~ (kw_with ~ "(" ~ property_decl_list ~ ")")?
 }
 
@@ -699,6 +716,9 @@ kw_fail       = @{ ^"fail" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_edge       = @{ ^"edge" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_type       = @{ ^"type" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_temporal   = @{ ^"temporal" ~ !(ASCII_ALPHANUMERIC | "_") }
+// CREATE NODE TYPE — bitemporal node-label DDL (R172a per ADR-027).
+// Context keyword: `node` remains a valid identifier elsewhere.
+kw_node       = @{ ^"node" ~ !(ASCII_ALPHANUMERIC | "_") }
 // MERGE NODES (R180) — context keywords (NOT in reserved_word, so they remain
 // valid identifiers and function names like coalesce()).
 kw_nodes      = @{ ^"nodes" ~ !(ASCII_ALPHANUMERIC | "_") }

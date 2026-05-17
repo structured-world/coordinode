@@ -49,6 +49,7 @@ impl Query {
                     | Clause::CreateVectorIndex(_)
                     | Clause::DropVectorIndex(_)
                     | Clause::CreateEdgeType(_)
+                    | Clause::CreateNodeType(_)
             )
         })
     }
@@ -101,6 +102,9 @@ pub enum Clause {
     CreateVectorIndex(CreateVectorIndexClause),
     DropVectorIndex(DropVectorIndexClause),
     CreateEdgeType(CreateEdgeTypeClause),
+    /// `CREATE NODE TYPE <name> [TEMPORAL] [WITH (...)]` — bitemporal-capable
+    /// label DDL (R172a per ADR-027). Mirror of `CreateEdgeType` for nodes.
+    CreateNodeType(CreateNodeTypeClause),
 
     /// `CREATE TRIGGER … ON :Label CREATE|UPDATE|DELETE BEFORE|AFTER COMMIT EXECUTE … [ON ERROR …]`.
     CreateTrigger(CreateTriggerClause),
@@ -301,6 +305,28 @@ pub struct CreateEdgeTypeClause {
     /// Whether the edge type carries bitemporal `(valid_from, valid_to)` fields.
     pub temporal: bool,
     /// User-declared edge properties from the optional `WITH (...)` block.
+    pub properties: Vec<EdgePropertyDecl>,
+}
+
+/// `CREATE NODE TYPE <name> [TEMPORAL] [WITH (...)]` — bitemporal-capable
+/// label DDL (R172a per ADR-027). Mirror of `CreateEdgeTypeClause` for nodes.
+///
+/// When `temporal == true`, every node record of this label carries the
+/// `(valid_from, valid_to)` valid-time interval plus the engine-assigned
+/// `__ingestion_ts__` (HLC commit-ts), and multiple versions of the same
+/// `node_id` coexist on per-version storage keys. The TEMPORAL flag is
+/// immutable for the lifetime of the label — toggling on an existing
+/// label is rejected at DDL time; the migration path is "create a new
+/// label, copy data, drop old".
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateNodeTypeClause {
+    /// Label name (e.g., "Person").
+    pub name: String,
+    /// Whether nodes of this label are bitemporal.
+    pub temporal: bool,
+    /// User-declared node properties from the optional `WITH (...)` block.
+    /// Reuses `EdgePropertyDecl` — the property-declaration grammar is the
+    /// same for nodes and edges.
     pub properties: Vec<EdgePropertyDecl>,
 }
 

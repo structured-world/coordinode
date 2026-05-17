@@ -29,6 +29,26 @@ CREATE EDGE TYPE WORKS_AT TEMPORAL WITH (
 
 Once a type is declared, you cannot flip its `TEMPORAL` flag — the storage layout would no longer match the existing data. Drop and re-create the type if you really need to convert.
 
+## Declaring a temporal node label
+
+Nodes follow the same opt-in model via a parallel DDL surface:
+
+```cypher
+CREATE NODE TYPE Person TEMPORAL WITH (
+  name:       STRING NOT NULL,
+  valid_from: TIMESTAMP NOT NULL,
+  valid_to:   TIMESTAMP
+)
+```
+
+- `TEMPORAL` opts the entire label into bitemporal semantics. The engine enforces `valid_from` presence on every `CREATE (n:Person {...})` write.
+- The `WITH (...)` block is optional and declares user-visible properties. Declaring `valid_from` / `valid_to` here is conventional — it locks the type contract — but the engine enforces `valid_from` presence regardless of whether it appears in `WITH`.
+- Supported property types: same set as edges (`STRING`, `INT`, `FLOAT`, `BOOL`, `TIMESTAMP`, `BLOB`, `MAP`, `GEO`, `BINARY`, `DOCUMENT`).
+- The `TEMPORAL` flag is immutable: a re-`CREATE NODE TYPE` of the same label is rejected. Migration path is "create a new label, copy data, drop old".
+- The label name `__ingestion_ts__` and the edge-row-metadata names `__src__` / `__tgt__` / `__type__` are reserved at DDL time and cannot be user-declared.
+
+Non-temporal labels (the default — `CREATE NODE TYPE User WITH (...)` without `TEMPORAL`, or never declared at all and used implicitly) keep the existing single-row-per-node storage layout — no per-version overhead.
+
 ## Writing temporal edges
 
 Every `CREATE` of a temporal edge **must** provide a `valid_from` epoch-ms timestamp:

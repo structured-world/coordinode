@@ -2298,6 +2298,12 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             properties,
         } => execute_create_edge_type(name, *temporal, properties, ctx),
 
+        LogicalOp::CreateNodeType {
+            name,
+            temporal,
+            properties,
+        } => execute_create_node_type(name, *temporal, properties, ctx),
+
         LogicalOp::CreateTrigger { clause } => execute_create_trigger(clause, ctx),
         LogicalOp::DropTrigger { name } => execute_drop_trigger(name, ctx),
         LogicalOp::ShowTriggers => execute_show_triggers(ctx),
@@ -6529,6 +6535,55 @@ fn execute_create_node(
         .map(|s| s.mode)
         .unwrap_or(SchemaMode::Flexible);
 
+    // R172a reserved-name guard at CREATE time: `__ingestion_ts__` is
+    // engine-owned on temporal labels — populated automatically with the HLC
+    // commit timestamp, user-immutable. Rejecting user-supplied values up
+    // front prevents accidental shadowing and matches the symmetric DDL-time
+    // reserved-name diagnostic in `execute_create_node_type`.
+    for (prop_name, _) in properties {
+        if prop_name == "__ingestion_ts__" {
+            return Err(ExecutionError::Unsupported(
+                "property name '__ingestion_ts__' is reserved for engine-internal use \
+                 (auto-populated on temporal labels with the HLC commit timestamp); \
+                 it cannot be assigned in CREATE"
+                    .into(),
+            ));
+        }
+    }
+
+    // R172a write-time guard: temporal node types require `valid_from` on every
+    // CREATE (mirror of the edge-side enforcement at `execute_create_edge`).
+    // Mechanical bitemporal storage (per-version node key with the i64 BE
+    // valid_from suffix) lands in R172b; this guard is here so the contract is
+    // honoured from R172a onward — a CREATE on a TEMPORAL label without
+    // `valid_from` is rejected at write time rather than silently writing a
+    // record that the future per-version key encoder cannot place.
+    //
+    // Multi-label case: scan EVERY label, not just `labels.first()`. A node
+    // declared `CREATE (n:Foo:Bar)` where any of Foo / Bar carries the
+    // TEMPORAL flag must satisfy the bitemporal contract. This is conservative
+    // — if a temporal mix is invalid (R172b will need to decide which key
+    // layout wins on conflict), the write must still reject without
+    // `valid_from`. Reports the first temporal label name to the user.
+    let mut temporal_label: Option<String> = None;
+    for lbl in labels {
+        if let Ok(Some(s)) = ctx.load_current_label_schema(lbl) {
+            if s.temporal {
+                temporal_label = Some(lbl.clone());
+                break;
+            }
+        }
+    }
+    if let Some(tlabel) = temporal_label {
+        let has_valid_from = properties.iter().any(|(name, _)| name == "valid_from");
+        if !has_valid_from {
+            return Err(ExecutionError::Unsupported(format!(
+                "label '{tlabel}' is TEMPORAL: CREATE requires a 'valid_from' \
+                 timestamp property on every node"
+            )));
+        }
+    }
+
     for input_row in input_rows {
         let node_id = ctx.id_allocator.next();
 
@@ -7026,6 +7081,22 @@ fn execute_update(
                     property,
                     expr,
                 } => {
+                    // R172a reserved-name guard at SET time: `__ingestion_ts__`
+                    // is engine-owned on temporal labels (auto-populated with
+                    // HLC commit-ts, user-immutable). Reject before any storage
+                    // mutation so the bitemporal contract cannot be subverted
+                    // via `SET n.__ingestion_ts__ = ...`. Edge metadata names
+                    // (`__src__`/`__tgt__`/`__type__`) are rejected separately
+                    // in `update_edge_property` for the edge SET path.
+                    if property == "__ingestion_ts__" {
+                        return Err(ExecutionError::Unsupported(
+                            "SET on '__ingestion_ts__' is reserved: this field is \
+                             engine-managed on temporal labels and cannot be \
+                             assigned by SET"
+                                .into(),
+                        ));
+                    }
+
                     // Map literals → Document for nested property storage.
                     let val = eval_expr(expr, &out_row).map_to_document();
 
@@ -10519,6 +10590,109 @@ fn execute_alter_label(
 /// requires `valid_from` and stores per-version edgeprop entries.
 ///
 /// Returns one row: `{ name, temporal, version, properties }`.
+/// Execute `CREATE NODE TYPE <name> [TEMPORAL] [WITH (...)]` (R172a per
+/// ADR-027). Mirror of `execute_create_edge_type` for node labels.
+///
+/// Persists a new `LabelSchema` with the bitemporal flag set as declared and
+/// the user-supplied property declarations. Rejects:
+///   - Duplicate label (label already has a current-revision pointer)
+///   - Reserved engine-internal property names (`__ingestion_ts__`,
+///     `valid_from`, `valid_to`, `__src__`, `__tgt__`, `__type__`) — these
+///     are populated/owned by the engine; user declarations would shadow them
+///   - Unsupported property type spellings
+///
+/// The TEMPORAL flag is immutable from this point forward: changing it
+/// requires creating a new label type and copying data (per ADR-027).
+fn execute_create_node_type(
+    name: &str,
+    temporal: bool,
+    properties: &[crate::cypher::ast::EdgePropertyDecl],
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    use coordinode_core::schema::definition::{
+        LabelSchema, PlacementPolicy, PropertyDef, PropertyType,
+    };
+
+    // Reject if the label was registered before (either via explicit DDL or
+    // via implicit label creation on first node write — both write a current-
+    // revision pointer at schema:current_revision:label:<name>).
+    if ctx.load_current_label_schema(name)?.is_some() {
+        return Err(ExecutionError::Unsupported(format!(
+            "label '{name}' already exists"
+        )));
+    }
+
+    // Reject reserved engine-internal property names. `__ingestion_ts__`
+    // (HLC commit-ts on temporal labels) is fully engine-owned — declaring
+    // it would shadow the canonical engine value. `__src__` / `__tgt__` /
+    // `__type__` are edge-row metadata and have no meaning on a node label;
+    // rejecting them keeps the reserved-name surface symmetric and prevents
+    // accidental confusion. `valid_from` / `valid_to` are NOT in this list
+    // by design: they are user-supplied bitemporal interval fields on
+    // temporal labels (see arch/core/temporal-edges.md) — engine validates
+    // their type and invariants at write time but does not own the values.
+    for decl in properties {
+        if matches!(
+            decl.name.as_str(),
+            "__ingestion_ts__" | "__src__" | "__tgt__" | "__type__"
+        ) {
+            return Err(ExecutionError::Unsupported(format!(
+                "property name '{}' is reserved for engine-internal use and \
+                 cannot be declared in CREATE NODE TYPE",
+                decl.name
+            )));
+        }
+    }
+
+    // CE default placement is `NodeId`. EE DDL surface for non-NodeId
+    // placement is `SHARD BY HASH(...)` / `SHARD BY RANGE(...)` on a
+    // separate clause; CREATE NODE TYPE does not currently accept inline
+    // placement specs.
+    let mut schema = LabelSchema::new(name, PlacementPolicy::NodeId);
+    schema.set_temporal(temporal);
+
+    for decl in properties {
+        let ptype = match decl.type_name.as_str() {
+            "STRING" => PropertyType::String,
+            "INT" => PropertyType::Int,
+            "FLOAT" => PropertyType::Float,
+            "BOOL" => PropertyType::Bool,
+            "TIMESTAMP" => PropertyType::Timestamp,
+            "BLOB" => PropertyType::Blob,
+            "MAP" => PropertyType::Map,
+            "GEO" => PropertyType::Geo,
+            "BINARY" => PropertyType::Binary,
+            "DOCUMENT" => PropertyType::Document,
+            other => {
+                return Err(ExecutionError::Unsupported(format!(
+                    "unsupported property type '{other}' for label '{name}'"
+                )));
+            }
+        };
+        let mut prop = PropertyDef::new(&decl.name, ptype);
+        if decl.not_null {
+            prop = prop.not_null();
+        }
+        schema.add_property(prop);
+    }
+
+    // Persist new schema + current-revision pointer atomically.
+    ctx.save_current_label_schema(&schema)?;
+
+    let mut row = Row::new();
+    row.insert("name".to_string(), Value::String(name.to_string()));
+    row.insert("temporal".to_string(), Value::Bool(temporal));
+    row.insert(
+        "revision".to_string(),
+        Value::Int(schema.schema_revision as i64),
+    );
+    row.insert(
+        "properties".to_string(),
+        Value::Int(properties.len() as i64),
+    );
+    Ok(vec![row])
+}
+
 fn execute_create_edge_type(
     name: &str,
     temporal: bool,
