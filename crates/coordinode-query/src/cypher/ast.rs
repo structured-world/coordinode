@@ -117,6 +117,12 @@ pub enum Clause {
     ///
     /// Demotes a graph node back to a nested DOCUMENT property on another node.
     AttachDocument(AttachDocumentClause),
+    /// `MERGE NODES (a, b) INTO <target> [ON CONFLICT ...] [TRANSFER EDGES FROM <src> TO <dst>] [ON DUPLICATE ...] [TRANSFER EDGE PROPERTIES]`
+    ///
+    /// Native node merge — collapses two nodes into one preserving properties
+    /// and edges in a single MVCC transaction. Replaces APOC's
+    /// `apoc.refactor.mergeNodes()` with a first-class Cypher operation.
+    MergeNodes(MergeNodesClause),
     /// SET clause with optional ON VIOLATION SKIP modifier.
     ///
     /// Syntax: `SET n.prop = val [ON VIOLATION SKIP]`
@@ -661,6 +667,86 @@ pub struct UpsertClause {
 pub struct DeleteClause {
     pub detach: bool,
     pub exprs: Vec<Expr>,
+}
+
+/// `MERGE NODES (a, b) INTO <target>` clause — see R180 / `arch/compatibility/native-procedures.md`.
+///
+/// Collapses two bound node variables into one within a single MVCC transaction.
+/// The non-surviving node is DETACH DELETEd after property merge and edge transfer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeNodesClause {
+    /// First node variable in `MERGE NODES (a, b)` — must be bound by preceding MATCH.
+    pub source_a: String,
+    /// Second node variable in `MERGE NODES (a, b)` — must be bound by preceding MATCH.
+    pub source_b: String,
+    /// `INTO <target>` — surviving node. Validated by parser to be one of `source_a` / `source_b`.
+    pub target: String,
+    /// Property merge strategy. Default: `KeepFirst` (target node wins).
+    pub conflict: MergeNodesConflictStrategy,
+    /// `TRANSFER EDGES FROM <src> TO <dst>` clause if present.
+    /// Parser validates `dst == target` and `src` is the non-target source.
+    /// When `None`, edges remain on the non-surviving node and are removed by the
+    /// DETACH DELETE that finalises the merge (i.e., dropped).
+    pub transfer_edges: Option<TransferEdgesEndpoints>,
+    /// `ON DUPLICATE …` strategy for parallel edges discovered during transfer.
+    /// Parser rejects this when `transfer_edges` is `None`.
+    /// Default when transfer is present: `KeepBoth` (preserve parallel edges).
+    pub duplicate: MergeNodesDuplicateStrategy,
+    /// `TRANSFER EDGE PROPERTIES` — copy edge facets from non-surviving to surviving.
+    ///
+    /// Per arch/compatibility/native-procedures.md: "Edge properties are
+    /// transferred by default." The clause is therefore a redundant
+    /// readability marker — its absence does NOT mean "drop edge properties".
+    /// The flag is preserved on the AST so future extensions can carry
+    /// alternative policies without re-encoding the grammar.
+    pub transfer_edge_properties: bool,
+}
+
+/// Endpoints of `TRANSFER EDGES FROM <src> TO <dst>` inside `MERGE NODES`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferEdgesEndpoints {
+    /// Non-surviving source — edges are read from this node.
+    pub src: String,
+    /// Surviving destination — must equal `MergeNodesClause::target`.
+    pub dst: String,
+}
+
+/// Property conflict resolution strategy for `MERGE NODES`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum MergeNodesConflictStrategy {
+    /// `KEEP FIRST` (default) — surviving node's properties win on collision.
+    /// Equivalent to `COALESCE(target.prop, source.prop)` but cheaper: the
+    /// target's value is taken verbatim, source is only read for properties
+    /// absent on the target.
+    #[default]
+    KeepFirst,
+    /// `KEEP LAST` — non-surviving node's properties overwrite the surviving's.
+    KeepLast,
+    /// `COALESCE` — non-null values from the non-surviving fill nulls on the
+    /// surviving. Differs from `KeepFirst` only when target has explicit-null
+    /// property values: COALESCE replaces them, KeepFirst preserves them.
+    Coalesce,
+    /// `SET <expressions>` — per-property expressions. Each set item is
+    /// evaluated against a row binding `a` → surviving-node, `b` → non-surviving-node.
+    SetExpressions(Vec<SetItem>),
+}
+
+/// Duplicate-edge resolution strategy for `MERGE NODES TRANSFER EDGES`.
+///
+/// "Duplicate" means: target↔x already exists AND non-surviving↔x also exists
+/// with the same edge type and direction.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum MergeNodesDuplicateStrategy {
+    /// `KEEP BOTH` (default) — both edges preserved as parallel edges.
+    /// Posting list contains two entries for x.
+    #[default]
+    KeepBoth,
+    /// `MERGE PROPERTIES` — single edge, edge facets merged via COALESCE
+    /// (non-null source fills null target). Source edge is then removed.
+    MergeProperties,
+    /// `KEEP TARGET` — keep target↔x as-is, discard non-surviving↔x.
+    /// Edge facets on the non-surviving edge are discarded.
+    KeepTarget,
 }
 
 /// DETACH DOCUMENT clause: promote a nested DOCUMENT property to a graph node.

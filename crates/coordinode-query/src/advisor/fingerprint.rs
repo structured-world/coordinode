@@ -206,6 +206,22 @@ fn write_clause(buf: &mut String, clause: &Clause) {
                 buf.push_str(" ON REMAINING FAIL");
             }
         }
+        Clause::MergeNodes(mn) => {
+            buf.push_str("MERGE NODES (");
+            buf.push_str(&mn.source_a);
+            buf.push_str(", ");
+            buf.push_str(&mn.source_b);
+            buf.push_str(") INTO ");
+            buf.push_str(&mn.target);
+            // Fingerprint omits conflict/duplicate strategy details — same shape
+            // regardless of resolution policy keeps cache hit rates high.
+            if mn.transfer_edges.is_some() {
+                buf.push_str(" TRANSFER EDGES");
+            }
+            if mn.transfer_edge_properties {
+                buf.push_str(" TRANSFER EDGE PROPERTIES");
+            }
+        }
         Clause::Set(items, _violation_mode) => {
             buf.push_str("SET ");
             write_set_items(buf, items);

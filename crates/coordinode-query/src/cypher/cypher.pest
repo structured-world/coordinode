@@ -28,6 +28,7 @@ clause = {
   | create_edge_type_clause
   | create_clause
   | merge_all_clause
+  | merge_nodes_clause
   | merge_clause
   | upsert_clause
   | detach_document_clause
@@ -241,6 +242,57 @@ on_create_action = { kw_on ~ kw_create ~ kw_set ~ set_items }
 // --- MERGE ALL (CoordiNode extension: Cartesian-product relationship merge) ---
 
 merge_all_clause = { kw_merge ~ kw_all ~ pattern ~ merge_action* }
+
+// --- MERGE NODES (R180: native node merge, replaces APOC apoc.refactor.mergeNodes) ---
+//
+//   MERGE NODES (a, b) INTO a
+//     [ON CONFLICT KEEP FIRST | KEEP LAST | COALESCE | SET <set_items>]
+//     [TRANSFER EDGES FROM <src> TO <dst>]
+//     [ON DUPLICATE KEEP BOTH | MERGE PROPERTIES | KEEP TARGET]
+//     [TRANSFER EDGE PROPERTIES]
+//
+// Semantic validation in parser (not grammar):
+//   - INTO target ∈ {a, b}
+//   - TRANSFER EDGES: dst == target, src ∈ {a, b} \ {target}
+//   - ON DUPLICATE requires TRANSFER EDGES present
+merge_nodes_clause = {
+    kw_merge ~ kw_nodes ~ "(" ~ identifier ~ "," ~ identifier ~ ")"
+    ~ kw_into ~ identifier
+    ~ merge_nodes_option*
+}
+
+merge_nodes_option = {
+    merge_nodes_on_conflict
+  | merge_nodes_transfer_edges
+  | merge_nodes_on_duplicate
+  | merge_nodes_transfer_edge_props
+}
+
+merge_nodes_on_conflict = {
+    kw_on ~ kw_conflict ~ ( mn_strategy_keep_first
+                          | mn_strategy_keep_last
+                          | mn_strategy_coalesce
+                          | mn_strategy_set )
+}
+mn_strategy_keep_first = { kw_keep ~ kw_first }
+mn_strategy_keep_last  = { kw_keep ~ kw_last }
+mn_strategy_coalesce   = { kw_coalesce }
+mn_strategy_set        = { kw_set ~ set_items }
+
+merge_nodes_transfer_edges = {
+    kw_transfer ~ kw_edges ~ kw_from ~ identifier ~ kw_to ~ identifier
+}
+
+merge_nodes_on_duplicate = {
+    kw_on ~ kw_duplicate ~ ( mn_dup_keep_both
+                           | mn_dup_merge_properties
+                           | mn_dup_keep_target )
+}
+mn_dup_keep_both        = { kw_keep ~ kw_both }
+mn_dup_merge_properties = { kw_merge ~ kw_properties }
+mn_dup_keep_target      = { kw_keep ~ kw_target }
+
+merge_nodes_transfer_edge_props = { kw_transfer ~ kw_edge ~ kw_properties }
 
 // --- UPSERT MATCH (CoordiNode extension) ---
 
@@ -538,6 +590,18 @@ kw_fail       = @{ ^"fail" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_edge       = @{ ^"edge" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_type       = @{ ^"type" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_temporal   = @{ ^"temporal" ~ !(ASCII_ALPHANUMERIC | "_") }
+// MERGE NODES (R180) — context keywords (NOT in reserved_word, so they remain
+// valid identifiers and function names like coalesce()).
+kw_nodes      = @{ ^"nodes" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_from       = @{ ^"from" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_keep       = @{ ^"keep" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_first      = @{ ^"first" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_last       = @{ ^"last" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_coalesce   = @{ ^"coalesce" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_both       = @{ ^"both" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_target     = @{ ^"target" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_properties = @{ ^"properties" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_duplicate  = @{ ^"duplicate" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // --- Identifiers ---
 

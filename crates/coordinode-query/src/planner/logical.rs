@@ -254,6 +254,23 @@ pub enum LogicalOp {
         transfer: Option<crate::cypher::ast::TransferEdgesSpec>,
     },
 
+    /// `MERGE NODES (a, b) INTO <target>` — native node-merge operation (R180).
+    ///
+    /// `input` produces rows binding `source_a` and `source_b` to node columns
+    /// (built by the planner from a preceding MATCH). For each input row, the
+    /// executor collapses the two nodes into `target` within a single MVCC
+    /// transaction: property merge → edge transfer → DETACH DELETE non-target.
+    MergeNodes {
+        input: Box<LogicalOp>,
+        source_a: String,
+        source_b: String,
+        target: String,
+        conflict: crate::cypher::ast::MergeNodesConflictStrategy,
+        transfer_edges: Option<crate::cypher::ast::TransferEdgesEndpoints>,
+        duplicate: crate::cypher::ast::MergeNodesDuplicateStrategy,
+        transfer_edge_properties: bool,
+    },
+
     /// MERGE / MERGE ALL: match-or-create with optional ON MATCH SET / ON CREATE SET.
     ///
     /// When `multi = false` (MERGE): unique match — errors if >1 src OR >1 tgt matches.
@@ -817,6 +834,18 @@ impl LogicalOp {
                 beta.substitute_params(params);
                 gamma.substitute_params(params);
             }
+            LogicalOp::MergeNodes {
+                input, conflict, ..
+            } => {
+                input.substitute_params(params);
+                if let crate::cypher::ast::MergeNodesConflictStrategy::SetExpressions(items) =
+                    conflict
+                {
+                    for item in items {
+                        substitute_params_in_set_item(item, params);
+                    }
+                }
+            }
             LogicalOp::AlterLabel { .. }
             | LogicalOp::CreateTextIndex { .. }
             | LogicalOp::DropTextIndex { .. }
@@ -1374,6 +1403,13 @@ fn estimate_op_cost(
         | LogicalOp::CreateVectorIndex { .. }
         | LogicalOp::DropVectorIndex { .. }
         | LogicalOp::CreateEdgeType { .. } => (1.0, 1.0),
+        LogicalOp::MergeNodes { input, .. } => {
+            // Cost ≈ input cost + per-row (property merge + edge transfer over avg_fan_out).
+            // Edge transfer dominates: ~2 × avg_fan_out posting-list ops per merge.
+            let (in_cost, in_rows) = estimate_op_cost(input, defaults, stats, hints);
+            let per_row = 2.0 * defaults.avg_fan_out;
+            (in_cost + in_rows * per_row, in_rows)
+        }
         LogicalOp::Empty => (0.0, 1.0),
     }
 }
@@ -1953,6 +1989,41 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
                 "{prefix}CreateEdgeType({name}{temporal_marker}, props={})\n",
                 properties.len()
             ));
+        }
+        LogicalOp::MergeNodes {
+            input,
+            source_a,
+            source_b,
+            target,
+            conflict,
+            transfer_edges,
+            duplicate,
+            transfer_edge_properties,
+        } => {
+            let conflict_tag = match conflict {
+                crate::cypher::ast::MergeNodesConflictStrategy::KeepFirst => "KEEP_FIRST",
+                crate::cypher::ast::MergeNodesConflictStrategy::KeepLast => "KEEP_LAST",
+                crate::cypher::ast::MergeNodesConflictStrategy::Coalesce => "COALESCE",
+                crate::cypher::ast::MergeNodesConflictStrategy::SetExpressions(_) => "SET",
+            };
+            let transfer_tag = match transfer_edges {
+                Some(t) => format!(" TRANSFER {}→{}", t.src, t.dst),
+                None => String::new(),
+            };
+            let dup_tag = match duplicate {
+                crate::cypher::ast::MergeNodesDuplicateStrategy::KeepBoth => "",
+                crate::cypher::ast::MergeNodesDuplicateStrategy::MergeProperties => " DUP_MERGE",
+                crate::cypher::ast::MergeNodesDuplicateStrategy::KeepTarget => " DUP_KEEP_TGT",
+            };
+            let props_tag = if *transfer_edge_properties {
+                " +EDGE_PROPS"
+            } else {
+                ""
+            };
+            output.push_str(&format!(
+                "{prefix}MergeNodes({source_a},{source_b}) INTO {target} {conflict_tag}{transfer_tag}{dup_tag}{props_tag}\n"
+            ));
+            explain_op(input, indent + 1, output);
         }
         LogicalOp::Empty => {
             output.push_str(&format!("{prefix}Empty\n"));

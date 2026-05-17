@@ -198,6 +198,20 @@ impl<'a> Analyzer<'a> {
                     self.check_expr(&t.predicate);
                 }
             }
+            Clause::MergeNodes(mn) => {
+                // Both source variables must be bound by a preceding MATCH.
+                for v in [&mn.source_a, &mn.source_b] {
+                    if !self.scope.contains_key(v) {
+                        self.errors
+                            .push(SemanticError::UndefinedVariable { name: v.clone() });
+                    }
+                }
+                if let MergeNodesConflictStrategy::SetExpressions(ref items) = mn.conflict {
+                    for item in items {
+                        self.check_set_item(item);
+                    }
+                }
+            }
             Clause::Set(items, _violation_mode) => {
                 for item in items {
                     self.check_set_item(item);

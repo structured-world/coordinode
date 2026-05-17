@@ -226,6 +226,10 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let mc = build_merge_clause(pair)?;
             clauses.push(Clause::MergeMany(mc));
         }
+        Rule::merge_nodes_clause => {
+            let mn = build_merge_nodes_clause(pair)?;
+            clauses.push(Clause::MergeNodes(mn));
+        }
         Rule::upsert_clause => {
             let uc = build_upsert_clause(pair)?;
             clauses.push(Clause::Upsert(uc));
@@ -1150,6 +1154,169 @@ fn build_merge_clause(pair: Pair<'_, Rule>) -> Result<MergeClause, ParseError> {
             .ok_or_else(|| ParseError::Invalid("MERGE clause missing pattern".into()))?,
         on_match,
         on_create,
+    })
+}
+
+fn build_merge_nodes_clause(pair: Pair<'_, Rule>) -> Result<MergeNodesClause, ParseError> {
+    let mut idents = Vec::with_capacity(3);
+    let mut options = Vec::new();
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::identifier => idents.push(inner.as_str().to_string()),
+            Rule::merge_nodes_option => options.push(inner),
+            _ => {}
+        }
+    }
+    if idents.len() != 3 {
+        return Err(ParseError::Invalid(format!(
+            "MERGE NODES expected (a, b) INTO target — got {} identifiers",
+            idents.len()
+        )));
+    }
+    let source_a = idents.remove(0);
+    let source_b = idents.remove(0);
+    let target = idents.remove(0);
+    if target != source_a && target != source_b {
+        return Err(ParseError::Invalid(format!(
+            "MERGE NODES INTO `{target}` must be one of `{source_a}`, `{source_b}`"
+        )));
+    }
+    if source_a == source_b {
+        return Err(ParseError::Invalid(
+            "MERGE NODES requires two distinct source variables".to_string(),
+        ));
+    }
+
+    let mut conflict = MergeNodesConflictStrategy::default();
+    let mut transfer_edges: Option<TransferEdgesEndpoints> = None;
+    let mut duplicate: Option<MergeNodesDuplicateStrategy> = None;
+    // Default per arch/compatibility/native-procedures.md: edge properties are
+    // always transferred. The `TRANSFER EDGE PROPERTIES` clause is a redundant
+    // readability ack; its absence does NOT mean "drop properties".
+    let mut transfer_edge_properties = true;
+
+    for opt in options {
+        let inner = first_inner(opt)?;
+        match inner.as_rule() {
+            Rule::merge_nodes_on_conflict => {
+                // Skip the `ON CONFLICT` literal token pairs (kw_on, kw_conflict)
+                // and pick the strategy node.
+                let strategy = inner
+                    .into_inner()
+                    .find(|p| {
+                        matches!(
+                            p.as_rule(),
+                            Rule::mn_strategy_keep_first
+                                | Rule::mn_strategy_keep_last
+                                | Rule::mn_strategy_coalesce
+                                | Rule::mn_strategy_set
+                        )
+                    })
+                    .ok_or_else(|| {
+                        ParseError::Invalid("MERGE NODES ON CONFLICT: missing strategy".into())
+                    })?;
+                conflict = match strategy.as_rule() {
+                    Rule::mn_strategy_keep_first => MergeNodesConflictStrategy::KeepFirst,
+                    Rule::mn_strategy_keep_last => MergeNodesConflictStrategy::KeepLast,
+                    Rule::mn_strategy_coalesce => MergeNodesConflictStrategy::Coalesce,
+                    Rule::mn_strategy_set => {
+                        let mut items = Vec::new();
+                        for c in strategy.into_inner() {
+                            if c.as_rule() == Rule::set_items {
+                                items = build_set_items(c)?;
+                            }
+                        }
+                        MergeNodesConflictStrategy::SetExpressions(items)
+                    }
+                    other => {
+                        return Err(ParseError::Invalid(format!(
+                            "MERGE NODES ON CONFLICT: unexpected strategy node {other:?}"
+                        )));
+                    }
+                };
+            }
+            Rule::merge_nodes_transfer_edges => {
+                let mut ids = Vec::with_capacity(2);
+                for c in inner.into_inner() {
+                    if c.as_rule() == Rule::identifier {
+                        ids.push(c.as_str().to_string());
+                    }
+                }
+                if ids.len() != 2 {
+                    return Err(ParseError::Invalid(
+                        "MERGE NODES TRANSFER EDGES expected `FROM <src> TO <dst>`".into(),
+                    ));
+                }
+                let dst = ids.remove(1);
+                let src = ids.remove(0);
+                // Semantic checks: dst must be target; src must be the other source.
+                if dst != target {
+                    return Err(ParseError::Invalid(format!(
+                        "MERGE NODES TRANSFER EDGES TO `{dst}` must match INTO target `{target}`"
+                    )));
+                }
+                let expected_src = if target == source_a {
+                    &source_b
+                } else {
+                    &source_a
+                };
+                if src != *expected_src {
+                    return Err(ParseError::Invalid(format!(
+                        "MERGE NODES TRANSFER EDGES FROM `{src}` must be the non-surviving source `{expected_src}`"
+                    )));
+                }
+                transfer_edges = Some(TransferEdgesEndpoints { src, dst });
+            }
+            Rule::merge_nodes_on_duplicate => {
+                let strategy = inner
+                    .into_inner()
+                    .find(|p| {
+                        matches!(
+                            p.as_rule(),
+                            Rule::mn_dup_keep_both
+                                | Rule::mn_dup_merge_properties
+                                | Rule::mn_dup_keep_target
+                        )
+                    })
+                    .ok_or_else(|| {
+                        ParseError::Invalid("MERGE NODES ON DUPLICATE: missing strategy".into())
+                    })?;
+                duplicate = Some(match strategy.as_rule() {
+                    Rule::mn_dup_keep_both => MergeNodesDuplicateStrategy::KeepBoth,
+                    Rule::mn_dup_merge_properties => MergeNodesDuplicateStrategy::MergeProperties,
+                    Rule::mn_dup_keep_target => MergeNodesDuplicateStrategy::KeepTarget,
+                    other => {
+                        return Err(ParseError::Invalid(format!(
+                            "MERGE NODES ON DUPLICATE: unexpected strategy node {other:?}"
+                        )));
+                    }
+                });
+            }
+            Rule::merge_nodes_transfer_edge_props => {
+                transfer_edge_properties = true;
+            }
+            other => {
+                return Err(ParseError::Invalid(format!(
+                    "MERGE NODES: unexpected option node {other:?}"
+                )));
+            }
+        }
+    }
+
+    if duplicate.is_some() && transfer_edges.is_none() {
+        return Err(ParseError::Invalid(
+            "MERGE NODES ON DUPLICATE requires a TRANSFER EDGES clause".into(),
+        ));
+    }
+
+    Ok(MergeNodesClause {
+        source_a,
+        source_b,
+        target,
+        conflict,
+        transfer_edges,
+        duplicate: duplicate.unwrap_or_default(),
+        transfer_edge_properties,
     })
 }
 
@@ -3197,6 +3364,174 @@ mod tests {
         } else {
             panic!("expected DELETE clause");
         }
+    }
+
+    // -- MERGE NODES (R180) --
+
+    #[test]
+    fn merge_nodes_default_keep_first() {
+        let q = parse_ok("MATCH (a:User {id: 1}), (b:User {id: 2}) MERGE NODES (a, b) INTO a");
+        let mn = match &q.clauses[1] {
+            Clause::MergeNodes(mn) => mn,
+            other => panic!("expected MergeNodes, got {other:?}"),
+        };
+        assert_eq!(mn.source_a, "a");
+        assert_eq!(mn.source_b, "b");
+        assert_eq!(mn.target, "a");
+        assert_eq!(mn.conflict, MergeNodesConflictStrategy::KeepFirst);
+        assert!(mn.transfer_edges.is_none());
+        assert_eq!(mn.duplicate, MergeNodesDuplicateStrategy::KeepBoth);
+        assert!(
+            mn.transfer_edge_properties,
+            "edge properties transfer is on by default per arch spec"
+        );
+    }
+
+    #[test]
+    fn merge_nodes_into_b_target() {
+        let q = parse_ok("MATCH (a), (b) MERGE NODES (a, b) INTO b");
+        let mn = match &q.clauses[1] {
+            Clause::MergeNodes(mn) => mn,
+            _ => panic!("expected MergeNodes"),
+        };
+        assert_eq!(mn.target, "b");
+    }
+
+    #[test]
+    fn merge_nodes_all_conflict_strategies() {
+        for (cypher, expected) in [
+            (
+                "MATCH (a), (b) MERGE NODES (a, b) INTO a ON CONFLICT KEEP FIRST",
+                MergeNodesConflictStrategy::KeepFirst,
+            ),
+            (
+                "MATCH (a), (b) MERGE NODES (a, b) INTO a ON CONFLICT KEEP LAST",
+                MergeNodesConflictStrategy::KeepLast,
+            ),
+            (
+                "MATCH (a), (b) MERGE NODES (a, b) INTO a ON CONFLICT COALESCE",
+                MergeNodesConflictStrategy::Coalesce,
+            ),
+        ] {
+            let q = parse_ok(cypher);
+            let mn = match &q.clauses[1] {
+                Clause::MergeNodes(mn) => mn,
+                _ => panic!("expected MergeNodes"),
+            };
+            assert_eq!(mn.conflict, expected, "for input {cypher}");
+        }
+    }
+
+    #[test]
+    fn merge_nodes_on_conflict_set_expressions() {
+        let q = parse_ok(
+            "MATCH (a), (b) MERGE NODES (a, b) INTO a \
+             ON CONFLICT SET a.name = b.name, a.tags = a.tags",
+        );
+        let mn = match &q.clauses[1] {
+            Clause::MergeNodes(mn) => mn,
+            _ => panic!("expected MergeNodes"),
+        };
+        match &mn.conflict {
+            MergeNodesConflictStrategy::SetExpressions(items) => {
+                assert_eq!(items.len(), 2);
+            }
+            other => panic!("expected SetExpressions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_nodes_with_transfer_and_duplicate() {
+        let q = parse_ok(
+            "MATCH (a), (b) MERGE NODES (a, b) INTO a \
+             TRANSFER EDGES FROM b TO a \
+             ON DUPLICATE MERGE PROPERTIES \
+             TRANSFER EDGE PROPERTIES",
+        );
+        let mn = match &q.clauses[1] {
+            Clause::MergeNodes(mn) => mn,
+            _ => panic!("expected MergeNodes"),
+        };
+        let t = mn.transfer_edges.as_ref().expect("transfer set");
+        assert_eq!(t.src, "b");
+        assert_eq!(t.dst, "a");
+        assert_eq!(mn.duplicate, MergeNodesDuplicateStrategy::MergeProperties);
+        assert!(mn.transfer_edge_properties);
+    }
+
+    #[test]
+    fn merge_nodes_all_duplicate_strategies() {
+        for (cypher, expected) in [
+            (
+                "MATCH (a), (b) MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a ON DUPLICATE KEEP BOTH",
+                MergeNodesDuplicateStrategy::KeepBoth,
+            ),
+            (
+                "MATCH (a), (b) MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a ON DUPLICATE MERGE PROPERTIES",
+                MergeNodesDuplicateStrategy::MergeProperties,
+            ),
+            (
+                "MATCH (a), (b) MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a ON DUPLICATE KEEP TARGET",
+                MergeNodesDuplicateStrategy::KeepTarget,
+            ),
+        ] {
+            let q = parse_ok(cypher);
+            let mn = match &q.clauses[1] {
+                Clause::MergeNodes(mn) => mn,
+                _ => panic!("expected MergeNodes"),
+            };
+            assert_eq!(mn.duplicate, expected, "for input {cypher}");
+        }
+    }
+
+    #[test]
+    fn merge_nodes_rejects_unknown_target() {
+        let err = parse_err("MATCH (a), (b) MERGE NODES (a, b) INTO c");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("INTO `c`") && msg.contains("must be one of"),
+            "expected target validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn merge_nodes_rejects_same_source_variables() {
+        let err = parse_err("MATCH (a) MERGE NODES (a, a) INTO a");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("distinct source variables"),
+            "expected distinctness error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn merge_nodes_rejects_transfer_dst_not_target() {
+        let err = parse_err("MATCH (a), (b) MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO b");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("TRANSFER EDGES TO `b` must match INTO target `a`"),
+            "expected dst==target error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn merge_nodes_rejects_transfer_src_eq_target() {
+        let err = parse_err("MATCH (a), (b) MERGE NODES (a, b) INTO a TRANSFER EDGES FROM a TO a");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("must be the non-surviving source"),
+            "expected non-surviving error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn merge_nodes_rejects_duplicate_without_transfer() {
+        let err = parse_err("MATCH (a), (b) MERGE NODES (a, b) INTO a ON DUPLICATE KEEP BOTH");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("ON DUPLICATE requires a TRANSFER EDGES clause"),
+            "expected requires-transfer error, got: {msg}"
+        );
     }
 
     // -- SET --
