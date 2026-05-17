@@ -4857,13 +4857,18 @@ fn create_node_type_temporal_flag_persists_across_restart() {
 // to-end CREATE + MATCH on temporal labels (Phase A scaffold validation).
 // =====================================================================
 
-/// CREATE 3 versions of the same logical node on a temporal label — each
-/// CREATE allocates a fresh node_id today (R172c will introduce identity-
-/// preserving multi-version writes). MATCH still returns 3 rows because
-/// they all share the prefix-scan, and each row carries its own
-/// `valid_from` so downstream queries can differentiate.
+/// Three CREATEs on a temporal label produce three separate node_ids
+/// today (each `CREATE` allocates a fresh id via `id_allocator.next()`).
+/// R172c will introduce identity-preserving multi-version writes
+/// (`SET n.valid_to = ...` close-version + new CREATE re-using the same
+/// `node_id`). R172b's encoder unit tests cover the same-node-id case
+/// (`temporal_node_key_versions_sort_chronologically`); this integration
+/// test verifies the end-to-end CREATE + MATCH path with three distinct
+/// temporal nodes each carrying their own `valid_from`, validating that
+/// the temporal write path doesn't silently degrade to non-temporal
+/// storage.
 #[test]
-fn create_temporal_nodes_three_versions_then_match_returns_all() {
+fn create_temporal_nodes_each_with_own_valid_from_match_returns_all() {
     use coordinode_core::graph::types::Value;
     let (mut db, _dir) = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
@@ -5059,4 +5064,76 @@ fn delete_on_temporal_node_rejected_until_r172c() {
         .expect("create plain");
     db.execute_cypher("MATCH (n:Plain) DELETE n")
         .expect("DELETE on non-temporal unaffected");
+}
+
+/// `valid_to` on a temporal CREATE with a non-numeric type is rejected at
+/// write time — symmetric with the `valid_from` type guard. The Null
+/// variant on `valid_to` is special-cased as "no end" (open interval).
+#[test]
+fn temporal_create_rejects_valid_to_type_mismatch() {
+    let (mut db, _dir) = open_db();
+    // FLEXIBLE label so STRICT mode doesn't reject undeclared types first
+    // (we want the temporal type guard to fire, not the schema-mode guard).
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
+        .expect("CREATE NODE TYPE Person TEMPORAL");
+    db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
+        .expect("ALTER to FLEXIBLE");
+
+    // String valid_to — rejected.
+    let err = db
+        .execute_cypher("CREATE (p:Person {name: 'X', valid_from: 100, valid_to: 'oops'})")
+        .expect_err("string valid_to must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("valid_to") && msg.contains("INT"),
+        "error must mention valid_to and INT/TIMESTAMP: {msg}"
+    );
+
+    // valid_to: NULL — accepted (open interval, "still active").
+    db.execute_cypher("CREATE (p:Person {name: 'Y', valid_from: 100, valid_to: NULL})")
+        .expect("valid_to NULL must be accepted as open-ended interval");
+}
+
+/// Negative / pre-epoch `valid_from` is accepted at write time — the
+/// sortable-i64 encoding preserves chronological order across the sign
+/// boundary. Lets users model historical events (e.g. valid_from = -1ms
+/// before Unix epoch) without storage corruption. Encoder unit test
+/// `temporal_node_key_versions_sort_chronologically` covers the sort
+/// property at the byte level; this verifies the end-to-end path.
+#[test]
+fn temporal_create_accepts_negative_valid_from() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Event TEMPORAL WITH (name: STRING, valid_from: INT)")
+        .expect("CREATE NODE TYPE Event TEMPORAL");
+
+    // Pre-epoch event (Roman empire-style epoch shift demo).
+    db.execute_cypher("CREATE (e:Event {name: 'Antiquity', valid_from: -62135596800000})")
+        .expect("negative valid_from must be accepted");
+    // Modern event.
+    db.execute_cypher("CREATE (e:Event {name: 'Modern', valid_from: 1577836800000})")
+        .expect("positive valid_from accepted");
+
+    use coordinode_core::graph::types::Value;
+    let rows = db
+        .execute_cypher("MATCH (e:Event) RETURN e.name AS name, e.valid_from AS vf")
+        .expect("MATCH events");
+    assert_eq!(rows.len(), 2);
+    let mut by_vf: Vec<(i64, String)> = rows
+        .iter()
+        .filter_map(|r| {
+            let vf = match r.get("vf") {
+                Some(Value::Int(i)) => *i,
+                _ => return None,
+            };
+            let name = match r.get("name") {
+                Some(Value::String(s)) => s.clone(),
+                _ => return None,
+            };
+            Some((vf, name))
+        })
+        .collect();
+    by_vf.sort_by_key(|(vf, _)| *vf);
+    assert_eq!(by_vf[0].1, "Antiquity");
+    assert_eq!(by_vf[1].1, "Modern");
+    assert!(by_vf[0].0 < 0 && by_vf[1].0 > 0);
 }
