@@ -6247,6 +6247,33 @@ fn execute_upsert(
                         ctx.mvcc_put(Partition::Node, &key, &bytes)?;
                         ctx.write_stats.nodes_created += 1;
 
+                        // Fire BEFORE COMMIT CREATE triggers on the new
+                        // node's label. UPSERT's ON CREATE branch is
+                        // logically `CREATE (n:Label {…})`; users expect
+                        // the same trigger semantics as a hand-written
+                        // CREATE.
+                        if !label.is_empty() {
+                            let props_map: std::collections::HashMap<String, Value> = np
+                                .properties
+                                .iter()
+                                .map(|(name, expr)| {
+                                    let val = eval_expr(expr, row).map_to_document();
+                                    (name.clone(), val)
+                                })
+                                .collect();
+                            let trigger_params =
+                                trigger_params_for_node_create(node_id, &props_map);
+                            let target_segment =
+                                coordinode_core::schema::triggers::TriggerTargetSchema::label(
+                                    label.clone(),
+                                )
+                                .index_key_segment();
+                            let matched = ctx.lookup_matching_triggers(&target_segment, "c")?;
+                            if !matched.is_empty() {
+                                fire_before_commit_triggers(&matched, &trigger_params, ctx)?;
+                            }
+                        }
+
                         let var_name = np.variable.as_deref().unwrap_or("_");
                         current_row
                             .insert(var_name.to_string(), Value::Int(node_id.as_raw() as i64));
@@ -6311,6 +6338,33 @@ fn execute_upsert(
                         write_adj_key_reverse(&edge_type, target_id, &mut edge_key_buf);
                         ctx.adj_merge_add(&edge_key_buf, source_id.as_raw());
                         ctx.write_stats.edges_created += 1;
+
+                        // Fire BEFORE COMMIT CREATE triggers on the new
+                        // edge type. UPSERT's ON CREATE branch on a
+                        // relationship pattern is logically the same as
+                        // `CREATE (a)-[:TYPE]->(b)` and must fire the same
+                        // trigger. `$after` is empty (no inline properties
+                        // captured at the executor level for this path —
+                        // UPSERT ON CREATE patterns currently store edge
+                        // properties via subsequent SET items, not inline).
+                        if !edge_type.is_empty() {
+                            let resolved_props: Vec<(String, Value)> = Vec::new();
+                            let trigger_params = trigger_params_for_edge_create(
+                                &edge_type,
+                                source_id,
+                                target_id,
+                                &resolved_props,
+                            );
+                            let target_segment =
+                                coordinode_core::schema::triggers::TriggerTargetSchema::edge_type(
+                                    &edge_type,
+                                )
+                                .index_key_segment();
+                            let matched = ctx.lookup_matching_triggers(&target_segment, "c")?;
+                            if !matched.is_empty() {
+                                fire_before_commit_triggers(&matched, &trigger_params, ctx)?;
+                            }
+                        }
 
                         if let Some(ev) = &rp.variable {
                             current_row
@@ -7687,6 +7741,35 @@ fn execute_remove(
     for row in input_rows {
         let mut out_row = row.clone();
 
+        // Snapshot pre-mutation node state for UPDATE trigger firing —
+        // REMOVE is symmetric with SET: it mutates the node, so a registered
+        // UPDATE trigger must observe the change. Use schema_peek_node to
+        // avoid consuming pending merge_node_deltas (same rule as SET).
+        let mut update_snapshots: std::collections::HashMap<
+            NodeId,
+            (Vec<String>, std::collections::BTreeMap<String, Value>),
+        > = std::collections::HashMap::new();
+        for item in items {
+            let variable = match item {
+                crate::cypher::ast::RemoveItem::Property { variable, .. }
+                | crate::cypher::ast::RemoveItem::PropertyPath { variable, .. }
+                | crate::cypher::ast::RemoveItem::Label { variable, .. } => variable,
+            };
+            let node_id = match out_row.get(variable) {
+                Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+                _ => continue,
+            };
+            if update_snapshots.contains_key(&node_id) {
+                continue;
+            }
+            let key = encode_node_key(ctx.shard_id, node_id);
+            if let Some(bytes) = ctx.schema_peek_node(&key)? {
+                if let Ok(record) = NodeRecord::from_msgpack(&bytes) {
+                    update_snapshots.insert(node_id, snapshot_node_record(&record, ctx));
+                }
+            }
+        }
+
         for item in items {
             match item {
                 crate::cypher::ast::RemoveItem::Property { variable, property } => {
@@ -7799,6 +7882,37 @@ fn execute_remove(
                     }
                 }
             }
+        }
+
+        // After all REMOVE items applied, fire UPDATE triggers once per
+        // touched node. The trigger registration uses the PRE-mutation
+        // labels: REMOVE n:Label can shrink the label set, but a trigger
+        // registered on the removed label should still observe the change
+        // (it's the last firing window before the label is gone).
+        // Same probe-before-materialise rule as `execute_update`.
+        for (node_id, (pre_labels, before_props)) in &update_snapshots {
+            let mut all_matched: Vec<coordinode_core::schema::triggers::TriggerSchema> = Vec::new();
+            for label in pre_labels {
+                let target_segment =
+                    coordinode_core::schema::triggers::TriggerTargetSchema::label(label.clone())
+                        .index_key_segment();
+                let matched = ctx.lookup_matching_triggers(&target_segment, "u")?;
+                all_matched.extend(matched);
+            }
+            if all_matched.is_empty() {
+                continue;
+            }
+            let key = encode_node_key(ctx.shard_id, *node_id);
+            let Some(post_bytes) = ctx.mvcc_get(Partition::Node, &key)? else {
+                continue;
+            };
+            let Ok(post_record) = NodeRecord::from_msgpack(&post_bytes) else {
+                continue;
+            };
+            let (_post_labels, after_props) = snapshot_node_record(&post_record, ctx);
+            let trigger_params =
+                trigger_params_for_node_update(*node_id, before_props, &after_props);
+            fire_before_commit_triggers(&all_matched, &trigger_params, ctx)?;
         }
 
         results.push(out_row);
@@ -9229,6 +9343,21 @@ fn create_single_edge(
         || ctx.mvcc_get(Partition::Schema, &et_key)?.is_some();
     if !already_registered {
         ctx.mvcc_put(Partition::Schema, &et_key, b"")?;
+    }
+
+    // Fire BEFORE COMMIT CREATE triggers registered on this edge type.
+    // `create_single_edge` is the bare-bones edge insertion path used by
+    // DETACH DOCUMENT (for the new connecting edge); semantically a
+    // `CREATE (a)-[:TYPE]->(b)` so the same trigger must fire. No inline
+    // properties are written here, so `$after` is empty.
+    let resolved_props: Vec<(String, Value)> = Vec::new();
+    let trigger_params = trigger_params_for_edge_create(edge_type, src, tgt, &resolved_props);
+    let target_segment =
+        coordinode_core::schema::triggers::TriggerTargetSchema::edge_type(edge_type)
+            .index_key_segment();
+    let matched = ctx.lookup_matching_triggers(&target_segment, "c")?;
+    if !matched.is_empty() {
+        fire_before_commit_triggers(&matched, &trigger_params, ctx)?;
     }
     Ok(())
 }
