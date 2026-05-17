@@ -214,6 +214,10 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let c = build_create_edge_type_clause(pair)?;
             clauses.push(Clause::CreateEdgeType(c));
         }
+        Rule::create_node_type_clause => {
+            let c = build_create_node_type_clause(pair)?;
+            clauses.push(Clause::CreateNodeType(c));
+        }
         Rule::create_trigger_clause => {
             let c = build_create_trigger_clause(pair)?;
             clauses.push(Clause::CreateTrigger(c));
@@ -1015,6 +1019,70 @@ fn build_create_edge_type_clause(pair: Pair<'_, Rule>) -> Result<CreateEdgeTypeC
     }
 
     Ok(CreateEdgeTypeClause {
+        name,
+        temporal,
+        properties,
+    })
+}
+
+/// Build a `CREATE NODE TYPE … [TEMPORAL] [WITH (...)]` clause (R172a per
+/// ADR-027). Mirror of `build_create_edge_type_clause` — the grammar shape
+/// is identical apart from `kw_edge` → `kw_node`, so the inner walker is
+/// structurally the same.
+fn build_create_node_type_clause(
+    pair: Pair<'_, Rule>,
+) -> Result<crate::cypher::ast::CreateNodeTypeClause, ParseError> {
+    let mut name = String::new();
+    let mut temporal = false;
+    let mut properties: Vec<EdgePropertyDecl> = Vec::new();
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::identifier if name.is_empty() => {
+                name = inner.as_str().to_string();
+            }
+            Rule::kw_temporal => temporal = true,
+            Rule::property_decl_list => {
+                for decl in inner.into_inner() {
+                    if decl.as_rule() == Rule::property_decl {
+                        let mut prop_name = String::new();
+                        let mut prop_type = String::new();
+                        let mut not_null = false;
+                        for part in decl.into_inner() {
+                            match part.as_rule() {
+                                Rule::identifier if prop_name.is_empty() => {
+                                    prop_name = part.as_str().to_string();
+                                }
+                                Rule::property_type_name => {
+                                    prop_type = part.as_str().to_uppercase();
+                                }
+                                Rule::property_decl_modifier => {
+                                    not_null = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !prop_name.is_empty() && !prop_type.is_empty() {
+                            properties.push(EdgePropertyDecl {
+                                name: prop_name,
+                                type_name: prop_type,
+                                not_null,
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if name.is_empty() {
+        return Err(ParseError::Invalid(
+            "CREATE NODE TYPE requires a label name".into(),
+        ));
+    }
+
+    Ok(crate::cypher::ast::CreateNodeTypeClause {
         name,
         temporal,
         properties,
@@ -5116,6 +5184,114 @@ mod tests {
     fn create_edge_type_rejects_unknown_type() {
         // QUATERNION isn't in the property_type_name keyword set → parse error.
         let _ = parse_err("CREATE EDGE TYPE WORKS_AT WITH (foo: QUATERNION)");
+    }
+
+    // ===== CREATE NODE TYPE (R172a per ADR-027) =====
+
+    #[test]
+    fn create_node_type_minimal() {
+        let q = parse_ok("CREATE NODE TYPE Person");
+        match &q.clauses[0] {
+            Clause::CreateNodeType(c) => {
+                assert_eq!(c.name, "Person");
+                assert!(!c.temporal);
+                assert!(c.properties.is_empty());
+            }
+            other => panic!("expected CreateNodeType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_node_type_temporal_no_properties() {
+        let q = parse_ok("CREATE NODE TYPE Person TEMPORAL");
+        match &q.clauses[0] {
+            Clause::CreateNodeType(c) => {
+                assert_eq!(c.name, "Person");
+                assert!(c.temporal);
+                assert!(c.properties.is_empty());
+            }
+            other => panic!("expected CreateNodeType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_node_type_temporal_with_properties() {
+        let q = parse_ok(
+            "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING NOT NULL, valid_from: TIMESTAMP NOT NULL, valid_to: TIMESTAMP)",
+        );
+        match &q.clauses[0] {
+            Clause::CreateNodeType(c) => {
+                assert_eq!(c.name, "Person");
+                assert!(c.temporal);
+                assert_eq!(c.properties.len(), 3);
+                assert_eq!(c.properties[0].name, "name");
+                assert_eq!(c.properties[0].type_name, "STRING");
+                assert!(c.properties[0].not_null);
+                assert_eq!(c.properties[1].name, "valid_from");
+                assert_eq!(c.properties[1].type_name, "TIMESTAMP");
+                assert!(c.properties[1].not_null);
+                assert_eq!(c.properties[2].name, "valid_to");
+                assert!(!c.properties[2].not_null);
+            }
+            other => panic!("expected CreateNodeType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_node_type_non_temporal_with_properties() {
+        // TEMPORAL is optional — point-in-time labels may still declare props.
+        let q = parse_ok("CREATE NODE TYPE User WITH (email: STRING NOT NULL)");
+        match &q.clauses[0] {
+            Clause::CreateNodeType(c) => {
+                assert_eq!(c.name, "User");
+                assert!(!c.temporal);
+                assert_eq!(c.properties.len(), 1);
+                assert_eq!(c.properties[0].name, "email");
+                assert!(c.properties[0].not_null);
+            }
+            other => panic!("expected CreateNodeType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_node_type_rejects_unknown_property_type() {
+        let _ = parse_err("CREATE NODE TYPE Person WITH (foo: QUATERNION)");
+    }
+
+    /// `node` is a context keyword (only meaningful in `CREATE NODE TYPE`),
+    /// NOT in reserved_word. It must remain a valid identifier elsewhere —
+    /// e.g., as a variable name in MATCH / RETURN.
+    #[test]
+    fn create_node_type_does_not_break_node_as_identifier() {
+        // `node` as variable name in MATCH / RETURN must still parse.
+        let _ = parse_ok("MATCH (node:Person) RETURN node");
+        let _ = parse_ok("MATCH (n:Foo) WHERE n.node = 1 RETURN n");
+        // `node` as property accessor inside an expression.
+        let _ = parse_ok("MATCH (n) RETURN n.node");
+    }
+
+    /// Empty `WITH ()` block isn't valid grammar — `property_decl_list`
+    /// requires at least one declaration. This mirrors the edge-type
+    /// behaviour and prevents accidentally-empty WITH clauses.
+    #[test]
+    fn create_node_type_empty_with_block_rejected() {
+        // Empty WITH () → grammar rejects (property_decl_list = decl+).
+        let _ = parse_err("CREATE NODE TYPE Person TEMPORAL WITH ()");
+    }
+
+    /// Keyword `TEMPORAL` is case-insensitive (^"temporal" in pest); both
+    /// `TEMPORAL` and `Temporal` and `temporal` must parse identically.
+    #[test]
+    fn create_node_type_temporal_case_insensitive() {
+        for form in ["TEMPORAL", "Temporal", "temporal"] {
+            let q = parse_ok(&format!("CREATE NODE TYPE Person {form}"));
+            match &q.clauses[0] {
+                Clause::CreateNodeType(c) => {
+                    assert!(c.temporal, "form '{form}' must set temporal=true")
+                }
+                other => panic!("expected CreateNodeType for form '{form}', got {other:?}"),
+            }
+        }
     }
 
     #[test]

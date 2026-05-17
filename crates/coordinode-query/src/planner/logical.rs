@@ -369,6 +369,19 @@ pub enum LogicalOp {
         properties: Vec<crate::cypher::ast::EdgePropertyDecl>,
     },
 
+    /// CREATE NODE TYPE: declare a node-label schema entry (R172a per ADR-027).
+    ///
+    /// When `temporal = true`, every node of this label carries the bitemporal
+    /// `(valid_from, valid_to)` interval and the engine-assigned
+    /// `__ingestion_ts__` field; the storage layer keeps one node record per
+    /// `(node_id, valid_from)` so multiple versions of the same node coexist.
+    /// The TEMPORAL flag is immutable for the lifetime of the label.
+    CreateNodeType {
+        name: String,
+        temporal: bool,
+        properties: Vec<crate::cypher::ast::EdgePropertyDecl>,
+    },
+
     /// CREATE TRIGGER — the trigger architecture. Registers a trigger definition in the
     /// schema partition, updates the `(target, event)` index, and (in EE)
     /// notifies trigger workers of the new subscription.
@@ -872,6 +885,7 @@ impl LogicalOp {
             | LogicalOp::CreateVectorIndex { .. }
             | LogicalOp::DropVectorIndex { .. }
             | LogicalOp::CreateEdgeType { .. }
+            | LogicalOp::CreateNodeType { .. }
             | LogicalOp::CreateTrigger { .. }
             | LogicalOp::DropTrigger { .. }
             | LogicalOp::ShowTriggers
@@ -1423,6 +1437,7 @@ fn estimate_op_cost(
         | LogicalOp::CreateVectorIndex { .. }
         | LogicalOp::DropVectorIndex { .. }
         | LogicalOp::CreateEdgeType { .. }
+        | LogicalOp::CreateNodeType { .. }
         | LogicalOp::CreateTrigger { .. }
         | LogicalOp::DropTrigger { .. }
         | LogicalOp::ShowTriggers
@@ -2011,6 +2026,17 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             let temporal_marker = if *temporal { " TEMPORAL" } else { "" };
             output.push_str(&format!(
                 "{prefix}CreateEdgeType({name}{temporal_marker}, props={})\n",
+                properties.len()
+            ));
+        }
+        LogicalOp::CreateNodeType {
+            name,
+            temporal,
+            properties,
+        } => {
+            let temporal_marker = if *temporal { " TEMPORAL" } else { "" };
+            output.push_str(&format!(
+                "{prefix}CreateNodeType({name}{temporal_marker}, props={})\n",
                 properties.len()
             ));
         }
