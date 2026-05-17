@@ -1734,3 +1734,172 @@ fn merge_nodes_atomic_rollback_when_later_row_fails() {
     );
     assert_eq!(b1_edges[0].get("n"), Some(&Value::String("Peer".into())),);
 }
+
+/// STRICT extra-map gap: a source whose schema is VALIDATED stores undeclared
+/// props in `extra`. Without explicit validation of `target_rec.extra`, those
+/// undeclared keys would slip into a STRICT target through the merge.
+#[test]
+fn merge_nodes_strict_rejects_source_extra_overflow() {
+    use coordinode_core::graph::types::Value;
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
+
+    let (mut db, _dir) = open_db();
+
+    // Target STRICT — only `email` declared.
+    let mut tgt = LabelSchema::new_node_id("StrictCustomer");
+    tgt.set_mode(SchemaMode::Strict);
+    tgt.add_property(PropertyDef::new("email", PropertyType::String).not_null());
+    db.create_label_schema(tgt).unwrap();
+
+    // Source VALIDATED — declares `email` only, so any other CREATE prop
+    // lands in `extra` (the overflow map) rather than in props.
+    let mut src = LabelSchema::new_node_id("ValidatedLead");
+    src.set_mode(SchemaMode::Validated);
+    src.add_property(PropertyDef::new("email", PropertyType::String));
+    db.create_label_schema(src).unwrap();
+
+    db.execute_cypher("CREATE (a:StrictCustomer {email: 'a@x.com'})")
+        .unwrap();
+    // The `note` is undeclared on ValidatedLead → goes into source's extra.
+    db.execute_cypher("CREATE (b:ValidatedLead {email: 'b@x.com', note: 'sales lead'})")
+        .unwrap();
+
+    let result = db.execute_cypher(
+        "MATCH (a:StrictCustomer), (b:ValidatedLead) \
+         MERGE NODES (a, b) INTO a ON CONFLICT KEEP LAST",
+    );
+    assert!(
+        result.is_err(),
+        "STRICT target must reject merged extra-map keys: {result:?}"
+    );
+    let err = format!("{}", result.err().unwrap());
+    assert!(
+        err.contains("unknown property 'note'") || err.contains("strict"),
+        "error must mention the offending field: {err}"
+    );
+
+    // Rollback invariant: target unchanged, source still present.
+    let rows = db
+        .execute_cypher("MATCH (a:StrictCustomer) RETURN a.email AS e")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("e"), Some(&Value::String("a@x.com".into())));
+
+    let src_rows = db
+        .execute_cypher("MATCH (b:ValidatedLead) RETURN b.email AS e")
+        .unwrap();
+    assert_eq!(src_rows.len(), 1, "source must survive failed merge");
+}
+
+// NOTE: WITH-clause property pass-through (`MATCH (a) WITH a RETURN a.prop`)
+// returns NULL for properties even without MERGE NODES — see
+// `baseline_with_a_return_a_prop` below. This is a pre-existing executor
+// limitation independent of R180; once executor-side WITH passthrough is
+// fixed, a MERGE-NODES-specific WITH test should land here to confirm row
+// refresh survives the projection barrier.
+
+/// Vector property changed by merge must propagate to the HNSW vector
+/// index — otherwise nearest-neighbour searches return stale results.
+#[test]
+fn merge_nodes_updates_vector_index_on_target() {
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE VECTOR INDEX item_emb ON :Item(embedding) \
+         OPTIONS { metric: 'cosine', dimensions: 3 }",
+    )
+    .expect("create vector index");
+
+    // Two items with embeddings; merge with KEEP_LAST so b's vector becomes a's.
+    db.execute_cypher("CREATE (a:Item {id: 1, embedding: [1.0, 0.0, 0.0]})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:Item {id: 2, embedding: [0.0, 1.0, 0.0]})")
+        .unwrap();
+
+    // Use ON CONFLICT SET on `embedding` only — KEEP LAST would overwrite a.id
+    // too, defeating the "merged vector lands on the same id" assertion below.
+    db.execute_cypher(
+        "MATCH (a:Item {id: 1}), (b:Item {id: 2}) \
+         MERGE NODES (a, b) INTO a ON CONFLICT SET a.embedding = b.embedding",
+    )
+    .unwrap();
+
+    // After merge, a's embedding should be [0, 1, 0]. A nearest-neighbour
+    // query against [0, 1, 0] must return `a` first. If the vector index
+    // weren't updated, it'd still match a with the stale [1, 0, 0] vector
+    // and the nearest result might be no row (a's old vector got dropped
+    // on source delete) or wrong-ordered.
+    use coordinode_core::graph::types::Value;
+    let rows = db
+        .execute_cypher(
+            "MATCH (n:Item) \
+             WHERE vector_distance(n.embedding, [0.0, 1.0, 0.0]) < 0.1 \
+             RETURN n.id AS id",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1, "vector index must locate the merged target");
+    assert_eq!(rows[0].get("id"), Some(&Value::Int(1)));
+}
+
+/// Two MERGE NODES clauses in the same query: target binding from the first
+/// must remain available for the second. Confirms LogicalOp::MergeNodes
+/// composes through the executor pipeline.
+#[test]
+fn merge_nodes_chained_two_merges_into_single_target() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com', tag: 'A'})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com', city: 'Berlin'})")
+        .unwrap();
+    db.execute_cypher("CREATE (c:User {email: 'c@x.com', age: 42})")
+        .unwrap();
+
+    // After: a absorbs b and c. Each step is a separate MERGE NODES clause
+    // operating on the row produced by the prior one.
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}), (c:User {email: 'c@x.com'}) \
+         MERGE NODES (a, b) INTO a ON CONFLICT COALESCE \
+         MERGE NODES (a, c) INTO a ON CONFLICT COALESCE",
+    )
+    .unwrap();
+
+    let users = db
+        .execute_cypher("MATCH (u:User) RETURN u.email AS e")
+        .unwrap();
+    assert_eq!(users.len(), 1, "only a survives after both merges");
+
+    use coordinode_core::graph::types::Value;
+    let merged = db
+        .execute_cypher(
+            "MATCH (a:User {email: 'a@x.com'}) \
+             RETURN a.tag AS tag, a.city AS city, a.age AS age",
+        )
+        .unwrap();
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].get("tag"), Some(&Value::String("A".into())));
+    assert_eq!(merged[0].get("city"), Some(&Value::String("Berlin".into())));
+    assert_eq!(merged[0].get("age"), Some(&Value::Int(42)));
+}
+
+/// Baseline canary: `WITH a RETURN a.prop` returns NULL today — a known
+/// pre-existing executor limitation independent of MERGE NODES. Marked
+/// `#[ignore]` until executor-side WITH-passthrough is fixed; at that
+/// point this test will flip from documenting the bug to guarding the
+/// fix, and a MERGE-NODES-specific WITH-passthrough test can land.
+#[test]
+#[ignore = "pre-existing executor gap: WITH does not pass property columns through to RETURN"]
+fn baseline_with_a_return_a_prop() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {age: 30, name: 'Alice'})")
+        .unwrap();
+    let rows = db
+        .execute_cypher("MATCH (a:User) WITH a RETURN a.age AS age")
+        .unwrap();
+    use coordinode_core::graph::types::Value;
+    assert_eq!(
+        rows[0].get("age"),
+        Some(&Value::Int(30)),
+        "If this fails, WITH-then-RETURN of a property is broken at the executor \
+         level, independently of MERGE NODES."
+    );
+}
