@@ -3497,3 +3497,428 @@ fn trigger_node_label_does_not_fire_on_same_named_edge_type() {
         "node-label trigger must not fire on same-named edge type: {wrongly:?}"
     );
 }
+
+// =====================================================================
+// R191 expansion — SET on edge, MERGE node/edge, DETACH DELETE cascade,
+// explicit DELETE edge trigger firings.
+// =====================================================================
+
+/// SET on an edge property fires the edge-type UPDATE trigger with
+/// `$before` / `$after` carrying the edge prop maps and
+/// `$src` / `$tgt` / `$edge_type` describing the edge.
+#[test]
+fn trigger_before_commit_edge_update_fires_on_set_with_before_and_after() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER on_edge_set ON [:FOLLOWS] UPDATE BEFORE COMMIT \
+         EXECUTE CREATE (e:EdgeChange { \
+           action: $event, t: $edge_type, s: $src, d: $tgt, \
+           old: $before, new: $after })",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (a:User {id: 1})").unwrap();
+    db.execute_cypher("CREATE (b:User {id: 2})").unwrap();
+    db.execute_cypher(
+        "MATCH (a:User {id: 1}), (b:User {id: 2}) \
+         CREATE (a)-[:FOLLOWS {weight: 5}]->(b)",
+    )
+    .unwrap();
+    db.execute_cypher("MATCH (a:User {id: 1})-[r:FOLLOWS]->(b:User {id: 2}) SET r.weight = 99")
+        .unwrap();
+
+    let logs = db
+        .execute_cypher(
+            "MATCH (e:EdgeChange) RETURN \
+               e.action AS act, e.t AS t, e.s AS s, e.d AS d, \
+               e.old AS old, e.new AS new",
+        )
+        .unwrap();
+    assert_eq!(logs.len(), 1, "edge-UPDATE trigger must have fired once");
+    assert_eq!(logs[0].get("act"), Some(&Value::String("UPDATE".into())));
+    assert_eq!(logs[0].get("t"), Some(&Value::String("FOLLOWS".into())));
+    assert!(matches!(logs[0].get("s"), Some(Value::Int(_))));
+    assert!(matches!(logs[0].get("d"), Some(Value::Int(_))));
+    assert!(matches!(
+        logs[0].get("old"),
+        Some(Value::Map(_) | Value::Document(_))
+    ));
+    assert!(matches!(
+        logs[0].get("new"),
+        Some(Value::Map(_) | Value::Document(_))
+    ));
+}
+
+/// Multiple SET items in one row against the same edge fire the UPDATE
+/// trigger exactly once — `$before` is the snapshot at start of the SET
+/// clause, `$after` is the cumulative result. Mirrors the node-side
+/// once-per-statement invariant.
+#[test]
+fn trigger_before_commit_edge_update_fires_once_per_edge_per_statement() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER edge_fire_count ON [:FOLLOWS] UPDATE BEFORE COMMIT \
+         EXECUTE CREATE (e:EdgeFireMark)",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (a:User {id: 1})").unwrap();
+    db.execute_cypher("CREATE (b:User {id: 2})").unwrap();
+    db.execute_cypher(
+        "MATCH (a:User {id: 1}), (b:User {id: 2}) \
+         CREATE (a)-[:FOLLOWS {x: 0, y: 0, z: 0}]->(b)",
+    )
+    .unwrap();
+    db.execute_cypher(
+        "MATCH (a:User {id: 1})-[r:FOLLOWS]->(b:User {id: 2}) \
+         SET r.x = 1, r.y = 2, r.z = 3",
+    )
+    .unwrap();
+
+    let marks = db
+        .execute_cypher("MATCH (m:EdgeFireMark) RETURN count(m) AS n")
+        .unwrap();
+    assert_eq!(marks.len(), 1);
+    assert_eq!(
+        marks[0].get("n"),
+        Some(&Value::Int(1)),
+        "3 SET items on the same edge must produce exactly 1 trigger firing"
+    );
+}
+
+/// SET on a node that has no matching trigger must NOT fire any edge
+/// trigger that happens to share the property column path — index
+/// segments `n:Label` vs `e:Type` are disjoint and this guards the
+/// edge-update wiring against accidental fan-out.
+#[test]
+fn trigger_edge_update_does_not_fire_on_node_set() {
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER follow_update ON [:FOLLOWS] UPDATE BEFORE COMMIT \
+         EXECUTE CREATE (e:WronglyFired)",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (u:User {weight: 1})").unwrap();
+    db.execute_cypher("MATCH (u:User) SET u.weight = 2")
+        .unwrap();
+
+    let wrongly = db
+        .execute_cypher("MATCH (e:WronglyFired) RETURN e")
+        .unwrap();
+    assert!(
+        wrongly.is_empty(),
+        "edge-UPDATE trigger must not fire on a node SET: {wrongly:?}"
+    );
+}
+
+/// MERGE on a non-existent node creates the node and fires the
+/// label-CREATE trigger registered on the new node's label.
+#[test]
+fn trigger_before_commit_merge_node_fires_create_on_miss() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER on_merge_user ON :User CREATE BEFORE COMMIT \
+         EXECUTE CREATE (e:UserLog {action: $event})",
+    )
+    .unwrap();
+
+    db.execute_cypher("MERGE (u:User {name: 'Alice'})").unwrap();
+
+    let logs = db
+        .execute_cypher("MATCH (e:UserLog) RETURN e.action AS a")
+        .unwrap();
+    assert_eq!(
+        logs.len(),
+        1,
+        "MERGE create branch must fire CREATE trigger"
+    );
+    assert_eq!(logs[0].get("a"), Some(&Value::String("CREATE".into())));
+}
+
+/// MERGE that hits an existing node must NOT fire a CREATE trigger.
+/// (ON MATCH SET fires UPDATE; that is covered by the node UPDATE path.)
+#[test]
+fn trigger_merge_node_does_not_fire_create_on_hit() {
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher("CREATE (u:User {name: 'Alice'})")
+        .unwrap();
+
+    db.execute_cypher(
+        "CREATE TRIGGER on_merge_user ON :User CREATE BEFORE COMMIT \
+         EXECUTE CREATE (e:UserLog {action: $event})",
+    )
+    .unwrap();
+
+    db.execute_cypher("MERGE (u:User {name: 'Alice'})").unwrap();
+
+    let logs = db.execute_cypher("MATCH (e:UserLog) RETURN e").unwrap();
+    assert!(
+        logs.is_empty(),
+        "MERGE that hits an existing node must not fire CREATE trigger: {logs:?}"
+    );
+}
+
+/// MERGE on a non-existent relationship creates the edge and fires the
+/// edge-type CREATE trigger with `$src` / `$tgt` / `$edge_type`.
+#[test]
+fn trigger_before_commit_merge_edge_fires_create_on_miss() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER on_merge_follow ON [:FOLLOWS] CREATE BEFORE COMMIT \
+         EXECUTE CREATE (e:FollowLog {action: $event, t: $edge_type})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (a:User {id: 1})").unwrap();
+    db.execute_cypher("CREATE (b:User {id: 2})").unwrap();
+    db.execute_cypher(
+        "MATCH (a:User {id: 1}), (b:User {id: 2}) \
+         MERGE (a)-[:FOLLOWS]->(b)",
+    )
+    .unwrap();
+
+    let logs = db
+        .execute_cypher("MATCH (e:FollowLog) RETURN e.action AS act, e.t AS t")
+        .unwrap();
+    assert_eq!(
+        logs.len(),
+        1,
+        "MERGE edge create branch must fire CREATE trigger"
+    );
+    assert_eq!(logs[0].get("act"), Some(&Value::String("CREATE".into())));
+    assert_eq!(logs[0].get("t"), Some(&Value::String("FOLLOWS".into())));
+}
+
+/// MERGE that hits an existing edge must NOT fire a CREATE trigger.
+#[test]
+fn trigger_merge_edge_does_not_fire_create_on_hit() {
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher("CREATE (a:User {id: 1})").unwrap();
+    db.execute_cypher("CREATE (b:User {id: 2})").unwrap();
+    db.execute_cypher("MATCH (a:User {id: 1}), (b:User {id: 2}) CREATE (a)-[:FOLLOWS]->(b)")
+        .unwrap();
+
+    db.execute_cypher(
+        "CREATE TRIGGER on_merge_follow ON [:FOLLOWS] CREATE BEFORE COMMIT \
+         EXECUTE CREATE (e:FollowLog {action: $event})",
+    )
+    .unwrap();
+
+    db.execute_cypher("MATCH (a:User {id: 1}), (b:User {id: 2}) MERGE (a)-[:FOLLOWS]->(b)")
+        .unwrap();
+
+    let logs = db.execute_cypher("MATCH (e:FollowLog) RETURN e").unwrap();
+    assert!(
+        logs.is_empty(),
+        "MERGE that hits an existing edge must not fire CREATE trigger: {logs:?}"
+    );
+}
+
+/// DETACH DELETE cascades into edge DELETE triggers: every connected
+/// edge fires the registered DELETE trigger on its edge type, with
+/// `$before` carrying the edge's pre-delete props.
+#[test]
+fn trigger_before_commit_detach_delete_cascades_edge_delete_triggers() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER on_follow_delete ON [:FOLLOWS] DELETE BEFORE COMMIT \
+         EXECUTE CREATE (e:FollowDeletion {action: $event, t: $edge_type, b: $before})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (a:User {id: 1})").unwrap();
+    db.execute_cypher("CREATE (b:User {id: 2})").unwrap();
+    db.execute_cypher("CREATE (c:User {id: 3})").unwrap();
+    db.execute_cypher(
+        "MATCH (a:User {id: 1}), (b:User {id: 2}) \
+         CREATE (a)-[:FOLLOWS {weight: 5}]->(b)",
+    )
+    .unwrap();
+    db.execute_cypher(
+        "MATCH (a:User {id: 1}), (c:User {id: 3}) \
+         CREATE (a)-[:FOLLOWS {weight: 7}]->(c)",
+    )
+    .unwrap();
+
+    db.execute_cypher("MATCH (a:User {id: 1}) DETACH DELETE a")
+        .unwrap();
+
+    let logs = db
+        .execute_cypher(
+            "MATCH (e:FollowDeletion) \
+             RETURN e.action AS act, e.t AS t, e.b AS b",
+        )
+        .unwrap();
+    assert_eq!(
+        logs.len(),
+        2,
+        "DETACH DELETE must fire edge-DELETE trigger for each connected edge: {logs:?}"
+    );
+    for log in &logs {
+        assert_eq!(log.get("act"), Some(&Value::String("DELETE".into())));
+        assert_eq!(log.get("t"), Some(&Value::String("FOLLOWS".into())));
+        assert!(matches!(
+            log.get("b"),
+            Some(Value::Map(_) | Value::Document(_))
+        ));
+    }
+}
+
+/// Explicit `DELETE r` on an edge variable fires the edge-type DELETE
+/// trigger with `$before` carrying the edge's properties.
+#[test]
+fn trigger_before_commit_explicit_delete_edge_fires() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER on_follow_delete ON [:FOLLOWS] DELETE BEFORE COMMIT \
+         EXECUTE CREATE (e:FollowDeletion {action: $event, b: $before})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (a:User {id: 1})").unwrap();
+    db.execute_cypher("CREATE (b:User {id: 2})").unwrap();
+    db.execute_cypher(
+        "MATCH (a:User {id: 1}), (b:User {id: 2}) \
+         CREATE (a)-[:FOLLOWS {weight: 5}]->(b)",
+    )
+    .unwrap();
+
+    db.execute_cypher("MATCH (a:User {id: 1})-[r:FOLLOWS]->(b:User {id: 2}) DELETE r")
+        .unwrap();
+
+    let logs = db
+        .execute_cypher("MATCH (e:FollowDeletion) RETURN e.action AS act, e.b AS b")
+        .unwrap();
+    assert_eq!(
+        logs.len(),
+        1,
+        "explicit DELETE r must fire edge DELETE trigger"
+    );
+    assert_eq!(logs[0].get("act"), Some(&Value::String("DELETE".into())));
+    assert!(matches!(
+        logs[0].get("b"),
+        Some(Value::Map(_) | Value::Document(_))
+    ));
+}
+
+/// Explicit DELETE on a temporal edge fires the DELETE trigger once per
+/// version under the matched `(src, tgt)` pair — `$before` carries each
+/// version's properties in turn.
+#[test]
+fn trigger_before_commit_explicit_delete_temporal_edge_fires_per_version() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE EDGE TYPE WORKS_AT TEMPORAL WITH ( \
+           role: STRING, \
+           valid_from: TIMESTAMP NOT NULL, \
+           valid_to: TIMESTAMP \
+         )",
+    )
+    .unwrap();
+
+    db.execute_cypher(
+        "CREATE TRIGGER on_works_delete ON [:WORKS_AT] DELETE BEFORE COMMIT \
+         EXECUTE CREATE (e:WorksDeletion {action: $event, b: $before})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (a:Person {id: 1})").unwrap();
+    db.execute_cypher("CREATE (c:Company {id: 10})").unwrap();
+    // Two versions on the same (a, c) pair.
+    db.execute_cypher(
+        "MATCH (a:Person {id: 1}), (c:Company {id: 10}) \
+         CREATE (a)-[:WORKS_AT {role: 'SWE', valid_from: 1577836800000, valid_to: 1640995200000}]->(c)",
+    )
+    .unwrap();
+    db.execute_cypher(
+        "MATCH (a:Person {id: 1}), (c:Company {id: 10}) \
+         CREATE (a)-[:WORKS_AT {role: 'Staff', valid_from: 1640995200000}]->(c)",
+    )
+    .unwrap();
+
+    db.execute_cypher("MATCH (a:Person {id: 1})-[r:WORKS_AT]->(c:Company {id: 10}) DELETE r")
+        .unwrap();
+
+    let logs = db
+        .execute_cypher("MATCH (e:WorksDeletion) RETURN e.action AS act, e.b AS b")
+        .unwrap();
+    assert_eq!(
+        logs.len(),
+        2,
+        "DELETE on a temporal edge must fire one DELETE trigger per stored version: {logs:?}"
+    );
+    for log in &logs {
+        assert_eq!(log.get("act"), Some(&Value::String("DELETE".into())));
+        assert!(matches!(
+            log.get("b"),
+            Some(Value::Map(_) | Value::Document(_))
+        ));
+    }
+}
+
+/// Edge UPDATE trigger with `ON ERROR PROPAGATE` aborts the originating
+/// SET — the edge property must NOT be modified after rollback.
+#[test]
+fn trigger_edge_update_propagate_aborts_set() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    // Reject node: STRICT label with only `action` allowed. Trigger body
+    // writes a forbidden field → execution error inside trigger → SET
+    // rolls back.
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
+    let mut audit_schema = LabelSchema::new_node_id("Audit");
+    audit_schema.set_mode(SchemaMode::Strict);
+    audit_schema.add_property(PropertyDef::new("action", PropertyType::String).not_null());
+    db.create_label_schema(audit_schema).unwrap();
+
+    db.execute_cypher(
+        "CREATE TRIGGER reject_follow_update ON [:FOLLOWS] UPDATE BEFORE COMMIT \
+         EXECUTE CREATE (e:Audit {forbidden_field: $event}) \
+         ON ERROR PROPAGATE",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (a:User {id: 1})").unwrap();
+    db.execute_cypher("CREATE (b:User {id: 2})").unwrap();
+    db.execute_cypher(
+        "MATCH (a:User {id: 1}), (b:User {id: 2}) \
+         CREATE (a)-[:FOLLOWS {weight: 5}]->(b)",
+    )
+    .unwrap();
+
+    let result =
+        db.execute_cypher("MATCH (a:User {id: 1})-[r:FOLLOWS]->(b:User {id: 2}) SET r.weight = 99");
+    assert!(
+        result.is_err(),
+        "PROPAGATE: trigger error must abort the SET: {result:?}"
+    );
+
+    let rows = db
+        .execute_cypher("MATCH (a:User {id: 1})-[r:FOLLOWS]->(b:User {id: 2}) RETURN r.weight AS w")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("w"),
+        Some(&Value::Int(5)),
+        "edge prop must remain unchanged after PROPAGATE abort"
+    );
+}
