@@ -1782,7 +1782,24 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                                 .alias
                                 .clone()
                                 .unwrap_or_else(|| expr_display_name(&item.expr));
-                            out.insert(key, val);
+                            out.insert(key.clone(), val);
+
+                            // Variable passthrough: when a projection item is
+                            // bare `Variable(x)` (and is left unrenamed, OR is
+                            // aliased — in which case we re-bind the alias's
+                            // property columns), also propagate every `x.prop`
+                            // and `x.__*__` auxiliary column from the input
+                            // row. Without this, `MATCH (a) WITH a RETURN
+                            // a.prop` would lose all property bindings at the
+                            // WITH barrier and `a.prop` would resolve to NULL.
+                            if let Expr::Variable(var_name) = &item.expr {
+                                let prefix = format!("{var_name}.");
+                                for (col, value) in &row {
+                                    if let Some(suffix) = col.strip_prefix(&prefix) {
+                                        out.insert(format!("{key}.{suffix}"), value.clone());
+                                    }
+                                }
+                            }
                         }
                     }
                     out

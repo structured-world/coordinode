@@ -1791,12 +1791,34 @@ fn merge_nodes_strict_rejects_source_extra_overflow() {
     assert_eq!(src_rows.len(), 1, "source must survive failed merge");
 }
 
-// NOTE: WITH-clause property pass-through (`MATCH (a) WITH a RETURN a.prop`)
-// returns NULL for properties even without MERGE NODES — see
-// `baseline_with_a_return_a_prop` below. This is a pre-existing executor
-// limitation independent of R180; once executor-side WITH passthrough is
-// fixed, a MERGE-NODES-specific WITH test should land here to confirm row
-// refresh survives the projection barrier.
+/// MERGE NODES — WITH-passthrough composability: the row produced by MERGE
+/// NODES survives a WITH barrier and downstream RETURN sees the merged
+/// target's property columns.
+#[test]
+fn merge_nodes_target_binding_survives_with_clause() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com', age: 30})")
+        .unwrap();
+    db.execute_cypher("CREATE (b:User {email: 'b@x.com', city: 'Berlin'})")
+        .unwrap();
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:User {email: 'a@x.com'}), (b:User {email: 'b@x.com'}) \
+             MERGE NODES (a, b) INTO a ON CONFLICT COALESCE \
+             WITH a \
+             RETURN a.age AS age, a.city AS city",
+        )
+        .unwrap();
+    use coordinode_core::graph::types::Value;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("age"), Some(&Value::Int(30)));
+    assert_eq!(
+        rows[0].get("city"),
+        Some(&Value::String("Berlin".into())),
+        "merged column must pass through WITH barrier"
+    );
+}
 
 /// Vector property changed by merge must propagate to the HNSW vector
 /// index — otherwise nearest-neighbour searches return stale results.
@@ -1881,13 +1903,10 @@ fn merge_nodes_chained_two_merges_into_single_target() {
     assert_eq!(merged[0].get("age"), Some(&Value::Int(42)));
 }
 
-/// Baseline canary: `WITH a RETURN a.prop` returns NULL today — a known
-/// pre-existing executor limitation independent of MERGE NODES. Marked
-/// `#[ignore]` until executor-side WITH-passthrough is fixed; at that
-/// point this test will flip from documenting the bug to guarding the
-/// fix, and a MERGE-NODES-specific WITH-passthrough test can land.
+/// Regression guard for executor WITH-passthrough: `MATCH (a) WITH a RETURN
+/// a.prop` must propagate `a`'s property columns past the WITH projection
+/// barrier (fix landed alongside the R190 trigger DDL commit).
 #[test]
-#[ignore = "pre-existing executor gap: WITH does not pass property columns through to RETURN"]
 fn baseline_with_a_return_a_prop() {
     let (mut db, _dir) = open_db();
     db.execute_cypher("CREATE (a:User {age: 30, name: 'Alice'})")
