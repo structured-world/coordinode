@@ -537,6 +537,44 @@ ALTER TRIGGER audit SET EXECUTE …  -- replace body without re-registering
 DROP TRIGGER audit
 ```
 
+**Targets — node labels and edge types:**
+
+```cypher
+-- Node trigger: fires when nodes with the given label are mutated.
+CREATE TRIGGER user_audit ON :User CREATE BEFORE COMMIT EXECUTE ...
+
+-- Edge trigger: fires when edges of the given type are mutated.
+CREATE TRIGGER follow_audit ON [:FOLLOWS] CREATE BEFORE COMMIT EXECUTE ...
+```
+
+Edge triggers and node triggers occupy separate index namespaces:
+`:User` and `[:User]` never collide even when they share a name.
+
+**Events:**
+
+| Event | Node — fires on | Edge — fires on |
+|-------|-----------------|-----------------|
+| `CREATE` | `CREATE (n:Label ...)`, `MERGE (n:Label)` create branch | `CREATE (a)-[:TYPE ...]->(b)`, `MERGE (a)-[:TYPE]->(b)` create branch |
+| `UPDATE` | `SET n.prop = ...` (one firing per node per statement, regardless of how many SET items) | `SET r.prop = ...` (one firing per matched edge per statement) |
+| `DELETE` | `DELETE n` / `DETACH DELETE n` | `DELETE r`, plus cascade firings for every edge removed by `DETACH DELETE` on an endpoint |
+
+**Trigger body parameters:**
+
+| Parameter | Node trigger | Edge trigger |
+|-----------|--------------|--------------|
+| `$event`   | `"CREATE" \| "UPDATE" \| "DELETE"` | same |
+| `$before`  | Pre-mutation prop map (or `NULL` for CREATE) | Pre-mutation edge prop map (or `NULL` for CREATE) |
+| `$after`   | Post-mutation prop map (or `NULL` for DELETE) | Post-mutation edge prop map (or `NULL` for DELETE) |
+| `$node`    | NodeId of the affected node | — |
+| `$src`     | — | Source NodeId |
+| `$tgt`     | — | Target NodeId |
+| `$edge_type` | — | Edge type name (`"FOLLOWS"`, ...) |
+
+For temporal edges, `DELETE r` fires the DELETE trigger once per stored
+version of the matched `(src, tgt)` pair — each firing's `$before` is
+that version's property map. `SET r.x = ...` fires once for the matched
+version (keyed on `valid_from`).
+
 **Execution model:**
 
 | Timing | Where it runs | Failure default | Failure mode |

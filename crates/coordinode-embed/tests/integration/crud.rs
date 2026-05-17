@@ -3874,6 +3874,183 @@ fn trigger_before_commit_explicit_delete_temporal_edge_fires_per_version() {
     }
 }
 
+/// `SET r += {...}` on an edge variable is a silent no-op in the current
+/// executor (the MergeProperties SET arm requires `Value::Int` and skips
+/// edge variables). The UPDATE trigger MUST NOT fire for a SET that did
+/// not mutate the edge.
+#[test]
+fn trigger_edge_update_does_not_fire_when_set_is_non_mutating() {
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER on_follow_update ON [:FOLLOWS] UPDATE BEFORE COMMIT \
+         EXECUTE CREATE (e:WronglyFired)",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (a:User {id: 1})").unwrap();
+    db.execute_cypher("CREATE (b:User {id: 2})").unwrap();
+    db.execute_cypher(
+        "MATCH (a:User {id: 1}), (b:User {id: 2}) \
+         CREATE (a)-[:FOLLOWS {weight: 5}]->(b)",
+    )
+    .unwrap();
+
+    // `SET r += {x: 1}` — MergeProperties variant. Current executor
+    // skips edge variables in this arm (no edgeprop mutation). The
+    // trigger MUST NOT fire on a no-op SET.
+    db.execute_cypher("MATCH (a:User {id: 1})-[r:FOLLOWS]->(b:User {id: 2}) SET r += {x: 1}")
+        .unwrap();
+
+    let wrongly = db
+        .execute_cypher("MATCH (e:WronglyFired) RETURN e")
+        .unwrap();
+    assert!(
+        wrongly.is_empty(),
+        "edge-UPDATE trigger must not fire on a non-mutating SET variant: {wrongly:?}"
+    );
+}
+
+/// SET on a temporal edge fires the UPDATE trigger against the matched
+/// version (per-version edgeprop key). Only that version's props show
+/// up as `$before` / `$after`; sibling versions are untouched.
+#[test]
+fn trigger_before_commit_edge_update_temporal_fires_per_version() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE EDGE TYPE WORKS_AT TEMPORAL WITH ( \
+           role: STRING, \
+           valid_from: TIMESTAMP NOT NULL, \
+           valid_to: TIMESTAMP \
+         )",
+    )
+    .unwrap();
+
+    db.execute_cypher(
+        "CREATE TRIGGER on_works_update ON [:WORKS_AT] UPDATE BEFORE COMMIT \
+         EXECUTE CREATE (e:WorksChange { \
+           action: $event, t: $edge_type, old: $before, new: $after })",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (a:Person {id: 1})").unwrap();
+    db.execute_cypher("CREATE (c:Company {id: 10})").unwrap();
+    // Two versions: close the first, open the second.
+    db.execute_cypher(
+        "MATCH (a:Person {id: 1}), (c:Company {id: 10}) \
+         CREATE (a)-[:WORKS_AT {role: 'SWE', valid_from: 1577836800000, valid_to: 1640995200000}]->(c)",
+    )
+    .unwrap();
+    db.execute_cypher(
+        "MATCH (a:Person {id: 1}), (c:Company {id: 10}) \
+         CREATE (a)-[:WORKS_AT {role: 'Staff', valid_from: 1640995200000}]->(c)",
+    )
+    .unwrap();
+
+    // SET on the open version only — match the row whose valid_to IS NULL.
+    db.execute_cypher(
+        "MATCH (a:Person {id: 1})-[r:WORKS_AT]->(c:Company {id: 10}) \
+         WHERE r.valid_to IS NULL \
+         SET r.role = 'Principal'",
+    )
+    .unwrap();
+
+    let logs = db
+        .execute_cypher(
+            "MATCH (e:WorksChange) RETURN e.action AS act, e.t AS t, e.old AS old, e.new AS new",
+        )
+        .unwrap();
+    assert_eq!(
+        logs.len(),
+        1,
+        "exactly one UPDATE trigger firing (one matched temporal version): {logs:?}"
+    );
+    assert_eq!(logs[0].get("act"), Some(&Value::String("UPDATE".into())));
+    assert_eq!(logs[0].get("t"), Some(&Value::String("WORKS_AT".into())));
+    assert!(matches!(
+        logs[0].get("old"),
+        Some(Value::Map(_) | Value::Document(_))
+    ));
+    assert!(matches!(
+        logs[0].get("new"),
+        Some(Value::Map(_) | Value::Document(_))
+    ));
+}
+
+/// MERGE node with `ON CREATE SET`:
+/// On the create branch, CREATE trigger fires first (when the node
+/// lands), then the ON CREATE SET items go through `execute_update`,
+/// which fires the UPDATE trigger. Both must fire — they describe
+/// distinct logical events.
+#[test]
+fn trigger_merge_on_create_set_fires_create_then_update() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER user_create ON :User CREATE BEFORE COMMIT \
+         EXECUTE CREATE (e:UserLog {action: $event})",
+    )
+    .unwrap();
+    db.execute_cypher(
+        "CREATE TRIGGER user_update ON :User UPDATE BEFORE COMMIT \
+         EXECUTE CREATE (e:UserLog {action: $event})",
+    )
+    .unwrap();
+
+    db.execute_cypher("MERGE (u:User {name: 'Alice'}) ON CREATE SET u.score = 1")
+        .unwrap();
+
+    let logs = db
+        .execute_cypher("MATCH (e:UserLog) RETURN e.action AS a")
+        .unwrap();
+    let actions: Vec<_> = logs.iter().filter_map(|r| r.get("a").cloned()).collect();
+    assert!(
+        actions.contains(&Value::String("CREATE".into())),
+        "MERGE create branch must fire CREATE trigger: {actions:?}"
+    );
+    assert!(
+        actions.contains(&Value::String("UPDATE".into())),
+        "ON CREATE SET must fire UPDATE trigger: {actions:?}"
+    );
+    assert_eq!(actions.len(), 2);
+}
+
+/// MERGE node with `ON MATCH SET`:
+/// On the match branch (existing node), only UPDATE fires — no CREATE,
+/// since the node was not created in this transaction.
+#[test]
+fn trigger_merge_on_match_set_fires_update_only() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher("CREATE (u:User {name: 'Alice'})")
+        .unwrap();
+
+    db.execute_cypher(
+        "CREATE TRIGGER user_create ON :User CREATE BEFORE COMMIT \
+         EXECUTE CREATE (e:UserLog {action: $event})",
+    )
+    .unwrap();
+    db.execute_cypher(
+        "CREATE TRIGGER user_update ON :User UPDATE BEFORE COMMIT \
+         EXECUTE CREATE (e:UserLog {action: $event})",
+    )
+    .unwrap();
+
+    db.execute_cypher("MERGE (u:User {name: 'Alice'}) ON MATCH SET u.score = 1")
+        .unwrap();
+
+    let logs = db
+        .execute_cypher("MATCH (e:UserLog) RETURN e.action AS a")
+        .unwrap();
+    let actions: Vec<_> = logs.iter().filter_map(|r| r.get("a").cloned()).collect();
+    assert_eq!(actions.len(), 1, "exactly one trigger firing: {actions:?}");
+    assert_eq!(actions[0], Value::String("UPDATE".into()));
+}
+
 /// Edge UPDATE trigger with `ON ERROR PROPAGATE` aborts the originating
 /// SET — the edge property must NOT be modified after rollback.
 #[test]
