@@ -560,6 +560,55 @@ impl<'a> ExecutionContext<'a> {
         self.cascade_chain.clear();
     }
 
+    /// R190-6 / ADR-026 §3: load all enabled triggers that match a single
+    /// `(target_segment, event)` mutation. The lookup is O(matching_triggers)
+    /// — it reads exactly one index key + N definition keys, never scans the
+    /// trigger table. R191 / R192 call this at trigger firing time; R190
+    /// itself only ships the helper + tests.
+    ///
+    /// `target_segment` must come from
+    /// `TriggerTargetSchema::index_key_segment` (`n:Label` or `e:EdgeType`).
+    /// `event_segment` is `"c"` / `"u"` / `"d"` (CREATE / UPDATE / DELETE).
+    ///
+    /// Disabled triggers (via `ALTER TRIGGER … DISABLE`) are filtered out
+    /// before returning — the index entry persists across enable/disable so
+    /// re-enabling does not have to re-index, but firing must skip disabled.
+    pub fn lookup_matching_triggers(
+        &mut self,
+        target_segment: &str,
+        event_segment: &str,
+    ) -> Result<Vec<coordinode_core::schema::triggers::TriggerSchema>, ExecutionError> {
+        use coordinode_core::schema::triggers::{
+            encode_trigger_index_key, encode_trigger_key, TriggerSchema,
+        };
+        let idx_key = encode_trigger_index_key(target_segment, event_segment);
+        let names: Vec<String> = match self.mvcc_get(Partition::Schema, &idx_key)? {
+            Some(bytes) => rmp_serde::from_slice(&bytes).map_err(|e| {
+                ExecutionError::Serialization(format!(
+                    "trigger_index decode for {target_segment}/{event_segment}: {e}"
+                ))
+            })?,
+            None => return Ok(Vec::new()),
+        };
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            let def_key = encode_trigger_key(&name);
+            let Some(bytes) = self.mvcc_get(Partition::Schema, &def_key)? else {
+                // Inconsistent state — index references a missing definition.
+                // Skip rather than fail the mutation; the next DDL will
+                // rebuild the index.
+                continue;
+            };
+            let schema: TriggerSchema = rmp_serde::from_slice(&bytes).map_err(|e| {
+                ExecutionError::Serialization(format!("trigger `{name}` decode: {e}"))
+            })?;
+            if schema.enabled {
+                out.push(schema);
+            }
+        }
+        Ok(out)
+    }
+
     /// Read a Node key for schema checks without triggering RYOW merge-delta materialization.
     ///
     /// Schema checks in PropertyPath and DocFunction SET items need the node's primary
@@ -2249,16 +2298,10 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             properties,
         } => execute_create_edge_type(name, *temporal, properties, ctx),
 
-        // R190 trigger DDL — full executors land in R190-5. For now the
-        // operator typechecks and surfaces a clear "not yet wired" error so
-        // grammar + planner can ship independently and the integration test
-        // gating R190-5 has something to fail against.
-        LogicalOp::CreateTrigger { .. }
-        | LogicalOp::DropTrigger { .. }
-        | LogicalOp::ShowTriggers
-        | LogicalOp::AlterTrigger { .. } => Err(ExecutionError::Unsupported(
-            "trigger DDL executor pending R190-5 (grammar/AST/planner complete)".to_string(),
-        )),
+        LogicalOp::CreateTrigger { clause } => execute_create_trigger(clause, ctx),
+        LogicalOp::DropTrigger { name } => execute_drop_trigger(name, ctx),
+        LogicalOp::ShowTriggers => execute_show_triggers(ctx),
+        LogicalOp::AlterTrigger { clause } => execute_alter_trigger(clause, ctx),
 
         LogicalOp::Empty => Ok(vec![Row::new()]),
 
@@ -9813,6 +9856,313 @@ fn execute_create_edge_type(
         "properties".to_string(),
         Value::Int(properties.len() as i64),
     );
+    Ok(vec![row])
+}
+
+// ======================================================================
+// R190 / ADR-026: Trigger DDL executors
+// ======================================================================
+
+fn current_hlc_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
+/// Translate parser AST → persisted schema form (no logic difference, just
+/// a layering boundary — the parser's `cypher::ast` types live in
+/// coordinode-query; storage uses coordinode-core types).
+fn trigger_target_to_schema(
+    t: &crate::cypher::ast::TriggerTarget,
+) -> coordinode_core::schema::triggers::TriggerTargetSchema {
+    use crate::cypher::ast::TriggerTarget as A;
+    use coordinode_core::schema::triggers::TriggerTargetSchema as S;
+    match t {
+        A::Label(name) => S::label(name),
+        A::EdgeType(name) => S::edge_type(name),
+    }
+}
+
+fn trigger_events_to_schema(
+    e: crate::cypher::ast::TriggerEvents,
+) -> coordinode_core::schema::triggers::TriggerEventsSchema {
+    coordinode_core::schema::triggers::TriggerEventsSchema {
+        on_create: e.on_create,
+        on_update: e.on_update,
+        on_delete: e.on_delete,
+    }
+}
+
+fn trigger_timing_to_schema(
+    t: crate::cypher::ast::TriggerTiming,
+) -> coordinode_core::schema::triggers::TriggerTimingSchema {
+    use crate::cypher::ast::TriggerTiming as A;
+    use coordinode_core::schema::triggers::TriggerTimingSchema as S;
+    match t {
+        A::BeforeCommit => S::BeforeCommit,
+        A::AfterCommit => S::AfterCommit,
+    }
+}
+
+fn on_error_to_schema(
+    p: &crate::cypher::ast::OnErrorPolicy,
+) -> coordinode_core::schema::triggers::OnErrorPolicySchema {
+    use crate::cypher::ast::OnErrorPolicy as A;
+    use coordinode_core::schema::triggers::OnErrorPolicySchema as S;
+    match p {
+        A::Propagate => S::Propagate,
+        A::Retry { n, backoff_ms } => S::Retry {
+            n: *n,
+            backoff_ms: *backoff_ms,
+        },
+        A::DeadLetter => S::DeadLetter,
+    }
+}
+
+/// Load the existing trigger-name list for an index key, append `name`, and
+/// persist it back. Idempotent: re-adding an already-present name is a no-op.
+fn append_to_trigger_index(
+    ctx: &mut ExecutionContext<'_>,
+    target_segment: &str,
+    event_segment: &str,
+    name: &str,
+) -> Result<(), ExecutionError> {
+    use coordinode_core::schema::triggers::encode_trigger_index_key;
+    let key = encode_trigger_index_key(target_segment, event_segment);
+    let mut names: Vec<String> = match ctx.mvcc_get(Partition::Schema, &key)? {
+        Some(bytes) => rmp_serde::from_slice(&bytes).map_err(|e| {
+            ExecutionError::Serialization(format!(
+                "trigger_index decode for {target_segment}/{event_segment}: {e}"
+            ))
+        })?,
+        None => Vec::new(),
+    };
+    if !names.iter().any(|n| n == name) {
+        names.push(name.to_string());
+        let bytes = rmp_serde::to_vec(&names)
+            .map_err(|e| ExecutionError::Serialization(format!("trigger_index encode: {e}")))?;
+        ctx.mvcc_put(Partition::Schema, &key, &bytes)?;
+    }
+    Ok(())
+}
+
+/// Remove `name` from the index entry; if the list becomes empty, delete the key.
+fn remove_from_trigger_index(
+    ctx: &mut ExecutionContext<'_>,
+    target_segment: &str,
+    event_segment: &str,
+    name: &str,
+) -> Result<(), ExecutionError> {
+    use coordinode_core::schema::triggers::encode_trigger_index_key;
+    let key = encode_trigger_index_key(target_segment, event_segment);
+    let mut names: Vec<String> = match ctx.mvcc_get(Partition::Schema, &key)? {
+        Some(bytes) => rmp_serde::from_slice(&bytes)
+            .map_err(|e| ExecutionError::Serialization(format!("trigger_index decode: {e}")))?,
+        None => return Ok(()),
+    };
+    let before = names.len();
+    names.retain(|n| n != name);
+    if names.len() == before {
+        return Ok(());
+    }
+    if names.is_empty() {
+        ctx.mvcc_delete(Partition::Schema, &key)?;
+    } else {
+        let bytes = rmp_serde::to_vec(&names)
+            .map_err(|e| ExecutionError::Serialization(format!("trigger_index encode: {e}")))?;
+        ctx.mvcc_put(Partition::Schema, &key, &bytes)?;
+    }
+    Ok(())
+}
+
+fn execute_create_trigger(
+    c: &crate::cypher::ast::CreateTriggerClause,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    use coordinode_core::schema::triggers::{encode_trigger_key, TriggerSchema};
+
+    let key = encode_trigger_key(&c.name);
+    if ctx.mvcc_get(Partition::Schema, &key)?.is_some() {
+        return Err(ExecutionError::Conflict(format!(
+            "trigger `{}` already exists; use DROP TRIGGER first or ALTER it",
+            c.name
+        )));
+    }
+
+    let target_schema = trigger_target_to_schema(&c.target);
+    let target_segment = target_schema.index_key_segment();
+    let events_schema = trigger_events_to_schema(c.events);
+
+    let schema = TriggerSchema {
+        name: c.name.clone(),
+        target: target_schema,
+        events: events_schema,
+        timing: trigger_timing_to_schema(c.timing),
+        body_source: c.body_source.clone(),
+        cascade_limit: c.cascade_limit,
+        cascade_fanout: c.cascade_fanout,
+        on_error: c.on_error.as_ref().map(on_error_to_schema),
+        enabled: true,
+        created_at_hlc_us: current_hlc_us(),
+    };
+    let bytes = rmp_serde::to_vec(&schema)
+        .map_err(|e| ExecutionError::Serialization(format!("trigger `{}` encode: {e}", c.name)))?;
+    ctx.mvcc_put(Partition::Schema, &key, &bytes)?;
+
+    for event_seg in events_schema.enabled_segments() {
+        append_to_trigger_index(ctx, &target_segment, event_seg, &c.name)?;
+    }
+
+    let mut row = Row::new();
+    row.insert("name".into(), Value::String(c.name.clone()));
+    row.insert("status".into(), Value::String("created".into()));
+    Ok(vec![row])
+}
+
+fn execute_drop_trigger(
+    name: &str,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    use coordinode_core::schema::triggers::{encode_trigger_key, TriggerSchema};
+
+    let key = encode_trigger_key(name);
+    let bytes = match ctx.mvcc_get(Partition::Schema, &key)? {
+        Some(b) => b,
+        None => {
+            return Err(ExecutionError::Unsupported(format!(
+                "no such trigger `{name}`"
+            )));
+        }
+    };
+    let schema: TriggerSchema = rmp_serde::from_slice(&bytes)
+        .map_err(|e| ExecutionError::Serialization(format!("trigger `{name}` decode: {e}")))?;
+    let target_segment = schema.target.index_key_segment();
+    for event_seg in schema.events.enabled_segments() {
+        remove_from_trigger_index(ctx, &target_segment, event_seg, name)?;
+    }
+    ctx.mvcc_delete(Partition::Schema, &key)?;
+
+    let mut row = Row::new();
+    row.insert("name".into(), Value::String(name.into()));
+    row.insert("status".into(), Value::String("dropped".into()));
+    Ok(vec![row])
+}
+
+fn execute_show_triggers(ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>, ExecutionError> {
+    use coordinode_core::schema::triggers::{trigger_scan_prefix, TriggerSchema};
+
+    let prefix = trigger_scan_prefix();
+    let scanned = ctx.mvcc_prefix_scan(Partition::Schema, prefix)?;
+
+    let mut rows: Vec<Row> = Vec::new();
+    for (k, v) in scanned {
+        // Skip index keys: they share the `schema:trigger` prefix only up to
+        // the trailing colon; full prefix `schema:trigger:` discriminates.
+        if !k.starts_with(prefix) {
+            continue;
+        }
+        // Defensive: ensure the next byte after the prefix is part of a
+        // trigger name, not the index sub-prefix `_index:`.
+        let suffix = &k[prefix.len()..];
+        if suffix.starts_with(b"_index") || suffix.is_empty() {
+            continue;
+        }
+        let schema: TriggerSchema = match rmp_serde::from_slice(&v) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let mut row = Row::new();
+        row.insert("name".into(), Value::String(schema.name.clone()));
+        let target_kind = match &schema.target {
+            coordinode_core::schema::triggers::TriggerTargetSchema::Label { .. } => "label",
+            coordinode_core::schema::triggers::TriggerTargetSchema::EdgeType { .. } => "edge_type",
+        };
+        row.insert("target_kind".into(), Value::String(target_kind.into()));
+        row.insert(
+            "target_name".into(),
+            Value::String(schema.target.name().to_string()),
+        );
+        row.insert(
+            "events".into(),
+            Value::String(
+                schema
+                    .events
+                    .enabled_segments()
+                    .join(",")
+                    .to_uppercase()
+                    .replace('C', "CREATE")
+                    .replace('U', "UPDATE")
+                    .replace('D', "DELETE"),
+            ),
+        );
+        row.insert(
+            "timing".into(),
+            Value::String(match schema.timing {
+                coordinode_core::schema::triggers::TriggerTimingSchema::BeforeCommit => {
+                    "BEFORE_COMMIT".into()
+                }
+                coordinode_core::schema::triggers::TriggerTimingSchema::AfterCommit => {
+                    "AFTER_COMMIT".into()
+                }
+            }),
+        );
+        row.insert("enabled".into(), Value::Bool(schema.enabled));
+        row.insert(
+            "body_source".into(),
+            Value::String(schema.body_source.clone()),
+        );
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn execute_alter_trigger(
+    c: &crate::cypher::ast::AlterTriggerClause,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    use crate::cypher::ast::AlterTriggerAction;
+    use coordinode_core::schema::triggers::{encode_trigger_key, TriggerSchema};
+
+    let key = encode_trigger_key(&c.name);
+    let bytes = match ctx.mvcc_get(Partition::Schema, &key)? {
+        Some(b) => b,
+        None => {
+            return Err(ExecutionError::Unsupported(format!(
+                "no such trigger `{}`",
+                c.name
+            )));
+        }
+    };
+    let mut schema: TriggerSchema = rmp_serde::from_slice(&bytes)
+        .map_err(|e| ExecutionError::Serialization(format!("trigger `{}` decode: {e}", c.name)))?;
+
+    let status: &'static str = match &c.action {
+        AlterTriggerAction::Disable => {
+            schema.enabled = false;
+            "disabled"
+        }
+        AlterTriggerAction::Enable => {
+            schema.enabled = true;
+            "enabled"
+        }
+        AlterTriggerAction::SetBody(src) => {
+            schema.body_source = src.clone();
+            "body_replaced"
+        }
+        AlterTriggerAction::SetOnError(pol) => {
+            schema.on_error = Some(on_error_to_schema(pol));
+            "on_error_replaced"
+        }
+    };
+
+    let bytes = rmp_serde::to_vec(&schema)
+        .map_err(|e| ExecutionError::Serialization(format!("trigger `{}` encode: {e}", c.name)))?;
+    ctx.mvcc_put(Partition::Schema, &key, &bytes)?;
+
+    let mut row = Row::new();
+    row.insert("name".into(), Value::String(c.name.clone()));
+    row.insert("status".into(), Value::String(status.into()));
     Ok(vec![row])
 }
 
