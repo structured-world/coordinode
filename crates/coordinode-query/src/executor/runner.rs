@@ -7132,15 +7132,22 @@ fn execute_update(
 
     let mut results = Vec::new();
 
-    // R172b safe-reject for temporal nodes: SET on a temporal node would
-    // write through `encode_node_key` (16-byte form) and silently bypass
-    // the per-version 25-byte key the record actually lives under,
-    // corrupting the bitemporal storage layer. Look at every node variable
-    // touched by this SET clause and consult its bound `__label__` column
-    // (populated by MATCH / NodeScan). If any matched node belongs to a
-    // temporal label, reject the SET. Full per-version SET semantics
-    // (close-version via `SET n.valid_to = ...`, immutability of
-    // `valid_from`, per-version key write) lands in R172c.
+    // R172c temporal-node SET routing. For each SET item targeting a node
+    // on a temporal label, dispatch by property name:
+    //
+    //   * `valid_from` → reject (immutable: it is the version-key suffix;
+    //     re-key requires DELETE + CREATE, mirror of the edge-side rule).
+    //   * `valid_to`   → mutate in place at the version-key the matched
+    //     row binds (close-version semantics; no re-key needed because
+    //     `valid_to` lives in the record value, not in the key).
+    //   * Other property / label mutations → write a NEW version row at
+    //     `valid_from = NOW` per ADR-027. R172c Phase 2 — currently
+    //     rejected with a clear pointer instructing the user to use the
+    //     canonical close-version idiom (`SET n.valid_to = …`) plus an
+    //     explicit `CREATE` for the new version state.
+    //
+    // Edge SET items (Value::String binding) skip this whole block —
+    // they have their own temporal handling in `update_edge_property`.
     for row in input_rows {
         for item in items {
             let var = match item {
@@ -7151,20 +7158,46 @@ fn execute_update(
                 | crate::cypher::ast::SetItem::MergeProperties { variable, .. }
                 | crate::cypher::ast::SetItem::AddLabel { variable, .. } => variable,
             };
-            // Skip edge variables (Value::String binding); they have their
-            // own temporal handling in `update_edge_property`.
             if !matches!(row.get(var), Some(Value::Int(_))) {
                 continue;
             }
             let Some(Value::String(primary)) = row.get(&format!("{var}.__label__")) else {
                 continue;
             };
-            if let Ok(Some(s)) = ctx.load_current_label_schema(primary) {
-                if s.temporal {
+            let is_temporal = ctx
+                .load_current_label_schema(primary)
+                .ok()
+                .flatten()
+                .is_some_and(|s| s.temporal);
+            if !is_temporal {
+                continue;
+            }
+            match item {
+                crate::cypher::ast::SetItem::Property { property, .. }
+                    if property == "valid_from" =>
+                {
                     return Err(ExecutionError::Unsupported(format!(
-                        "SET on temporal label '{primary}' is not yet supported \
-                         (lands in R172c — per-version write executor). The current \
-                         R172b scope is CREATE + read on temporal labels only."
+                        "SET {var}.valid_from is rejected on temporal label '{primary}': \
+                         valid_from is the version-key suffix and is immutable. To \
+                         re-key a version, DELETE the row and CREATE a new one with \
+                         the desired valid_from."
+                    )));
+                }
+                crate::cypher::ast::SetItem::Property { property, .. }
+                    if property == "valid_to" =>
+                {
+                    // Close-version SET — mutated in place by the dedicated
+                    // helper below (after the read-only scan completes).
+                    continue;
+                }
+                _ => {
+                    return Err(ExecutionError::Unsupported(format!(
+                        "SET on temporal label '{primary}' currently supports only \
+                         `SET {var}.valid_to = …` (close-version) in R172c Phase 1. \
+                         Property mutations that imply a new version row (write at \
+                         valid_from = NOW) land in R172c Phase 2. Workaround: close \
+                         the current version (`SET {var}.valid_to = …`) and CREATE \
+                         a new version with the updated property values."
                     )));
                 }
             }
@@ -7334,6 +7367,105 @@ fn execute_update(
                         Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                         _ => continue,
                     };
+
+                    // R172c temporal node close-version path: when the label
+                    // is TEMPORAL and the property being set is `valid_to`,
+                    // mutate the record at the per-version (25-byte) key
+                    // bound by the row's `valid_from`. The valid_from key
+                    // suffix does NOT change — only the in-value `valid_to`
+                    // field flips from NULL (open) to a concrete end-of-
+                    // validity timestamp (closed). Pre-check temporal label
+                    // routing already rejected `valid_from` SETs and any
+                    // non-`valid_to` Property/PropertyPath/etc. on temporal
+                    // labels, so reaching this point implies a legitimate
+                    // close-version write.
+                    let is_temporal_label = out_row
+                        .get(&format!("{variable}.__label__"))
+                        .and_then(|v| match v {
+                            Value::String(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .and_then(|lbl| ctx.load_current_label_schema(&lbl).ok().flatten())
+                        .is_some_and(|s| s.temporal);
+                    if is_temporal_label && property == "valid_to" {
+                        // The bound row carries `n.valid_from` from the
+                        // earlier NodeScan; without it we cannot locate
+                        // the per-version key for this match. A missing
+                        // value here means the planner produced a row
+                        // referencing a temporal node without surfacing
+                        // its `valid_from` — that's a planner bug, not a
+                        // user-recoverable state, so fail loudly.
+                        let valid_from = match out_row.get(&format!("{variable}.valid_from")) {
+                            Some(Value::Int(ms)) => *ms,
+                            Some(Value::Timestamp(ms)) => *ms,
+                            _ => {
+                                return Err(ExecutionError::Unsupported(format!(
+                                    "SET {variable}.valid_to on temporal node: matched \
+                                     row is missing `{variable}.valid_from` (planner \
+                                     must surface valid_from for temporal node mutations)"
+                                )));
+                            }
+                        };
+                        // Validate new valid_to per the temporal interval
+                        // contract (must be > valid_from, or NULL to reopen).
+                        let new_valid_to: Option<i64> = match &val {
+                            Value::Int(ms) => Some(*ms),
+                            Value::Timestamp(ms) => Some(*ms),
+                            Value::Null => None,
+                            other => {
+                                return Err(ExecutionError::Unsupported(format!(
+                                    "SET {variable}.valid_to on temporal node: value \
+                                     must be INT, TIMESTAMP, or NULL, got {other:?}"
+                                )));
+                            }
+                        };
+                        if let Some(vt) = new_valid_to {
+                            if vt <= valid_from {
+                                return Err(ExecutionError::Unsupported(format!(
+                                    "SET {variable}.valid_to ({vt}) must be strictly \
+                                     greater than valid_from ({valid_from})"
+                                )));
+                            }
+                        }
+                        let temp_key = coordinode_core::graph::node::encode_temporal_node_key(
+                            ctx.shard_id,
+                            node_id,
+                            valid_from,
+                        );
+                        let bytes = ctx.mvcc_get(Partition::Node, &temp_key)?.ok_or_else(|| {
+                            ExecutionError::Unsupported(format!(
+                                "SET {variable}.valid_to: temporal node record \
+                                     not found at version (node_id={node_id}, \
+                                     valid_from={valid_from})"
+                            ))
+                        })?;
+                        let mut record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
+                            ExecutionError::Serialization(format!("node decode: {e}"))
+                        })?;
+                        let field_id = ctx.interner.intern("valid_to");
+                        match new_valid_to {
+                            Some(vt) => record.set(field_id, Value::Int(vt)),
+                            None => {
+                                // Re-open a closed version: drop the
+                                // `valid_to` field entirely so the version
+                                // becomes open again.
+                                record.props.remove(&field_id);
+                            }
+                        }
+                        let new_bytes = record.to_msgpack().map_err(|e| {
+                            ExecutionError::Serialization(format!("node encode: {e}"))
+                        })?;
+                        ctx.mvcc_put(Partition::Node, &temp_key, &new_bytes)?;
+                        ctx.write_stats.properties_set += 1;
+                        out_row.insert(
+                            format!("{variable}.valid_to"),
+                            match new_valid_to {
+                                Some(vt) => Value::Int(vt),
+                                None => Value::Null,
+                            },
+                        );
+                        continue;
+                    }
 
                     // Read current node record
                     let key = encode_node_key(ctx.shard_id, node_id);

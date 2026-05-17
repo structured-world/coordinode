@@ -5391,3 +5391,161 @@ fn empirical_pattern_predicate_into_temporal_label() {
     db.execute_cypher("MATCH (o:Org) WHERE (o)-[:KNOWS]->(:Org) RETURN o")
         .expect("pattern predicate into non-temporal accepted");
 }
+
+// =====================================================================
+// R172c Phase 1 — close-version SET valid_to on temporal nodes +
+// valid_from immutability.
+// =====================================================================
+
+/// SET on a temporal node's `valid_to` closes the matched version in
+/// place — the per-version key (with `valid_from` suffix) is unchanged,
+/// only the value's `valid_to` field flips from open (NULL) to closed.
+/// Then a subsequent MATCH reflects the new state.
+#[test]
+fn temporal_set_valid_to_closes_version_in_place() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("CREATE NODE TYPE Person TEMPORAL");
+
+    // Seed: an open temporal version (no valid_to).
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
+        .expect("seed open version");
+
+    // Close it.
+    db.execute_cypher("MATCH (p:Person) WHERE p.valid_to IS NULL SET p.valid_to = 200")
+        .expect("close-version SET valid_to");
+
+    // Verify: MATCH should still find ONE row (the same version), but
+    // with valid_to now populated to 200.
+    let rows = db
+        .execute_cypher(
+            "MATCH (p:Person) RETURN p.name AS name, p.valid_from AS vf, p.valid_to AS vt",
+        )
+        .expect("MATCH after close");
+    assert_eq!(rows.len(), 1, "single closed version: {rows:?}");
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Alice".into())));
+    assert_eq!(rows[0].get("vf"), Some(&Value::Int(100)));
+    assert_eq!(rows[0].get("vt"), Some(&Value::Int(200)));
+}
+
+/// SET valid_to = NULL on a closed temporal version re-opens it (removes
+/// the in-record valid_to field entirely). Mirror of the temporal-edge
+/// re-open idiom.
+#[test]
+fn temporal_set_valid_to_null_reopens_version() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("CREATE NODE TYPE Person TEMPORAL");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100, valid_to: 200})")
+        .expect("seed closed version");
+
+    // Re-open by setting valid_to = NULL.
+    db.execute_cypher("MATCH (p:Person) WHERE p.valid_to = 200 SET p.valid_to = NULL")
+        .expect("re-open SET valid_to NULL");
+
+    use coordinode_core::graph::types::Value;
+    let rows = db
+        .execute_cypher("MATCH (p:Person) RETURN p.name AS name, p.valid_to AS vt")
+        .expect("MATCH after reopen");
+    assert_eq!(rows.len(), 1);
+    // After remove, valid_to is absent — Cypher returns Null.
+    assert!(
+        matches!(rows[0].get("vt"), None | Some(Value::Null)),
+        "valid_to must be absent after reopen: got {:?}",
+        rows[0].get("vt")
+    );
+}
+
+/// SET valid_from on a temporal node is rejected — it's the version-
+/// key suffix and is immutable. User must DELETE + CREATE to re-key.
+/// Mirror of the temporal-edge rule.
+#[test]
+fn temporal_set_valid_from_rejected_immutable() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
+        .expect("CREATE NODE TYPE Person TEMPORAL");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
+        .expect("seed");
+
+    let err = db
+        .execute_cypher("MATCH (p:Person) SET p.valid_from = 200")
+        .expect_err("SET valid_from on temporal must reject as immutable");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("valid_from") && msg.contains("immutable"),
+        "error must mention valid_from + immutable: {msg}"
+    );
+}
+
+/// SET on a non-`valid_to` property of a temporal node is currently
+/// rejected with a clear R172c Phase 2 pointer (the canonical idiom in
+/// Phase 1 is close-version + new CREATE).
+#[test]
+fn temporal_set_other_property_phase2_pointer() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
+        .expect("CREATE NODE TYPE Person TEMPORAL");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
+        .expect("seed");
+
+    let err = db
+        .execute_cypher("MATCH (p:Person) SET p.name = 'Bob'")
+        .expect_err("SET non-valid_to on temporal rejected in Phase 1");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("Phase 2") && msg.contains("close-version"),
+        "error must mention Phase 2 + close-version workaround: {msg}"
+    );
+}
+
+/// SET valid_to with a value <= valid_from is rejected — same interval
+/// invariant as CREATE.
+#[test]
+fn temporal_set_valid_to_rejects_inverted_interval() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("CREATE NODE TYPE Person TEMPORAL");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
+        .expect("seed");
+
+    let err = db
+        .execute_cypher("MATCH (p:Person) WHERE p.valid_to IS NULL SET p.valid_to = 50")
+        .expect_err("valid_to < valid_from must be rejected");
+    assert!(
+        format!("{err}").contains("valid_to"),
+        "error must mention valid_to: {err}"
+    );
+
+    let err = db
+        .execute_cypher("MATCH (p:Person) WHERE p.valid_to IS NULL SET p.valid_to = 100")
+        .expect_err("valid_to == valid_from must be rejected (zero-duration)");
+    assert!(format!("{err}").contains("valid_to"));
+}
+
+/// SET on a non-temporal node is unaffected by R172c routing — should
+/// still mutate-in-place via the standard non-temporal path.
+#[test]
+fn r172c_set_non_temporal_unaffected() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Plain WITH (name: STRING)")
+        .expect("CREATE NODE TYPE Plain");
+    db.execute_cypher("CREATE (p:Plain {name: 'X'})")
+        .expect("seed");
+
+    db.execute_cypher("MATCH (p:Plain) SET p.name = 'Y'")
+        .expect("non-temporal SET still works");
+
+    let rows = db
+        .execute_cypher("MATCH (p:Plain) RETURN p.name AS name")
+        .expect("MATCH");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Y".into())));
+}
