@@ -5888,6 +5888,23 @@ fn check_single_hop_exists(
     row: &Row,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<bool, ExecutionError> {
+    // R172b safe-reject: pattern predicate destination label-filter reads
+    // neighbour records via 16-byte `encode_node_key` and would silently
+    // return false for temporal-labelled targets stored at the 25-byte
+    // per-version key. Without this guard `WHERE EXISTS { (a)-[:E]->(:Temp) }`
+    // would silently evaluate to false instead of failing loudly. Full
+    // per-version pattern-predicate evaluation lands in R172d.
+    for lbl in &dst_node.labels {
+        if let Ok(Some(s)) = ctx.load_current_label_schema(lbl) {
+            if s.temporal {
+                return Err(ExecutionError::Unsupported(format!(
+                    "pattern predicate with temporal target label '{lbl}' is not \
+                     yet supported (lands in R172d — per-version read executor)."
+                )));
+            }
+        }
+    }
+
     // Resolve source node ID from bound variable
     let src_id = match &src_node.variable {
         Some(name) => match row.get(name.as_str()) {
@@ -6246,6 +6263,31 @@ fn execute_upsert(
         execute_update(&matches, on_match, &ViolationMode::Fail, ctx)
     } else {
         // Phase 3: ON CREATE — create nodes and edges from patterns (two-pass)
+        // R172b safe-reject for temporal labels: UPSERT ON CREATE uses
+        // `encode_node_key` (16-byte form) directly and would silently
+        // bypass the per-version 25-byte key on a temporal label, also
+        // skipping `__ingestion_ts__` auto-population and the
+        // `valid_from`-required guard. Per-version semantics for UPSERT
+        // ON CREATE land in R172c alongside MERGE.
+        for create_pattern in on_create_patterns {
+            for element in &create_pattern.elements {
+                if let PatternElement::Node(np) = element {
+                    for lbl in &np.labels {
+                        if let Ok(Some(s)) = ctx.load_current_label_schema(lbl) {
+                            if s.temporal {
+                                return Err(ExecutionError::Unsupported(format!(
+                                    "UPSERT ON CREATE into temporal label '{lbl}' is not \
+                                     yet supported (lands in R172c — per-version write \
+                                     executor). Use an explicit CREATE clause for \
+                                     temporal labels in the R172b scope."
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let mut results = vec![Row::new()];
 
         for create_pattern in on_create_patterns {

@@ -5329,3 +5329,65 @@ fn empirical_detach_document_from_temporal_source() {
          confusing wording with an explicit R172c pointer: {msg}"
     );
 }
+
+/// EMPIRICAL: UPSERT ON CREATE into a TEMPORAL label — execute_upsert
+/// has its own CREATE branch that calls `encode_node_key` directly
+/// (16-byte form), bypassing the temporal-aware path in
+/// `execute_create_node`. Without a guard this would silently store a
+/// temporal-flagged label's node under the non-temporal key.
+#[test]
+fn empirical_upsert_on_create_into_temporal_label() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
+        .expect("CREATE NODE TYPE Person TEMPORAL");
+
+    // UPSERT MATCH (p:Person {name:'X'}) ON CREATE CREATE (p:Person ...)
+    // — Person is temporal, the ON CREATE pattern would write via
+    // non-temporal key. R172b safe-reject must intercept.
+    let err = db
+        .execute_cypher(
+            "UPSERT MATCH (p:Person {name: 'X'}) \
+             ON CREATE CREATE (p:Person {name: 'X', valid_from: 100})",
+        )
+        .expect_err("UPSERT ON CREATE into temporal label must reject with R172c pointer");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("temporal") && msg.contains("R172c") && msg.contains("Person"),
+        "error must mention temporal + R172c + label: {msg}"
+    );
+
+    // UPSERT MATCH with ON CREATE into non-temporal label is unaffected.
+    db.execute_cypher("CREATE NODE TYPE Plain WITH (name: STRING)")
+        .expect("CREATE NODE TYPE Plain");
+    db.execute_cypher("UPSERT MATCH (p:Plain {name: 'Y'}) ON CREATE CREATE (p:Plain {name: 'Y'})")
+        .expect("non-temporal UPSERT ON CREATE accepted");
+}
+
+/// EMPIRICAL: pattern predicate `WHERE EXISTS { (a)-[:E]->(:Temp) }`
+/// reads neighbour records via 16-byte `encode_node_key`. Temporal
+/// targets stored at the 25-byte per-version key would silently evaluate
+/// to false. R172b safe-reject converts to a loud R172d pointer.
+#[test]
+fn empirical_pattern_predicate_into_temporal_label() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
+        .expect("CREATE Person TEMPORAL");
+    db.execute_cypher("CREATE NODE TYPE Org WITH (name: STRING)")
+        .expect("CREATE Org");
+    db.execute_cypher("CREATE (o:Org {name: 'Acme'})")
+        .expect("seed Org");
+
+    // Implicit pattern-predicate form `WHERE (o)-[:E]->(:Label)`.
+    let err = db
+        .execute_cypher("MATCH (o:Org) WHERE (o)-[:KNOWS]->(:Person) RETURN o")
+        .expect_err("pattern predicate into temporal must reject with R172d pointer");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("temporal") && msg.contains("R172d") && msg.contains("Person"),
+        "error must mention temporal + R172d + label: {msg}"
+    );
+
+    // Pattern predicate into non-temporal label is unaffected.
+    db.execute_cypher("MATCH (o:Org) WHERE (o)-[:KNOWS]->(:Org) RETURN o")
+        .expect("pattern predicate into non-temporal accepted");
+}
