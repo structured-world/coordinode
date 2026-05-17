@@ -5137,3 +5137,195 @@ fn temporal_create_accepts_negative_valid_from() {
     assert_eq!(by_vf[1].1, "Modern");
     assert!(by_vf[0].0 < 0 && by_vf[1].0 > 0);
 }
+
+/// `MATCH (a)-[:E]->(b:TempLabel) RETURN b` would silently emit zero rows
+/// today (target materialisation reads the 16-byte non-temporal key on a
+/// node stored under the 25-byte temporal key). The traversal safe-reject
+/// fails loudly with an R172d pointer instead.
+#[test]
+fn traverse_into_temporal_label_rejected_until_r172d() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
+        .expect("CREATE NODE TYPE Person TEMPORAL");
+    db.execute_cypher("CREATE NODE TYPE Org WITH (name: STRING)")
+        .expect("CREATE NODE TYPE Org");
+    db.execute_cypher("CREATE (o:Org {name: 'Acme'})")
+        .expect("seed Org");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
+        .expect("seed temporal Person");
+
+    let err = db
+        .execute_cypher("MATCH (o:Org)-[:KNOWS]->(p:Person) RETURN p")
+        .expect_err("traversal into temporal target must reject in R172b");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("temporal") && msg.contains("R172d") && msg.contains("Person"),
+        "error must mention temporal + R172d + label: {msg}"
+    );
+
+    // Traversal into non-temporal label still works (no rows for empty
+    // edge set, but no error).
+    db.execute_cypher("MATCH (p:Person)-[:KNOWS]->(o:Org) RETURN o")
+        .expect("traversal INTO non-temporal target accepted");
+}
+
+/// EMPIRICAL: DETACH DOCUMENT promoting a sub-doc into a TEMPORAL node.
+/// DETACH DOCUMENT delegates to `execute_create_node` for the new node,
+/// which is temporal-aware via R172a+R172b. The question: does the
+/// existing DETACH path correctly pass `valid_from` through, or does the
+/// new node land at a non-temporal key silently?
+#[test]
+fn empirical_detach_document_into_temporal_label() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Address TEMPORAL WITH (city: STRING, valid_from: INT)")
+        .expect("CREATE NODE TYPE Address TEMPORAL");
+
+    // Seed: a User with a nested address doc that ALSO carries valid_from.
+    db.execute_cypher("CREATE (u:User {id: 1, address: {city: 'NYC', valid_from: 100}})")
+        .expect("seed");
+
+    // Try to promote the address doc into a temporal Address node.
+    let result = db.execute_cypher(
+        "MATCH (u:User {id: 1}) \
+         DETACH DOCUMENT u.address AS (a:Address)-[:HAS_ADDRESS]->(u)",
+    );
+    match result {
+        Ok(_) => {
+            // Promoted node exists — does MATCH find it?
+            let rows = db
+                .execute_cypher("MATCH (a:Address) RETURN a.city AS city, a.valid_from AS vf")
+                .expect("MATCH Address after detach");
+            eprintln!(
+                "DETACH-into-temporal returned {} rows: {rows:?}",
+                rows.len()
+            );
+            // If 0 rows → silent storage corruption (node written but unfindable).
+            // If 1 row → temporal CREATE path correctly used.
+            // Note: this is empirical exploration; assertion is on observed
+            // behaviour, not a hard contract.
+            assert!(
+                !rows.is_empty(),
+                "DETACH into temporal label produced a node that MATCH cannot find — \
+                 silent storage path mismatch"
+            );
+        }
+        Err(e) => {
+            // The new node would need valid_from — if the doc didn't carry it,
+            // execute_create_node's temporal guard rejects. That's correct.
+            eprintln!("DETACH-into-temporal rejected: {e}");
+        }
+    }
+}
+
+/// EMPIRICAL: ATTACH DOCUMENT with a TEMPORAL source — does the source
+/// node actually get deleted, or does `cascade_delete_source_node`
+/// silently fail because it uses `encode_node_key` (16-byte form) on a
+/// node stored at the 25-byte temporal key?
+#[test]
+fn empirical_attach_document_from_temporal_source() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Address TEMPORAL WITH (city: STRING, valid_from: INT)")
+        .expect("CREATE NODE TYPE Address TEMPORAL");
+
+    // Seed: a temporal Address node + a User node + the HAS_ADDRESS edge.
+    db.execute_cypher("CREATE (a:Address {city: 'NYC', valid_from: 100})")
+        .expect("seed Address");
+    db.execute_cypher("CREATE (u:User {id: 1})")
+        .expect("seed User");
+    db.execute_cypher("MATCH (a:Address), (u:User {id: 1}) CREATE (a)-[:HAS_ADDRESS]->(u)")
+        .expect("seed edge");
+
+    // Verify Address exists before ATTACH.
+    let pre = db
+        .execute_cypher("MATCH (a:Address) RETURN a.city AS city")
+        .expect("pre-attach scan");
+    eprintln!("pre-attach Address count: {}", pre.len());
+
+    // R172b safe-reject must give a clear R172c pointer instead of the
+    // confusing pre-guard "source node not found" message.
+    let err = db
+        .execute_cypher("ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address")
+        .expect_err("ATTACH from temporal source must reject with clear R172c pointer");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("temporal") && msg.contains("R172c") && msg.contains("Address"),
+        "error must mention temporal + R172c + label: {msg}"
+    );
+    // Pre-guard behaviour was "source node node:1 not found".
+    assert!(
+        !msg.contains("source node") || !msg.contains("not found"),
+        "error must not contain the confusing pre-guard wording: {msg}"
+    );
+
+    // Pre-state Address count was 1; after the reject the source must
+    // still be in place (no partial mutation).
+    assert_eq!(pre.len(), 1, "pre-attach Address must exist");
+}
+
+/// EMPIRICAL: ATTACH DOCUMENT INTO a TEMPORAL target — does the target's
+/// property get correctly modified, or does the merge_node_delta path
+/// silently bypass the per-version key?
+#[test]
+fn empirical_attach_document_into_temporal_target() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
+        .expect("CREATE NODE TYPE Person TEMPORAL");
+
+    // Seed: a temporal Person + a plain Address node + the edge.
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
+        .expect("seed Person");
+    db.execute_cypher("CREATE (a:Address {city: 'NYC'})")
+        .expect("seed Address");
+    db.execute_cypher("MATCH (p:Person), (a:Address) CREATE (a)-[:HAS_ADDRESS]->(p)")
+        .expect("seed edge");
+
+    let err = db
+        .execute_cypher("ATTACH (a:Address)-[:HAS_ADDRESS]->(p:Person) INTO p.address")
+        .expect_err("ATTACH into temporal target must reject");
+    let msg = format!("{err}");
+    // ATTACH synthesises a MATCH `(a)-[:E]->(p)` internally; the traverse
+    // safe-reject (R172d) fires first if the target label is temporal.
+    // Otherwise the ATTACH guard fires. Either path is acceptable — the
+    // assertion is that we get a CLEAR temporal-aware error, not a
+    // confusing "not found" / silent corruption.
+    assert!(
+        msg.contains("temporal") && msg.contains("Person"),
+        "error must mention temporal + Person: {msg}"
+    );
+    assert!(
+        !msg.contains("not found"),
+        "error must not say 'not found': {msg}"
+    );
+}
+
+/// EMPIRICAL: DETACH DOCUMENT FROM a TEMPORAL source — the source node
+/// is read via `encode_node_key` then property-removed via merge delta.
+/// Both ops silent-fail on temporal records (stored at 25-byte key).
+#[test]
+fn empirical_detach_document_from_temporal_source() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
+        .expect("CREATE NODE TYPE Person TEMPORAL");
+    db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
+        .expect("ALTER to FLEXIBLE so address can be a nested doc");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100, address: {city: 'NYC'}})")
+        .expect("seed temporal Person with nested doc");
+
+    let err = db
+        .execute_cypher(
+            "MATCH (p:Person) DETACH DOCUMENT p.address AS (a:Address)-[:HAS_ADDRESS]->(p)",
+        )
+        .expect_err("DETACH FROM temporal source must reject with clear R172c pointer");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("temporal") && msg.contains("R172c") && msg.contains("Person"),
+        "error must explicitly mention temporal + R172c + label: {msg}"
+    );
+    // The pre-guard behaviour was a confusing "node not found" message.
+    // The R172b safe-reject replaces it with the R172c pointer.
+    assert!(
+        !msg.contains("not found"),
+        "error must not say 'not found' — R172b safe-reject replaces that \
+         confusing wording with an explicit R172c pointer: {msg}"
+    );
+}

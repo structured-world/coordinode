@@ -2672,6 +2672,27 @@ fn execute_traverse(
     params: &TraverseParams<'_>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
+    // R172b safe-reject for temporal target labels: the traversal target-
+    // materialisation step reads `node:<shard>:<tgt_uid>` (16-byte key) to
+    // load the target's record for label filter + property emit. Temporal
+    // nodes live at 25-byte per-version keys; the 16-byte read silently
+    // returns None and the row is dropped. Without this guard, MATCH
+    // (a)-[:E]->(b:TempLabel) would emit zero rows instead of failing
+    // loudly. Per-version target read (prefix scan with version
+    // materialisation) is R172d scope.
+    for lbl in params.target_labels {
+        if let Ok(Some(s)) = ctx.load_current_label_schema(lbl) {
+            if s.temporal {
+                return Err(ExecutionError::Unsupported(format!(
+                    "traversal into temporal label '{lbl}' is not yet supported \
+                     (lands in R172d — per-version read executor). The current \
+                     R172b scope is CREATE + label-scoped MATCH on temporal \
+                     labels only."
+                )));
+            }
+        }
+    }
+
     if let Some(lb) = params.length {
         execute_varlen_traverse(input_rows, params, lb, ctx)
     } else {
@@ -6403,6 +6424,24 @@ fn execute_create_from_pattern(
             labels,
             property_filters,
         } => {
+            // R172b safe-reject for temporal labels: this code path (used by
+            // MERGE's create branch and by `MERGE (a)-[:E]->(b)` endpoint
+            // synthesis) writes via the 16-byte non-temporal key
+            // unconditionally. A temporal target would silently land in
+            // non-temporal storage. Per-version semantics for MERGE/UPSERT
+            // on temporal labels land in R172c.
+            for lbl in labels {
+                if let Ok(Some(s)) = ctx.load_current_label_schema(lbl) {
+                    if s.temporal {
+                        return Err(ExecutionError::Unsupported(format!(
+                            "MERGE / UPSERT into temporal label '{lbl}' is not yet \
+                             supported (lands in R172c — per-version write executor). \
+                             Use explicit CREATE for temporal labels in the R172b scope."
+                        )));
+                    }
+                }
+            }
+
             let node_id = ctx.id_allocator.next();
             let label = labels.first().cloned().unwrap_or_default();
 
@@ -7924,6 +7963,37 @@ fn execute_remove(
     items: &[crate::cypher::ast::RemoveItem],
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
+    // R172b safe-reject for temporal nodes: REMOVE mutates record props
+    // and writes via the 16-byte non-temporal key, silently bypassing the
+    // per-version record. Mirror of the SET / DELETE guards. Full
+    // REMOVE-on-temporal semantics (close-version via SET valid_to is the
+    // intended idiom; REMOVE valid_from is rejected as immutable; REMOVE
+    // of other props writes a new version) land in R172c.
+    for row in input_rows {
+        for item in items {
+            let var = match item {
+                crate::cypher::ast::RemoveItem::Property { variable, .. }
+                | crate::cypher::ast::RemoveItem::PropertyPath { variable, .. }
+                | crate::cypher::ast::RemoveItem::Label { variable, .. } => variable,
+            };
+            if !matches!(row.get(var), Some(Value::Int(_))) {
+                continue;
+            }
+            let Some(Value::String(primary)) = row.get(&format!("{var}.__label__")) else {
+                continue;
+            };
+            if let Ok(Some(s)) = ctx.load_current_label_schema(primary) {
+                if s.temporal {
+                    return Err(ExecutionError::Unsupported(format!(
+                        "REMOVE on temporal label '{primary}' is not yet supported \
+                         (lands in R172c — per-version write executor). The current \
+                         R172b scope is CREATE + read on temporal labels only."
+                    )));
+                }
+            }
+        }
+    }
+
     let mut results = Vec::new();
 
     for row in input_rows {
@@ -8489,6 +8559,32 @@ fn execute_merge_nodes(
                 "TRANSFER EDGES FROM `{}` must be the non-surviving source `{expected_src}`",
                 t.src
             )));
+        }
+    }
+
+    // R172b safe-reject for temporal labels: MERGE NODES reads source
+    // nodes via 16-byte `encode_node_key`, mutates the target record, and
+    // deletes the non-survivor via `detach_delete_node` — none of these
+    // paths are temporal-aware. Merging two temporal nodes (whether the
+    // intent is "fold version histories" or "treat all versions as one
+    // logical node") is genuinely a per-version write-executor concern
+    // and lands in R172c.
+    for row in input_rows {
+        for var in [source_a, source_b] {
+            if !matches!(row.get(var), Some(Value::Int(_))) {
+                continue;
+            }
+            let Some(Value::String(primary)) = row.get(&format!("{var}.__label__")) else {
+                continue;
+            };
+            if let Ok(Some(s)) = ctx.load_current_label_schema(primary) {
+                if s.temporal {
+                    return Err(ExecutionError::Unsupported(format!(
+                        "MERGE NODES on temporal label '{primary}' is not yet supported \
+                         (lands in R172c — per-version write executor)."
+                    )));
+                }
+            }
         }
     }
 
@@ -9401,6 +9497,30 @@ fn execute_detach_document(
         None => None,
     };
 
+    // R172b safe-reject: DETACH DOCUMENT reads the source node via
+    // `encode_node_key` (16-byte form) and removes a property from it via
+    // merge-delta on the same key. Temporal source records live at the
+    // 25-byte per-version key and would return None → confusing
+    // "DETACH DOCUMENT: node not found" error. The newly created target
+    // node IS temporal-aware (delegates to `execute_create_node`); only
+    // the source-mutation side is blocked here. R172c lifts this guard.
+    for row in input_rows {
+        let Some(Value::String(primary)) = row.get(&format!("{source_variable}.__label__")) else {
+            continue;
+        };
+        if let Ok(Some(s)) = ctx.load_current_label_schema(primary) {
+            if s.temporal {
+                return Err(ExecutionError::Unsupported(format!(
+                    "DETACH DOCUMENT from temporal source label '{primary}' \
+                     (var `{source_variable}`) is not yet supported (lands in \
+                     R172c — per-version write executor). DETACH INTO a new \
+                     temporal target label still works (delegates to the \
+                     temporal-aware CREATE path)."
+                )));
+            }
+        }
+    }
+
     let mut results: Vec<Row> = Vec::new();
 
     for input_row in input_rows {
@@ -9900,6 +10020,30 @@ fn execute_attach_document(
         Some(t) => Some(extract_transfer_edge_types(&t.predicate)?),
         None => None,
     };
+
+    // R172b safe-reject: ATTACH DOCUMENT reads source via `encode_node_key`
+    // (16-byte form) and modifies target via merge-delta on the same key.
+    // Temporal source/target records live at the 25-byte per-version key
+    // and would return None → confusing "source/target not found" error
+    // when the real issue is the read path being non-temporal-aware. Bound
+    // `__label__` columns reveal the labels without an extra storage read.
+    for row in input_rows {
+        for var in [source_variable, target_variable] {
+            let Some(Value::String(primary)) = row.get(&format!("{var}.__label__")) else {
+                continue;
+            };
+            if let Ok(Some(s)) = ctx.load_current_label_schema(primary) {
+                if s.temporal {
+                    return Err(ExecutionError::Unsupported(format!(
+                        "ATTACH DOCUMENT on temporal label '{primary}' (var `{var}`) \
+                         is not yet supported (lands in R172c — per-version write \
+                         executor). The current R172b scope is CREATE + label-scoped \
+                         MATCH on temporal labels only."
+                    )));
+                }
+            }
+        }
+    }
 
     let mut results: Vec<Row> = Vec::new();
 
