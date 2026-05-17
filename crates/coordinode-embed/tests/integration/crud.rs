@@ -3040,3 +3040,195 @@ fn trigger_create_rejects_empty_body() {
         "empty body must fail at parser level: {result:?}"
     );
 }
+
+// ── BEFORE COMMIT trigger firing (R191) ────────────────────────────────
+
+/// Audit log via BEFORE COMMIT trigger: creating a `:User` fires the
+/// trigger, which writes an `:AuditEntry` referencing the new node. Both
+/// land in the same MVCC transaction.
+#[test]
+fn trigger_before_commit_audit_fires_on_create() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER audit_user ON :User CREATE BEFORE COMMIT \
+         EXECUTE CREATE (e:AuditEntry {action: $event, user_id: $node}) \
+         ON ERROR PROPAGATE",
+    )
+    .expect("install audit trigger");
+
+    db.execute_cypher("CREATE (u:User {name: 'Alice', id: 42})")
+        .expect("create user — trigger fires inline");
+
+    // After the CREATE: the User exists AND the AuditEntry exists.
+    let users = db
+        .execute_cypher("MATCH (u:User) RETURN u.name AS n")
+        .unwrap();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].get("n"), Some(&Value::String("Alice".into())));
+
+    let audit = db
+        .execute_cypher("MATCH (e:AuditEntry) RETURN e.action AS action, e.user_id AS uid")
+        .unwrap();
+    assert_eq!(
+        audit.len(),
+        1,
+        "audit trigger must have fired on User CREATE"
+    );
+    assert_eq!(
+        audit[0].get("action"),
+        Some(&Value::String("CREATE".into()))
+    );
+    // $node was passed as Int — the audit entry should reference the new User's id.
+    assert!(
+        matches!(audit[0].get("uid"), Some(Value::Int(_))),
+        "user_id must be set from $node parameter; got {:?}",
+        audit[0].get("uid")
+    );
+}
+
+/// BEFORE COMMIT trigger that fails with `ON ERROR PROPAGATE` aborts the
+/// originating transaction. No node persists after the abort.
+#[test]
+fn trigger_before_commit_propagate_aborts_caller() {
+    let (mut db, _dir) = open_db();
+
+    // The trigger body fails at fire time because the body references an
+    // unparseable Cypher snippet — installed via ALTER SET EXECUTE which
+    // re-validates and would reject syntactically broken bodies. So we
+    // need a body that PARSES at DDL time but fails during execution.
+    //
+    // A reliable runtime error: write a property whose name violates a
+    // STRICT label's schema. The trigger body creates an `:Audit` node
+    // with a property `audit_label` — `:Audit` is declared STRICT below
+    // with only `action` allowed.
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
+    let mut audit_schema = LabelSchema::new_node_id("Audit");
+    audit_schema.set_mode(SchemaMode::Strict);
+    audit_schema.add_property(PropertyDef::new("action", PropertyType::String).not_null());
+    db.create_label_schema(audit_schema)
+        .expect("strict Audit label");
+
+    db.execute_cypher(
+        "CREATE TRIGGER reject_user ON :User CREATE BEFORE COMMIT \
+         EXECUTE CREATE (e:Audit {forbidden_field: $event}) \
+         ON ERROR PROPAGATE",
+    )
+    .expect("install rejection trigger");
+
+    let result = db.execute_cypher("CREATE (u:User {name: 'Mallory'})");
+    assert!(
+        result.is_err(),
+        "PROPAGATE: trigger error must abort the CREATE: {result:?}"
+    );
+
+    let users = db
+        .execute_cypher("MATCH (u:User) RETURN u.name AS n")
+        .unwrap();
+    assert!(
+        users.is_empty(),
+        "originating CREATE must have rolled back: {users:?}"
+    );
+}
+
+/// L1 cascade-depth trip: two triggers ping-pong write into each other's
+/// labels, depth limit `CASCADE_LIMIT 2` ensures the chain dies fast and
+/// the CascadeOverflow chain is attached for diagnostics.
+#[test]
+fn trigger_before_commit_cascade_overflow() {
+    let (mut db, _dir) = open_db();
+
+    // A→B cycle: trigger on :A writes to :B, trigger on :B writes to :A.
+    db.execute_cypher(
+        "CREATE TRIGGER on_a ON :A CREATE BEFORE COMMIT \
+         EXECUTE CREATE (b:B) \
+         CASCADE_LIMIT 2",
+    )
+    .unwrap();
+    db.execute_cypher(
+        "CREATE TRIGGER on_b ON :B CREATE BEFORE COMMIT \
+         EXECUTE CREATE (a:A) \
+         CASCADE_LIMIT 2",
+    )
+    .unwrap();
+
+    // Originating CREATE (:A) fires on_a → CREATE (:B) fires on_b → CREATE
+    // (:A) fires on_a again → depth becomes 3 → exceeds CASCADE_LIMIT 2.
+    let result = db.execute_cypher("CREATE (a:A {seed: true})");
+    assert!(
+        result.is_err(),
+        "cascading triggers must trip CASCADE_LIMIT and abort: {result:?}"
+    );
+    let msg = format!("{}", result.err().unwrap());
+    assert!(
+        msg.contains("cascade depth exceeded") || msg.contains("CascadeOverflow"),
+        "error must indicate cascade overflow: {msg}"
+    );
+
+    // Nothing persisted — entire transaction rolled back.
+    let a_nodes = db.execute_cypher("MATCH (a:A) RETURN a").unwrap();
+    let b_nodes = db.execute_cypher("MATCH (b:B) RETURN b").unwrap();
+    assert!(
+        a_nodes.is_empty() && b_nodes.is_empty(),
+        "cascade trip must roll back the whole transaction; got a={} b={}",
+        a_nodes.len(),
+        b_nodes.len()
+    );
+}
+
+/// BEFORE COMMIT trigger declared on a label different from the one being
+/// created must NOT fire — index discrimination correctness regression
+/// guard.
+#[test]
+fn trigger_before_commit_only_fires_on_matching_label() {
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER only_user ON :User CREATE BEFORE COMMIT \
+         EXECUTE CREATE (e:WronglyFired)",
+    )
+    .unwrap();
+
+    // Create a different label — trigger must not fire.
+    db.execute_cypher("CREATE (n:Customer {id: 1})").unwrap();
+
+    let wrongly = db
+        .execute_cypher("MATCH (e:WronglyFired) RETURN e")
+        .unwrap();
+    assert!(
+        wrongly.is_empty(),
+        ":Customer creation must not fire :User trigger: {wrongly:?}"
+    );
+}
+
+/// Disabled BEFORE COMMIT trigger must NOT fire even on matching event.
+#[test]
+fn trigger_before_commit_disabled_does_not_fire() {
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER paused ON :User CREATE BEFORE COMMIT \
+         EXECUTE CREATE (e:WouldFireIfEnabled)",
+    )
+    .unwrap();
+    db.execute_cypher("ALTER TRIGGER paused DISABLE").unwrap();
+
+    db.execute_cypher("CREATE (u:User {id: 1})").unwrap();
+
+    let evidence = db
+        .execute_cypher("MATCH (e:WouldFireIfEnabled) RETURN e")
+        .unwrap();
+    assert!(
+        evidence.is_empty(),
+        "disabled trigger must not fire: {evidence:?}"
+    );
+
+    // Re-enable, create again, NOW it should fire.
+    db.execute_cypher("ALTER TRIGGER paused ENABLE").unwrap();
+    db.execute_cypher("CREATE (u:User {id: 2})").unwrap();
+    let evidence = db
+        .execute_cypher("MATCH (e:WouldFireIfEnabled) RETURN e")
+        .unwrap();
+    assert_eq!(evidence.len(), 1, "re-enabled trigger must fire");
+}
