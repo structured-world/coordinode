@@ -178,7 +178,8 @@ pub struct LogStore {
 
 impl LogStore {
     /// Open the LogStore, routing oplog segments to the oplog-eligible
-    /// endpoint chosen for shard 0 (R157, [arch/core/storage-stack.md](../../../arch/core/storage-stack.md)
+    /// endpoint chosen for shard 0
+    /// ([arch/core/storage-stack.md](../../../arch/core/storage-stack.md)
     /// Layer 1↔2, INV-D1). Path layout: `<endpoint.path>/oplog/<shard_id>/`.
     /// Recovery scans every oplog-eligible endpoint's directory for sealed
     /// segments left over from a previous config-driven routing.
@@ -186,9 +187,9 @@ impl LogStore {
     /// Loads `last_log_id` and `last_purged` from `Partition::Raft` so
     /// `get_log_state()` is O(1) even after a restart.
     pub fn open(engine: Arc<StorageEngine>) -> Result<Self, io::Error> {
-        // R157: shard 0 = single Raft log shard in CE. Multi-shard EE
-        // (Phase 3) will open one LogStore per shard, each routing to
-        // its own select_oplog_endpoint(shard_id).
+        // Shard 0 = single Raft log shard in CE. Multi-shard EE will
+        // open one LogStore per shard, each routing to its own
+        // select_oplog_endpoint(shard_id).
         let shard_id: u32 = 0;
         let oplog_endpoint = engine
             .select_oplog_endpoint(shard_id)

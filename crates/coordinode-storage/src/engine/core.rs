@@ -19,9 +19,11 @@ use crate::cache::access::AccessTracker;
 use crate::cache::tiered::TieredCache;
 use crate::engine::batch::WriteBatch;
 use crate::engine::compaction::CompactionScheduler;
+use crate::engine::config::EndpointConfig;
 use crate::engine::config::{FlushPolicy, StorageConfig};
 use crate::engine::flush::FlushManager;
 use crate::engine::partition::Partition;
+use crate::engine::routing::PartitionRouting;
 use crate::error::{StorageError, StorageResult};
 use crate::wal::{StandaloneWal, WalConfig};
 
@@ -95,9 +97,9 @@ pub struct StorageEngine {
     /// derive their own sub-directories without re-reading the config.
     data_dir: PathBuf,
     /// Configured endpoints — cloned from `StorageConfig.endpoints` at
-    /// open time so subsystems (R157 WAL/oplog placement, R158 tier
-    /// routing, R161 hard-limit enforcement) can resolve target
-    /// endpoints without retaining a reference to the original config.
+    /// open time so subsystems (WAL/oplog placement, tier routing,
+    /// hard-limit enforcement) can resolve target endpoints without
+    /// retaining a reference to the original config.
     endpoints: Vec<crate::engine::config::EndpointConfig>,
     /// Optional standalone WAL (embedded / no-Raft mode only).
     ///
@@ -170,10 +172,53 @@ impl StorageEngine {
             config.block_cache_bytes,
         ));
 
+        // Two-pass open (per-LSM-level endpoint routing):
+        //
+        // **Pass 1** — open the Schema partition with no per-level routing.
+        // Schema holds the routing metadata for every other partition, so
+        // it has to be reachable before we can decide where other partitions'
+        // SSTs should land. Schema itself stays single-tier on the primary
+        // endpoint by design; metadata is small and the bootstrap problem
+        // (routing-needed-to-open-the-routing-store) does not arise.
+        //
+        // **Pass 2** — for each non-Schema partition, load the persisted
+        // [`PartitionRouting`] from Schema or initialise (compute + persist)
+        // on first open against this endpoint set. Open the partition tree
+        // with `level_routes` derived from the routing.
         let mut trees = HashMap::with_capacity(Partition::all().len());
+
+        // Pass 1: Schema partition (single-tier, no routing).
+        let schema_config = config
+            .to_tree_config(Partition::Schema, Arc::clone(&seqno), &gc_watermark)
+            .use_cache(Arc::clone(&cache));
+        let schema_tree = schema_config.open()?;
+        trees.insert(Partition::Schema, schema_tree.clone());
+
+        // Restore seqno from Schema BEFORE reading routing — the routing
+        // get() needs a fresh seqno bound so it observes prior persisted
+        // writes.
+        {
+            use lsm_tree::AbstractTree;
+            if let Some(max) = schema_tree.get_highest_seqno() {
+                seqno.fetch_max(max + 1);
+            }
+        }
+
+        // Pass 2: load/initialise routing for each non-Schema partition,
+        // then open it with `level_routes` wired.
         for &part in Partition::all() {
+            if part == Partition::Schema {
+                continue;
+            }
+            let routing =
+                load_or_init_partition_routing(&schema_tree, &seqno, &config.endpoints, part)?;
             let tree_config = config
-                .to_tree_config(part, Arc::clone(&seqno), &gc_watermark)
+                .to_tree_config_with_routing(
+                    part,
+                    Arc::clone(&seqno),
+                    &gc_watermark,
+                    Some(&routing),
+                )
                 .use_cache(Arc::clone(&cache));
             let tree = tree_config.open()?;
             trees.insert(part, tree);
@@ -240,7 +285,7 @@ impl StorageEngine {
         // Open and replay WAL if requested.  Must happen AFTER the lsm-tree
         // partitions are open so we can apply replayed mutations directly.
         let wal = if let Some(wal_cfg) = wal_config {
-            // R157: standalone WAL lands at <wal_eligible_endpoint>/wal/standalone.wal
+            // Standalone WAL lands at <wal_eligible_endpoint>/wal/standalone.wal
             // by default. Caller can override with an explicit
             // `wal_cfg.path` for tests or unusual deployments. Recovery
             // additionally scans every WAL-eligible endpoint to discover
@@ -262,7 +307,7 @@ impl StorageEngine {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| StorageError::Io(format!("create wal dir {parent:?}: {e}")))?;
             }
-            // R157: scan other WAL-eligible endpoints for orphaned WAL
+            // Scan other WAL-eligible endpoints for orphaned WAL
             // files that a previous config might have left behind.
             // Surfacing them as a warning lets the operator clean up
             // manually; we do NOT auto-replay foreign WAL files because
@@ -378,14 +423,14 @@ impl StorageEngine {
     /// Root data directory for this engine.
     ///
     /// Subsystems that need their own on-disk sub-directories may derive
-    /// paths from this for the **single-endpoint** baseline; with R157
+    /// paths from this for the **single-endpoint** baseline; with
     /// multi-endpoint placement they instead consult [`Self::endpoints`] /
     /// [`Self::select_oplog_endpoint`].
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 
-    /// Configured endpoints (R157, [storage-stack.md](../../arch/core/storage-stack.md)
+    /// Configured endpoints ([storage-stack.md](../../arch/core/storage-stack.md)
     /// Layer 1). Subsystems consult this to resolve WAL/oplog/SST placement
     /// targets. Returned by reference — endpoints are config-time immutable
     /// after engine open.
@@ -393,8 +438,8 @@ impl StorageEngine {
         &self.endpoints
     }
 
-    /// Resolve the oplog target endpoint for a given shard (R157,
-    /// [storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2,
+    /// Resolve the oplog target endpoint for a given shard
+    /// ([storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2,
     /// INV-D1). Convenience accessor that re-runs the per-shard
     /// round-robin selection logic from [`crate::engine::config::StorageConfig::select_oplog_endpoint`]
     /// against the stored endpoint list. Returns an `Io` error if no
@@ -420,7 +465,7 @@ impl StorageEngine {
         Ok(eligible[(shard_id as usize) % eligible.len()])
     }
 
-    /// All oplog-eligible endpoints — used for recovery scan (R157).
+    /// All oplog-eligible endpoints — used for cross-endpoint recovery scan.
     /// On engine open, callers (`LogStore::open` for Raft) inspect every
     /// oplog-eligible endpoint's `oplog/<shard_id>/` directory to
     /// discover sealed segments that may have been written under a
@@ -552,6 +597,104 @@ impl StorageEngine {
 
     /// Flush all pending writes to durable storage.
     ///
+    /// Force a major compaction on the named partition tree.
+    ///
+    /// Drives the lsm-tree compactor to push all SSTs down to the
+    /// bottom level. Under multi-endpoint per-LSM-level routing this
+    /// physically moves data from the upper-level (hot-tier) endpoints
+    /// to the bottom-level (cold-tier) endpoint — the underlying
+    /// mechanism behind cascade eviction.
+    ///
+    /// Blocks the caller until compaction finishes. Intended for
+    /// operator-driven maintenance, capacity-pressure cascade eviction,
+    /// and end-to-end tests; not used on the steady-state write path.
+    pub fn major_compact(&self, part: Partition) -> StorageResult<()> {
+        let tree = self.tree(part)?;
+        // Target table size of 64 MiB is the lsm-tree default — picked
+        // here explicitly so the major compaction's output SST size is
+        // independent of any per-partition tuning we may layer on later.
+        // `seqno_threshold = SeqNo::MAX` means "drop nothing for
+        // retention" — major compaction here is for placement, not GC.
+        tree.major_compact(64 * 1024 * 1024, lsm_tree::SeqNo::MAX)
+            .map_err(|e| StorageError::Io(format!("major compact {}: {e}", part.name())))?;
+        Ok(())
+    }
+
+    /// Report from a single cascade-eviction invocation.
+    ///
+    /// `compacted_partitions` counts the partition trees whose routing
+    /// referenced the saturated endpoint and for which a major
+    /// compaction was therefore triggered.
+    ///
+    /// Trigger a cascade eviction for the named endpoint.
+    ///
+    /// For each non-Schema partition whose persisted routing references
+    /// `endpoint_id`, fire a major compaction on its tree. Major
+    /// compaction pushes SSTs down through the LSM level hierarchy,
+    /// and because per-LSM-level routing places the bottom levels on
+    /// cooler endpoints, the net effect is to move data off the
+    /// saturated endpoint and onto its next-cooler neighbour.
+    ///
+    /// This is the **mechanism** consumed by the capacity-tracking
+    /// layer (the auto-trigger at 95% of `hard_limit_bytes`); the
+    /// caller wires the detection loop.
+    ///
+    /// Returns `Ok(report)` with the number of partitions touched,
+    /// even when zero (the named endpoint may not host any partition's
+    /// data).
+    pub fn cascade_evict_endpoint(&self, endpoint_id: &str) -> StorageResult<CascadeReport> {
+        // Verify the endpoint is configured. An unknown id is operator
+        // error and we surface it directly rather than silently doing
+        // nothing.
+        if !self.endpoints.iter().any(|e| e.id == endpoint_id) {
+            return Err(StorageError::Io(format!(
+                "cascade_evict_endpoint: unknown endpoint id {endpoint_id:?}"
+            )));
+        }
+
+        let schema_tree = self.tree(Partition::Schema)?;
+        let read_seqno = self.seqno.get();
+
+        let mut compacted_partitions = 0u32;
+        for &part in Partition::all() {
+            if part == Partition::Schema || part == Partition::Raft {
+                continue;
+            }
+            // Load the persisted routing for this partition. If it does
+            // not reference the saturated endpoint, nothing to do.
+            let key = routing_key_for(part);
+            let bytes = match schema_tree
+                .get(&key, read_seqno)
+                .map_err(|e| StorageError::Io(format!("schema get routing {}: {e}", part.name())))?
+            {
+                Some(b) => b,
+                None => continue,
+            };
+            let routing: crate::engine::routing::PartitionRouting = rmp_serde::from_slice(&bytes)
+                .map_err(|e| {
+                StorageError::Io(format!("decode routing for {}: {e}", part.name()))
+            })?;
+            if !routing.endpoints_used().iter().any(|id| *id == endpoint_id) {
+                continue;
+            }
+            // Fire major compaction synchronously. This blocks until
+            // the tree finishes — at scale the caller is expected to
+            // gate this on the capacity-tracking loop so it only fires
+            // for genuinely saturated endpoints.
+            tracing::info!(
+                endpoint = endpoint_id,
+                partition = part.name(),
+                "cascade eviction: triggering major compaction"
+            );
+            self.major_compact(part)?;
+            compacted_partitions += 1;
+        }
+
+        Ok(CascadeReport {
+            compacted_partitions,
+        })
+    }
+
     /// Flushes the active memtable of every partition tree to an SST file.
     /// SST files are written atomically (atomic rename), so this provides
     /// crash safety without requiring a separate WAL fsync.
@@ -805,6 +948,91 @@ impl StorageEngine {
             }
         }
         1.0
+    }
+}
+
+/// Outcome of one cascade-eviction invocation.
+///
+/// `compacted_partitions` is the number of partition trees on which
+/// a major compaction was fired in response to the eviction request.
+/// A value of zero means the named endpoint did not host any
+/// partition's data, which is a valid no-op (e.g. the operator named
+/// a hot-only endpoint but no partition had data flushed to it yet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CascadeReport {
+    /// Count of partition trees whose major compaction was triggered.
+    pub compacted_partitions: u32,
+}
+
+/// Encode a routing-metadata key for the Schema partition.
+///
+/// Key format: `meta:routing:<partition_name>` — colon-prefixed so the
+/// existing `schema:`-prefixed keys do not collide with routing
+/// metadata. Schema partition's docstring reserves the `schema:`
+/// namespace; `meta:` is the canonical namespace for engine-level
+/// configuration metadata.
+fn routing_key_for(partition: Partition) -> Vec<u8> {
+    format!("meta:routing:{}", partition.name()).into_bytes()
+}
+
+/// Load the persisted [`PartitionRouting`] for a partition from
+/// the Schema tree, or initialise (compute default + persist) on first
+/// open against this endpoint set.
+///
+/// **Validation:** persisted routings are validated against the current
+/// `endpoints` list. If a previously-referenced endpoint id is missing,
+/// returns [`StorageError::Io`] wrapping a [`RoutingError::UnknownEndpoint`] —
+/// the operator removed an endpoint that still hosts SSTs, and continuing
+/// would orphan that data when lsm-tree's recovery scan misses it.
+///
+/// **Persistence format:** MessagePack via `rmp_serde::to_vec` /
+/// `from_slice`, matching the rest of the storage layer's serialisation
+/// conventions (oplog, WAL records, document snapshots).
+fn load_or_init_partition_routing(
+    schema_tree: &lsm_tree::AnyTree,
+    seqno: &lsm_tree::SharedSequenceNumberGenerator,
+    endpoints: &[EndpointConfig],
+    partition: Partition,
+) -> StorageResult<PartitionRouting> {
+    use lsm_tree::AbstractTree;
+    let key = routing_key_for(partition);
+    let read_seqno = seqno.get();
+    match schema_tree.get(&key, read_seqno).map_err(|e| {
+        StorageError::Io(format!("schema get routing for {}: {e}", partition.name()))
+    })? {
+        Some(bytes) => {
+            // Existing routing — decode and validate against current
+            // endpoint set.
+            let routing: PartitionRouting = rmp_serde::from_slice(&bytes).map_err(|e| {
+                StorageError::Io(format!(
+                    "decode persisted routing for {}: {e}",
+                    partition.name()
+                ))
+            })?;
+            routing
+                .validate(endpoints)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            Ok(routing)
+        }
+        None => {
+            // First open against this endpoint set — compute default,
+            // persist, return.
+            let routing = PartitionRouting::default_for_endpoints(endpoints);
+            let encoded = rmp_serde::to_vec(&routing).map_err(|e| {
+                StorageError::Io(format!(
+                    "encode default routing for {}: {e}",
+                    partition.name()
+                ))
+            })?;
+            let write_seqno = seqno.next();
+            schema_tree.insert(&key, &encoded, write_seqno);
+            tracing::info!(
+                partition = partition.name(),
+                endpoints = ?routing.endpoints_used(),
+                "initialised default per-LSM-level routing"
+            );
+            Ok(routing)
+        }
     }
 }
 

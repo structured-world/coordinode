@@ -69,8 +69,8 @@ impl OplogManager {
     }
 
     /// Open the oplog manager with an active write directory plus extra
-    /// directories scanned for sealed segments at startup (R157,
-    /// [storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2).
+    /// directories scanned for sealed segments at startup
+    /// ([storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2).
     ///
     /// `active_dir` receives all new segments. `recovery_dirs` are
     /// scanned at startup for `oplog-*.bin` files and merged into the
@@ -782,7 +782,7 @@ mod tests {
         assert_eq!(entries[8].index, 11);
     }
 
-    // ── R157: multi-endpoint open ───────────────────────────────────
+    // ── Multi-endpoint open ─────────────────────────────────────────
 
     /// `open_multi` discovers sealed segments living in a different
     /// directory than the active one and merges them into the sealed

@@ -1,4 +1,4 @@
-//! R157 integration tests — WAL + oplog segment placement across
+//! Integration tests — WAL + oplog segment placement across
 //! multi-endpoint storage configs.
 //!
 //! Pins the placement contract end-to-end:
@@ -390,7 +390,7 @@ fn logstore_open_errors_on_no_persistence_config() {
     );
 }
 
-/// **R157 INV-D1 (config-time):** `with_endpoints` MUST panic when given
+/// **INV-D1 (config-time):** `with_endpoints` MUST panic when given
 /// only Volatile endpoints — oplog/Raft cannot survive on cache media.
 /// Tests that genuinely want an all-Volatile config use the explicit
 /// `with_endpoints_no_persistence` escape hatch (covered by the previous
