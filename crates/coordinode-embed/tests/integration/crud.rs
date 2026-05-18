@@ -5109,6 +5109,98 @@ fn delete_on_already_closed_temporal_node_is_safe() {
     );
 }
 
+/// R172c Phase 3: REMOVE n.<prop> on a temporal node writes a NEW version
+/// with the property absent, while preserving the historical (closed)
+/// version intact.
+#[test]
+fn remove_property_on_temporal_node_writes_new_version_without_prop() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, nickname: STRING, valid_from: INT)",
+    )
+    .expect("CREATE NODE TYPE");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', nickname: 'Ali', valid_from: 100})")
+        .expect("CREATE temporal");
+
+    db.execute_cypher("MATCH (p:Person) REMOVE p.nickname")
+        .expect("REMOVE on temporal must succeed (Phase 3 close+open)");
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (p:Person) RETURN p.name AS name, p.valid_from AS vf, \
+             p.valid_to AS vt, p.nickname AS nick",
+        )
+        .expect("MATCH after REMOVE");
+    assert!(rows.len() >= 2, "must have old + new version: {rows:?}");
+
+    // Original (vf=100) closed, still has nickname.
+    let original = rows
+        .iter()
+        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
+        .expect("original vf=100 row");
+    assert_eq!(
+        original.get("nick"),
+        Some(&Value::String("Ali".into())),
+        "original version preserved nickname: {original:?}"
+    );
+    assert!(
+        matches!(original.get("vt"), Some(Value::Int(_))),
+        "original closed with valid_to: {original:?}"
+    );
+
+    // New version (vf != 100) has no nickname.
+    let new_version = rows
+        .iter()
+        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
+        .expect("new version row");
+    assert!(
+        matches!(new_version.get("nick"), None | Some(Value::Null)),
+        "new version must not have nickname: {new_version:?}"
+    );
+}
+
+/// REMOVE valid_from / valid_to on a temporal node is rejected — these
+/// are engine-managed bitemporal axis fields, not user properties.
+#[test]
+fn remove_bitemporal_axis_on_temporal_node_is_rejected() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("CREATE NODE TYPE");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100, valid_to: 200})")
+        .expect("CREATE temporal");
+
+    for axis in ["valid_from", "valid_to"] {
+        let err = db
+            .execute_cypher(&format!("MATCH (p:Person) REMOVE p.{axis}"))
+            .expect_err(&format!("REMOVE p.{axis} must reject"));
+        let msg = format!("{err}");
+        assert!(msg.contains(axis), "error must mention {axis}: {msg}");
+    }
+}
+
+/// REMOVE on a non-temporal node is unaffected by the new-version
+/// machinery — it remains the in-place mutation it always was.
+#[test]
+fn remove_property_on_non_temporal_node_remains_in_place() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Plain WITH (name: STRING, nickname: STRING)")
+        .expect("CREATE NODE TYPE Plain");
+    db.execute_cypher("CREATE (n:Plain {name: 'X', nickname: 'Y'})")
+        .expect("CREATE plain");
+    db.execute_cypher("MATCH (n:Plain) REMOVE n.nickname")
+        .expect("REMOVE on non-temporal");
+    let rows = db
+        .execute_cypher("MATCH (n:Plain) RETURN n.name AS name, n.nickname AS nick")
+        .expect("MATCH after");
+    assert_eq!(rows.len(), 1, "non-temporal stays single row");
+    assert_eq!(rows[0].get("name"), Some(&Value::String("X".into())),);
+    assert!(matches!(rows[0].get("nick"), None | Some(Value::Null)));
+}
+
 /// `valid_to` on a temporal CREATE with a non-numeric type is rejected at
 /// write time — symmetric with the `valid_from` type guard. The Null
 /// variant on `valid_to` is special-cased as "no end" (open interval).
