@@ -8601,13 +8601,27 @@ fn execute_delete(
     let mut deleted_edges: std::collections::HashSet<(String, u64, u64)> =
         std::collections::HashSet::new();
 
-    // R172b safe-reject for temporal nodes: DELETE on a temporal node
-    // would call `mvcc_delete` on the 16-byte non-temporal key, silently
-    // missing the per-version 25-byte storage entry. Mirror of the SET
-    // guard in `execute_update`. Full per-version DELETE semantics
-    // (positive bitemporal fact tombstone per ADR-027, `WITH GDPR_ERASURE`
-    // hard-delete escape hatch) lands in R172c.
-    for row in input_rows {
+    // R172c Phase 3: DELETE on temporal nodes is a *positive bitemporal
+    // fact* (XTDB-donor pattern, ADR-027). Instead of hard-deleting the
+    // stored per-version records, we append a tombstone row at
+    // `valid_from = NOW, valid_to = NULL` carrying `__deleted__: true`
+    // — an explicit assertion that the node ceased to exist at NOW.
+    // History before NOW is preserved and remains queryable. The
+    // current open version (if any — matched row with valid_to IS NULL)
+    // also has its valid_to closed at NOW so a bitemporal scan sees:
+    //
+    //     ─── valid_from = 100, valid_to = NOW ──── (was alive)
+    //     ─── valid_from = NOW, __deleted__ = true ── (tombstone)
+    //
+    // Hard erasure across ALL versions (GDPR right-to-erase) requires
+    // an explicit `WITH GDPR_ERASURE` modifier on DELETE — parser
+    // support lands in R172c Phase 3b. Until then a tombstone is the
+    // only DELETE mode on temporal labels.
+    //
+    // Pre-scan: collect temporal-label node deletions for this DELETE
+    // clause; edge variables (Value::String) take the normal path.
+    let mut temporal_node_deletes: Vec<(usize, String, NodeId, i64, String)> = Vec::new();
+    for (row_idx, row) in input_rows.iter().enumerate() {
         for var in variables {
             if !matches!(row.get(var), Some(Value::Int(_))) {
                 continue;
@@ -8615,22 +8629,115 @@ fn execute_delete(
             let Some(Value::String(primary)) = row.get(&format!("{var}.__label__")) else {
                 continue;
             };
-            if let Ok(Some(s)) = ctx.load_current_label_schema(primary) {
-                if s.temporal {
+            let is_temporal = ctx
+                .load_current_label_schema(primary)
+                .ok()
+                .flatten()
+                .is_some_and(|s| s.temporal);
+            if !is_temporal {
+                continue;
+            }
+            let node_id = match row.get(var) {
+                Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+                _ => continue,
+            };
+            let current_valid_from = match row.get(&format!("{var}.valid_from")) {
+                Some(Value::Int(ms)) => *ms,
+                Some(Value::Timestamp(ms)) => *ms,
+                _ => {
                     return Err(ExecutionError::Unsupported(format!(
-                        "DELETE on temporal label '{primary}' is not yet supported \
-                         (lands in R172c — per-version write executor with the \
-                         positive-bitemporal-fact tombstone model per ADR-027). \
-                         The current R172b scope is CREATE + read on temporal \
-                         labels only."
+                        "DELETE {var} on temporal label '{primary}': matched row is \
+                         missing `{var}.valid_from` (planner must surface valid_from)"
                     )));
                 }
-            }
+            };
+            temporal_node_deletes.push((
+                row_idx,
+                var.clone(),
+                node_id,
+                current_valid_from,
+                primary.clone(),
+            ));
         }
     }
 
-    for row in input_rows {
+    let mut tombstoned_temporal_rows: std::collections::HashSet<(usize, String)> =
+        std::collections::HashSet::new();
+    if !temporal_node_deletes.is_empty() {
+        let now_us = current_hlc_us() as i64;
+        for (row_idx, var, node_id, current_valid_from, _primary) in &temporal_node_deletes {
+            let new_valid_from = if now_us > *current_valid_from {
+                now_us
+            } else {
+                current_valid_from + 1
+            };
+
+            // Step 1: close the matched open version (if it WAS open —
+            // valid_to absent or NULL). If the matched version was
+            // already closed (a historical version), skip closing — the
+            // tombstone alone marks the deletion event.
+            let current_key = coordinode_core::graph::node::encode_temporal_node_key(
+                ctx.shard_id,
+                *node_id,
+                *current_valid_from,
+            );
+            let Some(current_bytes) = ctx.mvcc_get(Partition::Node, &current_key)? else {
+                // Already gone — skip (idempotent).
+                continue;
+            };
+            let mut closing_record = NodeRecord::from_msgpack(&current_bytes).map_err(|e| {
+                ExecutionError::Serialization(format!("temporal close decode: {e}"))
+            })?;
+            let vt_fid = ctx.interner.intern("valid_to");
+            let was_open = !closing_record.props.contains_key(&vt_fid);
+            if was_open {
+                closing_record.set(vt_fid, Value::Int(new_valid_from));
+                let closing_bytes = closing_record.to_msgpack().map_err(|e| {
+                    ExecutionError::Serialization(format!("temporal close encode: {e}"))
+                })?;
+                ctx.mvcc_put(Partition::Node, &current_key, &closing_bytes)?;
+            }
+
+            // Step 2: write the tombstone row at NOW. Carries the same
+            // labels as the closing record (so downstream MATCH still
+            // sees the row under the right label), no user properties,
+            // `__deleted__: true`, refreshed `__ingestion_ts__`. The
+            // tombstone has `valid_from = NOW`, `valid_to = NULL` —
+            // the deletion is "current" from NOW onward.
+            let mut tombstone = NodeRecord::with_labels(closing_record.labels.clone());
+            let deleted_fid = ctx.interner.intern("__deleted__");
+            tombstone.set(deleted_fid, Value::Bool(true));
+            let vf_fid = ctx.interner.intern("valid_from");
+            tombstone.set(vf_fid, Value::Int(new_valid_from));
+            let its_fid = ctx.interner.intern("__ingestion_ts__");
+            tombstone.set(its_fid, Value::Int(now_us));
+            let tombstone_key = coordinode_core::graph::node::encode_temporal_node_key(
+                ctx.shard_id,
+                *node_id,
+                new_valid_from,
+            );
+            let tombstone_bytes = tombstone
+                .to_msgpack()
+                .map_err(|e| ExecutionError::Serialization(format!("tombstone encode: {e}")))?;
+            ctx.mvcc_put(Partition::Node, &tombstone_key, &tombstone_bytes)?;
+            ctx.write_stats.nodes_deleted += 1;
+
+            tombstoned_temporal_rows.insert((*row_idx, var.clone()));
+        }
+    }
+
+    for (row_idx, row) in input_rows.iter().enumerate() {
         for var in variables {
+            // R172c Phase 3: if this (row, var) was tombstoned above as a
+            // temporal-node positive bitemporal fact, skip the legacy
+            // hard-delete path entirely — the tombstone IS the delete.
+            // Edges connected to a temporal node are intentionally left
+            // intact: at past valid times the node still existed, so its
+            // edges are still part of history. Edge cascade for temporal
+            // nodes is a separate concern tracked under R172c Phase 4.
+            if tombstoned_temporal_rows.contains(&(row_idx, var.clone())) {
+                continue;
+            }
             // Edge variable bindings carry the edge type as a String value,
             // not a node id. DELETE on an edge variable hard-deletes that
             // logical edge: non-temporal types remove the one edgeprop entry
