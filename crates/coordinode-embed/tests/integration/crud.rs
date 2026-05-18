@@ -5008,32 +5008,105 @@ fn temporal_and_non_temporal_coexist_in_same_db() {
     );
 }
 
-/// DELETE on a temporal node is rejected for the same reason — R172c is
-/// where the positive-bitemporal-fact tombstone model lands.
+/// R172c Phase 3: DELETE on a temporal node is a *positive bitemporal
+/// fact* — the original version is closed at `valid_to = NOW` and a new
+/// tombstone version is appended at `valid_from = NOW` carrying
+/// `__deleted__: true`. History before NOW remains queryable; the node
+/// no longer "exists" from NOW onward.
 #[test]
-fn delete_on_temporal_node_rejected_until_r172c() {
+fn delete_on_temporal_node_writes_tombstone_and_closes_open_version() {
+    use coordinode_core::graph::types::Value;
     let (mut db, _dir) = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
         .expect("CREATE NODE TYPE");
     db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
         .expect("CREATE temporal");
 
-    let err = db
-        .execute_cypher("MATCH (p:Person) DELETE p")
-        .expect_err("DELETE on temporal node must reject in R172b scope");
-    let msg = format!("{err}");
+    db.execute_cypher("MATCH (p:Person) DELETE p")
+        .expect("R172c Phase 3: DELETE on temporal must succeed");
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (p:Person) RETURN p.name AS name, p.valid_from AS vf, \
+             p.valid_to AS vt, p.__deleted__ AS deleted",
+        )
+        .expect("MATCH after delete");
+
     assert!(
-        msg.contains("temporal") && msg.contains("R172c"),
-        "error must mention temporal + R172c: {msg}"
+        rows.len() >= 2,
+        "after tombstone there must be at least the original closed version and the tombstone: {rows:?}"
     );
 
-    // DELETE on non-temporal node is unaffected.
+    // Find the tombstone row (deleted = true).
+    let tombstone = rows
+        .iter()
+        .find(|r| matches!(r.get("deleted"), Some(Value::Bool(true))))
+        .expect("tombstone row with __deleted__=true must exist");
+    assert!(
+        matches!(tombstone.get("vf"), Some(Value::Int(_))),
+        "tombstone must have a valid_from"
+    );
+
+    // The original version (vf=100) must have valid_to set (was closed).
+    let original = rows
+        .iter()
+        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
+        .expect("original valid_from=100 row must still exist");
+    assert!(
+        matches!(original.get("vt"), Some(Value::Int(_))),
+        "original open version must have valid_to set after delete: {original:?}"
+    );
+}
+
+/// DELETE on a non-temporal node is unaffected by the temporal tombstone
+/// machinery — hard-delete remains the semantics for non-temporal labels.
+#[test]
+fn delete_on_non_temporal_node_remains_hard_delete() {
+    let (mut db, _dir) = open_db();
     db.execute_cypher("CREATE NODE TYPE Plain WITH (name: STRING)")
         .expect("CREATE NODE TYPE Plain");
     db.execute_cypher("CREATE (n:Plain {name: 'X'})")
         .expect("create plain");
     db.execute_cypher("MATCH (n:Plain) DELETE n")
         .expect("DELETE on non-temporal unaffected");
+
+    let rows = db
+        .execute_cypher("MATCH (n:Plain) RETURN n.name AS name")
+        .expect("MATCH after delete");
+    assert!(
+        rows.is_empty(),
+        "non-temporal DELETE is hard-delete: {rows:?}"
+    );
+}
+
+/// DELETE on a temporal node that was already closed (no open version)
+/// is a no-op tombstone — we still record the deletion event but don't
+/// touch any open version (there isn't one). This is idempotent: a
+/// second DELETE on a tombstoned node still writes a fresh tombstone
+/// row (each is a separate fact) but does not corrupt state.
+#[test]
+fn delete_on_already_closed_temporal_node_is_safe() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("CREATE NODE TYPE");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100, valid_to: 200})")
+        .expect("CREATE closed temporal");
+    // Delete the closed version.
+    db.execute_cypher("MATCH (p:Person) DELETE p")
+        .expect("DELETE on closed temporal must not error");
+    let rows = db
+        .execute_cypher("MATCH (p:Person) RETURN p.valid_from AS vf, p.__deleted__ AS deleted")
+        .expect("MATCH after delete");
+    // Original (closed) + tombstone.
+    assert!(rows.len() >= 2, "rows after delete: {rows:?}");
+    assert!(
+        rows.iter()
+            .any(|r| matches!(r.get("deleted"), Some(Value::Bool(true)))),
+        "tombstone row must exist: {rows:?}"
+    );
 }
 
 /// `valid_to` on a temporal CREATE with a non-numeric type is rejected at
