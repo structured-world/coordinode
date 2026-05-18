@@ -8364,13 +8364,28 @@ fn execute_remove(
     items: &[crate::cypher::ast::RemoveItem],
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    // R172b safe-reject for temporal nodes: REMOVE mutates record props
-    // and writes via the 16-byte non-temporal key, silently bypassing the
-    // per-version record. Mirror of the SET / DELETE guards. Full
-    // REMOVE-on-temporal semantics (close-version via SET valid_to is the
-    // intended idiom; REMOVE valid_from is rejected as immutable; REMOVE
-    // of other props writes a new version) land in R172c.
-    for row in input_rows {
+    // R172c Phase 3: REMOVE on a temporal node is a *new version* — same
+    // close-current + open-new dance as Phase 2 SET. Removing a property
+    // / label is a state change that must be visible as a new version in
+    // the bitemporal record, not a silent in-place mutation of the
+    // matched historical row.
+    //
+    // Rules:
+    //   * REMOVE `n.valid_from` / `n.valid_to` → REJECT. These are the
+    //     bitemporal axis fields; close-current is done via
+    //     `SET n.valid_to = …`, not REMOVE.
+    //   * REMOVE `n.__ingestion_ts__` / `n.__deleted__` → REJECT.
+    //     Engine-managed system fields.
+    //   * REMOVE `n.<other_prop>` → close current + open new with the
+    //     property absent in the new record.
+    //   * REMOVE `n:Label` → close current + open new with the label
+    //     dropped.
+    //   * REMOVE `n.<path.to.nested>` (PropertyPath) → REJECT (Phase 3b,
+    //     same reason as SET nested path — merge_node_deltas is keyed on
+    //     the non-temporal key and needs a temporal-aware rewrite).
+    let mut temporal_remove_vars: std::collections::HashSet<(usize, String)> =
+        std::collections::HashSet::new();
+    for (row_idx, row) in input_rows.iter().enumerate() {
         for item in items {
             let var = match item {
                 crate::cypher::ast::RemoveItem::Property { variable, .. }
@@ -8383,13 +8398,42 @@ fn execute_remove(
             let Some(Value::String(primary)) = row.get(&format!("{var}.__label__")) else {
                 continue;
             };
-            if let Ok(Some(s)) = ctx.load_current_label_schema(primary) {
-                if s.temporal {
+            let is_temporal = ctx
+                .load_current_label_schema(primary)
+                .ok()
+                .flatten()
+                .is_some_and(|s| s.temporal);
+            if !is_temporal {
+                continue;
+            }
+            match item {
+                crate::cypher::ast::RemoveItem::Property { property, .. } => {
+                    if property == "valid_from" || property == "valid_to" {
+                        return Err(ExecutionError::Unsupported(format!(
+                            "REMOVE {var}.{property} is rejected on temporal label \
+                             '{primary}': bitemporal axis fields are engine-managed. \
+                             Use `SET {var}.valid_to = …` to close the current version."
+                        )));
+                    }
+                    if property == "__ingestion_ts__" || property == "__deleted__" {
+                        return Err(ExecutionError::Unsupported(format!(
+                            "REMOVE {var}.{property} is rejected on temporal label \
+                             '{primary}': '{property}' is an engine-managed system field."
+                        )));
+                    }
+                    temporal_remove_vars.insert((row_idx, var.clone()));
+                }
+                crate::cypher::ast::RemoveItem::PropertyPath { path, .. } => {
                     return Err(ExecutionError::Unsupported(format!(
-                        "REMOVE on temporal label '{primary}' is not yet supported \
-                         (lands in R172c — per-version write executor). The current \
-                         R172b scope is CREATE + read on temporal labels only."
+                        "REMOVE on a nested property path (`{var}.{}`) on temporal \
+                         label '{primary}' is not yet supported (R172c Phase 3b). \
+                         The doc-delta merge operand layer is currently keyed on \
+                         the non-temporal node key.",
+                        path.join(".")
                     )));
+                }
+                crate::cypher::ast::RemoveItem::Label { .. } => {
+                    temporal_remove_vars.insert((row_idx, var.clone()));
                 }
             }
         }
@@ -8397,8 +8441,127 @@ fn execute_remove(
 
     let mut results = Vec::new();
 
-    for row in input_rows {
+    for (row_idx, row) in input_rows.iter().enumerate() {
         let mut out_row = row.clone();
+
+        // R172c Phase 3: close-current + open-new processing for temporal
+        // nodes whose REMOVE pre-scan classified as new-version. Mirrors
+        // the SET Phase 2 block — same shape, same invariants. Items
+        // applied here are recorded in `processed_temporal_items` so the
+        // standard REMOVE loop below skips them on this row.
+        let mut processed_temporal_items: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        let temporal_remove_vars_for_row: Vec<String> = temporal_remove_vars
+            .iter()
+            .filter(|(idx, _)| *idx == row_idx)
+            .map(|(_, v)| v.clone())
+            .collect();
+        if !temporal_remove_vars_for_row.is_empty() {
+            let now_us = current_hlc_us() as i64;
+            for var in &temporal_remove_vars_for_row {
+                let node_id = match out_row.get(var) {
+                    Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+                    _ => continue,
+                };
+                let current_valid_from = match out_row.get(&format!("{var}.valid_from")) {
+                    Some(Value::Int(ms)) => *ms,
+                    Some(Value::Timestamp(ms)) => *ms,
+                    _ => {
+                        return Err(ExecutionError::Unsupported(format!(
+                            "temporal REMOVE on `{var}`: matched row is missing \
+                             `{var}.valid_from` (planner must surface valid_from on \
+                             every temporal node materialised for mutation)"
+                        )));
+                    }
+                };
+                let new_valid_from = if now_us > current_valid_from {
+                    now_us
+                } else {
+                    current_valid_from + 1
+                };
+                let current_key = coordinode_core::graph::node::encode_temporal_node_key(
+                    ctx.shard_id,
+                    node_id,
+                    current_valid_from,
+                );
+                let current_bytes =
+                    ctx.mvcc_get(Partition::Node, &current_key)?
+                        .ok_or_else(|| {
+                            ExecutionError::Unsupported(format!(
+                                "temporal REMOVE on `{var}`: matched version record not \
+                                 found at (node_id={node_id}, valid_from={current_valid_from})"
+                            ))
+                        })?;
+                let mut closing_record = NodeRecord::from_msgpack(&current_bytes).map_err(|e| {
+                    ExecutionError::Serialization(format!("temporal REMOVE decode: {e}"))
+                })?;
+                let mut new_record = closing_record.clone();
+
+                for (item_idx, item) in items.iter().enumerate() {
+                    let item_var = match item {
+                        crate::cypher::ast::RemoveItem::Property { variable, .. }
+                        | crate::cypher::ast::RemoveItem::PropertyPath { variable, .. }
+                        | crate::cypher::ast::RemoveItem::Label { variable, .. } => {
+                            variable.as_str()
+                        }
+                    };
+                    if item_var != var.as_str() {
+                        continue;
+                    }
+                    match item {
+                        crate::cypher::ast::RemoveItem::Property { property, .. } => {
+                            if let Some(field_id) = ctx.interner.lookup(property) {
+                                new_record.remove(field_id);
+                            }
+                            ctx.write_stats.properties_removed += 1;
+                        }
+                        crate::cypher::ast::RemoveItem::Label { label, .. } => {
+                            new_record.remove_label(label);
+                            ctx.write_stats.labels_removed += 1;
+                        }
+                        crate::cypher::ast::RemoveItem::PropertyPath { .. } => {
+                            // Already rejected at pre-scan — unreachable here.
+                            unreachable!("temporal PropertyPath REMOVE rejected in pre-scan");
+                        }
+                    }
+                    processed_temporal_items.insert(item_idx);
+                }
+
+                let vf_fid = ctx.interner.intern("valid_from");
+                let vt_fid = ctx.interner.intern("valid_to");
+                let its_fid = ctx.interner.intern("__ingestion_ts__");
+                new_record.set(vf_fid, Value::Int(new_valid_from));
+                new_record.props.remove(&vt_fid);
+                new_record.set(its_fid, Value::Int(now_us));
+                closing_record.set(vt_fid, Value::Int(new_valid_from));
+
+                let closing_bytes = closing_record.to_msgpack().map_err(|e| {
+                    ExecutionError::Serialization(format!("temporal REMOVE close encode: {e}"))
+                })?;
+                ctx.mvcc_put(Partition::Node, &current_key, &closing_bytes)?;
+
+                let new_key = coordinode_core::graph::node::encode_temporal_node_key(
+                    ctx.shard_id,
+                    node_id,
+                    new_valid_from,
+                );
+                let new_bytes = new_record.to_msgpack().map_err(|e| {
+                    ExecutionError::Serialization(format!("temporal REMOVE new encode: {e}"))
+                })?;
+                ctx.mvcc_put(Partition::Node, &new_key, &new_bytes)?;
+
+                // Surface the new version's valid_from on out_row so any
+                // downstream RETURN sees the latest version, symmetric with
+                // SET Phase 2 behaviour.
+                out_row.insert(format!("{var}.valid_from"), Value::Int(new_valid_from));
+                if new_record.primary_label() != closing_record.primary_label() {
+                    out_row.insert(
+                        format!("{var}.__label__"),
+                        Value::String(new_record.primary_label().to_string()),
+                    );
+                }
+            }
+        }
 
         // Snapshot pre-mutation node state for UPDATE trigger firing —
         // REMOVE is symmetric with SET: it mutates the node, so a registered
@@ -8429,7 +8592,10 @@ fn execute_remove(
             }
         }
 
-        for item in items {
+        for (item_idx, item) in items.iter().enumerate() {
+            if processed_temporal_items.contains(&item_idx) {
+                continue;
+            }
             match item {
                 crate::cypher::ast::RemoveItem::Property { variable, property } => {
                     let node_id = match out_row.get(variable) {
