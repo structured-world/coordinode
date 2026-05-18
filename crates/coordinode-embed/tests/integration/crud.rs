@@ -5646,15 +5646,17 @@ fn empirical_attach_document_from_temporal_source() {
         .expect("pre-attach scan");
     eprintln!("pre-attach Address count: {}", pre.len());
 
-    // R172b safe-reject must give a clear R172c pointer instead of the
-    // confusing pre-guard "source node not found" message.
+    // R172c Phase 3c: ATTACH still rejects when the *source* is
+    // temporal (cascade-delete of a temporal source is Phase 4). The
+    // pre-guard's confusing "source node not found" message is replaced
+    // with an explicit Phase 4 pointer.
     let err = db
         .execute_cypher("ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address")
-        .expect_err("ATTACH from temporal source must reject with clear R172c pointer");
+        .expect_err("ATTACH from temporal source must reject");
     let msg = format!("{err}");
     assert!(
-        msg.contains("temporal") && msg.contains("R172c") && msg.contains("Address"),
-        "error must mention temporal + R172c + label: {msg}"
+        msg.contains("temporal") && msg.contains("Phase 4") && msg.contains("Address"),
+        "error must mention temporal + Phase 4 + label: {msg}"
     );
     // Pre-guard behaviour was "source node node:1 not found".
     assert!(
@@ -5703,37 +5705,79 @@ fn empirical_attach_document_into_temporal_target() {
     );
 }
 
-/// EMPIRICAL: DETACH DOCUMENT FROM a TEMPORAL source — the source node
-/// is read via `encode_node_key` then property-removed via merge delta.
-/// Both ops silent-fail on temporal records (stored at 25-byte key).
+/// R172c Phase 3c: DETACH DOCUMENT FROM a TEMPORAL source now works via
+/// the close+open dance — the matched per-version record is closed at
+/// `valid_to = NOW`, a new version is opened with the property removed.
+/// History before NOW is preserved.
 #[test]
-fn empirical_detach_document_from_temporal_source() {
+fn detach_document_from_temporal_source_writes_new_version_without_property() {
+    use coordinode_core::graph::types::Value;
     let (mut db, _dir) = open_db();
-    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
         .expect("CREATE NODE TYPE Person TEMPORAL");
     db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
         .expect("ALTER to FLEXIBLE so address can be a nested doc");
-    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100, address: {city: 'NYC'}})")
-        .expect("seed temporal Person with nested doc");
+    db.execute_cypher(
+        "CREATE (p:Person {name: 'Alice', valid_from: 100, \
+         address: {city: 'NYC'}})",
+    )
+    .expect("seed temporal Person with nested doc");
 
-    let err = db
+    db.execute_cypher(
+        "MATCH (p:Person) DETACH DOCUMENT p.address AS (a:Address)-[:HAS_ADDRESS]->(p)",
+    )
+    .expect("DETACH on temporal source must succeed (R172c Phase 3c)");
+
+    // Person now has two versions: original (vf=100, has address) closed,
+    // and the new version (vf=NOW, no address) open.
+    let rows = db
         .execute_cypher(
-            "MATCH (p:Person) DETACH DOCUMENT p.address AS (a:Address)-[:HAS_ADDRESS]->(p)",
+            "MATCH (p:Person) RETURN p.valid_from AS vf, p.valid_to AS vt, \
+             p.address AS address",
         )
-        .expect_err("DETACH FROM temporal source must reject with clear R172c pointer");
-    let msg = format!("{err}");
+        .expect("MATCH Person after detach");
+    assert!(rows.len() >= 2, "must have old + new version: {rows:?}");
+
+    let original = rows
+        .iter()
+        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
+        .expect("original vf=100 row");
     assert!(
-        msg.contains("temporal") && msg.contains("R172c") && msg.contains("Person"),
-        "error must explicitly mention temporal + R172c + label: {msg}"
+        matches!(original.get("vt"), Some(Value::Int(_))),
+        "original closed: {original:?}"
     );
-    // The pre-guard behaviour was a confusing "node not found" message.
-    // The R172b safe-reject replaces it with the R172c pointer.
     assert!(
-        !msg.contains("not found"),
-        "error must not say 'not found' — R172b safe-reject replaces that \
-         confusing wording with an explicit R172c pointer: {msg}"
+        matches!(original.get("address"), Some(Value::Document(_))),
+        "original retains address: {original:?}"
     );
+
+    let new_version = rows
+        .iter()
+        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
+        .expect("new version row");
+    assert!(
+        matches!(new_version.get("address"), None | Some(Value::Null)),
+        "new version must not have address: {new_version:?}"
+    );
+
+    // The promoted Address node exists (created by execute_create_node).
+    let addr = db
+        .execute_cypher("MATCH (a:Address) RETURN a.city AS city")
+        .expect("MATCH new Address");
+    assert_eq!(addr.len(), 1, "exactly one promoted Address: {addr:?}");
+    assert_eq!(addr[0].get("city"), Some(&Value::String("NYC".into())));
 }
+
+// Note: DETACH DOCUMENT WITH TRANSFER EDGES on a temporal source is
+// rejected in `execute_detach_document` (the `Phase 4` guard inside the
+// function), but a direct integration test using `execute_cypher` is
+// blocked by a pre-existing semantic analyzer issue — the `r` variable
+// in `TRANSFER EDGES … WHERE type(r) IN […]` is not auto-bound in the
+// predicate scope, so the call fails at the semantic phase before the
+// executor runs. The lower-level `coordinode-query::tests::detach_document`
+// suite bypasses semantic and exercises TRANSFER EDGES directly. Lifting
+// the guard requires the Phase 4 (node_id, valid_from) edge ownership
+// decision; the assertion remains in the executor as a defence-in-depth.
 
 /// EMPIRICAL: UPSERT ON CREATE into a TEMPORAL label — execute_upsert
 /// has its own CREATE branch that calls `encode_node_key` directly
