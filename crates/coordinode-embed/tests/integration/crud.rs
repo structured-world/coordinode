@@ -5544,34 +5544,83 @@ fn temporal_create_accepts_negative_valid_from() {
 }
 
 /// `MATCH (a)-[:E]->(b:TempLabel) RETURN b` would silently emit zero rows
-/// today (target materialisation reads the 16-byte non-temporal key on a
-/// node stored under the 25-byte temporal key). The traversal safe-reject
-/// fails loudly with an R172d pointer instead.
+/// R172d initial slice: traversal into a temporal target label now
+/// materialises every version of the target (prefix scan over
+/// `node:<shard>:<target_uid>:*`). Each version emits its own row.
 #[test]
-fn traverse_into_temporal_label_rejected_until_r172d() {
+fn traverse_into_temporal_label_materialises_all_versions() {
+    use coordinode_core::graph::types::Value;
     let (mut db, _dir) = open_db();
-    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
         .expect("CREATE NODE TYPE Person TEMPORAL");
+    db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
+        .expect("FLEXIBLE");
     db.execute_cypher("CREATE NODE TYPE Org WITH (name: STRING)")
         .expect("CREATE NODE TYPE Org");
     db.execute_cypher("CREATE (o:Org {name: 'Acme'})")
         .expect("seed Org");
     db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
         .expect("seed temporal Person");
+    db.execute_cypher("MATCH (o:Org), (p:Person) CREATE (o)-[:KNOWS]->(p)")
+        .expect("seed edge");
 
-    let err = db
-        .execute_cypher("MATCH (o:Org)-[:KNOWS]->(p:Person) RETURN p")
-        .expect_err("traversal into temporal target must reject in R172b");
-    let msg = format!("{err}");
+    // Mutate the temporal target to produce a second version.
+    db.execute_cypher("MATCH (p:Person) SET p.nickname = 'Ali'")
+        .expect("SET to produce second version");
+
+    // The traversal must now emit two rows — one per version of p.
+    let rows = db
+        .execute_cypher(
+            "MATCH (o:Org)-[:KNOWS]->(p:Person) \
+             RETURN p.valid_from AS vf, p.nickname AS nick",
+        )
+        .expect("traversal into temporal target succeeds");
     assert!(
-        msg.contains("temporal") && msg.contains("R172d") && msg.contains("Person"),
-        "error must mention temporal + R172d + label: {msg}"
+        rows.len() >= 2,
+        "must emit at least one row per target version, got: {rows:?}"
     );
 
-    // Traversal into non-temporal label still works (no rows for empty
-    // edge set, but no error).
-    db.execute_cypher("MATCH (p:Person)-[:KNOWS]->(o:Org) RETURN o")
-        .expect("traversal INTO non-temporal target accepted");
+    let original = rows
+        .iter()
+        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
+        .expect("original vf=100 row");
+    assert!(
+        matches!(original.get("nick"), None | Some(Value::Null)),
+        "original version has no nickname: {original:?}"
+    );
+
+    let new_version = rows
+        .iter()
+        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
+        .expect("new version row");
+    assert_eq!(
+        new_version.get("nick"),
+        Some(&Value::String("Ali".into())),
+        "new version carries nickname: {new_version:?}"
+    );
+}
+
+/// Traversal into a non-temporal target is unaffected by the new
+/// version-fan-out path.
+#[test]
+fn traverse_into_non_temporal_label_still_single_row() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Person WITH (name: STRING)")
+        .expect("CREATE Person");
+    db.execute_cypher("CREATE NODE TYPE Org WITH (name: STRING)")
+        .expect("CREATE Org");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice'})")
+        .expect("seed person");
+    db.execute_cypher("CREATE (o:Org {name: 'Acme'})")
+        .expect("seed org");
+    db.execute_cypher("MATCH (p:Person), (o:Org) CREATE (p)-[:WORKS_AT]->(o)")
+        .expect("seed edge");
+    let rows = db
+        .execute_cypher("MATCH (p:Person)-[:WORKS_AT]->(o:Org) RETURN o.name AS name")
+        .expect("traversal");
+    assert_eq!(rows.len(), 1, "non-temporal target = single row");
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Acme".into())));
 }
 
 /// EMPIRICAL: DETACH DOCUMENT promoting a sub-doc into a TEMPORAL node.
@@ -5669,14 +5718,19 @@ fn empirical_attach_document_from_temporal_source() {
     assert_eq!(pre.len(), 1, "pre-attach Address must exist");
 }
 
-/// EMPIRICAL: ATTACH DOCUMENT INTO a TEMPORAL target — does the target's
-/// property get correctly modified, or does the merge_node_delta path
-/// silently bypass the per-version key?
+/// R172c Phase 3c + R172d initial slice: ATTACH DOCUMENT INTO a TEMPORAL
+/// target now works end-to-end. The pattern traverses into the temporal
+/// target (R172d per-version target fan-out), and ATTACH applies the
+/// DocDelta::SetPath via the close+open dance against the matched
+/// per-version target record.
 #[test]
-fn empirical_attach_document_into_temporal_target() {
+fn attach_document_into_temporal_target_writes_new_version_with_property() {
+    use coordinode_core::graph::types::Value;
     let (mut db, _dir) = open_db();
-    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
         .expect("CREATE NODE TYPE Person TEMPORAL");
+    db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
+        .expect("FLEXIBLE");
 
     // Seed: a temporal Person + a plain Address node + the edge.
     db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
@@ -5686,22 +5740,24 @@ fn empirical_attach_document_into_temporal_target() {
     db.execute_cypher("MATCH (p:Person), (a:Address) CREATE (a)-[:HAS_ADDRESS]->(p)")
         .expect("seed edge");
 
-    let err = db
-        .execute_cypher("ATTACH (a:Address)-[:HAS_ADDRESS]->(p:Person) INTO p.address")
-        .expect_err("ATTACH into temporal target must reject");
-    let msg = format!("{err}");
-    // ATTACH synthesises a MATCH `(a)-[:E]->(p)` internally; the traverse
-    // safe-reject (R172d) fires first if the target label is temporal.
-    // Otherwise the ATTACH guard fires. Either path is acceptable — the
-    // assertion is that we get a CLEAR temporal-aware error, not a
-    // confusing "not found" / silent corruption.
+    db.execute_cypher("ATTACH (a:Address)-[:HAS_ADDRESS]->(p:Person) INTO p.address")
+        .expect("ATTACH into temporal target must succeed (R172d + Phase 3c)");
+
+    // Person now has two versions: original (vf=100, no address) closed,
+    // and new version (vf=NOW) carrying the attached address doc.
+    let rows = db
+        .execute_cypher(
+            "MATCH (p:Person) RETURN p.valid_from AS vf, p.valid_to AS vt, p.address AS addr",
+        )
+        .expect("MATCH Person after ATTACH");
+    assert!(rows.len() >= 2, "old + new version: {rows:?}");
+    let new_version = rows
+        .iter()
+        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
+        .expect("new version row");
     assert!(
-        msg.contains("temporal") && msg.contains("Person"),
-        "error must mention temporal + Person: {msg}"
-    );
-    assert!(
-        !msg.contains("not found"),
-        "error must not say 'not found': {msg}"
+        matches!(new_version.get("addr"), Some(Value::Document(_))),
+        "new version carries attached address doc: {new_version:?}"
     );
 }
 
