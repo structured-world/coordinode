@@ -252,6 +252,17 @@ CREATE EDGE TYPE WORKS_AT TEMPORAL WITH (
 - Reserved engine-managed property names rejected at DDL time: `__ingestion_ts__`, `__src__`, `__tgt__`, `__type__`. `valid_from` and `valid_to` are user-supplied bitemporal axis fields (declarable, not reserved).
 - Property types in `WITH (...)`: `STRING`, `INT`, `FLOAT`, `BOOL`, `TIMESTAMP`, `BLOB`, `MAP`, `GEO`, `BINARY`, `DOCUMENT`. Modifier `NOT NULL`.
 
+**Temporal-node mutation semantics** (all routes through the close-current + open-new dance, see [Temporal Edges → Writing temporal nodes](./temporal-edges.md#writing-temporal-nodes)):
+
+- `SET n.<flat>` / `SET n.<nested.path>` / `SET n += {...}` / `SET n = {...}` / `SET doc_push(...)` / `doc_pull` / `doc_add_to_set` / `doc_inc` — close+open. Multi-item SET in one clause = one new version.
+- `SET n.valid_to = …` — in-place close, no new version. `SET n.valid_from = …` — rejected.
+- `REMOVE n.<flat>` / `REMOVE n.<nested.path>` / `REMOVE n:Label` — close+open with the property/label dropped. `REMOVE n.valid_from` / `REMOVE n.valid_to` — rejected.
+- `DELETE n` — positive bitemporal tombstone (`__deleted__: true` at `valid_from = NOW`); current open version closed; history preserved.
+- `DETACH DOCUMENT n.<path> AS (t:Target)-[:E]->(n)` — close+open on the source, property promoted to a new node (temporal-aware CREATE). `TRANSFER EDGES` on a temporal source: rejected.
+- `ATTACH (s:Source)-[:E]->(t:Temp) INTO t.<path>` — close+open on the target. Temporal source on ATTACH: rejected.
+- Traversal `MATCH (a)-[:E]->(b:Temp)` materialises every version of `b` (one row per version); pattern predicate `WHERE (a)-[:E]->(:Temp)` matches if any version carries the label.
+- Not yet supported on temporal labels: `MERGE`, `UPSERT ON CREATE`, B-tree index lookup, `AS OF VALID_TIME` clause (planned).
+
 #### CREATE INDEX / DROP INDEX ✅
 
 B-tree index on a single property. Optional: `UNIQUE`, `SPARSE` (skip nulls), `WHERE` predicate (partial index).

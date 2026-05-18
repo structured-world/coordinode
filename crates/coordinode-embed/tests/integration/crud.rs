@@ -6202,6 +6202,38 @@ fn pattern_predicate_into_temporal_label_matches_any_version() {
         .expect("pattern predicate into non-temporal accepted");
 }
 
+/// R172d edge case: negated pattern predicate `WHERE NOT (a)-[:E]->(:Temp)`
+/// inverts the "any version matches" semantics — returns true only when
+/// no neighbour version carries the requested labels.
+#[test]
+fn negated_pattern_predicate_into_temporal_label_returns_when_no_match() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
+        .expect("CREATE");
+    db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
+        .expect("FLEXIBLE");
+    db.execute_cypher("CREATE NODE TYPE Org WITH (name: STRING)")
+        .expect("CREATE Org");
+
+    // Two Orgs: one connected to a temporal Person, one isolated.
+    db.execute_cypher("CREATE (o1:Org {name: 'Connected'})")
+        .expect("seed");
+    db.execute_cypher("CREATE (o2:Org {name: 'Lonely'})")
+        .expect("seed");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
+        .expect("seed temporal");
+    db.execute_cypher("MATCH (o:Org {name: 'Connected'}), (p:Person) CREATE (o)-[:KNOWS]->(p)")
+        .expect("seed edge");
+
+    // NOT predicate must keep only the Org with no KNOWS to a Person.
+    let rows = db
+        .execute_cypher("MATCH (o:Org) WHERE NOT (o)-[:KNOWS]->(:Person) RETURN o.name AS name")
+        .expect("negated pattern predicate");
+    assert_eq!(rows.len(), 1, "only the lonely Org matches: {rows:?}");
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Lonely".into())));
+}
+
 // =====================================================================
 // R172c Phase 1 — close-version SET valid_to on temporal nodes +
 // valid_from immutability.
