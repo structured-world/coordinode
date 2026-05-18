@@ -18,7 +18,7 @@ use coordinode_core::txn::proposal::{
 };
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_raft::cluster::RaftNode;
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::oplog::entry::{OplogEntry, OplogOp};
 use coordinode_storage::oplog::manager::OplogManager;
@@ -27,7 +27,13 @@ use coordinode_storage::oplog::tailer::{CdcFilters, OplogTailer, ResumeToken};
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn open_engine(dir: &std::path::Path) -> Arc<StorageEngine> {
-    let config = StorageConfig::new(dir);
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir,
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     Arc::new(StorageEngine::open(&config).expect("open engine"))
 }
 
@@ -251,11 +257,11 @@ async fn cdc_tailer_delivers_raft_proposals() {
     node.shutdown().await.expect("shutdown");
 
     // The oplog dir for shard 0.
-    let oplog_dir = data_dir.join("raft_oplog");
+    let oplog_dir = data_dir.join("oplog").join("0");
 
     assert!(
         oplog_dir.exists(),
-        "raft_oplog directory must exist after Raft writes"
+        "oplog/0 directory must exist after Raft writes"
     );
 
     // Tail the oplog from the start.
@@ -331,7 +337,7 @@ async fn cdc_tailer_resume_after_partial_read() {
 
     node.shutdown().await.expect("shutdown");
 
-    let oplog_dir = data_dir.join("raft_oplog");
+    let oplog_dir = data_dir.join("oplog").join("0");
 
     // First read: get all entries and find a midpoint.
     let mut tailer = OplogTailer::new(&oplog_dir, ResumeToken::from_start(0));
@@ -432,7 +438,7 @@ async fn cdc_filter_edge_type_through_raft() {
 
     node.shutdown().await.expect("shutdown");
 
-    let oplog_dir = data_dir.join("raft_oplog");
+    let oplog_dir = data_dir.join("oplog").join("0");
 
     // Filter: only FOLLOWS edges
     let mut tailer = OplogTailer::new(&oplog_dir, ResumeToken::from_start(0));

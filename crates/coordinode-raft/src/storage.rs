@@ -177,16 +177,38 @@ pub struct LogStore {
 }
 
 impl LogStore {
-    /// Open the LogStore, creating the oplog directory under
-    /// `engine.data_dir()/raft_oplog/` if it does not exist.
+    /// Open the LogStore, routing oplog segments to the oplog-eligible
+    /// endpoint chosen for shard 0 (R157, [arch/core/storage-stack.md](../../../arch/core/storage-stack.md)
+    /// Layer 1↔2, INV-D1). Path layout: `<endpoint.path>/oplog/<shard_id>/`.
+    /// Recovery scans every oplog-eligible endpoint's directory for sealed
+    /// segments left over from a previous config-driven routing.
     ///
     /// Loads `last_log_id` and `last_purged` from `Partition::Raft` so
     /// `get_log_state()` is O(1) even after a restart.
     pub fn open(engine: Arc<StorageEngine>) -> Result<Self, io::Error> {
-        let oplog_dir = engine.data_dir().join("raft_oplog");
-        let oplog = OplogManager::open(
-            &oplog_dir,
-            0, // shard_id — single shard for the Raft log
+        // R157: shard 0 = single Raft log shard in CE. Multi-shard EE
+        // (Phase 3) will open one LogStore per shard, each routing to
+        // its own select_oplog_endpoint(shard_id).
+        let shard_id: u32 = 0;
+        let oplog_endpoint = engine
+            .select_oplog_endpoint(shard_id)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let active_dir = oplog_endpoint
+            .path
+            .join("oplog")
+            .join(format!("{shard_id}"));
+        // Recovery scan dirs: every oplog-eligible endpoint's
+        // oplog/<shard_id>/ directory. Some may not exist yet — open_multi
+        // skips missing dirs without error.
+        let recovery_dirs: Vec<std::path::PathBuf> = engine
+            .all_oplog_eligible_endpoints()
+            .iter()
+            .map(|ep| ep.path.join("oplog").join(format!("{shard_id}")))
+            .collect();
+        let oplog = OplogManager::open_multi(
+            &active_dir,
+            &recovery_dirs,
+            shard_id,
             RAFT_OPLOG_MAX_BYTES,
             RAFT_OPLOG_MAX_ENTRIES,
             RAFT_OPLOG_RETENTION_SECS,
@@ -1284,11 +1306,19 @@ mod tests {
     use super::*;
     use coordinode_core::txn::proposal::PartitionId;
     use coordinode_core::txn::timestamp::Timestamp;
-    use coordinode_storage::engine::config::StorageConfig;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
 
     fn test_engine() -> (tempfile::TempDir, Arc<StorageEngine>) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open(&config).expect("open"));
         (dir, engine)
     }
@@ -1618,7 +1648,13 @@ mod tests {
 
         // Phase 1: write + purge
         {
-            let config = StorageConfig::new(&path);
+            let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                &path,
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]);
             let engine = Arc::new(StorageEngine::open(&config).expect("open"));
             let mut store = LogStore::open(Arc::clone(&engine)).unwrap();
 
@@ -1641,7 +1677,13 @@ mod tests {
 
         // Phase 2: reopen, verify purge state persisted
         {
-            let config = StorageConfig::new(&path);
+            let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                &path,
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]);
             let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
             let mut store = LogStore::open(engine).unwrap();
 
@@ -1709,7 +1751,13 @@ mod tests {
 
         // Phase 1: build snapshot
         {
-            let config = StorageConfig::new(&path);
+            let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                &path,
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]);
             let engine = Arc::new(StorageEngine::open(&config).expect("open"));
             engine
                 .put(Partition::Node, b"node:0:1", b"alice")
@@ -1732,7 +1780,13 @@ mod tests {
 
         // Phase 2: reopen, verify snapshot is still there
         {
-            let config = StorageConfig::new(&path);
+            let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                &path,
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]);
             let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
             let mut sm = CoordinodeStateMachine::new(engine);
 
@@ -1789,7 +1843,13 @@ mod tests {
 
         let dir = tempfile::TempDir::new().unwrap();
         let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
         let sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()));
 
@@ -1824,7 +1884,13 @@ mod tests {
 
         let dir = tempfile::TempDir::new().unwrap();
         let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
         let sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()));
 
@@ -1893,12 +1959,20 @@ mod tests {
     #[test]
     fn apply_seqnos_match_commit_ts_with_oracle() {
         use coordinode_core::txn::timestamp::TimestampOracle;
-        use coordinode_storage::engine::config::StorageConfig;
+        use coordinode_storage::engine::config::{
+            Durability, EndpointConfig, Media, StorageConfig, Tier,
+        };
 
         // Create engine WITH oracle so seqno = oracle timestamp
         let dir = tempfile::TempDir::new().unwrap();
         let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
         let sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()));
 
@@ -1959,7 +2033,7 @@ mod tests {
     // ── Regression: unclean shutdown restart ─────────────────────────────────
     //
     // Bug: CoordiNode 0.3.17 crashed on restart with:
-    //   "create segment /data/raft_oplog/oplog-00000000000000000000.bin: File exists (os error 17)"
+    //   "create segment /data/oplog/0/oplog-00000000000000000000.bin: File exists (os error 17)"
     //
     // Root cause: after crash between oplog.flush() and put(KEY_LAST_LOG_ID),
     // the LSM key was absent but the segment file existed. On restart,
@@ -1975,7 +2049,13 @@ mod tests {
     #[tokio::test]
     async fn restart_after_crash_recovers_last_log_id_from_oplog() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
 
         // ── First "run": write entries, then simulate crash (delete LSM key) ──
         {
@@ -2000,7 +2080,7 @@ mod tests {
             );
 
             // Simulate crash: remove the LSM key that was persisted by append().
-            // The oplog segment files (in data_dir/raft_oplog/) remain on disk.
+            // The oplog segment files (in <oplog_endpoint>/oplog/<shard>/) remain on disk.
             engine
                 .delete(Partition::Raft, KEY_LAST_LOG_ID)
                 .expect("delete LSM key to simulate crash");
@@ -2038,7 +2118,13 @@ mod tests {
     #[tokio::test]
     async fn restart_after_crash_with_sealed_segment_recovers_last_log_id() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
 
         {
             let engine = Arc::new(StorageEngine::open(&config).expect("open engine"));

@@ -1891,12 +1891,18 @@ mod counter_merge_tests {
     #[test]
     fn counter_merge_through_storage_engine() {
         // Integration: merge through real StorageEngine + Counter partition.
-        use crate::engine::config::StorageConfig;
+        use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
         use crate::engine::core::StorageEngine;
         use crate::engine::partition::Partition;
 
         let dir = tempfile::tempdir().unwrap();
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open(&config).unwrap();
 
         let key = b"counter:degree:42";
@@ -1926,13 +1932,19 @@ mod counter_merge_tests {
     #[test]
     fn counter_merge_concurrent_increments() {
         // Integration: concurrent merges from multiple threads.
-        use crate::engine::config::StorageConfig;
+        use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
         use crate::engine::core::StorageEngine;
         use crate::engine::partition::Partition;
         use std::sync::Arc;
 
         let dir = tempfile::tempdir().unwrap();
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open(&config).unwrap());
 
         let key = b"counter:concurrent";

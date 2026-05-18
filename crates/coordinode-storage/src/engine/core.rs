@@ -94,6 +94,11 @@ pub struct StorageEngine {
     /// Root data directory — exposed so subsystems (e.g. Raft oplog) can
     /// derive their own sub-directories without re-reading the config.
     data_dir: PathBuf,
+    /// Configured endpoints — cloned from `StorageConfig.endpoints` at
+    /// open time so subsystems (R157 WAL/oplog placement, R158 tier
+    /// routing, R161 hard-limit enforcement) can resolve target
+    /// endpoints without retaining a reference to the original config.
+    endpoints: Vec<crate::engine::config::EndpointConfig>,
     /// Optional standalone WAL (embedded / no-Raft mode only).
     ///
     /// `Some` only when opened via `open_with_wal`. In cluster mode this is
@@ -222,7 +227,8 @@ impl StorageEngine {
         )?;
 
         info!(
-            path = %config.data_dir.display(),
+            path = %config.data_dir().display(),
+            endpoints = config.endpoints.len(),
             partitions = trees.len(),
             cache_layers = config.cache.layers.len(),
             flush_workers = config.flush_workers,
@@ -234,9 +240,46 @@ impl StorageEngine {
         // Open and replay WAL if requested.  Must happen AFTER the lsm-tree
         // partitions are open so we can apply replayed mutations directly.
         let wal = if let Some(wal_cfg) = wal_config {
-            let wal_path = wal_cfg
-                .path
-                .unwrap_or_else(|| config.data_dir.join("standalone.wal"));
+            // R157: standalone WAL lands at <wal_eligible_endpoint>/wal/standalone.wal
+            // by default. Caller can override with an explicit
+            // `wal_cfg.path` for tests or unusual deployments. Recovery
+            // additionally scans every WAL-eligible endpoint to discover
+            // orphaned WAL files left over by a previous config change.
+            let wal_path = if let Some(p) = wal_cfg.path.clone() {
+                p
+            } else {
+                let endpoint = config.select_wal_endpoint().map_err(|e| {
+                    StorageError::Io(format!(
+                        "standalone WAL requested but {e} — add at least one \
+                         non-volatile NVMe/SSD/Hot-tier endpoint to StorageConfig"
+                    ))
+                })?;
+                endpoint.path.join("wal").join("standalone.wal")
+            };
+            // Ensure parent dir exists (the endpoint path may exist as a
+            // tempdir without the wal/ subdir).
+            if let Some(parent) = wal_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| StorageError::Io(format!("create wal dir {parent:?}: {e}")))?;
+            }
+            // R157: scan other WAL-eligible endpoints for orphaned WAL
+            // files that a previous config might have left behind.
+            // Surfacing them as a warning lets the operator clean up
+            // manually; we do NOT auto-replay foreign WAL files because
+            // their lineage relative to current partition state is
+            // ambiguous.
+            for ep in config.all_wal_eligible_endpoints() {
+                let orphan_candidate = ep.path.join("wal").join("standalone.wal");
+                if orphan_candidate != wal_path && orphan_candidate.exists() {
+                    tracing::warn!(
+                        active_wal = %wal_path.display(),
+                        orphan = %orphan_candidate.display(),
+                        endpoint_id = %ep.id,
+                        "orphaned standalone WAL found on a different endpoint — \
+                         left in place for operator inspection (not replayed)"
+                    );
+                }
+            }
             let sync = wal_cfg.sync;
 
             let (mut standalone_wal, replay_records) = StandaloneWal::open(wal_path.clone(), sync)?;
@@ -317,7 +360,8 @@ impl StorageEngine {
             tiered_cache,
             access_tracker: AccessTracker::new(),
             gc_watermark,
-            data_dir: config.data_dir.clone(),
+            data_dir: config.data_dir().to_path_buf(),
+            endpoints: config.endpoints.clone(),
             wal,
         })
     }
@@ -333,10 +377,59 @@ impl StorageEngine {
 
     /// Root data directory for this engine.
     ///
-    /// Subsystems that need their own on-disk sub-directories (e.g. the Raft
-    /// oplog at `data_dir/raft_oplog/`) derive their paths from this.
+    /// Subsystems that need their own on-disk sub-directories may derive
+    /// paths from this for the **single-endpoint** baseline; with R157
+    /// multi-endpoint placement they instead consult [`Self::endpoints`] /
+    /// [`Self::select_oplog_endpoint`].
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Configured endpoints (R157, [storage-stack.md](../../arch/core/storage-stack.md)
+    /// Layer 1). Subsystems consult this to resolve WAL/oplog/SST placement
+    /// targets. Returned by reference — endpoints are config-time immutable
+    /// after engine open.
+    pub fn endpoints(&self) -> &[crate::engine::config::EndpointConfig] {
+        &self.endpoints
+    }
+
+    /// Resolve the oplog target endpoint for a given shard (R157,
+    /// [storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2,
+    /// INV-D1). Convenience accessor that re-runs the per-shard
+    /// round-robin selection logic from [`crate::engine::config::StorageConfig::select_oplog_endpoint`]
+    /// against the stored endpoint list. Returns an `Io` error if no
+    /// endpoint qualifies — typical caller is `LogStore::open` (Raft),
+    /// which surfaces this as a configuration error.
+    pub fn select_oplog_endpoint(
+        &self,
+        shard_id: u32,
+    ) -> StorageResult<&crate::engine::config::EndpointConfig> {
+        let eligible: Vec<&crate::engine::config::EndpointConfig> = self
+            .endpoints
+            .iter()
+            .filter(|ep| ep.is_oplog_eligible())
+            .collect();
+        if eligible.is_empty() {
+            return Err(StorageError::Io(
+                "no oplog-eligible endpoint configured (need Durable or Degraded \
+                 durability — INV-D1: oplog must survive process restart)"
+                    .to_string(),
+            ));
+        }
+        // SAFETY: eligible non-empty checked above.
+        Ok(eligible[(shard_id as usize) % eligible.len()])
+    }
+
+    /// All oplog-eligible endpoints — used for recovery scan (R157).
+    /// On engine open, callers (`LogStore::open` for Raft) inspect every
+    /// oplog-eligible endpoint's `oplog/<shard_id>/` directory to
+    /// discover sealed segments that may have been written under a
+    /// previous config-driven endpoint routing.
+    pub fn all_oplog_eligible_endpoints(&self) -> Vec<&crate::engine::config::EndpointConfig> {
+        self.endpoints
+            .iter()
+            .filter(|ep| ep.is_oplog_eligible())
+            .collect()
     }
 
     /// Advance the seqno by one and return the new value.
@@ -749,6 +842,7 @@ impl Drop for StorageEngine {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
     use tempfile::TempDir;
 
     /// Counter for unique MemFs paths across parallel tests.
@@ -769,15 +863,29 @@ mod tests {
             (engine, None)
         } else {
             let dir = TempDir::new().expect("failed to create temp dir");
-            let config = StorageConfig::new(dir.path());
+            let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]);
             let engine = StorageEngine::open(&config).expect("failed to open engine");
             (engine, Some(dir))
         }
     }
 
     fn test_engine_memfs() -> StorageEngine {
+        use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
         let id = MEMFS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let config = StorageConfig::with_memfs(format!("/memfs/test_{id}"));
+        let config = StorageConfig::with_endpoints_no_persistence(vec![EndpointConfig::new(
+            "default-memfs",
+            format!("/memfs/test_{id}"),
+            Media::Ram,
+            Durability::Volatile,
+            Tier::Memory,
+        )])
+        .with_fs(Arc::new(lsm_tree::fs::MemFs::new()));
         StorageEngine::open(&config).expect("failed to open memfs engine")
     }
 
@@ -1016,7 +1124,13 @@ mod tests {
     #[test]
     fn persist_and_reopen() {
         let dir = TempDir::new().expect("failed to create temp dir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
 
         {
             let engine = StorageEngine::open(&config).expect("open failed");
@@ -1056,7 +1170,13 @@ mod tests {
     #[test]
     fn engine_with_no_compression() {
         let dir = TempDir::new().expect("failed to create temp dir");
-        let mut config = StorageConfig::new(dir.path());
+        let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         config.compression = crate::engine::config::CompressionConfig {
             hot_codec: crate::engine::config::CompressionCodec::None,
             cold_codec: crate::engine::config::CompressionCodec::None,
@@ -1073,7 +1193,13 @@ mod tests {
     #[test]
     fn engine_with_partition_compression_overrides() {
         let dir = TempDir::new().expect("failed to create temp dir");
-        let mut config = StorageConfig::new(dir.path());
+        let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         config.partition_compression = Some(vec![(
             Partition::Blob,
             crate::engine::config::CompressionCodec::None,
@@ -1106,7 +1232,13 @@ mod tests {
     #[test]
     fn engine_compressed_data_survives_reopen() {
         let dir = TempDir::new().expect("failed to create temp dir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
 
         {
             let engine = StorageEngine::open(&config).expect("open");
@@ -1176,12 +1308,19 @@ mod wal_integration_tests {
     //! data written to the WAL is visible after engine reopen.
 
     use super::*;
+    use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
     use coordinode_core::txn::proposal::{Mutation, PartitionId};
     use tempfile::TempDir;
 
     /// Returns a `StorageConfig` pointing at `dir` with WAL enabled (WAL path = `dir/standalone.wal`).
     fn cfg_with_wal(dir: &TempDir) -> (StorageConfig, WalConfig) {
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let wal_config = WalConfig {
             path: Some(dir.path().join("standalone.wal")),
             sync: crate::wal::WalSyncPolicy::SyncPerRecord,
@@ -1421,7 +1560,13 @@ mod wal_integration_tests {
         // Verifies that wal_append() on a plain open() engine (no WAL) returns None
         // without error — caller can use this to branch between WAL and legacy paths.
         let dir = TempDir::new().expect("temp dir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open(&config).expect("open without wal");
 
         assert!(!engine.has_wal(), "plain open must have no WAL");
@@ -1442,6 +1587,7 @@ mod wal_integration_tests {
 #[allow(clippy::expect_used, clippy::panic)]
 mod merge_tests {
     use super::*;
+    use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
     use crate::engine::merge::{encode_add, encode_add_batch, encode_remove};
     use coordinode_core::graph::doc_delta::{DocDelta, PathTarget, PREFIX_NODE_RECORD};
     use coordinode_core::graph::edge::PostingList;
@@ -1451,7 +1597,13 @@ mod merge_tests {
 
     fn test_engine() -> (StorageEngine, TempDir) {
         let dir = TempDir::new().expect("failed to create temp dir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open(&config).expect("failed to open engine");
         (engine, dir)
     }
@@ -1547,7 +1699,13 @@ mod merge_tests {
     #[test]
     fn merge_survives_persist_and_reopen() {
         let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let key = b"adj:FOLLOWS:out:99";
 
         {
@@ -1608,7 +1766,13 @@ mod merge_tests {
         use std::thread;
 
         let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open(&config).expect("open"));
         let key = b"adj:FOLLOWS:out:celebrity";
 
@@ -1663,7 +1827,13 @@ mod merge_tests {
     #[test]
     fn merge_compaction_correctness() {
         let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open(&config).expect("open");
         let key = b"adj:RATED:out:99";
 
@@ -1711,7 +1881,13 @@ mod merge_tests {
     #[test]
     fn merge_compaction_reopen_correctness() {
         let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let key = b"adj:KNOWS:out:77";
 
         {
@@ -1830,7 +2006,13 @@ mod merge_tests {
     #[test]
     fn merge_double_compaction_partial_re_merge() {
         let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open(&config).expect("open");
         let key = b"adj:FOLLOWS:out:hub";
 
@@ -1871,7 +2053,13 @@ mod merge_tests {
         use std::thread;
 
         let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open(&config).expect("open"));
         let key = b"adj:FOLLOWS:out:supernode";
 
@@ -1931,7 +2119,13 @@ mod merge_tests {
     #[test]
     fn merge_time_travel_snapshot_correctness() {
         let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open(&config).expect("open");
         let key = b"adj:RATES:out:user42";
 
@@ -1997,7 +2191,13 @@ mod merge_tests {
     #[test]
     fn merge_compaction_preserves_time_travel() {
         let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open(&config).expect("open");
         let key = b"adj:KNOWS:out:node7";
 
@@ -2101,7 +2301,13 @@ mod merge_tests {
         use std::thread;
 
         let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open(&config).expect("open"));
         let key = b"adj:LIKES:out:user99";
 
@@ -2298,7 +2504,13 @@ mod merge_tests {
         use std::sync::Arc;
 
         let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
 
         let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1000)));
         let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open");
@@ -2326,7 +2538,13 @@ mod merge_tests {
         use std::sync::Arc;
 
         let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
         let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open");
 
@@ -2362,7 +2580,13 @@ mod merge_tests {
 
         let dir = TempDir::new().expect("tempdir");
         let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open");
 
         engine
@@ -2392,7 +2616,13 @@ mod merge_tests {
 
         let dir = TempDir::new().expect("tempdir");
         let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open_with_oracle(&config, oracle).expect("open");
 
         assert!(
@@ -2410,7 +2640,13 @@ mod merge_tests {
 
         let dir = TempDir::new().expect("tempdir");
         let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open");
 
         engine
@@ -2435,7 +2671,13 @@ mod merge_tests {
 
         let dir = TempDir::new().expect("tempdir");
         let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open_with_oracle(&config, oracle).expect("open");
 
         engine
@@ -2577,7 +2819,13 @@ mod merge_tests {
         use coordinode_core::graph::types::Value;
 
         let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let key = b"node:\x00\x01\x00\x00\x00\x00\x00\x00\x00\x03";
 
         {
@@ -2628,7 +2876,13 @@ mod merge_tests {
         use std::sync::Arc;
 
         let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open(&config).expect("open"));
         let key = b"node:\x00\x01\x00\x00\x00\x00\x00\x00\x00\x04";
 
@@ -2699,7 +2953,13 @@ mod merge_tests {
         use std::sync::Arc;
 
         let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open(&config).expect("open"));
         let key = b"node:\x00\x01\x00\x00\x00\x00\x00\x00\x00\x05";
 
@@ -2798,7 +3058,13 @@ mod merge_tests {
         use std::sync::Arc;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open(&config).expect("open"));
 
         // Create base node with a DOCUMENT property at field_id=10.
@@ -2864,7 +3130,13 @@ mod merge_tests {
         use std::sync::Arc;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open(&config).expect("open"));
 
         // Create base node with an empty array at field_id=20.

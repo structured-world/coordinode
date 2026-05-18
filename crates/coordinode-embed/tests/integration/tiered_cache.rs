@@ -5,12 +5,18 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use coordinode_storage::cache::config::{CacheLayerConfig, TieredCacheConfig};
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 
 fn engine_with_cache(dir: &std::path::Path) -> StorageEngine {
-    let mut config = StorageConfig::new(dir.join("data"));
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.join("data"),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     config.cache = TieredCacheConfig {
         compaction_interval_secs: 0, // Disable background thread in tests
         layers: vec![CacheLayerConfig {
@@ -123,7 +129,13 @@ fn cache_across_partitions() {
 #[test]
 fn engine_without_cache_works() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path().join("data"));
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path().join("data"),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     // Default config has no cache layers
     let engine = StorageEngine::open(&config).expect("open");
 
@@ -138,7 +150,13 @@ fn engine_without_cache_works() {
 #[test]
 fn two_layer_drain_through_via_engine() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut config = StorageConfig::new(dir.path().join("data"));
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path().join("data"),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     config.cache = TieredCacheConfig {
         compaction_interval_secs: 0,
         layers: vec![
@@ -242,7 +260,13 @@ fn cache_survives_engine_reopen() {
 
     // Write + populate cache
     {
-        let mut config = StorageConfig::new(dir.path().join("data"));
+        let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path().join("data"),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         config.cache = cache_config.clone();
         let engine = StorageEngine::open(&config).expect("open");
 
@@ -258,7 +282,13 @@ fn cache_survives_engine_reopen() {
 
     // Reopen — cache file should be recovered
     {
-        let mut config = StorageConfig::new(dir.path().join("data"));
+        let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path().join("data"),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         config.cache = cache_config;
         let engine = StorageEngine::open(&config).expect("reopen");
 
@@ -285,7 +315,13 @@ fn cache_survives_engine_reopen() {
 #[test]
 fn background_compaction_via_engine() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut config = StorageConfig::new(dir.path().join("data"));
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path().join("data"),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     config.cache = TieredCacheConfig {
         compaction_interval_secs: 1,
         layers: vec![CacheLayerConfig {
@@ -332,7 +368,13 @@ fn background_compaction_via_engine() {
 #[test]
 fn cache_eviction_doesnt_lose_data() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut config = StorageConfig::new(dir.path().join("data"));
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path().join("data"),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     config.cache = TieredCacheConfig {
         compaction_interval_secs: 0, // Disable background thread in tests
         layers: vec![CacheLayerConfig {

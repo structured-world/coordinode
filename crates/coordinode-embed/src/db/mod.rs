@@ -24,7 +24,7 @@ use coordinode_query::executor::runner::{
 };
 use coordinode_query::planner;
 use coordinode_raft::proposal::{LocalProposalPipeline, OwnedLocalProposalPipeline};
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::Guard;
@@ -322,7 +322,13 @@ impl Database {
     /// For cluster mode (CE 3-node HA), use `open_with_pipeline()` with
     /// a `RaftProposalPipeline` instead.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
-        let config = StorageConfig::new(path.as_ref());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            path.as_ref(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let oracle = Arc::new(TimestampOracle::new());
         let engine = StorageEngine::open_with_oracle(&config, oracle.clone())?;
         let engine = Arc::new(engine);
@@ -343,7 +349,13 @@ impl Database {
         oracle: Arc<TimestampOracle>,
         pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline>,
     ) -> Result<Self, DatabaseError> {
-        let config = StorageConfig::new(path.as_ref());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            path.as_ref(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         Self::finish_open(path.as_ref(), config, oracle, engine, pipeline)
     }
 

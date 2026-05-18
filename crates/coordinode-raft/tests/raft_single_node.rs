@@ -12,7 +12,7 @@ use coordinode_core::txn::proposal::{
 };
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_raft::cluster::RaftNode;
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 
@@ -26,7 +26,13 @@ fn init_test_tracing() {
 fn test_engine() -> (tempfile::TempDir, Arc<StorageEngine>) {
     init_test_tracing();
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = Arc::new(StorageEngine::open(&config).expect("open"));
     (dir, engine)
 }
@@ -590,7 +596,13 @@ async fn e2e_crash_recovery_data_survives_restart() {
 
     // Phase 1: Write data
     {
-        let config = StorageConfig::new(&path);
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            &path,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open(&config).expect("open"));
         let engine_read = Arc::clone(&engine);
         let node = RaftNode::single_node(engine).await.expect("bootstrap");
@@ -634,7 +646,13 @@ async fn e2e_crash_recovery_data_survives_restart() {
 
     // Phase 2: Reopen from same storage directory and verify
     {
-        let config = StorageConfig::new(&path);
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            &path,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
         let engine_read = Arc::clone(&engine);
 
@@ -709,7 +727,13 @@ async fn e2e_watermark_survives_restart() {
 
     // Phase 1: Write and record watermark
     {
-        let config = StorageConfig::new(&path);
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            &path,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open(&config).expect("open"));
         let node = RaftNode::single_node(engine).await.expect("bootstrap");
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -738,7 +762,13 @@ async fn e2e_watermark_survives_restart() {
 
     // Phase 2: Reopen and verify watermark
     {
-        let config = StorageConfig::new(&path);
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            &path,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
         let node = RaftNode::open(1, engine).await.expect("resume");
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;

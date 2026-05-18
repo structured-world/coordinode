@@ -1510,12 +1510,20 @@ mod tests {
         Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline, RaftProposal,
     };
     use coordinode_core::txn::timestamp::Timestamp;
-    use coordinode_storage::engine::config::StorageConfig;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
     use coordinode_storage::engine::partition::Partition;
 
     fn test_engine() -> (tempfile::TempDir, Arc<StorageEngine>) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open(&config).expect("open"));
         (dir, engine)
     }

@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
@@ -22,7 +22,13 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 fn setup_versioned_key(num_versions: usize) -> (StorageEngine, tempfile::TempDir, Vec<u64>) {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1000)));
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open_with_oracle(&config, oracle).expect("open");
 
     let mut seqnos = Vec::with_capacity(num_versions);
@@ -117,7 +123,13 @@ fn bench_write_throughput(c: &mut Criterion) {
                 b.iter(|| {
                     let dir = tempfile::TempDir::new().expect("tempdir");
                     let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1000)));
-                    let config = StorageConfig::new(dir.path());
+                    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                        "default",
+                        dir.path(),
+                        Media::Hdd,
+                        Durability::Durable,
+                        Tier::Warm,
+                    )]);
                     let engine = StorageEngine::open_with_oracle(&config, oracle).expect("open");
 
                     let value = [0xCDu8; 256];

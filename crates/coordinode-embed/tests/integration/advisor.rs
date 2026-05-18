@@ -1407,7 +1407,9 @@ fn stats_cache_ttl_max_stays_stale_until_invalidation() {
 #[test]
 fn explain_suggest_no_false_positive_when_index_exists() {
     use coordinode_query::index::{IndexDefinition, IndexRegistry};
-    use coordinode_storage::engine::config::StorageConfig;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
     use coordinode_storage::engine::core::StorageEngine;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1415,7 +1417,13 @@ fn explain_suggest_no_false_positive_when_index_exists() {
     // Step 1: Pre-populate storage with an index definition.
     // Open raw storage, register index, close.
     {
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open(&config).expect("open engine");
         let reg = IndexRegistry::new();
         reg.register(
@@ -1453,14 +1461,22 @@ fn explain_suggest_no_false_positive_when_index_exists() {
 #[test]
 fn explain_suggest_partial_coverage() {
     use coordinode_query::index::{IndexDefinition, IndexRegistry};
-    use coordinode_storage::engine::config::StorageConfig;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
     use coordinode_storage::engine::core::StorageEngine;
 
     let dir = tempfile::tempdir().expect("tempdir");
 
     // Pre-populate: index on User.name only
     {
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open(&config).expect("open engine");
         let reg = IndexRegistry::new();
         reg.register(&engine, IndexDefinition::btree("user_name", "User", "name"))

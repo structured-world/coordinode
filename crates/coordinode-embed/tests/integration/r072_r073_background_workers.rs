@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use lsm_tree::AbstractTree;
@@ -22,7 +22,13 @@ use lsm_tree::AbstractTree;
 /// Open a StorageEngine with an aggressive flush threshold (1 byte) so
 /// any write immediately triggers the FlushManager.
 fn aggressive_flush_config(dir: &std::path::Path) -> StorageConfig {
-    let mut cfg = StorageConfig::new(dir);
+    let mut cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir,
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     cfg.max_write_buffer_bytes = 1; // always flush
     cfg.max_sealed_memtables = 0; // always flush sealed
     cfg.flush_poll_interval_ms = 10; // fast poll for tests
@@ -95,7 +101,13 @@ fn flush_manager_data_survives_reopen() {
 
     // Write 20 keys and drop the engine (triggers best-effort Drop flush).
     {
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open(&config).expect("open engine");
         for i in 0_u32..20 {
             let key = format!("persist_key_{i:04}");
@@ -113,7 +125,13 @@ fn flush_manager_data_survives_reopen() {
 
     // Reopen and verify all keys survive.
     {
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open(&config).expect("reopen engine");
         for i in 0_u32..20 {
             let key = format!("persist_key_{i:04}");

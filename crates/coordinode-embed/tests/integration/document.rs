@@ -6,14 +6,20 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use coordinode_core::graph::node::{encode_node_key, NodeId, NodeRecord, PropertyValue};
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::Guard;
 
 fn open_engine() -> (StorageEngine, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open(&config).expect("open engine");
     (engine, dir)
 }
@@ -197,7 +203,13 @@ fn document_persists_across_reopen() {
 
     // Write + close
     {
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open(&config).expect("open");
         let mut rec = NodeRecord::new("Persistent");
         rec.set(1, PropertyValue::Document(doc.clone()));
@@ -210,7 +222,13 @@ fn document_persists_across_reopen() {
 
     // Reopen + verify
     {
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open(&config).expect("reopen");
         let stored = engine
             .get(Partition::Node, &key)

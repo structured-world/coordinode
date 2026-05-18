@@ -30,7 +30,7 @@ use coordinode_core::txn::proposal::{
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::storage::{CommittedLeaderId, Entry, LogStore, Request};
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::oplog::manager::OplogManager;
@@ -40,7 +40,13 @@ use openraft::storage::{IOFlushed, RaftLogReader, RaftLogStorage};
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn open_engine(dir: &std::path::Path) -> Arc<StorageEngine> {
-    let config = StorageConfig::new(dir);
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir,
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     Arc::new(StorageEngine::open(&config).expect("open engine"))
 }
 

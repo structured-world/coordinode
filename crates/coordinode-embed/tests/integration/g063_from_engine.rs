@@ -13,7 +13,7 @@ use coordinode_core::txn::timestamp::TimestampOracle;
 use coordinode_core::txn::write_concern::WriteConcernLevel;
 use coordinode_embed::Database;
 use coordinode_raft::proposal::OwnedLocalProposalPipeline;
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use tempfile::tempdir;
 
@@ -22,7 +22,13 @@ use tempfile::tempdir;
 fn from_engine_basic_query() {
     let dir = tempdir().unwrap();
     let oracle = Arc::new(TimestampOracle::new());
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap();
     let engine = Arc::new(engine);
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
@@ -43,7 +49,13 @@ fn from_engine_basic_query() {
 fn from_engine_volatile_write_drains() {
     let dir = tempdir().unwrap();
     let oracle = Arc::new(TimestampOracle::new());
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap();
     let engine = Arc::new(engine);
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
@@ -72,7 +84,13 @@ fn from_engine_volatile_write_drains() {
 fn from_engine_shared_engine_visibility() {
     let dir = tempdir().unwrap();
     let oracle = Arc::new(TimestampOracle::new());
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap();
     let engine = Arc::new(engine);
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
@@ -101,7 +119,13 @@ fn from_engine_shared_engine_visibility() {
 fn from_engine_drop_flushes_drain() {
     let dir = tempdir().unwrap();
     let oracle = Arc::new(TimestampOracle::new());
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap();
     let engine = Arc::new(engine);
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =

@@ -16,7 +16,7 @@ use coordinode_core::graph::types::Value;
 use coordinode_query::cypher::ast::{Expr, SetItem};
 use coordinode_query::executor::runner::{execute, ExecutionError};
 use coordinode_query::planner::logical::{LogicalOp, LogicalPlan};
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 
 /// Helper: create an UPSERT plan that matches User by name and sets age.
@@ -111,7 +111,13 @@ fn read_user_age(
 #[test]
 fn concurrent_upsert_data_consistency() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = Arc::new(StorageEngine::open(&config).expect("open"));
     let allocator = Arc::new(NodeIdAllocator::resume_from(NodeId::from_raw(1000)));
 
@@ -201,7 +207,13 @@ fn concurrent_upsert_data_consistency() {
 #[test]
 fn concurrent_upsert_last_writer_wins() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = Arc::new(StorageEngine::open(&config).expect("open"));
     let allocator = Arc::new(NodeIdAllocator::resume_from(NodeId::from_raw(2000)));
 

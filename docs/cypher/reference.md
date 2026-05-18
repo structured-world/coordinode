@@ -43,10 +43,12 @@ WHERE n.name STARTS WITH 'A'
 WHERE n.name ENDS WITH 'son'
 WHERE n.bio CONTAINS 'engineer'
 WHERE n.role IN ['admin', 'editor']
-WHERE (a)-[:KNOWS]->(b)                   -- pattern predicate
+WHERE (a)-[:KNOWS]->(b)                   -- pattern predicate (single-hop, bound endpoints)
 WHERE NOT (a)-[:BLOCKED]->(b)             -- negated pattern predicate
 WHERE n.score > 0 XOR n.featured = true
 ```
+
+**Pattern-predicate scope (current vs planned).** Today single-hop pattern predicates with bound endpoints work; multi-hop predicates with an unbound intermediate (`WHERE (a)-[:R]->(x)-[:R]->(b)`) and inline edge property filters (`WHERE (a)-[:R {weight: 5}]->(b)`) parse but evaluate to `false`. Both shapes are scheduled to land together via the `EXISTS { MATCH … }` subquery executor (R525) which the parser/planner will use as the desugar target for any non-trivial pattern predicate — multi-hop chains, edge property filters, and variable-length paths reuse the existing MATCH planner uniformly.
 
 #### RETURN ✅
 
@@ -244,9 +246,20 @@ CREATE EDGE TYPE WORKS_AT TEMPORAL WITH (
   valid_from: TIMESTAMP NOT NULL,
   valid_to:   TIMESTAMP
 )
+
+-- Generalised multi-edge: schema-declared discriminator column.
+-- Multiple edges of the same type between the same pair, distinguished
+-- by the discriminator value. `TEMPORAL` is sugar for
+-- `DISCRIMINATED BY (valid_from)` + interval semantics.
+CREATE EDGE TYPE KNOWS WITH (
+  context:   STRING NOT NULL,
+  since:     DATE,
+  intensity: FLOAT
+) DISCRIMINATED BY (context)
 ```
 
 - `TEMPORAL` opts the type into bitemporal semantics. On `CREATE`, every instance must supply `valid_from`. The engine auto-populates `__ingestion_ts__` (HLC commit-ts, user-readable, immutable). See [Temporal Edges](./temporal-edges.md) for the full bitemporal model.
+- `DISCRIMINATED BY (col)` declares an edge type with multiple edges allowed per `(src, tgt)` pair, distinguished by the named column. The column must be `NOT NULL` and is auto-indexed. Discriminator equality predicates (`WHERE k.context = 'work'`) push down to a key-prefix lookup, not a property scan — `O(1)` per matched neighbour. Range predicates push down to bounded prefix scans. The discriminator is immutable per type — migration is "create new type, copy data, drop old".
 - Non-temporal and temporal labels coexist in the same database out of the box — non-temporal pays zero per-node storage overhead.
 - The `TEMPORAL` flag is immutable: re-`CREATE` of an existing label/type is rejected. Migration path is "create new type, copy data, drop old".
 - Reserved engine-managed property names rejected at DDL time: `__ingestion_ts__`, `__src__`, `__tgt__`, `__type__`. `valid_from` and `valid_to` are user-supplied bitemporal axis fields (declarable, not reserved).

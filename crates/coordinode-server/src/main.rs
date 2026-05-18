@@ -13,6 +13,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, Tier};
 use coordinode_storage::Guard;
 use tonic::transport::Server;
 use tracing::info;
@@ -71,7 +72,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             logging::init_logging();
             info!(data_dir = %data_dir, deep = deep, "verifying storage integrity");
 
-            let config = coordinode_storage::engine::config::StorageConfig::new(&data_dir);
+            let config = coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    &data_dir,
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]);
             let engine = coordinode_storage::engine::core::StorageEngine::open(&config)?;
             let disk = engine.disk_space()?;
             info!(disk_bytes = disk, "storage opened successfully");
@@ -137,7 +146,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // administration, and ensures consistent apply ordering via oracle.
 
             // Common setup: open storage engine + timestamp oracle.
-            let storage_config = coordinode_storage::engine::config::StorageConfig::new(&data_dir);
+            let storage_config =
+                coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                    EndpointConfig::new(
+                        "default",
+                        &data_dir,
+                        Media::Hdd,
+                        Durability::Durable,
+                        Tier::Warm,
+                    ),
+                ]);
             let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
             let engine = coordinode_storage::engine::core::StorageEngine::open_with_oracle(
                 &storage_config,

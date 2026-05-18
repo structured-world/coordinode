@@ -162,10 +162,18 @@ mod tests {
     use super::*;
     use crate::encrypted::keys::{KeyPair, SearchKey};
     use crate::encrypted::token::generate_search_token;
-    use coordinode_storage::engine::config::StorageConfig;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
 
     fn test_engine(dir: &std::path::Path) -> StorageEngine {
-        let config = StorageConfig::new(dir);
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         StorageEngine::open(&config).unwrap()
     }
 

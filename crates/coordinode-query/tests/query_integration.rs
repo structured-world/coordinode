@@ -18,7 +18,7 @@ use coordinode_query::index::{
 use coordinode_query::planner::{build_logical_plan, estimate_cost};
 use coordinode_search::tantivy::multi_lang::{MultiLangConfig, MultiLanguageTextIndex};
 use coordinode_search::tantivy::TextIndex;
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::Guard;
@@ -81,7 +81,13 @@ fn make_test_ctx<'a>(
 }
 
 fn test_engine(dir: &std::path::Path) -> StorageEngine {
-    let config = StorageConfig::new(dir);
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir,
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     StorageEngine::open(&config).expect("open engine")
 }
 

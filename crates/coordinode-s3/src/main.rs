@@ -14,6 +14,7 @@ mod mapping;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, Tier};
 use tracing::info;
 
 fn main() {
@@ -55,7 +56,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr: SocketAddr = addr_str.parse()?;
 
-    let config = coordinode_storage::engine::config::StorageConfig::new(&data_dir);
+    let config = coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "default",
+            &data_dir,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        ),
+    ]);
     let engine = Arc::new(coordinode_storage::engine::core::StorageEngine::open(
         &config,
     )?);

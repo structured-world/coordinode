@@ -479,19 +479,33 @@ mod tests {
     use crate::cluster::RaftNode;
     use coordinode_core::txn::proposal::ProposalIdGenerator;
     use coordinode_core::txn::timestamp::Timestamp;
-    use coordinode_storage::engine::config::StorageConfig;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
     use tempfile::TempDir;
 
     fn test_engine() -> (TempDir, Arc<StorageEngine>) {
         let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open(&config).expect("open"));
         (dir, engine)
     }
 
     fn setup() -> (StorageEngine, TempDir) {
         let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open(&config).expect("open");
         (engine, dir)
     }

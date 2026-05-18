@@ -1,7 +1,7 @@
 //! Integration tests: Oplog as Raft log storage (R075).
 //!
 //! Tests verify that:
-//!   - `LogStore::open()` creates `data_dir/raft_oplog/`
+//!   - `LogStore::open()` creates `<oplog_endpoint>/oplog/<shard>/` (R157)
 //!   - `append()` writes to oplog; `get_log_state()` returns O(1) `last_log_id`
 //!   - `last_log_id` and `last_purged` survive close + reopen (Partition::Raft)
 //!   - `purge()` updates `last_purged` and filters entries in `try_get_log_entries`
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use coordinode_core::txn::proposal::{Mutation, PartitionId, ProposalId, RaftProposal};
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_raft::storage::{CommittedLeaderId, Entry, LogId, LogStore, Request, TypeConfig};
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use openraft::entry::RaftEntry;
 use openraft::storage::{IOFlushed, LogState, RaftLogReader, RaftLogStorage};
@@ -23,7 +23,13 @@ use openraft::storage::{IOFlushed, LogState, RaftLogReader, RaftLogStorage};
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn open_engine(dir: &std::path::Path) -> Arc<StorageEngine> {
-    let config = StorageConfig::new(dir);
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir,
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     Arc::new(StorageEngine::open(&config).expect("open engine"))
 }
 
@@ -49,7 +55,9 @@ fn make_log_id(index: u64, term: u64) -> LogId {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-/// `LogStore::open()` creates `data_dir/raft_oplog/` on first open.
+/// `LogStore::open()` creates `<oplog_endpoint>/oplog/<shard_id>/` on first
+/// open (R157 multi-endpoint placement). For a single-endpoint config the
+/// endpoint path equals `engine.data_dir()`.
 #[test]
 fn logstore_creates_oplog_directory() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -57,9 +65,9 @@ fn logstore_creates_oplog_directory() {
 
     LogStore::open(Arc::clone(&engine)).expect("open logstore");
 
-    let oplog_dir = engine.data_dir().join("raft_oplog");
-    assert!(oplog_dir.exists(), "raft_oplog directory must be created");
-    assert!(oplog_dir.is_dir(), "raft_oplog must be a directory");
+    let oplog_dir = engine.data_dir().join("oplog").join("0");
+    assert!(oplog_dir.exists(), "oplog/0 directory must be created");
+    assert!(oplog_dir.is_dir(), "oplog/0 must be a directory");
 }
 
 /// Appended entries are readable and `get_log_state()` returns `last_log_id`.

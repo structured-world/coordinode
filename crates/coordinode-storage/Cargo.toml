@@ -46,6 +46,7 @@ rayon = { workspace = true }
 tempfile = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
+serde_json = { workspace = true }
 # Storage internal test dependencies (consumed from fjall per ADR-019)
 nanoid = "0.4.0"
 test-log = "0.2.18"

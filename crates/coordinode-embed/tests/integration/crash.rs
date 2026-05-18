@@ -6,7 +6,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use coordinode_embed::Database;
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 
@@ -94,7 +94,13 @@ fn set_property_within_session() {
 #[test]
 fn storage_partitions_are_isolated() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open(&config).expect("open");
 
     // Write to Node partition
@@ -119,7 +125,13 @@ fn storage_survives_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     {
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open(&config).expect("open");
         engine
             .put(Partition::Node, b"persist:key", b"persist:value")
@@ -127,7 +139,13 @@ fn storage_survives_reopen() {
     }
 
     {
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open(&config).expect("reopen");
         let val = engine.get(Partition::Node, b"persist:key").expect("get");
         assert_eq!(val.as_deref(), Some(b"persist:value".as_slice()));

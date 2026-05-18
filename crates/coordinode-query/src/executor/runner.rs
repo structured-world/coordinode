@@ -13220,11 +13220,19 @@ mod tests {
     use super::*;
     use crate::cypher::ast::BinaryOperator;
     use coordinode_core::graph::node::NodeRecord;
-    use coordinode_storage::engine::config::StorageConfig;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
 
     /// Create a test engine in a temp directory.
     fn test_engine(dir: &std::path::Path) -> StorageEngine {
-        let config = StorageConfig::new(dir);
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         StorageEngine::open(&config).expect("open engine")
     }
 
@@ -16430,7 +16438,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
         let engine = StorageEngine::open_with_oracle(
-            &coordinode_storage::engine::config::StorageConfig::new(dir.path()),
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
             oracle.clone(),
         )
         .expect("open with oracle");
@@ -16540,7 +16556,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
         let engine = StorageEngine::open_with_oracle(
-            &coordinode_storage::engine::config::StorageConfig::new(dir.path()),
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
             oracle.clone(),
         )
         .expect("open with oracle");

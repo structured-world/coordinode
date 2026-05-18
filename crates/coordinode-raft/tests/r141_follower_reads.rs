@@ -25,7 +25,7 @@ use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::read_fence::{
     ReadConcern, ReadFenceError, ReadPreference, CE_STALENESS_THRESHOLD_ENTRIES,
 };
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 
 /// Hard timeout for multi-node tests that require cluster formation.
@@ -57,9 +57,36 @@ async fn bootstrap_3node() -> (
     let d2 = tempfile::tempdir().expect("d2");
     let d3 = tempfile::tempdir().expect("d3");
 
-    let e1 = Arc::new(StorageEngine::open(&StorageConfig::new(d1.path())).expect("e1"));
-    let e2 = Arc::new(StorageEngine::open(&StorageConfig::new(d2.path())).expect("e2"));
-    let e3 = Arc::new(StorageEngine::open(&StorageConfig::new(d3.path())).expect("e3"));
+    let e1 = Arc::new(
+        StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            d1.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]))
+        .expect("e1"),
+    );
+    let e2 = Arc::new(
+        StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            d2.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]))
+        .expect("e2"),
+    );
+    let e3 = Arc::new(
+        StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            d3.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]))
+        .expect("e3"),
+    );
 
     let n1 = RaftNode::open_cluster(
         1,
@@ -110,7 +137,13 @@ fn init_test_tracing() {
 fn test_engine() -> (tempfile::TempDir, Arc<StorageEngine>) {
     init_test_tracing();
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = Arc::new(StorageEngine::open(&config).expect("open"));
     (dir, engine)
 }

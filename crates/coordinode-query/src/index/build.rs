@@ -258,10 +258,18 @@ pub fn build_index(
 mod tests {
     use super::*;
     use coordinode_core::graph::node::encode_node_key;
-    use coordinode_storage::engine::config::StorageConfig;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
 
     fn test_engine(dir: &std::path::Path) -> StorageEngine {
-        let config = StorageConfig::new(dir);
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         StorageEngine::open(&config).expect("open engine")
     }
 
