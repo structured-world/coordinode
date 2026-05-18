@@ -5201,6 +5201,276 @@ fn remove_property_on_non_temporal_node_remains_in_place() {
     assert!(matches!(rows[0].get("nick"), None | Some(Value::Null)));
 }
 
+/// R172c Phase 3b: SET on a nested property path of a temporal node writes
+/// a NEW version with the nested change applied, while preserving the
+/// historical (closed) version intact.
+#[test]
+fn set_nested_property_path_on_temporal_node_writes_new_version() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
+        .expect("CREATE NODE TYPE");
+    db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
+        .expect("ALTER FLEXIBLE");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100, config: {host: 'old'}})")
+        .expect("CREATE temporal with nested doc");
+
+    db.execute_cypher("MATCH (p:Person) SET p.config.host = 'new'")
+        .expect("nested SET on temporal must succeed (Phase 3b)");
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (p:Person) RETURN p.valid_from AS vf, p.valid_to AS vt, p.config AS config",
+        )
+        .expect("MATCH after nested SET");
+    assert!(
+        rows.len() >= 2,
+        "must have old + new version after nested SET: {rows:?}"
+    );
+
+    // Original (vf=100) closed, still has config.host = 'old'.
+    let original = rows
+        .iter()
+        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
+        .expect("original vf=100 row");
+    assert!(
+        matches!(original.get("vt"), Some(Value::Int(_))),
+        "original closed: {original:?}"
+    );
+    if let Some(Value::Document(rmpv::Value::Map(entries))) = original.get("config") {
+        let host = entries.iter().find_map(|(k, v)| match (k, v) {
+            (rmpv::Value::String(s), v) if s.as_str() == Some("host") => Some(v.clone()),
+            _ => None,
+        });
+        assert_eq!(host, Some(rmpv::Value::String("old".into())));
+    } else {
+        panic!("original config must be Document: {original:?}");
+    }
+
+    // New version: config.host = 'new'.
+    let new_version = rows
+        .iter()
+        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
+        .expect("new version row");
+    if let Some(Value::Document(rmpv::Value::Map(entries))) = new_version.get("config") {
+        let host = entries.iter().find_map(|(k, v)| match (k, v) {
+            (rmpv::Value::String(s), v) if s.as_str() == Some("host") => Some(v.clone()),
+            _ => None,
+        });
+        assert_eq!(host, Some(rmpv::Value::String("new".into())));
+    } else {
+        panic!("new version config must be Document: {new_version:?}");
+    }
+}
+
+/// R172c Phase 3b: REMOVE on a nested property path of a temporal node
+/// writes a new version with the nested key removed, while the historical
+/// version retains it.
+#[test]
+fn remove_nested_property_path_on_temporal_node_writes_new_version() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
+        .expect("CREATE NODE TYPE");
+    db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
+        .expect("FLEXIBLE");
+    db.execute_cypher(
+        "CREATE (p:Person {name: 'A', valid_from: 100, \
+         config: {host: 'h', port: 80}})",
+    )
+    .expect("CREATE with nested doc");
+
+    db.execute_cypher("MATCH (p:Person) REMOVE p.config.port")
+        .expect("nested REMOVE on temporal must succeed (Phase 3b)");
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (p:Person) RETURN p.valid_from AS vf, p.valid_to AS vt, p.config AS config",
+        )
+        .expect("MATCH after nested REMOVE");
+    assert!(rows.len() >= 2, "old + new: {rows:?}");
+
+    // Original keeps port=80.
+    let original = rows
+        .iter()
+        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
+        .expect("original");
+    if let Some(Value::Document(rmpv::Value::Map(entries))) = original.get("config") {
+        assert!(
+            entries
+                .iter()
+                .any(|(k, _)| matches!(k, rmpv::Value::String(s) if s.as_str() == Some("port"))),
+            "original must retain port: {entries:?}"
+        );
+    } else {
+        panic!("expected Document on original");
+    }
+
+    // New version has no port.
+    let new_version = rows
+        .iter()
+        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
+        .expect("new");
+    if let Some(Value::Document(rmpv::Value::Map(entries))) = new_version.get("config") {
+        assert!(
+            !entries
+                .iter()
+                .any(|(k, _)| matches!(k, rmpv::Value::String(s) if s.as_str() == Some("port"))),
+            "new version must NOT have port: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(k, _)| matches!(k, rmpv::Value::String(s) if s.as_str() == Some("host"))),
+            "new version must retain host: {entries:?}"
+        );
+    } else {
+        panic!("expected Document on new version");
+    }
+}
+
+/// R172c Phase 3b: doc_push on a temporal node array property writes a new
+/// version with the appended element; historical version unchanged.
+#[test]
+fn doc_push_on_temporal_node_writes_new_version_with_append() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Bag TEMPORAL")
+        .expect("CREATE NODE TYPE");
+    db.execute_cypher("ALTER LABEL Bag SET SCHEMA FLEXIBLE")
+        .expect("FLEXIBLE");
+    db.execute_cypher("CREATE (b:Bag {valid_from: 100, data: {items: ['a']}})")
+        .expect("CREATE with array");
+
+    db.execute_cypher("MATCH (b:Bag) SET doc_push(b.data.items, 'b')")
+        .expect("doc_push on temporal must succeed (Phase 3b)");
+
+    let rows = db
+        .execute_cypher("MATCH (b:Bag) RETURN b.valid_from AS vf, b.valid_to AS vt, b.data AS data")
+        .expect("MATCH after doc_push");
+    assert!(rows.len() >= 2, "old + new: {rows:?}");
+
+    let extract_items = |row: &std::collections::BTreeMap<String, Value>| -> Vec<rmpv::Value> {
+        if let Some(Value::Document(rmpv::Value::Map(entries))) = row.get("data") {
+            for (k, v) in entries {
+                if matches!(k, rmpv::Value::String(s) if s.as_str() == Some("items")) {
+                    if let rmpv::Value::Array(arr) = v {
+                        return arr.clone();
+                    }
+                }
+            }
+        }
+        Vec::new()
+    };
+
+    let original = rows
+        .iter()
+        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
+        .expect("original");
+    let new_version = rows
+        .iter()
+        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
+        .expect("new");
+    assert_eq!(extract_items(original).len(), 1, "original keeps 1 item");
+    let new_items = extract_items(new_version);
+    assert_eq!(new_items.len(), 2, "new version has 2 items: {new_items:?}");
+    assert_eq!(new_items[0], rmpv::Value::String("a".into()));
+    assert_eq!(new_items[1], rmpv::Value::String("b".into()));
+}
+
+/// R172c Phase 3b: doc_inc on a temporal node numeric property writes a
+/// new version with the incremented value.
+#[test]
+fn doc_inc_on_temporal_node_writes_new_version_with_increment() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Counter TEMPORAL")
+        .expect("CREATE NODE TYPE");
+    db.execute_cypher("ALTER LABEL Counter SET SCHEMA FLEXIBLE")
+        .expect("FLEXIBLE");
+    db.execute_cypher("CREATE (c:Counter {valid_from: 100, stats: {views: 10}})")
+        .expect("CREATE with counter");
+    db.execute_cypher("MATCH (c:Counter) SET doc_inc(c.stats.views, 5)")
+        .expect("doc_inc on temporal");
+
+    let rows = db
+        .execute_cypher("MATCH (c:Counter) RETURN c.valid_from AS vf, c.stats AS stats")
+        .expect("MATCH");
+    assert!(rows.len() >= 2);
+
+    let extract_views = |row: &std::collections::BTreeMap<String, Value>| -> Option<f64> {
+        if let Some(Value::Document(rmpv::Value::Map(entries))) = row.get("stats") {
+            for (k, v) in entries {
+                if matches!(k, rmpv::Value::String(s) if s.as_str() == Some("views")) {
+                    return match v {
+                        rmpv::Value::Integer(i) => i.as_i64().map(|n| n as f64),
+                        rmpv::Value::F64(f) => Some(*f),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        None
+    };
+
+    let original = rows
+        .iter()
+        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
+        .expect("original");
+    let new_version = rows
+        .iter()
+        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
+        .expect("new");
+    assert_eq!(extract_views(original), Some(10.0));
+    assert_eq!(extract_views(new_version), Some(15.0));
+}
+
+/// R172c Phase 3b edge case: multiple nested SET items on the same
+/// temporal node in one clause must produce ONE new version with all
+/// changes applied — not N versions.
+#[test]
+fn multiple_nested_set_items_on_temporal_node_produce_one_new_version() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
+        .expect("CREATE NODE TYPE");
+    db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
+        .expect("FLEXIBLE");
+    db.execute_cypher("CREATE (p:Person {valid_from: 100, addr: {street: 's1', city: 'c1'}})")
+        .expect("CREATE");
+
+    db.execute_cypher("MATCH (p:Person) SET p.addr.street = 's2', p.addr.city = 'c2'")
+        .expect("multi-SET");
+
+    let rows = db
+        .execute_cypher("MATCH (p:Person) RETURN p.valid_from AS vf, p.addr AS addr")
+        .expect("MATCH");
+    assert_eq!(
+        rows.len(),
+        2,
+        "multi-SET on same node = 1 new version (2 rows total): {rows:?}"
+    );
+
+    let new_version = rows
+        .iter()
+        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
+        .expect("new");
+    if let Some(Value::Document(rmpv::Value::Map(entries))) = new_version.get("addr") {
+        let street = entries
+            .iter()
+            .find(|(k, _)| matches!(k, rmpv::Value::String(s) if s.as_str() == Some("street")))
+            .map(|(_, v)| v.clone());
+        let city = entries
+            .iter()
+            .find(|(k, _)| matches!(k, rmpv::Value::String(s) if s.as_str() == Some("city")))
+            .map(|(_, v)| v.clone());
+        assert_eq!(street, Some(rmpv::Value::String("s2".into())));
+        assert_eq!(city, Some(rmpv::Value::String("c2".into())));
+    } else {
+        panic!("expected Document on new version");
+    }
+}
+
 /// `valid_to` on a temporal CREATE with a non-numeric type is rejected at
 /// write time — symmetric with the `valid_from` type guard. The Null
 /// variant on `valid_to` is special-cased as "no end" (open interval).
@@ -5759,27 +6029,11 @@ fn temporal_set_mixed_valid_to_and_other_rejected() {
     );
 }
 
-/// SET PropertyPath / DocFunction on a temporal node currently rejects
-/// with a Phase 2b pointer (nested DocDelta operands need per-version
-/// merge-op routing which lands in a follow-up commit).
-#[test]
-fn temporal_set_property_path_phase2b_pointer() {
-    let (mut db, _dir) = open_db();
-    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
-        .expect("CREATE NODE TYPE Person TEMPORAL");
-    db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
-        .expect("flex");
-    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
-        .expect("seed");
-
-    let err = db
-        .execute_cypher("MATCH (p:Person) SET p.config.host = 'localhost'")
-        .expect_err("nested SET on temporal rejected pending Phase 2b");
-    assert!(
-        format!("{err}").contains("Phase 2b"),
-        "error must mention Phase 2b: {err}"
-    );
-}
+// (Former `temporal_set_property_path_phase2b_pointer` reject test
+// removed in R172c Phase 3b: nested SET on temporal is now supported
+// — covered by `set_nested_property_path_on_temporal_node_writes_new_version`,
+// `doc_push_on_temporal_node_writes_new_version_with_append`,
+// `doc_inc_on_temporal_node_writes_new_version_with_increment`, etc.)
 
 /// SET valid_to with a value <= valid_from is rejected — same interval
 /// invariant as CREATE.

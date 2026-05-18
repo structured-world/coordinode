@@ -7343,19 +7343,99 @@ fn execute_update(
                                 }
                             }
                         }
-                        crate::cypher::ast::SetItem::PropertyPath { .. }
-                        | crate::cypher::ast::SetItem::DocFunction { .. } => {
-                            // Deferred to R172c Phase 2b — nested DocDelta
-                            // merge operands need per-version routing through
-                            // `merge_node_deltas`, which is currently keyed on
-                            // the non-temporal node key. Reject loudly until
-                            // the merge-op layer is temporal-aware.
-                            return Err(ExecutionError::Unsupported(format!(
-                                "nested path SET / doc function on temporal node \
-                                 `{var}` is not yet supported (R172c Phase 2b). \
-                                 Use a flat `SET {var}.<prop> = …` for the new \
-                                 version, or close the current version + CREATE."
-                            )));
+                        crate::cypher::ast::SetItem::PropertyPath { path, expr, .. } => {
+                            // R172c Phase 3b: nested PropertyPath SET on
+                            // temporal. Build the same DocDelta the
+                            // non-temporal path queues as a merge operand,
+                            // but apply it in-memory to `new_record` so the
+                            // close+open writes carry the post-delta state.
+                            let val = eval_expr(expr, &out_row).map_to_document();
+                            if path.is_empty() {
+                                return Err(ExecutionError::Unsupported(format!(
+                                    "SET on temporal node `{var}`: empty property path"
+                                )));
+                            }
+                            let field_id = ctx.interner.intern(&path[0]);
+                            let sub_path = path[1..].to_vec();
+                            let delta = coordinode_core::graph::doc_delta::DocDelta::SetPath {
+                                target: coordinode_core::graph::doc_delta::PathTarget::PropField(
+                                    field_id,
+                                ),
+                                path: sub_path,
+                                value: val.to_rmpv(),
+                            };
+                            coordinode_storage::engine::merge::apply_doc_deltas_to_record(
+                                &mut new_record,
+                                &[delta],
+                            );
+                            ctx.write_stats.properties_set += 1;
+                            // Surface the leaf path in out_row for RETURN.
+                            let path_str = path.join(".");
+                            out_row.insert(format!("{var}.{path_str}"), val);
+                        }
+                        crate::cypher::ast::SetItem::DocFunction {
+                            function,
+                            path,
+                            value_expr,
+                            ..
+                        } => {
+                            // R172c Phase 3b: doc_push / doc_pull /
+                            // doc_add_to_set / doc_inc on temporal nodes.
+                            // Same construction as the non-temporal path,
+                            // but applied in-memory to `new_record`.
+                            let val = eval_expr(value_expr, &out_row);
+                            let (field_id, sub_path) = if path.is_empty() {
+                                (ctx.interner.intern(var), vec![])
+                            } else {
+                                (ctx.interner.intern(&path[0]), path[1..].to_vec())
+                            };
+                            let target =
+                                coordinode_core::graph::doc_delta::PathTarget::PropField(field_id);
+                            let delta = match function.as_str() {
+                                "doc_push" => {
+                                    coordinode_core::graph::doc_delta::DocDelta::ArrayPush {
+                                        target,
+                                        path: sub_path,
+                                        value: val.to_rmpv(),
+                                    }
+                                }
+                                "doc_pull" => {
+                                    coordinode_core::graph::doc_delta::DocDelta::ArrayPull {
+                                        target,
+                                        path: sub_path,
+                                        value: val.to_rmpv(),
+                                    }
+                                }
+                                "doc_add_to_set" => {
+                                    coordinode_core::graph::doc_delta::DocDelta::ArrayAddToSet {
+                                        target,
+                                        path: sub_path,
+                                        value: val.to_rmpv(),
+                                    }
+                                }
+                                "doc_inc" => {
+                                    let amount = match &val {
+                                        Value::Int(i) => *i as f64,
+                                        Value::Float(f) => *f,
+                                        _ => 0.0,
+                                    };
+                                    coordinode_core::graph::doc_delta::DocDelta::Increment {
+                                        target,
+                                        path: sub_path,
+                                        amount,
+                                    }
+                                }
+                                other => {
+                                    return Err(ExecutionError::Unsupported(format!(
+                                        "unknown doc function on temporal node `{var}`: {other}"
+                                    )));
+                                }
+                            };
+                            coordinode_storage::engine::merge::apply_doc_deltas_to_record(
+                                &mut new_record,
+                                &[delta],
+                            );
+                            ctx.write_stats.properties_set += 1;
                         }
                     }
                     processed_temporal_items.insert(item_idx);
@@ -8423,14 +8503,10 @@ fn execute_remove(
                     }
                     temporal_remove_vars.insert((row_idx, var.clone()));
                 }
-                crate::cypher::ast::RemoveItem::PropertyPath { path, .. } => {
-                    return Err(ExecutionError::Unsupported(format!(
-                        "REMOVE on a nested property path (`{var}.{}`) on temporal \
-                         label '{primary}' is not yet supported (R172c Phase 3b). \
-                         The doc-delta merge operand layer is currently keyed on \
-                         the non-temporal node key.",
-                        path.join(".")
-                    )));
+                crate::cypher::ast::RemoveItem::PropertyPath { .. } => {
+                    // R172c Phase 3b: classify; the delta is built and
+                    // applied to `new_record` in the close+open block.
+                    temporal_remove_vars.insert((row_idx, var.clone()));
                 }
                 crate::cypher::ast::RemoveItem::Label { .. } => {
                     temporal_remove_vars.insert((row_idx, var.clone()));
@@ -8519,9 +8595,40 @@ fn execute_remove(
                             new_record.remove_label(label);
                             ctx.write_stats.labels_removed += 1;
                         }
-                        crate::cypher::ast::RemoveItem::PropertyPath { .. } => {
-                            // Already rejected at pre-scan — unreachable here.
-                            unreachable!("temporal PropertyPath REMOVE rejected in pre-scan");
+                        crate::cypher::ast::RemoveItem::PropertyPath { path, .. } => {
+                            // R172c Phase 3b: nested REMOVE on temporal —
+                            // build DeletePath DocDelta, apply in-memory.
+                            if path.is_empty() {
+                                return Err(ExecutionError::Unsupported(format!(
+                                    "REMOVE on temporal node `{var}`: empty property path"
+                                )));
+                            }
+                            let field_id = ctx.interner.intern(&path[0]);
+                            let sub_path = path[1..].to_vec();
+                            let delta = if sub_path.is_empty() {
+                                // Top-level prop removal — RemoveProperty
+                                // (no sub-path traversal).
+                                coordinode_core::graph::doc_delta::DocDelta::RemoveProperty {
+                                    target:
+                                        coordinode_core::graph::doc_delta::PathTarget::PropField(
+                                            field_id,
+                                        ),
+                                    key: None,
+                                }
+                            } else {
+                                coordinode_core::graph::doc_delta::DocDelta::DeletePath {
+                                    target:
+                                        coordinode_core::graph::doc_delta::PathTarget::PropField(
+                                            field_id,
+                                        ),
+                                    path: sub_path,
+                                }
+                            };
+                            coordinode_storage::engine::merge::apply_doc_deltas_to_record(
+                                &mut new_record,
+                                &[delta],
+                            );
+                            ctx.write_stats.properties_removed += 1;
                         }
                     }
                     processed_temporal_items.insert(item_idx);
