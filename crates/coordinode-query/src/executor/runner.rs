@@ -7133,22 +7133,26 @@ fn execute_update(
     let mut results = Vec::new();
 
     // R172c temporal-node SET routing. For each SET item targeting a node
-    // on a temporal label, dispatch by property name:
+    // on a temporal label, classify by property:
     //
-    //   * `valid_from` → reject (immutable: it is the version-key suffix;
-    //     re-key requires DELETE + CREATE, mirror of the edge-side rule).
-    //   * `valid_to`   → mutate in place at the version-key the matched
-    //     row binds (close-version semantics; no re-key needed because
-    //     `valid_to` lives in the record value, not in the key).
+    //   * `valid_from` → reject (immutable storage-key suffix).
+    //   * `valid_to`   → mutate in place at the matched per-version key
+    //     (close-version path, Phase 1).
     //   * Other property / label mutations → write a NEW version row at
-    //     `valid_from = NOW` per ADR-027. R172c Phase 2 — currently
-    //     rejected with a clear pointer instructing the user to use the
-    //     canonical close-version idiom (`SET n.valid_to = …`) plus an
-    //     explicit `CREATE` for the new version state.
+    //     `valid_from = NOW` (close current + open new — Phase 2).
+    //
+    // Mixed `valid_to` + other items on the SAME variable in the SAME
+    // clause is rejected as ambiguous: should `valid_to` close the
+    // current version, or set the new version's valid_to? User must
+    // split into separate statements.
     //
     // Edge SET items (Value::String binding) skip this whole block —
     // they have their own temporal handling in `update_edge_property`.
-    for row in input_rows {
+    let mut temporal_new_version_vars: std::collections::HashSet<(usize, String)> =
+        std::collections::HashSet::new();
+    let mut temporal_in_place_vars: std::collections::HashSet<(usize, String)> =
+        std::collections::HashSet::new();
+    for (row_idx, row) in input_rows.iter().enumerate() {
         for item in items {
             let var = match item {
                 crate::cypher::ast::SetItem::Property { variable, .. }
@@ -7186,28 +7190,222 @@ fn execute_update(
                 crate::cypher::ast::SetItem::Property { property, .. }
                     if property == "valid_to" =>
                 {
-                    // Close-version SET — mutated in place by the dedicated
-                    // helper below (after the read-only scan completes).
-                    continue;
+                    temporal_in_place_vars.insert((row_idx, var.clone()));
                 }
                 _ => {
-                    return Err(ExecutionError::Unsupported(format!(
-                        "SET on temporal label '{primary}' currently supports only \
-                         `SET {var}.valid_to = …` (close-version) in R172c Phase 1. \
-                         Property mutations that imply a new version row (write at \
-                         valid_from = NOW) land in R172c Phase 2. Workaround: close \
-                         the current version (`SET {var}.valid_to = …`) and CREATE \
-                         a new version with the updated property values."
-                    )));
+                    temporal_new_version_vars.insert((row_idx, var.clone()));
                 }
             }
+        }
+    }
+    // Mixed in-place + new-version on the same (row, var) is ambiguous.
+    for entry in &temporal_in_place_vars {
+        if temporal_new_version_vars.contains(entry) {
+            let (_idx, var) = entry;
+            return Err(ExecutionError::Unsupported(format!(
+                "SET clause mixes `{var}.valid_to = …` (close-version) with other \
+                 property mutations on the same temporal node in the same clause. \
+                 This is ambiguous: should valid_to close the current version or \
+                 set the new version's interval? Split into separate statements: \
+                 first close the current version with `SET {var}.valid_to = …`, \
+                 then CREATE a new version (or vice versa with the open+set form)."
+            )));
         }
     }
 
     // 'row_loop label: when violation_mode == Skip, `continue 'row_loop` silently
     // drops the row instead of propagating the schema error.
-    'row_loop: for row in input_rows {
+    'row_loop: for (row_idx, row) in input_rows.iter().enumerate() {
         let mut out_row = row.clone();
+
+        // R172c Phase 2: close-current + open-new processing for temporal
+        // nodes mutated by non-`valid_to` SET items. This block fires
+        // BEFORE the normal SET loop. For each (var) on this row that the
+        // pre-scan classified as "needs new version", we:
+        //   1. Read the current matched version's record (via the bound
+        //      `n.valid_from`-suffixed key).
+        //   2. Clone it; apply all relevant SET items to the clone.
+        //   3. Close current: rewrite the matched record with
+        //      `valid_to = NOW`.
+        //   4. Open new: write the clone at a fresh per-version key
+        //      `node:<shard>:<node_id>:<NOW>` with `valid_to = NULL` and
+        //      a fresh `__ingestion_ts__`. Same `node_id` — the new row
+        //      is a new VERSION of the same logical node.
+        //
+        // All non-`valid_to` SET items targeting a temporal node are then
+        // marked processed and skipped in the main SET loop below.
+        let mut processed_temporal_items: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        let temporal_new_vars_for_row: Vec<String> = temporal_new_version_vars
+            .iter()
+            .filter(|(idx, _)| *idx == row_idx)
+            .map(|(_, v)| v.clone())
+            .collect();
+        if !temporal_new_vars_for_row.is_empty() {
+            let now_us = current_hlc_us() as i64;
+            for var in &temporal_new_vars_for_row {
+                let node_id = match out_row.get(var) {
+                    Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+                    _ => continue,
+                };
+                let current_valid_from = match out_row.get(&format!("{var}.valid_from")) {
+                    Some(Value::Int(ms)) => *ms,
+                    Some(Value::Timestamp(ms)) => *ms,
+                    _ => {
+                        return Err(ExecutionError::Unsupported(format!(
+                            "temporal SET on `{var}`: matched row is missing \
+                             `{var}.valid_from` (the planner must surface valid_from \
+                             on every temporal node materialised for mutation)"
+                        )));
+                    }
+                };
+                // NOW must be strictly greater than the matched version's
+                // valid_from so the new version's interval is valid. If the
+                // wall clock is at or before valid_from (legitimate during
+                // backfill / replay scenarios) we bump to valid_from + 1 µs.
+                let new_valid_from = if now_us > current_valid_from {
+                    now_us
+                } else {
+                    current_valid_from + 1
+                };
+
+                // Step 1: read current matched version record.
+                let current_key = coordinode_core::graph::node::encode_temporal_node_key(
+                    ctx.shard_id,
+                    node_id,
+                    current_valid_from,
+                );
+                let current_bytes =
+                    ctx.mvcc_get(Partition::Node, &current_key)?
+                        .ok_or_else(|| {
+                            ExecutionError::Unsupported(format!(
+                                "temporal SET on `{var}`: matched version record not \
+                             found at (node_id={node_id}, valid_from={current_valid_from})"
+                            ))
+                        })?;
+                let mut closing_record = NodeRecord::from_msgpack(&current_bytes).map_err(|e| {
+                    ExecutionError::Serialization(format!("temporal node decode: {e}"))
+                })?;
+                let mut new_record = closing_record.clone();
+
+                // Step 2: apply each relevant SET item to the new record.
+                // Mark each item's index in `processed_temporal_items` so
+                // the main SET loop skips it for this row.
+                for (item_idx, item) in items.iter().enumerate() {
+                    let item_var = match item {
+                        crate::cypher::ast::SetItem::Property { variable, .. }
+                        | crate::cypher::ast::SetItem::PropertyPath { variable, .. }
+                        | crate::cypher::ast::SetItem::DocFunction { variable, .. }
+                        | crate::cypher::ast::SetItem::ReplaceProperties { variable, .. }
+                        | crate::cypher::ast::SetItem::MergeProperties { variable, .. }
+                        | crate::cypher::ast::SetItem::AddLabel { variable, .. } => {
+                            variable.as_str()
+                        }
+                    };
+                    if item_var != var.as_str() {
+                        continue;
+                    }
+                    // Skip valid_to (in-place) and valid_from (rejected at pre-scan).
+                    if let crate::cypher::ast::SetItem::Property { property, .. } = item {
+                        if property == "valid_to" || property == "valid_from" {
+                            continue;
+                        }
+                    }
+                    match item {
+                        crate::cypher::ast::SetItem::Property { property, expr, .. } => {
+                            let val = eval_expr(expr, &out_row).map_to_document();
+                            let field_id = ctx.interner.intern(property);
+                            new_record.set(field_id, val);
+                        }
+                        crate::cypher::ast::SetItem::AddLabel { label, .. } => {
+                            new_record.add_label(label.clone());
+                        }
+                        crate::cypher::ast::SetItem::ReplaceProperties { expr, .. } => {
+                            let val = eval_expr(expr, &out_row);
+                            if let Value::Map(map) = val {
+                                // Clear existing user props, keep engine-managed
+                                // fields (__ingestion_ts__, valid_from, valid_to
+                                // are reapplied below).
+                                new_record.props.clear();
+                                new_record.extra = None;
+                                for (k, v) in map {
+                                    let fid = ctx.interner.intern(&k);
+                                    new_record.set(fid, v.map_to_document());
+                                }
+                            }
+                        }
+                        crate::cypher::ast::SetItem::MergeProperties { expr, .. } => {
+                            let val = eval_expr(expr, &out_row);
+                            if let Value::Map(map) = val {
+                                for (k, v) in map {
+                                    let fid = ctx.interner.intern(&k);
+                                    new_record.set(fid, v.map_to_document());
+                                }
+                            }
+                        }
+                        crate::cypher::ast::SetItem::PropertyPath { .. }
+                        | crate::cypher::ast::SetItem::DocFunction { .. } => {
+                            // Deferred to R172c Phase 2b — nested DocDelta
+                            // merge operands need per-version routing through
+                            // `merge_node_deltas`, which is currently keyed on
+                            // the non-temporal node key. Reject loudly until
+                            // the merge-op layer is temporal-aware.
+                            return Err(ExecutionError::Unsupported(format!(
+                                "nested path SET / doc function on temporal node \
+                                 `{var}` is not yet supported (R172c Phase 2b). \
+                                 Use a flat `SET {var}.<prop> = …` for the new \
+                                 version, or close the current version + CREATE."
+                            )));
+                        }
+                    }
+                    processed_temporal_items.insert(item_idx);
+                }
+
+                // Apply the new version's bitemporal axes:
+                // - new record: valid_from = NOW, valid_to = NULL (open),
+                //   refreshed __ingestion_ts__.
+                // - closing record: valid_to = NOW.
+                let vf_fid = ctx.interner.intern("valid_from");
+                let vt_fid = ctx.interner.intern("valid_to");
+                let its_fid = ctx.interner.intern("__ingestion_ts__");
+                new_record.set(vf_fid, Value::Int(new_valid_from));
+                new_record.props.remove(&vt_fid);
+                new_record.set(its_fid, Value::Int(now_us));
+                closing_record.set(vt_fid, Value::Int(new_valid_from));
+
+                // Step 3: write close-current (mutate at same per-version key).
+                let closing_bytes = closing_record.to_msgpack().map_err(|e| {
+                    ExecutionError::Serialization(format!("temporal close encode: {e}"))
+                })?;
+                ctx.mvcc_put(Partition::Node, &current_key, &closing_bytes)?;
+
+                // Step 4: write open-new (at fresh per-version key for NOW).
+                let new_key = coordinode_core::graph::node::encode_temporal_node_key(
+                    ctx.shard_id,
+                    node_id,
+                    new_valid_from,
+                );
+                let new_bytes = new_record.to_msgpack().map_err(|e| {
+                    ExecutionError::Serialization(format!("temporal new encode: {e}"))
+                })?;
+                ctx.mvcc_put(Partition::Node, &new_key, &new_bytes)?;
+                ctx.write_stats.nodes_created += 1;
+
+                // Reflect the new version's prop columns in the output row.
+                out_row.insert(format!("{var}.valid_from"), Value::Int(new_valid_from));
+                out_row.insert(format!("{var}.valid_to"), Value::Null);
+                out_row.insert(format!("{var}.__ingestion_ts__"), Value::Int(now_us));
+                for (&field_id, value) in &new_record.props {
+                    if let Some(name) = ctx.interner.resolve(field_id) {
+                        if name == "valid_from" || name == "valid_to" || name == "__ingestion_ts__"
+                        {
+                            continue;
+                        }
+                        out_row.insert(format!("{var}.{name}"), value.clone());
+                    }
+                }
+            }
+        }
 
         // Snapshot the pre-mutation state of each node variable referenced
         // by the SET items in this row, so we can fire UPDATE triggers
@@ -7230,7 +7428,15 @@ fn execute_update(
         }
         let mut edge_update_snapshots: std::collections::HashMap<String, EdgeUpdateSnapshot> =
             std::collections::HashMap::new();
-        for item in items {
+        for (snap_item_idx, item) in items.iter().enumerate() {
+            // R172c Phase 2: skip items already processed in the close+open
+            // pass above. Their snapshot is implicitly the pre-mutation
+            // record (which still exists at the matched per-version key
+            // until we rewrote its valid_to). For UPDATE-trigger purposes
+            // the closing snapshot is captured by the close+open block.
+            if processed_temporal_items.contains(&snap_item_idx) {
+                continue;
+            }
             let variable = match item {
                 crate::cypher::ast::SetItem::Property { variable, .. }
                 | crate::cypher::ast::SetItem::PropertyPath { variable, .. }
@@ -7319,7 +7525,14 @@ fn execute_update(
             }
         }
 
-        for item in items {
+        for (item_idx, item) in items.iter().enumerate() {
+            // R172c Phase 2: skip items already handled by the close+open
+            // path at the top of this row's processing. Their property
+            // values are already in the new version's record and the
+            // output row was updated to reflect that state.
+            if processed_temporal_items.contains(&item_idx) {
+                continue;
+            }
             match item {
                 crate::cypher::ast::SetItem::Property {
                     variable,

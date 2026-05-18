@@ -5008,36 +5008,6 @@ fn temporal_and_non_temporal_coexist_in_same_db() {
     );
 }
 
-/// SET on a temporal node is currently rejected — full per-version SET
-/// semantics land in R172c. Without this guard, SET would write through
-/// the 16-byte non-temporal key and silently bypass the 25-byte temporal
-/// record (data corruption). Better to fail loudly until R172c ships.
-#[test]
-fn set_on_temporal_node_rejected_until_r172c() {
-    let (mut db, _dir) = open_db();
-    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
-        .expect("CREATE NODE TYPE");
-    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
-        .expect("CREATE temporal");
-
-    let err = db
-        .execute_cypher("MATCH (p:Person) SET p.name = 'Bob'")
-        .expect_err("SET on temporal node must reject in R172b scope");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("temporal") && msg.contains("R172c"),
-        "error must mention temporal + R172c: {msg}"
-    );
-
-    // SET on a non-temporal label is unaffected.
-    db.execute_cypher("CREATE NODE TYPE Plain WITH (name: STRING)")
-        .expect("CREATE NODE TYPE Plain");
-    db.execute_cypher("CREATE (n:Plain {name: 'X'})")
-        .expect("create plain");
-    db.execute_cypher("MATCH (n:Plain) SET n.name = 'Y'")
-        .expect("SET on non-temporal unaffected");
-}
-
 /// DELETE on a temporal node is rejected for the same reason — R172c is
 /// where the positive-bitemporal-fact tombstone model lands.
 #[test]
@@ -5482,24 +5452,167 @@ fn temporal_set_valid_from_rejected_immutable() {
     );
 }
 
-/// SET on a non-`valid_to` property of a temporal node is currently
-/// rejected with a clear R172c Phase 2 pointer (the canonical idiom in
-/// Phase 1 is close-version + new CREATE).
+/// R172c Phase 2: SET on a non-`valid_to` property of a temporal node
+/// closes the current version and opens a new one. Same `node_id`
+/// (identity preserved), new `valid_from = NOW`, new `valid_to = NULL`,
+/// new `__ingestion_ts__`. The previous version is closed by setting
+/// its `valid_to` to the new version's `valid_from`.
 #[test]
-fn temporal_set_other_property_phase2_pointer() {
+fn temporal_set_property_close_and_open_new_version() {
+    use coordinode_core::graph::types::Value;
     let (mut db, _dir) = open_db();
-    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
-        .expect("CREATE NODE TYPE Person TEMPORAL");
+    db.execute_cypher(
+        "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("CREATE NODE TYPE Person TEMPORAL");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
+        .expect("seed");
+
+    // Pre-state: ONE open version.
+    let pre = db
+        .execute_cypher(
+            "MATCH (p:Person) RETURN p.name AS name, p.valid_from AS vf, p.valid_to AS vt",
+        )
+        .unwrap();
+    assert_eq!(pre.len(), 1);
+    assert_eq!(pre[0].get("name"), Some(&Value::String("Alice".into())));
+    assert_eq!(pre[0].get("vf"), Some(&Value::Int(100)));
+
+    // SET the name — must produce a new version.
+    db.execute_cypher("MATCH (p:Person) WHERE p.valid_to IS NULL SET p.name = 'Bob'")
+        .expect("temporal SET non-valid_to must succeed (Phase 2)");
+
+    // Post-state: TWO versions of the same logical node — old closed +
+    // new open. Both have the same `node_id` (verified via id() in a
+    // single MATCH bind).
+    let post = db
+        .execute_cypher(
+            "MATCH (p:Person) RETURN p.name AS name, p.valid_from AS vf, p.valid_to AS vt, \
+             p.__ingestion_ts__ AS its",
+        )
+        .unwrap();
+    assert_eq!(post.len(), 2, "must be 2 versions: {post:?}");
+
+    // Sort by valid_from to make ordering deterministic.
+    let mut sorted: Vec<_> = post
+        .iter()
+        .map(|r| {
+            let vf = match r.get("vf") {
+                Some(Value::Int(i)) => *i,
+                _ => 0,
+            };
+            (vf, r.clone())
+        })
+        .collect();
+    sorted.sort_by_key(|(vf, _)| *vf);
+
+    // Old version: valid_from=100, valid_to=NOW(new), name='Alice'.
+    let old = &sorted[0].1;
+    assert_eq!(old.get("name"), Some(&Value::String("Alice".into())));
+    assert_eq!(old.get("vf"), Some(&Value::Int(100)));
+    let old_vt = old.get("vt");
+    assert!(
+        matches!(old_vt, Some(Value::Int(_))),
+        "old version's valid_to must be set: {old_vt:?}"
+    );
+
+    // New version: valid_from=NOW, valid_to=NULL, name='Bob'.
+    let new = &sorted[1].1;
+    assert_eq!(new.get("name"), Some(&Value::String("Bob".into())));
+    let new_vf = match new.get("vf") {
+        Some(Value::Int(i)) => *i,
+        _ => panic!("new vf must be Int"),
+    };
+    let old_vt_i = match old_vt {
+        Some(Value::Int(i)) => *i,
+        _ => panic!("old vt must be Int"),
+    };
+    assert_eq!(
+        new_vf, old_vt_i,
+        "new version's valid_from must equal old version's valid_to"
+    );
+    assert!(
+        matches!(new.get("vt"), None | Some(Value::Null)),
+        "new version's valid_to must be NULL (open)"
+    );
+    assert!(
+        matches!(new.get("its"), Some(Value::Int(_))),
+        "new version must have __ingestion_ts__"
+    );
+}
+
+/// Multiple SET items in one clause produce ONE new version (not N),
+/// with all items applied to the single new record.
+#[test]
+fn temporal_set_multiple_items_one_new_version() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Person TEMPORAL WITH \
+         (name: STRING, age: INT, valid_from: INT, valid_to: INT)",
+    )
+    .expect("CREATE NODE TYPE Person TEMPORAL");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', age: 30, valid_from: 100})")
+        .expect("seed");
+
+    db.execute_cypher("MATCH (p:Person) WHERE p.valid_to IS NULL SET p.name = 'Bob', p.age = 31")
+        .expect("multi-item SET on temporal must produce one new version");
+
+    let rows = db
+        .execute_cypher("MATCH (p:Person) RETURN p.name AS name, p.age AS age, p.valid_from AS vf")
+        .unwrap();
+    assert_eq!(rows.len(), 2, "exactly 2 versions: {rows:?}");
+
+    // Find the open one (the newer version).
+    let new = rows
+        .iter()
+        .find(|r| matches!(r.get("name"), Some(Value::String(s)) if s == "Bob"))
+        .expect("new version with name=Bob");
+    assert_eq!(new.get("age"), Some(&Value::Int(31)));
+}
+
+/// Mixed `valid_to` + non-`valid_to` items in the same clause is
+/// rejected — ambiguous semantics. User must split.
+#[test]
+fn temporal_set_mixed_valid_to_and_other_rejected() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("CREATE NODE TYPE Person TEMPORAL");
     db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
         .expect("seed");
 
     let err = db
-        .execute_cypher("MATCH (p:Person) SET p.name = 'Bob'")
-        .expect_err("SET non-valid_to on temporal rejected in Phase 1");
-    let msg = format!("{err}");
+        .execute_cypher(
+            "MATCH (p:Person) WHERE p.valid_to IS NULL SET p.name = 'Bob', p.valid_to = 200",
+        )
+        .expect_err("mixed valid_to + other in same clause must be rejected");
     assert!(
-        msg.contains("Phase 2") && msg.contains("close-version"),
-        "error must mention Phase 2 + close-version workaround: {msg}"
+        format!("{err}").contains("ambiguous"),
+        "error must mention ambiguous: {err}"
+    );
+}
+
+/// SET PropertyPath / DocFunction on a temporal node currently rejects
+/// with a Phase 2b pointer (nested DocDelta operands need per-version
+/// merge-op routing which lands in a follow-up commit).
+#[test]
+fn temporal_set_property_path_phase2b_pointer() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
+        .expect("CREATE NODE TYPE Person TEMPORAL");
+    db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
+        .expect("flex");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
+        .expect("seed");
+
+    let err = db
+        .execute_cypher("MATCH (p:Person) SET p.config.host = 'localhost'")
+        .expect_err("nested SET on temporal rejected pending Phase 2b");
+    assert!(
+        format!("{err}").contains("Phase 2b"),
+        "error must mention Phase 2b: {err}"
     );
 }
 
