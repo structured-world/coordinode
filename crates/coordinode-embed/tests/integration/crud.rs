@@ -5868,29 +5868,40 @@ fn empirical_upsert_on_create_into_temporal_label() {
         .expect("non-temporal UPSERT ON CREATE accepted");
 }
 
-/// EMPIRICAL: pattern predicate `WHERE EXISTS { (a)-[:E]->(:Temp) }`
-/// reads neighbour records via 16-byte `encode_node_key`. Temporal
-/// targets stored at the 25-byte per-version key would silently evaluate
-/// to false. R172b safe-reject converts to a loud R172d pointer.
+/// R172d initial slice: pattern predicate `WHERE (a)-[:E]->(:Temp)` now
+/// works on a temporal target. The destination label-filter prefix-scans
+/// every version of the candidate node and returns true if ANY version
+/// carries all the requested labels (matches "every version is a fact"
+/// default semantics until G096's AS OF clause lands).
 #[test]
-fn empirical_pattern_predicate_into_temporal_label() {
+fn pattern_predicate_into_temporal_label_matches_any_version() {
+    use coordinode_core::graph::types::Value;
     let (mut db, _dir) = open_db();
-    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
+    db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
         .expect("CREATE Person TEMPORAL");
+    db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
+        .expect("FLEXIBLE");
     db.execute_cypher("CREATE NODE TYPE Org WITH (name: STRING)")
         .expect("CREATE Org");
+
     db.execute_cypher("CREATE (o:Org {name: 'Acme'})")
         .expect("seed Org");
+    db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
+        .expect("seed temporal Person");
+    db.execute_cypher("MATCH (o:Org), (p:Person) CREATE (o)-[:KNOWS]->(p)")
+        .expect("seed edge");
 
-    // Implicit pattern-predicate form `WHERE (o)-[:E]->(:Label)`.
-    let err = db
-        .execute_cypher("MATCH (o:Org) WHERE (o)-[:KNOWS]->(:Person) RETURN o")
-        .expect_err("pattern predicate into temporal must reject with R172d pointer");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("temporal") && msg.contains("R172d") && msg.contains("Person"),
-        "error must mention temporal + R172d + label: {msg}"
-    );
+    // Mutate the temporal target to produce a second version. Both
+    // versions still carry the :Person label, so the pattern predicate
+    // must still match.
+    db.execute_cypher("MATCH (p:Person) SET p.nickname = 'Ali'")
+        .expect("SET on temporal");
+
+    let rows = db
+        .execute_cypher("MATCH (o:Org) WHERE (o)-[:KNOWS]->(:Person) RETURN o.name AS name")
+        .expect("pattern predicate into temporal must succeed");
+    assert_eq!(rows.len(), 1, "Org matches once: {rows:?}");
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Acme".into())));
 
     // Pattern predicate into non-temporal label is unaffected.
     db.execute_cypher("MATCH (o:Org) WHERE (o)-[:KNOWS]->(:Org) RETURN o")

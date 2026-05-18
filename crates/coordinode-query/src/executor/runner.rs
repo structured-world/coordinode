@@ -5986,22 +5986,18 @@ fn check_single_hop_exists(
     row: &Row,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<bool, ExecutionError> {
-    // R172b safe-reject: pattern predicate destination label-filter reads
-    // neighbour records via 16-byte `encode_node_key` and would silently
-    // return false for temporal-labelled targets stored at the 25-byte
-    // per-version key. Without this guard `WHERE EXISTS { (a)-[:E]->(:Temp) }`
-    // would silently evaluate to false instead of failing loudly. Full
-    // per-version pattern-predicate evaluation lands in R172d.
-    for lbl in &dst_node.labels {
-        if let Ok(Some(s)) = ctx.load_current_label_schema(lbl) {
-            if s.temporal {
-                return Err(ExecutionError::Unsupported(format!(
-                    "pattern predicate with temporal target label '{lbl}' is not \
-                     yet supported (lands in R172d — per-version read executor)."
-                )));
-            }
-        }
-    }
+    // R172d: pattern predicate destination label-filter on a temporal
+    // target prefix-scans every version of the candidate node and
+    // returns true if ANY version carries all the requested labels.
+    // This matches the "every version is a fact" semantics of the
+    // current label-scoped MATCH on temporal labels — without AS OF
+    // (G096), an existence check spans the full version history.
+    let dst_is_temporal = dst_node.labels.iter().any(|lbl| {
+        ctx.load_current_label_schema(lbl)
+            .ok()
+            .flatten()
+            .is_some_and(|s| s.temporal)
+    });
 
     // Resolve source node ID from bound variable
     let src_id = match &src_node.variable {
@@ -6047,14 +6043,30 @@ fn check_single_hop_exists(
                     return Ok(true);
                 }
             } else {
-                // Check labels on neighbors
+                // Check labels on neighbors. Temporal targets: prefix-scan
+                // every version and accept the match if ANY version
+                // carries all the requested labels.
                 for (tgt_uid, _) in &neighbors {
                     let tgt_id = NodeId::from_raw(*tgt_uid);
-                    let node_key = encode_node_key(ctx.shard_id, tgt_id);
-                    if let Some(data) = ctx.mvcc_get(Partition::Node, &node_key)? {
-                        if let Ok(record) = NodeRecord::from_msgpack(&data) {
-                            if dst_node.labels.iter().all(|l| record.labels.contains(l)) {
-                                return Ok(true);
+                    if dst_is_temporal {
+                        let prefix = coordinode_core::graph::node::temporal_node_id_prefix(
+                            ctx.shard_id,
+                            tgt_id,
+                        );
+                        for (_k, data) in ctx.mvcc_prefix_scan(Partition::Node, &prefix)? {
+                            if let Ok(record) = NodeRecord::from_msgpack(&data) {
+                                if dst_node.labels.iter().all(|l| record.labels.contains(l)) {
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                    } else {
+                        let node_key = encode_node_key(ctx.shard_id, tgt_id);
+                        if let Some(data) = ctx.mvcc_get(Partition::Node, &node_key)? {
+                            if let Ok(record) = NodeRecord::from_msgpack(&data) {
+                                if dst_node.labels.iter().all(|l| record.labels.contains(l)) {
+                                    return Ok(true);
+                                }
                             }
                         }
                     }
