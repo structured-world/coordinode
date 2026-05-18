@@ -10278,29 +10278,19 @@ fn execute_detach_document(
         None => None,
     };
 
-    // R172b safe-reject: DETACH DOCUMENT reads the source node via
-    // `encode_node_key` (16-byte form) and removes a property from it via
-    // merge-delta on the same key. Temporal source records live at the
-    // 25-byte per-version key and would return None → confusing
-    // "DETACH DOCUMENT: node not found" error. The newly created target
-    // node IS temporal-aware (delegates to `execute_create_node`); only
-    // the source-mutation side is blocked here. R172c lifts this guard.
-    for row in input_rows {
-        let Some(Value::String(primary)) = row.get(&format!("{source_variable}.__label__")) else {
-            continue;
-        };
-        if let Ok(Some(s)) = ctx.load_current_label_schema(primary) {
-            if s.temporal {
-                return Err(ExecutionError::Unsupported(format!(
-                    "DETACH DOCUMENT from temporal source label '{primary}' \
-                     (var `{source_variable}`) is not yet supported (lands in \
-                     R172c — per-version write executor). DETACH INTO a new \
-                     temporal target label still works (delegates to the \
-                     temporal-aware CREATE path)."
-                )));
-            }
-        }
-    }
+    // R172c Phase 3c: DETACH DOCUMENT on a temporal source no longer
+    // safe-rejects. The source-mutation side ("remove property from
+    // source") routes through the close+open dance — read source's
+    // current per-version record, build a new version with the property
+    // removed via DocDelta (applied in-memory by
+    // `apply_doc_deltas_to_record`), close current at valid_to = NOW.
+    //
+    // TRANSFER EDGES on a temporal source remains rejected: edge
+    // transfer semantics on bitemporal nodes are Phase 4 territory
+    // (the new version of the source has a different temporal identity
+    // than the closed version — which version owns the transferred
+    // edges?). Without that decision we'd silently re-point edges to
+    // an ambiguous (node_id, valid_from) pair.
 
     let mut results: Vec<Row> = Vec::new();
 
@@ -10314,8 +10304,54 @@ fn execute_detach_document(
             }
         };
 
+        // Detect whether the source label is temporal — affects how we
+        // read the record and how we apply the property removal.
+        let source_is_temporal = match input_row.get(&format!("{source_variable}.__label__")) {
+            Some(Value::String(primary)) => ctx
+                .load_current_label_schema(primary)
+                .ok()
+                .flatten()
+                .is_some_and(|s| s.temporal),
+            _ => false,
+        };
+
+        if source_is_temporal && transfer_types.is_some() {
+            return Err(ExecutionError::Unsupported(format!(
+                "DETACH DOCUMENT with TRANSFER EDGES on a temporal source \
+                 (var `{source_variable}`) is not yet supported: edge \
+                 ownership across version boundaries requires the Phase 4 \
+                 (node_id, valid_from) routing. Use plain DETACH DOCUMENT \
+                 (no TRANSFER EDGES) and add the desired edges to the new \
+                 target explicitly."
+            )));
+        }
+
         // 1. Read the source node.
-        let node_key = encode_node_key(ctx.shard_id, source_id);
+        //
+        // Non-temporal: 16-byte node key — same as before.
+        // Temporal: 25-byte per-version key derived from the row's
+        // `<source>.valid_from` binding. The matched version is the one
+        // we'll close; the property is removed on the new version.
+        let (node_key, source_valid_from): (Vec<u8>, Option<i64>) = if source_is_temporal {
+            let vf = match input_row.get(&format!("{source_variable}.valid_from")) {
+                Some(Value::Int(ms)) => *ms,
+                Some(Value::Timestamp(ms)) => *ms,
+                _ => {
+                    return Err(ExecutionError::Unsupported(format!(
+                        "DETACH DOCUMENT on temporal source `{source_variable}`: \
+                         matched row is missing `{source_variable}.valid_from` \
+                         (planner must surface valid_from on every temporal node \
+                         materialised for mutation)"
+                    )));
+                }
+            };
+            (
+                coordinode_core::graph::node::encode_temporal_node_key(ctx.shard_id, source_id, vf),
+                Some(vf),
+            )
+        } else {
+            (encode_node_key(ctx.shard_id, source_id), None)
+        };
         let Some(bytes) = ctx.mvcc_get(Partition::Node, &node_key)? else {
             return Err(ExecutionError::Unsupported(format!(
                 "DETACH DOCUMENT: node {source_id} not found"
@@ -10371,8 +10407,90 @@ fn execute_detach_document(
         };
         create_single_edge(edge_src, edge_tgt, edge_type, ctx)?;
 
-        // 6. Remove the property from the source node via merge operand.
-        emit_property_removal(source_id, property_path, field_id_opt, ctx)?;
+        // 6. Remove the property from the source node.
+        //
+        // Non-temporal: queue a DocDelta merge operand against the
+        // 16-byte node key (O(1), no read).
+        // Temporal: read the matched per-version record, apply the
+        // DocDelta to the clone in-memory via
+        // `apply_doc_deltas_to_record`, write closing record at the
+        // current temporal key (valid_to = NOW) and the new version at
+        // a fresh temporal key. Preserves history.
+        if source_is_temporal {
+            let Some(current_valid_from) = source_valid_from else {
+                // source_is_temporal implies valid_from was captured
+                // above; unreachable in practice.
+                return Err(ExecutionError::Unsupported(format!(
+                    "DETACH DOCUMENT on temporal source `{source_variable}`: \
+                     internal state missing valid_from"
+                )));
+            };
+            let now_us = current_hlc_us() as i64;
+            let new_valid_from = if now_us > current_valid_from {
+                now_us
+            } else {
+                current_valid_from + 1
+            };
+            let mut closing_record = record.clone();
+            let mut new_record = record.clone();
+
+            // Build and apply the DocDelta for the property removal,
+            // mirroring `emit_property_removal` but applied in-memory.
+            use coordinode_core::graph::doc_delta::{DocDelta, PathTarget};
+            let delta = if property_path.len() == 1 {
+                match field_id_opt {
+                    Some(fid) => DocDelta::RemoveProperty {
+                        target: PathTarget::PropField(fid),
+                        key: None,
+                    },
+                    None => DocDelta::RemoveProperty {
+                        target: PathTarget::Extra,
+                        key: Some(property_path[0].clone()),
+                    },
+                }
+            } else {
+                let target = match field_id_opt {
+                    Some(fid) => PathTarget::PropField(fid),
+                    None => PathTarget::Extra,
+                };
+                DocDelta::DeletePath {
+                    target,
+                    path: property_path[1..].to_vec(),
+                }
+            };
+            coordinode_storage::engine::merge::apply_doc_deltas_to_record(
+                &mut new_record,
+                &[delta],
+            );
+
+            // Refresh bitemporal axis fields on both records.
+            let vf_fid = ctx.interner.intern("valid_from");
+            let vt_fid = ctx.interner.intern("valid_to");
+            let its_fid = ctx.interner.intern("__ingestion_ts__");
+            closing_record.set(vt_fid, Value::Int(new_valid_from));
+            new_record.set(vf_fid, Value::Int(new_valid_from));
+            new_record.props.remove(&vt_fid);
+            new_record.set(its_fid, Value::Int(now_us));
+
+            // Write close-current at the matched key; open-new at a
+            // fresh per-version key.
+            let closing_bytes = closing_record
+                .to_msgpack()
+                .map_err(|e| ExecutionError::Serialization(format!("DETACH close encode: {e}")))?;
+            ctx.mvcc_put(Partition::Node, &node_key, &closing_bytes)?;
+            let new_key = coordinode_core::graph::node::encode_temporal_node_key(
+                ctx.shard_id,
+                source_id,
+                new_valid_from,
+            );
+            let new_bytes = new_record
+                .to_msgpack()
+                .map_err(|e| ExecutionError::Serialization(format!("DETACH new encode: {e}")))?;
+            ctx.mvcc_put(Partition::Node, &new_key, &new_bytes)?;
+            ctx.write_stats.properties_removed += 1;
+        } else {
+            emit_property_removal(source_id, property_path, field_id_opt, ctx)?;
+        }
 
         // 7. Optional TRANSFER EDGES.
         if let Some(ref types) = transfer_types {
@@ -10802,24 +10920,25 @@ fn execute_attach_document(
         None => None,
     };
 
-    // R172b safe-reject: ATTACH DOCUMENT reads source via `encode_node_key`
-    // (16-byte form) and modifies target via merge-delta on the same key.
-    // Temporal source/target records live at the 25-byte per-version key
-    // and would return None → confusing "source/target not found" error
-    // when the real issue is the read path being non-temporal-aware. Bound
-    // `__label__` columns reveal the labels without an extra storage read.
+    // R172c Phase 3c: ATTACH DOCUMENT supports a temporal *target* —
+    // the target's matched per-version record is read via its
+    // `<target>.valid_from` binding and the property added via the
+    // close+open dance (DocDelta::SetPath applied in-memory to the
+    // new-version clone). Temporal *source* remains rejected: ATTACH
+    // cascade-deletes the source, which on a temporal label needs the
+    // positive-bitemporal-fact tombstone composition + cross-version
+    // edge cleanup (Phase 4).
     for row in input_rows {
-        for var in [source_variable, target_variable] {
-            let Some(Value::String(primary)) = row.get(&format!("{var}.__label__")) else {
-                continue;
-            };
+        if let Some(Value::String(primary)) = row.get(&format!("{source_variable}.__label__")) {
             if let Ok(Some(s)) = ctx.load_current_label_schema(primary) {
                 if s.temporal {
                     return Err(ExecutionError::Unsupported(format!(
-                        "ATTACH DOCUMENT on temporal label '{primary}' (var `{var}`) \
-                         is not yet supported (lands in R172c — per-version write \
-                         executor). The current R172b scope is CREATE + label-scoped \
-                         MATCH on temporal labels only."
+                        "ATTACH DOCUMENT on a temporal *source* (var \
+                         `{source_variable}`, label '{primary}') is not yet \
+                         supported: ATTACH cascade-deletes the source, which on \
+                         a temporal label requires the positive-bitemporal-fact \
+                         tombstone composition + cross-version edge cleanup \
+                         (Phase 4). ATTACH onto a temporal *target* is supported."
                     )));
                 }
             }
@@ -10846,8 +10965,41 @@ fn execute_attach_document(
             }
         };
 
+        // Detect temporal target — affects how we read/write target's
+        // record. Source is always non-temporal at this point (temporal
+        // source was rejected at the pre-scan above).
+        let target_is_temporal = match input_row.get(&format!("{target_variable}.__label__")) {
+            Some(Value::String(primary)) => ctx
+                .load_current_label_schema(primary)
+                .ok()
+                .flatten()
+                .is_some_and(|s| s.temporal),
+            _ => false,
+        };
+
         // --- 1. Conflict check on the target property ---
-        let target_key = encode_node_key(ctx.shard_id, target_id);
+        //
+        // Non-temporal target: read the 16-byte node-key record.
+        // Temporal target: read the matched per-version record at the
+        // 25-byte key derived from `<target>.valid_from`.
+        let (target_key, target_valid_from): (Vec<u8>, Option<i64>) = if target_is_temporal {
+            let vf = match input_row.get(&format!("{target_variable}.valid_from")) {
+                Some(Value::Int(ms)) => *ms,
+                Some(Value::Timestamp(ms)) => *ms,
+                _ => {
+                    return Err(ExecutionError::Unsupported(format!(
+                        "ATTACH DOCUMENT on temporal target `{target_variable}`: \
+                         matched row is missing `{target_variable}.valid_from`"
+                    )));
+                }
+            };
+            (
+                coordinode_core::graph::node::encode_temporal_node_key(ctx.shard_id, target_id, vf),
+                Some(vf),
+            )
+        } else {
+            (encode_node_key(ctx.shard_id, target_id), None)
+        };
         let target_bytes = ctx.mvcc_get(Partition::Node, &target_key)?.ok_or_else(|| {
             ExecutionError::Unsupported(format!(
                 "ATTACH DOCUMENT: target node {target_id} not found"
@@ -10865,7 +11017,7 @@ fn execute_attach_document(
             )));
         }
 
-        // --- 2. Read source node ---
+        // --- 2. Read source node (always non-temporal here) ---
         let source_key = encode_node_key(ctx.shard_id, source_id);
         let source_bytes = ctx.mvcc_get(Partition::Node, &source_key)?.ok_or_else(|| {
             ExecutionError::Unsupported(format!(
@@ -10878,13 +11030,71 @@ fn execute_attach_document(
         // --- 3. Package source properties as a DOCUMENT ---
         let doc = source_record_to_document(&source_record, ctx.interner);
 
-        // Emit a `DocDelta::SetPath` merge operand at the target. For a
-        // single-segment target path (e.g. `u.address`) the subpath is empty
-        // — `set_at_path` treats that as "replace the root", which maps to
-        // `props[address_fid] := doc`. Multi-segment paths navigate inside
-        // the existing DOCUMENT. Either way it's an O(1) write with no
-        // read-modify-write.
-        emit_attach_set_path(target_id, target_property_path, doc, ctx)?;
+        // Write the document at `target_property_path` on the target.
+        //
+        // Non-temporal target: queue a `DocDelta::SetPath` merge operand
+        // (O(1) write, no read).
+        // Temporal target: build the same SetPath delta, apply it
+        // in-memory to a clone of the target record, then write
+        // close-current at the matched key (valid_to = NOW) and
+        // open-new at a fresh per-version key. Preserves history.
+        if target_is_temporal {
+            let Some(current_valid_from) = target_valid_from else {
+                return Err(ExecutionError::Unsupported(format!(
+                    "ATTACH DOCUMENT on temporal target `{target_variable}`: \
+                     internal state missing valid_from"
+                )));
+            };
+            let now_us = current_hlc_us() as i64;
+            let new_valid_from = if now_us > current_valid_from {
+                now_us
+            } else {
+                current_valid_from + 1
+            };
+            let mut closing_record = target_record.clone();
+            let mut new_record = target_record.clone();
+
+            // Build SetPath delta — same shape `emit_attach_set_path`
+            // produces, but applied in-memory.
+            use coordinode_core::graph::doc_delta::{DocDelta, PathTarget};
+            let first = &target_property_path[0];
+            let field_id = ctx.interner.intern(first);
+            let sub_path = target_property_path[1..].to_vec();
+            let delta = DocDelta::SetPath {
+                target: PathTarget::PropField(field_id),
+                path: sub_path,
+                value: doc,
+            };
+            coordinode_storage::engine::merge::apply_doc_deltas_to_record(
+                &mut new_record,
+                &[delta],
+            );
+
+            let vf_fid = ctx.interner.intern("valid_from");
+            let vt_fid = ctx.interner.intern("valid_to");
+            let its_fid = ctx.interner.intern("__ingestion_ts__");
+            closing_record.set(vt_fid, Value::Int(new_valid_from));
+            new_record.set(vf_fid, Value::Int(new_valid_from));
+            new_record.props.remove(&vt_fid);
+            new_record.set(its_fid, Value::Int(now_us));
+
+            let closing_bytes = closing_record
+                .to_msgpack()
+                .map_err(|e| ExecutionError::Serialization(format!("ATTACH close encode: {e}")))?;
+            ctx.mvcc_put(Partition::Node, &target_key, &closing_bytes)?;
+            let new_key = coordinode_core::graph::node::encode_temporal_node_key(
+                ctx.shard_id,
+                target_id,
+                new_valid_from,
+            );
+            let new_bytes = new_record
+                .to_msgpack()
+                .map_err(|e| ExecutionError::Serialization(format!("ATTACH new encode: {e}")))?;
+            ctx.mvcc_put(Partition::Node, &new_key, &new_bytes)?;
+            ctx.write_stats.properties_set += 1;
+        } else {
+            emit_attach_set_path(target_id, target_property_path, doc, ctx)?;
+        }
 
         // --- 4. Delete the connecting edge (both directions) ---
         let (edge_src, edge_tgt) = match edge_direction {
