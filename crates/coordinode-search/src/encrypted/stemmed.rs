@@ -294,11 +294,19 @@ mod tests {
     #[test]
     fn end_to_end_stemmed_sse_storage() {
         use crate::encrypted::storage::EncryptedIndex;
-        use coordinode_storage::engine::config::StorageConfig;
+        use coordinode_storage::engine::config::{
+            Durability, EndpointConfig, Media, StorageConfig, Tier,
+        };
         use coordinode_storage::engine::core::StorageEngine;
 
         let dir = tempfile::tempdir().unwrap();
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open(&config).unwrap();
         let key = test_key();
 

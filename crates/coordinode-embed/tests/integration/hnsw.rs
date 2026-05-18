@@ -458,11 +458,19 @@ fn snapshot_mode_emits_stats_warning() {
     use coordinode_query::executor::runner::execute;
     use coordinode_query::{cypher, planner};
     use coordinode_raft::proposal::LocalProposalPipeline;
-    use coordinode_storage::engine::config::StorageConfig;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
     use coordinode_storage::engine::core::StorageEngine;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open(&config).expect("open");
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(coordinode_core::graph::node::NodeId::from_raw(0));
@@ -578,11 +586,19 @@ fn r106e_concurrent_insert_invisible_in_snapshot() {
     use coordinode_query::executor::runner::execute;
     use coordinode_query::{cypher, planner};
     use coordinode_raft::proposal::LocalProposalPipeline;
-    use coordinode_storage::engine::config::StorageConfig;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
     use coordinode_storage::engine::core::StorageEngine;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1000)));
     let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open");
     let mut interner = FieldInterner::new();
@@ -719,11 +735,19 @@ fn r106e_concurrent_delete_still_visible_in_snapshot() {
     use coordinode_query::executor::runner::execute;
     use coordinode_query::{cypher, planner};
     use coordinode_raft::proposal::LocalProposalPipeline;
-    use coordinode_storage::engine::config::StorageConfig;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
     use coordinode_storage::engine::core::StorageEngine;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1000)));
     let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open");
     let mut interner = FieldInterner::new();
@@ -850,11 +874,19 @@ fn r106e_time_travel_vector_search_via_mvcc_read_ts() {
     use coordinode_query::executor::runner::execute;
     use coordinode_query::{cypher, planner};
     use coordinode_raft::proposal::LocalProposalPipeline;
-    use coordinode_storage::engine::config::StorageConfig;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
     use coordinode_storage::engine::core::StorageEngine;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(coordinode_core::graph::node::NodeId::from_raw(0));
 

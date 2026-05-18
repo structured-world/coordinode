@@ -51,8 +51,13 @@ pub struct OplogManager {
 impl OplogManager {
     /// Open (or create) the oplog directory for `shard_id`.
     ///
-    /// Scans existing `oplog-*.bin` files and registers them as sealed segments.
-    /// The active writer starts as `None`; it is created lazily on first [`append`](Self::append).
+    /// Scans existing `oplog-*.bin` files in `dir` and registers them as
+    /// sealed segments. The active writer starts as `None`; it is created
+    /// lazily on first [`append`](Self::append).
+    ///
+    /// New segments are written to `dir` only. For multi-endpoint setups
+    /// where sealed segments may exist on additional endpoints (left over
+    /// from a previous config-driven routing), use [`Self::open_multi`].
     pub fn open(
         dir: &Path,
         shard_id: ShardId,
@@ -60,23 +65,77 @@ impl OplogManager {
         max_entries: u32,
         retention_secs: u64,
     ) -> StorageResult<Self> {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| StorageError::Io(format!("create oplog dir {:?}: {e}", dir)))?;
+        Self::open_multi(dir, &[], shard_id, max_bytes, max_entries, retention_secs)
+    }
 
-        let mut paths: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)
-            .map_err(|e| StorageError::Io(format!("read oplog dir {:?}: {e}", dir)))?
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let p = e.path();
-                let idx = parse_first_index(&p)?;
-                Some((idx, p))
-            })
-            .collect();
+    /// Open the oplog manager with an active write directory plus extra
+    /// directories scanned for sealed segments at startup (R157,
+    /// [storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2).
+    ///
+    /// `active_dir` receives all new segments. `recovery_dirs` are
+    /// scanned at startup for `oplog-*.bin` files and merged into the
+    /// `sealed` list in chronological order by `first_index`. The active
+    /// dir is automatically included in the recovery scan — callers do
+    /// NOT need to pass it twice.
+    ///
+    /// Use case: a config change re-routed the active oplog endpoint;
+    /// sealed segments from the previous endpoint remain queryable
+    /// through this scan-on-open without manual migration.
+    pub fn open_multi(
+        active_dir: &Path,
+        recovery_dirs: &[PathBuf],
+        shard_id: ShardId,
+        max_bytes: u64,
+        max_entries: u32,
+        retention_secs: u64,
+    ) -> StorageResult<Self> {
+        std::fs::create_dir_all(active_dir)
+            .map_err(|e| StorageError::Io(format!("create oplog dir {:?}: {e}", active_dir)))?;
+
+        // Build the scan set: active_dir + recovery_dirs, deduplicated
+        // by canonical path so callers can pass the active dir in the
+        // recovery list without double-counting.
+        let mut scan_dirs: Vec<PathBuf> = Vec::with_capacity(1 + recovery_dirs.len());
+        scan_dirs.push(active_dir.to_path_buf());
+        for d in recovery_dirs {
+            if d != active_dir && !scan_dirs.contains(d) {
+                scan_dirs.push(d.clone());
+            }
+        }
+
+        let mut paths: Vec<(u64, PathBuf)> = Vec::new();
+        for dir in &scan_dirs {
+            // recovery dirs may not exist (operator pruned them) — skip
+            // missing without error.
+            if !dir.exists() {
+                continue;
+            }
+            let entries = std::fs::read_dir(dir)
+                .map_err(|e| StorageError::Io(format!("read oplog dir {:?}: {e}", dir)))?;
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if let Some(idx) = parse_first_index(&p) {
+                    paths.push((idx, p));
+                }
+            }
+        }
 
         paths.sort_by_key(|&(idx, _)| idx);
 
+        // Reject duplicate first_index across endpoints — the operator
+        // must clean up before the engine boots, since two segments at
+        // the same first_index represent ambiguous fork history.
+        if let Some(window) = paths.windows(2).find(|w| w[0].0 == w[1].0) {
+            return Err(StorageError::Io(format!(
+                "duplicate oplog segment first_index={} across endpoints: {:?} and {:?} \
+                 — operator must reconcile (likely leftover from a previous \
+                 config-driven oplog endpoint re-route)",
+                window[0].0, window[0].1, window[1].1,
+            )));
+        }
+
         Ok(Self {
-            dir: dir.to_path_buf(),
+            dir: active_dir.to_path_buf(),
             shard_id,
             max_bytes,
             max_entries,
@@ -368,7 +427,7 @@ impl OplogManager {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::panic, clippy::cloned_ref_to_slice_refs)]
 mod tests {
     use super::*;
     use crate::oplog::entry::OplogOp;
@@ -721,5 +780,109 @@ mod tests {
         assert_eq!(entries.len(), 9);
         assert_eq!(entries[0].index, 3);
         assert_eq!(entries[8].index, 11);
+    }
+
+    // ── R157: multi-endpoint open ───────────────────────────────────
+
+    /// `open_multi` discovers sealed segments living in a different
+    /// directory than the active one and merges them into the sealed
+    /// list in chronological order — proves cross-endpoint oplog
+    /// recovery actually scans `recovery_dirs`, not just the active
+    /// directory.
+    #[test]
+    fn open_multi_recovers_segments_from_recovery_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let active = tmp.path().join("active");
+        let recovery = tmp.path().join("recovery");
+
+        // Pre-populate recovery dir with two sealed segments (manually
+        // create empty files matching the segment_path naming convention
+        // — open_multi only enumerates filenames, doesn't validate
+        // contents for the path-merge logic).
+        std::fs::create_dir_all(&recovery).expect("create recovery");
+        let seg_a = segment_path(&recovery, 0);
+        let seg_b = segment_path(&recovery, 100);
+        std::fs::write(&seg_a, b"").expect("write seg a");
+        std::fs::write(&seg_b, b"").expect("write seg b");
+
+        // Write one segment in active dir at first_index = 200.
+        std::fs::create_dir_all(&active).expect("create active");
+        let seg_c = segment_path(&active, 200);
+        std::fs::write(&seg_c, b"").expect("write seg c");
+
+        let mgr = OplogManager::open_multi(
+            &active,
+            &[recovery.clone()],
+            0,
+            64 * 1024 * 1024,
+            50_000,
+            7 * 24 * 3600,
+        )
+        .expect("open_multi");
+
+        // All three segments discovered, sorted by first_index.
+        assert_eq!(mgr.sealed.len(), 3);
+        assert_eq!(mgr.sealed[0].0, 0);
+        assert_eq!(mgr.sealed[1].0, 100);
+        assert_eq!(mgr.sealed[2].0, 200);
+        // Active dir wins for new writes — active path preserved.
+        assert_eq!(mgr.dir, active);
+    }
+
+    /// `open_multi` rejects ambiguous fork: two segments with the same
+    /// `first_index` across different endpoints means the operator
+    /// must reconcile before the engine boots.
+    #[test]
+    fn open_multi_rejects_duplicate_first_index_across_endpoints() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let active = tmp.path().join("active");
+        let recovery = tmp.path().join("recovery");
+        std::fs::create_dir_all(&active).expect("create active");
+        std::fs::create_dir_all(&recovery).expect("create recovery");
+
+        // Same first_index = 42 in both directories.
+        std::fs::write(segment_path(&active, 42), b"").expect("write a");
+        std::fs::write(segment_path(&recovery, 42), b"").expect("write b");
+
+        let result = OplogManager::open_multi(
+            &active,
+            &[recovery],
+            0,
+            64 * 1024 * 1024,
+            50_000,
+            7 * 24 * 3600,
+        );
+        let err = match result {
+            Ok(_) => panic!("duplicate first_index must fail"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("duplicate") && msg.contains("first_index"),
+            "error should mention duplicate first_index, got: {msg}"
+        );
+    }
+
+    /// `open_multi` tolerates missing recovery directories silently —
+    /// a previously-routed endpoint may have been removed from the
+    /// config and its directory pruned by the operator; this MUST NOT
+    /// fail the open.
+    #[test]
+    fn open_multi_skips_missing_recovery_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let active = tmp.path().join("active");
+        let missing = tmp.path().join("does_not_exist");
+
+        let mgr = OplogManager::open_multi(
+            &active,
+            &[missing],
+            0,
+            64 * 1024 * 1024,
+            50_000,
+            7 * 24 * 3600,
+        )
+        .expect("missing recovery dir must not error");
+        assert_eq!(mgr.sealed.len(), 0);
+        assert!(active.exists(), "active dir must be created");
     }
 }

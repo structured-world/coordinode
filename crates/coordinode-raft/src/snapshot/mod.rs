@@ -1026,12 +1026,20 @@ fn xxh3_hash(data: &[u8]) -> u64 {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use coordinode_storage::engine::config::StorageConfig;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
     use coordinode_storage::engine::core::StorageEngine;
     use tempfile::tempdir;
 
     fn open_engine(dir: &std::path::Path) -> StorageEngine {
-        let config = StorageConfig::new(dir);
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         StorageEngine::open(&config).expect("open engine")
     }
 
@@ -1564,7 +1572,13 @@ mod tests {
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let oracle = Arc::new(TimestampOracle::resume_from(
             coordinode_core::txn::timestamp::Timestamp::from_raw(1_000_000),
         ));
@@ -1819,7 +1833,13 @@ mod tests {
         use coordinode_core::txn::timestamp::Timestamp;
 
         let dir = tempdir().unwrap();
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
         let engine =
             StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open oracle engine");

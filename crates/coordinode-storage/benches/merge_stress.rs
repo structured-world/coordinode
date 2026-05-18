@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::thread;
 
 use coordinode_core::graph::edge::PostingList;
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::merge::{encode_add, encode_add_batch};
 use coordinode_storage::engine::partition::Partition;
@@ -29,7 +29,13 @@ fn bench_merge_throughput(c: &mut Criterion) {
             |b, &(num_writers, edges_per_writer)| {
                 b.iter(|| {
                     let dir = tempfile::TempDir::new().expect("tempdir");
-                    let config = StorageConfig::new(dir.path());
+                    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                        "default",
+                        dir.path(),
+                        Media::Hdd,
+                        Durability::Durable,
+                        Tier::Warm,
+                    )]);
                     let engine = Arc::new(StorageEngine::open(&config).expect("open"));
                     let key = b"adj:FOLLOWS:out:bench";
 
@@ -69,7 +75,13 @@ fn bench_merge_throughput(c: &mut Criterion) {
     group.bench_function("single_merge_10w×1000e", |b| {
         b.iter(|| {
             let dir = tempfile::TempDir::new().expect("tempdir");
-            let config = StorageConfig::new(dir.path());
+            let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]);
             let engine = Arc::new(StorageEngine::open(&config).expect("open"));
             let key = b"adj:FOLLOWS:out:bench_single";
 

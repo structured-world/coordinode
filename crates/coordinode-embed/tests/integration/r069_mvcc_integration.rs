@@ -94,13 +94,21 @@ fn occ_conflict_concurrent_threads() {
     use coordinode_core::graph::node::NodeIdAllocator;
     use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
     use coordinode_query::executor::runner::ExecutionError;
-    use coordinode_storage::engine::config::StorageConfig;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
     use coordinode_storage::engine::core::StorageEngine;
     use std::sync::{Arc, Barrier};
 
     let dir = tempfile::tempdir().expect("tempdir");
     let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1000)));
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open"));
 
     // Setup: write initial value

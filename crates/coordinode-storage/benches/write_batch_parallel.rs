@@ -13,7 +13,9 @@
 #![allow(clippy::expect_used)]
 
 use coordinode_storage::engine::batch::WriteBatch;
-use coordinode_storage::engine::config::{FlushPolicy, StorageConfig};
+use coordinode_storage::engine::config::{
+    Durability, EndpointConfig, FlushPolicy, Media, StorageConfig, Tier,
+};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
@@ -29,7 +31,13 @@ const MULTI_PARTITIONS: &[Partition] = &[
 /// Open a storage engine in a temporary directory with Manual flush policy.
 fn open_engine() -> (StorageEngine, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().expect("tempdir");
-    let mut config = StorageConfig::new(dir.path());
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     config.flush_policy = FlushPolicy::Manual;
     let engine = StorageEngine::open(&config).expect("open engine");
     (engine, dir)

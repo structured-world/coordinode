@@ -6,7 +6,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 
@@ -29,7 +29,13 @@ fn executor_mvcc_write_buffer_flushed() {
     use coordinode_core::graph::node::NodeIdAllocator;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open(&config).expect("open");
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1000));
     let mut interner = FieldInterner::new();
@@ -99,7 +105,13 @@ fn executor_mvcc_delete_via_buffer() {
     use coordinode_core::graph::node::NodeIdAllocator;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open(&config).expect("open");
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(100));
 
@@ -176,7 +188,13 @@ fn occ_conflict_on_concurrent_write() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1000)));
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open");
     let allocator = NodeIdAllocator::new(0);
 
@@ -227,7 +245,13 @@ fn occ_no_false_positive() {
     use coordinode_core::graph::node::NodeIdAllocator;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open(&config).expect("open");
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1000));
     let allocator = NodeIdAllocator::new(0);
@@ -260,7 +284,13 @@ fn occ_adj_partition_excluded() {
     use coordinode_core::graph::node::NodeIdAllocator;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open(&config).expect("open");
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1000));
     let allocator = NodeIdAllocator::new(0);
@@ -315,7 +345,13 @@ fn occ_conflict_via_prefix_scan() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1000)));
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open");
     let allocator = NodeIdAllocator::new(0);
 
@@ -377,7 +413,13 @@ fn occ_conflict_via_prefix_scan() {
 #[test]
 fn mvcc_gc_compaction_removes_old_versions() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open(&config).expect("open");
 
     // Write 3 versions of the same key. Each put gets an auto-incremented
@@ -424,7 +466,13 @@ fn mvcc_gc_compaction_removes_old_versions() {
 #[test]
 fn mvcc_gc_preserves_newest_expired_version() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open(&config).expect("open");
 
     // Write 2 versions (seqno 1, 2). Both will be below watermark.
@@ -458,7 +506,13 @@ fn mvcc_gc_preserves_newest_expired_version() {
 #[test]
 fn mvcc_gc_watermark_zero_keeps_everything() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open(&config).expect("open");
 
     // Write two versions. gc_watermark stays at default 0.
@@ -488,7 +542,13 @@ fn mvcc_gc_watermark_zero_keeps_everything() {
 #[test]
 fn mvcc_gc_multiple_keys_independent() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open(&config).expect("open");
 
     // Key A: 2 versions (seqno ~1, ~2)
@@ -551,7 +611,13 @@ fn executor_mvcc_flush_via_proposal_pipeline() {
     use coordinode_raft::proposal::LocalProposalPipeline;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open(&config).expect("open");
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1000));
     let id_gen = ProposalIdGenerator::new();
@@ -626,7 +692,13 @@ fn executor_occ_conflict_with_pipeline() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1000)));
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open");
     let id_gen = ProposalIdGenerator::new();
     let allocator = NodeIdAllocator::new(0);
@@ -685,7 +757,13 @@ fn executor_adj_excluded_from_occ_with_pipeline() {
     use coordinode_raft::proposal::LocalProposalPipeline;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open(&config).expect("open");
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1000));
     let id_gen = ProposalIdGenerator::new();
@@ -741,7 +819,13 @@ fn executor_pipeline_mixed_puts_and_deletes() {
     use coordinode_raft::proposal::LocalProposalPipeline;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open(&config).expect("open");
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1000));
     let id_gen = ProposalIdGenerator::new();
@@ -808,7 +892,13 @@ fn executor_pipeline_read_only_no_proposal() {
     use coordinode_raft::proposal::LocalProposalPipeline;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open(&config).expect("open");
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1000));
     let id_gen = ProposalIdGenerator::new();
@@ -1130,7 +1220,13 @@ fn r065_occ_detects_concurrent_modification() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let oracle = std::sync::Arc::new(TimestampOracle::new());
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open");
 
     // Write initial value
@@ -1192,7 +1288,13 @@ fn r066_occ_detects_aba_write() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1000)));
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open");
 
     // Write initial value "A"

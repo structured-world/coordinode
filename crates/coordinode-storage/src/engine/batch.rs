@@ -251,12 +251,18 @@ impl<'a> WriteBatch<'a> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::engine::config::StorageConfig;
+    use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
     use tempfile::TempDir;
 
     fn test_engine_with_policy(policy: FlushPolicy) -> (StorageEngine, TempDir) {
         let dir = TempDir::new().expect("failed to create temp dir");
-        let mut config = StorageConfig::new(dir.path());
+        let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         config.flush_policy = policy;
         let engine = StorageEngine::open(&config).expect("failed to open engine");
         (engine, dir)
@@ -336,7 +342,13 @@ mod tests {
     #[test]
     fn sync_per_batch_survives_reopen() {
         let dir = TempDir::new().expect("create temp dir");
-        let mut config = StorageConfig::new(dir.path());
+        let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         config.flush_policy = FlushPolicy::SyncPerBatch;
 
         // Write batch with SyncPerBatch
@@ -361,7 +373,13 @@ mod tests {
     #[test]
     fn uncommitted_batch_not_visible() {
         let dir = TempDir::new().expect("create temp dir");
-        let mut config = StorageConfig::new(dir.path());
+        let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         config.flush_policy = FlushPolicy::SyncPerBatch;
 
         // Create batch but drop without committing

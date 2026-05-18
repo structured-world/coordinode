@@ -27,6 +27,8 @@ mod integration {
     mod r072_r073_background_workers;
     mod r074_oplog;
     mod r075_oplog_raft;
+    mod r156_multi_endpoint;
+    mod r157_wal_oplog_placement;
     mod schema;
     mod shared_engine;
     mod text_index;

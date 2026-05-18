@@ -126,12 +126,18 @@ pub fn scrub_all(engine: &StorageEngine) -> StorageResult<ScrubReport> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::engine::config::StorageConfig;
+    use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
     use tempfile::TempDir;
 
     fn test_engine() -> (StorageEngine, TempDir) {
         let dir = TempDir::new().expect("failed to create temp dir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = StorageEngine::open(&config).expect("failed to open engine");
         (engine, dir)
     }

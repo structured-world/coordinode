@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::oplog::entry::{OplogEntry, OplogOp};
@@ -31,7 +31,13 @@ use coordinode_storage::oplog::manager::OplogManager;
 const NODE_PARTITION_TAG: u8 = 1;
 
 fn open_engine(dir: &std::path::Path) -> Arc<StorageEngine> {
-    let config = StorageConfig::new(dir);
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir,
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     Arc::new(StorageEngine::open(&config).expect("open engine"))
 }
 

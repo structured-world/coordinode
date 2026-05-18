@@ -16,7 +16,7 @@ use coordinode_core::txn::proposal::{
 };
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_raft::cluster::RaftNode;
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 
@@ -43,7 +43,13 @@ struct TestNode {
 /// Create the FIRST node (leader) — calls initialize().
 async fn create_leader(node_id: u64, port: u16) -> TestNode {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = Arc::new(StorageEngine::open(&config).expect("open"));
     let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     let advertise_addr = format!("http://127.0.0.1:{port}");
@@ -62,7 +68,13 @@ async fn create_leader(node_id: u64, port: u16) -> TestNode {
 /// Create a JOINING node — does NOT call initialize(), waits for leader.
 async fn create_follower(node_id: u64, port: u16) -> TestNode {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::new(dir.path());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let engine = Arc::new(StorageEngine::open(&config).expect("open"));
     let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
 
@@ -495,9 +507,36 @@ async fn cluster_crash_recovery() {
 
         // Phase 1: Bootstrap + write data
         {
-            let e1 = Arc::new(StorageEngine::open(&StorageConfig::new(&path1)).expect("open 1"));
-            let e2 = Arc::new(StorageEngine::open(&StorageConfig::new(&path2)).expect("open 2"));
-            let e3 = Arc::new(StorageEngine::open(&StorageConfig::new(&path3)).expect("open 3"));
+            let e1 = Arc::new(
+                StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                    "default",
+                    &path1,
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                )]))
+                .expect("open 1"),
+            );
+            let e2 = Arc::new(
+                StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                    "default",
+                    &path2,
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                )]))
+                .expect("open 2"),
+            );
+            let e3 = Arc::new(
+                StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                    "default",
+                    &path3,
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                )]))
+                .expect("open 3"),
+            );
 
             let n1 = RaftNode::open_cluster(
                 1,
@@ -563,9 +602,36 @@ async fn cluster_crash_recovery() {
 
         // Phase 2: Reopen all nodes from same storage, verify data
         {
-            let e1 = Arc::new(StorageEngine::open(&StorageConfig::new(&path1)).expect("reopen 1"));
-            let e2 = Arc::new(StorageEngine::open(&StorageConfig::new(&path2)).expect("reopen 2"));
-            let e3 = Arc::new(StorageEngine::open(&StorageConfig::new(&path3)).expect("reopen 3"));
+            let e1 = Arc::new(
+                StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                    "default",
+                    &path1,
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                )]))
+                .expect("reopen 1"),
+            );
+            let e2 = Arc::new(
+                StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                    "default",
+                    &path2,
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                )]))
+                .expect("reopen 2"),
+            );
+            let e3 = Arc::new(
+                StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                    "default",
+                    &path3,
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                )]))
+                .expect("reopen 3"),
+            );
 
             // Reopen with SAME ports so membership addresses match
             let n1 = RaftNode::open_cluster(
@@ -809,7 +875,13 @@ async fn cluster_snapshot_install_restores_data() {
 
         // Install snapshot into a completely fresh engine (simulating new node)
         let fresh_dir = tempfile::tempdir().expect("fresh dir");
-        let fresh_config = StorageConfig::new(fresh_dir.path());
+        let fresh_config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            fresh_dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let fresh_engine = Arc::new(StorageEngine::open(&fresh_config).expect("fresh engine"));
 
         coordinode_raft::snapshot::install_full_snapshot(&fresh_engine, &snap_data)
@@ -882,7 +954,13 @@ async fn cluster_background_snapshot_trigger() {
 
         // Create leader with 1s snapshot trigger interval
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = StorageConfig::new(dir.path());
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         let engine = Arc::new(StorageEngine::open(&config).expect("open"));
         let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{p1}").parse().expect("addr");
 
@@ -962,7 +1040,16 @@ async fn cluster_snapshot_grpc_transfer_to_new_node() {
 
         // Leader with disabled background trigger (we control timing manually)
         let dir1 = tempfile::tempdir().expect("d1");
-        let e1 = Arc::new(StorageEngine::open(&StorageConfig::new(dir1.path())).expect("open1"));
+        let e1 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir1.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open1"),
+        );
         let snap_config = coordinode_raft::cluster::SnapshotTriggerConfig {
             check_interval: Duration::from_secs(3600), // disable periodic
             disk_space_threshold: u64::MAX,            // disable disk-based
@@ -1021,7 +1108,16 @@ async fn cluster_snapshot_grpc_transfer_to_new_node() {
         // Now add a NEW node that has never seen any data.
         // The leader's logs are purged, so it MUST send a snapshot via gRPC.
         let dir2 = tempfile::tempdir().expect("d2");
-        let e2 = Arc::new(StorageEngine::open(&StorageConfig::new(dir2.path())).expect("open2"));
+        let e2 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir2.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open2"),
+        );
 
         let n2 = RaftNode::open_joining(
             2,
@@ -1089,7 +1185,16 @@ async fn cluster_snapshot_multi_chunk_transfer() {
         let p2 = alloc_port();
 
         let dir1 = tempfile::tempdir().expect("d1");
-        let e1 = Arc::new(StorageEngine::open(&StorageConfig::new(dir1.path())).expect("open1"));
+        let e1 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir1.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open1"),
+        );
         let snap_config = coordinode_raft::cluster::SnapshotTriggerConfig {
             check_interval: Duration::from_secs(3600),
             disk_space_threshold: u64::MAX,
@@ -1172,7 +1277,16 @@ async fn cluster_snapshot_multi_chunk_transfer() {
 
         // Add new node — must receive snapshot via chunked gRPC transfer
         let dir2 = tempfile::tempdir().expect("d2");
-        let e2 = Arc::new(StorageEngine::open(&StorageConfig::new(dir2.path())).expect("open2"));
+        let e2 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir2.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open2"),
+        );
 
         let n2 = RaftNode::open_joining(
             2,
@@ -1242,10 +1356,37 @@ async fn cluster_follower_restart_reconnection() {
         let dir3 = tempfile::tempdir().expect("d3");
         let path3 = dir3.path().to_path_buf();
 
-        let e1 = Arc::new(StorageEngine::open(&StorageConfig::new(dir1.path())).expect("open1"));
+        let e1 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir1.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open1"),
+        );
         let e2_dir = tempfile::tempdir().expect("d2");
-        let e2 = Arc::new(StorageEngine::open(&StorageConfig::new(e2_dir.path())).expect("open2"));
-        let e3 = Arc::new(StorageEngine::open(&StorageConfig::new(&path3)).expect("open3"));
+        let e2 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                e2_dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open2"),
+        );
+        let e3 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                &path3,
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open3"),
+        );
 
         // Bootstrap 3-node cluster
         let n1 = RaftNode::open_cluster(
@@ -1323,7 +1464,16 @@ async fn cluster_follower_restart_reconnection() {
 
         // ── Restart node 3 on SAME port ──────────────────────────────
         // Leader must reconnect to this new instance via connect_lazy().
-        let e3_new = Arc::new(StorageEngine::open(&StorageConfig::new(&path3)).expect("reopen3"));
+        let e3_new = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                &path3,
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("reopen3"),
+        );
         let n3_new = RaftNode::open_cluster(
             3,
             Arc::clone(&e3_new),
@@ -1420,9 +1570,36 @@ async fn cluster_incremental_snapshot_cross_engine() {
         let dir2 = tempfile::tempdir().expect("d2");
         let dir3 = tempfile::tempdir().expect("d3");
 
-        let e1 = Arc::new(StorageEngine::open(&StorageConfig::new(dir1.path())).expect("open1"));
-        let e2 = Arc::new(StorageEngine::open(&StorageConfig::new(dir2.path())).expect("open2"));
-        let e3 = Arc::new(StorageEngine::open(&StorageConfig::new(dir3.path())).expect("open3"));
+        let e1 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir1.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open1"),
+        );
+        let e2 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir2.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open2"),
+        );
+        let e3 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir3.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open3"),
+        );
 
         let n1 = RaftNode::open_cluster(
             1,
@@ -1587,9 +1764,36 @@ async fn cluster_graceful_leader_transfer() {
         let dir2 = tempfile::tempdir().expect("d2");
         let dir3 = tempfile::tempdir().expect("d3");
 
-        let e1 = Arc::new(StorageEngine::open(&StorageConfig::new(dir1.path())).expect("open1"));
-        let e2 = Arc::new(StorageEngine::open(&StorageConfig::new(dir2.path())).expect("open2"));
-        let e3 = Arc::new(StorageEngine::open(&StorageConfig::new(dir3.path())).expect("open3"));
+        let e1 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir1.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open1"),
+        );
+        let e2 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir2.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open2"),
+        );
+        let e3 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir3.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open3"),
+        );
 
         let n1 = RaftNode::open_cluster(
             1,
@@ -1734,9 +1938,36 @@ async fn cluster_graceful_shutdown_transfers_leadership() {
         let dir2 = tempfile::tempdir().expect("d2");
         let dir3 = tempfile::tempdir().expect("d3");
 
-        let e1 = Arc::new(StorageEngine::open(&StorageConfig::new(dir1.path())).expect("open1"));
-        let e2 = Arc::new(StorageEngine::open(&StorageConfig::new(dir2.path())).expect("open2"));
-        let e3 = Arc::new(StorageEngine::open(&StorageConfig::new(dir3.path())).expect("open3"));
+        let e1 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir1.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open1"),
+        );
+        let e2 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir2.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open2"),
+        );
+        let e3 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir3.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open3"),
+        );
 
         let n1 = RaftNode::open_cluster(
             1,
@@ -1815,7 +2046,16 @@ async fn cluster_snapshot_bootstrap_then_log_replay() {
         let p2 = alloc_port();
 
         let dir1 = tempfile::tempdir().expect("d1");
-        let e1 = Arc::new(StorageEngine::open(&StorageConfig::new(dir1.path())).expect("open1"));
+        let e1 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir1.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open1"),
+        );
 
         let snap_config = coordinode_raft::cluster::SnapshotTriggerConfig {
             check_interval: Duration::from_secs(3600),
@@ -1883,7 +2123,16 @@ async fn cluster_snapshot_bootstrap_then_log_replay() {
         // ── New node joins (zero data) ──
         // Must receive: snapshot (pre-data) + log replay (post-data)
         let dir2 = tempfile::tempdir().expect("d2");
-        let e2 = Arc::new(StorageEngine::open(&StorageConfig::new(dir2.path())).expect("open2"));
+        let e2 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir2.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open2"),
+        );
         let n2 = RaftNode::open_joining(
             2,
             Arc::clone(&e2),
@@ -1958,9 +2207,36 @@ async fn cluster_replication_status_tracking() {
         let dir2 = tempfile::tempdir().expect("d2");
         let dir3 = tempfile::tempdir().expect("d3");
 
-        let e1 = Arc::new(StorageEngine::open(&StorageConfig::new(dir1.path())).expect("open1"));
-        let e2 = Arc::new(StorageEngine::open(&StorageConfig::new(dir2.path())).expect("open2"));
-        let e3 = Arc::new(StorageEngine::open(&StorageConfig::new(dir3.path())).expect("open3"));
+        let e1 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir1.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open1"),
+        );
+        let e2 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir2.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open2"),
+        );
+        let e3 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir3.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open3"),
+        );
 
         let n1 = RaftNode::open_cluster(
             1,
@@ -2110,9 +2386,36 @@ async fn cluster_read_concern_levels() {
         let dir2 = tempfile::tempdir().expect("d2");
         let dir3 = tempfile::tempdir().expect("d3");
 
-        let e1 = Arc::new(StorageEngine::open(&StorageConfig::new(dir1.path())).expect("open1"));
-        let e2 = Arc::new(StorageEngine::open(&StorageConfig::new(dir2.path())).expect("open2"));
-        let e3 = Arc::new(StorageEngine::open(&StorageConfig::new(dir3.path())).expect("open3"));
+        let e1 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir1.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open1"),
+        );
+        let e2 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir2.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open2"),
+        );
+        let e3 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir3.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open3"),
+        );
 
         let n1 = RaftNode::open_cluster(
             1,
@@ -2238,9 +2541,36 @@ async fn cluster_write_concern_w0_vs_majority() {
         let dir2 = tempfile::tempdir().expect("d2");
         let dir3 = tempfile::tempdir().expect("d3");
 
-        let e1 = Arc::new(StorageEngine::open(&StorageConfig::new(dir1.path())).expect("open1"));
-        let e2 = Arc::new(StorageEngine::open(&StorageConfig::new(dir2.path())).expect("open2"));
-        let e3 = Arc::new(StorageEngine::open(&StorageConfig::new(dir3.path())).expect("open3"));
+        let e1 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir1.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open1"),
+        );
+        let e2 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir2.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open2"),
+        );
+        let e3 = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir3.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open3"),
+        );
 
         let n1 = RaftNode::open_cluster(
             1,

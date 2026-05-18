@@ -285,11 +285,17 @@ impl StorageStats for StorageStatsComputer {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::engine::config::StorageConfig;
+    use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
     use coordinode_core::graph::node::{encode_node_key, NodeId};
 
     fn test_engine(dir: &std::path::Path) -> StorageEngine {
-        let config = StorageConfig::new(dir);
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
         StorageEngine::open(&config).expect("open engine")
     }
 

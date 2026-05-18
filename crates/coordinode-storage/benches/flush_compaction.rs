@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use coordinode_storage::engine::config::StorageConfig;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
@@ -22,7 +22,13 @@ use lsm_tree::AbstractTree;
 
 /// Config with aggressive flush so FlushManager triggers immediately.
 fn flush_config(dir: &std::path::Path) -> StorageConfig {
-    let mut cfg = StorageConfig::new(dir);
+    let mut cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir,
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     cfg.max_write_buffer_bytes = 1;
     cfg.max_sealed_memtables = 0;
     cfg.flush_poll_interval_ms = 5;
