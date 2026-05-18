@@ -11,7 +11,7 @@ use crate::cache::config::TieredCacheConfig;
 use crate::engine::merge::{CounterMerge, DocumentMerge, PostingListMerge};
 use crate::engine::partition::Partition;
 
-// ── Storage endpoint types (R156, arch/core/storage-stack.md Layer 1 + ──
+// ── Storage endpoint types (arch/core/storage-stack.md Layer 1 + ────────
 //                            arch/placement/storage-endpoints.md)        ──
 
 /// Physical media type backing a storage endpoint.
@@ -74,7 +74,7 @@ pub enum Durability {
 /// endpoints of differing media + access cost.
 ///
 /// Tier hierarchy (fastest first): `Memory > HotCache > Hot > Warm > Cold`.
-/// Per-LSM-level routing (R158) maps L0-L1 → `Hot`-tier endpoint, L2-L3 →
+/// Per-LSM-level routing maps L0-L1 → `Hot`-tier endpoint, L2-L3 →
 /// `Warm`, L4+ → `Cold`. Cache layers (DRAM, NVMe cache file) are
 /// orthogonal — they live in-process, not as `Volatile` endpoints.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -104,8 +104,8 @@ pub enum Tier {
 ///
 /// The full physical layout — per-LSM-level placement (L0-L1 → NVMe, L4+ →
 /// HDD), cascade eviction across endpoints, WAL/oplog segment routing — is
-/// driven by subsequent tasks (R157-R161) consuming this type. R156
-/// establishes only the configuration surface.
+/// driven by the placement and capacity-tracking layers that consume this
+/// type. This module establishes only the configuration surface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointConfig {
     /// Unique identifier for this endpoint (operator-chosen; appears in
@@ -142,7 +142,7 @@ pub struct EndpointConfig {
     /// `hard_limit_bytes` are non-zero, `hard_limit_bytes` MUST be
     /// `<= capacity_bytes` — validated in [`StorageConfig::with_endpoints`].
     /// Cascade eviction triggers at 95% of `hard_limit_bytes` when non-zero.
-    /// Behaviour implemented in R161.
+    /// Behaviour implemented by the hard-limit enforcement layer.
     pub hard_limit_bytes: u64,
     /// Free-form tags for placement rules (`{"zone": "eu-west-1a",
     /// "rack": "r42"}`). Consumed by Layer 6 (CRUSH) in R163.
@@ -199,7 +199,7 @@ impl EndpointConfig {
         self
     }
 
-    /// WAL eligibility predicate (R157, [storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2):
+    /// WAL eligibility predicate ([storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2):
     /// endpoint is eligible to host the standalone WAL iff it offers fast
     /// sequential writes (NVMe/SSD media OR `Hot` tier) AND it is non-volatile.
     /// `HotCache` is **not** eligible — it is a volatile-by-design RAM/NVMe
@@ -214,7 +214,7 @@ impl EndpointConfig {
         fast && non_volatile
     }
 
-    /// Oplog eligibility predicate (R157, [storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2,
+    /// Oplog eligibility predicate ([storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2,
     /// [storage-endpoints.md](../../arch/placement/storage-endpoints.md) INV-D1):
     /// endpoint is eligible to host oplog segments iff its durability class
     /// guarantees survival of a process restart. `Volatile` is rejected
@@ -327,11 +327,11 @@ pub struct StorageConfig {
     /// single-endpoint case is just a one-element vec passed to
     /// [`StorageConfig::with_endpoints`].
     ///
-    /// **R156 scope:** this field carries the endpoint list, but per-LSM-
-    /// level placement (L0-L1 → NVMe, L4+ → HDD) lands in R158, cascade
-    /// eviction in R161, WAL/oplog endpoint routing in R157, page ECC in
-    /// R159. R156 establishes the configuration surface and the backward-
-    /// compat shim only.
+    /// **Configuration surface only:** this field carries the endpoint
+    /// list. Concrete placement decisions — per-LSM-level routing
+    /// (L0-L1 → NVMe, L4+ → HDD), cascade eviction, WAL/oplog endpoint
+    /// routing, page ECC — are made by the placement, capacity, and
+    /// redundancy layers consuming this type.
     ///
     /// **Invariant** (checked at engine open): MUST be non-empty.
     pub endpoints: Vec<EndpointConfig>,
@@ -470,7 +470,7 @@ impl StorageConfig {
     /// builders or assign fields directly to customise.
     pub fn with_endpoints(endpoints: Vec<EndpointConfig>) -> Self {
         Self::validate_common(&endpoints);
-        // R157 INV-D1 (config-time): at least one oplog-eligible endpoint.
+        // INV-D1 (config-time): at least one oplog-eligible endpoint.
         // Oplog = Raft log = WAL = CDC source (ADR-017) MUST survive
         // process restart, so a config with no durable/degraded endpoints
         // cannot host a production storage engine. Tests that genuinely
@@ -486,7 +486,7 @@ impl StorageConfig {
         Self::build(endpoints)
     }
 
-    /// Construct a StorageConfig **without** the R157 INV-D1 persistence
+    /// Construct a StorageConfig **without** the INV-D1 persistence
     /// check — caller asserts the engine will NOT open Raft (`LogStore`)
     /// or the standalone WAL (`StorageEngine::open_with_wal`).
     ///
@@ -586,7 +586,7 @@ impl StorageConfig {
     /// Kept as a convenience accessor for diagnostics and the single-
     /// endpoint case. Subsystems that need a specific endpoint per their
     /// placement contract (WAL → [`select_wal_endpoint`], oplog →
-    /// [`select_oplog_endpoint`], partition trees → R158 per-LSM-level
+    /// [`select_oplog_endpoint`], partition trees → per-LSM-level
     /// routing) MUST use those methods rather than `data_dir`.
     pub fn data_dir(&self) -> &Path {
         // SAFETY: with_endpoints asserts non-empty.
@@ -594,7 +594,7 @@ impl StorageConfig {
     }
 
     /// Select the endpoint that hosts the **standalone WAL** for this
-    /// instance (R157, [storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2).
+    /// instance ([storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2).
     ///
     /// Picks the first endpoint matching [`EndpointConfig::is_wal_eligible`].
     /// WAL is non-replicated single-file storage; spreading it across
@@ -614,7 +614,7 @@ impl StorageConfig {
     }
 
     /// Select the endpoint that hosts oplog segments for `shard_id`
-    /// (R157, [storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2,
+    /// ([storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2,
     /// [storage-endpoints.md](../../arch/placement/storage-endpoints.md) INV-D1).
     ///
     /// Round-robin within the oplog-eligible set, keyed by `shard_id`.
@@ -715,6 +715,24 @@ impl StorageConfig {
         seqno: lsm_tree::SharedSequenceNumberGenerator,
         gc_watermark: &Arc<AtomicU64>,
     ) -> lsm_tree::Config {
+        self.to_tree_config_with_routing(part, seqno, gc_watermark, None)
+    }
+
+    /// As [`Self::to_tree_config`] but with explicit per-LSM-level
+    /// endpoint routing. When `routing` is `Some`, the lsm-tree `Config`
+    /// is wired with `LevelRoute`s built from the routing — SST files
+    /// for each LSM level land at the endpoint chosen for that level.
+    /// When `routing` is `None`, the partition uses single-tier
+    /// behaviour (all SSTs at the primary endpoint) — the bootstrap
+    /// path for the Schema partition and the test path for engines
+    /// opened without persistence.
+    pub(crate) fn to_tree_config_with_routing(
+        &self,
+        part: Partition,
+        seqno: lsm_tree::SharedSequenceNumberGenerator,
+        gc_watermark: &Arc<AtomicU64>,
+        routing: Option<&crate::engine::routing::PartitionRouting>,
+    ) -> lsm_tree::Config {
         // Build compression policy — partition-level override or global.
         let compression_policy = if let Some(overrides) = &self.partition_compression {
             if let Some(&(_, codec)) = overrides.iter().find(|&&(p, _)| p == part) {
@@ -726,11 +744,17 @@ impl StorageConfig {
             self.compression.to_compression_policy()
         };
 
-        // R156: partition path derives from the first configured endpoint.
-        // Per-LSM-level routing across multiple endpoints (L0-L1 → NVMe,
-        // L4+ → HDD) lands in R158 — until then every partition's full
-        // tree lives on the first endpoint, matching the pre-R156 behaviour
-        // (single `data_dir`) for backwards compatibility.
+        // The lsm-tree primary `Config.path` lives at the first
+        // configured endpoint — that endpoint hosts the partition's
+        // manifest. SST files land at per-level paths derived from
+        // `routing`: L0-L1 on the hot endpoint, L2-L3 on warm, L4-L6
+        // on cold. Levels routed to the primary endpoint fall through
+        // to `Config.path` (no explicit `LevelRoute` emitted).
+        //
+        // When `routing` is `None` — the bootstrap case (Schema
+        // partition, tests using `with_endpoints_no_persistence`) —
+        // the partition stays single-tier on the primary endpoint.
+        let primary_endpoint_id = self.endpoints[0].id.clone();
         let partition_dir = self.endpoints[0].path.join(part.name());
         let mut config = lsm_tree::Config::new_with_generators(
             partition_dir,
@@ -740,8 +764,24 @@ impl StorageConfig {
         .data_block_compression_policy(compression_policy);
 
         // Custom filesystem backend (e.g., MemFs for in-memory tests)
-        if let Some(ref fs) = self.fs {
+        let fs_for_routes: Arc<dyn lsm_tree::fs::Fs> = if let Some(ref fs) = self.fs {
             config = config.with_shared_fs(Arc::clone(fs));
+            Arc::clone(fs)
+        } else {
+            Arc::new(lsm_tree::fs::StdFs)
+        };
+
+        // Wire per-LSM-level endpoint routing into lsm-tree config.
+        if let Some(routing) = routing {
+            let routes = routing.to_level_routes(
+                &self.endpoints,
+                part.name(),
+                &primary_endpoint_id,
+                Arc::clone(&fs_for_routes),
+            );
+            if !routes.is_empty() {
+                config = config.level_routes(routes);
+            }
         }
 
         // Partitions with merge operators: no retention filter
@@ -887,7 +927,7 @@ mod tests {
         }
     }
 
-    // ── R156: endpoint model tests ──────────────────────────────────
+    // ── Endpoint model tests ────────────────────────────────────────
 
     #[test]
     fn single_endpoint_disk_shape() {
@@ -981,7 +1021,7 @@ mod tests {
         assert_eq!(config.endpoints[0].server.as_deref(), Some("srv-3"));
     }
 
-    // ── R157: WAL/oplog endpoint eligibility + selection ──────────────
+    // ── WAL/oplog endpoint eligibility + selection ────────────────────
 
     #[test]
     fn wal_eligibility_matrix() {
@@ -1098,7 +1138,7 @@ mod tests {
     fn select_oplog_endpoint_errors_when_none_eligible() {
         // All-volatile config — must go through the explicit
         // `with_endpoints_no_persistence` escape hatch because
-        // `with_endpoints` would now panic per R157 INV-D1.
+        // `with_endpoints` would now panic per INV-D1.
         let cache = EndpointConfig::new(
             "cache",
             "/cache",
@@ -1283,9 +1323,8 @@ mod tests {
         let seqno: lsm_tree::SharedSequenceNumberGenerator =
             Arc::new(lsm_tree::SequenceNumberCounter::default());
         let gc_watermark = Arc::new(AtomicU64::new(0));
-        // R156: per-LSM-level routing not yet active (R158 work) — every
-        // partition uses the first endpoint. This test pins the documented
-        // behaviour so R158 explicitly migrates it.
+        // Without explicit per-level routing every partition uses the
+        // first endpoint. This test pins the single-tier fallback path.
         let _ = config.to_tree_config(Partition::Node, Arc::clone(&seqno), &gc_watermark);
         // Verify the first endpoint's path is the one we picked.
         assert!(dir1.path().exists(), "first endpoint dir is the active one");

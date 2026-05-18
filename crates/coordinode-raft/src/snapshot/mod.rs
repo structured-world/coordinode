@@ -144,6 +144,15 @@ pub fn build_full_snapshot(engine: &StorageEngine) -> io::Result<Vec<u8>> {
             let (key, value) = guard
                 .into_inner()
                 .map_err(|e| io::Error::other(format!("snapshot iter {}: {e}", part.name())))?;
+            // Skip Schema `meta:*` keys — engine-internal per-node
+            // configuration (the LSM-level routing computed against this
+            // node's endpoint set, never replicated). `raft:*` keys are
+            // included here intentionally: existing apply paths filter
+            // them on the receiver side, and including them at build time
+            // preserves the build↔apply hash-checksum invariant.
+            if part == Partition::Schema && key.starts_with(b"meta:") {
+                continue;
+            }
             entries.push((key.to_vec(), value.to_vec()));
         }
 
@@ -256,6 +265,9 @@ pub fn build_incremental_snapshot(
         if part == Partition::Schema {
             // Schema partition: always include ALL keys regardless of since_ts.
             // Dgraph pattern: schema/type keys are always sent for consistency.
+            // Skip `meta:*` keys (engine-internal per-node routing
+            // configuration, never replicated). `raft:*` keys stay in to
+            // preserve hash invariant — apply paths filter them on receive.
             let iter = engine
                 .prefix_scan(part, &[])
                 .map_err(|e| io::Error::other(format!("incr scan {}: {e}", part.name())))?;
@@ -263,6 +275,9 @@ pub fn build_incremental_snapshot(
                 let (raw_key, raw_value) = guard
                     .into_inner()
                     .map_err(|e| io::Error::other(format!("incr iter {}: {e}", part.name())))?;
+                if raw_key.starts_with(b"meta:") {
+                    continue;
+                }
                 changed.push((raw_key.to_vec(), raw_value.to_vec()));
             }
         } else {
@@ -438,7 +453,9 @@ pub fn install_incremental_snapshot(engine: &StorageEngine, data: &[u8]) -> io::
             }
 
             // Skip raft: keys in Schema partition
-            if partition == Partition::Schema && key.starts_with(b"raft:") {
+            if partition == Partition::Schema
+                && (key.starts_with(b"raft:") || key.starts_with(b"meta:"))
+            {
                 continue;
             }
 
@@ -557,7 +574,9 @@ pub fn install_full_snapshot(engine: &StorageEngine, data: &[u8]) -> io::Result<
             }
 
             // Skip raft: keys in Schema partition — managed by openraft
-            if partition == Partition::Schema && key.starts_with(b"raft:") {
+            if partition == Partition::Schema
+                && (key.starts_with(b"raft:") || key.starts_with(b"meta:"))
+            {
                 continue;
             }
 
@@ -614,7 +633,9 @@ pub fn install_full_snapshot(engine: &StorageEngine, data: &[u8]) -> io::Result<
                 .map_err(|e| io::Error::other(format!("cleanup iter {}: {e}", partition.name())))?;
 
             // Preserve raft: keys in Schema partition
-            if *partition == Partition::Schema && key.as_ref().starts_with(b"raft:") {
+            if *partition == Partition::Schema
+                && (key.as_ref().starts_with(b"raft:") || key.as_ref().starts_with(b"meta:"))
+            {
                 continue;
             }
 
@@ -767,7 +788,9 @@ pub fn install_full_snapshot_from_reader(
             if partition == Partition::Raft {
                 continue;
             }
-            if partition == Partition::Schema && key.starts_with(b"raft:") {
+            if partition == Partition::Schema
+                && (key.starts_with(b"raft:") || key.starts_with(b"meta:"))
+            {
                 continue;
             }
 
@@ -834,7 +857,9 @@ pub fn install_full_snapshot_from_reader(
                 .key()
                 .map_err(|e| io::Error::other(format!("cleanup iter {}: {e}", partition.name())))?;
 
-            if *partition == Partition::Schema && key.as_ref().starts_with(b"raft:") {
+            if *partition == Partition::Schema
+                && (key.as_ref().starts_with(b"raft:") || key.as_ref().starts_with(b"meta:"))
+            {
                 continue;
             }
             if !snap_keys.contains(key.as_ref()) {
@@ -949,7 +974,9 @@ pub fn install_incremental_snapshot_from_reader(
             if *partition == Partition::Raft {
                 continue;
             }
-            if *partition == Partition::Schema && key.starts_with(b"raft:") {
+            if *partition == Partition::Schema
+                && (key.starts_with(b"raft:") || key.starts_with(b"meta:"))
+            {
                 continue;
             }
 

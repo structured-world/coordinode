@@ -29,6 +29,7 @@ mod integration {
     mod r075_oplog_raft;
     mod r156_multi_endpoint;
     mod r157_wal_oplog_placement;
+    mod r158_per_level_routing;
     mod schema;
     mod shared_engine;
     mod text_index;

@@ -90,7 +90,17 @@ pub fn scrub_partition(
     // storage engine's internal xxh3 checksum verification.
     let iter = engine.prefix_scan(part, b"")?;
     for guard in iter {
-        let _ = guard.into_inner();
+        // Skip engine-internal metadata keys in Schema partition
+        // (`meta:routing:*`, future `meta:*` keys). These are operator
+        // configuration, not user data — scrub_* counts must reflect user
+        // payload integrity only. The block read still verifies the page
+        // checksum (lsm-tree internal mechanism), so metadata bit-rot is
+        // still surfaced; the metadata key just is not counted as a
+        // user-data record.
+        let (key, _value) = guard.into_inner()?;
+        if part == Partition::Schema && key.starts_with(b"meta:") {
+            continue;
+        }
         count += 1;
     }
 
