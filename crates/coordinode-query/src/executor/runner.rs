@@ -2686,26 +2686,18 @@ fn execute_traverse(
     params: &TraverseParams<'_>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    // R172b safe-reject for temporal target labels: the traversal target-
-    // materialisation step reads `node:<shard>:<tgt_uid>` (16-byte key) to
-    // load the target's record for label filter + property emit. Temporal
-    // nodes live at 25-byte per-version keys; the 16-byte read silently
-    // returns None and the row is dropped. Without this guard, MATCH
-    // (a)-[:E]->(b:TempLabel) would emit zero rows instead of failing
-    // loudly. Per-version target read (prefix scan with version
-    // materialisation) is R172d scope.
-    for lbl in params.target_labels {
-        if let Ok(Some(s)) = ctx.load_current_label_schema(lbl) {
-            if s.temporal {
-                return Err(ExecutionError::Unsupported(format!(
-                    "traversal into temporal label '{lbl}' is not yet supported \
-                     (lands in R172d — per-version read executor). The current \
-                     R172b scope is CREATE + label-scoped MATCH on temporal \
-                     labels only."
-                )));
-            }
-        }
-    }
+    // R172d (initial slice): traversal into a temporal target label
+    // materialises EVERY version of the target node (prefix-scan over
+    // `node:<shard>:<target_uid>:*`). The version's `valid_from` is
+    // surfaced as `<target>.valid_from`, and each version emits its own
+    // row so downstream RETURN / WHERE can filter by interval. Without
+    // an `AS OF VALID_TIME` clause (G096) the read is "all versions" —
+    // the same default as label-scoped MATCH on temporal labels. Once
+    // R172d gains the AS OF clause + planner push-down, this scan will
+    // be narrowed to the requested time slice.
+    //
+    // Behaviour is detected per target label at row-build time; the
+    // dispatch happens in `build_target_rows`.
 
     if let Some(lb) = params.length {
         execute_varlen_traverse(input_rows, params, lb, ctx)
@@ -2800,53 +2792,109 @@ fn build_target_rows(
     let edge_type = trp.edge_type;
 
     let target_id = NodeId::from_raw(target_uid);
-    let target_key = encode_node_key(ctx.shard_id, target_id);
-    let target_record = match ctx.mvcc_get(Partition::Node, &target_key)? {
-        Some(bytes) => NodeRecord::from_msgpack(&bytes).map_err(|e| {
-            ExecutionError::Serialization(format!("target node deserialization error: {e}"))
-        })?,
-        None => return Ok(Vec::new()),
+
+    // R172d: detect whether ANY of the target labels is temporal. If
+    // so, every version of the target is materialised (prefix scan);
+    // otherwise the legacy 16-byte point read is used. Detection runs
+    // at row-build time — label schemas don't change within a single
+    // query, so the lookup is cheap enough not to cache further.
+    let target_is_temporal = target_labels.iter().any(|lbl| {
+        ctx.load_current_label_schema(lbl)
+            .ok()
+            .flatten()
+            .is_some_and(|s| s.temporal)
+    });
+
+    // Collect (record, optional valid_from) pairs to emit. Non-temporal
+    // path produces one pair; temporal path produces one per version.
+    let target_records: Vec<(NodeRecord, Option<i64>)> = if target_is_temporal {
+        let prefix = coordinode_core::graph::node::temporal_node_id_prefix(ctx.shard_id, target_id);
+        let scanned = ctx.mvcc_prefix_scan(Partition::Node, &prefix)?;
+        if scanned.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out: Vec<(NodeRecord, Option<i64>)> = Vec::with_capacity(scanned.len());
+        for (key, bytes) in scanned {
+            let Some((_, _, vf)) = coordinode_core::graph::node::decode_temporal_node_key(&key)
+            else {
+                continue;
+            };
+            let rec = NodeRecord::from_msgpack(&bytes).map_err(|e| {
+                ExecutionError::Serialization(format!(
+                    "target temporal node deserialization error: {e}"
+                ))
+            })?;
+            out.push((rec, Some(vf)));
+        }
+        if out.is_empty() {
+            return Ok(Vec::new());
+        }
+        out
+    } else {
+        let target_key = encode_node_key(ctx.shard_id, target_id);
+        let target_record = match ctx.mvcc_get(Partition::Node, &target_key)? {
+            Some(bytes) => NodeRecord::from_msgpack(&bytes).map_err(|e| {
+                ExecutionError::Serialization(format!("target node deserialization error: {e}"))
+            })?,
+            None => return Ok(Vec::new()),
+        };
+        vec![(target_record, None)]
     };
 
-    // Label filter
-    if !target_labels.is_empty() && !target_labels.iter().any(|l| target_record.has_label(l)) {
+    // For each version (or the single non-temporal record), build a
+    // base out_row carrying the target's properties + version axes,
+    // then apply the edge-property fan-out + filter pipeline below.
+    let mut materialised_rows: Vec<Row> = Vec::with_capacity(target_records.len());
+    for (target_record, valid_from_opt) in target_records {
+        // Label filter
+        if !target_labels.is_empty() && !target_labels.iter().any(|l| target_record.has_label(l)) {
+            continue;
+        }
+
+        let mut out_row = trp.input_row.clone();
+        out_row.insert(target_variable.to_string(), Value::Int(target_uid as i64));
+
+        for (field_id, value) in &target_record.props {
+            if let Some(field_name) = ctx.interner.resolve(*field_id) {
+                let col_name = format!("{target_variable}.{field_name}");
+                out_row.insert(col_name, value.clone());
+            }
+        }
+        if let Some(extra) = &target_record.extra {
+            for (name, value) in extra {
+                let col_name = format!("{target_variable}.{name}");
+                out_row.insert(col_name, value.clone());
+            }
+        }
+
+        let target_label = target_record.primary_label().to_string();
+        out_row.insert(
+            format!("{target_variable}.__label__"),
+            Value::String(target_label.clone()),
+        );
+
+        // R172d: re-surface valid_from from the key suffix so callers
+        // always see a non-null binding even if the stored property map
+        // happens to omit it (defensive — write path requires it).
+        if let Some(vf) = valid_from_opt {
+            out_row.insert(format!("{target_variable}.valid_from"), Value::Int(vf));
+        }
+
+        // Inject COMPUTED property values from schema (R082).
+        inject_computed_properties(&mut out_row, target_variable, &target_label, ctx);
+
+        materialised_rows.push(out_row);
+    }
+
+    if materialised_rows.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut out_row = trp.input_row.clone();
-    out_row.insert(target_variable.to_string(), Value::Int(target_uid as i64));
-
-    for (field_id, value) in &target_record.props {
-        if let Some(field_name) = ctx.interner.resolve(*field_id) {
-            let col_name = format!("{target_variable}.{field_name}");
-            out_row.insert(col_name, value.clone());
-        }
-    }
-    if let Some(extra) = &target_record.extra {
-        for (name, value) in extra {
-            let col_name = format!("{target_variable}.{name}");
-            out_row.insert(col_name, value.clone());
-        }
-    }
-
-    let target_label = target_record.primary_label().to_string();
-    out_row.insert(
-        format!("{target_variable}.__label__"),
-        Value::String(target_label.clone()),
-    );
-
-    // Inject COMPUTED property values from schema (R082).
-    inject_computed_properties(&mut out_row, target_variable, &target_label, ctx);
-
-    // Edge variable bindings: type marker + per-version property fan-out for
-    // temporal edges. For non-temporal types this resolves to a single optional
-    // edgeprop blob, exactly as before.
+    // Edge variable bindings: type marker + per-version property fan-out
+    // for temporal edges. For non-temporal types this resolves to a single
+    // optional edgeprop blob. Cartesian-product across `materialised_rows`
+    // so each target version pairs with each edge version.
     let edge_property_rows: Vec<Row> = if let (Some(ev), Some(et)) = (edge_variable, edge_type) {
-        out_row.insert(format!("{ev}.__type__"), Value::String(et.to_string()));
-        // G070: also store the relationship variable itself (not only `r.__type__`)
-        // so that aggregate expressions like `count(r)` evaluate to a non-null value.
-        out_row.insert(ev.to_string(), Value::String(et.to_string()));
-
         let source_id_raw = trp.input_row.get(params.source).and_then(|v| {
             if let Value::Int(id) = v {
                 Some(*id as u64)
@@ -2854,83 +2902,97 @@ fn build_target_rows(
                 None
             }
         });
-        let Some(src_raw) = source_id_raw else {
-            return Ok(vec![out_row]);
-        };
-        let (ep_src, ep_tgt) = match params.direction {
-            Direction::Outgoing | Direction::Both => (NodeId::from_raw(src_raw), target_id),
-            Direction::Incoming => (target_id, NodeId::from_raw(src_raw)),
-        };
+        if let Some(src_raw) = source_id_raw {
+            let (ep_src, ep_tgt) = match params.direction {
+                Direction::Outgoing | Direction::Both => (NodeId::from_raw(src_raw), target_id),
+                Direction::Incoming => (target_id, NodeId::from_raw(src_raw)),
+            };
 
-        // Hidden metadata columns let downstream SET / DELETE on the edge
-        // variable resolve identity without re-parsing the pattern: the source
-        // / target nodes the edge connects, in canonical edgeprop-key order
-        // (source first regardless of arrow direction).
-        out_row.insert(format!("{ev}.__src__"), Value::Int(ep_src.as_raw() as i64));
-        out_row.insert(format!("{ev}.__tgt__"), Value::Int(ep_tgt.as_raw() as i64));
-
-        if trp.edge_is_temporal {
-            // Prefix-scan every version of this (src, tgt) edge and emit a
-            // dedicated row for each. valid_from is reconstructed from the key
-            // suffix so callers always see a non-null valid_from even if the
-            // stored property map happens to omit it (defensive — write path
-            // requires it, but readers should never depend on storage layout).
-            //
-            // When the planner pushed down a `temporal_filter.upper_ms`, we
-            // narrow the scan to keys whose `valid_from <= upper_ms`. Versions
-            // exceeding the bound aren't materialized.
-            let prefix = temporal_edgeprop_pair_prefix(et, ep_src, ep_tgt);
-            let scanned = ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)?;
-            let versions: Vec<_> =
-                if let Some(upper_ms) = params.temporal_filter.and_then(|tf| tf.upper_ms) {
-                    let bound = coordinode_core::graph::edge::valid_from_upper_bound_key(
-                        et, ep_src, ep_tgt, upper_ms,
-                    );
-                    scanned.into_iter().filter(|(k, _)| k < &bound).collect()
-                } else {
-                    scanned
-                };
-            if versions.is_empty() {
-                // Temporal pair with zero stored versions: treat as no edge.
-                // Surfaces after hard DELETE — adj-posting may briefly survive
-                // the delete window; without this guard the traversal would
-                // emit a ghost row for the now-empty pair.
-                Vec::new()
-            } else {
-                let mut rows = Vec::with_capacity(versions.len());
-                for (key, ep_bytes) in versions {
-                    let mut version_row = out_row.clone();
-                    if let Some((_, _, _, vf)) =
-                        coordinode_core::graph::edge::decode_temporal_edgeprop_key(&key)
-                    {
-                        version_row.insert(format!("{ev}.valid_from"), Value::Int(vf));
+            if trp.edge_is_temporal {
+                let prefix = temporal_edgeprop_pair_prefix(et, ep_src, ep_tgt);
+                let scanned = ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)?;
+                let versions: Vec<_> =
+                    if let Some(upper_ms) = params.temporal_filter.and_then(|tf| tf.upper_ms) {
+                        let bound = coordinode_core::graph::edge::valid_from_upper_bound_key(
+                            et, ep_src, ep_tgt, upper_ms,
+                        );
+                        scanned.into_iter().filter(|(k, _)| k < &bound).collect()
+                    } else {
+                        scanned
+                    };
+                let mut acc: Vec<Row> =
+                    Vec::with_capacity(materialised_rows.len() * versions.len());
+                if !versions.is_empty() {
+                    for base in &materialised_rows {
+                        for (key, ep_bytes) in &versions {
+                            let mut version_row = base.clone();
+                            version_row
+                                .insert(format!("{ev}.__type__"), Value::String(et.to_string()));
+                            version_row.insert(ev.to_string(), Value::String(et.to_string()));
+                            version_row.insert(
+                                format!("{ev}.__src__"),
+                                Value::Int(ep_src.as_raw() as i64),
+                            );
+                            version_row.insert(
+                                format!("{ev}.__tgt__"),
+                                Value::Int(ep_tgt.as_raw() as i64),
+                            );
+                            if let Some((_, _, _, vf)) =
+                                coordinode_core::graph::edge::decode_temporal_edgeprop_key(key)
+                            {
+                                version_row.insert(format!("{ev}.valid_from"), Value::Int(vf));
+                            }
+                            if let Ok(prop_map) =
+                                rmp_serde::from_slice::<Vec<(u32, Value)>>(ep_bytes)
+                            {
+                                for (field_id, value) in prop_map {
+                                    if let Some(field_name) = ctx.interner.resolve(field_id) {
+                                        version_row.insert(format!("{ev}.{field_name}"), value);
+                                    }
+                                }
+                            }
+                            acc.push(version_row);
+                        }
                     }
-                    if let Ok(prop_map) = rmp_serde::from_slice::<Vec<(u32, Value)>>(&ep_bytes) {
-                        for (field_id, value) in prop_map {
-                            if let Some(field_name) = ctx.interner.resolve(field_id) {
-                                version_row.insert(format!("{ev}.{field_name}"), value);
+                }
+                acc
+            } else {
+                let ep_key = encode_edgeprop_key(et, ep_src, ep_tgt);
+                let ep_bytes_opt = ctx.mvcc_get(Partition::EdgeProp, &ep_key)?;
+                let mut acc: Vec<Row> = Vec::with_capacity(materialised_rows.len());
+                for base in materialised_rows {
+                    let mut row = base;
+                    row.insert(format!("{ev}.__type__"), Value::String(et.to_string()));
+                    row.insert(ev.to_string(), Value::String(et.to_string()));
+                    row.insert(format!("{ev}.__src__"), Value::Int(ep_src.as_raw() as i64));
+                    row.insert(format!("{ev}.__tgt__"), Value::Int(ep_tgt.as_raw() as i64));
+                    if let Some(ref ep_bytes) = ep_bytes_opt {
+                        if let Ok(prop_map) = rmp_serde::from_slice::<Vec<(u32, Value)>>(ep_bytes) {
+                            for (field_id, value) in prop_map {
+                                if let Some(field_name) = ctx.interner.resolve(field_id) {
+                                    row.insert(format!("{ev}.{field_name}"), value);
+                                }
                             }
                         }
                     }
-                    rows.push(version_row);
+                    acc.push(row);
                 }
-                rows
+                acc
             }
         } else {
-            let ep_key = encode_edgeprop_key(et, ep_src, ep_tgt);
-            if let Some(ep_bytes) = ctx.mvcc_get(Partition::EdgeProp, &ep_key)? {
-                if let Ok(prop_map) = rmp_serde::from_slice::<Vec<(u32, Value)>>(&ep_bytes) {
-                    for (field_id, value) in prop_map {
-                        if let Some(field_name) = ctx.interner.resolve(field_id) {
-                            out_row.insert(format!("{ev}.{field_name}"), value);
-                        }
-                    }
-                }
-            }
-            vec![out_row]
+            // No source id binding — emit each materialised row carrying
+            // only the bare edge-type marker.
+            materialised_rows
+                .into_iter()
+                .map(|mut row| {
+                    row.insert(format!("{ev}.__type__"), Value::String(et.to_string()));
+                    row.insert(ev.to_string(), Value::String(et.to_string()));
+                    row
+                })
+                .collect()
         }
     } else {
-        vec![out_row]
+        materialised_rows
     };
 
     // Apply target / edge inline filters to each candidate row. Filters drop
@@ -3181,9 +3243,23 @@ fn execute_single_hop_traverse(
         // traversal forces the sequential path. Non-temporal queries keep the
         // parallel optimization.
         let has_temporal = params.edge_temporal.iter().any(|t| *t);
+        // R172d: temporal target labels need per-version prefix scans
+        // which the parallel target-materialisation path doesn't speak
+        // yet. Force sequential when any target label is temporal —
+        // mirrors the same gate as temporal edges above.
+        let target_has_temporal = params.target_labels.iter().any(|lbl| {
+            ctx.load_current_label_schema(lbl)
+                .ok()
+                .flatten()
+                .is_some_and(|s| s.temporal)
+        });
 
         // Switch to parallel when fan-out exceeds threshold
-        if use_parallel && !has_temporal && neighbors.len() >= ctx.adaptive.parallel_threshold {
+        if use_parallel
+            && !has_temporal
+            && !target_has_temporal
+            && neighbors.len() >= ctx.adaptive.parallel_threshold
+        {
             ctx.warnings.push(format!(
                 "adaptive: parallel processing activated for node {} ({} edges, threshold {})",
                 source_id.as_raw(),
@@ -3341,11 +3417,19 @@ fn execute_varlen_traverse(
             }
 
             // Build result rows: parallel if enough neighbors, sequential otherwise.
-            // Temporal edges force sequential because the parallel path doesn't yet
-            // know how to fan out across stored versions.
+            // Temporal edges and temporal target labels force sequential —
+            // the parallel path doesn't yet know how to fan out across
+            // stored versions on either axis.
             let has_temporal = params.edge_temporal.iter().any(|t| *t);
+            let target_has_temporal = params.target_labels.iter().any(|lbl| {
+                ctx.load_current_label_schema(lbl)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|s| s.temporal)
+            });
             let use_parallel = ctx.adaptive.enabled
                 && !has_temporal
+                && !target_has_temporal
                 && depth_neighbors.len() >= ctx.adaptive.parallel_threshold;
 
             if use_parallel {
