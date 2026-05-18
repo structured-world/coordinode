@@ -352,6 +352,28 @@ fn apply_delta_to_record_batched(
     }
 }
 
+/// Apply a sequence of `DocDelta` operands to a `NodeRecord` in memory.
+///
+/// Mirrors the `DocumentMerge` LSM merge path but operates on a pre-loaded
+/// record. Callers use this when they need to materialise the post-delta
+/// state synchronously rather than queue merge operands — the canonical
+/// case is the R172c Phase 3b temporal close+open path, where a nested
+/// `SET n.doc.a.b = …` on a temporal node must produce the full new-version
+/// NodeRecord (not a merge operand on the non-temporal key).
+///
+/// Batches Extra-targeting deltas through a shared `rmpv` representation
+/// for the same throughput characteristic as the merge operator.
+/// PropField and RemoveProperty deltas are applied immediately.
+pub fn apply_doc_deltas_to_record(rec: &mut NodeRecord, deltas: &[DocDelta]) {
+    let mut extra_doc: Option<rmpv::Value> = None;
+    for delta in deltas {
+        apply_delta_to_record_batched(rec, delta, &mut extra_doc);
+    }
+    if let Some(doc) = extra_doc {
+        rmpv_to_extra(rec, &doc);
+    }
+}
+
 /// Convert NodeRecord's extra map to an rmpv::Value::Map for delta application.
 fn extra_to_rmpv(rec: &NodeRecord) -> rmpv::Value {
     match &rec.extra {
