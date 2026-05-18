@@ -49,6 +49,36 @@ CREATE NODE TYPE Person TEMPORAL WITH (
 
 Non-temporal labels (the default — `CREATE NODE TYPE User WITH (...)` without `TEMPORAL`, or never declared at all and used implicitly) keep the existing single-row-per-node storage layout — no per-version overhead.
 
+## Writing temporal nodes
+
+A `CREATE (n:Person {...})` on a temporal label writes a per-version record keyed by `(node_id, valid_from)`. Every mutation that changes user-visible state — `SET`, `REMOVE`, `DELETE`, `DETACH DOCUMENT`, an `ATTACH DOCUMENT` targeting this node — produces a new version through the same close-current + open-new dance:
+
+1. The matched version's record is rewritten in place with `valid_to = NOW` (HLC commit-ts).
+2. A new record is written at `valid_from = NOW`, carrying the mutated state with `valid_to` absent and a fresh `__ingestion_ts__`.
+
+The same `node_id` survives across versions — the per-version key suffix is what changes. History before `NOW` is always preserved.
+
+Specifics per mutation surface:
+
+- `SET n.<flat> = expr` — close current, open new with the property set on the clone.
+- `SET n.<nested.path> = expr` — same, but the new property is applied to the cloned record via the DocDelta in-memory path (no merge operand against the non-temporal key).
+- `SET doc_push(n.tags, 'x')` / `doc_pull` / `doc_add_to_set` / `doc_inc` — same close+open, the mutation is applied to the clone via the DocDelta in-memory path.
+- `SET n += {…}` (`MergeProperties`) — close+open with the literal merged onto the clone.
+- `SET n = {…}` (`ReplaceProperties`) — close+open, user props wiped on the clone, then the literal applied. Engine-managed axes (`valid_from` / `valid_to` / `__ingestion_ts__`) are re-applied on the new version.
+- `SET n.valid_to = …` — **in-place close**, no new version. This is the single in-place mutation on a temporal node and the canonical way to terminate an ongoing version.
+- `SET n.valid_from = …` — **rejected**. `valid_from` is the per-version key suffix and is immutable; to re-key a version, `DELETE` the row and `CREATE` a new one.
+- `REMOVE n.<flat>` / `REMOVE n.<nested.path>` / `REMOVE n:Label` — close+open with the property / label dropped on the clone. Multi-item REMOVE in one clause = one new version.
+- `REMOVE n.valid_from` / `REMOVE n.valid_to` — **rejected**: bitemporal axes are engine-managed.
+- `DELETE n` — **positive bitemporal fact**: the current open version is closed at `valid_to = NOW` and a tombstone version is appended at `valid_from = NOW` carrying `__deleted__: true`. History before NOW remains queryable. No edge cascade for temporal nodes (deferred until the cross-version edge ownership model lands).
+- `DETACH DOCUMENT n.<path> AS (t:Target)-[:E]->(n)` — close+open with the property removed on the clone; promotion of the property into a new node uses the standard temporal-aware CREATE path. `TRANSFER EDGES` on a temporal source is rejected (Phase 4).
+- `ATTACH (s:Source)-[:E]->(t:Temp) INTO t.<path>` — close+open on the target with the source's properties set at `<path>` on the clone. Temporal source on ATTACH (which cascade-deletes the source) is rejected.
+
+## Reading temporal nodes
+
+`MATCH (n:Person)` and `MATCH (a)-[:E]->(n:Person)` both materialise **every version** of each matched node by default — one row per version, with `n.valid_from`, `n.valid_to`, and any user props on that version. Pattern predicates `WHERE (a)-[:E]->(:Person)` match if **any** version of the candidate carries the label.
+
+Filter to the current state with `WHERE n.valid_to IS NULL AND coalesce(n.__deleted__, false) = false`; for a point in time, use a literal comparison on `n.valid_from` / `n.valid_to`. The dedicated `AS OF VALID_TIME <ts>` clause that pushes the time slice down into the prefix scan is planned (see arch decisions on R172d).
+
 ## Writing temporal edges
 
 Every `CREATE` of a temporal edge **must** provide a `valid_from` epoch-ms timestamp:
