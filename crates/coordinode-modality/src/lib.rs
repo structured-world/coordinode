@@ -53,6 +53,7 @@
 #![deny(missing_docs)]
 
 pub mod blob;
+pub mod document;
 pub mod edge;
 pub mod error;
 pub mod index;
@@ -60,6 +61,7 @@ pub mod node;
 pub mod schema;
 
 pub use blob::{BlobStore, LocalBlobStore};
+pub use document::{DocumentStore, LocalDocumentStore};
 pub use edge::{EdgeStore, LocalEdgeStore};
 pub use error::{StoreError, StoreResult};
 pub use index::{IndexStore, LocalIndexStore};
