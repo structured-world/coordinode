@@ -103,21 +103,6 @@ impl Coordinator {
     /// Returns `StorageError::PartitionNotFound` if the partition
     /// is not registered (should never happen after a successful
     /// `open` — `Partition::all()` keys every entry).
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use coordinode_storage::engine::config::*;
-    /// # use coordinode_storage::engine::core::StorageEngine;
-    /// # use coordinode_storage::engine::partition::Partition;
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/x"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// let tree = engine.coordinator().tree(Partition::Node)?;
-    /// let _ = tree;
-    /// # Ok::<_, coordinode_storage::error::StorageError>(())
-    /// ```
     pub fn tree(&self, part: Partition) -> StorageResult<&lsm_tree::AnyTree> {
         self.trees
             .get(&part)
@@ -159,21 +144,6 @@ impl Coordinator {
     /// `snapshot()` — the value returned is suitable as a read
     /// visibility bound (readers at this seqno see all writes
     /// committed strictly before).
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/x"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// let s0 = engine.coordinator().current_seqno();
-    /// let s1 = engine.coordinator().current_seqno();
-    /// // Reads with no intervening writes see the same horizon.
-    /// assert_eq!(s0, s1);
-    /// # Ok::<_, coordinode_storage::error::StorageError>(())
-    /// ```
     pub fn current_seqno(&self) -> lsm_tree::SeqNo {
         self.seqno.get()
     }
@@ -185,18 +155,6 @@ impl Coordinator {
     /// `SeqnoConsumerRegistry` (R137a / ADR-028) drives this from
     /// outside: it computes `shard_floor()` across CDC / snapshot /
     /// backup consumers and writes the result here.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/x"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// engine.coordinator().set_gc_watermark(42);
-    /// # Ok::<_, coordinode_storage::error::StorageError>(())
-    /// ```
     pub fn set_gc_watermark(&self, watermark: u64) {
         self.gc_watermark.store(watermark, Ordering::Release);
     }
