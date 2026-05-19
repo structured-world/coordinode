@@ -145,10 +145,17 @@ pub struct Bbox {
 /// `(label_id, crs)` — one logical index per `(label, property)` pair
 /// in the higher schema layer.
 pub trait SpatialStore {
-    /// Index a point. Overwrites the existing entry for `node_id`
-    /// under the same `(label_id, crs)` if one exists. The old entry's
-    /// curve key is computed from the old coordinates by the caller —
-    /// at the trait level a write is just a put.
+    /// Index a point.
+    ///
+    /// **Contract gotcha:** the index key is
+    /// `(label_id, crs, curve, node_id)` — so writing the *same*
+    /// `node_id` with *different* coordinates lands in a *different*
+    /// physical row. The old row is NOT garbage-collected by this
+    /// call. Callers updating a moving point MUST call
+    /// [`Self::delete`] with the OLD coordinates first (or use a
+    /// dedicated upsert helper at the layer above, which can hide
+    /// the old-coord bookkeeping). Inserting the same `(node_id,
+    /// coords)` pair twice IS idempotent (same key, same body).
     fn insert(&self, label_id: u32, node_id: NodeId, point: &Point) -> StoreResult<()>;
 
     /// Remove the entry for `node_id` previously written with `point`.
@@ -671,6 +678,102 @@ mod tests {
         assert_eq!(hits2.len(), 1);
         assert_eq!(hits1[0].0, NodeId::from_raw(10));
         assert_eq!(hits2[0].0, NodeId::from_raw(20));
+    }
+
+    #[test]
+    fn insert_same_node_at_new_coords_leaves_stale_row() {
+        // Document the trait contract: moving a point requires
+        // delete(old) before insert(new). Without it, both rows are
+        // visible. This is the regression guard for the doc on
+        // `insert`.
+        let (_dir, engine) = mk_engine();
+        let store = LocalSpatialStore::new(&engine);
+        let id = NodeId::from_raw(1);
+        let p1 = Point::new_2d(Crs::Cartesian2d, 0.0, 0.0);
+        let p2 = Point::new_2d(Crs::Cartesian2d, 100.0, 100.0);
+        store.insert(1, id, &p1).unwrap();
+        store.insert(1, id, &p2).unwrap();
+
+        let bbox = Bbox {
+            lower: Point::new_2d(Crs::Cartesian2d, -200.0, -200.0),
+            upper: Point::new_2d(Crs::Cartesian2d, 200.0, 200.0),
+        };
+        let hits = store.scan_within_bbox(1, Crs::Cartesian2d, &bbox).unwrap();
+        // Both rows visible: stale-key behaviour the docstring warns
+        // about.
+        assert_eq!(hits.len(), 2);
+        let ids: Vec<u64> = hits.iter().map(|(id, _)| id.as_raw()).collect();
+        assert_eq!(ids, vec![1, 1]);
+    }
+
+    #[test]
+    fn move_point_via_explicit_delete_then_insert() {
+        // The supported pattern for moving a point: delete(old) →
+        // insert(new). Exactly one row visible afterwards.
+        let (_dir, engine) = mk_engine();
+        let store = LocalSpatialStore::new(&engine);
+        let id = NodeId::from_raw(2);
+        let p1 = Point::new_2d(Crs::Cartesian2d, 0.0, 0.0);
+        let p2 = Point::new_2d(Crs::Cartesian2d, 50.0, 50.0);
+        store.insert(2, id, &p1).unwrap();
+        store.delete(2, id, &p1).unwrap();
+        store.insert(2, id, &p2).unwrap();
+
+        let bbox = Bbox {
+            lower: Point::new_2d(Crs::Cartesian2d, -100.0, -100.0),
+            upper: Point::new_2d(Crs::Cartesian2d, 100.0, 100.0),
+        };
+        let hits = store.scan_within_bbox(2, Crs::Cartesian2d, &bbox).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!((hits[0].1.coords[0] - 50.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn insert_same_coords_twice_is_idempotent() {
+        // Same (node_id, coords) = same key. The second insert
+        // overwrites with identical bytes — net effect is one row.
+        let (_dir, engine) = mk_engine();
+        let store = LocalSpatialStore::new(&engine);
+        let id = NodeId::from_raw(3);
+        let p = Point::new_2d(Crs::Cartesian2d, 5.0, 5.0);
+        store.insert(3, id, &p).unwrap();
+        store.insert(3, id, &p).unwrap();
+
+        let bbox = Bbox {
+            lower: Point::new_2d(Crs::Cartesian2d, 0.0, 0.0),
+            upper: Point::new_2d(Crs::Cartesian2d, 10.0, 10.0),
+        };
+        let hits = store.scan_within_bbox(3, Crs::Cartesian2d, &bbox).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn bbox_inclusive_at_corner_points() {
+        // Per docstring, Bbox is *inclusive*. A point at exactly the
+        // lower-left corner and a point at exactly upper-right must
+        // both match.
+        let (_dir, engine) = mk_engine();
+        let store = LocalSpatialStore::new(&engine);
+        let bbox = Bbox {
+            lower: Point::new_2d(Crs::Cartesian2d, 10.0, 20.0),
+            upper: Point::new_2d(Crs::Cartesian2d, 30.0, 40.0),
+        };
+        store
+            .insert(
+                5,
+                NodeId::from_raw(1),
+                &Point::new_2d(Crs::Cartesian2d, 10.0, 20.0),
+            )
+            .unwrap();
+        store
+            .insert(
+                5,
+                NodeId::from_raw(2),
+                &Point::new_2d(Crs::Cartesian2d, 30.0, 40.0),
+            )
+            .unwrap();
+        let hits = store.scan_within_bbox(5, Crs::Cartesian2d, &bbox).unwrap();
+        assert_eq!(hits.len(), 2);
     }
 
     #[test]
