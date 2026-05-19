@@ -1321,6 +1321,59 @@ mod tests {
         assert_eq!(decoded, PageEccPolicy::ForceOff);
     }
 
+    // ── Hard-limit strategy ─────────────────────────────────────────
+
+    #[test]
+    fn hard_limit_strategy_default_is_reject() {
+        // Default placement preserves the safe behaviour — never moves
+        // data on behalf of the operator unless explicitly opted in.
+        assert_eq!(HardLimitStrategy::default(), HardLimitStrategy::Reject);
+    }
+
+    #[test]
+    fn endpoint_with_hard_limit_strategy_builder() {
+        // The chainable builder must mirror the other field builders
+        // (`with_server`, `with_capacity_bytes`, `with_page_ecc`).
+        let ep = EndpointConfig::new("ep", "/p", Media::Hdd, Durability::Durable, Tier::Warm)
+            .with_hard_limit_strategy(HardLimitStrategy::CascadeEvict);
+        assert_eq!(ep.hard_limit_strategy, HardLimitStrategy::CascadeEvict);
+    }
+
+    #[test]
+    fn endpoint_deserializes_without_hard_limit_strategy_defaults_to_reject() {
+        // Backward-compat: a config serialised BEFORE the
+        // `hard_limit_strategy` field existed must deserialize cleanly
+        // with `Reject` default. Pins the `#[serde(default)]`
+        // guarantee — accidentally removing it would break operators
+        // upgrading from older config files.
+        let json = r#"{
+            "id": "ep-old",
+            "path": "/old",
+            "media": "hdd",
+            "durability": "durable",
+            "tier": "warm",
+            "capacity_bytes": 0,
+            "hard_limit_bytes": 100
+        }"#;
+        let ep: EndpointConfig = serde_json::from_str(json).expect("decode legacy config");
+        assert_eq!(ep.hard_limit_strategy, HardLimitStrategy::Reject);
+    }
+
+    #[test]
+    fn hard_limit_strategy_serde_roundtrip() {
+        let reject_json = serde_json::to_string(&HardLimitStrategy::Reject).expect("encode reject");
+        assert_eq!(reject_json, "\"reject\"");
+        let cascade_json =
+            serde_json::to_string(&HardLimitStrategy::CascadeEvict).expect("encode cascade_evict");
+        assert_eq!(cascade_json, "\"cascade_evict\"");
+
+        let decoded: HardLimitStrategy = serde_json::from_str("\"reject\"").expect("decode reject");
+        assert_eq!(decoded, HardLimitStrategy::Reject);
+        let decoded: HardLimitStrategy =
+            serde_json::from_str("\"cascade_evict\"").expect("decode cascade_evict");
+        assert_eq!(decoded, HardLimitStrategy::CascadeEvict);
+    }
+
     // ── WAL/oplog endpoint eligibility + selection ────────────────────
 
     #[test]

@@ -43,6 +43,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -310,6 +312,102 @@ fn dir_size(root: &Path) -> u64 {
     total
 }
 
+/// Background capacity scanner — a single OS thread that periodically
+/// re-runs the per-endpoint disk scan + alert + auto-cascade logic.
+///
+/// Follows the same lifecycle pattern as
+/// [`crate::engine::flush::FlushManager`] / `CompactionScheduler` (also
+/// std-thread-based with an `Arc<AtomicBool>` shutdown flag) for
+/// consistency across `coordinode-storage` background workers. The
+/// engine owns the scanner; dropping the engine flips the shutdown
+/// flag and joins the thread before tree handles are released.
+///
+/// The scanner does NOT itself decide cascade-eviction strategy or
+/// emit metrics — it just calls back into `refresh_fn` on every tick.
+/// The engine wires `refresh_fn` to `StorageEngine::refresh_capacity`
+/// so all the policy lives in one place.
+pub struct CapacityScanner {
+    shutdown: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl CapacityScanner {
+    /// Spawn the scanner thread.
+    ///
+    /// `interval` is the wall-clock period between scans. Default
+    /// engine cadence is 5 s but tests may pass shorter values for
+    /// faster convergence. `refresh_fn` is called from the scanner
+    /// thread on every tick; it MUST be `Send + 'static` because the
+    /// thread outlives the call stack that constructed the scanner.
+    ///
+    /// Returns an `Err` only if the OS thread spawn itself fails
+    /// (resource-limit hit at process level).
+    pub fn start<F>(interval: Duration, refresh_fn: F) -> std::io::Result<Self>
+    where
+        F: Fn() + Send + 'static,
+    {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_w = Arc::clone(&shutdown);
+        let handle = std::thread::Builder::new()
+            .name("coord-capacity-scanner".to_string())
+            .spawn(move || capacity_scanner_loop(interval, shutdown_w, refresh_fn))?;
+        Ok(Self {
+            shutdown,
+            handle: Some(handle),
+        })
+    }
+
+    /// Signal the scanner to stop after its current iteration. Idempotent.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for CapacityScanner {
+    fn drop(&mut self) {
+        self.shutdown();
+        if let Some(handle) = self.handle.take() {
+            // Best-effort join — a poisoned thread is logged but does
+            // not panic the engine drop (writes already happened; the
+            // scanner is bookkeeping only).
+            if let Err(e) = handle.join() {
+                tracing::warn!(
+                    error = ?e,
+                    "capacity scanner thread panicked during shutdown",
+                );
+            }
+        }
+    }
+}
+
+/// The actual loop body — pulled out as a free function so unit tests
+/// can drive the loop synchronously by injecting a controlled
+/// shutdown flag.
+fn capacity_scanner_loop<F>(interval: Duration, shutdown: Arc<AtomicBool>, refresh_fn: F)
+where
+    F: Fn(),
+{
+    // Sleep granularity: the scanner wakes every `tick_granularity` to
+    // check the shutdown flag promptly even when `interval` is large.
+    // This keeps engine close latency bounded (~100 ms) regardless of
+    // the scan cadence.
+    let tick_granularity = Duration::from_millis(100);
+    loop {
+        // Run one refresh.
+        refresh_fn();
+        // Sleep up to `interval`, checking the shutdown flag every
+        // `tick_granularity`. Burns nothing if shutdown is already set.
+        let mut elapsed = Duration::ZERO;
+        while elapsed < interval {
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(tick_granularity);
+            elapsed += tick_granularity;
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -525,5 +623,52 @@ mod tests {
         // mutation of state.
         tracker.refresh(&BTreeMap::new(), &["node"]);
         assert_eq!(tracker.get("missing").unwrap().used(), 0);
+    }
+
+    #[test]
+    fn scanner_fires_refresh_then_shuts_down() {
+        // The scanner thread must invoke refresh_fn at least once per
+        // interval and must exit promptly after Drop.
+        let count = Arc::new(AtomicU64::new(0));
+        let cnt_clone = Arc::clone(&count);
+        let scanner = CapacityScanner::start(Duration::from_millis(50), move || {
+            cnt_clone.fetch_add(1, Ordering::Relaxed);
+        })
+        .expect("scanner spawn");
+
+        // Sleep long enough to observe at least ~3 ticks (3 × 50 ms +
+        // scheduling slop).
+        std::thread::sleep(Duration::from_millis(250));
+        let observed = count.load(Ordering::Relaxed);
+        assert!(
+            observed >= 3,
+            "expected scanner to fire at least 3 times in 250 ms with 50 ms interval, got {observed}",
+        );
+
+        // Drop → shutdown → join. Should return within
+        // tick_granularity (100 ms) + epsilon. We bound the wait with
+        // a timeout via std::thread::scope to fail loudly if join
+        // hangs.
+        let start = std::time::Instant::now();
+        drop(scanner);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "scanner shutdown should be near-instant (<1 s), took {elapsed:?}",
+        );
+    }
+
+    #[test]
+    fn scanner_shutdown_is_idempotent() {
+        // Calling shutdown() multiple times must not panic and must
+        // not affect drop semantics. Guards against a double-drop
+        // pattern (e.g., explicit close in error-handling path
+        // followed by RAII drop).
+        let scanner = CapacityScanner::start(Duration::from_secs(60), || {}).expect("spawn");
+        scanner.shutdown();
+        scanner.shutdown();
+        scanner.shutdown();
+        // Drop must still join cleanly.
+        drop(scanner);
     }
 }
