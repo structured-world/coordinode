@@ -59,6 +59,7 @@ pub mod error;
 pub mod index;
 pub mod node;
 pub mod schema;
+pub mod vector;
 
 pub use blob::{BlobStore, LocalBlobStore};
 pub use document::{DocumentStore, LocalDocumentStore};
@@ -67,3 +68,4 @@ pub use error::{StoreError, StoreResult};
 pub use index::{IndexStore, LocalIndexStore};
 pub use node::{LocalNodeStore, NodeStore};
 pub use schema::{LocalSchemaStore, SchemaStore};
+pub use vector::{LocalVectorStore, VectorStore};

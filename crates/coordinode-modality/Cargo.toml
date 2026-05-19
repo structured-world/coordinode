@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 coordinode-core = { workspace = true }
 coordinode-storage = { workspace = true }
+coordinode-vector = { workspace = true }
 lsm-tree = { package = "coordinode-lsm-tree", version = "4", default-features = false }
 rmp-serde = { workspace = true }
 rmpv = { workspace = true }
