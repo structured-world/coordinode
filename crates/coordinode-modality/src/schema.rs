@@ -305,6 +305,36 @@ mod tests {
     }
 
     #[test]
+    fn edge_type_revision_bump_preserves_history() {
+        // Symmetric to the label revision-bump test: save v1, save
+        // v2, current load returns v2, v1 body still readable via
+        // its revisioned key.
+        let (_dir, engine) = open_engine();
+        let store = LocalSchemaStore::new(&engine);
+
+        let mut v1 = EdgeTypeSchema::new("KNOWS");
+        v1.schema_revision = 1;
+        store.save_edge_type(&v1).expect("save v1");
+
+        let mut v2 = EdgeTypeSchema::new("KNOWS");
+        v2.schema_revision = 2;
+        store.save_edge_type(&v2).expect("save v2");
+
+        let cur = store
+            .load_edge_type("KNOWS")
+            .expect("ok")
+            .expect("Some(schema)");
+        assert_eq!(cur.schema_revision, 2);
+
+        let v1_bytes = engine
+            .get(Partition::Schema, &encode_edge_type_schema_key("KNOWS", 1))
+            .expect("ok")
+            .expect("v1 body");
+        let v1_loaded = EdgeTypeSchema::from_msgpack(&v1_bytes).expect("decode v1");
+        assert_eq!(v1_loaded.schema_revision, 1);
+    }
+
+    #[test]
     fn legacy_zero_length_edge_marker_loads_as_none() {
         // Pre-DDL deployments wrote a zero-length value at the
         // revisioned key to mark "edge type exists, no schema body".

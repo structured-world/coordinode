@@ -17,7 +17,7 @@
 //!
 //! ## Atomicity
 //!
-//! [`Self::put_edge`] writes the forward adjacency merge, the
+//! [`EdgeStore::put_edge`] writes the forward adjacency merge, the
 //! reverse adjacency merge, and the optional edgeprop body in a
 //! single [`WriteBatch`] — the storage engine commits all three (or
 //! none) and produces one seqno. Readers never observe a half-built
@@ -25,9 +25,10 @@
 //!
 //! ## Temporal edges (ADR-027)
 //!
-//! [`Self::put_edge_temporal`] writes one version per `valid_from_ms`
-//! via [`encode_temporal_edgeprop_key`], so every edge update appends
-//! a new row rather than overwriting. [`Self::get_props_at`] scans the
+//! [`EdgeStore::put_edge_temporal`] writes one version per
+//! `valid_from_ms` via [`encode_temporal_edgeprop_key`], so every
+//! edge update appends a new row rather than overwriting.
+//! [`EdgeStore::get_props_at`] scans the
 //! `(edge_type, src, tgt)` prefix and returns the version whose
 //! `valid_from_ms <= at_ms` is largest. Adjacency entries are written
 //! by the temporal path too — the version model for adj itself
@@ -730,6 +731,43 @@ mod tests {
         // Expect: (200..205) removed, (205..210) kept, (300..305) added.
         let expected: Vec<u64> = (205u64..210).chain(300..305).collect();
         assert_eq!(neighbors, expected);
+    }
+
+    #[test]
+    fn concurrent_put_edge_temporal_distinct_versions() {
+        // Four threads each write a distinct valid_from version of
+        // the same (et, src, tgt). After join, scan_edge_versions
+        // returns all four, sorted by valid_from.
+        use std::sync::Arc;
+        use std::thread;
+
+        let (_dir, engine) = open_engine();
+        let engine = Arc::new(engine);
+        let src = NodeId::from_raw(1);
+        let tgt = NodeId::from_raw(2);
+
+        let handles: Vec<_> = (0..4u64)
+            .map(|t| {
+                let engine = Arc::clone(&engine);
+                thread::spawn(move || {
+                    let store = LocalEdgeStore::new(&engine);
+                    let vf = (t as i64 + 1) * 1000;
+                    let mut props = EdgeProperties::new();
+                    props.set(1, coordinode_core::graph::types::Value::Int(vf));
+                    store
+                        .put_edge_temporal("E", src, tgt, vf, &props)
+                        .expect("put temporal");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("join");
+        }
+
+        let store = LocalEdgeStore::new(&engine);
+        let versions = store.scan_edge_versions("E", src, tgt).expect("scan");
+        let vfs: Vec<i64> = versions.iter().map(|(vf, _)| *vf).collect();
+        assert_eq!(vfs, vec![1000, 2000, 3000, 4000]);
     }
 
     #[test]

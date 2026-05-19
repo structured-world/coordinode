@@ -233,6 +233,28 @@ mod tests {
     }
 
     #[test]
+    fn insert_same_id_twice_dedups_by_id() {
+        // Verified behaviour: HnswIndex maintains an id→idx map and
+        // overwrites the slot when the same id is re-inserted. The
+        // second vector replaces the first. `len()` stays at 1.
+        //
+        // (Initial intuition was the opposite — HNSW graphs without
+        // explicit dedup would grow. The id_to_idx HashMap in
+        // coordinode-vector guards against that. This test pins the
+        // observed behaviour so a future implementation change does
+        // not silently revert it.)
+        let store = LocalVectorStore::new(mk_config(2));
+        store.insert(1, vec![0.0, 0.0]).unwrap();
+        store.insert(1, vec![5.0, 5.0]).unwrap();
+        assert_eq!(store.len().unwrap(), 1, "same id must dedup");
+        // KNN from (5, 5) returns the updated vector at distance 0.
+        let res = store.knn_search(&[5.0, 5.0], 1).unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].id, 1);
+        assert!(res[0].score.abs() < 1e-6, "score should be ~0 at (5,5)");
+    }
+
+    #[test]
     fn knn_returns_full_set_when_k_exceeds_size() {
         // k > number of inserted points must not panic — return what
         // we have, in distance order.
