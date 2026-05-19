@@ -289,6 +289,15 @@ impl EndpointConfig {
         self
     }
 
+    /// Override the per-block ECC policy. Default is
+    /// [`PageEccPolicy::Auto`] — see [`PageEccPolicy`] for the
+    /// durability-derived effective decision.
+    #[must_use]
+    pub fn with_page_ecc(mut self, policy: PageEccPolicy) -> Self {
+        self.page_ecc = policy;
+        self
+    }
+
     /// WAL eligibility predicate ([storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2):
     /// endpoint is eligible to host the standalone WAL iff it offers fast
     /// sequential writes (NVMe/SSD media OR `Hot` tier) AND it is non-volatile.
@@ -1162,6 +1171,92 @@ mod tests {
         let mut degraded_force = degraded.clone();
         degraded_force.page_ecc = PageEccPolicy::ForceOff;
         assert!(!degraded_force.is_page_ecc_enabled());
+    }
+
+    #[test]
+    fn page_ecc_force_on_volatile_accepted() {
+        // `ForceOn` on a Volatile endpoint is documented as
+        // "legal but wasteful" — engine does NOT reject. The Volatile
+        // endpoint can vanish, so ECC bytes there are useless, but the
+        // operator may have a reason (e.g. testing the encoder path on
+        // a known-volatile mount). No-second-guess contract.
+        let mut ep = EndpointConfig::new(
+            "cache",
+            "/cache",
+            Media::Nvme,
+            Durability::Volatile,
+            Tier::HotCache,
+        );
+        ep.page_ecc = PageEccPolicy::ForceOn;
+        // No panic, no validation error — just stored.
+        assert!(ep.is_page_ecc_enabled());
+    }
+
+    #[test]
+    fn endpoint_with_page_ecc_builder() {
+        // The `with_page_ecc` builder must mirror the other field
+        // builders (`with_server`, `with_capacity_bytes`, ...). Pin
+        // the chainable builder pattern.
+        let ep = EndpointConfig::new("ep", "/p", Media::Hdd, Durability::Degraded, Tier::Cold)
+            .with_page_ecc(PageEccPolicy::ForceOff);
+        assert_eq!(ep.page_ecc, PageEccPolicy::ForceOff);
+        assert!(!ep.is_page_ecc_enabled());
+    }
+
+    #[test]
+    fn endpoint_deserializes_without_page_ecc_field_defaults_to_auto() {
+        // Backward-compat: a config serialized BEFORE the `page_ecc`
+        // field existed must deserialize cleanly with `Auto` default.
+        // Pins the `#[serde(default)]` guarantee — accidentally
+        // removing it would break operators upgrading from older
+        // pre-release config files.
+        let json = r#"{
+            "id": "ep-old",
+            "path": "/old",
+            "media": "hdd",
+            "durability": "durable",
+            "tier": "warm",
+            "capacity_bytes": 0,
+            "hard_limit_bytes": 0
+        }"#;
+        let ep: EndpointConfig = serde_json::from_str(json).expect("decode legacy config");
+        assert_eq!(ep.page_ecc, PageEccPolicy::Auto);
+        assert!(!ep.is_page_ecc_enabled(), "Durable + Auto → OFF");
+    }
+
+    #[test]
+    fn endpoint_full_serde_roundtrip_with_page_ecc() {
+        // Full EndpointConfig round-trip including the new field plus
+        // every other field — proves the new addition does not
+        // break existing serialisation.
+        let ep = EndpointConfig::new(
+            "ep-full",
+            "/full",
+            Media::Nvme,
+            Durability::Degraded,
+            Tier::Hot,
+        )
+        .with_server("srv-7")
+        .with_capacity_bytes(1_000_000_000_000)
+        .with_hard_limit_bytes(900_000_000_000)
+        .with_page_ecc(PageEccPolicy::ForceOff)
+        .with_tag("zone", "eu-west-1a");
+
+        let encoded = serde_json::to_string(&ep).expect("encode");
+        let decoded: EndpointConfig = serde_json::from_str(&encoded).expect("decode");
+
+        assert_eq!(decoded.id, "ep-full");
+        assert_eq!(decoded.server.as_deref(), Some("srv-7"));
+        assert_eq!(decoded.media, Media::Nvme);
+        assert_eq!(decoded.durability, Durability::Degraded);
+        assert_eq!(decoded.tier, Tier::Hot);
+        assert_eq!(decoded.capacity_bytes, 1_000_000_000_000);
+        assert_eq!(decoded.hard_limit_bytes, 900_000_000_000);
+        assert_eq!(decoded.page_ecc, PageEccPolicy::ForceOff);
+        assert_eq!(
+            decoded.tags.get("zone").map(String::as_str),
+            Some("eu-west-1a")
+        );
     }
 
     #[test]
