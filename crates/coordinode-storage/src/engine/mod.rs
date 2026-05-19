@@ -4,6 +4,7 @@ pub mod batch;
 pub mod capacity;
 pub(crate) mod compaction;
 pub mod config;
+pub mod coordinator;
 pub mod core;
 pub(crate) mod flush;
 pub mod merge;

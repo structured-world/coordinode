@@ -327,7 +327,7 @@ fn dir_size(root: &Path) -> u64 {
 /// re-runs the per-endpoint disk scan + alert + auto-cascade logic.
 ///
 /// Follows the same lifecycle pattern as
-/// [`crate::engine::flush::FlushManager`] / `CompactionScheduler` (also
+/// `crate::engine::flush::FlushManager` / `CompactionScheduler` (also
 /// std-thread-based with an `Arc<AtomicBool>` shutdown flag) for
 /// consistency across `coordinode-storage` background workers. The
 /// engine owns the scanner; dropping the engine flips the shutdown

@@ -35,7 +35,7 @@ struct FlushRequest {
 
 /// Background memtable → SST flush worker pool.
 ///
-/// Started by [`StorageEngine::finish_open`] and dropped automatically when the
+/// Started by `StorageEngine::finish_open` and dropped automatically when the
 /// engine is dropped (field ordering ensures FlushManager drops before trees).
 pub(crate) struct FlushManager {
     /// Worker thread handles.
