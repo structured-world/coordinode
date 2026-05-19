@@ -30,32 +30,55 @@ use tonic::Status;
 /// to `.map_err(|e| db_err_to_status("op", e))` so that capacity
 /// errors propagate as a typed `RESOURCE_EXHAUSTED` to the client.
 pub fn db_err_to_status(context: &str, err: DatabaseError) -> Status {
-    if let DatabaseError::Storage(StorageError::CapacityExhausted {
-        ref endpoint_id,
-        used_bytes,
-        hard_limit_bytes,
-    }) = err
-    {
-        let msg = format!(
-            "{context}: endpoint {endpoint_id:?} capacity exhausted \
-             (used={used_bytes}, hard_limit={hard_limit_bytes})"
-        );
-        let mut status = Status::resource_exhausted(msg);
-        // Attach structured metadata so clients can parse the
-        // endpoint id / values without screen-scraping the message.
-        let meta = status.metadata_mut();
-        if let Ok(v) = endpoint_id.parse() {
-            meta.insert("endpoint-id", v);
+    if let DatabaseError::Storage(ref inner) = err {
+        if matches!(inner, StorageError::CapacityExhausted { .. }) {
+            return capacity_exhausted_status(context, inner);
         }
-        if let Ok(v) = used_bytes.to_string().parse() {
-            meta.insert("used-bytes", v);
-        }
-        if let Ok(v) = hard_limit_bytes.to_string().parse() {
-            meta.insert("hard-limit-bytes", v);
-        }
-        return status;
     }
     Status::internal(format!("{context}: {err}"))
+}
+
+/// Same mapping for callers that hold a raw [`StorageError`] (no
+/// `DatabaseError` wrapper) — typically subsystems that call
+/// `engine.put` / `engine.delete` directly (blob store, admin RPCs,
+/// background workers). Behaviour matches [`db_err_to_status`] for
+/// the capacity case.
+pub fn storage_err_to_status(context: &str, err: StorageError) -> Status {
+    if matches!(err, StorageError::CapacityExhausted { .. }) {
+        return capacity_exhausted_status(context, &err);
+    }
+    Status::internal(format!("{context}: {err}"))
+}
+
+/// Shared body for the capacity-exhausted → `RESOURCE_EXHAUSTED`
+/// mapping. Pre: `err` IS `StorageError::CapacityExhausted`.
+fn capacity_exhausted_status(context: &str, err: &StorageError) -> Status {
+    let (endpoint_id, used_bytes, hard_limit_bytes) = match err {
+        StorageError::CapacityExhausted {
+            endpoint_id,
+            used_bytes,
+            hard_limit_bytes,
+        } => (endpoint_id.as_str(), *used_bytes, *hard_limit_bytes),
+        // Unreachable in practice — callers gate on the variant
+        // before invoking this helper. Defensively map to Internal.
+        _ => return Status::internal(format!("{context}: {err}")),
+    };
+    let msg = format!(
+        "{context}: endpoint {endpoint_id:?} capacity exhausted \
+         (used={used_bytes}, hard_limit={hard_limit_bytes})"
+    );
+    let mut status = Status::resource_exhausted(msg);
+    let meta = status.metadata_mut();
+    if let Ok(v) = endpoint_id.parse() {
+        meta.insert("endpoint-id", v);
+    }
+    if let Ok(v) = used_bytes.to_string().parse() {
+        meta.insert("used-bytes", v);
+    }
+    if let Ok(v) = hard_limit_bytes.to_string().parse() {
+        meta.insert("hard-limit-bytes", v);
+    }
+    status
 }
 
 #[cfg(test)]

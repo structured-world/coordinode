@@ -10,6 +10,7 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 
 use crate::proto::graph;
+use crate::services::storage_err_to_status;
 
 /// gRPC BlobService implementation.
 ///
@@ -86,10 +87,10 @@ impl graph::blob_service_server::BlobService for BlobServiceImpl {
                 Ok(None) => {
                     self.engine
                         .put(Partition::Blob, &key, chunk_data)
-                        .map_err(|e| Status::internal(format!("storage error: {e}")))?;
+                        .map_err(|e| storage_err_to_status("blob storage", e))?;
                 }
                 Err(e) => {
-                    return Err(Status::internal(format!("storage error: {e}")));
+                    return Err(storage_err_to_status("blob storage", e));
                 }
             }
         }
@@ -101,7 +102,7 @@ impl graph::blob_service_server::BlobService for BlobServiceImpl {
             .map_err(|e| Status::internal(format!("serialize error: {e}")))?;
         self.engine
             .put(Partition::BlobRef, &meta_key, &meta_value)
-            .map_err(|e| Status::internal(format!("storage error: {e}")))?;
+            .map_err(|e| storage_err_to_status("blob storage", e))?;
 
         let chunk_ids: Vec<String> = blob_ref.chunks.iter().map(|id| id.to_hex()).collect();
 
@@ -132,7 +133,7 @@ impl graph::blob_service_server::BlobService for BlobServiceImpl {
         let meta_bytes = self
             .engine
             .get(Partition::BlobRef, &meta_key)
-            .map_err(|e| Status::internal(format!("storage error: {e}")))?
+            .map_err(|e| storage_err_to_status("blob storage", e))?
             .ok_or_else(|| Status::not_found(format!("blob {blob_id} not found")))?;
 
         let blob_ref = BlobRef::from_msgpack(&meta_bytes)
@@ -165,9 +166,7 @@ impl graph::blob_service_server::BlobService for BlobServiceImpl {
                         break;
                     }
                     Err(e) => {
-                        let _ = tx
-                            .send(Err(Status::internal(format!("storage error: {e}"))))
-                            .await;
+                        let _ = tx.send(Err(storage_err_to_status("blob storage", e))).await;
                         break;
                     }
                 }
@@ -188,7 +187,7 @@ impl graph::blob_service_server::BlobService for BlobServiceImpl {
         let meta_bytes = self
             .engine
             .get(Partition::BlobRef, &meta_key)
-            .map_err(|e| Status::internal(format!("storage error: {e}")))?
+            .map_err(|e| storage_err_to_status("blob storage", e))?
             .ok_or_else(|| Status::not_found(format!("blob {blob_id} not found")))?;
 
         let blob_ref = BlobRef::from_msgpack(&meta_bytes)
@@ -200,14 +199,14 @@ impl graph::blob_service_server::BlobService for BlobServiceImpl {
             let key = encode_blob_key(chunk_id);
             self.engine
                 .delete(Partition::Blob, &key)
-                .map_err(|e| Status::internal(format!("storage error: {e}")))?;
+                .map_err(|e| storage_err_to_status("blob storage", e))?;
             deleted += 1;
         }
 
         // Delete blob metadata
         self.engine
             .delete(Partition::BlobRef, &meta_key)
-            .map_err(|e| Status::internal(format!("storage error: {e}")))?;
+            .map_err(|e| storage_err_to_status("blob storage", e))?;
 
         info!(blob_id = %blob_id, chunks_deleted = deleted, "blob deleted");
 
@@ -226,7 +225,7 @@ impl graph::blob_service_server::BlobService for BlobServiceImpl {
         let meta_bytes = self
             .engine
             .get(Partition::BlobRef, &meta_key)
-            .map_err(|e| Status::internal(format!("storage error: {e}")))?
+            .map_err(|e| storage_err_to_status("blob storage", e))?
             .ok_or_else(|| Status::not_found(format!("blob {blob_id} not found")))?;
 
         let blob_ref = BlobRef::from_msgpack(&meta_bytes)

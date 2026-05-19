@@ -8,6 +8,7 @@ use coordinode_embed::Database;
 
 use crate::proto::{common, graph, query};
 use crate::services::cypher::value_to_proto_pub;
+use crate::services::db_err_to_status;
 
 /// Backtick-escape a Cypher identifier (label or property key).
 ///
@@ -134,7 +135,7 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         let rows = {
             let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
             db.execute_cypher_with_params(&cypher, params)
-                .map_err(|e| Status::internal(format!("vector search error: {e}")))?
+                .map_err(|e| db_err_to_status("vector search", e))?
         };
 
         let results: Vec<query::VectorResult> =
@@ -190,7 +191,7 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         let rows = {
             let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
             db.execute_cypher_with_params(&cypher, params)
-                .map_err(|e| Status::internal(format!("hybrid search error: {e}")))?
+                .map_err(|e| db_err_to_status("hybrid search", e))?
         };
 
         let results: Vec<query::VectorResult> =
