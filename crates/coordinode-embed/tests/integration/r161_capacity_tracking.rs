@@ -1194,6 +1194,116 @@ fn reads_remain_functional_on_full_endpoint() {
     );
 }
 
+/// Triggers fire bodies through the same `mvcc_write_buffer` as the
+/// originating mutation. When the targeted endpoint is Full, the
+/// trigger's body write MUST fail fast with `CapacityExhausted` —
+/// no implicit retry, no infinite loop. The whole transaction
+/// aborts via the standard error-propagation path, exactly like
+/// a non-trigger write would.
+///
+/// The protection is structural: the trigger executor calls
+/// `execute_op` which lands in the same `engine.put` /
+/// `WriteBatch::commit` gate. There is no retry layer in
+/// `fire_before_commit_triggers` (verified by source inspection
+/// and asserted here by measuring wall time of the failing call).
+#[test]
+fn trigger_fail_fast_on_capacity_exhausted() {
+    use coordinode_embed::Database;
+    use std::time::Instant;
+
+    let dir = TempDir::new().expect("tempdir");
+    // Smallish limit; trigger DDL itself writes to Schema (bypasses
+    // the gate) so DDL succeeds even after the limit is hit; we
+    // need to populate the trigger BEFORE filling so the user-data
+    // partitions are below the limit at DDL time.
+    let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let storage_config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "ep",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )
+    .with_hard_limit_bytes(40_000)]);
+    let engine = std::sync::Arc::new(
+        coordinode_storage::engine::core::StorageEngine::open_with_oracle(
+            &storage_config,
+            std::sync::Arc::clone(&oracle),
+        )
+        .expect("open engine"),
+    );
+    let pipeline: std::sync::Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
+        std::sync::Arc::new(coordinode_raft::proposal::OwnedLocalProposalPipeline::new(
+            &engine,
+        ));
+    let mut db =
+        Database::from_engine(dir.path(), std::sync::Arc::clone(&engine), oracle, pipeline)
+            .expect("from_engine");
+
+    // Setup: trigger on User CREATE creates an Audit node — the
+    // simplest possible cascade. With a Full endpoint both nodes
+    // are denied at the same gate; without a retry loop the call
+    // returns fast.
+    db.execute_cypher(
+        "CREATE TRIGGER audit_user ON :User CREATE BEFORE COMMIT \
+         EXECUTE CREATE (a:Audit)",
+    )
+    .expect("create trigger");
+
+    // Fill the endpoint through direct engine writes (bypasses the
+    // Cypher path so we can fill without firing the trigger
+    // ourselves).
+    for i in 0..5000u32 {
+        let key = format!("node:0:{i:010}");
+        let _ = engine.put(
+            coordinode_storage::engine::partition::Partition::Node,
+            key.as_bytes(),
+            b"payload-bytes",
+        );
+    }
+    engine.persist().expect("persist");
+    engine.refresh_capacity();
+    assert!(
+        !engine.capacity().get("ep").unwrap().is_writable(),
+        "endpoint must be Full before firing the trigger-source mutation",
+    );
+
+    // Fire the trigger via a CREATE that the trigger watches. The
+    // ENTIRE transaction (user CREATE + trigger CREATE) must abort
+    // immediately. We measure wall time — a retry loop would push
+    // this well past 1 s. Fail-fast keeps it < 200 ms even on
+    // contended CI machines.
+    let started = Instant::now();
+    let result = db.execute_cypher("CREATE (u:User {name: 'alice'})");
+    let elapsed = started.elapsed();
+
+    let err = match result {
+        Err(e) => e,
+        Ok(rows) => panic!(
+            "expected CapacityExhausted, got Ok with {} rows",
+            rows.len(),
+        ),
+    };
+    // The DatabaseError carries the typed CapacityExhausted —
+    // either as Storage(...) (rare for Cypher writes) or as
+    // Execution(Storage(...)) via the proposal pipeline path
+    // we already lift.
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("capacity exhausted") || msg.contains("CapacityExhausted"),
+        "expected capacity-exhausted error from trigger path, got: {msg}",
+    );
+
+    // Wall-time guard: a retry loop with exponential backoff would
+    // be many seconds. Fail-fast is single-digit milliseconds in
+    // practice; 200 ms is the conservative CI ceiling.
+    assert!(
+        elapsed < std::time::Duration::from_millis(200),
+        "trigger fail-fast must complete in < 200 ms (got {elapsed:?}) \
+         — a longer wall time suggests a hidden retry loop",
+    );
+}
+
 /// Compaction-driven recovery: write past the limit, fire
 /// `major_compact` (the real production path that reclaims space
 /// from stale MVCC versions, tombstones, and pre-compaction
