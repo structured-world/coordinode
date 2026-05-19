@@ -21,6 +21,11 @@ tracing = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "store_throughput"
+harness = false
 
 [lints]
 workspace = true

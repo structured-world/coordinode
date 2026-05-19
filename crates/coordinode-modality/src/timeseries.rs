@@ -305,6 +305,31 @@ pub struct LocalTimeSeriesStore<'a> {
 
 impl<'a> LocalTimeSeriesStore<'a> {
     /// Wrap a storage engine for time-series store operations.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use coordinode_modality::{
+    ///     LocalTimeSeriesStore, TimeSeriesStore, Bucket, Measurement,
+    /// };
+    /// use coordinode_core::graph::node::NodeId;
+    /// use std::collections::BTreeMap;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/store"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm,
+    /// # )]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// let store = LocalTimeSeriesStore::new(&engine);
+    /// let mut fields = BTreeMap::new();
+    /// fields.insert("temp".into(), 22.5);
+    /// let bucket = Bucket::from_measurements(
+    ///     rmpv::Value::String("sensor-1".into()),
+    ///     vec![Measurement { timestamp_us: 100, fields }],
+    /// );
+    /// store.put_bucket(0, NodeId::from_raw(42), &bucket)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn new(engine: &'a StorageEngine) -> Self {
         Self { engine }
     }
@@ -569,6 +594,42 @@ mod tests {
         let entries = store.scan_overflow(1, bid).unwrap();
         assert_eq!(entries.len(), 1, "second write must overwrite first");
         assert_eq!(entries[0].measurement.timestamp_us, 200);
+    }
+
+    #[test]
+    fn concurrent_put_overflow_distinct_seqnos_converges() {
+        // Four threads write distinct arrival_seqnos into the same
+        // bucket's overflow segment. All four must be visible after
+        // join, sorted by arrival_seqno on scan.
+        use std::sync::Arc;
+        use std::thread;
+
+        let (_dir, engine) = mk_engine();
+        let engine = Arc::new(engine);
+        let bid = NodeId::from_raw(70);
+        let label = 13u32;
+
+        let handles: Vec<_> = (0..4u64)
+            .map(|t| {
+                let engine = Arc::clone(&engine);
+                thread::spawn(move || {
+                    let store = LocalTimeSeriesStore::new(&engine);
+                    let entry = OverflowEntry {
+                        arrival_seqno: t + 1,
+                        measurement: mk_measurement((t as i64 + 1) * 100, t as f64),
+                    };
+                    store.put_overflow(label, bid, &entry).expect("put");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("join");
+        }
+
+        let store = LocalTimeSeriesStore::new(&engine);
+        let entries = store.scan_overflow(label, bid).expect("scan");
+        let seqnos: Vec<u64> = entries.iter().map(|e| e.arrival_seqno).collect();
+        assert_eq!(seqnos, vec![1, 2, 3, 4]);
     }
 
     #[test]

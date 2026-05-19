@@ -193,6 +193,29 @@ pub struct LocalSpatialStore<'a> {
 
 impl<'a> LocalSpatialStore<'a> {
     /// Wrap a storage engine for spatial store operations.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use coordinode_modality::{LocalSpatialStore, SpatialStore, Crs, Point, Bbox};
+    /// use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/store"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm,
+    /// # )]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// let store = LocalSpatialStore::new(&engine);
+    /// let paris = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
+    /// store.insert(1, NodeId::from_raw(1), &paris)?;
+    /// let bbox = Bbox {
+    ///     lower: Point::new_2d(Crs::Wgs84_2d, 2.0, 48.0),
+    ///     upper: Point::new_2d(Crs::Wgs84_2d, 3.0, 49.0),
+    /// };
+    /// let hits = store.scan_within_bbox(1, Crs::Wgs84_2d, &bbox)?;
+    /// assert_eq!(hits.len(), 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn new(engine: &'a StorageEngine) -> Self {
         Self { engine }
     }
@@ -881,6 +904,43 @@ mod tests {
         let hits = store.scan_within_bbox(7, Crs::Cartesian2d, &bbox).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, NodeId::from_raw(1));
+    }
+
+    #[test]
+    fn concurrent_insert_distinct_ids_all_visible() {
+        // Four threads insert different node_ids into the same
+        // (label, crs) keyspace. After join, scan must surface all
+        // four points. Engine handles concurrent puts at the level
+        // below the store.
+        use std::sync::Arc;
+        use std::thread;
+
+        let (_dir, engine) = mk_engine();
+        let engine = Arc::new(engine);
+
+        let handles: Vec<_> = (0..4u64)
+            .map(|t| {
+                let engine = Arc::clone(&engine);
+                thread::spawn(move || {
+                    let store = LocalSpatialStore::new(&engine);
+                    let point = Point::new_2d(Crs::Cartesian2d, t as f64, t as f64);
+                    store
+                        .insert(1, NodeId::from_raw(t + 1), &point)
+                        .expect("insert");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("join");
+        }
+
+        let store = LocalSpatialStore::new(&engine);
+        let bbox = Bbox {
+            lower: Point::new_2d(Crs::Cartesian2d, -10.0, -10.0),
+            upper: Point::new_2d(Crs::Cartesian2d, 10.0, 10.0),
+        };
+        let hits = store.scan_within_bbox(1, Crs::Cartesian2d, &bbox).unwrap();
+        assert_eq!(hits.len(), 4, "all four concurrent inserts must be visible");
     }
 
     #[test]

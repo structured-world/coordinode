@@ -63,6 +63,26 @@ pub struct LocalIndexStore<'a> {
 
 impl<'a> LocalIndexStore<'a> {
     /// Wrap a storage engine for index-store operations.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use coordinode_modality::{LocalIndexStore, IndexStore};
+    /// use coordinode_core::graph::node::NodeId;
+    /// use coordinode_core::graph::types::Value;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/store"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm,
+    /// # )]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// let store = LocalIndexStore::new(&engine);
+    /// let key = [Value::String("alice".into())];
+    /// store.put_entry("by_name", &key, NodeId::from_raw(1))?;
+    /// let hits = store.scan_exact("by_name", &key)?;
+    /// assert_eq!(hits, vec![NodeId::from_raw(1)]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn new(engine: &'a StorageEngine) -> Self {
         Self { engine }
     }

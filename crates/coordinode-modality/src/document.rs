@@ -128,6 +128,29 @@ pub struct LocalDocumentStore<'a> {
 
 impl<'a> LocalDocumentStore<'a> {
     /// Wrap a storage engine for document-store operations.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use coordinode_modality::{LocalDocumentStore, DocumentStore};
+    /// use coordinode_core::graph::node::NodeId;
+    /// use coordinode_core::graph::doc_delta::PathTarget;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/store"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm,
+    /// # )]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// let store = LocalDocumentStore::new(&engine);
+    /// store.set_path(
+    ///     0,
+    ///     NodeId::from_raw(1),
+    ///     PathTarget::Extra,
+    ///     vec!["profile".into(), "city".into()],
+    ///     rmpv::Value::String("Berlin".into()),
+    /// )?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn new(engine: &'a StorageEngine) -> Self {
         Self { engine }
     }
@@ -770,6 +793,49 @@ mod tests {
             }
             Value::String(s) => assert_eq!(s.as_str(), "via_field"),
             other => panic!("expected string at field 7, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn concurrent_set_path_distinct_keys_converges() {
+        // Four threads each set a distinct key under extra; merge
+        // operator collapses all four deltas into a single node body
+        // on read.
+        use std::sync::Arc;
+        use std::thread;
+
+        let (_dir, engine) = open_engine();
+        let engine = Arc::new(engine);
+        let id = NodeId::from_raw(100);
+        let nodes = LocalNodeStore::new(&engine);
+        nodes.put(0, id, &NodeRecord::new("Multi")).expect("seed");
+
+        let handles: Vec<_> = (0..4u64)
+            .map(|t| {
+                let engine = Arc::clone(&engine);
+                thread::spawn(move || {
+                    let docs = LocalDocumentStore::new(&engine);
+                    docs.set_path(
+                        0,
+                        id,
+                        PathTarget::Extra,
+                        vec![format!("k{t}")],
+                        rmpv::Value::Integer((t as i64).into()),
+                    )
+                    .expect("set_path");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("join");
+        }
+
+        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        for t in 0u64..4 {
+            assert!(
+                rec.get_extra(&format!("k{t}")).is_some(),
+                "key k{t} missing after concurrent set_path",
+            );
         }
     }
 

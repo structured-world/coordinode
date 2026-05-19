@@ -155,6 +155,24 @@ pub struct LocalEdgeStore<'a> {
 
 impl<'a> LocalEdgeStore<'a> {
     /// Wrap a storage engine for edge-store operations.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use coordinode_modality::{LocalEdgeStore, EdgeStore};
+    /// use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/store"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm,
+    /// # )]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// let store = LocalEdgeStore::new(&engine);
+    /// store.put_edge("KNOWS", NodeId::from_raw(1), NodeId::from_raw(2), None)?;
+    /// let neighbours = store.scan_neighbors_out("KNOWS", NodeId::from_raw(1))?;
+    /// assert_eq!(neighbours, vec![NodeId::from_raw(2)]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn new(engine: &'a StorageEngine) -> Self {
         Self { engine }
     }

@@ -63,6 +63,22 @@ pub struct LocalSchemaStore<'a> {
 impl<'a> LocalSchemaStore<'a> {
     /// Wrap a storage engine for schema-store operations. Cheap: the
     /// store carries only a borrow.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use coordinode_modality::{LocalSchemaStore, SchemaStore};
+    /// use coordinode_core::schema::definition::LabelSchema;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/store"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm,
+    /// # )]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// let store = LocalSchemaStore::new(&engine);
+    /// assert!(store.load_label("User")?.is_none());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn new(engine: &'a StorageEngine) -> Self {
         Self { engine }
     }
