@@ -16,8 +16,30 @@ use coordinode_core::txn::proposal::{
 use coordinode_storage::engine::config::FlushPolicy;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::error::StorageError;
 
 use crate::storage::{CoordinodeStateMachine, Request, TypeConfig};
+
+/// Map a [`StorageError`] from the engine into a [`ProposalError`]
+/// preserving the typed `CapacityExhausted` variant. Other storage
+/// errors collapse into [`ProposalError::Storage`] (stringified) for
+/// now — only the capacity case needs structured propagation today,
+/// since it carries operator-actionable metadata (endpoint id +
+/// limits) that the gRPC handler maps to `Status::resource_exhausted`.
+fn storage_to_proposal_err(e: StorageError) -> ProposalError {
+    match e {
+        StorageError::CapacityExhausted {
+            endpoint_id,
+            used_bytes,
+            hard_limit_bytes,
+        } => ProposalError::CapacityExhausted {
+            endpoint_id,
+            used_bytes,
+            hard_limit_bytes,
+        },
+        other => ProposalError::Storage(other.to_string()),
+    }
+}
 
 /// Base timeout for Raft proposal (first attempt).
 /// Doubles on each retry: 4s → 8s → 16s.
@@ -110,12 +132,12 @@ impl<'a> LocalProposalPipeline<'a> {
             } => {
                 self.engine
                     .put(to_partition(*partition), key, value)
-                    .map_err(|e| ProposalError::Storage(e.to_string()))?;
+                    .map_err(storage_to_proposal_err)?;
             }
             Mutation::Delete { partition, key } => {
                 self.engine
                     .delete(to_partition(*partition), key)
-                    .map_err(|e| ProposalError::Storage(e.to_string()))?;
+                    .map_err(storage_to_proposal_err)?;
             }
             Mutation::Merge {
                 partition,
@@ -124,7 +146,7 @@ impl<'a> LocalProposalPipeline<'a> {
             } => {
                 self.engine
                     .merge(to_partition(*partition), key, operand)
-                    .map_err(|e| ProposalError::Storage(e.to_string()))?;
+                    .map_err(storage_to_proposal_err)?;
             }
         }
         Ok(())
@@ -208,12 +230,12 @@ impl ProposalPipeline for OwnedLocalProposalPipeline {
                 } => {
                     self.engine
                         .put(to_partition(*partition), key, value)
-                        .map_err(|e| ProposalError::Storage(e.to_string()))?;
+                        .map_err(storage_to_proposal_err)?;
                 }
                 Mutation::Delete { partition, key } => {
                     self.engine
                         .delete(to_partition(*partition), key)
-                        .map_err(|e| ProposalError::Storage(e.to_string()))?;
+                        .map_err(storage_to_proposal_err)?;
                 }
                 Mutation::Merge {
                     partition,
@@ -222,7 +244,7 @@ impl ProposalPipeline for OwnedLocalProposalPipeline {
                 } => {
                     self.engine
                         .merge(to_partition(*partition), key, operand)
-                        .map_err(|e| ProposalError::Storage(e.to_string()))?;
+                        .map_err(storage_to_proposal_err)?;
                 }
             }
         }
