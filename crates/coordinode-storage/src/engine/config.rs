@@ -168,6 +168,11 @@ pub struct EndpointConfig {
     /// has no on-disk effect.
     #[serde(default)]
     pub page_ecc: PageEccPolicy,
+    /// Strategy for handling writes that would exceed
+    /// [`hard_limit_bytes`](Self::hard_limit_bytes). See
+    /// [`HardLimitStrategy`]. Default `Reject`.
+    #[serde(default)]
+    pub hard_limit_strategy: HardLimitStrategy,
     /// Free-form tags for placement rules (`{"zone": "eu-west-1a",
     /// "rack": "r42"}`). Consumed by the cluster-topology / CRUSH layer.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -231,6 +236,31 @@ impl PageEccPolicy {
     }
 }
 
+/// Per-endpoint strategy when a write would push `used_bytes` past the
+/// configured `hard_limit_bytes`.
+///
+/// `Reject` is the default — a write that cannot land here surfaces as
+/// a `CapacityExhausted` error so the coordinator can try another
+/// endpoint or fail back to the client. `CascadeEvict` instead asks
+/// the tier-aware layer to demote SSTs from this endpoint to the next
+/// cooler endpoint (per the per-LSM-level routing) and then retry.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardLimitStrategy {
+    /// Fail the write with `StorageError::CapacityExhausted`.
+    /// Coordinator may retry on a different endpoint per the
+    /// tier-fallback policy. Safe default — never moves data on
+    /// behalf of the operator.
+    #[default]
+    Reject,
+    /// Trigger a cascade eviction targeting this endpoint when it
+    /// crosses the auto-cascade threshold (95% of `hard_limit_bytes`),
+    /// then continue with the write. Eviction runs in the background
+    /// via the per-LSM-level routing's bottom-level compaction;
+    /// individual writes do NOT block on it.
+    CascadeEvict,
+}
+
 impl EndpointConfig {
     /// Construct an endpoint with required fields. `server` defaults to
     /// `None` (CE single-node); set via [`Self::with_server`] for EE
@@ -253,6 +283,7 @@ impl EndpointConfig {
             capacity_bytes: 0,
             hard_limit_bytes: 0,
             page_ecc: PageEccPolicy::default(),
+            hard_limit_strategy: HardLimitStrategy::default(),
             tags: std::collections::BTreeMap::new(),
         }
     }
@@ -295,6 +326,14 @@ impl EndpointConfig {
     #[must_use]
     pub fn with_page_ecc(mut self, policy: PageEccPolicy) -> Self {
         self.page_ecc = policy;
+        self
+    }
+
+    /// Override the hard-limit strategy. Default is
+    /// [`HardLimitStrategy::Reject`].
+    #[must_use]
+    pub fn with_hard_limit_strategy(mut self, strategy: HardLimitStrategy) -> Self {
+        self.hard_limit_strategy = strategy;
         self
     }
 

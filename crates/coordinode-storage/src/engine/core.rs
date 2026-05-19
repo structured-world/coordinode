@@ -101,6 +101,17 @@ pub struct StorageEngine {
     /// hard-limit enforcement) can resolve target endpoints without
     /// retaining a reference to the original config.
     endpoints: Vec<crate::engine::config::EndpointConfig>,
+    /// Per-endpoint capacity tracker — atomic `used_bytes` snapshots,
+    /// hard-limit thresholds, `is_writable` gating flag. Populated at
+    /// engine open from the endpoint config; refreshed by the
+    /// background scanner.
+    capacity: Arc<crate::engine::capacity::CapacityTracker>,
+    /// Per-partition resolved L0 endpoint id (the endpoint that
+    /// receives newly flushed SSTs for this partition). Cached at
+    /// engine open so the pre-write capacity gate is a single
+    /// HashMap lookup on the hot path. Schema partition is mapped to
+    /// the primary endpoint id (single-tier bootstrap).
+    partition_l0_endpoint: HashMap<Partition, String>,
     /// Optional standalone WAL (embedded / no-Raft mode only).
     ///
     /// `Some` only when opened via `open_with_wal`. In cluster mode this is
@@ -205,13 +216,23 @@ impl StorageEngine {
         }
 
         // Pass 2: load/initialise routing for each non-Schema partition,
-        // then open it with `level_routes` wired.
+        // then open it with `level_routes` wired. Also cache each
+        // partition's L0 endpoint id for the pre-write capacity gate.
+        let primary_endpoint_id = config.endpoints[0].id.clone();
+        let mut partition_l0_endpoint: HashMap<Partition, String> = HashMap::new();
+        partition_l0_endpoint.insert(Partition::Schema, primary_endpoint_id.clone());
         for &part in Partition::all() {
             if part == Partition::Schema {
                 continue;
             }
             let routing =
                 load_or_init_partition_routing(&schema_tree, &seqno, &config.endpoints, part)?;
+            let l0_endpoint = routing
+                .levels
+                .get(&0)
+                .cloned()
+                .unwrap_or_else(|| primary_endpoint_id.clone());
+            partition_l0_endpoint.insert(part, l0_endpoint);
             let tree_config = config
                 .to_tree_config_with_routing(
                     part,
@@ -399,7 +420,7 @@ impl StorageEngine {
             flush_manager: Some(flush_manager),
             compaction_scheduler: Some(compaction_scheduler),
             trees,
-            seqno,
+            seqno: Arc::clone(&seqno),
             cache,
             flush_policy: config.flush_policy,
             tiered_cache,
@@ -407,6 +428,36 @@ impl StorageEngine {
             gc_watermark,
             data_dir: config.data_dir().to_path_buf(),
             endpoints: config.endpoints.clone(),
+            capacity: {
+                let tracker = crate::engine::capacity::CapacityTracker::new(&config.endpoints);
+                // Warm-load persisted `used_bytes` snapshots so the
+                // pre-write gate has plausible values from the prior
+                // run until the first refresh scan completes. Missing
+                // snapshots (first-ever open) stay at zero.
+                for ep in &config.endpoints {
+                    let persisted = load_persisted_capacity(&schema_tree, &seqno, &ep.id);
+                    if persisted > 0 {
+                        if let Some(usage) = tracker.get(&ep.id) {
+                            usage
+                                .used_bytes
+                                .store(persisted, std::sync::atomic::Ordering::Release);
+                            // Pre-set `is_writable` to match the loaded
+                            // severity — a previously-Full endpoint
+                            // stays gated until the first scan
+                            // confirms either way.
+                            use crate::engine::capacity::CapacitySeverity;
+                            let sev =
+                                CapacitySeverity::for_usage(persisted, usage.hard_limit_bytes);
+                            let writable = !matches!(sev, CapacitySeverity::Full);
+                            usage
+                                .is_writable
+                                .store(writable, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                }
+                Arc::new(tracker)
+            },
+            partition_l0_endpoint,
             wal,
         })
     }
@@ -527,13 +578,123 @@ impl StorageEngine {
 
     /// Write a key-value pair to the given partition.
     /// Invalidates any cached entry for this key.
+    ///
+    /// Pre-write capacity gate: if the partition's resolved L0
+    /// endpoint is currently non-writable (its `used_bytes` is at or
+    /// above `hard_limit_bytes` per the latest capacity scan), the
+    /// call returns [`StorageError::CapacityExhausted`] without
+    /// inserting. The coordinator may retry on a different endpoint
+    /// or surface the error to the client.
     pub fn put(&self, part: Partition, key: &[u8], value: &[u8]) -> StorageResult<()> {
+        self.check_partition_capacity(part)?;
         let tree = self.tree(part)?;
         tree.insert(key, value, self.seqno.next());
         if let Some(cache) = &self.tiered_cache {
             cache.remove(part, key);
         }
         Ok(())
+    }
+
+    /// Pre-write capacity gate for a partition. Looks up the
+    /// partition's L0 endpoint in the cached routing and consults the
+    /// capacity tracker's `is_writable` flag. Returns
+    /// [`StorageError::CapacityExhausted`] when the endpoint has
+    /// crossed the 100% threshold; `Ok(())` otherwise.
+    ///
+    /// `Schema` and `Raft` partitions are always permitted — these
+    /// hold engine-internal metadata that must remain accessible even
+    /// when user-data endpoints are full (otherwise the operator
+    /// could not read the metrics that prove the endpoint is full).
+    pub fn check_partition_capacity(&self, part: Partition) -> StorageResult<()> {
+        if matches!(part, Partition::Schema | Partition::Raft) {
+            return Ok(());
+        }
+        let Some(endpoint_id) = self.partition_l0_endpoint.get(&part) else {
+            return Ok(());
+        };
+        let Some(usage) = self.capacity.get(endpoint_id) else {
+            return Ok(());
+        };
+        if !usage.is_writable() {
+            return Err(StorageError::CapacityExhausted {
+                endpoint_id: usage.id.clone(),
+                used_bytes: usage.used(),
+                hard_limit_bytes: usage.hard_limit_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    /// Capacity tracker handle — exposed so background scanners,
+    /// Prometheus exporters, and admin RPCs can read per-endpoint
+    /// usage state without going through `put`/`get` paths.
+    pub fn capacity(&self) -> &Arc<crate::engine::capacity::CapacityTracker> {
+        &self.capacity
+    }
+
+    /// Refresh the capacity tracker by scanning every configured
+    /// endpoint's per-partition `tables/` directory and recomputing
+    /// `used_bytes`. Side effects: severity-transition logs,
+    /// `is_writable` flag flips at the 100% threshold, and (when the
+    /// endpoint strategy is `CascadeEvict`) a cascade-eviction fire
+    /// at the 95% emergency threshold.
+    ///
+    /// Synchronous — caller decides cadence. A background polling
+    /// loop wrapper lives in the engine's open path.
+    pub fn refresh_capacity(&self) {
+        let endpoint_paths: std::collections::BTreeMap<String, PathBuf> = self
+            .endpoints
+            .iter()
+            .map(|ep| (ep.id.clone(), ep.path.clone()))
+            .collect();
+        let partition_names: Vec<&str> = Partition::all()
+            .iter()
+            .filter(|p| **p != Partition::Raft)
+            .map(|p| p.name())
+            .collect();
+        self.capacity.refresh(&endpoint_paths, &partition_names);
+
+        // Persist used_bytes snapshots to Schema for warm-load on the
+        // next engine open. Each snapshot is a tiny u64 (MessagePack
+        // ≈ 9 bytes including header); writing one per endpoint per
+        // refresh tick is negligible overhead.
+        if let Ok(schema_tree) = self.tree(Partition::Schema) {
+            use lsm_tree::AbstractTree;
+            for (_id, usage) in self.capacity.iter() {
+                let key = capacity_key_for(&usage.id);
+                if let Ok(encoded) = rmp_serde::to_vec(&usage.used()) {
+                    schema_tree.insert(&key, &encoded, self.seqno.next());
+                }
+            }
+        }
+
+        // Auto-cascade pass: any endpoint at Emergency severity with
+        // `CascadeEvict` strategy triggers a cascade eviction. This
+        // runs synchronously after the refresh — the scan and the
+        // cascade fire on the same task tick so the user-facing
+        // tracing log of the threshold crossing immediately precedes
+        // the eviction's tracing log.
+        for (id, usage) in self.capacity.iter() {
+            use crate::engine::capacity::CapacitySeverity;
+            use crate::engine::config::HardLimitStrategy;
+            if matches!(usage.strategy, HardLimitStrategy::CascadeEvict)
+                && matches!(usage.severity(), CapacitySeverity::Emergency)
+            {
+                let id = id.to_string();
+                metrics::counter!(
+                    "endpoint_cascade_events_total",
+                    "endpoint_id" => id.clone(),
+                )
+                .increment(1);
+                if let Err(e) = self.cascade_evict_endpoint(&id) {
+                    tracing::warn!(
+                        endpoint = %id,
+                        error = %e,
+                        "auto cascade eviction failed",
+                    );
+                }
+            }
+        }
     }
 
     /// Delete a key from the given partition.
@@ -948,6 +1109,36 @@ impl StorageEngine {
             }
         }
         1.0
+    }
+}
+
+/// Encode a capacity-snapshot key for the Schema partition.
+///
+/// Key format: `meta:capacity:<endpoint_id>` — colon-prefixed to live
+/// in the engine-metadata namespace alongside `meta:routing:*`. Value
+/// is a MessagePack-encoded `u64` for the most-recent `used_bytes`
+/// observation. Lets a fresh engine open warm the capacity tracker
+/// to last-known values rather than running every gate against
+/// zero-used until the first scan completes.
+fn capacity_key_for(endpoint_id: &str) -> Vec<u8> {
+    format!("meta:capacity:{endpoint_id}").into_bytes()
+}
+
+/// Load the last-known `used_bytes` for an endpoint from Schema. Used
+/// at engine open to seed the capacity tracker before the first scan
+/// runs. Returns `0` (== "treat as fresh") when no snapshot exists —
+/// not an error: a partition with no prior persisted snapshot is the
+/// fresh-engine case.
+fn load_persisted_capacity(
+    schema_tree: &lsm_tree::AnyTree,
+    seqno: &lsm_tree::SharedSequenceNumberGenerator,
+    endpoint_id: &str,
+) -> u64 {
+    use lsm_tree::AbstractTree;
+    let key = capacity_key_for(endpoint_id);
+    match schema_tree.get(&key, seqno.get()) {
+        Ok(Some(bytes)) => rmp_serde::from_slice(&bytes).unwrap_or(0),
+        _ => 0,
     }
 }
 

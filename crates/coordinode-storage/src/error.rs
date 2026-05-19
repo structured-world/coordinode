@@ -34,6 +34,22 @@ pub enum StorageError {
         actual: u32,
         context: String,
     },
+
+    /// Endpoint capacity exhausted (INV-D3 hard-limit gate). The named
+    /// endpoint's `used_bytes` is at or above its `hard_limit_bytes`
+    /// and its `is_writable` flag is currently `false`. Coordinator
+    /// may retry on a different endpoint or surface the error to the
+    /// client.
+    #[error(
+        "endpoint {endpoint_id:?} capacity exhausted (used={used_bytes}, \
+         hard_limit={hard_limit_bytes}) — writes rejected until cascade \
+         eviction or operator cleanup brings usage below the limit"
+    )]
+    CapacityExhausted {
+        endpoint_id: String,
+        used_bytes: u64,
+        hard_limit_bytes: u64,
+    },
 }
 
 /// Result type alias for storage operations.
