@@ -381,6 +381,64 @@ fn used_bytes_warm_load_on_reopen() {
     );
 }
 
+/// Warm-load preserves a `Full` severity state: opening an engine
+/// whose previous run persisted `used_bytes >= hard_limit_bytes` MUST
+/// initialise the tracker with `is_writable = false` BEFORE the first
+/// scan tick runs. Otherwise the operator would observe a transient
+/// "writable" window on reopen that the next scan would immediately
+/// close, defeating the purpose of warm-load.
+#[test]
+fn warm_load_preserves_full_severity_state() {
+    let dir = TempDir::new().expect("tempdir");
+    let make_config = || {
+        StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "ep",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(4096)])
+    };
+
+    // Phase 1: fill past 100% + persist the snapshot.
+    {
+        let engine = StorageEngine::open(&make_config()).expect("first open");
+        for i in 0..500u32 {
+            let key = format!("node:0:{i:010}");
+            engine
+                .put(Partition::Node, key.as_bytes(), b"payload-bytes")
+                .expect("put");
+        }
+        engine.persist().expect("persist");
+        engine.refresh_capacity();
+        // Persist the schema partition again so the meta:capacity:*
+        // snapshot reaches SST before drop.
+        engine.persist().expect("final persist");
+        let usage = engine.capacity().get("ep").unwrap();
+        assert!(!usage.is_writable(), "endpoint full at end of phase 1");
+    }
+
+    // Phase 2: reopen. The very first inspection — BEFORE any scan
+    // tick — must already report is_writable=false because warm-load
+    // resolved severity against the persisted used_bytes.
+    let engine = StorageEngine::open(&make_config()).expect("reopen");
+    let usage = engine.capacity().get("ep").unwrap();
+    assert!(
+        !usage.is_writable(),
+        "warm-load must preserve Full severity → is_writable=false; \
+         no transient writable window on reopen",
+    );
+
+    // The pre-write gate must also reject — proves the warm-loaded
+    // is_writable flag is consulted by `check_partition_capacity`.
+    let denied = engine.put(Partition::Node, b"node:0:after-reopen", b"x");
+    assert!(
+        matches!(denied, Err(StorageError::CapacityExhausted { .. })),
+        "warm-loaded Full endpoint must reject writes on reopen, got: {denied:?}",
+    );
+}
+
 /// Endpoints without a `hard_limit_bytes` configuration (default `0`)
 /// MUST never enter alert severity or flip `is_writable`. The tracker
 /// still records `used_bytes` for diagnostics but the limit is
