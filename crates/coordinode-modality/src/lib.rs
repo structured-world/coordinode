@@ -31,7 +31,7 @@
 //! | Blob (binary chunks + blob references) | [`BlobStore`] | [`LocalBlobStore`] |
 //! | Index (secondary indexes — btree, hash, fulltext term postings) | [`IndexStore`] | [`LocalIndexStore`] |
 //! | Node (incl. temporal versioning, ADR-027) | [`NodeStore`] | [`LocalNodeStore`] |
-//! | Edge | EdgeStore | — (next PR) |
+//! | Edge (adjacency + properties, non-temporal) | [`EdgeStore`] | [`LocalEdgeStore`] |
 //! | Vector | VectorStore | — (next PR) |
 //! | Document | DocumentStore | — (next PR) |
 //! | TimeSeries | TimeSeriesStore | — (next PR) |
@@ -53,12 +53,14 @@
 #![deny(missing_docs)]
 
 pub mod blob;
+pub mod edge;
 pub mod error;
 pub mod index;
 pub mod node;
 pub mod schema;
 
 pub use blob::{BlobStore, LocalBlobStore};
+pub use edge::{EdgeStore, LocalEdgeStore};
 pub use error::{StoreError, StoreResult};
 pub use index::{IndexStore, LocalIndexStore};
 pub use node::{LocalNodeStore, NodeStore};
