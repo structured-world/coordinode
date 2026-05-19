@@ -860,6 +860,9 @@ name = "coordinode-cluster"
 version = "0.4.3"
 dependencies = [
  "coordinode-storage",
+ "criterion",
+ "proptest",
+ "rmp-serde",
  "serde",
  "thiserror 2.0.18",
  "tracing",

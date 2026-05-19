@@ -34,6 +34,14 @@ impl ShardId {
     pub const ZERO: Self = Self(0);
 
     /// Raw u32 accessor.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coordinode_cluster::ShardId;
+    /// assert_eq!(ShardId::ZERO.raw(), 0);
+    /// assert_eq!(ShardId(42).raw(), 42);
+    /// ```
     pub fn raw(self) -> u32 {
         self.0
     }
@@ -63,6 +71,15 @@ pub struct NodeAddr {
 
 impl NodeAddr {
     /// The canonical single-node CE address — in-process server.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coordinode_cluster::NodeAddr;
+    /// let addr = NodeAddr::local();
+    /// assert_eq!(addr.server, "local");
+    /// assert_eq!(addr.address, "local");
+    /// ```
     pub fn local() -> Self {
         Self {
             server: "local".to_owned(),
@@ -117,6 +134,15 @@ pub enum Modality {
 impl Modality {
     /// Iterate every modality variant — useful for stores that index
     /// per-modality state on bootstrap.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coordinode_cluster::Modality;
+    /// // Every Layer 4 modality is represented.
+    /// assert_eq!(Modality::all().len(), 9);
+    /// assert!(Modality::all().contains(&Modality::Vector));
+    /// ```
     pub fn all() -> &'static [Modality] {
         &[
             Modality::Node,
@@ -163,6 +189,18 @@ impl FailureDomain {
     /// Build a single-server domain for CE single-node deployments.
     /// All upper levels collapse to `"local"`; only the endpoint and
     /// tier carry information.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coordinode_cluster::FailureDomain;
+    /// use coordinode_storage::engine::config::Tier;
+    ///
+    /// let d = FailureDomain::local("ep-1", Tier::Hot);
+    /// assert_eq!(d.geo, "local");
+    /// assert_eq!(d.endpoint, "ep-1");
+    /// assert_eq!(d.tier, Tier::Hot);
+    /// ```
     pub fn local(endpoint: impl Into<EndpointId>, tier: Tier) -> Self {
         Self {
             geo: "local".to_owned(),
@@ -190,6 +228,16 @@ pub struct TopologyTree {
 impl TopologyTree {
     /// Build a trivial single-endpoint tree — used by tests and by
     /// the most-minimal CE deployment shape.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coordinode_cluster::TopologyTree;
+    /// use coordinode_storage::engine::config::Tier;
+    ///
+    /// let tree = TopologyTree::single_endpoint("ep", Tier::Warm);
+    /// assert_eq!(tree.endpoint_count(), 1);
+    /// ```
     pub fn single_endpoint(endpoint: impl Into<EndpointId>, tier: Tier) -> Self {
         Self {
             endpoints: vec![FailureDomain::local(endpoint, tier)],
@@ -197,11 +245,34 @@ impl TopologyTree {
     }
 
     /// Number of endpoints across the whole tree.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coordinode_cluster::TopologyTree;
+    /// assert_eq!(TopologyTree::default().endpoint_count(), 0);
+    /// ```
     pub fn endpoint_count(&self) -> usize {
         self.endpoints.len()
     }
 
-    /// Unique server identifiers present in the tree.
+    /// Unique server identifiers present in the tree, in sorted order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coordinode_cluster::{FailureDomain, TopologyTree};
+    /// use coordinode_storage::engine::config::Tier;
+    ///
+    /// let mut a = FailureDomain::local("ep-a", Tier::Hot);
+    /// a.server = "srv-1".into();
+    /// let mut b = FailureDomain::local("ep-b", Tier::Warm);
+    /// b.server = "srv-1".into();
+    /// let mut c = FailureDomain::local("ep-c", Tier::Cold);
+    /// c.server = "srv-2".into();
+    /// let tree = TopologyTree { endpoints: vec![a, b, c] };
+    /// assert_eq!(tree.servers(), vec!["srv-1".to_string(), "srv-2".to_string()]);
+    /// ```
     pub fn servers(&self) -> Vec<ServerId> {
         let mut out: Vec<_> = self
             .endpoints
@@ -212,6 +283,53 @@ impl TopologyTree {
             .collect();
         out.sort();
         out
+    }
+
+    /// Endpoints living in a specific data centre. Used by
+    /// `SeqnoConsumerRegistry` (ADR-028) to expand a cascading
+    /// retention scope like `dc:eu-west-1` to the concrete
+    /// endpoint set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coordinode_cluster::TopologyTree;
+    /// // CE single-node tree: every endpoint is in dc "local".
+    /// let tree = TopologyTree::default();
+    /// let hits: Vec<_> = tree.endpoints_in_dc("eu-west-1").collect();
+    /// assert!(hits.is_empty());
+    /// ```
+    pub fn endpoints_in_dc<'a>(
+        &'a self,
+        dc: &'a str,
+    ) -> impl Iterator<Item = &'a FailureDomain> + 'a {
+        self.endpoints.iter().filter(move |d| d.dc == dc)
+    }
+
+    /// Endpoints living in a specific rack. Same usage pattern as
+    /// [`Self::endpoints_in_dc`].
+    pub fn endpoints_in_rack<'a>(
+        &'a self,
+        rack: &'a str,
+    ) -> impl Iterator<Item = &'a FailureDomain> + 'a {
+        self.endpoints.iter().filter(move |d| d.rack == rack)
+    }
+
+    /// Endpoints living in a specific geo zone. Same usage pattern
+    /// as [`Self::endpoints_in_dc`].
+    pub fn endpoints_in_geo<'a>(
+        &'a self,
+        geo: &'a str,
+    ) -> impl Iterator<Item = &'a FailureDomain> + 'a {
+        self.endpoints.iter().filter(move |d| d.geo == geo)
+    }
+
+    /// Endpoints living on a specific server.
+    pub fn endpoints_on_server<'a>(
+        &'a self,
+        server: &'a str,
+    ) -> impl Iterator<Item = &'a FailureDomain> + 'a {
+        self.endpoints.iter().filter(move |d| d.server == server)
     }
 }
 
@@ -240,6 +358,13 @@ pub enum CrushRule {
 impl CrushRule {
     /// The default CE rule — any endpoint on the local server at the
     /// requested tier.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coordinode_cluster::CrushRule;
+    /// assert_eq!(CrushRule::local_tier(), CrushRule::LocalTier);
+    /// ```
     pub fn local_tier() -> Self {
         CrushRule::LocalTier
     }
