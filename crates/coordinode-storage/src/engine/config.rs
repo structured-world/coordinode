@@ -144,10 +144,91 @@ pub struct EndpointConfig {
     /// Cascade eviction triggers at 95% of `hard_limit_bytes` when non-zero.
     /// Behaviour implemented by the hard-limit enforcement layer.
     pub hard_limit_bytes: u64,
+    /// Per-block Reed-Solomon ECC policy for SST blocks on this endpoint.
+    ///
+    /// `Auto` (the default) derives the effective policy from the
+    /// [`Durability`] class — see
+    /// [`PageEccPolicy::effective_for_durability`]:
+    /// * `Durability::Degraded` → ECC **on** (single drive without RAID
+    ///   has no array-level redundancy; ECC is the only recovery
+    ///   mechanism for an unrecoverable read).
+    /// * `Durability::Durable` → ECC **off** (RAID covers bit-rot at the
+    ///   array level; disabling Page ECC saves ~5-15% CPU on the read
+    ///   path).
+    /// * `Durability::Volatile` → ECC **off** (entire endpoint can
+    ///   vanish; per-block ECC pointless).
+    ///
+    /// `ForceOn` / `ForceOff` override the auto rule (operator decision).
+    /// `ForceOn` on a `Volatile` endpoint is legal but wasteful — the
+    /// engine does NOT reject it; the operator is assumed to know why.
+    ///
+    /// The encoder/decoder lives in `coordinode-lsm-tree` and is gated
+    /// behind a build-time feature flag there. Until the upstream flag
+    /// lands, this field is the **config surface only** — flipping it
+    /// has no on-disk effect.
+    #[serde(default)]
+    pub page_ecc: PageEccPolicy,
     /// Free-form tags for placement rules (`{"zone": "eu-west-1a",
-    /// "rack": "r42"}`). Consumed by Layer 6 (CRUSH) in R163.
+    /// "rack": "r42"}`). Consumed by the cluster-topology / CRUSH layer.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub tags: std::collections::BTreeMap<String, String>,
+}
+
+/// Per-block Reed-Solomon ECC policy on the SST block format.
+///
+/// The effective policy for an endpoint with `PageEccPolicy::Auto` is
+/// derived from [`Durability`] at engine open time — see
+/// [`Self::effective_for_durability`].
+///
+/// SST block layout when ECC is enabled (sketch):
+///
+/// ```text
+/// [4 KB user payload] [4 B page xxh3 checksum] [N B Reed-Solomon ECC trailer]
+/// ```
+///
+/// The page xxh3 checksum is **always present** regardless of ECC
+/// policy — its byte position is fixed so a reader can verify
+/// corruption before deciding whether to attempt ECC recovery.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PageEccPolicy {
+    /// Derive the effective policy from [`Durability`] at open time.
+    /// This is the recommended default — operators rarely need to
+    /// override.
+    #[default]
+    Auto,
+    /// ECC always written + verified on this endpoint, regardless of
+    /// durability class. Use when a durability-`durable` endpoint backs
+    /// hardware known to drop bits silently (operator judgment).
+    ForceOn,
+    /// ECC never written or expected on this endpoint, regardless of
+    /// durability class. Use when CPU is the bottleneck and the
+    /// operator accepts the risk on a `degraded` endpoint, or when a
+    /// `durable` endpoint is on certified-corruption-proof media and
+    /// the auto-on rule changes in a future revision.
+    ForceOff,
+}
+
+impl PageEccPolicy {
+    /// Resolve the effective on/off decision for the given durability.
+    ///
+    /// The Auto-derive table:
+    ///
+    /// | durability  | Auto effective | rationale                       |
+    /// |-------------|----------------|---------------------------------|
+    /// | Durable     | off            | RAID covers bit-rot; CPU savings |
+    /// | Degraded    | on             | only recovery mechanism         |
+    /// | Volatile    | off            | endpoint can vanish; ECC pointless |
+    ///
+    /// `ForceOn` and `ForceOff` short-circuit the durability check.
+    #[must_use]
+    pub fn effective_for_durability(self, durability: Durability) -> bool {
+        match self {
+            Self::ForceOn => true,
+            Self::ForceOff => false,
+            Self::Auto => matches!(durability, Durability::Degraded),
+        }
+    }
 }
 
 impl EndpointConfig {
@@ -171,8 +252,17 @@ impl EndpointConfig {
             tier,
             capacity_bytes: 0,
             hard_limit_bytes: 0,
+            page_ecc: PageEccPolicy::default(),
             tags: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Effective ECC on/off decision for this endpoint, resolving
+    /// [`PageEccPolicy::Auto`] against the configured [`Durability`].
+    /// See [`PageEccPolicy::effective_for_durability`] for the table.
+    #[must_use]
+    pub fn is_page_ecc_enabled(&self) -> bool {
+        self.page_ecc.effective_for_durability(self.durability)
     }
 
     /// Set the server identifier (EE multi-server topology).
@@ -1019,6 +1109,82 @@ mod tests {
         ep.server = Some("srv-3".to_string());
         let config = StorageConfig::with_endpoints(vec![ep]);
         assert_eq!(config.endpoints[0].server.as_deref(), Some("srv-3"));
+    }
+
+    // ── Per-block ECC policy ─────────────────────────────────────────
+
+    #[test]
+    fn page_ecc_default_is_auto() {
+        // The `Default` derive places `Auto` first in the enum → must
+        // resolve to `PageEccPolicy::Auto`. Pins the default — any
+        // future reorder is a breaking config change.
+        assert_eq!(PageEccPolicy::default(), PageEccPolicy::Auto);
+    }
+
+    #[test]
+    fn page_ecc_auto_derives_per_durability() {
+        // Durable: RAID covers bit-rot; Auto resolves to OFF.
+        assert!(!PageEccPolicy::Auto.effective_for_durability(Durability::Durable));
+        // Degraded: no array-level redundancy; Auto resolves to ON.
+        assert!(PageEccPolicy::Auto.effective_for_durability(Durability::Degraded));
+        // Volatile: endpoint can vanish; per-block ECC pointless → OFF.
+        assert!(!PageEccPolicy::Auto.effective_for_durability(Durability::Volatile));
+    }
+
+    #[test]
+    fn page_ecc_force_overrides_durability() {
+        // ForceOn ignores durability — even Volatile reports ON.
+        assert!(PageEccPolicy::ForceOn.effective_for_durability(Durability::Volatile));
+        assert!(PageEccPolicy::ForceOn.effective_for_durability(Durability::Durable));
+        // ForceOff ignores durability — even Degraded reports OFF (the
+        // dangerous case; operator opted out explicitly).
+        assert!(!PageEccPolicy::ForceOff.effective_for_durability(Durability::Degraded));
+        assert!(!PageEccPolicy::ForceOff.effective_for_durability(Durability::Durable));
+    }
+
+    #[test]
+    fn endpoint_is_page_ecc_enabled_uses_effective_policy() {
+        // Default policy (Auto) on a Degraded endpoint → ON.
+        let degraded = EndpointConfig::new("a", "/a", Media::Hdd, Durability::Degraded, Tier::Cold);
+        assert!(degraded.is_page_ecc_enabled());
+
+        // Default policy (Auto) on a Durable endpoint → OFF.
+        let durable = EndpointConfig::new("b", "/b", Media::Hdd, Durability::Durable, Tier::Warm);
+        assert!(!durable.is_page_ecc_enabled());
+
+        // ForceOn override on a Durable endpoint → ON.
+        let mut durable_force = durable.clone();
+        durable_force.page_ecc = PageEccPolicy::ForceOn;
+        assert!(durable_force.is_page_ecc_enabled());
+
+        // ForceOff override on a Degraded endpoint → OFF (operator's
+        // dangerous choice; engine does not reject it).
+        let mut degraded_force = degraded.clone();
+        degraded_force.page_ecc = PageEccPolicy::ForceOff;
+        assert!(!degraded_force.is_page_ecc_enabled());
+    }
+
+    #[test]
+    fn page_ecc_policy_serde_roundtrip() {
+        // serde encoding for the policy variants matches the
+        // snake-case rename — operator-facing config files use
+        // `auto`/`force_on`/`force_off`.
+        let auto_json = serde_json::to_string(&PageEccPolicy::Auto).expect("encode auto");
+        assert_eq!(auto_json, "\"auto\"");
+        let force_on_json =
+            serde_json::to_string(&PageEccPolicy::ForceOn).expect("encode force_on");
+        assert_eq!(force_on_json, "\"force_on\"");
+        let force_off_json =
+            serde_json::to_string(&PageEccPolicy::ForceOff).expect("encode force_off");
+        assert_eq!(force_off_json, "\"force_off\"");
+
+        let decoded: PageEccPolicy = serde_json::from_str("\"auto\"").expect("decode auto");
+        assert_eq!(decoded, PageEccPolicy::Auto);
+        let decoded: PageEccPolicy = serde_json::from_str("\"force_on\"").expect("decode force_on");
+        assert_eq!(decoded, PageEccPolicy::ForceOn);
+        let decoded: PageEccPolicy =
+            serde_json::from_str("\"force_off\"").expect("decode force_off");
+        assert_eq!(decoded, PageEccPolicy::ForceOff);
     }
 
     // ── WAL/oplog endpoint eligibility + selection ────────────────────
