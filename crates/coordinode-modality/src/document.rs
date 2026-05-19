@@ -49,6 +49,25 @@ use crate::error::{StoreError, StoreResult};
 pub trait DocumentStore {
     /// Set a value at a dotted path on the node's document property.
     /// Intermediate maps are created as needed.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalDocumentStore, DocumentStore};
+    /// # use coordinode_core::graph::{doc_delta::PathTarget, node::NodeId};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalDocumentStore::new(&engine);
+    /// store.set_path(
+    ///     0, NodeId::from_raw(1), PathTarget::Extra,
+    ///     vec!["a".into(), "b".into()],
+    ///     rmpv::Value::String("hello".into()),
+    /// )?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn set_path(
         &self,
         shard_id: u16,
@@ -69,6 +88,25 @@ pub trait DocumentStore {
 
     /// Append a value to an array at path. Creates the array if
     /// missing.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalDocumentStore, DocumentStore};
+    /// # use coordinode_core::graph::{doc_delta::PathTarget, node::NodeId};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalDocumentStore::new(&engine);
+    /// store.array_push(
+    ///     0, NodeId::from_raw(1), PathTarget::Extra,
+    ///     vec!["tags".into()],
+    ///     rmpv::Value::String("rust".into()),
+    /// )?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn array_push(
         &self,
         shard_id: u16,
@@ -100,6 +138,21 @@ pub trait DocumentStore {
     ) -> StoreResult<()>;
 
     /// Numeric increment at path (commutative).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalDocumentStore, DocumentStore};
+    /// # use coordinode_core::graph::{doc_delta::PathTarget, node::NodeId};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalDocumentStore::new(&engine);
+    /// store.increment(0, NodeId::from_raw(1), PathTarget::Extra, vec!["v".into()], 1.0)?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn increment(
         &self,
         shard_id: u16,

@@ -176,6 +176,22 @@ impl Bucket {
     /// Build a v1 bucket from a measurement vector. Measurements are
     /// stored in arrival order — sorting is the closure-time job and
     /// belongs to the catalog/compactor.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coordinode_modality::{Bucket, Measurement};
+    /// use std::collections::BTreeMap;
+    ///
+    /// let mut fields = BTreeMap::new();
+    /// fields.insert("temp".into(), 22.5);
+    /// let bucket = Bucket::from_measurements(
+    ///     rmpv::Value::String("sensor-1".into()),
+    ///     vec![Measurement { timestamp_us: 100, fields }],
+    /// );
+    /// assert_eq!(bucket.control.count, 1);
+    /// assert_eq!(bucket.control.time_min_us, 100);
+    /// ```
     pub fn from_measurements(meta: rmpv::Value, measurements: Vec<Measurement>) -> Self {
         let control = BucketControl::from_measurements(&measurements);
         let mut timestamps = Vec::with_capacity(measurements.len());
@@ -239,9 +255,44 @@ pub trait TimeSeriesStore {
     /// Persist a complete bucket. Overwrites any prior body at the
     /// same node id — bucket bodies are written wholesale by the
     /// catalog when it flushes its in-memory buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalTimeSeriesStore, TimeSeriesStore, Bucket, Measurement};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # use std::collections::BTreeMap;
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalTimeSeriesStore::new(&engine);
+    /// let bucket = Bucket::from_measurements(
+    ///     rmpv::Value::String("s1".into()),
+    ///     vec![Measurement { timestamp_us: 0, fields: BTreeMap::new() }],
+    /// );
+    /// store.put_bucket(0, NodeId::from_raw(1), &bucket)?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn put_bucket(&self, shard_id: u16, bucket_id: NodeId, bucket: &Bucket) -> StoreResult<()>;
 
     /// Read the bucket body. Returns `None` when the key is absent.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalTimeSeriesStore, TimeSeriesStore};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalTimeSeriesStore::new(&engine);
+    /// let _bucket = store.get_bucket(0, NodeId::from_raw(1))?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn get_bucket(&self, shard_id: u16, bucket_id: NodeId) -> StoreResult<Option<Bucket>>;
 
     /// Tombstone the bucket. Idempotent on a missing key. Does *not*
@@ -270,6 +321,28 @@ pub trait TimeSeriesStore {
 
     /// Append one late measurement to the overflow segment under
     /// `(label_id, bucket_id)`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{
+    /// #     LocalTimeSeriesStore, TimeSeriesStore, Measurement, OverflowEntry,
+    /// # };
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # use std::collections::BTreeMap;
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalTimeSeriesStore::new(&engine);
+    /// let entry = OverflowEntry {
+    ///     arrival_seqno: 1,
+    ///     measurement: Measurement { timestamp_us: 100, fields: BTreeMap::new() },
+    /// };
+    /// store.put_overflow(7, NodeId::from_raw(1), &entry)?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn put_overflow(
         &self,
         label_id: u32,

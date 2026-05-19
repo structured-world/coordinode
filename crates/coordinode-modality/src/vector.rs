@@ -40,7 +40,19 @@ use crate::error::{StoreError, StoreResult};
 /// bulk-insert operations on it. Composition across `(label, property)`
 /// pairs is the caller's responsibility — see crate docs.
 pub trait VectorStore: Send + Sync {
-    /// Insert or replace a vector for a node.
+    /// Insert or replace a vector for a node. `HnswIndex` dedups by
+    /// node id — re-inserting the same id replaces the vector slot.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use coordinode_modality::{LocalVectorStore, VectorStore};
+    /// # use coordinode_vector::hnsw::HnswConfig;
+    /// let store = LocalVectorStore::new(HnswConfig::default());
+    /// store.insert(1, vec![1.0, 0.0, 0.0])?;
+    /// store.insert(2, vec![0.0, 1.0, 0.0])?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn insert(&self, node_id: u64, vector: Vec<f32>) -> StoreResult<()>;
 
     /// Mark a node's vector as deleted.
@@ -53,6 +65,19 @@ pub trait VectorStore: Send + Sync {
 
     /// K-nearest-neighbour search. Returns up to `k` results sorted by
     /// distance ascending.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use coordinode_modality::{LocalVectorStore, VectorStore};
+    /// # use coordinode_vector::hnsw::HnswConfig;
+    /// let store = LocalVectorStore::new(HnswConfig::default());
+    /// store.insert(1, vec![1.0, 0.0, 0.0])?;
+    /// store.insert(2, vec![0.0, 1.0, 0.0])?;
+    /// let hits = store.knn_search(&[1.0, 0.0, 0.0], 1)?;
+    /// assert_eq!(hits[0].id, 1);
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn knn_search(&self, query: &[f32], k: usize) -> StoreResult<Vec<SearchResult>>;
 
     /// KNN search with an optional disk-backed f32 loader for offloaded
@@ -66,6 +91,18 @@ pub trait VectorStore: Send + Sync {
     ) -> StoreResult<Vec<SearchResult>>;
 
     /// Bulk-insert vectors. Returns the number inserted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use coordinode_modality::{LocalVectorStore, VectorStore};
+    /// # use coordinode_vector::hnsw::HnswConfig;
+    /// let store = LocalVectorStore::new(HnswConfig::default());
+    /// let mut iter = (0..100u64).map(|i| (i, vec![i as f32, 0.0, 0.0]));
+    /// let n = store.bulk_insert(&mut iter)?;
+    /// assert_eq!(n, 100);
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn bulk_insert(&self, vectors: &mut dyn Iterator<Item = (u64, Vec<f32>)>)
         -> StoreResult<usize>;
 

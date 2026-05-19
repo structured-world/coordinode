@@ -34,6 +34,22 @@ pub use coordinode_core::graph::blob::INLINE_THRESHOLD;
 pub trait BlobStore {
     /// Persist a chunk by content hash. Idempotent: re-putting an
     /// existing `chunk_id` overwrites identical bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalBlobStore, BlobStore};
+    /// # use coordinode_core::graph::blob::ChunkId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalBlobStore::new(&engine);
+    /// let id = ChunkId::from_data(b"hello");
+    /// store.put_chunk(&id, b"hello")?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn put_chunk(&self, chunk_id: &ChunkId, data: &[u8]) -> StoreResult<()>;
 
     /// Persist many chunks atomically (single underlying batch).
@@ -43,6 +59,22 @@ pub trait BlobStore {
     /// Fetch a chunk by content hash. Returns `None` if not stored
     /// (either never written, or already swept by GC because no ref
     /// pointed at it).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalBlobStore, BlobStore};
+    /// # use coordinode_core::graph::blob::ChunkId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalBlobStore::new(&engine);
+    /// let id = ChunkId::from_data(b"hello");
+    /// let _maybe_data = store.get_chunk(&id)?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn get_chunk(&self, chunk_id: &ChunkId) -> StoreResult<Option<Vec<u8>>>;
 
     /// Persist the [`BlobRef`] for a (node, prop) pair. Overwrites any
