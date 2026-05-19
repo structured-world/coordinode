@@ -1024,6 +1024,7 @@ dependencies = [
  "flume",
  "log",
  "lz4_flex",
+ "metrics",
  "nanoid",
  "proptest",
  "rand 0.10.1",
