@@ -3,22 +3,22 @@
 //! Stores entries of the form `idx:<name>:<sortable_value>:<node_id>`
 //! (value-bytes encoded by [`coordinode_core::index::encoding`] for
 //! correct lexicographic ordering). Supports point lookup
-//! ([`Self::scan_exact`]) and range scan ([`Self::scan_range`]).
+//! ([`IndexStore::scan_exact`]) and full-index walk
+//! ([`IndexStore::scan_all`]).
 //!
-//! The store deliberately does NOT carry index metadata
-//! ([`IndexDefinition`](../../coordinode_query/index/struct.IndexDefinition.html))
-//! — that is a query-layer concept (kind, target label, target
-//! property). The store operates one level below: caller passes the
-//! index name + value(s) + node id and gets back the bytes-level
-//! entry behaviour.
+//! The store deliberately does NOT carry index metadata (kind,
+//! target label, target property) — that is a query-layer concept.
+//! The store operates one level below: caller passes the index name,
+//! value(s), and node id and gets back the bytes-level entry
+//! behaviour.
 //!
 //! ## Single-column vs compound
 //!
 //! Both layouts share the same key shape (`idx:name:encoded:id`);
 //! compound uses [`encode_compound_value`] to pack multiple [`Value`]s
 //! with a separator byte. The store exposes both via
-//! [`Self::put_entry`] (slice of values) so the caller doesn't need
-//! to branch on arity.
+//! [`IndexStore::put_entry`] (slice of values) so the caller doesn't
+//! need to branch on arity.
 
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
@@ -264,6 +264,46 @@ mod tests {
         // Sorted by (encoded value, node_id): alice/1, alice/3, bob/2.
         let ids: Vec<u64> = all.iter().map(|(_, id)| id.as_raw()).collect();
         assert_eq!(ids, vec![1, 3, 2]);
+    }
+
+    #[test]
+    fn compound_index_three_columns() {
+        // N=3 compound: confirm encode/scan symmetry beyond N=2. Two
+        // entries differ only in the third column.
+        let (_dir, engine) = open_engine();
+        let store = LocalIndexStore::new(&engine);
+        let key_a = vec![
+            Value::String("alice".into()),
+            Value::String("US".into()),
+            Value::Int(30),
+        ];
+        let key_b = vec![
+            Value::String("alice".into()),
+            Value::String("US".into()),
+            Value::Int(40),
+        ];
+        store
+            .put_entry("triple", &key_a, NodeId::from_raw(1))
+            .expect("put a");
+        store
+            .put_entry("triple", &key_b, NodeId::from_raw(2))
+            .expect("put b");
+
+        // Exact match on key_a returns only node 1; key_b only 2.
+        assert_eq!(
+            store.scan_exact("triple", &key_a).expect("scan"),
+            vec![NodeId::from_raw(1)],
+        );
+        assert_eq!(
+            store.scan_exact("triple", &key_b).expect("scan"),
+            vec![NodeId::from_raw(2)],
+        );
+
+        // scan_all walks both, in encoded-key order (key_a's Int=30
+        // sorts before key_b's Int=40).
+        let all = store.scan_all("triple").expect("scan all");
+        let ids: Vec<u64> = all.iter().map(|(_, id)| id.as_raw()).collect();
+        assert_eq!(ids, vec![1, 2]);
     }
 
     #[test]

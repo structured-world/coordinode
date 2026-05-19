@@ -942,6 +942,7 @@ dependencies = [
  "coordinode-lsm-tree",
  "coordinode-storage",
  "coordinode-vector",
+ "proptest",
  "rmp-serde",
  "rmpv",
  "serde",

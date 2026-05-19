@@ -17,7 +17,7 @@
 //! Temporal labels store one row per version. The "current as-of T"
 //! read scans the per-id prefix and picks the row whose
 //! `valid_from <= T` is largest. The store exposes this directly via
-//! [`Self::get_at`] so callers don't reimplement the seek-and-pick.
+//! [`NodeStore::get_at`] so callers don't reimplement the seek-and-pick.
 
 use coordinode_core::graph::node::{
     decode_temporal_node_key, encode_node_key, encode_temporal_node_key, temporal_node_id_prefix,

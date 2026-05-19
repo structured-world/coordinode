@@ -44,7 +44,8 @@
 //!   open / Tier 3 overflow) — the catalog decides which method to
 //!   call; this store implements the actual writes.
 //! - **Bitemporal axes** (`__ingestion_ts__` field, ADR-027) — added
-//!   per measurement at the catalog layer before [`Bucket::append`].
+//!   per measurement at the catalog layer before the bucket is
+//!   written via [`TimeSeriesStore::put_bucket`].
 //!
 //! ## Overflow segment
 //!
@@ -58,7 +59,8 @@
 //!
 //! Reads merge-sort the base bucket with the overflow scan; the
 //! background compactor periodically re-encodes the base and atomic-
-//! ally deletes its overflow set via [`Self::compact_overflow`].
+//! ally deletes its overflow set via
+//! [`TimeSeriesStore::compact_overflow`].
 
 use std::collections::BTreeMap;
 
@@ -509,6 +511,64 @@ mod tests {
         assert_eq!(stats.max, 22.0);
         let materialised: Vec<_> = read_back.measurements().collect();
         assert_eq!(materialised, measurements);
+    }
+
+    #[test]
+    fn heterogeneous_fields_produce_uneven_column_lengths() {
+        // Two measurements with different field sets. The bucket
+        // builder appends per-field — so "temp" column has one entry
+        // (from the first measurement) and "humidity" has one (from
+        // the second). This is the documented behaviour: columns are
+        // NOT padded with NaN. Catalog above is responsible for
+        // detecting "schema change" and rolling over to a new bucket.
+        let mut fields_a = BTreeMap::new();
+        fields_a.insert("temp".into(), 22.0);
+        let mut fields_b = BTreeMap::new();
+        fields_b.insert("humidity".into(), 65.0);
+        let bucket = Bucket::from_measurements(
+            rmpv::Value::Nil,
+            vec![
+                Measurement {
+                    timestamp_us: 100,
+                    fields: fields_a,
+                },
+                Measurement {
+                    timestamp_us: 200,
+                    fields: fields_b,
+                },
+            ],
+        );
+        assert_eq!(bucket.timestamps.len(), 2);
+        assert_eq!(bucket.fields.get("temp").map(|c| c.len()), Some(1));
+        assert_eq!(bucket.fields.get("humidity").map(|c| c.len()), Some(1));
+        // Documented gotcha: column length != bucket count when
+        // schemas diverge.
+        assert_eq!(bucket.control.count, 2);
+    }
+
+    #[test]
+    fn overflow_same_seqno_silently_overwrites() {
+        // Two writers picking the same arrival_seqno collide at the
+        // same key. The second write overwrites — first measurement
+        // is lost. Documented hazard: the catalog above must mint
+        // strictly-monotonic seqnos per bucket.
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let bid = NodeId::from_raw(60);
+
+        let first = OverflowEntry {
+            arrival_seqno: 7,
+            measurement: mk_measurement(100, 1.0),
+        };
+        let second = OverflowEntry {
+            arrival_seqno: 7,
+            measurement: mk_measurement(200, 2.0),
+        };
+        store.put_overflow(1, bid, &first).unwrap();
+        store.put_overflow(1, bid, &second).unwrap();
+        let entries = store.scan_overflow(1, bid).unwrap();
+        assert_eq!(entries.len(), 1, "second write must overwrite first");
+        assert_eq!(entries[0].measurement.timestamp_us, 200);
     }
 
     #[test]

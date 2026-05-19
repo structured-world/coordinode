@@ -729,6 +729,28 @@ mod tests {
     }
 
     #[test]
+    fn knn_returns_duplicate_when_stale_row_exists() {
+        // Same contract gap as scan_within_bbox: moving a point
+        // without deleting the old key leaves two physical rows. knn
+        // returns both — the caller must dedup by node_id at the
+        // composition layer above.
+        let (_dir, engine) = mk_engine();
+        let store = LocalSpatialStore::new(&engine);
+        let id = NodeId::from_raw(1);
+        store
+            .insert(1, id, &Point::new_2d(Crs::Cartesian2d, 0.0, 0.0))
+            .unwrap();
+        store
+            .insert(1, id, &Point::new_2d(Crs::Cartesian2d, 1.0, 1.0))
+            .unwrap();
+
+        let center = Point::new_2d(Crs::Cartesian2d, 0.0, 0.0);
+        let knn = store.knn_nearest(1, Crs::Cartesian2d, &center, 5).unwrap();
+        let ids: Vec<u64> = knn.iter().map(|(id, _, _)| id.as_raw()).collect();
+        assert_eq!(ids, vec![1, 1], "stale row produces duplicate id in knn");
+    }
+
+    #[test]
     fn insert_same_coords_twice_is_idempotent() {
         // Same (node_id, coords) = same key. The second insert
         // overwrites with identical bytes — net effect is one row.
