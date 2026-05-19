@@ -252,6 +252,59 @@ mod tests {
     }
 
     #[test]
+    fn put_chunk_overwrites_with_identical_bytes() {
+        // Content-addressed: same ChunkId means same bytes. Putting
+        // twice must be idempotent (the engine accepts the overwrite
+        // silently).
+        let (_dir, engine) = open_engine();
+        let store = LocalBlobStore::new(&engine);
+        let id = ChunkId::from_data(b"xyz");
+        store.put_chunk(&id, b"xyz").expect("first put");
+        store.put_chunk(&id, b"xyz").expect("second put");
+        assert_eq!(
+            store.get_chunk(&id).expect("ok").as_deref(),
+            Some(b"xyz".as_slice()),
+        );
+    }
+
+    #[test]
+    fn multiple_blob_refs_per_node_distinct_prop_ids() {
+        // (node_id, prop_id) is the key. Same node with two property
+        // IDs must keep two distinct refs.
+        let (_dir, engine) = open_engine();
+        let store = LocalBlobStore::new(&engine);
+        let node = NodeId::from_raw(7);
+        let payload_a = vec![0x01_u8; INLINE_THRESHOLD + 4];
+        let payload_b = vec![0x02_u8; INLINE_THRESHOLD + 4];
+        let (ref_a, chunks_a) = create_blob(&payload_a);
+        let (ref_b, chunks_b) = create_blob(&payload_b);
+        store.put_chunks(&chunks_a).expect("chunks a");
+        store.put_chunks(&chunks_b).expect("chunks b");
+        store.put_blob_ref(node, 1, &ref_a).expect("ref a");
+        store.put_blob_ref(node, 2, &ref_b).expect("ref b");
+
+        let loaded_a = store
+            .get_blob_ref(node, 1)
+            .expect("ok")
+            .expect("ref a present");
+        let loaded_b = store
+            .get_blob_ref(node, 2)
+            .expect("ok")
+            .expect("ref b present");
+        assert_eq!(loaded_a, ref_a);
+        assert_eq!(loaded_b, ref_b);
+        assert_ne!(loaded_a, loaded_b);
+    }
+
+    #[test]
+    fn get_chunk_missing_is_none() {
+        let (_dir, engine) = open_engine();
+        let store = LocalBlobStore::new(&engine);
+        let id = ChunkId::from_data(b"never");
+        assert!(store.get_chunk(&id).expect("ok").is_none());
+    }
+
+    #[test]
     fn corrupt_blob_ref_surfaces_as_decode_error() {
         let (_dir, engine) = open_engine();
         let store = LocalBlobStore::new(&engine);

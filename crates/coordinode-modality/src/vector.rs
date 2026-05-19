@@ -233,6 +233,48 @@ mod tests {
     }
 
     #[test]
+    fn knn_returns_full_set_when_k_exceeds_size() {
+        // k > number of inserted points must not panic — return what
+        // we have, in distance order.
+        let store = LocalVectorStore::new(mk_config(2));
+        store.insert(1, vec![0.0, 0.0]).unwrap();
+        store.insert(2, vec![1.0, 1.0]).unwrap();
+        let results = store.knn_search(&[0.0, 0.0], 10).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn knn_results_sorted_by_distance_ascending() {
+        let store = LocalVectorStore::new(mk_config(2));
+        // Three points at increasing distance from origin.
+        store.insert(1, vec![3.0, 0.0]).unwrap();
+        store.insert(2, vec![1.0, 0.0]).unwrap();
+        store.insert(3, vec![2.0, 0.0]).unwrap();
+        let results = store.knn_search(&[0.0, 0.0], 3).unwrap();
+        assert_eq!(results.len(), 3);
+        let ids: Vec<u64> = results.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![2, 3, 1]);
+        // Strictly ascending distance.
+        for pair in results.windows(2) {
+            assert!(
+                pair[0].score <= pair[1].score,
+                "score not ascending: {} -> {}",
+                pair[0].score,
+                pair[1].score,
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_insert_empty_iter_returns_zero() {
+        let store = LocalVectorStore::new(mk_config(2));
+        let mut empty = std::iter::empty::<(u64, Vec<f32>)>();
+        let n = store.bulk_insert(&mut empty).unwrap();
+        assert_eq!(n, 0);
+        assert!(store.is_empty().unwrap());
+    }
+
+    #[test]
     fn from_index_wraps_existing_handle() {
         let raw = Arc::new(RwLock::new(HnswIndex::new(mk_config(2))));
         raw.write().unwrap().insert(99, vec![5.0, 6.0]);
