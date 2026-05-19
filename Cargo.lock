@@ -941,6 +941,8 @@ dependencies = [
  "coordinode-core",
  "coordinode-lsm-tree",
  "coordinode-storage",
+ "rmp-serde",
+ "rmpv",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",

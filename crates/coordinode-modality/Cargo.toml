@@ -11,6 +11,8 @@ publish.workspace = true
 coordinode-core = { workspace = true }
 coordinode-storage = { workspace = true }
 lsm-tree = { package = "coordinode-lsm-tree", version = "4", default-features = false }
+rmp-serde = { workspace = true }
+rmpv = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
