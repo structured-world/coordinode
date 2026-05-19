@@ -61,6 +61,16 @@ pub trait VectorStore: Send + Sync {
     /// fragments the graph. This call is a no-op — callers MUST apply
     /// an MVCC visibility filter to search results to suppress
     /// tombstoned IDs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use coordinode_modality::{LocalVectorStore, VectorStore};
+    /// # use coordinode_vector::hnsw::HnswConfig;
+    /// let store = LocalVectorStore::new(HnswConfig::default());
+    /// store.remove(42)?; // no-op at the index level
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn remove(&self, node_id: u64) -> StoreResult<()>;
 
     /// K-nearest-neighbour search. Returns up to `k` results sorted by
@@ -83,6 +93,19 @@ pub trait VectorStore: Send + Sync {
     /// KNN search with an optional disk-backed f32 loader for offloaded
     /// indexes. Falls back to in-memory rerank when `loader` is `None`
     /// or the index does not offload vectors.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use coordinode_modality::{LocalVectorStore, VectorStore};
+    /// # use coordinode_vector::hnsw::HnswConfig;
+    /// let store = LocalVectorStore::new(HnswConfig::default());
+    /// store.insert(1, vec![1.0, 0.0, 0.0])?;
+    /// // No loader = same as knn_search.
+    /// let hits = store.knn_search_with_loader(&[1.0, 0.0, 0.0], 1, None)?;
+    /// assert_eq!(hits.len(), 1);
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn knn_search_with_loader(
         &self,
         query: &[f32],
@@ -107,9 +130,31 @@ pub trait VectorStore: Send + Sync {
         -> StoreResult<usize>;
 
     /// Current number of indexed vectors (including tombstoned).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use coordinode_modality::{LocalVectorStore, VectorStore};
+    /// # use coordinode_vector::hnsw::HnswConfig;
+    /// let store = LocalVectorStore::new(HnswConfig::default());
+    /// assert_eq!(store.len()?, 0);
+    /// store.insert(1, vec![1.0, 0.0, 0.0])?;
+    /// assert_eq!(store.len()?, 1);
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn len(&self) -> StoreResult<usize>;
 
     /// True when no vectors have been inserted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use coordinode_modality::{LocalVectorStore, VectorStore};
+    /// # use coordinode_vector::hnsw::HnswConfig;
+    /// let store = LocalVectorStore::new(HnswConfig::default());
+    /// assert!(store.is_empty()?);
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn is_empty(&self) -> StoreResult<bool>;
 }
 

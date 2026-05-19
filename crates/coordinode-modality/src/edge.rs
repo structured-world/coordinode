@@ -156,6 +156,21 @@ pub trait EdgeStore {
 
     /// Reverse neighbours: sources of edges `? --edge_type--> tgt`.
     /// Symmetric to [`Self::scan_neighbors_out`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalEdgeStore, EdgeStore};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalEdgeStore::new(&engine);
+    /// let _sources = store.scan_neighbors_in("KNOWS", NodeId::from_raw(2))?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn scan_neighbors_in(&self, edge_type: &str, tgt: NodeId) -> StoreResult<Vec<NodeId>>;
 
     /// Per-version write of edge properties for `(edge_type, src, tgt)`
@@ -220,6 +235,21 @@ pub trait EdgeStore {
 
     /// All temporal versions of `(edge_type, src, tgt)`, sorted by
     /// `valid_from_ms` ascending.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalEdgeStore, EdgeStore};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalEdgeStore::new(&engine);
+    /// let _versions = store.scan_edge_versions("E", NodeId::from_raw(1), NodeId::from_raw(2))?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn scan_edge_versions(
         &self,
         edge_type: &str,
@@ -230,6 +260,21 @@ pub trait EdgeStore {
     /// Tombstone one specific temporal version. Idempotent on a
     /// missing version. Adjacency entries are NOT touched — removing
     /// the last version of an edge needs the adj-versioning ADR.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalEdgeStore, EdgeStore};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalEdgeStore::new(&engine);
+    /// store.delete_edge_temporal("E", NodeId::from_raw(1), NodeId::from_raw(2), 1000)?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn delete_edge_temporal(
         &self,
         edge_type: &str,
