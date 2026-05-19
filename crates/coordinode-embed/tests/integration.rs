@@ -30,6 +30,7 @@ mod integration {
     mod r156_multi_endpoint;
     mod r157_wal_oplog_placement;
     mod r158_per_level_routing;
+    mod r159_page_checksum;
     mod schema;
     mod shared_engine;
     mod text_index;
