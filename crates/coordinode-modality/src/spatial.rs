@@ -28,12 +28,19 @@
 //! | Cartesian 2D | 7203 | Morton, x/y quantised to 32 bits each |
 //! | Cartesian 3D | 9157 | Morton, x/y/z quantised to 21 bits each |
 //!
-//! Z-order with quantisation is the v1 baseline — it gives correct
-//! prefix-equals-region semantics for range scans without depending on
-//! an external S2 / Hilbert library. S2-cell encoding for WGS-84 and
-//! Hilbert for 2D Cartesian land as a follow-up; the API is unchanged
-//! by that swap because callers see only the `u64` curve key plus the
-//! post-filter step on the original `f64` body.
+//! Z-order with quantisation is the v1 baseline. It is correct (every
+//! point inside the bbox has a curve key inside `[morton_min,
+//! morton_max]`) and the bbox scan terminates the iterator early once
+//! the curve crosses `morton_max`. The Morton curve traces a Z-shape,
+//! so the linear interval `[morton_min, morton_max]` is *over*-
+//! inclusive — it can contain cells outside the bbox; the exact
+//! `point_in_bbox` post-filter on the original `f64` body discards
+//! those. Skipping the Z-shape's false-positive sub-intervals
+//! (litmax/bigmin) is a follow-up — for v1 the saving is the early
+//! break, not subrange skipping. S2-cell encoding for WGS-84 and
+//! Hilbert for 2D Cartesian also land as follow-ups; the API surface
+//! is unchanged by either swap because callers only see the `u64`
+//! curve key + exact post-filter step.
 //!
 //! ## What this store does and doesn't do
 //!
@@ -221,6 +228,63 @@ fn decode_node_id_from_key(key: &[u8]) -> Option<NodeId> {
     Some(NodeId::from_raw(u64::from_be_bytes(id_bytes)))
 }
 
+/// Decode the 8-byte Morton curve key from a full spatial index key.
+/// Layout: `idx:spatial:<label_id:4>:<crs:2>:<curve:8>:<node_id:8>`.
+/// Returns `None` if the key is too short.
+fn decode_curve_from_key(key: &[u8]) -> Option<u64> {
+    let curve_end = key.len().checked_sub(8)?;
+    let curve_start = curve_end.checked_sub(8)?;
+    let curve_bytes: [u8; 8] = key[curve_start..curve_end].try_into().ok()?;
+    Some(u64::from_be_bytes(curve_bytes))
+}
+
+/// Morton bounding range for a 2D bbox. The returned `[min, max]` is
+/// the lexicographic interval that contains every cell of the bbox —
+/// but also contains cells *outside* the bbox (Morton's Z-shape).
+/// Callers MUST post-filter with `point_in_bbox`.
+fn morton_window(bbox: &Bbox) -> (u64, u64) {
+    match bbox.lower.crs {
+        Crs::Wgs84_2d => {
+            let lon_min = quantise_u32(bbox.lower.coords[0], -180.0, 180.0);
+            let lat_min = quantise_u32(bbox.lower.coords[1], -90.0, 90.0);
+            let lon_max = quantise_u32(bbox.upper.coords[0], -180.0, 180.0);
+            let lat_max = quantise_u32(bbox.upper.coords[1], -90.0, 90.0);
+            (morton_2d(lon_min, lat_min), morton_2d(lon_max, lat_max))
+        }
+        Crs::Cartesian2d => {
+            let x_min = quantise_u32(bbox.lower.coords[0], -1e9, 1e9);
+            let y_min = quantise_u32(bbox.lower.coords[1], -1e9, 1e9);
+            let x_max = quantise_u32(bbox.upper.coords[0], -1e9, 1e9);
+            let y_max = quantise_u32(bbox.upper.coords[1], -1e9, 1e9);
+            (morton_2d(x_min, y_min), morton_2d(x_max, y_max))
+        }
+        Crs::Wgs84_3d => {
+            let lon_min = quantise_bits(bbox.lower.coords[0], -180.0, 180.0, 21);
+            let lat_min = quantise_bits(bbox.lower.coords[1], -90.0, 90.0, 21);
+            let alt_min = quantise_bits(bbox.lower.coords[2], -11_000.0, 100_000.0, 21);
+            let lon_max = quantise_bits(bbox.upper.coords[0], -180.0, 180.0, 21);
+            let lat_max = quantise_bits(bbox.upper.coords[1], -90.0, 90.0, 21);
+            let alt_max = quantise_bits(bbox.upper.coords[2], -11_000.0, 100_000.0, 21);
+            (
+                morton_3d(lon_min, lat_min, alt_min),
+                morton_3d(lon_max, lat_max, alt_max),
+            )
+        }
+        Crs::Cartesian3d => {
+            let x_min = quantise_bits(bbox.lower.coords[0], -1e6, 1e6, 21);
+            let y_min = quantise_bits(bbox.lower.coords[1], -1e6, 1e6, 21);
+            let z_min = quantise_bits(bbox.lower.coords[2], -1e6, 1e6, 21);
+            let x_max = quantise_bits(bbox.upper.coords[0], -1e6, 1e6, 21);
+            let y_max = quantise_bits(bbox.upper.coords[1], -1e6, 1e6, 21);
+            let z_max = quantise_bits(bbox.upper.coords[2], -1e6, 1e6, 21);
+            (
+                morton_3d(x_min, y_min, z_min),
+                morton_3d(x_max, y_max, z_max),
+            )
+        }
+    }
+}
+
 /// Quantise an `f64` from `[lo, hi]` to a `u32` linear bucket.
 fn quantise_u32(value: f64, lo: f64, hi: f64) -> u32 {
     let clamped = value.clamp(lo, hi);
@@ -374,14 +438,29 @@ impl SpatialStore for LocalSpatialStore<'_> {
         bbox: &Bbox,
     ) -> StoreResult<Vec<(NodeId, Point)>> {
         let prefix = encode_spatial_prefix(label_id, crs);
+        let (curve_min, curve_max) = morton_window(bbox);
         let mut out = Vec::new();
         let iter = self.engine.prefix_scan(Partition::Idx, &prefix)?;
         for guard in iter {
             let (key, value) = guard.into_inner()?;
+            // Iterator walks the (label_id, crs) prefix in key order;
+            // keys after curve_max cannot match the bbox window.
+            // `decode_curve_from_key` is `None` only for malformed
+            // keys we couldn't have written ourselves — skip them.
+            if let Some(curve) = decode_curve_from_key(&key) {
+                if curve > curve_max {
+                    break;
+                }
+                if curve < curve_min {
+                    continue;
+                }
+            }
             let Some(node_id) = decode_node_id_from_key(&key) else {
                 continue;
             };
             let point = decode_body(value.as_ref())?;
+            // Morton window is over-inclusive (Z-shape covers cells
+            // outside the bbox); exact post-filter is mandatory.
             if point_in_bbox(&point, bbox) {
                 out.push((node_id, point));
             }
@@ -592,6 +671,91 @@ mod tests {
         assert_eq!(hits2.len(), 1);
         assert_eq!(hits1[0].0, NodeId::from_raw(10));
         assert_eq!(hits2[0].0, NodeId::from_raw(20));
+    }
+
+    #[test]
+    fn morton_window_brackets_every_bbox_point() {
+        // Property: every point inside the bbox quantises to a curve
+        // inside [curve_min, curve_max]. This is the correctness
+        // contract the early-break in scan_within_bbox depends on.
+        let bbox = Bbox {
+            lower: Point::new_2d(Crs::Cartesian2d, -100.0, -50.0),
+            upper: Point::new_2d(Crs::Cartesian2d, 100.0, 50.0),
+        };
+        let (cmin, cmax) = morton_window(&bbox);
+        for x in [-99.0, -10.0, 0.0, 10.0, 99.0] {
+            for y in [-49.0, -5.0, 0.0, 5.0, 49.0] {
+                let p = Point::new_2d(Crs::Cartesian2d, x, y);
+                let c = encode_curve(&p);
+                assert!(
+                    (cmin..=cmax).contains(&c),
+                    "point ({x},{y}) curve {c} outside [{cmin},{cmax}]",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scan_within_bbox_filters_morton_false_positives() {
+        // Morton's Z-shape means a curve key inside [cmin, cmax] may
+        // decode to a point outside the bbox. The exact post-filter
+        // must drop those. Specifically: insert points spanning a wide
+        // X axis but narrow Y; the bbox is the same shape. Without
+        // post-filter, points with curves inside the linear interval
+        // but Y outside would leak.
+        let (_dir, engine) = mk_engine();
+        let store = LocalSpatialStore::new(&engine);
+        // Two points: one inside the bbox, one with Y far outside but
+        // a curve key that may fall in the [cmin, cmax] range.
+        let inside = Point::new_2d(Crs::Cartesian2d, 5.0, 1.0);
+        let outside_y = Point::new_2d(Crs::Cartesian2d, 5.0, 50.0);
+        store.insert(1, NodeId::from_raw(1), &inside).unwrap();
+        store.insert(1, NodeId::from_raw(2), &outside_y).unwrap();
+        let bbox = Bbox {
+            lower: Point::new_2d(Crs::Cartesian2d, 0.0, 0.0),
+            upper: Point::new_2d(Crs::Cartesian2d, 10.0, 2.0),
+        };
+        let hits = store.scan_within_bbox(1, Crs::Cartesian2d, &bbox).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, NodeId::from_raw(1));
+    }
+
+    #[test]
+    fn scan_within_bbox_breaks_early_past_curve_max() {
+        // Construct three points whose curve keys we can predict, so
+        // we know the iteration must stop at the middle one.
+        let (_dir, engine) = mk_engine();
+        let store = LocalSpatialStore::new(&engine);
+        // Tight bbox containing only the first point. Inserted points
+        // far apart so curves diverge sharply.
+        store
+            .insert(
+                7,
+                NodeId::from_raw(1),
+                &Point::new_2d(Crs::Cartesian2d, 0.0, 0.0),
+            )
+            .unwrap();
+        store
+            .insert(
+                7,
+                NodeId::from_raw(2),
+                &Point::new_2d(Crs::Cartesian2d, 5e8, 5e8),
+            )
+            .unwrap();
+        store
+            .insert(
+                7,
+                NodeId::from_raw(3),
+                &Point::new_2d(Crs::Cartesian2d, 9e8, 9e8),
+            )
+            .unwrap();
+        let bbox = Bbox {
+            lower: Point::new_2d(Crs::Cartesian2d, -1.0, -1.0),
+            upper: Point::new_2d(Crs::Cartesian2d, 1.0, 1.0),
+        };
+        let hits = store.scan_within_bbox(7, Crs::Cartesian2d, &bbox).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, NodeId::from_raw(1));
     }
 
     #[test]
