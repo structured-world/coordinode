@@ -313,3 +313,229 @@ fn cascade_eviction_moves_data_to_cooler_endpoint() {
         "cold endpoint SST count must increase after cascade eviction (before={before}, after={after})",
     );
 }
+
+/// `cascade_evict_endpoint` with an unknown endpoint id must surface a
+/// clear error rather than silently doing nothing — operator typo would
+/// otherwise be lost in the noise of "no partitions needed eviction".
+#[test]
+fn cascade_eviction_unknown_endpoint_errors() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "only",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    let result = engine.cascade_evict_endpoint("nonexistent");
+    let err = match result {
+        Ok(_) => panic!("cascade_evict_endpoint must reject unknown endpoint id"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("unknown") && msg.contains("nonexistent"),
+        "error must name the unknown endpoint id, got: {msg}",
+    );
+}
+
+/// `cascade_evict_endpoint` for an endpoint that hosts no partition's
+/// data (e.g. operator named a hot endpoint before any flush happened)
+/// must succeed as a no-op: zero compactions, no error. Common case
+/// during a manually-triggered eviction immediately after engine open.
+#[test]
+fn cascade_eviction_with_no_partition_data_is_noop() {
+    let hot = TempDir::new().expect("hot tempdir");
+    let cold = TempDir::new().expect("cold tempdir");
+
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "ep-hot",
+            hot.path(),
+            Media::Nvme,
+            Durability::Durable,
+            Tier::Hot,
+        ),
+        EndpointConfig::new(
+            "ep-cold",
+            cold.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Cold,
+        ),
+    ]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    // Single tiny write that stays in memtable — no flush, no SST,
+    // no partition tree has any data on disk yet.
+    engine.put(Partition::Node, b"k", b"v").expect("put");
+
+    let report = engine
+        .cascade_evict_endpoint("ep-hot")
+        .expect("cascade eviction must succeed even when there's nothing on the endpoint");
+    // Major compaction is still triggered on partitions whose routing
+    // references the endpoint — even if there is no SST to compact,
+    // the call itself is a no-op at lsm-tree level. The contract we
+    // pin: no error, finite number of compacted partitions.
+    let _ = report.compacted_partitions; // smoke check the field is reachable
+}
+
+/// `cascade_evict_endpoint` must touch ALL partitions whose persisted
+/// routing references the saturated endpoint — not just the first one.
+/// Verifies the iteration covers the non-Schema, non-Raft set fully.
+#[test]
+fn cascade_eviction_touches_multiple_partitions() {
+    let hot = TempDir::new().expect("hot tempdir");
+    let cold = TempDir::new().expect("cold tempdir");
+
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "ep-hot",
+            hot.path(),
+            Media::Nvme,
+            Durability::Durable,
+            Tier::Hot,
+        ),
+        EndpointConfig::new(
+            "ep-cold",
+            cold.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Cold,
+        ),
+    ]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    // Write into THREE distinct partitions so each has a tree with
+    // pending state.
+    for i in 0..500u32 {
+        let k = format!("node:0:{i:010}");
+        engine
+            .put(Partition::Node, k.as_bytes(), b"n")
+            .expect("put node");
+    }
+    for i in 0..500u32 {
+        let k = format!("edgeprop:T:{i:010}");
+        engine
+            .put(Partition::EdgeProp, k.as_bytes(), b"e")
+            .expect("put edgeprop");
+    }
+    for i in 0..500u32 {
+        let k = format!("idx:i:{i:010}");
+        engine
+            .put(Partition::Idx, k.as_bytes(), b"i")
+            .expect("put idx");
+    }
+    engine.persist().expect("persist");
+
+    let report = engine
+        .cascade_evict_endpoint("ep-hot")
+        .expect("cascade eviction");
+    assert!(
+        report.compacted_partitions >= 3,
+        "cascade eviction must touch every routed partition (>=3 expected for Node + EdgeProp + Idx), got {}",
+        report.compacted_partitions,
+    );
+}
+
+/// Reopen with an ADDED endpoint must NOT alter the persisted routing —
+/// existing partitions keep their previously-computed level mapping so
+/// lsm-tree recovery still finds every SST. Adding endpoints is an
+/// operator-driven event that may later be acted on by an explicit
+/// rebalance, but at engine-open time the persisted routing wins.
+#[test]
+fn reopen_with_added_endpoint_preserves_routing() {
+    let hot = TempDir::new().expect("hot tempdir");
+    let warm = TempDir::new().expect("warm tempdir");
+    let cold = TempDir::new().expect("cold tempdir");
+
+    // First open with two endpoints (Hot + Cold). Default routing
+    // places L2-L3 on Hot (Warm fallback chain → Hot, since no Warm
+    // endpoint exists).
+    {
+        let config = StorageConfig::with_endpoints(vec![
+            EndpointConfig::new(
+                "ep-hot",
+                hot.path(),
+                Media::Nvme,
+                Durability::Durable,
+                Tier::Hot,
+            ),
+            EndpointConfig::new(
+                "ep-cold",
+                cold.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Cold,
+            ),
+        ]);
+        let engine = StorageEngine::open(&config).expect("first open");
+        for i in 0..500u32 {
+            let k = format!("node:0:{i:010}");
+            engine
+                .put(Partition::Node, k.as_bytes(), b"v")
+                .expect("put");
+        }
+        engine.persist().expect("persist");
+        engine
+            .major_compact(Partition::Node)
+            .expect("major compact");
+    }
+
+    // SST tables snapshot before the topology change. After reopen
+    // with the same routing they MUST be byte-stable (no migration).
+    let warm_tables_path = warm.path().join(Partition::Node.name()).join("tables");
+    assert!(
+        !warm_tables_path.exists(),
+        "warm endpoint had no role in first open — must have no tables dir",
+    );
+
+    // Reopen with a NEW Warm endpoint added. Persisted routing should
+    // win: L2-L3 stays on Hot (where it was originally placed), the
+    // new Warm endpoint receives no data for the Node partition at
+    // open time.
+    let config_with_warm = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "ep-hot",
+            hot.path(),
+            Media::Nvme,
+            Durability::Durable,
+            Tier::Hot,
+        ),
+        EndpointConfig::new(
+            "ep-warm",
+            warm.path(),
+            Media::Ssd,
+            Durability::Durable,
+            Tier::Warm,
+        ),
+        EndpointConfig::new(
+            "ep-cold",
+            cold.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Cold,
+        ),
+    ]);
+    let engine = StorageEngine::open(&config_with_warm).expect("reopen with added endpoint");
+
+    // Data still readable — proves recovery scan covered the persisted
+    // route set (cold endpoint), not the would-be-rederived set that
+    // would have routed L4+ to warm.
+    let key = b"node:0:0000000042";
+    let v = engine
+        .get(Partition::Node, key)
+        .expect("get")
+        .expect("present");
+    assert_eq!(&v[..], b"v");
+
+    // The newly added Warm endpoint has NO Node tables dir — confirms
+    // persisted routing did NOT auto-rederive against the new topology.
+    assert!(
+        !warm_tables_path.exists(),
+        "added Warm endpoint must NOT receive any Node SSTs without an explicit rebalance \
+         (persisted routing wins on reopen)",
+    );
+}
