@@ -223,20 +223,31 @@ impl CapacityTracker {
     pub fn refresh(
         &self,
         endpoint_paths: &BTreeMap<String, std::path::PathBuf>,
-        partition_names: &[&str],
+        _partition_names: &[&str],
     ) {
         for (id, usage) in &self.endpoints {
             let Some(root) = endpoint_paths.get(id) else {
                 continue;
             };
-            let mut total = 0u64;
-            for part in partition_names {
-                let tables = root.join(part).join("tables");
-                if !tables.exists() {
-                    continue;
-                }
-                total = total.saturating_add(dir_size(&tables));
-            }
+            // Recursively sum every file under the endpoint root.
+            // This captures every on-disk artefact the engine writes
+            // through this mount point, not just partition SSTs:
+            //   - `<part>/tables/`     — LSM SST files
+            //   - `<part>/manifest/`   — lsm-tree manifest + segment metadata
+            //   - `wal/standalone.wal` — standalone WAL file (R157)
+            //   - `oplog/<shard>/`     — Raft oplog segments (R157)
+            //   - `text_indexes/`      — tantivy FTS index segments
+            //   - any future engine-managed subdirectory
+            //
+            // Matches `du -sh <endpoint>` — the operational definition
+            // of "how full is this disk from coordinode's view". A
+            // narrower per-partition scan misses anything outside
+            // `tables/` and silently under-counts capacity.
+            //
+            // The `partition_names` argument is preserved for
+            // backward-compatible API but no longer used — the walk
+            // is exhaustive.
+            let total = dir_size(root);
             usage.used_bytes.store(total, Ordering::Release);
 
             // Prometheus gauges — read by the metrics-exporter-prometheus
