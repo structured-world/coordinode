@@ -1,0 +1,17 @@
+[package]
+name = "coordinode-cluster"
+description = "Layer 6 cluster topology: ClusterTopology + ShardRouting traits with CE SingleNodeTopology + SingleShardRouting implementations (storage-stack.md Layer 6, crush.md 5-level failure domain hierarchy)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+coordinode-storage = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true
