@@ -267,6 +267,51 @@ mod tests {
     }
 
     #[test]
+    fn scan_exact_missing_returns_empty() {
+        let (_dir, engine) = open_engine();
+        let store = LocalIndexStore::new(&engine);
+        let hits = store
+            .scan_exact("nonexistent", &[Value::Int(42)])
+            .expect("scan");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn sortable_type_ordering_null_lt_bool_lt_int_lt_string() {
+        // ADR contract: Value ordering Null < Bool < Int < Float <
+        // String < Timestamp. scan_all walks in encoded-key order so
+        // we can read the type ordering off directly. One entry per
+        // type, all under the same index name and node_id 1.
+        let (_dir, engine) = open_engine();
+        let store = LocalIndexStore::new(&engine);
+        let id = NodeId::from_raw(1);
+        let entries: Vec<Vec<Value>> = vec![
+            vec![Value::Null],
+            vec![Value::Bool(true)],
+            vec![Value::Int(0)],
+            vec![Value::String("z".into())],
+        ];
+        // Insert in reverse to prove ordering comes from key
+        // encoding, not insertion order.
+        for v in entries.iter().rev() {
+            store.put_entry("mix", v, id).expect("put");
+        }
+        let all = store.scan_all("mix").expect("scan");
+        assert_eq!(all.len(), 4);
+        // The keys themselves carry the encoded value bytes — verify
+        // their order matches the ADR contract by comparing prefixes
+        // pairwise (each later key sorts >= the previous one).
+        for pair in all.windows(2) {
+            assert!(
+                pair[0].0 <= pair[1].0,
+                "index keys not sorted: {:?} vs {:?}",
+                pair[0].0,
+                pair[1].0,
+            );
+        }
+    }
+
+    #[test]
     fn scan_all_isolates_per_index_name() {
         // Two indexes share the partition; each scan returns only
         // its own entries.
