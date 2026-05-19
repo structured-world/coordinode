@@ -632,6 +632,107 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_put_edge_on_super_node_preserves_all_edges() {
+        // Concurrent merge-operator stress on a single source.
+        // Four threads each add 25 distinct out-edges from the same
+        // src. After join, all 100 must be visible — the contract is
+        // that add/remove are commutative+idempotent merge operands.
+        use std::sync::Arc;
+        use std::thread;
+
+        let (_dir, engine) = open_engine();
+        let engine = Arc::new(engine);
+        let src = NodeId::from_raw(1);
+        let threads_n = 4u64;
+        let per_thread = 25u64;
+
+        let handles: Vec<_> = (0..threads_n)
+            .map(|t| {
+                let engine = Arc::clone(&engine);
+                thread::spawn(move || {
+                    let store = LocalEdgeStore::new(&engine);
+                    for i in 0..per_thread {
+                        let tgt = NodeId::from_raw(t * per_thread + i + 100);
+                        store.put_edge("F", src, tgt, None).expect("put");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        let store = LocalEdgeStore::new(&engine);
+        let mut neighbors: Vec<u64> = store
+            .scan_neighbors_out("F", src)
+            .expect("scan")
+            .iter()
+            .map(|n| n.as_raw())
+            .collect();
+        neighbors.sort_unstable();
+        let expected: Vec<u64> = (100..100 + threads_n * per_thread).collect();
+        assert_eq!(neighbors, expected, "all concurrent edges must be present");
+    }
+
+    #[test]
+    fn concurrent_add_then_remove_converges() {
+        // Concurrent add(x) and remove(x) from different threads —
+        // last-writer-wins not applicable to merge operators; both
+        // ops must compose into a consistent posting list. Specifically:
+        // after the same number of adds and removes for each target,
+        // every target either present or absent (never duplicated).
+        use std::sync::Arc;
+        use std::thread;
+
+        let (_dir, engine) = open_engine();
+        let engine = Arc::new(engine);
+        let src = NodeId::from_raw(1);
+
+        // Pre-populate 10 edges so the remover has something to remove.
+        let setup = LocalEdgeStore::new(&engine);
+        for i in 0..10u64 {
+            setup
+                .put_edge("F", src, NodeId::from_raw(i + 200), None)
+                .expect("setup");
+        }
+
+        // Adder thread: adds 5 more.
+        let engine_a = Arc::clone(&engine);
+        let adder = thread::spawn(move || {
+            let store = LocalEdgeStore::new(&engine_a);
+            for i in 0..5u64 {
+                store
+                    .put_edge("F", src, NodeId::from_raw(i + 300), None)
+                    .expect("add");
+            }
+        });
+        // Remover thread: removes 5 of the pre-populated.
+        let engine_r = Arc::clone(&engine);
+        let remover = thread::spawn(move || {
+            let store = LocalEdgeStore::new(&engine_r);
+            for i in 0..5u64 {
+                store
+                    .delete_edge("F", src, NodeId::from_raw(i + 200))
+                    .expect("delete");
+            }
+        });
+        adder.join().expect("adder");
+        remover.join().expect("remover");
+
+        let store = LocalEdgeStore::new(&engine);
+        let mut neighbors: Vec<u64> = store
+            .scan_neighbors_out("F", src)
+            .expect("scan")
+            .iter()
+            .map(|n| n.as_raw())
+            .collect();
+        neighbors.sort_unstable();
+        // Expect: (200..205) removed, (205..210) kept, (300..305) added.
+        let expected: Vec<u64> = (205u64..210).chain(300..305).collect();
+        assert_eq!(neighbors, expected);
+    }
+
+    #[test]
     fn corrupt_posting_list_surfaces_as_decode_error() {
         let (_dir, engine) = open_engine();
         let store = LocalEdgeStore::new(&engine);
