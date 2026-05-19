@@ -65,6 +65,24 @@ pub struct LocalBlobStore<'a> {
 
 impl<'a> LocalBlobStore<'a> {
     /// Wrap a storage engine for blob-store operations.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use coordinode_modality::{LocalBlobStore, BlobStore};
+    /// use coordinode_core::graph::blob::ChunkId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/store"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm,
+    /// # )]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// let store = LocalBlobStore::new(&engine);
+    /// let id = ChunkId::from_data(b"hello");
+    /// store.put_chunk(&id, b"hello")?;
+    /// assert_eq!(store.get_chunk(&id)?.as_deref(), Some(b"hello".as_slice()));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn new(engine: &'a StorageEngine) -> Self {
         Self { engine }
     }

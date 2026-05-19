@@ -73,7 +73,29 @@ pub struct LocalNodeStore<'a> {
 }
 
 impl<'a> LocalNodeStore<'a> {
-    /// Wrap a storage engine for node-store operations.
+    /// Wrap a storage engine for node-store operations. The store is
+    /// stateless beyond the borrow — cheap to construct, clone the
+    /// engine handle to share across threads.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use coordinode_modality::{LocalNodeStore, NodeStore};
+    /// use coordinode_core::graph::node::{NodeId, NodeRecord};
+    /// use coordinode_storage::engine::config::{
+    ///     Durability, EndpointConfig, Media, StorageConfig, Tier,
+    /// };
+    /// use coordinode_storage::engine::core::StorageEngine;
+    ///
+    /// let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    ///     "ep", std::path::Path::new("/tmp/store"),
+    ///     Media::Hdd, Durability::Durable, Tier::Warm,
+    /// )]);
+    /// let engine = StorageEngine::open(&cfg)?;
+    /// let store = LocalNodeStore::new(&engine);
+    /// store.put(0, NodeId::from_raw(1), &NodeRecord::new("User"))?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn new(engine: &'a StorageEngine) -> Self {
         Self { engine }
     }

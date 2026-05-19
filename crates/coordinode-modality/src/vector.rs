@@ -85,6 +85,20 @@ pub struct LocalVectorStore {
 
 impl LocalVectorStore {
     /// Build a new store wrapping a freshly-constructed `HnswIndex`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coordinode_modality::{LocalVectorStore, VectorStore};
+    /// use coordinode_vector::hnsw::HnswConfig;
+    ///
+    /// let store = LocalVectorStore::new(HnswConfig::default());
+    /// store.insert(1, vec![1.0, 0.0, 0.0])?;
+    /// store.insert(2, vec![0.0, 1.0, 0.0])?;
+    /// let knn = store.knn_search(&[1.0, 0.0, 0.0], 1)?;
+    /// assert_eq!(knn[0].id, 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn new(config: HnswConfig) -> Self {
         Self {
             inner: Arc::new(RwLock::new(HnswIndex::new(config))),
