@@ -23,28 +23,38 @@
 //! none) and produces one seqno. Readers never observe a half-built
 //! edge.
 //!
-//! ## What this PR does NOT cover
+//! ## Temporal edges (ADR-027)
 //!
-//! - **Temporal edges** (ADR-027 `valid_from` per version). Will be
-//!   added as `put_edge_temporal` / `get_props_at` in a follow-up
-//!   commit. The non-temporal API here matches the steady-state
-//!   `runner.rs` write path one-to-one.
-//! - **Discriminator-suffixed multiplicity** (ADR-029). Same
-//!   rationale — discriminator-aware keys are a separate concern
-//!   that will land alongside temporal in the EdgeStore follow-up.
+//! [`Self::put_edge_temporal`] writes one version per `valid_from_ms`
+//! via [`encode_temporal_edgeprop_key`], so every edge update appends
+//! a new row rather than overwriting. [`Self::get_props_at`] scans the
+//! `(edge_type, src, tgt)` prefix and returns the version whose
+//! `valid_from_ms <= at_ms` is largest. Adjacency entries are written
+//! by the temporal path too — the version model for adj itself
+//! (tombstone markers vs. per-version posting lists) is a separate
+//! ADR and is intentionally NOT decided here.
+//!
+//! ## Out of scope here
+//!
+//! - **Discriminator-suffixed multiplicity** (ADR-029). Discriminator
+//!   key encoders don't yet exist; revisit once the upstream encoding
+//!   helpers are in place.
+//! - **Adjacency versioning** for temporal edges (see above).
 //! - **Posting-list splits for super-nodes** (>512KB shards). The
 //!   underlying merge operator already handles the split transparently
 //!   — the store API is unchanged; this is mentioned for completeness.
 
 use coordinode_core::graph::edge::{
-    encode_adj_key_forward, encode_adj_key_reverse, encode_edgeprop_key, EdgeProperties,
-    PostingList,
+    decode_temporal_edgeprop_key, encode_adj_key_forward, encode_adj_key_reverse,
+    encode_edgeprop_key, encode_temporal_edgeprop_key, temporal_edgeprop_pair_prefix,
+    EdgeProperties, PostingList,
 };
 use coordinode_core::graph::node::NodeId;
 use coordinode_storage::engine::batch::WriteBatch;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::merge::{encode_add, encode_remove};
 use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::Guard;
 
 use crate::error::{StoreError, StoreResult};
 
@@ -86,6 +96,55 @@ pub trait EdgeStore {
     /// Reverse neighbours: sources of edges
     /// `? --edge_type--> tgt`.
     fn scan_neighbors_in(&self, edge_type: &str, tgt: NodeId) -> StoreResult<Vec<NodeId>>;
+
+    /// Per-version write of edge properties for `(edge_type, src, tgt)`
+    /// (ADR-027 temporal edges). Stores `props` under the temporal
+    /// edgeprop key suffixed with `valid_from_ms`; multiple versions
+    /// coexist. Adjacency entries are written too (same merge as the
+    /// non-temporal path) so the edge is visible to neighbour scans.
+    ///
+    /// Adjacency itself is not yet version-keyed — that requires a
+    /// separate ADR on the version model (tombstone markers vs.
+    /// per-version posting lists) and is tracked as a follow-up.
+    fn put_edge_temporal(
+        &self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        valid_from_ms: i64,
+        props: &EdgeProperties,
+    ) -> StoreResult<()>;
+
+    /// Read the edge-property version active at `at_ms`: the version
+    /// whose `valid_from_ms <= at_ms` is largest. Returns `None` if no
+    /// such version exists.
+    fn get_props_at(
+        &self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        at_ms: i64,
+    ) -> StoreResult<Option<EdgeProperties>>;
+
+    /// All temporal versions of `(edge_type, src, tgt)`, sorted by
+    /// `valid_from_ms` ascending.
+    fn scan_edge_versions(
+        &self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+    ) -> StoreResult<Vec<(i64, EdgeProperties)>>;
+
+    /// Tombstone one specific temporal version. Idempotent on a
+    /// missing version. Adjacency entries are NOT touched — removing
+    /// the last version of an edge needs the adj-versioning ADR.
+    fn delete_edge_temporal(
+        &self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        valid_from_ms: i64,
+    ) -> StoreResult<()>;
 }
 
 /// CE single-shard implementation of [`EdgeStore`].
@@ -179,6 +238,98 @@ impl EdgeStore for LocalEdgeStore<'_> {
 
     fn scan_neighbors_in(&self, edge_type: &str, tgt: NodeId) -> StoreResult<Vec<NodeId>> {
         self.read_posting(&encode_adj_key_reverse(edge_type, tgt))
+    }
+
+    fn put_edge_temporal(
+        &self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        valid_from_ms: i64,
+        props: &EdgeProperties,
+    ) -> StoreResult<()> {
+        let fwd_key = encode_adj_key_forward(edge_type, src);
+        let rev_key = encode_adj_key_reverse(edge_type, tgt);
+        let ep_key = encode_temporal_edgeprop_key(edge_type, src, tgt, valid_from_ms);
+        let body = props.to_msgpack().map_err(|e| StoreError::Decode {
+            kind: "edge properties",
+            message: format!("encode: {e}"),
+        })?;
+
+        let mut batch = WriteBatch::new(self.engine);
+        batch.merge(Partition::Adj, fwd_key, encode_add(tgt.as_raw()));
+        batch.merge(Partition::Adj, rev_key, encode_add(src.as_raw()));
+        batch.put(Partition::EdgeProp, ep_key, body);
+        batch.commit()?;
+        Ok(())
+    }
+
+    fn get_props_at(
+        &self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        at_ms: i64,
+    ) -> StoreResult<Option<EdgeProperties>> {
+        let prefix = temporal_edgeprop_pair_prefix(edge_type, src, tgt);
+        let iter = self.engine.prefix_scan(Partition::EdgeProp, &prefix)?;
+        let mut best: Option<(i64, EdgeProperties)> = None;
+        for guard in iter {
+            let (key, value) = guard.into_inner()?;
+            let Some((_, _, _, valid_from)) = decode_temporal_edgeprop_key(&key) else {
+                continue;
+            };
+            if valid_from > at_ms {
+                continue;
+            }
+            let props =
+                EdgeProperties::from_msgpack(value.as_ref()).map_err(|e| StoreError::Decode {
+                    kind: "edge properties",
+                    message: format!("decode: {e}"),
+                })?;
+            best = match best {
+                Some((vf, _)) if vf >= valid_from => best,
+                _ => Some((valid_from, props)),
+            };
+        }
+        Ok(best.map(|(_, p)| p))
+    }
+
+    fn scan_edge_versions(
+        &self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+    ) -> StoreResult<Vec<(i64, EdgeProperties)>> {
+        let prefix = temporal_edgeprop_pair_prefix(edge_type, src, tgt);
+        let iter = self.engine.prefix_scan(Partition::EdgeProp, &prefix)?;
+        let mut out = Vec::new();
+        for guard in iter {
+            let (key, value) = guard.into_inner()?;
+            let Some((_, _, _, valid_from)) = decode_temporal_edgeprop_key(&key) else {
+                continue;
+            };
+            let props =
+                EdgeProperties::from_msgpack(value.as_ref()).map_err(|e| StoreError::Decode {
+                    kind: "edge properties",
+                    message: format!("decode: {e}"),
+                })?;
+            out.push((valid_from, props));
+        }
+        out.sort_by_key(|(vf, _)| *vf);
+        Ok(out)
+    }
+
+    fn delete_edge_temporal(
+        &self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        valid_from_ms: i64,
+    ) -> StoreResult<()> {
+        let key = encode_temporal_edgeprop_key(edge_type, src, tgt, valid_from_ms);
+        self.engine.delete(Partition::EdgeProp, &key)?;
+        Ok(())
     }
 }
 
@@ -331,6 +482,153 @@ mod tests {
             .expect("scan")
             .is_empty());
         assert_eq!(store.scan_neighbors_out("LIKES", a).expect("scan"), vec![b],);
+    }
+
+    fn props_with(field: u32, value: i64) -> EdgeProperties {
+        let mut p = EdgeProperties::new();
+        p.set(field, coordinode_core::graph::types::Value::Int(value));
+        p
+    }
+
+    #[test]
+    fn put_temporal_versions_round_trip_via_scan() {
+        let (_dir, engine) = open_engine();
+        let store = LocalEdgeStore::new(&engine);
+        let a = NodeId::from_raw(1);
+        let b = NodeId::from_raw(2);
+        for (vf, salary) in [(1000i64, 50_000), (2000, 60_000), (3000, 70_000)] {
+            store
+                .put_edge_temporal("WORKS_AT", a, b, vf, &props_with(1, salary))
+                .expect("put temporal");
+        }
+        let versions = store
+            .scan_edge_versions("WORKS_AT", a, b)
+            .expect("scan versions");
+        assert_eq!(versions.len(), 3);
+        assert_eq!(versions[0].0, 1000);
+        assert_eq!(versions[2].0, 3000);
+    }
+
+    #[test]
+    fn get_props_at_returns_largest_valid_from_le_query() {
+        let (_dir, engine) = open_engine();
+        let store = LocalEdgeStore::new(&engine);
+        let a = NodeId::from_raw(1);
+        let b = NodeId::from_raw(2);
+        store
+            .put_edge_temporal("E", a, b, 1000, &props_with(1, 10))
+            .unwrap();
+        store
+            .put_edge_temporal("E", a, b, 2000, &props_with(1, 20))
+            .unwrap();
+        store
+            .put_edge_temporal("E", a, b, 3000, &props_with(1, 30))
+            .unwrap();
+
+        // At 1500 — only the 1000-version is visible.
+        let p = store
+            .get_props_at("E", a, b, 1500)
+            .unwrap()
+            .expect("present");
+        assert_eq!(
+            p.get(1),
+            Some(&coordinode_core::graph::types::Value::Int(10))
+        );
+
+        // At 2500 — pick the 2000-version (largest <= 2500).
+        let p = store
+            .get_props_at("E", a, b, 2500)
+            .unwrap()
+            .expect("present");
+        assert_eq!(
+            p.get(1),
+            Some(&coordinode_core::graph::types::Value::Int(20))
+        );
+
+        // At 3000 — boundary inclusive: pick the 3000-version.
+        let p = store
+            .get_props_at("E", a, b, 3000)
+            .unwrap()
+            .expect("present");
+        assert_eq!(
+            p.get(1),
+            Some(&coordinode_core::graph::types::Value::Int(30))
+        );
+    }
+
+    #[test]
+    fn get_props_at_before_first_version_returns_none() {
+        let (_dir, engine) = open_engine();
+        let store = LocalEdgeStore::new(&engine);
+        let a = NodeId::from_raw(1);
+        let b = NodeId::from_raw(2);
+        store
+            .put_edge_temporal("E", a, b, 5000, &props_with(1, 1))
+            .unwrap();
+        assert!(store.get_props_at("E", a, b, 1000).unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_temporal_version_removes_only_that_version() {
+        let (_dir, engine) = open_engine();
+        let store = LocalEdgeStore::new(&engine);
+        let a = NodeId::from_raw(1);
+        let b = NodeId::from_raw(2);
+        store
+            .put_edge_temporal("E", a, b, 100, &props_with(1, 10))
+            .unwrap();
+        store
+            .put_edge_temporal("E", a, b, 200, &props_with(1, 20))
+            .unwrap();
+        store.delete_edge_temporal("E", a, b, 100).unwrap();
+        let versions = store.scan_edge_versions("E", a, b).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].0, 200);
+    }
+
+    #[test]
+    fn delete_temporal_is_idempotent() {
+        let (_dir, engine) = open_engine();
+        let store = LocalEdgeStore::new(&engine);
+        store
+            .delete_edge_temporal("E", NodeId::from_raw(1), NodeId::from_raw(2), 9999)
+            .expect("idempotent delete");
+    }
+
+    #[test]
+    fn temporal_writes_isolated_per_pair() {
+        let (_dir, engine) = open_engine();
+        let store = LocalEdgeStore::new(&engine);
+        let a = NodeId::from_raw(1);
+        let b = NodeId::from_raw(2);
+        let c = NodeId::from_raw(3);
+        store
+            .put_edge_temporal("E", a, b, 100, &props_with(1, 1))
+            .unwrap();
+        store
+            .put_edge_temporal("E", a, c, 200, &props_with(1, 2))
+            .unwrap();
+        let only_ab = store.scan_edge_versions("E", a, b).unwrap();
+        let only_ac = store.scan_edge_versions("E", a, c).unwrap();
+        assert_eq!(only_ab.len(), 1);
+        assert_eq!(only_ab[0].0, 100);
+        assert_eq!(only_ac.len(), 1);
+        assert_eq!(only_ac[0].0, 200);
+    }
+
+    #[test]
+    fn temporal_put_also_writes_adjacency() {
+        // A temporal edge must be visible in the neighbour scan — the
+        // adj merge runs as part of the temporal write.
+        let (_dir, engine) = open_engine();
+        let store = LocalEdgeStore::new(&engine);
+        let a = NodeId::from_raw(1);
+        let b = NodeId::from_raw(2);
+        store
+            .put_edge_temporal("E", a, b, 100, &props_with(1, 1))
+            .unwrap();
+        assert_eq!(store.scan_neighbors_out("E", a).unwrap(), vec![b]);
+        assert_eq!(store.scan_neighbors_in("E", b).unwrap(), vec![a]);
     }
 
     #[test]
