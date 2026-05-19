@@ -57,6 +57,21 @@ pub trait IndexStore {
 
     /// Remove a specific entry. Returns Ok even if the entry was
     /// already absent (matches storage tombstone semantics).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalIndexStore, IndexStore};
+    /// # use coordinode_core::graph::{node::NodeId, types::Value};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalIndexStore::new(&engine);
+    /// store.delete_entry("by_name", &[Value::String("alice".into())], NodeId::from_raw(1))?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn delete_entry(&self, name: &str, values: &[Value], node_id: NodeId) -> StoreResult<()>;
 
     /// Return all node ids whose entry has the exact given value(s).
@@ -83,6 +98,20 @@ pub trait IndexStore {
     /// reaper, index rebuild, count). For large indexes the caller
     /// should prefer a streaming form once Layer 4 grows one — for
     /// PR-scope simplicity this materialises into a `Vec`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalIndexStore, IndexStore};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalIndexStore::new(&engine);
+    /// let _all = store.scan_all("by_name")?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn scan_all(&self, name: &str) -> StoreResult<Vec<(Vec<u8>, NodeId)>>;
 }
 

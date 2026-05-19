@@ -76,10 +76,40 @@ pub trait SchemaStore {
     /// Symmetric to [`Self::load_label`]. Returns `None` for missing
     /// edge type OR for legacy zero-length idempotent existence
     /// markers (predates DDL revisioning).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalSchemaStore, SchemaStore};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalSchemaStore::new(&engine);
+    /// let _edge_type = store.load_edge_type("KNOWS")?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn load_edge_type(&self, name: &str) -> StoreResult<Option<EdgeTypeSchema>>;
 
     /// Persist an edge type schema as the current revision. Same
     /// atomicity contract as [`Self::save_label`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalSchemaStore, SchemaStore};
+    /// # use coordinode_core::schema::definition::EdgeTypeSchema;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalSchemaStore::new(&engine);
+    /// let schema = EdgeTypeSchema::new("KNOWS");
+    /// store.save_edge_type(&schema)?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn save_edge_type(&self, schema: &EdgeTypeSchema) -> StoreResult<()>;
 }
 

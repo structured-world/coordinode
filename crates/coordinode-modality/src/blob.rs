@@ -54,6 +54,25 @@ pub trait BlobStore {
 
     /// Persist many chunks atomically (single underlying batch).
     /// Useful when a new blob ref pulls in multiple new chunks.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalBlobStore, BlobStore};
+    /// # use coordinode_core::graph::blob::ChunkId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalBlobStore::new(&engine);
+    /// let chunks = vec![
+    ///     (ChunkId::from_data(b"a"), b"a".to_vec()),
+    ///     (ChunkId::from_data(b"b"), b"b".to_vec()),
+    /// ];
+    /// store.put_chunks(&chunks)?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn put_chunks(&self, chunks: &[(ChunkId, Vec<u8>)]) -> StoreResult<()>;
 
     /// Fetch a chunk by content hash. Returns `None` if not stored
@@ -79,14 +98,60 @@ pub trait BlobStore {
 
     /// Persist the [`BlobRef`] for a (node, prop) pair. Overwrites any
     /// previous ref at the same key.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalBlobStore, BlobStore};
+    /// # use coordinode_core::graph::{blob::BlobRef, node::NodeId};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalBlobStore::new(&engine);
+    /// let blob_ref = BlobRef { total_size: 0, chunks: vec![] };
+    /// store.put_blob_ref(NodeId::from_raw(1), 0, &blob_ref)?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn put_blob_ref(&self, node_id: NodeId, prop_id: u32, blob_ref: &BlobRef) -> StoreResult<()>;
 
     /// Fetch the [`BlobRef`] for a (node, prop) pair.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalBlobStore, BlobStore};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalBlobStore::new(&engine);
+    /// let _ref = store.get_blob_ref(NodeId::from_raw(1), 0)?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn get_blob_ref(&self, node_id: NodeId, prop_id: u32) -> StoreResult<Option<BlobRef>>;
 
     /// Remove the [`BlobRef`] for a (node, prop) pair. Chunks remain
     /// in [`Partition::Blob`] — orphan chunks are reclaimed by the
     /// Layer 3 GC sweep.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalBlobStore, BlobStore};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalBlobStore::new(&engine);
+    /// store.delete_blob_ref(NodeId::from_raw(1), 0)?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn delete_blob_ref(&self, node_id: NodeId, prop_id: u32) -> StoreResult<()>;
 }
 

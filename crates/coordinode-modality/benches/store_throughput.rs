@@ -8,15 +8,21 @@
 
 #![allow(clippy::unwrap_used)]
 
+use coordinode_core::graph::blob::ChunkId;
+use coordinode_core::graph::doc_delta::PathTarget;
 use coordinode_core::graph::node::{NodeId, NodeRecord};
+use coordinode_core::graph::types::Value;
 use coordinode_modality::{
-    Bbox, Crs, EdgeStore, LocalEdgeStore, LocalNodeStore, LocalSpatialStore, LocalVectorStore,
-    NodeStore, Point, SpatialStore, VectorStore,
+    Bbox, BlobStore, Bucket, Crs, DocumentStore, EdgeStore, IndexStore, LocalBlobStore,
+    LocalDocumentStore, LocalEdgeStore, LocalIndexStore, LocalNodeStore, LocalSpatialStore,
+    LocalTimeSeriesStore, LocalVectorStore, Measurement, NodeStore, Point, SpatialStore,
+    TimeSeriesStore, VectorStore,
 };
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_vector::hnsw::HnswConfig;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::collections::BTreeMap;
 use tempfile::TempDir;
 
 fn mk_engine() -> (TempDir, StorageEngine) {
@@ -140,11 +146,106 @@ fn bench_spatial_bbox(c: &mut Criterion) {
     group.finish();
 }
 
+/// Index throughput: single-column put + exact lookup.
+fn bench_index_put_scan(c: &mut Criterion) {
+    let mut group = c.benchmark_group("index_put_then_scan_exact");
+    group.sample_size(10);
+    for &n in &[100usize, 1000, 10_000] {
+        let (_dir, engine) = mk_engine();
+        let store = LocalIndexStore::new(&engine);
+        for i in 0..n as u64 {
+            store
+                .put_entry("by_id", &[Value::Int(i as i64)], NodeId::from_raw(i))
+                .unwrap();
+        }
+        let probe = (n / 2) as i64;
+        group.bench_with_input(BenchmarkId::from_parameter(n), &probe, |b, p| {
+            b.iter(|| store.scan_exact("by_id", &[Value::Int(*p)]).unwrap())
+        });
+    }
+    group.finish();
+}
+
+/// Document merge throughput: set_path delta on cold node.
+fn bench_document_set_path(c: &mut Criterion) {
+    let mut group = c.benchmark_group("document_set_path");
+    group.sample_size(20);
+    let (_dir, engine) = mk_engine();
+    let docs = LocalDocumentStore::new(&engine);
+    let nodes = LocalNodeStore::new(&engine);
+    nodes
+        .put(0, NodeId::from_raw(1), &NodeRecord::new("L"))
+        .unwrap();
+    group.bench_function("single_set_path", |b| {
+        let mut i = 0u64;
+        b.iter(|| {
+            docs.set_path(
+                0,
+                NodeId::from_raw(1),
+                PathTarget::Extra,
+                vec![format!("k{i}")],
+                rmpv::Value::Integer((i as i64).into()),
+            )
+            .unwrap();
+            i = i.wrapping_add(1);
+        });
+    });
+    group.finish();
+}
+
+/// TimeSeries bucket put + get round-trip.
+fn bench_timeseries_bucket(c: &mut Criterion) {
+    let mut group = c.benchmark_group("timeseries_bucket_round_trip");
+    group.sample_size(10);
+    for &n in &[10usize, 100, 1000] {
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let mut measurements = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut fields = BTreeMap::new();
+            fields.insert("v".into(), i as f64);
+            measurements.push(Measurement {
+                timestamp_us: i as i64 * 1000,
+                fields,
+            });
+        }
+        let bucket = Bucket::from_measurements(rmpv::Value::Nil, measurements);
+        store.put_bucket(0, NodeId::from_raw(1), &bucket).unwrap();
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| store.get_bucket(0, NodeId::from_raw(1)).unwrap())
+        });
+    }
+    group.finish();
+}
+
+/// Blob chunk round-trip at varying payload sizes.
+fn bench_blob_chunk(c: &mut Criterion) {
+    let mut group = c.benchmark_group("blob_chunk_round_trip");
+    group.sample_size(20);
+    for &n in &[1024usize, 8 * 1024, 64 * 1024] {
+        let (_dir, engine) = mk_engine();
+        let store = LocalBlobStore::new(&engine);
+        let payload = vec![0xab_u8; n];
+        let id = ChunkId::from_data(&payload);
+        store.put_chunk(&id, &payload).unwrap();
+        group.throughput(Throughput::Bytes(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| store.get_chunk(&id).unwrap())
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_node_put,
     bench_edge_scan,
     bench_vector_knn,
-    bench_spatial_bbox
+    bench_spatial_bbox,
+    bench_index_put_scan,
+    bench_document_set_path,
+    bench_timeseries_bucket,
+    bench_blob_chunk
 );
 criterion_main!(benches);

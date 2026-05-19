@@ -78,6 +78,22 @@ pub trait DocumentStore {
     ) -> StoreResult<()>;
 
     /// Delete a value at a dotted path. Idempotent on missing path.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalDocumentStore, DocumentStore};
+    /// # use coordinode_core::graph::{doc_delta::PathTarget, node::NodeId};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalDocumentStore::new(&engine);
+    /// store.delete_path(0, NodeId::from_raw(1), PathTarget::Extra,
+    ///                   vec!["a".into(), "b".into()])?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn delete_path(
         &self,
         shard_id: u16,
@@ -118,6 +134,23 @@ pub trait DocumentStore {
 
     /// Remove the first occurrence of a value from an array at path.
     /// Idempotent.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalDocumentStore, DocumentStore};
+    /// # use coordinode_core::graph::{doc_delta::PathTarget, node::NodeId};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalDocumentStore::new(&engine);
+    /// store.array_pull(0, NodeId::from_raw(1), PathTarget::Extra,
+    ///                  vec!["tags".into()],
+    ///                  rmpv::Value::String("rust".into()))?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn array_pull(
         &self,
         shard_id: u16,
@@ -128,6 +161,23 @@ pub trait DocumentStore {
     ) -> StoreResult<()>;
 
     /// Add value to array only if not already present.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalDocumentStore, DocumentStore};
+    /// # use coordinode_core::graph::{doc_delta::PathTarget, node::NodeId};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalDocumentStore::new(&engine);
+    /// store.array_add_to_set(0, NodeId::from_raw(1), PathTarget::Extra,
+    ///                        vec!["tags".into()],
+    ///                        rmpv::Value::String("rust".into()))?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn array_add_to_set(
         &self,
         shard_id: u16,
@@ -165,6 +215,21 @@ pub trait DocumentStore {
     /// Remove a top-level property from the node's record. For
     /// `PathTarget::Extra` the caller supplies the key; for
     /// `PathTarget::PropField(_)` the field id in the target is used.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalDocumentStore, DocumentStore};
+    /// # use coordinode_core::graph::{doc_delta::PathTarget, node::NodeId};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalDocumentStore::new(&engine);
+    /// store.remove_property(0, NodeId::from_raw(1), PathTarget::Extra, Some("name".into()))?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn remove_property(
         &self,
         shard_id: u16,

@@ -299,11 +299,41 @@ pub trait TimeSeriesStore {
     /// touch the overflow segment — use [`Self::compact_overflow`]
     /// (with an empty merged bucket) or call this *after* draining
     /// overflow.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalTimeSeriesStore, TimeSeriesStore};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalTimeSeriesStore::new(&engine);
+    /// store.delete_bucket(0, NodeId::from_raw(1))?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn delete_bucket(&self, shard_id: u16, bucket_id: NodeId) -> StoreResult<()>;
 
     /// Mark the bucket closed by updating its control block in place.
     /// Reads `bucket`, sets `control.closed = true`, writes back.
     /// Returns `false` if no bucket exists at that key.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalTimeSeriesStore, TimeSeriesStore};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalTimeSeriesStore::new(&engine);
+    /// let _ok = store.mark_closed(0, NodeId::from_raw(1))?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn mark_closed(&self, shard_id: u16, bucket_id: NodeId) -> StoreResult<bool>;
 
     /// Re-open a previously closed bucket so the catalog's late-arrival
@@ -317,6 +347,21 @@ pub trait TimeSeriesStore {
     /// against the same bucket key must serialise at the catalog
     /// layer above. CAS-equivalent atomicity is enforced because the
     /// engine is single-writer-per-key.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalTimeSeriesStore, TimeSeriesStore};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalTimeSeriesStore::new(&engine);
+    /// let _ok = store.reopen_bucket(0, NodeId::from_raw(1))?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn reopen_bucket(&self, shard_id: u16, bucket_id: NodeId) -> StoreResult<bool>;
 
     /// Append one late measurement to the overflow segment under
@@ -351,12 +396,43 @@ pub trait TimeSeriesStore {
     ) -> StoreResult<()>;
 
     /// All overflow entries for one bucket, in arrival_seqno order.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalTimeSeriesStore, TimeSeriesStore};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalTimeSeriesStore::new(&engine);
+    /// let _entries = store.scan_overflow(7, NodeId::from_raw(1))?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn scan_overflow(&self, label_id: u32, bucket_id: NodeId) -> StoreResult<Vec<OverflowEntry>>;
 
     /// Atomic compact: write the merged base bucket and tombstone
     /// every overflow key currently visible. The two writes land in
     /// one [`WriteBatch`] so a crash cannot leave overflow visible
     /// against an already-rewritten base.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalTimeSeriesStore, TimeSeriesStore, Bucket};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalTimeSeriesStore::new(&engine);
+    /// let merged = Bucket::from_measurements(rmpv::Value::Nil, vec![]);
+    /// store.compact_overflow(0, 7, NodeId::from_raw(1), &merged, &[1, 2])?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn compact_overflow(
         &self,
         shard_id: u16,

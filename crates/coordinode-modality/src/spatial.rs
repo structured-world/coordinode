@@ -175,6 +175,22 @@ pub trait SpatialStore {
 
     /// Remove the entry for `node_id` previously written with `point`.
     /// Idempotent on a missing key.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalSpatialStore, SpatialStore, Crs, Point};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalSpatialStore::new(&engine);
+    /// let p = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
+    /// store.delete(1, NodeId::from_raw(1), &p)?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn delete(&self, label_id: u32, node_id: NodeId, point: &Point) -> StoreResult<()>;
 
     /// Range-scan candidates whose curve key falls inside the
