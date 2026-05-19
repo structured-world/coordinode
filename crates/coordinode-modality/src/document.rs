@@ -398,6 +398,216 @@ mod tests {
         nodes.get(0, id).expect("ok").expect("Some");
     }
 
+    fn read_array_len(rec: &coordinode_core::graph::node::NodeRecord, key: &str) -> usize {
+        let v = rec.get_extra(key).expect("key present");
+        match v {
+            Value::Document(rmpv::Value::Array(arr)) => arr.len(),
+            Value::Array(arr) => arr.len(),
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    fn read_numeric(rec: &coordinode_core::graph::node::NodeRecord, key: &str) -> f64 {
+        let v = rec.get_extra(key).expect("key present");
+        match v {
+            Value::Document(rmpv::Value::F64(f)) => *f,
+            Value::Document(rmpv::Value::Integer(i)) => {
+                i.as_f64().expect("integer convertible to f64")
+            }
+            Value::Float(f) => *f,
+            Value::Int(i) => *i as f64,
+            other => panic!("expected numeric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_push_creates_array_if_missing() {
+        let (_dir, engine) = open_engine();
+        let nodes = LocalNodeStore::new(&engine);
+        let id = NodeId::from_raw(20);
+        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+
+        let docs = LocalDocumentStore::new(&engine);
+        docs.array_push(
+            0,
+            id,
+            PathTarget::Extra,
+            vec!["scores".to_string()],
+            rmpv::Value::F64(42.0),
+        )
+        .expect("push");
+
+        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        assert_eq!(read_array_len(&rec, "scores"), 1);
+    }
+
+    #[test]
+    fn array_push_appends_in_order() {
+        let (_dir, engine) = open_engine();
+        let nodes = LocalNodeStore::new(&engine);
+        let id = NodeId::from_raw(21);
+        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+
+        let docs = LocalDocumentStore::new(&engine);
+        for v in [1.0, 2.0, 3.0] {
+            docs.array_push(
+                0,
+                id,
+                PathTarget::Extra,
+                vec!["xs".to_string()],
+                rmpv::Value::F64(v),
+            )
+            .expect("push");
+        }
+        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        assert_eq!(read_array_len(&rec, "xs"), 3);
+    }
+
+    #[test]
+    fn array_pull_missing_value_is_noop() {
+        // Seed an array, pull a value not in it — array unchanged.
+        let (_dir, engine) = open_engine();
+        let nodes = LocalNodeStore::new(&engine);
+        let id = NodeId::from_raw(22);
+        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+
+        let docs = LocalDocumentStore::new(&engine);
+        docs.array_push(
+            0,
+            id,
+            PathTarget::Extra,
+            vec!["tags".to_string()],
+            rmpv::Value::String("a".into()),
+        )
+        .expect("seed");
+        docs.array_pull(
+            0,
+            id,
+            PathTarget::Extra,
+            vec!["tags".to_string()],
+            rmpv::Value::String("not-there".into()),
+        )
+        .expect("pull");
+        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        assert_eq!(read_array_len(&rec, "tags"), 1);
+    }
+
+    #[test]
+    fn array_pull_missing_path_is_noop() {
+        let (_dir, engine) = open_engine();
+        let nodes = LocalNodeStore::new(&engine);
+        let id = NodeId::from_raw(23);
+        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+
+        let docs = LocalDocumentStore::new(&engine);
+        docs.array_pull(
+            0,
+            id,
+            PathTarget::Extra,
+            vec!["never".to_string()],
+            rmpv::Value::String("x".into()),
+        )
+        .expect("pull missing");
+        // Node still readable.
+        nodes.get(0, id).expect("ok").expect("Some");
+    }
+
+    #[test]
+    fn increment_accepts_negative_delta() {
+        let (_dir, engine) = open_engine();
+        let nodes = LocalNodeStore::new(&engine);
+        let id = NodeId::from_raw(24);
+        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+
+        let docs = LocalDocumentStore::new(&engine);
+        docs.increment(0, id, PathTarget::Extra, vec!["v".to_string()], 10.0)
+            .expect("inc up");
+        docs.increment(0, id, PathTarget::Extra, vec!["v".to_string()], -3.5)
+            .expect("inc down");
+        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        assert!((read_numeric(&rec, "v") - 6.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn increment_creates_value_if_missing() {
+        let (_dir, engine) = open_engine();
+        let nodes = LocalNodeStore::new(&engine);
+        let id = NodeId::from_raw(25);
+        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+
+        let docs = LocalDocumentStore::new(&engine);
+        // No prior value — increment from scratch lands at delta.
+        docs.increment(0, id, PathTarget::Extra, vec!["fresh".to_string()], 7.0)
+            .expect("inc");
+        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        assert!((read_numeric(&rec, "fresh") - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn remove_property_missing_is_idempotent() {
+        let (_dir, engine) = open_engine();
+        let nodes = LocalNodeStore::new(&engine);
+        let id = NodeId::from_raw(26);
+        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+
+        let docs = LocalDocumentStore::new(&engine);
+        docs.remove_property(0, id, PathTarget::Extra, Some("never".to_string()))
+            .expect("remove missing");
+        nodes.get(0, id).expect("ok").expect("Some");
+    }
+
+    #[test]
+    fn set_path_deep_nesting_creates_intermediates() {
+        // Four-level nested path on an empty Extra — every
+        // intermediate map must be created so the leaf set lands.
+        let (_dir, engine) = open_engine();
+        let nodes = LocalNodeStore::new(&engine);
+        let id = NodeId::from_raw(27);
+        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+
+        let docs = LocalDocumentStore::new(&engine);
+        docs.set_path(
+            0,
+            id,
+            PathTarget::Extra,
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
+            rmpv::Value::String("deep".into()),
+        )
+        .expect("set deep");
+
+        fn descend<'a>(map: &'a rmpv::Value, key: &str) -> &'a rmpv::Value {
+            let rmpv::Value::Map(pairs) = map else {
+                panic!("expected Map descending at {key}, got {map:?}");
+            };
+            pairs
+                .iter()
+                .find_map(|(k, v)| match k {
+                    rmpv::Value::String(s) if s.as_str() == Some(key) => Some(v),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("key {key} missing"))
+        }
+
+        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        let a = rec.get_extra("a").expect("a present");
+        let a_inner = match a {
+            Value::Document(m) => m,
+            other => panic!("expected Document at a, got {other:?}"),
+        };
+        let b = descend(a_inner, "b");
+        let c = descend(b, "c");
+        let d = descend(c, "d");
+        match d {
+            rmpv::Value::String(s) => assert_eq!(s.as_str(), Some("deep")),
+            other => panic!("expected String at d, got {other:?}"),
+        }
+    }
+
     /// ArrayAddToSet dedups — adding the same value twice yields a
     /// single-element array.
     #[test]
