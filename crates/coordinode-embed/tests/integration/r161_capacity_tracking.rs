@@ -14,6 +14,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use coordinode_storage::engine::batch::WriteBatch;
 use coordinode_storage::engine::capacity::CapacitySeverity;
 use coordinode_storage::engine::config::{
     Durability, EndpointConfig, HardLimitStrategy, Media, StorageConfig, Tier,
@@ -761,4 +762,417 @@ fn endpoint_without_hard_limit_never_alerts() {
     engine
         .put(Partition::Node, b"node:0:no-limit", b"v")
         .expect("unlimited endpoint accepts writes indefinitely");
+}
+
+/// Multi-endpoint capacity tracking: each endpoint's `used_bytes` is
+/// computed independently from its own `tables/` directories, and
+/// severity / `is_writable` transitions on one endpoint do NOT affect
+/// any other endpoint's state. Production CE+EE tier deployments
+/// rely on this — the scanner must report per-endpoint state, never
+/// aggregate.
+#[test]
+fn multi_endpoint_tracking_is_independent_per_endpoint() {
+    let hot = TempDir::new().expect("hot tempdir");
+    let warm = TempDir::new().expect("warm tempdir");
+    let cold = TempDir::new().expect("cold tempdir");
+
+    // Three endpoints, three different hard_limits. Default routing
+    // places L0-L1 on Hot (the first endpoint), L2-L3 on Warm,
+    // L4-L6 on Cold. We will force data through compaction so all
+    // three tiers receive bytes, then assert each endpoint's tracker
+    // is updated independently.
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "ep-hot",
+            hot.path(),
+            Media::Nvme,
+            Durability::Durable,
+            Tier::Hot,
+        )
+        .with_hard_limit_bytes(1_000_000_000),
+        EndpointConfig::new(
+            "ep-warm",
+            warm.path(),
+            Media::Ssd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(2_000_000_000),
+        EndpointConfig::new(
+            "ep-cold",
+            cold.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Cold,
+        )
+        .with_hard_limit_bytes(10_000_000_000),
+    ]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    // Write + persist + major-compact to populate L0 and L4+ levels.
+    for i in 0..500u32 {
+        let key = format!("node:0:{i:010}");
+        engine
+            .put(Partition::Node, key.as_bytes(), b"payload-bytes")
+            .expect("put");
+    }
+    engine.persist().expect("persist");
+    engine
+        .major_compact(Partition::Node)
+        .expect("major compact");
+    engine.refresh_capacity();
+
+    // Each endpoint must have an independent tracker entry.
+    let hot_usage = engine.capacity().get("ep-hot").expect("hot tracked");
+    let warm_usage = engine.capacity().get("ep-warm").expect("warm tracked");
+    let cold_usage = engine.capacity().get("ep-cold").expect("cold tracked");
+
+    // hard_limit_bytes preserved per-endpoint.
+    assert_eq!(hot_usage.hard_limit_bytes, 1_000_000_000);
+    assert_eq!(warm_usage.hard_limit_bytes, 2_000_000_000);
+    assert_eq!(cold_usage.hard_limit_bytes, 10_000_000_000);
+
+    // Cold gets the bottom-level SSTs after major compaction → its
+    // tracker MUST report > 0 used_bytes. Hot keeps the partition
+    // manifest, so it also reports > 0 (manifest bytes).
+    assert!(
+        cold_usage.used() > 0,
+        "cold endpoint must hold bottom-level SSTs after major_compact, got 0",
+    );
+    assert!(
+        hot_usage.used() > 0,
+        "hot endpoint must hold the partition manifest, got 0",
+    );
+
+    // All three are well under their limits, so severity stays Normal
+    // independently — no endpoint's severity is "inherited" from
+    // another.
+    assert_eq!(hot_usage.severity(), CapacitySeverity::Normal);
+    assert_eq!(warm_usage.severity(), CapacitySeverity::Normal);
+    assert_eq!(cold_usage.severity(), CapacitySeverity::Normal);
+    assert!(hot_usage.is_writable());
+    assert!(warm_usage.is_writable());
+    assert!(cold_usage.is_writable());
+}
+
+/// Multi-endpoint scenario: filling ONE endpoint past 100% MUST NOT
+/// flip `is_writable` on any other endpoint, and MUST NOT trigger
+/// auto-cascade for an endpoint that is itself not in Emergency.
+/// Pins per-endpoint isolation of state transitions.
+#[test]
+fn multi_endpoint_full_state_does_not_leak_across_endpoints() {
+    let hot = TempDir::new().expect("hot tempdir");
+    let cold = TempDir::new().expect("cold tempdir");
+
+    let config = StorageConfig::with_endpoints(vec![
+        // Tiny Hot limit so it fills.
+        EndpointConfig::new(
+            "ep-hot",
+            hot.path(),
+            Media::Nvme,
+            Durability::Durable,
+            Tier::Hot,
+        )
+        .with_hard_limit_bytes(4096),
+        // Huge Cold limit so it stays Normal.
+        EndpointConfig::new(
+            "ep-cold",
+            cold.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Cold,
+        )
+        .with_hard_limit_bytes(10_000_000_000),
+    ]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    for i in 0..500u32 {
+        let key = format!("node:0:{i:010}");
+        let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
+    }
+    engine.persist().expect("persist");
+    engine.refresh_capacity();
+
+    let hot_usage = engine.capacity().get("ep-hot").expect("tracked");
+    let cold_usage = engine.capacity().get("ep-cold").expect("tracked");
+
+    // Hot is Full (writes exceeded 4 KB easily).
+    assert_eq!(hot_usage.severity(), CapacitySeverity::Full);
+    assert!(!hot_usage.is_writable());
+    // Cold is well under its 10 GB limit — Normal, writable.
+    assert_eq!(cold_usage.severity(), CapacitySeverity::Normal);
+    assert!(
+        cold_usage.is_writable(),
+        "cold endpoint must NOT inherit Hot's Full state — \
+         per-endpoint state tracking",
+    );
+}
+
+/// DOWN-crossing severity (Full → Normal after recovery) MUST NOT
+/// increment `endpoint_threshold_alerts_total`. The counter measures
+/// "alerts went off", not "severity changed in either direction".
+/// Pins the asymmetric semantics of the alert counter.
+#[test]
+fn down_crossing_severity_does_not_increment_alert_counter() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "ep",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )
+    .with_hard_limit_bytes(4096)]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    // Phase 1: write to Full (UP-crossing increments counter).
+    for i in 0..500u32 {
+        let key = format!("node:0:{i:010}");
+        let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
+    }
+    engine.persist().expect("persist");
+    engine.refresh_capacity();
+    let usage = engine.capacity().get("ep").expect("tracked");
+    assert_eq!(usage.severity(), CapacitySeverity::Full);
+
+    // Phase 2: install a fresh recorder, then delete SSTs +
+    // refresh — the DOWN-crossing back to Normal must NOT increment
+    // the alert counter.
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        let tables = dir.path().join(Partition::Node.name()).join("tables");
+        for entry in std::fs::read_dir(&tables).expect("tables") {
+            let p = entry.expect("entry").path();
+            if p.is_file() {
+                std::fs::remove_file(p).expect("remove SST");
+            }
+        }
+        engine.refresh_capacity();
+    });
+
+    // Severity must now be Normal (the DOWN-crossing happened
+    // inside the recorder scope).
+    let usage = engine.capacity().get("ep").expect("tracked");
+    assert_eq!(
+        usage.severity(),
+        CapacitySeverity::Normal,
+        "deletion + refresh must drop severity back to Normal",
+    );
+    assert!(
+        usage.is_writable(),
+        "DOWN-crossing also flips is_writable back on"
+    );
+
+    // No alert counter increments captured during the DOWN-crossing
+    // refresh. The recorder only saw events from the second refresh
+    // call (where severity moved DOWN), so any
+    // `endpoint_threshold_alerts_total` increments here would be a
+    // bug.
+    let snapshot = snapshotter.snapshot();
+    for (key, _unit, _desc, value) in snapshot.into_vec() {
+        if key.key().name() == "endpoint_threshold_alerts_total" {
+            if let DebugValue::Counter(n) = value {
+                assert_eq!(
+                    n, 0,
+                    "DOWN-crossing must not increment the alert counter — \
+                     the counter records severity escalations only",
+                );
+            }
+        }
+    }
+}
+
+// ── Regression tests for hard-limit gate completeness ─────────────────
+//
+// The initial pre-write gate was wired only to `engine.put`. All three
+// remaining write paths (`engine.delete`, `engine.merge`,
+// `WriteBatch::commit`) were left ungated — writes through them would
+// succeed even on a Full endpoint, silently violating INV-D3. Each
+// test below MUST fail against the pre-fix code and pass after the
+// gate is propagated to every write path.
+
+/// `engine.delete` on a Full endpoint MUST reject with
+/// `CapacityExhausted`. A delete tombstone still consumes memtable
+/// bytes that will eventually flush to an SST — under INV-D3 the
+/// endpoint can't accept it.
+#[test]
+fn delete_on_full_endpoint_rejects() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "small",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )
+    .with_hard_limit_bytes(4096)]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    for i in 0..500u32 {
+        let key = format!("node:0:{i:010}");
+        let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
+    }
+    engine.persist().expect("persist");
+    engine.refresh_capacity();
+    let usage = engine.capacity().get("small").expect("tracked");
+    assert!(!usage.is_writable(), "endpoint must be full");
+
+    let result = engine.delete(Partition::Node, b"node:0:any-key");
+    assert!(
+        matches!(result, Err(StorageError::CapacityExhausted { .. })),
+        "delete on Full endpoint must reject with CapacityExhausted, got: {result:?}",
+    );
+}
+
+/// `engine.merge` on a Full endpoint MUST reject with
+/// `CapacityExhausted`. Merge operands accumulate in the memtable
+/// until compaction folds them — they are additive in storage cost.
+#[test]
+fn merge_on_full_endpoint_rejects() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "small",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )
+    .with_hard_limit_bytes(4096)]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    // Fill via the Adj partition (Adj is the canonical merge target —
+    // posting-list deltas via `engine.merge`).
+    for i in 0..500u32 {
+        let key = format!("adj:T:out:{i:010}");
+        let _ = engine.put(Partition::Adj, key.as_bytes(), b"payload-bytes");
+    }
+    engine.persist().expect("persist");
+    engine.refresh_capacity();
+    let usage = engine.capacity().get("small").expect("tracked");
+    assert!(!usage.is_writable(), "endpoint must be full");
+
+    let result = engine.merge(Partition::Adj, b"adj:T:out:42", &[0u8; 8]);
+    assert!(
+        matches!(result, Err(StorageError::CapacityExhausted { .. })),
+        "merge on Full endpoint must reject with CapacityExhausted, got: {result:?}",
+    );
+}
+
+/// `WriteBatch::commit` on a Full endpoint MUST reject — this is the
+/// primary write path used by Raft proposal apply, query runner, and
+/// most internal subsystems. The pre-write gate must fire here too,
+/// or the entire mechanism is bypassable by every actual writer.
+#[test]
+fn write_batch_commit_on_full_endpoint_rejects() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "small",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )
+    .with_hard_limit_bytes(4096)]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    for i in 0..500u32 {
+        let key = format!("node:0:{i:010}");
+        let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
+    }
+    engine.persist().expect("persist");
+    engine.refresh_capacity();
+    let usage = engine.capacity().get("small").expect("tracked");
+    assert!(!usage.is_writable(), "endpoint must be full");
+
+    let mut batch = WriteBatch::new(&engine);
+    batch.put(Partition::Node, b"node:0:batched", b"v");
+    let result = batch.commit();
+    assert!(
+        matches!(result, Err(StorageError::CapacityExhausted { .. })),
+        "WriteBatch::commit on Full endpoint must reject, got: {result:?}",
+    );
+}
+
+/// `WriteBatch` with mixed partitions: if ANY partition's L0 endpoint
+/// is Full, the entire commit MUST reject (atomicity — partial
+/// commits across partitions are not a thing in our model). Even if
+/// some partitions in the batch target a non-Full endpoint, the
+/// presence of a single Full-targeted mutation aborts the whole.
+#[test]
+fn write_batch_commit_rejects_when_any_partition_endpoint_full() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "small",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )
+    .with_hard_limit_bytes(4096)]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    for i in 0..500u32 {
+        let key = format!("node:0:{i:010}");
+        let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
+    }
+    engine.persist().expect("persist");
+    engine.refresh_capacity();
+    assert!(!engine.capacity().get("small").unwrap().is_writable());
+
+    let mut batch = WriteBatch::new(&engine);
+    // Schema is bypassed by the gate, so this mutation alone would
+    // succeed. Mixing it with a Node-targeted mutation must still
+    // abort because Node's L0 endpoint is Full.
+    batch.put(Partition::Schema, b"schema:label:Test", b"{}");
+    batch.put(Partition::Node, b"node:0:mixed", b"v");
+    let result = batch.commit();
+    assert!(
+        matches!(result, Err(StorageError::CapacityExhausted { .. })),
+        "mixed-partition batch with one Full-targeted mutation must reject, got: {result:?}",
+    );
+}
+
+/// Read paths MUST remain functional on a Full endpoint —
+/// `engine.get`, `prefix_scan` and friends MUST NOT consult the
+/// capacity gate. Operators need to be able to inspect data on a
+/// full endpoint to decide what to evict.
+#[test]
+fn reads_remain_functional_on_full_endpoint() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "small",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )
+    .with_hard_limit_bytes(4096)]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    for i in 0..500u32 {
+        let key = format!("node:0:{i:010}");
+        let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
+    }
+    engine.persist().expect("persist");
+    engine.refresh_capacity();
+    assert!(!engine.capacity().get("small").unwrap().is_writable());
+
+    // Point reads succeed.
+    let v = engine
+        .get(Partition::Node, b"node:0:0000000042")
+        .expect("get must work on Full endpoint");
+    assert!(v.is_some(), "key must still be readable");
+
+    // Prefix scans succeed.
+    let iter = engine
+        .prefix_scan(Partition::Node, b"node:0:")
+        .expect("prefix_scan must work on Full endpoint");
+    let count = iter.count();
+    assert!(
+        count > 0,
+        "prefix scan must return existing keys on Full endpoint",
+    );
 }
