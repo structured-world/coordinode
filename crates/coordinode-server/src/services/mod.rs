@@ -30,12 +30,41 @@ use tonic::Status;
 /// to `.map_err(|e| db_err_to_status("op", e))` so that capacity
 /// errors propagate as a typed `RESOURCE_EXHAUSTED` to the client.
 pub fn db_err_to_status(context: &str, err: DatabaseError) -> Status {
-    if let DatabaseError::Storage(ref inner) = err {
-        if matches!(inner, StorageError::CapacityExhausted { .. }) {
-            return capacity_exhausted_status(context, inner);
-        }
+    // Drill into both `Storage(...)` and `Execution(...)` variants —
+    // a capacity-exhausted write can surface through either path.
+    // Direct engine writes (e.g. blob upload) raise
+    // `DatabaseError::Storage(CapacityExhausted)`. Cypher writes go
+    // through the query executor's proposal pipeline, which lifts the
+    // `ProposalError::CapacityExhausted` into
+    // `ExecutionError::Storage(StorageError::CapacityExhausted)`, then
+    // gets wrapped as `DatabaseError::Execution(...)`. Both shapes must
+    // map to the same `RESOURCE_EXHAUSTED` Status.
+    if let Some(inner) = capacity_exhausted_inner(&err) {
+        return capacity_exhausted_status(context, inner);
     }
     Status::internal(format!("{context}: {err}"))
+}
+
+/// Locate a `StorageError::CapacityExhausted` anywhere in the
+/// `DatabaseError` tree. Returns the borrowed inner variant when
+/// found, `None` otherwise.
+fn capacity_exhausted_inner(err: &DatabaseError) -> Option<&StorageError> {
+    match err {
+        DatabaseError::Storage(s) if matches!(s, StorageError::CapacityExhausted { .. }) => Some(s),
+        DatabaseError::Execution(exec) => {
+            // `ExecutionError::Storage(StorageError)` is the carry
+            // path from the proposal pipeline mapping in the
+            // executor. Pattern-match via the Display chain is
+            // fragile; use the typed accessor.
+            if let coordinode_query::executor::runner::ExecutionError::Storage(s) = exec {
+                if matches!(s, StorageError::CapacityExhausted { .. }) {
+                    return Some(s);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Same mapping for callers that hold a raw [`StorageError`] (no
