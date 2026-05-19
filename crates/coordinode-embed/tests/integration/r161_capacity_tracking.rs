@@ -1194,6 +1194,162 @@ fn reads_remain_functional_on_full_endpoint() {
     );
 }
 
+/// Compaction-driven recovery: write past the limit, fire
+/// `major_compact` (the real production path that reclaims space
+/// from stale MVCC versions, tombstones, and pre-compaction
+/// L0/L1 overlap), refresh, and assert writes RESUME automatically
+/// because `used_bytes` dropped back below `hard_limit_bytes`.
+///
+/// This is the canonical "I deleted a bunch of data and the engine
+/// keeps refusing my writes — why?" question. The answer: deletes
+/// produce tombstones which still occupy space; only compaction
+/// physically reclaims it. The capacity gate has to follow the
+/// post-compaction reality, not a synchronous accounting that
+/// confuses logical deletes with physical reclamation.
+#[test]
+fn writes_resume_after_compaction_frees_space() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "ep",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )
+    .with_hard_limit_bytes(40_000)]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    // Phase 1: bulk-write the SAME 100 keys 50 times. Each rewrite
+    // creates a new MVCC version of the same key; the engine keeps
+    // all 50 versions in SSTs until compaction folds them. This is
+    // the easy way to manufacture compaction-reclaimable space
+    // without depending on tombstones.
+    for round in 0..50u32 {
+        for i in 0..100u32 {
+            let key = format!("node:0:{i:010}");
+            let value = format!("round-{round}-payload-bytes-padding-padding");
+            let _ = engine.put(Partition::Node, key.as_bytes(), value.as_bytes());
+        }
+    }
+    engine.persist().expect("persist");
+    engine.refresh_capacity();
+    let usage = engine.capacity().get("ep").expect("tracked");
+    assert!(
+        !usage.is_writable(),
+        "endpoint must be full after rewrite barrage (used={})",
+        usage.used(),
+    );
+
+    // Subsequent put rejects.
+    let denied = engine.put(Partition::Node, b"node:0:while-full", b"x");
+    assert!(
+        matches!(denied, Err(StorageError::CapacityExhausted { .. })),
+        "writes must be gated while endpoint is Full",
+    );
+
+    // Phase 2: fire major compaction. It will fold every key down to
+    // its latest version, reclaiming the ~49× redundancy from
+    // Phase 1. After refresh, used_bytes drops back below the
+    // threshold and is_writable flips on.
+    engine
+        .major_compact(Partition::Node)
+        .expect("major compact");
+    engine.refresh_capacity();
+    let usage = engine.capacity().get("ep").expect("tracked");
+    assert!(
+        usage.is_writable(),
+        "writes must resume after compaction reclaims space \
+         (used={} <= hard_limit=40000)",
+        usage.used(),
+    );
+
+    // Phase 3: confirm the gate now accepts new writes.
+    engine
+        .put(Partition::Node, b"node:0:after-compact", b"v")
+        .expect("write must succeed after compaction recovery");
+}
+
+/// Cascade-eviction-driven recovery on a multi-tier config: the
+/// Hot endpoint fills past its limit, `cascade_evict_endpoint`
+/// fires (via the `CascadeEvict` strategy + emergency severity)
+/// to push bottom-level SSTs to the Cold endpoint, the Hot
+/// endpoint's `used_bytes` drops back below the threshold, and
+/// writes resume on partitions routed to Hot.
+///
+/// This is the canonical CE+EE flow for "Hot tier capacity event
+/// auto-recovers without operator intervention".
+#[test]
+fn writes_resume_after_cascade_eviction_frees_hot_endpoint() {
+    let hot = TempDir::new().expect("hot tempdir");
+    let cold = TempDir::new().expect("cold tempdir");
+
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "ep-hot",
+            hot.path(),
+            Media::Nvme,
+            Durability::Durable,
+            Tier::Hot,
+        )
+        .with_hard_limit_bytes(40_000)
+        .with_hard_limit_strategy(HardLimitStrategy::CascadeEvict),
+        EndpointConfig::new(
+            "ep-cold",
+            cold.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Cold,
+        ),
+    ]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    // Bulk write — same key set, many rewrites, plus diverse keys
+    // to give compaction enough material to push to bottom level.
+    for round in 0..30u32 {
+        for i in 0..200u32 {
+            let key = format!("node:0:{i:010}");
+            let value = format!("round-{round}-payload-bytes-padding");
+            let _ = engine.put(Partition::Node, key.as_bytes(), value.as_bytes());
+        }
+    }
+    engine.persist().expect("persist");
+    engine.refresh_capacity();
+    let usage = engine.capacity().get("ep-hot").expect("hot tracked");
+    assert!(
+        !usage.is_writable(),
+        "Hot endpoint must reach Full after bulk write \
+         (used={})",
+        usage.used(),
+    );
+
+    // `refresh_capacity` itself already fires the auto-cascade for
+    // `CascadeEvict` strategy at Emergency-or-Full severity — see
+    // run_capacity_refresh. The cascade calls major_compact, which
+    // pushes the bottom-level SSTs to the Cold endpoint via the
+    // per-LSM-level routing's L4+ → Cold mapping.
+
+    // Run a second refresh: the post-cascade SSTs should now be on
+    // Cold, freeing Hot.
+    engine.refresh_capacity();
+    let hot_usage = engine.capacity().get("ep-hot").expect("hot");
+    let cold_usage = engine.capacity().get("ep-cold").expect("cold");
+
+    // Hot endpoint MUST have dropped below its limit (cascade
+    // physically moved bytes off).
+    assert!(
+        hot_usage.is_writable(),
+        "Hot endpoint must auto-recover after cascade eviction \
+         (hot_used={}, cold_used={})",
+        hot_usage.used(),
+        cold_usage.used(),
+    );
+
+    // Subsequent put on Node (routed to Hot at L0) succeeds.
+    engine
+        .put(Partition::Node, b"node:0:after-cascade", b"v")
+        .expect("write must succeed after cascade-driven recovery");
+}
+
 /// Capacity scanner MUST count every on-disk file under the endpoint
 /// root, not just `<part>/tables/`. Engine-managed artefacts that
 /// live in sibling directories (WAL, oplog segments, tantivy FTS
