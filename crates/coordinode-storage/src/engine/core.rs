@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use coordinode_core::txn::proposal::Mutation;
@@ -21,6 +21,7 @@ use crate::engine::batch::WriteBatch;
 use crate::engine::compaction::CompactionScheduler;
 use crate::engine::config::EndpointConfig;
 use crate::engine::config::{FlushPolicy, StorageConfig};
+use crate::engine::coordinator::Coordinator;
 use crate::engine::flush::FlushManager;
 use crate::engine::partition::Partition;
 use crate::engine::routing::PartitionRouting;
@@ -82,17 +83,16 @@ pub struct StorageEngine {
     flush_manager: Option<FlushManager>,
     /// Background compaction worker pool. Dropped second (after flush, before trees).
     compaction_scheduler: Option<CompactionScheduler>,
-    trees: HashMap<Partition, lsm_tree::AnyTree>,
-    seqno: lsm_tree::SharedSequenceNumberGenerator,
-    cache: Arc<lsm_tree::Cache>,
+    /// Layer-3 multi-partition coordinator: owns the partition tree map,
+    /// shared seqno generator, block cache, and MVCC GC watermark. Every
+    /// partition-keyed read/write delegates here. See
+    /// [`crate::engine::coordinator`].
+    coordinator: Coordinator,
     flush_policy: FlushPolicy,
     /// Optional tiered block cache (DRAM → NVMe → SSD cascade).
     tiered_cache: Option<TieredCache>,
     /// Per-key access tracker for cache eviction and heat map.
     access_tracker: AccessTracker,
-    /// Shared GC watermark for the seqno-based retention compaction filter.
-    /// Versions with seqno <= this value are eligible for GC during compaction.
-    gc_watermark: Arc<AtomicU64>,
     /// Root data directory — exposed so subsystems (e.g. Raft oplog) can
     /// derive their own sub-directories without re-reading the config.
     data_dir: PathBuf,
@@ -471,16 +471,14 @@ impl StorageEngine {
             None
         };
 
+        let coordinator = Coordinator::new(trees, Arc::clone(&seqno), cache, gc_watermark);
         Ok(Self {
             flush_manager: Some(flush_manager),
             compaction_scheduler: Some(compaction_scheduler),
-            trees,
-            seqno: Arc::clone(&seqno),
-            cache,
+            coordinator,
             flush_policy: config.flush_policy,
             tiered_cache,
             access_tracker: AccessTracker::new(),
-            gc_watermark,
             data_dir: config.data_dir().to_path_buf(),
             endpoints: config.endpoints.clone(),
             capacity: capacity_arc,
@@ -492,11 +490,19 @@ impl StorageEngine {
 
     /// Get a tree handle by logical partition.
     pub fn tree(&self, part: Partition) -> StorageResult<&lsm_tree::AnyTree> {
-        self.trees
+        self.coordinator
+            .trees()
             .get(&part)
             .ok_or_else(|| StorageError::PartitionNotFound {
                 name: part.name().to_string(),
             })
+    }
+
+    /// Borrow the Layer-3 coordinator. R142a (`ReplicatedWriter`)
+    /// and R137a (`SeqnoConsumerRegistry`) plug in at this seam —
+    /// see [`Coordinator`] doc for the wire-in contract.
+    pub fn coordinator(&self) -> &Coordinator {
+        &self.coordinator
     }
 
     /// Root data directory for this engine.
@@ -560,7 +566,7 @@ impl StorageEngine {
     ///
     /// Used by [`WriteBatch`] to assign a single seqno to an entire batch.
     pub(crate) fn next_seqno(&self) -> lsm_tree::SeqNo {
-        self.seqno.next()
+        self.coordinator.next_seqno()
     }
 
     /// Update the GC watermark for the seqno-based retention filter.
@@ -568,7 +574,7 @@ impl StorageEngine {
     /// Versions with `seqno <= watermark` become eligible for removal
     /// during LSM compaction.
     pub fn set_gc_watermark(&self, watermark: u64) {
-        self.gc_watermark.store(watermark, Ordering::Release);
+        self.coordinator.set_gc_watermark(watermark);
     }
 
     /// Read a value by key from the given partition.
@@ -588,7 +594,7 @@ impl StorageEngine {
 
         // Fall through to LSM storage.
         let tree = self.tree(part)?;
-        let value = tree.get(key, self.seqno.get())?;
+        let value = tree.get(key, self.coordinator.current_seqno())?;
 
         match value {
             Some(v) => {
@@ -615,8 +621,7 @@ impl StorageEngine {
     /// or surface the error to the client.
     pub fn put(&self, part: Partition, key: &[u8], value: &[u8]) -> StorageResult<()> {
         self.check_partition_capacity(part)?;
-        let tree = self.tree(part)?;
-        tree.insert(key, value, self.seqno.next());
+        self.coordinator.put_no_capacity_check(part, key, value)?;
         if let Some(cache) = &self.tiered_cache {
             cache.remove(part, key);
         }
@@ -673,8 +678,8 @@ impl StorageEngine {
         run_capacity_refresh(
             &self.capacity,
             &self.endpoints,
-            &self.trees,
-            &self.seqno,
+            self.coordinator.trees(),
+            self.coordinator.seqno_generator(),
             |id| self.cascade_evict_endpoint(id),
         );
     }
@@ -688,8 +693,7 @@ impl StorageEngine {
     /// not by stuffing more tombstones onto a Full endpoint.
     pub fn delete(&self, part: Partition, key: &[u8]) -> StorageResult<()> {
         self.check_partition_capacity(part)?;
-        let tree = self.tree(part)?;
-        tree.remove(key, self.seqno.next());
+        self.coordinator.delete(part, key)?;
         if let Some(cache) = &self.tiered_cache {
             cache.remove(part, key);
         }
@@ -707,8 +711,8 @@ impl StorageEngine {
     /// Invalidates any cached entry for this key (stale after merge).
     pub fn merge(&self, part: Partition, key: &[u8], operand: &[u8]) -> StorageResult<()> {
         self.check_partition_capacity(part)?;
-        let tree = self.tree(part)?;
-        tree.merge(key, operand, self.seqno.next());
+        self.coordinator
+            .merge_no_capacity_check(part, key, operand)?;
         if let Some(cache) = &self.tiered_cache {
             cache.remove(part, key);
         }
@@ -742,7 +746,7 @@ impl StorageEngine {
     /// Check if a key exists in the given partition.
     pub fn contains_key(&self, part: Partition, key: &[u8]) -> StorageResult<bool> {
         let tree = self.tree(part)?;
-        let value = tree.get(key, self.seqno.get())?;
+        let value = tree.get(key, self.coordinator.current_seqno())?;
         Ok(value.is_some())
     }
 
@@ -794,7 +798,12 @@ impl StorageEngine {
     /// even when zero (the named endpoint may not host any partition's
     /// data).
     pub fn cascade_evict_endpoint(&self, endpoint_id: &str) -> StorageResult<CascadeReport> {
-        run_cascade_evict(&self.endpoints, &self.trees, &self.seqno, endpoint_id)
+        run_cascade_evict(
+            &self.endpoints,
+            self.coordinator.trees(),
+            self.coordinator.seqno_generator(),
+            endpoint_id,
+        )
     }
 
     /// Flushes the active memtable of every partition tree to an SST file.
@@ -805,7 +814,7 @@ impl StorageEngine {
     /// performed after the SST flush.  This keeps the WAL small: all data
     /// that was in the WAL is now in SST, so the journal can be truncated.
     pub fn persist(&self) -> StorageResult<()> {
-        for tree in self.trees.values() {
+        for tree in self.coordinator.trees().values() {
             tree.flush_active_memtable(0)?;
         }
         // Checkpoint WAL after successful SST flush.
@@ -847,7 +856,12 @@ impl StorageEngine {
 
     /// Get approximate disk space used by the engine in bytes.
     pub fn disk_space(&self) -> StorageResult<u64> {
-        Ok(self.trees.values().map(|t| t.disk_space()).sum())
+        Ok(self
+            .coordinator
+            .trees()
+            .values()
+            .map(|t| t.disk_space())
+            .sum())
     }
 
     /// Smallest "data durably on disk" watermark across partitions that
@@ -874,7 +888,8 @@ impl StorageEngine {
     /// the oplog is still the only way to reconstruct mutations sitting in
     /// some partition's memtable.
     pub fn min_partition_flushed_seqno(&self) -> u64 {
-        self.trees
+        self.coordinator
+            .trees()
             .values()
             .filter_map(|t| {
                 let highest = t.get_highest_seqno()?;
@@ -896,7 +911,7 @@ impl StorageEngine {
 
     /// Get the shared block cache.
     pub fn cache(&self) -> &Arc<lsm_tree::Cache> {
-        &self.cache
+        self.coordinator.cache()
     }
 
     /// Force a major compaction on a specific partition.
@@ -921,13 +936,13 @@ impl StorageEngine {
     /// to get `(UserKey, UserValue)`.
     pub fn prefix_scan(&self, part: Partition, prefix: &[u8]) -> StorageResult<StorageIter> {
         let tree = self.tree(part)?;
-        let seqno = self.seqno.get();
+        let seqno = self.coordinator.current_seqno();
         Ok(Box::new(tree.prefix(prefix, seqno, None)))
     }
 
     /// Scan key-value pairs visible at a specific sequence number.
     ///
-    /// Like [`prefix_scan`], but reads at an arbitrary point-in-time.
+    /// Like [`Self::prefix_scan`], but reads at an arbitrary point-in-time.
     /// Used by incremental snapshots to compare old vs current state.
     pub fn prefix_scan_at(
         &self,
@@ -959,7 +974,7 @@ impl StorageEngine {
     /// Returns the current LSM seqno. Reads with this seqno see all writes
     /// up to and including this point; later writes are invisible.
     pub fn snapshot(&self) -> lsm_tree::SeqNo {
-        self.seqno.get()
+        self.coordinator.snapshot()
     }
 
     /// Creates a point-in-time snapshot at a specific sequence number.
@@ -1257,7 +1272,7 @@ fn routing_key_for(partition: Partition) -> Vec<u8> {
 ///
 /// **Validation:** persisted routings are validated against the current
 /// `endpoints` list. If a previously-referenced endpoint id is missing,
-/// returns [`StorageError::Io`] wrapping a [`RoutingError::UnknownEndpoint`] —
+/// returns [`StorageError::Io`] wrapping a `RoutingError::UnknownEndpoint` —
 /// the operator removed an endpoint that still hosts SSTs, and continuing
 /// would orphan that data when lsm-tree's recovery scan misses it.
 ///
@@ -1342,7 +1357,7 @@ impl Drop for StorageEngine {
         drop(self.compaction_scheduler.take());
 
         // Step 3: best-effort final flush of any remaining active memtable data.
-        for tree in self.trees.values() {
+        for tree in self.coordinator.trees().values() {
             let _ = tree.flush_active_memtable(0);
         }
     }

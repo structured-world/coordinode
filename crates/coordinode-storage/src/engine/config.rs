@@ -723,8 +723,8 @@ impl StorageConfig {
     ///
     /// Kept as a convenience accessor for diagnostics and the single-
     /// endpoint case. Subsystems that need a specific endpoint per their
-    /// placement contract (WAL → [`select_wal_endpoint`], oplog →
-    /// [`select_oplog_endpoint`], partition trees → per-LSM-level
+    /// placement contract (WAL → [`Self::select_wal_endpoint`], oplog →
+    /// [`Self::select_oplog_endpoint`], partition trees → per-LSM-level
     /// routing) MUST use those methods rather than `data_dir`.
     pub fn data_dir(&self) -> &Path {
         // SAFETY: with_endpoints asserts non-empty.

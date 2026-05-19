@@ -149,7 +149,7 @@ impl<'a> WriteBatch<'a> {
     ///
     /// ## Parallel memtable writes
     ///
-    /// When the batch contains at least [`PARALLEL_THRESHOLD`] mutations that
+    /// When the batch contains at least `PARALLEL_THRESHOLD` mutations that
     /// target at least two distinct partitions, mutations are grouped by
     /// partition and each group is applied concurrently on a rayon thread.
     /// This is safe because:
