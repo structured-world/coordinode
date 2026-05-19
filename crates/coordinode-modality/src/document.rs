@@ -608,6 +608,171 @@ mod tests {
         }
     }
 
+    #[test]
+    fn delete_path_existing_path_removes_value() {
+        let (_dir, engine) = open_engine();
+        let nodes = LocalNodeStore::new(&engine);
+        let id = NodeId::from_raw(28);
+        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+
+        let docs = LocalDocumentStore::new(&engine);
+        docs.set_path(
+            0,
+            id,
+            PathTarget::Extra,
+            vec!["a".into(), "b".into()],
+            rmpv::Value::String("hello".into()),
+        )
+        .expect("set");
+        docs.delete_path(0, id, PathTarget::Extra, vec!["a".into(), "b".into()])
+            .expect("delete");
+
+        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        // After delete, "a" map exists but lacks "b" — or the whole
+        // "a" entry may be gone if it became empty. Either way, "b"
+        // must not be reachable.
+        if let Some(Value::Document(rmpv::Value::Map(pairs))) = rec.get_extra("a") {
+            let has_b = pairs
+                .iter()
+                .any(|(k, _)| matches!(k, rmpv::Value::String(s) if s.as_str() == Some("b")));
+            assert!(!has_b, "b must be gone after delete_path");
+        }
+    }
+
+    #[test]
+    fn array_pull_existing_value_removes_one() {
+        // Push 3 entries, pull one — array has 2 left.
+        let (_dir, engine) = open_engine();
+        let nodes = LocalNodeStore::new(&engine);
+        let id = NodeId::from_raw(29);
+        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+
+        let docs = LocalDocumentStore::new(&engine);
+        for s in ["a", "b", "c"] {
+            docs.array_push(
+                0,
+                id,
+                PathTarget::Extra,
+                vec!["tags".into()],
+                rmpv::Value::String(s.into()),
+            )
+            .expect("push");
+        }
+        docs.array_pull(
+            0,
+            id,
+            PathTarget::Extra,
+            vec!["tags".into()],
+            rmpv::Value::String("b".into()),
+        )
+        .expect("pull");
+
+        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        assert_eq!(read_array_len(&rec, "tags"), 2);
+    }
+
+    #[test]
+    fn remove_property_existing_property_clears_it() {
+        let (_dir, engine) = open_engine();
+        let nodes = LocalNodeStore::new(&engine);
+        let id = NodeId::from_raw(30);
+        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+
+        let docs = LocalDocumentStore::new(&engine);
+        docs.set_path(
+            0,
+            id,
+            PathTarget::Extra,
+            vec!["temp".into()],
+            rmpv::Value::String("v".into()),
+        )
+        .expect("seed");
+        docs.remove_property(0, id, PathTarget::Extra, Some("temp".into()))
+            .expect("remove");
+
+        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        assert!(
+            rec.get_extra("temp").is_none(),
+            "temp must be gone after remove_property",
+        );
+    }
+
+    #[test]
+    fn set_path_overwrites_leaf_with_different_type() {
+        // Set leaf as String, overwrite with Integer at same path —
+        // result reflects last write (DocDelta::SetPath replaces, not
+        // merges).
+        let (_dir, engine) = open_engine();
+        let nodes = LocalNodeStore::new(&engine);
+        let id = NodeId::from_raw(31);
+        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+
+        let docs = LocalDocumentStore::new(&engine);
+        docs.set_path(
+            0,
+            id,
+            PathTarget::Extra,
+            vec!["x".into()],
+            rmpv::Value::String("hello".into()),
+        )
+        .expect("set string");
+        docs.set_path(
+            0,
+            id,
+            PathTarget::Extra,
+            vec!["x".into()],
+            rmpv::Value::Integer(42.into()),
+        )
+        .expect("set int");
+
+        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        let v = rec.get_extra("x").expect("x present");
+        match v {
+            Value::Document(rmpv::Value::Integer(i)) => {
+                assert_eq!(i.as_i64(), Some(42));
+            }
+            Value::Int(i) => assert_eq!(*i, 42),
+            other => panic!("expected integer after overwrite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_path_on_propfield_target_uses_interned_id() {
+        // PathTarget::PropField(field_id) writes into the interned
+        // property map instead of `extra`. Visible through the
+        // typed accessor on NodeRecord.
+        let (_dir, engine) = open_engine();
+        let nodes = LocalNodeStore::new(&engine);
+        let id = NodeId::from_raw(32);
+        let mut base = NodeRecord::new("L");
+        base.set_extra("placeholder", Value::Int(0));
+        nodes.put(0, id, &base).expect("put");
+
+        let docs = LocalDocumentStore::new(&engine);
+        docs.set_path(
+            0,
+            id,
+            PathTarget::PropField(7),
+            Vec::new(), // top-level write at field 7
+            rmpv::Value::String("via_field".into()),
+        )
+        .expect("set propfield");
+
+        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        let v = rec
+            .props
+            .get(&7)
+            .unwrap_or_else(|| panic!("field 7 must be set; props={:?}", rec.props));
+        // Same shape question: rmpv vs raw — accept either.
+        match v {
+            Value::Document(rmpv::Value::String(s)) => {
+                assert_eq!(s.as_str(), Some("via_field"));
+            }
+            Value::String(s) => assert_eq!(s.as_str(), "via_field"),
+            other => panic!("expected string at field 7, got {other:?}"),
+        }
+    }
+
     /// ArrayAddToSet dedups — adding the same value twice yields a
     /// single-element array.
     #[test]

@@ -359,6 +359,62 @@ mod tests {
     }
 
     #[test]
+    fn put_temporal_same_valid_from_overwrites_body() {
+        // Two writes at the same (node_id, valid_from) land at the
+        // same key — second wins, no version explosion.
+        let (_dir, engine) = open_engine();
+        let store = LocalNodeStore::new(&engine);
+        let id = NodeId::from_raw(40);
+
+        let mut rec_v1 = rec("A");
+        rec_v1.set_extra("v", coordinode_core::graph::types::Value::Int(1));
+        let mut rec_v2 = rec("A");
+        rec_v2.set_extra("v", coordinode_core::graph::types::Value::Int(2));
+
+        store.put_temporal(0, id, 1000, &rec_v1).expect("v1");
+        store.put_temporal(0, id, 1000, &rec_v2).expect("v2");
+
+        let versions = store.scan_versions(0, id).expect("scan");
+        assert_eq!(versions.len(), 1, "same valid_from = one row");
+        assert_eq!(versions[0].0, 1000);
+        assert_eq!(
+            versions[0].1.get_extra("v"),
+            Some(&coordinode_core::graph::types::Value::Int(2)),
+        );
+    }
+
+    #[test]
+    fn scan_versions_on_empty_node_returns_empty() {
+        let (_dir, engine) = open_engine();
+        let store = LocalNodeStore::new(&engine);
+        let versions = store.scan_versions(0, NodeId::from_raw(999)).expect("ok");
+        assert!(versions.is_empty());
+    }
+
+    #[test]
+    fn get_at_boundary_i64_min_max() {
+        // Per ADR-027 valid_from_ms is i64. Test we can write at the
+        // extreme boundaries and the sortable encoding still works.
+        let (_dir, engine) = open_engine();
+        let store = LocalNodeStore::new(&engine);
+        let id = NodeId::from_raw(41);
+
+        store
+            .put_temporal(0, id, i64::MIN, &rec("min"))
+            .expect("min");
+        store
+            .put_temporal(0, id, i64::MAX, &rec("max"))
+            .expect("max");
+        let versions = store.scan_versions(0, id).expect("scan");
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].0, i64::MIN);
+        assert_eq!(versions[1].0, i64::MAX);
+        // Query at 0 picks the MIN-version (largest valid_from <= 0).
+        let active = store.get_at(0, id, 0).expect("ok").expect("Some");
+        assert_eq!(active.primary_label(), "min");
+    }
+
+    #[test]
     fn corrupt_node_bytes_surface_as_decode_error() {
         let (_dir, engine) = open_engine();
         let store = LocalNodeStore::new(&engine);
