@@ -24,7 +24,7 @@ use coordinode_core::schema::definition::{
 };
 use coordinode_core::schema::validation::validate_one;
 use coordinode_core::txn::proposal::{
-    Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline, RaftProposal,
+    Mutation, PartitionId, ProposalError, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_storage::engine::core::StorageEngine;
@@ -1161,13 +1161,11 @@ impl<'a> ExecutionContext<'a> {
                 let timeout = std::time::Duration::from_millis(u64::from(timeout_ms));
                 pipeline
                     .propose_with_timeout(&proposal, timeout)
-                    .map_err(|e| {
-                        ExecutionError::Serialization(format!("proposal pipeline error: {e}"))
-                    })?;
+                    .map_err(proposal_err_to_execution)?;
             } else {
-                pipeline.propose_and_wait(&proposal).map_err(|e| {
-                    ExecutionError::Serialization(format!("proposal pipeline error: {e}"))
-                })?;
+                pipeline
+                    .propose_and_wait(&proposal)
+                    .map_err(proposal_err_to_execution)?;
             }
         } else {
             // Legacy direct-write path (no pipeline configured).
@@ -13212,6 +13210,40 @@ fn execute_procedure_call(
     }
 
     Ok(rows)
+}
+
+/// Map a [`ProposalError`] from the proposal pipeline into an
+/// [`ExecutionError`] preserving the typed `CapacityExhausted`
+/// variant. Without this, the gRPC handler would see a generic
+/// `Internal` Status for a capacity-exhausted write rather than the
+/// gRPC-canonical `RESOURCE_EXHAUSTED` (and the operator-actionable
+/// `endpoint-id` / `used-bytes` / `hard-limit-bytes` metadata
+/// headers would never be set).
+///
+/// Maps:
+/// - `ProposalError::CapacityExhausted { .. }` →
+///   `ExecutionError::Storage(StorageError::CapacityExhausted { .. })`
+///   so the type survives the next `DatabaseError::Execution(...)`
+///   wrap. The server's `db_err_to_status` already drills into both
+///   `Storage` and `Execution` variants when resolving capacity.
+/// - Everything else → `ExecutionError::Serialization(...)` with the
+///   stringified pipeline error (legacy behaviour).
+fn proposal_err_to_execution(err: ProposalError) -> ExecutionError {
+    if let ProposalError::CapacityExhausted {
+        endpoint_id,
+        used_bytes,
+        hard_limit_bytes,
+    } = err
+    {
+        return ExecutionError::Storage(
+            coordinode_storage::error::StorageError::CapacityExhausted {
+                endpoint_id,
+                used_bytes,
+                hard_limit_bytes,
+            },
+        );
+    }
+    ExecutionError::Serialization(format!("proposal pipeline error: {err}"))
 }
 
 #[cfg(test)]

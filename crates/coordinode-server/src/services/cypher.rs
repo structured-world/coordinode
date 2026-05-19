@@ -129,21 +129,51 @@ fn convert_params(
 
 /// Convert a DatabaseError to a tonic Status.
 ///
-/// The `Storage` case delegates to
-/// [`crate::services::db_err_to_status`] so that
-/// `StorageError::CapacityExhausted` propagates as the gRPC-canonical
-/// `RESOURCE_EXHAUSTED` with structured `endpoint-id` / `used-bytes`
-/// / `hard-limit-bytes` metadata. Other storage errors fall through
-/// to `Internal`.
+/// Capacity-exhausted errors — whether they arrive as
+/// `DatabaseError::Storage(CapacityExhausted)` (direct engine write)
+/// or `DatabaseError::Execution(ExecutionError::Storage(CapacityExhausted))`
+/// (Cypher writes through the proposal pipeline) — delegate to
+/// [`crate::services::db_err_to_status`], which drills into both
+/// shapes and emits `Status::resource_exhausted` with structured
+/// metadata (`endpoint-id`, `used-bytes`, `hard-limit-bytes`).
+///
+/// Remaining variants keep their pre-existing categorisation:
+/// Parse/Semantic → `invalid_argument`; Plan/Execution/Storage(other)/Other
+/// → `internal`.
 fn db_error_to_status(err: DatabaseError) -> Status {
-    match err {
-        DatabaseError::Parse(e) => Status::invalid_argument(format!("Parse error: {e}")),
-        DatabaseError::Semantic(e) => Status::invalid_argument(format!("Semantic error: {e}")),
-        DatabaseError::Plan(e) => Status::internal(format!("Plan error: {e}")),
-        DatabaseError::Execution(e) => Status::internal(format!("Execution error: {e}")),
-        DatabaseError::Storage(_) => crate::services::db_err_to_status("Storage error", err),
-        DatabaseError::Other(e) => Status::internal(format!("Error: {e}")),
+    // Capacity-exhausted check FIRST — wins over the per-variant
+    // category mapping below. The helper drills into both
+    // `Storage(...)` and `Execution(Storage(...))` shapes; if it
+    // identifies a `CapacityExhausted` it returns `ResourceExhausted`
+    // with structured metadata. Otherwise it returns `Internal`,
+    // which we override with the legacy category-specific mapping.
+    let probe = crate::services::db_err_to_status("Cypher", err);
+    if probe.code() == tonic::Code::ResourceExhausted {
+        return probe;
     }
+    // Probe was Internal — re-classify by inspecting the message
+    // prefix (Display always emits `"<category> error: ..."` from the
+    // `thiserror` annotations on `DatabaseError`).
+    let msg = probe.message();
+    if let Some(rest) = msg.strip_prefix("Cypher: parse error: ") {
+        return Status::invalid_argument(format!("Parse error: {rest}"));
+    }
+    if let Some(rest) = msg.strip_prefix("Cypher: semantic error: ") {
+        return Status::invalid_argument(format!("Semantic error: {rest}"));
+    }
+    if let Some(rest) = msg.strip_prefix("Cypher: plan error: ") {
+        return Status::internal(format!("Plan error: {rest}"));
+    }
+    if let Some(rest) = msg.strip_prefix("Cypher: execution error: ") {
+        return Status::internal(format!("Execution error: {rest}"));
+    }
+    if let Some(rest) = msg.strip_prefix("Cypher: storage error: ") {
+        return Status::internal(format!("Storage error: {rest}"));
+    }
+    if let Some(rest) = msg.strip_prefix("Cypher: ") {
+        return Status::internal(format!("Error: {rest}"));
+    }
+    probe
 }
 
 /// Translate the proto `ReadConcernLevel` integer to the executor enum. The
@@ -1621,5 +1651,140 @@ mod tests {
             .expect("cache write should succeed");
         let stats = resp.into_inner().stats.expect("stats");
         assert_eq!(stats.nodes_created, 1);
+    }
+
+    /// End-to-end capacity propagation through the gRPC handler:
+    ///
+    /// Fill an endpoint past its `hard_limit_bytes`, refresh the
+    /// capacity tracker, then issue a CREATE query through
+    /// `CypherServiceImpl::execute_cypher`. The handler returns a
+    /// `tonic::Status` exactly as a gRPC client would observe over
+    /// the wire (the transport is transparent for `Status`
+    /// content). Assertions:
+    ///
+    /// - `Status::code() == Code::ResourceExhausted` (gRPC-canonical
+    ///   for capacity-exhausted writes; NOT `Internal`).
+    /// - `endpoint-id` metadata header carries the saturated
+    ///   endpoint's id so the client can match without scraping
+    ///   the message.
+    /// - `used-bytes` + `hard-limit-bytes` metadata headers carry
+    ///   the numeric snapshot for client-side rendering.
+    ///
+    /// Proves the chain
+    /// `StorageError::CapacityExhausted` →
+    /// `DatabaseError::Storage(...)` →
+    /// `db_err_to_status` → `Status::resource_exhausted` is intact
+    /// end-to-end at the handler boundary.
+    #[tokio::test]
+    async fn capacity_exhausted_surfaces_as_resource_exhausted_through_grpc_handler() {
+        use coordinode_query::advisor::nplus1::NPlus1Detector;
+        use coordinode_query::advisor::QueryRegistry;
+        use coordinode_storage::engine::config::{
+            Durability as Dur, EndpointConfig, Media, StorageConfig, Tier,
+        };
+        use coordinode_storage::engine::core::StorageEngine;
+        use coordinode_storage::engine::partition::Partition;
+        use tonic::Code;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Step 1: open the engine standalone with a tiny hard_limit so
+        // a modest write blows past the threshold. The capacity gate
+        // engages once `refresh_capacity` observes Full.
+        //
+        // Layered like `Database::open_with_oracle` would: build the
+        // engine first, then plant data, then wrap it as a Database
+        // via `from_engine`. Going through `Database::open` directly
+        // would lock us to `hard_limit_bytes = 0` (its default
+        // single-endpoint config).
+        let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+        let storage_config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "ep",
+            dir.path(),
+            Media::Hdd,
+            Dur::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(40_000)]);
+        let engine = std::sync::Arc::new(
+            StorageEngine::open_with_oracle(&storage_config, std::sync::Arc::clone(&oracle))
+                .expect("open engine with custom hard_limit"),
+        );
+
+        // Bulk-write to push past 40 KB on disk.
+        for i in 0..5000u32 {
+            let key = format!("node:0:{i:010}");
+            let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
+        }
+        engine.persist().expect("persist");
+        engine.refresh_capacity();
+        let usage = engine.capacity().get("ep").expect("tracked");
+        assert!(
+            !usage.is_writable(),
+            "endpoint must be Full after bulk write (used={})",
+            usage.used(),
+        );
+
+        // Step 2: wrap the saturated engine in a Database and stand
+        // up the gRPC service. No tonic transport — calling the
+        // handler method directly returns the same `tonic::Status`
+        // that a client would observe over the wire.
+        let pipeline: std::sync::Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
+            std::sync::Arc::new(coordinode_raft::proposal::OwnedLocalProposalPipeline::new(
+                &engine,
+            ));
+        let db = Database::from_engine(dir.path(), engine, oracle, pipeline).expect("from_engine");
+        let database = std::sync::Arc::new(std::sync::Mutex::new(db));
+        let registry = std::sync::Arc::new(QueryRegistry::new());
+        let detector = std::sync::Arc::new(NPlus1Detector::new());
+        let svc = CypherServiceImpl::new(
+            std::sync::Arc::clone(&database),
+            std::sync::Arc::clone(&registry),
+            std::sync::Arc::clone(&detector),
+        );
+
+        // Step 3: send a CREATE through the handler. Must surface as
+        // ResourceExhausted with structured metadata.
+        let result = svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "CREATE (n:GatedByCapacity)".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: None,
+                write_concern: None,
+            }))
+            .await;
+
+        let status = match result {
+            Err(s) => s,
+            Ok(_) => panic!("expected ResourceExhausted, got Ok"),
+        };
+        assert_eq!(
+            status.code(),
+            Code::ResourceExhausted,
+            "expected RESOURCE_EXHAUSTED (gRPC canonical for capacity), got: {:?} — message: {}",
+            status.code(),
+            status.message(),
+        );
+        let meta = status.metadata();
+        assert_eq!(
+            meta.get("endpoint-id").and_then(|v| v.to_str().ok()),
+            Some("ep"),
+            "endpoint-id metadata header must carry the saturated endpoint id",
+        );
+        assert!(
+            meta.get("used-bytes").is_some(),
+            "used-bytes metadata header must be set",
+        );
+        assert!(
+            meta.get("hard-limit-bytes").is_some(),
+            "hard-limit-bytes metadata header must be set",
+        );
+        let hard_limit = meta
+            .get("hard-limit-bytes")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .expect("hard-limit-bytes parses as u64");
+        assert_eq!(hard_limit, 40_000);
     }
 }
