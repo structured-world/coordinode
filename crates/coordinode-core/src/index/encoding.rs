@@ -4,7 +4,7 @@
 //! lexicographic byte comparison. This is critical for B-tree indexes
 //! stored in the LSM sorted keyspace.
 
-use coordinode_core::graph::types::Value;
+use crate::graph::types::Value;
 
 /// Type tag bytes for ordering: Null < Bool < Int < Float < String.
 const TAG_NULL: u8 = 0x00;

@@ -5,7 +5,6 @@
 
 pub mod build;
 pub mod definition;
-pub mod encoding;
 pub mod ops;
 pub mod registry;
 pub mod ttl;
