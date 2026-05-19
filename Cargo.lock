@@ -944,6 +944,7 @@ dependencies = [
  "coordinode-vector",
  "rmp-serde",
  "rmpv",
+ "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
