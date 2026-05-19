@@ -14,6 +14,7 @@
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::wal::{WalConfig, WalSyncPolicy};
 use tempfile::TempDir;
 
 /// With a three-tier endpoint config (Hot NVMe + Warm SSD + Cold HDD),
@@ -537,5 +538,166 @@ fn reopen_with_added_endpoint_preserves_routing() {
         !warm_tables_path.exists(),
         "added Warm endpoint must NOT receive any Node SSTs without an explicit rebalance \
          (persisted routing wins on reopen)",
+    );
+}
+
+/// WAL replay through a multi-tier config: write data via the standalone
+/// WAL (no SST flush), crash (drop engine), reopen, verify data survives.
+/// The replay path applies mutations to memtables and the next flush
+/// places SSTs per the persisted level routing — so the multi-tier
+/// distribution must compose cleanly with WAL recovery.
+#[test]
+fn wal_replay_through_multi_tier_routing() {
+    let hot = TempDir::new().expect("hot tempdir");
+    let warm = TempDir::new().expect("warm tempdir");
+    let cold = TempDir::new().expect("cold tempdir");
+
+    let make_config = || {
+        StorageConfig::with_endpoints(vec![
+            EndpointConfig::new(
+                "ep-hot",
+                hot.path(),
+                Media::Nvme,
+                Durability::Durable,
+                Tier::Hot,
+            ),
+            EndpointConfig::new(
+                "ep-warm",
+                warm.path(),
+                Media::Ssd,
+                Durability::Durable,
+                Tier::Warm,
+            ),
+            EndpointConfig::new(
+                "ep-cold",
+                cold.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Cold,
+            ),
+        ])
+    };
+    let wal_cfg = || WalConfig {
+        path: None,
+        sync: WalSyncPolicy::SyncPerRecord,
+    };
+
+    // Phase 1: open with WAL, write, drop without flush.
+    {
+        let engine =
+            StorageEngine::open_with_wal(&make_config(), Some(wal_cfg())).expect("first open");
+        engine
+            .put(Partition::Node, b"survives-multi-tier", b"replay-me")
+            .expect("write through WAL");
+        // Drop without persist — memtable NOT flushed, only the WAL
+        // record is on disk.
+    }
+
+    // Phase 2: reopen. WAL replay restores the memtable; the engine is
+    // operational with the routing persisted from Phase 1.
+    let engine =
+        StorageEngine::open_with_wal(&make_config(), Some(wal_cfg())).expect("reopen with replay");
+    let value = engine
+        .get(Partition::Node, b"survives-multi-tier")
+        .expect("get after replay")
+        .expect("key must survive WAL replay across the multi-tier topology");
+    assert_eq!(&value[..], b"replay-me");
+
+    // Force a flush so the replayed data hits SST. Major-compact pushes
+    // it to the bottom level which routes to the cold endpoint.
+    engine.persist().expect("persist");
+    engine
+        .major_compact(Partition::Node)
+        .expect("major compact");
+
+    let cold_tables = cold.path().join(Partition::Node.name()).join("tables");
+    assert!(
+        cold_tables.exists(),
+        "cold endpoint tables dir must exist after WAL replay + flush + compaction; \
+         multi-tier routing must compose with WAL replay path",
+    );
+    let cold_count = std::fs::read_dir(&cold_tables)
+        .expect("read cold dir")
+        .count();
+    assert!(
+        cold_count > 0,
+        "cold endpoint must hold the post-replay SST after major compaction, got {cold_count}",
+    );
+}
+
+/// Cascade-evicting the primary endpoint is operationally a no-op for
+/// data movement: the primary is the lsm-tree `Config.path` catch-all,
+/// and `to_level_routes` omits LevelRoutes pointing to the primary, so
+/// compaction has no cooler tier to push data into via level_routes.
+///
+/// The call still returns `Ok` and reports the partitions whose
+/// routing references the primary (every partition does — they all
+/// have a level routed to primary in any multi-endpoint config).
+/// Documents the edge case so operators understand "you cannot cascade
+/// off the primary endpoint without first promoting another endpoint
+/// to primary" — that promotion is a separate, future operator
+/// action.
+#[test]
+fn cascade_eviction_of_primary_endpoint_is_data_motion_noop() {
+    let hot = TempDir::new().expect("hot tempdir");
+    let cold = TempDir::new().expect("cold tempdir");
+
+    // ep-hot is FIRST → primary.
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "ep-hot",
+            hot.path(),
+            Media::Nvme,
+            Durability::Durable,
+            Tier::Hot,
+        ),
+        EndpointConfig::new(
+            "ep-cold",
+            cold.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Cold,
+        ),
+    ]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    // Write + persist + major-compact to populate the cold endpoint.
+    for i in 0..500u32 {
+        let k = format!("node:0:{i:010}");
+        engine
+            .put(Partition::Node, k.as_bytes(), b"v")
+            .expect("put");
+    }
+    engine.persist().expect("persist");
+    engine
+        .major_compact(Partition::Node)
+        .expect("initial major compact");
+
+    let cold_tables = cold.path().join(Partition::Node.name()).join("tables");
+    let cold_before = std::fs::read_dir(&cold_tables)
+        .expect("read cold dir")
+        .count();
+
+    // Cascade-evict the PRIMARY (ep-hot). The call succeeds and reports
+    // a compaction — but the cold endpoint's SST count does NOT
+    // increase further (data was already pushed by the initial
+    // major_compact, and there is no cooler tier below primary to
+    // demote to).
+    let report = engine
+        .cascade_evict_endpoint("ep-hot")
+        .expect("cascade evict primary succeeds");
+    assert!(
+        report.compacted_partitions > 0,
+        "every partition's routing references the primary, so cascade evicts each tree, got {}",
+        report.compacted_partitions,
+    );
+
+    let cold_after = std::fs::read_dir(&cold_tables)
+        .expect("read cold dir")
+        .count();
+    assert_eq!(
+        cold_after, cold_before,
+        "cascade-evicting the primary endpoint cannot move further data \
+         (level_routes already placed bottom-level data on cold; primary has no cooler peer in this topology)",
     );
 }
