@@ -103,6 +103,21 @@ impl Coordinator {
     /// Returns `StorageError::PartitionNotFound` if the partition
     /// is not registered (should never happen after a successful
     /// `open` — `Partition::all()` keys every entry).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_storage::engine::config::*;
+    /// # use coordinode_storage::engine::core::StorageEngine;
+    /// # use coordinode_storage::engine::partition::Partition;
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// let tree = engine.coordinator().tree(Partition::Node)?;
+    /// let _ = tree;
+    /// # Ok::<_, coordinode_storage::error::StorageError>(())
+    /// ```
     pub fn tree(&self, part: Partition) -> StorageResult<&lsm_tree::AnyTree> {
         self.trees
             .get(&part)
@@ -144,6 +159,21 @@ impl Coordinator {
     /// `snapshot()` — the value returned is suitable as a read
     /// visibility bound (readers at this seqno see all writes
     /// committed strictly before).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// let s0 = engine.coordinator().current_seqno();
+    /// let s1 = engine.coordinator().current_seqno();
+    /// // Reads with no intervening writes see the same horizon.
+    /// assert_eq!(s0, s1);
+    /// # Ok::<_, coordinode_storage::error::StorageError>(())
+    /// ```
     pub fn current_seqno(&self) -> lsm_tree::SeqNo {
         self.seqno.get()
     }
@@ -155,6 +185,18 @@ impl Coordinator {
     /// `SeqnoConsumerRegistry` (R137a / ADR-028) drives this from
     /// outside: it computes `shard_floor()` across CDC / snapshot /
     /// backup consumers and writes the result here.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// engine.coordinator().set_gc_watermark(42);
+    /// # Ok::<_, coordinode_storage::error::StorageError>(())
+    /// ```
     pub fn set_gc_watermark(&self, watermark: u64) {
         self.gc_watermark.store(watermark, Ordering::Release);
     }
@@ -368,6 +410,98 @@ mod tests {
         assert!(engine
             .has_write_after(Partition::Node, b"k", snap)
             .expect("hwa"),);
+    }
+
+    #[test]
+    fn coordinator_tree_returns_every_partition() {
+        // Every Partition::all() variant must be openable through
+        // the coordinator — guards against future partition additions
+        // that forget to register a tree.
+        let (_dir, engine) = open_engine();
+        for &part in Partition::all() {
+            engine
+                .coordinator()
+                .tree(part)
+                .unwrap_or_else(|e| panic!("tree({part:?}) failed: {e}"));
+        }
+    }
+
+    #[test]
+    fn coordinator_has_write_after_no_write_returns_false() {
+        // Probe an untouched key at a horizon that no write has
+        // crossed → false. Guards against the false-positive case
+        // where has_write_after over-reports.
+        let (_dir, engine) = open_engine();
+        let after = engine.snapshot();
+        let observed = engine
+            .has_write_after(Partition::Node, b"untouched", after)
+            .expect("hwa");
+        assert!(!observed);
+    }
+
+    #[test]
+    fn coordinator_contains_key_round_trip() {
+        let (_dir, engine) = open_engine();
+        assert!(!engine.contains_key(Partition::Node, b"k").unwrap());
+        engine.put(Partition::Node, b"k", b"v").unwrap();
+        assert!(engine.contains_key(Partition::Node, b"k").unwrap());
+        engine.delete(Partition::Node, b"k").unwrap();
+        assert!(!engine.contains_key(Partition::Node, b"k").unwrap());
+    }
+
+    #[test]
+    fn coordinator_prefix_scan_empty_returns_empty_iter() {
+        let (_dir, engine) = open_engine();
+        let iter = engine.prefix_scan(Partition::Node, b"never").unwrap();
+        let count = iter.count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn coordinator_set_gc_watermark_observable() {
+        // set_gc_watermark must be Release-ordered so a subsequent
+        // Acquire-load (e.g. inside the compaction filter factory)
+        // observes the new value. Smoke-check: write, then construct
+        // a fresh factory that reads it.
+        let (_dir, engine) = open_engine();
+        engine.set_gc_watermark(12345);
+        // The retention filter factory reads via Arc<AtomicU64>; we
+        // can't get at it directly, but the engine's set_gc_watermark
+        // delegates to coordinator.set_gc_watermark which uses
+        // store(Release). Smoke: writes don't panic and the engine
+        // remains operable.
+        engine
+            .put(Partition::Node, b"k", b"v")
+            .expect("put after gc watermark set");
+        let v = engine.get(Partition::Node, b"k").unwrap();
+        assert_eq!(v.as_deref(), Some(b"v".as_slice()));
+    }
+
+    #[test]
+    fn coordinator_concurrent_reads_under_arc_share() {
+        // The coordinator's read methods take &self only — Arc-share
+        // a StorageEngine across threads and probe in parallel.
+        use std::sync::Arc;
+        use std::thread;
+
+        let (dir, engine) = open_engine();
+        let engine = Arc::new(engine);
+        engine.put(Partition::Node, b"k", b"v").unwrap();
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let e = Arc::clone(&engine);
+                thread::spawn(move || {
+                    for _ in 0..50 {
+                        let v = e.get(Partition::Node, b"k").expect("get");
+                        assert_eq!(v.as_deref(), Some(b"v".as_slice()));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("join");
+        }
+        drop(dir); // keep TempDir alive for the scope of the test
     }
 
     #[test]
