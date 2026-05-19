@@ -253,6 +253,19 @@ pub trait TimeSeriesStore {
     /// Returns `false` if no bucket exists at that key.
     fn mark_closed(&self, shard_id: u16, bucket_id: NodeId) -> StoreResult<bool>;
 
+    /// Re-open a previously closed bucket so the catalog's late-arrival
+    /// Tier-2 path can append into it (ADR-027). Returns:
+    ///
+    /// - `Ok(true)` — bucket existed and `closed` flipped from `true`
+    ///   to `false` (or was already `false`).
+    /// - `Ok(false)` — bucket does not exist; nothing was written.
+    ///
+    /// This implementation reads-then-writes; concurrent writers
+    /// against the same bucket key must serialise at the catalog
+    /// layer above. CAS-equivalent atomicity is enforced because the
+    /// engine is single-writer-per-key.
+    fn reopen_bucket(&self, shard_id: u16, bucket_id: NodeId) -> StoreResult<bool>;
+
     /// Append one late measurement to the overflow segment under
     /// `(label_id, bucket_id)`.
     fn put_overflow(
@@ -372,6 +385,21 @@ impl TimeSeriesStore for LocalTimeSeriesStore<'_> {
             return Ok(true);
         }
         bucket.control.closed = true;
+        let encoded = encode_bucket(&bucket)?;
+        self.engine.put(Partition::Node, &key, &encoded)?;
+        Ok(true)
+    }
+
+    fn reopen_bucket(&self, shard_id: u16, bucket_id: NodeId) -> StoreResult<bool> {
+        let key = encode_node_key(shard_id, bucket_id);
+        let Some(bytes) = self.engine.get(Partition::Node, &key)? else {
+            return Ok(false);
+        };
+        let mut bucket = decode_bucket(bytes.as_ref())?;
+        if !bucket.control.closed {
+            return Ok(true);
+        }
+        bucket.control.closed = false;
         let encoded = encode_bucket(&bucket)?;
         self.engine.put(Partition::Node, &key, &encoded)?;
         Ok(true)
@@ -517,6 +545,88 @@ mod tests {
         assert!(store.mark_closed(0, id).unwrap());
         let read = store.get_bucket(0, id).unwrap().unwrap();
         assert!(read.control.closed);
+    }
+
+    #[test]
+    fn reopen_bucket_flips_closed_back_to_false() {
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let bucket = Bucket::from_measurements(rmpv::Value::Nil, vec![mk_measurement(1, 1.0)]);
+        let id = NodeId::from_raw(31);
+        store.put_bucket(0, id, &bucket).unwrap();
+        assert!(store.mark_closed(0, id).unwrap());
+        assert!(store.reopen_bucket(0, id).unwrap());
+        let read = store.get_bucket(0, id).unwrap().unwrap();
+        assert!(!read.control.closed);
+    }
+
+    #[test]
+    fn reopen_bucket_on_already_open_is_idempotent() {
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let bucket = Bucket::from_measurements(rmpv::Value::Nil, vec![mk_measurement(1, 1.0)]);
+        let id = NodeId::from_raw(32);
+        store.put_bucket(0, id, &bucket).unwrap();
+        // Never closed — reopen returns true and leaves closed=false.
+        assert!(store.reopen_bucket(0, id).unwrap());
+        let read = store.get_bucket(0, id).unwrap().unwrap();
+        assert!(!read.control.closed);
+    }
+
+    #[test]
+    fn reopen_missing_bucket_returns_false() {
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        assert!(!store.reopen_bucket(0, NodeId::from_raw(404)).unwrap());
+    }
+
+    #[test]
+    fn late_write_flow_close_reopen_append_compact() {
+        // End-to-end Tier-2 late-arrival simulation: build a bucket,
+        // close it, route one late point through the overflow segment
+        // (Tier 3 is the simpler API), then reopen so the catalog can
+        // resume in-buffer appends, and finally compact overflow back
+        // into the base.
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let id = NodeId::from_raw(50);
+        let label = 11u32;
+
+        let base = Bucket::from_measurements(
+            rmpv::Value::String("sensor".into()),
+            vec![mk_measurement(100, 1.0), mk_measurement(200, 2.0)],
+        );
+        store.put_bucket(0, id, &base).unwrap();
+        assert!(store.mark_closed(0, id).unwrap());
+
+        // Tier 3: stash a late measurement in overflow.
+        let late = OverflowEntry {
+            arrival_seqno: 1,
+            measurement: mk_measurement(150, 1.5),
+        };
+        store.put_overflow(label, id, &late).unwrap();
+
+        // Catalog decides this bucket is hot again → reopen.
+        assert!(store.reopen_bucket(0, id).unwrap());
+        let mid = store.get_bucket(0, id).unwrap().unwrap();
+        assert!(!mid.control.closed);
+
+        // Background compactor folds overflow into the base.
+        let merged = Bucket::from_measurements(
+            rmpv::Value::String("sensor".into()),
+            vec![
+                mk_measurement(100, 1.0),
+                mk_measurement(150, 1.5),
+                mk_measurement(200, 2.0),
+            ],
+        );
+        store.compact_overflow(0, label, id, &merged, &[1]).unwrap();
+
+        let after = store.get_bucket(0, id).unwrap().unwrap();
+        assert_eq!(after.control.count, 3);
+        assert_eq!(after.control.time_min_us, 100);
+        assert_eq!(after.control.time_max_us, 200);
+        assert!(store.scan_overflow(label, id).unwrap().is_empty());
     }
 
     #[test]
