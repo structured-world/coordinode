@@ -12,6 +12,7 @@ use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::Guard;
 
 use crate::proto::graph;
+use crate::services::db_err_to_status;
 
 /// Map proto `PropertyType` integer value to internal `PropertyType`.
 ///
@@ -289,7 +290,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
         let schema_revision = {
             let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
             db.create_label_schema(schema)
-                .map_err(|e| Status::internal(format!("create_label error: {e}")))?
+                .map_err(|e| db_err_to_status("create_label", e))?
         };
 
         Ok(Response::new(graph::Label {
@@ -324,7 +325,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
         let schema_revision = {
             let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
             db.create_edge_type_schema(schema)
-                .map_err(|e| Status::internal(format!("create_edge_type error: {e}")))?
+                .map_err(|e| db_err_to_status("create_edge_type", e))?
         };
 
         Ok(Response::new(graph::EdgeType {
@@ -410,7 +411,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
         // Note: `label` is a Cypher reserved keyword — use `lbl` as alias.
         let rows = db
             .execute_cypher("MATCH (n) RETURN DISTINCT n.__label__ AS lbl ORDER BY lbl")
-            .map_err(|e| Status::internal(format!("list_labels cypher error: {e}")))?;
+            .map_err(|e| db_err_to_status("list_labels cypher", e))?;
 
         for row in rows {
             if let Some(Value::String(name)) = row.get("lbl") {

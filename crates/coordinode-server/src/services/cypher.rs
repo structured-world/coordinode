@@ -128,13 +128,20 @@ fn convert_params(
 }
 
 /// Convert a DatabaseError to a tonic Status.
+///
+/// The `Storage` case delegates to
+/// [`crate::services::db_err_to_status`] so that
+/// `StorageError::CapacityExhausted` propagates as the gRPC-canonical
+/// `RESOURCE_EXHAUSTED` with structured `endpoint-id` / `used-bytes`
+/// / `hard-limit-bytes` metadata. Other storage errors fall through
+/// to `Internal`.
 fn db_error_to_status(err: DatabaseError) -> Status {
     match err {
         DatabaseError::Parse(e) => Status::invalid_argument(format!("Parse error: {e}")),
         DatabaseError::Semantic(e) => Status::invalid_argument(format!("Semantic error: {e}")),
         DatabaseError::Plan(e) => Status::internal(format!("Plan error: {e}")),
         DatabaseError::Execution(e) => Status::internal(format!("Execution error: {e}")),
-        DatabaseError::Storage(e) => Status::internal(format!("Storage error: {e}")),
+        DatabaseError::Storage(_) => crate::services::db_err_to_status("Storage error", err),
         DatabaseError::Other(e) => Status::internal(format!("Error: {e}")),
     }
 }
