@@ -8,6 +8,7 @@ use coordinode_embed::Database;
 
 use crate::proto::{common, graph};
 use crate::services::cypher::{proto_to_value_pub, value_to_proto_pub};
+use crate::services::db_err_to_status;
 
 /// Backtick-escape a Cypher identifier (label, relationship type, or property key).
 fn cypher_ident(name: &str) -> String {
@@ -62,7 +63,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         let rows = {
             let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
             db.execute_cypher_with_params(&cypher, params)
-                .map_err(|e| Status::internal(format!("create_node error: {e}")))?
+                .map_err(|e| db_err_to_status("create_node", e))?
         };
 
         let node_id = match rows.first().and_then(|r| r.get("n")) {
@@ -98,7 +99,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         let rows = {
             let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
             db.execute_cypher_with_params("MATCH (n) WHERE n = $id RETURN *", params)
-                .map_err(|e| Status::internal(format!("get_node error: {e}")))?
+                .map_err(|e| db_err_to_status("get_node", e))?
         };
 
         let row = rows
@@ -179,7 +180,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         let rows = {
             let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
             db.execute_cypher_with_params(&cypher, params)
-                .map_err(|e| Status::internal(format!("create_edge error: {e}")))?
+                .map_err(|e| db_err_to_status("create_edge", e))?
         };
 
         let row = rows
@@ -271,7 +272,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         let rows = {
             let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
             db.execute_cypher_with_params(&cypher, params)
-                .map_err(|e| Status::internal(format!("traverse error: {e}")))?
+                .map_err(|e| db_err_to_status("traverse", e))?
         };
 
         let nodes: Vec<graph::Node> = rows

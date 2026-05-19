@@ -680,7 +680,14 @@ impl StorageEngine {
     }
 
     /// Delete a key from the given partition.
+    ///
+    /// Pre-write capacity gate applies: a delete writes a tombstone
+    /// that still consumes memtable bytes (and eventually SST bytes
+    /// after flush). Under INV-D3 the gate must fire here too;
+    /// operators evict via cascade or by reducing `hard_limit_bytes`,
+    /// not by stuffing more tombstones onto a Full endpoint.
     pub fn delete(&self, part: Partition, key: &[u8]) -> StorageResult<()> {
+        self.check_partition_capacity(part)?;
         let tree = self.tree(part)?;
         tree.remove(key, self.seqno.next());
         if let Some(cache) = &self.tiered_cache {
@@ -699,6 +706,7 @@ impl StorageEngine {
     ///
     /// Invalidates any cached entry for this key (stale after merge).
     pub fn merge(&self, part: Partition, key: &[u8], operand: &[u8]) -> StorageResult<()> {
+        self.check_partition_capacity(part)?;
         let tree = self.tree(part)?;
         tree.merge(key, operand, self.seqno.next());
         if let Some(cache) = &self.tiered_cache {

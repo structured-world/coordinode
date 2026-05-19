@@ -222,6 +222,25 @@ pub enum ProposalError {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// A targeted storage endpoint reached its hard limit and is no
+    /// longer accepting writes. Carries the endpoint id and limit
+    /// values so callers can route to a different endpoint, surface
+    /// a meaningful client error (gRPC `RESOURCE_EXHAUSTED`), or
+    /// trigger an operator-driven eviction.
+    ///
+    /// Distinct from the generic `Storage(String)` variant so that
+    /// type information survives the propagation chain
+    /// (`StorageError::CapacityExhausted` → `ProposalError` → query /
+    /// gRPC layer) instead of being lost in a `to_string()` cast.
+    #[error(
+        "endpoint {endpoint_id:?} capacity exhausted (used={used_bytes}, hard_limit={hard_limit_bytes})"
+    )]
+    CapacityExhausted {
+        endpoint_id: String,
+        used_bytes: u64,
+        hard_limit_bytes: u64,
+    },
+
     /// Proposal was a duplicate (already applied). Not an error in
     /// normal operation — Raft replay can deliver the same proposal twice.
     #[error("duplicate proposal: {0}")]

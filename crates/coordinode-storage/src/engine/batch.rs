@@ -173,6 +173,23 @@ impl<'a> WriteBatch<'a> {
         // used independently in closures below.
         let WriteBatch { engine, mutations } = self;
 
+        // Pre-write capacity gate — atomicity contract: if any
+        // partition in the batch targets a Full L0 endpoint, abort
+        // the entire commit before any seqno is consumed or any
+        // mutation lands in a memtable. Partition::Schema and
+        // Partition::Raft bypass the gate via `check_partition_capacity`
+        // (engine-internal metadata path), matching the single-write
+        // gate behaviour. Using a set keeps the check O(distinct
+        // partitions) instead of O(mutations).
+        let mut checked: std::collections::HashSet<Partition> =
+            std::collections::HashSet::with_capacity(Partition::all().len());
+        for m in &mutations {
+            let part = m.partition();
+            if checked.insert(part) {
+                engine.check_partition_capacity(part)?;
+            }
+        }
+
         // Single seqno for the entire batch — logical atomicity.
         let seqno = engine.next_seqno();
 
