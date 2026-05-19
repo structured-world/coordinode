@@ -856,6 +856,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "coordinode-cluster"
+version = "0.4.3"
+dependencies = [
+ "coordinode-storage",
+ "serde",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "coordinode-core"
 version = "0.4.3"
 dependencies = [
