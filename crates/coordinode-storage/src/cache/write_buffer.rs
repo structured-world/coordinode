@@ -165,7 +165,7 @@ impl NvmeWriteBuffer {
 }
 
 impl WriteBufferHook for NvmeWriteBuffer {
-    /// Checkpoint: atomically rename current file → draining.<token>.bin.
+    /// Checkpoint: atomically rename current file → `draining.<token>.bin`.
     ///
     /// New `w:cache` writes after this point go to a fresh current file
     /// (created lazily on next `append()`). Returns the generation token

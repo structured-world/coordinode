@@ -37,7 +37,7 @@ impl StorageStatsComputer {
     /// Compute statistics by scanning raw (non-MVCC) storage.
     ///
     /// Use this when writing directly to StorageEngine (tests, bulk import).
-    /// For MVCC-enabled databases (normal operation), use [`compute_mvcc`].
+    /// For MVCC-enabled databases (normal operation), use [`Self::compute_mvcc`].
     pub fn compute(engine: &StorageEngine) -> StorageResult<Self> {
         let (total_nodes, label_counts) = Self::count_nodes(engine)?;
         let (edge_type_fan_outs, overall_avg_fan_out) = Self::sample_fan_out(engine)?;

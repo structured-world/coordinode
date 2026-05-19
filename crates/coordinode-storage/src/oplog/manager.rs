@@ -186,7 +186,7 @@ impl OplogManager {
 
     /// Seal and close the active segment.
     ///
-    /// The sealed file is added to [`sealed`](Self::sealed). The next
+    /// The sealed file is added to the manager's sealed list. The next
     /// [`append`](Self::append) will create a fresh segment.
     pub fn rotate(&mut self) -> StorageResult<()> {
         let Some(writer) = self.current.take() else {

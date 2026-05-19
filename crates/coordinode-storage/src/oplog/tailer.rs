@@ -1,7 +1,7 @@
 //! [`OplogTailer`]: read-only oplog cursor for CDC consumers.
 //!
 //! The tailer reads sealed segment files directly from the oplog directory
-//! without acquiring any lock on the [`OplogManager`]. Sealed segments are
+//! without acquiring any lock on the `OplogManager`. Sealed segments are
 //! immutable once written, so concurrent reads are safe.
 //!
 //! ## Usage
@@ -95,7 +95,7 @@ pub struct CdcFilters {
 
 /// Read-only cursor over sealed oplog segments.
 ///
-/// Reads directly from segment files on disk — no lock on [`OplogManager`].
+/// Reads directly from segment files on disk — no lock on `OplogManager`.
 /// Safe to run concurrently with the write path.
 pub struct OplogTailer {
     /// Path to the oplog directory for one shard (`<data_dir>/oplog/<shard_id>/`).
