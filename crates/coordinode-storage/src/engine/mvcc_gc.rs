@@ -1,7 +1,7 @@
 //! Seqno-based MVCC version retention via LSM compaction filter.
 //!
 //! During compaction, this filter drops old MVCC versions whose seqno
-//! falls below the GC watermark (provided by [`SnapshotTracker`]).
+//! falls below the GC watermark (provided by `SnapshotTracker`).
 //! At least one version per user key is always preserved to prevent
 //! total data loss.
 //!

@@ -73,5 +73,9 @@ harness = false
 name = "write_batch_parallel"
 harness = false
 
+[[bench]]
+name = "coordinator_dispatch"
+harness = false
+
 [lints]
 workspace = true
