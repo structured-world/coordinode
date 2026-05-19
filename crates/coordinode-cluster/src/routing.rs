@@ -23,10 +23,26 @@ pub trait ShardRouting: Send + Sync {
     /// node id or the shard partition key for a query). The hash
     /// function MUST be stable across cluster restarts so consistent
     /// routing decisions hold.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coordinode_cluster::{ShardId, ShardRouting, SingleShardRouting};
+    /// let r = SingleShardRouting::new();
+    /// assert_eq!(r.shard_for_key(b"any-key"), ShardId::ZERO);
+    /// ```
     fn shard_for_key(&self, key: &[u8]) -> ShardId;
 
     /// The full set of shard ids served by this cluster. CE returns
     /// `[ShardId::ZERO]`; EE returns the live shard map.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coordinode_cluster::{ShardId, ShardRouting, SingleShardRouting};
+    /// let r = SingleShardRouting::new();
+    /// assert_eq!(r.shard_ids(), vec![ShardId::ZERO]);
+    /// ```
     fn shard_ids(&self) -> Vec<ShardId>;
 
     /// Resolve a shard id to its node address. Mirrors
@@ -34,6 +50,15 @@ pub trait ShardRouting: Send + Sync {
     /// routing trait so the query layer can resolve without holding
     /// a topology reference when topology is empty (degenerate
     /// startup case).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coordinode_cluster::{NodeAddr, ShardId, ShardRouting, SingleShardRouting};
+    /// let r = SingleShardRouting::new();
+    /// assert_eq!(r.resolve(ShardId::ZERO)?, NodeAddr::local());
+    /// # Ok::<_, coordinode_cluster::TopologyError>(())
+    /// ```
     fn resolve(&self, shard: ShardId) -> TopologyResult<NodeAddr>;
 }
 

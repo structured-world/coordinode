@@ -23,10 +23,34 @@ pub trait ClusterTopology: Send + Sync {
     /// must NOT depend on the tree being hierarchical in storage —
     /// CE returns a flat `Vec<FailureDomain>` and the EE impl can
     /// expose a richer shape under the same accessor.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use coordinode_cluster::{ClusterTopology, SingleNodeTopology};
+    /// # use coordinode_storage::engine::config::*;
+    /// let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    ///     "ep", std::path::Path::new("/tmp/x"),
+    ///     Media::Hdd, Durability::Durable, Tier::Warm,
+    /// )]);
+    /// let topo = SingleNodeTopology::from_storage(&cfg);
+    /// assert_eq!(topo.topology_tree().endpoint_count(), 1);
+    /// ```
     fn topology_tree(&self) -> &TopologyTree;
 
     /// Every shard in the cluster, in id order. CE returns a single
     /// `[ShardDescriptor]` with id [`ShardId::ZERO`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use coordinode_cluster::{ClusterTopology, ShardId, SingleNodeTopology, TopologyTree};
+    /// # use coordinode_storage::engine::config::Tier;
+    /// let topo = SingleNodeTopology::from_tree(
+    ///     TopologyTree::single_endpoint("ep", Tier::Warm),
+    /// );
+    /// assert_eq!(topo.shards()[0].id, ShardId::ZERO);
+    /// ```
     fn shards(&self) -> &[ShardDescriptor];
 
     /// Resolve a shard id to the node currently authoritative for it
@@ -34,6 +58,20 @@ pub trait ClusterTopology: Send + Sync {
     ///
     /// Returns [`TopologyError::ShardNotFound`] for ids outside the
     /// active shard set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use coordinode_cluster::{
+    /// #     ClusterTopology, NodeAddr, ShardId, SingleNodeTopology, TopologyTree,
+    /// # };
+    /// # use coordinode_storage::engine::config::Tier;
+    /// let topo = SingleNodeTopology::from_tree(
+    ///     TopologyTree::single_endpoint("ep", Tier::Warm),
+    /// );
+    /// assert_eq!(topo.shard_leader(ShardId::ZERO)?, NodeAddr::local());
+    /// # Ok::<_, coordinode_cluster::TopologyError>(())
+    /// ```
     fn shard_leader(&self, shard: ShardId) -> TopologyResult<NodeAddr>;
 
     /// Endpoint candidate set for placing data of a given `modality`
@@ -44,6 +82,23 @@ pub trait ClusterTopology: Send + Sync {
     /// EE-only rule variants on a CE impl surface as
     /// [`TopologyError::EeOnly`] so the gRPC layer can map them to
     /// `UNIMPLEMENTED`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use coordinode_cluster::{
+    /// #     ClusterTopology, CrushRule, Modality, SingleNodeTopology, TopologyTree,
+    /// # };
+    /// # use coordinode_storage::engine::config::Tier;
+    /// let topo = SingleNodeTopology::from_tree(
+    ///     TopologyTree::single_endpoint("ep", Tier::Hot),
+    /// );
+    /// let hits = topo.placement_candidates(
+    ///     &CrushRule::local_tier(), Modality::Vector, Tier::Hot,
+    /// )?;
+    /// assert_eq!(hits, vec!["ep".to_string()]);
+    /// # Ok::<_, coordinode_cluster::TopologyError>(())
+    /// ```
     fn placement_candidates(
         &self,
         rule: &CrushRule,
@@ -101,6 +156,17 @@ impl SingleNodeTopology {
     /// Build a topology from a pre-built `TopologyTree`. Test helper /
     /// escape hatch for unit tests that don't want to wire up a real
     /// `StorageConfig`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coordinode_cluster::{ClusterTopology, SingleNodeTopology, TopologyTree};
+    /// use coordinode_storage::engine::config::Tier;
+    ///
+    /// let tree = TopologyTree::single_endpoint("ep-x", Tier::Hot);
+    /// let topo = SingleNodeTopology::from_tree(tree);
+    /// assert_eq!(topo.topology_tree().endpoint_count(), 1);
+    /// ```
     pub fn from_tree(tree: TopologyTree) -> Self {
         let leader = NodeAddr::local();
         let shards = vec![ShardDescriptor {
