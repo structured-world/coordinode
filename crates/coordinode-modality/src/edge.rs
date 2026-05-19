@@ -65,6 +65,21 @@ pub trait EdgeStore {
     /// Create (or upsert) an edge `src --edge_type--> tgt` with
     /// optional properties. Writes forward + reverse adjacency
     /// merges and the edgeprop body atomically.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalEdgeStore, EdgeStore};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalEdgeStore::new(&engine);
+    /// store.put_edge("KNOWS", NodeId::from_raw(1), NodeId::from_raw(2), None)?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn put_edge(
         &self,
         edge_type: &str,
@@ -77,6 +92,21 @@ pub trait EdgeStore {
     /// `None` if the edge has no property body — note that an edge
     /// CAN exist (visible in the adjacency lists) with no property
     /// body, this is the common case for property-less edges.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalEdgeStore, EdgeStore};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalEdgeStore::new(&engine);
+    /// let _props = store.get_props("KNOWS", NodeId::from_raw(1), NodeId::from_raw(2))?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn get_props(
         &self,
         edge_type: &str,
@@ -87,15 +117,45 @@ pub trait EdgeStore {
     /// Remove an edge. Issues remove merges on both adjacency
     /// posting lists and tombstones the edgeprop body in a single
     /// atomic batch. Idempotent on already-missing edges.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalEdgeStore, EdgeStore};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalEdgeStore::new(&engine);
+    /// store.delete_edge("KNOWS", NodeId::from_raw(1), NodeId::from_raw(2))?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn delete_edge(&self, edge_type: &str, src: NodeId, tgt: NodeId) -> StoreResult<()>;
 
     /// Forward neighbours: targets reachable as
     /// `src --edge_type--> ?`. Returns the posting-list contents in
     /// ascending node-id order (the on-disk representation).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalEdgeStore, EdgeStore};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalEdgeStore::new(&engine);
+    /// let _targets = store.scan_neighbors_out("KNOWS", NodeId::from_raw(1))?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn scan_neighbors_out(&self, edge_type: &str, src: NodeId) -> StoreResult<Vec<NodeId>>;
 
-    /// Reverse neighbours: sources of edges
-    /// `? --edge_type--> tgt`.
+    /// Reverse neighbours: sources of edges `? --edge_type--> tgt`.
+    /// Symmetric to [`Self::scan_neighbors_out`].
     fn scan_neighbors_in(&self, edge_type: &str, tgt: NodeId) -> StoreResult<Vec<NodeId>>;
 
     /// Per-version write of edge properties for `(edge_type, src, tgt)`
@@ -107,6 +167,22 @@ pub trait EdgeStore {
     /// Adjacency itself is not yet version-keyed — that requires a
     /// separate ADR on the version model (tombstone markers vs.
     /// per-version posting lists) and is tracked as a follow-up.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalEdgeStore, EdgeStore};
+    /// # use coordinode_core::graph::{edge::EdgeProperties, node::NodeId};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalEdgeStore::new(&engine);
+    /// let props = EdgeProperties::new();
+    /// store.put_edge_temporal("E", NodeId::from_raw(1), NodeId::from_raw(2), 1000, &props)?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn put_edge_temporal(
         &self,
         edge_type: &str,
@@ -119,6 +195,21 @@ pub trait EdgeStore {
     /// Read the edge-property version active at `at_ms`: the version
     /// whose `valid_from_ms <= at_ms` is largest. Returns `None` if no
     /// such version exists.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalEdgeStore, EdgeStore};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalEdgeStore::new(&engine);
+    /// let _at_now = store.get_props_at("E", NodeId::from_raw(1), NodeId::from_raw(2), 1500)?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn get_props_at(
         &self,
         edge_type: &str,

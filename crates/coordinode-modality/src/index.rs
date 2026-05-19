@@ -38,6 +38,21 @@ pub trait IndexStore {
     /// single-column (slice of 1) and compound (slice of N) work.
     /// Idempotent: re-putting the same `(name, values, node_id)` is a
     /// no-op semantically.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalIndexStore, IndexStore};
+    /// # use coordinode_core::graph::{node::NodeId, types::Value};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalIndexStore::new(&engine);
+    /// store.put_entry("by_name", &[Value::String("alice".into())], NodeId::from_raw(1))?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn put_entry(&self, name: &str, values: &[Value], node_id: NodeId) -> StoreResult<()>;
 
     /// Remove a specific entry. Returns Ok even if the entry was
@@ -46,6 +61,21 @@ pub trait IndexStore {
 
     /// Return all node ids whose entry has the exact given value(s).
     /// Empty `Vec` means "no matches".
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalIndexStore, IndexStore};
+    /// # use coordinode_core::graph::types::Value;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalIndexStore::new(&engine);
+    /// let hits = store.scan_exact("by_name", &[Value::String("alice".into())])?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn scan_exact(&self, name: &str, values: &[Value]) -> StoreResult<Vec<NodeId>>;
 
     /// Return all (sortable bytes, node id) pairs in the named index,

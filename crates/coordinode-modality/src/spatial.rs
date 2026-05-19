@@ -156,6 +156,21 @@ pub trait SpatialStore {
     /// dedicated upsert helper at the layer above, which can hide
     /// the old-coord bookkeeping). Inserting the same `(node_id,
     /// coords)` pair twice IS idempotent (same key, same body).
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalSpatialStore, SpatialStore, Crs, Point};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalSpatialStore::new(&engine);
+    /// let paris = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
+    /// store.insert(1, NodeId::from_raw(1), &paris)?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn insert(&self, label_id: u32, node_id: NodeId, point: &Point) -> StoreResult<()>;
 
     /// Remove the entry for `node_id` previously written with `point`.
@@ -166,6 +181,24 @@ pub trait SpatialStore {
     /// quantised window of `bbox`, then post-filter by exact bbox
     /// containment on the original `f64` coordinates. Returns
     /// `(node_id, point)` pairs in curve-key order.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalSpatialStore, SpatialStore, Crs, Point, Bbox};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalSpatialStore::new(&engine);
+    /// let bbox = Bbox {
+    ///     lower: Point::new_2d(Crs::Wgs84_2d, 2.0, 48.0),
+    ///     upper: Point::new_2d(Crs::Wgs84_2d, 3.0, 49.0),
+    /// };
+    /// let hits = store.scan_within_bbox(1, Crs::Wgs84_2d, &bbox)?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn scan_within_bbox(
         &self,
         label_id: u32,
@@ -177,6 +210,21 @@ pub trait SpatialStore {
     /// whole `(label_id, crs)` partition and keeps the top-k by exact
     /// distance — fine for trait-level CE; an EE / indexed
     /// implementation can specialise this method.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalSpatialStore, SpatialStore, Crs, Point};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalSpatialStore::new(&engine);
+    /// let center = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
+    /// let knn = store.knn_nearest(1, Crs::Wgs84_2d, &center, 5)?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn knn_nearest(
         &self,
         label_id: u32,
@@ -413,6 +461,17 @@ fn haversine(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
 /// Exact distance between two points sharing a CRS. Haversine for geo,
 /// Euclidean for Cartesian (with the 3D altitude leg added for
 /// WGS-84-3D).
+///
+/// # Examples
+///
+/// ```
+/// use coordinode_modality::{distance, Crs, Point};
+/// let paris = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
+/// let kyiv = Point::new_2d(Crs::Wgs84_2d, 30.5234, 50.4501);
+/// // Great-circle distance is about 2030 km.
+/// let d = distance(&paris, &kyiv);
+/// assert!((1_900_000.0..2_100_000.0).contains(&d));
+/// ```
 pub fn distance(a: &Point, b: &Point) -> f64 {
     debug_assert_eq!(a.crs, b.crs);
     match a.crs {

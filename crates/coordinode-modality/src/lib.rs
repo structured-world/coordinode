@@ -70,7 +70,7 @@ pub use error::{StoreError, StoreResult};
 pub use index::{IndexStore, LocalIndexStore};
 pub use node::{LocalNodeStore, NodeStore};
 pub use schema::{LocalSchemaStore, SchemaStore};
-pub use spatial::{Bbox, Crs, LocalSpatialStore, Point, SpatialStore};
+pub use spatial::{distance, Bbox, Crs, LocalSpatialStore, Point, SpatialStore};
 pub use timeseries::{
     Bucket, BucketControl, FieldStats, LocalTimeSeriesStore, Measurement, OverflowEntry,
     TimeSeriesStore,

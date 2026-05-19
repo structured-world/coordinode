@@ -35,11 +35,41 @@ pub trait SchemaStore {
     /// then loads the revision-suffixed body. Returns `Decode` if the
     /// pointer is corrupt (not 8 bytes) or the named revision is
     /// missing.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalSchemaStore, SchemaStore};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalSchemaStore::new(&engine);
+    /// let _label = store.load_label("User")?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn load_label(&self, name: &str) -> StoreResult<Option<LabelSchema>>;
 
     /// Persist a label schema as the current revision. Body and
     /// pointer are written in a single atomic batch — readers never
     /// observe a pointer naming a missing revision.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalSchemaStore, SchemaStore};
+    /// # use coordinode_core::schema::definition::LabelSchema;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalSchemaStore::new(&engine);
+    /// # let schema: LabelSchema = unimplemented!();
+    /// store.save_label(&schema)?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn save_label(&self, schema: &LabelSchema) -> StoreResult<()>;
 
     /// Load the current revision of an edge type schema by name.

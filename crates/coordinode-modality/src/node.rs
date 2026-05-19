@@ -34,27 +34,112 @@ use crate::error::{StoreError, StoreResult};
 pub trait NodeStore {
     /// Read a non-temporal node record by (shard, id). Returns `None`
     /// if the key is absent or has been tombstoned.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalNodeStore, NodeStore};
+    /// # use coordinode_core::graph::node::{NodeId, NodeRecord};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalNodeStore::new(&engine);
+    /// let id = NodeId::from_raw(1);
+    /// assert!(store.get(0, id)?.is_none());
+    /// store.put(0, id, &NodeRecord::new("User"))?;
+    /// assert!(store.get(0, id)?.is_some());
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn get(&self, shard_id: u16, node_id: NodeId) -> StoreResult<Option<NodeRecord>>;
 
     /// Write a non-temporal node record. Overwrites any prior body
     /// at the same key. Atomicity matches the underlying engine
     /// (single put = single LSM mutation).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalNodeStore, NodeStore};
+    /// # use coordinode_core::graph::node::{NodeId, NodeRecord};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalNodeStore::new(&engine);
+    /// store.put(0, NodeId::from_raw(1), &NodeRecord::new("User"))?;
+    /// // Second write overwrites the first.
+    /// store.put(0, NodeId::from_raw(1), &NodeRecord::new("Admin"))?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn put(&self, shard_id: u16, node_id: NodeId, record: &NodeRecord) -> StoreResult<()>;
 
     /// Tombstone a non-temporal node record. Idempotent on a missing
     /// key.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalNodeStore, NodeStore};
+    /// # use coordinode_core::graph::node::NodeId;
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalNodeStore::new(&engine);
+    /// // Deleting a never-existed key is a no-op (succeeds).
+    /// store.delete(0, NodeId::from_raw(404))?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn delete(&self, shard_id: u16, node_id: NodeId) -> StoreResult<()>;
 
     /// Read the temporal version of a node valid at `at_ms`:
     /// returns the version whose `valid_from <= at_ms` is largest.
     /// Returns `None` if the node has no version at-or-before that
     /// instant.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalNodeStore, NodeStore};
+    /// # use coordinode_core::graph::node::{NodeId, NodeRecord};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalNodeStore::new(&engine);
+    /// let id = NodeId::from_raw(1);
+    /// store.put_temporal(0, id, 1000, &NodeRecord::new("v1"))?;
+    /// store.put_temporal(0, id, 2000, &NodeRecord::new("v2"))?;
+    /// // At 1500, the v1 version is active.
+    /// assert!(store.get_at(0, id, 1500)?.is_some());
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn get_at(&self, shard_id: u16, node_id: NodeId, at_ms: i64)
         -> StoreResult<Option<NodeRecord>>;
 
     /// Write a per-version temporal node record. Each `valid_from`
     /// gets its own key — versions accumulate, prior versions remain
     /// readable through [`Self::get_at`] and [`Self::scan_versions`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalNodeStore, NodeStore};
+    /// # use coordinode_core::graph::node::{NodeId, NodeRecord};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalNodeStore::new(&engine);
+    /// store.put_temporal(0, NodeId::from_raw(1), 1000, &NodeRecord::new("v1"))?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn put_temporal(
         &self,
         shard_id: u16,
@@ -64,6 +149,22 @@ pub trait NodeStore {
     ) -> StoreResult<()>;
 
     /// All temporal versions of one node, in valid_from order.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalNodeStore, NodeStore};
+    /// # use coordinode_core::graph::node::{NodeId, NodeRecord};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalNodeStore::new(&engine);
+    /// let versions = store.scan_versions(0, NodeId::from_raw(1))?;
+    /// for (valid_from, _record) in &versions { let _ = valid_from; }
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
     fn scan_versions(&self, shard_id: u16, node_id: NodeId) -> StoreResult<Vec<(i64, NodeRecord)>>;
 }
 
