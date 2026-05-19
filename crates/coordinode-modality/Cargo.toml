@@ -1,0 +1,21 @@
+[package]
+name = "coordinode-modality"
+description = "Layer 4 modality stores: typed per-modality APIs over the multimodal coordinator (NodeStore, EdgeStore, VectorStore, DocumentStore, TimeSeriesStore, SpatialStore, IndexStore, BlobStore, SchemaStore)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+coordinode-core = { workspace = true }
+coordinode-storage = { workspace = true }
+lsm-tree = { package = "coordinode-lsm-tree", version = "4", default-features = false }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

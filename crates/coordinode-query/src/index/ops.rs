@@ -8,7 +8,7 @@ use coordinode_storage::error::StorageError;
 use coordinode_storage::Guard;
 
 use super::definition::IndexDefinition;
-use super::encoding::{
+use coordinode_core::index::encoding::{
     decode_node_id_from_index_key, encode_compound_index_key, encode_compound_value,
     encode_index_key, encode_value,
 };

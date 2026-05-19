@@ -75,7 +75,8 @@ pub fn reap_ttl_index(
         result.checked += 1;
 
         // Extract node ID from index key
-        if let Some(node_id) = super::encoding::decode_node_id_from_index_key(&key) {
+        if let Some(node_id) = coordinode_core::index::encoding::decode_node_id_from_index_key(&key)
+        {
             // Read the node to check its timestamp value
             let node_key = encode_node_key(shard_id, NodeId::from_raw(node_id));
             match engine.get(Partition::Node, &node_key) {
@@ -198,7 +199,7 @@ mod tests {
         timestamp_us: i64,
     ) {
         let value = Value::Timestamp(timestamp_us);
-        let key = super::super::encoding::encode_index_key(&index.name, &value, node_id);
+        let key = coordinode_core::index::encoding::encode_index_key(&index.name, &value, node_id);
         engine.put(Partition::Idx, &key, &[]).expect("put index");
     }
 

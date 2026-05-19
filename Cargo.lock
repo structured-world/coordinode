@@ -935,6 +935,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "coordinode-modality"
+version = "0.4.3"
+dependencies = [
+ "coordinode-core",
+ "coordinode-lsm-tree",
+ "coordinode-storage",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "coordinode-query"
 version = "0.4.3"
 dependencies = [

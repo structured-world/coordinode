@@ -214,7 +214,11 @@ pub fn build_index(
             }
 
             // Use compound index entry
-            let encoded = super::encoding::encode_compound_index_key(&index.name, &values, node_id);
+            let encoded = coordinode_core::index::encoding::encode_compound_index_key(
+                &index.name,
+                &values,
+                node_id,
+            );
             match engine.put(Partition::Idx, &encoded, &[]) {
                 Ok(()) => result.indexed += 1,
                 Err(e) => {
