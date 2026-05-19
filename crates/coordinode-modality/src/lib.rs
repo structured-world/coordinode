@@ -59,6 +59,7 @@ pub mod error;
 pub mod index;
 pub mod node;
 pub mod schema;
+pub mod timeseries;
 pub mod vector;
 
 pub use blob::{BlobStore, LocalBlobStore};
@@ -68,4 +69,8 @@ pub use error::{StoreError, StoreResult};
 pub use index::{IndexStore, LocalIndexStore};
 pub use node::{LocalNodeStore, NodeStore};
 pub use schema::{LocalSchemaStore, SchemaStore};
+pub use timeseries::{
+    Bucket, BucketControl, FieldStats, LocalTimeSeriesStore, Measurement, OverflowEntry,
+    TimeSeriesStore,
+};
 pub use vector::{LocalVectorStore, VectorStore};
