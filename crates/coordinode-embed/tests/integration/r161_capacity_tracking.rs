@@ -381,6 +381,291 @@ fn used_bytes_warm_load_on_reopen() {
     );
 }
 
+/// Prometheus counter `endpoint_threshold_alerts_total` MUST
+/// increment on every severity UP-crossing. Drives the endpoint into
+/// `Warning` severity through a local metrics recorder and inspects
+/// the captured counter value.
+#[test]
+fn threshold_alert_counter_increments_on_severity_crossing() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let dir = TempDir::new().expect("tempdir");
+    // 4 KB limit so a modest write crosses Warning then Full.
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "alert-ep",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )
+    .with_hard_limit_bytes(4096)]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    // Drive enough writes to push severity past Normal → Warning →
+    // Full. Persist + refresh INSIDE the recorder scope so the alert
+    // emissions are captured.
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        for i in 0..500u32 {
+            let key = format!("node:0:{i:010}");
+            // Note: writes start succeeding (endpoint not yet full
+            // until the first refresh fires the gate). Ignore the
+            // CapacityExhausted that surfaces partway through —
+            // we only care about the counter side-effect.
+            let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
+        }
+        engine.persist().expect("persist");
+        engine.refresh_capacity();
+    });
+
+    // Walk the snapshot and find the threshold-alert counter for our
+    // endpoint. Any UP-crossing (Normal→Warning, Warning→Full, etc.)
+    // contributes one increment. We assert at least ONE — the exact
+    // count depends on whether refresh observed an intermediate
+    // severity or jumped straight to Full.
+    let snapshot = snapshotter.snapshot();
+    let mut alert_count = 0u64;
+    for (key, _unit, _desc, value) in snapshot.into_vec() {
+        if key.key().name() == "endpoint_threshold_alerts_total" {
+            // Confirm the labels carry our endpoint id.
+            let has_endpoint = key
+                .key()
+                .labels()
+                .any(|l| l.key() == "endpoint_id" && l.value() == "alert-ep");
+            if has_endpoint {
+                if let DebugValue::Counter(n) = value {
+                    alert_count += n;
+                }
+            }
+        }
+    }
+    assert!(
+        alert_count >= 1,
+        "expected at least one threshold alert counter increment on severity crossing, got {alert_count}",
+    );
+}
+
+/// Prometheus counter `endpoint_cascade_events_total` MUST increment
+/// each time auto-cascade fires. Triggers Emergency severity on a
+/// CascadeEvict-strategy endpoint and inspects the counter.
+#[test]
+fn cascade_events_counter_increments_on_auto_cascade() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let hot = TempDir::new().expect("hot tempdir");
+    let cold = TempDir::new().expect("cold tempdir");
+    // 4 KB hard limit so a modest write reliably lands in
+    // Emergency-or-Full severity — guarantees auto-cascade fires
+    // independently of LSM compression / SST overhead variance.
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "ep-hot",
+            hot.path(),
+            Media::Nvme,
+            Durability::Durable,
+            Tier::Hot,
+        )
+        .with_hard_limit_bytes(4096)
+        .with_hard_limit_strategy(HardLimitStrategy::CascadeEvict),
+        EndpointConfig::new(
+            "ep-cold",
+            cold.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Cold,
+        ),
+    ]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        for i in 0..500u32 {
+            let key = format!("node:0:{i:010}");
+            let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
+        }
+        engine.persist().expect("persist");
+        engine.refresh_capacity();
+    });
+
+    let snapshot = snapshotter.snapshot();
+    let mut cascade_count = 0u64;
+    for (key, _unit, _desc, value) in snapshot.into_vec() {
+        if key.key().name() == "endpoint_cascade_events_total" {
+            let has_endpoint = key
+                .key()
+                .labels()
+                .any(|l| l.key() == "endpoint_id" && l.value() == "ep-hot");
+            if has_endpoint {
+                if let DebugValue::Counter(n) = value {
+                    cascade_count += n;
+                }
+            }
+        }
+    }
+    assert!(
+        cascade_count >= 1,
+        "expected at least one cascade event counter increment when auto-cascade fired, got {cascade_count}",
+    );
+}
+
+/// Gauges `endpoint_used_bytes` and `endpoint_hard_limit_bytes` MUST
+/// be set on every refresh — observable via the same debugging
+/// recorder. Pins the gauge contract.
+#[test]
+fn capacity_gauges_emitted_on_refresh() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "gauge-ep",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )
+    .with_hard_limit_bytes(1_000_000)]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        for i in 0..200u32 {
+            let key = format!("node:0:{i:010}");
+            engine
+                .put(Partition::Node, key.as_bytes(), b"payload-bytes")
+                .expect("put");
+        }
+        engine.persist().expect("persist");
+        engine.refresh_capacity();
+    });
+
+    let snapshot = snapshotter.snapshot();
+    let mut saw_used_gauge = false;
+    let mut saw_limit_gauge = false;
+    for (key, _unit, _desc, value) in snapshot.into_vec() {
+        let name = key.key().name();
+        let endpoint_ok = key
+            .key()
+            .labels()
+            .any(|l| l.key() == "endpoint_id" && l.value() == "gauge-ep");
+        if !endpoint_ok {
+            continue;
+        }
+        if let DebugValue::Gauge(g) = value {
+            let g = g.into_inner();
+            if name == "endpoint_used_bytes" {
+                saw_used_gauge = true;
+                assert!(g > 0.0, "used_bytes gauge must be positive after writes");
+            } else if name == "endpoint_hard_limit_bytes" {
+                saw_limit_gauge = true;
+                assert_eq!(g, 1_000_000.0, "hard_limit_bytes gauge mirrors config");
+            }
+        }
+    }
+    assert!(
+        saw_used_gauge,
+        "endpoint_used_bytes gauge must be emitted on refresh"
+    );
+    assert!(
+        saw_limit_gauge,
+        "endpoint_hard_limit_bytes gauge must be emitted on refresh"
+    );
+}
+
+/// Concurrent put + refresh: writers and the capacity scanner must
+/// not race in ways that produce torn reads or panics. Spawns N
+/// writer threads doing bulk puts while a parallel thread loops on
+/// `refresh_capacity()`. Final state must be consistent: every key
+/// written before the test stopped is readable, the tracker's
+/// `used_bytes` is monotonically non-decreasing across observations,
+/// and `is_writable` semantics hold.
+#[test]
+fn concurrent_put_and_refresh_no_torn_reads() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let dir = TempDir::new().expect("tempdir");
+    // Generous limit so writers don't get gated mid-test.
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "ep",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )
+    .with_hard_limit_bytes(1_000_000_000)]);
+    let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Refresher thread — bangs on refresh_capacity() while writers
+    // push data through. Any race in the AtomicU64 / AtomicBool /
+    // Mutex<CapacitySeverity> code path would surface as a panic
+    // (poison) or a tracker.used() reading that goes backwards.
+    let refresher_handle = {
+        let engine = Arc::clone(&engine);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut last_used: u64 = 0;
+            while !stop.load(Ordering::Acquire) {
+                engine.refresh_capacity();
+                let usage = engine.capacity().get("ep").expect("tracked");
+                let cur = usage.used();
+                // Monotonicity: `used_bytes` can only grow during this
+                // test (no deletes). A backward step would mean a torn
+                // read or a logic bug in the scan path. (Allow == —
+                // back-to-back refreshes with no new flushes return
+                // the same value.)
+                assert!(
+                    cur >= last_used,
+                    "used_bytes regressed mid-test: {last_used} -> {cur}",
+                );
+                last_used = cur;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        })
+    };
+
+    // 4 writer threads each pushing 250 puts = 1000 writes total.
+    let mut writer_handles = Vec::new();
+    for w in 0..4 {
+        let engine = Arc::clone(&engine);
+        writer_handles.push(std::thread::spawn(move || {
+            for i in 0..250u32 {
+                let key = format!("node:0:w{w}:{i:010}");
+                engine
+                    .put(Partition::Node, key.as_bytes(), b"payload-bytes")
+                    .expect("put");
+            }
+        }));
+    }
+    for h in writer_handles {
+        h.join().expect("writer join");
+    }
+    // Force a final flush so SSTs are on disk for the last refresh.
+    engine.persist().expect("persist");
+    stop.store(true, Ordering::Release);
+    refresher_handle.join().expect("refresher join");
+
+    // Final state check: every key readable, tracker reports a
+    // plausible used_bytes (> 0, < limit).
+    for w in 0..4 {
+        for i in 0..250u32 {
+            let key = format!("node:0:w{w}:{i:010}");
+            let v = engine
+                .get(Partition::Node, key.as_bytes())
+                .expect("get")
+                .unwrap_or_else(|| panic!("missing key after concurrent run: {key}"));
+            assert_eq!(&v[..], b"payload-bytes");
+        }
+    }
+    let usage = engine.capacity().get("ep").expect("tracked");
+    assert!(usage.used() > 0);
+    assert!(usage.is_writable(), "well under the 1 GB limit");
+}
+
 /// Warm-load preserves a `Full` severity state: opening an engine
 /// whose previous run persisted `used_bytes >= hard_limit_bytes` MUST
 /// initialise the tracker with `is_writable = false` BEFORE the first

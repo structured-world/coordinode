@@ -1160,8 +1160,17 @@ fn run_capacity_refresh<F>(
     for (id, usage) in capacity.iter() {
         use crate::engine::capacity::CapacitySeverity;
         use crate::engine::config::HardLimitStrategy;
+        // Auto-cascade fires at ≥95% per the storage-stack hard-limit
+        // table: Emergency (95-99%) AND Full (100%+) both warrant
+        // eviction. Limiting to Emergency-only would miss the common
+        // case where writes burst past 100% within one scan interval
+        // and severity jumps Normal → Full directly without a
+        // visible Emergency band.
         if matches!(usage.strategy, HardLimitStrategy::CascadeEvict)
-            && matches!(usage.severity(), CapacitySeverity::Emergency)
+            && matches!(
+                usage.severity(),
+                CapacitySeverity::Emergency | CapacitySeverity::Full
+            )
         {
             let id = id.to_string();
             metrics::counter!(
