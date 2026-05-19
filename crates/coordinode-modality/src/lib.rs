@@ -30,7 +30,7 @@
 //! | Schema (label / edge-type / migration / chunk-assignment DDL state) | [`SchemaStore`] | [`LocalSchemaStore`] |
 //! | Blob (binary chunks + blob references) | [`BlobStore`] | [`LocalBlobStore`] |
 //! | Index (secondary indexes — btree, hash, fulltext term postings) | [`IndexStore`] | [`LocalIndexStore`] |
-//! | Node | NodeStore | — (next PR) |
+//! | Node (incl. temporal versioning, ADR-027) | [`NodeStore`] | [`LocalNodeStore`] |
 //! | Edge | EdgeStore | — (next PR) |
 //! | Vector | VectorStore | — (next PR) |
 //! | Document | DocumentStore | — (next PR) |
@@ -55,9 +55,11 @@
 pub mod blob;
 pub mod error;
 pub mod index;
+pub mod node;
 pub mod schema;
 
 pub use blob::{BlobStore, LocalBlobStore};
 pub use error::{StoreError, StoreResult};
 pub use index::{IndexStore, LocalIndexStore};
+pub use node::{LocalNodeStore, NodeStore};
 pub use schema::{LocalSchemaStore, SchemaStore};
