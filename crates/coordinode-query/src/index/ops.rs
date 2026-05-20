@@ -1,17 +1,35 @@
 //! Index CRUD operations: create/delete entries, scan by value.
+//!
+//! Internally delegates to [`coordinode_modality::LocalIndexStore`]
+//! for the typed key encode / put / delete / prefix-scan operations.
+//! The module preserves its existing free-function signatures so
+//! callers across the executor don't churn — the modality store is
+//! the implementation, not the call surface.
 
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
+use coordinode_modality::{IndexStore as _, LocalIndexStore, StoreError};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::StorageError;
 use coordinode_storage::Guard;
 
 use super::definition::IndexDefinition;
-use coordinode_core::index::encoding::{
-    decode_node_id_from_index_key, encode_compound_index_key, encode_compound_value,
-    encode_index_key, encode_value,
-};
+use coordinode_core::index::encoding::decode_node_id_from_index_key;
+
+/// Convert [`coordinode_modality::StoreError`] back into the
+/// existing [`StorageError`] vocabulary used by callers of this
+/// module. `StoreError::Storage` unwraps to the underlying engine
+/// error; other variants fold into a synthetic `PartitionNotFound`
+/// with the message preserved.
+fn map_store_err(e: StoreError) -> StorageError {
+    match e {
+        StoreError::Storage(se) => se,
+        other => StorageError::PartitionNotFound {
+            name: format!("index store: {other}"),
+        },
+    }
+}
 
 /// Create an index entry for a node's property value.
 pub fn create_index_entry(
@@ -20,17 +38,24 @@ pub fn create_index_entry(
     node_id: NodeId,
     value: &Value,
 ) -> Result<(), StorageError> {
-    // For unique indexes, check for existing entries with the same value
+    let store = LocalIndexStore::new(engine);
+    let values_slice = std::slice::from_ref(value);
+    // For unique indexes, check for existing entries with the same value.
     if index.unique {
-        let existing = index_scan_exact(engine, &index.name, value)?;
-        if !existing.is_empty() && !existing.contains(&node_id.as_raw()) {
+        let existing = store
+            .scan_exact(&index.name, values_slice)
+            .map_err(map_store_err)?;
+        if existing
+            .iter()
+            .any(|existing_id| existing_id.as_raw() != node_id.as_raw())
+        {
             return Err(StorageError::Conflict);
         }
     }
-
-    let key = encode_index_key(&index.name, value, node_id.as_raw());
-    // Index entries have empty values — the key itself contains all information
-    engine.put(Partition::Idx, &key, &[])
+    // Index entries have empty values — the key itself carries the data.
+    store
+        .put_entry(&index.name, values_slice, node_id)
+        .map_err(map_store_err)
 }
 
 /// Create index entries for a node, handling compound/sparse/multikey.
@@ -75,25 +100,21 @@ fn write_compound_entry(
     node_id: NodeId,
     values: &[Value],
 ) -> Result<(), StorageError> {
+    let store = LocalIndexStore::new(engine);
     if index.unique {
-        let encoded = encode_compound_value(values);
-        let mut prefix = index.key_prefix();
-        prefix.extend_from_slice(&encoded);
-        prefix.push(b':');
-
-        let iter = engine.prefix_scan(Partition::Idx, &prefix)?;
-        for guard in iter {
-            let (key, _) = guard.into_inner().map_err(StorageError::Engine)?;
-            if let Some(existing_id) = decode_node_id_from_index_key(&key) {
-                if existing_id != node_id.as_raw() {
-                    return Err(StorageError::Conflict);
-                }
-            }
+        let existing = store
+            .scan_exact(&index.name, values)
+            .map_err(map_store_err)?;
+        if existing
+            .iter()
+            .any(|existing_id| existing_id.as_raw() != node_id.as_raw())
+        {
+            return Err(StorageError::Conflict);
         }
     }
-
-    let key = encode_compound_index_key(&index.name, values, node_id.as_raw());
-    engine.put(Partition::Idx, &key, &[])
+    store
+        .put_entry(&index.name, values, node_id)
+        .map_err(map_store_err)
 }
 
 /// Expand multikey values: for each array, produce combinations with elements.
@@ -131,8 +152,9 @@ pub fn delete_index_entry(
     node_id: NodeId,
     value: &Value,
 ) -> Result<(), StorageError> {
-    let key = encode_index_key(&index.name, value, node_id.as_raw());
-    engine.delete(Partition::Idx, &key)
+    LocalIndexStore::new(engine)
+        .delete_entry(&index.name, std::slice::from_ref(value), node_id)
+        .map_err(map_store_err)
 }
 
 /// Delete compound index entries for a node.
@@ -142,19 +164,19 @@ pub fn delete_index_entries(
     node_id: NodeId,
     values: &[Value],
 ) -> Result<(), StorageError> {
+    let store = LocalIndexStore::new(engine);
     let has_array = values.iter().any(|v| matches!(v, Value::Array(_)));
-
     if has_array {
-        let expanded = expand_multikey(values);
-        for combo in &expanded {
-            let key = encode_compound_index_key(&index.name, combo, node_id.as_raw());
-            engine.delete(Partition::Idx, &key)?;
+        for combo in &expand_multikey(values) {
+            store
+                .delete_entry(&index.name, combo, node_id)
+                .map_err(map_store_err)?;
         }
     } else {
-        let key = encode_compound_index_key(&index.name, values, node_id.as_raw());
-        engine.delete(Partition::Idx, &key)?;
+        store
+            .delete_entry(&index.name, values, node_id)
+            .map_err(map_store_err)?;
     }
-
     Ok(())
 }
 
@@ -164,26 +186,11 @@ pub fn index_scan_exact(
     index_name: &str,
     value: &Value,
 ) -> Result<Vec<u64>, StorageError> {
-    let encoded = encode_value(value);
-    let mut prefix = Vec::with_capacity(4 + index_name.len() + 1 + encoded.len() + 1);
-    prefix.extend_from_slice(b"idx:");
-    prefix.extend_from_slice(index_name.as_bytes());
-    prefix.push(b':');
-    prefix.extend_from_slice(&encoded);
-    prefix.push(b':');
-
-    let iter = engine.prefix_scan(Partition::Idx, &prefix)?;
-    let mut results = Vec::new();
-
-    for guard in iter {
-        let (key, _value) = guard.into_inner().map_err(StorageError::Engine)?;
-
-        if let Some(node_id) = decode_node_id_from_index_key(&key) {
-            results.push(node_id);
-        }
-    }
-
-    Ok(results)
+    let store = LocalIndexStore::new(engine);
+    let ids = store
+        .scan_exact(index_name, std::slice::from_ref(value))
+        .map_err(map_store_err)?;
+    Ok(ids.into_iter().map(|id| id.as_raw()).collect())
 }
 
 /// Scan index for all entries (full index scan). Returns (value_bytes, node_id) pairs.
