@@ -10,20 +10,34 @@ fail-fast = false
 [profile.default.slow-timeout]
 period = "30s"
 
-# Raft cluster tests: serial execution.
-# Each test spawns 3 tokio runtimes with gRPC servers — heavy on CPU and
-# timing-sensitive (leader election 300-600ms). Parallel runs cause flaky
-# failures from resource contention. Ports are random (bind :0) so no
-# port conflicts, but CPU contention makes elections timeout.
+# Raft cluster tests: bounded concurrency.
+# Each test spawns 3 tokio runtimes with gRPC servers — election-timing-
+# sensitive (300-600ms). Earlier full-parallel runs were flaky from CPU
+# oversubscription. Pattern: each test claims 3 threads (one per node);
+# group caps at 6 → at most 2 raft tests concurrent on a ≥8-core host.
+# Verified stable across 3 consecutive runs (25/25 each, ~104s).
 [[profile.default.overrides]]
 filter = "binary(raft_cluster)"
-threads-required = 1
-test-group = "serial-raft"
+threads-required = 3
+test-group = "raft-cluster"
 
-[test-groups.serial-raft]
-max-threads = 1
+[test-groups.raft-cluster]
+max-threads = 6
 
-# CI profile: same as default but with JUnit output
+# Heavy property-based tests: bounded concurrency to prevent oversubscription
+# when they coincide with raft tests. Each proptest claims 2 threads; group
+# caps at 4 → at most 2 proptests concurrent, leaving headroom for raft and
+# the rest of the workspace. Cases-per-test was reduced (modality 128→32,
+# storage 64→32) — see test source comments.
+[[profile.default.overrides]]
+filter = "test(/proptest_invariants/) + test(/coordinator_proptest/)"
+threads-required = 2
+test-group = "heavy-proptest"
+
+[test-groups.heavy-proptest]
+max-threads = 4
+
+# CI profile: inherits overrides via re-declaration + JUnit output
 [profile.ci]
 fail-fast = false
 
@@ -35,5 +49,10 @@ path = "junit.xml"
 
 [[profile.ci.overrides]]
 filter = "binary(raft_cluster)"
-threads-required = 1
-test-group = "serial-raft"
+threads-required = 3
+test-group = "raft-cluster"
+
+[[profile.ci.overrides]]
+filter = "test(/proptest_invariants/) + test(/coordinator_proptest/)"
+threads-required = 2
+test-group = "heavy-proptest"
