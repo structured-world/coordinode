@@ -758,6 +758,131 @@ mod tests {
     }
 
     #[test]
+    fn occ_scope_validate_empty_scope_is_clean() {
+        // Empty scope → never any conflict regardless of writes.
+        let (_dir, engine) = open_engine();
+        let coord = engine.coordinator();
+        let scope = coord.occ_scope_at(engine.snapshot());
+        engine
+            .put(Partition::Node, b"unrelated", b"v")
+            .expect("put");
+        let res = coord.validate_occ(&scope).expect("validate ok");
+        assert!(
+            res.is_none(),
+            "empty scope must produce no conflict — nothing was read"
+        );
+    }
+
+    #[test]
+    fn occ_scope_validate_returns_first_conflict_decisive() {
+        // Multiple tracked keys, multiple post-snapshot writes — first
+        // conflict found short-circuits. The return value identifies
+        // *a* conflict; downstream retry handles all of them after
+        // restart.
+        let (_dir, engine) = open_engine();
+        let coord = engine.coordinator();
+        let scope = coord.occ_scope_at(engine.snapshot().saturating_sub(1));
+        scope.track(Partition::Node, b"a");
+        scope.track(Partition::Node, b"b");
+        scope.track(Partition::Node, b"c");
+        engine.put(Partition::Node, b"a", b"v").expect("put a");
+        engine.put(Partition::Node, b"b", b"v").expect("put b");
+        engine.put(Partition::Node, b"c", b"v").expect("put c");
+        let conflict = coord
+            .validate_occ(&scope)
+            .expect("validate ok")
+            .expect("conflict expected");
+        // HashSet iteration order is unspecified, but the partition is
+        // pinned and the key is one of the tracked set.
+        assert_eq!(conflict.partition, Partition::Node);
+        assert!(
+            [b"a".as_slice(), b"b".as_slice(), b"c".as_slice()].contains(&conflict.key.as_slice()),
+            "conflict key must be one of the tracked keys",
+        );
+    }
+
+    #[test]
+    fn occ_scope_drain_resets_and_extends_after() {
+        // drain() must clear the internal set so subsequent track/extend
+        // start from an empty state (matches the test path that pulls
+        // tracked keys out for assertion then expects an empty scope).
+        let (_dir, engine) = open_engine();
+        let scope = engine.coordinator().occ_scope_at(engine.snapshot());
+        scope.track(Partition::Node, b"k1");
+        scope.track(Partition::Node, b"k2");
+        let drained = scope.drain();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(scope.tracked_count(), 0);
+        // Post-drain track works.
+        scope.track(Partition::Node, b"k3");
+        assert_eq!(scope.tracked_count(), 1);
+        assert!(scope.contains(Partition::Node, b"k3"));
+        assert!(!scope.contains(Partition::Node, b"k1"));
+    }
+
+    #[test]
+    fn occ_scope_contains_unit() {
+        let (_dir, engine) = open_engine();
+        let scope = engine.coordinator().occ_scope_at(engine.snapshot());
+        scope.track(Partition::EdgeProp, b"ep_key");
+        assert!(scope.contains(Partition::EdgeProp, b"ep_key"));
+        assert!(!scope.contains(Partition::EdgeProp, b"missing"));
+        // Same key, wrong partition → false (partition is part of the
+        // identity).
+        assert!(!scope.contains(Partition::Node, b"ep_key"));
+    }
+
+    #[test]
+    fn occ_scope_validate_multi_partition_mixed_outcome() {
+        // Conflict on a non-commutative partition + writes on a
+        // commutative partition: only the non-commutative key triggers.
+        let (_dir, engine) = open_engine();
+        let coord = engine.coordinator();
+        let scope = coord.occ_scope_at(engine.snapshot().saturating_sub(1));
+        scope.track(Partition::Adj, b"adj_key"); // commutative — skipped
+        scope.track(Partition::Schema, b"schema_key"); // checked
+        engine
+            .merge(Partition::Adj, b"adj_key", b"x")
+            .expect("merge");
+        engine
+            .put(Partition::Schema, b"schema_key", b"v")
+            .expect("put");
+        let conflict = coord
+            .validate_occ(&scope)
+            .expect("validate ok")
+            .expect("schema_key conflict expected");
+        assert_eq!(
+            conflict.partition,
+            Partition::Schema,
+            "Adj is commutative, only Schema must surface as conflict",
+        );
+    }
+
+    #[test]
+    fn multimodal_coordinator_dyn_dispatch_works() {
+        // Bind to the trait through `&dyn`. This is the contract used
+        // by EE Phase 3 (`MultiShardCoordinator`) — Layer 4 / Layer 5
+        // hold a trait object, never a concrete type.
+        let (_dir, engine) = open_engine();
+        let coord: &dyn MultiModalCoordinator = engine.coordinator();
+        let snap = coord.snapshot();
+        engine.put(Partition::Node, b"dyn_k", b"v").expect("put");
+        assert_eq!(
+            coord
+                .get(Partition::Node, b"dyn_k")
+                .expect("dyn get")
+                .as_deref(),
+            Some(b"v".as_slice()),
+        );
+        // Snapshot-pinned read sees nothing — the put happened after
+        // we captured `snap`.
+        assert!(coord
+            .snapshot_get(&snap, Partition::Node, b"dyn_k")
+            .expect("dyn snap get")
+            .is_none());
+    }
+
+    #[test]
     fn coordinator_snapshot_isolation_holds() {
         let (_dir, engine) = open_engine();
         engine.put(Partition::Node, b"k", b"v1").expect("put v1");

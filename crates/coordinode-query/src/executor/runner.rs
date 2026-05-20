@@ -891,10 +891,11 @@ impl<'a> ExecutionContext<'a> {
     ///
     /// ## OCC Conflict Detection
     ///
-    /// Before flushing writes, checks every key in `mvcc_read_set` for
-    /// versions committed after `mvcc_read_ts` (our snapshot). If any
-    /// such version exists, another transaction modified a key we read
-    /// → read-write conflict → `ErrConflict`.
+    /// Before flushing writes, delegates to Layer-3
+    /// `MultiModalCoordinator::validate_occ` which walks `occ_scope`'s
+    /// tracked keys and checks each for a version with `seqno >
+    /// read_ts`. If any such version exists, another transaction
+    /// modified a key we read → read-write conflict → `ErrConflict`.
     ///
     /// `adj:` partition keys are excluded from conflict checking because
     /// posting list operations are commutative (use merge operators).
@@ -3047,8 +3048,9 @@ struct ParallelCtx<'a> {
     chunk_size: usize,
     /// OCC read-set keys collected during parallel processing (G067).
     /// When `Some`, parallel workers push `(Partition, key)` for each storage
-    /// read so that the caller can merge them into `ExecutionContext::mvcc_read_set`
-    /// after the parallel block. `None` when MVCC oracle is inactive (legacy mode).
+    /// read so that the caller can merge them into `ExecutionContext::occ_scope`
+    /// via `OccScope::extend` after the parallel block. `None` when MVCC
+    /// oracle is inactive (legacy mode).
     occ_read_keys: Option<OccReadKeys>,
 }
 
@@ -3060,9 +3062,10 @@ struct ParallelCtx<'a> {
 /// - Target nodes are not being modified in the current transaction
 /// - RYOW (read-your-own-writes) is irrelevant for reading OTHER nodes
 ///
-/// OCC read-set tracking (G067): when `pctx.occ_read_keys` is `Some`, all
-/// read keys are collected into the `Mutex<Vec>` for the caller to merge into
-/// `ExecutionContext::mvcc_read_set` after the parallel block completes.
+/// OCC read-set tracking (G067 + G104): when `pctx.occ_read_keys` is `Some`,
+/// all read keys are collected into the `Mutex<Vec>` for the caller to merge
+/// into `ExecutionContext::occ_scope` via `OccScope::extend` after the
+/// parallel block completes.
 fn process_targets_parallel(
     neighbors: &[(u64, u64, usize)],
     input_row: &Row,
@@ -16476,7 +16479,8 @@ mod tests {
 
     #[test]
     fn g067_parallel_traversal_populates_occ_read_set() {
-        // Verify that parallel traversal collects read keys into mvcc_read_set
+        // Verify that parallel traversal collects read keys into the
+        // Layer-3 OccScope (G067 tracker, G104 architecture)
         // so OCC conflict detection works for write transactions on super-nodes.
         let dir = tempfile::tempdir().expect("tempdir");
         let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
@@ -16596,6 +16600,71 @@ mod tests {
                 "target node {target_id} should be in OCC read-set",
             );
         }
+    }
+
+    #[test]
+    fn g104_ensure_occ_scope_idempotent_in_mvcc_mode() {
+        // ensure_occ_scope must create scope exactly once per
+        // transaction and return the same handle on subsequent
+        // calls — otherwise tracked keys collected before the
+        // second call would be lost.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open with oracle");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+
+        // First call materialises the scope and tracks one key.
+        {
+            let scope = ctx.ensure_occ_scope().expect("MVCC mode → Some");
+            scope.track(Partition::Node, b"k1");
+        }
+        // Second call returns the SAME scope — k1 is still tracked.
+        let scope = ctx.ensure_occ_scope().expect("still Some");
+        assert!(scope.contains(Partition::Node, b"k1"));
+        scope.track(Partition::Node, b"k2");
+        assert_eq!(scope.tracked_count(), 2);
+    }
+
+    #[test]
+    fn g104_ensure_occ_scope_returns_none_in_legacy_mode() {
+        // Legacy mode (no MVCC oracle) → no OCC scope, no conflict
+        // detection. Calling ensure_occ_scope must be safe and
+        // return None.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = StorageEngine::open(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+        )
+        .expect("open");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        // ctx.mvcc_oracle stays None.
+        assert!(ctx.ensure_occ_scope().is_none());
+        assert!(ctx.occ_scope.is_none(), "no scope materialised");
     }
 
     #[test]
