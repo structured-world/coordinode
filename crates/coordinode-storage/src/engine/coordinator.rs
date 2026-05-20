@@ -28,10 +28,10 @@
 //! - **Not Layer 1** — capacity tracking, endpoint config,
 //!   page-ECC policy live in `engine::capacity` and
 //!   `engine::config`.
-//! - **Not replication** — `ReplicatedWriter` (R142a) wraps
-//!   Layer-4 store writes from outside, not coordinator calls.
-//!   The coordinator only needs to expose a deterministic write
-//!   stream (achieved via the shared seqno generator).
+//! - **Not replication** — the replicated-writer wraps Layer-4 store
+//!   writes from outside, not coordinator calls. The coordinator only
+//!   needs to expose a deterministic write stream (achieved via the
+//!   shared seqno generator).
 //! - **Not consumer registry** — `SeqnoConsumerRegistry` observes
 //!   [`MultiModalCoordinator::current_seqno`] from outside; the
 //!   coordinator does not pull on retention.
@@ -194,10 +194,10 @@ pub trait MultiModalCoordinator: Send + Sync {
     /// from WAL"; CE always returns `Some`.
     fn snapshot_at(&self, seqno: lsm_tree::SeqNo) -> Option<lsm_tree::SeqNo>;
 
-    /// MVCC GC watermark setter. `SeqnoConsumerRegistry` (R137a /
-    /// ADR-028) drives this from outside with the floor across CDC /
-    /// snapshot / backup consumers. Versions with seqno ≤ watermark
-    /// become eligible for compaction-time drop.
+    /// MVCC GC watermark setter. The seqno-consumer registry drives
+    /// this from outside with the floor across CDC / snapshot /
+    /// backup consumers. Versions with seqno ≤ watermark become
+    /// eligible for compaction-time drop.
     fn set_gc_watermark(&self, watermark: u64);
 
     /// Read a key at the latest visible seqno.
@@ -314,8 +314,8 @@ pub struct LocalMultiModalCoordinator {
     /// physical cache budget.
     cache: Arc<lsm_tree::Cache>,
     /// MVCC GC watermark — the seqno below which version-history
-    /// retention can be dropped at compaction time. Observed by
-    /// `SeqnoRetentionFilter` (R063) on every compaction.
+    /// retention can be dropped at compaction time. Observed by the
+    /// seqno-retention compaction filter on every compaction.
     gc_watermark: Arc<AtomicU64>,
 }
 

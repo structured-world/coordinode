@@ -3062,9 +3062,9 @@ struct ParallelCtx<'a> {
 /// - Target nodes are not being modified in the current transaction
 /// - RYOW (read-your-own-writes) is irrelevant for reading OTHER nodes
 ///
-/// OCC read-set tracking (G067 + G104): when `pctx.occ_read_keys` is `Some`,
-/// all read keys are collected into the `Mutex<Vec>` for the caller to merge
-/// into `ExecutionContext::occ_scope` via `OccScope::extend` after the
+/// OCC read-set tracking: when `pctx.occ_read_keys` is `Some`, all read
+/// keys are collected into the `Mutex<Vec>` for the caller to merge into
+/// `ExecutionContext::occ_scope` via `OccScope::extend` after the
 /// parallel block completes.
 fn process_targets_parallel(
     neighbors: &[(u64, u64, usize)],
@@ -3295,7 +3295,7 @@ fn execute_single_hop_traverse(
                 .collect();
             let parallel_rows = process_targets_parallel(&with_src, row, params, &pctx);
             // Merge OCC read keys from parallel workers into the
-            // Layer-3 scope (G067 + G104).
+            // Layer-3 scope.
             if let Some(ref keys_mutex) = pctx.occ_read_keys {
                 if let (Ok(keys), Some(scope)) = (keys_mutex.lock(), ctx.ensure_occ_scope()) {
                     scope.extend(keys.iter().cloned());
@@ -3459,7 +3459,7 @@ fn execute_varlen_traverse(
                 };
                 let parallel_rows = process_targets_parallel(&depth_neighbors, row, params, &pctx);
                 // Merge OCC read keys from parallel workers into the
-                // Layer-3 scope (G067 + G104).
+                // Layer-3 scope.
                 if let Some(ref keys_mutex) = pctx.occ_read_keys {
                     if let (Ok(keys), Some(scope)) = (keys_mutex.lock(), ctx.ensure_occ_scope()) {
                         scope.extend(keys.iter().cloned());
@@ -16479,8 +16479,9 @@ mod tests {
 
     #[test]
     fn g067_parallel_traversal_populates_occ_read_set() {
-        // Verify that parallel traversal collects read keys into the
-        // Layer-3 OccScope (G067 tracker, G104 architecture)
+        // Verify that parallel traversal collects read keys into
+        // the Layer-3 OccScope so OCC conflict detection works for
+        // write transactions on super-nodes.
         // so OCC conflict detection works for write transactions on super-nodes.
         let dir = tempfile::tempdir().expect("tempdir");
         let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
@@ -16639,6 +16640,88 @@ mod tests {
         assert!(scope.contains(Partition::Node, b"k1"));
         scope.track(Partition::Node, b"k2");
         assert_eq!(scope.tracked_count(), 2);
+    }
+
+    #[test]
+    fn ryow_read_does_not_track_in_occ_scope() {
+        // Reading-your-own-write (write_buffer hit) must NOT enter
+        // the OCC scope — otherwise your own writes trigger
+        // self-conflict at commit (a transaction that puts a key
+        // and then reads it would always abort).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open with oracle");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+
+        // Write into the buffer (this is our own transaction's write).
+        ctx.mvcc_put(Partition::Node, b"own_key", b"own_value")
+            .expect("put");
+        // Read it back — RYOW hit, returns from write_buffer.
+        let v = ctx.mvcc_get(Partition::Node, b"own_key").expect("get");
+        assert_eq!(v.as_deref(), Some(b"own_value".as_slice()));
+        // The Layer-3 scope must NOT contain this key.
+        // Two valid post-states:
+        //   - no scope materialised at all (write-only path didn't
+        //     trip ensure_occ_scope from the read side, since the
+        //     read returned before the track call), OR
+        //   - scope exists but does not contain own_key.
+        match ctx.occ_scope.as_ref() {
+            None => { /* fine — no scope means no tracking happened */ }
+            Some(scope) => assert!(
+                !scope.contains(Partition::Node, b"own_key"),
+                "RYOW key must not be tracked in OCC scope",
+            ),
+        }
+    }
+
+    #[test]
+    fn legacy_mode_prefix_scan_does_not_materialise_scope() {
+        // Without an MVCC oracle, mvcc_prefix_scan must not create
+        // an OCC scope — there is no conflict detection in legacy
+        // mode and any scope would be dead weight.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = StorageEngine::open(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+        )
+        .expect("open");
+        engine.put(Partition::Node, b"k1", b"v1").expect("seed");
+        engine.put(Partition::Node, b"k2", b"v2").expect("seed");
+
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        // ctx.mvcc_oracle remains None — legacy mode.
+
+        let results = ctx.mvcc_prefix_scan(Partition::Node, b"k").expect("scan");
+        assert_eq!(results.len(), 2);
+        assert!(
+            ctx.occ_scope.is_none(),
+            "legacy mode must NOT materialise an OCC scope",
+        );
     }
 
     #[test]
