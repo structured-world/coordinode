@@ -1050,7 +1050,7 @@ impl Database {
                 dismissed: Arc::clone(&self.dismissed),
             }),
             mvcc_write_buffer: std::collections::HashMap::new(),
-            mvcc_read_set: std::collections::HashSet::new(),
+            occ_scope: None,
             vector_consistency: self.vector_consistency,
             vector_overfetch_factor: 1.2,
             vector_mvcc_stats: None,

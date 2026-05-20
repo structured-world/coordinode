@@ -50,7 +50,7 @@ fn make_test_ctx<'a>(
         mvcc_read_ts: coordinode_core::txn::timestamp::Timestamp::ZERO,
         mvcc_write_buffer: HashMap::new(),
         procedure_ctx: None,
-        mvcc_read_set: std::collections::HashSet::new(),
+        occ_scope: None,
         vector_consistency: coordinode_core::graph::types::VectorConsistencyMode::default(),
         vector_overfetch_factor: 1.2,
         vector_mvcc_stats: None,

@@ -314,20 +314,16 @@ pub struct ExecutionContext<'a> {
     /// `db.advisor.*` procedures in the executor.
     pub procedure_ctx: Option<crate::advisor::procedures::ProcedureContext>,
 
-    /// OCC read-set: keys read from storage during this transaction.
+    /// Layer-3 OCC scope: read-set tracker pinned at `mvcc_read_ts`.
     ///
-    /// At commit time, each key in the read-set is checked for writes
-    /// committed after `mvcc_read_ts`. If any such write exists, the
-    /// transaction has a read-write conflict and must be aborted.
-    ///
-    /// Keys written to `mvcc_write_buffer` (read-your-own-writes) are
-    /// NOT added to the read-set — they are part of our own transaction.
-    ///
-    /// `adj:` partition keys are excluded from conflict checking when
-    /// merge operators are in use — merge writes are commutative
-    /// and conflict-free by construction.
-    #[allow(clippy::type_complexity)]
-    pub mvcc_read_set: HashSet<(Partition, Vec<u8>)>,
+    /// Lazily created on the first read when `mvcc_oracle.is_some()`
+    /// via [`Self::ensure_occ_scope`]; the scope's `read_ts` is sourced
+    /// from `mvcc_read_ts.as_raw()`. Layer-5 hands it the keys it
+    /// touches (`s.track(part, key)`), Layer-3 validates at commit
+    /// time via `coordinator.validate_occ(&scope)` — see
+    /// [`coordinode_storage::engine::coordinator::OccScope`] for the
+    /// full contract and commutative-partition policy.
+    pub occ_scope: Option<coordinode_storage::engine::coordinator::OccScope>,
     /// Vector MVCC consistency mode. Controls how vector search interacts
     /// with snapshot isolation. Default: `Current` (no visibility filter).
     /// Set via `SET vector_consistency = 'snapshot'` or per-query hint.
@@ -671,6 +667,25 @@ impl<'a> ExecutionContext<'a> {
         Ok(Some(label))
     }
 
+    /// Lazily materialise the Layer-3 OCC scope for this transaction.
+    /// Returns `None` when MVCC is inactive (legacy mode has no
+    /// conflict detection).
+    ///
+    /// The scope is pinned at `mvcc_read_ts.as_raw()` — every read
+    /// recorded via [`OccScope::track`] becomes part of the read-set
+    /// validated at commit time.
+    fn ensure_occ_scope(&mut self) -> Option<&coordinode_storage::engine::coordinator::OccScope> {
+        if self.mvcc_oracle.is_some() && self.occ_scope.is_none() {
+            use coordinode_storage::engine::coordinator::MultiModalCoordinator;
+            self.occ_scope = Some(
+                self.engine
+                    .coordinator()
+                    .occ_scope_at(self.mvcc_read_ts.as_raw()),
+            );
+        }
+        self.occ_scope.as_ref()
+    }
+
     /// MVCC-aware read: write buffer → snapshot O(1) → legacy fallback.
     ///
     /// 1. Check write buffer (read-your-own-writes within this statement)
@@ -693,10 +708,10 @@ impl<'a> ExecutionContext<'a> {
             return Ok(buffered.clone());
         }
 
-        // Track this key in the OCC read-set (for conflict detection at commit).
-        // Only in MVCC mode — legacy mode doesn't have conflict detection.
-        if self.mvcc_oracle.is_some() {
-            self.mvcc_read_set.insert((part, key.to_vec()));
+        // Track this key in the Layer-3 OCC scope (conflict detection
+        // at commit). Legacy mode (no oracle) has no scope.
+        if let Some(scope) = self.ensure_occ_scope() {
+            scope.track(part, key);
         }
 
         // Native seqno MVCC read via snapshot_at (ADR-016) or legacy read
@@ -924,29 +939,18 @@ impl<'a> ExecutionContext<'a> {
         let commit_ts = oracle.next();
 
         // OCC conflict detection (ADR-016: native seqno-based).
-        //
-        // For each key in our read-set, check if the latest version's seqno
-        // is greater than our start_ts. If so, another transaction committed
-        // a write after we started — abort with ErrConflict.
-        //
-        // Uses lsm-tree's get_internal_entry to inspect seqno metadata
-        // without full value deserialization. Detects all writes including
-        // ABA (write + revert to same value).
-        for (part, key) in &self.mvcc_read_set {
-            // Exclude adj: partition — posting list writes are commutative
-            // and conflict-free (merge operators).
-            if *part == Partition::Adj {
-                continue;
-            }
-
-            if self
-                .engine
-                .has_write_after(*part, key, self.mvcc_read_ts.as_raw())?
-            {
+        // Delegated to Layer-3 — `coordinator.validate_occ` walks the
+        // scope's tracked keys, skips commutative partitions, and
+        // returns the first conflicting key. Detects all writes
+        // including ABA (write + revert to same value) via lsm-tree's
+        // `get_internal_entry` seqno inspection.
+        if let Some(scope) = self.occ_scope.as_ref() {
+            use coordinode_storage::engine::coordinator::MultiModalCoordinator;
+            if let Some(conflict) = self.engine.coordinator().validate_occ(scope)? {
                 return Err(ExecutionError::Conflict(format!(
-                    "OCC conflict: key in {part:?} partition was modified by another \
+                    "OCC conflict: key in {:?} partition was modified by another \
                      transaction after start_ts={}. Retry the transaction.",
-                    self.mvcc_read_ts.as_raw()
+                    conflict.partition, conflict.read_ts,
                 )));
             }
         }
@@ -1328,13 +1332,15 @@ impl<'a> ExecutionContext<'a> {
                 .map(|(k, v)| (k, v.to_vec()))
                 .collect();
 
-            // Track all scanned keys in OCC read-set.
+            // Track all scanned keys in the Layer-3 OCC scope.
             // Keys from the write buffer are our own writes — NOT tracked.
             let buffer_keys: HashSet<Vec<u8>> =
                 buffer_matches.iter().map(|(k, _)| k.clone()).collect();
-            for (k, _) in &results {
-                if !buffer_keys.contains(k) {
-                    self.mvcc_read_set.insert((part, k.clone()));
+            if let Some(scope) = self.ensure_occ_scope() {
+                for (k, _) in &results {
+                    if !buffer_keys.contains(k) {
+                        scope.track(part, k);
+                    }
                 }
             }
 
@@ -3285,10 +3291,11 @@ fn execute_single_hop_traverse(
                 .map(|&(tgt, et_idx)| (src_raw, tgt, et_idx))
                 .collect();
             let parallel_rows = process_targets_parallel(&with_src, row, params, &pctx);
-            // Merge OCC read keys from parallel workers (G067)
+            // Merge OCC read keys from parallel workers into the
+            // Layer-3 scope (G067 + G104).
             if let Some(ref keys_mutex) = pctx.occ_read_keys {
-                if let Ok(keys) = keys_mutex.lock() {
-                    ctx.mvcc_read_set.extend(keys.iter().cloned());
+                if let (Ok(keys), Some(scope)) = (keys_mutex.lock(), ctx.ensure_occ_scope()) {
+                    scope.extend(keys.iter().cloned());
                 }
             }
             results.extend(parallel_rows);
@@ -3448,10 +3455,11 @@ fn execute_varlen_traverse(
                     },
                 };
                 let parallel_rows = process_targets_parallel(&depth_neighbors, row, params, &pctx);
-                // Merge OCC read keys from parallel workers (G067)
+                // Merge OCC read keys from parallel workers into the
+                // Layer-3 scope (G067 + G104).
                 if let Some(ref keys_mutex) = pctx.occ_read_keys {
-                    if let Ok(keys) = keys_mutex.lock() {
-                        ctx.mvcc_read_set.extend(keys.iter().cloned());
+                    if let (Ok(keys), Some(scope)) = (keys_mutex.lock(), ctx.ensure_occ_scope()) {
+                        scope.extend(keys.iter().cloned());
                     }
                 }
                 results.extend(parallel_rows);
@@ -13397,7 +13405,7 @@ mod tests {
             mvcc_read_ts: coordinode_core::txn::timestamp::Timestamp::ZERO,
             procedure_ctx: None,
             mvcc_write_buffer: std::collections::HashMap::new(),
-            mvcc_read_set: std::collections::HashSet::new(),
+            occ_scope: None,
             vector_consistency: VectorConsistencyMode::default(),
             vector_overfetch_factor: 1.2,
             vector_mvcc_stats: None,
@@ -16559,8 +16567,15 @@ mod tests {
         // Verify OCC read-set contains Node keys for target nodes.
         // The source node (Hub, id=1) is read via sequential mvcc_get in NodeScan,
         // and 10 target nodes are read via parallel path — all should be tracked.
-        let node_read_keys: Vec<_> = ctx
-            .mvcc_read_set
+        let scope = ctx
+            .occ_scope
+            .as_ref()
+            .expect("MVCC mode must have an OCC scope");
+
+        // Drain into a Vec so we can both count Node-partition entries
+        // and probe specific target keys without re-locking per assert.
+        let tracked: Vec<_> = scope.drain();
+        let node_read_keys: Vec<_> = tracked
             .iter()
             .filter(|(part, _)| *part == Partition::Node)
             .collect();
@@ -16573,12 +16588,11 @@ mod tests {
             node_read_keys.len(),
         );
 
-        // Verify specific target keys are tracked
+        // Verify specific target keys are tracked.
         for target_id in 2..=11u64 {
             let target_key = encode_node_key(1, NodeId::from_raw(target_id));
             assert!(
-                ctx.mvcc_read_set
-                    .contains(&(Partition::Node, target_key.to_vec())),
+                tracked.contains(&(Partition::Node, target_key.to_vec())),
                 "target node {target_id} should be in OCC read-set",
             );
         }

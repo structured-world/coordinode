@@ -380,11 +380,13 @@ fn occ_conflict_via_prefix_scan() {
     assert_eq!(scan_results.len(), 1, "should find one node");
     assert_eq!(scan_results[0].0, b"node:0:1");
 
-    // Verify the scanned key IS in the read_set
+    // Verify the scanned key IS in the OCC scope (Layer 3)
     assert!(
-        ctx.mvcc_read_set
-            .contains(&(Partition::Node, b"node:0:1".to_vec())),
-        "prefix_scan results must be tracked in read_set"
+        ctx.occ_scope
+            .as_ref()
+            .expect("MVCC mode must have OCC scope")
+            .contains(Partition::Node, b"node:0:1"),
+        "prefix_scan results must be tracked in OCC scope"
     );
 
     // Txn B: concurrent write to the SAME key

@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::NodeIdAllocator;
@@ -45,7 +45,7 @@ pub fn make_ctx_legacy<'a>(
         mvcc_read_ts: Timestamp::ZERO,
         mvcc_write_buffer: HashMap::new(),
         procedure_ctx: None,
-        mvcc_read_set: HashSet::new(),
+        occ_scope: None,
         vector_consistency: VectorConsistencyMode::default(),
         vector_overfetch_factor: 1.2,
         vector_mvcc_stats: None,
@@ -105,7 +105,7 @@ pub fn make_ctx_mvcc<'a>(
         mvcc_read_ts: read_ts,
         mvcc_write_buffer: HashMap::new(),
         procedure_ctx: None,
-        mvcc_read_set: HashSet::new(),
+        occ_scope: None,
         vector_consistency: VectorConsistencyMode::default(),
         vector_overfetch_factor: 1.2,
         vector_mvcc_stats: None,
@@ -166,7 +166,7 @@ pub fn make_ctx_with_pipeline<'a>(
         mvcc_read_ts: read_ts,
         mvcc_write_buffer: HashMap::new(),
         procedure_ctx: None,
-        mvcc_read_set: HashSet::new(),
+        occ_scope: None,
         vector_consistency: VectorConsistencyMode::default(),
         vector_overfetch_factor: 1.2,
         vector_mvcc_stats: None,
