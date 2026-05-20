@@ -16988,6 +16988,197 @@ mod tests {
     }
 
     #[test]
+    fn mvcc_get_edge_props_tracks_key_in_occ_scope() {
+        // Critical correctness — typed edge-prop read must enter the
+        // Layer-3 OCC scope under the encoded EdgeProp key, otherwise
+        // OCC misses concurrent writers on edges that a transaction
+        // reads but does not write.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open");
+        let src = NodeId::from_raw(1);
+        let tgt = NodeId::from_raw(2);
+        let payload: Vec<(u32, Value)> = vec![(0, Value::Int(7))];
+        // Seed via direct engine put so the read populates the scope.
+        let ep_key = encode_edgeprop_key("REL", src, tgt);
+        engine
+            .put(
+                Partition::EdgeProp,
+                &ep_key,
+                &rmp_serde::to_vec(&payload).unwrap(),
+            )
+            .expect("seed");
+
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+
+        let _ = ctx
+            .mvcc_get_edge_props("REL", src, tgt)
+            .expect("get")
+            .expect("Some");
+
+        let scope = ctx.occ_scope.as_ref().expect("scope");
+        assert!(
+            scope.contains(Partition::EdgeProp, &ep_key),
+            "OCC scope must contain the encoded EdgeProp key after a typed read",
+        );
+    }
+
+    #[test]
+    fn mvcc_get_edge_props_temporal_tracks_25byte_key_not_short() {
+        // Temporal read must populate OCC with the per-version key,
+        // NOT the non-temporal `(src, tgt)` key — otherwise concurrent
+        // writers on a different version would falsely conflict (and
+        // vice versa).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open");
+        let src = NodeId::from_raw(11);
+        let tgt = NodeId::from_raw(22);
+        let payload: Vec<(u32, Value)> = vec![(1, Value::String("v".into()))];
+        let temporal_key = encode_temporal_edgeprop_key("REL", src, tgt, 5000);
+        engine
+            .put(
+                Partition::EdgeProp,
+                &temporal_key,
+                &rmp_serde::to_vec(&payload).unwrap(),
+            )
+            .expect("seed");
+        let non_temporal_key = encode_edgeprop_key("REL", src, tgt);
+
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+
+        let _ = ctx
+            .mvcc_get_edge_props_temporal("REL", src, tgt, 5000)
+            .expect("get")
+            .expect("Some");
+
+        let scope = ctx.occ_scope.as_ref().expect("scope");
+        assert!(
+            scope.contains(Partition::EdgeProp, &temporal_key),
+            "OCC scope must record the temporal (per-version) key",
+        );
+        assert!(
+            !scope.contains(Partition::EdgeProp, &non_temporal_key),
+            "OCC scope must NOT record the short non-temporal key on a temporal read",
+        );
+    }
+
+    #[test]
+    fn mvcc_put_edge_props_does_not_track_in_occ_scope() {
+        // Symmetric invariant to the node-side test: a pure write
+        // must NOT enter the OCC scope, otherwise the put + subsequent
+        // same-txn read would self-conflict at commit.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+
+        let src = NodeId::from_raw(33);
+        let tgt = NodeId::from_raw(44);
+        let payload: Vec<(u32, Value)> = vec![(2, Value::Bool(true))];
+        ctx.mvcc_put_edge_props("REL", src, tgt, &payload)
+            .expect("put");
+
+        let ep_key = encode_edgeprop_key("REL", src, tgt);
+        match ctx.occ_scope.as_ref() {
+            None => { /* no scope materialised on pure write — fine */ }
+            Some(scope) => assert!(
+                !scope.contains(Partition::EdgeProp, &ep_key),
+                "pure edge-prop write must NOT enter OCC scope",
+            ),
+        }
+    }
+
+    #[test]
+    fn mvcc_get_edge_props_decode_error_surfaces() {
+        // Corrupt bytes at the EdgeProp key surface as
+        // ExecutionError::Serialization with the (edge_type, src, tgt)
+        // diagnostic, not panic.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = StorageEngine::open(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+        )
+        .expect("open");
+        let src = NodeId::from_raw(55);
+        let tgt = NodeId::from_raw(66);
+        let ep_key = encode_edgeprop_key("REL", src, tgt);
+        engine
+            .put(Partition::EdgeProp, &ep_key, b"this-is-not-msgpack")
+            .expect("seed garbage");
+
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        let err = ctx
+            .mvcc_get_edge_props("REL", src, tgt)
+            .expect_err("garbage must surface as error");
+        match err {
+            ExecutionError::Serialization(msg) => {
+                assert!(msg.contains("REL"), "diag has edge_type: {msg}");
+                assert!(msg.contains("55"), "diag has src id: {msg}");
+                assert!(msg.contains("66"), "diag has tgt id: {msg}");
+            }
+            other => panic!("wrong error variant: {other:?}"),
+        }
+    }
+
+    #[test]
     fn mvcc_delete_edge_props_either_dispatches_on_temporal_flag() {
         // delete_edge_props_either must tombstone exactly the keyed
         // version. The non-temporal-key write at (src, tgt) survives
