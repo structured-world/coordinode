@@ -49,10 +49,12 @@ const ALLOWED: &[(&str, usize)] = &[
     // runner.rs current baseline: typed-helper internals call the raw
     // encoders by construction (~15 calls across mvcc_*_node /
     // mvcc_*_edge_props helpers), plus test fixtures in the cfg(test)
-    // module use them to build probe keys (~37 calls). Total = 52.
-    // Lowering this means a test-fixture migration (R166); raising
-    // it means new raw-encoder usage in production — reject.
-    ("src/executor/runner.rs", 52),
+    // module use them to build probe keys (~42 calls including the
+    // edge-prop OCC / decode-error / temporal-key audit tests added
+    // alongside the gate). Total = 57. Lowering this means a
+    // test-fixture migration (R166); raising it means new raw-encoder
+    // usage in production — reject.
+    ("src/executor/runner.rs", 57),
     // ops.rs — fully routed through LocalIndexStore after slice 12.
     ("src/index/ops.rs", 0),
     // build.rs (R165 slice 2): 1 residual usage in the cfg(test)
@@ -102,5 +104,55 @@ fn encoder_lockdown_no_raw_encoder_growth() {
         violations.is_empty(),
         "Encoder lockdown violations:\n{}",
         violations.join("\n"),
+    );
+}
+
+/// Catches the second failure mode: a new `coordinode-query/src/*.rs`
+/// file ships with raw encoder calls but isn't listed in `SCAN_FILES`
+/// — the gate would silently pass. This test walks every `.rs` under
+/// `src/` and asserts that any file using a raw encoder appears in
+/// the whitelist. New files without raw encoders are fine.
+#[test]
+fn encoder_lockdown_no_new_files_with_raw_encoders() {
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut bad: Vec<String> = Vec::new();
+
+    fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut all_src_files: Vec<std::path::PathBuf> = Vec::new();
+    walk(&src_root, &mut all_src_files);
+
+    for path in &all_src_files {
+        let rel = path
+            .strip_prefix(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+        let content = fs::read_to_string(path).unwrap_or_default();
+        let uses_raw = RAW_ENCODER_NEEDLES.iter().any(|n| content.contains(n));
+        if uses_raw && !SCAN_FILES.iter().any(|s| rel.ends_with(s)) {
+            bad.push(format!(
+                "{rel} uses raw encoders but is not in SCAN_FILES — add it (with a baseline allowance) to the lockdown table.",
+            ));
+        }
+    }
+
+    assert!(
+        bad.is_empty(),
+        "Encoder lockdown coverage gaps:\n{}",
+        bad.join("\n"),
     );
 }
