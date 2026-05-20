@@ -21,7 +21,7 @@ use crate::engine::batch::WriteBatch;
 use crate::engine::compaction::CompactionScheduler;
 use crate::engine::config::EndpointConfig;
 use crate::engine::config::{FlushPolicy, StorageConfig};
-use crate::engine::coordinator::Coordinator;
+use crate::engine::coordinator::{LocalMultiModalCoordinator, MultiModalCoordinator};
 use crate::engine::flush::FlushManager;
 use crate::engine::partition::Partition;
 use crate::engine::routing::PartitionRouting;
@@ -87,7 +87,7 @@ pub struct StorageEngine {
     /// shared seqno generator, block cache, and MVCC GC watermark. Every
     /// partition-keyed read/write delegates here. See
     /// [`crate::engine::coordinator`].
-    coordinator: Coordinator,
+    coordinator: LocalMultiModalCoordinator,
     flush_policy: FlushPolicy,
     /// Optional tiered block cache (DRAM → NVMe → SSD cascade).
     tiered_cache: Option<TieredCache>,
@@ -471,7 +471,8 @@ impl StorageEngine {
             None
         };
 
-        let coordinator = Coordinator::new(trees, Arc::clone(&seqno), cache, gc_watermark);
+        let coordinator =
+            LocalMultiModalCoordinator::new(trees, Arc::clone(&seqno), cache, gc_watermark);
         Ok(Self {
             flush_manager: Some(flush_manager),
             compaction_scheduler: Some(compaction_scheduler),
@@ -498,10 +499,10 @@ impl StorageEngine {
             })
     }
 
-    /// Borrow the Layer-3 coordinator. R142a (`ReplicatedWriter`)
-    /// and R137a (`SeqnoConsumerRegistry`) plug in at this seam —
-    /// see [`Coordinator`] doc for the wire-in contract.
-    pub fn coordinator(&self) -> &Coordinator {
+    /// Borrow the Layer-3 coordinator. Replicated-writer and the
+    /// seqno-consumer registry plug in at this seam — see
+    /// [`LocalMultiModalCoordinator`] doc for the wire-in contract.
+    pub fn coordinator(&self) -> &LocalMultiModalCoordinator {
         &self.coordinator
     }
 

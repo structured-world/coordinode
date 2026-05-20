@@ -7,6 +7,7 @@
 #![allow(clippy::unwrap_used)]
 
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
+use coordinode_storage::engine::coordinator::MultiModalCoordinator;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use criterion::{criterion_group, criterion_main, Criterion};

@@ -1,10 +1,12 @@
-//! Property-based tests for the Layer-3 [`Coordinator`] (R164).
+//! Property-based tests for the Layer-3 coordinator
+//! ([`coordinode_storage::engine::coordinator::LocalMultiModalCoordinator`]).
 //! Pins three contracts that the partition-keyed dispatch must
 //! honour regardless of input shape.
 
 #![allow(clippy::unwrap_used)]
 
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
+use coordinode_storage::engine::coordinator::MultiModalCoordinator;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use proptest::prelude::*;

@@ -23,6 +23,7 @@ use coordinode_core::graph::node::{
     decode_temporal_node_key, encode_node_key, encode_temporal_node_key, temporal_node_id_prefix,
     NodeId, NodeRecord,
 };
+use coordinode_storage::engine::coordinator::MultiModalCoordinator;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::Guard;
@@ -177,11 +178,34 @@ pub trait NodeStore {
         snapshot: lsm_tree::SeqNo,
     ) -> StoreResult<Option<NodeRecord>>;
 
+    /// Existence check at a pinned snapshot — equivalent to
+    /// `get_at_seqno(...).is_some()` but skips decoding the
+    /// `NodeRecord` body. Use on hot paths (MVCC visibility filter,
+    /// reachability) where the caller only needs yes/no.
+    fn contains_at_seqno(
+        &self,
+        shard_id: u16,
+        node_id: NodeId,
+        snapshot: lsm_tree::SeqNo,
+    ) -> StoreResult<bool>;
+
     /// Iterate every non-temporal node record in a shard, latest
     /// visible seqno. Yields `(NodeId, NodeRecord)` pairs in key
-    /// order. Used by index builders and TTL/maintenance reapers
-    /// that need a full-shard walk.
+    /// order. Materialised into a `Vec` — callers walking very
+    /// large shards (>1M nodes) should prefer
+    /// [`Self::for_each_in_shard`] which streams in constant
+    /// memory.
     fn scan_shard(&self, shard_id: u16) -> StoreResult<Vec<(NodeId, NodeRecord)>>;
+
+    /// Streaming shard walk. Invokes `visit(node_id, record)` for
+    /// every non-temporal entry; bails on the first visitor error.
+    /// Constant memory regardless of shard size — unlike
+    /// [`Self::scan_shard`] which collects into a `Vec`.
+    fn for_each_in_shard(
+        &self,
+        shard_id: u16,
+        visit: &mut dyn FnMut(NodeId, NodeRecord) -> StoreResult<()>,
+    ) -> StoreResult<()>;
 }
 
 /// CE single-shard implementation of [`NodeStore`].
@@ -331,6 +355,45 @@ impl NodeStore for LocalNodeStore<'_> {
             return Ok(None);
         };
         Self::decode_record(&bytes).map(Some)
+    }
+
+    fn contains_at_seqno(
+        &self,
+        shard_id: u16,
+        node_id: NodeId,
+        snapshot: lsm_tree::SeqNo,
+    ) -> StoreResult<bool> {
+        let key = encode_node_key(shard_id, node_id);
+        Ok(self
+            .engine
+            .coordinator()
+            .snapshot_get(&snapshot, Partition::Node, &key)?
+            .is_some())
+    }
+
+    fn for_each_in_shard(
+        &self,
+        shard_id: u16,
+        visit: &mut dyn FnMut(NodeId, NodeRecord) -> StoreResult<()>,
+    ) -> StoreResult<()> {
+        let mut prefix = Vec::with_capacity(8);
+        prefix.extend_from_slice(b"node:");
+        prefix.extend_from_slice(&shard_id.to_be_bytes());
+        prefix.push(b':');
+        let iter = self.engine.prefix_scan(Partition::Node, &prefix)?;
+        for guard in iter {
+            let (key, value) = guard.into_inner()?;
+            if key.len() != 16 {
+                continue;
+            }
+            let id_bytes: [u8; 8] = match key[8..16].try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let node_id = NodeId::from_raw(u64::from_be_bytes(id_bytes));
+            visit(node_id, Self::decode_record(&value)?)?;
+        }
+        Ok(())
     }
 
     fn scan_shard(&self, shard_id: u16) -> StoreResult<Vec<(NodeId, NodeRecord)>> {
