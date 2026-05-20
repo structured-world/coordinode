@@ -955,6 +955,20 @@ impl StorageEngine {
         Ok(Box::new(tree.prefix(prefix, seqno, None)))
     }
 
+    /// Inclusive-bounded range scan: yields entries with keys `K` such
+    /// that `start ≤ K ≤ end`. Convenience wrapper over
+    /// [`MultiModalCoordinator::range_scan`]; used by callers that have
+    /// decomposed a query into disjoint key intervals (e.g. spatial
+    /// Z-curve subrange decomposition).
+    pub fn range_scan(
+        &self,
+        part: Partition,
+        start: &[u8],
+        end: &[u8],
+    ) -> StorageResult<StorageIter> {
+        self.coordinator.range_scan(part, start, end)
+    }
+
     /// Get the tiered cache, if enabled.
     pub fn tiered_cache(&self) -> Option<&TieredCache> {
         self.tiered_cache.as_ref()

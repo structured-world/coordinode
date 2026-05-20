@@ -225,6 +225,15 @@ pub trait MultiModalCoordinator: Send + Sync {
         snapshot: lsm_tree::SeqNo,
     ) -> StorageResult<StorageIter>;
 
+    /// Inclusive-bounded range scan at the latest visible seqno.
+    /// Yields entries with keys `K` such that `start ≤ K ≤ end`.
+    /// Used by callers that have already decomposed a query into
+    /// disjoint key intervals (e.g. spatial Z-curve subrange
+    /// decomposition) — issuing a per-interval `range_scan` avoids
+    /// scanning the in-between keys that a single broad
+    /// `prefix_scan` would walk.
+    fn range_scan(&self, part: Partition, start: &[u8], end: &[u8]) -> StorageResult<StorageIter>;
+
     /// Snapshot-pinned prefix scan, materialised owned. Convenience
     /// over `prefix_scan_at` for callers that need eager collection.
     fn snapshot_prefix_scan(
@@ -473,6 +482,19 @@ impl MultiModalCoordinator for LocalMultiModalCoordinator {
     ) -> StorageResult<StorageIter> {
         let tree = self.tree(part)?;
         Ok(Box::new(tree.prefix(prefix, snapshot, None)))
+    }
+
+    fn range_scan(&self, part: Partition, start: &[u8], end: &[u8]) -> StorageResult<StorageIter> {
+        let tree = self.tree(part)?;
+        let seqno = self.seqno.get();
+        // `lsm_tree::AbstractTree::range` takes a `RangeBounds<K>`;
+        // inclusive bounds map directly. Owned `Vec<u8>` so the bounds
+        // outlive this call (lsm-tree borrows internally for the scan).
+        let range = (
+            std::ops::Bound::Included(start.to_vec()),
+            std::ops::Bound::Included(end.to_vec()),
+        );
+        Ok(Box::new(tree.range(range, seqno, None)))
     }
 
     fn snapshot_prefix_scan(
