@@ -11,8 +11,9 @@
 //! Side-writes interception for concurrent writers added with Raft (distributed mode).
 
 use coordinode_core::graph::intern::FieldInterner;
-use coordinode_core::graph::node::{NodeId, NodeRecord};
+use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
+use coordinode_modality::{LocalNodeStore, NodeStore};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::Guard;
@@ -87,16 +88,9 @@ pub fn build_index(
     // Phase 2: InProgress — scan nodes
     result.state = Some(IndexBuildState::InProgress);
 
-    let prefix = {
-        let mut p = Vec::with_capacity(8);
-        p.extend_from_slice(b"node:");
-        p.extend_from_slice(&shard_id.to_be_bytes());
-        p.push(b':');
-        p
-    };
-
-    let iter = match engine.prefix_scan(Partition::Node, &prefix) {
-        Ok(iter) => iter,
+    let nodes = LocalNodeStore::new(engine);
+    let scanned = match nodes.scan_shard(shard_id) {
+        Ok(v) => v,
         Err(e) => {
             result.errors.push(format!("scan error: {e}"));
             result.state = Some(IndexBuildState::Aborted);
@@ -111,25 +105,9 @@ pub fn build_index(
         .map(|p| interner.lookup(p))
         .collect();
 
-    for guard in iter {
-        let (key, value_bytes) = match guard.into_inner() {
-            Ok(kv) => kv,
-            Err(e) => {
-                result.errors.push(format!("read error: {e}"));
-                continue;
-            }
-        };
-
+    for (node_id_typed, record) in scanned {
         result.scanned += 1;
-
-        // Decode node record
-        let record = match NodeRecord::from_msgpack(&value_bytes) {
-            Ok(r) => r,
-            Err(e) => {
-                result.errors.push(format!("decode error: {e}"));
-                continue;
-            }
-        };
+        let node_id = node_id_typed.as_raw();
 
         // Label filter: only index nodes matching the target label
         if !record.has_label(&index.label) {
@@ -154,24 +132,6 @@ pub fn build_index(
                 continue;
             }
         }
-
-        // Extract node ID from key
-        let node_id = if key.len() >= 8 {
-            let id_bytes = &key[key.len() - 8..];
-            u64::from_be_bytes([
-                id_bytes[0],
-                id_bytes[1],
-                id_bytes[2],
-                id_bytes[3],
-                id_bytes[4],
-                id_bytes[5],
-                id_bytes[6],
-                id_bytes[7],
-            ])
-        } else {
-            result.errors.push("invalid key length".into());
-            continue;
-        };
 
         // For single-field index: get the property value
         if !index.is_compound() {
@@ -261,10 +221,11 @@ pub fn build_index(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use coordinode_core::graph::node::encode_node_key;
+    use coordinode_core::graph::node::{encode_node_key, NodeRecord};
     use coordinode_storage::engine::config::{
         Durability, EndpointConfig, Media, StorageConfig, Tier,
     };
+    use coordinode_storage::engine::partition::Partition;
 
     fn test_engine(dir: &std::path::Path) -> StorageEngine {
         let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
