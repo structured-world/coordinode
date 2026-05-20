@@ -1154,6 +1154,49 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
+    /// MVCC-aware typed edge-property delete. Tombstones the
+    /// non-temporal EdgeProp key. Used by edge DELETE paths and
+    /// the transfer-edges remap (old key drops after the new key
+    /// has been written).
+    pub fn mvcc_delete_edge_props(
+        &mut self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+    ) -> Result<(), ExecutionError> {
+        let key = encode_edgeprop_key(edge_type, src, tgt);
+        self.mvcc_delete(Partition::EdgeProp, &key)
+    }
+
+    /// MVCC-aware typed edge-property delete at a specific temporal
+    /// version. Tombstones the 25-byte per-version EdgeProp key.
+    pub fn mvcc_delete_edge_props_temporal(
+        &mut self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        valid_from_ms: i64,
+    ) -> Result<(), ExecutionError> {
+        let key = encode_temporal_edgeprop_key(edge_type, src, tgt, valid_from_ms);
+        self.mvcc_delete(Partition::EdgeProp, &key)
+    }
+
+    /// MVCC-aware typed edge-property delete that branches on a
+    /// runtime temporal flag. `Some(vf)` tombstones the per-version
+    /// key, `None` tombstones the non-temporal key.
+    pub fn mvcc_delete_edge_props_either(
+        &mut self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        valid_from_ms: Option<i64>,
+    ) -> Result<(), ExecutionError> {
+        match valid_from_ms {
+            Some(vf) => self.mvcc_delete_edge_props_temporal(edge_type, src, tgt, vf),
+            None => self.mvcc_delete_edge_props(edge_type, src, tgt),
+        }
+    }
+
     /// MVCC-aware typed node read that branches on a runtime
     /// temporal flag. When `valid_from_ms` is `Some(vf)`, reads the
     /// per-version row at the 25-byte temporal key; when `None`,
@@ -10250,25 +10293,18 @@ fn transfer_edgeprop_record(
         return Ok(());
     }
 
-    let old_key = encode_edgeprop_key(edge_type, old_src, old_tgt);
-    let new_key = encode_edgeprop_key(edge_type, new_src, new_tgt);
-
-    let Some(old_bytes) = ctx.mvcc_get(Partition::EdgeProp, &old_key)? else {
+    let Some(old_props) = ctx.mvcc_get_edge_props(edge_type, old_src, old_tgt)? else {
         return Ok(());
     };
 
     if merge_with_existing {
-        if let Some(existing) = ctx.mvcc_get(Partition::EdgeProp, &new_key)? {
-            // Edgeprop records are encoded as `Vec<(u32, Value)>` of interned
-            // (field_id, value) pairs — NOT NodeRecord. Decode both, COALESCE
-            // (non-null source fills missing/null target keys), re-encode.
-            let mut tgt: Vec<(u32, Value)> = rmp_serde::from_slice(&existing)
-                .map_err(|e| ExecutionError::Serialization(format!("edgeprop decode: {e}")))?;
-            let src: Vec<(u32, Value)> = rmp_serde::from_slice(&old_bytes)
-                .map_err(|e| ExecutionError::Serialization(format!("edgeprop decode: {e}")))?;
+        if let Some(mut tgt) = ctx.mvcc_get_edge_props(edge_type, new_src, new_tgt)? {
+            // Edgeprop records are `Vec<(field_id, Value)>` of interned
+            // (field_id, value) pairs. COALESCE: non-null source fills
+            // missing/null target keys.
             let mut tgt_index: HashMap<u32, usize> =
                 tgt.iter().enumerate().map(|(i, (k, _))| (*k, i)).collect();
-            for (k, v) in src {
+            for (k, v) in old_props {
                 if matches!(v, Value::Null) {
                     continue;
                 }
@@ -10284,17 +10320,15 @@ fn transfer_edgeprop_record(
                     }
                 }
             }
-            let bytes = rmp_serde::to_vec(&tgt)
-                .map_err(|e| ExecutionError::Serialization(format!("edgeprop encode: {e}")))?;
-            ctx.mvcc_put(Partition::EdgeProp, &new_key, &bytes)?;
-            ctx.mvcc_delete(Partition::EdgeProp, &old_key)?;
+            ctx.mvcc_put_edge_props(edge_type, new_src, new_tgt, &tgt)?;
+            ctx.mvcc_delete_edge_props(edge_type, old_src, old_tgt)?;
             return Ok(());
         }
     }
 
     // No collision (or merge not requested): simple rename.
-    ctx.mvcc_put(Partition::EdgeProp, &new_key, &old_bytes)?;
-    ctx.mvcc_delete(Partition::EdgeProp, &old_key)?;
+    ctx.mvcc_put_edge_props(edge_type, new_src, new_tgt, &old_props)?;
+    ctx.mvcc_delete_edge_props(edge_type, old_src, old_tgt)?;
     Ok(())
 }
 
@@ -10425,13 +10459,13 @@ fn detach_delete_node(
                             for (_k, bytes) in ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)? {
                                 edge_delete_snapshots.push(decode_edgeprop_into_map(&bytes, ctx));
                             }
+                        } else if let Some(prop_map) =
+                            ctx.mvcc_get_edge_props(&parts.edge_type, ep_src, ep_tgt)?
+                        {
+                            edge_delete_snapshots
+                                .push(decode_edgeprop_map_into_named(&prop_map, ctx));
                         } else {
-                            let ep_key = encode_edgeprop_key(&parts.edge_type, ep_src, ep_tgt);
-                            if let Some(bytes) = ctx.mvcc_get(Partition::EdgeProp, &ep_key)? {
-                                edge_delete_snapshots.push(decode_edgeprop_into_map(&bytes, ctx));
-                            } else {
-                                edge_delete_snapshots.push(std::collections::BTreeMap::new());
-                            }
+                            edge_delete_snapshots.push(std::collections::BTreeMap::new());
                         }
                     }
 
@@ -11486,29 +11520,29 @@ fn delete_single_edge(
             for (_k, bytes) in ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)? {
                 delete_snapshots.push(decode_edgeprop_into_map(&bytes, ctx));
             }
+        } else if let Some(prop_map) = ctx.mvcc_get_edge_props(edge_type, src, tgt)? {
+            delete_snapshots.push(decode_edgeprop_map_into_named(&prop_map, ctx));
         } else {
-            let ep_key = encode_edgeprop_key(edge_type, src, tgt);
-            if let Some(bytes) = ctx.mvcc_get(Partition::EdgeProp, &ep_key)? {
-                delete_snapshots.push(decode_edgeprop_into_map(&bytes, ctx));
-            } else {
-                // The pair has no edgeprop entry (e.g. propertyless edge);
-                // still fire once with an empty `$before` map so the trigger
-                // observes the deletion event.
-                delete_snapshots.push(std::collections::BTreeMap::new());
-            }
+            // The pair has no edgeprop entry (e.g. propertyless edge);
+            // still fire once with an empty `$before` map so the trigger
+            // observes the deletion event.
+            delete_snapshots.push(std::collections::BTreeMap::new());
         }
     }
 
     if is_temporal {
         // Snapshot every version key under the pair prefix, then delete each.
+        // Version-key delete still goes through the raw mvcc_delete because the
+        // suffix is harvested from the prefix scan rather than reconstructed
+        // from a (vf) value — keeping the bytes-form delete here is the
+        // direct expression of "drop whatever versions exist for this pair".
         let prefix = temporal_edgeprop_pair_prefix(edge_type, src, tgt);
         let versions = ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)?;
         for (key, _) in versions {
             ctx.mvcc_delete(Partition::EdgeProp, &key)?;
         }
     } else {
-        let ep_key = encode_edgeprop_key(edge_type, src, tgt);
-        ctx.mvcc_delete(Partition::EdgeProp, &ep_key)?;
+        ctx.mvcc_delete_edge_props(edge_type, src, tgt)?;
     }
 
     // Adj-posting tracks pair existence, not version count, so once all
@@ -11612,13 +11646,13 @@ fn cascade_delete_source_node(
                             for (_k, bytes) in ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)? {
                                 edge_delete_snapshots.push(decode_edgeprop_into_map(&bytes, ctx));
                             }
+                        } else if let Some(prop_map) =
+                            ctx.mvcc_get_edge_props(&parts.edge_type, ep_src, ep_tgt)?
+                        {
+                            edge_delete_snapshots
+                                .push(decode_edgeprop_map_into_named(&prop_map, ctx));
                         } else {
-                            let ep_key = encode_edgeprop_key(&parts.edge_type, ep_src, ep_tgt);
-                            if let Some(bytes) = ctx.mvcc_get(Partition::EdgeProp, &ep_key)? {
-                                edge_delete_snapshots.push(decode_edgeprop_into_map(&bytes, ctx));
-                            } else {
-                                edge_delete_snapshots.push(std::collections::BTreeMap::new());
-                            }
+                            edge_delete_snapshots.push(std::collections::BTreeMap::new());
                         }
                     }
 
@@ -11832,24 +11866,22 @@ fn update_edge_property(
         )));
     }
 
-    let ep_key = if is_temporal {
-        let valid_from = match row.get(&format!("{edge_variable}.valid_from")) {
-            Some(Value::Int(ms)) => *ms,
+    let valid_from_for_key: Option<i64> = if is_temporal {
+        match row.get(&format!("{edge_variable}.valid_from")) {
+            Some(Value::Int(ms)) => Some(*ms),
             _ => {
                 return Err(ExecutionError::Unsupported(format!(
                     "SET on temporal edge '{edge_variable}': matched row is missing valid_from"
                 )));
             }
-        };
-        encode_temporal_edgeprop_key(edge_type, src, tgt, valid_from)
+        }
     } else {
-        encode_edgeprop_key(edge_type, src, tgt)
+        None
     };
 
-    let mut prop_map: Vec<(u32, Value)> = match ctx.mvcc_get(Partition::EdgeProp, &ep_key)? {
-        Some(bytes) => rmp_serde::from_slice(&bytes).unwrap_or_default(),
-        None => Vec::new(),
-    };
+    let mut prop_map = ctx
+        .mvcc_get_edge_props_either(edge_type, src, tgt, valid_from_for_key)?
+        .unwrap_or_default();
     let field_id = ctx.interner.intern(property);
     let mut replaced = false;
     for entry in &mut prop_map {
@@ -11862,9 +11894,7 @@ fn update_edge_property(
     if !replaced {
         prop_map.push((field_id, value));
     }
-    let prop_bytes = rmp_serde::to_vec(&prop_map)
-        .map_err(|e| ExecutionError::Serialization(format!("edge prop encode: {e}")))?;
-    ctx.mvcc_put(Partition::EdgeProp, &ep_key, &prop_bytes)?;
+    ctx.mvcc_put_edge_props_either(edge_type, src, tgt, valid_from_for_key, &prop_map)?;
     ctx.write_stats.properties_set += 1;
     Ok(())
 }
@@ -16955,6 +16985,70 @@ mod tests {
             .expect("get")
             .expect("Some");
         assert_eq!(back.primary_label(), "Hist");
+    }
+
+    #[test]
+    fn mvcc_delete_edge_props_either_dispatches_on_temporal_flag() {
+        // delete_edge_props_either must tombstone exactly the keyed
+        // version. The non-temporal-key write at (src, tgt) survives
+        // when we delete temporally at (src, tgt, vf), and vice versa.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let src = NodeId::from_raw(1);
+        let tgt = NodeId::from_raw(2);
+        let payload: Vec<(u32, Value)> = vec![(0, Value::Int(42))];
+
+        // Seed BOTH the non-temporal AND a temporal version at vf=5000.
+        {
+            let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+            ctx.mvcc_oracle = Some(&oracle);
+            ctx.mvcc_read_ts = oracle.next();
+            ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
+            ctx.mvcc_put_edge_props_either("REL", src, tgt, None, &payload)
+                .expect("put non-temporal");
+            ctx.mvcc_put_edge_props_either("REL", src, tgt, Some(5000), &payload)
+                .expect("put temporal");
+            ctx.mvcc_flush().expect("flush seed");
+        }
+        // Delete only the temporal version.
+        {
+            let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+            ctx.mvcc_oracle = Some(&oracle);
+            ctx.mvcc_read_ts = oracle.next();
+            ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
+            ctx.mvcc_delete_edge_props_either("REL", src, tgt, Some(5000))
+                .expect("delete temporal");
+            ctx.mvcc_flush().expect("flush delete");
+        }
+        // Verify: temporal v gone; non-temporal still readable.
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        assert!(
+            ctx.mvcc_get_edge_props_either("REL", src, tgt, Some(5000))
+                .expect("read temporal")
+                .is_none(),
+            "temporal version must be tombstoned",
+        );
+        assert!(
+            ctx.mvcc_get_edge_props_either("REL", src, tgt, None)
+                .expect("read non-temporal")
+                .is_some(),
+            "non-temporal key must remain — delete_either dispatched on Some(vf)",
+        );
     }
 
     #[test]
