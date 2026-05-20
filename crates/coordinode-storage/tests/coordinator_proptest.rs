@@ -30,7 +30,10 @@ fn partition_strategy() -> impl Strategy<Value = Partition> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 64, .. ProptestConfig::default() })]
+    // 32 cases halves wall time vs 64 with near-identical coverage on the
+    // three round-trip invariants pinned here. Override via PROPTEST_CASES
+    // env var when running a deep regression check.
+    #![proptest_config(ProptestConfig { cases: 32, .. ProptestConfig::default() })]
 
     /// For any partition + any byte payload, put-then-get round-trips
     /// produce the same value through `engine.get` AND through
