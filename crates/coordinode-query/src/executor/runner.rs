@@ -54,6 +54,13 @@ pub enum ExecutionError {
     #[error("storage error: {0}")]
     Storage(#[from] coordinode_storage::error::StorageError),
 
+    /// Modality-store error from `coordinode-modality`. Wraps the typed
+    /// store error, which itself preserves the underlying `StorageError`
+    /// chain — capacity-exhausted, checksum-mismatch, and other engine
+    /// errors propagate end-to-end.
+    #[error("modality store error: {0}")]
+    Modality(#[from] coordinode_modality::StoreError),
+
     #[error("serialization error: {0}")]
     Serialization(String),
 
@@ -2605,24 +2612,18 @@ fn execute_btree_index_scan(
 
     let mut results = Vec::with_capacity(node_ids.len());
 
+    use coordinode_modality::NodeStore as _;
+    let nodes = coordinode_modality::LocalNodeStore::new(ctx.engine);
     for raw_id in node_ids {
         let node_id = NodeId::from_raw(raw_id);
-        let key = encode_node_key(ctx.shard_id, node_id);
 
         // Fetch the node record.
-        let bytes_opt = ctx
-            .engine
-            .get(Partition::Node, &key)
-            .map_err(ExecutionError::Storage)?;
+        let record_opt = nodes.get(ctx.shard_id, node_id)?;
 
-        let Some(bytes) = bytes_opt else {
+        let Some(record) = record_opt else {
             // Node was deleted since the index entry was created — skip stale entry.
             continue;
         };
-
-        let record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
-            ExecutionError::Serialization(format!("node {raw_id} deserialization: {e}"))
-        })?;
 
         // Verify label matches (guards against stale index entries for deleted/relabeled nodes).
         if !record.has_label(label) {
