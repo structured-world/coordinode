@@ -1004,6 +1004,42 @@ impl<'a> ExecutionContext<'a> {
         self.mvcc_delete(Partition::Node, &key)
     }
 
+    /// MVCC-aware typed node read that branches on a runtime
+    /// temporal flag. When `valid_from_ms` is `Some(vf)`, reads the
+    /// per-version row at the 25-byte temporal key; when `None`,
+    /// reads the 16-byte non-temporal key. Used by DETACH / ATTACH
+    /// executor paths where the source label's temporal flag is only
+    /// known at runtime from the bound row.
+    pub fn mvcc_get_node_either(
+        &mut self,
+        shard_id: u16,
+        node_id: NodeId,
+        valid_from_ms: Option<i64>,
+    ) -> Result<Option<NodeRecord>, ExecutionError> {
+        match valid_from_ms {
+            Some(vf) => self.mvcc_get_node_temporal(shard_id, node_id, vf),
+            None => self.mvcc_get_node(shard_id, node_id),
+        }
+    }
+
+    /// MVCC-aware typed node write that branches on a runtime
+    /// temporal flag. Symmetric counterpart to
+    /// [`Self::mvcc_get_node_either`] — writes at the temporal key
+    /// when `valid_from_ms = Some(vf)`, otherwise at the non-temporal
+    /// 16-byte key.
+    pub fn mvcc_put_node_either(
+        &mut self,
+        shard_id: u16,
+        node_id: NodeId,
+        valid_from_ms: Option<i64>,
+        record: &NodeRecord,
+    ) -> Result<(), ExecutionError> {
+        match valid_from_ms {
+            Some(vf) => self.mvcc_put_node_temporal(shard_id, node_id, vf, record),
+            None => self.mvcc_put_node(shard_id, node_id, record),
+        }
+    }
+
     /// MVCC-aware typed node delete. Buffers a tombstone for the
     /// non-temporal node key (16-byte `encode_node_key` form). Does
     /// NOT iterate temporal version rows (25-byte `temporal_node_key`
@@ -9364,20 +9400,16 @@ fn execute_delete(
             // First snapshot the pre-mutation state so we can both clean up
             // index entries AND build the `$before` map for any BEFORE
             // COMMIT DELETE trigger that fires on the node's labels.
-            let key = encode_node_key(ctx.shard_id, node_id);
             let pre_snapshot: Option<(Vec<String>, std::collections::BTreeMap<String, Value>)> =
-                ctx.mvcc_get(Partition::Node, &key)?.and_then(|bytes| {
-                    NodeRecord::from_msgpack(&bytes)
-                        .ok()
-                        .map(|rec| snapshot_node_record(&rec, ctx))
-                });
+                ctx.mvcc_get_node(ctx.shard_id, node_id)?
+                    .map(|rec| snapshot_node_record(&rec, ctx));
 
             let needs_index_cleanup = ctx.btree_index_registry.is_some()
                 || ctx.vector_index_registry.is_some()
                 || ctx.text_index_registry.is_some();
             if needs_index_cleanup {
-                if let Some(node_bytes) = ctx.mvcc_get(Partition::Node, &key)? {
-                    if let Ok(record) = NodeRecord::from_msgpack(&node_bytes) {
+                if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
+                    {
                         let label = record.primary_label().to_string();
 
                         // B-tree index cleanup: remove all indexed property
@@ -9415,7 +9447,7 @@ fn execute_delete(
                     }
                 }
             }
-            ctx.mvcc_delete(Partition::Node, &key)?;
+            ctx.mvcc_delete_node(ctx.shard_id, node_id)?;
             ctx.write_stats.nodes_deleted += 1;
 
             // Fire BEFORE COMMIT DELETE triggers on each of the deleted
@@ -10225,20 +10257,16 @@ fn detach_delete_node(
     // the node. Without this, indexes leak: unique constraints would still
     // reject re-creation with the same value, vector/text searches would
     // return stale UIDs.
-    let node_key = encode_node_key(ctx.shard_id, node_id);
     // Snapshot pre-mutation node state once for trigger firing — re-used after
     // the node is deleted to populate `$before` for the BEFORE COMMIT DELETE
     // trigger. Mirrors the `execute_delete` / `cascade_delete_source_node`
     // wiring so that MERGE NODES' source-cleanup fires the same triggers as
     // DETACH DELETE on the same node.
-    let node_pre_snapshot: Option<(Vec<String>, std::collections::BTreeMap<String, Value>)> =
-        ctx.mvcc_get(Partition::Node, &node_key)?.and_then(|bytes| {
-            NodeRecord::from_msgpack(&bytes)
-                .ok()
-                .map(|rec| snapshot_node_record(&rec, ctx))
-        });
-    if let Some(node_bytes) = ctx.mvcc_get(Partition::Node, &node_key)? {
-        if let Ok(record) = NodeRecord::from_msgpack(&node_bytes) {
+    let node_pre_snapshot: Option<(Vec<String>, std::collections::BTreeMap<String, Value>)> = ctx
+        .mvcc_get_node(ctx.shard_id, node_id)?
+        .map(|rec| snapshot_node_record(&rec, ctx));
+    if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
+        {
             let label = record.primary_label().to_string();
             if let Some(btree_reg) = ctx.btree_index_registry {
                 let props: Vec<(String, Value)> = record
@@ -10359,9 +10387,8 @@ fn detach_delete_node(
         ctx.merge_adj_adds.remove(edge_key);
         ctx.merge_adj_removes.remove(edge_key);
     }
-    // node_key already computed at the top of this function for the index
-    // cleanup pass; reuse it to drop the primary node record.
-    ctx.mvcc_delete(Partition::Node, &node_key)?;
+    // Drop the primary node record.
+    ctx.mvcc_delete_node(ctx.shard_id, node_id)?;
     ctx.write_stats.nodes_deleted += 1;
 
     // Fire BEFORE COMMIT DELETE triggers on the deleted node's labels —
@@ -10482,10 +10509,10 @@ fn execute_detach_document(
         // Temporal: 25-byte per-version key derived from the row's
         // `<source>.valid_from` binding. The matched version is the one
         // we'll close; the property is removed on the new version.
-        let (node_key, source_valid_from): (Vec<u8>, Option<i64>) = if source_is_temporal {
-            let vf = match input_row.get(&format!("{source_variable}.valid_from")) {
-                Some(Value::Int(ms)) => *ms,
-                Some(Value::Timestamp(ms)) => *ms,
+        let source_valid_from: Option<i64> = if source_is_temporal {
+            match input_row.get(&format!("{source_variable}.valid_from")) {
+                Some(Value::Int(ms)) => Some(*ms),
+                Some(Value::Timestamp(ms)) => Some(*ms),
                 _ => {
                     return Err(ExecutionError::Unsupported(format!(
                         "DETACH DOCUMENT on temporal source `{source_variable}`: \
@@ -10494,21 +10521,16 @@ fn execute_detach_document(
                          materialised for mutation)"
                     )));
                 }
-            };
-            (
-                coordinode_core::graph::node::encode_temporal_node_key(ctx.shard_id, source_id, vf),
-                Some(vf),
-            )
+            }
         } else {
-            (encode_node_key(ctx.shard_id, source_id), None)
+            None
         };
-        let Some(bytes) = ctx.mvcc_get(Partition::Node, &node_key)? else {
+        let Some(record) = ctx.mvcc_get_node_either(ctx.shard_id, source_id, source_valid_from)?
+        else {
             return Err(ExecutionError::Unsupported(format!(
                 "DETACH DOCUMENT: node {source_id} not found"
             )));
         };
-        let record = NodeRecord::from_msgpack(&bytes)
-            .map_err(|e| ExecutionError::Serialization(format!("node decode: {e}")))?;
 
         // 2. Resolve the property value at `property_path`.
         let (field_id_opt, doc_value) =
@@ -10623,20 +10645,18 @@ fn execute_detach_document(
             new_record.set(its_fid, Value::Int(now_us));
 
             // Write close-current at the matched key; open-new at a
-            // fresh per-version key.
-            let closing_bytes = closing_record
-                .to_msgpack()
-                .map_err(|e| ExecutionError::Serialization(format!("DETACH close encode: {e}")))?;
-            ctx.mvcc_put(Partition::Node, &node_key, &closing_bytes)?;
-            let new_key = coordinode_core::graph::node::encode_temporal_node_key(
-                ctx.shard_id,
-                source_id,
-                new_valid_from,
-            );
-            let new_bytes = new_record
-                .to_msgpack()
-                .map_err(|e| ExecutionError::Serialization(format!("DETACH new encode: {e}")))?;
-            ctx.mvcc_put(Partition::Node, &new_key, &new_bytes)?;
+            // fresh per-version key. `source_valid_from` is `Some(_)` on
+            // this temporal branch by construction; surface the bug as
+            // an error rather than an internal panic if that invariant
+            // were ever violated.
+            let current_vf = source_valid_from.ok_or_else(|| {
+                ExecutionError::Unsupported(
+                    "DETACH temporal branch reached with valid_from=None — internal invariant violation"
+                        .into(),
+                )
+            })?;
+            ctx.mvcc_put_node_temporal(ctx.shard_id, source_id, current_vf, &closing_record)?;
+            ctx.mvcc_put_node_temporal(ctx.shard_id, source_id, new_valid_from, &new_record)?;
             ctx.write_stats.properties_removed += 1;
         } else {
             emit_property_removal(source_id, property_path, field_id_opt, ctx)?;
@@ -11132,31 +11152,27 @@ fn execute_attach_document(
         // Non-temporal target: read the 16-byte node-key record.
         // Temporal target: read the matched per-version record at the
         // 25-byte key derived from `<target>.valid_from`.
-        let (target_key, target_valid_from): (Vec<u8>, Option<i64>) = if target_is_temporal {
-            let vf = match input_row.get(&format!("{target_variable}.valid_from")) {
-                Some(Value::Int(ms)) => *ms,
-                Some(Value::Timestamp(ms)) => *ms,
+        let target_valid_from: Option<i64> = if target_is_temporal {
+            match input_row.get(&format!("{target_variable}.valid_from")) {
+                Some(Value::Int(ms)) => Some(*ms),
+                Some(Value::Timestamp(ms)) => Some(*ms),
                 _ => {
                     return Err(ExecutionError::Unsupported(format!(
                         "ATTACH DOCUMENT on temporal target `{target_variable}`: \
                          matched row is missing `{target_variable}.valid_from`"
                     )));
                 }
-            };
-            (
-                coordinode_core::graph::node::encode_temporal_node_key(ctx.shard_id, target_id, vf),
-                Some(vf),
-            )
+            }
         } else {
-            (encode_node_key(ctx.shard_id, target_id), None)
+            None
         };
-        let target_bytes = ctx.mvcc_get(Partition::Node, &target_key)?.ok_or_else(|| {
-            ExecutionError::Unsupported(format!(
-                "ATTACH DOCUMENT: target node {target_id} not found"
-            ))
-        })?;
-        let target_record = NodeRecord::from_msgpack(&target_bytes)
-            .map_err(|e| ExecutionError::Serialization(format!("node decode: {e}")))?;
+        let target_record = ctx
+            .mvcc_get_node_either(ctx.shard_id, target_id, target_valid_from)?
+            .ok_or_else(|| {
+                ExecutionError::Unsupported(format!(
+                    "ATTACH DOCUMENT: target node {target_id} not found"
+                ))
+            })?;
         if !on_conflict_replace
             && target_property_exists(&target_record, target_property_path, ctx.interner)
         {
@@ -11228,19 +11244,18 @@ fn execute_attach_document(
             new_record.props.remove(&vt_fid);
             new_record.set(its_fid, Value::Int(now_us));
 
-            let closing_bytes = closing_record
-                .to_msgpack()
-                .map_err(|e| ExecutionError::Serialization(format!("ATTACH close encode: {e}")))?;
-            ctx.mvcc_put(Partition::Node, &target_key, &closing_bytes)?;
-            let new_key = coordinode_core::graph::node::encode_temporal_node_key(
-                ctx.shard_id,
-                target_id,
-                new_valid_from,
-            );
-            let new_bytes = new_record
-                .to_msgpack()
-                .map_err(|e| ExecutionError::Serialization(format!("ATTACH new encode: {e}")))?;
-            ctx.mvcc_put(Partition::Node, &new_key, &new_bytes)?;
+            // Close-current at matched key + open-new at fresh per-
+            // version key. `target_valid_from` is `Some(_)` on this
+            // temporal branch by construction; surface a bug as an
+            // error rather than panic.
+            let current_vf = target_valid_from.ok_or_else(|| {
+                ExecutionError::Unsupported(
+                    "ATTACH temporal branch reached with valid_from=None — internal invariant violation"
+                        .into(),
+                )
+            })?;
+            ctx.mvcc_put_node_temporal(ctx.shard_id, target_id, current_vf, &closing_record)?;
+            ctx.mvcc_put_node_temporal(ctx.shard_id, target_id, new_valid_from, &new_record)?;
             ctx.write_stats.properties_set += 1;
         } else {
             emit_attach_set_path(target_id, target_property_path, doc, ctx)?;
@@ -11580,19 +11595,15 @@ fn cascade_delete_source_node(
     // behaviour in `execute_delete`).
     // Snapshot the pre-mutation node record once: re-used for both the
     // BEFORE COMMIT DELETE trigger firing and (where present) index cleanup.
-    let key = encode_node_key(ctx.shard_id, source_id);
-    let pre_snapshot: Option<(Vec<String>, std::collections::BTreeMap<String, Value>)> =
-        ctx.mvcc_get(Partition::Node, &key)?.and_then(|bytes| {
-            NodeRecord::from_msgpack(&bytes)
-                .ok()
-                .map(|rec| snapshot_node_record(&rec, ctx))
-        });
+    let pre_snapshot: Option<(Vec<String>, std::collections::BTreeMap<String, Value>)> = ctx
+        .mvcc_get_node(ctx.shard_id, source_id)?
+        .map(|rec| snapshot_node_record(&rec, ctx));
     let needs_index_cleanup = ctx.btree_index_registry.is_some()
         || ctx.vector_index_registry.is_some()
         || ctx.text_index_registry.is_some();
     if needs_index_cleanup {
-        if let Some(node_bytes) = ctx.mvcc_get(Partition::Node, &key)? {
-            if let Ok(record) = NodeRecord::from_msgpack(&node_bytes) {
+        if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, source_id)? {
+            {
                 let label = record.primary_label().to_string();
                 if let Some(btree_reg) = ctx.btree_index_registry {
                     let props: Vec<(String, Value)> = record
@@ -11625,7 +11636,7 @@ fn cascade_delete_source_node(
             }
         }
     }
-    ctx.mvcc_delete(Partition::Node, &key)?;
+    ctx.mvcc_delete_node(ctx.shard_id, source_id)?;
     ctx.write_stats.nodes_deleted += 1;
 
     // Fire BEFORE COMMIT DELETE triggers on the source node's labels —
@@ -16854,6 +16865,62 @@ mod tests {
             .expect("get")
             .expect("Some");
         assert_eq!(back.primary_label(), "Hist");
+    }
+
+    #[test]
+    fn mvcc_get_node_either_dispatches_on_temporal_flag() {
+        // The runtime-branching helper must dispatch correctly:
+        //   None         → 16-byte non-temporal key
+        //   Some(vf)     → 25-byte temporal key
+        // Cross-contamination (e.g. non-temporal write read as temporal)
+        // would silently return wrong data — pin both paths.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+        ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
+
+        let id = NodeId::from_raw(150);
+        let nt = NodeRecord::new("NT");
+        let tmp = NodeRecord::new("T");
+        // Write non-temporal at id; write temporal at same id, vf=5000.
+        ctx.mvcc_put_node_either(0, id, None, &nt).expect("put nt");
+        ctx.mvcc_put_node_either(0, id, Some(5000), &tmp)
+            .expect("put t");
+
+        // Non-temporal read must surface NT, not T.
+        let read_nt = ctx
+            .mvcc_get_node_either(0, id, None)
+            .expect("read nt")
+            .expect("Some");
+        assert_eq!(read_nt.primary_label(), "NT");
+        // Temporal read at vf=5000 surfaces T.
+        let read_t = ctx
+            .mvcc_get_node_either(0, id, Some(5000))
+            .expect("read t")
+            .expect("Some");
+        assert_eq!(read_t.primary_label(), "T");
+        // Temporal read at a vf we did not write to is None.
+        let read_miss = ctx
+            .mvcc_get_node_either(0, id, Some(9999))
+            .expect("read miss");
+        assert!(read_miss.is_none());
     }
 
     #[test]
