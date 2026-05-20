@@ -6491,57 +6491,16 @@ fn execute_upsert(
             return Ok(matches);
         }
 
-        // Capture current state of matched nodes for CAS verification.
-        // For each variable that maps to a node ID, read the raw bytes now.
-        let mut cas_snapshots: Vec<Vec<(String, Vec<u8>)>> = Vec::new();
-        for row in &matches {
-            let mut snapshot = Vec::new();
-            for item in on_match {
-                if let crate::cypher::ast::SetItem::Property { variable, .. } = item {
-                    if let Some(Value::Int(id)) = row.get(variable) {
-                        let node_id = NodeId::from_raw(*id as u64);
-                        let key = encode_node_key(ctx.shard_id, node_id);
-                        if let Some(bytes) = ctx.mvcc_get(Partition::Node, &key)? {
-                            // Dedup: don't snapshot same variable twice
-                            if !snapshot.iter().any(|(v, _)| v == variable) {
-                                snapshot.push((variable.clone(), bytes.to_vec()));
-                            }
-                        }
-                    }
-                }
-            }
-            cas_snapshots.push(snapshot);
-        }
-
-        // CAS check: verify nodes haven't changed since MATCH read.
-        // In single-node synchronous mode this is inherently safe, but the
-        // check is present for correctness when concurrent executors exist
-        // (server mode with multiple connections, or future Raft leader).
-        for (row_idx, snapshot) in cas_snapshots.iter().enumerate() {
-            for (variable, original_bytes) in snapshot {
-                if let Some(Value::Int(id)) = matches[row_idx].get(variable) {
-                    let node_id = NodeId::from_raw(*id as u64);
-                    let key = encode_node_key(ctx.shard_id, node_id);
-                    let current_bytes = ctx.mvcc_get(Partition::Node, &key)?;
-                    match current_bytes {
-                        Some(ref bytes) if bytes.as_slice() != original_bytes.as_slice() => {
-                            return Err(ExecutionError::Conflict(format!(
-                                "UPSERT conflict: node {variable}(id={id}) was modified \
-                                 between MATCH and SET. Retry the UPSERT."
-                            )));
-                        }
-                        None => {
-                            return Err(ExecutionError::Conflict(format!(
-                                "UPSERT conflict: node {variable}(id={id}) was deleted \
-                                 between MATCH and SET."
-                            )));
-                        }
-                        _ => {} // bytes match — no conflict
-                    }
-                }
-            }
-        }
-
+        // Concurrent-modification detection is owned by Layer-3 OCC:
+        // every `mvcc_get` issued during MATCH (above) tracked the
+        // node key in the per-transaction `occ_scope`; at commit time
+        // `mvcc_flush` calls `coordinator.validate_occ` which probes
+        // `has_write_after` on each tracked key and surfaces
+        // `ExecutionError::Conflict` if any concurrent writer landed
+        // since `mvcc_read_ts`. The byte-level CAS that used to live
+        // here was pre-G104 manual machinery and is now redundant —
+        // also strictly less safe (it tolerated ABA writes, OCC does
+        // not).
         execute_update(&matches, on_match, &ViolationMode::Fail, ctx)
     } else {
         // Phase 3: ON CREATE — create nodes and edges from patterns (two-pass)
@@ -7097,12 +7056,6 @@ fn execute_create_node(
             record.set(field_id, Value::Int(ingestion_us));
         }
 
-        let key =
-            coordinode_core::graph::node::node_write_key(ctx.shard_id, node_id, valid_from_for_key);
-        let bytes = record
-            .to_msgpack()
-            .map_err(|e| ExecutionError::Serialization(format!("node serialization: {e}")))?;
-
         // Enforce unique constraints via B-tree index registry BEFORE writing
         // the node to storage. If a constraint would be violated, fail early.
         if let Some(btree_reg) = ctx.btree_index_registry {
@@ -7123,7 +7076,10 @@ fn execute_create_node(
             }
         }
 
-        ctx.mvcc_put(Partition::Node, &key, &bytes)?;
+        // `valid_from_for_key` is `Some(_)` for temporal labels and
+        // `None` otherwise — the typed dispatch helper picks the
+        // 25-byte temporal key or the 16-byte non-temporal key.
+        ctx.mvcc_put_node_either(ctx.shard_id, node_id, valid_from_for_key, &record)?;
         ctx.write_stats.nodes_created += 1;
         ctx.write_stats.properties_set += properties.len() as u64;
 
@@ -16865,6 +16821,78 @@ mod tests {
             .expect("get")
             .expect("Some");
         assert_eq!(back.primary_label(), "Hist");
+    }
+
+    #[test]
+    fn upsert_on_match_concurrent_write_is_caught_by_layer3_occ() {
+        // R165 S6 removed the manual byte-CAS pre-flight from
+        // execute_merge. Layer-3 OCC must now catch the same
+        // "concurrent writer modified a matched node between MATCH
+        // and SET" scenario at commit time via has_write_after.
+        //
+        // Scenario: txn reads node `k`, then a sibling txn writes to
+        // `k`, then the original txn writes (independent key) and
+        // flushes — the OCC scope tracked `k` during the read, so
+        // validate_occ at flush must surface ExecutionError::Conflict.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open");
+        // Seed a node so the simulated MATCH read returns Some.
+        let id = NodeId::from_raw(700);
+        let seed = NodeRecord::new("U");
+        let key = encode_node_key(0, id);
+        engine
+            .put(Partition::Node, &key, &seed.to_msgpack().unwrap())
+            .expect("seed");
+
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+        ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
+
+        // MATCH-phase read: populates the OCC scope with `k`.
+        let _ = ctx.mvcc_get_node(0, id).expect("match read").expect("Some");
+
+        // Concurrent writer modifies the same key out-of-band.
+        // Stamps a fresh seqno that is necessarily > mvcc_read_ts.
+        let mut altered = NodeRecord::new("U");
+        altered.set(ctx.interner.intern("name"), Value::String("Bob".into()));
+        engine
+            .put(Partition::Node, &key, &altered.to_msgpack().unwrap())
+            .expect("concurrent put");
+
+        // ON MATCH SET: buffer a write on an UNRELATED key so the txn
+        // is not read-only and flush actually runs OCC validation.
+        let other = NodeId::from_raw(701);
+        ctx.mvcc_put_node(0, other, &NodeRecord::new("Other"))
+            .expect("unrelated put");
+
+        let err = ctx
+            .mvcc_flush()
+            .expect_err("flush must surface the OCC conflict on the MATCH-read key");
+        match err {
+            ExecutionError::Conflict(msg) => {
+                assert!(
+                    msg.contains("OCC") || msg.contains("conflict"),
+                    "conflict message expected: {msg}",
+                );
+            }
+            other => panic!("expected ExecutionError::Conflict, got {other:?}"),
+        }
     }
 
     #[test]
