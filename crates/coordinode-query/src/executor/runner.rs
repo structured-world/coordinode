@@ -925,6 +925,85 @@ impl<'a> ExecutionContext<'a> {
         self.mvcc_put(Partition::Node, &key, &bytes)
     }
 
+    /// MVCC-aware typed read of a temporal node version.
+    ///
+    /// Reads the row at the 25-byte temporal key (shard, id,
+    /// `valid_from_ms`). Preserves snapshot pin, RYOW, and OCC
+    /// tracking — same machinery as [`Self::mvcc_get_node`], just
+    /// scoped to a specific per-version key. Returns `None` when no
+    /// row exists at that exact `valid_from`.
+    pub fn mvcc_get_node_temporal(
+        &mut self,
+        shard_id: u16,
+        node_id: NodeId,
+        valid_from_ms: i64,
+    ) -> Result<Option<NodeRecord>, ExecutionError> {
+        let key = coordinode_core::graph::node::encode_temporal_node_key(
+            shard_id,
+            node_id,
+            valid_from_ms,
+        );
+        let Some(bytes) = self.mvcc_get(Partition::Node, &key)? else {
+            return Ok(None);
+        };
+        let record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
+            ExecutionError::Serialization(format!(
+                "node {} temporal@{valid_from_ms} deserialization: {e}",
+                node_id.as_raw(),
+            ))
+        })?;
+        Ok(Some(record))
+    }
+
+    /// MVCC-aware typed write of a temporal node version.
+    ///
+    /// Buffers the put at the 25-byte temporal key (shard, id,
+    /// `valid_from_ms`) through `mvcc_put` (atomic flush + RYOW).
+    /// Used by the bitemporal close-current / open-new write pair
+    /// in the temporal executor.
+    pub fn mvcc_put_node_temporal(
+        &mut self,
+        shard_id: u16,
+        node_id: NodeId,
+        valid_from_ms: i64,
+        record: &NodeRecord,
+    ) -> Result<(), ExecutionError> {
+        let key = coordinode_core::graph::node::encode_temporal_node_key(
+            shard_id,
+            node_id,
+            valid_from_ms,
+        );
+        let bytes = record.to_msgpack().map_err(|e| {
+            ExecutionError::Serialization(format!(
+                "node {} temporal@{valid_from_ms} serialization: {e}",
+                node_id.as_raw(),
+            ))
+        })?;
+        self.mvcc_put(Partition::Node, &key, &bytes)
+    }
+
+    /// MVCC-aware typed delete of a temporal node version (tombstone
+    /// at the specific 25-byte temporal key). Reserved for a future
+    /// GDPR erasure path that hard-deletes individual versions; the
+    /// standard bitemporal delete path uses close-current +
+    /// tombstone-version inserts via [`Self::mvcc_put_node_temporal`]
+    /// instead. No production caller in coordinode-query yet — added
+    /// alongside the read/write pair so the typed surface stays
+    /// symmetric.
+    pub fn mvcc_delete_node_temporal(
+        &mut self,
+        shard_id: u16,
+        node_id: NodeId,
+        valid_from_ms: i64,
+    ) -> Result<(), ExecutionError> {
+        let key = coordinode_core::graph::node::encode_temporal_node_key(
+            shard_id,
+            node_id,
+            valid_from_ms,
+        );
+        self.mvcc_delete(Partition::Node, &key)
+    }
+
     /// MVCC-aware typed node delete. Buffers a tombstone for the
     /// non-temporal node key (16-byte `encode_node_key` form). Does
     /// NOT iterate temporal version rows (25-byte `temporal_node_key`
@@ -7414,22 +7493,14 @@ fn execute_update(
                 };
 
                 // Step 1: read current matched version record.
-                let current_key = coordinode_core::graph::node::encode_temporal_node_key(
-                    ctx.shard_id,
-                    node_id,
-                    current_valid_from,
-                );
-                let current_bytes =
-                    ctx.mvcc_get(Partition::Node, &current_key)?
-                        .ok_or_else(|| {
-                            ExecutionError::Unsupported(format!(
-                                "temporal SET on `{var}`: matched version record not \
-                             found at (node_id={node_id}, valid_from={current_valid_from})"
-                            ))
-                        })?;
-                let mut closing_record = NodeRecord::from_msgpack(&current_bytes).map_err(|e| {
-                    ExecutionError::Serialization(format!("temporal node decode: {e}"))
-                })?;
+                let mut closing_record = ctx
+                    .mvcc_get_node_temporal(ctx.shard_id, node_id, current_valid_from)?
+                    .ok_or_else(|| {
+                        ExecutionError::Unsupported(format!(
+                            "temporal SET on `{var}`: matched version record not \
+                         found at (node_id={node_id}, valid_from={current_valid_from})"
+                        ))
+                    })?;
                 let mut new_record = closing_record.clone();
 
                 // Step 2: apply each relevant SET item to the new record.
@@ -7598,21 +7669,15 @@ fn execute_update(
                 closing_record.set(vt_fid, Value::Int(new_valid_from));
 
                 // Step 3: write close-current (mutate at same per-version key).
-                let closing_bytes = closing_record.to_msgpack().map_err(|e| {
-                    ExecutionError::Serialization(format!("temporal close encode: {e}"))
-                })?;
-                ctx.mvcc_put(Partition::Node, &current_key, &closing_bytes)?;
-
-                // Step 4: write open-new (at fresh per-version key for NOW).
-                let new_key = coordinode_core::graph::node::encode_temporal_node_key(
+                ctx.mvcc_put_node_temporal(
                     ctx.shard_id,
                     node_id,
-                    new_valid_from,
-                );
-                let new_bytes = new_record.to_msgpack().map_err(|e| {
-                    ExecutionError::Serialization(format!("temporal new encode: {e}"))
-                })?;
-                ctx.mvcc_put(Partition::Node, &new_key, &new_bytes)?;
+                    current_valid_from,
+                    &closing_record,
+                )?;
+
+                // Step 4: write open-new (at fresh per-version key for NOW).
+                ctx.mvcc_put_node_temporal(ctx.shard_id, node_id, new_valid_from, &new_record)?;
                 ctx.write_stats.nodes_created += 1;
 
                 // Reflect the new version's prop columns in the output row.
@@ -7864,21 +7929,15 @@ fn execute_update(
                                 )));
                             }
                         }
-                        let temp_key = coordinode_core::graph::node::encode_temporal_node_key(
-                            ctx.shard_id,
-                            node_id,
-                            valid_from,
-                        );
-                        let bytes = ctx.mvcc_get(Partition::Node, &temp_key)?.ok_or_else(|| {
-                            ExecutionError::Unsupported(format!(
-                                "SET {variable}.valid_to: temporal node record \
+                        let mut record = ctx
+                            .mvcc_get_node_temporal(ctx.shard_id, node_id, valid_from)?
+                            .ok_or_else(|| {
+                                ExecutionError::Unsupported(format!(
+                                    "SET {variable}.valid_to: temporal node record \
                                      not found at version (node_id={node_id}, \
                                      valid_from={valid_from})"
-                            ))
-                        })?;
-                        let mut record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
-                            ExecutionError::Serialization(format!("node decode: {e}"))
-                        })?;
+                                ))
+                            })?;
                         let field_id = ctx.interner.intern("valid_to");
                         match new_valid_to {
                             Some(vt) => record.set(field_id, Value::Int(vt)),
@@ -7889,10 +7948,7 @@ fn execute_update(
                                 record.props.remove(&field_id);
                             }
                         }
-                        let new_bytes = record.to_msgpack().map_err(|e| {
-                            ExecutionError::Serialization(format!("node encode: {e}"))
-                        })?;
-                        ctx.mvcc_put(Partition::Node, &temp_key, &new_bytes)?;
+                        ctx.mvcc_put_node_temporal(ctx.shard_id, node_id, valid_from, &record)?;
                         ctx.write_stats.properties_set += 1;
                         out_row.insert(
                             format!("{variable}.valid_to"),
@@ -8675,22 +8731,14 @@ fn execute_remove(
                 } else {
                     current_valid_from + 1
                 };
-                let current_key = coordinode_core::graph::node::encode_temporal_node_key(
-                    ctx.shard_id,
-                    node_id,
-                    current_valid_from,
-                );
-                let current_bytes =
-                    ctx.mvcc_get(Partition::Node, &current_key)?
-                        .ok_or_else(|| {
-                            ExecutionError::Unsupported(format!(
-                                "temporal REMOVE on `{var}`: matched version record not \
-                                 found at (node_id={node_id}, valid_from={current_valid_from})"
-                            ))
-                        })?;
-                let mut closing_record = NodeRecord::from_msgpack(&current_bytes).map_err(|e| {
-                    ExecutionError::Serialization(format!("temporal REMOVE decode: {e}"))
-                })?;
+                let mut closing_record = ctx
+                    .mvcc_get_node_temporal(ctx.shard_id, node_id, current_valid_from)?
+                    .ok_or_else(|| {
+                        ExecutionError::Unsupported(format!(
+                            "temporal REMOVE on `{var}`: matched version record not \
+                             found at (node_id={node_id}, valid_from={current_valid_from})"
+                        ))
+                    })?;
                 let mut new_record = closing_record.clone();
 
                 for (item_idx, item) in items.iter().enumerate() {
@@ -8762,20 +8810,14 @@ fn execute_remove(
                 new_record.set(its_fid, Value::Int(now_us));
                 closing_record.set(vt_fid, Value::Int(new_valid_from));
 
-                let closing_bytes = closing_record.to_msgpack().map_err(|e| {
-                    ExecutionError::Serialization(format!("temporal REMOVE close encode: {e}"))
-                })?;
-                ctx.mvcc_put(Partition::Node, &current_key, &closing_bytes)?;
-
-                let new_key = coordinode_core::graph::node::encode_temporal_node_key(
+                ctx.mvcc_put_node_temporal(
                     ctx.shard_id,
                     node_id,
-                    new_valid_from,
-                );
-                let new_bytes = new_record.to_msgpack().map_err(|e| {
-                    ExecutionError::Serialization(format!("temporal REMOVE new encode: {e}"))
-                })?;
-                ctx.mvcc_put(Partition::Node, &new_key, &new_bytes)?;
+                    current_valid_from,
+                    &closing_record,
+                )?;
+
+                ctx.mvcc_put_node_temporal(ctx.shard_id, node_id, new_valid_from, &new_record)?;
 
                 // Surface the new version's valid_from on out_row so any
                 // downstream RETURN sees the latest version, symmetric with
@@ -9069,26 +9111,22 @@ fn execute_delete(
             // valid_to absent or NULL). If the matched version was
             // already closed (a historical version), skip closing — the
             // tombstone alone marks the deletion event.
-            let current_key = coordinode_core::graph::node::encode_temporal_node_key(
-                ctx.shard_id,
-                *node_id,
-                *current_valid_from,
-            );
-            let Some(current_bytes) = ctx.mvcc_get(Partition::Node, &current_key)? else {
+            let Some(mut closing_record) =
+                ctx.mvcc_get_node_temporal(ctx.shard_id, *node_id, *current_valid_from)?
+            else {
                 // Already gone — skip (idempotent).
                 continue;
             };
-            let mut closing_record = NodeRecord::from_msgpack(&current_bytes).map_err(|e| {
-                ExecutionError::Serialization(format!("temporal close decode: {e}"))
-            })?;
             let vt_fid = ctx.interner.intern("valid_to");
             let was_open = !closing_record.props.contains_key(&vt_fid);
             if was_open {
                 closing_record.set(vt_fid, Value::Int(new_valid_from));
-                let closing_bytes = closing_record.to_msgpack().map_err(|e| {
-                    ExecutionError::Serialization(format!("temporal close encode: {e}"))
-                })?;
-                ctx.mvcc_put(Partition::Node, &current_key, &closing_bytes)?;
+                ctx.mvcc_put_node_temporal(
+                    ctx.shard_id,
+                    *node_id,
+                    *current_valid_from,
+                    &closing_record,
+                )?;
             }
 
             // Step 2: write the tombstone row at NOW. Carries the same
@@ -9104,15 +9142,7 @@ fn execute_delete(
             tombstone.set(vf_fid, Value::Int(new_valid_from));
             let its_fid = ctx.interner.intern("__ingestion_ts__");
             tombstone.set(its_fid, Value::Int(now_us));
-            let tombstone_key = coordinode_core::graph::node::encode_temporal_node_key(
-                ctx.shard_id,
-                *node_id,
-                new_valid_from,
-            );
-            let tombstone_bytes = tombstone
-                .to_msgpack()
-                .map_err(|e| ExecutionError::Serialization(format!("tombstone encode: {e}")))?;
-            ctx.mvcc_put(Partition::Node, &tombstone_key, &tombstone_bytes)?;
+            ctx.mvcc_put_node_temporal(ctx.shard_id, *node_id, new_valid_from, &tombstone)?;
             ctx.write_stats.nodes_deleted += 1;
 
             tombstoned_temporal_rows.insert((*row_idx, var.clone()));
@@ -16652,6 +16682,498 @@ mod tests {
         assert!(scope.contains(Partition::Node, b"k1"));
         scope.track(Partition::Node, b"k2");
         assert_eq!(scope.tracked_count(), 2);
+    }
+
+    #[test]
+    fn mvcc_get_node_temporal_tracks_temporal_key_in_occ_scope() {
+        // Critical correctness: the temporal helper must enter the
+        // 25-byte temporal key (NOT the 16-byte non-temporal key) into
+        // the OCC scope. A bug here would silently miss conflicts on
+        // bitemporal reads.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open");
+        let id = NodeId::from_raw(77);
+        // Seed a temporal version so the read returns Some.
+        let temporal_key =
+            coordinode_core::graph::node::encode_temporal_node_key(0, id, 1234567890);
+        let rec = NodeRecord::new("E");
+        engine
+            .put(Partition::Node, &temporal_key, &rec.to_msgpack().unwrap())
+            .expect("seed");
+
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+
+        let _ = ctx
+            .mvcc_get_node_temporal(0, id, 1234567890)
+            .expect("get")
+            .expect("Some");
+
+        let scope = ctx.occ_scope.as_ref().expect("scope");
+        assert!(
+            scope.contains(Partition::Node, &temporal_key),
+            "OCC scope must contain the 25-byte temporal key, not the non-temporal one",
+        );
+        // Cross-check: non-temporal 16-byte key for the same id must NOT
+        // be tracked — temporal reads are version-specific.
+        let non_temporal_key = encode_node_key(0, id);
+        assert!(
+            !scope.contains(Partition::Node, &non_temporal_key),
+            "temporal read must NOT track the non-temporal 16-byte key",
+        );
+    }
+
+    #[test]
+    fn mvcc_put_node_temporal_does_not_track_in_occ_scope() {
+        // Symmetric to mvcc_put_node_does_not_track: pure temporal write
+        // must NOT enter the OCC scope (RYOW for own writes — never
+        // self-conflict).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+
+        let id = NodeId::from_raw(88);
+        ctx.mvcc_put_node_temporal(0, id, 1000, &NodeRecord::new("E"))
+            .expect("put");
+        let temporal_key = coordinode_core::graph::node::encode_temporal_node_key(0, id, 1000);
+        match ctx.occ_scope.as_ref() {
+            None => { /* fine — no scope materialised on pure write */ }
+            Some(scope) => assert!(
+                !scope.contains(Partition::Node, &temporal_key),
+                "pure temporal write must NOT enter OCC scope",
+            ),
+        }
+    }
+
+    #[test]
+    fn mvcc_get_node_temporal_decode_error_surfaces() {
+        // Corrupt bytes at a temporal key → ExecutionError::Serialization
+        // with valid_from_ms in the diagnostic, not panic.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = StorageEngine::open(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+        )
+        .expect("open");
+        let id = NodeId::from_raw(66);
+        let key = coordinode_core::graph::node::encode_temporal_node_key(0, id, 4242);
+        engine
+            .put(Partition::Node, &key, b"definitely-not-msgpack")
+            .expect("seed");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+
+        let err = ctx
+            .mvcc_get_node_temporal(0, id, 4242)
+            .expect_err("must surface as error");
+        match err {
+            ExecutionError::Serialization(msg) => {
+                assert!(msg.contains("66"), "diag has node id: {msg}");
+                assert!(msg.contains("4242"), "diag has valid_from: {msg}");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mvcc_temporal_handles_negative_valid_from_ms() {
+        // Pre-epoch timestamps (negative valid_from) MUST round-trip
+        // through the helper — encode_valid_from_sortable uses XOR-flip
+        // for sortable signed encoding. Guards against a regression that
+        // would silently break pre-1970 historical data.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+        ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
+
+        let id = NodeId::from_raw(99);
+        let pre_epoch = -1_577_836_800_000_i64; // ~1920
+        let rec = NodeRecord::new("Hist");
+        ctx.mvcc_put_node_temporal(0, id, pre_epoch, &rec)
+            .expect("put pre-epoch");
+        let back = ctx
+            .mvcc_get_node_temporal(0, id, pre_epoch)
+            .expect("get")
+            .expect("Some");
+        assert_eq!(back.primary_label(), "Hist");
+    }
+
+    #[test]
+    fn mvcc_delete_node_temporal_ryow_within_txn() {
+        // Same-transaction delete of a temporal version must be visible
+        // to subsequent same-txn reads (RYOW for temporal tombstones).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open");
+        // Seed v@1000 outside of the transaction-under-test.
+        let id = NodeId::from_raw(44);
+        let seeded_key = coordinode_core::graph::node::encode_temporal_node_key(0, id, 1000);
+        let rec = NodeRecord::new("Tx");
+        engine
+            .put(Partition::Node, &seeded_key, &rec.to_msgpack().unwrap())
+            .expect("seed");
+
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+        ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
+
+        assert!(ctx.mvcc_get_node_temporal(0, id, 1000).unwrap().is_some());
+        ctx.mvcc_delete_node_temporal(0, id, 1000)
+            .expect("delete in-txn");
+        assert!(
+            ctx.mvcc_get_node_temporal(0, id, 1000).unwrap().is_none(),
+            "RYOW: in-txn temporal tombstone visible to subsequent read",
+        );
+    }
+
+    #[test]
+    fn mvcc_temporal_handles_i64_extreme_valid_from() {
+        // Sortable encoding (encode_valid_from_sortable XOR-flip) must
+        // handle i64::MIN and i64::MAX without corruption. Guards
+        // against regressions in the boundary handling.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+        ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
+
+        let id = NodeId::from_raw(45);
+        let min_rec = NodeRecord::new("MinEdge");
+        let max_rec = NodeRecord::new("MaxEdge");
+
+        ctx.mvcc_put_node_temporal(0, id, i64::MIN, &min_rec)
+            .expect("put MIN");
+        ctx.mvcc_put_node_temporal(0, id, i64::MAX, &max_rec)
+            .expect("put MAX");
+
+        let back_min = ctx
+            .mvcc_get_node_temporal(0, id, i64::MIN)
+            .expect("get MIN")
+            .expect("Some");
+        let back_max = ctx
+            .mvcc_get_node_temporal(0, id, i64::MAX)
+            .expect("get MAX")
+            .expect("Some");
+        assert_eq!(back_min.primary_label(), "MinEdge");
+        assert_eq!(back_max.primary_label(), "MaxEdge");
+    }
+
+    #[test]
+    fn mvcc_temporal_keys_isolated_per_node_id_at_same_valid_from() {
+        // Two different node_ids at identical valid_from must NOT
+        // collide. The temporal key includes node_id, so this is the
+        // expected behaviour — but a regression in key layout (e.g.
+        // accidentally dropping the id byte block) would silently
+        // collapse them. Pin it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+        ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
+
+        let id_a = NodeId::from_raw(100);
+        let id_b = NodeId::from_raw(200);
+        let vf = 9999;
+        ctx.mvcc_put_node_temporal(0, id_a, vf, &NodeRecord::new("A"))
+            .expect("put A");
+        ctx.mvcc_put_node_temporal(0, id_b, vf, &NodeRecord::new("B"))
+            .expect("put B");
+
+        let back_a = ctx
+            .mvcc_get_node_temporal(0, id_a, vf)
+            .expect("get A")
+            .expect("Some");
+        let back_b = ctx
+            .mvcc_get_node_temporal(0, id_b, vf)
+            .expect("get B")
+            .expect("Some");
+        assert_eq!(back_a.primary_label(), "A");
+        assert_eq!(back_b.primary_label(), "B");
+    }
+
+    #[test]
+    fn mvcc_get_node_temporal_round_trip() {
+        // Write a versioned record at valid_from=1000, read back via
+        // typed helper, verify per-version key isolation (write at 1000
+        // does NOT show up when reading at 2000).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+        ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
+
+        let id = NodeId::from_raw(20);
+        let mut rec_v1 = NodeRecord::new("Event");
+        let name_fid = ctx.interner.intern("name");
+        rec_v1.set(name_fid, Value::String("v1".into()));
+
+        ctx.mvcc_put_node_temporal(0, id, 1000, &rec_v1)
+            .expect("put v1");
+        // RYOW: read back same version sees v1.
+        let read_v1 = ctx
+            .mvcc_get_node_temporal(0, id, 1000)
+            .expect("get v1")
+            .expect("Some");
+        assert_eq!(read_v1.get(name_fid), Some(&Value::String("v1".into())));
+        // Read at a DIFFERENT valid_from returns None — per-version key
+        // isolation (writes do not bleed across versions).
+        let read_v2 = ctx.mvcc_get_node_temporal(0, id, 2000).expect("get v2");
+        assert!(
+            read_v2.is_none(),
+            "per-version key isolation: write at 1000 must not show at 2000",
+        );
+    }
+
+    #[test]
+    fn mvcc_temporal_close_then_open_two_versions() {
+        // The bitemporal close-current + open-new pair: write v1 at
+        // valid_from=1000, then close it (set valid_to=2000 at SAME
+        // key) + open v2 at valid_from=2000. Both versions remain
+        // queryable at their respective per-version keys.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+        ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
+
+        let id = NodeId::from_raw(21);
+        let vf_fid = ctx.interner.intern("valid_from");
+        let vt_fid = ctx.interner.intern("valid_to");
+
+        // v1 open at 1000.
+        let mut rec_v1 = NodeRecord::new("Event");
+        rec_v1.set(vf_fid, Value::Int(1000));
+        ctx.mvcc_put_node_temporal(0, id, 1000, &rec_v1)
+            .expect("put v1");
+
+        // Close v1: set valid_to=2000 at same per-version key.
+        let mut closed_v1 = rec_v1.clone();
+        closed_v1.set(vt_fid, Value::Int(2000));
+        ctx.mvcc_put_node_temporal(0, id, 1000, &closed_v1)
+            .expect("close v1");
+
+        // Open v2 at fresh per-version key valid_from=2000.
+        let mut rec_v2 = NodeRecord::new("Event");
+        rec_v2.set(vf_fid, Value::Int(2000));
+        ctx.mvcc_put_node_temporal(0, id, 2000, &rec_v2)
+            .expect("put v2");
+
+        // Read v1 — sees the closed version (valid_to=2000 present).
+        let read_v1 = ctx
+            .mvcc_get_node_temporal(0, id, 1000)
+            .expect("get v1")
+            .expect("Some");
+        assert_eq!(
+            read_v1.get(vt_fid),
+            Some(&Value::Int(2000)),
+            "v1 must carry the close (valid_to=2000)",
+        );
+        // Read v2 — sees the open version (no valid_to).
+        let read_v2 = ctx
+            .mvcc_get_node_temporal(0, id, 2000)
+            .expect("get v2")
+            .expect("Some");
+        assert!(
+            !read_v2.props.contains_key(&vt_fid),
+            "v2 is open — must not carry valid_to",
+        );
+    }
+
+    #[test]
+    fn mvcc_delete_node_temporal_tombstones_specific_version() {
+        // Tombstone version at valid_from=1000 must hide that version
+        // only — other versions remain readable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let id = NodeId::from_raw(22);
+        let rec = NodeRecord::new("Event");
+
+        // Seed two versions in a flush'd txn.
+        {
+            let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+            ctx.mvcc_oracle = Some(&oracle);
+            ctx.mvcc_read_ts = oracle.next();
+            ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
+            ctx.mvcc_put_node_temporal(0, id, 1000, &rec).expect("v1");
+            ctx.mvcc_put_node_temporal(0, id, 2000, &rec).expect("v2");
+            ctx.mvcc_flush().expect("flush seed");
+        }
+        // Delete v1 in a fresh txn.
+        {
+            let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+            ctx.mvcc_oracle = Some(&oracle);
+            ctx.mvcc_read_ts = oracle.next();
+            ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
+            ctx.mvcc_delete_node_temporal(0, id, 1000)
+                .expect("delete v1");
+            ctx.mvcc_flush().expect("flush delete");
+        }
+        // Verify: v1 gone, v2 intact.
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        assert!(
+            ctx.mvcc_get_node_temporal(0, id, 1000)
+                .expect("get v1")
+                .is_none(),
+            "v1 tombstoned",
+        );
+        assert!(
+            ctx.mvcc_get_node_temporal(0, id, 2000)
+                .expect("get v2")
+                .is_some(),
+            "v2 untouched",
+        );
     }
 
     #[test]
