@@ -322,6 +322,23 @@ fn decode_node_id_from_key(key: &[u8]) -> Option<NodeId> {
     Some(NodeId::from_raw(u64::from_be_bytes(id_bytes)))
 }
 
+/// Decode the 8-byte Morton curve key from a full spatial index key.
+/// Layout: `idx:spatial:<label_id:4>:<crs:2>:<curve:8>:<node_id:8>`.
+/// Returns `None` if the key is too short.
+fn decode_curve_from_key(key: &[u8]) -> Option<u64> {
+    let curve_end = key.len().checked_sub(8)?;
+    let curve_start = curve_end.checked_sub(8)?;
+    let curve_bytes: [u8; 8] = key[curve_start..curve_end].try_into().ok()?;
+    Some(u64::from_be_bytes(curve_bytes))
+}
+
+// G101 scaffold — see GAPS.md G101 status note. The decompose +
+// interval-dispatch helpers are retained for the proper adaptive
+// re-attempt (hard cap + merging + adaptive bailout). Tests below
+// keep them exercised; the production path in scan_within_bbox
+// reverted to the broad-window scan because the naive integration
+// regressed the spatial bench ~40×.
+#[allow(dead_code)]
 /// Decompose a 2D quantised bbox into a list of disjoint Morton key
 /// intervals that COVER the bbox cells. Each returned `(lo, hi)`
 /// satisfies: every `(x, y)` with `morton_2d(x, y) ∈ [lo, hi]`
@@ -363,7 +380,7 @@ fn morton_2d_decompose(
     out
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 fn morton_2d_decompose_rec(
     cx_min: u64,
     cy_min: u64,
@@ -456,35 +473,77 @@ fn morton_2d_decompose_rec(
 }
 
 /// Resolve a CRS-and-bbox into the list of (lo, hi) Morton intervals
-/// to scan. 2D paths use [`morton_2d_decompose`]; 3D paths still
-/// return the single broad `[morton_min, morton_max]` interval
-/// (3D Z-curve decomposition reuses the 8-way octree generalisation
-/// — left as a follow-up since 3D usage is much rarer in practice).
+/// to scan. 2D paths use [`morton_2d_decompose`] with an adaptive
+/// bailout — see below. 3D paths still return the single broad
+/// `[morton_min, morton_max]` interval (8-way octree generalisation
+/// is a follow-up since 3D usage is much rarer in practice).
+///
+/// ## Adaptive bailout
+///
+/// Decomposition is a NET WIN only when the broad `[morton_min,
+/// morton_max]` interval contains substantially more cells than the
+/// bbox itself (long thin bboxes, latitude bands, scattered
+/// distributions). For square-ish bboxes in tightly-clustered
+/// indices the per-interval `range_scan` setup cost (~1µs each)
+/// dominates the dead-zone savings and we degrade vs the broad
+/// scan. Bench evidence: square 100×100 in 1000×1000 Cartesian2d
+/// with 10k uniform points showed ~3× slowdown with naive
+/// decomposition (87µs vs 28µs broad-scan baseline).
+///
+/// Rule: if the broad span is less than `BROAD_SCAN_THRESHOLD` times
+/// the decomposed total span, the dead-zone savings are too small
+/// to offset N range_scan setup costs — fall back to a single
+/// broad range. Empirically `8×` is a reasonable threshold: at less
+/// than 8× the decomposition would have to skip 87% of the broad
+/// span to break even on the typical 32-interval decomposition.
+#[allow(dead_code)]
 fn morton_intervals(bbox: &Bbox) -> Vec<(u64, u64)> {
     // Cap on intervals: empirically a few dozen suffices for typical
     // bboxes; beyond that we degrade to the broad range gracefully.
     const MAX_INTERVALS: usize = 64;
-    match bbox.lower.crs {
-        Crs::Wgs84_2d => {
-            let lon_min = quantise_u32(bbox.lower.coords[0], -180.0, 180.0);
-            let lat_min = quantise_u32(bbox.lower.coords[1], -90.0, 90.0);
-            let lon_max = quantise_u32(bbox.upper.coords[0], -180.0, 180.0);
-            let lat_max = quantise_u32(bbox.upper.coords[1], -90.0, 90.0);
-            morton_2d_decompose(lon_min, lon_max, lat_min, lat_max, MAX_INTERVALS)
-        }
-        Crs::Cartesian2d => {
-            let x_min = quantise_u32(bbox.lower.coords[0], -1e9, 1e9);
-            let y_min = quantise_u32(bbox.lower.coords[1], -1e9, 1e9);
-            let x_max = quantise_u32(bbox.upper.coords[0], -1e9, 1e9);
-            let y_max = quantise_u32(bbox.upper.coords[1], -1e9, 1e9);
-            morton_2d_decompose(x_min, x_max, y_min, y_max, MAX_INTERVALS)
-        }
+    // Adaptive bailout factor — see fn docstring.
+    const BROAD_SCAN_THRESHOLD: u64 = 8;
+
+    let (x_min, x_max, y_min, y_max) = match bbox.lower.crs {
+        Crs::Wgs84_2d => (
+            quantise_u32(bbox.lower.coords[0], -180.0, 180.0),
+            quantise_u32(bbox.upper.coords[0], -180.0, 180.0),
+            quantise_u32(bbox.lower.coords[1], -90.0, 90.0),
+            quantise_u32(bbox.upper.coords[1], -90.0, 90.0),
+        ),
+        Crs::Cartesian2d => (
+            quantise_u32(bbox.lower.coords[0], -1e9, 1e9),
+            quantise_u32(bbox.upper.coords[0], -1e9, 1e9),
+            quantise_u32(bbox.lower.coords[1], -1e9, 1e9),
+            quantise_u32(bbox.upper.coords[1], -1e9, 1e9),
+        ),
         Crs::Wgs84_3d | Crs::Cartesian3d => {
             // 3D follow-up — fall back to the broad window for now.
             let (lo, hi) = morton_window(bbox);
-            vec![(lo, hi)]
+            return vec![(lo, hi)];
         }
+    };
+
+    let decomposed = morton_2d_decompose(x_min, x_max, y_min, y_max, MAX_INTERVALS);
+    // Compare broad-span vs decomposed total span. If the decomposed
+    // version doesn't reduce the scan area by at least the threshold
+    // factor, the per-interval setup cost would dominate; collapse
+    // to one broad interval.
+    let broad_lo = morton_2d(x_min, y_min);
+    let broad_hi = morton_2d(x_max, y_max);
+    let broad_span = broad_hi.saturating_sub(broad_lo).saturating_add(1);
+    let decomposed_span: u64 = decomposed
+        .iter()
+        .map(|(lo, hi)| hi.saturating_sub(*lo).saturating_add(1))
+        .fold(0u64, u64::saturating_add);
+    // Saving = broad_span / decomposed_span. If < threshold, bail.
+    if decomposed_span == 0
+        || decomposed.len() <= 1
+        || broad_span / decomposed_span.max(1) < BROAD_SCAN_THRESHOLD
+    {
+        return vec![(broad_lo, broad_hi)];
     }
+    decomposed
 }
 
 /// Morton bounding range for a 2D bbox. The returned `[min, max]` is
@@ -697,41 +756,37 @@ impl SpatialStore for LocalSpatialStore<'_> {
         crs: Crs,
         bbox: &Bbox,
     ) -> StoreResult<Vec<(NodeId, Point)>> {
+        // **G101 status note (2026-05-21):** Z-curve subrange
+        // decomposition (`morton_intervals` + per-interval
+        // `range_scan`) was attempted but regressed the existing
+        // `spatial_scan_within_bbox` bench by ~40× (52µs vs 1.3µs at
+        // 100 points). Per-interval `range_scan` setup cost
+        // dominates for square bboxes in dense uniform indices.
+        // Pathological bboxes (e.g. y-span = 0 after quantisation)
+        // also explode the interval cap. Production path reverted to
+        // the original broad prefix-scan + post-filter; the
+        // decomposition helpers below are retained for the proper
+        // adaptive implementation (G101 stays Active).
         let prefix = encode_spatial_prefix(label_id, crs);
-        let intervals = morton_intervals(bbox);
+        let (curve_min, curve_max) = morton_window(bbox);
         let mut out = Vec::new();
-        // For each disjoint Morton interval issue one bounded range
-        // scan instead of a single broad prefix scan. Dead Z-curve
-        // subranges between intervals are skipped at the LSM-tree
-        // level rather than walked-and-discarded.
-        //
-        // Key layout: `<prefix><curve:8 BE><node_id:8 BE>`. To cover
-        // all node_ids at the boundary curve, the start key uses the
-        // lowest possible node_id suffix (zeros) and the end key the
-        // highest (0xff). Both bounds are inclusive in lsm-tree's
-        // `range` API.
-        for (curve_lo, curve_hi) in intervals {
-            let mut start_key = prefix.clone();
-            start_key.extend_from_slice(&curve_lo.to_be_bytes());
-            start_key.extend_from_slice(&[0u8; 8]);
-            let mut end_key = prefix.clone();
-            end_key.extend_from_slice(&curve_hi.to_be_bytes());
-            end_key.extend_from_slice(&[0xffu8; 8]);
-            let iter = self
-                .engine
-                .range_scan(Partition::Idx, &start_key, &end_key)?;
-            for guard in iter {
-                let (key, value) = guard.into_inner()?;
-                let Some(node_id) = decode_node_id_from_key(&key) else {
-                    continue;
-                };
-                let point = decode_body(value.as_ref())?;
-                // Intra-interval Z-shape false positives are still
-                // possible (a sub-cell on the rim spans both inside
-                // and outside coords); exact post-filter is mandatory.
-                if point_in_bbox(&point, bbox) {
-                    out.push((node_id, point));
+        let iter = self.engine.prefix_scan(Partition::Idx, &prefix)?;
+        for guard in iter {
+            let (key, value) = guard.into_inner()?;
+            if let Some(curve) = decode_curve_from_key(&key) {
+                if curve > curve_max {
+                    break;
                 }
+                if curve < curve_min {
+                    continue;
+                }
+            }
+            let Some(node_id) = decode_node_id_from_key(&key) else {
+                continue;
+            };
+            let point = decode_body(value.as_ref())?;
+            if point_in_bbox(&point, bbox) {
+                out.push((node_id, point));
             }
         }
         Ok(out)
@@ -902,46 +957,23 @@ mod tests {
     }
 
     #[test]
-    fn morton_intervals_dispatches_per_crs_to_2d_decompose() {
-        // The CRS-routing dispatch must wire Wgs84_2d and Cartesian2d
-        // through `morton_2d_decompose` (multiple disjoint intervals
-        // for sparse bboxes), not the broad single-interval fallback
-        // used by the 3D branch.
-        //
-        // Pin discriminator: any tiny bbox that covers far less than
-        // the whole curve space must produce MORE than one interval
-        // OR a single interval much narrower than the full space.
-        // The 3D fallback would return a single broad interval whose
-        // span ≈ `morton_window(bbox).1 - .0` (large in u64).
-        let wgs_bbox = Bbox {
+    fn morton_intervals_2d_dispatch_returns_non_empty() {
+        // Smoke-check the dispatch — Wgs84_2d and Cartesian2d both
+        // produce ≥ 1 interval for any non-degenerate bbox. The
+        // adaptive bailout is intentionally not asserted here:
+        // morton_intervals is currently retained as dead-code
+        // scaffold for the proper G101 re-attempt (see GAPS.md
+        // G101 status note).
+        let wgs = morton_intervals(&Bbox {
             lower: Point::new_2d(Crs::Wgs84_2d, 0.0, 0.0),
             upper: Point::new_2d(Crs::Wgs84_2d, 1.0, 1.0),
-        };
-        let wgs = morton_intervals(&wgs_bbox);
-        assert!(!wgs.is_empty(), "Wgs84_2d dispatch returns intervals");
-        let (broad_lo, broad_hi) = morton_window(&wgs_bbox);
-        let broad_span = broad_hi.saturating_sub(broad_lo);
-        let decomposed_span: u64 = wgs
-            .iter()
-            .map(|(lo, hi)| hi.saturating_sub(*lo))
-            .fold(0u64, u64::saturating_add);
-        // Decomposition's total covered span ≤ broad span (it carves
-        // out dead Z-curve subranges). Either we got many intervals,
-        // or a single one whose span is strictly less than the broad
-        // window — both prove dispatch hit `morton_2d_decompose`.
-        assert!(
-            wgs.len() > 1 || decomposed_span < broad_span,
-            "Wgs84_2d dispatch missed decompose path: got {} interval(s), \
-             decomposed_span={decomposed_span}, broad_span={broad_span}",
-            wgs.len(),
-        );
-
-        let cart_bbox = Bbox {
+        });
+        assert!(!wgs.is_empty());
+        let cart = morton_intervals(&Bbox {
             lower: Point::new_2d(Crs::Cartesian2d, 0.0, 0.0),
             upper: Point::new_2d(Crs::Cartesian2d, 100.0, 100.0),
-        };
-        let cart = morton_intervals(&cart_bbox);
-        assert!(!cart.is_empty(), "Cartesian2d dispatch returns intervals");
+        });
+        assert!(!cart.is_empty());
     }
 
     #[test]
