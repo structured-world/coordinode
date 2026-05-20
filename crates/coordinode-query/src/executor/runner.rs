@@ -2054,11 +2054,13 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                     // Check if the node key is visible at the snapshot timestamp.
                     if let Some(id_val) = row.get("_node_id") {
                         if let Some(id) = id_val.as_int() {
-                            let node_key = coordinode_core::graph::node::encode_node_key(
+                            use coordinode_modality::NodeStore as _;
+                            let nodes = coordinode_modality::LocalNodeStore::new(ctx.engine);
+                            match nodes.get_at_seqno(
                                 ctx.shard_id,
                                 coordinode_core::graph::node::NodeId::from_raw(id as u64),
-                            );
-                            match ctx.engine.snapshot_get(snap, Partition::Node, &node_key) {
+                                *snap,
+                            ) {
                                 Ok(Some(_)) => {
                                     visible.push(row.clone());
                                     stats.candidates_visible += 1;

@@ -166,6 +166,22 @@ pub trait NodeStore {
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
     fn scan_versions(&self, shard_id: u16, node_id: NodeId) -> StoreResult<Vec<(i64, NodeRecord)>>;
+
+    /// Read a non-temporal node at a specific MVCC snapshot seqno
+    /// (writes after the snapshot are invisible). Required by the
+    /// query layer's MVCC read path.
+    fn get_at_seqno(
+        &self,
+        shard_id: u16,
+        node_id: NodeId,
+        snapshot: lsm_tree::SeqNo,
+    ) -> StoreResult<Option<NodeRecord>>;
+
+    /// Iterate every non-temporal node record in a shard, latest
+    /// visible seqno. Yields `(NodeId, NodeRecord)` pairs in key
+    /// order. Used by index builders and TTL/maintenance reapers
+    /// that need a full-shard walk.
+    fn scan_shard(&self, shard_id: u16) -> StoreResult<Vec<(NodeId, NodeRecord)>>;
 }
 
 /// CE single-shard implementation of [`NodeStore`].
@@ -297,6 +313,50 @@ impl NodeStore for LocalNodeStore<'_> {
         // Engine returns keys in sorted byte order; the valid_from
         // suffix uses sortable encoding so the natural iteration
         // order is already chronological. Documented invariant.
+        Ok(out)
+    }
+
+    fn get_at_seqno(
+        &self,
+        shard_id: u16,
+        node_id: NodeId,
+        snapshot: lsm_tree::SeqNo,
+    ) -> StoreResult<Option<NodeRecord>> {
+        let key = encode_node_key(shard_id, node_id);
+        let Some(bytes) =
+            self.engine
+                .coordinator()
+                .snapshot_get(&snapshot, Partition::Node, &key)?
+        else {
+            return Ok(None);
+        };
+        Self::decode_record(&bytes).map(Some)
+    }
+
+    fn scan_shard(&self, shard_id: u16) -> StoreResult<Vec<(NodeId, NodeRecord)>> {
+        // Non-temporal node keys are exactly 16 bytes (node:<shard:2><id:8>);
+        // temporal keys add a :<vf:8> suffix making them 25 bytes. Filter
+        // to the 16-byte form so callers don't have to disambiguate.
+        let mut prefix = Vec::with_capacity(8);
+        prefix.extend_from_slice(b"node:");
+        prefix.extend_from_slice(&shard_id.to_be_bytes());
+        prefix.push(b':');
+        let iter = self.engine.prefix_scan(Partition::Node, &prefix)?;
+        let mut out = Vec::new();
+        for guard in iter {
+            let (key, value) = guard.into_inner()?;
+            // 16-byte non-temporal keys only — skip temporal versions
+            // (those have a trailing valid_from suffix).
+            if key.len() != 16 {
+                continue;
+            }
+            let id_bytes: [u8; 8] = match key[8..16].try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let node_id = NodeId::from_raw(u64::from_be_bytes(id_bytes));
+            out.push((node_id, Self::decode_record(&value)?));
+        }
         Ok(out)
     }
 }
@@ -535,6 +595,76 @@ mod tests {
         // Query at 0 picks the MIN-version (largest valid_from <= 0).
         let active = store.get_at(0, id, 0).expect("ok").expect("Some");
         assert_eq!(active.primary_label(), "min");
+    }
+
+    #[test]
+    fn get_at_seqno_returns_version_visible_at_snapshot() {
+        let (_dir, engine) = open_engine();
+        let store = LocalNodeStore::new(&engine);
+        let id = NodeId::from_raw(50);
+        store.put(0, id, &rec("v1")).expect("put v1");
+        let snap = engine.snapshot();
+        store.put(0, id, &rec("v2")).expect("put v2");
+        let at_snap = store.get_at_seqno(0, id, snap).expect("ok").expect("Some");
+        assert_eq!(at_snap.primary_label(), "v1");
+        let latest = store.get(0, id).expect("ok").expect("Some");
+        assert_eq!(latest.primary_label(), "v2");
+    }
+
+    #[test]
+    fn get_at_seqno_missing_returns_none() {
+        let (_dir, engine) = open_engine();
+        let store = LocalNodeStore::new(&engine);
+        let snap = engine.snapshot();
+        assert!(store
+            .get_at_seqno(0, NodeId::from_raw(999), snap)
+            .expect("ok")
+            .is_none());
+    }
+
+    #[test]
+    fn scan_shard_yields_every_non_temporal_record() {
+        let (_dir, engine) = open_engine();
+        let store = LocalNodeStore::new(&engine);
+        for i in 0u64..5 {
+            store
+                .put(0, NodeId::from_raw(i + 100), &rec(&format!("L{i}")))
+                .expect("put");
+        }
+        let all = store.scan_shard(0).expect("scan");
+        assert_eq!(all.len(), 5);
+        let mut ids: Vec<u64> = all.iter().map(|(id, _)| id.as_raw()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![100, 101, 102, 103, 104]);
+    }
+
+    #[test]
+    fn scan_shard_isolated_per_shard() {
+        let (_dir, engine) = open_engine();
+        let store = LocalNodeStore::new(&engine);
+        store.put(0, NodeId::from_raw(1), &rec("s0")).unwrap();
+        store.put(1, NodeId::from_raw(2), &rec("s1")).unwrap();
+        let shard0 = store.scan_shard(0).unwrap();
+        let shard1 = store.scan_shard(1).unwrap();
+        assert_eq!(shard0.len(), 1);
+        assert_eq!(shard1.len(), 1);
+        assert_eq!(shard0[0].0, NodeId::from_raw(1));
+        assert_eq!(shard1[0].0, NodeId::from_raw(2));
+    }
+
+    #[test]
+    fn scan_shard_skips_temporal_versions() {
+        // 25-byte temporal keys must not leak into the
+        // non-temporal scan result.
+        let (_dir, engine) = open_engine();
+        let store = LocalNodeStore::new(&engine);
+        store.put(0, NodeId::from_raw(1), &rec("nt")).unwrap();
+        store
+            .put_temporal(0, NodeId::from_raw(2), 1000, &rec("t"))
+            .unwrap();
+        let all = store.scan_shard(0).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, NodeId::from_raw(1));
     }
 
     #[test]
