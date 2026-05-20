@@ -16643,6 +16643,104 @@ mod tests {
     }
 
     #[test]
+    fn mvcc_flush_idempotent_under_second_call() {
+        // Calling mvcc_flush twice on the same context must not
+        // re-apply writes (otherwise w:0 fan-out triggers spurious
+        // duplicate puts on retry / control-flow seams).
+        // Expected semantics:
+        //   1st call: drains write_buffer + merge buffers → commit_ts.
+        //   2nd call: buffers empty → read-only path → returns
+        //   Ok(Some(read_ts)), no further engine writes.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open with oracle");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+        ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
+
+        ctx.mvcc_put(Partition::Node, b"flush_key", b"v1")
+            .expect("put");
+        // First flush: drains buffer, returns commit_ts (Some).
+        let first = ctx.mvcc_flush().expect("first flush ok");
+        assert!(first.is_some(), "first flush must return commit_ts");
+        // Engine sees the write after the first flush.
+        assert_eq!(
+            engine
+                .get(Partition::Node, b"flush_key")
+                .expect("get")
+                .as_deref(),
+            Some(b"v1".as_slice()),
+        );
+        // Second flush: buffer drained → read-only path → no engine
+        // mutation. Capture state before and after.
+        let second = ctx.mvcc_flush().expect("second flush ok");
+        assert!(
+            second.is_some(),
+            "second flush returns read_ts (read-only path)"
+        );
+        // Engine state unchanged — second flush must be a no-op write.
+        assert_eq!(
+            engine
+                .get(Partition::Node, b"flush_key")
+                .expect("get")
+                .as_deref(),
+            Some(b"v1".as_slice()),
+        );
+    }
+
+    #[test]
+    fn mvcc_flush_read_only_returns_read_ts_without_commit() {
+        // Read-only transaction → flush takes the early-return path
+        // (no oracle.next() allocation, no engine writes). Returns
+        // the read_ts itself.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open with oracle");
+        engine.put(Partition::Node, b"k", b"v").expect("seed");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        let read_ts = oracle.next();
+        ctx.mvcc_read_ts = read_ts;
+        // Read-only — only mvcc_get, no mvcc_put.
+        let _ = ctx.mvcc_get(Partition::Node, b"k").expect("get");
+        let result = ctx.mvcc_flush().expect("flush ok");
+        assert_eq!(
+            result,
+            Some(read_ts),
+            "read-only flush returns the original read_ts unchanged",
+        );
+    }
+
+    #[test]
     fn ryow_read_does_not_track_in_occ_scope() {
         // Reading-your-own-write (write_buffer hit) must NOT enter
         // the OCC scope — otherwise your own writes trigger
