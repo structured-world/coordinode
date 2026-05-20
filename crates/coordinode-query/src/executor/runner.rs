@@ -8237,12 +8237,7 @@ fn execute_update(
                         _ => continue,
                     };
 
-                    let key = encode_node_key(ctx.shard_id, node_id);
-                    if let Some(bytes) = ctx.mvcc_get(Partition::Node, &key)? {
-                        let mut record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
-                            ExecutionError::Serialization(format!("node decode: {e}"))
-                        })?;
-
+                    if let Some(mut record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
                         // Schema validation: SET n = {map} replaces ALL properties.
                         // In STRICT mode every key must be declared; VALIDATED checks declared keys only.
                         let label = record.primary_label().to_string();
@@ -8312,10 +8307,7 @@ fn execute_update(
                             }
                         }
 
-                        let new_bytes = record.to_msgpack().map_err(|e| {
-                            ExecutionError::Serialization(format!("node encode: {e}"))
-                        })?;
-                        ctx.mvcc_put(Partition::Node, &key, &new_bytes)?;
+                        ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
 
                         // Update out_row so that RETURN clauses in the same statement
                         // see the post-SET values. Remove all old variable.* entries
@@ -8360,12 +8352,7 @@ fn execute_update(
                         _ => continue,
                     };
 
-                    let key = encode_node_key(ctx.shard_id, node_id);
-                    if let Some(bytes) = ctx.mvcc_get(Partition::Node, &key)? {
-                        let mut record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
-                            ExecutionError::Serialization(format!("node decode: {e}"))
-                        })?;
-
+                    if let Some(mut record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
                         // Schema validation: SET n += {map} merges new properties.
                         // STRICT: every key in map must be declared; VALIDATED: checks declared keys.
                         let label = record.primary_label().to_string();
@@ -8433,10 +8420,7 @@ fn execute_update(
                             }
                         }
 
-                        let new_bytes = record.to_msgpack().map_err(|e| {
-                            ExecutionError::Serialization(format!("node encode: {e}"))
-                        })?;
-                        ctx.mvcc_put(Partition::Node, &key, &new_bytes)?;
+                        ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
 
                         // Update out_row so RETURN clauses see the merged values.
                         // MergeProperties adds/overwrites; existing untouched props stay.
@@ -16665,6 +16649,135 @@ mod tests {
         assert!(scope.contains(Partition::Node, b"k1"));
         scope.track(Partition::Node, b"k2");
         assert_eq!(scope.tracked_count(), 2);
+    }
+
+    #[test]
+    fn mvcc_get_node_tracks_in_occ_scope() {
+        // Critical correctness: typed read must enter the Layer-3
+        // OCC scope (otherwise OCC conflict detection misses node
+        // dependencies and writes appear to commit cleanly even
+        // when another transaction modified the read node).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open with oracle");
+        // Seed a node.
+        let id = NodeId::from_raw(99);
+        let seed = NodeRecord::new("Probe");
+        let bytes = seed.to_msgpack().expect("encode");
+        let key = encode_node_key(0, id);
+        engine.put(Partition::Node, &key, &bytes).expect("seed");
+
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+
+        let _ = ctx.mvcc_get_node(0, id).expect("get").expect("Some");
+        // OCC scope must contain the encoded node key.
+        let scope = ctx.occ_scope.as_ref().expect("MVCC mode → scope present");
+        assert!(
+            scope.contains(Partition::Node, &key),
+            "typed read must populate OCC scope under Node partition",
+        );
+    }
+
+    #[test]
+    fn mvcc_get_node_decode_error_surfaces_as_serialization_error() {
+        // Corrupt bytes in the partition must not panic — they must
+        // propagate as ExecutionError::Serialization through the
+        // typed helper's decode boundary.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = StorageEngine::open(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+        )
+        .expect("open");
+        let id = NodeId::from_raw(55);
+        let key = encode_node_key(0, id);
+        // Plant garbage — not a valid MessagePack NodeRecord.
+        engine
+            .put(Partition::Node, &key, b"this-is-not-msgpack")
+            .expect("seed garbage");
+
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        let err = ctx
+            .mvcc_get_node(0, id)
+            .expect_err("garbage must surface as error");
+        match err {
+            ExecutionError::Serialization(msg) => {
+                assert!(
+                    msg.contains("55"),
+                    "error message includes the node id for diagnostics: {msg}",
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mvcc_delete_node_then_get_returns_none_within_txn() {
+        // Same-transaction delete must be visible to subsequent
+        // typed reads (RYOW for tombstones).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open");
+        // Seed.
+        let id = NodeId::from_raw(11);
+        let rec = NodeRecord::new("Item");
+        let bytes = rec.to_msgpack().expect("encode");
+        let key = encode_node_key(0, id);
+        engine.put(Partition::Node, &key, &bytes).expect("seed");
+
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+        ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
+
+        // Initial read sees the seeded record.
+        assert!(ctx.mvcc_get_node(0, id).expect("get").is_some());
+        // Delete in-txn.
+        ctx.mvcc_delete_node(0, id).expect("delete");
+        // RYOW: subsequent same-txn read sees the tombstone.
+        assert!(
+            ctx.mvcc_get_node(0, id).expect("get").is_none(),
+            "RYOW must surface the in-txn tombstone",
+        );
     }
 
     #[test]
