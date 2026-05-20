@@ -45,15 +45,121 @@
 //! [`MultiModalCoordinator::set_gc_watermark`]. Neither hook requires
 //! API changes; the seam is the existing accessor surface.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use lsm_tree::{AbstractTree, Guard};
 
 use super::StorageIter;
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
+
+/// OCC read scope — Layer-3 owned read-set tracker for optimistic
+/// concurrency control.
+///
+/// A scope is created at transaction start (pinned to a snapshot
+/// seqno) and accumulates the `(Partition, key)` of every read that
+/// participates in conflict detection. At commit time the coordinator
+/// validates the scope: every tracked key is probed for a write whose
+/// seqno is newer than the scope's `read_ts`. If any such write
+/// exists the transaction has a read-write conflict and must abort.
+///
+/// **Thread-safe collection.** The internal set is `Mutex`-guarded so
+/// parallel executor paths (rayon worker pools traversing a fan-out
+/// edge set) can share a single `&OccScope` and push tracked keys
+/// concurrently. Uncontended path is one atomic CAS per insert.
+///
+/// **Commutative partitions skipped.** Writes to partitions reporting
+/// [`Partition::is_commutative`] (currently `Adj`, `Counter`) are
+/// conflict-free by construction — merge operators compose concurrent
+/// writers at read time. `track` records them but `validate_occ` on
+/// the coordinator excludes them from the conflict probe.
+pub struct OccScope {
+    read_ts: lsm_tree::SeqNo,
+    read_set: Mutex<HashSet<(Partition, Vec<u8>)>>,
+}
+
+impl OccScope {
+    /// Construct an empty scope pinned at the given snapshot seqno.
+    /// Prefer [`MultiModalCoordinator::occ_scope_at`] over direct
+    /// construction so the scope's `read_ts` is sourced from the
+    /// coordinator's snapshot machinery, not an ad-hoc value.
+    pub fn new(read_ts: lsm_tree::SeqNo) -> Self {
+        Self {
+            read_ts,
+            read_set: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// The pinned snapshot seqno this scope reads at. Conflict
+    /// detection at commit time probes "any write seqno > read_ts".
+    pub fn read_ts(&self) -> lsm_tree::SeqNo {
+        self.read_ts
+    }
+
+    /// Record a read against `(part, key)`. Idempotent — a key is
+    /// stored at most once regardless of how many times it is read.
+    pub fn track(&self, part: Partition, key: &[u8]) {
+        if let Ok(mut guard) = self.read_set.lock() {
+            guard.insert((part, key.to_vec()));
+        }
+    }
+
+    /// Bulk-merge tracked keys from another collection (e.g. results
+    /// of a rayon parallel block that collected into a local
+    /// `Vec<(Partition, Vec<u8>)>` before joining back).
+    pub fn extend<I: IntoIterator<Item = (Partition, Vec<u8>)>>(&self, iter: I) {
+        if let Ok(mut guard) = self.read_set.lock() {
+            guard.extend(iter);
+        }
+    }
+
+    /// Number of distinct tracked `(part, key)` pairs. Test/EXPLAIN
+    /// hook — production code does not inspect this.
+    pub fn tracked_count(&self) -> usize {
+        self.read_set.lock().map(|g| g.len()).unwrap_or(0)
+    }
+
+    /// Drain into a `Vec` for handing back to a parent scope or
+    /// emitting in EXPLAIN. Resets the internal set.
+    pub fn drain(&self) -> Vec<(Partition, Vec<u8>)> {
+        match self.read_set.lock() {
+            Ok(mut guard) => guard.drain().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Is `(part, key)` tracked in this scope? Provided for tests
+    /// and EXPLAIN-style introspection; the production OCC path
+    /// does not call this — it iterates the full set via
+    /// [`MultiModalCoordinator::validate_occ`].
+    pub fn contains(&self, part: Partition, key: &[u8]) -> bool {
+        match self.read_set.lock() {
+            Ok(guard) => guard.contains(&(part, key.to_vec())),
+            Err(_) => false,
+        }
+    }
+
+    /// Borrow the tracked set under the lock — internal use only.
+    /// Consumed by [`MultiModalCoordinator::validate_occ`].
+    pub(crate) fn with_keys<R>(&self, f: impl FnOnce(&HashSet<(Partition, Vec<u8>)>) -> R) -> R {
+        match self.read_set.lock() {
+            Ok(guard) => f(&guard),
+            Err(poisoned) => f(&poisoned.into_inner()),
+        }
+    }
+}
+
+/// First key whose post-snapshot write triggered the conflict.
+/// Returned by [`MultiModalCoordinator::validate_occ`] so callers
+/// can surface a useful conflict message.
+#[derive(Debug, Clone)]
+pub struct OccConflict {
+    pub partition: Partition,
+    pub key: Vec<u8>,
+    pub read_ts: lsm_tree::SeqNo,
+}
 
 /// Layer-3 contract: multimodal coordinator across the 8 partitions
 /// (`arch/core/storage-stack.md` §Layer 3, §Per-layer trait surface).
@@ -136,6 +242,47 @@ pub trait MultiModalCoordinator: Send + Sync {
         key: &[u8],
         after_seqno: lsm_tree::SeqNo,
     ) -> StorageResult<bool>;
+
+    /// Begin an OCC scope pinned at the given read snapshot. The
+    /// returned scope is empty; callers populate it via
+    /// [`OccScope::track`] during the transaction body, then submit
+    /// it to [`Self::validate_occ`] at commit time.
+    ///
+    /// The default implementation constructs a plain [`OccScope`].
+    /// EE multi-shard impls may override to attach shard-locality
+    /// metadata for cross-shard validation.
+    fn occ_scope_at(&self, read_ts: lsm_tree::SeqNo) -> OccScope {
+        OccScope::new(read_ts)
+    }
+
+    /// OCC commit-time validation. For every key tracked in `scope`,
+    /// probes the partition for a write whose seqno is strictly
+    /// greater than `scope.read_ts`. Commutative partitions
+    /// ([`Partition::is_commutative`] = true) are skipped — merge-
+    /// operator writes there don't produce read-write conflicts.
+    ///
+    /// Returns `Ok(None)` when no conflict was detected;
+    /// `Ok(Some(OccConflict))` for the first conflicting key found
+    /// (subsequent keys are not checked — the conflict is decisive).
+    /// `Err` only on storage I/O failure.
+    fn validate_occ(&self, scope: &OccScope) -> StorageResult<Option<OccConflict>> {
+        let read_ts = scope.read_ts;
+        scope.with_keys(|keys| {
+            for (part, key) in keys.iter() {
+                if part.is_commutative() {
+                    continue;
+                }
+                if self.has_write_after(*part, key, read_ts)? {
+                    return Ok(Some(OccConflict {
+                        partition: *part,
+                        key: key.clone(),
+                        read_ts,
+                    }));
+                }
+            }
+            Ok(None)
+        })
+    }
 }
 
 /// CE single-Raft, single-shard [`MultiModalCoordinator`] implementation.
@@ -515,6 +662,99 @@ mod tests {
             h.join().expect("join");
         }
         drop(dir); // keep TempDir alive for the scope of the test
+    }
+
+    #[test]
+    fn occ_scope_track_dedupes_and_validates_clean() {
+        let (_dir, engine) = open_engine();
+        let coord = engine.coordinator();
+        let scope = coord.occ_scope_at(engine.snapshot());
+        // Track same key twice — set semantics.
+        scope.track(Partition::Node, b"k1");
+        scope.track(Partition::Node, b"k1");
+        scope.track(Partition::Node, b"k2");
+        assert_eq!(scope.tracked_count(), 2);
+        // No writes since snapshot → no conflict.
+        let res = coord.validate_occ(&scope).expect("validate ok");
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn occ_scope_validate_detects_post_snapshot_write() {
+        let (_dir, engine) = open_engine();
+        let coord = engine.coordinator();
+        // SequenceNumberCounter::get() returns "next-to-allocate", so
+        // snapshot()'s value coincides with the next put's seqno. Probe
+        // at `snapshot - 1` to assert strict post-snapshot newer-write
+        // detection (same shape as coordinator_has_write_after_detects_put).
+        let scope = coord.occ_scope_at(engine.snapshot().saturating_sub(1));
+        scope.track(Partition::Node, b"hot");
+        engine.put(Partition::Node, b"hot", b"v").expect("put");
+        let conflict = coord
+            .validate_occ(&scope)
+            .expect("validate ok")
+            .expect("conflict expected");
+        assert_eq!(conflict.partition, Partition::Node);
+        assert_eq!(conflict.key.as_slice(), b"hot");
+    }
+
+    #[test]
+    fn occ_scope_skips_commutative_partitions() {
+        let (_dir, engine) = open_engine();
+        let coord = engine.coordinator();
+        let scope = coord.occ_scope_at(engine.snapshot());
+        // Adj is commutative — even a post-snapshot write must NOT
+        // produce a conflict on it.
+        scope.track(Partition::Adj, b"adj_key");
+        engine
+            .merge(Partition::Adj, b"adj_key", b"any")
+            .expect("merge");
+        let res = coord.validate_occ(&scope).expect("validate ok");
+        assert!(
+            res.is_none(),
+            "Adj writes are commutative — must not raise OCC conflict"
+        );
+    }
+
+    #[test]
+    fn occ_scope_extend_merges_parallel_collections() {
+        let (_dir, engine) = open_engine();
+        let coord = engine.coordinator();
+        let scope = coord.occ_scope_at(engine.snapshot());
+        // Simulate a parallel worker collecting into a local Vec then
+        // merging into the shared scope.
+        let parallel_keys = vec![
+            (Partition::Node, b"p1".to_vec()),
+            (Partition::Node, b"p2".to_vec()),
+            (Partition::EdgeProp, b"e1".to_vec()),
+        ];
+        scope.extend(parallel_keys);
+        assert_eq!(scope.tracked_count(), 3);
+    }
+
+    #[test]
+    fn occ_scope_concurrent_track_thread_safe() {
+        // OccScope must be Send+Sync so rayon workers can share &OccScope.
+        use std::sync::Arc;
+        use std::thread;
+        let (_dir, engine) = open_engine();
+        let scope = Arc::new(engine.coordinator().occ_scope_at(engine.snapshot()));
+        let handles: Vec<_> = (0..4)
+            .map(|tid| {
+                let s = Arc::clone(&scope);
+                thread::spawn(move || {
+                    for i in 0..50 {
+                        let key = format!("k{tid}-{i}");
+                        s.track(Partition::Node, key.as_bytes());
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("join");
+        }
+        // 4 threads × 50 keys, all distinct.
+        assert_eq!(scope.tracked_count(), 200);
     }
 
     #[test]

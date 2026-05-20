@@ -77,6 +77,21 @@ impl Partition {
         }
     }
 
+    /// True when writes in this partition are commutative (merge
+    /// operators) and therefore conflict-free for OCC purposes —
+    /// concurrent writers cannot produce a lost-update because the
+    /// merge function composes them at read time.
+    ///
+    /// Used by [`crate::engine::coordinator::MultiModalCoordinator::validate_occ`]
+    /// to skip conflict checks on these partitions: a read of a
+    /// commutative partition imposes no read-write ordering constraint.
+    ///
+    /// Currently `Adj` (posting-list merge ops for edge insertions and
+    /// removals) and `Counter` (additive deltas).
+    pub fn is_commutative(self) -> bool {
+        matches!(self, Self::Adj | Self::Counter)
+    }
+
     /// All partitions in creation order.
     pub fn all() -> &'static [Partition] {
         &[
