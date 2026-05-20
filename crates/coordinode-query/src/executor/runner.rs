@@ -622,6 +622,29 @@ impl<'a> ExecutionContext<'a> {
     ///
     /// Read order: write buffer first, then committed engine state.
     /// Does not consult `merge_node_deltas`.
+    /// Typed analogue of [`Self::schema_peek_node`] for callers that
+    /// want a decoded [`NodeRecord`]. Same non-materialising read
+    /// semantics — RYOW from write_buffer, snapshot fallback, no
+    /// touch on `merge_node_deltas`, no OCC scope tracking (this is
+    /// a schema-introspection read, not a transactional read).
+    /// Encapsulates `encode_node_key + schema_peek_node + from_msgpack`.
+    pub fn schema_peek_node_typed(
+        &self,
+        shard_id: u16,
+        node_id: NodeId,
+    ) -> Result<Option<NodeRecord>, ExecutionError> {
+        let key = encode_node_key(shard_id, node_id);
+        let Some(bytes) = self.schema_peek_node(&key)? else {
+            return Ok(None);
+        };
+        NodeRecord::from_msgpack(&bytes).map(Some).map_err(|e| {
+            ExecutionError::Serialization(format!(
+                "node {} schema-peek deserialization: {e}",
+                node_id.as_raw(),
+            ))
+        })
+    }
+
     pub fn schema_peek_node(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ExecutionError> {
         // Check write buffer (nodes already written or materialized in this txn).
         let buf_key = (Partition::Node, key.to_vec());
@@ -651,17 +674,15 @@ impl<'a> ExecutionContext<'a> {
     /// Returns `None` if the node does not exist (deleted or never created).
     pub fn schema_label_for_node(
         &mut self,
+        shard_id: u16,
         node_id: NodeId,
-        key: &[u8],
     ) -> Result<Option<String>, ExecutionError> {
         if let Some(label) = self.schema_label_cache.get(&node_id) {
             return Ok(Some(label.clone()));
         }
-        let Some(bytes) = self.schema_peek_node(key)? else {
+        let Some(record) = self.schema_peek_node_typed(shard_id, node_id)? else {
             return Ok(None);
         };
-        let record = NodeRecord::from_msgpack(&bytes)
-            .map_err(|e| ExecutionError::Serialization(format!("node decode: {e}")))?;
         let label = record.primary_label().to_string();
         self.schema_label_cache.insert(node_id, label.clone());
         Ok(Some(label))
@@ -1038,6 +1059,17 @@ impl<'a> ExecutionContext<'a> {
             Some(vf) => self.mvcc_put_node_temporal(shard_id, node_id, vf, record),
             None => self.mvcc_put_node(shard_id, node_id, record),
         }
+    }
+
+    /// Buffer a node document-delta operand for atomic flush. Hides
+    /// the `encode_node_key` + `merge_node_deltas.push` pattern.
+    /// The operand is a pre-encoded `DocDelta` operand bytes blob —
+    /// callers build it via `DocDelta::encode()`. Used by SET / REMOVE
+    /// nested-path executors (e.g. `SET n.config.host = "x"`,
+    /// `REMOVE n.tags[0]`).
+    pub fn mvcc_merge_node_delta(&mut self, shard_id: u16, node_id: NodeId, operand: Vec<u8>) {
+        let key = encode_node_key(shard_id, node_id);
+        self.merge_node_deltas.push((key, operand));
     }
 
     /// MVCC-aware typed node delete. Buffers a tombstone for the
@@ -7792,17 +7824,14 @@ fn execute_update(
             if update_snapshots.contains_key(&node_id) {
                 continue;
             }
-            let key = encode_node_key(ctx.shard_id, node_id);
-            // Use schema_peek_node (the same delta-non-materialising read
-            // used by SET's own schema checks) to avoid consuming any
-            // pending merge_node_deltas from a preceding REMOVE clause in
-            // the same query. mvcc_get would materialise those deltas
-            // into the write buffer, and in legacy (no-oracle) mode
+            // Use the delta-non-materialising peek (same read used by
+            // SET's own schema checks) to avoid consuming any pending
+            // merge_node_deltas from a preceding REMOVE clause in the
+            // same query. mvcc_get would materialise those deltas into
+            // the write buffer, and in legacy (no-oracle) mode
             // mvcc_flush ignores the buffer — the deltas would be lost.
-            if let Some(bytes) = ctx.schema_peek_node(&key)? {
-                if let Ok(record) = NodeRecord::from_msgpack(&bytes) {
-                    update_snapshots.insert(node_id, snapshot_node_record(&record, ctx));
-                }
+            if let Some(record) = ctx.schema_peek_node_typed(ctx.shard_id, node_id)? {
+                update_snapshots.insert(node_id, snapshot_node_record(&record, ctx));
             }
         }
 
@@ -8081,8 +8110,6 @@ fn execute_update(
                         _ => continue,
                     };
 
-                    let key = encode_node_key(ctx.shard_id, node_id);
-
                     // Schema check for the root property (path[0]).
                     // PropertyPath writes nested doc fields (e.g. SET n.config.host = "x").
                     // In STRICT mode the root property must be declared in the schema.
@@ -8092,7 +8119,7 @@ fn execute_update(
                     // schema_label_for_node caches the primary label per node per statement:
                     // SET n.a.x=1, n.a.y=2, n.a.z=3 on 100 nodes = 100 reads (not 300).
                     let schema_err: Option<ExecutionError> = {
-                        if let Some(label) = ctx.schema_label_for_node(node_id, &key)? {
+                        if let Some(label) = ctx.schema_label_for_node(ctx.shard_id, node_id)? {
                             match ctx.load_current_label_schema(&label)? {
                                 Some(ls) => {
                                     let root = &path[0];
@@ -8151,7 +8178,7 @@ fn execute_update(
                     let operand = delta.encode().map_err(|e| {
                         ExecutionError::Serialization(format!("DocDelta encode: {e}"))
                     })?;
-                    ctx.merge_node_deltas.push((key, operand));
+                    ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand);
                     ctx.write_stats.properties_set += 1;
 
                     let path_str = path.join(".");
@@ -8180,8 +8207,7 @@ fn execute_update(
                     // schema_label_for_node caches the primary label per node per statement —
                     // same invariant as PropertyPath: must not trigger RYOW materialization.
                     let schema_err: Option<ExecutionError> = {
-                        let key = encode_node_key(ctx.shard_id, node_id);
-                        if let Some(label) = ctx.schema_label_for_node(node_id, &key)? {
+                        if let Some(label) = ctx.schema_label_for_node(ctx.shard_id, node_id)? {
                             match ctx.load_current_label_schema(&label)? {
                                 Some(ls) => match ls.mode {
                                     SchemaMode::Strict => match ls.get_property(root_prop) {
@@ -8235,7 +8261,6 @@ fn execute_update(
                         (ctx.interner.intern(&path[0]), path[1..].to_vec())
                     };
 
-                    let key = encode_node_key(ctx.shard_id, node_id);
                     let target = coordinode_core::graph::doc_delta::PathTarget::PropField(field_id);
 
                     let delta = match function.as_str() {
@@ -8278,7 +8303,7 @@ fn execute_update(
                     let operand = delta.encode().map_err(|e| {
                         ExecutionError::Serialization(format!("DocDelta encode: {e}"))
                     })?;
-                    ctx.merge_node_deltas.push((key, operand));
+                    ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand);
                     ctx.write_stats.properties_set += 1;
                 }
                 crate::cypher::ast::SetItem::ReplaceProperties { variable, expr } => {
@@ -8512,19 +8537,11 @@ fn execute_update(
                         _ => continue,
                     };
 
-                    let key = encode_node_key(ctx.shard_id, node_id);
-                    if let Some(bytes) = ctx.mvcc_get(Partition::Node, &key)? {
-                        let mut record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
-                            ExecutionError::Serialization(format!("node decode: {e}"))
-                        })?;
-
+                    if let Some(mut record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
                         record.add_label(label.clone());
                         ctx.write_stats.labels_added += 1;
 
-                        let new_bytes = record.to_msgpack().map_err(|e| {
-                            ExecutionError::Serialization(format!("node encode: {e}"))
-                        })?;
-                        ctx.mvcc_put(Partition::Node, &key, &new_bytes)?;
+                        ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
 
                         out_row.insert(
                             format!("{variable}.__label__"),
@@ -8560,11 +8577,7 @@ fn execute_update(
                 continue;
             }
 
-            let key = encode_node_key(ctx.shard_id, *node_id);
-            let Some(post_bytes) = ctx.mvcc_get(Partition::Node, &key)? else {
-                continue;
-            };
-            let Ok(post_record) = NodeRecord::from_msgpack(&post_bytes) else {
+            let Some(post_record) = ctx.mvcc_get_node(ctx.shard_id, *node_id)? else {
                 continue;
             };
             let (_post_labels, after_props) = snapshot_node_record(&post_record, ctx);
@@ -8845,11 +8858,8 @@ fn execute_remove(
             if update_snapshots.contains_key(&node_id) {
                 continue;
             }
-            let key = encode_node_key(ctx.shard_id, node_id);
-            if let Some(bytes) = ctx.schema_peek_node(&key)? {
-                if let Ok(record) = NodeRecord::from_msgpack(&bytes) {
-                    update_snapshots.insert(node_id, snapshot_node_record(&record, ctx));
-                }
+            if let Some(record) = ctx.schema_peek_node_typed(ctx.shard_id, node_id)? {
+                update_snapshots.insert(node_id, snapshot_node_record(&record, ctx));
             }
         }
 
@@ -8864,12 +8874,7 @@ fn execute_remove(
                         _ => continue,
                     };
 
-                    let key = encode_node_key(ctx.shard_id, node_id);
-                    if let Some(bytes) = ctx.mvcc_get(Partition::Node, &key)? {
-                        let mut record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
-                            ExecutionError::Serialization(format!("node decode: {e}"))
-                        })?;
-
+                    if let Some(mut record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
                         if let Some(field_id) = ctx.interner.lookup(property) {
                             let old_value: Option<Value> = record.props.get(&field_id).cloned();
 
@@ -8909,10 +8914,7 @@ fn execute_remove(
                             ctx.write_stats.properties_removed += 1;
                         }
 
-                        let new_bytes = record.to_msgpack().map_err(|e| {
-                            ExecutionError::Serialization(format!("node encode: {e}"))
-                        })?;
-                        ctx.mvcc_put(Partition::Node, &key, &new_bytes)?;
+                        ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
                     }
 
                     out_row.remove(&format!("{variable}.{property}"));
@@ -8926,7 +8928,6 @@ fn execute_remove(
                     // O(1) delete via merge operand — no read required.
                     let field_id = ctx.interner.intern(&path[0]);
                     let sub_path = &path[1..];
-                    let key = encode_node_key(ctx.shard_id, node_id);
 
                     let delta = coordinode_core::graph::doc_delta::DocDelta::DeletePath {
                         target: coordinode_core::graph::doc_delta::PathTarget::PropField(field_id),
@@ -8935,7 +8936,7 @@ fn execute_remove(
                     let operand = delta.encode().map_err(|e| {
                         ExecutionError::Serialization(format!("DocDelta encode: {e}"))
                     })?;
-                    ctx.merge_node_deltas.push((key, operand));
+                    ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand);
                     ctx.write_stats.properties_removed += 1;
 
                     let path_str = path.join(".");
@@ -8947,19 +8948,11 @@ fn execute_remove(
                         _ => continue,
                     };
 
-                    let key = encode_node_key(ctx.shard_id, node_id);
-                    if let Some(bytes) = ctx.mvcc_get(Partition::Node, &key)? {
-                        let mut record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
-                            ExecutionError::Serialization(format!("node decode: {e}"))
-                        })?;
-
+                    if let Some(mut record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
                         record.remove_label(label);
                         ctx.write_stats.labels_removed += 1;
 
-                        let new_bytes = record.to_msgpack().map_err(|e| {
-                            ExecutionError::Serialization(format!("node encode: {e}"))
-                        })?;
-                        ctx.mvcc_put(Partition::Node, &key, &new_bytes)?;
+                        ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
 
                         out_row.insert(
                             format!("{variable}.__label__"),
@@ -8988,11 +8981,7 @@ fn execute_remove(
             if all_matched.is_empty() {
                 continue;
             }
-            let key = encode_node_key(ctx.shard_id, *node_id);
-            let Some(post_bytes) = ctx.mvcc_get(Partition::Node, &key)? else {
-                continue;
-            };
-            let Ok(post_record) = NodeRecord::from_msgpack(&post_bytes) else {
+            let Some(post_record) = ctx.mvcc_get_node(ctx.shard_id, *node_id)? else {
                 continue;
             };
             let (_post_labels, after_props) = snapshot_node_record(&post_record, ctx);
@@ -10835,8 +10824,6 @@ fn emit_property_removal(
 ) -> Result<(), ExecutionError> {
     use coordinode_core::graph::doc_delta::{DocDelta, PathTarget};
 
-    let key = encode_node_key(ctx.shard_id, node_id);
-
     let delta = if path.len() == 1 {
         match field_id_opt {
             Some(fid) => DocDelta::RemoveProperty {
@@ -10866,7 +10853,7 @@ fn emit_property_removal(
     let operand = delta
         .encode()
         .map_err(|e| ExecutionError::Serialization(format!("DocDelta encode: {e}")))?;
-    ctx.merge_node_deltas.push((key, operand));
+    ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand);
     ctx.write_stats.properties_removed += 1;
     Ok(())
 }
@@ -11315,7 +11302,6 @@ fn emit_attach_set_path(
 ) -> Result<(), ExecutionError> {
     use coordinode_core::graph::doc_delta::{DocDelta, PathTarget};
 
-    let key = encode_node_key(ctx.shard_id, target_id);
     // First segment → interned field id (matches the write-path used by
     // `SET n.address.x = y`).
     let first = &path[0];
@@ -11330,7 +11316,7 @@ fn emit_attach_set_path(
     let operand = delta
         .encode()
         .map_err(|e| ExecutionError::Serialization(format!("DocDelta encode: {e}")))?;
-    ctx.merge_node_deltas.push((key, operand));
+    ctx.mvcc_merge_node_delta(ctx.shard_id, target_id, operand);
     ctx.write_stats.properties_set += 1;
     Ok(())
 }
