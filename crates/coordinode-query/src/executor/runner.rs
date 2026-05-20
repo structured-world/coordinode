@@ -1074,6 +1074,86 @@ impl<'a> ExecutionContext<'a> {
         self.mvcc_put(Partition::EdgeProp, &key, &bytes)
     }
 
+    /// MVCC-aware typed edge-property read at a specific temporal
+    /// version. Reads the row at the temporal EdgeProp key
+    /// `(edge_type, src, tgt, valid_from_ms)`. Same MVCC semantics
+    /// as [`Self::mvcc_get_edge_props`].
+    pub fn mvcc_get_edge_props_temporal(
+        &mut self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        valid_from_ms: i64,
+    ) -> Result<Option<Vec<(u32, Value)>>, ExecutionError> {
+        let key = encode_temporal_edgeprop_key(edge_type, src, tgt, valid_from_ms);
+        let Some(bytes) = self.mvcc_get(Partition::EdgeProp, &key)? else {
+            return Ok(None);
+        };
+        let decoded = rmp_serde::from_slice::<Vec<(u32, Value)>>(&bytes).map_err(|e| {
+            ExecutionError::Serialization(format!(
+                "edge prop {edge_type}/{}/{} temporal@{valid_from_ms} decode: {e}",
+                src.as_raw(),
+                tgt.as_raw(),
+            ))
+        })?;
+        Ok(Some(decoded))
+    }
+
+    /// MVCC-aware typed edge-property read that branches on a
+    /// runtime temporal flag. `Some(vf)` reads the per-version key,
+    /// `None` reads the non-temporal key. Counterpart to
+    /// [`Self::mvcc_get_node_either`] for edges.
+    pub fn mvcc_get_edge_props_either(
+        &mut self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        valid_from_ms: Option<i64>,
+    ) -> Result<Option<Vec<(u32, Value)>>, ExecutionError> {
+        match valid_from_ms {
+            Some(vf) => self.mvcc_get_edge_props_temporal(edge_type, src, tgt, vf),
+            None => self.mvcc_get_edge_props(edge_type, src, tgt),
+        }
+    }
+
+    /// MVCC-aware typed edge-property write at a specific temporal
+    /// version. Counterpart to [`Self::mvcc_get_edge_props_temporal`].
+    pub fn mvcc_put_edge_props_temporal(
+        &mut self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        valid_from_ms: i64,
+        prop_map: &[(u32, Value)],
+    ) -> Result<(), ExecutionError> {
+        let key = encode_temporal_edgeprop_key(edge_type, src, tgt, valid_from_ms);
+        let bytes = rmp_serde::to_vec(prop_map).map_err(|e| {
+            ExecutionError::Serialization(format!(
+                "edge prop {edge_type}/{}/{} temporal@{valid_from_ms} encode: {e}",
+                src.as_raw(),
+                tgt.as_raw(),
+            ))
+        })?;
+        self.mvcc_put(Partition::EdgeProp, &key, &bytes)
+    }
+
+    /// MVCC-aware typed edge-property write that branches on a
+    /// runtime temporal flag. `Some(vf)` writes at the per-version
+    /// key, `None` writes at the non-temporal key.
+    pub fn mvcc_put_edge_props_either(
+        &mut self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        valid_from_ms: Option<i64>,
+        prop_map: &[(u32, Value)],
+    ) -> Result<(), ExecutionError> {
+        match valid_from_ms {
+            Some(vf) => self.mvcc_put_edge_props_temporal(edge_type, src, tgt, vf, prop_map),
+            None => self.mvcc_put_edge_props(edge_type, src, tgt, prop_map),
+        }
+    }
+
     /// MVCC-aware typed node read that branches on a runtime
     /// temporal flag. When `valid_from_ms` is `Some(vf)`, reads the
     /// per-version row at the 25-byte temporal key; when `None`,
@@ -7355,11 +7435,14 @@ fn execute_create_edge(
                     )));
                 }
             }
-            let prop_bytes = rmp_serde::to_vec(&prop_map)
-                .map_err(|e| ExecutionError::Serialization(format!("edge prop encode: {e}")))?;
             let valid_from_for_key = if is_temporal { valid_from_value } else { None };
-            let ep_key = edgeprop_write_key(edge_type, source_id, target_id, valid_from_for_key);
-            ctx.mvcc_put(Partition::EdgeProp, &ep_key, &prop_bytes)?;
+            ctx.mvcc_put_edge_props_either(
+                edge_type,
+                source_id,
+                target_id,
+                valid_from_for_key,
+                &prop_map,
+            )?;
             ctx.write_stats.properties_set += properties.len() as u64;
         }
 
@@ -7773,7 +7856,10 @@ fn execute_update(
             edge_type: String,
             src: NodeId,
             tgt: NodeId,
-            ep_key: Vec<u8>,
+            /// `Some(vf)` for temporal edges, `None` for non-temporal.
+            /// Lets the post-SET re-read pick the same per-version /
+            /// non-temporal EdgeProp key via `mvcc_get_edge_props_either`.
+            valid_from_ms: Option<i64>,
             before: std::collections::BTreeMap<String, Value>,
         }
         let mut edge_update_snapshots: std::collections::HashMap<String, EdgeUpdateSnapshot> =
@@ -7829,26 +7915,26 @@ fn execute_update(
                 let src = NodeId::from_raw(src_raw);
                 let tgt = NodeId::from_raw(tgt_raw);
                 let is_temporal = lookup_edge_type_temporal(&edge_type, ctx)?;
-                let ep_key = if is_temporal {
-                    let valid_from = match out_row.get(&format!("{variable}.valid_from")) {
-                        Some(Value::Int(ms)) => *ms,
+                let valid_from_ms: Option<i64> = if is_temporal {
+                    match out_row.get(&format!("{variable}.valid_from")) {
+                        Some(Value::Int(ms)) => Some(*ms),
                         _ => continue,
-                    };
-                    encode_temporal_edgeprop_key(&edge_type, src, tgt, valid_from)
+                    }
                 } else {
-                    encode_edgeprop_key(&edge_type, src, tgt)
+                    None
                 };
-                let before = match ctx.mvcc_get(Partition::EdgeProp, &ep_key)? {
-                    Some(bytes) => decode_edgeprop_into_map(&bytes, ctx),
-                    None => std::collections::BTreeMap::new(),
-                };
+                let before =
+                    match ctx.mvcc_get_edge_props_either(&edge_type, src, tgt, valid_from_ms)? {
+                        Some(prop_map) => decode_edgeprop_map_into_named(&prop_map, ctx),
+                        None => std::collections::BTreeMap::new(),
+                    };
                 edge_update_snapshots.insert(
                     variable.clone(),
                     EdgeUpdateSnapshot {
                         edge_type,
                         src,
                         tgt,
-                        ep_key,
+                        valid_from_ms,
                         before,
                     },
                 );
@@ -8628,25 +8714,34 @@ fn execute_update(
         // EdgeProp partition (no merge_node_deltas equivalent), but we
         // keep the index lookup first to avoid the materialise cost on
         // the happy path (no triggers).
-        for snap in edge_update_snapshots.values() {
+        // Collect snapshot views first to avoid borrowing ctx mutably
+        // while iterating an immutable borrow of edge_update_snapshots.
+        let snapshots_to_probe: Vec<_> = edge_update_snapshots
+            .values()
+            .map(|s| {
+                (
+                    s.edge_type.clone(),
+                    s.src,
+                    s.tgt,
+                    s.valid_from_ms,
+                    s.before.clone(),
+                )
+            })
+            .collect();
+        for (edge_type, src, tgt, valid_from_ms, before) in snapshots_to_probe {
             let target_segment =
-                coordinode_core::schema::triggers::TriggerTargetSchema::edge_type(&snap.edge_type)
+                coordinode_core::schema::triggers::TriggerTargetSchema::edge_type(&edge_type)
                     .index_key_segment();
             let matched = ctx.lookup_matching_triggers(&target_segment, "u")?;
             if matched.is_empty() {
                 continue;
             }
-            let after = match ctx.mvcc_get(Partition::EdgeProp, &snap.ep_key)? {
-                Some(bytes) => decode_edgeprop_into_map(&bytes, ctx),
+            let after = match ctx.mvcc_get_edge_props_either(&edge_type, src, tgt, valid_from_ms)? {
+                Some(prop_map) => decode_edgeprop_map_into_named(&prop_map, ctx),
                 None => std::collections::BTreeMap::new(),
             };
-            let trigger_params = trigger_params_for_edge_update(
-                &snap.edge_type,
-                snap.src,
-                snap.tgt,
-                &snap.before,
-                &after,
-            );
+            let trigger_params =
+                trigger_params_for_edge_update(&edge_type, src, tgt, &before, &after);
             fire_before_commit_triggers(&matched, &trigger_params, ctx)?;
         }
 
@@ -11809,11 +11904,11 @@ pub(crate) fn temporal_pair_remaining_versions(
     Ok(remaining)
 }
 
-/// Build the write key for an edgeprop entry given the temporal context.
-///
-/// `valid_from_ms` MUST be `Some(_)` when the edge type is declared temporal
-/// (callers enforce this earlier via the write-time guard) and `None` for
-/// non-temporal types. Mixing the two is a logic error in the caller.
+/// Test-only helper preserved for legacy tests that build edgeprop
+/// keys directly. Production code uses
+/// [`ExecutionContext::mvcc_put_edge_props_either`] /
+/// [`ExecutionContext::mvcc_get_edge_props_either`] instead.
+#[cfg(test)]
 pub(crate) fn edgeprop_write_key(
     edge_type: &str,
     source_id: NodeId,
@@ -12701,6 +12796,22 @@ fn decode_edgeprop_into_map(
             if let Some(name) = ctx.interner.resolve(field_id) {
                 out.insert(name.to_string(), value);
             }
+        }
+    }
+    out
+}
+
+/// Same projection as [`decode_edgeprop_into_map`] but takes the
+/// already-decoded `Vec<(field_id, Value)>` returned by the typed
+/// edge-prop helpers — avoids the redundant decode of bytes.
+fn decode_edgeprop_map_into_named(
+    prop_map: &[(u32, Value)],
+    ctx: &ExecutionContext<'_>,
+) -> std::collections::BTreeMap<String, Value> {
+    let mut out: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    for (field_id, value) in prop_map {
+        if let Some(name) = ctx.interner.resolve(*field_id) {
+            out.insert(name.to_string(), value.clone());
         }
     }
     out
