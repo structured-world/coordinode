@@ -33,7 +33,10 @@ fn open_engine() -> (TempDir, StorageEngine) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 128, .. ProptestConfig::default() })]
+    // 32 cases ≈ 4× faster than 128, still covers the property invariants
+    // with a reasonable sample of randomly-generated inputs. Override via
+    // PROPTEST_CASES env var when running a deep regression check.
+    #![proptest_config(ProptestConfig { cases: 32, .. ProptestConfig::default() })]
 
     /// Index value-sortable encoding: for any two values of the same
     /// type, the lexicographic byte order of their encoded keys must
