@@ -1025,6 +1025,55 @@ impl<'a> ExecutionContext<'a> {
         self.mvcc_delete(Partition::Node, &key)
     }
 
+    /// MVCC-aware typed edge-property read. Hides the
+    /// `encode_edgeprop_key + mvcc_get + rmp_serde decode` triple
+    /// used by traversal and merge paths. Returns `None` when the
+    /// edge has no property body (the common case for property-less
+    /// edges). The decoded shape matches the on-disk layout — a
+    /// `Vec<(interned_field_id, Value)>` — so callers reuse it
+    /// without conversion to/from `EdgeProperties::HashMap`.
+    pub fn mvcc_get_edge_props(
+        &mut self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+    ) -> Result<Option<Vec<(u32, Value)>>, ExecutionError> {
+        let key = encode_edgeprop_key(edge_type, src, tgt);
+        let Some(bytes) = self.mvcc_get(Partition::EdgeProp, &key)? else {
+            return Ok(None);
+        };
+        let decoded = rmp_serde::from_slice::<Vec<(u32, Value)>>(&bytes).map_err(|e| {
+            ExecutionError::Serialization(format!(
+                "edge prop {edge_type}/{}/{} decode: {e}",
+                src.as_raw(),
+                tgt.as_raw(),
+            ))
+        })?;
+        Ok(Some(decoded))
+    }
+
+    /// MVCC-aware typed edge-property write. Counterpart to
+    /// [`Self::mvcc_get_edge_props`] — encodes the
+    /// `Vec<(field_id, Value)>` property list with rmp_serde and
+    /// buffers a write at the `(edge_type, src, tgt)` EdgeProp key.
+    pub fn mvcc_put_edge_props(
+        &mut self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        prop_map: &[(u32, Value)],
+    ) -> Result<(), ExecutionError> {
+        let key = encode_edgeprop_key(edge_type, src, tgt);
+        let bytes = rmp_serde::to_vec(prop_map).map_err(|e| {
+            ExecutionError::Serialization(format!(
+                "edge prop {edge_type}/{}/{} encode: {e}",
+                src.as_raw(),
+                tgt.as_raw(),
+            ))
+        })?;
+        self.mvcc_put(Partition::EdgeProp, &key, &bytes)
+    }
+
     /// MVCC-aware typed node read that branches on a runtime
     /// temporal flag. When `valid_from_ms` is `Some(vf)`, reads the
     /// per-version row at the 25-byte temporal key; when `None`,
@@ -3166,8 +3215,7 @@ fn build_target_rows(
                 }
                 acc
             } else {
-                let ep_key = encode_edgeprop_key(et, ep_src, ep_tgt);
-                let ep_bytes_opt = ctx.mvcc_get(Partition::EdgeProp, &ep_key)?;
+                let ep_props_opt = ctx.mvcc_get_edge_props(et, ep_src, ep_tgt)?;
                 let mut acc: Vec<Row> = Vec::with_capacity(materialised_rows.len());
                 for base in materialised_rows {
                     let mut row = base;
@@ -3175,12 +3223,10 @@ fn build_target_rows(
                     row.insert(ev.to_string(), Value::String(et.to_string()));
                     row.insert(format!("{ev}.__src__"), Value::Int(ep_src.as_raw() as i64));
                     row.insert(format!("{ev}.__tgt__"), Value::Int(ep_tgt.as_raw() as i64));
-                    if let Some(ref ep_bytes) = ep_bytes_opt {
-                        if let Ok(prop_map) = rmp_serde::from_slice::<Vec<(u32, Value)>>(ep_bytes) {
-                            for (field_id, value) in prop_map {
-                                if let Some(field_name) = ctx.interner.resolve(field_id) {
-                                    row.insert(format!("{ev}.{field_name}"), value);
-                                }
+                    if let Some(ref prop_map) = ep_props_opt {
+                        for (field_id, value) in prop_map {
+                            if let Some(field_name) = ctx.interner.resolve(*field_id) {
+                                row.insert(format!("{ev}.{field_name}"), value.clone());
                             }
                         }
                     }
@@ -6048,16 +6094,13 @@ fn execute_merge_relationship_check(
                 Direction::Outgoing | Direction::Both => (source_id, target_id),
                 Direction::Incoming => (target_id, source_id),
             };
-            let ep_key = encode_edgeprop_key(et, ep_src, ep_tgt);
             // Load stored edge properties into a flat name→value map.
             let mut stored: std::collections::HashMap<String, Value> =
                 std::collections::HashMap::new();
-            if let Some(ep_bytes) = ctx.mvcc_get(Partition::EdgeProp, &ep_key)? {
-                if let Ok(prop_map) = rmp_serde::from_slice::<Vec<(u32, Value)>>(&ep_bytes) {
-                    for (field_id, value) in prop_map {
-                        if let Some(field_name) = ctx.interner.resolve(field_id) {
-                            stored.insert(field_name.to_string(), value);
-                        }
+            if let Some(prop_map) = ctx.mvcc_get_edge_props(et, ep_src, ep_tgt)? {
+                for (field_id, value) in prop_map {
+                    if let Some(field_name) = ctx.interner.resolve(field_id) {
+                        stored.insert(field_name.to_string(), value);
                     }
                 }
             }
@@ -6085,13 +6128,10 @@ fn execute_merge_relationship_check(
                     Direction::Outgoing | Direction::Both => (source_id, target_id),
                     Direction::Incoming => (target_id, source_id),
                 };
-                let ep_key = encode_edgeprop_key(et, ep_src, ep_tgt);
-                if let Some(ep_bytes) = ctx.mvcc_get(Partition::EdgeProp, &ep_key)? {
-                    if let Ok(prop_map) = rmp_serde::from_slice::<Vec<(u32, Value)>>(&ep_bytes) {
-                        for (field_id, value) in prop_map {
-                            if let Some(field_name) = ctx.interner.resolve(field_id) {
-                                row.insert(format!("{ev}.{field_name}"), value);
-                            }
+                if let Some(prop_map) = ctx.mvcc_get_edge_props(et, ep_src, ep_tgt)? {
+                    for (field_id, value) in prop_map {
+                        if let Some(field_name) = ctx.interner.resolve(field_id) {
+                            row.insert(format!("{ev}.{field_name}"), value);
                         }
                     }
                 }
@@ -6385,10 +6425,7 @@ fn execute_merge_relationship_create(
                 row.insert(format!("{ev}.{prop_name}"), value);
             }
         }
-        let prop_bytes = rmp_serde::to_vec(&prop_map)
-            .map_err(|e| ExecutionError::Serialization(format!("edge prop encode: {e}")))?;
-        let ep_key = encode_edgeprop_key(et, from_id, to_id);
-        ctx.mvcc_put(Partition::EdgeProp, &ep_key, &prop_bytes)?;
+        ctx.mvcc_put_edge_props(et, from_id, to_id, &prop_map)?;
         ctx.write_stats.properties_set += edge_filters.len() as u64;
     }
 
@@ -16807,6 +16844,86 @@ mod tests {
             .expect("get")
             .expect("Some");
         assert_eq!(back.primary_label(), "Hist");
+    }
+
+    #[test]
+    fn mvcc_get_edge_props_round_trip_through_put() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+        ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
+
+        let src = NodeId::from_raw(10);
+        let tgt = NodeId::from_raw(20);
+        let fid_weight = ctx.interner.intern("weight");
+        let fid_label = ctx.interner.intern("label");
+        let payload: Vec<(u32, Value)> = vec![
+            (fid_weight, Value::Float(0.85)),
+            (fid_label, Value::String("close-friend".into())),
+        ];
+
+        ctx.mvcc_put_edge_props("KNOWS", src, tgt, &payload)
+            .expect("put");
+        // RYOW read.
+        let back = ctx
+            .mvcc_get_edge_props("KNOWS", src, tgt)
+            .expect("get")
+            .expect("Some");
+        assert_eq!(back.len(), 2);
+        assert!(back.iter().any(|(fid, v)| *fid == fid_weight
+            && matches!(v, Value::Float(f) if (*f - 0.85).abs() < 1e-9)));
+        assert!(back
+            .iter()
+            .any(|(fid, v)| *fid == fid_label
+                && matches!(v, Value::String(s) if s == "close-friend")));
+
+        // Reverse direction must NOT see the entry — key includes (src, tgt) order.
+        let reverse = ctx.mvcc_get_edge_props("KNOWS", tgt, src).expect("rev");
+        assert!(
+            reverse.is_none(),
+            "edge props keyed by (src, tgt) — reverse order is a distinct key",
+        );
+    }
+
+    #[test]
+    fn mvcc_get_edge_props_missing_returns_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = StorageEngine::open(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+        )
+        .expect("open");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        let res = ctx
+            .mvcc_get_edge_props("NONE", NodeId::from_raw(1), NodeId::from_raw(2))
+            .expect("get");
+        assert!(res.is_none());
     }
 
     #[test]
