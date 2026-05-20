@@ -226,7 +226,12 @@ pub trait MultiModalCoordinator: Send + Sync {
     ) -> StorageResult<StorageIter>;
 
     /// Inclusive-bounded range scan at the latest visible seqno.
-    /// Yields entries with keys `K` such that `start ≤ K ≤ end`.
+    /// Yields entries with keys `K` such that `start ≤ K ≤ end`
+    /// (both bounds inclusive, in byte-lexicographic order). When
+    /// `start > end` the iterator yields no entries — callers must
+    /// ensure ordering themselves if they care; this API does not
+    /// validate or panic on inversion.
+    ///
     /// Used by callers that have already decomposed a query into
     /// disjoint key intervals (e.g. spatial Z-curve subrange
     /// decomposition) — issuing a per-interval `range_scan` avoids
@@ -637,6 +642,115 @@ mod tests {
         let iter = engine.prefix_scan(Partition::Node, b"never").unwrap();
         let count = iter.count();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn range_scan_inclusive_bounds_yields_both_endpoints() {
+        // lsm-tree's `range` API uses `Bound::Included` for both ends
+        // per our wrapper. Seed 3 keys; range over the outer two
+        // should yield all three.
+        let (_dir, engine) = open_engine();
+        engine.put(Partition::Node, b"a", b"1").expect("put a");
+        engine.put(Partition::Node, b"m", b"2").expect("put m");
+        engine.put(Partition::Node, b"z", b"3").expect("put z");
+        let iter = engine
+            .range_scan(Partition::Node, b"a", b"z")
+            .expect("range");
+        let keys: Vec<Vec<u8>> = iter.map(|g| g.into_inner().unwrap().0.to_vec()).collect();
+        assert_eq!(
+            keys,
+            vec![b"a".to_vec(), b"m".to_vec(), b"z".to_vec()],
+            "both endpoints inclusive",
+        );
+    }
+
+    #[test]
+    fn range_scan_skips_keys_outside_window() {
+        // Pin the "skip dead zones" contract that G101's bbox
+        // decomposition relies on — keys outside [start, end] must
+        // NOT appear in the iterator at all (not "yielded then
+        // filtered").
+        let (_dir, engine) = open_engine();
+        for k in [b"a" as &[u8], b"b", b"c", b"d", b"e"] {
+            engine.put(Partition::Node, k, b"v").expect("put");
+        }
+        let iter = engine
+            .range_scan(Partition::Node, b"b", b"d")
+            .expect("range");
+        let keys: Vec<Vec<u8>> = iter.map(|g| g.into_inner().unwrap().0.to_vec()).collect();
+        assert_eq!(keys, vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]);
+    }
+
+    #[test]
+    fn range_scan_point_query_single_key() {
+        // start == end → single-key probe via range API. Equivalent
+        // to a get, but exercised through the range path (used by
+        // 1×1-cell bbox decomposition).
+        let (_dir, engine) = open_engine();
+        engine.put(Partition::Node, b"k", b"v").expect("put");
+        let iter = engine
+            .range_scan(Partition::Node, b"k", b"k")
+            .expect("range");
+        let count = iter.count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn range_scan_inverted_bounds_yields_empty() {
+        // Defensive: when `start > end` lsm-tree's range yields no
+        // entries. Pins behaviour for callers that might construct
+        // bounds inadvertently (the spatial decomposer guarantees
+        // lo ≤ hi internally; this test backstops the API).
+        let (_dir, engine) = open_engine();
+        engine.put(Partition::Node, b"a", b"v").expect("put");
+        engine.put(Partition::Node, b"b", b"v").expect("put");
+        let iter = engine
+            .range_scan(Partition::Node, b"b", b"a")
+            .expect("range");
+        assert_eq!(iter.count(), 0, "inverted bounds yield no entries");
+    }
+
+    #[test]
+    fn range_scan_isolated_per_partition() {
+        // A key written to Node must not surface in a Schema range
+        // scan over the same byte range, and vice versa. Schema
+        // partition has bootstrap entries from engine open, so the
+        // assertion is asymmetric: filter to our exact probe key.
+        let (_dir, engine) = open_engine();
+        let probe_key = b"range_scan_isolation_probe_unique";
+        engine
+            .put(Partition::Node, probe_key, b"node-value")
+            .expect("put node");
+        engine
+            .put(Partition::Schema, probe_key, b"schema-value")
+            .expect("put schema");
+
+        let node_hits: Vec<_> = engine
+            .range_scan(Partition::Node, probe_key, probe_key)
+            .unwrap()
+            .map(|g| {
+                let (_k, v) = g.into_inner().unwrap();
+                v.to_vec()
+            })
+            .collect();
+        let schema_hits: Vec<_> = engine
+            .range_scan(Partition::Schema, probe_key, probe_key)
+            .unwrap()
+            .map(|g| {
+                let (_k, v) = g.into_inner().unwrap();
+                v.to_vec()
+            })
+            .collect();
+        assert_eq!(
+            node_hits,
+            vec![b"node-value".to_vec()],
+            "Node range_scan must NOT see Schema partition's value",
+        );
+        assert_eq!(
+            schema_hits,
+            vec![b"schema-value".to_vec()],
+            "Schema range_scan must NOT see Node partition's value",
+        );
     }
 
     #[test]

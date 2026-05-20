@@ -902,6 +902,78 @@ mod tests {
     }
 
     #[test]
+    fn morton_intervals_dispatches_per_crs_to_2d_decompose() {
+        // The CRS-routing dispatch must wire Wgs84_2d and Cartesian2d
+        // through `morton_2d_decompose` (multiple disjoint intervals
+        // for sparse bboxes), not the broad single-interval fallback
+        // used by the 3D branch.
+        //
+        // Pin discriminator: any tiny bbox that covers far less than
+        // the whole curve space must produce MORE than one interval
+        // OR a single interval much narrower than the full space.
+        // The 3D fallback would return a single broad interval whose
+        // span ≈ `morton_window(bbox).1 - .0` (large in u64).
+        let wgs_bbox = Bbox {
+            lower: Point::new_2d(Crs::Wgs84_2d, 0.0, 0.0),
+            upper: Point::new_2d(Crs::Wgs84_2d, 1.0, 1.0),
+        };
+        let wgs = morton_intervals(&wgs_bbox);
+        assert!(!wgs.is_empty(), "Wgs84_2d dispatch returns intervals");
+        let (broad_lo, broad_hi) = morton_window(&wgs_bbox);
+        let broad_span = broad_hi.saturating_sub(broad_lo);
+        let decomposed_span: u64 = wgs
+            .iter()
+            .map(|(lo, hi)| hi.saturating_sub(*lo))
+            .fold(0u64, u64::saturating_add);
+        // Decomposition's total covered span ≤ broad span (it carves
+        // out dead Z-curve subranges). Either we got many intervals,
+        // or a single one whose span is strictly less than the broad
+        // window — both prove dispatch hit `morton_2d_decompose`.
+        assert!(
+            wgs.len() > 1 || decomposed_span < broad_span,
+            "Wgs84_2d dispatch missed decompose path: got {} interval(s), \
+             decomposed_span={decomposed_span}, broad_span={broad_span}",
+            wgs.len(),
+        );
+
+        let cart_bbox = Bbox {
+            lower: Point::new_2d(Crs::Cartesian2d, 0.0, 0.0),
+            upper: Point::new_2d(Crs::Cartesian2d, 100.0, 100.0),
+        };
+        let cart = morton_intervals(&cart_bbox);
+        assert!(!cart.is_empty(), "Cartesian2d dispatch returns intervals");
+    }
+
+    #[test]
+    fn morton_decompose_excludes_broadly_distant_cells() {
+        // Strengthen the exclusion check: a 100×100 bbox at the
+        // origin must NOT include any cell whose centre is more than
+        // ~10x bbox-distance away in either dimension. Probe a grid
+        // of distant points and assert none of them lie in any
+        // interval.
+        let intervals = morton_2d_decompose(0, 100, 0, 100, 1024);
+        let distant_points: &[(u32, u32)] = &[
+            (10_000, 10_000),
+            (50_000, 50_000),
+            (1_000_000, 0),
+            (0, 1_000_000),
+            (u32::MAX, u32::MAX),
+            (u32::MAX / 2, u32::MAX / 2),
+            (1024, 1024),
+            (200, 200),
+            (101, 101), // just outside the bbox edge
+        ];
+        for &(x, y) in distant_points {
+            let m = morton_2d(x, y);
+            let covered = intervals.iter().any(|&(lo, hi)| m >= lo && m <= hi);
+            assert!(
+                !covered,
+                "distant point ({x}, {y}) → morton {m} unexpectedly covered",
+            );
+        }
+    }
+
+    #[test]
     fn morton_intervals_3d_falls_back_to_broad_window() {
         // 3D path is not decomposed in v1 — single broad interval.
         let bbox = Bbox {
