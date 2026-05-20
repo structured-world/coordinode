@@ -6,8 +6,9 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use coordinode_core::graph::node::{encode_node_key, NodeId, NodeRecord};
+use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
+use coordinode_modality::{LocalNodeStore, NodeStore};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::Guard;
@@ -49,6 +50,7 @@ pub fn reap_ttl_index(
         .unwrap_or(0);
 
     let cutoff_us = now_us - ttl_us;
+    let nodes = LocalNodeStore::new(engine);
 
     // Scan the index prefix
     let prefix = index.key_prefix();
@@ -78,14 +80,11 @@ pub fn reap_ttl_index(
         if let Some(node_id) = coordinode_core::index::encoding::decode_node_id_from_index_key(&key)
         {
             // Read the node to check its timestamp value
-            let node_key = encode_node_key(shard_id, NodeId::from_raw(node_id));
-            match engine.get(Partition::Node, &node_key) {
-                Ok(Some(bytes)) => {
-                    if let Ok(record) = NodeRecord::from_msgpack(&bytes) {
-                        // Check if the timestamp property has expired
-                        if is_node_expired(&record, index.property(), cutoff_us) {
-                            expired_nodes.push((node_id, key.to_vec()));
-                        }
+            match nodes.get(shard_id, NodeId::from_raw(node_id)) {
+                Ok(Some(record)) => {
+                    // Check if the timestamp property has expired
+                    if is_node_expired(&record, index.property(), cutoff_us) {
+                        expired_nodes.push((node_id, key.to_vec()));
                     }
                 }
                 Ok(None) => {
@@ -110,8 +109,7 @@ pub fn reap_ttl_index(
         }
 
         // Delete the node record
-        let node_key = encode_node_key(shard_id, NodeId::from_raw(*node_id));
-        if let Err(e) = engine.delete(Partition::Node, &node_key) {
+        if let Err(e) = nodes.delete(shard_id, NodeId::from_raw(*node_id)) {
             result
                 .errors
                 .push(format!("node delete error for node {node_id}: {e}"));
@@ -160,6 +158,7 @@ pub fn reap_all_ttl_indexes(
 mod tests {
     use super::*;
     use coordinode_core::graph::intern::FieldInterner;
+    use coordinode_core::graph::node::encode_node_key;
     use coordinode_storage::engine::config::{
         Durability, EndpointConfig, Media, StorageConfig, Tier,
     };

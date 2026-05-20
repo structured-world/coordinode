@@ -16,6 +16,7 @@ cjk = ["coordinode-search/cjk"]
 [dependencies]
 coordinode-core = { workspace = true }
 coordinode-storage = { workspace = true }
+coordinode-modality = { workspace = true }
 coordinode-vector = { workspace = true }
 coordinode-search = { workspace = true }
 pest = { workspace = true }
