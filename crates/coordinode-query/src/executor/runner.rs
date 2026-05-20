@@ -883,6 +883,60 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
+    /// MVCC-aware typed node read.
+    ///
+    /// Combines key encoding, raw read through [`Self::mvcc_get`]
+    /// (which handles snapshot pin, RYOW, and OCC tracking), and
+    /// MessagePack decode in one call. Replaces the manual
+    /// `encode_node_key` + `mvcc_get` + `from_msgpack` boilerplate at
+    /// runner-level Node read sites — Layer-5 wrapper over Layer-4
+    /// `LocalNodeStore` with MVCC orchestration preserved.
+    pub fn mvcc_get_node(
+        &mut self,
+        shard_id: u16,
+        node_id: NodeId,
+    ) -> Result<Option<NodeRecord>, ExecutionError> {
+        let key = encode_node_key(shard_id, node_id);
+        let Some(bytes) = self.mvcc_get(Partition::Node, &key)? else {
+            return Ok(None);
+        };
+        let record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
+            ExecutionError::Serialization(
+                format!("node {} deserialization: {e}", node_id.as_raw(),),
+            )
+        })?;
+        Ok(Some(record))
+    }
+
+    /// MVCC-aware typed node write. Buffers the put through
+    /// [`Self::mvcc_put`] (for atomic flush + RYOW visibility). Replaces
+    /// `encode_node_key + record.to_msgpack + mvcc_put` triples scattered
+    /// across CREATE / SET / UPDATE executors.
+    pub fn mvcc_put_node(
+        &mut self,
+        shard_id: u16,
+        node_id: NodeId,
+        record: &NodeRecord,
+    ) -> Result<(), ExecutionError> {
+        let key = encode_node_key(shard_id, node_id);
+        let bytes = record.to_msgpack().map_err(|e| {
+            ExecutionError::Serialization(format!("node {} serialization: {e}", node_id.as_raw(),))
+        })?;
+        self.mvcc_put(Partition::Node, &key, &bytes)
+    }
+
+    /// MVCC-aware typed node delete. Buffers a tombstone for the
+    /// non-temporal node key. Does NOT touch temporal version keys
+    /// (those are deleted separately via the temporal-aware variant).
+    pub fn mvcc_delete_node(
+        &mut self,
+        shard_id: u16,
+        node_id: NodeId,
+    ) -> Result<(), ExecutionError> {
+        let key = encode_node_key(shard_id, node_id);
+        self.mvcc_delete(Partition::Node, &key)
+    }
+
     /// Flush MVCC write buffer to storage with a commit timestamp.
     ///
     /// Called at the end of statement execution. Assigns commit_ts from
@@ -2839,11 +2893,8 @@ fn build_target_rows(
         }
         out
     } else {
-        let target_key = encode_node_key(ctx.shard_id, target_id);
-        let target_record = match ctx.mvcc_get(Partition::Node, &target_key)? {
-            Some(bytes) => NodeRecord::from_msgpack(&bytes).map_err(|e| {
-                ExecutionError::Serialization(format!("target node deserialization error: {e}"))
-            })?,
+        let target_record = match ctx.mvcc_get_node(ctx.shard_id, target_id)? {
+            Some(rec) => rec,
             None => return Ok(Vec::new()),
         };
         vec![(target_record, None)]
@@ -4540,14 +4591,10 @@ fn execute_doc_score(
         let mut matching: usize = 0;
 
         for (chunk_uid, _et_idx) in &neighbours {
-            let chunk_key = encode_node_key(ctx.shard_id, NodeId::from_raw(*chunk_uid));
-            let chunk_bytes = match ctx.mvcc_get(Partition::Node, &chunk_key)? {
-                Some(b) => b,
+            let chunk = match ctx.mvcc_get_node(ctx.shard_id, NodeId::from_raw(*chunk_uid))? {
+                Some(rec) => rec,
                 None => continue,
             };
-            let chunk = NodeRecord::from_msgpack(&chunk_bytes).map_err(|e| {
-                ExecutionError::Serialization(format!("chunk deserialization error: {e}"))
-            })?;
             let emb = embedding_fid.and_then(|fid| chunk.get(fid)).or_else(|| {
                 // Fallback: linear search by interned name (handles cases where
                 // the writer interned "embedding" under a different id than
@@ -6072,14 +6119,9 @@ fn check_single_hop_exists(
                                 }
                             }
                         }
-                    } else {
-                        let node_key = encode_node_key(ctx.shard_id, tgt_id);
-                        if let Some(data) = ctx.mvcc_get(Partition::Node, &node_key)? {
-                            if let Ok(record) = NodeRecord::from_msgpack(&data) {
-                                if dst_node.labels.iter().all(|l| record.labels.contains(l)) {
-                                    return Ok(true);
-                                }
-                            }
+                    } else if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, tgt_id)? {
+                        if dst_node.labels.iter().all(|l| record.labels.contains(l)) {
+                            return Ok(true);
                         }
                     }
                 }
@@ -6431,11 +6473,7 @@ fn execute_upsert(
                             record.set(field_id, val);
                         }
 
-                        let key = encode_node_key(ctx.shard_id, node_id);
-                        let bytes = record.to_msgpack().map_err(|e| {
-                            ExecutionError::Serialization(format!("node serialize: {e}"))
-                        })?;
-                        ctx.mvcc_put(Partition::Node, &key, &bytes)?;
+                        ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
                         ctx.write_stats.nodes_created += 1;
 
                         // Fire BEFORE COMMIT CREATE triggers on the new
@@ -6617,11 +6655,6 @@ fn execute_create_from_pattern(
                 record.set(field_id, val);
             }
 
-            let key = encode_node_key(ctx.shard_id, node_id);
-            let bytes = record
-                .to_msgpack()
-                .map_err(|e| ExecutionError::Serialization(format!("node serialize: {e}")))?;
-
             // Enforce unique constraints via B-tree index registry.
             if let Some(btree_reg) = ctx.btree_index_registry {
                 if !label.is_empty() {
@@ -6641,7 +6674,7 @@ fn execute_create_from_pattern(
                 }
             }
 
-            ctx.mvcc_put(Partition::Node, &key, &bytes)?;
+            ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
 
             // Fire BEFORE COMMIT CREATE triggers registered on the new
             // node's label. This path is reached from MERGE (create branch)
@@ -7869,12 +7902,7 @@ fn execute_update(
                     }
 
                     // Read current node record
-                    let key = encode_node_key(ctx.shard_id, node_id);
-                    if let Some(bytes) = ctx.mvcc_get(Partition::Node, &key)? {
-                        let mut record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
-                            ExecutionError::Serialization(format!("node decode: {e}"))
-                        })?;
-
+                    if let Some(mut record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
                         // Enforce schema mode before writing the property.
                         // Load the label schema for the node's primary label and
                         // check STRICT/VALIDATED constraints on the property name.
@@ -7964,10 +7992,7 @@ fn execute_update(
 
                         record.set(field_id, val.clone());
 
-                        let new_bytes = record.to_msgpack().map_err(|e| {
-                            ExecutionError::Serialization(format!("node encode: {e}"))
-                        })?;
-                        ctx.mvcc_put(Partition::Node, &key, &new_bytes)?;
+                        ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
                         ctx.write_stats.properties_set += 1;
 
                         // Notify vector index registry if setting a vector property.
@@ -16640,6 +16665,123 @@ mod tests {
         assert!(scope.contains(Partition::Node, b"k1"));
         scope.track(Partition::Node, b"k2");
         assert_eq!(scope.tracked_count(), 2);
+    }
+
+    #[test]
+    fn mvcc_get_node_round_trip_through_put() {
+        // Write a NodeRecord via the typed helper, read it back via
+        // the typed helper — values match end-to-end. Confirms encode +
+        // serialize + mvcc_put / mvcc_get + decode wire up correctly.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open with oracle");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+        ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
+
+        let id = NodeId::from_raw(7);
+        let mut rec = NodeRecord::new("User");
+        let fid = ctx.interner.intern("name");
+        rec.set(fid, Value::String("Alice".into()));
+
+        ctx.mvcc_put_node(1, id, &rec).expect("put");
+        // RYOW: same-txn read sees the buffered write.
+        let fetched = ctx.mvcc_get_node(1, id).expect("get").expect("Some — RYOW");
+        assert_eq!(fetched.primary_label(), "User");
+        assert_eq!(
+            fetched.get(fid),
+            Some(&Value::String("Alice".into())),
+            "value field round-trips",
+        );
+
+        // Flush so the engine actually holds the record.
+        ctx.mvcc_flush().expect("flush");
+        // Re-open a fresh ctx — confirm post-flush durability through
+        // the typed reader (legacy mode, no oracle).
+        let mut ctx2 = make_ctx(&engine, &mut interner, &allocator);
+        let post_flush = ctx2.mvcc_get_node(1, id).expect("get").expect("Some");
+        assert_eq!(post_flush.primary_label(), "User");
+    }
+
+    #[test]
+    fn mvcc_get_node_missing_returns_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = StorageEngine::open(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+        )
+        .expect("open");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        // Legacy mode, no oracle — typed read goes through engine.get.
+        let res = ctx.mvcc_get_node(0, NodeId::from_raw(99)).expect("get ok");
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn mvcc_delete_node_tombstones_node_key() {
+        // After mvcc_delete_node + flush, subsequent reads return None.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open with oracle");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+        ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
+
+        let id = NodeId::from_raw(42);
+        let rec = NodeRecord::new("Tag");
+        ctx.mvcc_put_node(0, id, &rec).expect("put");
+        ctx.mvcc_flush().expect("flush 1");
+
+        // Fresh ctx for the delete — would conflict otherwise.
+        let mut ctx2 = make_ctx(&engine, &mut interner, &allocator);
+        ctx2.mvcc_oracle = Some(&oracle);
+        ctx2.mvcc_read_ts = oracle.next();
+        ctx2.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
+        ctx2.mvcc_delete_node(0, id).expect("delete");
+        ctx2.mvcc_flush().expect("flush 2");
+
+        let mut ctx3 = make_ctx(&engine, &mut interner, &allocator);
+        let after_delete = ctx3.mvcc_get_node(0, id).expect("get ok");
+        assert!(after_delete.is_none(), "tombstone hides the row");
     }
 
     #[test]
