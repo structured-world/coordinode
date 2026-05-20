@@ -926,8 +926,11 @@ impl<'a> ExecutionContext<'a> {
     }
 
     /// MVCC-aware typed node delete. Buffers a tombstone for the
-    /// non-temporal node key. Does NOT touch temporal version keys
-    /// (those are deleted separately via the temporal-aware variant).
+    /// non-temporal node key (16-byte `encode_node_key` form). Does
+    /// NOT iterate temporal version rows (25-byte `temporal_node_key`
+    /// form) — temporal cleanup is handled by the per-version delete
+    /// paths (close-current + tombstone) that the temporal executor
+    /// invokes directly.
     pub fn mvcc_delete_node(
         &mut self,
         shard_id: u16,
@@ -16649,6 +16652,49 @@ mod tests {
         assert!(scope.contains(Partition::Node, b"k1"));
         scope.track(Partition::Node, b"k2");
         assert_eq!(scope.tracked_count(), 2);
+    }
+
+    #[test]
+    fn mvcc_put_node_does_not_track_in_occ_scope() {
+        // OCC tracks READS, not writes. A pure mvcc_put_node call
+        // must NOT enter the OCC scope (writes are flushed via
+        // mvcc_write_buffer, not validated against read-set). If
+        // they DID enter the scope, every put would self-conflict
+        // when paired with a later read of the same key in the same
+        // transaction.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = oracle.next();
+
+        let id = NodeId::from_raw(33);
+        let rec = NodeRecord::new("Probe");
+        ctx.mvcc_put_node(0, id, &rec).expect("put");
+
+        let expected_key = encode_node_key(0, id);
+        match ctx.occ_scope.as_ref() {
+            None => { /* fine — pure write created no scope */ }
+            Some(scope) => assert!(
+                !scope.contains(Partition::Node, &expected_key),
+                "pure write must NOT enter OCC scope — would self-conflict on later read",
+            ),
+        }
     }
 
     #[test]
