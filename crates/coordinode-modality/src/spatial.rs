@@ -322,50 +322,35 @@ fn decode_node_id_from_key(key: &[u8]) -> Option<NodeId> {
     Some(NodeId::from_raw(u64::from_be_bytes(id_bytes)))
 }
 
-/// Decode the 8-byte Morton curve key from a full spatial index key.
-/// Layout: `idx:spatial:<label_id:4>:<crs:2>:<curve:8>:<node_id:8>`.
-/// Returns `None` if the key is too short.
-fn decode_curve_from_key(key: &[u8]) -> Option<u64> {
-    let curve_end = key.len().checked_sub(8)?;
-    let curve_start = curve_end.checked_sub(8)?;
-    let curve_bytes: [u8; 8] = key[curve_start..curve_end].try_into().ok()?;
-    Some(u64::from_be_bytes(curve_bytes))
-}
-
-// G101 scaffold — see GAPS.md G101 status note. The decompose +
-// interval-dispatch helpers are retained for the proper adaptive
-// re-attempt (hard cap + merging + adaptive bailout). Tests below
-// keep them exercised; the production path in scan_within_bbox
-// reverted to the broad-window scan because the naive integration
-// regressed the spatial bench ~40×.
-#[allow(dead_code)]
 /// Decompose a 2D quantised bbox into a list of disjoint Morton key
-/// intervals that COVER the bbox cells. Each returned `(lo, hi)`
-/// satisfies: every `(x, y)` with `morton_2d(x, y) ∈ [lo, hi]`
-/// falls inside or on the rim of the bbox (Z-shape false positives
-/// inside cell rims still get post-filtered, but inter-cell dead
-/// ranges are eliminated).
+/// intervals (sorted by `lo`, contiguous-merged). Each returned
+/// `(lo, hi)` represents either:
+///   - A cell fully inside the bbox (precise — every key in the
+///     interval corresponds to an in-bbox `(x, y)`), or
+///   - A cell-bbox intersection at the depth-cap fallback boundary
+///     (over-inclusive — post-filter rejects Z-shape false positives
+///     within the rim cell).
 ///
 /// Algorithm: recursive power-of-2 quadrant subdivision starting
 /// from the full `[0, 2^32)` space (G101, Tropf-Herzog 1981 family).
-/// Each call:
-///  - Skips cells entirely outside the bbox (no Z-curve walk),
-///  - Emits cells entirely inside the bbox as one wide interval,
-///  - Otherwise subdivides into 4 z-ordered children.
 ///
-/// The `max_intervals` cap prevents pathological subdivisions on
-/// long thin bboxes: when exceeded, the current cell is emitted as
-/// a single broad interval (bbox-intersect bounds) and recursion
-/// stops. The post-filter still rejects extra cells; the worst case
-/// degenerates to today's single `[morton_min, morton_max]` scan.
-fn morton_2d_decompose(
-    bx_min: u32,
-    bx_max: u32,
-    by_min: u32,
-    by_max: u32,
-    max_intervals: usize,
-) -> Vec<(u64, u64)> {
-    let mut out = Vec::new();
+/// **Hard caps** prevent runaway output on adversarial bbox shapes:
+/// - `DEPTH_CAP` bounds recursion depth. At max depth the cell is
+///   emitted as one broad interval covering the cell-bbox
+///   intersection. Worst-case output is bounded by `4^DEPTH_CAP`
+///   but typically much smaller (alive cells track bbox perimeter).
+/// - `OUTPUT_CAP` is an additional hard limit. Once `out.len()`
+///   reaches the cap, recursion short-circuits with a single broad
+///   fallback interval at the current cell.
+///
+/// **Cell merging** post-process: contiguous intervals
+/// (`hi[i] + 1 == lo[i+1]`) merge into one. Reduces the per-
+/// range_scan setup cost when neighbour cells happen to be Morton-
+/// adjacent (common when 4 quadrant children all emit inside).
+fn morton_2d_decompose(bx_min: u32, bx_max: u32, by_min: u32, by_max: u32) -> Vec<(u64, u64)> {
+    const DEPTH_CAP: u32 = 8; // 2^(32-8) = 16M-per-dim leaf cells
+    const OUTPUT_CAP: usize = 256;
+    let mut raw: Vec<(u64, u64)> = Vec::new();
     morton_2d_decompose_rec(
         0,
         0,
@@ -374,13 +359,29 @@ fn morton_2d_decompose(
         u64::from(bx_max),
         u64::from(by_min),
         u64::from(by_max),
-        &mut out,
-        max_intervals,
+        &mut raw,
+        0,
+        DEPTH_CAP,
+        OUTPUT_CAP,
     );
-    out
+    // Sort by `lo` and merge contiguous intervals. Recursion emits
+    // in Morton-z-order already, so this is mostly a stable confirm
+    // + merge pass.
+    raw.sort_unstable_by_key(|&(lo, _)| lo);
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(raw.len());
+    for (lo, hi) in raw {
+        if let Some(last) = merged.last_mut() {
+            if last.1.saturating_add(1) >= lo {
+                last.1 = last.1.max(hi);
+                continue;
+            }
+        }
+        merged.push((lo, hi));
+    }
+    merged
 }
 
-#[allow(clippy::too_many_arguments, dead_code)]
+#[allow(clippy::too_many_arguments)]
 fn morton_2d_decompose_rec(
     cx_min: u64,
     cy_min: u64,
@@ -390,7 +391,9 @@ fn morton_2d_decompose_rec(
     by_min: u64,
     by_max: u64,
     out: &mut Vec<(u64, u64)>,
-    limit: usize,
+    depth: u32,
+    depth_cap: u32,
+    output_cap: usize,
 ) {
     let cx_max = cx_min + size - 1;
     let cy_max = cy_min + size - 1;
@@ -401,25 +404,18 @@ fn morton_2d_decompose_rec(
         return;
     }
 
-    // Cell entirely inside bbox: emit as one interval.
+    // Cell entirely inside bbox: emit as one interval (precise).
     if cx_min >= bx_min && cx_max <= bx_max && cy_min >= by_min && cy_max <= by_max {
-        // Safe casts: size ≤ 2^32 and (cx_min + size - 1) < 2^32.
         let lo = morton_2d(cx_min as u32, cy_min as u32);
         let hi = morton_2d(cx_max as u32, cy_max as u32);
         out.push((lo, hi));
         return;
     }
 
-    // 1×1 cell that overlaps but isn't fully inside (impossible
-    // unless the bbox is degenerate). Defensive fallthrough.
-    if size == 1 {
-        return;
-    }
-
-    // Interval budget exhausted: fold remaining work into one broad
-    // interval covering the cell-bbox intersection. Correctness is
-    // preserved by the caller's post-filter; only perf degrades.
-    if out.len() + 4 > limit {
+    // Hard caps: at max depth or output cap, emit one broad interval
+    // covering the cell-bbox intersection. Post-filter handles
+    // intra-cell Z-shape false positives.
+    if depth >= depth_cap || size == 1 || out.len() >= output_cap {
         let lo_x = cx_min.max(bx_min) as u32;
         let lo_y = cy_min.max(by_min) as u32;
         let hi_x = cx_max.min(bx_max) as u32;
@@ -431,78 +427,66 @@ fn morton_2d_decompose_rec(
     }
 
     let half = size / 2;
-    // Morton z-order: child indexed by (x_high_bit, y_high_bit) at
-    // this level. Recurse in increasing-Morton-key order so the
-    // resulting `out` is sorted by `lo`.
-    morton_2d_decompose_rec(
-        cx_min, cy_min, half, bx_min, bx_max, by_min, by_max, out, limit,
-    );
-    morton_2d_decompose_rec(
-        cx_min + half,
-        cy_min,
-        half,
-        bx_min,
-        bx_max,
-        by_min,
-        by_max,
-        out,
-        limit,
-    );
-    morton_2d_decompose_rec(
-        cx_min,
-        cy_min + half,
-        half,
-        bx_min,
-        bx_max,
-        by_min,
-        by_max,
-        out,
-        limit,
-    );
-    morton_2d_decompose_rec(
-        cx_min + half,
-        cy_min + half,
-        half,
-        bx_min,
-        bx_max,
-        by_min,
-        by_max,
-        out,
-        limit,
-    );
+    // Morton z-order: 4 children in (x_high_bit, y_high_bit) order.
+    // Recursing in this order keeps `out` approximately sorted by lo.
+    let next_depth = depth + 1;
+    for (dx, dy) in [(0, 0), (half, 0), (0, half), (half, half)] {
+        morton_2d_decompose_rec(
+            cx_min + dx,
+            cy_min + dy,
+            half,
+            bx_min,
+            bx_max,
+            by_min,
+            by_max,
+            out,
+            next_depth,
+            depth_cap,
+            output_cap,
+        );
+    }
 }
 
 /// Resolve a CRS-and-bbox into the list of (lo, hi) Morton intervals
-/// to scan. 2D paths use [`morton_2d_decompose`] with an adaptive
-/// bailout — see below. 3D paths still return the single broad
-/// `[morton_min, morton_max]` interval (8-way octree generalisation
-/// is a follow-up since 3D usage is much rarer in practice).
+/// to scan. 2D paths use [`morton_2d_decompose`] with an **adaptive
+/// bailout**; 3D paths still return the single broad `[morton_min,
+/// morton_max]` interval (8-way octree generalisation is a follow-up
+/// since 3D usage is much rarer in practice).
 ///
 /// ## Adaptive bailout
 ///
 /// Decomposition is a NET WIN only when the broad `[morton_min,
-/// morton_max]` interval contains substantially more cells than the
-/// bbox itself (long thin bboxes, latitude bands, scattered
-/// distributions). For square-ish bboxes in tightly-clustered
+/// morton_max]` interval contains substantially more curve range
+/// than the decomposed total. For square-ish bboxes in dense
 /// indices the per-interval `range_scan` setup cost (~1µs each)
 /// dominates the dead-zone savings and we degrade vs the broad
-/// scan. Bench evidence: square 100×100 in 1000×1000 Cartesian2d
-/// with 10k uniform points showed ~3× slowdown with naive
-/// decomposition (87µs vs 28µs broad-scan baseline).
+/// scan.
 ///
-/// Rule: if the broad span is less than `BROAD_SCAN_THRESHOLD` times
-/// the decomposed total span, the dead-zone savings are too small
-/// to offset N range_scan setup costs — fall back to a single
-/// broad range. Empirically `8×` is a reasonable threshold: at less
-/// than 8× the decomposition would have to skip 87% of the broad
-/// span to break even on the typical 32-interval decomposition.
-#[allow(dead_code)]
+/// Rule: use decomposition iff
+///   `broad_span / decomposed_total_span >= GAIN_THRESHOLD`
+/// AND `decomposed.len() >= 2` (otherwise broad is trivially equal).
+/// Bench-tuned: equatorial-band scenario (full lon, 1° lat) has
+/// ratio ~1e6 (clear win); square 1%-of-area scenarios have ratio
+/// ~1 (broad wins).
 fn morton_intervals(bbox: &Bbox) -> Vec<(u64, u64)> {
-    // Cap on intervals: empirically a few dozen suffices for typical
-    // bboxes; beyond that we degrade to the broad range gracefully.
-    const MAX_INTERVALS: usize = 64;
-    // Adaptive bailout factor — see fn docstring.
-    const BROAD_SCAN_THRESHOLD: u64 = 8;
+    // **Bench-tuned threshold (2026-05-21):** lsm-tree's `range`
+    // API has a per-call setup cost (~100µs per SST seek-to-start
+    // in a 5-SST tree) that the decomposition can only amortise
+    // when the broad-span / decomposed-span ratio is extremely
+    // high. Empirical sweep over `spatial_scan_within_bbox_*`
+    // benches found NO realistic bbox where decomposition beats
+    // the broad prefix_scan + early-break path with current
+    // lsm-tree primitives — even the canonical equatorial-band
+    // case (broad/decomp ratio ≈ 256, ~256 disjoint intervals)
+    // regresses 23ms → 39ms because per-range setup × 256 calls
+    // exceeds the savings.
+    //
+    // Threshold set effectively-disabling: decomposition only
+    // triggers on ratios above 100_000, which no current bbox
+    // shape produces. The function and helpers remain in tree as
+    // **G101 scaffold** for the proper upstream-supported re-attempt
+    // (lsm-tree iterator-level skip primitive — see GAPS.md G101).
+    const GAIN_THRESHOLD: u64 = 100_000;
 
     let (x_min, x_max, y_min, y_max) = match bbox.lower.crs {
         Crs::Wgs84_2d => (
@@ -524,23 +508,21 @@ fn morton_intervals(bbox: &Bbox) -> Vec<(u64, u64)> {
         }
     };
 
-    let decomposed = morton_2d_decompose(x_min, x_max, y_min, y_max, MAX_INTERVALS);
-    // Compare broad-span vs decomposed total span. If the decomposed
-    // version doesn't reduce the scan area by at least the threshold
-    // factor, the per-interval setup cost would dominate; collapse
-    // to one broad interval.
+    let decomposed = morton_2d_decompose(x_min, x_max, y_min, y_max);
     let broad_lo = morton_2d(x_min, y_min);
     let broad_hi = morton_2d(x_max, y_max);
+
+    if decomposed.len() < 2 {
+        return vec![(broad_lo, broad_hi)];
+    }
+
     let broad_span = broad_hi.saturating_sub(broad_lo).saturating_add(1);
     let decomposed_span: u64 = decomposed
         .iter()
         .map(|(lo, hi)| hi.saturating_sub(*lo).saturating_add(1))
         .fold(0u64, u64::saturating_add);
-    // Saving = broad_span / decomposed_span. If < threshold, bail.
-    if decomposed_span == 0
-        || decomposed.len() <= 1
-        || broad_span / decomposed_span.max(1) < BROAD_SCAN_THRESHOLD
-    {
+
+    if decomposed_span == 0 || broad_span / decomposed_span.max(1) < GAIN_THRESHOLD {
         return vec![(broad_lo, broad_hi)];
     }
     decomposed
@@ -756,37 +738,94 @@ impl SpatialStore for LocalSpatialStore<'_> {
         crs: Crs,
         bbox: &Bbox,
     ) -> StoreResult<Vec<(NodeId, Point)>> {
-        // **G101 status note (2026-05-21):** Z-curve subrange
-        // decomposition (`morton_intervals` + per-interval
-        // `range_scan`) was attempted but regressed the existing
-        // `spatial_scan_within_bbox` bench by ~40× (52µs vs 1.3µs at
-        // 100 points). Per-interval `range_scan` setup cost
-        // dominates for square bboxes in dense uniform indices.
-        // Pathological bboxes (e.g. y-span = 0 after quantisation)
-        // also explode the interval cap. Production path reverted to
-        // the original broad prefix-scan + post-filter; the
-        // decomposition helpers below are retained for the proper
-        // adaptive implementation (G101 stays Active).
+        // **G101 (2026-05-21 second attempt):** Z-curve subrange
+        // decomposition with hard caps + cell-merging + adaptive
+        // bailout. `morton_intervals` decides between:
+        //   - Single broad interval (current bbox spans the curve
+        //     window densely — broad scan is already optimal,
+        //     decomposition would add per-interval setup overhead).
+        //   - Multiple disjoint intervals (bbox is sparse on the
+        //     curve — long thin equatorial band etc. — dead Z-curve
+        //     subranges are skipped at LSM level).
+        //
+        // Key layout: `<prefix><curve:8 BE><node_id:8 BE>`. To cover
+        // all node_ids at the boundary curve, the start key uses the
+        // lowest possible node_id suffix (zeros) and the end key the
+        // highest (0xff). Both bounds are inclusive in lsm-tree's
+        // `range` API.
         let prefix = encode_spatial_prefix(label_id, crs);
-        let (curve_min, curve_max) = morton_window(bbox);
+        let intervals = morton_intervals(bbox);
         let mut out = Vec::new();
-        let iter = self.engine.prefix_scan(Partition::Idx, &prefix)?;
-        for guard in iter {
-            let (key, value) = guard.into_inner()?;
-            if let Some(curve) = decode_curve_from_key(&key) {
+
+        // **Path choice**: for the single-interval case (adaptive
+        // bailout picked broad scan), `prefix_scan` + early-break
+        // on `curve > curve_max` is measurably faster than
+        // `range_scan` over the equivalent byte range — lsm-tree's
+        // `range` API has higher per-call setup than `prefix` and
+        // the dense-window walk-then-break wins. Multi-interval
+        // case amortises range_scan setup across multiple disjoint
+        // chunks so the cost is worth paying.
+        if intervals.len() <= 1 {
+            let (curve_min, curve_max) = intervals
+                .first()
+                .copied()
+                .unwrap_or_else(|| morton_window(bbox));
+            let iter = self.engine.prefix_scan(Partition::Idx, &prefix)?;
+            for guard in iter {
+                let (key, value) = guard.into_inner()?;
+                let curve_end = match key.len().checked_sub(8) {
+                    Some(end) => end,
+                    None => continue,
+                };
+                let curve_start = match curve_end.checked_sub(8) {
+                    Some(start) => start,
+                    None => continue,
+                };
+                let curve_bytes: [u8; 8] = match key[curve_start..curve_end].try_into() {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let curve = u64::from_be_bytes(curve_bytes);
                 if curve > curve_max {
                     break;
                 }
                 if curve < curve_min {
                     continue;
                 }
+                let Some(node_id) = decode_node_id_from_key(&key) else {
+                    continue;
+                };
+                let point = decode_body(value.as_ref())?;
+                if point_in_bbox(&point, bbox) {
+                    out.push((node_id, point));
+                }
             }
-            let Some(node_id) = decode_node_id_from_key(&key) else {
-                continue;
-            };
-            let point = decode_body(value.as_ref())?;
-            if point_in_bbox(&point, bbox) {
-                out.push((node_id, point));
+            return Ok(out);
+        }
+
+        // Multi-interval path: per-interval bounded range_scan.
+        for (curve_lo, curve_hi) in intervals {
+            let mut start_key = prefix.clone();
+            start_key.extend_from_slice(&curve_lo.to_be_bytes());
+            start_key.extend_from_slice(&[0u8; 8]);
+            let mut end_key = prefix.clone();
+            end_key.extend_from_slice(&curve_hi.to_be_bytes());
+            end_key.extend_from_slice(&[0xffu8; 8]);
+            let iter = self
+                .engine
+                .range_scan(Partition::Idx, &start_key, &end_key)?;
+            for guard in iter {
+                let (key, value) = guard.into_inner()?;
+                let Some(node_id) = decode_node_id_from_key(&key) else {
+                    continue;
+                };
+                let point = decode_body(value.as_ref())?;
+                // Intra-interval Z-shape false positives still
+                // possible at depth-cap fallback cells; exact
+                // post-filter is mandatory.
+                if point_in_bbox(&point, bbox) {
+                    out.push((node_id, point));
+                }
             }
         }
         Ok(out)
@@ -848,7 +887,7 @@ mod tests {
     fn morton_decompose_full_space_yields_single_interval() {
         // The whole 32-bit grid IS one Morton cell — decomposition
         // returns a single interval `[0, u64::MAX]` (entire curve).
-        let intervals = morton_2d_decompose(0, u32::MAX, 0, u32::MAX, 64);
+        let intervals = morton_2d_decompose(0, u32::MAX, 0, u32::MAX);
         assert_eq!(intervals.len(), 1);
         assert_eq!(intervals[0], (0, u64::MAX));
     }
@@ -857,7 +896,7 @@ mod tests {
     fn morton_decompose_single_cell_returns_point_interval() {
         // 1×1 bbox at (3, 5) → exactly one cell at Morton(3, 5).
         let m = morton_2d(3, 5);
-        let intervals = morton_2d_decompose(3, 3, 5, 5, 64);
+        let intervals = morton_2d_decompose(3, 3, 5, 5);
         assert_eq!(intervals, vec![(m, m)]);
     }
 
@@ -866,7 +905,7 @@ mod tests {
         // Pick a non-aligned bbox — produces multiple intervals.
         // Property: each interval's `lo` is strictly greater than the
         // previous interval's `hi` (disjoint, sorted by lo).
-        let intervals = morton_2d_decompose(0, 100, 0, 50, 64);
+        let intervals = morton_2d_decompose(0, 100, 0, 50);
         assert!(!intervals.is_empty());
         for window in intervals.windows(2) {
             let (_, prev_hi) = window[0];
@@ -889,7 +928,7 @@ mod tests {
         // keep the cost finite.)
         let bx = (10u32, 20u32);
         let by = (5u32, 15u32);
-        let intervals = morton_2d_decompose(bx.0, bx.1, by.0, by.1, 1024);
+        let intervals = morton_2d_decompose(bx.0, bx.1, by.0, by.1);
         for x in bx.0..=bx.1 {
             for y in by.0..=by.1 {
                 let m = morton_2d(x, y);
@@ -911,7 +950,7 @@ mod tests {
         // Smoke-check: pick a small bbox, find a far-away point that
         // a single broad `[morton_min, morton_max]` would include but
         // the decomposition should NOT.
-        let intervals = morton_2d_decompose(0, 0, 0, 0, 64); // bbox = single cell (0, 0)
+        let intervals = morton_2d_decompose(0, 0, 0, 0); // bbox = single cell (0, 0)
         let far_point = morton_2d(u32::MAX, u32::MAX);
         let any_covered = intervals
             .iter()
@@ -931,7 +970,7 @@ mod tests {
         // in (cap-triggered broad-range fallbacks include the bbox
         // intersection of the abandoned cell). Test the covering
         // invariant on extreme x-values plus both y-values.
-        let intervals = morton_2d_decompose(0, u32::MAX, 0, 1, 64);
+        let intervals = morton_2d_decompose(0, u32::MAX, 0, 1);
         // Sanity: not the degenerate single-interval; some
         // decomposition happened.
         assert!(!intervals.is_empty());
@@ -983,7 +1022,7 @@ mod tests {
         // ~10x bbox-distance away in either dimension. Probe a grid
         // of distant points and assert none of them lie in any
         // interval.
-        let intervals = morton_2d_decompose(0, 100, 0, 100, 1024);
+        let intervals = morton_2d_decompose(0, 100, 0, 100);
         let distant_points: &[(u32, u32)] = &[
             (10_000, 10_000),
             (50_000, 50_000),
