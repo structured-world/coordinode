@@ -57,12 +57,16 @@
 #![warn(missing_docs)]
 
 mod catalog;
+mod clock;
 mod config;
 mod error;
 mod key;
 mod measurement_router;
 
 pub use catalog::BucketCatalog;
+#[cfg(any(test, feature = "test-clock"))]
+pub use clock::ScriptedClock;
+pub use clock::{IngestionClock, MonotonicHlcClock};
 pub use config::CatalogConfig;
 pub use error::{CatalogError, CatalogResult};
 pub use key::BucketKey;

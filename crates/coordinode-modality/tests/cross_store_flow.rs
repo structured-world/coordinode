@@ -163,10 +163,12 @@ fn vector_spatial_timeseries_on_same_logical_entity() {
         vec![
             Measurement {
                 timestamp_us: 100,
+                ingestion_ts_us: None,
                 fields: m1,
             },
             Measurement {
                 timestamp_us: 200,
+                ingestion_ts_us: None,
                 fields: m2,
             },
         ],

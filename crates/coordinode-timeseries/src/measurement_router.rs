@@ -141,6 +141,7 @@ mod tests {
         }
         Measurement {
             timestamp_us: ts_us,
+            ingestion_ts_us: None,
             fields: m,
         }
     }

@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime};
 use coordinode_core::graph::node::NodeId;
 use coordinode_modality::{Bucket, BucketControl, FieldStats, Measurement, TimeSeriesStore};
 
+use crate::clock::IngestionClock;
 use crate::config::{CatalogConfig, STRIPE_COUNT};
 use crate::error::{CatalogError, CatalogResult};
 use crate::key::BucketKey;
@@ -210,6 +211,12 @@ pub struct BucketCatalog<'store, S: TimeSeriesStore> {
     /// monotonic so a compactor that races a writer can't see
     /// duplicate seqnos.
     next_overflow_seqno: std::sync::atomic::AtomicU64,
+    /// Engine-assigned ingestion-time stamp source (bitemporal axis
+    /// per ADR-027). The catalog stamps every incoming measurement
+    /// via `clock.next()` before buffering — production replicas
+    /// share a Raft-leader-stamped clock; CE single-node uses
+    /// [`MonotonicHlcClock`]; tests use `ScriptedClock`.
+    clock: std::sync::Arc<dyn IngestionClock>,
 }
 
 impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
@@ -217,11 +224,14 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
     /// `shard_id`. `next_node_id_seed` is the starting node id for
     /// freshly-opened buckets — callers pass the shard's allocator
     /// tip so issued ids don't collide with regular graph nodes.
+    /// `clock` provides the bitemporal `__ingestion_ts__` stamp
+    /// source (see [`crate::IngestionClock`]).
     pub fn new(
         config: CatalogConfig,
         shard_id: u16,
         store: &'store S,
         next_node_id_seed: u64,
+        clock: std::sync::Arc<dyn IngestionClock>,
     ) -> CatalogResult<Self> {
         config.validate()?;
         Ok(Self {
@@ -231,6 +241,7 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
             stripes: std::array::from_fn(|_| RwLock::new(Stripe::default())),
             next_node_id: std::sync::atomic::AtomicU64::new(next_node_id_seed),
             next_overflow_seqno: std::sync::atomic::AtomicU64::new(1),
+            clock,
         })
     }
 
@@ -268,9 +279,17 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
         &self,
         label_id: u16,
         meta: rmpv::Value,
-        measurement: Measurement,
+        mut measurement: Measurement,
         now: SystemTime,
     ) -> CatalogResult<()> {
+        // Stamp the bitemporal ingestion-time axis. The clock is
+        // engine-assigned, never user-supplied — even if the caller
+        // pre-set `ingestion_ts_us`, we OVERWRITE here. The reserved-
+        // field-name property of `__ingestion_ts__` lives at the
+        // OpenCypher writer layer; this is the canonical assignment
+        // point for the wire format.
+        measurement.ingestion_ts_us = Some(self.clock.next());
+
         let key = BucketKey::from_meta(label_id, &meta);
         let stripe_idx = key.stripe_idx();
         // Poisoned-lock recovery: a poisoned write lock means a
@@ -680,6 +699,7 @@ mod tests {
         }
         Measurement {
             timestamp_us: ts_us,
+            ingestion_ts_us: None,
             fields: m,
         }
     }
@@ -692,7 +712,14 @@ mod tests {
             max_count: 0,
             ..CatalogConfig::default()
         };
-        assert!(BucketCatalog::new(cfg, 0, &store, 1).is_err());
+        assert!(BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new())
+        )
+        .is_err());
     }
 
     #[test]
@@ -700,7 +727,14 @@ mod tests {
         let (_dir, engine) = mk_engine();
         let store = LocalTimeSeriesStore::new(&engine);
         let cfg = CatalogConfig::arch_defaults();
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
 
         catalog
             .write_measurement(
@@ -728,7 +762,14 @@ mod tests {
             max_count: 3,
             ..CatalogConfig::default()
         };
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
         let meta = rmpv::Value::String("s1".into());
 
         // 3 measurements fill the bucket without rollover.
@@ -763,7 +804,14 @@ mod tests {
             max_count: 4,
             ..CatalogConfig::default()
         };
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
         let meta = rmpv::Value::String("s1".into());
 
         // Insert out-of-order: 100, 50, 200, 25 (Tier-1 absorption).
@@ -788,7 +836,14 @@ mod tests {
             granularity_span: Duration::from_millis(10),
             ..CatalogConfig::default()
         };
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
         let meta = rmpv::Value::String("s1".into());
 
         // First measurement at t=0, second at t=20ms (>10ms granularity).
@@ -812,7 +867,14 @@ mod tests {
         let (_dir, engine) = mk_engine();
         let store = LocalTimeSeriesStore::new(&engine);
         let cfg = CatalogConfig::arch_defaults();
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
         let meta = rmpv::Value::String("s1".into());
 
         // Open with {temp}, then write {temp, humidity}.
@@ -838,7 +900,14 @@ mod tests {
         let (_dir, engine) = mk_engine();
         let store = LocalTimeSeriesStore::new(&engine);
         let cfg = CatalogConfig::arch_defaults();
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
 
         catalog
             .write_measurement(
@@ -866,7 +935,14 @@ mod tests {
         let (_dir, engine) = mk_engine();
         let store = LocalTimeSeriesStore::new(&engine);
         let cfg = CatalogConfig::arch_defaults();
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
 
         for i in 0..10 {
             catalog
@@ -898,7 +974,14 @@ mod tests {
             granularity_span: Duration::from_secs(3600),
             ..CatalogConfig::default()
         };
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
         let meta = rmpv::Value::String("s1".into());
 
         // Buffer 3 measurements at t=0, 1000, 2000, then flush_all.
@@ -943,7 +1026,14 @@ mod tests {
             granularity_span: Duration::from_secs(3600),
             ..CatalogConfig::default()
         };
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
         let meta = rmpv::Value::String("s1".into());
 
         for i in 0..3 {
@@ -984,7 +1074,14 @@ mod tests {
             granularity_span: Duration::from_secs(3600),
             ..CatalogConfig::default()
         };
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
         let meta = rmpv::Value::String("s1".into());
 
         for i in 0..3 {
@@ -1024,7 +1121,14 @@ mod tests {
             granularity_span: Duration::from_millis(50),
             ..CatalogConfig::default()
         };
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
         let meta = rmpv::Value::String("s1".into());
 
         // Close bucket 1.
@@ -1061,7 +1165,14 @@ mod tests {
             granularity_span: Duration::from_secs(3600),
             ..CatalogConfig::default()
         };
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
 
         // Force enough flushes on ONE STRIPE to exceed MAX_RECENTLY_CLOSED.
         // Find a label_id whose bucket key lands in stripe 0 for a
@@ -1105,7 +1216,14 @@ mod tests {
             granularity_span: Duration::from_millis(50),
             ..CatalogConfig::default()
         };
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
         let meta = rmpv::Value::String("s1".into());
 
         // Close bucket 1 with measurements at t=0, 1ms.
@@ -1150,7 +1268,14 @@ mod tests {
             granularity_span: Duration::from_millis(50),
             ..CatalogConfig::default()
         };
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
         let meta = rmpv::Value::String("s1".into());
 
         for i in 0..2 {
@@ -1179,7 +1304,14 @@ mod tests {
         let (_dir, engine) = mk_engine();
         let store = LocalTimeSeriesStore::new(&engine);
         let cfg = CatalogConfig::arch_defaults();
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
 
         // Empty overflow → no compaction, returns Ok(false).
         let did = catalog.compact_if_needed(7, NodeId::from_raw(1)).unwrap();
@@ -1195,7 +1327,14 @@ mod tests {
             granularity_span: Duration::from_millis(50),
             ..CatalogConfig::default()
         };
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
         let meta = rmpv::Value::String("s1".into());
 
         // Set up: bucket 1 closed with 2 measurements at t=0, 1ms.
@@ -1254,7 +1393,14 @@ mod tests {
             granularity_span: Duration::from_millis(50),
             ..CatalogConfig::default()
         };
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
 
         // Bucket A under meta "sA": close + 51 overflow.
         let meta_a = rmpv::Value::String("sA".into());
@@ -1336,11 +1482,105 @@ mod tests {
     }
 
     #[test]
+    fn write_measurement_stamps_ingestion_ts_via_clock() {
+        // Bitemporal axis (sub-system #3): catalog stamps every
+        // incoming measurement with the clock's next() value before
+        // buffering. Subsequent flush + read-back surfaces the
+        // stamp via Bucket.ingestion_timestamps. Test pins the
+        // sequence via ScriptedClock so we know exactly which
+        // stamps land on which measurement.
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let cfg = CatalogConfig {
+            max_count: 3,
+            granularity_span: Duration::from_secs(3600),
+            ..CatalogConfig::default()
+        };
+        let clock = std::sync::Arc::new(crate::clock::ScriptedClock::new(vec![
+            1_000_000, 2_000_000, 3_000_000,
+        ]));
+        let catalog = BucketCatalog::new(cfg, 0, &store, 1, clock).unwrap();
+        let meta = rmpv::Value::String("sensor-1".into());
+
+        catalog
+            .write_measurement(7, meta.clone(), measurement(100, &[("temp", 20.0)]))
+            .unwrap();
+        catalog
+            .write_measurement(7, meta.clone(), measurement(200, &[("temp", 21.0)]))
+            .unwrap();
+        catalog
+            .write_measurement(7, meta.clone(), measurement(300, &[("temp", 22.0)]))
+            .unwrap();
+        catalog.flush_all().unwrap();
+
+        // Read back via the store, verify ingestion-ts column has
+        // exactly the three stamps in the order the catalog assigned.
+        let bucket = store
+            .get_bucket(0, NodeId::from_raw(1))
+            .unwrap()
+            .expect("bucket persisted");
+        assert_eq!(bucket.control.count, 3);
+        assert_eq!(
+            bucket.ingestion_timestamps,
+            vec![1_000_000, 2_000_000, 3_000_000],
+            "ingestion-ts column must carry the ScriptedClock sequence",
+        );
+        // Event-time and ingestion-time columns must be the same
+        // length (column alignment invariant).
+        assert_eq!(
+            bucket.timestamps.len(),
+            bucket.ingestion_timestamps.len(),
+            "ingestion_timestamps must be the same length as timestamps",
+        );
+    }
+
+    #[test]
+    fn write_measurement_ignores_caller_supplied_ingestion_ts() {
+        // Per ADR-027: `__ingestion_ts__` is engine-assigned, NEVER
+        // user-supplied. Even if the caller pre-sets `ingestion_ts_us`
+        // on the Measurement struct, the catalog MUST overwrite it
+        // with the clock value — otherwise a malicious client could
+        // backdate writes and break `AS OF INGESTION_TIME` semantics.
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let cfg = CatalogConfig::arch_defaults();
+        let clock = std::sync::Arc::new(crate::clock::ScriptedClock::new(vec![999]));
+        let catalog = BucketCatalog::new(cfg, 0, &store, 1, clock).unwrap();
+        let meta = rmpv::Value::String("sensor".into());
+
+        // Caller tries to claim ingestion_ts = 1 (far past).
+        let mut malicious_m = measurement(100, &[("v", 1.0)]);
+        malicious_m.ingestion_ts_us = Some(1);
+        catalog
+            .write_measurement(7, meta.clone(), malicious_m)
+            .unwrap();
+        catalog.flush_all().unwrap();
+
+        // Read back: engine MUST have overwritten to the clock's 999.
+        let bucket = store
+            .get_bucket(0, NodeId::from_raw(1))
+            .unwrap()
+            .expect("bucket persisted");
+        assert_eq!(
+            bucket.ingestion_timestamps,
+            vec![999],
+            "engine must overwrite caller-supplied ingestion_ts with clock value",
+        );
+    }
+
+    #[test]
     fn compact_all_pending_no_op_when_overflow_set_empty() {
         let (_dir, engine) = mk_engine();
         let store = LocalTimeSeriesStore::new(&engine);
         let cfg = CatalogConfig::arch_defaults();
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
         assert_eq!(catalog.compact_all_pending().unwrap(), 0);
     }
 
@@ -1352,7 +1592,14 @@ mod tests {
             max_count: 1000,
             ..CatalogConfig::default()
         };
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let catalog = BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+        )
+        .unwrap();
 
         // Scoped threads so workers can borrow `catalog` (which
         // itself borrows `store`) without the 'static bound that
@@ -1367,6 +1614,7 @@ mod tests {
                             rmpv::Value::String(format!("worker-{w}-key-{i}").into()),
                             Measurement {
                                 timestamp_us: i64::from(i),
+                                ingestion_ts_us: None,
                                 fields: {
                                     let mut f = BTreeMap::new();
                                     f.insert("v".to_string(), 1.0);
