@@ -108,6 +108,11 @@ struct RecentlyClosedLru {
 /// eligibility under bursty churn).
 const MAX_RECENTLY_CLOSED: usize = 512;
 
+/// Overflow count above which [`BucketCatalog::compact_if_needed`]
+/// triggers a [`TimeSeriesStore::compact_overflow`] call. Matches
+/// the arch §Background merge default.
+const OVERFLOW_COMPACT_THRESHOLD: usize = 50;
+
 impl RecentlyClosedLru {
     /// Insert / replace the handle for `key`. Evicts the
     /// oldest-`closed_at` entry when at capacity.
@@ -146,6 +151,17 @@ impl RecentlyClosedLru {
         self.by_key.remove(key)
     }
 
+    /// Look up the handle WITHOUT the TTL check. Used by the Tier-3
+    /// overflow path: a measurement that fails the Tier-2 reopen
+    /// gate (because the bucket has aged past `2 × granularity_span`
+    /// — re-open would be expensive, compaction already merged) can
+    /// still route to that bucket's overflow segment via
+    /// [`TimeSeriesStore::put_overflow`]. The LRU is the
+    /// `(BucketKey → node_id)` discovery service for that path.
+    fn get_any(&self, key: &BucketKey) -> Option<&ClosedBucketHandle> {
+        self.by_key.get(key)
+    }
+
     /// Diagnostic — number of currently-eligible handles. Tests only.
     #[cfg(test)]
     fn len(&self) -> usize {
@@ -182,10 +198,18 @@ pub struct BucketCatalog<'store, S: TimeSeriesStore> {
     store: &'store S,
     stripes: [RwLock<Stripe>; STRIPE_COUNT],
     /// Monotonic source of bucket node ids. The catalog issues these
-    /// directly today; Slice C will route them through the engine's
-    /// node-id allocator (per-shard) so they coexist with regular
-    /// graph nodes.
+    /// directly today; a follow-up will route them through the
+    /// engine's node-id allocator (per-shard) so they coexist with
+    /// regular graph nodes.
     next_node_id: std::sync::atomic::AtomicU64,
+    /// Monotonic source of overflow arrival seqnos. Catalog-local;
+    /// each [`OverflowEntry`] gets a unique seqno per catalog
+    /// lifetime. After [`Self::compact_if_needed`] runs the seqno
+    /// space implicitly resets (the merged base bucket invalidates
+    /// the prior overflow seqnos), but we keep the counter
+    /// monotonic so a compactor that races a writer can't see
+    /// duplicate seqnos.
+    next_overflow_seqno: std::sync::atomic::AtomicU64,
 }
 
 impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
@@ -206,6 +230,7 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
             store,
             stripes: std::array::from_fn(|_| RwLock::new(Stripe::default())),
             next_node_id: std::sync::atomic::AtomicU64::new(next_node_id_seed),
+            next_overflow_seqno: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
@@ -311,7 +336,7 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
                 if reopened {
                     // Take the handle out of LRU — the bucket is open again.
                     stripe.recently_closed.remove(&key);
-                    let mut bucket_control = BucketControl {
+                    let bucket_control = BucketControl {
                         version: 1,
                         count: 0,
                         time_min_us: handle.time_range.0,
@@ -319,17 +344,6 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
                         closed: false,
                         fields_stats: handle.fields.clone(),
                     };
-                    // The reopened bucket carries its prior count
-                    // implicitly via the persisted body — but the
-                    // catalog's in-memory state restarts at 0 because
-                    // we re-flush the *combined* set on next close,
-                    // using `from_measurements` over both the
-                    // persisted prefix and the new buffer. Since
-                    // we don't keep the persisted body in memory,
-                    // count starts at 0 and rollover triggers fire
-                    // sooner. Acceptable for Slice B; Slice C will
-                    // unify late-arrival into compact_overflow.
-                    bucket_control.count = 0;
                     stripe.open_buckets.insert(
                         key,
                         OpenBucket {
@@ -342,6 +356,52 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
                         },
                     );
                 }
+            }
+        }
+
+        // Tier 3 overflow: no open bucket, AND Tier 2 didn't fire
+        // (either no in-TTL handle, or the in-TTL handle's range
+        // didn't contain the measurement). If a TTL-expired handle
+        // for this key DOES contain the measurement's timestamp,
+        // route to the bucket's overflow segment instead of opening
+        // a fresh bucket.
+        //
+        // The overflow path covers genuinely late data (sensor
+        // offline for hours / retroactive corrections) — too old
+        // for a cheap re-open, but identifiable by the LRU's
+        // surviving `(BucketKey → node_id)` mapping. Truly orphaned
+        // late data (LRU evicted the handle entirely) still surfaces
+        // as [`CatalogError::LateBeyondTier1`] for the caller to
+        // route or reject.
+        if !stripe.open_buckets.contains_key(&key) {
+            let overflow_target = stripe.recently_closed.get_any(&key).and_then(|h| {
+                if measurement_fits_recently_closed(h, &measurement, self.config.granularity_span) {
+                    Some((h.node_id, h.meta.clone()))
+                } else {
+                    None
+                }
+            });
+            if let Some((node_id, _meta)) = overflow_target {
+                let arrival_seqno = self
+                    .next_overflow_seqno
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(
+                    label_id,
+                    meta_hash = format!("{:#x}", key.meta_hash),
+                    node_id = node_id.as_raw(),
+                    arrival_seqno,
+                    "Tier-3 overflow",
+                );
+                drop(stripe); // release lock before store I/O
+                self.store.put_overflow(
+                    u32::from(label_id),
+                    node_id,
+                    &coordinode_modality::OverflowEntry {
+                        arrival_seqno,
+                        measurement,
+                    },
+                )?;
+                return Ok(());
             }
         }
 
@@ -430,6 +490,63 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
             .sum()
     }
 
+    /// Inspect the overflow set for `(label_id, bucket_id)` and run
+    /// [`TimeSeriesStore::compact_overflow`] when it has grown past
+    /// the configured count threshold. Returns `Ok(true)` if a
+    /// compaction ran, `Ok(false)` if not.
+    ///
+    /// Threshold (arch default — see `arch/core/timeseries.md`
+    /// §Background merge): more than `OVERFLOW_COMPACT_THRESHOLD`
+    /// (50) overflow entries triggers compaction. The catalog does
+    /// NOT enforce an age threshold here — call sites that care
+    /// about "compact stale overflow" run their own age check and
+    /// invoke this hook unconditionally.
+    ///
+    /// **Driver model.** This method is the *trigger primitive*.
+    /// Production runs it from a periodic background driver (one
+    /// per shard); tests invoke it directly. The catalog itself
+    /// does not spawn any threads — driver wiring lives above.
+    pub fn compact_if_needed(&self, label_id: u32, bucket_id: NodeId) -> CatalogResult<bool> {
+        let overflow = self.store.scan_overflow(label_id, bucket_id)?;
+        if overflow.len() <= OVERFLOW_COMPACT_THRESHOLD {
+            return Ok(false);
+        }
+        // Read the current base bucket; merge with overflow
+        // measurements; write back atomically (compact_overflow
+        // builds the merge under a WriteBatch covering both the
+        // base put and the overflow tombstones).
+        let Some(base) = self.store.get_bucket(self.shard_id, bucket_id)? else {
+            tracing::warn!(
+                label_id,
+                bucket_id = bucket_id.as_raw(),
+                "compact_if_needed: base bucket missing — leaving overflow in place",
+            );
+            return Ok(false);
+        };
+        let mut merged: Vec<Measurement> = base.measurements().collect();
+        let mut overflow_seqnos: Vec<u64> = Vec::with_capacity(overflow.len());
+        for entry in overflow {
+            overflow_seqnos.push(entry.arrival_seqno);
+            merged.push(entry.measurement);
+        }
+        merged.sort_by_key(|m| m.timestamp_us);
+        let merged_bucket = Bucket::from_measurements(base.meta.clone(), merged);
+        self.store.compact_overflow(
+            self.shard_id,
+            label_id,
+            bucket_id,
+            &merged_bucket,
+            &overflow_seqnos,
+        )?;
+        tracing::debug!(
+            label_id,
+            bucket_id = bucket_id.as_raw(),
+            compacted = overflow_seqnos.len(),
+            "overflow compacted",
+        );
+        Ok(true)
+    }
+
     /// Persist `bucket` to the underlying TimeSeriesStore and mark
     /// it closed. Sorts the in-memory buffer by timestamp before
     /// columnising — Tier-1 in-buffer late arrivals are merged here.
@@ -456,27 +573,34 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
     }
 }
 
-/// Tier-2 eligibility check: is the incoming `measurement` plausibly
+/// Tier-2 / Tier-3 eligibility check: is the incoming `measurement`
 /// part of the closed bucket described by `handle`?
 ///
 /// Two conditions must hold:
-/// 1. `timestamp_us` falls within the bucket's stored time range
-///    (with a one-granularity slack on the upper end to absorb
-///    measurements that arrived right after close but before the
-///    cutoff that triggered close).
+/// 1. `timestamp_us` falls STRICTLY within the bucket's stored time
+///    range `[time_min, time_max]`. A measurement past the bucket's
+///    max belongs to a *later* bucket, never the closed one —
+///    routing it to overflow would corrupt the time-series story.
 /// 2. The measurement's fields are a SUBSET of the bucket's schema.
 ///    A reopen with a new column would force a schema rollover
 ///    immediately after — pointless round-trip — so fall through.
+///
+/// The `granularity_span` parameter is no longer used for slack
+/// (see commit history — the prior slack was so generous that
+/// any measurement within one granularity of the bucket's max
+/// was deemed "in window", which incorrectly routed
+/// post-rollover sequential measurements to the closed bucket's
+/// overflow). Kept for signature stability so future tweaks can
+/// reintroduce a small-fixed-duration slack if needed.
 fn measurement_fits_recently_closed(
     handle: &ClosedBucketHandle,
     measurement: &Measurement,
-    granularity_span: Duration,
+    _granularity_span: Duration,
 ) -> bool {
-    let slack = granularity_span.as_micros() as i64;
     if measurement.timestamp_us < handle.time_range.0 {
         return false;
     }
-    if measurement.timestamp_us > handle.time_range.1.saturating_add(slack) {
+    if measurement.timestamp_us > handle.time_range.1 {
         return false;
     }
     if handle.fields.is_empty() {
@@ -938,6 +1062,156 @@ mod tests {
         // pushed older ones out.
         let stripe0 = catalog.stripes[target_stripe].read().unwrap();
         assert_eq!(stripe0.recently_closed.len(), MAX_RECENTLY_CLOSED);
+    }
+
+    // -- Tier-3 overflow + compactor --
+
+    #[test]
+    fn tier3_routes_to_overflow_when_tier2_ttl_expired() {
+        // Flush a bucket, force its handle past TTL via fake-clock
+        // `write_measurement_at`. Tier 2 skips on TTL; Tier 3 picks
+        // up the same handle (no TTL check) and routes to overflow.
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let cfg = CatalogConfig {
+            max_count: 2,
+            granularity_span: Duration::from_millis(50),
+            ..CatalogConfig::default()
+        };
+        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let meta = rmpv::Value::String("s1".into());
+
+        // Close bucket 1 with measurements at t=0, 1ms.
+        for i in 0..2 {
+            catalog
+                .write_measurement(7, meta.clone(), measurement(i * 1000, &[("temp", 20.0)]))
+                .unwrap();
+        }
+        catalog.flush_all().unwrap();
+        assert_eq!(catalog.recently_closed_count(), 1);
+        assert!(store
+            .scan_overflow(7, NodeId::from_raw(1))
+            .unwrap()
+            .is_empty());
+
+        // Late measurement in-window (ts=500us inside [0, 1000])
+        // but `now` is far past TTL → Tier 2 skips → Tier 3 should
+        // route to overflow against bucket 1.
+        let future = SystemTime::now() + Duration::from_secs(1);
+        catalog
+            .write_measurement_at(7, meta.clone(), measurement(500, &[("temp", 22.0)]), future)
+            .unwrap();
+
+        // Overflow has one entry under bucket 1.
+        let overflow = store.scan_overflow(7, NodeId::from_raw(1)).unwrap();
+        assert_eq!(overflow.len(), 1);
+        assert_eq!(overflow[0].measurement.timestamp_us, 500);
+        // No new open bucket allocated for the key.
+        assert_eq!(catalog.open_bucket_count(), 0);
+    }
+
+    #[test]
+    fn tier3_skipped_when_handle_time_range_does_not_contain_measurement() {
+        // TTL-expired handle exists for the key but the late
+        // measurement timestamp is OUTSIDE the handle's range.
+        // Tier 3 must NOT route to that bucket's overflow — instead
+        // a fresh bucket opens for the new timestamp.
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let cfg = CatalogConfig {
+            max_count: 2,
+            granularity_span: Duration::from_millis(50),
+            ..CatalogConfig::default()
+        };
+        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let meta = rmpv::Value::String("s1".into());
+
+        for i in 0..2 {
+            catalog
+                .write_measurement(7, meta.clone(), measurement(i * 1000, &[("temp", 20.0)]))
+                .unwrap();
+        }
+        catalog.flush_all().unwrap();
+        // Bucket 1 covers [0, 1000]. Now write a measurement far in
+        // the future (ts=10s) past TTL → Tier 3 must not target
+        // bucket 1's overflow (out of range). A fresh bucket 2 opens.
+        let future = SystemTime::now() + Duration::from_secs(1);
+        catalog
+            .write_measurement_at(7, meta, measurement(10_000_000, &[("temp", 22.0)]), future)
+            .unwrap();
+
+        assert!(store
+            .scan_overflow(7, NodeId::from_raw(1))
+            .unwrap()
+            .is_empty());
+        assert_eq!(catalog.open_bucket_count(), 1);
+    }
+
+    #[test]
+    fn compact_if_needed_no_op_below_threshold() {
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let cfg = CatalogConfig::arch_defaults();
+        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+
+        // Empty overflow → no compaction, returns Ok(false).
+        let did = catalog.compact_if_needed(7, NodeId::from_raw(1)).unwrap();
+        assert!(!did);
+    }
+
+    #[test]
+    fn compact_if_needed_merges_overflow_into_base_when_above_threshold() {
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let cfg = CatalogConfig {
+            max_count: 2,
+            granularity_span: Duration::from_millis(50),
+            ..CatalogConfig::default()
+        };
+        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let meta = rmpv::Value::String("s1".into());
+
+        // Set up: bucket 1 closed with 2 measurements at t=0, 1ms.
+        for i in 0..2 {
+            catalog
+                .write_measurement(7, meta.clone(), measurement(i * 1000, &[("temp", 20.0)]))
+                .unwrap();
+        }
+        catalog.flush_all().unwrap();
+
+        // Force 51 overflow entries (> OVERFLOW_COMPACT_THRESHOLD=50).
+        let future = SystemTime::now() + Duration::from_secs(1);
+        for i in 0..51 {
+            catalog
+                .write_measurement_at(
+                    7,
+                    meta.clone(),
+                    measurement(500 + i, &[("temp", 30.0 + (i as f64))]),
+                    future,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.scan_overflow(7, NodeId::from_raw(1)).unwrap().len(),
+            51,
+        );
+
+        // Compact.
+        let did = catalog.compact_if_needed(7, NodeId::from_raw(1)).unwrap();
+        assert!(did, "compact must run when overflow exceeds threshold");
+
+        // Post-compact: overflow set empty, base bucket has 2 + 51 = 53
+        // measurements (merged + sorted).
+        assert!(store
+            .scan_overflow(7, NodeId::from_raw(1))
+            .unwrap()
+            .is_empty());
+        let base = store.get_bucket(0, NodeId::from_raw(1)).unwrap().unwrap();
+        assert_eq!(base.control.count, 53);
+        // First two are the originals (0, 1000); next 51 are the
+        // overflow entries (500..551). Sorted: 0, 500..551, 1000.
+        assert_eq!(base.timestamps[0], 0);
+        assert_eq!(base.timestamps[52], 1000);
     }
 
     #[test]
