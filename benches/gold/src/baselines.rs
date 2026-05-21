@@ -43,13 +43,27 @@ pub struct DocumentYcsb {
 
 /// One competitor row in a YCSB-A or YCSB-C table.
 ///
-/// `throughput_ops_s` and `read_p99_us` are optional because some
-/// multi-model competitors (SurrealDB 3.x, ArangoDB) don't publish
-/// directly-comparable YCSB numbers — we mark those `null` in the
-/// TOML and fill in once we run their engine against the same
-/// dataset in our harness.
+/// Per the methodology principle #7, every competitor entry is
+/// **codec-scoped**: the same engine appears once per compression
+/// mode (`<engine>_<codec>`, e.g. `mongodb_8_snappy` +
+/// `mongodb_8_zstd` + `mongodb_8_none`). Reports render the default
+/// codec and the disabled mode side-by-side so reviewers can tell
+/// whether a gap is engine perf or codec choice.
+///
+/// `throughput_ops_s` and `read_p99_us` are optional because several
+/// multi-model competitors don't publish directly-comparable YCSB
+/// numbers per codec yet — we omit the value and fill in once we
+/// run their engine against the same dataset in our harness.
 #[derive(Debug, Deserialize)]
 pub struct DocumentYcsbEntry {
+    /// Codec name as the upstream engine identifies it: e.g.
+    /// `"snappy"`, `"zstd"`, `"lz4"`, `"none"`, `"pglz"`.
+    pub codec: String,
+    /// Categorical tag for report-layer rendering. Expected values:
+    /// `"default"` (the codec the engine ships with), `"alternate"`
+    /// (another supported codec), `"disabled"` (compression off —
+    /// the apples-to-apples CPU baseline).
+    pub codec_role: String,
     #[serde(default)]
     pub throughput_ops_s: Option<f64>,
     #[serde(default)]
@@ -101,38 +115,103 @@ mod tests {
         // baselines.toml that breaks the schema fails this test
         // before the binaries try to use the table at runtime.
         let b = Baselines::embedded();
-        // Spot-check the primary document-store competitor: MongoDB 8.x
-        // on YCSB workload A. Per the rewritten methodology doc, this
-        // replaces the prior Redis comparison (Redis is a cache, not a
-        // multi-model engine — wrong competitor entirely).
+        // Spot-check the primary document-store competitor at the
+        // chosen comparison codec: MongoDB 8.x with zstd. Per
+        // methodology §"Codec choice" snappy is excluded — we
+        // standardize on zstd × zstd vs none × none across all
+        // multi-model comparisons.
         let mongo = b
             .document
             .ycsb
             .workload_a
-            .get("mongodb_8")
-            .expect("mongodb_8 baseline must exist for ycsb workload A");
-        assert!(mongo.throughput_ops_s.unwrap_or(0.0) > 0.0);
-        assert!(mongo.read_p99_us.unwrap_or(0.0) > 0.0);
+            .get("mongodb_8_zstd")
+            .expect("mongodb_8_zstd baseline must exist for ycsb workload A");
+        assert_eq!(mongo.codec, "zstd");
+        assert_eq!(mongo.codec_role, "default");
         assert!(!mongo.source.is_empty());
+    }
+
+    #[test]
+    fn document_baselines_use_only_zstd_or_none() {
+        // Methodology §"Codec choice" — snappy / lz4 / pglz are
+        // EXCLUDED. Every entry in document.ycsb.workload_a /
+        // workload_c must be codec = "zstd" or codec = "none".
+        // A future edit re-adding snappy fails this test.
+        let b = Baselines::embedded();
+        let all = b
+            .document
+            .ycsb
+            .workload_a
+            .values()
+            .chain(b.document.ycsb.workload_c.values());
+        for entry in all {
+            assert!(
+                entry.codec == "zstd" || entry.codec == "none",
+                "document baseline with codec `{}` (source `{}`) violates §Codec choice — \
+                 only zstd and none are allowed in document YCSB comparisons",
+                entry.codec,
+                entry.source,
+            );
+        }
     }
 
     #[test]
     fn document_workload_c_lists_only_multi_model_competitors() {
         // Workload C entries must be from the multi-model tier — no
-        // Redis, no ScyllaDB, no SQLite. This pins the methodology
-        // decision in code: a future edit re-adding Redis fails here.
+        // Redis, no ScyllaDB, no SQLite. Keys are codec-scoped
+        // (`<engine>_<codec>`); a future edit re-adding Redis fails
+        // here regardless of codec suffix.
         let b = Baselines::embedded();
         for name in b.document.ycsb.workload_c.keys() {
-            let allowed = matches!(
-                name.as_str(),
-                "mongodb_8" | "surrealdb_3_0" | "arangodb_3_12",
-            );
+            let engine_root = strip_codec_suffix(name);
+            let allowed = matches!(engine_root, "mongodb_8" | "surrealdb_3_0" | "arangodb_3_12",);
             assert!(
                 allowed,
-                "non-multi-model competitor `{name}` in YCSB workload_c — \
-                 only mongodb_8 / surrealdb_3_0 / arangodb_3_12 belong here per \
-                 arch/benchmarks/methodology.md",
+                "non-multi-model competitor `{name}` (root `{engine_root}`) in \
+                 YCSB workload_c — only mongodb_8 / surrealdb_3_0 / arangodb_3_12 \
+                 (per any codec) belong here per arch/benchmarks/methodology.md",
             );
+        }
+    }
+
+    #[test]
+    fn document_workload_a_covers_zstd_and_none_per_engine() {
+        // Methodology principle #7 + §"Codec choice" — every primary
+        // multi-model competitor must appear exactly twice per
+        // workload: `<engine>_zstd` AND `<engine>_none`. The report
+        // renders zstd-vs-zstd and none-vs-none columns side by side.
+        let b = Baselines::embedded();
+        let keys: std::collections::HashSet<&str> = b
+            .document
+            .ycsb
+            .workload_a
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for engine in ["mongodb_8", "surrealdb_3_0", "arangodb_3_12"] {
+            let zstd_key = format!("{engine}_zstd");
+            let none_key = format!("{engine}_none");
+            assert!(
+                keys.contains(zstd_key.as_str()),
+                "missing zstd baseline `{zstd_key}` in document.ycsb.workload_a — \
+                 every primary competitor MUST have a codec=zstd entry",
+            );
+            assert!(
+                keys.contains(none_key.as_str()),
+                "missing uncompressed baseline `{none_key}` in document.ycsb.workload_a — \
+                 every primary competitor MUST have a codec=none entry",
+            );
+        }
+    }
+
+    /// Strip a `_<codec>` suffix to recover the engine identifier.
+    /// `mongodb_8_snappy` → `mongodb_8`; `arangodb_3_12_lz4` →
+    /// `arangodb_3_12`. The codec is always the last underscore-
+    /// separated token in the entry name.
+    fn strip_codec_suffix(name: &str) -> &str {
+        match name.rsplit_once('_') {
+            Some((root, _codec)) => root,
+            None => name,
         }
     }
 }
