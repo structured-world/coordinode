@@ -681,12 +681,7 @@ fn collect_node_deletion_mutations(
                         } else {
                             (peer_id, nid)
                         };
-                        let ep_key =
-                            coordinode_core::graph::edge::encode_edgeprop_key(edge_type, src, tgt);
-                        mutations.push(Mutation::Delete {
-                            partition: PartitionId::EdgeProp,
-                            key: ep_key,
-                        });
+                        mutations.push(Mutation::delete_edge_props(edge_type, src, tgt));
                     }
                 }
 

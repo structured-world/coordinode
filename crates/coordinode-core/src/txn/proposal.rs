@@ -145,6 +145,53 @@ pub enum Mutation {
     },
 }
 
+impl Mutation {
+    /// Build a delete mutation for the edge-property body of a
+    /// specific `(edge_type, src, tgt)` triple.
+    ///
+    /// Encapsulates the raw `encode_edgeprop_key` call so callers
+    /// don't have to reach into the byte-level key encoder — keeps
+    /// the encoder-lockdown gate in `coordinode-query` clean. The
+    /// returned variant is the same `Mutation::Delete` shape that
+    /// flows through Raft replication; only the construction site
+    /// changes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coordinode_core::txn::proposal::Mutation;
+    /// use coordinode_core::graph::node::NodeId;
+    ///
+    /// let m = Mutation::delete_edge_props(
+    ///     "FOLLOWS",
+    ///     NodeId::from_raw(1),
+    ///     NodeId::from_raw(2),
+    /// );
+    /// // Mutation is the standard Delete variant; the typed
+    /// // builder just hides the key-encoding step.
+    /// match m {
+    ///     Mutation::Delete { partition, key } => {
+    ///         assert_eq!(
+    ///             partition,
+    ///             coordinode_core::txn::proposal::PartitionId::EdgeProp,
+    ///         );
+    ///         assert!(!key.is_empty());
+    ///     }
+    ///     _ => panic!("expected Delete"),
+    /// }
+    /// ```
+    pub fn delete_edge_props(
+        edge_type: &str,
+        src: crate::graph::node::NodeId,
+        tgt: crate::graph::node::NodeId,
+    ) -> Self {
+        Self::Delete {
+            partition: PartitionId::EdgeProp,
+            key: crate::graph::edge::encode_edgeprop_key(edge_type, src, tgt),
+        }
+    }
+}
+
 /// Partition identifier for serialization.
 ///
 /// Mirrors `coordinode_storage::engine::partition::Partition` but without
