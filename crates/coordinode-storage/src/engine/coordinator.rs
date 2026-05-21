@@ -230,6 +230,15 @@ pub struct OccConflict {
 /// the trait would leak Layer 2 concerns. Concrete impls may surface
 /// those handles for engine-internal use; trait consumers stay on the
 /// typed read/write/scan/seqno/OCC primitives below.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a `MultiModalCoordinator` — Layer 4 stores and Layer 5 executor can't bind to it",
+    label = "expected `&dyn MultiModalCoordinator` or `&LocalMultiModalCoordinator`",
+    note = "CE deployments obtain a coordinator via `StorageEngine::coordinator()` which returns the \
+            single-shard `LocalMultiModalCoordinator`. EE deployments plug `MultiShardCoordinator` \
+            against the same trait. If you're implementing a new coordinator, mirror the surface of \
+            `LocalMultiModalCoordinator` (seqno + read/write/scan/OCC primitives) and review \
+            arch/core/storage-stack.md §Layer 3 before adding methods."
+)]
 pub trait MultiModalCoordinator: Send + Sync {
     /// Allocate the next monotonically-increasing seqno.
     fn next_seqno(&self) -> lsm_tree::SeqNo;
