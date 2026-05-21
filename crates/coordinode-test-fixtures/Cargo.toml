@@ -1,0 +1,17 @@
+[package]
+name = "coordinode-test-fixtures"
+description = "Shared test fixtures for the coordinode workspace — `engine_for_logic()` / `engine_for_disk()` / `engine_for_memory()` over `lsm_tree::fs::StdFs` and `MemFs`. Honours `COORDINODE_TEST_BACKEND=memory|disk` env var for CI matrix. Dev-dependency only; never linked into production binaries."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false  # internal test fixture, not for crates.io
+
+[dependencies]
+coordinode-storage = { workspace = true }
+# Same package name + version as in coordinode-storage to ensure we
+# resolve to the same lsm-tree instance — different versions would
+# create two `Arc<dyn Fs>` types and the `MemFs` we hand to the
+# engine builder would be unusable.
+lsm-tree = { package = "coordinode-lsm-tree", version = "4", default-features = false }
+tempfile = { workspace = true }

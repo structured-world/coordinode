@@ -15,6 +15,7 @@ members = [
     "crates/coordinode-s3",
     "crates/coordinode-embed",
     "crates/coordinode-client",
+    "crates/coordinode-test-fixtures",
     "benches/gold",
     "tests/integration",
 ]
@@ -110,6 +111,7 @@ coordinode-server = { path = "crates/coordinode-server" }
 coordinode-s3 = { path = "crates/coordinode-s3" }
 coordinode-embed = { path = "crates/coordinode-embed" }
 coordinode-client = { path = "crates/coordinode-client" }
+coordinode-test-fixtures = { path = "crates/coordinode-test-fixtures" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
