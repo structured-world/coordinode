@@ -49,19 +49,24 @@ const ALLOWED: &[(&str, usize)] = &[
     // runner.rs current baseline: typed-helper internals call the raw
     // encoders by construction (~15 calls across mvcc_*_node /
     // mvcc_*_edge_props helpers), plus test fixtures in the cfg(test)
-    // module use them to build probe keys (~42 calls including the
-    // edge-prop OCC / decode-error / temporal-key audit tests added
-    // alongside the gate). Total = 57. Lowering this means a
-    // test-fixture migration (R166); raising it means new raw-encoder
-    // usage in production — reject.
-    ("src/executor/runner.rs", 57),
+    // module use them to build probe keys (~33 calls — the OCC-scope
+    // audit suite legitimately uses raw encoders to assert what key
+    // bytes the scope tracks, and the temporal-key audit tests pin
+    // 25-byte vs non-temporal key behaviour). Total = 48.
+    // Lowering this further requires migrating OCC-scope audit tests
+    // to assert via typed `OccScope::contains_typed(NodeId)` hooks
+    // (would need a modality-layer addition). Raising it = new raw-
+    // encoder usage in production code; reject.
+    ("src/executor/runner.rs", 48),
     // ops.rs — fully routed through LocalIndexStore after slice 12.
     ("src/index/ops.rs", 0),
-    // build.rs (R165 slice 2): 1 residual usage in the cfg(test)
-    // fixture for seeding probe nodes; production path migrated.
-    ("src/index/build.rs", 1),
-    // ttl.rs (R165 slice 1): 3 residual usages in cfg(test) fixtures.
-    ("src/index/ttl.rs", 3),
+    // build.rs (R166): cfg(test) `insert_node` helper now routes
+    // through LocalNodeStore. 0 raw encoder usages.
+    ("src/index/build.rs", 0),
+    // ttl.rs (R166): cfg(test) `insert_node_with_timestamp` helper
+    // + verify-deleted assertions now route through LocalNodeStore.
+    // 0 raw encoder usages.
+    ("src/index/ttl.rs", 0),
     // ttl_reaper.rs: 9 residual usages — production discover_ttl_targets
     // uses schema:label: prefix encoder (legitimate non-node encoder),
     // and cfg(test) fixtures use raw node-key encoders for probe data.

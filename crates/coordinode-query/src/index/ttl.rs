@@ -158,7 +158,6 @@ pub fn reap_all_ttl_indexes(
 mod tests {
     use super::*;
     use coordinode_core::graph::intern::FieldInterner;
-    use coordinode_core::graph::node::encode_node_key;
     use coordinode_storage::engine::config::{
         Durability, EndpointConfig, Media, StorageConfig, Tier,
     };
@@ -182,13 +181,13 @@ mod tests {
         timestamp_us: i64,
         interner: &mut FieldInterner,
     ) {
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
         let mut record = NodeRecord::new(label);
         let ts_field = interner.intern("created_at");
         record.set(ts_field, Value::Timestamp(timestamp_us));
-
-        let key = encode_node_key(shard_id, NodeId::from_raw(node_id));
-        let bytes = record.to_msgpack().expect("serialize");
-        engine.put(Partition::Node, &key, &bytes).expect("put");
+        LocalNodeStore::new(engine)
+            .put(shard_id, NodeId::from_raw(node_id), &record)
+            .expect("put");
     }
 
     fn create_ttl_index_entry(
@@ -231,12 +230,12 @@ mod tests {
         assert_eq!(result.deleted, 1); // Only node 1 expired
 
         // Verify node 1 was deleted
-        let key1 = encode_node_key(1, NodeId::from_raw(1));
-        assert!(engine.get(Partition::Node, &key1).expect("get").is_none());
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        let nodes = LocalNodeStore::new(&engine);
+        assert!(nodes.get(1, NodeId::from_raw(1)).expect("get").is_none());
 
         // Verify node 2 still exists
-        let key2 = encode_node_key(1, NodeId::from_raw(2));
-        assert!(engine.get(Partition::Node, &key2).expect("get").is_some());
+        assert!(nodes.get(1, NodeId::from_raw(2)).expect("get").is_some());
     }
 
     #[test]

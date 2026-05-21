@@ -221,11 +221,10 @@ pub fn build_index(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use coordinode_core::graph::node::{encode_node_key, NodeRecord};
+    use coordinode_core::graph::node::NodeRecord;
     use coordinode_storage::engine::config::{
         Durability, EndpointConfig, Media, StorageConfig, Tier,
     };
-    use coordinode_storage::engine::partition::Partition;
 
     fn test_engine(dir: &std::path::Path) -> StorageEngine {
         let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -246,14 +245,15 @@ mod tests {
         props: &[(&str, Value)],
         interner: &mut FieldInterner,
     ) {
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
         let mut record = NodeRecord::new(label);
         for (name, value) in props {
             let field_id = interner.intern(name);
             record.set(field_id, value.clone());
         }
-        let key = encode_node_key(shard_id, NodeId::from_raw(node_id));
-        let bytes = record.to_msgpack().expect("serialize");
-        engine.put(Partition::Node, &key, &bytes).expect("put");
+        LocalNodeStore::new(engine)
+            .put(shard_id, NodeId::from_raw(node_id), &record)
+            .expect("put");
     }
 
     #[test]
