@@ -22,6 +22,7 @@ use coordinode_core::schema::definition::{
 use coordinode_storage::engine::batch::WriteBatch;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::Guard;
 
 use crate::error::{StoreError, StoreResult};
 
@@ -111,6 +112,40 @@ pub trait SchemaStore {
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
     fn save_edge_type(&self, schema: &EdgeTypeSchema) -> StoreResult<()>;
+
+    /// List every declared label schema at its current revision.
+    /// Returns one [`LabelSchema`] per active label, in arbitrary
+    /// order (callers must sort if they need determinism). Labels
+    /// whose pointer references a missing body are skipped with a
+    /// `tracing::warn!` rather than aborting the whole listing.
+    ///
+    /// Used by background catalog work (TTL reaper, schema cache
+    /// build-up, observability endpoints) that need to enumerate
+    /// every label without knowing the names up front. Unlocks
+    /// migration of `coordinode-query::ttl_reaper::discover_ttl_targets`
+    /// off raw `schema:label:` prefix scans.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalSchemaStore, SchemaStore};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalSchemaStore::new(&engine);
+    /// for schema in store.list_labels()? {
+    ///     println!("label {}", schema.name);
+    /// }
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
+    fn list_labels(&self) -> StoreResult<Vec<LabelSchema>>;
+
+    /// List every declared edge type schema at its current revision.
+    /// Symmetric to [`Self::list_labels`]. Returns one
+    /// [`EdgeTypeSchema`] per active edge type, in arbitrary order.
+    fn list_edge_types(&self) -> StoreResult<Vec<EdgeTypeSchema>>;
 }
 
 /// CE single-shard implementation of [`SchemaStore`]. Operates
@@ -243,6 +278,64 @@ impl SchemaStore for LocalSchemaStore<'_> {
         batch.commit()?;
         Ok(())
     }
+
+    fn list_labels(&self) -> StoreResult<Vec<LabelSchema>> {
+        // Enumerate via the current-revision pointer prefix —
+        // pointers point at the active revision body, so this
+        // surfaces exactly one schema per declared label (vs the
+        // bare `schema:label:` prefix which yields one row per
+        // historical revision).
+        const POINTER_PREFIX: &[u8] = b"schema:current_revision:label:";
+        let iter = self.engine.prefix_scan(Partition::Schema, POINTER_PREFIX)?;
+        let mut out = Vec::new();
+        for guard in iter {
+            let (key, _) = guard.into_inner()?;
+            let Some(name) = std::str::from_utf8(&key[POINTER_PREFIX.len()..]).ok() else {
+                tracing::warn!(
+                    "SchemaStore::list_labels: skipping non-UTF8 label name in pointer key",
+                );
+                continue;
+            };
+            // `load_label` does the pointer-resolve + body decode in
+            // one shot. Errors propagate (a corrupt body is a real
+            // failure); a missing body would have been an Err inside
+            // load_label too.
+            match self.load_label(name) {
+                Ok(Some(schema)) => out.push(schema),
+                Ok(None) => {
+                    // Pointer existed but resolved to None — race
+                    // against a concurrent DROP LABEL. Skip silently.
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+
+    fn list_edge_types(&self) -> StoreResult<Vec<EdgeTypeSchema>> {
+        const POINTER_PREFIX: &[u8] = b"schema:current_revision:edge_type:";
+        let iter = self.engine.prefix_scan(Partition::Schema, POINTER_PREFIX)?;
+        let mut out = Vec::new();
+        for guard in iter {
+            let (key, _) = guard.into_inner()?;
+            let Some(name) = std::str::from_utf8(&key[POINTER_PREFIX.len()..]).ok() else {
+                tracing::warn!(
+                    "SchemaStore::list_edge_types: skipping non-UTF8 edge type name in pointer key",
+                );
+                continue;
+            };
+            match self.load_edge_type(name) {
+                Ok(Some(schema)) => out.push(schema),
+                Ok(None) => {
+                    // Either a pre-DDL idempotent existence marker
+                    // (zero-length body — `load_edge_type` returns
+                    // `None`) or a concurrent DROP. Skip.
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +365,10 @@ mod tests {
         let mut schema = LabelSchema::new("User", PlacementPolicy::NodeId);
         schema.add_property(PropertyDef::new("email", PropertyType::String).not_null());
         schema
+    }
+
+    fn sample_edge_type() -> EdgeTypeSchema {
+        EdgeTypeSchema::new("KNOWS")
     }
 
     #[test]
@@ -435,5 +532,103 @@ mod tests {
             store.load_edge_type("LEGACY").expect("ok").is_none(),
             "legacy zero-length marker must decode as None",
         );
+    }
+
+    // ── list_labels / list_edge_types ─────────────────────────────
+
+    #[test]
+    fn list_labels_returns_every_declared_label_at_current_revision() {
+        let (_dir, engine) = open_engine();
+        let store = LocalSchemaStore::new(&engine);
+        let mut a = sample_label();
+        a.name = "User".into();
+        a.schema_revision = 1;
+        let mut b = sample_label();
+        b.name = "Order".into();
+        b.schema_revision = 1;
+        let mut c = sample_label();
+        c.name = "User".into();
+        c.schema_revision = 2;
+        store.save_label(&a).expect("save User rev 1");
+        store.save_label(&b).expect("save Order rev 1");
+        store.save_label(&c).expect("save User rev 2");
+
+        let mut listed = store.list_labels().expect("list");
+        listed.sort_by(|l, r| l.name.cmp(&r.name));
+        assert_eq!(listed.len(), 2, "one schema per declared label");
+        assert_eq!(listed[0].name, "Order");
+        assert_eq!(listed[0].schema_revision, 1);
+        assert_eq!(listed[1].name, "User");
+        assert_eq!(listed[1].schema_revision, 2, "current rev for User");
+    }
+
+    #[test]
+    fn list_labels_empty_when_no_schemas_declared() {
+        let (_dir, engine) = open_engine();
+        let store = LocalSchemaStore::new(&engine);
+        let listed = store.list_labels().expect("list");
+        assert!(listed.is_empty());
+    }
+
+    #[test]
+    fn list_edge_types_returns_every_declared_edge_type_at_current_revision() {
+        let (_dir, engine) = open_engine();
+        let store = LocalSchemaStore::new(&engine);
+        let mut knows_v1 = sample_edge_type();
+        knows_v1.name = "KNOWS".into();
+        knows_v1.schema_revision = 1;
+        let mut owns = sample_edge_type();
+        owns.name = "OWNS".into();
+        owns.schema_revision = 1;
+        let mut knows_v2 = sample_edge_type();
+        knows_v2.name = "KNOWS".into();
+        knows_v2.schema_revision = 2;
+        store.save_edge_type(&knows_v1).expect("save KNOWS rev 1");
+        store.save_edge_type(&owns).expect("save OWNS rev 1");
+        store.save_edge_type(&knows_v2).expect("save KNOWS rev 2");
+
+        let mut listed = store.list_edge_types().expect("list");
+        listed.sort_by(|l, r| l.name.cmp(&r.name));
+        assert_eq!(listed.len(), 2, "one schema per declared edge type");
+        assert_eq!(listed[0].name, "KNOWS");
+        assert_eq!(listed[0].schema_revision, 2, "current rev for KNOWS");
+        assert_eq!(listed[1].name, "OWNS");
+    }
+
+    #[test]
+    fn list_edge_types_skips_legacy_zero_length_markers() {
+        // Pre-DDL idempotent existence markers shouldn't surface in
+        // the listing — `load_edge_type` returns None for them, so
+        // `list_edge_types` filters them out.
+        let (_dir, engine) = open_engine();
+        let store = LocalSchemaStore::new(&engine);
+        // Real schema for KNOWS.
+        let mut real = sample_edge_type();
+        real.name = "KNOWS".into();
+        real.schema_revision = 1;
+        store.save_edge_type(&real).expect("save");
+        // Legacy marker for LEGACY edge type — bare pointer + empty body.
+        engine
+            .put(
+                Partition::Schema,
+                &encode_edge_type_current_revision_key("LEGACY"),
+                &1u64.to_be_bytes(),
+            )
+            .expect("legacy pointer");
+        engine
+            .put(
+                Partition::Schema,
+                &encode_edge_type_schema_key("LEGACY", 1),
+                b"",
+            )
+            .expect("legacy empty body");
+
+        let listed = store.list_edge_types().expect("list");
+        assert_eq!(
+            listed.len(),
+            1,
+            "legacy marker must be skipped, only KNOWS surfaces",
+        );
+        assert_eq!(listed[0].name, "KNOWS");
     }
 }

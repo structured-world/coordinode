@@ -19,7 +19,9 @@ use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_revers
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
 use coordinode_core::schema::computed::{ComputedSpec, TtlScope};
-use coordinode_core::schema::definition::{LabelSchema, PropertyType};
+#[cfg(test)]
+use coordinode_core::schema::definition::LabelSchema;
+use coordinode_core::schema::definition::PropertyType;
 use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
@@ -198,45 +200,23 @@ fn reap_computed_ttl_inner(
 /// Scan label schemas and find all COMPUTED TTL properties.
 /// When `interner` is provided, resolves anchor field names to field IDs
 /// for correct multi-Timestamp resolution.
+///
+/// Uses the typed [`SchemaStore::list_labels`] API — surfaces every
+/// declared label at its **current** revision (the prior raw-prefix
+/// scan also visited historical revisions, which was wasteful and
+/// could mis-report TTLs from superseded schemas).
 fn discover_ttl_targets(
     engine: &StorageEngine,
     interner: Option<&coordinode_core::graph::intern::FieldInterner>,
 ) -> Result<Vec<TtlTarget>, String> {
-    let prefix = b"schema:label:";
-    let iter = engine
-        .prefix_scan(Partition::Schema, prefix)
+    use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+    let schemas = LocalSchemaStore::new(engine)
+        .list_labels()
         .map_err(|e| e.to_string())?;
 
     let mut targets = Vec::new();
-
-    for guard in iter {
-        let (key, value) = match guard.into_inner() {
-            Ok(kv) => kv,
-            Err(e) => {
-                tracing::warn!("ttl_reaper: failed to read schema entry: {e}");
-                continue;
-            }
-        };
-
-        // Versioned schema keys are `schema:label:<name>:<version>`. Strip
-        // the trailing `:<version>` suffix to recover the label name. Labels
-        // cannot contain ':' (DDL grammar restricts identifiers).
-        let label_name = match std::str::from_utf8(&key[prefix.len()..]) {
-            Ok(s) => match s.rsplit_once(':') {
-                Some((name, _version)) => name.to_string(),
-                None => continue,
-            },
-            Err(_) => continue,
-        };
-
-        let schema: LabelSchema = match LabelSchema::from_msgpack(&value) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("ttl_reaper: failed to parse schema for {label_name}: {e}");
-                continue;
-            }
-        };
-
+    for schema in schemas {
+        let label_name = schema.name.clone();
         for (prop_name, prop_def) in &schema.properties {
             if let PropertyType::Computed(ComputedSpec::Ttl {
                 duration_secs,
@@ -948,13 +928,13 @@ mod tests {
     }
 
     fn persist_schema(engine: &StorageEngine, schema: &LabelSchema) {
-        let key = coordinode_core::schema::definition::encode_label_schema_key(
-            &schema.name,
-            schema.schema_revision,
-        );
-        let bytes = schema.to_msgpack().expect("serialize schema");
-        engine
-            .put(Partition::Schema, &key, &bytes)
+        // Use the typed LocalSchemaStore so both the body and the
+        // current-revision pointer are written atomically — matches
+        // what `discover_ttl_targets` (via SchemaStore::list_labels)
+        // reads back through the pointer indirection.
+        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        LocalSchemaStore::new(engine)
+            .save_label(schema)
             .expect("persist schema");
     }
 
