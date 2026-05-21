@@ -290,6 +290,7 @@ fn bench_timeseries_bucket(c: &mut Criterion) {
             fields.insert("v".into(), i as f64);
             measurements.push(Measurement {
                 timestamp_us: i as i64 * 1000,
+                ingestion_ts_us: None,
                 fields,
             });
         }

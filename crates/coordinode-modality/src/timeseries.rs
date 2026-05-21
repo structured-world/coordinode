@@ -143,11 +143,46 @@ impl BucketControl {
 }
 
 /// Single time-series measurement: one event-time + N named float
-/// fields.
+/// fields, with an optional **engine-assigned** ingestion-time
+/// stamp (the second axis of the bitemporal model from ADR-027).
+///
+/// ## Bitemporal axes
+///
+/// CoordiNode time-series carries two distinct timestamps:
+///
+/// 1. **Event-time** ([`Self::timestamp_us`]) — when the measured
+///    event actually happened. User-supplied, may be out-of-order
+///    on arrival.
+/// 2. **Ingestion-time** ([`Self::ingestion_ts_us`]) —
+///    engine-assigned when the catalog accepted the measurement.
+///    Strictly monotonic per shard (sourced from the catalog's
+///    `IngestionClock`). Never user-supplied, never user-mutable,
+///    reserved field name `__ingestion_ts__` in OpenCypher.
+///
+/// `ingestion_ts_us` is `Option<i64>` purely for backward
+/// compatibility: buckets serialized before the bitemporal axis
+/// landed decode as `None` and remain readable; freshly-written
+/// measurements via the catalog always carry `Some`.
+///
+/// ## Why both
+///
+/// Event-time answers "what happened?". Ingestion-time answers
+/// "when did the database learn about it?". The bitemporal join —
+/// `AS OF INGESTION_TIME $t` — filters by `ingestion_ts_us ≤ $t`,
+/// excluding backfills and corrections that arrived after `$t`.
+/// Canonical use case: month-end-close replay ("what did we know
+/// about events at event-time E, as of ingestion-time
+/// T = month-end?").
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Measurement {
     /// Event-time in microseconds since epoch.
     pub timestamp_us: i64,
+    /// Engine-assigned ingestion-time in microseconds since epoch.
+    /// `None` on legacy measurements (pre-bitemporal buckets);
+    /// `Some` on every catalog-stamped write. Strictly monotonic
+    /// per shard.
+    #[serde(default)]
+    pub ingestion_ts_us: Option<i64>,
     /// Named float fields. Schema-on-write per bucket: a new field
     /// here would normally trigger bucket rollover at the catalog
     /// layer.
@@ -156,18 +191,40 @@ pub struct Measurement {
 
 /// A complete bucket: control block + meta value + columnar storage.
 ///
-/// Columns are kept aligned by index — `timestamps[i]` and every
+/// Columns are kept aligned by index — `timestamps[i]`,
+/// `ingestion_timestamps[i]` (when present), and every
 /// `fields[name][i]` describe the same measurement. The columnar
 /// layout is what enables predicate push-down to a single column.
+///
+/// ## Bitemporal `ingestion_timestamps` column
+///
+/// Carries the engine-assigned ingestion-time stamp per measurement,
+/// in parallel with the user-supplied event-time `timestamps`. The
+/// column is `Vec<i64>` (not `Vec<Option<i64>>`) for cache density —
+/// a sentinel of `i64::MIN` would have to encode "unset" if we ever
+/// needed it, but `from_measurements` populates this column for
+/// every measurement at write time.
+///
+/// **Backward compatibility.** Buckets serialized before the
+/// bitemporal axis landed (slice B/C of G103) have no
+/// `ingestion_timestamps` field on the wire. `#[serde(default)]`
+/// gives them an empty `Vec` on decode; reads check `is_empty()` to
+/// fall back to the "pre-bitemporal" path that surfaces `None` for
+/// ingestion-ts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bucket {
     /// Header — see [`BucketControl`].
     pub control: BucketControl,
     /// Meta-field value shared by every measurement in the bucket.
     pub meta: rmpv::Value,
-    /// Timestamps column (microseconds), aligned with every field
+    /// Event-time column (microseconds), aligned with every field
     /// column.
     pub timestamps: Vec<i64>,
+    /// Ingestion-time column (microseconds since epoch), aligned
+    /// with `timestamps`. Empty on legacy buckets; populated by
+    /// freshly-written buckets via the catalog's `IngestionClock`.
+    #[serde(default)]
+    pub ingestion_timestamps: Vec<i64>,
     /// Per-field columns, all of length `control.count`.
     pub fields: BTreeMap<String, Vec<f64>>,
 }
@@ -176,6 +233,13 @@ impl Bucket {
     /// Build a v1 bucket from a measurement vector. Measurements are
     /// stored in arrival order — sorting is the closure-time job and
     /// belongs to the catalog/compactor.
+    ///
+    /// The `ingestion_timestamps` column is populated when every
+    /// measurement carries `Some(ingestion_ts_us)`. If any
+    /// measurement has `None` the column is left empty (legacy
+    /// bucket shape) — this guards against a half-stamped bucket
+    /// where some rows have ingestion-ts and others don't, which
+    /// would silently misalign reads.
     ///
     /// # Examples
     ///
@@ -187,17 +251,24 @@ impl Bucket {
     /// fields.insert("temp".into(), 22.5);
     /// let bucket = Bucket::from_measurements(
     ///     rmpv::Value::String("sensor-1".into()),
-    ///     vec![Measurement { timestamp_us: 100, fields }],
+    ///     vec![Measurement { timestamp_us: 100, ingestion_ts_us: Some(200), fields }],
     /// );
     /// assert_eq!(bucket.control.count, 1);
     /// assert_eq!(bucket.control.time_min_us, 100);
+    /// assert_eq!(bucket.ingestion_timestamps, vec![200]);
     /// ```
     pub fn from_measurements(meta: rmpv::Value, measurements: Vec<Measurement>) -> Self {
         let control = BucketControl::from_measurements(&measurements);
         let mut timestamps = Vec::with_capacity(measurements.len());
+        let mut ingestion_timestamps = Vec::with_capacity(measurements.len());
+        let mut all_have_ingestion_ts = true;
         let mut fields: BTreeMap<String, Vec<f64>> = BTreeMap::new();
         for m in measurements {
             timestamps.push(m.timestamp_us);
+            match m.ingestion_ts_us {
+                Some(its) => ingestion_timestamps.push(its),
+                None => all_have_ingestion_ts = false,
+            }
             for (name, value) in m.fields {
                 fields
                     .entry(name)
@@ -205,18 +276,26 @@ impl Bucket {
                     .push(value);
             }
         }
+        // Half-stamped bucket — clear the column rather than ship a
+        // mismatched-length one that would silently misalign reads.
+        if !all_have_ingestion_ts {
+            ingestion_timestamps.clear();
+        }
         Self {
             control,
             meta,
             timestamps,
+            ingestion_timestamps,
             fields,
         }
     }
 
     /// Iterate measurements in storage order. Reconstructs each row
-    /// from the columnar layout — useful for tests and for the merge
-    /// step when overflow is folded into a base bucket.
+    /// from the columnar layout. Yields the bitemporal
+    /// `ingestion_ts_us` when present; `None` on legacy
+    /// (pre-bitemporal) buckets where the column is empty.
     pub fn measurements(&self) -> impl Iterator<Item = Measurement> + '_ {
+        let have_ingestion = !self.ingestion_timestamps.is_empty();
         (0..self.control.count as usize).map(move |i| {
             let mut fields = BTreeMap::new();
             for (name, col) in &self.fields {
@@ -226,6 +305,11 @@ impl Bucket {
             }
             Measurement {
                 timestamp_us: self.timestamps[i],
+                ingestion_ts_us: if have_ingestion {
+                    self.ingestion_timestamps.get(i).copied()
+                } else {
+                    None
+                },
                 fields,
             }
         })
@@ -270,7 +354,7 @@ pub trait TimeSeriesStore {
     /// # let store = LocalTimeSeriesStore::new(&engine);
     /// let bucket = Bucket::from_measurements(
     ///     rmpv::Value::String("s1".into()),
-    ///     vec![Measurement { timestamp_us: 0, fields: BTreeMap::new() }],
+    ///     vec![Measurement { timestamp_us: 0, ingestion_ts_us: None, fields: BTreeMap::new() }],
     /// );
     /// store.put_bucket(0, NodeId::from_raw(1), &bucket)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -383,7 +467,7 @@ pub trait TimeSeriesStore {
     /// # let store = LocalTimeSeriesStore::new(&engine);
     /// let entry = OverflowEntry {
     ///     arrival_seqno: 1,
-    ///     measurement: Measurement { timestamp_us: 100, fields: BTreeMap::new() },
+    ///     measurement: Measurement { timestamp_us: 100, ingestion_ts_us: None, fields: BTreeMap::new() },
     /// };
     /// store.put_overflow(7, NodeId::from_raw(1), &entry)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -504,7 +588,7 @@ impl<'a> LocalTimeSeriesStore<'a> {
     /// fields.insert("temp".into(), 22.5);
     /// let bucket = Bucket::from_measurements(
     ///     rmpv::Value::String("sensor-1".into()),
-    ///     vec![Measurement { timestamp_us: 100, fields }],
+    ///     vec![Measurement { timestamp_us: 100, ingestion_ts_us: None, fields }],
     /// );
     /// store.put_bucket(0, NodeId::from_raw(42), &bucket)?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -721,6 +805,7 @@ mod tests {
         fields.insert("temperature".to_owned(), temp);
         Measurement {
             timestamp_us: ts,
+            ingestion_ts_us: None,
             fields,
         }
     }
@@ -769,10 +854,12 @@ mod tests {
             vec![
                 Measurement {
                     timestamp_us: 100,
+                    ingestion_ts_us: None,
                     fields: fields_a,
                 },
                 Measurement {
                     timestamp_us: 200,
+                    ingestion_ts_us: None,
                     fields: fields_b,
                 },
             ],
@@ -1030,6 +1117,7 @@ mod tests {
 
         let m = |ts: i64| Measurement {
             timestamp_us: ts,
+            ingestion_ts_us: None,
             fields: BTreeMap::new(),
         };
 

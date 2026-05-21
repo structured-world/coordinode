@@ -18,3 +18,11 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[features]
+default = []
+# Exposes `ScriptedClock` outside of `cfg(test)` so downstream
+# integration tests (e.g. cross-crate AS OF INGESTION_TIME tests in
+# coordinode-query) can pin the bitemporal-axis clock to a known
+# sequence. Production binaries never enable this.
+test-clock = []
