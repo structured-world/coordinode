@@ -7,6 +7,7 @@ members = [
     "crates/coordinode-search",
     "crates/coordinode-storage",
     "crates/coordinode-modality",
+    "crates/coordinode-timeseries",
     "crates/coordinode-cluster",
     "crates/coordinode-raft",
     "crates/coordinode-auth",
@@ -100,6 +101,7 @@ coordinode-vector = { path = "crates/coordinode-vector" }
 coordinode-search = { path = "crates/coordinode-search" }
 coordinode-storage = { path = "crates/coordinode-storage" }
 coordinode-modality = { path = "crates/coordinode-modality" }
+coordinode-timeseries = { path = "crates/coordinode-timeseries" }
 coordinode-cluster = { path = "crates/coordinode-cluster" }
 coordinode-raft = { path = "crates/coordinode-raft" }
 coordinode-auth = { path = "crates/coordinode-auth" }
