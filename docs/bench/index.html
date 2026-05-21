@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>CoordiNode benchmark dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://cdn.jsdelivr.net/npm/vega@5.30.0"></script>
+  <script src="https://cdn.jsdelivr.net/npm/vega-lite@5.20.1"></script>
+  <script src="https://cdn.jsdelivr.net/npm/vega-embed@6.26.0"></script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>CoordiNode — benchmarks</h1>
+    <p class="subtitle">
+      Live results from
+      <a href="https://github.com/structured-world/coordinode/blob/main/bench-results"
+         >main/bench-results/</a> — automatic
+      on every push to <code>main</code>, with manual competitor
+      baselines committed separately.
+      Methodology in
+      <a href="https://github.com/structured-world/coordinode/blob/main/arch/benchmarks/methodology.md"
+         >arch/benchmarks/methodology.md</a>.
+    </p>
+  </header>
+
+  <main>
+
+    <section>
+      <h2>Vector — ANN benchmarks (SIFT1M / 128-dim / L2)</h2>
+
+      <p class="desc">
+        Recall@10 vs QPS Pareto frontier. Higher and to the right
+        is better. CoordiNode HNSW (<code>coordinode-vector</code>)
+        compared against
+        <a href="https://github.com/nmslib/hnswlib">hnswlib</a>
+        (specialist anchor) and multi-model competitors. ef_search
+        sweep ∈ {16, 32, 64, 128, 256, 512}; 10 replay rounds per
+        point; single-thread search.
+      </p>
+
+      <div id="vega-sift1m-pareto" class="vega-frame"></div>
+
+      <h3>Recall@10 at peak — over time</h3>
+      <p class="desc">
+        Dynamics across CoordiNode commits. One series per subject
+        (<code>coordinode</code>, competitor names). Each dot is a
+        bench run paired with the commit SHA shown on hover.
+        Competitor lines update only when the human runs an
+        off-cycle re-baseline (see
+        <a href="https://github.com/structured-world/coordinode/blob/main/benches/vector-ann/README.md">benches/vector-ann/README.md</a>).
+      </p>
+      <div id="vega-sift1m-timeline" class="vega-frame"></div>
+
+      <h3>QPS @ recall ≥ 0.95 — latest</h3>
+      <p class="desc">
+        Headline cell — single number per subject at the
+        last-committed SHA. The taller the bar, the more queries
+        per second the engine handles while still retrieving
+        ≥ 95% of the true top-10 neighbours.
+      </p>
+      <div id="vega-sift1m-bar" class="vega-frame"></div>
+    </section>
+
+    <section>
+      <h2>Other modalities</h2>
+      <p class="desc">
+        Graph (LDBC SNB), spatial (PostGIS-shape), time-series
+        (TSBS), full-text (Search Benchmark Game), document
+        (YCSB A/C) — coming as the per-modality bench binaries
+        land. The bench harness
+        (<code>crates/coordinode-bench</code>) is modality-agnostic;
+        adding a new section here is a matter of pointing the chart
+        loader at <code>bench-results/&lt;modality&gt;/</code>.
+      </p>
+    </section>
+
+  </main>
+
+  <footer>
+    <p>
+      Source:
+      <a href="https://github.com/structured-world/coordinode">github.com/structured-world/coordinode</a>
+      ·
+      Built from <code>docs/bench/</code> + <code>bench-results/</code>
+      on every push to main.
+    </p>
+  </footer>
+
+  <script src="charts.js"></script>
+</body>
+</html>
