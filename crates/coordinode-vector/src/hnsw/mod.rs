@@ -27,7 +27,11 @@
 //! - No cross-node HNSW graph sharing needed — data replicated via Raft,
 //!   HNSW built locally on each node.
 
+mod neighbours;
 mod visited;
+
+#[allow(unused_imports)] // Wired into HnswIndex in the next C1 step.
+pub(crate) use neighbours::AtomicNeighbourList;
 
 use std::collections::BinaryHeap;
 

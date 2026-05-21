@@ -1199,6 +1199,7 @@ dependencies = [
  "coordinode-core",
  "coordinode-storage",
  "criterion",
+ "crossbeam-epoch",
  "rmp-serde",
  "serde",
  "tempfile",

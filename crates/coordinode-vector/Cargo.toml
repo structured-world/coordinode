@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 coordinode-core = { workspace = true }
 coordinode-storage = { workspace = true }
+crossbeam-epoch = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
