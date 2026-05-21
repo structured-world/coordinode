@@ -260,6 +260,18 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
     /// open-bucket map. Late-arrival absorption then proceeds as
     /// usual.
     ///
+    /// **Event-time-only ingest** — no `__ingestion_ts__` stamping.
+    /// Use this for labels declared as plain
+    /// `CREATE LABEL X TIMESERIES` (the 95% IoT / monitoring /
+    /// observability workload). Any caller-supplied
+    /// `ingestion_ts_us` is overwritten to `None` so the engine-
+    /// assigned-only invariant holds.
+    ///
+    /// Storage payoff: `Bucket::from_measurements` sees an all-None
+    /// vec, clears the `ingestion_timestamps` column, and the
+    /// per-measurement +8B overhead drops to ~1B msgpack tag per
+    /// bucket. Per ADR-027 + ε-policy this is the default.
+    ///
     /// Returns `Ok(())` on append (most paths); errors propagate
     /// from the downstream store.
     pub fn write_measurement(
@@ -269,6 +281,25 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
         measurement: Measurement,
     ) -> CatalogResult<()> {
         self.write_measurement_at(label_id, meta, measurement, SystemTime::now())
+    }
+
+    /// **Bitemporal ingest** — engine stamps `__ingestion_ts__` via
+    /// the catalog's clock. Use this for labels declared as
+    /// `CREATE LABEL X TIMESERIES WITH BITEMPORAL` (compliance,
+    /// financial replay, ML reproducibility). Per ADR-027 the stamp
+    /// is engine-assigned, never user-supplied — any caller value
+    /// is overwritten.
+    ///
+    /// Resolves to the same write path as
+    /// [`Self::write_measurement`] after stamping; the only
+    /// difference is the populated `ingestion_ts_us`.
+    pub fn write_measurement_bitemporal(
+        &self,
+        label_id: u16,
+        meta: rmpv::Value,
+        measurement: Measurement,
+    ) -> CatalogResult<()> {
+        self.write_measurement_bitemporal_at(label_id, meta, measurement, SystemTime::now())
     }
 
     /// Variant of [`Self::write_measurement`] that accepts an
@@ -282,14 +313,44 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
         mut measurement: Measurement,
         now: SystemTime,
     ) -> CatalogResult<()> {
-        // Stamp the bitemporal ingestion-time axis. The clock is
-        // engine-assigned, never user-supplied — even if the caller
-        // pre-set `ingestion_ts_us`, we OVERWRITE here. The reserved-
-        // field-name property of `__ingestion_ts__` lives at the
-        // OpenCypher writer layer; this is the canonical assignment
-        // point for the wire format.
+        // Event-time-only: ensure NO ingestion stamp leaks through.
+        // The engine-assigned-only invariant means even a
+        // caller-supplied value is wiped.
+        measurement.ingestion_ts_us = None;
+
+        self.write_measurement_inner(label_id, meta, measurement, now)
+    }
+
+    /// Bitemporal variant — stamps `ingestion_ts_us` via the clock
+    /// before routing through the shared inner path. See
+    /// [`Self::write_measurement_bitemporal`] for the semantic
+    /// contract.
+    pub fn write_measurement_bitemporal_at(
+        &self,
+        label_id: u16,
+        meta: rmpv::Value,
+        mut measurement: Measurement,
+        now: SystemTime,
+    ) -> CatalogResult<()> {
+        // Engine-assigned stamp — overwrites caller value per
+        // ADR-027 "never user-supplied".
         measurement.ingestion_ts_us = Some(self.clock.next());
 
+        self.write_measurement_inner(label_id, meta, measurement, now)
+    }
+
+    /// Shared routing logic — stripe lock acquisition, Tier 1/2/3
+    /// decision tree, buffer append. Identical between event-time
+    /// and bitemporal paths; the only difference (presence of
+    /// `ingestion_ts_us`) is decided by the public entry point
+    /// that called us.
+    fn write_measurement_inner(
+        &self,
+        label_id: u16,
+        meta: rmpv::Value,
+        measurement: Measurement,
+        now: SystemTime,
+    ) -> CatalogResult<()> {
         let key = BucketKey::from_meta(label_id, &meta);
         let stripe_idx = key.stripe_idx();
         // Poisoned-lock recovery: a poisoned write lock means a
@@ -1519,13 +1580,13 @@ mod tests {
         let meta = rmpv::Value::String("sensor-1".into());
 
         catalog
-            .write_measurement(7, meta.clone(), measurement(100, &[("temp", 20.0)]))
+            .write_measurement_bitemporal(7, meta.clone(), measurement(100, &[("temp", 20.0)]))
             .unwrap();
         catalog
-            .write_measurement(7, meta.clone(), measurement(200, &[("temp", 21.0)]))
+            .write_measurement_bitemporal(7, meta.clone(), measurement(200, &[("temp", 21.0)]))
             .unwrap();
         catalog
-            .write_measurement(7, meta.clone(), measurement(300, &[("temp", 22.0)]))
+            .write_measurement_bitemporal(7, meta.clone(), measurement(300, &[("temp", 22.0)]))
             .unwrap();
         catalog.flush_all().unwrap();
 
@@ -1564,11 +1625,12 @@ mod tests {
         let catalog = BucketCatalog::new(cfg, 0, &store, 1, clock).unwrap();
         let meta = rmpv::Value::String("sensor".into());
 
-        // Caller tries to claim ingestion_ts = 1 (far past).
+        // Caller tries to claim ingestion_ts = 1 (far past) on a
+        // bitemporal label — engine must overwrite via clock.
         let mut malicious_m = measurement(100, &[("v", 1.0)]);
         malicious_m.ingestion_ts_us = Some(1);
         catalog
-            .write_measurement(7, meta.clone(), malicious_m)
+            .write_measurement_bitemporal(7, meta.clone(), malicious_m)
             .unwrap();
         catalog.flush_all().unwrap();
 
@@ -1581,6 +1643,92 @@ mod tests {
             bucket.ingestion_timestamps,
             vec![999],
             "engine must overwrite caller-supplied ingestion_ts with clock value",
+        );
+    }
+
+    #[test]
+    fn non_bitemporal_writes_leave_ingestion_column_empty_for_storage_saving() {
+        // ε-policy: `write_measurement` (event-time-only entry point)
+        // produces buckets with an empty `ingestion_timestamps` vec,
+        // even if the caller pre-set `ingestion_ts_us`. This is the
+        // storage payoff — non-bitemporal labels (95% TS workloads)
+        // pay zero per-measurement overhead for the bitemporal axis.
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let cfg = CatalogConfig::arch_defaults();
+        let clock = std::sync::Arc::new(crate::clock::ScriptedClock::new(vec![1, 2, 3]));
+        let catalog = BucketCatalog::new(cfg, 0, &store, 1, clock).unwrap();
+        let meta = rmpv::Value::String("iot-sensor".into());
+
+        // Caller even pre-stamps — engine still wipes (engine-assigned-only).
+        let mut m1 = measurement(100, &[("temp", 22.5)]);
+        m1.ingestion_ts_us = Some(99_999);
+        let m2 = measurement(200, &[("temp", 22.7)]);
+        let m3 = measurement(300, &[("temp", 22.4)]);
+
+        catalog.write_measurement(7, meta.clone(), m1).unwrap();
+        catalog.write_measurement(7, meta.clone(), m2).unwrap();
+        catalog.write_measurement(7, meta.clone(), m3).unwrap();
+        catalog.flush_all().unwrap();
+
+        let bucket = store
+            .get_bucket(0, NodeId::from_raw(1))
+            .unwrap()
+            .expect("bucket persisted");
+        assert_eq!(bucket.timestamps.len(), 3, "event-time column populated");
+        assert!(
+            bucket.ingestion_timestamps.is_empty(),
+            "non-bitemporal label produces empty ingestion column — \
+             storage saving by construction (ε-policy)",
+        );
+        // Iterator yields None for every row — confirms read-path
+        // observes the absence correctly.
+        for m in bucket.measurements() {
+            assert_eq!(
+                m.ingestion_ts_us, None,
+                "non-bitemporal bucket reads back ingestion_ts_us = None",
+            );
+        }
+    }
+
+    #[test]
+    fn non_bitemporal_overflow_path_leaves_stamp_none() {
+        // Tier-3 overflow path under event-time-only mode: caller
+        // pre-stamp wiped, overflow row stored with None.
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let cfg = CatalogConfig {
+            max_count: 2,
+            granularity_span: Duration::from_millis(50),
+            ..CatalogConfig::default()
+        };
+        let clock = std::sync::Arc::new(crate::clock::ScriptedClock::new(vec![1, 2, 3]));
+        let catalog = BucketCatalog::new(cfg, 0, &store, 1, clock).unwrap();
+        let meta = rmpv::Value::String("s".into());
+
+        // Open + flush a bucket via the event-time-only path.
+        for i in 0..2 {
+            catalog
+                .write_measurement(7, meta.clone(), measurement(i * 1000, &[("v", 1.0)]))
+                .unwrap();
+        }
+        catalog.flush_all().unwrap();
+
+        // Late write — routes to Tier-3 overflow when LRU TTL has expired.
+        let far_future = SystemTime::now() + Duration::from_secs(3600);
+        let mut malicious = measurement(500, &[("v", 99.0)]);
+        malicious.ingestion_ts_us = Some(42); // caller tries to stamp
+        catalog
+            .write_measurement_at(7, meta.clone(), malicious, far_future)
+            .unwrap();
+
+        // Tier-3 overflow row must have ingestion_ts_us = None
+        // (engine wiped, even on the overflow path).
+        let entries = store.scan_overflow(7, NodeId::from_raw(1)).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].measurement.ingestion_ts_us, None,
+            "Tier-3 overflow under event-time-only mode must NOT carry an ingestion stamp",
         );
     }
 
@@ -1812,10 +1960,12 @@ mod tests {
         let catalog = BucketCatalog::new(cfg, 0, &store, 1, clock).unwrap();
         let meta = rmpv::Value::String("s".into());
 
-        // Open + flush a bucket so the LRU has a handle.
+        // Open + flush a bucket so the LRU has a handle. Bitemporal
+        // path so the foundation Tier-3 stamp test still exercises
+        // the stamping route.
         for i in 0..2 {
             catalog
-                .write_measurement(7, meta.clone(), measurement(i * 1000, &[("v", 1.0)]))
+                .write_measurement_bitemporal(7, meta.clone(), measurement(i * 1000, &[("v", 1.0)]))
                 .unwrap();
         }
         catalog.flush_all().unwrap();
@@ -1826,7 +1976,7 @@ mod tests {
         // to Tier-3 overflow once the LRU TTL has expired.
         let far_future = SystemTime::now() + Duration::from_secs(3600);
         catalog
-            .write_measurement_at(
+            .write_measurement_bitemporal_at(
                 7,
                 meta.clone(),
                 measurement(500, &[("v", 99.0)]),
