@@ -10,7 +10,6 @@ use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::error::StorageError;
-use coordinode_storage::Guard;
 
 use super::definition::IndexDefinition;
 use super::ops::{create_index_entry, delete_index_entry, save_index_definition};
@@ -74,21 +73,15 @@ impl IndexRegistry {
     /// Load all index definitions from storage.
     ///
     /// Uses interior mutability — safe to call via `&self`.
+    /// Routes through the typed [`super::ops::list_index_definitions`]
+    /// helper so this method doesn't reach into raw `Partition::Schema`
+    /// prefix scans.
     pub fn load_all(&self, engine: &StorageEngine) -> Result<(), StorageError> {
-        // Scan the schema:idx: prefix for all index definitions
-        let iter = engine.prefix_scan(
-            coordinode_storage::engine::partition::Partition::Schema,
-            b"schema:idx:",
-        )?;
-
+        let defs = super::ops::list_index_definitions(engine)?;
         let mut map = self.indexes.write().unwrap_or_else(|e| e.into_inner());
-        for guard in iter {
-            let (_key, value) = guard.into_inner().map_err(StorageError::Engine)?;
-            if let Ok(def) = rmp_serde::from_slice::<IndexDefinition>(&value) {
-                map.insert(def.name.clone(), def);
-            }
+        for def in defs {
+            map.insert(def.name.clone(), def);
         }
-
         Ok(())
     }
 

@@ -247,6 +247,31 @@ pub fn load_index_definition(
     }
 }
 
+/// List every persisted index definition in `schema:idx:` order.
+///
+/// Equivalent to `coordinode_modality::SchemaStore::list_labels`
+/// but for [`IndexDefinition`] — which lives in `coordinode-query`
+/// (above modality), so the helper has to be here. Skips entries
+/// whose body fails to decode rather than aborting the whole list
+/// (a corrupt index def shouldn't take out the registry).
+pub fn list_index_definitions(
+    engine: &StorageEngine,
+) -> Result<Vec<IndexDefinition>, StorageError> {
+    let iter = engine.prefix_scan(Partition::Schema, b"schema:idx:")?;
+    let mut out = Vec::new();
+    for guard in iter {
+        let (_key, value) = guard.into_inner().map_err(StorageError::Engine)?;
+        match rmp_serde::from_slice::<IndexDefinition>(&value) {
+            Ok(def) => out.push(def),
+            Err(e) => {
+                tracing::warn!("list_index_definitions: skipping corrupt index def: {e}",);
+                continue;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Delete index definition and all entries.
 pub fn drop_index(engine: &StorageEngine, index: &IndexDefinition) -> Result<(), StorageError> {
     // Delete definition
@@ -452,6 +477,74 @@ mod tests {
         assert_eq!(loaded.label, "User");
         assert_eq!(loaded.property(), "email");
         assert!(loaded.unique);
+    }
+
+    #[test]
+    fn list_index_definitions_returns_every_persisted_definition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = test_engine(dir.path());
+
+        save_index_definition(
+            &engine,
+            &IndexDefinition::btree("user_email", "User", "email").unique(),
+        )
+        .expect("save email");
+        save_index_definition(&engine, &IndexDefinition::btree("user_age", "User", "age"))
+            .expect("save age");
+        save_index_definition(
+            &engine,
+            &IndexDefinition::compound(
+                "order_total_status",
+                "Order",
+                vec!["total".into(), "status".into()],
+            ),
+        )
+        .expect("save order");
+
+        let mut listed = list_index_definitions(&engine).expect("list");
+        listed.sort_by(|l, r| l.name.cmp(&r.name));
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].name, "order_total_status");
+        assert_eq!(listed[1].name, "user_age");
+        assert_eq!(listed[2].name, "user_email");
+        assert!(listed[2].unique);
+    }
+
+    #[test]
+    fn list_index_definitions_empty_when_no_definitions_persisted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = test_engine(dir.path());
+        let listed = list_index_definitions(&engine).expect("list");
+        assert!(listed.is_empty());
+    }
+
+    #[test]
+    fn list_index_definitions_skips_corrupt_bodies() {
+        // A corrupt `schema:idx:` entry must not abort the listing —
+        // it should be skipped with a tracing warning so a single
+        // bad definition doesn't take down registry rebuild on
+        // engine open.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = test_engine(dir.path());
+
+        save_index_definition(
+            &engine,
+            &IndexDefinition::btree("user_email", "User", "email"),
+        )
+        .expect("save real");
+        // Plant garbage under `schema:idx:garbage` so it's in the
+        // prefix scan results.
+        engine
+            .put(
+                coordinode_storage::engine::partition::Partition::Schema,
+                b"schema:idx:garbage",
+                b"not-msgpack-bytes",
+            )
+            .expect("plant garbage");
+
+        let listed = list_index_definitions(&engine).expect("list");
+        assert_eq!(listed.len(), 1, "corrupt entry skipped, real one kept");
+        assert_eq!(listed[0].name, "user_email");
     }
 
     #[test]
