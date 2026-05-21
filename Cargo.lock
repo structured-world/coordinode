@@ -1123,6 +1123,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "coordinode-timeseries"
+version = "0.4.3"
+dependencies = [
+ "coordinode-core",
+ "coordinode-modality",
+ "coordinode-storage",
+ "rmpv",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "coordinode-vector"
 version = "0.4.3"
 dependencies = [
