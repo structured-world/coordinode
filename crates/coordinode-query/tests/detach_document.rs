@@ -19,7 +19,6 @@ use coordinode_core::graph::types::Value;
 use coordinode_query::cypher::parse;
 use coordinode_query::executor::{execute, AdaptiveConfig, ExecutionContext, Row, WriteStats};
 use coordinode_query::planner::build_logical_plan;
-use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 
@@ -79,15 +78,11 @@ fn make_test_ctx<'a>(
     }
 }
 
-fn test_engine(dir: &std::path::Path) -> StorageEngine {
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "default",
-        dir,
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )]);
-    StorageEngine::open(&config).expect("open engine")
+/// Logic-test fixture — uses `engine_for_logic()` (memory by default,
+/// disk via `COORDINODE_TEST_BACKEND=disk`). DETACH DOCUMENT tests
+/// are pure query semantics; no persistence requirement.
+fn test_engine() -> coordinode_test_fixtures::EngineFixture {
+    coordinode_test_fixtures::engine_for_logic()
 }
 
 fn run(
@@ -196,8 +191,8 @@ fn read_address_prop(
 /// Basic detach: address map becomes an Address node + edge.
 #[test]
 fn detach_document_basic() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let address_doc = rmpv::Value::Map(vec![
@@ -210,14 +205,14 @@ fn detach_document_basic() {
             rmpv::Value::String("11000".into()),
         ),
     ]);
-    insert_user_with_address(&engine, &mut interner, 1, "Alice", address_doc.clone());
+    insert_user_with_address(engine, &mut interner, 1, "Alice", address_doc.clone());
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
     let results = run(
         "MATCH (n:User) \
          DETACH DOCUMENT n.address AS (a:Address)-[:HAS_ADDRESS]->(n) \
          RETURN a, a.city AS city, a.zip AS zip",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -234,7 +229,7 @@ fn detach_document_basic() {
     // The source property must be removed from the User node after flush.
     // NB: lsm-tree merge operators apply deltas on read — `record.props` no
     // longer contains the `address` field.
-    let addr_after = read_address_prop(&engine, &interner, 1);
+    let addr_after = read_address_prop(engine, &interner, 1);
     assert!(
         addr_after.is_none(),
         "address must be removed from User after DETACH, got: {addr_after:?}"
@@ -247,7 +242,7 @@ fn detach_document_basic() {
         other => panic!("expected `a` binding, got {other:?}"),
     };
     assert!(
-        adj_contains(&engine, "HAS_ADDRESS", new_id, 1),
+        adj_contains(engine, "HAS_ADDRESS", new_id, 1),
         "edge HAS_ADDRESS: {new_id} → 1 must exist after DETACH"
     );
 }
@@ -255,8 +250,8 @@ fn detach_document_basic() {
 /// Nested path: detach `n.meta.shipping` — multi-segment property path.
 #[test]
 fn detach_document_nested_path() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Build: { meta: { shipping: { city: "Prague" }, billing: { city: "Brno" } } }
@@ -277,7 +272,7 @@ fn detach_document_nested_path() {
     let mut record = NodeRecord::new("User");
     let fid = interner.intern("meta");
     record.set(fid, Value::Document(meta.clone()));
-    LocalNodeStore::new(&engine)
+    LocalNodeStore::new(engine)
         .put(1, NodeId::from_raw(1), &record)
         .unwrap();
 
@@ -286,7 +281,7 @@ fn detach_document_nested_path() {
         "MATCH (n:User) \
          DETACH DOCUMENT n.meta.shipping AS (s:ShippingAddress)-[:HAS_SHIPPING]->(n) \
          RETURN s.city AS city",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -298,7 +293,7 @@ fn detach_document_nested_path() {
 
     // meta.billing must survive; meta.shipping must be removed.
     let meta_fid = interner.lookup("meta").unwrap();
-    let after = LocalNodeStore::new(&engine)
+    let after = LocalNodeStore::new(engine)
         .get(1, NodeId::from_raw(1))
         .unwrap()
         .expect("node still present");
@@ -324,8 +319,8 @@ fn detach_document_nested_path() {
 /// TRANSFER EDGES: `type(r) IN [...]` re-points matching edges onto the new node.
 #[test]
 fn detach_document_transfers_matching_edges() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // User(1) with an address document, plus two pre-existing outgoing edges
@@ -334,18 +329,18 @@ fn detach_document_transfers_matching_edges() {
         rmpv::Value::String("city".into()),
         rmpv::Value::String("Prague".into()),
     )]);
-    insert_user_with_address(&engine, &mut interner, 1, "Alice", address_doc);
+    insert_user_with_address(engine, &mut interner, 1, "Alice", address_doc);
 
     // Peer nodes (ids 100, 200) — content irrelevant.
     insert_user_with_address(
-        &engine,
+        engine,
         &mut interner,
         100,
         "PeerShipping",
         rmpv::Value::Map(vec![]),
     );
     insert_user_with_address(
-        &engine,
+        engine,
         &mut interner,
         200,
         "PeerKnows",
@@ -353,8 +348,8 @@ fn detach_document_transfers_matching_edges() {
     );
 
     // (1)-[:SHIPS_TO]->(100) and (1)-[:KNOWS]->(200)
-    insert_edge_direct(&engine, "SHIPS_TO", 1, 100);
-    insert_edge_direct(&engine, "KNOWS", 1, 200);
+    insert_edge_direct(engine, "SHIPS_TO", 1, 100);
+    insert_edge_direct(engine, "KNOWS", 1, 200);
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
     let results = run(
@@ -362,7 +357,7 @@ fn detach_document_transfers_matching_edges() {
          DETACH DOCUMENT n.address AS (a:Address)-[:HAS_ADDRESS]->(n) \
          TRANSFER EDGES ON n TO a WHERE type(r) IN ['SHIPS_TO'] \
          RETURN a, a.city AS city",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -374,25 +369,25 @@ fn detach_document_transfers_matching_edges() {
 
     // SHIPS_TO must have moved 1 → new_id. KNOWS must still be on 1.
     assert!(
-        !adj_contains(&engine, "SHIPS_TO", 1, 100),
+        !adj_contains(engine, "SHIPS_TO", 1, 100),
         "SHIPS_TO(1 → 100) must be removed after transfer"
     );
     assert!(
-        adj_contains(&engine, "SHIPS_TO", new_id, 100),
+        adj_contains(engine, "SHIPS_TO", new_id, 100),
         "SHIPS_TO({new_id} → 100) must exist after transfer"
     );
     assert!(
-        adj_contains(&engine, "KNOWS", 1, 200),
+        adj_contains(engine, "KNOWS", 1, 200),
         "KNOWS(1 → 200) must remain on source (not transferred)"
     );
     assert!(
-        !adj_contains(&engine, "KNOWS", new_id, 200),
+        !adj_contains(engine, "KNOWS", new_id, 200),
         "KNOWS must NOT move to target"
     );
 
     // HAS_ADDRESS edge (new_id → 1) must exist.
     assert!(
-        adj_contains(&engine, "HAS_ADDRESS", new_id, 1),
+        adj_contains(engine, "HAS_ADDRESS", new_id, 1),
         "HAS_ADDRESS edge must exist after DETACH"
     );
 }
@@ -400,8 +395,8 @@ fn detach_document_transfers_matching_edges() {
 /// Error case: property does not exist.
 #[test]
 fn detach_document_missing_property_errors() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     use coordinode_modality::{LocalNodeStore, NodeStore as _};
@@ -409,7 +404,7 @@ fn detach_document_missing_property_errors() {
     let mut record = NodeRecord::new("User");
     let fid = interner.intern("name");
     record.set(fid, Value::String("Alice".into()));
-    LocalNodeStore::new(&engine)
+    LocalNodeStore::new(engine)
         .put(1, NodeId::from_raw(1), &record)
         .unwrap();
 
@@ -417,7 +412,7 @@ fn detach_document_missing_property_errors() {
     let err = run_err(
         "MATCH (n:User) \
          DETACH DOCUMENT n.address AS (a:Address)-[:HAS_ADDRESS]->(n)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -431,8 +426,8 @@ fn detach_document_missing_property_errors() {
 /// Error case: property exists but is not a DOCUMENT/MAP.
 #[test]
 fn detach_document_non_document_value_errors() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     use coordinode_modality::{LocalNodeStore, NodeStore as _};
@@ -440,7 +435,7 @@ fn detach_document_non_document_value_errors() {
     let mut record = NodeRecord::new("User");
     let fid = interner.intern("address");
     record.set(fid, Value::String("just a string".into()));
-    LocalNodeStore::new(&engine)
+    LocalNodeStore::new(engine)
         .put(1, NodeId::from_raw(1), &record)
         .unwrap();
 
@@ -448,7 +443,7 @@ fn detach_document_non_document_value_errors() {
     let err = run_err(
         "MATCH (n:User) \
          DETACH DOCUMENT n.address AS (a:Address)-[:HAS_ADDRESS]->(n)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -471,8 +466,8 @@ fn detach_document_default_edge_type_from_camel_case() {
     // → expected edge type `HAS_SENSOR_CONFIG`. We plumb this via the parser
     // path that *does* emit an empty edge type (an explicit anonymous rel).
     // Grammar: `-[]->` parses to rel_detail with empty rel_types.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let cfg = rmpv::Value::Map(vec![(
@@ -483,7 +478,7 @@ fn detach_document_default_edge_type_from_camel_case() {
     let mut record = NodeRecord::new("Device");
     let fid = interner.intern("sensorConfig");
     record.set(fid, Value::Document(cfg));
-    LocalNodeStore::new(&engine)
+    LocalNodeStore::new(engine)
         .put(1, NodeId::from_raw(1), &record)
         .unwrap();
 
@@ -492,7 +487,7 @@ fn detach_document_default_edge_type_from_camel_case() {
         "MATCH (n:Device) \
          DETACH DOCUMENT n.sensorConfig AS (c:SensorConfig)-[]->(n) \
          RETURN c, c.firmware AS fw",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -505,7 +500,7 @@ fn detach_document_default_edge_type_from_camel_case() {
     };
     // Expect HAS_SENSOR_CONFIG derived from camelCase property.
     assert!(
-        adj_contains(&engine, "HAS_SENSOR_CONFIG", new_id, 1),
+        adj_contains(engine, "HAS_SENSOR_CONFIG", new_id, 1),
         "edge HAS_SENSOR_CONFIG({new_id} → 1) must exist"
     );
 }

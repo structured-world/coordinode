@@ -18,7 +18,6 @@ use coordinode_query::index::{
 use coordinode_query::planner::{build_logical_plan, estimate_cost};
 use coordinode_search::tantivy::multi_lang::{MultiLangConfig, MultiLanguageTextIndex};
 use coordinode_search::tantivy::TextIndex;
-use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::Guard;
@@ -80,15 +79,11 @@ fn make_test_ctx<'a>(
     }
 }
 
-fn test_engine(dir: &std::path::Path) -> StorageEngine {
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "default",
-        dir,
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )]);
-    StorageEngine::open(&config).expect("open engine")
+/// Logic-test fixture (memory by default, disk via env). Query
+/// integration tests verify query semantics + traversal correctness;
+/// no persistence requirement.
+fn test_engine() -> coordinode_test_fixtures::EngineFixture {
+    coordinode_test_fixtures::engine_for_logic()
 }
 
 fn insert_node(
@@ -210,13 +205,13 @@ fn run_cypher_with_params(
 ///   Alice(1) -[:KNOWS]-> Bob(2) -[:KNOWS]-> Charlie(3) -[:KNOWS]-> Dave(4)
 ///   Alice(1) -[:KNOWS]-> Charlie(3)  (shortcut)
 ///   Alice(1) -[:LIKES]-> Eve(5)
-fn setup_social_graph() -> (tempfile::TempDir, StorageEngine, FieldInterner) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+fn setup_social_graph() -> (coordinode_test_fixtures::EngineFixture, FieldInterner) {
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Person",
@@ -227,7 +222,7 @@ fn setup_social_graph() -> (tempfile::TempDir, StorageEngine, FieldInterner) {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Person",
@@ -238,7 +233,7 @@ fn setup_social_graph() -> (tempfile::TempDir, StorageEngine, FieldInterner) {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         3,
         "Person",
@@ -249,7 +244,7 @@ fn setup_social_graph() -> (tempfile::TempDir, StorageEngine, FieldInterner) {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         4,
         "Person",
@@ -260,7 +255,7 @@ fn setup_social_graph() -> (tempfile::TempDir, StorageEngine, FieldInterner) {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         5,
         "Person",
@@ -271,25 +266,26 @@ fn setup_social_graph() -> (tempfile::TempDir, StorageEngine, FieldInterner) {
         &mut interner,
     );
 
-    insert_edge(&engine, "KNOWS", 1, 2); // Alice → Bob
-    insert_edge(&engine, "KNOWS", 2, 3); // Bob → Charlie
-    insert_edge(&engine, "KNOWS", 3, 4); // Charlie → Dave
-    insert_edge(&engine, "KNOWS", 1, 3); // Alice → Charlie (shortcut)
-    insert_edge(&engine, "LIKES", 1, 5); // Alice → Eve
+    insert_edge(engine, "KNOWS", 1, 2); // Alice → Bob
+    insert_edge(engine, "KNOWS", 2, 3); // Bob → Charlie
+    insert_edge(engine, "KNOWS", 3, 4); // Charlie → Dave
+    insert_edge(engine, "KNOWS", 1, 3); // Alice → Charlie (shortcut)
+    insert_edge(engine, "LIKES", 1, 5); // Alice → Eve
 
-    (dir, engine, interner)
+    (fx, interner)
 }
 
 // ── Variable-length path: full Cypher pipeline ──────────────────────────
 
 #[test]
 fn varlen_path_2_to_3_hops_end_to_end() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Alice -[:KNOWS*2..3]-> ? — should reach nodes at 2 and 3 hops
     let results = run_cypher(
         "MATCH (a:Person {name: \"Alice\"})-[:KNOWS*2..3]->(b) RETURN b",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -313,12 +309,13 @@ fn varlen_path_2_to_3_hops_end_to_end() {
 
 #[test]
 fn varlen_path_star_only_default_bounded() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Alice -[:KNOWS*]-> ? should NOT hang — default cap at 10 hops
     let results = run_cypher(
         "MATCH (a:Person {name: \"Alice\"})-[:KNOWS*]->(b) RETURN b",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -329,12 +326,12 @@ fn varlen_path_star_only_default_bounded() {
 #[test]
 fn varlen_cycle_terminates() {
     // Build a cycle: A→B→C→A
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "X",
@@ -342,7 +339,7 @@ fn varlen_cycle_terminates() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "X",
@@ -350,7 +347,7 @@ fn varlen_cycle_terminates() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         3,
         "X",
@@ -358,13 +355,13 @@ fn varlen_cycle_terminates() {
         &mut interner,
     );
 
-    insert_edge(&engine, "NEXT", 1, 2);
-    insert_edge(&engine, "NEXT", 2, 3);
-    insert_edge(&engine, "NEXT", 3, 1); // cycle
+    insert_edge(engine, "NEXT", 1, 2);
+    insert_edge(engine, "NEXT", 2, 3);
+    insert_edge(engine, "NEXT", 3, 1); // cycle
 
     let results = run_cypher(
         "MATCH (a:X {name: \"A\"})-[:NEXT*1..10]->(b) RETURN b",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -380,12 +377,13 @@ fn varlen_cycle_terminates() {
 
 #[test]
 fn aggregate_count_group_by_end_to_end() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Count people by age: Alice+Charlie=30, Bob=25, Dave=40, Eve=35
     let results = run_cypher(
         "MATCH (n:Person) RETURN n.age AS age, count(*) AS cnt",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -407,11 +405,12 @@ fn aggregate_count_group_by_end_to_end() {
 
 #[test]
 fn aggregate_sum_avg_end_to_end() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let results = run_cypher(
         "MATCH (n:Person) RETURN sum(n.age) AS total, avg(n.age) AS mean, count(*) AS cnt",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -427,9 +426,10 @@ fn aggregate_sum_avg_end_to_end() {
 
 #[test]
 fn unwind_list_end_to_end() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
-    let results = run_cypher("UNWIND [10, 20, 30] AS x RETURN x", &engine, &mut interner);
+    let results = run_cypher("UNWIND [10, 20, 30] AS x RETURN x", engine, &mut interner);
 
     assert_eq!(results.len(), 3);
     assert_eq!(results[0].get("x"), Some(&Value::Int(10)));
@@ -441,12 +441,13 @@ fn unwind_list_end_to_end() {
 
 #[test]
 fn optional_match_no_results_nulls_end_to_end() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Eve has no KNOWS edges — OPTIONAL MATCH should produce NULL for b
     let results = run_cypher(
         "MATCH (a:Person {name: \"Eve\"}) OPTIONAL MATCH (a)-[:KNOWS]->(b) RETURN a, b",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -463,12 +464,13 @@ fn optional_match_no_results_nulls_end_to_end() {
 
 #[test]
 fn optional_match_with_results_end_to_end() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Alice has KNOWS edges → should return real results
     let results = run_cypher(
         "MATCH (a:Person {name: \"Alice\"}) OPTIONAL MATCH (a)-[:KNOWS]->(b) RETURN a, b",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -491,12 +493,13 @@ fn optional_match_with_results_end_to_end() {
 
 #[test]
 fn with_aggregation_pipeline_end_to_end() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // MATCH → WITH count(*) AS cnt → RETURN cnt
     let results = run_cypher(
         "MATCH (n:Person) WITH count(*) AS cnt RETURN cnt",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -510,20 +513,22 @@ fn with_aggregation_pipeline_end_to_end() {
 
 #[test]
 fn match_all_nodes_by_label() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
-    let results = run_cypher("MATCH (n:Person) RETURN n", &engine, &mut interner);
+    let results = run_cypher("MATCH (n:Person) RETURN n", engine, &mut interner);
 
     assert_eq!(results.len(), 5, "should return all 5 Person nodes");
 }
 
 #[test]
 fn match_node_with_property_filter() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let results = run_cypher(
         "MATCH (n:Person {name: \"Bob\"}) RETURN n.name, n.age",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -532,11 +537,12 @@ fn match_node_with_property_filter() {
 
 #[test]
 fn match_where_comparison() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let results = run_cypher(
         "MATCH (n:Person) WHERE n.age > 30 RETURN n.name",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -546,11 +552,12 @@ fn match_where_comparison() {
 
 #[test]
 fn match_traverse_single_hop() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let results = run_cypher(
         "MATCH (a:Person {name: \"Alice\"})-[:KNOWS]->(b) RETURN b",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -570,12 +577,13 @@ fn match_traverse_single_hop() {
 
 #[test]
 fn match_traverse_specific_edge_type() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Only LIKES edges from Alice → Eve(5)
     let results = run_cypher(
         "MATCH (a:Person {name: \"Alice\"})-[:LIKES]->(b) RETURN b",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -585,11 +593,12 @@ fn match_traverse_specific_edge_type() {
 
 #[test]
 fn match_return_star() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let results = run_cypher(
         "MATCH (n:Person {name: \"Alice\"}) RETURN *",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -604,11 +613,12 @@ fn match_return_star() {
 
 #[test]
 fn order_by_asc() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let results = run_cypher(
         "MATCH (n:Person) RETURN n.age AS age ORDER BY age",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -636,19 +646,21 @@ fn compare_age(a: &Value, b: &Value) -> std::cmp::Ordering {
 
 #[test]
 fn limit_results() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
-    let results = run_cypher("MATCH (n:Person) RETURN n LIMIT 2", &engine, &mut interner);
+    let results = run_cypher("MATCH (n:Person) RETURN n LIMIT 2", engine, &mut interner);
 
     assert_eq!(results.len(), 2, "LIMIT 2 should return exactly 2 rows");
 }
 
 #[test]
 fn skip_results() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
-    let all = run_cypher("MATCH (n:Person) RETURN n", &engine, &mut interner);
-    let skipped = run_cypher("MATCH (n:Person) RETURN n SKIP 3", &engine, &mut interner);
+    let all = run_cypher("MATCH (n:Person) RETURN n", engine, &mut interner);
+    let skipped = run_cypher("MATCH (n:Person) RETURN n SKIP 3", engine, &mut interner);
 
     assert_eq!(
         skipped.len(),
@@ -661,11 +673,12 @@ fn skip_results() {
 
 #[test]
 fn order_by_limit_combined() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let results = run_cypher(
         "MATCH (n:Person) RETURN n.age AS age ORDER BY age DESC LIMIT 2",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -681,21 +694,21 @@ fn order_by_limit_combined() {
 
 #[test]
 fn create_node_and_read_back() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     run_cypher_with_alloc(
         "CREATE (n:Animal {species: \"Cat\", name: \"Whiskers\"})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
 
     let results = run_cypher_with_alloc(
         "MATCH (n:Animal) RETURN n.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -705,28 +718,28 @@ fn create_node_and_read_back() {
 
 #[test]
 fn create_multiple_nodes() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     // Shared allocator ensures unique IDs across CREATE calls
     run_cypher_with_alloc(
         "CREATE (a:City {name: \"Berlin\"})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "CREATE (b:City {name: \"Munich\"})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
 
     let results = run_cypher_with_alloc(
         "MATCH (n:City) RETURN n.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -737,21 +750,21 @@ fn create_multiple_nodes() {
 #[test]
 fn create_node_and_edge_inline() {
     // CREATE (a)-[:TYPE]->(b) in one pattern
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     run_cypher_with_alloc(
         "CREATE (a:City {name: \"Berlin\"})-[:CONNECTED_TO]->(b:City {name: \"Munich\"})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
 
     let results = run_cypher_with_alloc(
         "MATCH (a:City {name: \"Berlin\"})-[:CONNECTED_TO]->(b) RETURN b.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -762,19 +775,20 @@ fn create_node_and_edge_inline() {
 #[test]
 fn create_edge_between_existing_nodes() {
     // MATCH existing nodes, then CREATE edge between them
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     run_cypher_with_alloc(
         "MATCH (a:Person {name: \"Bob\"}), (b:Person {name: \"Eve\"}) CREATE (a)-[:LIKES]->(b)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
 
     let results = run_cypher_with_alloc(
         "MATCH (a:Person {name: \"Bob\"})-[:LIKES]->(b) RETURN b",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -786,7 +800,8 @@ fn create_edge_between_existing_nodes() {
 /// Verifies read-your-own-writes: second CREATE sees first's edge.
 #[test]
 fn create_multiple_edges_from_same_source() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     // CREATE two edges from Alice in one statement
@@ -794,7 +809,7 @@ fn create_multiple_edges_from_same_source() {
         "MATCH (a:Person {name: \"Alice\"}), (b:Person {name: \"Bob\"}), \
          (c:Person {name: \"Charlie\"}) \
          CREATE (a)-[:LIKES]->(b), (a)-[:LIKES]->(c)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -802,7 +817,7 @@ fn create_multiple_edges_from_same_source() {
     // Both edges should be visible
     let results = run_cypher_with_alloc(
         "MATCH (a:Person {name: \"Alice\"})-[:LIKES]->(b) RETURN b.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -814,20 +829,21 @@ fn create_multiple_edges_from_same_source() {
 /// Tests that merge buffer provides read-your-own-writes within execution.
 #[test]
 fn create_then_traverse_same_execution() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     // Create edge then immediately traverse in separate statements
     run_cypher_with_alloc(
         "MATCH (a:Person {name: \"Alice\"}), (b:Person {name: \"Eve\"}) \
          CREATE (a)-[:TRUSTS]->(b)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     let results = run_cypher_with_alloc(
         "MATCH (a:Person {name: \"Alice\"})-[:TRUSTS]->(b) RETURN b.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -837,14 +853,15 @@ fn create_then_traverse_same_execution() {
 /// R010c: DETACH DELETE removes node and its edges.
 #[test]
 fn detach_delete_removes_edges() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     // setup_social_graph creates: Alice->Bob (KNOWS), Alice->Charlie (KNOWS), etc.
     // DETACH DELETE Alice
     run_cypher_with_alloc(
         "MATCH (n:Person {name: \"Alice\"}) DETACH DELETE n",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -852,7 +869,7 @@ fn detach_delete_removes_edges() {
     // Alice should be gone
     let results = run_cypher_with_alloc(
         "MATCH (n:Person {name: \"Alice\"}) RETURN n",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -861,19 +878,20 @@ fn detach_delete_removes_edges() {
 
 #[test]
 fn set_property_update() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Update Alice's age
     run_cypher(
         "MATCH (n:Person {name: \"Alice\"}) SET n.age = 31",
-        &engine,
+        engine,
         &mut interner,
     );
 
     // Verify update
     let results = run_cypher(
         "MATCH (n:Person {name: \"Alice\"}) RETURN n.age AS age",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -883,18 +901,19 @@ fn set_property_update() {
 
 #[test]
 fn delete_node() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
-    let before = run_cypher("MATCH (n:Person) RETURN n", &engine, &mut interner);
+    let before = run_cypher("MATCH (n:Person) RETURN n", engine, &mut interner);
 
     // Delete Eve (no edges except LIKES from Alice, may need DETACH)
     run_cypher(
         "MATCH (n:Person {name: \"Eve\"}) DETACH DELETE n",
-        &engine,
+        engine,
         &mut interner,
     );
 
-    let after = run_cypher("MATCH (n:Person) RETURN n", &engine, &mut interner);
+    let after = run_cypher("MATCH (n:Person) RETURN n", engine, &mut interner);
 
     assert_eq!(
         after.len(),
@@ -909,11 +928,12 @@ fn delete_node() {
 
 #[test]
 fn aggregate_min_max_end_to_end() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let results = run_cypher(
         "MATCH (n:Person) RETURN min(n.age) AS youngest, max(n.age) AS oldest",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -924,11 +944,12 @@ fn aggregate_min_max_end_to_end() {
 
 #[test]
 fn aggregate_collect_end_to_end() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let results = run_cypher(
         "MATCH (n:Person) RETURN collect(n.name) AS names",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -954,11 +975,12 @@ fn aggregate_percentile_cont_respects_argument() {
     // percentileCont(age, 0.0) → 25.0  (min)
     // percentileCont(age, 1.0) → 40.0  (max)
     // percentileCont(age, 0.5) → 30.0  (median — also correct at p=0.5)
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let min_result = run_cypher(
         "MATCH (n:Person) RETURN percentileCont(n.age, 0.0) AS p0",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(min_result.len(), 1);
@@ -970,7 +992,7 @@ fn aggregate_percentile_cont_respects_argument() {
 
     let max_result = run_cypher(
         "MATCH (n:Person) RETURN percentileCont(n.age, 1.0) AS p100",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(max_result.len(), 1);
@@ -987,11 +1009,12 @@ fn aggregate_percentile_disc_respects_argument() {
     // Person ages: [25, 30, 30, 35, 40]. Sorted.
     // percentileDisc(age, 0.0) → 25.0  (saturating_sub(1) from ceil(0) = 0)
     // percentileDisc(age, 1.0) → 40.0  (ceil(1.0 * 5) - 1 = index 4)
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let low_result = run_cypher(
         "MATCH (n:Person) RETURN percentileDisc(n.age, 0.0) AS p0",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(low_result.len(), 1);
@@ -1003,7 +1026,7 @@ fn aggregate_percentile_disc_respects_argument() {
 
     let high_result = run_cypher(
         "MATCH (n:Person) RETURN percentileDisc(n.age, 1.0) AS p100",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(high_result.len(), 1);
@@ -1019,14 +1042,15 @@ fn aggregate_percentile_cont_with_query_parameter() {
     // Verify that percentileCont(x, $p) reads the percentile from the query
     // parameter map in ExecutionContext, matching Neo4j's behavior.
     // Person ages: [25, 30, 30, 35, 40]. percentileCont(age, $p) with $p=1.0 → 40.0.
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let mut params = std::collections::HashMap::new();
     params.insert("p".into(), Value::Float(1.0));
 
     let result = run_cypher_with_params(
         "MATCH (n:Person) RETURN percentileCont(n.age, $p) AS result",
-        &engine,
+        engine,
         &mut interner,
         params,
     );
@@ -1043,14 +1067,15 @@ fn aggregate_percentile_cont_with_query_parameter() {
 fn aggregate_percentile_disc_with_query_parameter() {
     // Same as above but for percentileDisc (nearest-rank variant).
     // Person ages: [25, 30, 30, 35, 40]. percentileDisc(age, $p) with $p=0.0 → 25.0.
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let mut params = std::collections::HashMap::new();
     params.insert("p".into(), Value::Float(0.0));
 
     let result = run_cypher_with_params(
         "MATCH (n:Person) RETURN percentileDisc(n.age, $p) AS result",
-        &engine,
+        engine,
         &mut interner,
         params,
     );
@@ -1068,14 +1093,15 @@ fn query_parameter_in_where_clause() {
     // Verify that $params in WHERE predicates are substituted before execution.
     // Uses the plan-level substitute_params() rewriter called inside execute().
     // Person ages: [25, 30, 30, 35, 40]. $min_age=35 → Dave (40) and Eve (35).
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let mut params = std::collections::HashMap::new();
     params.insert("min_age".into(), Value::Int(35));
 
     let result = run_cypher_with_params(
         "MATCH (n:Person) WHERE n.age >= $min_age RETURN n.name AS name ORDER BY n.age",
-        &engine,
+        engine,
         &mut interner,
         params,
     );
@@ -1098,7 +1124,8 @@ fn query_parameter_in_where_clause() {
 
 #[test]
 fn as_of_timestamp_basic() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Use a recent timestamp (within 7d retention)
     let now_us = std::time::SystemTime::now()
@@ -1114,7 +1141,7 @@ fn as_of_timestamp_basic() {
     // Should execute without error (may return same data since MVCC
     // isn't fully time-separated at storage level yet, but the pipeline
     // should not crash)
-    let results = run_cypher(&query, &engine, &mut interner);
+    let results = run_cypher(&query, engine, &mut interner);
     // At minimum, pipeline completes without error
     assert!(
         results.len() <= 5,
@@ -1128,12 +1155,13 @@ fn as_of_timestamp_basic() {
 
 #[test]
 fn match_where_order_limit_pipeline() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Full read pipeline: MATCH → WHERE → ORDER BY → LIMIT → RETURN
     let results = run_cypher(
         "MATCH (n:Person) WHERE n.age >= 30 RETURN n.name AS name, n.age AS age ORDER BY age DESC LIMIT 3",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -1144,12 +1172,13 @@ fn match_where_order_limit_pipeline() {
 
 #[test]
 fn traverse_then_aggregate() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Count how many people Alice knows
     let results = run_cypher(
         "MATCH (a:Person {name: \"Alice\"})-[:KNOWS]->(b) RETURN count(*) AS friends",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -1159,12 +1188,13 @@ fn traverse_then_aggregate() {
 
 #[test]
 fn multiple_match_patterns() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Two separate MATCH patterns → CartesianProduct
     let results = run_cypher(
         "MATCH (a:Person {name: \"Alice\"}), (b:Person {name: \"Bob\"}) RETURN a, b",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -1173,12 +1203,13 @@ fn multiple_match_patterns() {
 
 #[test]
 fn with_alias_passthrough() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // WITH renames variables — verify alias works across pipeline
     let results = run_cypher(
         "MATCH (n:Person) WITH n.name AS who RETURN who",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -1195,18 +1226,19 @@ fn with_alias_passthrough() {
 
 #[test]
 fn remove_property() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Remove Alice's age property
     run_cypher(
         "MATCH (n:Person {name: \"Alice\"}) REMOVE n.age",
-        &engine,
+        engine,
         &mut interner,
     );
 
     let results = run_cypher(
         "MATCH (n:Person {name: \"Alice\"}) RETURN n.age AS age",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -1222,14 +1254,15 @@ fn remove_property() {
 
 #[test]
 fn merge_existing_node() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // MERGE on existing node — should NOT create duplicate
-    let before = run_cypher("MATCH (n:Person) RETURN n", &engine, &mut interner);
+    let before = run_cypher("MATCH (n:Person) RETURN n", engine, &mut interner);
 
-    run_cypher("MERGE (n:Person {name: \"Alice\"})", &engine, &mut interner);
+    run_cypher("MERGE (n:Person {name: \"Alice\"})", engine, &mut interner);
 
-    let after = run_cypher("MATCH (n:Person) RETURN n", &engine, &mut interner);
+    let after = run_cypher("MATCH (n:Person) RETURN n", engine, &mut interner);
     assert_eq!(
         before.len(),
         after.len(),
@@ -1243,12 +1276,13 @@ fn merge_existing_node() {
 
 #[test]
 fn traverse_reverse_direction() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Bob <-[:KNOWS]- Alice — reverse traversal
     let results = run_cypher(
         "MATCH (a:Person {name: \"Bob\"})<-[:KNOWS]-(b) RETURN b",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -1268,12 +1302,13 @@ fn traverse_reverse_direction() {
 
 #[test]
 fn traverse_bidirectional() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Bob -[:KNOWS]- ? (both directions)
     let results = run_cypher(
         "MATCH (a:Person {name: \"Bob\"})-[:KNOWS]-(b) RETURN b",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -1296,12 +1331,13 @@ fn traverse_bidirectional() {
 
 #[test]
 fn aggregate_count_distinct_end_to_end() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Alice(30) and Charlie(30) have same age → count(DISTINCT age) = 4, not 5
     let results = run_cypher(
         "MATCH (n:Person) RETURN count(DISTINCT n.age) AS unique_ages",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -1315,7 +1351,8 @@ fn aggregate_count_distinct_end_to_end() {
 
 #[test]
 fn distinct_removes_non_consecutive_duplicate_rows() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Multiple paths to same person produce duplicate rows.
     // DISTINCT should remove them even when non-consecutive.
@@ -1323,7 +1360,7 @@ fn distinct_removes_non_consecutive_duplicate_rows() {
     // "RETURN DISTINCT n.age" should return 4 unique ages, not 5 rows.
     let results = run_cypher(
         "MATCH (n:Person) RETURN DISTINCT n.age AS age",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -1337,27 +1374,28 @@ fn distinct_removes_non_consecutive_duplicate_rows() {
 
 #[test]
 fn distinct_with_float_values() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Create nodes with float properties — duplicates should be removed
     // Create all sensors in one query to ensure sequential IDs
     run_cypher(
         "CREATE (a:Sensor {reading: 1.5}), (b:Sensor {reading: 2.7}), (c:Sensor {reading: 1.5}), (d:Sensor {reading: 2.7})",
-        &engine,
+        engine,
         &mut interner,
     );
 
     // Verify all 4 sensors exist
     let all = run_cypher(
         "MATCH (s:Sensor) RETURN s.reading AS r",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(all.len(), 4, "should have 4 sensors, got: {all:?}");
 
     let results = run_cypher(
         "MATCH (s:Sensor) RETURN DISTINCT s.reading AS r",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -1374,11 +1412,12 @@ fn distinct_with_float_values() {
 
 #[test]
 fn where_and_or_combined() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let results = run_cypher(
         "MATCH (n:Person) WHERE n.age = 30 OR n.age = 40 RETURN n.name",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -1388,11 +1427,12 @@ fn where_and_or_combined() {
 
 #[test]
 fn where_string_predicate() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let results = run_cypher(
         "MATCH (n:Person) WHERE n.name STARTS WITH \"A\" RETURN n.name",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -1405,8 +1445,8 @@ fn where_string_predicate() {
 
 #[test]
 fn upsert_creates_when_not_exists() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
@@ -1416,14 +1456,14 @@ fn upsert_creates_when_not_exists() {
          ON MATCH SET u.login_count = 99 \
          ON CREATE CREATE (u:User {email: \"alice@example.com\", login_count: 1}) \
          RETURN u",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
 
     let results = run_cypher_with_alloc(
         "MATCH (u:User) RETURN u.login_count AS cnt",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -1438,7 +1478,8 @@ fn upsert_creates_when_not_exists() {
 
 #[test]
 fn upsert_updates_when_exists() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     // Alice already exists → UPSERT should match and SET
@@ -1447,14 +1488,14 @@ fn upsert_updates_when_exists() {
          ON MATCH SET u.age = 99 \
          ON CREATE CREATE (u:Person {name: \"Alice\", age: 0}) \
          RETURN u",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
 
     let results = run_cypher_with_alloc(
         "MATCH (u:Person {name: \"Alice\"}) RETURN u.age AS age",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -1474,13 +1515,13 @@ fn upsert_updates_when_exists() {
 #[test]
 fn vector_distance_filter_end_to_end() {
     // Create nodes with vector properties, then filter by distance
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Insert nodes with vector embeddings
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Doc",
@@ -1491,7 +1532,7 @@ fn vector_distance_filter_end_to_end() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Doc",
@@ -1502,7 +1543,7 @@ fn vector_distance_filter_end_to_end() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         3,
         "Doc",
@@ -1517,7 +1558,7 @@ fn vector_distance_filter_end_to_end() {
     // Rust [1,0,0] → distance=0, Go [0.9,0.1,0] → distance≈0.14, Python [0,1,0] → distance=√2≈1.41
     let results = run_cypher(
         "MATCH (d:Doc) WHERE vector_distance(d.embedding, [1.0, 0.0, 0.0]) < 0.5 RETURN d.title",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -1532,8 +1573,8 @@ fn vector_distance_filter_end_to_end() {
 #[test]
 fn upsert_on_create_with_edge() {
     // UPSERT on empty DB with edge pattern → should create nodes + edge
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
@@ -1542,7 +1583,7 @@ fn upsert_on_create_with_edge() {
          ON MATCH SET u.size = 99 \
          ON CREATE CREATE (u:Team {name: \"Alpha\"})-[:HAS_MEMBER]->(m:Person {name: \"Leader\"}) \
          RETURN u",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -1550,7 +1591,7 @@ fn upsert_on_create_with_edge() {
     // Verify nodes created
     let teams = run_cypher_with_alloc(
         "MATCH (t:Team) RETURN t.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -1558,7 +1599,7 @@ fn upsert_on_create_with_edge() {
 
     let members = run_cypher_with_alloc(
         "MATCH (p:Person) RETURN p.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -1567,7 +1608,7 @@ fn upsert_on_create_with_edge() {
     // Verify edge created
     let edges = run_cypher_with_alloc(
         "MATCH (t:Team {name: \"Alpha\"})-[:HAS_MEMBER]->(p) RETURN p.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -1577,7 +1618,8 @@ fn upsert_on_create_with_edge() {
 #[test]
 fn upsert_idempotent_on_match() {
     // Run UPSERT twice — second time should match and SET, not create duplicate
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     // First UPSERT — Alice exists → ON MATCH SET age=50
@@ -1586,7 +1628,7 @@ fn upsert_idempotent_on_match() {
          ON MATCH SET u.age = 50 \
          ON CREATE CREATE (u:Person {name: \"Alice\", age: 0}) \
          RETURN u",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -1597,14 +1639,14 @@ fn upsert_idempotent_on_match() {
          ON MATCH SET u.age = 60 \
          ON CREATE CREATE (u:Person {name: \"Alice\", age: 0}) \
          RETURN u",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
 
     let results = run_cypher_with_alloc(
         "MATCH (u:Person {name: \"Alice\"}) RETURN u.age AS age",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -1619,7 +1661,7 @@ fn upsert_idempotent_on_match() {
     // Total Person count should be unchanged (5 from setup)
     let all = run_cypher_with_alloc(
         "MATCH (n:Person) RETURN n",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -1632,7 +1674,8 @@ fn upsert_cas_detects_conflict() {
     // We can't easily test concurrent modification in single-threaded executor,
     // but we verify the Conflict error variant exists and the CAS logic works
     // by checking that UPSERT succeeds when node is NOT modified.
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     // Normal UPSERT should succeed (no concurrent modification)
@@ -1642,7 +1685,7 @@ fn upsert_cas_detects_conflict() {
              ON MATCH SET u.age = 42 \
              ON CREATE CREATE (u:Person {name: \"Alice\", age: 0}) \
              RETURN u",
-            &engine,
+            engine,
             &mut interner,
             &allocator,
         )
@@ -1655,7 +1698,7 @@ fn upsert_cas_detects_conflict() {
     // Verify the update applied
     let check = run_cypher_with_alloc(
         "MATCH (u:Person {name: \"Alice\"}) RETURN u.age AS age",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -1665,7 +1708,8 @@ fn upsert_cas_detects_conflict() {
 #[test]
 fn upsert_on_match_set_expression() {
     // ON MATCH SET u.age = u.age + 10 — expression referencing current value
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     // Alice has age=30. UPSERT should set age = 30 + 10 = 40
@@ -1674,14 +1718,14 @@ fn upsert_on_match_set_expression() {
          ON MATCH SET u.age = u.age + 10 \
          ON CREATE CREATE (u:Person {name: \"Alice\", age: 0}) \
          RETURN u",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
 
     let results = run_cypher_with_alloc(
         "MATCH (u:Person {name: \"Alice\"}) RETURN u.age AS age",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -1697,7 +1741,8 @@ fn upsert_on_match_set_expression() {
 #[test]
 fn upsert_returns_result_row() {
     // UPSERT MATCH ... RETURN u should return the upserted node
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     let results = run_cypher_with_alloc(
@@ -1705,7 +1750,7 @@ fn upsert_returns_result_row() {
          ON MATCH SET u.age = 77 \
          ON CREATE CREATE (u:Person {name: \"Alice\", age: 0}) \
          RETURN u.age AS age",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -1718,8 +1763,8 @@ fn upsert_returns_result_row() {
 #[test]
 fn upsert_on_create_returns_new_node() {
     // UPSERT on empty DB → ON CREATE → RETURN should return the created node
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
@@ -1728,7 +1773,7 @@ fn upsert_on_create_returns_new_node() {
          ON MATCH SET u.active = true \
          ON CREATE CREATE (u:Robot {name: \"R2D2\", model: \"Astromech\"}) \
          RETURN u.name AS name, u.model AS model",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -1744,8 +1789,8 @@ fn upsert_on_create_returns_new_node() {
 #[test]
 fn upsert_empty_on_match_only_creates() {
     // UPSERT with no ON MATCH items — only ON CREATE should fire
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
@@ -1753,7 +1798,7 @@ fn upsert_empty_on_match_only_creates() {
         "UPSERT MATCH (u:Ghost {name: \"Casper\"}) \
          ON CREATE CREATE (u:Ghost {name: \"Casper\", friendly: true}) \
          RETURN u.name AS name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -1768,7 +1813,8 @@ fn upsert_empty_on_match_only_creates() {
 #[test]
 fn upsert_empty_on_create_only_updates() {
     // UPSERT with no ON CREATE patterns — ON MATCH SET only
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     // Alice exists → ON MATCH SET fires, no ON CREATE
@@ -1776,14 +1822,14 @@ fn upsert_empty_on_create_only_updates() {
         "UPSERT MATCH (u:Person {name: \"Alice\"}) \
          ON MATCH SET u.age = 88 \
          RETURN u",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
 
     let check = run_cypher_with_alloc(
         "MATCH (u:Person {name: \"Alice\"}) RETURN u.age AS age",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -1793,7 +1839,8 @@ fn upsert_empty_on_create_only_updates() {
 #[test]
 fn upsert_match_multiple_nodes() {
     // UPSERT where MATCH finds multiple nodes (Alice+Charlie both age=30)
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     // Both Alice(30) and Charlie(30) match → ON MATCH SET applies to both
@@ -1802,7 +1849,7 @@ fn upsert_match_multiple_nodes() {
          ON MATCH SET u.age = 31 \
          ON CREATE CREATE (u:Person {age: 30}) \
          RETURN u",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -1810,7 +1857,7 @@ fn upsert_match_multiple_nodes() {
     // Both should now have age=31
     let results = run_cypher_with_alloc(
         "MATCH (n:Person) WHERE n.age = 31 RETURN n.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -1824,7 +1871,8 @@ fn upsert_match_multiple_nodes() {
 
 #[test]
 fn upsert_on_match_set_multiple_properties() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     run_cypher_with_alloc(
@@ -1832,14 +1880,14 @@ fn upsert_on_match_set_multiple_properties() {
          ON MATCH SET u.age = 99, u.active = true \
          ON CREATE CREATE (u:Person {name: \"Bob\"}) \
          RETURN u",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
 
     let results = run_cypher_with_alloc(
         "MATCH (u:Person {name: \"Bob\"}) RETURN u.age AS age",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -1964,7 +2012,8 @@ fn explain_filter_reduces_rows() {
 #[test]
 fn explain_end_to_end_with_real_data() {
     // Full e2e: parse → plan → estimate → execute → verify explain matches
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let query = "MATCH (a:Person {name: \"Alice\"})-[:KNOWS]->(b) RETURN b.name";
     let ast = parse(query).unwrap();
@@ -1976,7 +2025,7 @@ fn explain_end_to_end_with_real_data() {
     assert!(cost.estimated_rows > 0.0);
 
     // Actually execute and compare
-    let results = run_cypher(query, &engine, &mut interner);
+    let results = run_cypher(query, engine, &mut interner);
     // Real result: Alice→Bob, Alice→Charlie = 2 rows
     assert_eq!(results.len(), 2);
 
@@ -2136,12 +2185,12 @@ fn planner_keeps_scalar_where_as_filter() {
 #[test]
 fn vector_filter_end_to_end_with_data() {
     // Full pipeline: create docs with vectors → MATCH WHERE vector_distance < threshold → results
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Doc",
@@ -2152,7 +2201,7 @@ fn vector_filter_end_to_end_with_data() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Doc",
@@ -2163,7 +2212,7 @@ fn vector_filter_end_to_end_with_data() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         3,
         "Doc",
@@ -2177,7 +2226,7 @@ fn vector_filter_end_to_end_with_data() {
     // VectorFilter path: vector_distance < 0.5
     let results = run_cypher(
         "MATCH (d:Doc) WHERE vector_distance(d.embedding, [1.0, 0.0, 0.0]) < 0.5 RETURN d.title",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -2190,12 +2239,12 @@ fn vector_filter_end_to_end_with_data() {
 
 #[test]
 fn vector_filter_similarity_end_to_end() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Doc",
@@ -2203,7 +2252,7 @@ fn vector_filter_similarity_end_to_end() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Doc",
@@ -2214,7 +2263,7 @@ fn vector_filter_similarity_end_to_end() {
     // vector_similarity > 0.9: only [1,0] is similar to query [1,0]
     let results = run_cypher(
         "MATCH (d:Doc) WHERE vector_similarity(d.embedding, [1.0, 0.0]) > 0.9 RETURN d",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -2228,14 +2277,14 @@ fn vector_filter_similarity_end_to_end() {
 #[test]
 fn mixed_traverse_then_vector_filter() {
     // Graph traversal → vector filter in single query
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // User(1) -[:LIKES]-> Doc(2, embed=[1,0,0])
     // User(1) -[:LIKES]-> Doc(3, embed=[0,1,0])
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "User",
@@ -2243,7 +2292,7 @@ fn mixed_traverse_then_vector_filter() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Doc",
@@ -2254,7 +2303,7 @@ fn mixed_traverse_then_vector_filter() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         3,
         "Doc",
@@ -2264,15 +2313,15 @@ fn mixed_traverse_then_vector_filter() {
         ],
         &mut interner,
     );
-    insert_edge(&engine, "LIKES", 1, 2);
-    insert_edge(&engine, "LIKES", 1, 3);
+    insert_edge(engine, "LIKES", 1, 2);
+    insert_edge(engine, "LIKES", 1, 3);
 
     // Traverse Alice→LIKES→Doc, then vector filter by similarity to [1,0,0]
     let results = run_cypher(
         "MATCH (u:User {name: \"Alice\"})-[:LIKES]->(d:Doc) \
          WHERE vector_distance(d.embedding, [1.0, 0.0, 0.0]) < 0.5 \
          RETURN d.title",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -2285,15 +2334,15 @@ fn mixed_traverse_then_vector_filter() {
 /// exists. Uses simple aliases (no dot-notation) for stable column lookup.
 #[test]
 fn vector_top_k_pattern_b_end_to_end() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // 5 documents with deterministic embeddings along the X axis.
     for i in 1..=5 {
         let x = i as f32 / 5.0;
         insert_node(
-            &engine,
+            engine,
             1,
             i as u64,
             "Doc",
@@ -2313,7 +2362,7 @@ fn vector_top_k_pattern_b_end_to_end() {
          ORDER BY dist \
          LIMIT 2 \
          RETURN docname, dist",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -2349,8 +2398,8 @@ fn vector_top_k_pattern_b_end_to_end() {
 /// and brute-force paths of the executor.
 #[test]
 fn vector_top_k_empty_input_returns_empty() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // No nodes inserted — MATCH returns 0 rows.
@@ -2360,7 +2409,7 @@ fn vector_top_k_empty_input_returns_empty() {
          ORDER BY d \
          LIMIT 5 \
          RETURN name, d",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -2376,13 +2425,13 @@ fn vector_top_k_empty_input_returns_empty() {
 /// via `if v.len() == query_vec.len()` guard in brute-force fallback.
 #[test]
 fn vector_top_k_dimension_mismatch_skips_rows() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Mixed dimensions: 2 nodes with dim=3, 1 with dim=2 (mismatch).
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Mixed",
@@ -2393,7 +2442,7 @@ fn vector_top_k_dimension_mismatch_skips_rows() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Mixed",
@@ -2404,7 +2453,7 @@ fn vector_top_k_dimension_mismatch_skips_rows() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         3,
         "Mixed",
@@ -2421,7 +2470,7 @@ fn vector_top_k_dimension_mismatch_skips_rows() {
          ORDER BY d \
          LIMIT 5 \
          RETURN nid, d",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -2459,8 +2508,8 @@ fn vector_top_k_dimension_mismatch_skips_rows() {
 /// must work correctly for paginated top-K queries.
 #[test]
 fn vector_top_k_skip_limit_fallback() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // 5 nodes at increasing distances from [0.0, 0.0]:
@@ -2468,7 +2517,7 @@ fn vector_top_k_skip_limit_fallback() {
     for i in 1..=5u64 {
         let x = i as f32 / 10.0;
         insert_node(
-            &engine,
+            engine,
             1,
             i,
             "P",
@@ -2488,7 +2537,7 @@ fn vector_top_k_skip_limit_fallback() {
          SKIP 1 \
          LIMIT 2 \
          RETURN nid, d",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -2518,8 +2567,8 @@ fn vector_top_k_skip_limit_fallback() {
 /// vector_distance. Manhattan distance uses ASC ordering (lower = closer).
 #[test]
 fn vector_top_k_manhattan_metric() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // 3 nodes at known Manhattan distances from [1.0, 0.0, 0.0]:
@@ -2527,7 +2576,7 @@ fn vector_top_k_manhattan_metric() {
     //   n2: [0.5, 0.5, 0.0] → L1 = 1.0
     //   n3: [0.0, 1.0, 1.0] → L1 = 3.0
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "M",
@@ -2538,7 +2587,7 @@ fn vector_top_k_manhattan_metric() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "M",
@@ -2549,7 +2598,7 @@ fn vector_top_k_manhattan_metric() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         3,
         "M",
@@ -2566,7 +2615,7 @@ fn vector_top_k_manhattan_metric() {
          ORDER BY d \
          LIMIT 2 \
          RETURN nid, d",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -2609,8 +2658,8 @@ fn vector_top_k_manhattan_metric() {
 /// must accept this direction and the executor must sort correctly.
 #[test]
 fn vector_top_k_similarity_desc_metric() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // 3 unit vectors with known cosine similarity to [1.0, 0.0]:
@@ -2618,7 +2667,7 @@ fn vector_top_k_similarity_desc_metric() {
     //   n2: [0.7, 0.7] → cos ≈ 0.707
     //   n3: [0.0, 1.0] → cos = 0.0
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "S",
@@ -2626,7 +2675,7 @@ fn vector_top_k_similarity_desc_metric() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "S",
@@ -2634,7 +2683,7 @@ fn vector_top_k_similarity_desc_metric() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         3,
         "S",
@@ -2648,7 +2697,7 @@ fn vector_top_k_similarity_desc_metric() {
          ORDER BY sim DESC \
          LIMIT 2 \
          RETURN nid, sim",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -2698,8 +2747,8 @@ fn vector_top_k_similarity_desc_metric() {
 /// optimized (wrong direction), but must still work via unoptimized Sort+Limit.
 #[test]
 fn vector_top_k_distance_desc_fallback_works() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // 4 nodes at known distances from [0.0, 0.0, 0.0]:
@@ -2707,7 +2756,7 @@ fn vector_top_k_distance_desc_fallback_works() {
     for i in 1..=4u64 {
         let x = i as f32;
         insert_node(
-            &engine,
+            engine,
             1,
             i,
             "F",
@@ -2725,7 +2774,7 @@ fn vector_top_k_distance_desc_fallback_works() {
          ORDER BY d DESC \
          LIMIT 2 \
          RETURN nid, d",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -2775,8 +2824,8 @@ fn vector_top_k_distance_desc_fallback_works() {
 /// ordering and that the distance alias is populated correctly.
 #[test]
 fn vector_top_k_brute_force_without_index() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // 6 nodes with varying distances to [1.0, 0.0, 0.0].
@@ -2790,7 +2839,7 @@ fn vector_top_k_brute_force_without_index() {
     ];
     for (id, vec) in &embeddings {
         insert_node(
-            &engine,
+            engine,
             1,
             *id,
             "Vec",
@@ -2809,7 +2858,7 @@ fn vector_top_k_brute_force_without_index() {
          ORDER BY d \
          LIMIT 3 \
          RETURN nid, d",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -2847,33 +2896,33 @@ fn vector_top_k_brute_force_without_index() {
 /// `type(r)` returns the relationship type as a string.
 #[test]
 fn type_function_returns_edge_type() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let alloc = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     run_cypher_with_alloc(
         "CREATE (a:Person {name: 'Alice'})",
-        &engine,
+        engine,
         &mut interner,
         &alloc,
     );
     run_cypher_with_alloc(
         "CREATE (b:Person {name: 'Bob'})",
-        &engine,
+        engine,
         &mut interner,
         &alloc,
     );
     run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
-        &engine,
+        engine,
         &mut interner,
         &alloc,
     );
 
     let results = run_cypher_with_alloc(
         "MATCH (a)-[r]->(b) RETURN type(r) AS rel_type",
-        &engine,
+        engine,
         &mut interner,
         &alloc,
     );
@@ -2889,12 +2938,12 @@ fn type_function_returns_edge_type() {
 /// `labels(n)` returns a list containing the node's label.
 #[test]
 fn labels_function_returns_node_label() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Movie",
@@ -2904,7 +2953,7 @@ fn labels_function_returns_node_label() {
 
     let results = run_cypher(
         "MATCH (n:Movie) RETURN labels(n) AS lbls",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -2922,39 +2971,39 @@ fn labels_function_returns_node_label() {
 /// `type(r)` with multiple edge types returns correct type per edge.
 #[test]
 fn type_function_multiple_edge_types() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let alloc = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     run_cypher_with_alloc(
         "CREATE (a:Person {name: 'X'})",
-        &engine,
+        engine,
         &mut interner,
         &alloc,
     );
     run_cypher_with_alloc(
         "CREATE (b:Company {name: 'Y'})",
-        &engine,
+        engine,
         &mut interner,
         &alloc,
     );
     run_cypher_with_alloc(
         "MATCH (a:Person {name: 'X'}), (b:Company {name: 'Y'}) CREATE (a)-[:WORKS_AT]->(b)",
-        &engine,
+        engine,
         &mut interner,
         &alloc,
     );
     run_cypher_with_alloc(
         "MATCH (a:Person {name: 'X'}), (b:Company {name: 'Y'}) CREATE (a)-[:INVESTED_IN]->(b)",
-        &engine,
+        engine,
         &mut interner,
         &alloc,
     );
 
     let results = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'X'})-[r]->(b) RETURN type(r) AS t ORDER BY t",
-        &engine,
+        engine,
         &mut interner,
         &alloc,
     );
@@ -2996,13 +3045,13 @@ fn vector_filter_cost_in_explain() {
 #[test]
 fn adaptive_divergence_detected_on_high_fan_out() {
     // Create a hub node with many edges to trigger divergence detection
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Hub node connected to 20 targets
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Hub",
@@ -3010,15 +3059,15 @@ fn adaptive_divergence_detected_on_high_fan_out() {
         &mut interner,
     );
     for i in 2..=21 {
-        insert_node(&engine, 1, i, "Leaf", &[], &mut interner);
-        insert_edge(&engine, "LINK", 1, i);
+        insert_node(engine, 1, i, "Leaf", &[], &mut interner);
+        insert_edge(engine, "LINK", 1, i);
     }
     // Each leaf also connects to 5 more nodes → 20 * 5 = 100 at depth 2
     let mut next_id = 22u64;
     for leaf in 2..=21 {
         for _ in 0..5 {
-            insert_node(&engine, 1, next_id, "Deep", &[], &mut interner);
-            insert_edge(&engine, "LINK", leaf, next_id);
+            insert_node(engine, 1, next_id, "Deep", &[], &mut interner);
+            insert_edge(engine, "LINK", leaf, next_id);
             next_id += 1;
         }
     }
@@ -3034,7 +3083,7 @@ fn adaptive_divergence_detected_on_high_fan_out() {
 
     let (_results, warnings) = run_cypher_adaptive(
         "MATCH (h:Hub {name: \"center\"})-[:LINK*1..3]->(t) RETURN t",
-        &engine,
+        engine,
         &mut interner,
         adaptive,
     );
@@ -3051,7 +3100,8 @@ fn adaptive_divergence_detected_on_high_fan_out() {
 #[test]
 fn adaptive_no_divergence_on_small_graph() {
     // Normal small graph should NOT trigger divergence
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let adaptive = AdaptiveConfig {
         enabled: true,
@@ -3063,7 +3113,7 @@ fn adaptive_no_divergence_on_small_graph() {
 
     let (_results, warnings) = run_cypher_adaptive(
         "MATCH (a:Person {name: \"Alice\"})-[:KNOWS*1..3]->(b) RETURN b",
-        &engine,
+        engine,
         &mut interner,
         adaptive,
     );
@@ -3079,12 +3129,12 @@ fn adaptive_no_divergence_on_small_graph() {
 #[test]
 fn adaptive_disabled_no_warnings() {
     // When disabled, no adaptive warnings even on high fan-out
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Hub",
@@ -3092,8 +3142,8 @@ fn adaptive_disabled_no_warnings() {
         &mut interner,
     );
     for i in 2..=50 {
-        insert_node(&engine, 1, i, "Leaf", &[], &mut interner);
-        insert_edge(&engine, "LINK", 1, i);
+        insert_node(engine, 1, i, "Leaf", &[], &mut interner);
+        insert_edge(engine, "LINK", 1, i);
     }
 
     let adaptive = AdaptiveConfig {
@@ -3106,7 +3156,7 @@ fn adaptive_disabled_no_warnings() {
 
     let (_results, warnings) = run_cypher_adaptive(
         "MATCH (h:Hub {name: \"x\"})-[:LINK*1..2]->(t) RETURN t",
-        &engine,
+        engine,
         &mut interner,
         adaptive,
     );
@@ -3121,7 +3171,8 @@ fn adaptive_disabled_no_warnings() {
 #[test]
 fn adaptive_check_interval_config() {
     // Verify check_interval is respected — with interval=1, even small divergence is caught
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let adaptive = AdaptiveConfig {
         enabled: true,
@@ -3133,7 +3184,7 @@ fn adaptive_check_interval_config() {
 
     let (_results, warnings) = run_cypher_adaptive(
         "MATCH (a:Person {name: \"Alice\"})-[:KNOWS*1..2]->(b) RETURN b",
-        &engine,
+        engine,
         &mut interner,
         adaptive,
     );
@@ -3167,12 +3218,12 @@ fn run_cypher_with_text_index(
 
 #[test]
 fn text_match_filters_by_fulltext() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Article",
@@ -3180,7 +3231,7 @@ fn text_match_filters_by_fulltext() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Article",
@@ -3188,7 +3239,7 @@ fn text_match_filters_by_fulltext() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         3,
         "Article",
@@ -3196,7 +3247,7 @@ fn text_match_filters_by_fulltext() {
         &mut interner,
     );
 
-    let text_dir = dir.path().join("text_idx");
+    let text_dir = fx.scratch_path().join("text_idx");
     let mut text_idx = TextIndex::open_or_create(&text_dir, 15_000_000, Some("english")).unwrap();
     text_idx.add_document(1, "Rust graph database").unwrap();
     text_idx.add_document(2, "Python machine learning").unwrap();
@@ -3206,7 +3257,7 @@ fn text_match_filters_by_fulltext() {
         MultiLanguageTextIndex::wrap(text_idx, MultiLangConfig::with_default_language("english"));
     let results = run_cypher_with_text_index(
         "MATCH (a:Article) WHERE text_match(a.title, \"graph\") RETURN a.title",
-        &engine,
+        engine,
         &mut interner,
         &multi_idx,
     );
@@ -3228,12 +3279,12 @@ fn text_match_planner_creates_text_filter() {
 
 #[test]
 fn text_score_returns_bm25() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Doc",
@@ -3241,7 +3292,7 @@ fn text_score_returns_bm25() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Doc",
@@ -3249,7 +3300,7 @@ fn text_score_returns_bm25() {
         &mut interner,
     );
 
-    let text_dir = dir.path().join("text_idx");
+    let text_dir = fx.scratch_path().join("text_idx");
     let mut text_idx = TextIndex::open_or_create(&text_dir, 15_000_000, None).unwrap();
     text_idx.add_document(1, "rust rust rust").unwrap();
     text_idx.add_document(2, "rust programming").unwrap();
@@ -3257,7 +3308,7 @@ fn text_score_returns_bm25() {
     let multi_idx = MultiLanguageTextIndex::wrap(text_idx, MultiLangConfig::default());
     let results = run_cypher_with_text_index(
         "MATCH (d:Doc) WHERE text_match(d.body, \"rust\") RETURN text_score(d.body, \"rust\") AS score",
-        &engine, &mut interner, &multi_idx,
+        engine, &mut interner, &multi_idx,
     );
 
     assert_eq!(results.len(), 2, "both docs match 'rust'");
@@ -3278,11 +3329,12 @@ fn text_score_returns_bm25() {
 // Consistent with R-HYB1 `text_score()` guard and R-HYB2b RankFuse guard.
 #[test]
 fn text_match_no_index_errors() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
     let ast = parse("MATCH (n:Person) WHERE text_match(n.name, \"Alice\") RETURN n").unwrap();
     let plan = build_logical_plan(&ast).unwrap();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
     let err = execute(&plan, &mut ctx)
         .expect_err("text_match() without any text index must error, not pass rows through");
     let msg = err.to_string();
@@ -3300,8 +3352,8 @@ fn text_match_no_index_errors() {
 // `execute_text_filter`.
 #[test]
 fn text_match_empty_input_short_circuits_without_index_lookup() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     // No Article nodes inserted — MATCH will produce 0 rows.
 
@@ -3310,7 +3362,7 @@ fn text_match_empty_input_short_circuits_without_index_lookup() {
     // result cleanly.
     let results = run_cypher(
         "MATCH (a:Article) WHERE text_match(a.body, \"rust\") RETURN a.body",
-        &engine,
+        engine,
         &mut interner,
     );
     assert!(
@@ -3324,12 +3376,12 @@ fn text_match_empty_input_short_circuits_without_index_lookup() {
 // and the property so the user can create the right index.
 #[test]
 fn text_match_registry_missing_entry_errors_with_label_and_property() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Article",
@@ -3338,14 +3390,14 @@ fn text_match_registry_missing_entry_errors_with_label_and_property() {
     );
 
     // Registry exists but has NO index for (Article, body).
-    let text_reg_dir = dir.path().join("empty_text_reg");
+    let text_reg_dir = fx.scratch_path().join("empty_text_reg");
     std::fs::create_dir_all(&text_reg_dir).unwrap();
     let text_reg = TextIndexRegistry::new(&text_reg_dir);
 
     let ast = parse("MATCH (a:Article) WHERE text_match(a.body, \"rust\") RETURN a").unwrap();
     let plan = build_logical_plan(&ast).unwrap();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
     ctx.text_index_registry = Some(&text_reg);
 
     let err = execute(&plan, &mut ctx).expect_err(
@@ -3367,13 +3419,14 @@ fn text_match_registry_missing_entry_errors_with_label_and_property() {
 // caller into thinking the document has zero BM25 relevance.
 #[test]
 fn text_score_without_text_match_errors() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
     // Plan builds fine (valid Cypher); executor detects the missing TextFilter
     // at runtime and aborts with ExecutionError::Unsupported.
     let ast = parse("MATCH (n:Person) RETURN text_score(n.name, \"Alice\") AS score").unwrap();
     let plan = build_logical_plan(&ast).unwrap();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
     let err = execute(&plan, &mut ctx).expect_err(
         "text_score() without paired text_match() must error at execute time, not return 0.0",
     );
@@ -3389,13 +3442,13 @@ fn text_score_without_text_match_errors() {
 // rank higher (BM25 = monotonic in term frequency when docs are similar length).
 #[test]
 fn text_score_orders_results_by_bm25() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Doc 1: "rust rust rust" — term frequency 3
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Doc",
@@ -3404,7 +3457,7 @@ fn text_score_orders_results_by_bm25() {
     );
     // Doc 2: "rust" — term frequency 1
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Doc",
@@ -3413,7 +3466,7 @@ fn text_score_orders_results_by_bm25() {
     );
     // Doc 3: "rust programming language" — term frequency 1 in longer doc
     insert_node(
-        &engine,
+        engine,
         1,
         3,
         "Doc",
@@ -3421,7 +3474,7 @@ fn text_score_orders_results_by_bm25() {
         &mut interner,
     );
 
-    let text_dir = dir.path().join("text_idx");
+    let text_dir = fx.scratch_path().join("text_idx");
     let mut text_idx = TextIndex::open_or_create(&text_dir, 15_000_000, None).unwrap();
     text_idx.add_document(1, "rust rust rust").unwrap();
     text_idx.add_document(2, "rust").unwrap();
@@ -3434,7 +3487,7 @@ fn text_score_orders_results_by_bm25() {
         "MATCH (d:Doc) WHERE text_match(d.body, \"rust\") \
          RETURN d.body AS body, text_score(d.body, \"rust\") AS score \
          ORDER BY score DESC",
-        &engine,
+        engine,
         &mut interner,
         &multi_idx,
     );
@@ -3473,15 +3526,15 @@ fn text_score_orders_results_by_bm25() {
 // a weighted blend of vector similarity and BM25 drives ordering.
 #[test]
 fn text_score_composes_with_vector_distance_in_order_by() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Two docs. Doc 1: vector matches exactly, text weakly matches.
     // Doc 2: vector distant, text strongly matches (multiple occurrences).
     // With a vector-heavy blend, doc 1 wins; pure text would reverse it.
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Doc",
@@ -3492,7 +3545,7 @@ fn text_score_composes_with_vector_distance_in_order_by() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Doc",
@@ -3503,7 +3556,7 @@ fn text_score_composes_with_vector_distance_in_order_by() {
         &mut interner,
     );
 
-    let text_dir = dir.path().join("text_idx");
+    let text_dir = fx.scratch_path().join("text_idx");
     let mut text_idx = TextIndex::open_or_create(&text_dir, 15_000_000, None).unwrap();
     text_idx.add_document(1, "rust").unwrap();
     text_idx.add_document(2, "rust rust rust rust").unwrap();
@@ -3520,7 +3573,7 @@ fn text_score_composes_with_vector_distance_in_order_by() {
                 (1.0 - vector_distance(d.embedding, [1.0, 0.0, 0.0])) * 0.9 \
                 + text_score(d.body, \"rust\") * 0.1 AS score \
          ORDER BY score DESC",
-        &engine,
+        engine,
         &mut interner,
         &multi_idx,
     );
@@ -3558,12 +3611,12 @@ fn text_score_composes_with_vector_distance_in_order_by() {
 // for every row when both filter operators run in the same plan.
 #[test]
 fn hybrid_score_matches_manual_arithmetic() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Doc",
@@ -3574,7 +3627,7 @@ fn hybrid_score_matches_manual_arithmetic() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Doc",
@@ -3585,7 +3638,7 @@ fn hybrid_score_matches_manual_arithmetic() {
         &mut interner,
     );
 
-    let text_dir = dir.path().join("text_idx");
+    let text_dir = fx.scratch_path().join("text_idx");
     let mut text_idx = TextIndex::open_or_create(&text_dir, 15_000_000, None).unwrap();
     text_idx.add_document(1, "rust programming").unwrap();
     text_idx.add_document(2, "rust rust rust").unwrap();
@@ -3599,7 +3652,7 @@ fn hybrid_score_matches_manual_arithmetic() {
          WHERE text_match(d.body, \"rust\") \
            AND vector_distance(d.embedding, [1.0, 0.0, 0.0]) < 1.0 \
          RETURN d.body AS body, hybrid_score(d, \"rust\") AS score",
-        &engine,
+        engine,
         &mut interner,
         &multi_idx,
     );
@@ -3611,7 +3664,7 @@ fn hybrid_score_matches_manual_arithmetic() {
          RETURN d.body AS body, \
                 (1.0 - vector_distance(d.embedding, [1.0, 0.0, 0.0])) * 0.65 \
                 + text_score(d.body, \"rust\") * 0.35 AS score",
-        &engine,
+        engine,
         &mut interner,
         &multi_idx,
     );
@@ -3651,12 +3704,12 @@ fn hybrid_score_matches_manual_arithmetic() {
 // L2 normalization). Verifies weight overriding end to end.
 #[test]
 fn hybrid_score_custom_weights_override_defaults() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Doc",
@@ -3667,7 +3720,7 @@ fn hybrid_score_custom_weights_override_defaults() {
         &mut interner,
     );
 
-    let text_dir = dir.path().join("text_idx");
+    let text_dir = fx.scratch_path().join("text_idx");
     let mut text_idx = TextIndex::open_or_create(&text_dir, 15_000_000, None).unwrap();
     text_idx.add_document(1, "rust rust rust").unwrap();
     let multi_idx = MultiLanguageTextIndex::wrap(text_idx, MultiLangConfig::default());
@@ -3677,7 +3730,7 @@ fn hybrid_score_custom_weights_override_defaults() {
          WHERE text_match(d.body, \"rust\") \
            AND vector_distance(d.embedding, [1.0, 0.0, 0.0]) < 1.0 \
          RETURN hybrid_score(d, \"rust\", {vector: 1.0, text: 0.0}) AS score",
-        &engine,
+        engine,
         &mut interner,
         &multi_idx,
     );
@@ -3699,11 +3752,12 @@ fn hybrid_score_custom_weights_override_defaults() {
 // required predicates, not silently return 0.0 / Null.
 #[test]
 fn hybrid_score_without_filters_errors() {
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
     let ast = parse("MATCH (n:Person) RETURN hybrid_score(n, \"Alice\") AS score").unwrap();
     let plan = build_logical_plan(&ast).unwrap();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
     let err = execute(&plan, &mut ctx).expect_err(
         "hybrid_score() without paired text_match / vector_distance must error at execute time",
     );
@@ -3729,12 +3783,12 @@ mod cjk_text_match {
     #[cfg(feature = "cjk-zh")]
     #[test]
     fn text_match_chinese_jieba() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = test_engine(dir.path());
+        let fx = test_engine();
+        let engine = &fx.engine;
         let mut interner = FieldInterner::new();
 
         insert_node(
-            &engine,
+            engine,
             1,
             1,
             "Article",
@@ -3742,7 +3796,7 @@ mod cjk_text_match {
             &mut interner,
         );
         insert_node(
-            &engine,
+            engine,
             1,
             2,
             "Article",
@@ -3750,7 +3804,7 @@ mod cjk_text_match {
             &mut interner,
         );
         insert_node(
-            &engine,
+            engine,
             1,
             3,
             "Article",
@@ -3758,7 +3812,7 @@ mod cjk_text_match {
             &mut interner,
         );
 
-        let text_dir = dir.path().join("text_idx_cn");
+        let text_dir = fx.scratch_path().join("text_idx_cn");
         let mut text_idx =
             TextIndex::open_or_create(&text_dir, 15_000_000, Some("chinese_jieba")).unwrap();
         text_idx.add_document(1, "北京是中国的首都").unwrap();
@@ -3772,7 +3826,7 @@ mod cjk_text_match {
         );
         let results = run_cypher_with_text_index(
             "MATCH (a:Article) WHERE text_match(a.title, \"北京\") RETURN a.title",
-            &engine,
+            engine,
             &mut interner,
             &multi_idx,
         );
@@ -3785,12 +3839,12 @@ mod cjk_text_match {
     #[cfg(feature = "cjk-ja")]
     #[test]
     fn text_match_japanese_lindera() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = test_engine(dir.path());
+        let fx = test_engine();
+        let engine = &fx.engine;
         let mut interner = FieldInterner::new();
 
         insert_node(
-            &engine,
+            engine,
             1,
             1,
             "Article",
@@ -3798,7 +3852,7 @@ mod cjk_text_match {
             &mut interner,
         );
         insert_node(
-            &engine,
+            engine,
             1,
             2,
             "Article",
@@ -3806,7 +3860,7 @@ mod cjk_text_match {
             &mut interner,
         );
 
-        let text_dir = dir.path().join("text_idx_jp");
+        let text_dir = fx.scratch_path().join("text_idx_jp");
         let mut text_idx =
             TextIndex::open_or_create(&text_dir, 15_000_000, Some("japanese_lindera")).unwrap();
         text_idx.add_document(1, "東京都に住んでいます").unwrap();
@@ -3818,7 +3872,7 @@ mod cjk_text_match {
         );
         let results = run_cypher_with_text_index(
             "MATCH (a:Article) WHERE text_match(a.title, \"東京\") RETURN a.title",
-            &engine,
+            engine,
             &mut interner,
             &multi_idx,
         );
@@ -3831,12 +3885,12 @@ mod cjk_text_match {
     #[cfg(feature = "cjk-ko")]
     #[test]
     fn text_match_korean_lindera() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = test_engine(dir.path());
+        let fx = test_engine();
+        let engine = &fx.engine;
         let mut interner = FieldInterner::new();
 
         insert_node(
-            &engine,
+            engine,
             1,
             1,
             "Article",
@@ -3847,7 +3901,7 @@ mod cjk_text_match {
             &mut interner,
         );
         insert_node(
-            &engine,
+            engine,
             1,
             2,
             "Article",
@@ -3855,7 +3909,7 @@ mod cjk_text_match {
             &mut interner,
         );
 
-        let text_dir = dir.path().join("text_idx_kr");
+        let text_dir = fx.scratch_path().join("text_idx_kr");
         let mut text_idx =
             TextIndex::open_or_create(&text_dir, 15_000_000, Some("korean_lindera")).unwrap();
         text_idx
@@ -3869,7 +3923,7 @@ mod cjk_text_match {
         );
         let results = run_cypher_with_text_index(
             "MATCH (a:Article) WHERE text_match(a.title, \"서울\") RETURN a.title",
-            &engine,
+            engine,
             &mut interner,
             &multi_idx,
         );
@@ -3903,13 +3957,13 @@ mod multi_lang_text_index {
     /// Mixed English + Russian documents in one index, searchable per language
     #[test]
     fn mixed_english_russian_via_override() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = test_engine(dir.path());
+        let fx = test_engine();
+        let engine = &fx.engine;
         let mut interner = FieldInterner::new();
 
         // Insert graph nodes
         insert_node(
-            &engine,
+            engine,
             1,
             1,
             "Article",
@@ -3920,7 +3974,7 @@ mod multi_lang_text_index {
             &mut interner,
         );
         insert_node(
-            &engine,
+            engine,
             1,
             2,
             "Article",
@@ -3932,7 +3986,7 @@ mod multi_lang_text_index {
         );
 
         // Build multi-language text index
-        let text_dir = dir.path().join("multilang_idx");
+        let text_dir = fx.scratch_path().join("multilang_idx");
         let config = MultiLangConfig::with_default_language("english");
         let mut ml_idx =
             MultiLanguageTextIndex::open_or_create(&text_dir, 15_000_000, config).unwrap();
@@ -3984,12 +4038,12 @@ mod multi_lang_text_index {
     /// "none" analyzer preserves exact tokens for technical identifiers
     #[test]
     fn none_analyzer_with_graph_nodes() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = test_engine(dir.path());
+        let fx = test_engine();
+        let engine = &fx.engine;
         let mut interner = FieldInterner::new();
 
         insert_node(
-            &engine,
+            engine,
             1,
             1,
             "ErrorCode",
@@ -4003,7 +4057,7 @@ mod multi_lang_text_index {
             &mut interner,
         );
 
-        let text_dir = dir.path().join("none_idx");
+        let text_dir = fx.scratch_path().join("none_idx");
         let config = MultiLangConfig::with_default_language("english")
             .with_field_analyzer("code", "none")
             .with_field_analyzer("description", "auto_detect");
@@ -4046,12 +4100,12 @@ mod multi_lang_text_index {
     /// through query engine (current integration: text_index.inner())
     #[test]
     fn per_document_language_via_text_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = test_engine(dir.path());
+        let fx = test_engine();
+        let engine = &fx.engine;
         let mut interner = FieldInterner::new();
 
         insert_node(
-            &engine,
+            engine,
             1,
             1,
             "Article",
@@ -4059,7 +4113,7 @@ mod multi_lang_text_index {
             &mut interner,
         );
         insert_node(
-            &engine,
+            engine,
             1,
             2,
             "Article",
@@ -4070,7 +4124,7 @@ mod multi_lang_text_index {
             &mut interner,
         );
         insert_node(
-            &engine,
+            engine,
             1,
             3,
             "Article",
@@ -4079,7 +4133,7 @@ mod multi_lang_text_index {
         );
 
         // Use TextIndex with per-document language
-        let text_dir = dir.path().join("perdoc_idx");
+        let text_dir = fx.scratch_path().join("perdoc_idx");
         let mut text_idx = TextIndex::open_or_create(&text_dir, 15_000_000, Some("none")).unwrap();
 
         text_idx
@@ -4125,7 +4179,7 @@ mod multi_lang_text_index {
             MultiLanguageTextIndex::wrap(text_idx, MultiLangConfig::with_default_language("none"));
         let results = run_cypher_with_text_index(
             "MATCH (a:Article) WHERE text_match(a.title, \"ERR_TIMEOUT_EXCEEDED\") RETURN a.title",
-            &engine,
+            engine,
             &mut interner,
             &multi_idx,
         );
@@ -4214,27 +4268,27 @@ mod multi_lang_text_index {
 /// posting lists so traversal from surviving nodes sees no stale edges.
 #[test]
 fn detach_delete_e2e_no_stale_edges_on_traversal() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     // Create graph: A->B, A->C, B->C, B->A (bidirectional knows)
     run_cypher_with_alloc(
         "CREATE (a:Person {name: 'Alice'})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "CREATE (b:Person {name: 'Bob'})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "CREATE (c:Person {name: 'Charlie'})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4242,27 +4296,27 @@ fn detach_delete_e2e_no_stale_edges_on_traversal() {
     // Edges: Alice->Bob, Alice->Charlie via KNOWS
     run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Charlie'}) CREATE (a)-[:KNOWS]->(c)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     // Bob->Alice via KNOWS (bidirectional)
     run_cypher_with_alloc(
         "MATCH (b:Person {name: 'Bob'}), (a:Person {name: 'Alice'}) CREATE (b)-[:KNOWS]->(a)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     // Bob->Charlie via KNOWS
     run_cypher_with_alloc(
         "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) CREATE (b)-[:KNOWS]->(c)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4270,7 +4324,7 @@ fn detach_delete_e2e_no_stale_edges_on_traversal() {
     // Verify: traversal from Bob shows Alice and Charlie as outgoing KNOWS
     let before = run_cypher_with_alloc(
         "MATCH (b:Person {name: 'Bob'})-[:KNOWS]->(friend) RETURN friend.name ORDER BY friend.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4283,7 +4337,7 @@ fn detach_delete_e2e_no_stale_edges_on_traversal() {
     // Verify: reverse traversal — who KNOWS Alice?
     let before_rev = run_cypher_with_alloc(
         "MATCH (friend)-[:KNOWS]->(a:Person {name: 'Alice'}) RETURN friend.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4295,7 +4349,7 @@ fn detach_delete_e2e_no_stale_edges_on_traversal() {
     // DETACH DELETE Alice
     run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}) DETACH DELETE a",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4303,7 +4357,7 @@ fn detach_delete_e2e_no_stale_edges_on_traversal() {
     // KEY CHECK: traversal from Bob should now show ONLY Charlie (Alice removed)
     let after = run_cypher_with_alloc(
         "MATCH (b:Person {name: 'Bob'})-[:KNOWS]->(friend) RETURN friend.name ORDER BY friend.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4321,7 +4375,7 @@ fn detach_delete_e2e_no_stale_edges_on_traversal() {
     // Should be only Bob (Alice's edge removed)
     let after_rev = run_cypher_with_alloc(
         "MATCH (friend)-[:KNOWS]->(c:Person {name: 'Charlie'}) RETURN friend.name ORDER BY friend.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4338,7 +4392,7 @@ fn detach_delete_e2e_no_stale_edges_on_traversal() {
     // KEY CHECK: Alice should not exist at all
     let alice_check = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}) RETURN a.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4348,28 +4402,28 @@ fn detach_delete_e2e_no_stale_edges_on_traversal() {
 /// E2E: DETACH DELETE with edge properties — edge props are cleaned up.
 #[test]
 fn detach_delete_e2e_edge_props_cleaned() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     // Create: Alice -[:REVIEWED {rating: 5}]-> Movie
     run_cypher_with_alloc(
         "CREATE (a:Person {name: 'Alice'})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "CREATE (m:Movie {title: 'Matrix'})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (m:Movie {title: 'Matrix'}) \
          CREATE (a)-[:REVIEWED {rating: 5}]->(m)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4377,7 +4431,7 @@ fn detach_delete_e2e_edge_props_cleaned() {
     // Verify edge property exists via traversal
     let before = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'})-[r:REVIEWED]->(m:Movie) RETURN r.rating",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4387,7 +4441,7 @@ fn detach_delete_e2e_edge_props_cleaned() {
     // DETACH DELETE Alice
     run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}) DETACH DELETE a",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4395,7 +4449,7 @@ fn detach_delete_e2e_edge_props_cleaned() {
     // Verify: reverse traversal from Movie should return nothing
     let after = run_cypher_with_alloc(
         "MATCH (p)-[:REVIEWED]->(m:Movie {title: 'Matrix'}) RETURN p.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4419,39 +4473,39 @@ fn detach_delete_e2e_edge_props_cleaned() {
 /// E2E: DETACH DELETE node with multiple edge types — all cleaned.
 #[test]
 fn detach_delete_e2e_multiple_edge_types() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     // Create: Alice -[:KNOWS]-> Bob, Alice -[:FOLLOWS]-> Bob, Alice -[:LIKES]-> Bob
     run_cypher_with_alloc(
         "CREATE (a:Person {name: 'Alice'})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "CREATE (b:Person {name: 'Bob'})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:FOLLOWS]->(b)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:LIKES]->(b)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4459,7 +4513,7 @@ fn detach_delete_e2e_multiple_edge_types() {
     // DETACH DELETE Alice
     run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}) DETACH DELETE a",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4467,7 +4521,7 @@ fn detach_delete_e2e_multiple_edge_types() {
     // Verify: Bob has no incoming edges from any type
     let knows = run_cypher_with_alloc(
         "MATCH (x)-[:KNOWS]->(b:Person {name: 'Bob'}) RETURN x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4475,7 +4529,7 @@ fn detach_delete_e2e_multiple_edge_types() {
 
     let follows = run_cypher_with_alloc(
         "MATCH (x)-[:FOLLOWS]->(b:Person {name: 'Bob'}) RETURN x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4486,7 +4540,7 @@ fn detach_delete_e2e_multiple_edge_types() {
 
     let likes = run_cypher_with_alloc(
         "MATCH (x)-[:LIKES]->(b:Person {name: 'Bob'}) RETURN x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4515,8 +4569,8 @@ fn detach_delete_e2e_multiple_edge_types() {
 /// Verifies that nested document properties don't interfere with edge cleanup.
 #[test]
 fn detach_delete_e2e_with_document_properties() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
@@ -4551,7 +4605,7 @@ fn detach_delete_e2e_with_document_properties() {
 
     // Device node with nested document
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Device",
@@ -4564,7 +4618,7 @@ fn detach_delete_e2e_with_document_properties() {
 
     // Sensor node with nested document
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Sensor",
@@ -4577,7 +4631,7 @@ fn detach_delete_e2e_with_document_properties() {
 
     // Hub node (simple properties)
     insert_node(
-        &engine,
+        engine,
         1,
         3,
         "Hub",
@@ -4586,14 +4640,14 @@ fn detach_delete_e2e_with_document_properties() {
     );
 
     // Edges: Router->Sensor (CONNECTS), Router->Hub (MANAGES), Hub->Sensor (MONITORS)
-    insert_edge(&engine, "CONNECTS", 1, 2);
-    insert_edge(&engine, "MANAGES", 1, 3);
-    insert_edge(&engine, "MONITORS", 3, 2);
+    insert_edge(engine, "CONNECTS", 1, 2);
+    insert_edge(engine, "MANAGES", 1, 3);
+    insert_edge(engine, "MONITORS", 3, 2);
 
     // Verify traversal before delete
     let before = run_cypher_with_alloc(
         "MATCH (d:Device {name: 'Router-A'})-[:CONNECTS]->(s) RETURN s.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4602,7 +4656,7 @@ fn detach_delete_e2e_with_document_properties() {
     // DETACH DELETE the Device node (has DOCUMENT property "config")
     run_cypher_with_alloc(
         "MATCH (d:Device {name: 'Router-A'}) DETACH DELETE d",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4610,7 +4664,7 @@ fn detach_delete_e2e_with_document_properties() {
     // Verify: Device is gone
     let device_check = run_cypher_with_alloc(
         "MATCH (d:Device) RETURN d.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4619,7 +4673,7 @@ fn detach_delete_e2e_with_document_properties() {
     // Verify: Sensor (with DOCUMENT property) still exists and queryable
     let sensor_check = run_cypher_with_alloc(
         "MATCH (s:Sensor {name: 'Temp-01'}) RETURN s.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4628,7 +4682,7 @@ fn detach_delete_e2e_with_document_properties() {
     // Verify: no stale CONNECTS edge from deleted Device to Sensor
     let stale_connects = run_cypher_with_alloc(
         "MATCH (x)-[:CONNECTS]->(s:Sensor {name: 'Temp-01'}) RETURN x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4640,7 +4694,7 @@ fn detach_delete_e2e_with_document_properties() {
     // Verify: no stale MANAGES edge from deleted Device to Hub
     let stale_manages = run_cypher_with_alloc(
         "MATCH (x)-[:MANAGES]->(h:Hub {name: 'Central-Hub'}) RETURN x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4652,7 +4706,7 @@ fn detach_delete_e2e_with_document_properties() {
     // Verify: Hub->Sensor MONITORS edge is still intact (unrelated to deleted Device)
     let monitors = run_cypher_with_alloc(
         "MATCH (h:Hub {name: 'Central-Hub'})-[:MONITORS]->(s) RETURN s.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4670,21 +4724,21 @@ fn detach_delete_e2e_with_document_properties() {
 /// E2E: Self-loop edge — node has an edge to itself. DETACH DELETE should not panic.
 #[test]
 fn detach_delete_e2e_self_loop() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     // Create node and self-loop
     run_cypher_with_alloc(
         "CREATE (a:Person {name: 'Narcissus'})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Narcissus'}) CREATE (a)-[:LOVES]->(a)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4692,13 +4746,13 @@ fn detach_delete_e2e_self_loop() {
     // Also create another node connected to Narcissus
     run_cypher_with_alloc(
         "CREATE (b:Person {name: 'Echo'})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "MATCH (e:Person {name: 'Echo'}), (n:Person {name: 'Narcissus'}) CREATE (e)-[:LOVES]->(n)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4706,7 +4760,7 @@ fn detach_delete_e2e_self_loop() {
     // DETACH DELETE Narcissus (has self-loop + incoming edge)
     run_cypher_with_alloc(
         "MATCH (n:Person {name: 'Narcissus'}) DETACH DELETE n",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4714,7 +4768,7 @@ fn detach_delete_e2e_self_loop() {
     // Verify: Narcissus gone
     let check = run_cypher_with_alloc(
         "MATCH (n:Person {name: 'Narcissus'}) RETURN n.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4723,7 +4777,7 @@ fn detach_delete_e2e_self_loop() {
     // Verify: Echo has no outgoing LOVES (target was deleted)
     let echo_loves = run_cypher_with_alloc(
         "MATCH (e:Person {name: 'Echo'})-[:LOVES]->(x) RETURN x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4735,7 +4789,7 @@ fn detach_delete_e2e_self_loop() {
     // Verify: Echo still exists
     let echo_check = run_cypher_with_alloc(
         "MATCH (e:Person {name: 'Echo'}) RETURN e.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4746,8 +4800,8 @@ fn detach_delete_e2e_self_loop() {
 /// Verifies no double-free or panic on already-cleaned posting lists.
 #[test]
 fn detach_delete_e2e_sequential_deletes() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
@@ -4755,26 +4809,26 @@ fn detach_delete_e2e_sequential_deletes() {
     for name in &["Alice", "Bob", "Charlie", "Dave"] {
         run_cypher_with_alloc(
             &format!("CREATE (:Person {{name: '{name}'}})"),
-            &engine,
+            engine,
             &mut interner,
             &allocator,
         );
     }
     run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:NEXT]->(b)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) CREATE (b)-[:NEXT]->(c)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "MATCH (c:Person {name: 'Charlie'}), (d:Person {name: 'Dave'}) CREATE (c)-[:NEXT]->(d)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4782,7 +4836,7 @@ fn detach_delete_e2e_sequential_deletes() {
     // Delete middle node Bob (has both incoming from Alice and outgoing to Charlie)
     run_cypher_with_alloc(
         "MATCH (b:Person {name: 'Bob'}) DETACH DELETE b",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4790,7 +4844,7 @@ fn detach_delete_e2e_sequential_deletes() {
     // Alice's outgoing NEXT should be empty (Bob was deleted)
     let alice_next = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'})-[:NEXT]->(x) RETURN x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4802,7 +4856,7 @@ fn detach_delete_e2e_sequential_deletes() {
     // Charlie's incoming NEXT should be empty (Bob was deleted)
     let charlie_prev = run_cypher_with_alloc(
         "MATCH (x)-[:NEXT]->(c:Person {name: 'Charlie'}) RETURN x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4814,7 +4868,7 @@ fn detach_delete_e2e_sequential_deletes() {
     // Charlie->Dave edge should still work
     let charlie_dave = run_cypher_with_alloc(
         "MATCH (c:Person {name: 'Charlie'})-[:NEXT]->(d) RETURN d.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4827,7 +4881,7 @@ fn detach_delete_e2e_sequential_deletes() {
     // Now delete Charlie (also a middle node after Bob's deletion)
     run_cypher_with_alloc(
         "MATCH (c:Person {name: 'Charlie'}) DETACH DELETE c",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4835,7 +4889,7 @@ fn detach_delete_e2e_sequential_deletes() {
     // Dave's incoming should be empty
     let dave_prev = run_cypher_with_alloc(
         "MATCH (x)-[:NEXT]->(d:Person {name: 'Dave'}) RETURN x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4847,7 +4901,7 @@ fn detach_delete_e2e_sequential_deletes() {
     // Alice and Dave should still exist, disconnected
     let remaining = run_cypher_with_alloc(
         "MATCH (p:Person) RETURN p.name ORDER BY p.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4862,39 +4916,39 @@ fn detach_delete_e2e_sequential_deletes() {
 /// sequence. Verifies merge buffer consistency.
 #[test]
 fn detach_delete_e2e_create_and_delete_same_session() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     // Create nodes and edges, then immediately delete one
     run_cypher_with_alloc(
         "CREATE (a:Temp {name: 'Alpha'})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "CREATE (b:Temp {name: 'Beta'})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "CREATE (c:Temp {name: 'Gamma'})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "MATCH (a:Temp {name: 'Alpha'}), (b:Temp {name: 'Beta'}) CREATE (a)-[:LINK]->(b)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "MATCH (b:Temp {name: 'Beta'}), (c:Temp {name: 'Gamma'}) CREATE (b)-[:LINK]->(c)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4902,7 +4956,7 @@ fn detach_delete_e2e_create_and_delete_same_session() {
     // Delete Beta right after creating it with edges
     run_cypher_with_alloc(
         "MATCH (b:Temp {name: 'Beta'}) DETACH DELETE b",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4910,7 +4964,7 @@ fn detach_delete_e2e_create_and_delete_same_session() {
     // Alpha should have no outgoing LINK
     let alpha_link = run_cypher_with_alloc(
         "MATCH (a:Temp {name: 'Alpha'})-[:LINK]->(x) RETURN x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4919,7 +4973,7 @@ fn detach_delete_e2e_create_and_delete_same_session() {
     // Gamma should have no incoming LINK
     let gamma_link = run_cypher_with_alloc(
         "MATCH (x)-[:LINK]->(c:Temp {name: 'Gamma'}) RETURN x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4931,7 +4985,7 @@ fn detach_delete_e2e_create_and_delete_same_session() {
     // Verify only Alpha and Gamma remain
     let remaining = run_cypher_with_alloc(
         "MATCH (t:Temp) RETURN t.name ORDER BY t.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -4947,8 +5001,8 @@ fn detach_delete_e2e_create_and_delete_same_session() {
 /// is accessible via dot-notation and contains correct data.
 #[test]
 fn detach_delete_e2e_deep_nested_docs_both_sides() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
@@ -4989,7 +5043,7 @@ fn detach_delete_e2e_deep_nested_docs_both_sides() {
     )]));
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Source",
@@ -5000,7 +5054,7 @@ fn detach_delete_e2e_deep_nested_docs_both_sides() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Target",
@@ -5010,12 +5064,12 @@ fn detach_delete_e2e_deep_nested_docs_both_sides() {
         ],
         &mut interner,
     );
-    insert_edge(&engine, "LINKED", 1, 2);
+    insert_edge(engine, "LINKED", 1, 2);
 
     // Verify dot-notation access on target before delete
     let before = run_cypher_with_alloc(
         "MATCH (t:Target {name: 'TgtNode'}) RETURN t.deep.data.nested.config.settings.value",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5029,7 +5083,7 @@ fn detach_delete_e2e_deep_nested_docs_both_sides() {
     // DETACH DELETE the source node (which also has a deep nested doc)
     run_cypher_with_alloc(
         "MATCH (s:Source {name: 'SrcNode'}) DETACH DELETE s",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5037,7 +5091,7 @@ fn detach_delete_e2e_deep_nested_docs_both_sides() {
     // Verify: target's deep nested document is FULLY intact after neighbor deletion
     let after = run_cypher_with_alloc(
         "MATCH (t:Target {name: 'TgtNode'}) RETURN t.deep.data.nested.config.settings.value",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5051,7 +5105,7 @@ fn detach_delete_e2e_deep_nested_docs_both_sides() {
     // Verify: no stale reverse edge from deleted source
     let stale = run_cypher_with_alloc(
         "MATCH (x)-[:LINKED]->(t:Target {name: 'TgtNode'}) RETURN x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5062,8 +5116,8 @@ fn detach_delete_e2e_deep_nested_docs_both_sides() {
 /// Verifies the copied document on target is independently owned (no data corruption).
 #[test]
 fn detach_delete_e2e_copied_nested_doc_survives() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
@@ -5092,7 +5146,7 @@ fn detach_delete_e2e_copied_nested_doc_survives() {
     ]));
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Config",
@@ -5105,7 +5159,7 @@ fn detach_delete_e2e_copied_nested_doc_survives() {
 
     // Target node — will receive a copy of the document
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Config",
@@ -5115,12 +5169,12 @@ fn detach_delete_e2e_copied_nested_doc_survives() {
         ],
         &mut interner,
     );
-    insert_edge(&engine, "CLONED_FROM", 2, 1);
+    insert_edge(engine, "CLONED_FROM", 2, 1);
 
     // Verify both have the same document
     let primary = run_cypher_with_alloc(
         "MATCH (c:Config {name: 'Primary'}) RETURN c.settings.network.ssid",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5131,7 +5185,7 @@ fn detach_delete_e2e_copied_nested_doc_survives() {
 
     let backup_before = run_cypher_with_alloc(
         "MATCH (c:Config {name: 'Backup'}) RETURN c.settings.network.ssid, c.settings.auth.method",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5147,7 +5201,7 @@ fn detach_delete_e2e_copied_nested_doc_survives() {
     // DETACH DELETE the primary (source of the cloned document)
     run_cypher_with_alloc(
         "MATCH (c:Config {name: 'Primary'}) DETACH DELETE c",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5155,7 +5209,7 @@ fn detach_delete_e2e_copied_nested_doc_survives() {
     // Verify: Backup's document is FULLY intact — independent copy, not shared reference
     let backup_after = run_cypher_with_alloc(
         "MATCH (c:Config {name: 'Backup'}) RETURN c.settings.network.ssid, c.settings.network.channel, c.settings.auth.method",
-        &engine, &mut interner, &allocator,
+        engine, &mut interner, &allocator,
     );
     assert_eq!(backup_after.len(), 1, "Backup node must survive");
     assert_eq!(
@@ -5177,7 +5231,7 @@ fn detach_delete_e2e_copied_nested_doc_survives() {
     // Verify: no stale CLONED_FROM edge
     let stale = run_cypher_with_alloc(
         "MATCH (c:Config {name: 'Backup'})-[:CLONED_FROM]->(x) RETURN x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5190,27 +5244,27 @@ fn detach_delete_e2e_copied_nested_doc_survives() {
 /// E2E: Edge with map-type properties. DETACH DELETE cleans up complex edge props.
 #[test]
 fn detach_delete_e2e_edge_with_map_properties() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
     // Create nodes
     run_cypher_with_alloc(
         "CREATE (a:User {name: 'Alice'})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "CREATE (b:User {name: 'Bob'})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "CREATE (c:User {name: 'Charlie'})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5219,7 +5273,7 @@ fn detach_delete_e2e_edge_with_map_properties() {
     run_cypher_with_alloc(
         "MATCH (a:User {name: 'Alice'}), (b:User {name: 'Bob'}) \
          CREATE (a)-[:KNOWS {since: 2020, strength: 0.9}]->(b)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5227,7 +5281,7 @@ fn detach_delete_e2e_edge_with_map_properties() {
     run_cypher_with_alloc(
         "MATCH (c:User {name: 'Charlie'}), (a:User {name: 'Alice'}) \
          CREATE (c)-[:FOLLOWS {since: 2023}]->(a)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5235,7 +5289,7 @@ fn detach_delete_e2e_edge_with_map_properties() {
     run_cypher_with_alloc(
         "MATCH (b:User {name: 'Bob'}), (c:User {name: 'Charlie'}) \
          CREATE (b)-[:KNOWS]->(c)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5243,7 +5297,7 @@ fn detach_delete_e2e_edge_with_map_properties() {
     // Verify edge props exist before delete
     let before_ep = run_cypher_with_alloc(
         "MATCH (a:User {name: 'Alice'})-[r:KNOWS]->(b:User {name: 'Bob'}) RETURN r.since, r.strength",
-        &engine, &mut interner, &allocator,
+        engine, &mut interner, &allocator,
     );
     assert_eq!(before_ep.len(), 1);
     assert_eq!(before_ep[0].get("r.since"), Some(&Value::Int(2020)));
@@ -5251,7 +5305,7 @@ fn detach_delete_e2e_edge_with_map_properties() {
     // DETACH DELETE Alice
     run_cypher_with_alloc(
         "MATCH (a:User {name: 'Alice'}) DETACH DELETE a",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5259,7 +5313,7 @@ fn detach_delete_e2e_edge_with_map_properties() {
     // Verify: no stale edges to/from Alice
     let bob_in = run_cypher_with_alloc(
         "MATCH (x)-[:KNOWS]->(b:User {name: 'Bob'}) RETURN x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5267,7 +5321,7 @@ fn detach_delete_e2e_edge_with_map_properties() {
 
     let charlie_follows = run_cypher_with_alloc(
         "MATCH (c:User {name: 'Charlie'})-[:FOLLOWS]->(x) RETURN x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5279,7 +5333,7 @@ fn detach_delete_e2e_edge_with_map_properties() {
     // Verify: Bob->Charlie edge (unrelated to Alice) is intact
     let bob_charlie = run_cypher_with_alloc(
         "MATCH (b:User {name: 'Bob'})-[:KNOWS]->(c:User {name: 'Charlie'}) RETURN c.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5316,8 +5370,8 @@ fn detach_delete_e2e_edge_with_map_properties() {
 /// New node at potentially same storage location should have clean state.
 #[test]
 fn detach_delete_e2e_create_after_delete_no_ghost() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
@@ -5341,7 +5395,7 @@ fn detach_delete_e2e_create_after_delete_no_ghost() {
     ]));
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Service",
@@ -5353,14 +5407,14 @@ fn detach_delete_e2e_create_after_delete_no_ghost() {
     );
     run_cypher_with_alloc(
         "CREATE (dep:Dependency {name: 'Redis'})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "MATCH (s:Service {name: 'OldService'}), (d:Dependency {name: 'Redis'}) \
          CREATE (s)-[:DEPENDS_ON {critical: true}]->(d)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5368,7 +5422,7 @@ fn detach_delete_e2e_create_after_delete_no_ghost() {
     // DETACH DELETE OldService
     run_cypher_with_alloc(
         "MATCH (s:Service {name: 'OldService'}) DETACH DELETE s",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5376,7 +5430,7 @@ fn detach_delete_e2e_create_after_delete_no_ghost() {
     // CREATE new service with same label but different data
     run_cypher_with_alloc(
         "CREATE (s:Service {name: 'NewService', version: 2})",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5384,7 +5438,7 @@ fn detach_delete_e2e_create_after_delete_no_ghost() {
     // Verify: new service has NO ghost properties from old service
     let new_svc = run_cypher_with_alloc(
         "MATCH (s:Service {name: 'NewService'}) RETURN s.name, s.version",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5398,7 +5452,7 @@ fn detach_delete_e2e_create_after_delete_no_ghost() {
     // Verify: new service has NO edges (old service's DEPENDS_ON was deleted)
     let new_deps = run_cypher_with_alloc(
         "MATCH (s:Service {name: 'NewService'})-[:DEPENDS_ON]->(d) RETURN d.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5407,7 +5461,7 @@ fn detach_delete_e2e_create_after_delete_no_ghost() {
     // Verify: Redis has no incoming DEPENDS_ON (from deleted OldService)
     let redis_deps = run_cypher_with_alloc(
         "MATCH (x)-[:DEPENDS_ON]->(d:Dependency {name: 'Redis'}) RETURN x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5420,14 +5474,14 @@ fn detach_delete_e2e_create_after_delete_no_ghost() {
     run_cypher_with_alloc(
         "MATCH (s:Service {name: 'NewService'}), (d:Dependency {name: 'Redis'}) \
          CREATE (s)-[:DEPENDS_ON {critical: false}]->(d)",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
 
     let new_deps2 = run_cypher_with_alloc(
         "MATCH (s:Service {name: 'NewService'})-[r:DEPENDS_ON]->(d) RETURN d.name, r.critical",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5448,8 +5502,8 @@ fn detach_delete_e2e_create_after_delete_no_ghost() {
 /// verify all 4 remaining nodes + their documents + surviving edges intact.
 #[test]
 fn detach_delete_e2e_diamond_graph_documents() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
 
@@ -5510,7 +5564,7 @@ fn detach_delete_e2e_diamond_graph_documents() {
     ]));
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Node",
@@ -5518,7 +5572,7 @@ fn detach_delete_e2e_diamond_graph_documents() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Node",
@@ -5526,7 +5580,7 @@ fn detach_delete_e2e_diamond_graph_documents() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         3,
         "Node",
@@ -5537,7 +5591,7 @@ fn detach_delete_e2e_diamond_graph_documents() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         4,
         "Node",
@@ -5549,15 +5603,15 @@ fn detach_delete_e2e_diamond_graph_documents() {
     );
 
     // Diamond edges
-    insert_edge(&engine, "FEEDS", 1, 2); // Top -> Left
-    insert_edge(&engine, "FEEDS", 1, 3); // Top -> Right
-    insert_edge(&engine, "FEEDS", 2, 4); // Left -> Bottom
-    insert_edge(&engine, "FEEDS", 3, 4); // Right -> Bottom
+    insert_edge(engine, "FEEDS", 1, 2); // Top -> Left
+    insert_edge(engine, "FEEDS", 1, 3); // Top -> Right
+    insert_edge(engine, "FEEDS", 2, 4); // Left -> Bottom
+    insert_edge(engine, "FEEDS", 3, 4); // Right -> Bottom
 
     // DETACH DELETE Top (central fan-out node)
     run_cypher_with_alloc(
         "MATCH (n:Node {name: 'Top'}) DETACH DELETE n",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5565,7 +5619,7 @@ fn detach_delete_e2e_diamond_graph_documents() {
     // Verify: Left's document is intact
     let left = run_cypher_with_alloc(
         "MATCH (n:Node {name: 'Left'}) RETURN n.state.role, n.state.metrics.throughput",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5582,7 +5636,7 @@ fn detach_delete_e2e_diamond_graph_documents() {
     // Verify: Right's document is intact
     let right = run_cypher_with_alloc(
         "MATCH (n:Node {name: 'Right'}) RETURN n.state.role, n.state.metrics.throughput",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5595,7 +5649,7 @@ fn detach_delete_e2e_diamond_graph_documents() {
     // Verify: Bottom's document is intact (with array)
     let bottom = run_cypher_with_alloc(
         "MATCH (n:Node {name: 'Bottom'}) RETURN n.state.role",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5608,7 +5662,7 @@ fn detach_delete_e2e_diamond_graph_documents() {
     // Verify: Left->Bottom and Right->Bottom edges survive
     let feeds_bottom = run_cypher_with_alloc(
         "MATCH (x)-[:FEEDS]->(b:Node {name: 'Bottom'}) RETURN x.name ORDER BY x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5625,7 +5679,7 @@ fn detach_delete_e2e_diamond_graph_documents() {
     // Verify: no stale incoming FEEDS to Left or Right from deleted Top
     let left_incoming = run_cypher_with_alloc(
         "MATCH (x)-[:FEEDS]->(n:Node {name: 'Left'}) RETURN x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5636,7 +5690,7 @@ fn detach_delete_e2e_diamond_graph_documents() {
 
     let right_incoming = run_cypher_with_alloc(
         "MATCH (x)-[:FEEDS]->(n:Node {name: 'Right'}) RETURN x.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -5656,7 +5710,8 @@ fn optional_match_correlated_where_cross_variable() {
     // Current bug: right side executes once, `a.age` evaluates to Null
     // because "a" is not in right-side rows. All rows filtered out →
     // incorrect NULL result instead of matching rows.
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Charlie is 30. Find all Person nodes older than Charlie.
     // Expected: Dave(40) and Eve(35) match b.age > a.age (30).
@@ -5666,7 +5721,7 @@ fn optional_match_correlated_where_cross_variable() {
          WHERE b.age > a.age AND b.name <> a.name \
          RETURN a.name AS self_name, b.name AS older_name \
          ORDER BY older_name",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -5695,14 +5750,15 @@ fn optional_match_correlated_where_cross_variable() {
 fn optional_match_correlated_no_match_returns_null() {
     // Dave is 40 — the oldest person. No one is older.
     // Correlated OPTIONAL MATCH should return NULL for b.
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let results = run_cypher(
         "MATCH (a:Person {name: \"Dave\"}) \
          OPTIONAL MATCH (b:Person) \
          WHERE b.age > a.age AND b.name <> a.name \
          RETURN a.name AS self_name, b.name AS older_name",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -5715,7 +5771,8 @@ fn optional_match_correlated_no_match_returns_null() {
 fn optional_match_correlated_traversal_with_cross_scope() {
     // More realistic pattern: MATCH (a) OPTIONAL MATCH (b)-[:R]->(c) WHERE c.x = f(a.y)
     // Here "a" is only in left scope, "b" and "c" are in right scope.
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Find people whose KNOWS targets include someone the same age as Alice.
     // Alice is 30. Charlie is also 30.
@@ -5727,7 +5784,7 @@ fn optional_match_correlated_traversal_with_cross_scope() {
          OPTIONAL MATCH (b:Person)-[:KNOWS]->(c:Person) \
          WHERE c.age = a.age AND c.name <> a.name \
          RETURN a.name AS src, b.name AS via, c.name AS peer",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -5761,7 +5818,8 @@ fn optional_match_nested_correlated() {
     // Second OPTIONAL MATCH: for each (a,b) row, find b→c where c.age > a.age(30).
     //   (Alice, Bob): Bob→Charlie(30) — 30 > 30? No. → NULL
     //   (Alice, Charlie): Charlie→Dave(40) — 40 > 30? Yes, and Dave ≠ Charlie. → Dave
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     let results = run_cypher(
         "MATCH (a:Person {name: \"Alice\"}) \
@@ -5770,7 +5828,7 @@ fn optional_match_nested_correlated() {
          WHERE c.age > a.age AND c.name <> b.name \
          RETURN a.name AS a_name, b.name AS b_name, c.name AS c_name \
          ORDER BY b_name",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -5808,7 +5866,8 @@ fn optional_match_non_correlated_still_works() {
     // Verify that non-correlated OPTIONAL MATCH (the common case) still uses
     // the fast global execution path and produces correct results.
     // This is a regression guard against the correlated optimization.
-    let (_dir, engine, mut interner) = setup_social_graph();
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
 
     // Simple non-correlated: MATCH (a) OPTIONAL MATCH (a)-[:KNOWS]->(b)
     // Bob KNOWS Charlie only.
@@ -5816,7 +5875,7 @@ fn optional_match_non_correlated_still_works() {
         "MATCH (a:Person {name: \"Bob\"}) \
          OPTIONAL MATCH (a)-[:KNOWS]->(b) \
          RETURN a.name AS self_name, b.name AS friend",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -5862,13 +5921,13 @@ fn hint_absent_uses_default() {
 fn g015_text_match_3arg_with_language() {
     // Verify text_match(field, query, language) works through the full
     // planner → executor pipeline with explicit language tokenization.
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Insert English and Russian articles
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Doc",
@@ -5876,7 +5935,7 @@ fn g015_text_match_3arg_with_language() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Doc",
@@ -5884,7 +5943,7 @@ fn g015_text_match_3arg_with_language() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         3,
         "Doc",
@@ -5892,7 +5951,7 @@ fn g015_text_match_3arg_with_language() {
         &mut interner,
     );
 
-    let text_dir = dir.path().join("text_idx");
+    let text_dir = fx.scratch_path().join("text_idx");
     let config = MultiLangConfig::with_default_language("english")
         .with_field_analyzer("title", "auto_detect");
     let mut ml_idx = MultiLanguageTextIndex::open_or_create(&text_dir, 15_000_000, config).unwrap();
@@ -5935,7 +5994,7 @@ fn g015_text_match_3arg_with_language() {
     // 3-arg: search with explicit English tokenization
     let results = run_cypher_with_text_index(
         "MATCH (d:Doc) WHERE text_match(d.title, \"running forest\", \"english\") RETURN d.title",
-        &engine,
+        engine,
         &mut interner,
         &ml_idx,
     );
@@ -5947,7 +6006,7 @@ fn g015_text_match_3arg_with_language() {
     // 2-arg: should still work (uses default language from config)
     let results_2arg = run_cypher_with_text_index(
         "MATCH (d:Doc) WHERE text_match(d.title, \"forest\") RETURN d.title",
-        &engine,
+        engine,
         &mut interner,
         &ml_idx,
     );
@@ -6056,8 +6115,8 @@ fn g015_explain_shows_language_in_text_filter() {
 /// Verifies the merge operand is applied and readable via dot-notation.
 #[test]
 fn r164_set_deep_path_on_document_property() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Create a node with a DOCUMENT property containing nested structure.
@@ -6080,7 +6139,7 @@ fn r164_set_deep_path_on_document_property() {
     );
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Device",
@@ -6094,14 +6153,14 @@ fn r164_set_deep_path_on_document_property() {
     // SET the deep path via merge operand.
     let _rows = run_cypher(
         "MATCH (n:Device) SET n.config.network.ssid = 'home_wifi' RETURN n.name",
-        &engine,
+        engine,
         &mut interner,
     );
 
     // Read back and verify the nested value changed.
     let rows = run_cypher(
         "MATCH (n:Device) RETURN n.config.network.ssid",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1);
@@ -6114,14 +6173,14 @@ fn r164_set_deep_path_on_document_property() {
 /// SET creates intermediate objects when path doesn't fully exist.
 #[test]
 fn r164_set_path_creates_intermediates() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Create node with empty DOCUMENT config property.
     let empty_doc = rmpv::Value::Map(vec![]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Device",
@@ -6132,14 +6191,14 @@ fn r164_set_path_creates_intermediates() {
     // SET a deep path — intermediates should be created automatically.
     run_cypher(
         "MATCH (n:Device) SET n.config.network.ssid = 'new_network'",
-        &engine,
+        engine,
         &mut interner,
     );
 
     // Read back the full path.
     let rows = run_cypher(
         "MATCH (n:Device) RETURN n.config.network.ssid",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1);
@@ -6152,8 +6211,8 @@ fn r164_set_path_creates_intermediates() {
 /// REMOVE n.config.network.ssid deletes a nested path.
 #[test]
 fn r164_remove_deep_path() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Create a node with nested config.
@@ -6170,7 +6229,7 @@ fn r164_remove_deep_path() {
         ),
     )]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Device",
@@ -6181,14 +6240,14 @@ fn r164_remove_deep_path() {
     // REMOVE the ssid nested property.
     run_cypher(
         "MATCH (n:Device) REMOVE n.config.network.ssid",
-        &engine,
+        engine,
         &mut interner,
     );
 
     // ssid should be Null, password should still exist.
     let rows = run_cypher(
         "MATCH (n:Device) RETURN n.config.network.ssid, n.config.network.password",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1);
@@ -6202,8 +6261,8 @@ fn r164_remove_deep_path() {
 /// REMOVE on non-existent deep path is a no-op (idempotent).
 #[test]
 fn r164_remove_nonexistent_path_is_noop() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![(
@@ -6211,7 +6270,7 @@ fn r164_remove_nonexistent_path_is_noop() {
         rmpv::Value::String("test".into()),
     )]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Device",
@@ -6222,14 +6281,14 @@ fn r164_remove_nonexistent_path_is_noop() {
     // REMOVE a path that doesn't exist — should not error.
     run_cypher(
         "MATCH (n:Device) REMOVE n.config.nonexistent.deep.path",
-        &engine,
+        engine,
         &mut interner,
     );
 
     // Verify the existing data is untouched.
     let rows = run_cypher(
         "MATCH (n:Device) RETURN n.config.name",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1);
@@ -6242,8 +6301,8 @@ fn r164_remove_nonexistent_path_is_noop() {
 /// Mixed SET: single-level property + deep path in same statement.
 #[test]
 fn r164_mixed_set_property_and_path() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![(
@@ -6251,7 +6310,7 @@ fn r164_mixed_set_property_and_path() {
         rmpv::Value::String("1.0".into()),
     )]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Device",
@@ -6265,13 +6324,13 @@ fn r164_mixed_set_property_and_path() {
     // SET both a flat property and a deep path in one statement.
     run_cypher(
         "MATCH (n:Device) SET n.name = 'new', n.config.version = '2.0'",
-        &engine,
+        engine,
         &mut interner,
     );
 
     let rows = run_cypher(
         "MATCH (n:Device) RETURN n.name, n.config.version",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1);
@@ -6285,13 +6344,13 @@ fn r164_mixed_set_property_and_path() {
 /// SET deep path with non-string values: integer, nested map, boolean.
 #[test]
 fn r164_set_deep_path_non_string_values() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Device",
@@ -6302,13 +6361,13 @@ fn r164_set_deep_path_non_string_values() {
     // SET integer at deep path.
     run_cypher(
         "MATCH (n:Device) SET n.config.retry_count = 5",
-        &engine,
+        engine,
         &mut interner,
     );
 
     let rows = run_cypher(
         "MATCH (n:Device) RETURN n.config.retry_count",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1);
@@ -6317,13 +6376,13 @@ fn r164_set_deep_path_non_string_values() {
     // SET boolean at deep path.
     run_cypher(
         "MATCH (n:Device) SET n.config.enabled = true",
-        &engine,
+        engine,
         &mut interner,
     );
 
     let rows = run_cypher(
         "MATCH (n:Device) RETURN n.config.enabled",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1);
@@ -6334,8 +6393,8 @@ fn r164_set_deep_path_non_string_values() {
 /// Both changes should persist (no lost update).
 #[test]
 fn r164_set_two_different_paths_sequential() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![(
@@ -6352,7 +6411,7 @@ fn r164_set_two_different_paths_sequential() {
         ]),
     )]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Device",
@@ -6363,21 +6422,21 @@ fn r164_set_two_different_paths_sequential() {
     // First SET: change ssid.
     run_cypher(
         "MATCH (n:Device) SET n.config.network.ssid = 'new_wifi'",
-        &engine,
+        engine,
         &mut interner,
     );
 
     // Second SET: change password (different path, same node).
     run_cypher(
         "MATCH (n:Device) SET n.config.network.password = 'new_secret'",
-        &engine,
+        engine,
         &mut interner,
     );
 
     // Both changes should be visible.
     let rows = run_cypher(
         "MATCH (n:Device) RETURN n.config.network.ssid, n.config.network.password",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1);
@@ -6394,8 +6453,8 @@ fn r164_set_two_different_paths_sequential() {
 /// SET overwrites existing value at deep path (last-writer-wins).
 #[test]
 fn r164_set_overwrites_existing_deep_value() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![(
@@ -6403,7 +6462,7 @@ fn r164_set_overwrites_existing_deep_value() {
         rmpv::Value::Integer(1.into()),
     )]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Device",
@@ -6413,13 +6472,13 @@ fn r164_set_overwrites_existing_deep_value() {
 
     run_cypher(
         "MATCH (n:Device) SET n.config.level = 42",
-        &engine,
+        engine,
         &mut interner,
     );
 
     let rows = run_cypher(
         "MATCH (n:Device) RETURN n.config.level",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1);
@@ -6432,8 +6491,8 @@ fn r164_set_overwrites_existing_deep_value() {
 /// This exercises the RYOW materialization path in mvcc_get().
 #[test]
 fn g064_ryow_set_then_return_same_query() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![(
@@ -6441,7 +6500,7 @@ fn g064_ryow_set_then_return_same_query() {
         rmpv::Value::String("1.0".into()),
     )]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Device",
@@ -6452,7 +6511,7 @@ fn g064_ryow_set_then_return_same_query() {
     // SET + RETURN in the same query — must see the updated value.
     let rows = run_cypher(
         "MATCH (n:Device) SET n.config.version = '2.0' RETURN n.config.version",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1);
@@ -6466,13 +6525,13 @@ fn g064_ryow_set_then_return_same_query() {
 /// The merge operator should create the property as a Document with intermediate maps.
 #[test]
 fn g064_set_path_creates_property_from_nothing() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Node with only a "name" property, no "config" at all.
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Device",
@@ -6483,14 +6542,14 @@ fn g064_set_path_creates_property_from_nothing() {
     // SET a deep path on a property that doesn't exist.
     run_cypher(
         "MATCH (n:Device) SET n.config.network.ssid = 'new_wifi'",
-        &engine,
+        engine,
         &mut interner,
     );
 
     // Verify the property was created with the nested value.
     let rows = run_cypher(
         "MATCH (n:Device) RETURN n.config.network.ssid, n.name",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1);
@@ -6506,13 +6565,13 @@ fn g064_set_path_creates_property_from_nothing() {
 /// All should be applied (via separate merge operands).
 #[test]
 fn g064_multiple_set_paths_same_statement() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Device",
@@ -6523,13 +6582,13 @@ fn g064_multiple_set_paths_same_statement() {
     // Two deep SETs in one statement.
     run_cypher(
         "MATCH (n:Device) SET n.config.a = 1, n.config.b = 2",
-        &engine,
+        engine,
         &mut interner,
     );
 
     let rows = run_cypher(
         "MATCH (n:Device) RETURN n.config.a, n.config.b",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1);
@@ -6540,8 +6599,8 @@ fn g064_multiple_set_paths_same_statement() {
 /// REMOVE + SET on different paths of the same DOCUMENT in one statement.
 #[test]
 fn g064_remove_and_set_same_document_one_statement() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![
@@ -6555,7 +6614,7 @@ fn g064_remove_and_set_same_document_one_statement() {
         ),
     ]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Device",
@@ -6566,13 +6625,13 @@ fn g064_remove_and_set_same_document_one_statement() {
     // REMOVE one path, SET another in the same statement.
     run_cypher(
         "MATCH (n:Device) REMOVE n.config.old_key SET n.config.new_key = 'added'",
-        &engine,
+        engine,
         &mut interner,
     );
 
     let rows = run_cypher(
         "MATCH (n:Device) RETURN n.config.old_key, n.config.keep_key, n.config.new_key",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1);
@@ -6591,8 +6650,8 @@ fn g064_remove_and_set_same_document_one_statement() {
 /// The NodeScan must see the updated value through materialization.
 #[test]
 fn g064_ryow_prefix_scan_sees_merge_deltas() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![(
@@ -6600,7 +6659,7 @@ fn g064_ryow_prefix_scan_sees_merge_deltas() {
         rmpv::Value::String("inactive".into()),
     )]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Device",
@@ -6612,14 +6671,14 @@ fn g064_ryow_prefix_scan_sees_merge_deltas() {
     // The second read must see the merge-operand update.
     run_cypher(
         "MATCH (n:Device) SET n.config.status = 'active'",
-        &engine,
+        engine,
         &mut interner,
     );
 
     // Separate query confirms the merge was flushed to storage.
     let rows = run_cypher(
         "MATCH (n:Device) RETURN n.config.status",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1);
@@ -6632,13 +6691,13 @@ fn g064_ryow_prefix_scan_sees_merge_deltas() {
 /// SET deep path with a map literal value (nested object, not just scalar).
 #[test]
 fn g064_set_deep_path_map_literal_value() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Device",
@@ -6649,13 +6708,13 @@ fn g064_set_deep_path_map_literal_value() {
     // SET a map literal at a deep path.
     run_cypher(
         "MATCH (n:Device) SET n.config.firmware = {version: '2.1', build: 4521}",
-        &engine,
+        engine,
         &mut interner,
     );
 
     let rows = run_cypher(
         "MATCH (n:Device) RETURN n.config.firmware.version, n.config.firmware.build",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1);
@@ -6672,8 +6731,8 @@ fn g064_set_deep_path_map_literal_value() {
 /// UPSERT (MERGE) with deep path SET in ON MATCH clause.
 #[test]
 fn g064_upsert_on_match_with_property_path() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![(
@@ -6681,7 +6740,7 @@ fn g064_upsert_on_match_with_property_path() {
         rmpv::Value::Integer(5.into()),
     )]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "User",
@@ -6695,13 +6754,13 @@ fn g064_upsert_on_match_with_property_path() {
     // MERGE with ON MATCH SET on a deep path.
     run_cypher(
         "MERGE (u:User {email: 'alice@example.com'}) ON MATCH SET u.stats.last_login = 'today'",
-        &engine,
+        engine,
         &mut interner,
     );
 
     let rows = run_cypher(
         "MATCH (u:User) RETURN u.stats.last_login, u.stats.login_count",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1);
@@ -6718,8 +6777,8 @@ fn g064_upsert_on_match_with_property_path() {
 /// doc_push appends a value to an array property.
 #[test]
 fn r165_doc_push_to_array() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![(
@@ -6727,7 +6786,7 @@ fn r165_doc_push_to_array() {
         rmpv::Value::Array(vec![rmpv::Value::String("a".into())]),
     )]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Bag",
@@ -6737,11 +6796,11 @@ fn r165_doc_push_to_array() {
 
     run_cypher(
         "MATCH (n:Bag) SET doc_push(n.data.items, 'b')",
-        &engine,
+        engine,
         &mut interner,
     );
 
-    let rows = run_cypher("MATCH (n:Bag) RETURN n.data.items", &engine, &mut interner);
+    let rows = run_cypher("MATCH (n:Bag) RETURN n.data.items", engine, &mut interner);
     assert_eq!(rows.len(), 1);
     if let Some(Value::Document(doc)) = rows[0].get("n.data.items") {
         if let rmpv::Value::Array(arr) = doc {
@@ -6759,8 +6818,8 @@ fn r165_doc_push_to_array() {
 /// doc_pull removes the first occurrence of a value from an array.
 #[test]
 fn r165_doc_pull_from_array() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![(
@@ -6772,7 +6831,7 @@ fn r165_doc_pull_from_array() {
         ]),
     )]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Item",
@@ -6782,11 +6841,11 @@ fn r165_doc_pull_from_array() {
 
     run_cypher(
         "MATCH (n:Item) SET doc_pull(n.data.tags, 'a')",
-        &engine,
+        engine,
         &mut interner,
     );
 
-    let rows = run_cypher("MATCH (n:Item) RETURN n.data.tags", &engine, &mut interner);
+    let rows = run_cypher("MATCH (n:Item) RETURN n.data.tags", engine, &mut interner);
     assert_eq!(rows.len(), 1);
     // Only first "a" removed.
     if let Some(Value::Document(doc)) = rows[0].get("n.data.tags") {
@@ -6805,8 +6864,8 @@ fn r165_doc_pull_from_array() {
 /// doc_add_to_set adds only if not already present.
 #[test]
 fn r165_doc_add_to_set_dedup() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![(
@@ -6814,7 +6873,7 @@ fn r165_doc_add_to_set_dedup() {
         rmpv::Value::Array(vec![rmpv::Value::String("rust".into())]),
     )]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Item",
@@ -6825,16 +6884,16 @@ fn r165_doc_add_to_set_dedup() {
     // Add "rust" (already exists) and "go" (new).
     run_cypher(
         "MATCH (n:Item) SET doc_add_to_set(n.data.tags, 'rust')",
-        &engine,
+        engine,
         &mut interner,
     );
     run_cypher(
         "MATCH (n:Item) SET doc_add_to_set(n.data.tags, 'go')",
-        &engine,
+        engine,
         &mut interner,
     );
 
-    let rows = run_cypher("MATCH (n:Item) RETURN n.data.tags", &engine, &mut interner);
+    let rows = run_cypher("MATCH (n:Item) RETURN n.data.tags", engine, &mut interner);
     assert_eq!(rows.len(), 1);
     if let Some(Value::Document(doc)) = rows[0].get("n.data.tags") {
         if let rmpv::Value::Array(arr) = doc {
@@ -6852,8 +6911,8 @@ fn r165_doc_add_to_set_dedup() {
 /// doc_inc atomically increments a numeric field.
 #[test]
 fn r165_doc_inc_integer() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![(
@@ -6861,7 +6920,7 @@ fn r165_doc_inc_integer() {
         rmpv::Value::Integer(10.into()),
     )]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Page",
@@ -6871,15 +6930,11 @@ fn r165_doc_inc_integer() {
 
     run_cypher(
         "MATCH (n:Page) SET doc_inc(n.stats.views, 5)",
-        &engine,
+        engine,
         &mut interner,
     );
 
-    let rows = run_cypher(
-        "MATCH (n:Page) RETURN n.stats.views",
-        &engine,
-        &mut interner,
-    );
+    let rows = run_cypher("MATCH (n:Page) RETURN n.stats.views", engine, &mut interner);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("n.stats.views"), Some(&Value::Int(15)));
 }
@@ -6887,8 +6942,8 @@ fn r165_doc_inc_integer() {
 /// doc_inc with negative value decrements.
 #[test]
 fn r165_doc_inc_negative() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![(
@@ -6896,7 +6951,7 @@ fn r165_doc_inc_negative() {
         rmpv::Value::F64(10.5),
     )]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Player",
@@ -6906,13 +6961,13 @@ fn r165_doc_inc_negative() {
 
     run_cypher(
         "MATCH (n:Player) SET doc_inc(n.stats.score, -2.5)",
-        &engine,
+        engine,
         &mut interner,
     );
 
     let rows = run_cypher(
         "MATCH (n:Player) RETURN n.stats.score",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1);
@@ -6922,13 +6977,13 @@ fn r165_doc_inc_negative() {
 /// doc_push creates array from nothing when property doesn't exist.
 #[test]
 fn r165_doc_push_creates_array() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Item",
@@ -6938,11 +6993,11 @@ fn r165_doc_push_creates_array() {
 
     run_cypher(
         "MATCH (n:Item) SET doc_push(n.data.tags, 'first')",
-        &engine,
+        engine,
         &mut interner,
     );
 
-    let rows = run_cypher("MATCH (n:Item) RETURN n.data.tags", &engine, &mut interner);
+    let rows = run_cypher("MATCH (n:Item) RETURN n.data.tags", engine, &mut interner);
     assert_eq!(rows.len(), 1);
     if let Some(Value::Document(doc)) = rows[0].get("n.data.tags") {
         if let rmpv::Value::Array(arr) = doc {
@@ -6959,8 +7014,8 @@ fn r165_doc_push_creates_array() {
 /// Multiple doc functions in one SET statement.
 #[test]
 fn r165_multiple_doc_ops_one_statement() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![
@@ -6974,7 +7029,7 @@ fn r165_multiple_doc_ops_one_statement() {
         ),
     ]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Item",
@@ -6985,13 +7040,13 @@ fn r165_multiple_doc_ops_one_statement() {
     // Push to array AND increment counter in one statement.
     run_cypher(
         "MATCH (n:Item) SET doc_push(n.data.tags, 'b'), doc_inc(n.data.count, 1)",
-        &engine,
+        engine,
         &mut interner,
     );
 
     let rows = run_cypher(
         "MATCH (n:Item) RETURN n.data.tags, n.data.count",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1);
@@ -7010,13 +7065,13 @@ fn r165_multiple_doc_ops_one_statement() {
 /// doc_inc on non-existent field creates it with the increment value as initial.
 #[test]
 fn r165_doc_inc_creates_from_nothing() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Page",
@@ -7026,15 +7081,11 @@ fn r165_doc_inc_creates_from_nothing() {
 
     run_cypher(
         "MATCH (n:Page) SET doc_inc(n.stats.views, 1)",
-        &engine,
+        engine,
         &mut interner,
     );
 
-    let rows = run_cypher(
-        "MATCH (n:Page) RETURN n.stats.views",
-        &engine,
-        &mut interner,
-    );
+    let rows = run_cypher("MATCH (n:Page) RETURN n.stats.views", engine, &mut interner);
     assert_eq!(rows.len(), 1);
     // Increment on nil → creates with the amount as initial value.
     assert_eq!(rows[0].get("n.stats.views"), Some(&Value::Int(1)));
@@ -7043,8 +7094,8 @@ fn r165_doc_inc_creates_from_nothing() {
 /// doc_pull on missing value is a no-op (idempotent).
 #[test]
 fn r165_doc_pull_missing_value_noop() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let doc = rmpv::Value::Map(vec![(
@@ -7052,7 +7103,7 @@ fn r165_doc_pull_missing_value_noop() {
         rmpv::Value::Array(vec![rmpv::Value::String("a".into())]),
     )]);
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Item",
@@ -7063,11 +7114,11 @@ fn r165_doc_pull_missing_value_noop() {
     // Pull "nonexistent" — should be no-op.
     run_cypher(
         "MATCH (n:Item) SET doc_pull(n.data.tags, 'nonexistent')",
-        &engine,
+        engine,
         &mut interner,
     );
 
-    let rows = run_cypher("MATCH (n:Item) RETURN n.data.tags", &engine, &mut interner);
+    let rows = run_cypher("MATCH (n:Item) RETURN n.data.tags", engine, &mut interner);
     assert_eq!(rows.len(), 1);
     if let Some(Value::Document(doc)) = rows[0].get("n.data.tags") {
         if let rmpv::Value::Array(arr) = doc {
@@ -7093,12 +7144,12 @@ fn r165_doc_pull_missing_value_noop() {
 #[test]
 fn test_wildcard_relationship_returns_results() {
     // Graph: Alice(1) -[:KNOWS]-> Bob(2), Alice(1) -[:LIKES]-> Eve(5)
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Person",
@@ -7106,7 +7157,7 @@ fn test_wildcard_relationship_returns_results() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Person",
@@ -7114,7 +7165,7 @@ fn test_wildcard_relationship_returns_results() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         5,
         "Person",
@@ -7122,18 +7173,18 @@ fn test_wildcard_relationship_returns_results() {
         &mut interner,
     );
 
-    insert_edge(&engine, "KNOWS", 1, 2);
-    insert_edge(&engine, "LIKES", 1, 5);
+    insert_edge(engine, "KNOWS", 1, 2);
+    insert_edge(engine, "LIKES", 1, 5);
 
     // Register edge types in schema so wildcard scan can enumerate them (G069).
     // In production, the executor registers these automatically on CREATE.
-    register_schema_edge_type(&engine, "KNOWS");
-    register_schema_edge_type(&engine, "LIKES");
+    register_schema_edge_type(engine, "KNOWS");
+    register_schema_edge_type(engine, "LIKES");
 
     // Wildcard: should return both KNOWS and LIKES edges (2 rows)
     let rows = run_cypher(
         "MATCH (n)-[r]->(m) RETURN r.__type__",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(
@@ -7160,7 +7211,7 @@ fn test_wildcard_relationship_returns_results() {
     // Typed pattern should still work and return only KNOWS (regression guard)
     let typed_rows = run_cypher(
         "MATCH (n)-[r:KNOWS]->(m) RETURN r.__type__",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(
@@ -7177,12 +7228,12 @@ fn test_wildcard_relationship_returns_results() {
 /// G069 edge case: wildcard on a graph with no schema-registered edge types returns 0 rows.
 #[test]
 fn test_wildcard_relationship_empty_schema_returns_zero() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Person",
@@ -7193,7 +7244,7 @@ fn test_wildcard_relationship_empty_schema_returns_zero() {
 
     let rows = run_cypher(
         "MATCH (n)-[r]->(m) RETURN r.__type__",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(
@@ -7216,12 +7267,12 @@ fn test_wildcard_relationship_empty_schema_returns_zero() {
 #[test]
 fn test_count_relationship_variable() {
     // Graph: Alice(1) -[:KNOWS]-> Bob(2), Alice(1) -[:KNOWS]-> Charlie(3)
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Person",
@@ -7229,7 +7280,7 @@ fn test_count_relationship_variable() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Person",
@@ -7237,7 +7288,7 @@ fn test_count_relationship_variable() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         3,
         "Person",
@@ -7245,14 +7296,14 @@ fn test_count_relationship_variable() {
         &mut interner,
     );
 
-    insert_edge(&engine, "KNOWS", 1, 2);
-    insert_edge(&engine, "KNOWS", 1, 3);
-    register_schema_edge_type(&engine, "KNOWS");
+    insert_edge(engine, "KNOWS", 1, 2);
+    insert_edge(engine, "KNOWS", 1, 3);
+    register_schema_edge_type(engine, "KNOWS");
 
     // count(r) should return 2, not 0
     let rows = run_cypher(
         "MATCH (a)-[r:KNOWS]->(b) RETURN count(r) AS cnt",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(rows.len(), 1, "aggregation should produce exactly 1 row");
@@ -7266,7 +7317,7 @@ fn test_count_relationship_variable() {
     // count(*) should also return 2 (unaffected baseline)
     let rows_star = run_cypher(
         "MATCH (a)-[r:KNOWS]->(b) RETURN count(*) AS cnt",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(
@@ -7278,7 +7329,7 @@ fn test_count_relationship_variable() {
     // count(a) (node variable) should also return 2 (unaffected baseline)
     let rows_node = run_cypher(
         "MATCH (a)-[r:KNOWS]->(b) RETURN count(a) AS cnt",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(
@@ -7302,15 +7353,15 @@ fn test_count_relationship_variable() {
 /// `upsert_relations()` use MERGE for idempotent edge creation.
 #[test]
 fn test_merge_relationship_creates_edge() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     // Create two nodes via Cypher
     run_cypher_with_alloc(
         "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7319,7 +7370,7 @@ fn test_merge_relationship_creates_edge() {
     // G072: previously failed with "MERGE create from non-NodeScan pattern"
     let merge_q = "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
                    MERGE (a)-[r:KNOWS]->(b) RETURN r.__type__ AS rel_type";
-    let merge_rows = run_cypher_with_alloc(merge_q, &engine, &mut interner, &allocator);
+    let merge_rows = run_cypher_with_alloc(merge_q, engine, &mut interner, &allocator);
     assert_eq!(
         merge_rows.len(),
         1,
@@ -7335,7 +7386,7 @@ fn test_merge_relationship_creates_edge() {
     // Verify edge actually exists
     let check_rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) RETURN count(*) AS cnt",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7346,7 +7397,7 @@ fn test_merge_relationship_creates_edge() {
     );
 
     // MERGE again — should be IDEMPOTENT (match existing, no duplicates)
-    let merge_rows2 = run_cypher_with_alloc(merge_q, &engine, &mut interner, &allocator);
+    let merge_rows2 = run_cypher_with_alloc(merge_q, engine, &mut interner, &allocator);
     assert_eq!(
         merge_rows2.len(),
         1,
@@ -7357,7 +7408,7 @@ fn test_merge_relationship_creates_edge() {
     // Count edges — must still be 1 (idempotent)
     let count_rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) RETURN count(*) AS cnt",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7371,13 +7422,13 @@ fn test_merge_relationship_creates_edge() {
     // Ensure unrelated node pair returns 0 (correct scoping)
     let _ = run_cypher_with_alloc(
         "CREATE (c:Person {name: 'Charlie'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     let no_edge_rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(c:Person {name: 'Charlie'}) RETURN count(*) AS cnt",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7396,15 +7447,15 @@ fn test_merge_relationship_creates_edge() {
 /// - No cross-contamination: only exactly the 3 edges are created
 #[test]
 fn test_merge_relationship_multiple_pairs() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     // Create 3 nodes
     run_cypher_with_alloc(
         "CREATE (:Person {name: 'A'}), (:Person {name: 'B'}), (:Person {name: 'C'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7412,19 +7463,19 @@ fn test_merge_relationship_multiple_pairs() {
     // MERGE A→B, A→C, B→C using a single query with cartesian product of pairs
     run_cypher_with_alloc(
         "MATCH (x:Person {name: 'A'}), (y:Person {name: 'B'}) MERGE (x)-[r:KNOWS]->(y) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "MATCH (x:Person {name: 'A'}), (y:Person {name: 'C'}) MERGE (x)-[r:KNOWS]->(y) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "MATCH (x:Person {name: 'B'}), (y:Person {name: 'C'}) MERGE (x)-[r:KNOWS]->(y) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7432,7 +7483,7 @@ fn test_merge_relationship_multiple_pairs() {
     // Total KNOWS edges across all nodes must be exactly 3
     let rows = run_cypher_with_alloc(
         "MATCH (a)-[r:KNOWS]->(b) RETURN count(*) AS cnt",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7445,26 +7496,26 @@ fn test_merge_relationship_multiple_pairs() {
     // Running all three MERGEs again must be idempotent — still 3 edges
     run_cypher_with_alloc(
         "MATCH (x:Person {name: 'A'}), (y:Person {name: 'B'}) MERGE (x)-[r:KNOWS]->(y) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "MATCH (x:Person {name: 'A'}), (y:Person {name: 'C'}) MERGE (x)-[r:KNOWS]->(y) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     run_cypher_with_alloc(
         "MATCH (x:Person {name: 'B'}), (y:Person {name: 'C'}) MERGE (x)-[r:KNOWS]->(y) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
 
     let rows2 = run_cypher_with_alloc(
         "MATCH (a)-[r:KNOWS]->(b) RETURN count(*) AS cnt",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7483,14 +7534,14 @@ fn test_merge_relationship_multiple_pairs() {
 /// - Second MERGE (match path) does NOT trigger ON CREATE SET again
 #[test]
 fn test_merge_relationship_on_create_set() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     run_cypher_with_alloc(
         "CREATE (:Person {name: 'Alice'}), (:Person {name: 'Bob'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7499,7 +7550,7 @@ fn test_merge_relationship_on_create_set() {
     let rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          MERGE (a)-[r:KNOWS]->(b) ON CREATE SET a.merged = 1 RETURN a.merged AS m",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7514,7 +7565,7 @@ fn test_merge_relationship_on_create_set() {
     let rows2 = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          MERGE (a)-[r:KNOWS]->(b) ON CREATE SET a.merged = 99 RETURN a.merged AS m",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7536,14 +7587,14 @@ fn test_merge_relationship_on_create_set() {
 /// - Both source and target nodes are created implicitly
 #[test]
 fn test_merge_relationship_standalone_creates_from_scratch() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     let rows = run_cypher_with_alloc(
         "MERGE (a:Person {name: 'X'})-[r:KNOWS]->(b:Person {name: 'Y'}) RETURN r.__type__",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7558,7 +7609,7 @@ fn test_merge_relationship_standalone_creates_from_scratch() {
     // Verify the edge persists: the path can be found in a subsequent MATCH
     let match_rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'X'})-[r:KNOWS]->(b:Person {name: 'Y'}) RETURN a.name, b.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7585,8 +7636,8 @@ fn test_merge_relationship_standalone_creates_from_scratch() {
 /// - ON CREATE SET fires only on the first run; ON MATCH SET fires on the second
 #[test]
 fn test_merge_relationship_standalone_idempotent() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
@@ -7595,7 +7646,7 @@ fn test_merge_relationship_standalone_idempotent() {
         "MERGE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) \
          ON CREATE SET a.created = 1 \
          RETURN r.__type__, a.created AS c",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7615,7 +7666,7 @@ fn test_merge_relationship_standalone_idempotent() {
         "MERGE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) \
          ON MATCH SET a.matched = 1 \
          RETURN r.__type__, a.matched AS m",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7634,7 +7685,7 @@ fn test_merge_relationship_standalone_idempotent() {
     // Verify no duplicate nodes: only one Person {name:'Alice'} should exist
     let alice_rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}) RETURN count(a) AS cnt",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7654,15 +7705,15 @@ fn test_merge_relationship_standalone_idempotent() {
 /// - Node count stays the same after MERGE
 #[test]
 fn test_merge_relationship_standalone_reuses_existing_nodes() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     // Pre-create both nodes without any edge
     run_cypher_with_alloc(
         "CREATE (:City {name: 'Paris'}), (:City {name: 'London'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7671,7 +7722,7 @@ fn test_merge_relationship_standalone_reuses_existing_nodes() {
     let rows = run_cypher_with_alloc(
         "MERGE (a:City {name: 'Paris'})-[r:CONNECTED_TO]->(b:City {name: 'London'}) \
          RETURN r.__type__",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7684,7 +7735,7 @@ fn test_merge_relationship_standalone_reuses_existing_nodes() {
     // Verify node count: still exactly 2 City nodes (no duplicates)
     let city_rows = run_cypher_with_alloc(
         "MATCH (c:City) RETURN count(c) AS cnt",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7707,15 +7758,15 @@ fn test_merge_relationship_standalone_reuses_existing_nodes() {
 /// would create unpredictable results. Use MERGE ALL for multi-target upsert.
 #[test]
 fn test_merge_relationship_standalone_ambiguous_source_errors() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     // Create two Person nodes with the same label and property
     run_cypher_with_alloc(
         "CREATE (:Person {role: 'admin'}), (:Person {role: 'admin'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7726,7 +7777,7 @@ fn test_merge_relationship_standalone_ambiguous_source_errors() {
     )
     .expect("parse");
     let plan = build_logical_plan(&ast).expect("plan");
-    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
     let result = execute(&plan, &mut ctx);
 
     assert!(result.is_err(), "ambiguous source should return an error");
@@ -7740,15 +7791,15 @@ fn test_merge_relationship_standalone_ambiguous_source_errors() {
 /// G074 — standalone MERGE errors when the target pattern is ambiguous.
 #[test]
 fn test_merge_relationship_standalone_ambiguous_target_errors() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     // Create two Device nodes with the same label and property
     run_cypher_with_alloc(
         "CREATE (:Device {type: 'sensor'}), (:Device {type: 'sensor'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7759,7 +7810,7 @@ fn test_merge_relationship_standalone_ambiguous_target_errors() {
     )
     .expect("parse");
     let plan = build_logical_plan(&ast).expect("plan");
-    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
     let result = execute(&plan, &mut ctx);
 
     assert!(result.is_err(), "ambiguous target should return an error");
@@ -7778,8 +7829,8 @@ fn test_merge_relationship_standalone_ambiguous_target_errors() {
 /// - Both ON CREATE and ON MATCH paths produce rows with accessible node properties
 #[test]
 fn test_merge_relationship_standalone_return_node_variables() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
@@ -7787,7 +7838,7 @@ fn test_merge_relationship_standalone_return_node_variables() {
     let rows1 = run_cypher_with_alloc(
         "MERGE (a:Author {name: 'Alice'})-[r:WROTE]->(b:Book {title: 'Rust101'}) \
          RETURN a.name, b.title, r.__type__",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7812,7 +7863,7 @@ fn test_merge_relationship_standalone_return_node_variables() {
     let rows2 = run_cypher_with_alloc(
         "MERGE (a:Author {name: 'Alice'})-[r:WROTE]->(b:Book {title: 'Rust101'}) \
          RETURN a.name, b.title, r.__type__",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7841,14 +7892,14 @@ fn test_merge_relationship_standalone_return_node_variables() {
 /// - When the edge does NOT yet exist, ON MATCH SET does NOT fire
 #[test]
 fn test_merge_relationship_on_match_set() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     run_cypher_with_alloc(
         "CREATE (:Person {name: 'Alice', visits: 0}), (:Person {name: 'Bob'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7857,7 +7908,7 @@ fn test_merge_relationship_on_match_set() {
     let rows1 = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          MERGE (a)-[r:KNOWS]->(b) ON MATCH SET a.visits = a.visits + 1 RETURN a.visits AS v",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7872,7 +7923,7 @@ fn test_merge_relationship_on_match_set() {
     let rows2 = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          MERGE (a)-[r:KNOWS]->(b) ON MATCH SET a.visits = a.visits + 1 RETURN a.visits AS v",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7892,14 +7943,14 @@ fn test_merge_relationship_on_match_set() {
 /// - The edge is created and retrievable via the reverse pattern
 #[test]
 fn test_merge_relationship_incoming_direction() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     run_cypher_with_alloc(
         "CREATE (:Person {name: 'Alice'}), (:Person {name: 'Bob'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7909,7 +7960,7 @@ fn test_merge_relationship_incoming_direction() {
     let rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          MERGE (a)<-[r:KNOWS]-(b) RETURN r.__type__ AS rel_type",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7923,7 +7974,7 @@ fn test_merge_relationship_incoming_direction() {
     // Verify the edge exists in the forward direction (Bob→Alice)
     let check = run_cypher_with_alloc(
         "MATCH (b:Person {name: 'Bob'})-[r:KNOWS]->(a:Person {name: 'Alice'}) RETURN count(*) AS cnt",
-        &engine, &mut interner, &allocator,
+        engine, &mut interner, &allocator,
     );
     assert_eq!(
         check[0].get("cnt"),
@@ -7935,13 +7986,13 @@ fn test_merge_relationship_incoming_direction() {
     run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          MERGE (a)<-[r:KNOWS]-(b) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     let check2 = run_cypher_with_alloc(
         "MATCH (b:Person {name: 'Bob'})-[r:KNOWS]->(a:Person {name: 'Alice'}) RETURN count(*) AS cnt",
-        &engine, &mut interner, &allocator,
+        engine, &mut interner, &allocator,
     );
     assert_eq!(
         check2[0].get("cnt"),
@@ -7961,14 +8012,14 @@ fn test_merge_relationship_incoming_direction() {
 ///   Note: true parallel edges (cnt=2) require a data model change tracked separately.
 #[test]
 fn test_merge_relationship_edge_properties_stored_and_checked() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     run_cypher_with_alloc(
         "CREATE (:Person {name: 'Alice'}), (:Person {name: 'Bob'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7977,7 +8028,7 @@ fn test_merge_relationship_edge_properties_stored_and_checked() {
     let rows1 = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          MERGE (a)-[r:KNOWS {weight: 1}]->(b) RETURN r.__type__ AS rel_type, r.weight AS w",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -7997,7 +8048,7 @@ fn test_merge_relationship_edge_properties_stored_and_checked() {
     let match_rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) \
          RETURN r.weight AS w",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8012,7 +8063,7 @@ fn test_merge_relationship_edge_properties_stored_and_checked() {
     let rows2 = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          MERGE (a)-[r:KNOWS {weight: 1}]->(b) RETURN r.weight AS w",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8029,7 +8080,7 @@ fn test_merge_relationship_edge_properties_stored_and_checked() {
     let rows3 = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          MERGE (a)-[r:KNOWS {weight: 2}]->(b) RETURN r.weight AS w",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8044,7 +8095,7 @@ fn test_merge_relationship_edge_properties_stored_and_checked() {
     let total = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) \
          RETURN count(*) AS cnt",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8058,7 +8109,7 @@ fn test_merge_relationship_edge_properties_stored_and_checked() {
     let after = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) \
          RETURN r.weight AS w",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8077,14 +8128,14 @@ fn test_merge_relationship_edge_properties_stored_and_checked() {
 /// - On second run (ON MATCH), `r.weight` is accessible and `r.created` is readable
 #[test]
 fn test_merge_relationship_edge_properties_on_create_set() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     run_cypher_with_alloc(
         "CREATE (:Item {id: 'X'}), (:Item {id: 'Y'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8095,7 +8146,7 @@ fn test_merge_relationship_edge_properties_on_create_set() {
          MERGE (a)-[r:LINKS {weight: 5}]->(b) \
          ON CREATE SET r.new_flag = 1 \
          RETURN r.weight AS w",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8112,7 +8163,7 @@ fn test_merge_relationship_edge_properties_on_create_set() {
          MERGE (a)-[r:LINKS {weight: 5}]->(b) \
          ON MATCH SET r.visits = 1 \
          RETURN r.weight AS w",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8135,14 +8186,14 @@ fn test_merge_relationship_edge_properties_on_create_set() {
 /// - Re-running the query is idempotent (still exactly 1 KNOWS and 1 LIKES)
 #[test]
 fn test_merge_two_relationship_clauses() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     run_cypher_with_alloc(
         "CREATE (:Person {name: 'Alice'}), (:Person {name: 'Bob'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8153,14 +8204,14 @@ fn test_merge_two_relationship_clauses() {
          MERGE (a)-[r1:KNOWS]->(b) \
          MERGE (a)-[r2:LIKES]->(b) \
          RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
 
     let knows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) RETURN count(*) AS cnt",
-        &engine, &mut interner, &allocator,
+        engine, &mut interner, &allocator,
     );
     assert_eq!(
         knows[0].get("cnt"),
@@ -8170,7 +8221,7 @@ fn test_merge_two_relationship_clauses() {
 
     let likes = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'})-[r:LIKES]->(b:Person {name: 'Bob'}) RETURN count(*) AS cnt",
-        &engine, &mut interner, &allocator,
+        engine, &mut interner, &allocator,
     );
     assert_eq!(
         likes[0].get("cnt"),
@@ -8184,14 +8235,14 @@ fn test_merge_two_relationship_clauses() {
          MERGE (a)-[r1:KNOWS]->(b) \
          MERGE (a)-[r2:LIKES]->(b) \
          RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
 
     let knows2 = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) RETURN count(*) AS cnt",
-        &engine, &mut interner, &allocator,
+        engine, &mut interner, &allocator,
     );
     assert_eq!(
         knows2[0].get("cnt"),
@@ -8201,7 +8252,7 @@ fn test_merge_two_relationship_clauses() {
 
     let likes2 = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'})-[r:LIKES]->(b:Person {name: 'Bob'}) RETURN count(*) AS cnt",
-        &engine, &mut interner, &allocator,
+        engine, &mut interner, &allocator,
     );
     assert_eq!(
         likes2[0].get("cnt"),
@@ -8219,14 +8270,14 @@ fn test_merge_two_relationship_clauses() {
 /// - Idempotency on self-loop
 #[test]
 fn test_merge_relationship_self_loop() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     run_cypher_with_alloc(
         "CREATE (:Node {name: 'X'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8234,7 +8285,7 @@ fn test_merge_relationship_self_loop() {
     // Self-referential MERGE
     let rows = run_cypher_with_alloc(
         "MATCH (a:Node {name: 'X'}) MERGE (a)-[r:SELF_REF]->(a) RETURN r.__type__ AS rel_type",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8247,7 +8298,7 @@ fn test_merge_relationship_self_loop() {
     // Verify retrievable
     let check = run_cypher_with_alloc(
         "MATCH (a:Node {name: 'X'})-[r:SELF_REF]->(b:Node {name: 'X'}) RETURN count(*) AS cnt",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8260,13 +8311,13 @@ fn test_merge_relationship_self_loop() {
     // Idempotency
     run_cypher_with_alloc(
         "MATCH (a:Node {name: 'X'}) MERGE (a)-[r:SELF_REF]->(a) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     let check2 = run_cypher_with_alloc(
         "MATCH (a:Node {name: 'X'})-[r:SELF_REF]->(b:Node {name: 'X'}) RETURN count(*) AS cnt",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8290,14 +8341,14 @@ fn test_merge_relationship_self_loop() {
 /// - count(r) on the MERGE-created edge returns 1 (G070 + G072 integration)
 #[test]
 fn test_g069_wildcard_after_cypher_merge() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     run_cypher_with_alloc(
         "CREATE (:Person {name: 'Alice'}), (:Person {name: 'Bob'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8306,7 +8357,7 @@ fn test_g069_wildcard_after_cypher_merge() {
     run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
          MERGE (a)-[r:KNOWS]->(b) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8314,7 +8365,7 @@ fn test_g069_wildcard_after_cypher_merge() {
     // Wildcard [r] must find the MERGE-created KNOWS edge (G069 fix)
     let wild_rows = run_cypher_with_alloc(
         "MATCH (a)-[r]->(b) RETURN r.__type__ AS t",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8328,7 +8379,7 @@ fn test_g069_wildcard_after_cypher_merge() {
     // count(r) on the MERGE-created edge must return 1 (G070 fix)
     let cnt_rows = run_cypher_with_alloc(
         "MATCH (a)-[r:KNOWS]->(b) RETURN count(r) AS cnt",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8344,13 +8395,13 @@ fn test_g069_wildcard_after_cypher_merge() {
 #[test]
 fn g071_where_pattern_predicate_positive() {
     // WHERE (a)-[:KNOWS]->(b) should return rows where the edge exists
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Person",
@@ -8358,19 +8409,19 @@ fn g071_where_pattern_predicate_positive() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Person",
         &[("name", Value::String("Bob".into()))],
         &mut interner,
     );
-    insert_edge(&engine, "KNOWS", 1, 2);
-    register_schema_edge_type(&engine, "KNOWS");
+    insert_edge(engine, "KNOWS", 1, 2);
+    register_schema_edge_type(engine, "KNOWS");
 
     let rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) WHERE (a)-[:KNOWS]->(b) RETURN a.name AS src, b.name AS dst",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8382,13 +8433,13 @@ fn g071_where_pattern_predicate_positive() {
 #[test]
 fn g071_where_not_pattern_predicate() {
     // WHERE NOT (a)-[:KNOWS]->(b) should return rows where the edge does NOT exist
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Person",
@@ -8396,7 +8447,7 @@ fn g071_where_not_pattern_predicate() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Person",
@@ -8404,11 +8455,11 @@ fn g071_where_not_pattern_predicate() {
         &mut interner,
     );
     // No KNOWS edge from Alice to Bob
-    register_schema_edge_type(&engine, "KNOWS");
+    register_schema_edge_type(engine, "KNOWS");
 
     let rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) WHERE NOT (a)-[:KNOWS]->(b) RETURN a.name AS src, b.name AS dst",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8419,13 +8470,13 @@ fn g071_where_not_pattern_predicate() {
 #[test]
 fn g071_where_not_pattern_predicate_blocks_when_edge_exists() {
     // WHERE NOT (a)-[:KNOWS]->(b) should filter out rows where the edge DOES exist
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Person",
@@ -8433,19 +8484,19 @@ fn g071_where_not_pattern_predicate_blocks_when_edge_exists() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Person",
         &[("name", Value::String("Bob".into()))],
         &mut interner,
     );
-    insert_edge(&engine, "KNOWS", 1, 2);
-    register_schema_edge_type(&engine, "KNOWS");
+    insert_edge(engine, "KNOWS", 1, 2);
+    register_schema_edge_type(engine, "KNOWS");
 
     let rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) WHERE NOT (a)-[:KNOWS]->(b) RETURN a.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8459,13 +8510,13 @@ fn g071_where_not_pattern_predicate_blocks_when_edge_exists() {
 #[test]
 fn g071_pattern_predicate_with_and() {
     // WHERE (a)-[:KNOWS]->(b) AND b.age > 20
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Person",
@@ -8473,7 +8524,7 @@ fn g071_pattern_predicate_with_and() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Person",
@@ -8483,12 +8534,12 @@ fn g071_pattern_predicate_with_and() {
         ],
         &mut interner,
     );
-    insert_edge(&engine, "KNOWS", 1, 2);
-    register_schema_edge_type(&engine, "KNOWS");
+    insert_edge(engine, "KNOWS", 1, 2);
+    register_schema_edge_type(engine, "KNOWS");
 
     let rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) WHERE (a)-[:KNOWS]->(b) AND b.age > 20 RETURN b.name AS name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8499,13 +8550,13 @@ fn g071_pattern_predicate_with_and() {
 #[test]
 fn g071_pattern_predicate_wildcard_type() {
     // WHERE (a)-[]->(b) — wildcard edge type
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Person",
@@ -8513,19 +8564,19 @@ fn g071_pattern_predicate_wildcard_type() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Person",
         &[("name", Value::String("Bob".into()))],
         &mut interner,
     );
-    insert_edge(&engine, "FOLLOWS", 1, 2);
-    register_schema_edge_type(&engine, "FOLLOWS");
+    insert_edge(engine, "FOLLOWS", 1, 2);
+    register_schema_edge_type(engine, "FOLLOWS");
 
     let rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) WHERE (a)-[]->(b) RETURN b.name AS name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8535,13 +8586,13 @@ fn g071_pattern_predicate_wildcard_type() {
 #[test]
 fn g071_pattern_predicate_wrong_direction() {
     // WHERE (a)-[:KNOWS]->(b) but edge is b→a, not a→b
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Person",
@@ -8549,19 +8600,19 @@ fn g071_pattern_predicate_wrong_direction() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Person",
         &[("name", Value::String("Bob".into()))],
         &mut interner,
     );
-    insert_edge(&engine, "KNOWS", 2, 1); // Bob→Alice, not Alice→Bob
-    register_schema_edge_type(&engine, "KNOWS");
+    insert_edge(engine, "KNOWS", 2, 1); // Bob→Alice, not Alice→Bob
+    register_schema_edge_type(engine, "KNOWS");
 
     let rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) WHERE (a)-[:KNOWS]->(b) RETURN a.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8572,13 +8623,13 @@ fn g071_pattern_predicate_wrong_direction() {
 fn g071_standalone_where_not_pattern() {
     // Standalone WHERE (two separate MATCH clauses + WHERE) — the exact syntax from G071 description:
     // MATCH (src) MATCH (dst) WHERE NOT (src)-[:TYPE]->(dst) CREATE ...
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Person",
@@ -8586,19 +8637,19 @@ fn g071_standalone_where_not_pattern() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Person",
         &[("name", Value::String("Bob".into()))],
         &mut interner,
     );
-    register_schema_edge_type(&engine, "FOLLOWS");
+    register_schema_edge_type(engine, "FOLLOWS");
 
     // No FOLLOWS edge from Alice to Bob → NOT should pass
     let rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}) MATCH (b:Person {name: 'Bob'}) WHERE NOT (a)-[:FOLLOWS]->(b) RETURN a.name AS src, b.name AS dst",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8606,10 +8657,10 @@ fn g071_standalone_where_not_pattern() {
     assert_eq!(rows[0].get("src"), Some(&Value::String("Alice".into())));
 
     // Now add edge and verify NOT filters it out
-    insert_edge(&engine, "FOLLOWS", 1, 2);
+    insert_edge(engine, "FOLLOWS", 1, 2);
     let rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}) MATCH (b:Person {name: 'Bob'}) WHERE NOT (a)-[:FOLLOWS]->(b) RETURN a.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8619,13 +8670,13 @@ fn g071_standalone_where_not_pattern() {
 #[test]
 fn g071_pattern_predicate_incoming_direction() {
     // WHERE (a)<-[:KNOWS]-(b) — incoming direction
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Person",
@@ -8633,19 +8684,19 @@ fn g071_pattern_predicate_incoming_direction() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Person",
         &[("name", Value::String("Bob".into()))],
         &mut interner,
     );
-    insert_edge(&engine, "KNOWS", 2, 1); // Bob→Alice (so Alice has incoming KNOWS from Bob)
-    register_schema_edge_type(&engine, "KNOWS");
+    insert_edge(engine, "KNOWS", 2, 1); // Bob→Alice (so Alice has incoming KNOWS from Bob)
+    register_schema_edge_type(engine, "KNOWS");
 
     let rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) WHERE (a)<-[:KNOWS]-(b) RETURN a.name AS name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8656,13 +8707,13 @@ fn g071_pattern_predicate_incoming_direction() {
 #[test]
 fn g071_pattern_predicate_in_or() {
     // WHERE (a)-[:KNOWS]->(b) OR a.name = 'Charlie'
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Person",
@@ -8670,7 +8721,7 @@ fn g071_pattern_predicate_in_or() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Person",
@@ -8678,21 +8729,21 @@ fn g071_pattern_predicate_in_or() {
         &mut interner,
     );
     // No edge but name doesn't match Charlie either → 0 rows
-    register_schema_edge_type(&engine, "KNOWS");
+    register_schema_edge_type(engine, "KNOWS");
 
     let rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) WHERE (a)-[:KNOWS]->(b) OR a.name = 'Charlie' RETURN a.name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     assert_eq!(rows.len(), 0, "neither condition met → 0 rows");
 
     // Now add edge → OR's first branch is true
-    insert_edge(&engine, "KNOWS", 1, 2);
+    insert_edge(engine, "KNOWS", 1, 2);
     let rows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) WHERE (a)-[:KNOWS]->(b) OR a.name = 'Charlie' RETURN a.name AS name",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8710,15 +8761,15 @@ fn g071_pattern_predicate_in_or() {
 /// - Each edge row is returned, so result.len() == 4.
 #[test]
 fn test_merge_all_creates_cartesian_product() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     // Create 2 Src nodes and 2 Tgt nodes.
     run_cypher_with_alloc(
         "CREATE (:Src {name: 's1'}), (:Src {name: 's2'}), (:Tgt {name: 't1'}), (:Tgt {name: 't2'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8726,7 +8777,7 @@ fn test_merge_all_creates_cartesian_product() {
     // MERGE ALL should find-or-create edges for all 4 (src × tgt) pairs.
     let rows = run_cypher_with_alloc(
         "MERGE ALL (a:Src)-[r:CONNECTS]->(b:Tgt) RETURN r.__type__",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8749,14 +8800,14 @@ fn test_merge_all_creates_cartesian_product() {
 /// - Total edge count stays at 4.
 #[test]
 fn test_merge_all_idempotent() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     run_cypher_with_alloc(
         "CREATE (:A {id: '1'}), (:A {id: '2'}), (:B {id: '1'}), (:B {id: '2'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8764,7 +8815,7 @@ fn test_merge_all_idempotent() {
     // First run: creates 4 edges.
     let rows1 = run_cypher_with_alloc(
         "MERGE ALL (a:A)-[r:LINKS]->(b:B) RETURN r.__type__",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8773,7 +8824,7 @@ fn test_merge_all_idempotent() {
     // Second run: all edges already exist → ON MATCH path, same 4 rows returned.
     let rows2 = run_cypher_with_alloc(
         "MERGE ALL (a:A)-[r:LINKS]->(b:B) RETURN r.__type__",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8788,15 +8839,15 @@ fn test_merge_all_idempotent() {
 /// - Result has exactly 1 row (1×1 Cartesian product).
 #[test]
 fn test_merge_all_creates_from_scratch() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     // No nodes exist — MERGE ALL creates both endpoint nodes and the edge.
     let rows = run_cypher_with_alloc(
         "MERGE ALL (a:Source {kind: 'x'})-[r:FEEDS]->(b:Sink {kind: 'y'}) RETURN r.__type__",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8816,15 +8867,15 @@ fn test_merge_all_creates_from_scratch() {
 /// - With 2 src and 1 tgt → 2 edges created.
 #[test]
 fn test_merge_all_does_not_error_on_ambiguous_source() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     // Create 2 identical-label source nodes and 1 target.
     run_cypher_with_alloc(
         "CREATE (:Worker {role: 'op'}), (:Worker {role: 'op'}), (:Queue {name: 'main'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8832,7 +8883,7 @@ fn test_merge_all_does_not_error_on_ambiguous_source() {
     // MERGE ALL: 2 src × 1 tgt = 2 edges. Must NOT error.
     let rows = run_cypher_with_alloc(
         "MERGE ALL (a:Worker {role: 'op'})-[r:PROCESSES]->(b:Queue {name: 'main'}) RETURN r.__type__",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8848,14 +8899,14 @@ fn test_merge_all_does_not_error_on_ambiguous_source() {
 /// - Second run (ON MATCH path) returns same edges without changing weight.
 #[test]
 fn test_merge_all_on_create_set() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     run_cypher_with_alloc(
         "CREATE (:P {id: '1'}), (:P {id: '2'}), (:Q {id: 'x'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8863,7 +8914,7 @@ fn test_merge_all_on_create_set() {
     // First run: creates 2 edges, ON CREATE SET fires for each.
     let rows = run_cypher_with_alloc(
         "MERGE ALL (a:P)-[r:CONNECTS]->(b:Q) ON CREATE SET r.weight = 1 RETURN r.__type__",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8872,7 +8923,7 @@ fn test_merge_all_on_create_set() {
     // Second run: ON MATCH path, same 2 edges returned.
     let rows2 = run_cypher_with_alloc(
         "MERGE ALL (a:P)-[r:CONNECTS]->(b:Q) ON CREATE SET r.weight = 1 RETURN r.__type__",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8887,15 +8938,15 @@ fn test_merge_all_on_create_set() {
 /// - With 1 src and 2 tgt → 2 edges created.
 #[test]
 fn test_merge_all_does_not_error_on_ambiguous_target() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     // Create 1 source and 2 identical-label target nodes.
     run_cypher_with_alloc(
         "CREATE (:Router {id: 'r1'}), (:Device {type: 'sensor'}), (:Device {type: 'sensor'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8903,7 +8954,7 @@ fn test_merge_all_does_not_error_on_ambiguous_target() {
     // MERGE ALL: 1 router × 2 devices = 2 edges. Must NOT error.
     let rows = run_cypher_with_alloc(
         "MERGE ALL (a:Router {id: 'r1'})-[r:MANAGES]->(b:Device {type: 'sensor'}) RETURN r.__type__",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8919,22 +8970,22 @@ fn test_merge_all_does_not_error_on_ambiguous_target() {
 /// - ON CREATE SET does NOT fire (edges already exist).
 #[test]
 fn test_merge_all_on_match_set() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
 
     // Create 2 src nodes and 1 tgt node, plus the edges between them.
     run_cypher_with_alloc(
         "CREATE (:Host {name: 'h1'}), (:Host {name: 'h2'}), (:Service {name: 'svc'}) RETURN 1",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
     // Pre-create both edges so MERGE ALL takes the ON MATCH path.
     run_cypher_with_alloc(
         "MERGE ALL (a:Host)-[r:CALLS]->(b:Service {name: 'svc'}) RETURN r.__type__",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -8942,7 +8993,7 @@ fn test_merge_all_on_match_set() {
     // Second run with ON MATCH SET — both edges exist, SET fires for each.
     let rows = run_cypher_with_alloc(
         "MERGE ALL (a:Host)-[r:CALLS]->(b:Service {name: 'svc'}) ON MATCH SET r.visited = 1 RETURN r.__type__",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -9128,8 +9179,8 @@ fn rrf_score_plan_contains_rank_fuse() {
 /// against that scale mismatch.
 #[test]
 fn rrf_score_handles_divergent_distributions() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // 4 docs. Node 6 is top-1 on vector (tied with node 1 at cos=1.0) AND
@@ -9148,7 +9199,7 @@ fn rrf_score_handles_divergent_distributions() {
     ];
     for (id, v, body) in &rows {
         insert_node(
-            &engine,
+            engine,
             1,
             *id,
             "Chunk",
@@ -9160,14 +9211,15 @@ fn rrf_score_handles_divergent_distributions() {
         );
     }
 
-    let (vec_reg, text_reg) = setup_rrf_indices(dir.path(), "Chunk", "embedding", "body", 2, &rows);
+    let (vec_reg, text_reg) =
+        setup_rrf_indices(fx.scratch_path(), "Chunk", "embedding", "body", 2, &rows);
 
     let rrf_results = run_cypher_with_registries(
         "MATCH (c:Chunk) \
          RETURN c, \
                 rrf_score([c.embedding, c.body], {vector: [1.0, 0.0], text: \"rust\"}) AS score \
          ORDER BY score DESC",
-        &engine,
+        engine,
         &mut interner,
         Some(&vec_reg),
         Some(&text_reg),
@@ -9248,8 +9300,8 @@ fn rrf_score_handles_divergent_distributions() {
 /// not short-circuit.
 #[test]
 fn rrf_score_missing_method_uses_penalty_rank() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Two docs — only doc #1 has text that matches "rust"; both have vectors.
@@ -9259,7 +9311,7 @@ fn rrf_score_missing_method_uses_penalty_rank() {
     ];
     for (id, v, body) in &rows {
         insert_node(
-            &engine,
+            engine,
             1,
             *id,
             "Doc",
@@ -9271,13 +9323,14 @@ fn rrf_score_missing_method_uses_penalty_rank() {
         );
     }
 
-    let (vec_reg, text_reg) = setup_rrf_indices(dir.path(), "Doc", "embedding", "body", 2, &rows);
+    let (vec_reg, text_reg) =
+        setup_rrf_indices(fx.scratch_path(), "Doc", "embedding", "body", 2, &rows);
 
     let results = run_cypher_with_registries(
         "MATCH (d:Doc) \
          RETURN d, \
                 rrf_score([d.embedding, d.body], {vector: [1.0, 0.0], text: \"rust\"}) AS score",
-        &engine,
+        engine,
         &mut interner,
         Some(&vec_reg),
         Some(&text_reg),
@@ -9311,12 +9364,12 @@ fn rrf_score_missing_method_uses_penalty_rank() {
 /// values) errors with a clear message.
 #[test]
 fn rrf_score_unscorable_method_errors() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Item",
@@ -9324,7 +9377,7 @@ fn rrf_score_unscorable_method_errors() {
         &mut interner,
     );
     insert_node(
-        &engine,
+        engine,
         1,
         2,
         "Item",
@@ -9335,14 +9388,14 @@ fn rrf_score_unscorable_method_errors() {
     // Empty registries — `name` has neither a vector index nor a text index,
     // and it isn't a vector value → method is genuinely unscorable.
     let vec_reg = VectorIndexRegistry::new();
-    let text_dir = dir.path().join("rrf_empty");
+    let text_dir = fx.scratch_path().join("rrf_empty");
     std::fs::create_dir_all(&text_dir).unwrap();
     let text_reg = TextIndexRegistry::new(&text_dir);
 
     let err = run_cypher_with_registries(
         "MATCH (i:Item) \
          RETURN rrf_score([i.name], {vector: [1.0]}) AS score",
-        &engine,
+        engine,
         &mut interner,
         Some(&vec_reg),
         Some(&text_reg),
@@ -9360,8 +9413,8 @@ fn rrf_score_unscorable_method_errors() {
 /// then verify their scores are identical.
 #[test]
 fn rrf_score_competition_rank_ties() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Three docs: #1 and #2 are identical (guaranteed tie on both methods),
@@ -9373,7 +9426,7 @@ fn rrf_score_competition_rank_ties() {
     ];
     for (id, v, body) in &rows {
         insert_node(
-            &engine,
+            engine,
             1,
             *id,
             "Doc",
@@ -9385,14 +9438,15 @@ fn rrf_score_competition_rank_ties() {
         );
     }
 
-    let (vec_reg, text_reg) = setup_rrf_indices(dir.path(), "Doc", "embedding", "body", 2, &rows);
+    let (vec_reg, text_reg) =
+        setup_rrf_indices(fx.scratch_path(), "Doc", "embedding", "body", 2, &rows);
 
     let results = run_cypher_with_registries(
         "MATCH (d:Doc) \
          RETURN d, \
                 rrf_score([d.embedding, d.body], {vector: [1.0, 0.0], text: \"rust\"}) AS score \
          ORDER BY score DESC",
-        &engine,
+        engine,
         &mut interner,
         Some(&vec_reg),
         Some(&text_reg),
@@ -9423,8 +9477,8 @@ fn rrf_score_competition_rank_ties() {
 /// (if LIMIT clipped before RankFuse, ranks would be wrong).
 #[test]
 fn rrf_score_pipeline_with_order_by_and_limit() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let rows: Vec<(u64, Vec<f32>, &str)> = vec![
@@ -9436,7 +9490,7 @@ fn rrf_score_pipeline_with_order_by_and_limit() {
     ];
     for (id, v, body) in &rows {
         insert_node(
-            &engine,
+            engine,
             1,
             *id,
             "Doc",
@@ -9448,14 +9502,15 @@ fn rrf_score_pipeline_with_order_by_and_limit() {
         );
     }
 
-    let (vec_reg, text_reg) = setup_rrf_indices(dir.path(), "Doc", "embedding", "body", 2, &rows);
+    let (vec_reg, text_reg) =
+        setup_rrf_indices(fx.scratch_path(), "Doc", "embedding", "body", 2, &rows);
 
     let results = run_cypher_with_registries(
         "MATCH (d:Doc) \
          RETURN d, \
                 rrf_score([d.embedding, d.body], {vector: [1.0, 0.0], text: \"rust\"}) AS score \
          ORDER BY score DESC LIMIT 3",
-        &engine,
+        engine,
         &mut interner,
         Some(&vec_reg),
         Some(&text_reg),
@@ -9487,8 +9542,8 @@ fn rrf_score_pipeline_with_order_by_and_limit() {
 /// rows, rather than erroring out.
 #[test]
 fn rrf_score_brute_force_vector_without_hnsw() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let rows: Vec<(u64, Vec<f32>, &str)> = vec![
@@ -9498,7 +9553,7 @@ fn rrf_score_brute_force_vector_without_hnsw() {
     ];
     for (id, v, body) in &rows {
         insert_node(
-            &engine,
+            engine,
             1,
             *id,
             "Item",
@@ -9513,7 +9568,7 @@ fn rrf_score_brute_force_vector_without_hnsw() {
     // Only register the TEXT index — the vector property `ctx_emb` has NO
     // HNSW index and no vector_registry entry. RankFuse must fall through
     // to `VectorBruteForce` and still produce correct ranks.
-    let text_reg_dir = dir.path().join("brute_text_reg");
+    let text_reg_dir = fx.scratch_path().join("brute_text_reg");
     std::fs::create_dir_all(&text_reg_dir).unwrap();
     let text_reg = TextIndexRegistry::new(&text_reg_dir);
     text_reg
@@ -9537,7 +9592,7 @@ fn rrf_score_brute_force_vector_without_hnsw() {
          RETURN i, \
                 rrf_score([i.ctx_emb, i.body], {vector: [1.0, 0.0], text: \"rust\"}) AS score \
          ORDER BY score DESC",
-        &engine,
+        engine,
         &mut interner,
         Some(&vec_reg),
         Some(&text_reg),
@@ -9568,12 +9623,12 @@ fn rrf_score_brute_force_vector_without_hnsw() {
 /// at execute time with a message naming the problem.
 #[test]
 fn rrf_score_non_property_method_errors() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     insert_node(
-        &engine,
+        engine,
         1,
         1,
         "Doc",
@@ -9581,7 +9636,7 @@ fn rrf_score_non_property_method_errors() {
         &mut interner,
     );
     let vec_reg = VectorIndexRegistry::new();
-    let text_dir = dir.path().join("rrf_nonprop");
+    let text_dir = fx.scratch_path().join("rrf_nonprop");
     std::fs::create_dir_all(&text_dir).unwrap();
     let text_reg = TextIndexRegistry::new(&text_dir);
 
@@ -9589,7 +9644,7 @@ fn rrf_score_non_property_method_errors() {
     let err = run_cypher_with_registries(
         "MATCH (d:Doc) \
          RETURN rrf_score([d.embedding + 0], {vector: [1.0, 0.0]}) AS score",
-        &engine,
+        engine,
         &mut interner,
         Some(&vec_reg),
         Some(&text_reg),
@@ -9624,14 +9679,14 @@ fn rrf_score_multiple_differing_calls_rejected() {
 /// key, execution errors with a clear message.
 #[test]
 fn rrf_score_missing_vector_key_when_needed_errors() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let rows: Vec<(u64, Vec<f32>, &str)> = vec![(1, vec![1.0, 0.0], "placeholder")];
     for (id, v, body) in &rows {
         insert_node(
-            &engine,
+            engine,
             1,
             *id,
             "Doc",
@@ -9642,13 +9697,14 @@ fn rrf_score_missing_vector_key_when_needed_errors() {
             &mut interner,
         );
     }
-    let (vec_reg, text_reg) = setup_rrf_indices(dir.path(), "Doc", "embedding", "body", 2, &rows);
+    let (vec_reg, text_reg) =
+        setup_rrf_indices(fx.scratch_path(), "Doc", "embedding", "body", 2, &rows);
 
     // Method needs vector but the map has only `text`.
     let err = run_cypher_with_registries(
         "MATCH (d:Doc) \
          RETURN rrf_score([d.embedding], {text: \"placeholder\"}) AS score",
-        &engine,
+        engine,
         &mut interner,
         Some(&vec_reg),
         Some(&text_reg),
@@ -9666,8 +9722,8 @@ fn rrf_score_missing_vector_key_when_needed_errors() {
 /// sees the score column.
 #[test]
 fn rrf_score_order_by_direct_call() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let rows: Vec<(u64, Vec<f32>, &str)> = vec![
@@ -9677,7 +9733,7 @@ fn rrf_score_order_by_direct_call() {
     ];
     for (id, v, body) in &rows {
         insert_node(
-            &engine,
+            engine,
             1,
             *id,
             "Doc",
@@ -9688,7 +9744,8 @@ fn rrf_score_order_by_direct_call() {
             &mut interner,
         );
     }
-    let (vec_reg, text_reg) = setup_rrf_indices(dir.path(), "Doc", "embedding", "body", 2, &rows);
+    let (vec_reg, text_reg) =
+        setup_rrf_indices(fx.scratch_path(), "Doc", "embedding", "body", 2, &rows);
 
     // ORDER BY references the FUNCTION CALL directly, not an alias. This
     // forces the Sort → Project → RankFuse chain where Project must pass
@@ -9697,7 +9754,7 @@ fn rrf_score_order_by_direct_call() {
         "MATCH (d:Doc) \
          RETURN d.body AS body \
          ORDER BY rrf_score([d.embedding, d.body], {vector: [1.0, 0.0], text: \"rust\"}) DESC",
-        &engine,
+        engine,
         &mut interner,
         Some(&vec_reg),
         Some(&text_reg),
@@ -9720,8 +9777,8 @@ fn rrf_score_order_by_direct_call() {
 /// Exercises the degenerate query map `{vector: ...}` (no `text` key).
 #[test]
 fn rrf_score_vector_only_multiple_methods() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let rows: Vec<(u64, Vec<f32>, &str)> = vec![
@@ -9731,7 +9788,7 @@ fn rrf_score_vector_only_multiple_methods() {
     ];
     for (id, v, body) in &rows {
         insert_node(
-            &engine,
+            engine,
             1,
             *id,
             "Doc",
@@ -9743,7 +9800,8 @@ fn rrf_score_vector_only_multiple_methods() {
         );
     }
 
-    let (vec_reg, text_reg) = setup_rrf_indices(dir.path(), "Doc", "embedding", "body", 2, &rows);
+    let (vec_reg, text_reg) =
+        setup_rrf_indices(fx.scratch_path(), "Doc", "embedding", "body", 2, &rows);
 
     // Two vector "methods" — in this synthetic case both point at the same
     // property, but it exercises the N-method wiring end-to-end.
@@ -9752,7 +9810,7 @@ fn rrf_score_vector_only_multiple_methods() {
          RETURN d, \
                 rrf_score([d.embedding, d.embedding], {vector: [1.0, 0.0]}) AS score \
          ORDER BY score DESC",
-        &engine,
+        engine,
         &mut interner,
         Some(&vec_reg),
         Some(&text_reg),
@@ -9798,8 +9856,8 @@ fn seed_doc_with_chunks(
 /// hand over the HAS_CHUNK children.
 #[test]
 fn doc_score_matches_manual_aggregate() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Doc 1: three chunks, all with embeddings.
@@ -9807,7 +9865,7 @@ fn doc_score_matches_manual_aggregate() {
     //   max = 1.0, avg = 0.8, matching (sim>0) = 3, total = 3, coverage = 1.0
     //   expected = 0.5*1.0 + 0.3*0.8 + 0.2*1.0 = 0.94
     seed_doc_with_chunks(
-        &engine,
+        engine,
         &mut interner,
         1,
         &[
@@ -9820,7 +9878,7 @@ fn doc_score_matches_manual_aggregate() {
     let results = run_cypher(
         "MATCH (d:Document) \
          RETURN d, doc_score(d, [1.0, 0.0]) AS score",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(results.len(), 1);
@@ -9844,12 +9902,12 @@ fn doc_score_matches_manual_aggregate() {
 /// R-HYB2c regression #2a: positional overrides α/β/γ.
 #[test]
 fn doc_score_custom_weights_positional() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     seed_doc_with_chunks(
-        &engine,
+        engine,
         &mut interner,
         1,
         &[Some(vec![1.0, 0.0]), Some(vec![0.6, 0.8])],
@@ -9859,7 +9917,7 @@ fn doc_score_custom_weights_positional() {
     let results = run_cypher(
         "MATCH (d:Document) \
          RETURN doc_score(d, [1.0, 0.0], 1.0, 0.0, 0.0) AS score",
-        &engine,
+        engine,
         &mut interner,
     );
     let score = match results[0].get("score") {
@@ -9875,12 +9933,12 @@ fn doc_score_custom_weights_positional() {
 /// R-HYB2c regression #2b: weights map overrides α/β/γ.
 #[test]
 fn doc_score_custom_weights_map() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     seed_doc_with_chunks(
-        &engine,
+        engine,
         &mut interner,
         1,
         &[Some(vec![1.0, 0.0]), Some(vec![0.6, 0.8])],
@@ -9890,7 +9948,7 @@ fn doc_score_custom_weights_map() {
     let results = run_cypher(
         "MATCH (d:Document) \
          RETURN doc_score(d, [1.0, 0.0], {alpha: 0.0, beta: 0.0, gamma: 1.0}) AS score",
-        &engine,
+        engine,
         &mut interner,
     );
     let score = match results[0].get("score") {
@@ -9907,17 +9965,17 @@ fn doc_score_custom_weights_map() {
 /// (not an error, not null). Required by the task spec.
 #[test]
 fn doc_score_zero_chunks_returns_zero() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Insert Document with NO HAS_CHUNK edges.
-    insert_node(&engine, 1, 1, "Document", &[], &mut interner);
+    insert_node(engine, 1, 1, "Document", &[], &mut interner);
 
     let results = run_cypher(
         "MATCH (d:Document) \
          RETURN doc_score(d, [1.0, 0.0]) AS score",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(results.len(), 1);
@@ -9936,13 +9994,13 @@ fn doc_score_zero_chunks_returns_zero() {
 /// coverage = matching / total where total includes all HAS_CHUNK children.
 #[test]
 fn doc_score_missing_embeddings_reduce_coverage() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // 4 chunks: 2 with embedding (both aligned with query), 2 without.
     seed_doc_with_chunks(
-        &engine,
+        engine,
         &mut interner,
         1,
         &[Some(vec![1.0, 0.0]), Some(vec![0.8, 0.6]), None, None],
@@ -9951,7 +10009,7 @@ fn doc_score_missing_embeddings_reduce_coverage() {
     let results = run_cypher(
         "MATCH (d:Document) \
          RETURN doc_score(d, [1.0, 0.0]) AS score",
-        &engine,
+        engine,
         &mut interner,
     );
     let score = match results[0].get("score") {
@@ -9976,8 +10034,8 @@ fn doc_score_missing_embeddings_reduce_coverage() {
 /// actual chunk similarities (which may be zero/negative); coverage drops.
 #[test]
 fn doc_score_negative_similarity_chunks_excluded_from_matching() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // 3 chunks, all with embedding; none aligned with query [1,0]:
@@ -9985,7 +10043,7 @@ fn doc_score_negative_similarity_chunks_excluded_from_matching() {
     //   [-1.0, 0.0] → cos = -1
     //   [-0.5, 0.5] → cos ≈ -0.707
     seed_doc_with_chunks(
-        &engine,
+        engine,
         &mut interner,
         1,
         &[
@@ -9998,7 +10056,7 @@ fn doc_score_negative_similarity_chunks_excluded_from_matching() {
     let results = run_cypher(
         "MATCH (d:Document) \
          RETURN doc_score(d, [1.0, 0.0]) AS score",
-        &engine,
+        engine,
         &mut interner,
     );
     let score = match results[0].get("score") {
@@ -10028,27 +10086,27 @@ fn doc_score_negative_similarity_chunks_excluded_from_matching() {
 /// R-HYB2c: doc_score composes with ORDER BY and LIMIT to pick top docs.
 #[test]
 fn doc_score_orders_documents_by_relevance() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Doc 1: all chunks aligned with query → high score
     seed_doc_with_chunks(
-        &engine,
+        engine,
         &mut interner,
         1,
         &[Some(vec![1.0, 0.0]), Some(vec![0.9, 0.1])],
     );
     // Doc 2: mixed — one aligned, one orthogonal → mid score
     seed_doc_with_chunks(
-        &engine,
+        engine,
         &mut interner,
         2,
         &[Some(vec![1.0, 0.0]), Some(vec![0.0, 1.0])],
     );
     // Doc 3: all orthogonal → low score
     seed_doc_with_chunks(
-        &engine,
+        engine,
         &mut interner,
         3,
         &[Some(vec![0.0, 1.0]), Some(vec![0.0, 1.0])],
@@ -10058,7 +10116,7 @@ fn doc_score_orders_documents_by_relevance() {
         "MATCH (d:Document) \
          RETURN d, doc_score(d, [1.0, 0.0]) AS score \
          ORDER BY score DESC",
-        &engine,
+        engine,
         &mut interner,
     );
     assert_eq!(results.len(), 3);
@@ -10203,18 +10261,18 @@ fn doc_score_multiple_differing_calls_rejected() {
 /// read it.
 #[test]
 fn doc_score_order_by_direct_call() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
-    seed_doc_with_chunks(&engine, &mut interner, 1, &[Some(vec![1.0, 0.0])]);
-    seed_doc_with_chunks(&engine, &mut interner, 2, &[Some(vec![0.0, 1.0])]);
+    seed_doc_with_chunks(engine, &mut interner, 1, &[Some(vec![1.0, 0.0])]);
+    seed_doc_with_chunks(engine, &mut interner, 2, &[Some(vec![0.0, 1.0])]);
 
     let results = run_cypher(
         "MATCH (d:Document) \
          RETURN d.id AS id \
          ORDER BY doc_score(d, [1.0, 0.0]) DESC",
-        &engine,
+        engine,
         &mut interner,
     );
 
@@ -10241,12 +10299,12 @@ fn doc_score_order_by_direct_call() {
 /// to a vector before execution.
 #[test]
 fn doc_score_query_as_parameter() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     seed_doc_with_chunks(
-        &engine,
+        engine,
         &mut interner,
         1,
         &[Some(vec![1.0, 0.0]), Some(vec![0.9, 0.1])],
@@ -10257,7 +10315,7 @@ fn doc_score_query_as_parameter() {
     let results = run_cypher_with_params(
         "MATCH (d:Document) \
          RETURN doc_score(d, $q) AS score",
-        &engine,
+        engine,
         &mut interner,
         params,
     );
@@ -10403,10 +10461,10 @@ fn read_consistency_explicit_current_hint_defeats_auto_promotion() {
 /// `mvcc_read_ts`; in `Current` mode the query succeeds immediately.
 #[test]
 fn read_consistency_current_does_not_block_on_watermark() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
-    insert_node(&engine, 1, 1, "Person", &[], &mut interner);
+    insert_node(engine, 1, 1, "Person", &[], &mut interner);
 
     // Watermark stuck at 0; mvcc_read_ts = 1000. In `Snapshot` mode this
     // would time out; in `Current` it doesn't consult the watermark at all.
@@ -10417,7 +10475,7 @@ fn read_consistency_current_does_not_block_on_watermark() {
     assert_eq!(plan.read_consistency, ReadConsistencyMode::Current);
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
     ctx.mvcc_read_ts = coordinode_core::txn::timestamp::Timestamp::from_raw(1000);
     ctx.applied_watermark = Some(std::sync::Arc::clone(&wm));
     ctx.read_timeout = std::time::Duration::from_millis(50);
@@ -10437,10 +10495,10 @@ fn read_consistency_current_does_not_block_on_watermark() {
 /// when the applier never catches up. Direct test of the timeout path.
 #[test]
 fn read_consistency_snapshot_times_out_on_stale_watermark() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
-    insert_node(&engine, 1, 1, "Person", &[], &mut interner);
+    insert_node(engine, 1, 1, "Person", &[], &mut interner);
 
     // Watermark stuck at 0; mvcc_read_ts = 1000; timeout = 50ms → must error.
     let wm = MaxAssignedWatermark::new(coordinode_core::txn::timestamp::Timestamp::ZERO);
@@ -10450,7 +10508,7 @@ fn read_consistency_snapshot_times_out_on_stale_watermark() {
     assert_eq!(plan.read_consistency, ReadConsistencyMode::Snapshot);
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
     ctx.mvcc_read_ts = coordinode_core::txn::timestamp::Timestamp::from_raw(1000);
     ctx.applied_watermark = Some(std::sync::Arc::clone(&wm));
     ctx.read_timeout = std::time::Duration::from_millis(50);
@@ -10472,10 +10530,10 @@ fn read_consistency_snapshot_times_out_on_stale_watermark() {
 /// returns rows.
 #[test]
 fn read_consistency_snapshot_unblocks_on_watermark_advance() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
-    insert_node(&engine, 1, 1, "Person", &[], &mut interner);
+    insert_node(engine, 1, 1, "Person", &[], &mut interner);
 
     let wm = MaxAssignedWatermark::new(coordinode_core::txn::timestamp::Timestamp::ZERO);
     let wm_advancer = std::sync::Arc::clone(&wm);
@@ -10487,7 +10545,7 @@ fn read_consistency_snapshot_unblocks_on_watermark_advance() {
     let ast = parse("MATCH (p:Person) RETURN p /*+ read_consistency('snapshot') */").unwrap();
     let plan = build_logical_plan(&ast).unwrap();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
     ctx.mvcc_read_ts = coordinode_core::txn::timestamp::Timestamp::from_raw(500);
     ctx.applied_watermark = Some(std::sync::Arc::clone(&wm));
     ctx.read_timeout = std::time::Duration::from_millis(500);
@@ -10513,15 +10571,15 @@ fn read_consistency_snapshot_unblocks_on_watermark_advance() {
 /// is available.
 #[test]
 fn read_consistency_snapshot_without_watermark_is_noop() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
-    insert_node(&engine, 1, 1, "Person", &[], &mut interner);
+    insert_node(engine, 1, 1, "Person", &[], &mut interner);
 
     let ast = parse("MATCH (p:Person) RETURN p /*+ read_consistency('snapshot') */").unwrap();
     let plan = build_logical_plan(&ast).unwrap();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
     // No applied_watermark. Would be an error if watermark were required.
     assert!(ctx.applied_watermark.is_none());
     ctx.mvcc_read_ts = coordinode_core::txn::timestamp::Timestamp::from_raw(1000);
@@ -10559,10 +10617,10 @@ fn read_consistency_drives_explain_vector_consistency_label() {
 /// behave identically.
 #[test]
 fn read_consistency_exact_also_blocks_on_watermark() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
-    insert_node(&engine, 1, 1, "Person", &[], &mut interner);
+    insert_node(engine, 1, 1, "Person", &[], &mut interner);
 
     let wm = MaxAssignedWatermark::new(coordinode_core::txn::timestamp::Timestamp::ZERO);
 
@@ -10578,7 +10636,7 @@ fn read_consistency_exact_also_blocks_on_watermark() {
     );
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
     ctx.mvcc_read_ts = coordinode_core::txn::timestamp::Timestamp::from_raw(1000);
     ctx.applied_watermark = Some(std::sync::Arc::clone(&wm));
     ctx.read_timeout = std::time::Duration::from_millis(50);
@@ -10596,10 +10654,10 @@ fn read_consistency_exact_also_blocks_on_watermark() {
 /// This covers the target-resolution branch in `execute()`.
 #[test]
 fn read_consistency_snapshot_targets_as_of_timestamp_when_set() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
-    insert_node(&engine, 1, 1, "Person", &[], &mut interner);
+    insert_node(engine, 1, 1, "Person", &[], &mut interner);
 
     // Watermark at 750. snapshot_ts (AS OF) = 700 → wait_for should
     // return immediately (current >= target). mvcc_read_ts = 5000
@@ -10610,7 +10668,7 @@ fn read_consistency_snapshot_targets_as_of_timestamp_when_set() {
     let ast = parse("MATCH (p:Person) RETURN p /*+ read_consistency('snapshot') */").unwrap();
     let plan = build_logical_plan(&ast).unwrap();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
     ctx.mvcc_read_ts = coordinode_core::txn::timestamp::Timestamp::from_raw(5000);
     ctx.snapshot_ts = Some(700);
     ctx.applied_watermark = Some(std::sync::Arc::clone(&wm));
