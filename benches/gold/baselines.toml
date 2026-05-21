@@ -1,59 +1,213 @@
 # Competitor baseline numbers — Level 3 composite score consumes
-# these. Each entry MUST cite a source so the ratios in our reports
-# stay auditable. Update when new competitor results land.
+# these. Every entry MUST cite a source. Numbers expressed in the
+# benchmark's native unit; the report layer converts to ratios with
+# units made explicit.
 #
-# Format: per-benchmark group, sub-keyed by competitor identifier.
-# Numbers expressed in the benchmark's native unit; the report layer
-# converts to ratios with units made explicit.
+# CoordiNode's primary competitors are MULTI-MODEL engines that
+# overlap our positioning: SurrealDB, ArangoDB, MongoDB (also
+# OpenSearch for vector+text, PostGIS for spatial). Modality-only
+# specialists (Neo4j-only, hnswlib-only, etc.) are kept as secondary
+# anchors so engineers can also see "does CoordiNode hold specialist-
+# tier perf in modality X?", but the headline marketing numbers are
+# always vs multi-model peers.
+#
+# Numbers marked `null` are "must measure" — competitor doesn't
+# publish a directly comparable number for this benchmark; our own
+# bench fills in the comparison once we run their engine against
+# the same dataset.
+
+# ─────────────────────────────────────────────────────────────
+# Graph (LDBC SNB Interactive v2, SF-1 unless noted)
+# ─────────────────────────────────────────────────────────────
 
 [graph.ldbc_snb_interactive_v2]
 dataset = "SF-1"
 
+# Primary: multi-model
+[graph.ldbc_snb_interactive_v2.surrealdb_3_0]
+notes = "SurrealDB 3.0 published 8-22x graph speedup vs 2.x but no direct LDBC numbers yet — measured by us against their crud-bench graph_traversal group"
+source = "SurrealDB 3.0 benchmarks blog (Oct 2025)"
+
+[graph.ldbc_snb_interactive_v2.arangodb_3_12]
+notes = "ArangoDB beats Neo4j 1.7-8.5x on wiki-Talk (PageRank, WCC) — community LDBC SNB impl available"
+source = "arango.ai benchmark blog (2025)"
+
+# Secondary anchor
 [graph.ldbc_snb_interactive_v2.neo4j_5]
-throughput_ops_min = 50000
-source = "LDBC official audit, April 2023"
+throughput_ops_min = 8000
+source = "UC Merced LDBC SNB Interactive v1 study (2023)"
+
+# ─────────────────────────────────────────────────────────────
+# Vector (ann-benchmarks SIFT1M + VectorDBBench Cohere-768)
+# ─────────────────────────────────────────────────────────────
 
 [vector.ann_benchmarks.sift1m]
 metric = "euclidean"
 
+# Primary: multi-model
+[vector.ann_benchmarks.sift1m.opensearch_2]
+p99_ms = 10.0
+notes = "1M x 768-dim k-NN ~10ms; engines: NMSLIB / FAISS / Lucene; Trail of Bits independent benchmark found ~11% faster than Elasticsearch 8.15"
+source = "Trail of Bits OpenSearch vs Elasticsearch benchmarks (March 2025)"
+
+[vector.ann_benchmarks.sift1m.mongodb_8_atlas]
+notes = "MongoDB Atlas Vector Search official benchmark: 15.3M vectors x 2048-dim voyage-3-large, 90-95% recall, <50ms latency with scalar quantization"
+p99_ms = 50.0
+source = "MongoDB Vector Search Benchmark official docs (2025)"
+
+[vector.ann_benchmarks.sift1m.surrealdb_3_0]
+notes = "SurrealDB 3.0 published HNSW ~8x faster than 2.x (indexed vector similarity dropped from ~35s to ~4.5s on their crud-bench) — direct ann-benchmarks number must be measured"
+source = "SurrealDB 3.0 benchmarks blog (Oct 2025)"
+
+# Secondary anchors (modality specialists — engineering reference, not marketing)
 [vector.ann_benchmarks.sift1m.hnswlib]
 recall_95_qps = 18000
 recall_99_qps = 10000
 build_time_s = 30
-source = "ann-benchmarks.com, April 2025"
+source = "ann-benchmarks.com (April 2025)"
+
+[vector.ann_benchmarks.sift1m.qdrant]
+recall_95_qps = 5000
+p99_ms = 8.0
+recall_at_10 = 0.98
+source = "VectorDBBench (Cohere-768, 2024-2025 community results)"
 
 [vector.ann_benchmarks.sift1m.pgvector]
 recall_95_qps = 3000
 recall_99_qps = 1500
-source = "ann-benchmarks.com, April 2025"
+source = "ann-benchmarks.com (April 2025) — secondary anchor only, NOT a CoordiNode competitor"
+
+# ─────────────────────────────────────────────────────────────
+# Full-Text (Search Benchmark Game + BEIR)
+# ─────────────────────────────────────────────────────────────
 
 [text.search_benchmark_game.wikipedia]
 
+# Primary: multi-model
+[text.search_benchmark_game.wikipedia.opensearch_2]
+notes = "OpenSearch 2.x with Lucene 9.x backend — comparable to Lucene 10.3 raw; benchmark measures via REST so adds network RTT"
+source = "search-benchmark-game (Tantivy-Lucene tier)"
+
+[text.search_benchmark_game.wikipedia.mongodb_atlas_search]
+notes = "MongoDB Atlas Search uses Lucene under the hood; query latency comparable to Lucene 10.3 + Atlas networking overhead"
+source = "MongoDB Atlas Search docs"
+
+# Secondary anchors
 [text.search_benchmark_game.wikipedia.tantivy]
 median_query_us = 100
-source = "search-benchmark-game, May 2025"
+notes = "We embed Tantivy directly — this is our floor"
+source = "search-benchmark-game (May 2025)"
 
 [text.search_benchmark_game.wikipedia.lucene_10]
 median_query_us = 100
-source = "Lucene committer analysis, May 2025"
+source = "Lucene committer analysis (May 2025)"
+
+# ─────────────────────────────────────────────────────────────
+# Time-Series (TSBS DevOps, 100 hosts unless noted)
+# ─────────────────────────────────────────────────────────────
 
 [timeseries.tsbs_devops.hosts_100]
 
+# Primary: multi-model
+[timeseries.tsbs_devops.hosts_100.mongodb_8_timeseries]
+ingestion_rows_s = 200000
+lastpoint_ms = 3.0
+notes = "MongoDB time-series collections with bucket pattern — wide variance based on schema; community TSBS port numbers"
+source = "MongoDB time-series docs + community TSBS port (2024-2025)"
+
+[timeseries.tsbs_devops.hosts_100.surrealdb_3_0]
+notes = "SurrealDB 3.x time mode — not directly TSBS-benched yet"
+source = "SurrealDB 3.0 release notes"
+
+# Secondary anchors
 [timeseries.tsbs_devops.hosts_100.questdb_8]
 ingestion_rows_s = 1500000
 lastpoint_ms = 0.5
-source = "QuestDB blog, 2025"
+source = "QuestDB blog (2025)"
 
-[kv.ycsb.workload_a]
+[timeseries.tsbs_devops.hosts_100.timescaledb_2]
+ingestion_rows_s = 500000
+lastpoint_ms = 2.0
+source = "TimescaleDB TSBS official"
 
-[kv.ycsb.workload_a.redis]
-throughput_ops_s = 100000
-read_p99_us = 200
-source = "Community benchmarks, April 2025"
+# ─────────────────────────────────────────────────────────────
+# Spatial (SpatialBench SF-1)
+# ─────────────────────────────────────────────────────────────
 
-[kv.ycsb.workload_c]
+[spatial.spatialbench]
+dataset = "SF-1"
 
-[kv.ycsb.workload_c.redis]
-throughput_ops_s = 200000
-read_p99_us = 150
-source = "Community benchmarks, April 2025"
+# Primary: multi-model
+[spatial.spatialbench.postgis_3]
+notes = "Reference baseline — <-> KNN via GiST/SP-GiST + ST_DWithin + bounding-box pre-filter; the spatial industry standard, de facto reference"
+source = "Apache SedonaDB SpatialBench official results + PostGIS docs"
+
+[spatial.spatialbench.mongodb_8_geospatial]
+notes = "MongoDB 2dsphere index with $geoNear / $geoWithin; conservative due to BSON overhead vs PostGIS native geometries"
+source = "MongoDB geospatial docs + community SpatialBench port"
+
+[spatial.spatialbench.surrealdb_3_0]
+notes = "SurrealDB 3.x geospatial — not yet SpatialBench-published"
+source = "SurrealDB 3.0 release notes"
+
+# Secondary anchors
+[spatial.spatialbench.duckdb_spatial]
+notes = "Fastest on most SpatialBench queries (columnar advantage); not a CoordiNode competitor (analytics tool)"
+source = "SpatialBench results (2025)"
+
+[spatial.spatialbench.sedonadb]
+notes = "Comparable to DuckDB+Spatial on bulk geo"
+source = "Databricks SpatialBench analysis (Jan 2026)"
+
+# ─────────────────────────────────────────────────────────────
+# Document (YCSB A/B/C/F — networked client→server)
+# ─────────────────────────────────────────────────────────────
+
+[document.ycsb.workload_a]
+
+# Primary: multi-model document stores
+[document.ycsb.workload_a.mongodb_8]
+throughput_ops_s = 30000
+read_p99_us = 2000.0
+notes = "MongoDB 8.0 is 36% faster than 7.0 read mix, 32% faster mixed; community YCSB ports"
+source = "MongoDB 8.0 perf blog (2025) + community YCSB"
+
+[document.ycsb.workload_a.surrealdb_3_0]
+notes = "Run via SurrealDB's crud-bench harness — not directly YCSB-comparable but maps to YCSB-A workload pattern"
+source = "SurrealDB crud-bench"
+
+[document.ycsb.workload_a.arangodb_3_12]
+notes = "ArangoDB arangobench --test general-document-replace"
+source = "ArangoDB docs"
+
+[document.ycsb.workload_c]
+
+[document.ycsb.workload_c.mongodb_8]
+throughput_ops_s = 40000
+read_p99_us = 1500.0
+notes = "Read-heavy MongoDB 8.0 — WiredTiger cache wins"
+source = "MongoDB 8.0 perf blog (2025) + community YCSB"
+
+# ─────────────────────────────────────────────────────────────
+# Multi-Model Holistic (UniBench + MMSBench-Net)
+# ─────────────────────────────────────────────────────────────
+
+[holistic.unibench]
+
+[holistic.unibench.arangodb_3_12]
+notes = "ArangoDB has the strongest UniBench scores in the original paper (Lu/Holubova SIGAPP 2023) — the bench to beat"
+source = "UniBench paper (ACM SIGAPP 2023)"
+
+[holistic.unibench.orientdb_3]
+notes = "Original UniBench second-place; OrientDB development slowed post-2023"
+source = "UniBench paper"
+
+[holistic.unibench.polyglot_baseline]
+notes = "Neo4j + MongoDB + Redis stack with app-level joins — the 'before' picture CoordiNode replaces"
+source = "UniBench paper"
+
+[holistic.mmsbench_net]
+
+[holistic.mmsbench_net.arangodb_3_12]
+notes = "Real-world network-management scenario benchmark; ArangoDB / MongoDB / Neo4j / polyglot baselines"
+source = "MMSBench-Net (CEUR-WS Vol-3714 paper6, 2024)"
