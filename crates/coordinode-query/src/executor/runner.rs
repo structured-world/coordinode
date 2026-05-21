@@ -13439,6 +13439,7 @@ mod tests {
     use super::*;
     use crate::cypher::ast::BinaryOperator;
     use coordinode_core::graph::node::NodeRecord;
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     use coordinode_storage::engine::config::{
         Durability, EndpointConfig, Media, StorageConfig, Tier,
     };
@@ -13455,7 +13456,11 @@ mod tests {
         StorageEngine::open(&config).expect("open engine")
     }
 
-    /// Insert a test node into storage.
+    /// Insert a test node into storage via the typed Layer-4
+    /// [`coordinode_modality::LocalNodeStore`]. The helper used to
+    /// hand-build the node key via `encode_node_key`; routing
+    /// through `NodeStore::put` keeps the fixture aligned with the
+    /// engine's idiomatic write path (R165 / R166 encoder lockdown).
     fn insert_node(
         engine: &StorageEngine,
         shard_id: u16,
@@ -13464,14 +13469,15 @@ mod tests {
         props: &[(&str, Value)],
         interner: &mut FieldInterner,
     ) {
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
         let mut record = NodeRecord::new(label);
         for (name, value) in props {
             let field_id = interner.intern(name);
             record.set(field_id, value.clone());
         }
-        let key = encode_node_key(shard_id, NodeId::from_raw(node_id));
-        let bytes = record.to_msgpack().expect("serialize");
-        engine.put(Partition::Node, &key, &bytes).expect("put node");
+        LocalNodeStore::new(engine)
+            .put(shard_id, NodeId::from_raw(node_id), &record)
+            .expect("put node");
     }
 
     /// Insert an edge via merge operator (both forward and reverse posting list).
@@ -14332,12 +14338,10 @@ mod tests {
             .get("n")
             .and_then(|v| v.as_int())
             .expect("node id");
-        let key = encode_node_key(1, NodeId::from_raw(node_id as u64));
-        let bytes = engine
-            .get(Partition::Node, &key)
+        let record = LocalNodeStore::new(&engine)
+            .get(1, NodeId::from_raw(node_id as u64))
             .expect("get")
             .expect("node exists");
-        let record = NodeRecord::from_msgpack(&bytes).expect("decode");
         assert_eq!(record.primary_label(), "User");
     }
 
@@ -14412,12 +14416,10 @@ mod tests {
 
         // Verify the update persisted in storage
         let node_id = result[0].get("n").and_then(|v| v.as_int()).expect("id");
-        let key = encode_node_key(1, NodeId::from_raw(node_id as u64));
-        let bytes = engine
-            .get(Partition::Node, &key)
+        let record = LocalNodeStore::new(&engine)
+            .get(1, NodeId::from_raw(node_id as u64))
             .expect("get")
             .expect("exists");
-        let record = NodeRecord::from_msgpack(&bytes).expect("decode");
         let name_id = interner.lookup("name").expect("field id");
         assert_eq!(record.get(name_id), Some(&Value::String("Alicia".into())));
     }
@@ -14429,8 +14431,10 @@ mod tests {
         let mut ctx = make_ctx(&engine, &mut interner, &allocator);
 
         // First, verify Alice exists
-        let key = encode_node_key(1, NodeId::from_raw(1));
-        assert!(engine.get(Partition::Node, &key).expect("get").is_some());
+        assert!(LocalNodeStore::new(&engine)
+            .get(1, NodeId::from_raw(1))
+            .expect("get")
+            .is_some());
 
         // DETACH DELETE node 1 (Alice) — she has edges, so DETACH is required.
         let plan = LogicalPlan {
@@ -14455,7 +14459,10 @@ mod tests {
         execute(&plan, &mut ctx).expect("execute");
 
         // Verify Alice was deleted
-        assert!(engine.get(Partition::Node, &key).expect("get").is_none());
+        assert!(LocalNodeStore::new(&engine)
+            .get(1, NodeId::from_raw(1))
+            .expect("get")
+            .is_none());
     }
 
     #[test]
@@ -14491,12 +14498,10 @@ mod tests {
 
         // Verify age was removed
         let node_id = result[0].get("n").and_then(|v| v.as_int()).expect("id");
-        let key = encode_node_key(1, NodeId::from_raw(node_id as u64));
-        let bytes = engine
-            .get(Partition::Node, &key)
+        let record = LocalNodeStore::new(&engine)
+            .get(1, NodeId::from_raw(node_id as u64))
             .expect("get")
             .expect("exists");
-        let record = NodeRecord::from_msgpack(&bytes).expect("decode");
         let age_id = interner.lookup("age").expect("field id");
         assert!(record.get(age_id).is_none());
     }
@@ -14620,12 +14625,10 @@ mod tests {
 
         // Verify age was updated
         let node_id = result[0].get("n").and_then(|v| v.as_int()).expect("id");
-        let key = encode_node_key(1, NodeId::from_raw(node_id as u64));
-        let bytes = engine
-            .get(Partition::Node, &key)
+        let record = LocalNodeStore::new(&engine)
+            .get(1, NodeId::from_raw(node_id as u64))
             .expect("get")
             .expect("exists");
-        let record = NodeRecord::from_msgpack(&bytes).expect("decode");
         let age_id = interner.lookup("age").expect("field id");
         assert_eq!(record.get(age_id), Some(&Value::Int(31)));
     }
@@ -14748,12 +14751,10 @@ mod tests {
 
         // Verify age was updated
         let node_id = result[0].get("n").and_then(|v| v.as_int()).expect("id");
-        let key = encode_node_key(1, NodeId::from_raw(node_id as u64));
-        let bytes = engine
-            .get(Partition::Node, &key)
+        let record = LocalNodeStore::new(&engine)
+            .get(1, NodeId::from_raw(node_id as u64))
             .expect("get")
             .expect("exists");
-        let record = NodeRecord::from_msgpack(&bytes).expect("decode");
         let age_id = interner.lookup("age").expect("field id");
         assert_eq!(record.get(age_id), Some(&Value::Int(31)));
     }
@@ -14805,14 +14806,12 @@ mod tests {
         // Externally modify Alice's age directly via storage (simulates
         // concurrent modification from another connection)
         let alice_id = NodeId::from_raw(1);
-        let key = encode_node_key(1, alice_id);
         {
-            let bytes = engine.get(Partition::Node, &key).unwrap().unwrap();
-            let mut record = NodeRecord::from_msgpack(&bytes).unwrap();
+            let nodes = LocalNodeStore::new(&engine);
+            let mut record = nodes.get(1, alice_id).unwrap().unwrap();
             let age_id = interner.lookup("age").unwrap();
             record.set(age_id, Value::Int(999)); // external modification
-            let new_bytes = record.to_msgpack().unwrap();
-            engine.put(Partition::Node, &key, &new_bytes).unwrap();
+            nodes.put(1, alice_id, &record).unwrap();
         }
 
         // Second UPSERT: this reads fresh bytes in CAS snapshot,
@@ -14848,8 +14847,10 @@ mod tests {
         }
 
         // Verify final value is 60 (second UPSERT applied)
-        let final_bytes = engine.get(Partition::Node, &key).unwrap().unwrap();
-        let record = NodeRecord::from_msgpack(&final_bytes).unwrap();
+        let record = LocalNodeStore::new(&engine)
+            .get(1, alice_id)
+            .unwrap()
+            .unwrap();
         let age_id = interner.lookup("age").unwrap();
         assert_eq!(record.get(age_id), Some(&Value::Int(60)));
     }
@@ -16229,9 +16230,8 @@ mod tests {
         // merge removes already flushed by execute() → mvcc_flush()
 
         // Verify Alice's node is gone
-        let alice_key = encode_node_key(1, NodeId::from_raw(1));
-        assert!(engine
-            .get(Partition::Node, &alice_key)
+        assert!(LocalNodeStore::new(&engine)
+            .get(1, NodeId::from_raw(1))
             .expect("get")
             .is_none());
 
