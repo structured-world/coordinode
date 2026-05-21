@@ -930,7 +930,7 @@ fn reaper_loop(
 mod tests {
     use super::*;
     use coordinode_core::graph::intern::FieldInterner;
-    use coordinode_core::graph::node::encode_node_key;
+    use coordinode_core::graph::node::NodeId;
     use coordinode_core::schema::definition::PropertyDef;
     use coordinode_storage::engine::config::{
         Durability, EndpointConfig, Media, StorageConfig, Tier,
@@ -966,17 +966,21 @@ mod tests {
         timestamp_us: i64,
         interner: &mut FieldInterner,
     ) {
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
         let mut record = NodeRecord::new(label);
         let ts_field = interner.intern("created_at");
         record.set(ts_field, Value::Timestamp(timestamp_us));
-        let key = encode_node_key(shard_id, NodeId::from_raw(node_id));
-        let bytes = record.to_msgpack().expect("serialize");
-        engine.put(Partition::Node, &key, &bytes).expect("put node");
+        LocalNodeStore::new(engine)
+            .put(shard_id, NodeId::from_raw(node_id), &record)
+            .expect("put node");
     }
 
     fn node_exists(engine: &StorageEngine, shard_id: u16, node_id: u64) -> bool {
-        let key = encode_node_key(shard_id, NodeId::from_raw(node_id));
-        engine.get(Partition::Node, &key).expect("get").is_some()
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        LocalNodeStore::new(engine)
+            .get(shard_id, NodeId::from_raw(node_id))
+            .expect("get")
+            .is_some()
     }
 
     fn make_ttl_schema(label: &str, duration_secs: u64, scope: TtlScope) -> LabelSchema {
@@ -1128,9 +1132,11 @@ mod tests {
             "node should survive field removal"
         );
 
-        let key = encode_node_key(1, NodeId::from_raw(10));
-        let bytes = engine.get(Partition::Node, &key).unwrap().unwrap();
-        let record = NodeRecord::from_msgpack(&bytes).unwrap();
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        let record = LocalNodeStore::new(&engine)
+            .get(1, NodeId::from_raw(10))
+            .unwrap()
+            .unwrap();
         // The timestamp field should be removed.
         let has_timestamp = record
             .props
@@ -1177,9 +1183,9 @@ mod tests {
         let pd_field = interner.intern("profile_data");
         record.set(ts_field, Value::Timestamp(old_ts));
         record.set(pd_field, Value::String("sensitive content".into()));
-        let key = encode_node_key(1, NodeId::from_raw(30));
-        engine
-            .put(Partition::Node, &key, &record.to_msgpack().expect("ser"))
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        LocalNodeStore::new(&engine)
+            .put(1, NodeId::from_raw(30), &record)
             .expect("put");
 
         // Use the same interner so the reaper can resolve target_field_id = pd_field.
@@ -1196,11 +1202,10 @@ mod tests {
         );
 
         // Reload node and verify: profile_data deleted, created_at preserved.
-        let raw = engine
-            .get(Partition::Node, &key)
+        let updated = LocalNodeStore::new(&engine)
+            .get(1, NodeId::from_raw(30))
             .expect("get")
             .expect("node exists");
-        let updated = NodeRecord::from_msgpack(&raw).expect("decode");
         assert!(
             !updated.props.contains_key(&pd_field),
             "profile_data must be removed by subtree TTL"
@@ -1246,9 +1251,9 @@ mod tests {
         let mut record = NodeRecord::new("Cache");
         record.set(ts_field, Value::Timestamp(old_ts));
         record.set(payload_field, Value::String("stale data".into()));
-        let key = encode_node_key(1, NodeId::from_raw(99));
-        engine
-            .put(Partition::Node, &key, &record.to_msgpack().expect("ser"))
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        LocalNodeStore::new(&engine)
+            .put(1, NodeId::from_raw(99), &record)
             .expect("put");
 
         // Reap with the EMPTY interner — target_field_id will be None.
@@ -1270,11 +1275,10 @@ mod tests {
         );
 
         // The node must be untouched.
-        let raw = engine
-            .get(Partition::Node, &key)
+        let updated = LocalNodeStore::new(&engine)
+            .get(1, NodeId::from_raw(99))
             .expect("get")
             .expect("node exists");
-        let updated = NodeRecord::from_msgpack(&raw).expect("decode");
         assert!(
             updated.props.contains_key(&payload_field),
             "payload must NOT be removed when target_field_id is unresolved"
@@ -1315,9 +1319,9 @@ mod tests {
         let mut record = NodeRecord::new("Profile");
         record.set(ts_field, Value::Timestamp(old_ts));
         record.set(bio_field, Value::String("hello".into()));
-        let key = encode_node_key(1, NodeId::from_raw(77));
-        engine
-            .put(Partition::Node, &key, &record.to_msgpack().expect("ser"))
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        LocalNodeStore::new(&engine)
+            .put(1, NodeId::from_raw(77), &record)
             .expect("put");
 
         // First reap: bio must be removed, node survives, subtrees_removed = 1.
@@ -1326,11 +1330,10 @@ mod tests {
         assert!(node_exists(&engine, 1, 77), "node must survive subtree TTL");
 
         // Verify bio is gone.
-        let raw = engine
-            .get(Partition::Node, &key)
+        let after_r1 = LocalNodeStore::new(&engine)
+            .get(1, NodeId::from_raw(77))
             .expect("get")
             .expect("node exists");
-        let after_r1 = NodeRecord::from_msgpack(&raw).expect("decode");
         assert!(
             !after_r1.props.contains_key(&bio_field),
             "bio removed after first pass"
@@ -1391,9 +1394,10 @@ mod tests {
         let mut peer_record = NodeRecord::new("User");
         let name_field = interner.intern("name");
         peer_record.set(name_field, Value::String("alice".into()));
-        let peer_key = encode_node_key(1, NodeId::from_raw(100));
-        let peer_bytes = peer_record.to_msgpack().unwrap();
-        engine.put(Partition::Node, &peer_key, &peer_bytes).unwrap();
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        LocalNodeStore::new(&engine)
+            .put(1, NodeId::from_raw(100), &peer_record)
+            .unwrap();
 
         // Create edge: node 1 -[OWNS]-> node 100
         let fwd_key = encode_adj_key_forward("OWNS", NodeId::from_raw(1));
@@ -1490,9 +1494,10 @@ mod tests {
         record.set(created_field, Value::Timestamp(two_hours_ago));
         record.set(updated_field, Value::Timestamp(now));
 
-        let key = encode_node_key(1, NodeId::from_raw(42));
-        let bytes = record.to_msgpack().expect("serialize");
-        engine.put(Partition::Node, &key, &bytes).expect("put");
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        LocalNodeStore::new(&engine)
+            .put(1, NodeId::from_raw(42), &record)
+            .expect("put");
 
         // Use interner-aware reaper function directly.
         let result = reap_computed_ttl_with_interner(&engine, 1, 1000, &interner);

@@ -67,11 +67,14 @@ const ALLOWED: &[(&str, usize)] = &[
     // + verify-deleted assertions now route through LocalNodeStore.
     // 0 raw encoder usages.
     ("src/index/ttl.rs", 0),
-    // ttl_reaper.rs: 9 residual usages — production discover_ttl_targets
-    // uses schema:label: prefix encoder (legitimate non-node encoder),
-    // and cfg(test) fixtures use raw node-key encoders for probe data.
-    // Pending R166 + a SchemaStore::list_labels API.
-    ("src/index/ttl_reaper.rs", 9),
+    // ttl_reaper.rs (R166): cfg(test) fixtures + `insert_node` +
+    // `node_exists` helpers + 3 verify-after-reap assertions migrated
+    // to LocalNodeStore. 1 residual usage: production
+    // `prepare_subtree_mutations` builds explicit EdgeProp keys for a
+    // batched Mutation::Delete record — can migrate to LocalEdgeStore
+    // once the modality layer surfaces a batched-mutation primitive
+    // (currently the catalog batches Mutations across partitions).
+    ("src/index/ttl_reaper.rs", 1),
     ("src/index/registry.rs", 0),
 ];
 
