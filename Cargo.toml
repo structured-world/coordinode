@@ -82,6 +82,7 @@ rand = "0.10"
 
 # Parallelism
 rayon = "1.10"
+crossbeam-epoch = "0.9"
 
 # Async utilities
 futures-util = "0.3"
