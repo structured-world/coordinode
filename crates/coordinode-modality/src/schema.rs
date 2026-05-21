@@ -46,7 +46,7 @@ pub trait SchemaStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSchemaStore::new(&engine);
+    /// # let store = LocalSchemaStore::new(engine);
     /// let _label = store.load_label("User")?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -66,7 +66,7 @@ pub trait SchemaStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSchemaStore::new(&engine);
+    /// # let store = LocalSchemaStore::new(engine);
     /// # let schema: LabelSchema = unimplemented!();
     /// store.save_label(&schema)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -87,7 +87,7 @@ pub trait SchemaStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSchemaStore::new(&engine);
+    /// # let store = LocalSchemaStore::new(engine);
     /// let _edge_type = store.load_edge_type("KNOWS")?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -106,7 +106,7 @@ pub trait SchemaStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSchemaStore::new(&engine);
+    /// # let store = LocalSchemaStore::new(engine);
     /// let schema = EdgeTypeSchema::new("KNOWS");
     /// store.save_edge_type(&schema)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -134,7 +134,7 @@ pub trait SchemaStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSchemaStore::new(&engine);
+    /// # let store = LocalSchemaStore::new(engine);
     /// for schema in store.list_labels()? {
     ///     println!("label {}", schema.name);
     /// }
@@ -170,7 +170,7 @@ impl<'a> LocalSchemaStore<'a> {
     /// #     Media::Hdd, Durability::Durable, Tier::Warm,
     /// # )]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalSchemaStore::new(&engine);
+    /// let store = LocalSchemaStore::new(engine);
     /// assert!(store.load_label("User")?.is_none());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -343,22 +343,12 @@ impl SchemaStore for LocalSchemaStore<'_> {
 mod tests {
     use super::*;
     use coordinode_core::schema::definition::{PlacementPolicy, PropertyDef, PropertyType};
-    use coordinode_storage::engine::config::{
-        Durability, EndpointConfig, Media, StorageConfig, Tier,
-    };
-    use tempfile::TempDir;
 
-    fn open_engine() -> (TempDir, StorageEngine) {
-        let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]);
-        let engine = StorageEngine::open(&config).expect("open engine");
-        (dir, engine)
+    /// Logic-test fixture (memory backing, env-flippable via
+    /// `COORDINODE_TEST_BACKEND`). Schema CRUD has no persistence
+    /// semantics.
+    fn open_engine() -> coordinode_test_fixtures::EngineFixture {
+        coordinode_test_fixtures::engine_for_logic()
     }
 
     fn sample_label() -> LabelSchema {
@@ -373,8 +363,9 @@ mod tests {
 
     #[test]
     fn round_trip_label_schema() {
-        let (_dir, engine) = open_engine();
-        let store = LocalSchemaStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalSchemaStore::new(engine);
         let schema = sample_label();
 
         assert!(
@@ -400,8 +391,9 @@ mod tests {
         // second save with a bumped revision, pointer points to the
         // newer revision AND both bodies are still readable (revision
         // history is preserved).
-        let (_dir, engine) = open_engine();
-        let store = LocalSchemaStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalSchemaStore::new(engine);
 
         let mut v1 = sample_label();
         v1.schema_revision = 1;
@@ -429,8 +421,9 @@ mod tests {
 
     #[test]
     fn corrupt_pointer_surfaces_as_decode_error() {
-        let (_dir, engine) = open_engine();
-        let store = LocalSchemaStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalSchemaStore::new(engine);
         // Inject a corrupt pointer (3 bytes instead of 8).
         engine
             .put(
@@ -445,8 +438,9 @@ mod tests {
 
     #[test]
     fn pointer_naming_missing_revision_surfaces_as_decode_error() {
-        let (_dir, engine) = open_engine();
-        let store = LocalSchemaStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalSchemaStore::new(engine);
         // Pointer says revision 7 exists, but no body at rev 7.
         engine
             .put(
@@ -467,8 +461,9 @@ mod tests {
 
     #[test]
     fn edge_type_round_trip() {
-        let (_dir, engine) = open_engine();
-        let store = LocalSchemaStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalSchemaStore::new(engine);
         let schema = EdgeTypeSchema::new("KNOWS");
 
         assert!(store.load_edge_type("KNOWS").expect("none").is_none());
@@ -482,8 +477,9 @@ mod tests {
         // Symmetric to the label revision-bump test: save v1, save
         // v2, current load returns v2, v1 body still readable via
         // its revisioned key.
-        let (_dir, engine) = open_engine();
-        let store = LocalSchemaStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalSchemaStore::new(engine);
 
         let mut v1 = EdgeTypeSchema::new("KNOWS");
         v1.schema_revision = 1;
@@ -512,8 +508,9 @@ mod tests {
         // Pre-DDL deployments wrote a zero-length value at the
         // revisioned key to mark "edge type exists, no schema body".
         // The store must surface this as `None`, not a decode error.
-        let (_dir, engine) = open_engine();
-        let store = LocalSchemaStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalSchemaStore::new(engine);
         engine
             .put(
                 Partition::Schema,
@@ -538,8 +535,9 @@ mod tests {
 
     #[test]
     fn list_labels_returns_every_declared_label_at_current_revision() {
-        let (_dir, engine) = open_engine();
-        let store = LocalSchemaStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalSchemaStore::new(engine);
         let mut a = sample_label();
         a.name = "User".into();
         a.schema_revision = 1;
@@ -564,16 +562,18 @@ mod tests {
 
     #[test]
     fn list_labels_empty_when_no_schemas_declared() {
-        let (_dir, engine) = open_engine();
-        let store = LocalSchemaStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalSchemaStore::new(engine);
         let listed = store.list_labels().expect("list");
         assert!(listed.is_empty());
     }
 
     #[test]
     fn list_edge_types_returns_every_declared_edge_type_at_current_revision() {
-        let (_dir, engine) = open_engine();
-        let store = LocalSchemaStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalSchemaStore::new(engine);
         let mut knows_v1 = sample_edge_type();
         knows_v1.name = "KNOWS".into();
         knows_v1.schema_revision = 1;
@@ -600,8 +600,9 @@ mod tests {
         // Pre-DDL idempotent existence markers shouldn't surface in
         // the listing — `load_edge_type` returns None for them, so
         // `list_edge_types` filters them out.
-        let (_dir, engine) = open_engine();
-        let store = LocalSchemaStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalSchemaStore::new(engine);
         // Real schema for KNOWS.
         let mut real = sample_edge_type();
         real.name = "KNOWS".into();

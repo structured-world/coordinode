@@ -14,22 +14,17 @@ use coordinode_modality::{
     Bbox, Crs, IndexStore, LocalIndexStore, LocalNodeStore, LocalSpatialStore, NodeStore, Point,
     SpatialStore,
 };
-use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
-use coordinode_storage::engine::core::StorageEngine;
 use proptest::prelude::*;
-use tempfile::TempDir;
 
-fn open_engine() -> (TempDir, StorageEngine) {
-    let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "ep",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )]);
-    let engine = StorageEngine::open(&config).expect("open");
-    (dir, engine)
+/// Logic-test fixture — invariant proptests verify per-modality
+/// store behaviour, not persistence. Memory backing → ~2× faster
+/// per proptest case → ~4× total wall clock for the 4 spatial /
+/// node-versioning / index-ordering invariants (each runs 32+
+/// generated cases). Default backend honours
+/// `COORDINODE_TEST_BACKEND`; CI matrix flips to disk to catch
+/// FS-specific bugs MemFs would miss.
+fn open_engine() -> coordinode_test_fixtures::EngineFixture {
+    coordinode_test_fixtures::engine_for_logic()
 }
 
 proptest! {
@@ -47,8 +42,9 @@ proptest! {
         a in any::<i64>(),
         b in any::<i64>(),
     ) {
-        let (_dir, engine) = open_engine();
-        let store = LocalIndexStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalIndexStore::new(engine);
         store
             .put_entry("p", &[Value::Int(a)], NodeId::from_raw(1))
             .unwrap();
@@ -77,8 +73,9 @@ proptest! {
     fn node_scan_versions_always_sorted(
         valid_froms in prop::collection::vec(any::<i64>(), 1..16),
     ) {
-        let (_dir, engine) = open_engine();
-        let store = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(1);
         for &vf in &valid_froms {
             store
@@ -102,8 +99,9 @@ proptest! {
         x in -1e6_f64 .. 1e6,
         y in -1e6_f64 .. 1e6,
     ) {
-        let (_dir, engine) = open_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore::new(engine);
         let id = NodeId::from_raw(1);
         let p = Point::new_2d(Crs::Cartesian2d, x, y);
         store.insert(1, id, &p).unwrap();
@@ -126,8 +124,9 @@ proptest! {
         ox in 11.0_f64 .. 100.0,
         oy in 11.0_f64 .. 100.0,
     ) {
-        let (_dir, engine) = open_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore::new(engine);
         store
             .insert(
                 1,

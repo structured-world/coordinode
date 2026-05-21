@@ -45,7 +45,7 @@ pub trait BlobStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalBlobStore::new(&engine);
+    /// # let store = LocalBlobStore::new(engine);
     /// let id = ChunkId::from_data(b"hello");
     /// store.put_chunk(&id, b"hello")?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -65,7 +65,7 @@ pub trait BlobStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalBlobStore::new(&engine);
+    /// # let store = LocalBlobStore::new(engine);
     /// let chunks = vec![
     ///     (ChunkId::from_data(b"a"), b"a".to_vec()),
     ///     (ChunkId::from_data(b"b"), b"b".to_vec()),
@@ -89,7 +89,7 @@ pub trait BlobStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalBlobStore::new(&engine);
+    /// # let store = LocalBlobStore::new(engine);
     /// let id = ChunkId::from_data(b"hello");
     /// let _maybe_data = store.get_chunk(&id)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -109,7 +109,7 @@ pub trait BlobStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalBlobStore::new(&engine);
+    /// # let store = LocalBlobStore::new(engine);
     /// let blob_ref = BlobRef { total_size: 0, chunks: vec![] };
     /// store.put_blob_ref(NodeId::from_raw(1), 0, &blob_ref)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -128,7 +128,7 @@ pub trait BlobStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalBlobStore::new(&engine);
+    /// # let store = LocalBlobStore::new(engine);
     /// let _ref = store.get_blob_ref(NodeId::from_raw(1), 0)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -148,7 +148,7 @@ pub trait BlobStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalBlobStore::new(&engine);
+    /// # let store = LocalBlobStore::new(engine);
     /// store.delete_blob_ref(NodeId::from_raw(1), 0)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -174,7 +174,7 @@ impl<'a> LocalBlobStore<'a> {
     /// #     Media::Hdd, Durability::Durable, Tier::Warm,
     /// # )]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalBlobStore::new(&engine);
+    /// let store = LocalBlobStore::new(engine);
     /// let id = ChunkId::from_data(b"hello");
     /// store.put_chunk(&id, b"hello")?;
     /// assert_eq!(store.get_chunk(&id)?.as_deref(), Some(b"hello".as_slice()));
@@ -251,28 +251,18 @@ impl BlobStore for LocalBlobStore<'_> {
 mod tests {
     use super::*;
     use coordinode_core::graph::blob::create_blob;
-    use coordinode_storage::engine::config::{
-        Durability, EndpointConfig, Media, StorageConfig, Tier,
-    };
-    use tempfile::TempDir;
 
-    fn open_engine() -> (TempDir, StorageEngine) {
-        let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]);
-        let engine = StorageEngine::open(&config).expect("open");
-        (dir, engine)
+    /// Logic-test fixture (memory backing, env-flippable). Blob
+    /// chunk CRUD verifies store contract, not persistence.
+    fn open_engine() -> coordinode_test_fixtures::EngineFixture {
+        coordinode_test_fixtures::engine_for_logic()
     }
 
     #[test]
     fn chunk_round_trip() {
-        let (_dir, engine) = open_engine();
-        let store = LocalBlobStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalBlobStore::new(engine);
 
         let id = ChunkId::from_data(b"abc");
         assert!(store.get_chunk(&id).expect("none").is_none());
@@ -286,8 +276,9 @@ mod tests {
         // Single WriteBatch ⇒ all chunks visible together. Smoke
         // check: write three chunks via put_chunks, then verify each
         // individually.
-        let (_dir, engine) = open_engine();
-        let store = LocalBlobStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalBlobStore::new(engine);
         let chunks = vec![
             (ChunkId::from_data(b"a"), b"a".to_vec()),
             (ChunkId::from_data(b"b"), b"b".to_vec()),
@@ -304,15 +295,17 @@ mod tests {
 
     #[test]
     fn put_chunks_empty_is_noop() {
-        let (_dir, engine) = open_engine();
-        let store = LocalBlobStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalBlobStore::new(engine);
         store.put_chunks(&[]).expect("empty batch ok");
     }
 
     #[test]
     fn blob_ref_round_trip() {
-        let (_dir, engine) = open_engine();
-        let store = LocalBlobStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalBlobStore::new(engine);
         let node_id = NodeId::from_raw(42);
         let prop_id = 7;
 
@@ -344,8 +337,9 @@ mod tests {
         // Deleting the ref must NOT touch chunks — orphan chunks are
         // GC'd by Layer 3 sweep, not by the store. Verifies the
         // dedup-friendly behaviour.
-        let (_dir, engine) = open_engine();
-        let store = LocalBlobStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalBlobStore::new(engine);
         let node_id = NodeId::from_raw(11);
         let payload = vec![0x33_u8; INLINE_THRESHOLD + 8];
         let (blob_ref, chunks) = create_blob(&payload);
@@ -371,8 +365,9 @@ mod tests {
         // Content-addressed: same ChunkId means same bytes. Putting
         // twice must be idempotent (the engine accepts the overwrite
         // silently).
-        let (_dir, engine) = open_engine();
-        let store = LocalBlobStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalBlobStore::new(engine);
         let id = ChunkId::from_data(b"xyz");
         store.put_chunk(&id, b"xyz").expect("first put");
         store.put_chunk(&id, b"xyz").expect("second put");
@@ -386,8 +381,9 @@ mod tests {
     fn multiple_blob_refs_per_node_distinct_prop_ids() {
         // (node_id, prop_id) is the key. Same node with two property
         // IDs must keep two distinct refs.
-        let (_dir, engine) = open_engine();
-        let store = LocalBlobStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalBlobStore::new(engine);
         let node = NodeId::from_raw(7);
         let payload_a = vec![0x01_u8; INLINE_THRESHOLD + 4];
         let payload_b = vec![0x02_u8; INLINE_THRESHOLD + 4];
@@ -413,16 +409,18 @@ mod tests {
 
     #[test]
     fn get_chunk_missing_is_none() {
-        let (_dir, engine) = open_engine();
-        let store = LocalBlobStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalBlobStore::new(engine);
         let id = ChunkId::from_data(b"never");
         assert!(store.get_chunk(&id).expect("ok").is_none());
     }
 
     #[test]
     fn corrupt_blob_ref_surfaces_as_decode_error() {
-        let (_dir, engine) = open_engine();
-        let store = LocalBlobStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalBlobStore::new(engine);
         let node_id = NodeId::from_raw(99);
         // Inject garbage bytes at the BlobRef key.
         engine

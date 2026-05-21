@@ -351,7 +351,7 @@ pub trait TimeSeriesStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalTimeSeriesStore::new(&engine);
+    /// # let store = LocalTimeSeriesStore::new(engine);
     /// let bucket = Bucket::from_measurements(
     ///     rmpv::Value::String("s1".into()),
     ///     vec![Measurement { timestamp_us: 0, ingestion_ts_us: None, fields: BTreeMap::new() }],
@@ -373,7 +373,7 @@ pub trait TimeSeriesStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalTimeSeriesStore::new(&engine);
+    /// # let store = LocalTimeSeriesStore::new(engine);
     /// let _bucket = store.get_bucket(0, NodeId::from_raw(1))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -394,7 +394,7 @@ pub trait TimeSeriesStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalTimeSeriesStore::new(&engine);
+    /// # let store = LocalTimeSeriesStore::new(engine);
     /// store.delete_bucket(0, NodeId::from_raw(1))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -414,7 +414,7 @@ pub trait TimeSeriesStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalTimeSeriesStore::new(&engine);
+    /// # let store = LocalTimeSeriesStore::new(engine);
     /// let _ok = store.mark_closed(0, NodeId::from_raw(1))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -442,7 +442,7 @@ pub trait TimeSeriesStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalTimeSeriesStore::new(&engine);
+    /// # let store = LocalTimeSeriesStore::new(engine);
     /// let _ok = store.reopen_bucket(0, NodeId::from_raw(1))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -464,7 +464,7 @@ pub trait TimeSeriesStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalTimeSeriesStore::new(&engine);
+    /// # let store = LocalTimeSeriesStore::new(engine);
     /// let entry = OverflowEntry {
     ///     arrival_seqno: 1,
     ///     measurement: Measurement { timestamp_us: 100, ingestion_ts_us: None, fields: BTreeMap::new() },
@@ -491,7 +491,7 @@ pub trait TimeSeriesStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalTimeSeriesStore::new(&engine);
+    /// # let store = LocalTimeSeriesStore::new(engine);
     /// let _entries = store.scan_overflow(7, NodeId::from_raw(1))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -512,7 +512,7 @@ pub trait TimeSeriesStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalTimeSeriesStore::new(&engine);
+    /// # let store = LocalTimeSeriesStore::new(engine);
     /// let merged = Bucket::from_measurements(rmpv::Value::Nil, vec![]);
     /// store.compact_overflow(0, 7, NodeId::from_raw(1), &merged, &[1, 2])?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -548,7 +548,7 @@ pub trait TimeSeriesStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalTimeSeriesStore::new(&engine);
+    /// # let store = LocalTimeSeriesStore::new(engine);
     /// for (label_id, bucket_id) in store.list_overflow_buckets()? {
     ///     println!("compact candidate: ({label_id}, {})", bucket_id.as_raw());
     /// }
@@ -583,7 +583,7 @@ impl<'a> LocalTimeSeriesStore<'a> {
     /// #     Media::Hdd, Durability::Durable, Tier::Warm,
     /// # )]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalTimeSeriesStore::new(&engine);
+    /// let store = LocalTimeSeriesStore::new(engine);
     /// let mut fields = BTreeMap::new();
     /// fields.insert("temp".into(), 22.5);
     /// let bucket = Bucket::from_measurements(
@@ -781,23 +781,12 @@ impl TimeSeriesStore for LocalTimeSeriesStore<'_> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use coordinode_storage::engine::config::{
-        Durability, EndpointConfig, Media, StorageConfig, Tier,
-    };
-    use coordinode_storage::engine::core::StorageEngine;
-    use tempfile::TempDir;
 
-    fn mk_engine() -> (TempDir, StorageEngine) {
-        let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]);
-        let engine = StorageEngine::open(&config).expect("open");
-        (dir, engine)
+    /// Logic-test fixture (memory backing, env-flippable). Bucket
+    /// CRUD + overflow routing tests verify ts-store contracts,
+    /// not persistence.
+    fn mk_engine() -> coordinode_test_fixtures::EngineFixture {
+        coordinode_test_fixtures::engine_for_logic()
     }
 
     fn mk_measurement(ts: i64, temp: f64) -> Measurement {
@@ -812,8 +801,9 @@ mod tests {
 
     #[test]
     fn bucket_round_trip() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalTimeSeriesStore::new(engine);
         let measurements = vec![
             mk_measurement(100, 18.5),
             mk_measurement(200, 22.0),
@@ -878,8 +868,9 @@ mod tests {
         // same key. The second write overwrites — first measurement
         // is lost. Documented hazard: the catalog above must mint
         // strictly-monotonic seqnos per bucket.
-        let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalTimeSeriesStore::new(engine);
         let bid = NodeId::from_raw(60);
 
         let first = OverflowEntry {
@@ -905,8 +896,8 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let (_dir, engine) = mk_engine();
-        let engine = Arc::new(engine);
+        let fx = mk_engine();
+        let engine = Arc::clone(&fx.engine);
         let bid = NodeId::from_raw(70);
         let label = 13u32;
 
@@ -943,23 +934,26 @@ mod tests {
 
     #[test]
     fn get_missing_bucket_returns_none() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalTimeSeriesStore::new(engine);
         assert!(store.get_bucket(0, NodeId::from_raw(99)).unwrap().is_none());
     }
 
     #[test]
     fn delete_is_idempotent() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalTimeSeriesStore::new(engine);
         store.delete_bucket(0, NodeId::from_raw(7)).unwrap();
         store.delete_bucket(0, NodeId::from_raw(7)).unwrap();
     }
 
     #[test]
     fn mark_closed_sets_flag_and_is_idempotent() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalTimeSeriesStore::new(engine);
         let bucket = Bucket::from_measurements(rmpv::Value::Nil, vec![mk_measurement(1, 1.0)]);
         let id = NodeId::from_raw(11);
         store.put_bucket(0, id, &bucket).unwrap();
@@ -971,8 +965,9 @@ mod tests {
 
     #[test]
     fn reopen_bucket_flips_closed_back_to_false() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalTimeSeriesStore::new(engine);
         let bucket = Bucket::from_measurements(rmpv::Value::Nil, vec![mk_measurement(1, 1.0)]);
         let id = NodeId::from_raw(31);
         store.put_bucket(0, id, &bucket).unwrap();
@@ -984,8 +979,9 @@ mod tests {
 
     #[test]
     fn reopen_bucket_on_already_open_is_idempotent() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalTimeSeriesStore::new(engine);
         let bucket = Bucket::from_measurements(rmpv::Value::Nil, vec![mk_measurement(1, 1.0)]);
         let id = NodeId::from_raw(32);
         store.put_bucket(0, id, &bucket).unwrap();
@@ -997,8 +993,9 @@ mod tests {
 
     #[test]
     fn reopen_missing_bucket_returns_false() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalTimeSeriesStore::new(engine);
         assert!(!store.reopen_bucket(0, NodeId::from_raw(404)).unwrap());
     }
 
@@ -1009,8 +1006,9 @@ mod tests {
         // (Tier 3 is the simpler API), then reopen so the catalog can
         // resume in-buffer appends, and finally compact overflow back
         // into the base.
-        let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalTimeSeriesStore::new(engine);
         let id = NodeId::from_raw(50);
         let label = 11u32;
 
@@ -1053,15 +1051,17 @@ mod tests {
 
     #[test]
     fn mark_closed_missing_returns_false() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalTimeSeriesStore::new(engine);
         assert!(!store.mark_closed(0, NodeId::from_raw(404)).unwrap());
     }
 
     #[test]
     fn overflow_round_trip_sorted_by_seqno() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalTimeSeriesStore::new(engine);
         let bid = NodeId::from_raw(5);
         // Insert out of order — scan must return ordered by arrival_seqno.
         for seqno in [3u64, 1, 2] {
@@ -1078,8 +1078,9 @@ mod tests {
 
     #[test]
     fn overflow_scoped_per_bucket() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalTimeSeriesStore::new(engine);
         let a = NodeId::from_raw(1);
         let b = NodeId::from_raw(2);
         store
@@ -1112,8 +1113,9 @@ mod tests {
 
     #[test]
     fn list_overflow_buckets_returns_unique_pairs_across_multiple_entries() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalTimeSeriesStore::new(engine);
 
         let m = |ts: i64| Measurement {
             timestamp_us: ts,
@@ -1164,16 +1166,18 @@ mod tests {
 
     #[test]
     fn list_overflow_buckets_empty_when_no_overflow() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalTimeSeriesStore::new(engine);
         let listed = store.list_overflow_buckets().expect("list");
         assert!(listed.is_empty());
     }
 
     #[test]
     fn compact_overflow_writes_base_and_deletes_overflow_atomically() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalTimeSeriesStore::new(engine);
         let label_id = 4u32;
         let bid = NodeId::from_raw(50);
 

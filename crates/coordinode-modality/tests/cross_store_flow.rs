@@ -16,22 +16,13 @@ use coordinode_modality::{
     LocalDocumentStore, LocalEdgeStore, LocalIndexStore, LocalNodeStore, LocalSpatialStore,
     LocalTimeSeriesStore, Measurement, NodeStore, Point, SpatialStore, TimeSeriesStore,
 };
-use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
-use coordinode_storage::engine::core::StorageEngine;
 use std::collections::BTreeMap;
-use tempfile::TempDir;
 
-fn open_shared_engine() -> (TempDir, StorageEngine) {
-    let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "ep",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )]);
-    let engine = StorageEngine::open(&config).expect("open engine");
-    (dir, engine)
+/// Logic-test fixture (memory backing, env-flippable). Cross-store
+/// integration tests verify per-modality slicing of a shared
+/// engine — no persistence semantics.
+fn open_shared_engine() -> coordinode_test_fixtures::EngineFixture {
+    coordinode_test_fixtures::engine_for_logic()
 }
 
 /// Realistic flow: create two user nodes, link them, index one by
@@ -40,11 +31,12 @@ fn open_shared_engine() -> (TempDir, StorageEngine) {
 /// — collisions or stale-key bugs would surface here.
 #[test]
 fn node_edge_index_document_flow() {
-    let (_dir, engine) = open_shared_engine();
-    let nodes = LocalNodeStore::new(&engine);
-    let edges = LocalEdgeStore::new(&engine);
-    let indexes = LocalIndexStore::new(&engine);
-    let docs = LocalDocumentStore::new(&engine);
+    let fx = open_shared_engine();
+    let engine = &fx.engine;
+    let nodes = LocalNodeStore::new(engine);
+    let edges = LocalEdgeStore::new(engine);
+    let indexes = LocalIndexStore::new(engine);
+    let docs = LocalDocumentStore::new(engine);
 
     let alice = NodeId::from_raw(1);
     let bob = NodeId::from_raw(2);
@@ -139,10 +131,11 @@ fn node_edge_index_document_flow() {
 /// is keyed independently so they coexist.
 #[test]
 fn vector_spatial_timeseries_on_same_logical_entity() {
-    let (_dir, engine) = open_shared_engine();
-    let nodes = LocalNodeStore::new(&engine);
-    let spatial = LocalSpatialStore::new(&engine);
-    let ts = LocalTimeSeriesStore::new(&engine);
+    let fx = open_shared_engine();
+    let engine = &fx.engine;
+    let nodes = LocalNodeStore::new(engine);
+    let spatial = LocalSpatialStore::new(engine);
+    let ts = LocalTimeSeriesStore::new(engine);
 
     let sensor = NodeId::from_raw(42);
     nodes
@@ -209,9 +202,10 @@ fn vector_spatial_timeseries_on_same_logical_entity() {
 fn schema_blob_node_consistency() {
     use coordinode_core::graph::blob::{BlobRef, ChunkId};
 
-    let (_dir, engine) = open_shared_engine();
-    let nodes = LocalNodeStore::new(&engine);
-    let blobs = LocalBlobStore::new(&engine);
+    let fx = open_shared_engine();
+    let engine = &fx.engine;
+    let nodes = LocalNodeStore::new(engine);
+    let blobs = LocalBlobStore::new(engine);
 
     let node = NodeId::from_raw(7);
     nodes

@@ -76,7 +76,7 @@ pub trait EdgeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalEdgeStore::new(&engine);
+    /// # let store = LocalEdgeStore::new(engine);
     /// store.put_edge("KNOWS", NodeId::from_raw(1), NodeId::from_raw(2), None)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -103,7 +103,7 @@ pub trait EdgeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalEdgeStore::new(&engine);
+    /// # let store = LocalEdgeStore::new(engine);
     /// let _props = store.get_props("KNOWS", NodeId::from_raw(1), NodeId::from_raw(2))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -128,7 +128,7 @@ pub trait EdgeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalEdgeStore::new(&engine);
+    /// # let store = LocalEdgeStore::new(engine);
     /// store.delete_edge("KNOWS", NodeId::from_raw(1), NodeId::from_raw(2))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -148,7 +148,7 @@ pub trait EdgeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalEdgeStore::new(&engine);
+    /// # let store = LocalEdgeStore::new(engine);
     /// let _targets = store.scan_neighbors_out("KNOWS", NodeId::from_raw(1))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -167,7 +167,7 @@ pub trait EdgeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalEdgeStore::new(&engine);
+    /// # let store = LocalEdgeStore::new(engine);
     /// let _sources = store.scan_neighbors_in("KNOWS", NodeId::from_raw(2))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -193,7 +193,7 @@ pub trait EdgeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalEdgeStore::new(&engine);
+    /// # let store = LocalEdgeStore::new(engine);
     /// let props = EdgeProperties::new();
     /// store.put_edge_temporal("E", NodeId::from_raw(1), NodeId::from_raw(2), 1000, &props)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -221,7 +221,7 @@ pub trait EdgeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalEdgeStore::new(&engine);
+    /// # let store = LocalEdgeStore::new(engine);
     /// let _at_now = store.get_props_at("E", NodeId::from_raw(1), NodeId::from_raw(2), 1500)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -246,7 +246,7 @@ pub trait EdgeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalEdgeStore::new(&engine);
+    /// # let store = LocalEdgeStore::new(engine);
     /// let _versions = store.scan_edge_versions("E", NodeId::from_raw(1), NodeId::from_raw(2))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -271,7 +271,7 @@ pub trait EdgeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalEdgeStore::new(&engine);
+    /// # let store = LocalEdgeStore::new(engine);
     /// store.delete_edge_temporal("E", NodeId::from_raw(1), NodeId::from_raw(2), 1000)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -303,7 +303,7 @@ impl<'a> LocalEdgeStore<'a> {
     /// #     Media::Hdd, Durability::Durable, Tier::Warm,
     /// # )]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalEdgeStore::new(&engine);
+    /// let store = LocalEdgeStore::new(engine);
     /// store.put_edge("KNOWS", NodeId::from_raw(1), NodeId::from_raw(2), None)?;
     /// let neighbours = store.scan_neighbors_out("KNOWS", NodeId::from_raw(1))?;
     /// assert_eq!(neighbours, vec![NodeId::from_raw(2)]);
@@ -492,28 +492,17 @@ impl EdgeStore for LocalEdgeStore<'_> {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use coordinode_storage::engine::config::{
-        Durability, EndpointConfig, Media, StorageConfig, Tier,
-    };
-    use tempfile::TempDir;
 
-    fn open_engine() -> (TempDir, StorageEngine) {
-        let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]);
-        let engine = StorageEngine::open(&config).expect("open");
-        (dir, engine)
+    /// Logic-test fixture (memory backing, env-flippable).
+    fn open_engine() -> coordinode_test_fixtures::EngineFixture {
+        coordinode_test_fixtures::engine_for_logic()
     }
 
     #[test]
     fn put_edge_creates_forward_and_reverse_adj() {
-        let (_dir, engine) = open_engine();
-        let store = LocalEdgeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalEdgeStore::new(engine);
         let alice = NodeId::from_raw(1);
         let bob = NodeId::from_raw(2);
 
@@ -531,8 +520,9 @@ mod tests {
 
     #[test]
     fn put_edge_with_props_stores_property_body() {
-        let (_dir, engine) = open_engine();
-        let store = LocalEdgeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalEdgeStore::new(engine);
         let mut props = EdgeProperties::new();
         props.set(7, coordinode_core::graph::types::Value::Int(42));
 
@@ -549,8 +539,9 @@ mod tests {
         // Property-less edge: adj entries exist, edgeprop body
         // doesn't. get_props returns None (NOT "edge does not
         // exist" — that's a separate query at the adj layer).
-        let (_dir, engine) = open_engine();
-        let store = LocalEdgeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalEdgeStore::new(engine);
         store
             .put_edge("LIKES", NodeId::from_raw(1), NodeId::from_raw(2), None)
             .expect("put");
@@ -564,8 +555,9 @@ mod tests {
     fn multiple_neighbors_listed_in_sorted_order() {
         // The posting list maintains sorted order; scan returns it
         // unchanged. Verified across multi-merge writes.
-        let (_dir, engine) = open_engine();
-        let store = LocalEdgeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalEdgeStore::new(engine);
         let src = NodeId::from_raw(1);
         // Insert out of order to exercise the merge operator's sort.
         for tgt in [5u64, 3, 8, 1, 2] {
@@ -584,8 +576,9 @@ mod tests {
 
     #[test]
     fn delete_edge_removes_from_adjacency_and_props() {
-        let (_dir, engine) = open_engine();
-        let store = LocalEdgeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalEdgeStore::new(engine);
         let a = NodeId::from_raw(1);
         let b = NodeId::from_raw(2);
         let c = NodeId::from_raw(3);
@@ -609,8 +602,9 @@ mod tests {
 
     #[test]
     fn delete_edge_is_idempotent() {
-        let (_dir, engine) = open_engine();
-        let store = LocalEdgeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalEdgeStore::new(engine);
         // Never created — delete must still succeed (merge remove
         // on an absent uid is a no-op; edgeprop delete on a missing
         // key is fine).
@@ -623,8 +617,9 @@ mod tests {
     fn edge_types_are_isolated_in_adj() {
         // Same (src, tgt) pair under different edge types must NOT
         // share adjacency entries. Different keyspaces.
-        let (_dir, engine) = open_engine();
-        let store = LocalEdgeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalEdgeStore::new(engine);
         let a = NodeId::from_raw(1);
         let b = NodeId::from_raw(2);
         store.put_edge("KNOWS", a, b, None).expect("put");
@@ -647,8 +642,9 @@ mod tests {
 
     #[test]
     fn put_temporal_versions_round_trip_via_scan() {
-        let (_dir, engine) = open_engine();
-        let store = LocalEdgeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalEdgeStore::new(engine);
         let a = NodeId::from_raw(1);
         let b = NodeId::from_raw(2);
         for (vf, salary) in [(1000i64, 50_000), (2000, 60_000), (3000, 70_000)] {
@@ -666,8 +662,9 @@ mod tests {
 
     #[test]
     fn get_props_at_returns_largest_valid_from_le_query() {
-        let (_dir, engine) = open_engine();
-        let store = LocalEdgeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalEdgeStore::new(engine);
         let a = NodeId::from_raw(1);
         let b = NodeId::from_raw(2);
         store
@@ -713,8 +710,9 @@ mod tests {
 
     #[test]
     fn get_props_at_before_first_version_returns_none() {
-        let (_dir, engine) = open_engine();
-        let store = LocalEdgeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalEdgeStore::new(engine);
         let a = NodeId::from_raw(1);
         let b = NodeId::from_raw(2);
         store
@@ -725,8 +723,9 @@ mod tests {
 
     #[test]
     fn delete_temporal_version_removes_only_that_version() {
-        let (_dir, engine) = open_engine();
-        let store = LocalEdgeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalEdgeStore::new(engine);
         let a = NodeId::from_raw(1);
         let b = NodeId::from_raw(2);
         store
@@ -743,8 +742,9 @@ mod tests {
 
     #[test]
     fn delete_temporal_is_idempotent() {
-        let (_dir, engine) = open_engine();
-        let store = LocalEdgeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalEdgeStore::new(engine);
         store
             .delete_edge_temporal("E", NodeId::from_raw(1), NodeId::from_raw(2), 9999)
             .expect("idempotent delete");
@@ -752,8 +752,9 @@ mod tests {
 
     #[test]
     fn temporal_writes_isolated_per_pair() {
-        let (_dir, engine) = open_engine();
-        let store = LocalEdgeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalEdgeStore::new(engine);
         let a = NodeId::from_raw(1);
         let b = NodeId::from_raw(2);
         let c = NodeId::from_raw(3);
@@ -775,8 +776,9 @@ mod tests {
     fn temporal_put_also_writes_adjacency() {
         // A temporal edge must be visible in the neighbour scan — the
         // adj merge runs as part of the temporal write.
-        let (_dir, engine) = open_engine();
-        let store = LocalEdgeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalEdgeStore::new(engine);
         let a = NodeId::from_raw(1);
         let b = NodeId::from_raw(2);
         store
@@ -795,8 +797,8 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let (_dir, engine) = open_engine();
-        let engine = Arc::new(engine);
+        let fx = open_engine();
+        let engine = Arc::clone(&fx.engine);
         let src = NodeId::from_raw(1);
         let threads_n = 4u64;
         let per_thread = 25u64;
@@ -839,8 +841,8 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let (_dir, engine) = open_engine();
-        let engine = Arc::new(engine);
+        let fx = open_engine();
+        let engine = Arc::clone(&fx.engine);
         let src = NodeId::from_raw(1);
 
         // Pre-populate 10 edges so the remover has something to remove.
@@ -895,8 +897,8 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let (_dir, engine) = open_engine();
-        let engine = Arc::new(engine);
+        let fx = open_engine();
+        let engine = Arc::clone(&fx.engine);
         let src = NodeId::from_raw(1);
         let tgt = NodeId::from_raw(2);
 
@@ -926,8 +928,9 @@ mod tests {
 
     #[test]
     fn corrupt_posting_list_surfaces_as_decode_error() {
-        let (_dir, engine) = open_engine();
-        let store = LocalEdgeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalEdgeStore::new(engine);
         let a = NodeId::from_raw(1);
         // Inject garbage bytes at the forward-adj key.
         engine
