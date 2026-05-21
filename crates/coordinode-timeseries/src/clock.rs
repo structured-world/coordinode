@@ -52,6 +52,33 @@ pub trait IngestionClock: Send + Sync {
 /// the stamp, followers replay it). This default is correct for
 /// single-process / single-shard tests and for CE single-node
 /// deployments.
+///
+/// ## Monotonicity scope and the restart gap
+///
+/// `MonotonicHlcClock` guarantees strict monotonicity **within a
+/// single process instance**. Each new instance seeds from
+/// `SystemTime::now()`. If the host wall clock moves backward
+/// between catalog construction events — NTP correction, container
+/// VM time slip, manual `date` adjustment — a freshly-constructed
+/// clock can issue a stamp ≤ a stamp issued by the prior instance.
+/// That violates strict-monotonicity per shard across restarts.
+///
+/// Production CE single-node deployments protect against this by
+/// persisting the last-issued stamp to durable state on each catalog
+/// flush and seeding the next instance with `max(persisted + 1,
+/// wall_clock_now)`. That persistence layer is a follow-up; until
+/// it lands, the failure mode is: after a backward wall-clock jump,
+/// the first N catalog stamps may collide with prior values, which
+/// makes `AS OF INGESTION_TIME` queries non-deterministic for
+/// timestamps near the boundary. Single-node CE in practice doesn't
+/// see backward NTP jumps frequently; the gap is documented here so
+/// the follow-up has a known landing site rather than being lost.
+///
+/// Multi-replica deployments do NOT have this problem — the Raft-
+/// leader-stamped variant persists last-issued through the consensus
+/// log automatically (replicas replay leader stamps, so on
+/// leadership change the new leader resumes from
+/// `replicated_last + 1`, immune to local wall-clock state).
 pub struct MonotonicHlcClock {
     /// Greatest stamp ever returned. The next call returns
     /// `max(prior + 1, SystemTime::now())`.
