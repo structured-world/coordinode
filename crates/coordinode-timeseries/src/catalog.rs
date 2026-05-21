@@ -549,6 +549,22 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
             merged.push(entry.measurement);
         }
         merged.sort_by_key(|m| m.timestamp_us);
+        // Bitemporal backfill: a base bucket written before the
+        // `__ingestion_ts__` axis landed has measurements with
+        // `ingestion_ts_us = None`. After compaction the bucket
+        // becomes the new authoritative copy; we backfill the missing
+        // stamps with `self.clock.next()` so the merged bucket carries
+        // a complete ingestion_timestamps column and stays queryable
+        // under `AS OF INGESTION_TIME`. Without backfill,
+        // `Bucket::from_measurements` would see a half-stamped vec
+        // and CLEAR the ingestion_timestamps column to prevent
+        // misalignment — losing the bitemporal axis on every legacy
+        // bucket touched by compaction.
+        for m in &mut merged {
+            if m.ingestion_ts_us.is_none() {
+                m.ingestion_ts_us = Some(self.clock.next());
+            }
+        }
         let merged_bucket = Bucket::from_measurements(base.meta.clone(), merged);
         self.store.compact_overflow(
             self.shard_id,
@@ -1565,6 +1581,266 @@ mod tests {
             bucket.ingestion_timestamps,
             vec![999],
             "engine must overwrite caller-supplied ingestion_ts with clock value",
+        );
+    }
+
+    #[test]
+    fn legacy_bucket_without_ingestion_column_decodes_as_none() {
+        // Backward compat: a bucket persisted by a pre-bitemporal
+        // engine has NO `ingestion_timestamps` field on the wire.
+        // `#[serde(default)]` decodes it as `Vec::new()`. The
+        // measurements iterator must then yield `ingestion_ts_us = None`
+        // for every row, not panic or yield zeros.
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+
+        // Hand-build a v1-shape bucket (no ingestion_timestamps column)
+        // via Bucket::from_measurements with all Nones — verifies the
+        // half-stamped-clearing branch produces a wire-compatible
+        // empty column.
+        let m = |ts: i64| measurement(ts, &[("v", 1.0)]);
+        let legacy_bucket =
+            Bucket::from_measurements(rmpv::Value::String("legacy".into()), vec![m(100), m(200)]);
+        assert!(
+            legacy_bucket.ingestion_timestamps.is_empty(),
+            "all-None input must produce empty ingestion column (legacy shape on wire)",
+        );
+        store
+            .put_bucket(0, NodeId::from_raw(42), &legacy_bucket)
+            .unwrap();
+
+        // Round-trip through the store.
+        let read_back = store.get_bucket(0, NodeId::from_raw(42)).unwrap().unwrap();
+        assert!(
+            read_back.ingestion_timestamps.is_empty(),
+            "legacy bucket round-trip preserves empty ingestion column",
+        );
+        // Iterator must yield None for every measurement.
+        for ms in read_back.measurements() {
+            assert_eq!(
+                ms.ingestion_ts_us, None,
+                "legacy bucket iterator must yield ingestion_ts_us=None",
+            );
+        }
+    }
+
+    #[test]
+    fn compact_preserves_ingestion_axis_for_fully_stamped_data() {
+        // Bitemporal happy-path: base bucket fully stamped, overflow
+        // entries fully stamped, post-compact merged bucket carries
+        // every original stamp (no backfill needed, all stamps from
+        // the original writer's clock).
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let cfg = CatalogConfig {
+            max_count: 2,
+            granularity_span: Duration::from_millis(50),
+            ..CatalogConfig::default()
+        };
+        // ScriptedClock with enough stamps for: 2 base writes + 51
+        // overflow writes + backfill safety margin.
+        let stamps: Vec<i64> = (1_000_000..1_000_100).collect();
+        let clock = std::sync::Arc::new(crate::clock::ScriptedClock::new(stamps.clone()));
+        let catalog = BucketCatalog::new(cfg, 0, &store, 1, clock).unwrap();
+        let meta = rmpv::Value::String("s".into());
+
+        // 2 base measurements + flush (closes bucket).
+        catalog
+            .write_measurement(7, meta.clone(), measurement(0, &[("v", 1.0)]))
+            .unwrap();
+        catalog
+            .write_measurement(7, meta.clone(), measurement(1000, &[("v", 2.0)]))
+            .unwrap();
+        catalog.flush_all().unwrap();
+
+        // 51 overflow entries above threshold — every one stamped by
+        // the catalog's clock before routing to overflow.
+        let future = SystemTime::now() + Duration::from_secs(1);
+        for i in 0..51 {
+            catalog
+                .write_measurement_at(
+                    7,
+                    meta.clone(),
+                    measurement(500 + i, &[("v", 30.0 + (i as f64))]),
+                    future,
+                )
+                .unwrap();
+        }
+
+        // Compact.
+        assert!(catalog.compact_if_needed(7, NodeId::from_raw(1)).unwrap());
+
+        // Post-compact: read back, every measurement still has Some
+        // ingestion_ts. Column length matches event-time column.
+        let merged = store.get_bucket(0, NodeId::from_raw(1)).unwrap().unwrap();
+        assert_eq!(merged.timestamps.len(), 53);
+        assert_eq!(
+            merged.ingestion_timestamps.len(),
+            53,
+            "every measurement keeps its stamp through compaction",
+        );
+        // Every stamp must be from the original write (1_000_000..)
+        // — backfill code path must NOT fire for fully-stamped data.
+        for its in &merged.ingestion_timestamps {
+            assert!(
+                *its >= 1_000_000 && *its < 1_000_100,
+                "stamp {its} is outside the ScriptedClock range — backfill fired \
+                 unnecessarily on fully-stamped data",
+            );
+        }
+    }
+
+    #[test]
+    fn compact_backfills_legacy_base_bucket_via_clock() {
+        // Edge case: a legacy (pre-bitemporal) base bucket on disk
+        // with `ingestion_timestamps.is_empty()`. Catalog accepts
+        // new overflow writes (stamped). compact_if_needed runs
+        // merge — the backfill loop fills every base measurement's
+        // missing `ingestion_ts_us` with `clock.next()` so the
+        // merged bucket carries a full ingestion_timestamps column.
+        // Without backfill, `Bucket::from_measurements` would clear
+        // the column (half-stamped → drop) and lose the bitemporal
+        // axis on every legacy bucket touched.
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+
+        // Plant a legacy bucket directly (no catalog write — bypasses
+        // the stamping path). 5 measurements, no ingestion column.
+        let legacy_bucket = Bucket::from_measurements(
+            rmpv::Value::String("s".into()),
+            (0..5)
+                .map(|i| measurement(i * 100, &[("v", i as f64)]))
+                .collect(),
+        );
+        assert!(
+            legacy_bucket.ingestion_timestamps.is_empty(),
+            "plant precondition: legacy bucket has empty ingestion column",
+        );
+        store
+            .put_bucket(0, NodeId::from_raw(1), &legacy_bucket)
+            .unwrap();
+        // Mark closed manually so compact_if_needed proceeds.
+        store.mark_closed(0, NodeId::from_raw(1)).unwrap();
+
+        // Set up catalog with a deterministic clock. Stamps:
+        //   5 backfills (for legacy base) + 51 overflow writes
+        //   = 56 stamps minimum.
+        let stamps: Vec<i64> = (5_000_000..5_000_100).collect();
+        let clock = std::sync::Arc::new(crate::clock::ScriptedClock::new(stamps));
+        let cfg = CatalogConfig {
+            max_count: 2,
+            granularity_span: Duration::from_millis(50),
+            ..CatalogConfig::default()
+        };
+        let catalog = BucketCatalog::new(cfg, 0, &store, 100, clock).unwrap();
+
+        // 51 overflow writes — manually since the catalog doesn't
+        // know about the planted bucket. Route them directly via
+        // store.put_overflow so they target bucket 1.
+        for i in 0..51 {
+            store
+                .put_overflow(
+                    7,
+                    NodeId::from_raw(1),
+                    &coordinode_modality::OverflowEntry {
+                        arrival_seqno: i as u64 + 1,
+                        measurement: Measurement {
+                            timestamp_us: 500 + i as i64,
+                            // Overflow measurements pre-stamped (as if
+                            // catalog had stamped them in production).
+                            ingestion_ts_us: Some(9_000_000 + i as i64),
+                            fields: {
+                                let mut f = BTreeMap::new();
+                                f.insert("v".to_string(), 100.0 + (i as f64));
+                                f
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+        }
+
+        // Compact — must backfill the 5 legacy measurements with
+        // clock stamps, keep the 51 overflow stamps verbatim.
+        assert!(catalog.compact_if_needed(7, NodeId::from_raw(1)).unwrap());
+
+        // Verify: merged bucket has 56 measurements, all stamped.
+        let merged = store.get_bucket(0, NodeId::from_raw(1)).unwrap().unwrap();
+        assert_eq!(merged.timestamps.len(), 56, "5 base + 51 overflow");
+        assert_eq!(
+            merged.ingestion_timestamps.len(),
+            56,
+            "every measurement carries a stamp post-compact (no half-stamped clearing)",
+        );
+        // Count how many stamps came from the ScriptedClock vs
+        // overflow-supplied. Exactly 5 should be from ScriptedClock
+        // (the backfill for the legacy base), 51 from overflow.
+        let mut backfilled = 0;
+        let mut overflow_preserved = 0;
+        for its in &merged.ingestion_timestamps {
+            if (5_000_000..5_000_100).contains(its) {
+                backfilled += 1;
+            } else if (9_000_000..9_000_100).contains(its) {
+                overflow_preserved += 1;
+            } else {
+                panic!("unexpected stamp {its} — not in backfill or overflow ranges");
+            }
+        }
+        assert_eq!(backfilled, 5, "5 legacy base measurements backfilled");
+        assert_eq!(
+            overflow_preserved, 51,
+            "51 overflow stamps preserved verbatim through compaction",
+        );
+    }
+
+    #[test]
+    fn overflow_path_preserves_ingestion_stamp() {
+        // Tier-3 routing: a measurement that misses Tier-1/Tier-2
+        // and routes to overflow MUST still carry the stamp the
+        // catalog assigned. Verify by writing far-late, then
+        // reading back via scan_overflow.
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let cfg = CatalogConfig {
+            max_count: 2,
+            granularity_span: Duration::from_millis(50),
+            ..CatalogConfig::default()
+        };
+        let clock = std::sync::Arc::new(crate::clock::ScriptedClock::new(vec![
+            777_000, 888_000, 999_000,
+        ]));
+        let catalog = BucketCatalog::new(cfg, 0, &store, 1, clock).unwrap();
+        let meta = rmpv::Value::String("s".into());
+
+        // Open + flush a bucket so the LRU has a handle.
+        for i in 0..2 {
+            catalog
+                .write_measurement(7, meta.clone(), measurement(i * 1000, &[("v", 1.0)]))
+                .unwrap();
+        }
+        catalog.flush_all().unwrap();
+        // ScriptedClock has burned 2 stamps. The next overflow write
+        // gets stamp 999_000.
+
+        // Late write — fits in the closed bucket's window so it routes
+        // to Tier-3 overflow once the LRU TTL has expired.
+        let far_future = SystemTime::now() + Duration::from_secs(3600);
+        catalog
+            .write_measurement_at(
+                7,
+                meta.clone(),
+                measurement(500, &[("v", 99.0)]),
+                far_future,
+            )
+            .unwrap();
+
+        // Inspect the overflow row directly.
+        let entries = store.scan_overflow(7, NodeId::from_raw(1)).unwrap();
+        assert_eq!(entries.len(), 1, "Tier-3 routed the late write to overflow");
+        assert_eq!(
+            entries[0].measurement.ingestion_ts_us,
+            Some(999_000),
+            "Tier-3 overflow entry must carry the catalog-assigned stamp",
         );
     }
 
