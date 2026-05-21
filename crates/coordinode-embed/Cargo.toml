@@ -14,6 +14,7 @@ coordinode-raft = { workspace = true }
 coordinode-vector = { workspace = true }
 coordinode-search = { workspace = true }
 coordinode-storage = { workspace = true }
+coordinode-modality = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }

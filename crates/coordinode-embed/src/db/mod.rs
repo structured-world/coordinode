@@ -193,26 +193,18 @@ impl coordinode_vector::VectorLoader for StorageVectorLoader {
         ids: &[u64],
         property: &str,
     ) -> std::collections::HashMap<u64, Vec<f32>> {
-        use coordinode_core::graph::node::NodeRecord;
-
         let mut result = std::collections::HashMap::with_capacity(ids.len());
         let field_id = match self.interner.lookup(property) {
             Some(id) => id,
             None => return result,
         };
 
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        let node_store = LocalNodeStore::new(&self.engine);
         for &node_id in ids {
-            let key = coordinode_core::graph::node::encode_node_key(
-                self.shard_id,
-                NodeId::from_raw(node_id),
-            );
-            let value = match self.engine.get(Partition::Node, &key) {
-                Ok(Some(v)) => v,
+            let record = match node_store.get(self.shard_id, NodeId::from_raw(node_id)) {
+                Ok(Some(r)) => r,
                 _ => continue,
-            };
-            let record = match NodeRecord::from_msgpack(&value) {
-                Ok(r) => r,
-                Err(_) => continue,
             };
             if let Some(val) = record.props.get(&field_id) {
                 if let Some(vec_data) = try_extract_vector(val) {

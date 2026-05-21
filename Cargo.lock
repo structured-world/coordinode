@@ -892,6 +892,7 @@ version = "0.4.3"
 dependencies = [
  "coordinode-core",
  "coordinode-lsm-tree",
+ "coordinode-modality",
  "coordinode-query",
  "coordinode-raft",
  "coordinode-search",

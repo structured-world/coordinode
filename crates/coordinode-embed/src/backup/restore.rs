@@ -117,7 +117,9 @@ pub fn restore_json<R: BufRead>(
     reader: &mut R,
 ) -> Result<RestoreStats, RestoreError> {
     use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse};
-    use coordinode_core::graph::node::{encode_node_key, NodeRecord};
+    use coordinode_core::graph::node::NodeRecord;
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let node_store = LocalNodeStore::new(engine);
 
     let mut stats = RestoreStats::default();
 
@@ -163,12 +165,8 @@ pub fn restore_json<R: BufRead>(
                     }
                 }
 
-                let key = encode_node_key(shard_id, NodeId::from_raw(id));
-                let value = record
-                    .to_msgpack()
-                    .map_err(|e| RestoreError::Deserialization(e.to_string()))?;
-                engine
-                    .put(Partition::Node, &key, &value)
+                node_store
+                    .put(shard_id, NodeId::from_raw(id), &record)
                     .map_err(|e| RestoreError::Storage(e.to_string()))?;
 
                 stats.nodes += 1;
