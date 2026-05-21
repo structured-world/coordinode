@@ -46,7 +46,7 @@ pub trait NodeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalNodeStore::new(&engine);
+    /// # let store = LocalNodeStore::new(engine);
     /// let id = NodeId::from_raw(1);
     /// assert!(store.get(0, id)?.is_none());
     /// store.put(0, id, &NodeRecord::new("User"))?;
@@ -69,7 +69,7 @@ pub trait NodeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalNodeStore::new(&engine);
+    /// # let store = LocalNodeStore::new(engine);
     /// store.put(0, NodeId::from_raw(1), &NodeRecord::new("User"))?;
     /// // Second write overwrites the first.
     /// store.put(0, NodeId::from_raw(1), &NodeRecord::new("Admin"))?;
@@ -90,7 +90,7 @@ pub trait NodeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalNodeStore::new(&engine);
+    /// # let store = LocalNodeStore::new(engine);
     /// // Deleting a never-existed key is a no-op (succeeds).
     /// store.delete(0, NodeId::from_raw(404))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -112,7 +112,7 @@ pub trait NodeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalNodeStore::new(&engine);
+    /// # let store = LocalNodeStore::new(engine);
     /// let id = NodeId::from_raw(1);
     /// store.put_temporal(0, id, 1000, &NodeRecord::new("v1"))?;
     /// store.put_temporal(0, id, 2000, &NodeRecord::new("v2"))?;
@@ -137,7 +137,7 @@ pub trait NodeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalNodeStore::new(&engine);
+    /// # let store = LocalNodeStore::new(engine);
     /// store.put_temporal(0, NodeId::from_raw(1), 1000, &NodeRecord::new("v1"))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -161,7 +161,7 @@ pub trait NodeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalNodeStore::new(&engine);
+    /// # let store = LocalNodeStore::new(engine);
     /// let versions = store.scan_versions(0, NodeId::from_raw(1))?;
     /// for (valid_from, _record) in &versions { let _ = valid_from; }
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -224,7 +224,6 @@ impl<'a> LocalNodeStore<'a> {
     /// use coordinode_modality::{LocalNodeStore, NodeStore};
     /// use coordinode_core::graph::node::{NodeId, NodeRecord};
     /// use coordinode_storage::engine::config::{
-    ///     Durability, EndpointConfig, Media, StorageConfig, Tier,
     /// };
     /// use coordinode_storage::engine::core::StorageEngine;
     ///
@@ -233,7 +232,7 @@ impl<'a> LocalNodeStore<'a> {
     ///     Media::Hdd, Durability::Durable, Tier::Warm,
     /// )]);
     /// let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalNodeStore::new(&engine);
+    /// let store = LocalNodeStore::new(engine);
     /// store.put(0, NodeId::from_raw(1), &NodeRecord::new("User"))?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -428,22 +427,11 @@ impl NodeStore for LocalNodeStore<'_> {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use coordinode_storage::engine::config::{
-        Durability, EndpointConfig, Media, StorageConfig, Tier,
-    };
-    use tempfile::TempDir;
 
-    fn open_engine() -> (TempDir, StorageEngine) {
-        let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]);
-        let engine = StorageEngine::open(&config).expect("open");
-        (dir, engine)
+    /// Logic-test fixture (memory backing, env-flippable). Node
+    /// CRUD verifies store contracts, not persistence.
+    fn open_engine() -> coordinode_test_fixtures::EngineFixture {
+        coordinode_test_fixtures::engine_for_logic()
     }
 
     fn rec(label: &str) -> NodeRecord {
@@ -452,8 +440,9 @@ mod tests {
 
     #[test]
     fn non_temporal_round_trip() {
-        let (_dir, engine) = open_engine();
-        let store = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(7);
         assert!(store.get(0, id).expect("none").is_none());
         store.put(0, id, &rec("User")).expect("put");
@@ -463,8 +452,9 @@ mod tests {
 
     #[test]
     fn put_overwrites_existing_record() {
-        let (_dir, engine) = open_engine();
-        let store = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(1);
         store.put(0, id, &rec("A")).expect("put A");
         store.put(0, id, &rec("B")).expect("put B");
@@ -474,8 +464,9 @@ mod tests {
 
     #[test]
     fn delete_tombstones_record() {
-        let (_dir, engine) = open_engine();
-        let store = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(1);
         store.put(0, id, &rec("X")).expect("put");
         store.delete(0, id).expect("delete");
@@ -484,8 +475,9 @@ mod tests {
 
     #[test]
     fn delete_missing_is_idempotent() {
-        let (_dir, engine) = open_engine();
-        let store = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalNodeStore::new(engine);
         store
             .delete(0, NodeId::from_raw(999))
             .expect("delete missing");
@@ -494,8 +486,9 @@ mod tests {
     #[test]
     fn shards_isolated_by_key_prefix() {
         // Same node_id under different shards must NOT collide.
-        let (_dir, engine) = open_engine();
-        let store = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(42);
         store.put(0, id, &rec("ShardZero")).expect("put");
         store.put(1, id, &rec("ShardOne")).expect("put");
@@ -511,8 +504,9 @@ mod tests {
 
     #[test]
     fn temporal_versions_round_trip() {
-        let (_dir, engine) = open_engine();
-        let store = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(11);
         store.put_temporal(0, id, 100, &rec("V1")).expect("put v1");
         store.put_temporal(0, id, 200, &rec("V2")).expect("put v2");
@@ -533,8 +527,9 @@ mod tests {
         // - at 199 → V1 (largest <= 199)
         // - at 200 → V2 (exact match)
         // - at 1_000_000 → V3 (far future picks newest)
-        let (_dir, engine) = open_engine();
-        let store = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(11);
         store.put_temporal(0, id, 100, &rec("V1")).expect("v1");
         store.put_temporal(0, id, 200, &rec("V2")).expect("v2");
@@ -579,8 +574,9 @@ mod tests {
     fn get_at_isolated_per_node_id() {
         // Two distinct nodes in the same shard each have temporal
         // versions — get_at on one must not bleed into the other.
-        let (_dir, engine) = open_engine();
-        let store = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalNodeStore::new(engine);
         let a = NodeId::from_raw(1);
         let b = NodeId::from_raw(2);
         store.put_temporal(0, a, 50, &rec("A50")).expect("a");
@@ -608,8 +604,9 @@ mod tests {
     fn put_temporal_same_valid_from_overwrites_body() {
         // Two writes at the same (node_id, valid_from) land at the
         // same key — second wins, no version explosion.
-        let (_dir, engine) = open_engine();
-        let store = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(40);
 
         let mut rec_v1 = rec("A");
@@ -631,8 +628,9 @@ mod tests {
 
     #[test]
     fn scan_versions_on_empty_node_returns_empty() {
-        let (_dir, engine) = open_engine();
-        let store = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalNodeStore::new(engine);
         let versions = store.scan_versions(0, NodeId::from_raw(999)).expect("ok");
         assert!(versions.is_empty());
     }
@@ -641,8 +639,9 @@ mod tests {
     fn get_at_boundary_i64_min_max() {
         // Per ADR-027 valid_from_ms is i64. Test we can write at the
         // extreme boundaries and the sortable encoding still works.
-        let (_dir, engine) = open_engine();
-        let store = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(41);
 
         store
@@ -662,8 +661,9 @@ mod tests {
 
     #[test]
     fn get_at_seqno_returns_version_visible_at_snapshot() {
-        let (_dir, engine) = open_engine();
-        let store = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(50);
         store.put(0, id, &rec("v1")).expect("put v1");
         let snap = engine.snapshot();
@@ -676,8 +676,9 @@ mod tests {
 
     #[test]
     fn get_at_seqno_missing_returns_none() {
-        let (_dir, engine) = open_engine();
-        let store = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalNodeStore::new(engine);
         let snap = engine.snapshot();
         assert!(store
             .get_at_seqno(0, NodeId::from_raw(999), snap)
@@ -687,8 +688,9 @@ mod tests {
 
     #[test]
     fn scan_shard_yields_every_non_temporal_record() {
-        let (_dir, engine) = open_engine();
-        let store = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalNodeStore::new(engine);
         for i in 0u64..5 {
             store
                 .put(0, NodeId::from_raw(i + 100), &rec(&format!("L{i}")))
@@ -703,8 +705,9 @@ mod tests {
 
     #[test]
     fn scan_shard_isolated_per_shard() {
-        let (_dir, engine) = open_engine();
-        let store = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalNodeStore::new(engine);
         store.put(0, NodeId::from_raw(1), &rec("s0")).unwrap();
         store.put(1, NodeId::from_raw(2), &rec("s1")).unwrap();
         let shard0 = store.scan_shard(0).unwrap();
@@ -719,8 +722,9 @@ mod tests {
     fn scan_shard_skips_temporal_versions() {
         // 25-byte temporal keys must not leak into the
         // non-temporal scan result.
-        let (_dir, engine) = open_engine();
-        let store = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalNodeStore::new(engine);
         store.put(0, NodeId::from_raw(1), &rec("nt")).unwrap();
         store
             .put_temporal(0, NodeId::from_raw(2), 1000, &rec("t"))
@@ -732,8 +736,9 @@ mod tests {
 
     #[test]
     fn corrupt_node_bytes_surface_as_decode_error() {
-        let (_dir, engine) = open_engine();
-        let store = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalNodeStore::new(engine);
         engine
             .put(
                 Partition::Node,

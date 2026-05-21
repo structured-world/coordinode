@@ -60,7 +60,7 @@ pub trait DocumentStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(&engine);
+    /// # let store = LocalDocumentStore::new(engine);
     /// store.set_path(
     ///     0, NodeId::from_raw(1), PathTarget::Extra,
     ///     vec!["a".into(), "b".into()],
@@ -89,7 +89,7 @@ pub trait DocumentStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(&engine);
+    /// # let store = LocalDocumentStore::new(engine);
     /// store.delete_path(0, NodeId::from_raw(1), PathTarget::Extra,
     ///                   vec!["a".into(), "b".into()])?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -115,7 +115,7 @@ pub trait DocumentStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(&engine);
+    /// # let store = LocalDocumentStore::new(engine);
     /// store.array_push(
     ///     0, NodeId::from_raw(1), PathTarget::Extra,
     ///     vec!["tags".into()],
@@ -145,7 +145,7 @@ pub trait DocumentStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(&engine);
+    /// # let store = LocalDocumentStore::new(engine);
     /// store.array_pull(0, NodeId::from_raw(1), PathTarget::Extra,
     ///                  vec!["tags".into()],
     ///                  rmpv::Value::String("rust".into()))?;
@@ -172,7 +172,7 @@ pub trait DocumentStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(&engine);
+    /// # let store = LocalDocumentStore::new(engine);
     /// store.array_add_to_set(0, NodeId::from_raw(1), PathTarget::Extra,
     ///                        vec!["tags".into()],
     ///                        rmpv::Value::String("rust".into()))?;
@@ -199,7 +199,7 @@ pub trait DocumentStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(&engine);
+    /// # let store = LocalDocumentStore::new(engine);
     /// store.increment(0, NodeId::from_raw(1), PathTarget::Extra, vec!["v".into()], 1.0)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -226,7 +226,7 @@ pub trait DocumentStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(&engine);
+    /// # let store = LocalDocumentStore::new(engine);
     /// store.remove_property(0, NodeId::from_raw(1), PathTarget::Extra, Some("name".into()))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -259,7 +259,7 @@ impl<'a> LocalDocumentStore<'a> {
     /// #     Media::Hdd, Durability::Durable, Tier::Warm,
     /// # )]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalDocumentStore::new(&engine);
+    /// let store = LocalDocumentStore::new(engine);
     /// store.set_path(
     ///     0,
     ///     NodeId::from_raw(1),
@@ -411,36 +411,26 @@ mod tests {
     use crate::node::{LocalNodeStore, NodeStore};
     use coordinode_core::graph::node::NodeRecord;
     use coordinode_core::graph::types::Value;
-    use coordinode_storage::engine::config::{
-        Durability, EndpointConfig, Media, StorageConfig, Tier,
-    };
-    use tempfile::TempDir;
 
-    fn open_engine() -> (TempDir, StorageEngine) {
-        let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]);
-        let engine = StorageEngine::open(&config).expect("open");
-        (dir, engine)
+    /// Logic-test fixture (memory backing, env-flippable). Document
+    /// property tests verify dot-notation + merge-op contracts.
+    fn open_engine() -> coordinode_test_fixtures::EngineFixture {
+        coordinode_test_fixtures::engine_for_logic()
     }
 
     /// Round-trip a SetPath against the Extra map and verify the
     /// merge operator surfaces it on the next read through NodeStore.
     #[test]
     fn set_path_on_extra_visible_after_node_get() {
-        let (_dir, engine) = open_engine();
+        let fx = open_engine();
+        let engine = &fx.engine;
         // First seed a base node so the merge has something to merge
         // into.
-        let nodes = LocalNodeStore::new(&engine);
+        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(1);
         nodes.put(0, id, &NodeRecord::new("User")).expect("put");
 
-        let docs = LocalDocumentStore::new(&engine);
+        let docs = LocalDocumentStore::new(engine);
         docs.set_path(
             0,
             id,
@@ -481,12 +471,13 @@ mod tests {
     /// Increment commutativity — apply +1 three times, expect +3.
     #[test]
     fn increment_accumulates_over_multiple_deltas() {
-        let (_dir, engine) = open_engine();
-        let nodes = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(7);
         nodes.put(0, id, &NodeRecord::new("Counter")).expect("put");
 
-        let docs = LocalDocumentStore::new(&engine);
+        let docs = LocalDocumentStore::new(engine);
         for _ in 0..3 {
             docs.increment(0, id, PathTarget::Extra, vec!["hits".to_string()], 1.0)
                 .expect("inc");
@@ -520,12 +511,13 @@ mod tests {
     /// observable state change.
     #[test]
     fn delete_path_missing_is_idempotent() {
-        let (_dir, engine) = open_engine();
-        let nodes = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(99);
         nodes.put(0, id, &NodeRecord::new("X")).expect("put");
 
-        let docs = LocalDocumentStore::new(&engine);
+        let docs = LocalDocumentStore::new(engine);
         // Path doesn't exist — delete must succeed silently.
         docs.delete_path(
             0,
@@ -563,12 +555,13 @@ mod tests {
 
     #[test]
     fn array_push_creates_array_if_missing() {
-        let (_dir, engine) = open_engine();
-        let nodes = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(20);
         nodes.put(0, id, &NodeRecord::new("L")).expect("put");
 
-        let docs = LocalDocumentStore::new(&engine);
+        let docs = LocalDocumentStore::new(engine);
         docs.array_push(
             0,
             id,
@@ -584,12 +577,13 @@ mod tests {
 
     #[test]
     fn array_push_appends_in_order() {
-        let (_dir, engine) = open_engine();
-        let nodes = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(21);
         nodes.put(0, id, &NodeRecord::new("L")).expect("put");
 
-        let docs = LocalDocumentStore::new(&engine);
+        let docs = LocalDocumentStore::new(engine);
         for v in [1.0, 2.0, 3.0] {
             docs.array_push(
                 0,
@@ -607,12 +601,13 @@ mod tests {
     #[test]
     fn array_pull_missing_value_is_noop() {
         // Seed an array, pull a value not in it — array unchanged.
-        let (_dir, engine) = open_engine();
-        let nodes = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(22);
         nodes.put(0, id, &NodeRecord::new("L")).expect("put");
 
-        let docs = LocalDocumentStore::new(&engine);
+        let docs = LocalDocumentStore::new(engine);
         docs.array_push(
             0,
             id,
@@ -635,12 +630,13 @@ mod tests {
 
     #[test]
     fn array_pull_missing_path_is_noop() {
-        let (_dir, engine) = open_engine();
-        let nodes = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(23);
         nodes.put(0, id, &NodeRecord::new("L")).expect("put");
 
-        let docs = LocalDocumentStore::new(&engine);
+        let docs = LocalDocumentStore::new(engine);
         docs.array_pull(
             0,
             id,
@@ -655,12 +651,13 @@ mod tests {
 
     #[test]
     fn increment_accepts_negative_delta() {
-        let (_dir, engine) = open_engine();
-        let nodes = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(24);
         nodes.put(0, id, &NodeRecord::new("L")).expect("put");
 
-        let docs = LocalDocumentStore::new(&engine);
+        let docs = LocalDocumentStore::new(engine);
         docs.increment(0, id, PathTarget::Extra, vec!["v".to_string()], 10.0)
             .expect("inc up");
         docs.increment(0, id, PathTarget::Extra, vec!["v".to_string()], -3.5)
@@ -671,12 +668,13 @@ mod tests {
 
     #[test]
     fn increment_creates_value_if_missing() {
-        let (_dir, engine) = open_engine();
-        let nodes = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(25);
         nodes.put(0, id, &NodeRecord::new("L")).expect("put");
 
-        let docs = LocalDocumentStore::new(&engine);
+        let docs = LocalDocumentStore::new(engine);
         // No prior value — increment from scratch lands at delta.
         docs.increment(0, id, PathTarget::Extra, vec!["fresh".to_string()], 7.0)
             .expect("inc");
@@ -686,12 +684,13 @@ mod tests {
 
     #[test]
     fn remove_property_missing_is_idempotent() {
-        let (_dir, engine) = open_engine();
-        let nodes = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(26);
         nodes.put(0, id, &NodeRecord::new("L")).expect("put");
 
-        let docs = LocalDocumentStore::new(&engine);
+        let docs = LocalDocumentStore::new(engine);
         docs.remove_property(0, id, PathTarget::Extra, Some("never".to_string()))
             .expect("remove missing");
         nodes.get(0, id).expect("ok").expect("Some");
@@ -701,12 +700,13 @@ mod tests {
     fn set_path_deep_nesting_creates_intermediates() {
         // Four-level nested path on an empty Extra — every
         // intermediate map must be created so the leaf set lands.
-        let (_dir, engine) = open_engine();
-        let nodes = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(27);
         nodes.put(0, id, &NodeRecord::new("L")).expect("put");
 
-        let docs = LocalDocumentStore::new(&engine);
+        let docs = LocalDocumentStore::new(engine);
         docs.set_path(
             0,
             id,
@@ -751,12 +751,13 @@ mod tests {
 
     #[test]
     fn delete_path_existing_path_removes_value() {
-        let (_dir, engine) = open_engine();
-        let nodes = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(28);
         nodes.put(0, id, &NodeRecord::new("L")).expect("put");
 
-        let docs = LocalDocumentStore::new(&engine);
+        let docs = LocalDocumentStore::new(engine);
         docs.set_path(
             0,
             id,
@@ -783,12 +784,13 @@ mod tests {
     #[test]
     fn array_pull_existing_value_removes_one() {
         // Push 3 entries, pull one — array has 2 left.
-        let (_dir, engine) = open_engine();
-        let nodes = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(29);
         nodes.put(0, id, &NodeRecord::new("L")).expect("put");
 
-        let docs = LocalDocumentStore::new(&engine);
+        let docs = LocalDocumentStore::new(engine);
         for s in ["a", "b", "c"] {
             docs.array_push(
                 0,
@@ -814,12 +816,13 @@ mod tests {
 
     #[test]
     fn remove_property_existing_property_clears_it() {
-        let (_dir, engine) = open_engine();
-        let nodes = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(30);
         nodes.put(0, id, &NodeRecord::new("L")).expect("put");
 
-        let docs = LocalDocumentStore::new(&engine);
+        let docs = LocalDocumentStore::new(engine);
         docs.set_path(
             0,
             id,
@@ -843,12 +846,13 @@ mod tests {
         // Set leaf as String, overwrite with Integer at same path —
         // result reflects last write (DocDelta::SetPath replaces, not
         // merges).
-        let (_dir, engine) = open_engine();
-        let nodes = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(31);
         nodes.put(0, id, &NodeRecord::new("L")).expect("put");
 
-        let docs = LocalDocumentStore::new(&engine);
+        let docs = LocalDocumentStore::new(engine);
         docs.set_path(
             0,
             id,
@@ -882,14 +886,15 @@ mod tests {
         // PathTarget::PropField(field_id) writes into the interned
         // property map instead of `extra`. Visible through the
         // typed accessor on NodeRecord.
-        let (_dir, engine) = open_engine();
-        let nodes = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(32);
         let mut base = NodeRecord::new("L");
         base.set_extra("placeholder", Value::Int(0));
         nodes.put(0, id, &base).expect("put");
 
-        let docs = LocalDocumentStore::new(&engine);
+        let docs = LocalDocumentStore::new(engine);
         docs.set_path(
             0,
             id,
@@ -922,8 +927,8 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let (_dir, engine) = open_engine();
-        let engine = Arc::new(engine);
+        let fx = open_engine();
+        let engine = Arc::clone(&fx.engine);
         let id = NodeId::from_raw(100);
         let nodes = LocalNodeStore::new(&engine);
         nodes.put(0, id, &NodeRecord::new("Multi")).expect("seed");
@@ -961,12 +966,13 @@ mod tests {
     /// single-element array.
     #[test]
     fn array_add_to_set_deduplicates() {
-        let (_dir, engine) = open_engine();
-        let nodes = LocalNodeStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(5);
         nodes.put(0, id, &NodeRecord::new("Y")).expect("put");
 
-        let docs = LocalDocumentStore::new(&engine);
+        let docs = LocalDocumentStore::new(engine);
         for _ in 0..3 {
             docs.array_add_to_set(
                 0,

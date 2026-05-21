@@ -166,7 +166,7 @@ pub trait SpatialStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSpatialStore::new(&engine);
+    /// # let store = LocalSpatialStore::new(engine);
     /// let paris = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
     /// store.insert(1, NodeId::from_raw(1), &paris)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -186,7 +186,7 @@ pub trait SpatialStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSpatialStore::new(&engine);
+    /// # let store = LocalSpatialStore::new(engine);
     /// let p = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
     /// store.delete(1, NodeId::from_raw(1), &p)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -207,7 +207,7 @@ pub trait SpatialStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSpatialStore::new(&engine);
+    /// # let store = LocalSpatialStore::new(engine);
     /// let bbox = Bbox {
     ///     lower: Point::new_2d(Crs::Wgs84_2d, 2.0, 48.0),
     ///     upper: Point::new_2d(Crs::Wgs84_2d, 3.0, 49.0),
@@ -236,7 +236,7 @@ pub trait SpatialStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSpatialStore::new(&engine);
+    /// # let store = LocalSpatialStore::new(engine);
     /// let center = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
     /// let knn = store.knn_nearest(1, Crs::Wgs84_2d, &center, 5)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -269,7 +269,7 @@ impl<'a> LocalSpatialStore<'a> {
     /// #     Media::Hdd, Durability::Durable, Tier::Warm,
     /// # )]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalSpatialStore::new(&engine);
+    /// let store = LocalSpatialStore::new(engine);
     /// let paris = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
     /// store.insert(1, NodeId::from_raw(1), &paris)?;
     /// let bbox = Bbox {
@@ -863,22 +863,12 @@ impl SpatialStore for LocalSpatialStore<'_> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use coordinode_storage::engine::config::{
-        Durability, EndpointConfig, Media, StorageConfig, Tier,
-    };
-    use tempfile::TempDir;
 
-    fn mk_engine() -> (TempDir, StorageEngine) {
-        let dir = TempDir::new().unwrap();
-        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]);
-        let engine = StorageEngine::open(&config).unwrap();
-        (dir, engine)
+    /// Logic-test fixture (memory backing, env-flippable). Spatial
+    /// Z-curve tests verify encoding/scan correctness, not
+    /// persistence.
+    fn mk_engine() -> coordinode_test_fixtures::EngineFixture {
+        coordinode_test_fixtures::engine_for_logic()
     }
 
     // -- G101 Z-curve subrange decomposition --
@@ -1067,8 +1057,9 @@ mod tests {
 
     #[test]
     fn insert_then_scan_bbox_returns_point() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore::new(engine);
         let paris = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
         store.insert(1, NodeId::from_raw(1), &paris).unwrap();
         let bbox = Bbox {
@@ -1083,8 +1074,9 @@ mod tests {
 
     #[test]
     fn scan_bbox_filters_outside_points() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore::new(engine);
         let paris = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
         let kyiv = Point::new_2d(Crs::Wgs84_2d, 30.5234, 50.4501);
         store.insert(1, NodeId::from_raw(1), &paris).unwrap();
@@ -1102,8 +1094,9 @@ mod tests {
 
     #[test]
     fn delete_removes_point() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore::new(engine);
         let p = Point::new_2d(Crs::Cartesian2d, 10.0, 20.0);
         store.insert(7, NodeId::from_raw(42), &p).unwrap();
         store.delete(7, NodeId::from_raw(42), &p).unwrap();
@@ -1117,8 +1110,9 @@ mod tests {
 
     #[test]
     fn knn_returns_closest_in_distance_order() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore::new(engine);
         let pts = [
             (1u64, 0.0, 0.0),
             (2, 1.0, 0.0),
@@ -1144,8 +1138,9 @@ mod tests {
 
     #[test]
     fn knn_k_zero_returns_empty() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore::new(engine);
         store
             .insert(
                 1,
@@ -1177,8 +1172,9 @@ mod tests {
 
     #[test]
     fn cartesian_3d_round_trip_and_knn() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore::new(engine);
         let origin = Point::new_3d(Crs::Cartesian3d, 0.0, 0.0, 0.0);
         let near = Point::new_3d(Crs::Cartesian3d, 1.0, 1.0, 1.0);
         let far = Point::new_3d(Crs::Cartesian3d, 100.0, 100.0, 100.0);
@@ -1193,8 +1189,9 @@ mod tests {
 
     #[test]
     fn scoped_by_label_id() {
-        let (_dir, engine) = mk_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore::new(engine);
         let p = Point::new_2d(Crs::Cartesian2d, 1.0, 1.0);
         store.insert(1, NodeId::from_raw(10), &p).unwrap();
         store.insert(2, NodeId::from_raw(20), &p).unwrap();
@@ -1216,8 +1213,9 @@ mod tests {
         // delete(old) before insert(new). Without it, both rows are
         // visible. This is the regression guard for the doc on
         // `insert`.
-        let (_dir, engine) = mk_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore::new(engine);
         let id = NodeId::from_raw(1);
         let p1 = Point::new_2d(Crs::Cartesian2d, 0.0, 0.0);
         let p2 = Point::new_2d(Crs::Cartesian2d, 100.0, 100.0);
@@ -1240,8 +1238,9 @@ mod tests {
     fn move_point_via_explicit_delete_then_insert() {
         // The supported pattern for moving a point: delete(old) →
         // insert(new). Exactly one row visible afterwards.
-        let (_dir, engine) = mk_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore::new(engine);
         let id = NodeId::from_raw(2);
         let p1 = Point::new_2d(Crs::Cartesian2d, 0.0, 0.0);
         let p2 = Point::new_2d(Crs::Cartesian2d, 50.0, 50.0);
@@ -1264,8 +1263,9 @@ mod tests {
         // without deleting the old key leaves two physical rows. knn
         // returns both — the caller must dedup by node_id at the
         // composition layer above.
-        let (_dir, engine) = mk_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore::new(engine);
         let id = NodeId::from_raw(1);
         store
             .insert(1, id, &Point::new_2d(Crs::Cartesian2d, 0.0, 0.0))
@@ -1284,8 +1284,9 @@ mod tests {
     fn insert_same_coords_twice_is_idempotent() {
         // Same (node_id, coords) = same key. The second insert
         // overwrites with identical bytes — net effect is one row.
-        let (_dir, engine) = mk_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore::new(engine);
         let id = NodeId::from_raw(3);
         let p = Point::new_2d(Crs::Cartesian2d, 5.0, 5.0);
         store.insert(3, id, &p).unwrap();
@@ -1304,8 +1305,9 @@ mod tests {
         // Per docstring, Bbox is *inclusive*. A point at exactly the
         // lower-left corner and a point at exactly upper-right must
         // both match.
-        let (_dir, engine) = mk_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore::new(engine);
         let bbox = Bbox {
             lower: Point::new_2d(Crs::Cartesian2d, 10.0, 20.0),
             upper: Point::new_2d(Crs::Cartesian2d, 30.0, 40.0),
@@ -1358,8 +1360,9 @@ mod tests {
         // X axis but narrow Y; the bbox is the same shape. Without
         // post-filter, points with curves inside the linear interval
         // but Y outside would leak.
-        let (_dir, engine) = mk_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore::new(engine);
         // Two points: one inside the bbox, one with Y far outside but
         // a curve key that may fall in the [cmin, cmax] range.
         let inside = Point::new_2d(Crs::Cartesian2d, 5.0, 1.0);
@@ -1379,8 +1382,9 @@ mod tests {
     fn scan_within_bbox_breaks_early_past_curve_max() {
         // Construct three points whose curve keys we can predict, so
         // we know the iteration must stop at the middle one.
-        let (_dir, engine) = mk_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let fx = mk_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore::new(engine);
         // Tight bbox containing only the first point. Inserted points
         // far apart so curves diverge sharply.
         store
@@ -1422,8 +1426,8 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let (_dir, engine) = mk_engine();
-        let engine = Arc::new(engine);
+        let fx = mk_engine();
+        let engine = Arc::clone(&fx.engine);
 
         let handles: Vec<_> = (0..4u64)
             .map(|t| {

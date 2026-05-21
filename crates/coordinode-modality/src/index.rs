@@ -49,7 +49,7 @@ pub trait IndexStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalIndexStore::new(&engine);
+    /// # let store = LocalIndexStore::new(engine);
     /// store.put_entry("by_name", &[Value::String("alice".into())], NodeId::from_raw(1))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -68,7 +68,7 @@ pub trait IndexStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalIndexStore::new(&engine);
+    /// # let store = LocalIndexStore::new(engine);
     /// store.delete_entry("by_name", &[Value::String("alice".into())], NodeId::from_raw(1))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -87,7 +87,7 @@ pub trait IndexStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalIndexStore::new(&engine);
+    /// # let store = LocalIndexStore::new(engine);
     /// let hits = store.scan_exact("by_name", &[Value::String("alice".into())])?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -108,7 +108,7 @@ pub trait IndexStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalIndexStore::new(&engine);
+    /// # let store = LocalIndexStore::new(engine);
     /// let _all = store.scan_all("by_name")?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -135,7 +135,7 @@ impl<'a> LocalIndexStore<'a> {
     /// #     Media::Hdd, Durability::Durable, Tier::Warm,
     /// # )]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalIndexStore::new(&engine);
+    /// let store = LocalIndexStore::new(engine);
     /// let key = [Value::String("alice".into())];
     /// store.put_entry("by_name", &key, NodeId::from_raw(1))?;
     /// let hits = store.scan_exact("by_name", &key)?;
@@ -211,28 +211,17 @@ impl IndexStore for LocalIndexStore<'_> {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use coordinode_storage::engine::config::{
-        Durability, EndpointConfig, Media, StorageConfig, Tier,
-    };
-    use tempfile::TempDir;
 
-    fn open_engine() -> (TempDir, StorageEngine) {
-        let dir = TempDir::new().expect("tempdir");
-        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]);
-        let engine = StorageEngine::open(&config).expect("open");
-        (dir, engine)
+    /// Logic-test fixture (memory backing, env-flippable).
+    fn open_engine() -> coordinode_test_fixtures::EngineFixture {
+        coordinode_test_fixtures::engine_for_logic()
     }
 
     #[test]
     fn single_value_round_trip() {
-        let (_dir, engine) = open_engine();
-        let store = LocalIndexStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalIndexStore::new(engine);
         let v = vec![Value::String("alice".into())];
         store
             .put_entry("user_name", &v, NodeId::from_raw(1))
@@ -245,8 +234,9 @@ mod tests {
     fn duplicate_values_return_all_nodes() {
         // Index value "alice" maps to two nodes — scan_exact returns
         // both, sorted by node_id (because the key suffix is BE u64).
-        let (_dir, engine) = open_engine();
-        let store = LocalIndexStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalIndexStore::new(engine);
         let v = vec![Value::String("alice".into())];
         for id in [1u64, 2, 3] {
             store
@@ -266,8 +256,9 @@ mod tests {
 
     #[test]
     fn delete_removes_specific_entry() {
-        let (_dir, engine) = open_engine();
-        let store = LocalIndexStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalIndexStore::new(engine);
         let v = vec![Value::String("alice".into())];
         store
             .put_entry("user_name", &v, NodeId::from_raw(1))
@@ -286,8 +277,9 @@ mod tests {
 
     #[test]
     fn delete_missing_entry_is_idempotent() {
-        let (_dir, engine) = open_engine();
-        let store = LocalIndexStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalIndexStore::new(engine);
         let v = vec![Value::Int(7)];
         // Never put — delete must still succeed.
         store
@@ -297,8 +289,9 @@ mod tests {
 
     #[test]
     fn compound_index_distinguishes_by_secondary_column() {
-        let (_dir, engine) = open_engine();
-        let store = LocalIndexStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalIndexStore::new(engine);
         let alice_us = vec![Value::String("alice".into()), Value::String("US".into())];
         let alice_uk = vec![Value::String("alice".into()), Value::String("UK".into())];
 
@@ -324,8 +317,9 @@ mod tests {
 
     #[test]
     fn scan_all_returns_every_entry() {
-        let (_dir, engine) = open_engine();
-        let store = LocalIndexStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalIndexStore::new(engine);
         let alice = vec![Value::String("alice".into())];
         let bob = vec![Value::String("bob".into())];
         store
@@ -349,8 +343,9 @@ mod tests {
     fn compound_index_three_columns() {
         // N=3 compound: confirm encode/scan symmetry beyond N=2. Two
         // entries differ only in the third column.
-        let (_dir, engine) = open_engine();
-        let store = LocalIndexStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalIndexStore::new(engine);
         let key_a = vec![
             Value::String("alice".into()),
             Value::String("US".into()),
@@ -387,8 +382,9 @@ mod tests {
 
     #[test]
     fn scan_exact_missing_returns_empty() {
-        let (_dir, engine) = open_engine();
-        let store = LocalIndexStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalIndexStore::new(engine);
         let hits = store
             .scan_exact("nonexistent", &[Value::Int(42)])
             .expect("scan");
@@ -401,8 +397,9 @@ mod tests {
         // String < Timestamp. scan_all walks in encoded-key order so
         // we can read the type ordering off directly. One entry per
         // type, all under the same index name and node_id 1.
-        let (_dir, engine) = open_engine();
-        let store = LocalIndexStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalIndexStore::new(engine);
         let id = NodeId::from_raw(1);
         let entries: Vec<Vec<Value>> = vec![
             vec![Value::Null],
@@ -434,8 +431,9 @@ mod tests {
     fn scan_all_isolates_per_index_name() {
         // Two indexes share the partition; each scan returns only
         // its own entries.
-        let (_dir, engine) = open_engine();
-        let store = LocalIndexStore::new(&engine);
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalIndexStore::new(engine);
         let v = vec![Value::Int(42)];
         store.put_entry("a", &v, NodeId::from_raw(1)).expect("put");
         store.put_entry("b", &v, NodeId::from_raw(2)).expect("put");

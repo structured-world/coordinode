@@ -78,8 +78,13 @@ use coordinode_storage::engine::core::StorageEngine;
 /// because Tantivy and similar consumers are disk-only and benefit
 /// from the same lifetime guard as the engine.
 pub struct EngineFixture {
-    /// The configured engine. Public so tests use it directly.
-    pub engine: StorageEngine,
+    /// The configured engine, wrapped in `Arc` so tests that spawn
+    /// threads can `Arc::clone(&fx.engine)` and `move` the clone
+    /// into a `'static` closure. The vast majority of callers use
+    /// `&fx.engine` and rely on `Arc<T>` deref to `&T` — that path
+    /// is unchanged. Only thread-spawning tests need the explicit
+    /// clone.
+    pub engine: Arc<StorageEngine>,
     /// Backend-specific state. For disk: a `TempDir` whose lifetime
     /// must outlast every access through `engine`. For memory: an
     /// `Arc<MemFs>` that keeps the in-memory FS alive. Field is not
@@ -170,7 +175,7 @@ pub fn engine_for_disk() -> EngineFixture {
         Durability::Durable,
         Tier::Warm,
     )]);
-    let engine = StorageEngine::open(&cfg).expect("open disk engine");
+    let engine = Arc::new(StorageEngine::open(&cfg).expect("open disk engine"));
     let scratch = tempfile::TempDir::new().expect("create scratch tempdir");
     EngineFixture {
         engine,
@@ -196,7 +201,7 @@ pub fn engine_for_memory() -> EngineFixture {
         Tier::Memory,
     )])
     .with_fs(Arc::clone(&fs) as Arc<dyn lsm_tree::fs::Fs>);
-    let engine = StorageEngine::open(&cfg).expect("open memory engine");
+    let engine = Arc::new(StorageEngine::open(&cfg).expect("open memory engine"));
     let scratch = tempfile::TempDir::new().expect("create scratch tempdir");
     EngineFixture {
         engine,

@@ -969,6 +969,7 @@ dependencies = [
  "coordinode-core",
  "coordinode-lsm-tree",
  "coordinode-storage",
+ "coordinode-test-fixtures",
  "coordinode-vector",
  "criterion",
  "proptest",
