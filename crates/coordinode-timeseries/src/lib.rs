@@ -1,5 +1,14 @@
 //! Time-series above-store catalog (G103, Slice A).
 //!
+//! **no-std tier:** `std-only`. The catalog uses `std::sync::RwLock`
+//! (striped concurrency), `std::time::SystemTime` (rollover decisions,
+//! LRU TTL), and `std::collections::HashMap` (open-bucket map). The
+//! production [`PersistentMonotonicHlcClock`] also embeds an
+//! `Arc<StorageEngine>` for restart-monotonicity persistence. None
+//! of these are replaceable below `std`; per
+//! `coordinode/CLAUDE.md §"no-std Readiness Policy"` this crate
+//! legitimately occupies the `std-only` tier.
+//!
 //! This crate implements **BucketCatalog** — the per-shard in-memory
 //! state machine that sits **above** [`coordinode_modality::TimeSeriesStore`]
 //! and turns individual measurement INSERTs into batched bucket

@@ -69,6 +69,14 @@ const PERSIST_EVERY_N_STAMPS: u64 = 64;
 /// stamps each incoming measurement via this trait before
 /// buffering — measurements then carry the bitemporal axis through
 /// the bucket's `ingestion_timestamps` column.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not an `IngestionClock` — the catalog can't stamp measurements with it",
+    label = "expected an `IngestionClock` implementation here",
+    note = "for production CE single-node use `PersistentMonotonicHlcClock::open(engine, shard_id)?` — \
+            it persists the last-issued stamp to the engine so restart monotonicity holds across \
+            backward wall-clock jumps. For tests use `MonotonicHlcClock::new()` (no persistence) or \
+            `ScriptedClock::new(seq)` (deterministic test sequence, requires the `test-clock` feature)."
+)]
 pub trait IngestionClock: Send + Sync {
     /// Return the next stamp. Microseconds since UNIX epoch.
     /// Strictly monotonic; non-decreasing is NOT sufficient.

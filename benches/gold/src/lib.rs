@@ -4,6 +4,11 @@
 //! `src/{ycsb,report}/main.rs` are thin drivers over the modules
 //! here.
 //!
+//! **no-std tier:** `std-only`. Benchmark harnesses inherently need
+//! `std::time::Instant` (latency measurement), `std::fs` (dataset
+//! loaders for SIFT1M / LDBC / TSBS), and `tempfile` (engine fixture
+//! dirs). Out of scope for any no-std readiness.
+//!
 //! Status: **YCSB A + C, baseline-comparison report.**
 //!
 //! Out-of-scope of this initial cut (tracked as follow-up):
