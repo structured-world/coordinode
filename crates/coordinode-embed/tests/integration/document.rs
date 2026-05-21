@@ -5,7 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use coordinode_core::graph::node::{encode_node_key, NodeId, NodeRecord, PropertyValue};
+use coordinode_core::graph::node::{NodeId, NodeRecord, PropertyValue};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
@@ -58,18 +58,16 @@ fn document_property_storage_roundtrip() {
     rec.set(1, PropertyValue::String("sensor-001".into()));
     rec.set(2, PropertyValue::Document(doc.clone()));
 
-    let key = encode_node_key(0, NodeId::from_raw(1));
-    let bytes = rec.to_msgpack().expect("serialize");
-    engine
-        .put(Partition::Node, &key, &bytes)
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    LocalNodeStore::new(&engine)
+        .put(0, NodeId::from_raw(1), &rec)
         .expect("put to storage");
 
     // Read back
-    let stored = engine
-        .get(Partition::Node, &key)
+    let restored = LocalNodeStore::new(&engine)
+        .get(0, NodeId::from_raw(1))
         .expect("get from storage")
         .expect("key should exist");
-    let restored = NodeRecord::from_msgpack(&stored).expect("deserialize");
 
     assert_eq!(restored.primary_label(), "Device");
     assert_eq!(
@@ -96,17 +94,15 @@ fn document_deep_nesting_storage_roundtrip() {
     let mut rec = NodeRecord::new("Config");
     rec.set(1, PropertyValue::Document(level1.clone()));
 
-    let key = encode_node_key(0, NodeId::from_raw(2));
-    let bytes = rec.to_msgpack().expect("serialize");
-    engine
-        .put(Partition::Node, &key, &bytes)
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    LocalNodeStore::new(&engine)
+        .put(0, NodeId::from_raw(2), &rec)
         .expect("put to storage");
 
-    let stored = engine
-        .get(Partition::Node, &key)
+    let restored = LocalNodeStore::new(&engine)
+        .get(0, NodeId::from_raw(2))
         .expect("get from storage")
         .expect("key should exist");
-    let restored = NodeRecord::from_msgpack(&stored).expect("deserialize");
 
     assert_eq!(restored.get(1), Some(&PropertyValue::Document(level1)));
 }
@@ -130,17 +126,15 @@ fn document_heterogeneous_array_storage() {
     let mut rec = NodeRecord::new("Test");
     rec.set(1, PropertyValue::Document(doc.clone()));
 
-    let key = encode_node_key(0, NodeId::from_raw(3));
-    let bytes = rec.to_msgpack().expect("serialize");
-    engine
-        .put(Partition::Node, &key, &bytes)
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    LocalNodeStore::new(&engine)
+        .put(0, NodeId::from_raw(3), &rec)
         .expect("put to storage");
 
-    let stored = engine
-        .get(Partition::Node, &key)
+    let restored = LocalNodeStore::new(&engine)
+        .get(0, NodeId::from_raw(3))
         .expect("get from storage")
         .expect("key should exist");
-    let restored = NodeRecord::from_msgpack(&stored).expect("deserialize");
 
     assert_eq!(restored.get(1), Some(&PropertyValue::Document(doc)));
 }
@@ -163,17 +157,15 @@ fn document_mixed_with_regular_properties() {
     rec.set(5, PropertyValue::Vector(vec![0.1, 0.2, 0.3]));
     rec.set(6, PropertyValue::Document(doc.clone()));
 
-    let key = encode_node_key(0, NodeId::from_raw(4));
-    let bytes = rec.to_msgpack().expect("serialize");
-    engine
-        .put(Partition::Node, &key, &bytes)
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    LocalNodeStore::new(&engine)
+        .put(0, NodeId::from_raw(4), &rec)
         .expect("put to storage");
 
-    let stored = engine
-        .get(Partition::Node, &key)
+    let restored = LocalNodeStore::new(&engine)
+        .get(0, NodeId::from_raw(4))
         .expect("get from storage")
         .expect("key should exist");
-    let restored = NodeRecord::from_msgpack(&stored).expect("deserialize");
 
     assert_eq!(
         restored.get(1),
@@ -199,7 +191,8 @@ fn document_persists_across_reopen() {
         rmpv::Value::String("data".into()),
     )]);
 
-    let key = encode_node_key(0, NodeId::from_raw(5));
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let id = NodeId::from_raw(5);
 
     // Write + close
     {
@@ -213,9 +206,8 @@ fn document_persists_across_reopen() {
         let engine = StorageEngine::open(&config).expect("open");
         let mut rec = NodeRecord::new("Persistent");
         rec.set(1, PropertyValue::Document(doc.clone()));
-        let bytes = rec.to_msgpack().expect("serialize");
-        engine
-            .put(Partition::Node, &key, &bytes)
+        LocalNodeStore::new(&engine)
+            .put(0, id, &rec)
             .expect("put to storage");
         // engine drops here (storage flush on drop)
     }
@@ -230,11 +222,10 @@ fn document_persists_across_reopen() {
             Tier::Warm,
         )]);
         let engine = StorageEngine::open(&config).expect("reopen");
-        let stored = engine
-            .get(Partition::Node, &key)
+        let restored = LocalNodeStore::new(&engine)
+            .get(0, id)
             .expect("get from storage")
             .expect("key should exist after reopen");
-        let restored = NodeRecord::from_msgpack(&stored).expect("deserialize");
         assert_eq!(restored.primary_label(), "Persistent");
         assert_eq!(restored.get(1), Some(&PropertyValue::Document(doc)));
     }
