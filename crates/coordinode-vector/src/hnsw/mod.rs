@@ -339,6 +339,21 @@ impl HnswIndex {
         }
     }
 
+    /// Read-only access to the active configuration. Useful for
+    /// bench harnesses that need to inspect M / ef_construction
+    /// without holding a separate copy.
+    pub fn config(&self) -> &HnswConfig {
+        &self.config
+    }
+
+    /// Override `ef_search` at runtime. The HNSW graph topology
+    /// (M, ef_construction, layer assignments) does not depend on
+    /// `ef_search` — it's a pure runtime knob that trades recall
+    /// for latency. Mutating it between queries is safe.
+    pub fn set_ef_search(&mut self, ef: usize) {
+        self.config.ef_search = ef;
+    }
+
     /// Number of indexed vectors.
     pub fn len(&self) -> usize {
         self.nodes.len()

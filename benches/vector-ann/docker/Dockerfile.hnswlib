@@ -1,0 +1,24 @@
+# hnswlib competitor adapter — produces CoordiNode JSON schema.
+#
+# Built ONCE per release (image lives on the runner under /srv/
+# coordinode-bench/competitor-images/). Re-invoke manually when:
+# - hnswlib publishes a new version (pin the release tag below)
+# - methodology changes that need rerunning the baseline
+#
+# Not part of CI. Output JSON is moved into the repo's
+# bench-results/ directory by the human running the benchmark.
+
+FROM python:3.13-slim
+
+ARG HNSWLIB_VERSION=0.8.0
+
+RUN pip install --no-cache-dir \
+        "hnswlib==${HNSWLIB_VERSION}" \
+        "numpy>=2.0" \
+        "psutil>=6.0"
+
+WORKDIR /bench
+
+COPY hnswlib_runner.py /bench/
+
+ENTRYPOINT ["python3", "/bench/hnswlib_runner.py"]

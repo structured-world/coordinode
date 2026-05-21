@@ -1,0 +1,49 @@
+# Manual-run competitor benchmark stack.
+#
+# These benches are NOT triggered by CI — they run ONCE on the
+# bench host (gpu.private.systems / 192.168.1.200) per release or
+# when a competitor publishes a notable HNSW change. The resulting
+# JSON is placed into the repo under bench-results/ by the human
+# running them.
+#
+# Usage:
+#   cd /opt/coordinode/benches/vector-ann
+#   docker compose -f docker/compose.competitors.yml build hnswlib
+#   docker compose -f docker/compose.competitors.yml run --rm hnswlib \
+#       --train       /data/sift/sift_base.fvecs \
+#       --query       /data/sift/sift_query.fvecs \
+#       --groundtruth /data/sift/sift_groundtruth.ivecs \
+#       --dataset-name sift-128-euclidean \
+#       --cn-sha      $(git -C /opt/coordinode rev-parse HEAD) \
+#       --output      /out
+#
+# Then move /out/vector/sift-128-euclidean/*.json into the repo
+# (bench-results/vector/sift-128-euclidean/) and commit it.
+
+services:
+
+  hnswlib:
+    build:
+      context: .
+      dockerfile: Dockerfile.hnswlib
+    image: coordinode-bench-hnswlib:latest
+    volumes:
+      # SIFT1M / GIST / GloVe dataset root — must exist on the host
+      # before running; see ../README.md "One-time dataset placement".
+      - /srv/coordinode-bench/datasets:/data:ro
+      # Output JSON lands here, then the human moves it into the repo.
+      - ./out:/out
+    # No always-on container; entrypoint is the runner, we run it once.
+
+  # Future competitor adapters land here as additional services.
+  # Each must produce JSON matching crates/coordinode-bench BenchReport
+  # schema with the `subject` field set to the competitor name. See
+  # docker/hnswlib_runner.py for the canonical implementation
+  # template.
+  #
+  # Planned but NOT shipped in this PR (Stage 2 follow-ups):
+  # - faiss-cpu          (specialist anchor)
+  # - mongodb-8-vector   (multi-model competitor)
+  # - opensearch-2-knn   (multi-model competitor)
+  # - surrealdb-3-hnsw   (multi-model competitor — the marketing
+  #                       head-to-head per arch/benchmarks/methodology.md)

@@ -1,0 +1,26 @@
+[package]
+name = "coordinode-bench-vector-ann"
+description = "ann-benchmarks SIFT1M / GloVe / Deep-image adapter for CoordiNode HNSW — recall@k + QPS sweep against ann-benchmarks.com datasets. Outputs canonical JSON (coordinode-bench schema). Competitors (hnswlib, faiss, Annoy) run in Docker on the same host; results placed manually in `bench-results/`."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+coordinode-vector = { workspace = true }
+coordinode-bench = { workspace = true }
+coordinode-core = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "bench-vector-ann"
+path = "src/main.rs"
