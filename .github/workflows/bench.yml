@@ -128,25 +128,56 @@ jobs:
       # - name: Document — YCSB A/C
       #   ...
 
-      - name: Commit results to bench-results/
+      - name: Push results to bench-data branch
+        # Bench JSONs land on a dedicated orphan branch (`bench-data`)
+        # — NOT on `main`. `main` is branch-protected; auto-bot commits
+        # are forbidden. The docs workflow pulls bench-data on every
+        # run via `git checkout bench-data -- bench-results/`. This
+        # decouples the heavyweight bench data history from the source
+        # tree on main.
+        #
+        # bench-data is an orphan branch: each push replaces the entire
+        # tree, so history never compounds (we keep a few generations
+        # via the GH workflow artifact upload step for forensic
+        # reproducibility, not in git).
         run: |
           set -euo pipefail
-          NEW_FILES=$(git -C "$GITHUB_WORKSPACE" status --porcelain bench-results/ | awk '{print $2}')
+          NEW_FILES=$(git status --porcelain bench-results/ | awk '{print $2}')
           if [ -z "$NEW_FILES" ]; then
-            echo "no new bench-results files produced — skipping commit"
+            echo "no new bench-results files produced — skipping push"
             exit 0
           fi
+
+          # Snapshot the new files outside the working tree.
+          SNAPSHOT=$(mktemp -d)
+          # If bench-data already exists, pull its current contents first
+          # so we APPEND rather than replace.
+          if git ls-remote --exit-code --heads origin bench-data > /dev/null 2>&1; then
+            git fetch origin bench-data:bench-data
+            git -C "$GITHUB_WORKSPACE" archive bench-data -- bench-results/ 2>/dev/null \
+              | tar -x -C "$SNAPSHOT" 2>/dev/null \
+              || echo "::notice::bench-data archive empty — starting fresh"
+          fi
+          # Overlay the new files on top of the snapshot.
+          cp -R bench-results/. "$SNAPSHOT/bench-results/" 2>/dev/null || true
+
           git config user.name  "coordinode-bench-bot"
           git config user.email "bench-bot@users.noreply.github.com"
+
+          # Recreate bench-data as a fresh orphan branch each run.
+          git checkout --orphan bench-data
+          git rm -rf . 2>/dev/null || true
+          # Copy snapshot back into the working tree.
+          mkdir -p bench-results
+          cp -R "$SNAPSHOT/bench-results/." bench-results/
           git add bench-results/
-          # `[skip ci]` prevents recursion. paths: filter above
-          # also excludes bench-results/, so this is belt-and-
-          # suspenders.
           git commit \
-            -m "chore(bench): results @ ${{ github.sha }} [skip ci]" \
-            -m "Modalities: $(echo "$NEW_FILES" | xargs -I{} dirname {} | sort -u | xargs)" \
+            -m "chore(bench): results @ ${{ github.sha }}" \
+            -m "Modalities: $(find bench-results -mindepth 1 -maxdepth 1 -type d | xargs -I{} basename {} | sort -u | xargs)" \
             -m "Auto-committed by .github/workflows/bench.yml (runner: gpu-private-systems)"
-          git push origin HEAD:main
+          # Force-push the orphan branch — overwrites history every run,
+          # which is the intended pattern for this branch.
+          git push origin bench-data --force
 
       - name: Upload workflow artifact (90-day retention)
         uses: actions/upload-artifact@v4

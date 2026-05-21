@@ -4,13 +4,16 @@
   "packageManager": "yarn@4.13.0",
   "scripts": {
     "gen-api-docs": "python3 scripts/gen-api-docs.py",
-    "docs:dev": "DOCS_BASE=/ vitepress dev docs",
-    "docs:build": "python3 scripts/gen-api-docs.py && DOCS_BASE=/ vitepress build docs",
+    "build-bench-manifest": "python3 scripts/build-bench-manifest.py",
+    "docs:dev": "python3 scripts/build-bench-manifest.py && DOCS_BASE=/ vitepress dev docs",
+    "docs:build": "python3 scripts/gen-api-docs.py && python3 scripts/build-bench-manifest.py && DOCS_BASE=/ vitepress build docs",
     "docs:preview": "DOCS_BASE=/ vitepress preview docs"
   },
   "devDependencies": {
     "@structured-world/vue-privacy": "^1.10.0",
+    "echarts": "^5.5.1",
     "vitepress": "^1.6.4",
-    "vue": "^3.5.14"
+    "vue": "^3.5.14",
+    "vue-echarts": "^7.0.3"
   }
 }
