@@ -1,0 +1,140 @@
+# Benchmark suite — all modalities, sequential, single self-hosted runner.
+#
+# CoordiNode benches ONE host at a time (<bench-runner> —
+# org runner label `gpu-private-systems`). Splitting per modality
+# into separate workflows is pointless: they share the box, the
+# datasets directory, the CPU cores, and the build cache. Running
+# them in one job means:
+#
+# - One `cargo build --release` for the whole workspace, reused
+#   across every modality step
+# - Sequential order — no contention for CPU/IO
+# - Single commit at the end with the full batch of new JSONs
+# - One concurrency lock — no two bench batches race
+#
+# Triggered ONLY by push to main. Competitor benches are NOT in
+# this workflow — they run manually on the same runner per release
+# (see benches/vector-ann/README.md).
+
+name: bench
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # Any modality engine code, the shared harness, or any bench
+      # binary triggers a full re-bench. Result-only commits don't
+      # match (bench-results/ deliberately excluded).
+      - 'crates/coordinode-core/**'
+      - 'crates/coordinode-storage/**'
+      - 'crates/coordinode-modality/**'
+      - 'crates/coordinode-vector/**'
+      - 'crates/coordinode-search/**'
+      - 'crates/coordinode-query/**'
+      - 'crates/coordinode-bench/**'
+      - 'benches/*/src/**'
+      - 'benches/*/Cargo.toml'
+      - '.github/workflows/bench.yml'
+  workflow_dispatch:
+    inputs:
+      modalities:
+        description: 'Comma-separated modality names to run (default: all known). E.g. "vector" to re-bench only vector.'
+        required: false
+        default: 'vector'
+
+concurrency:
+  group: bench
+  cancel-in-progress: false  # bench runs are minutes-to-hours; never abort an in-flight batch
+
+permissions:
+  contents: write  # post-bench JSON commit to bench-results/
+
+jobs:
+  bench:
+    name: All modalities (sequential)
+    runs-on:
+      - self-hosted
+      - gpu-private-systems
+    timeout-minutes: 180
+
+    env:
+      DATASET_ROOT: <bench-data-root>/datasets
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Build all bench binaries
+        run: cargo build --release --bins -p coordinode-bench-vector-ann
+        # As we add graph / spatial / ts / search / doc bench
+        # binaries to the workspace, append `-p <name>` here. One
+        # cargo invocation = one shared compile graph = fastest.
+
+      # ── Vector (ann-benchmarks SIFT1M) ─────────────────────────
+      - name: Vector — SIFT1M sweep
+        id: vector
+        if: ${{ contains(inputs.modalities || 'vector,graph,spatial,timeseries,search,document', 'vector') }}
+        run: |
+          set -euo pipefail
+          DS_DIR="$DATASET_ROOT/sift"
+          for f in sift_base.fvecs sift_query.fvecs sift_groundtruth.ivecs; do
+            test -f "$DS_DIR/$f" || { echo "::error::missing $DS_DIR/$f — see benches/vector-ann/README.md"; exit 1; }
+          done
+          ./target/release/bench-vector-ann \
+            --train       "$DS_DIR/sift_base.fvecs" \
+            --query       "$DS_DIR/sift_query.fvecs" \
+            --groundtruth "$DS_DIR/sift_groundtruth.ivecs" \
+            --dataset-name sift-128-euclidean \
+            --m 32 \
+            --ef-construction 200 \
+            --codec none \
+            --output bench-results
+
+      # ── Future modality steps land here, one per modality ─────
+      # - name: Graph — LDBC SNB SF1 Interactive
+      #   if: ${{ contains(inputs.modalities || '...', 'graph') }}
+      #   run: ./target/release/bench-graph-ldbc ...
+      #
+      # - name: Spatial — PostGIS-shape workloads
+      #   ...
+      #
+      # - name: Time-series — TSBS DevOps 100-host
+      #   ...
+      #
+      # - name: Search — Search Benchmark Game
+      #   ...
+      #
+      # - name: Document — YCSB A/C
+      #   ...
+
+      - name: Commit results to bench-results/
+        run: |
+          set -euo pipefail
+          NEW_FILES=$(git -C "$GITHUB_WORKSPACE" status --porcelain bench-results/ | awk '{print $2}')
+          if [ -z "$NEW_FILES" ]; then
+            echo "no new bench-results files produced — skipping commit"
+            exit 0
+          fi
+          git config user.name  "coordinode-bench-bot"
+          git config user.email "bench-bot@users.noreply.github.com"
+          git add bench-results/
+          # `[skip ci]` prevents recursion. paths: filter above
+          # also excludes bench-results/, so this is belt-and-
+          # suspenders.
+          git commit \
+            -m "chore(bench): results @ ${{ github.sha }} [skip ci]" \
+            -m "Modalities: $(echo "$NEW_FILES" | xargs -I{} dirname {} | sort -u | xargs)" \
+            -m "Auto-committed by .github/workflows/bench.yml (runner: gpu-private-systems)"
+          git push origin HEAD:main
+
+      - name: Upload workflow artifact (90-day retention)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ github.sha }}
+          path: bench-results/**/*.json
+          retention-days: 90
+          if-no-files-found: warn
