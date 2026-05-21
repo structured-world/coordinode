@@ -162,31 +162,102 @@ source = "Databricks SpatialBench analysis (Jan 2026)"
 # ─────────────────────────────────────────────────────────────
 # Document (YCSB A/B/C/F — networked client→server)
 # ─────────────────────────────────────────────────────────────
+#
+# Per methodology.md principle #7, every competitor is benched in
+# exactly TWO codec modes: **zstd** (codec-fair) and **none**
+# (CPU-only baseline). Snappy / LZ4 / pglz are deliberately
+# excluded — see methodology.md §"Codec choice" for the reasoning.
+# Snappy baselines from upstream publications are kept as
+# `notes`-only context, NOT as comparable rows.
 
 [document.ycsb.workload_a]
 
-# Primary: multi-model document stores
-[document.ycsb.workload_a.mongodb_8]
-throughput_ops_s = 30000
-read_p99_us = 2000.0
-notes = "MongoDB 8.0 is 36% faster than 7.0 read mix, 32% faster mixed; community YCSB ports"
-source = "MongoDB 8.0 perf blog (2025) + community YCSB"
+# Primary: multi-model document stores — every engine appears twice
+# (zstd + none) so the report can render zstd-vs-zstd and
+# none-vs-none columns side by side.
 
-[document.ycsb.workload_a.surrealdb_3_0]
-notes = "Run via SurrealDB's crud-bench harness — not directly YCSB-comparable but maps to YCSB-A workload pattern"
+# MongoDB 8.x — zstd (WiredTiger 4.2+, override of default snappy)
+[document.ycsb.workload_a.mongodb_8_zstd]
+codec = "zstd"
+codec_role = "default"
+notes = "WiredTiger zstd: `blockCompressor: zstd`. Must measure in our harness — community YCSB numbers are predominantly snappy. (For context only: MongoDB 8.0 with snappy is ~30K ops/s @ 2ms P99 — see MongoDB 8.0 perf blog 2025.)"
+source = "MongoDB WiredTiger compression docs + harness measurement"
+
+# MongoDB 8.x — uncompressed
+[document.ycsb.workload_a.mongodb_8_none]
+codec = "none"
+codec_role = "disabled"
+notes = "`blockCompressor: none` — pins the CPU-only baseline. Must measure in our harness; community baselines are scarce because this isn't a production config."
+source = "MongoDB docs (config option) + harness measurement"
+
+# SurrealDB 3.x — zstd (RocksDB-backed engine default)
+[document.ycsb.workload_a.surrealdb_3_0_zstd]
+codec = "zstd"
+codec_role = "default"
+notes = "SurrealDB 3.x RocksDB-backed engine default (zstd). Run via SurrealDB's crud-bench harness — not directly YCSB-comparable but maps to YCSB-A workload pattern."
 source = "SurrealDB crud-bench"
 
-[document.ycsb.workload_a.arangodb_3_12]
-notes = "ArangoDB arangobench --test general-document-replace"
+# SurrealDB 3.x — uncompressed
+[document.ycsb.workload_a.surrealdb_3_0_none]
+codec = "none"
+codec_role = "disabled"
+notes = "`--rocksdb-compression-type none`. Must measure."
+source = "SurrealDB storage backend docs"
+
+# ArangoDB 3.12+ — zstd (override of default lz4)
+[document.ycsb.workload_a.arangodb_3_12_zstd]
+codec = "zstd"
+codec_role = "default"
+notes = "ArangoDB with RocksDB engine forced zstd (`--rocksdb.compression-type zstd`). Default is lz4; we override for codec-fair comparison. arangobench --test general-document-replace."
+source = "ArangoDB RocksDB compression docs"
+
+# ArangoDB 3.12+ — uncompressed
+[document.ycsb.workload_a.arangodb_3_12_none]
+codec = "none"
+codec_role = "disabled"
+notes = "`--rocksdb.compression-type none`. Must measure."
 source = "ArangoDB docs"
 
 [document.ycsb.workload_c]
 
-[document.ycsb.workload_c.mongodb_8]
-throughput_ops_s = 40000
-read_p99_us = 1500.0
-notes = "Read-heavy MongoDB 8.0 — WiredTiger cache wins"
-source = "MongoDB 8.0 perf blog (2025) + community YCSB"
+# Workload C — read-only. Codec impact is on decompression CPU +
+# cache density. Same zstd / none pair as workload_a.
+
+[document.ycsb.workload_c.mongodb_8_zstd]
+codec = "zstd"
+codec_role = "default"
+notes = "Read-heavy MongoDB 8.0 with zstd. Higher decompression cost than snappy but better cache density; measure to size the trade. (For context: snappy run published at ~40K ops/s @ 1.5ms P99 per MongoDB 8.0 perf blog 2025.)"
+source = "MongoDB WiredTiger compression docs + harness measurement"
+
+[document.ycsb.workload_c.mongodb_8_none]
+codec = "none"
+codec_role = "disabled"
+notes = "Read-heavy uncompressed — CPU baseline. Must measure."
+source = "MongoDB docs"
+
+[document.ycsb.workload_c.surrealdb_3_0_zstd]
+codec = "zstd"
+codec_role = "default"
+notes = "SurrealDB 3.x default. Must measure."
+source = "SurrealDB crud-bench"
+
+[document.ycsb.workload_c.surrealdb_3_0_none]
+codec = "none"
+codec_role = "disabled"
+notes = "`--rocksdb-compression-type none`. Must measure."
+source = "SurrealDB storage backend docs"
+
+[document.ycsb.workload_c.arangodb_3_12_zstd]
+codec = "zstd"
+codec_role = "default"
+notes = "ArangoDB read-only with forced zstd via arangobench --test get."
+source = "ArangoDB RocksDB compression docs"
+
+[document.ycsb.workload_c.arangodb_3_12_none]
+codec = "none"
+codec_role = "disabled"
+notes = "ArangoDB read-only with compression off. Must measure."
+source = "ArangoDB docs"
 
 # ─────────────────────────────────────────────────────────────
 # Multi-Model Holistic (UniBench + MMSBench-Net)

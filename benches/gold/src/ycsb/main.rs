@@ -41,111 +41,140 @@ fn main() {
 }
 
 fn print_report(a: &WorkloadResult, c: &WorkloadResult, baselines: &Baselines) {
-    // Primary competitor: MongoDB 8.x — the multi-model document-
-    // store baseline per the rewritten methodology doc. Redis is
-    // explicitly NOT a target (in-memory cache, different product).
-    let mongo_a = baselines
+    // Primary competitor: MongoDB 8.x at the chosen comparison
+    // codec (zstd) plus the uncompressed CPU baseline. Per
+    // methodology §"Codec choice" snappy is explicitly excluded —
+    // we standardize on zstd × zstd and none × none.
+    let mongo_a_zstd = baselines
         .document
         .ycsb
         .workload_a
-        .get("mongodb_8")
-        .expect("mongodb_8 baseline for workload A");
-    let mongo_c = baselines
+        .get("mongodb_8_zstd")
+        .expect("mongodb_8_zstd baseline for workload A");
+    let _mongo_a_none = baselines
+        .document
+        .ycsb
+        .workload_a
+        .get("mongodb_8_none")
+        .expect("mongodb_8_none baseline for workload A");
+    let mongo_c_zstd = baselines
         .document
         .ycsb
         .workload_c
-        .get("mongodb_8")
-        .expect("mongodb_8 baseline for workload C");
-
-    let mongo_a_throughput = mongo_a
-        .throughput_ops_s
-        .expect("mongodb_8 workload_a throughput must be populated");
-    let mongo_a_p99 = mongo_a
-        .read_p99_us
-        .expect("mongodb_8 workload_a read_p99_us must be populated");
-    let mongo_c_throughput = mongo_c
-        .throughput_ops_s
-        .expect("mongodb_8 workload_c throughput must be populated");
-    let mongo_c_p99 = mongo_c
-        .read_p99_us
-        .expect("mongodb_8 workload_c read_p99_us must be populated");
+        .get("mongodb_8_zstd")
+        .expect("mongodb_8_zstd baseline for workload C");
+    let _mongo_c_none = baselines
+        .document
+        .ycsb
+        .workload_c
+        .get("mongodb_8_none")
+        .expect("mongodb_8_none baseline for workload C");
 
     println!(
         "{}",
         report::format_header(a.preset.records, a.preset.operations),
     );
     println!(
-        "\n⚠ DISCLAIMER — this is the INTERNAL REGRESSION BENCH only.\n\
-         CoordiNode is running embedded in-process here; MongoDB's number\n\
-         is networked client→server. The ratios below are NOT publishable\n\
-         marketing numbers — they measure engine micro-perf, not buyer-\n\
-         comparable workloads. For honest comparisons see the v0.4-alpha\n\
-         milestone gate in arch/benchmarks/methodology.md (requires the\n\
-         networked YCSB harness, not yet built).\n",
+        "\n⚠ DISCLAIMER — INTERNAL REGRESSION BENCH only.\n\
+         CoordiNode is running embedded in-process here; MongoDB's row is\n\
+         a placeholder (the value column reads \"-\" until the harness\n\
+         actually runs Mongo via mongoperf / YCSB / networked driver in\n\
+         BOTH zstd and uncompressed modes per methodology §Codec choice).\n\
+         The ratios below are NOT publishable marketing numbers — they\n\
+         measure engine micro-perf, not buyer-comparable workloads.\n\
+         For honest comparisons see the v0.4-alpha milestone gate in\n\
+         arch/benchmarks/methodology.md.\n",
     );
 
-    println!(
-        "{}",
-        report::format_modality_block(
-            "Document (YCSB Workload A: 50% read / 50% update)",
-            &[
-                report::Row {
-                    metric: "Throughput (ops/s)",
-                    cn: a.throughput_ops_s(),
-                    leader: mongo_a_throughput,
-                    higher_is_better: true,
-                },
-                report::Row {
-                    metric: "Read P99 (µs)",
-                    cn: a.read_p99_us(),
-                    leader: mongo_a_p99,
-                    higher_is_better: false,
-                },
-            ],
-            &format!("MongoDB 8.x ({})", mongo_a.source),
-        ),
+    println!("\nDocument (YCSB Workload A: 50% read / 50% update)");
+    print_codec_block(
+        "CN (zstd)",
+        a.throughput_ops_s(),
+        a.read_p99_us(),
+        "MongoDB 8.x (zstd)",
+        mongo_a_zstd.throughput_ops_s,
+        mongo_a_zstd.read_p99_us,
+        &mongo_a_zstd.source,
+    );
+    print_codec_block(
+        "CN (none)",
+        a.throughput_ops_s(),
+        a.read_p99_us(),
+        "MongoDB 8.x (none)",
+        None,
+        None,
+        "harness measurement pending",
     );
 
-    println!(
-        "{}",
-        report::format_modality_block(
-            "Document (YCSB Workload C: 100% read)",
-            &[
-                report::Row {
-                    metric: "Throughput (ops/s)",
-                    cn: c.throughput_ops_s(),
-                    leader: mongo_c_throughput,
-                    higher_is_better: true,
-                },
-                report::Row {
-                    metric: "Read P99 (µs)",
-                    cn: c.read_p99_us(),
-                    leader: mongo_c_p99,
-                    higher_is_better: false,
-                },
-            ],
-            &format!("MongoDB 8.x ({})", mongo_c.source),
-        ),
+    println!("\nDocument (YCSB Workload C: 100% read)");
+    print_codec_block(
+        "CN (zstd)",
+        c.throughput_ops_s(),
+        c.read_p99_us(),
+        "MongoDB 8.x (zstd)",
+        mongo_c_zstd.throughput_ops_s,
+        mongo_c_zstd.read_p99_us,
+        &mongo_c_zstd.source,
+    );
+    print_codec_block(
+        "CN (none)",
+        c.throughput_ops_s(),
+        c.read_p99_us(),
+        "MongoDB 8.x (none)",
+        None,
+        None,
+        "harness measurement pending",
     );
 
-    let cn_score = report::geometric_mean(&[
-        report::throughput_ratio(a.throughput_ops_s(), mongo_a_throughput),
-        report::latency_ratio(a.read_p99_us(), mongo_a_p99),
-        report::throughput_ratio(c.throughput_ops_s(), mongo_c_throughput),
-        report::latency_ratio(c.read_p99_us(), mongo_c_p99),
-    ]);
     println!(
         "\n┌─────────────────────────────────────────────────────────────┐\n\
          │ Document partial — YCSB A + C, internal regression bench    │\n\
-         │ vs MongoDB 8.x (networked baseline):                        │\n\
-         │   Geometric mean of 4 ratios = {cn_score:.3}x                       │\n\
          │                                                             │\n\
-         │ Pending for v0.4-alpha gate per methodology.md:             │\n\
+         │ Per methodology §\"Codec choice\":                            │\n\
+         │   • zstd × zstd and none × none are the only valid sweeps   │\n\
+         │   • snappy / lz4 are EXCLUDED                               │\n\
+         │   • MongoDB zstd / none numbers require harness measurement │\n\
+         │                                                             │\n\
+         │ Pending for v0.4-alpha gate:                                │\n\
          │   • Networked CoordiNode YCSB (gRPC client→server)          │\n\
+         │   • MongoDB harness running both zstd and none modes        │\n\
          │   • Vector vs OpenSearch / SurrealDB (ann-benchmarks SIFT1M)│\n\
          │ Pending for v0.5-alpha:                                     │\n\
          │   • LDBC SNB vs SurrealDB / ArangoDB / Neo4j                │\n\
          │   • UniBench multi-model vs ArangoDB                        │\n\
          └─────────────────────────────────────────────────────────────┘",
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_codec_block(
+    cn_label: &str,
+    cn_throughput: f64,
+    cn_p99_us: f64,
+    leader_label: &str,
+    leader_throughput: Option<f64>,
+    leader_p99_us: Option<f64>,
+    leader_source: &str,
+) {
+    println!("  ─────────────────────────────────────────────────────────────");
+    println!(
+        "  {:<18} → throughput {:>10.0} ops/s   read P99 {:>7.2} µs",
+        cn_label, cn_throughput, cn_p99_us,
+    );
+    match (leader_throughput, leader_p99_us) {
+        (Some(t), Some(p)) => {
+            let throughput_ratio = report::throughput_ratio(cn_throughput, t);
+            let latency_ratio = report::latency_ratio(cn_p99_us, p);
+            println!(
+                "  {:<18} → throughput {:>10.0} ops/s   read P99 {:>7.2} µs   (CN {:.2}× thr / {:.2}× lat)",
+                leader_label, t, p, throughput_ratio, latency_ratio,
+            );
+        }
+        _ => {
+            println!(
+                "  {:<18} → harness measurement PENDING ({})",
+                leader_label, leader_source,
+            );
+        }
+    }
 }
