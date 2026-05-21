@@ -66,7 +66,10 @@ mod measurement_router;
 pub use catalog::BucketCatalog;
 #[cfg(any(test, feature = "test-clock"))]
 pub use clock::ScriptedClock;
-pub use clock::{IngestionClock, MonotonicHlcClock};
+pub use clock::{
+    load_last_stamp, persist_last_stamp, IngestionClock, MonotonicHlcClock,
+    PersistentMonotonicHlcClock,
+};
 pub use config::CatalogConfig;
 pub use error::{CatalogError, CatalogResult};
 pub use key::BucketKey;
