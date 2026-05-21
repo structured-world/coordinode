@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse, PostingList};
 use coordinode_core::graph::intern::FieldInterner;
-use coordinode_core::graph::node::{encode_node_key, NodeId, NodeIdAllocator, NodeRecord};
+use coordinode_core::graph::node::{NodeId, NodeIdAllocator, NodeRecord};
 use coordinode_core::graph::types::Value;
 use coordinode_query::cypher::parse;
 use coordinode_query::executor::{execute, AdaptiveConfig, ExecutionContext, Row, WriteStats};
@@ -122,14 +122,14 @@ fn insert_node(
     label: &str,
     props: &[(&str, Value)],
 ) {
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     let mut record = NodeRecord::new(label);
     for (name, value) in props {
         let fid = interner.intern(name);
         record.set(fid, value.clone());
     }
-    let key = encode_node_key(1, NodeId::from_raw(id));
-    engine
-        .put(Partition::Node, &key, &record.to_msgpack().unwrap())
+    LocalNodeStore::new(engine)
+        .put(1, NodeId::from_raw(id), &record)
         .unwrap();
 }
 
@@ -176,8 +176,9 @@ fn adj_contains(engine: &StorageEngine, edge_type: &str, src: u64, tgt: u64) -> 
 }
 
 fn node_exists(engine: &StorageEngine, id: u64) -> bool {
-    engine
-        .get(Partition::Node, &encode_node_key(1, NodeId::from_raw(id)))
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    LocalNodeStore::new(engine)
+        .get(1, NodeId::from_raw(id))
         .unwrap()
         .is_some()
 }
@@ -188,9 +189,10 @@ fn read_prop(
     node_id: u64,
     prop: &str,
 ) -> Option<Value> {
-    let key = encode_node_key(1, NodeId::from_raw(node_id));
-    let bytes = engine.get(Partition::Node, &key).unwrap()?;
-    let record = NodeRecord::from_msgpack(&bytes).unwrap();
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let record = LocalNodeStore::new(engine)
+        .get(1, NodeId::from_raw(node_id))
+        .unwrap()?;
     let fid = interner.lookup(prop)?;
     record.props.get(&fid).cloned()
 }

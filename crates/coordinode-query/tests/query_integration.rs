@@ -8,7 +8,7 @@
 
 use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse, PostingList};
 use coordinode_core::graph::intern::FieldInterner;
-use coordinode_core::graph::node::{encode_node_key, NodeId, NodeIdAllocator, NodeRecord};
+use coordinode_core::graph::node::{NodeId, NodeIdAllocator, NodeRecord};
 use coordinode_core::graph::types::Value;
 use coordinode_query::cypher::parse;
 use coordinode_query::executor::{execute, AdaptiveConfig, ExecutionContext, WriteStats};
@@ -99,14 +99,15 @@ fn insert_node(
     props: &[(&str, Value)],
     interner: &mut FieldInterner,
 ) {
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     let mut record = NodeRecord::new(label);
     for (name, value) in props {
         let field_id = interner.intern(name);
         record.set(field_id, value.clone());
     }
-    let key = encode_node_key(shard_id, NodeId::from_raw(node_id));
-    let bytes = record.to_msgpack().expect("serialize");
-    engine.put(Partition::Node, &key, &bytes).expect("put node");
+    LocalNodeStore::new(engine)
+        .put(shard_id, NodeId::from_raw(node_id), &record)
+        .expect("put node");
 }
 
 /// Register an edge type in the schema partition so wildcard relationship
