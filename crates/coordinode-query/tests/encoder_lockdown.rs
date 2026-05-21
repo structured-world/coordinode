@@ -64,14 +64,13 @@ const ALLOWED: &[(&str, usize)] = &[
     // + verify-deleted assertions now route through LocalNodeStore.
     // 0 raw encoder usages.
     ("src/index/ttl.rs", 0),
-    // ttl_reaper.rs (R166): cfg(test) fixtures + `insert_node` +
-    // `node_exists` helpers + 3 verify-after-reap assertions migrated
-    // to LocalNodeStore. 1 residual usage: production
-    // `prepare_subtree_mutations` builds explicit EdgeProp keys for a
-    // batched Mutation::Delete record — can migrate to LocalEdgeStore
-    // once the modality layer surfaces a batched-mutation primitive
-    // (currently the catalog batches Mutations across partitions).
-    ("src/index/ttl_reaper.rs", 1),
+    // ttl_reaper.rs: fully migrated. cfg(test) fixtures route through
+    // LocalNodeStore; the production `prepare_subtree_mutations` builds
+    // its EdgeProp delete via the typed `Mutation::delete_edge_props`
+    // constructor in `coordinode-core` (which holds the encoder call
+    // at the right layer, co-located with the encoder it wraps).
+    // 0 raw encoder usages.
+    ("src/index/ttl_reaper.rs", 0),
     ("src/index/registry.rs", 0),
 ];
 
