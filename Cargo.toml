@@ -15,6 +15,7 @@ members = [
     "crates/coordinode-s3",
     "crates/coordinode-embed",
     "crates/coordinode-client",
+    "benches/gold",
     "tests/integration",
 ]
 

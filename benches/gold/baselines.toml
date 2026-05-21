@@ -1,0 +1,59 @@
+# Competitor baseline numbers — Level 3 composite score consumes
+# these. Each entry MUST cite a source so the ratios in our reports
+# stay auditable. Update when new competitor results land.
+#
+# Format: per-benchmark group, sub-keyed by competitor identifier.
+# Numbers expressed in the benchmark's native unit; the report layer
+# converts to ratios with units made explicit.
+
+[graph.ldbc_snb_interactive_v2]
+dataset = "SF-1"
+
+[graph.ldbc_snb_interactive_v2.neo4j_5]
+throughput_ops_min = 50000
+source = "LDBC official audit, April 2023"
+
+[vector.ann_benchmarks.sift1m]
+metric = "euclidean"
+
+[vector.ann_benchmarks.sift1m.hnswlib]
+recall_95_qps = 18000
+recall_99_qps = 10000
+build_time_s = 30
+source = "ann-benchmarks.com, April 2025"
+
+[vector.ann_benchmarks.sift1m.pgvector]
+recall_95_qps = 3000
+recall_99_qps = 1500
+source = "ann-benchmarks.com, April 2025"
+
+[text.search_benchmark_game.wikipedia]
+
+[text.search_benchmark_game.wikipedia.tantivy]
+median_query_us = 100
+source = "search-benchmark-game, May 2025"
+
+[text.search_benchmark_game.wikipedia.lucene_10]
+median_query_us = 100
+source = "Lucene committer analysis, May 2025"
+
+[timeseries.tsbs_devops.hosts_100]
+
+[timeseries.tsbs_devops.hosts_100.questdb_8]
+ingestion_rows_s = 1500000
+lastpoint_ms = 0.5
+source = "QuestDB blog, 2025"
+
+[kv.ycsb.workload_a]
+
+[kv.ycsb.workload_a.redis]
+throughput_ops_s = 100000
+read_p99_us = 200
+source = "Community benchmarks, April 2025"
+
+[kv.ycsb.workload_c]
+
+[kv.ycsb.workload_c.redis]
+throughput_ops_s = 200000
+read_p99_us = 150
+source = "Community benchmarks, April 2025"

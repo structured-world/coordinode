@@ -1,0 +1,25 @@
+[package]
+name = "coordinode-gold-bench"
+description = "Gold benchmark suite (L2 from arch/benchmarks/methodology.md): YCSB, LDBC SNB, ann-benchmarks, TSBS, SpatialBench against published competitor baselines. Outputs the structured per-modality + composite score report."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false  # internal benchmark harness; not for crates.io
+
+[[bin]]
+name = "gold-ycsb"
+path = "src/ycsb/main.rs"
+
+[[bin]]
+name = "gold-report"
+path = "src/report/main.rs"
+
+[dependencies]
+coordinode-storage = { workspace = true }
+coordinode-modality = { workspace = true }
+coordinode-core = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+toml = "0.9"
+tempfile = { workspace = true }
