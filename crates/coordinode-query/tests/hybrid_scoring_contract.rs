@@ -29,7 +29,7 @@
 
 use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse, PostingList};
 use coordinode_core::graph::intern::FieldInterner;
-use coordinode_core::graph::node::{encode_node_key, NodeId, NodeIdAllocator, NodeRecord};
+use coordinode_core::graph::node::{NodeId, NodeIdAllocator, NodeRecord};
 use coordinode_core::graph::types::Value;
 use coordinode_query::cypher::parse;
 use coordinode_query::executor::{execute, AdaptiveConfig, ExecutionContext, WriteStats};
@@ -112,15 +112,16 @@ fn insert_node(
     props: &[(&str, Value)],
     interner: &mut FieldInterner,
 ) {
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     let nid = NodeId::from_raw(node_id);
     let mut record = NodeRecord::new(label);
     for (k, v) in props {
         let fid = interner.intern(k);
         record.set(fid, v.clone());
     }
-    let key = encode_node_key(1, nid);
-    let bytes = record.to_msgpack().expect("serialize");
-    engine.put(Partition::Node, &key, &bytes).expect("put");
+    LocalNodeStore::new(engine)
+        .put(1, nid, &record)
+        .expect("put");
 }
 
 fn insert_edge(engine: &StorageEngine, edge_type: &str, source_id: u64, target_id: u64) {

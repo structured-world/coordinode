@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse, PostingList};
 use coordinode_core::graph::intern::FieldInterner;
-use coordinode_core::graph::node::{encode_node_key, NodeId, NodeIdAllocator, NodeRecord};
+use coordinode_core::graph::node::{NodeId, NodeIdAllocator, NodeRecord};
 use coordinode_core::graph::types::Value;
 use coordinode_query::cypher::parse;
 use coordinode_query::executor::{execute, AdaptiveConfig, ExecutionContext, Row, WriteStats};
@@ -123,14 +123,15 @@ fn insert_user_with_address(
     name: &str,
     address: rmpv::Value,
 ) {
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     let mut record = NodeRecord::new("User");
     let name_fid = interner.intern("name");
     let addr_fid = interner.intern("address");
     record.set(name_fid, Value::String(name.into()));
     record.set(addr_fid, Value::Document(address));
-    let key = encode_node_key(1, NodeId::from_raw(id));
-    let bytes = record.to_msgpack().expect("serialize");
-    engine.put(Partition::Node, &key, &bytes).expect("put node");
+    LocalNodeStore::new(engine)
+        .put(1, NodeId::from_raw(id), &record)
+        .expect("put node");
 }
 
 fn register_schema_edge_type(engine: &StorageEngine, edge_type: &str) {
@@ -182,9 +183,10 @@ fn read_address_prop(
     interner: &FieldInterner,
     node_id: u64,
 ) -> Option<Value> {
-    let key = encode_node_key(1, NodeId::from_raw(node_id));
-    let bytes = engine.get(Partition::Node, &key).expect("get node")?;
-    let record = NodeRecord::from_msgpack(&bytes).expect("decode");
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let record = LocalNodeStore::new(engine)
+        .get(1, NodeId::from_raw(node_id))
+        .expect("get node")?;
     let fid = interner.lookup("address")?;
     record.props.get(&fid).cloned()
 }
@@ -271,12 +273,12 @@ fn detach_document_nested_path() {
         (rmpv::Value::String("billing".into()), billing.clone()),
     ]);
 
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     let mut record = NodeRecord::new("User");
     let fid = interner.intern("meta");
     record.set(fid, Value::Document(meta.clone()));
-    let key = encode_node_key(1, NodeId::from_raw(1));
-    engine
-        .put(Partition::Node, &key, &record.to_msgpack().unwrap())
+    LocalNodeStore::new(&engine)
+        .put(1, NodeId::from_raw(1), &record)
         .unwrap();
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
@@ -296,11 +298,10 @@ fn detach_document_nested_path() {
 
     // meta.billing must survive; meta.shipping must be removed.
     let meta_fid = interner.lookup("meta").unwrap();
-    let bytes = engine
-        .get(Partition::Node, &key)
+    let after = LocalNodeStore::new(&engine)
+        .get(1, NodeId::from_raw(1))
         .unwrap()
         .expect("node still present");
-    let after = NodeRecord::from_msgpack(&bytes).unwrap();
     let Value::Document(meta_after) = after.props.get(&meta_fid).cloned().unwrap() else {
         panic!("meta must still be a Document");
     };
@@ -403,13 +404,13 @@ fn detach_document_missing_property_errors() {
     let engine = test_engine(dir.path());
     let mut interner = FieldInterner::new();
 
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     // User with no `address` field at all.
     let mut record = NodeRecord::new("User");
     let fid = interner.intern("name");
     record.set(fid, Value::String("Alice".into()));
-    let key = encode_node_key(1, NodeId::from_raw(1));
-    engine
-        .put(Partition::Node, &key, &record.to_msgpack().unwrap())
+    LocalNodeStore::new(&engine)
+        .put(1, NodeId::from_raw(1), &record)
         .unwrap();
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
@@ -434,13 +435,13 @@ fn detach_document_non_document_value_errors() {
     let engine = test_engine(dir.path());
     let mut interner = FieldInterner::new();
 
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     // `address` is a plain string — not a document.
     let mut record = NodeRecord::new("User");
     let fid = interner.intern("address");
     record.set(fid, Value::String("just a string".into()));
-    let key = encode_node_key(1, NodeId::from_raw(1));
-    engine
-        .put(Partition::Node, &key, &record.to_msgpack().unwrap())
+    LocalNodeStore::new(&engine)
+        .put(1, NodeId::from_raw(1), &record)
         .unwrap();
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
@@ -478,12 +479,12 @@ fn detach_document_default_edge_type_from_camel_case() {
         rmpv::Value::String("firmware".into()),
         rmpv::Value::String("2.1".into()),
     )]);
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     let mut record = NodeRecord::new("Device");
     let fid = interner.intern("sensorConfig");
     record.set(fid, Value::Document(cfg));
-    let key = encode_node_key(1, NodeId::from_raw(1));
-    engine
-        .put(Partition::Node, &key, &record.to_msgpack().unwrap())
+    LocalNodeStore::new(&engine)
+        .put(1, NodeId::from_raw(1), &record)
         .unwrap();
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
