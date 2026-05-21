@@ -7,9 +7,18 @@ on:
       - 'docs/**'
       - 'proto/**'
       - 'scripts/gen-api-docs.py'
+      - 'scripts/build-bench-manifest.py'
       - 'package.json'
       - 'yarn.lock'
       - '.github/workflows/docs.yml'
+  # Re-run when bench-data branch updates (new bench JSONs arrive).
+  # The bench-data branch is auto-pushed by .github/workflows/bench.yml
+  # after each main-push bench run; the docs build merges its
+  # bench-results/ tree before vitepress build.
+  workflow_run:
+    workflows: [bench]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -29,6 +38,22 @@ jobs:
         with:
           fetch-depth: 0
           submodules: true
+
+      # Pull bench-results/ from the `bench-data` orphan branch so
+      # the manifest builder sees the latest JSONs. Branch may not
+      # exist on first deploy — fall back to local bench-results/
+      # (committed manually for the first runs / for edits).
+      - name: Merge bench-data branch contents
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin bench-data > /dev/null 2>&1; then
+            git fetch origin bench-data:bench-data
+            git checkout bench-data -- bench-results/ || true
+            echo "::notice::merged bench-data branch into bench-results/"
+          else
+            echo "::notice::bench-data branch not present yet; using bench-results/ from main"
+          fi
+          ls -R bench-results/ 2>/dev/null | head -30 || true
 
       - uses: actions/setup-node@v6
         with:

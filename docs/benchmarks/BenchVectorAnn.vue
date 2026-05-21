@@ -1,0 +1,510 @@
+<script setup lang="ts">
+// SIFT1M ANN benchmark dashboard. Apache ECharts via vue-echarts
+// — picked over Vega-Lite because:
+//   • Legend toggle per engine works out of the box (click engine
+//     name to hide/show its line — every chart on the page).
+//   • Axis scale switch (linear ↔ log) is a one-line config change
+//     we expose via a UI toggle.
+//   • dataZoom slider lets the user brush a commit-range window on
+//     the timeline chart to inspect drift between releases.
+//   • Native dark-mode theme — auto-syncs with VitePress.
+//   • Animated transitions between data updates.
+//
+// All three charts read the same in-memory `reports[]` array;
+// recomputed reactively when the user clicks a control.
+import { computed, onMounted, ref, watch } from "vue";
+import VChart from "vue-echarts";
+import { use } from "echarts/core";
+import { CanvasRenderer } from "echarts/renderers";
+import {
+  LineChart,
+  ScatterChart,
+  BarChart,
+} from "echarts/charts";
+import {
+  TitleComponent,
+  TooltipComponent,
+  LegendComponent,
+  GridComponent,
+  DataZoomComponent,
+  MarkLineComponent,
+  ToolboxComponent,
+} from "echarts/components";
+
+use([
+  CanvasRenderer,
+  LineChart,
+  ScatterChart,
+  BarChart,
+  TitleComponent,
+  TooltipComponent,
+  LegendComponent,
+  GridComponent,
+  DataZoomComponent,
+  MarkLineComponent,
+  ToolboxComponent,
+]);
+
+const DATASET = "sift-128-euclidean";
+
+interface ManifestEntry {
+  path: string;
+  modality: string;
+  dataset: string;
+  subject: string;
+  sha?: string;
+  sha_short?: string;
+  timestamp?: string;
+}
+
+interface Manifest {
+  schema_version: number;
+  entries: ManifestEntry[];
+}
+
+interface SweepPoint {
+  ef_search: number;
+  recall_at_k: number;
+  qps: number;
+  latency_us_p50: number;
+  latency_us_p95: number;
+  latency_us_p99: number;
+  latency_us_mean: number;
+}
+
+interface BenchReport {
+  timestamp: string;
+  git: { sha: string; sha_short: string; commit_date: string };
+  subject: string;
+  modality: string;
+  dataset: string;
+  hardware: { cpu_brand: string; cpu_cores: number; ram_gb: number };
+  metrics: {
+    sweep?: SweepPoint[];
+    recall_at_k_peak?: number;
+    qps_at_recall_peak?: number;
+    qps_at_recall_0_95?: number;
+    build_secs?: number;
+    dataset_n_train?: number;
+  };
+}
+
+const status = ref<"loading" | "empty" | "ok" | "error">("loading");
+const errorMsg = ref<string>("");
+const reports = ref<BenchReport[]>([]);
+
+// UI state
+const qpsLogScale = ref<boolean>(true);
+const yMetric = ref<"qps" | "latency_us_p99">("qps");
+const enabledSubjects = ref<Set<string>>(new Set());
+
+const subjects = computed<string[]>(() => {
+  const s = new Set<string>();
+  for (const r of reports.value) s.add(r.subject);
+  return [...s].sort();
+});
+
+watch(subjects, (list) => {
+  if (enabledSubjects.value.size === 0 && list.length > 0) {
+    enabledSubjects.value = new Set(list);
+  }
+});
+
+function toggleSubject(subject: string) {
+  if (enabledSubjects.value.has(subject)) {
+    enabledSubjects.value.delete(subject);
+  } else {
+    enabledSubjects.value.add(subject);
+  }
+  enabledSubjects.value = new Set(enabledSubjects.value);
+}
+
+const visibleReports = computed<BenchReport[]>(() =>
+  reports.value.filter((r) => enabledSubjects.value.has(r.subject)),
+);
+
+async function loadManifest(): Promise<Manifest> {
+  const base = (import.meta.env.BASE_URL ?? "/").replace(/\/+$/, "/");
+  const url = `${base}bench-data/index.json`;
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) {
+    throw new Error(
+      `Could not load ${url} (HTTP ${r.status}). The docs build must run with bench-results in scope.`,
+    );
+  }
+  return r.json();
+}
+
+async function loadReport(path: string): Promise<BenchReport> {
+  const base = (import.meta.env.BASE_URL ?? "/").replace(/\/+$/, "/");
+  const url = `${base}${path}`;
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error(`${path}: HTTP ${r.status}`);
+  return r.json();
+}
+
+// Pareto frontier — Recall@10 vs QPS (or P99 latency). Each engine
+// has one line through its sweep points, sorted by recall ascending.
+const paretoOption = computed(() => {
+  const subjectMap = new Map<string, { recall: number; y: number; ef: number; sha: string }[]>();
+  for (const rep of visibleReports.value) {
+    for (const p of rep.metrics.sweep ?? []) {
+      const arr = subjectMap.get(rep.subject) ?? [];
+      arr.push({
+        recall: p.recall_at_k,
+        y: yMetric.value === "qps" ? p.qps : p.latency_us_p99,
+        ef: p.ef_search,
+        sha: rep.git.sha_short,
+      });
+      subjectMap.set(rep.subject, arr);
+    }
+  }
+  const series = [...subjectMap.entries()].map(([subject, points]) => ({
+    name: subject,
+    type: "line" as const,
+    smooth: true,
+    symbol: "circle",
+    symbolSize: 9,
+    data: points
+      .sort((a, b) => a.recall - b.recall)
+      .map((p) => [p.recall, p.y, p.ef, p.sha]),
+    emphasis: { focus: "series" as const },
+  }));
+  const yIsLog = yMetric.value === "qps" && qpsLogScale.value;
+  const yTitle = yMetric.value === "qps" ? "QPS (single-thread)" : "P99 latency (µs)";
+  return {
+    tooltip: {
+      trigger: "item",
+      formatter: (params: any) => {
+        const [recall, y, ef, sha] = params.data as [number, number, number, string];
+        const yLabel = yMetric.value === "qps" ? "QPS" : "P99 µs";
+        return [
+          `<b>${params.seriesName}</b> (${sha})`,
+          `Recall @ 10: ${recall.toFixed(4)}`,
+          `${yLabel}: ${y.toLocaleString(undefined, { maximumFractionDigits: 0 })}`,
+          `ef_search: ${ef}`,
+        ].join("<br>");
+      },
+    },
+    legend: {
+      type: "scroll",
+      top: 0,
+      textStyle: { color: "var(--vp-c-text-1)" },
+    },
+    grid: { top: 50, left: 60, right: 24, bottom: 56 },
+    xAxis: {
+      type: "value",
+      name: "Recall @ 10",
+      nameLocation: "middle",
+      nameGap: 30,
+      min: 0.7,
+      max: 1.0,
+    },
+    yAxis: {
+      type: yIsLog ? "log" : "value",
+      name: yTitle,
+      nameLocation: "middle",
+      nameGap: 50,
+    },
+    series,
+  };
+});
+
+// Timeline — peak recall @ 10 across CN commits. One line per
+// subject. CoordiNode moves with every push to main; competitor
+// lines stay flat between manual re-baselines.
+const timelineOption = computed(() => {
+  const subjectMap = new Map<
+    string,
+    { ts: string; recall: number; sha: string }[]
+  >();
+  for (const rep of visibleReports.value) {
+    if (typeof rep.metrics.recall_at_k_peak !== "number") continue;
+    const arr = subjectMap.get(rep.subject) ?? [];
+    arr.push({
+      ts: rep.timestamp,
+      recall: rep.metrics.recall_at_k_peak,
+      sha: rep.git.sha_short,
+    });
+    subjectMap.set(rep.subject, arr);
+  }
+  const series = [...subjectMap.entries()].map(([subject, rows]) => ({
+    name: subject,
+    type: "line" as const,
+    smooth: true,
+    symbol: "circle",
+    symbolSize: 8,
+    data: rows
+      .sort((a, b) => a.ts.localeCompare(b.ts))
+      .map((r) => [r.ts, r.recall, r.sha]),
+    emphasis: { focus: "series" as const },
+  }));
+  return {
+    tooltip: {
+      trigger: "item",
+      formatter: (params: any) => {
+        const [ts, recall, sha] = params.data as [string, number, string];
+        return [
+          `<b>${params.seriesName}</b> (${sha})`,
+          new Date(ts).toLocaleString(),
+          `Peak recall @ 10: ${recall.toFixed(4)}`,
+        ].join("<br>");
+      },
+    },
+    legend: {
+      type: "scroll",
+      top: 0,
+      textStyle: { color: "var(--vp-c-text-1)" },
+    },
+    grid: { top: 50, left: 60, right: 24, bottom: 80 },
+    dataZoom: [
+      { type: "slider", height: 18, bottom: 12 },
+      { type: "inside" },
+    ],
+    xAxis: {
+      type: "time",
+      name: "Commit time",
+      nameLocation: "middle",
+      nameGap: 30,
+    },
+    yAxis: {
+      type: "value",
+      name: "Peak recall @ 10",
+      nameLocation: "middle",
+      nameGap: 50,
+      min: 0.85,
+      max: 1.0,
+    },
+    series,
+  };
+});
+
+// Bar — QPS @ recall ≥ 0.95 (latest run per subject).
+const barOption = computed(() => {
+  const latestBySubject = new Map<string, BenchReport>();
+  for (const r of visibleReports.value) {
+    if (typeof r.metrics.qps_at_recall_0_95 !== "number") continue;
+    const existing = latestBySubject.get(r.subject);
+    if (!existing || r.timestamp > existing.timestamp) {
+      latestBySubject.set(r.subject, r);
+    }
+  }
+  const data = [...latestBySubject.values()]
+    .map((r) => ({
+      name: r.subject,
+      value: r.metrics.qps_at_recall_0_95 as number,
+      sha: r.git.sha_short,
+    }))
+    .sort((a, b) => b.value - a.value);
+  return {
+    tooltip: {
+      trigger: "item",
+      formatter: (params: any) => {
+        const { name, value, data } = params;
+        const sha = (data as { sha: string }).sha;
+        return `<b>${name}</b> (${sha})<br>QPS @ recall ≥ 0.95: ${value.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
+      },
+    },
+    grid: { top: 24, left: 60, right: 24, bottom: 50 },
+    xAxis: {
+      type: "category",
+      data: data.map((d) => d.name),
+      axisLabel: { interval: 0 },
+    },
+    yAxis: {
+      type: "value",
+      name: "QPS @ recall ≥ 0.95",
+      nameLocation: "middle",
+      nameGap: 50,
+    },
+    series: [
+      {
+        type: "bar",
+        data: data,
+        itemStyle: { borderRadius: 4 },
+        emphasis: { focus: "series" },
+        label: {
+          show: true,
+          position: "top",
+          formatter: (p: any) =>
+            (p.data.value as number).toLocaleString(undefined, {
+              maximumFractionDigits: 0,
+            }),
+        },
+      },
+    ],
+  };
+});
+
+async function render() {
+  try {
+    const manifest = await loadManifest();
+    const entries = manifest.entries.filter(
+      (e) => e.modality === "vector" && e.dataset === DATASET,
+    );
+    if (entries.length === 0) {
+      status.value = "empty";
+      return;
+    }
+    const fetched: BenchReport[] = [];
+    for (const e of entries) {
+      try {
+        fetched.push(await loadReport(e.path));
+      } catch (err) {
+        console.warn(`skipping ${e.path}: ${(err as Error).message}`);
+      }
+    }
+    if (fetched.length === 0) {
+      status.value = "empty";
+      return;
+    }
+    reports.value = fetched;
+    status.value = "ok";
+  } catch (e) {
+    status.value = "error";
+    errorMsg.value = (e as Error).message;
+  }
+}
+
+onMounted(render);
+</script>
+
+<template>
+  <div class="bench-block">
+    <div v-if="status === 'loading'" class="bench-status">
+      Loading bench results…
+    </div>
+    <div v-else-if="status === 'empty'" class="bench-status">
+      No SIFT1M results published yet. The first bench run will populate
+      this view.
+    </div>
+    <div v-else-if="status === 'error'" class="bench-status bench-error">
+      {{ errorMsg }}
+    </div>
+
+    <template v-if="status === 'ok'">
+      <!-- Subject toggle row — click engine name to hide/show. -->
+      <div class="controls">
+        <div class="control-group">
+          <span class="control-label">Engines:</span>
+          <button
+            v-for="s in subjects"
+            :key="s"
+            :class="['chip', enabledSubjects.has(s) ? 'on' : 'off']"
+            @click="toggleSubject(s)"
+          >
+            {{ s }}
+          </button>
+        </div>
+        <div class="control-group">
+          <span class="control-label">Y-axis:</span>
+          <button
+            :class="['chip', yMetric === 'qps' ? 'on' : 'off']"
+            @click="yMetric = 'qps'"
+          >
+            QPS
+          </button>
+          <button
+            :class="['chip', yMetric === 'latency_us_p99' ? 'on' : 'off']"
+            @click="yMetric = 'latency_us_p99'"
+          >
+            P99 latency
+          </button>
+          <button
+            v-if="yMetric === 'qps'"
+            :class="['chip', qpsLogScale ? 'on' : 'off']"
+            @click="qpsLogScale = !qpsLogScale"
+          >
+            {{ qpsLogScale ? "log" : "linear" }}
+          </button>
+        </div>
+      </div>
+
+      <h3>Pareto frontier — Recall @ 10 vs {{ yMetric === "qps" ? "QPS" : "P99 latency" }}</h3>
+      <v-chart class="echart" :option="paretoOption" autoresize />
+
+      <h3>Peak recall over time</h3>
+      <p class="hint">
+        Drag the slider below the chart to zoom into a commit range.
+        Click an engine in the legend to hide/show its line.
+      </p>
+      <v-chart class="echart" :option="timelineOption" autoresize />
+
+      <h3>QPS @ recall ≥ 0.95 — latest run per engine</h3>
+      <v-chart class="echart bar" :option="barOption" autoresize />
+    </template>
+  </div>
+</template>
+
+<style scoped>
+.bench-block {
+  margin: 1.5rem 0;
+}
+.bench-status {
+  padding: 1rem;
+  background: var(--vp-c-bg-soft);
+  border-radius: 6px;
+  color: var(--vp-c-text-2);
+  margin-bottom: 1.5rem;
+}
+.bench-error {
+  color: var(--vp-c-danger-1);
+  border: 1px solid var(--vp-c-danger-2);
+}
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.5rem;
+  padding: 0.75rem 0;
+  margin-bottom: 1rem;
+  border-bottom: 1px solid var(--vp-c-divider);
+  font-size: 0.88rem;
+}
+.control-group {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+.control-label {
+  color: var(--vp-c-text-2);
+  font-weight: 500;
+}
+.chip {
+  border: 1px solid var(--vp-c-divider);
+  background: var(--vp-c-bg-soft);
+  color: var(--vp-c-text-2);
+  padding: 0.25rem 0.7rem;
+  border-radius: 999px;
+  cursor: pointer;
+  font: inherit;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.chip:hover {
+  border-color: var(--vp-c-brand-1);
+}
+.chip.on {
+  background: var(--vp-c-brand-soft);
+  color: var(--vp-c-brand-1);
+  border-color: var(--vp-c-brand-1);
+}
+.chip.off {
+  opacity: 0.55;
+}
+.echart {
+  width: 100%;
+  height: 420px;
+  margin: 0.5rem 0 2rem;
+}
+.echart.bar {
+  height: 320px;
+}
+.hint {
+  color: var(--vp-c-text-2);
+  font-size: 0.9rem;
+  margin: 0 0 0.5rem;
+}
+h3 {
+  margin-top: 2rem;
+}
+</style>

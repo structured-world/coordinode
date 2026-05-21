@@ -180,6 +180,7 @@ export default defineConfig({
       { text: "Cypher", link: "/cypher/" },
       { text: "API", link: "/api/" },
       { text: "SDK", link: "/sdk/python" },
+      { text: "Benchmarks", link: "/benchmarks/" },
       { text: "Roadmap", link: "/ROADMAP" },
     ],
 
