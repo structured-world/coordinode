@@ -10,8 +10,7 @@ use coordinode_embed::Database;
 /// Executing a query records its fingerprint in the advisor registry.
 #[test]
 fn query_execution_records_fingerprint() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     db.execute_cypher("CREATE (n:User {name: 'Alice'})")
         .expect("create");
@@ -28,8 +27,7 @@ fn query_execution_records_fingerprint() {
 /// Queries with different literals but same structure share a fingerprint.
 #[test]
 fn same_structure_shares_fingerprint() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     db.execute_cypher("CREATE (n:User {name: 'Alice'})")
         .expect("create 1");
@@ -48,8 +46,7 @@ fn same_structure_shares_fingerprint() {
 /// Different query structures produce different fingerprints.
 #[test]
 fn different_structures_different_fingerprints() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     db.execute_cypher("CREATE (n:User {name: 'Alice'})")
         .expect("create");
@@ -66,8 +63,7 @@ fn different_structures_different_fingerprints() {
 /// top_by_count returns the most frequently executed query patterns.
 #[test]
 fn top_by_count_reflects_execution_frequency() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     // Execute CREATE once, MATCH three times
     db.execute_cypher("CREATE (n:User {name: 'Alice'})")
@@ -88,8 +84,7 @@ fn top_by_count_reflects_execution_frequency() {
 /// Timing is recorded (non-zero duration for real queries).
 #[test]
 fn timing_is_recorded() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     db.execute_cypher("CREATE (n:User {name: 'Alice'})")
         .expect("create");
@@ -108,8 +103,7 @@ fn timing_is_recorded() {
 /// Reset clears all advisor state.
 #[test]
 fn reset_clears_registry() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     db.execute_cypher("CREATE (n:User {name: 'Alice'})")
         .expect("create");
@@ -127,8 +121,7 @@ use coordinode_query::advisor::SourceContext;
 /// Source location is recorded when executing with source context.
 #[test]
 fn source_location_recorded_via_execute() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     let src = SourceContext::new("src/api/handlers.rs", 42, "get_user");
     db.execute_cypher_with_source("CREATE (n:User {name: 'Alice'})", &src)
@@ -147,8 +140,7 @@ fn source_location_recorded_via_execute() {
 /// Multiple calls from same source accumulate call count.
 #[test]
 fn source_call_count_accumulates() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     let src = SourceContext::new("src/handler.rs", 10, "list_users");
     for _ in 0..5 {
@@ -165,8 +157,7 @@ fn source_call_count_accumulates() {
 /// Multiple different sources for same query are tracked separately.
 #[test]
 fn multiple_sources_for_same_query() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     let src1 = SourceContext::new("src/api.rs", 10, "handler_a");
     let src2 = SourceContext::new("src/api.rs", 20, "handler_b");
@@ -196,8 +187,7 @@ fn multiple_sources_for_same_query() {
 /// EXPLAIN SUGGEST returns plan + suggestions for a query with missing index.
 #[test]
 fn explain_suggest_detects_missing_index() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = Database::open(dir.path()).expect("open");
+    let db = Database::open_in_memory().expect("open");
 
     // MATCH (n:User) WHERE n.email = 'x' RETURN n → full label scan + filter
     let result = db
@@ -229,8 +219,7 @@ fn explain_suggest_detects_missing_index() {
 /// EXPLAIN SUGGEST returns no suggestions for a simple scan without filter.
 #[test]
 fn explain_suggest_no_suggestions_for_simple_scan() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = Database::open(dir.path()).expect("open");
+    let db = Database::open_in_memory().expect("open");
 
     let result = db
         .explain_suggest("MATCH (n:User) RETURN n")
@@ -245,8 +234,7 @@ fn explain_suggest_no_suggestions_for_simple_scan() {
 /// EXPLAIN SUGGEST display format includes suggestions section.
 #[test]
 fn explain_suggest_display_format() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = Database::open(dir.path()).expect("open");
+    let db = Database::open_in_memory().expect("open");
 
     let result = db
         .explain_suggest("MATCH (n:User) WHERE n.email = 'x' RETURN n")
@@ -266,8 +254,7 @@ fn explain_suggest_display_format() {
 /// EXPLAIN SUGGEST detects unbounded variable-length traversal.
 #[test]
 fn explain_suggest_detects_unbounded_traversal() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = Database::open(dir.path()).expect("open");
+    let db = Database::open_in_memory().expect("open");
 
     let result = db
         .explain_suggest("MATCH (a:User)-[:KNOWS*1..]->(b) RETURN b")
@@ -286,8 +273,7 @@ fn explain_suggest_detects_unbounded_traversal() {
 /// Bounded traversal produces no unbounded warning.
 #[test]
 fn explain_suggest_bounded_traversal_ok() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = Database::open(dir.path()).expect("open");
+    let db = Database::open_in_memory().expect("open");
 
     let result = db
         .explain_suggest("MATCH (a:User)-[:KNOWS*1..5]->(b) RETURN b")
@@ -305,8 +291,7 @@ fn explain_suggest_bounded_traversal_ok() {
 /// EXPLAIN SUGGEST detects Cartesian product from disconnected patterns.
 #[test]
 fn explain_suggest_detects_cartesian_product() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = Database::open(dir.path()).expect("open");
+    let db = Database::open_in_memory().expect("open");
 
     let result = db
         .explain_suggest("MATCH (a:User), (b:Post) RETURN a, b")
@@ -325,8 +310,7 @@ fn explain_suggest_detects_cartesian_product() {
 /// EXPLAIN SUGGEST detects VectorFilter without graph pre-filter.
 #[test]
 fn explain_suggest_detects_vector_without_prefilter() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = Database::open(dir.path()).expect("open");
+    let db = Database::open_in_memory().expect("open");
 
     // VectorFilter directly on NodeScan (no graph narrowing)
     let result = db
@@ -348,8 +332,7 @@ fn explain_suggest_detects_vector_without_prefilter() {
 /// VectorFilter after graph traversal produces no pre-filter warning.
 #[test]
 fn explain_suggest_vector_with_prefilter_ok() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = Database::open(dir.path()).expect("open");
+    let db = Database::open_in_memory().expect("open");
 
     // VectorFilter after Traverse (has graph narrowing)
     let result = db
@@ -373,8 +356,7 @@ fn explain_suggest_vector_with_prefilter_ok() {
 /// EXPLAIN SUGGEST detects KNN pattern (ORDER BY distance + LIMIT without index).
 #[test]
 fn explain_suggest_detects_knn_without_index() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = Database::open(dir.path()).expect("open");
+    let db = Database::open_in_memory().expect("open");
 
     let result = db
         .explain_suggest(
@@ -400,8 +382,7 @@ fn explain_suggest_skips_knn_suggestion_when_index_exists() {
     use coordinode_core::graph::types::VectorMetric;
     use coordinode_query::index::VectorIndexConfig;
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     // Create HNSW index for (Place, location).
     db.create_vector_index(
@@ -443,8 +424,7 @@ fn explain_suggest_suggests_for_different_property_when_one_indexed() {
     use coordinode_core::graph::types::VectorMetric;
     use coordinode_query::index::VectorIndexConfig;
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     // Index on (Place, location), but query on (Place, thumbnail) — different property.
     db.create_vector_index(
@@ -481,8 +461,7 @@ fn explain_suggest_suggests_for_different_property_when_one_indexed() {
 /// Multiple suggestions are ranked by severity.
 #[test]
 fn explain_suggest_ranks_by_severity() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = Database::open(dir.path()).expect("open");
+    let db = Database::open_in_memory().expect("open");
 
     // Query with both filter on unindexed property + Cartesian product
     let result = db
@@ -504,8 +483,7 @@ fn explain_suggest_ranks_by_severity() {
 /// N+1 pattern detected when same query executed from same source many times.
 #[test]
 fn nplus1_detected_via_execute() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     let src = SourceContext::new("src/handlers/feed.rs", 67, "build_feed");
 
@@ -528,8 +506,7 @@ fn nplus1_detected_via_execute() {
 /// N+1 not flagged below threshold.
 #[test]
 fn nplus1_not_flagged_below_threshold() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     let src = SourceContext::new("src/api.rs", 10, "get_user");
 
@@ -548,8 +525,7 @@ fn nplus1_not_flagged_below_threshold() {
 /// Different sources are tracked independently for N+1.
 #[test]
 fn nplus1_different_sources_independent() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     let src_a = SourceContext::new("a.rs", 1, "fn_a");
     let src_b = SourceContext::new("b.rs", 2, "fn_b");
@@ -572,8 +548,7 @@ fn nplus1_different_sources_independent() {
 /// Mixing execute_cypher (no source) and execute_cypher_with_source works.
 #[test]
 fn mixed_source_and_no_source() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     let src = SourceContext::new("src/main.rs", 1, "main")
         .with_app("test-app")
@@ -605,8 +580,7 @@ use coordinode_core::graph::types::Value;
 /// CALL db.advisor.queryStats() returns stats after executing queries.
 #[test]
 fn call_query_stats_via_cypher() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     // Execute some queries first
     db.execute_cypher("CREATE (n:User {name: 'Alice'})")
@@ -646,8 +620,7 @@ fn call_query_stats_via_cypher() {
 /// CALL db.advisor.queryStats() with YIELD filters columns.
 #[test]
 fn call_query_stats_with_yield() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     db.execute_cypher("CREATE (n:User {name: 'Alice'})")
         .expect("create");
@@ -669,8 +642,7 @@ fn call_query_stats_with_yield() {
 /// CALL db.advisor.suggestions() returns suggestions for recorded queries.
 #[test]
 fn call_suggestions_via_cypher() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     // Execute queries to populate registry
     for _ in 0..5 {
@@ -697,8 +669,7 @@ fn call_suggestions_via_cypher() {
 /// CALL db.advisor.slowQueries() with arguments.
 #[test]
 fn call_slow_queries_via_cypher() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     // Execute some queries
     db.execute_cypher("CREATE (n:User {name: 'Alice'})")
@@ -722,8 +693,7 @@ fn call_slow_queries_via_cypher() {
 /// CALL db.advisor.reset() clears all advisor state.
 #[test]
 fn call_reset_via_cypher() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     // Record some queries
     db.execute_cypher("CREATE (n:User {name: 'Alice'})")
@@ -753,8 +723,7 @@ fn call_reset_via_cypher() {
 /// CALL db.advisor.dismiss() suppresses a suggestion.
 #[test]
 fn call_dismiss_via_cypher() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     // Record queries
     db.execute_cypher("MATCH (n:User) RETURN n").expect("match");
@@ -796,8 +765,7 @@ fn call_dismiss_via_cypher() {
 /// EXPLAIN for edge vector query shows EdgeVectorSearch with strategy.
 #[test]
 fn explain_edge_vector_shows_strategy() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = Database::open(dir.path()).expect("open");
+    let db = Database::open_in_memory().expect("open");
 
     // Query with vector filter on an edge variable after traverse
     let explain = db
@@ -830,8 +798,7 @@ fn explain_edge_vector_shows_strategy() {
 /// EXPLAIN for node vector query still shows VectorFilter (not EdgeVectorSearch).
 #[test]
 fn explain_node_vector_not_rewritten() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = Database::open(dir.path()).expect("open");
+    let db = Database::open_in_memory().expect("open");
 
     // Node vector filter — should NOT be rewritten to EdgeVectorSearch
     let explain = db
@@ -855,8 +822,7 @@ fn explain_node_vector_not_rewritten() {
 /// Edge vector query executes correctly (brute-force evaluation on edge properties).
 #[test]
 fn edge_vector_query_executes() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     // Create nodes and edges with vector properties
     db.execute_cypher("CREATE (a:User {name: 'Alice'})")
@@ -900,8 +866,7 @@ fn edge_vector_query_executes() {
 /// EXPLAIN SUGGEST for edge vector shows strategy in plan.
 #[test]
 fn explain_suggest_edge_vector_strategy() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = Database::open(dir.path()).expect("open");
+    let db = Database::open_in_memory().expect("open");
 
     let result = db
         .explain_suggest(
@@ -922,8 +887,7 @@ fn explain_suggest_edge_vector_strategy() {
 /// Unknown procedure returns error.
 #[test]
 fn call_unknown_procedure_error() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     let result = db.execute_cypher("CALL db.nonexistent.procedure()");
     assert!(result.is_err(), "unknown procedure should return error");
@@ -933,8 +897,7 @@ fn call_unknown_procedure_error() {
 /// more accurate cost estimates than hardcoded defaults.
 #[test]
 fn explain_uses_real_storage_stats() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     // Get cost estimate on empty database (uses stats: 0 nodes)
     let explain_empty = db
@@ -993,8 +956,7 @@ fn explain_uses_real_storage_stats() {
 /// EXPLAIN SUGGEST also uses real storage statistics.
 #[test]
 fn explain_suggest_uses_real_stats() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     // Insert data
     for i in 0..20 {
@@ -1027,8 +989,7 @@ fn explain_suggest_uses_real_stats() {
 /// EXPLAIN correctly reflects deleted nodes (MVCC tombstones excluded).
 #[test]
 fn explain_stats_exclude_deleted_nodes() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     // Create 10 nodes
     for i in 0..10 {
@@ -1064,8 +1025,7 @@ fn explain_stats_exclude_deleted_nodes() {
 /// EXPLAIN reflects real fan-out from adjacency data.
 #[test]
 fn explain_uses_real_fan_out() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     // Create a small social graph: each user follows 3 others
     for i in 0..10 {
@@ -1111,8 +1071,7 @@ fn explain_uses_real_fan_out() {
 /// Querying an edge type not in stats uses overall avg_fan_out.
 #[test]
 fn explain_stats_fallback_unknown_label_and_edge_type() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     // Create data for one label + one edge type
     for i in 0..20 {
@@ -1170,8 +1129,7 @@ fn explain_stats_fallback_unknown_label_and_edge_type() {
 /// Stats with mixed read-write: EXPLAIN after interleaved creates and deletes.
 #[test]
 fn explain_stats_after_interleaved_writes() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     // Create 30 nodes, delete 10, create 5 more = 25 remaining
     for i in 0..30 {
@@ -1212,8 +1170,7 @@ fn explain_stats_after_interleaved_writes() {
 /// results (cache hit path — second call should use cached stats).
 #[test]
 fn stats_cache_returns_consistent_results() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     for i in 0..20 {
         db.execute_cypher(&format!("CREATE (n:Cached {{id: {i}}})",))
@@ -1234,8 +1191,7 @@ fn stats_cache_returns_consistent_results() {
 /// and that `invalidate_stats_cache()` also works for manual cache busting.
 #[test]
 fn stats_cache_auto_invalidates_on_writes() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
 
     // Seed 10 nodes.
     for i in 0..10 {
@@ -1286,8 +1242,7 @@ fn stats_cache_auto_invalidates_on_writes() {
 /// Verify that `compute_stats()` returns `Some` on a fresh empty DB.
 #[test]
 fn compute_stats_works_on_empty_db() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = Database::open(dir.path()).expect("open");
+    let db = Database::open_in_memory().expect("open");
     let stats = db.compute_stats();
     assert!(stats.is_some(), "compute_stats should succeed on empty DB");
 }
@@ -1299,8 +1254,7 @@ fn compute_stats_works_on_empty_db() {
 fn stats_cache_ttl_zero_always_recomputes() {
     use coordinode_core::graph::stats::StorageStats;
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
     db.set_stats_ttl(std::time::Duration::ZERO);
 
     // Seed 10 nodes via normal path.
@@ -1347,8 +1301,7 @@ fn stats_cache_ttl_zero_always_recomputes() {
 fn stats_cache_ttl_max_stays_stale_until_invalidation() {
     use coordinode_core::graph::stats::StorageStats;
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open");
+    let mut db = Database::open_in_memory().expect("open");
     db.set_stats_ttl(std::time::Duration::MAX);
 
     // Seed 10 nodes.

@@ -7,6 +7,9 @@ pub mod oplog;
 pub mod scrub;
 pub mod wal;
 
+#[cfg(test)]
+pub(crate) mod internal_test_helpers;
+
 /// Re-export the `Guard` trait so downstream crates can call `into_inner()`
 /// on `IterGuardImpl` without directly depending on `lsm_tree`.
 pub use lsm_tree::Guard;

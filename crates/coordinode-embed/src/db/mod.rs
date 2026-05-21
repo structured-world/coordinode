@@ -329,6 +329,44 @@ impl Database {
         Self::finish_open(path.as_ref(), config, oracle, engine, pipeline)
     }
 
+    /// Open an in-memory database backed by `lsm_tree::fs::MemFs`.
+    ///
+    /// Useful for:
+    /// - Integration tests that exercise the full `EmbeddedDb`
+    ///   stack (Cypher executor + storage + modality) without
+    ///   needing host filesystem.
+    /// - Ephemeral dev shells, in-process benchmarks, demo
+    ///   environments that should not leave files behind.
+    /// - CI matrix legs where `engine_for_logic()` from
+    ///   `coordinode-test-fixtures` isn't a fit because the test
+    ///   uses the full `Database::*` surface.
+    ///
+    /// **Persistence semantics:** no real disk I/O happens. Process
+    /// restart loses all data. Tests that exercise WAL recovery /
+    /// crash safety / reopen-after-flush MUST use [`Self::open`]
+    /// with a `tempfile::TempDir` instead — MemFs doesn't simulate
+    /// the persistence layer, only the FS-call surface.
+    pub fn open_in_memory() -> Result<Self, DatabaseError> {
+        // Virtual path under MemFs root. Doesn't have to exist on
+        // the host FS — MemFs maintains its own tree under this.
+        let virtual_path = std::path::PathBuf::from("/coordinode-embed-in-memory");
+        let fs = Arc::new(lsm_tree::fs::MemFs::new());
+        let config = StorageConfig::with_endpoints_no_persistence(vec![EndpointConfig::new(
+            "default-memfs",
+            &virtual_path,
+            Media::Ram,
+            Durability::Volatile,
+            Tier::Memory,
+        )])
+        .with_fs(fs as Arc<dyn lsm_tree::fs::Fs>);
+        let oracle = Arc::new(TimestampOracle::new());
+        let engine = StorageEngine::open_with_oracle(&config, oracle.clone())?;
+        let engine = Arc::new(engine);
+        let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
+            Arc::new(OwnedLocalProposalPipeline::new(&engine));
+        Self::finish_open(&virtual_path, config, oracle, engine, pipeline)
+    }
+
     /// Initialize a database from pre-opened engine, oracle, and pipeline.
     ///
     /// Used by the server binary in cluster mode (G063): the server creates

@@ -7,17 +7,20 @@
 
 use coordinode_embed::Database;
 
-fn open_db() -> (Database, tempfile::TempDir) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = Database::open(dir.path()).expect("open db");
-    (db, dir)
+/// Logic-test fixture — uses in-memory MemFs backing. The 9 CRUD
+/// tests that DON'T verify persistence semantics use this helper.
+/// Tests that exercise open + close + reopen (persistence
+/// invariants) inline their own `Database::open(dir.path())` with
+/// a real tempdir.
+fn open_db() -> Database {
+    Database::open_in_memory().expect("open db")
 }
 
 // ── CREATE ──────────────────────────────────────────────────────────
 
 #[test]
 fn create_single_node() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     let rows = db
         .execute_cypher("CREATE (n:User {name: 'Alice'}) RETURN n")
         .expect("create");
@@ -26,7 +29,7 @@ fn create_single_node() {
 
 #[test]
 fn create_multiple_nodes() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {name: 'Alice'})")
         .expect("create a");
     db.execute_cypher("CREATE (b:User {name: 'Bob'})")
@@ -37,7 +40,7 @@ fn create_multiple_nodes() {
 
 #[test]
 fn create_node_with_single_label() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (n:Admin {name: 'Root'})")
         .expect("create");
     let rows = db
@@ -48,7 +51,7 @@ fn create_node_with_single_label() {
 
 #[test]
 fn create_node_with_various_types() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     let rows = db
         .execute_cypher(
             "CREATE (n:TypeTest {str: 'hello', int: 42, float: 3.14, bool: true}) RETURN n",
@@ -59,7 +62,7 @@ fn create_node_with_various_types() {
 
 #[test]
 fn create_relationship() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     // Verify CREATE with relationship pattern doesn't error
     let result =
         db.execute_cypher("CREATE (a:User {name: 'Alice'})-[:KNOWS]->(b:User {name: 'Bob'})");
@@ -70,7 +73,7 @@ fn create_relationship() {
 
 #[test]
 fn match_no_results() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     let rows = db
         .execute_cypher("MATCH (n:Nonexistent) RETURN n")
         .expect("match");
@@ -79,7 +82,7 @@ fn match_no_results() {
 
 #[test]
 fn match_with_where_filter() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {name: 'Alice', age: 30})")
         .expect("create a");
     db.execute_cypher("CREATE (b:User {name: 'Bob', age: 25})")
@@ -92,7 +95,7 @@ fn match_with_where_filter() {
 
 #[test]
 fn match_return_count() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:Fruit {name: 'Apple'})")
         .expect("1");
     db.execute_cypher("CREATE (b:Fruit {name: 'Banana'})")
@@ -109,7 +112,7 @@ fn match_return_count() {
 
 #[test]
 fn set_property() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (n:User {name: 'Alice'})")
         .expect("create");
     db.execute_cypher("MATCH (n:User {name: 'Alice'}) SET n.age = 30")
@@ -124,7 +127,7 @@ fn set_property() {
 
 #[test]
 fn delete_node() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (n:Temp {val: 1})")
         .expect("create");
     let before = db
@@ -140,7 +143,7 @@ fn delete_node() {
 
 #[test]
 fn detach_delete_node() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {name: 'Alice'})")
         .expect("create");
     db.execute_cypher("CREATE (b:User {name: 'Bob'})")
@@ -157,7 +160,7 @@ fn detach_delete_node() {
 /// Verifies that the targeted adj lookup (G051 fix) works for multi-edge-type graphs.
 #[test]
 fn detach_delete_cleans_multi_edge_type_graph() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     // Schema
     db.execute_cypher("CREATE (a:Person {name: 'Alice'})")
@@ -204,7 +207,7 @@ fn detach_delete_cleans_multi_edge_type_graph() {
 /// DETACH DELETE on a node with no edges works (no spurious errors).
 #[test]
 fn detach_delete_node_without_edges() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (n:Orphan {id: 1})")
         .expect("create");
     db.execute_cypher("MATCH (n:Orphan) DETACH DELETE n")
@@ -219,7 +222,7 @@ fn detach_delete_node_without_edges() {
 
 #[test]
 fn merge_create_when_not_exists() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("MERGE (n:Config {key: 'timeout', value: '30'})")
         .expect("merge");
     let rows = db
@@ -230,7 +233,7 @@ fn merge_create_when_not_exists() {
 
 #[test]
 fn merge_no_duplicate() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("MERGE (n:Config {key: 'timeout'})")
         .expect("merge 1");
     db.execute_cypher("MERGE (n:Config {key: 'timeout'})")
@@ -248,7 +251,7 @@ fn merge_no_duplicate() {
 /// - Idempotent: second run finds existing path, does not create duplicates
 #[test]
 fn merge_relationship_standalone() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     // First run — creates both nodes and the edge
     db.execute_cypher(
@@ -310,7 +313,7 @@ fn data_survives_close_reopen() {
 
 #[test]
 fn map_projection_shorthand() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (n:User {name: 'Alice', age: 30})")
         .expect("create");
 
@@ -341,7 +344,7 @@ fn map_projection_shorthand() {
 
 #[test]
 fn map_projection_with_computed_field() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (n:User {name: 'Bob', age: 25})")
         .expect("create");
 
@@ -371,7 +374,7 @@ fn map_projection_with_computed_field() {
 fn read_concern_snapshot_pins_to_timestamp() {
     use coordinode_core::txn::read_concern::{ReadConcern, ReadConcernLevel};
 
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     // Write v1 of a node
     db.execute_cypher("CREATE (u:User {name: 'alice', version: 1})")
@@ -437,7 +440,7 @@ fn read_concern_snapshot_pins_to_timestamp() {
 fn read_concern_session_level() {
     use coordinode_core::txn::read_concern::ReadConcernLevel;
 
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     // Default is Local
     assert_eq!(db.read_concern(), ReadConcernLevel::Local);
@@ -473,7 +476,7 @@ fn read_concern_session_level() {
 fn write_concern_levels() {
     use coordinode_core::txn::write_concern::WriteConcernLevel;
 
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     // Default is Majority
     assert_eq!(db.write_concern(), WriteConcernLevel::Majority);
@@ -544,7 +547,7 @@ fn write_concern_causal_validation() {
 fn write_concern_journal_and_full_api() {
     use coordinode_core::txn::write_concern::{WriteConcern, WriteConcernLevel};
 
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     // Set full write concern with journal gate
     let wc = WriteConcern {
@@ -587,7 +590,7 @@ fn write_concern_journal_and_full_api() {
 /// cleanup loops that treat in/out edges as separate sets.
 #[test]
 fn detach_delete_node_with_self_loop() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:Person {name: 'narcissist'})-[:LIKES]->(a)")
         .expect("create self-loop");
 
@@ -621,7 +624,7 @@ fn detach_delete_node_with_self_loop() {
 /// outgoing adjacency from both endpoints.
 #[test]
 fn detach_delete_node_with_both_directions() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})\
                   -[:KNOWS]->(c:Person {name: 'Charlie'})",
@@ -656,7 +659,7 @@ fn detach_delete_node_with_both_directions() {
 /// are unaffected.
 #[test]
 fn detach_delete_source_node_clears_all_outgoing_edges() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     // Multi-statement seeding: create hub then attach 3 targets one by one.
     // Our Cypher impl may not support the multi-path comma CREATE syntax
     // for back-references to the same variable; this form avoids that.
@@ -690,7 +693,7 @@ fn detach_delete_source_node_clears_all_outgoing_edges() {
 /// any existing node with that label.
 #[test]
 fn merge_empty_property_pattern_matches_existing() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (n:Singleton {id: 1})")
         .expect("seed");
     db.execute_cypher("MERGE (s:Singleton)")
@@ -710,7 +713,7 @@ fn merge_empty_property_pattern_matches_existing() {
 /// `WHERE n.prop = NULL` must NEVER match anything per Cypher semantics.
 #[test]
 fn where_equals_null_never_matches_per_cypher_spec() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (n:Item {name: 'a', tag: 'red'})")
         .expect("seed a");
     db.execute_cypher("CREATE (n:Item {name: 'b'})")
@@ -740,7 +743,7 @@ fn where_equals_null_never_matches_per_cypher_spec() {
 /// to every UI doing `n.user.profile.avatar`.
 #[test]
 fn dot_notation_missing_path_returns_null() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (n:Doc {title: 't', config: {a: 1}})")
         .expect("create");
 
@@ -766,7 +769,7 @@ fn dot_notation_missing_path_returns_null() {
 /// every workflow that uses dot-notation to update one field.
 #[test]
 fn document_path_set_preserves_sibling_keys() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (n:Doc {id: 1, config: {host: 'a', port: 80, tls: true}})")
         .expect("seed");
 
@@ -791,7 +794,7 @@ fn document_path_set_preserves_sibling_keys() {
 /// these properties equal these values", not "set them".)
 #[test]
 fn merge_match_does_not_silently_overwrite_existing_properties() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (u:User {email: 'a@x.com', age: 30})")
         .expect("seed");
     db.execute_cypher("MERGE (u:User {email: 'a@x.com'})")
@@ -815,7 +818,7 @@ fn merge_match_does_not_silently_overwrite_existing_properties() {
 /// surviving node's properties and the non-survivor is gone.
 #[test]
 fn merge_nodes_default_keep_first_drops_non_survivor() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com', name: 'Alice'})")
         .expect("seed a");
     db.execute_cypher("CREATE (b:User {email: 'b@x.com', name: 'Bob'})")
@@ -844,7 +847,7 @@ fn merge_nodes_default_keep_first_drops_non_survivor() {
 /// `KEEP LAST` overrides target's properties with source's where keys overlap.
 #[test]
 fn merge_nodes_keep_last_overwrites_target_props() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com', score: 1})")
         .expect("seed a");
     db.execute_cypher("CREATE (b:User {email: 'b@x.com', score: 99})")
@@ -871,7 +874,7 @@ fn merge_nodes_keep_last_overwrites_target_props() {
 /// `COALESCE` strategy: source fills only properties absent on target.
 #[test]
 fn merge_nodes_coalesce_fills_missing_only() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com', age: 30})")
         .expect("seed a");
     db.execute_cypher("CREATE (b:User {email: 'b@x.com', age: 99, city: 'Berlin'})")
@@ -905,7 +908,7 @@ fn merge_nodes_coalesce_fills_missing_only() {
 /// `ON CONFLICT SET` evaluates per-property expressions against the row.
 #[test]
 fn merge_nodes_on_conflict_set_expressions() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com', score: 5})")
         .expect("seed a");
     db.execute_cypher("CREATE (b:User {email: 'b@x.com', score: 12})")
@@ -932,7 +935,7 @@ fn merge_nodes_on_conflict_set_expressions() {
 /// Outgoing edges of the non-survivor are re-pointed to the target.
 #[test]
 fn merge_nodes_transfers_outgoing_edges() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .expect("seed a");
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -968,7 +971,7 @@ fn merge_nodes_transfers_outgoing_edges() {
 /// Incoming edges are re-pointed: x→b becomes x→a.
 #[test]
 fn merge_nodes_transfers_incoming_edges() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .expect("seed a");
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -1003,7 +1006,7 @@ fn merge_nodes_transfers_incoming_edges() {
 /// Self-loop b→b becomes target→target on merge.
 #[test]
 fn merge_nodes_self_loop_becomes_target_self_loop() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .expect("seed a");
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -1027,7 +1030,7 @@ fn merge_nodes_self_loop_becomes_target_self_loop() {
 /// is a no-op rather than an error.
 #[test]
 fn merge_nodes_idempotent_when_source_missing() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .expect("seed a");
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -1054,7 +1057,7 @@ fn merge_nodes_idempotent_when_source_missing() {
 /// `INTO b` makes b the surviving node and a the dropped one.
 #[test]
 fn merge_nodes_into_b_keeps_b() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .expect("seed a");
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -1078,7 +1081,7 @@ fn merge_nodes_into_b_keeps_b() {
 /// `KEEP BOTH`, after merge, a has TWO outgoing :KNOWS edges to c.
 #[test]
 fn merge_nodes_duplicate_keep_both_creates_parallel_edge() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .expect("seed a");
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -1122,7 +1125,7 @@ fn merge_nodes_duplicate_keep_both_creates_parallel_edge() {
 /// Error when INTO target refers to a variable not bound to one of (a, b).
 #[test]
 fn merge_nodes_rejects_unbound_target() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .expect("seed a");
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -1144,7 +1147,7 @@ fn merge_nodes_rejects_unbound_target() {
 /// this is the realistic retry-after-success scenario.
 #[test]
 fn merge_nodes_re_execution_with_no_b_is_clean_noop() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .expect("seed a");
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -1171,7 +1174,7 @@ fn merge_nodes_re_execution_with_no_b_is_clean_noop() {
 /// edge to the same peer, drop the non-survivor's edge entirely.
 #[test]
 fn merge_nodes_duplicate_keep_target_drops_source_edge() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .unwrap();
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -1217,7 +1220,7 @@ fn merge_nodes_duplicate_keep_target_drops_source_edge() {
 /// nulls on the target-side edge.
 #[test]
 fn merge_nodes_duplicate_merge_properties_coalesces_edge_facets() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .unwrap();
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -1267,7 +1270,7 @@ fn merge_nodes_duplicate_merge_properties_coalesces_edge_facets() {
 /// node record is dropped. Catches the index-leak bug.
 #[test]
 fn merge_nodes_releases_unique_index_entry_of_dropped_source() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE UNIQUE INDEX idx_user_email ON :User(email)")
         .expect("create unique index");
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
@@ -1295,7 +1298,7 @@ fn merge_nodes_releases_unique_index_entry_of_dropped_source() {
 /// index — old value's entry released, new value's entry registered.
 #[test]
 fn merge_nodes_keep_last_updates_btree_index() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE UNIQUE INDEX idx_user_handle ON :User(handle)")
         .expect("create unique index");
     db.execute_cypher("CREATE (a:User {handle: 'a_handle'})")
@@ -1330,7 +1333,7 @@ fn merge_nodes_keep_last_updates_btree_index() {
 /// "INTO a" semantics — labels of the surviving node win.
 #[test]
 fn merge_nodes_preserves_target_labels_only() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:Person {id: 1})").unwrap();
     db.execute_cypher("CREATE (b:Account {id: 2})").unwrap();
 
@@ -1359,7 +1362,7 @@ fn merge_nodes_preserves_target_labels_only() {
 /// edgeprop record is left under the old (b,b) key.
 #[test]
 fn merge_nodes_self_loop_carries_edge_properties() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .unwrap();
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -1392,7 +1395,7 @@ fn merge_nodes_self_loop_carries_edge_properties() {
 /// regressions where the `a` variable would lose its row column after MERGE.
 #[test]
 fn merge_nodes_passes_target_binding_to_return() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com', age: 30})")
         .unwrap();
     db.execute_cypher("CREATE (b:User {email: 'b@x.com', city: 'Berlin'})")
@@ -1425,7 +1428,7 @@ fn merge_nodes_passes_target_binding_to_return() {
 fn merge_nodes_strict_schema_rejects_unknown_source_property() {
     use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
 
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     let mut schema = LabelSchema::new_node_id("Customer");
     schema.set_mode(SchemaMode::Strict);
@@ -1471,7 +1474,7 @@ fn merge_nodes_strict_schema_rejects_unknown_source_property() {
 /// This is the canonical dedup case for graphs with mutual links.
 #[test]
 fn merge_nodes_edge_between_source_and_target_becomes_self_loop() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .unwrap();
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -1504,7 +1507,7 @@ fn merge_nodes_edge_between_source_and_target_becomes_self_loop() {
 /// outgoing cross-link cases collapse cleanly.
 #[test]
 fn merge_nodes_edge_target_to_source_becomes_self_loop() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .unwrap();
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -1531,7 +1534,7 @@ fn merge_nodes_edge_target_to_source_becomes_self_loop() {
 /// that the per-direction posting-list iteration handles fan-out correctly.
 #[test]
 fn merge_nodes_transfers_multiple_outgoing_peers() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .unwrap();
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -1566,7 +1569,7 @@ fn merge_nodes_validated_schema_rejects_type_mismatch() {
     use coordinode_core::graph::types::Value;
     use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
 
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     let mut invoice = LabelSchema::new_node_id("Invoice");
     invoice.set_mode(SchemaMode::Validated);
@@ -1611,7 +1614,7 @@ fn merge_nodes_validated_schema_rejects_type_mismatch() {
 /// edges must still drop the source cleanly without touching the target.
 #[test]
 fn merge_nodes_empty_source_drops_cleanly() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com', score: 5})")
         .unwrap();
     db.execute_cypher("CREATE (b:User)").unwrap(); // bare label, no props
@@ -1642,7 +1645,7 @@ fn merge_nodes_atomic_rollback_when_later_row_fails() {
     use coordinode_core::graph::types::Value;
     use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
 
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     // Target label is STRICT, declares only `name`.
     let mut user = LabelSchema::new_node_id("AtomicUser");
@@ -1743,7 +1746,7 @@ fn merge_nodes_strict_rejects_source_extra_overflow() {
     use coordinode_core::graph::types::Value;
     use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
 
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     // Target STRICT — only `email` declared.
     let mut tgt = LabelSchema::new_node_id("StrictCustomer");
@@ -1796,7 +1799,7 @@ fn merge_nodes_strict_rejects_source_extra_overflow() {
 /// target's property columns.
 #[test]
 fn merge_nodes_target_binding_survives_with_clause() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com', age: 30})")
         .unwrap();
     db.execute_cypher("CREATE (b:User {email: 'b@x.com', city: 'Berlin'})")
@@ -1824,7 +1827,7 @@ fn merge_nodes_target_binding_survives_with_clause() {
 /// index — otherwise nearest-neighbour searches return stale results.
 #[test]
 fn merge_nodes_updates_vector_index_on_target() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE VECTOR INDEX item_emb ON :Item(embedding) \
@@ -1868,7 +1871,7 @@ fn merge_nodes_updates_vector_index_on_target() {
 /// composes through the executor pipeline.
 #[test]
 fn merge_nodes_chained_two_merges_into_single_target() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com', tag: 'A'})")
         .unwrap();
     db.execute_cypher("CREATE (b:User {email: 'b@x.com', city: 'Berlin'})")
@@ -1908,7 +1911,7 @@ fn merge_nodes_chained_two_merges_into_single_target() {
 /// barrier (fix landed alongside the the trigger architecture trigger DDL commit).
 #[test]
 fn baseline_with_a_return_a_prop() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {age: 30, name: 'Alice'})")
         .unwrap();
     let rows = db
@@ -1930,7 +1933,7 @@ fn baseline_with_a_return_a_prop() {
 /// future "preserve by default" silent regression would be caught.
 #[test]
 fn merge_nodes_without_transfer_drops_source_edges() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .unwrap();
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -1974,7 +1977,7 @@ fn merge_nodes_without_transfer_drops_source_edges() {
 #[test]
 fn merge_nodes_temporal_edge_transfers_all_versions() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE EDGE TYPE WORKS_AT TEMPORAL \
          WITH (valid_from: TIMESTAMP, valid_to: TIMESTAMP, role: STRING)",
@@ -2031,7 +2034,7 @@ fn merge_nodes_temporal_edge_transfers_all_versions() {
 /// edgeprop records, both must rehome on the target.
 #[test]
 fn merge_nodes_transfers_multiple_edge_types_between_same_pair() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .unwrap();
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -2080,7 +2083,7 @@ fn merge_nodes_transfers_multiple_edge_types_between_same_pair() {
 /// with the rest of the write pipeline.
 #[test]
 fn merge_nodes_followed_by_set_in_same_query() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .unwrap();
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -2112,7 +2115,7 @@ fn merge_nodes_followed_by_set_in_same_query() {
 /// the executor pipelines CREATE outputs into a downstream MATCH.
 #[test]
 fn merge_nodes_after_create_in_same_query() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     // First CREATE seed nodes that we don't intend to merge.
     db.execute_cypher("CREATE (a:User {email: 'a@x.com', score: 1})")
@@ -2140,7 +2143,10 @@ fn merge_nodes_after_create_in_same_query() {
 #[test]
 fn merge_nodes_updates_text_index_on_target() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    // CREATE TEXT INDEX needs a real FS path for Tantivy — keep
+    // this test on disk regardless of the env matrix default.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open db");
 
     db.execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
         .expect("create text index");
@@ -2185,7 +2191,7 @@ fn merge_nodes_updates_text_index_on_target() {
 /// or panic).
 #[test]
 fn merge_nodes_errors_clearly_when_target_missing() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .unwrap();
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -2223,7 +2229,7 @@ fn merge_nodes_errors_clearly_when_target_missing() {
 /// where a downstream DELETE would target a stale id.
 #[test]
 fn merge_nodes_followed_by_delete_in_same_query() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .unwrap();
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -2254,7 +2260,7 @@ fn merge_nodes_strict_accepts_compliant_merge() {
     use coordinode_core::graph::types::Value;
     use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
 
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     // STRICT schema: declares email, name. Both sources stay within these
     // declared keys, so the merge result MUST be accepted.
@@ -2296,7 +2302,7 @@ fn merge_nodes_strict_accepts_compliant_merge() {
 /// per-peer transfer loop.
 #[test]
 fn merge_nodes_self_loop_and_other_peers_mixed_transfer() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
         .unwrap();
     db.execute_cypher("CREATE (b:User {email: 'b@x.com'})")
@@ -2361,7 +2367,7 @@ fn merge_nodes_self_loop_and_other_peers_mixed_transfer() {
 #[test]
 fn trigger_ddl_create_show_alter_drop_lifecycle() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER audit ON :User CREATE | UPDATE | DELETE AFTER COMMIT \
@@ -2409,7 +2415,7 @@ fn trigger_ddl_create_show_alter_drop_lifecycle() {
 /// conflict error; no partial state should leak into the index.
 #[test]
 fn trigger_create_rejects_duplicate_name() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE TRIGGER t ON :User CREATE BEFORE COMMIT \
          EXECUTE CREATE (a:Log)",
@@ -2433,7 +2439,7 @@ fn trigger_create_rejects_duplicate_name() {
 /// DROP / ALTER of a non-existent trigger surfaces a clear "no such" error.
 #[test]
 fn trigger_drop_and_alter_reject_unknown_name() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     let drop_err = db.execute_cypher("DROP TRIGGER ghost").unwrap_err();
     assert!(
         format!("{drop_err}").contains("no such trigger"),
@@ -2453,7 +2459,7 @@ fn trigger_drop_and_alter_reject_unknown_name() {
 #[test]
 fn trigger_alter_set_body_and_on_error() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE TRIGGER t ON :User CREATE AFTER COMMIT \
          EXECUTE CREATE (e:Orig) \
@@ -2483,7 +2489,7 @@ fn trigger_alter_set_body_and_on_error() {
 #[test]
 fn trigger_label_vs_edge_target_disjoint() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE TRIGGER on_invoice_node ON :Invoice CREATE BEFORE COMMIT \
          EXECUTE CREATE (a:NodeLog)",
@@ -2514,7 +2520,7 @@ fn trigger_label_vs_edge_target_disjoint() {
 /// persistence path is testable now and would catch a serde-shape regression.
 #[test]
 fn trigger_cascade_overrides_persist_through_show() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE TRIGGER tight ON :User CREATE AFTER COMMIT \
          EXECUTE CREATE (a:L) \
@@ -2548,7 +2554,7 @@ fn trigger_cascade_overrides_persist_through_show() {
 /// as the regression guard against an accidental O(N) DDL path.
 #[test]
 fn trigger_bulk_registration_100_triggers() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     for i in 0..100u32 {
         db.execute_cypher(&format!(
             "CREATE TRIGGER bulk_{i} ON :User CREATE AFTER COMMIT \
@@ -2579,7 +2585,7 @@ fn trigger_bulk_registration_100_triggers() {
 #[test]
 fn trigger_lookup_excludes_disabled() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE TRIGGER active_one ON :User CREATE AFTER COMMIT \
          EXECUTE CREATE (a:L)",
@@ -2609,7 +2615,7 @@ fn trigger_lookup_excludes_disabled() {
 #[test]
 fn trigger_drop_then_recreate_same_name_works() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE TRIGGER reuse ON :User CREATE AFTER COMMIT \
          EXECUTE CREATE (a:OldVersion)",
@@ -2640,7 +2646,7 @@ fn trigger_drop_then_recreate_same_name_works() {
 #[test]
 fn trigger_set_body_preserves_other_fields() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE TRIGGER t ON :User CREATE AFTER COMMIT \
          EXECUTE CREATE (a:Original) \
@@ -2713,7 +2719,7 @@ fn trigger_drop_clears_secondary_index_entries() {
         encode_trigger_index_key, encode_trigger_key, TriggerTargetSchema,
     };
     use coordinode_storage::engine::partition::Partition;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER cleanup ON :Customer CREATE | UPDATE BEFORE COMMIT \
@@ -2797,7 +2803,7 @@ fn trigger_drop_clears_secondary_index_entries() {
 #[test]
 fn trigger_name_starting_with_index_word_still_listed() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE TRIGGER _index_collision ON :User CREATE AFTER COMMIT \
          EXECUTE CREATE (a:L)",
@@ -2823,7 +2829,7 @@ fn trigger_name_starting_with_index_word_still_listed() {
 /// of `0` must work so the runtime enforcement gate is in place.
 #[test]
 fn trigger_cascade_limit_zero_parses_and_persists() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE TRIGGER strict_zero ON :User CREATE AFTER COMMIT \
          EXECUTE CREATE (a:L) \
@@ -2852,7 +2858,7 @@ fn trigger_cascade_limit_zero_parses_and_persists() {
 /// drop without manual storage surgery.
 #[test]
 fn trigger_create_rejects_invalid_body_source() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     // `RETURN` with nothing after it is a syntax error. The parser path
     // through CREATE TRIGGER consumes `EXECUTE` then re-parses the body
     // at DDL time and must reject.
@@ -2910,7 +2916,7 @@ fn trigger_create_rejects_invalid_body_source() {
 #[test]
 fn with_rename_passthrough_property_columns() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {age: 30, name: 'Alice'})")
         .unwrap();
 
@@ -2931,7 +2937,7 @@ fn with_rename_passthrough_property_columns() {
 #[test]
 fn with_multi_variable_passthrough() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {age: 30})").unwrap();
     db.execute_cypher("CREATE (b:User {age: 40})").unwrap();
 
@@ -2956,7 +2962,7 @@ fn with_multi_variable_passthrough() {
 #[test]
 fn with_passthrough_followed_by_where() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {age: 18})").unwrap();
     db.execute_cypher("CREATE (b:User {age: 25})").unwrap();
     db.execute_cypher("CREATE (c:User {age: 40})").unwrap();
@@ -2984,7 +2990,7 @@ fn with_passthrough_followed_by_where() {
 #[test]
 fn with_distinct_passthrough() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (a:User {id: 1, name: 'Alice'})")
         .unwrap();
     db.execute_cypher("CREATE (b:User {id: 1, name: 'Alice'})")
@@ -3033,7 +3039,7 @@ fn disabled_trigger_persists_across_restart() {
 /// time — the grammar requires `trigger_body_clause+` (one or more).
 #[test]
 fn trigger_create_rejects_empty_body() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     let result = db.execute_cypher("CREATE TRIGGER empty ON :User CREATE AFTER COMMIT EXECUTE");
     assert!(
         result.is_err(),
@@ -3049,7 +3055,7 @@ fn trigger_create_rejects_empty_body() {
 #[test]
 fn trigger_before_commit_audit_fires_on_create() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER audit_user ON :User CREATE BEFORE COMMIT \
@@ -3092,7 +3098,7 @@ fn trigger_before_commit_audit_fires_on_create() {
 /// originating transaction. No node persists after the abort.
 #[test]
 fn trigger_before_commit_propagate_aborts_caller() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     // The trigger body fails at fire time because the body references an
     // unparseable Cypher snippet — installed via ALTER SET EXECUTE which
@@ -3137,7 +3143,7 @@ fn trigger_before_commit_propagate_aborts_caller() {
 /// the CascadeOverflow chain is attached for diagnostics.
 #[test]
 fn trigger_before_commit_cascade_overflow() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     // A→B cycle: trigger on :A writes to :B, trigger on :B writes to :A.
     db.execute_cypher(
@@ -3182,7 +3188,7 @@ fn trigger_before_commit_cascade_overflow() {
 /// guard.
 #[test]
 fn trigger_before_commit_only_fires_on_matching_label() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER only_user ON :User CREATE BEFORE COMMIT \
@@ -3205,7 +3211,7 @@ fn trigger_before_commit_only_fires_on_matching_label() {
 /// Disabled BEFORE COMMIT trigger must NOT fire even on matching event.
 #[test]
 fn trigger_before_commit_disabled_does_not_fire() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER paused ON :User CREATE BEFORE COMMIT \
@@ -3239,7 +3245,7 @@ fn trigger_before_commit_disabled_does_not_fire() {
 #[test]
 fn trigger_before_commit_multi_label_fires_each_label_trigger() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER on_user ON :User CREATE BEFORE COMMIT \
@@ -3282,7 +3288,7 @@ fn trigger_before_commit_multi_label_fires_each_label_trigger() {
 #[test]
 fn trigger_before_commit_after_param_is_available_as_map() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER capture ON :Person CREATE BEFORE COMMIT \
@@ -3314,7 +3320,7 @@ fn trigger_before_commit_after_param_is_available_as_map() {
 /// every enabled one must fire on each matching mutation.
 #[test]
 fn trigger_before_commit_multiple_triggers_same_label_all_fire() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     for i in 0..3u32 {
         db.execute_cypher(&format!(
@@ -3339,7 +3345,7 @@ fn trigger_before_commit_multiple_triggers_same_label_all_fire() {
 #[test]
 fn trigger_before_commit_delete_fires_and_carries_before() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER on_delete ON :User DELETE BEFORE COMMIT \
@@ -3375,7 +3381,7 @@ fn trigger_before_commit_delete_fires_and_carries_before() {
 #[test]
 fn trigger_before_commit_update_fires_with_before_and_after() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER on_update ON :Counter UPDATE BEFORE COMMIT \
@@ -3409,7 +3415,7 @@ fn trigger_before_commit_update_fires_with_before_and_after() {
 #[test]
 fn trigger_before_commit_update_fires_once_per_node_per_statement() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER count_fires ON :Item UPDATE BEFORE COMMIT \
@@ -3439,7 +3445,7 @@ fn trigger_before_commit_update_fires_once_per_node_per_statement() {
 #[test]
 fn trigger_before_commit_edge_create_fires_with_endpoints() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER on_follow ON [:FOLLOWS] CREATE BEFORE COMMIT \
@@ -3476,7 +3482,7 @@ fn trigger_before_commit_edge_create_fires_with_endpoints() {
 /// segments `n:X` vs `e:X` are disjoint per ADR but this guards the wiring).
 #[test]
 fn trigger_node_label_does_not_fire_on_same_named_edge_type() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER node_only ON :SharedName CREATE BEFORE COMMIT \
@@ -3509,7 +3515,7 @@ fn trigger_node_label_does_not_fire_on_same_named_edge_type() {
 #[test]
 fn trigger_before_commit_edge_update_fires_on_set_with_before_and_after() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER on_edge_set ON [:FOLLOWS] UPDATE BEFORE COMMIT \
@@ -3558,7 +3564,7 @@ fn trigger_before_commit_edge_update_fires_on_set_with_before_and_after() {
 #[test]
 fn trigger_before_commit_edge_update_fires_once_per_edge_per_statement() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER edge_fire_count ON [:FOLLOWS] UPDATE BEFORE COMMIT \
@@ -3596,7 +3602,7 @@ fn trigger_before_commit_edge_update_fires_once_per_edge_per_statement() {
 /// edge-update wiring against accidental fan-out.
 #[test]
 fn trigger_edge_update_does_not_fire_on_node_set() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER follow_update ON [:FOLLOWS] UPDATE BEFORE COMMIT \
@@ -3622,7 +3628,7 @@ fn trigger_edge_update_does_not_fire_on_node_set() {
 #[test]
 fn trigger_before_commit_merge_node_fires_create_on_miss() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER on_merge_user ON :User CREATE BEFORE COMMIT \
@@ -3647,7 +3653,7 @@ fn trigger_before_commit_merge_node_fires_create_on_miss() {
 /// (ON MATCH SET fires UPDATE; that is covered by the node UPDATE path.)
 #[test]
 fn trigger_merge_node_does_not_fire_create_on_hit() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher("CREATE (u:User {name: 'Alice'})")
         .unwrap();
@@ -3672,7 +3678,7 @@ fn trigger_merge_node_does_not_fire_create_on_hit() {
 #[test]
 fn trigger_before_commit_merge_edge_fires_create_on_miss() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER on_merge_follow ON [:FOLLOWS] CREATE BEFORE COMMIT \
@@ -3703,7 +3709,7 @@ fn trigger_before_commit_merge_edge_fires_create_on_miss() {
 /// MERGE that hits an existing edge must NOT fire a CREATE trigger.
 #[test]
 fn trigger_merge_edge_does_not_fire_create_on_hit() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher("CREATE (a:User {id: 1})").unwrap();
     db.execute_cypher("CREATE (b:User {id: 2})").unwrap();
@@ -3732,7 +3738,7 @@ fn trigger_merge_edge_does_not_fire_create_on_hit() {
 #[test]
 fn trigger_before_commit_detach_delete_cascades_edge_delete_triggers() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER on_follow_delete ON [:FOLLOWS] DELETE BEFORE COMMIT \
@@ -3783,7 +3789,7 @@ fn trigger_before_commit_detach_delete_cascades_edge_delete_triggers() {
 #[test]
 fn trigger_before_commit_explicit_delete_edge_fires() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER on_follow_delete ON [:FOLLOWS] DELETE BEFORE COMMIT \
@@ -3823,7 +3829,7 @@ fn trigger_before_commit_explicit_delete_edge_fires() {
 #[test]
 fn trigger_before_commit_explicit_delete_temporal_edge_fires_per_version() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE EDGE TYPE WORKS_AT TEMPORAL WITH ( \
@@ -3880,7 +3886,7 @@ fn trigger_before_commit_explicit_delete_temporal_edge_fires_per_version() {
 /// not mutate the edge.
 #[test]
 fn trigger_edge_update_does_not_fire_when_set_is_non_mutating() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER on_follow_update ON [:FOLLOWS] UPDATE BEFORE COMMIT \
@@ -3917,7 +3923,7 @@ fn trigger_edge_update_does_not_fire_when_set_is_non_mutating() {
 #[test]
 fn trigger_before_commit_edge_update_temporal_fires_per_version() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE EDGE TYPE WORKS_AT TEMPORAL WITH ( \
@@ -3987,7 +3993,7 @@ fn trigger_before_commit_edge_update_temporal_fires_per_version() {
 #[test]
 fn trigger_merge_on_create_set_fires_create_then_update() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER user_create ON :User CREATE BEFORE COMMIT \
@@ -4024,7 +4030,7 @@ fn trigger_merge_on_create_set_fires_create_then_update() {
 #[test]
 fn trigger_merge_on_match_set_fires_update_only() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher("CREATE (u:User {name: 'Alice'})")
         .unwrap();
@@ -4057,7 +4063,7 @@ fn trigger_merge_on_match_set_fires_update_only() {
 #[test]
 fn trigger_before_commit_attach_document_fires_source_node_delete() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER on_addr_delete ON :Address DELETE BEFORE COMMIT \
@@ -4092,7 +4098,7 @@ fn trigger_before_commit_attach_document_fires_source_node_delete() {
 #[test]
 fn trigger_before_commit_attach_document_cascades_orphan_edge_deletes() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER on_link_delete ON [:LINK] DELETE BEFORE COMMIT \
@@ -4153,7 +4159,7 @@ fn trigger_before_commit_attach_document_cascades_orphan_edge_deletes() {
 #[test]
 fn trigger_before_commit_remove_property_fires_update() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER on_user_update ON :User UPDATE BEFORE COMMIT \
@@ -4186,7 +4192,7 @@ fn trigger_before_commit_remove_property_fires_update() {
 #[test]
 fn trigger_before_commit_remove_label_fires_update() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER on_user_update ON :User UPDATE BEFORE COMMIT \
@@ -4210,7 +4216,7 @@ fn trigger_before_commit_remove_label_fires_update() {
 #[test]
 fn trigger_before_commit_remove_fires_once_per_node_per_statement() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER count_fires ON :Item UPDATE BEFORE COMMIT \
@@ -4240,7 +4246,7 @@ fn trigger_before_commit_remove_fires_once_per_node_per_statement() {
 #[test]
 fn trigger_before_commit_upsert_on_create_fires_node_create() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER user_create ON :User CREATE BEFORE COMMIT \
@@ -4266,7 +4272,7 @@ fn trigger_before_commit_upsert_on_create_fires_node_create() {
 #[test]
 fn trigger_before_commit_upsert_on_create_fires_edge_create() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER follow_create ON [:FOLLOWS] CREATE BEFORE COMMIT \
@@ -4298,7 +4304,7 @@ fn trigger_before_commit_upsert_on_create_fires_edge_create() {
 #[test]
 fn trigger_before_commit_detach_document_fires_node_and_edge_create() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER addr_create ON :Address CREATE BEFORE COMMIT \
@@ -4353,7 +4359,7 @@ fn trigger_before_commit_detach_document_fires_node_and_edge_create() {
 #[test]
 fn trigger_before_commit_merge_nodes_fires_source_delete() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER user_delete ON :User DELETE BEFORE COMMIT \
@@ -4393,7 +4399,7 @@ fn trigger_before_commit_merge_nodes_fires_source_delete() {
 #[test]
 fn trigger_before_commit_merge_nodes_fires_target_update() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER user_update ON :User UPDATE BEFORE COMMIT \
@@ -4437,7 +4443,7 @@ fn trigger_before_commit_merge_nodes_fires_target_update() {
 #[test]
 fn trigger_before_commit_merge_nodes_cascades_orphan_edge_deletes() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER edge_delete ON [:FOLLOWS] DELETE BEFORE COMMIT \
@@ -4482,7 +4488,7 @@ fn trigger_before_commit_merge_nodes_cascades_orphan_edge_deletes() {
 #[test]
 fn trigger_edge_update_propagate_aborts_set() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     // Reject node: STRICT label with only `action` allowed. Trigger body
     // writes a forbidden field → execution error inside trigger → SET
@@ -4538,7 +4544,7 @@ fn trigger_edge_update_propagate_aborts_set() {
 #[test]
 fn create_node_type_minimal_persists_schema() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     let rows = db
         .execute_cypher("CREATE NODE TYPE Widget")
@@ -4554,7 +4560,7 @@ fn create_node_type_minimal_persists_schema() {
 #[test]
 fn create_node_type_temporal_sets_flag() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     let rows = db
         .execute_cypher("CREATE NODE TYPE Person TEMPORAL")
@@ -4567,7 +4573,7 @@ fn create_node_type_temporal_sets_flag() {
 #[test]
 fn create_node_type_with_properties() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     let rows = db
         .execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING NOT NULL, age: INT)")
@@ -4581,7 +4587,7 @@ fn create_node_type_with_properties() {
 /// silently violate ADR-027's immutability invariant.
 #[test]
 fn create_node_type_rejects_duplicate() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher("CREATE NODE TYPE Widget")
         .expect("first CREATE");
@@ -4599,7 +4605,7 @@ fn create_node_type_rejects_duplicate() {
 /// it as a user property must be rejected at DDL time.
 #[test]
 fn create_node_type_rejects_reserved_ingestion_ts() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     let err = db
         .execute_cypher("CREATE NODE TYPE Foo TEMPORAL WITH (__ingestion_ts__: TIMESTAMP)")
         .expect_err("reserved name must be rejected");
@@ -4617,7 +4623,7 @@ fn create_node_type_rejects_reserved_ingestion_ts() {
 /// This test verifies the declaration is accepted on a temporal node label.
 #[test]
 fn create_node_type_allows_valid_from_to_declaration() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE NODE TYPE Person TEMPORAL WITH (valid_from: TIMESTAMP NOT NULL, valid_to: TIMESTAMP)",
     )
@@ -4630,7 +4636,7 @@ fn create_node_type_allows_valid_from_to_declaration() {
 /// rejected at DDL time for consistency.
 #[test]
 fn create_node_type_rejects_other_reserved_names() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     for reserved in ["__src__", "__tgt__", "__type__"] {
         let cypher = format!("CREATE NODE TYPE Foo_{reserved} WITH ({reserved}: STRING)");
         let result = db.execute_cypher(&cypher);
@@ -4648,7 +4654,7 @@ fn create_node_type_rejects_other_reserved_names() {
 /// rely on the invariant.
 #[test]
 fn create_node_on_temporal_label_without_valid_from_rejected() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     // Declare `name` and `valid_from` so STRICT schema mode (default) does
     // not reject undeclared properties — we want to isolate the TEMPORAL
@@ -4676,7 +4682,7 @@ fn create_node_on_temporal_label_without_valid_from_rejected() {
 /// final coercion semantics).
 #[test]
 fn create_node_on_temporal_label_with_valid_from_accepted() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
         .expect("CREATE NODE TYPE Person TEMPORAL");
@@ -4690,7 +4696,7 @@ fn create_node_on_temporal_label_with_valid_from_accepted() {
 /// labels declared without TEMPORAL.
 #[test]
 fn create_node_on_non_temporal_label_does_not_require_valid_from() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher("CREATE NODE TYPE User WITH (name: STRING)")
         .expect("CREATE NODE TYPE User");
@@ -4704,7 +4710,7 @@ fn create_node_on_non_temporal_label_does_not_require_valid_from() {
 /// `temporal=true`. Implicit-label CREATEs continue to work as before.
 #[test]
 fn create_node_on_undeclared_label_does_not_require_valid_from() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (u:NeverDeclared {x: 1})")
         .expect("undeclared label without TEMPORAL: no valid_from required");
 }
@@ -4719,7 +4725,7 @@ fn create_node_on_undeclared_label_does_not_require_valid_from() {
 /// guard semantics, not schema-mode property filtering.
 #[test]
 fn create_node_multi_label_with_any_temporal_requires_valid_from() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     // Bar is TEMPORAL; Foo is left undeclared (implicit FLEXIBLE) so the
     // STRICT mode default does not reject undeclared `valid_from`.
     db.execute_cypher("CREATE NODE TYPE Bar TEMPORAL WITH (valid_from: INT)")
@@ -4751,7 +4757,7 @@ fn create_node_multi_label_with_any_temporal_requires_valid_from() {
 /// found; both-temporal must behave consistently with one-temporal.
 #[test]
 fn create_node_multi_label_both_temporal_requires_valid_from() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE TempA TEMPORAL WITH (valid_from: INT)")
         .expect("CREATE TempA");
     db.execute_cypher("CREATE NODE TYPE TempB TEMPORAL WITH (valid_from: INT)")
@@ -4771,7 +4777,7 @@ fn create_node_multi_label_both_temporal_requires_valid_from() {
 /// `__src__` / `__tgt__` / `__type__`.
 #[test]
 fn set_node_ingestion_ts_rejected() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE (n:Foo {x: 1})")
         .expect("seed node");
     let err = db
@@ -4788,7 +4794,7 @@ fn set_node_ingestion_ts_rejected() {
 /// is symmetric with the DDL-time reject in `execute_create_node_type`.
 #[test]
 fn create_node_with_ingestion_ts_literal_rejected() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     let err = db
         .execute_cypher("CREATE (n:Foo {__ingestion_ts__: 999, x: 1})")
         .expect_err("CREATE with __ingestion_ts__ literal must be rejected");
@@ -4800,7 +4806,7 @@ fn create_node_with_ingestion_ts_literal_rejected() {
 /// node without the required property (STRICT mode + NOT NULL → reject).
 #[test]
 fn create_node_type_not_null_modifier_persists() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Item WITH (name: STRING NOT NULL, qty: INT)")
         .expect("CREATE NODE TYPE Item with NOT NULL");
 
@@ -4870,7 +4876,7 @@ fn create_node_type_temporal_flag_persists_across_restart() {
 #[test]
 fn create_temporal_nodes_each_with_own_valid_from_match_returns_all() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
         .expect("CREATE NODE TYPE Person TEMPORAL");
 
@@ -4903,7 +4909,7 @@ fn create_temporal_nodes_each_with_own_valid_from_match_returns_all() {
 #[test]
 fn temporal_create_populates_ingestion_ts() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
         .expect("CREATE NODE TYPE Person TEMPORAL");
 
@@ -4941,7 +4947,7 @@ fn temporal_create_populates_ingestion_ts() {
 /// mirror of the temporal-edge guard). Zero-duration versions are bugs.
 #[test]
 fn temporal_create_rejects_inverted_or_zero_interval() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
     )
@@ -4975,7 +4981,7 @@ fn temporal_create_rejects_inverted_or_zero_interval() {
 #[test]
 fn temporal_and_non_temporal_coexist_in_same_db() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
 
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
         .expect("Person TEMPORAL");
@@ -5016,7 +5022,7 @@ fn temporal_and_non_temporal_coexist_in_same_db() {
 #[test]
 fn delete_on_temporal_node_writes_tombstone_and_closes_open_version() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
         .expect("CREATE NODE TYPE");
     db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
@@ -5062,7 +5068,7 @@ fn delete_on_temporal_node_writes_tombstone_and_closes_open_version() {
 /// machinery — hard-delete remains the semantics for non-temporal labels.
 #[test]
 fn delete_on_non_temporal_node_remains_hard_delete() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Plain WITH (name: STRING)")
         .expect("CREATE NODE TYPE Plain");
     db.execute_cypher("CREATE (n:Plain {name: 'X'})")
@@ -5087,7 +5093,7 @@ fn delete_on_non_temporal_node_remains_hard_delete() {
 #[test]
 fn delete_on_already_closed_temporal_node_is_safe() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
     )
@@ -5115,7 +5121,7 @@ fn delete_on_already_closed_temporal_node_is_safe() {
 #[test]
 fn remove_property_on_temporal_node_writes_new_version_without_prop() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, nickname: STRING, valid_from: INT)",
     )
@@ -5164,7 +5170,7 @@ fn remove_property_on_temporal_node_writes_new_version_without_prop() {
 /// are engine-managed bitemporal axis fields, not user properties.
 #[test]
 fn remove_bitemporal_axis_on_temporal_node_is_rejected() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
     )
@@ -5186,7 +5192,7 @@ fn remove_bitemporal_axis_on_temporal_node_is_rejected() {
 #[test]
 fn remove_property_on_non_temporal_node_remains_in_place() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Plain WITH (name: STRING, nickname: STRING)")
         .expect("CREATE NODE TYPE Plain");
     db.execute_cypher("CREATE (n:Plain {name: 'X', nickname: 'Y'})")
@@ -5207,7 +5213,7 @@ fn remove_property_on_non_temporal_node_remains_in_place() {
 #[test]
 fn set_nested_property_path_on_temporal_node_writes_new_version() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
         .expect("CREATE NODE TYPE");
     db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
@@ -5269,7 +5275,7 @@ fn set_nested_property_path_on_temporal_node_writes_new_version() {
 #[test]
 fn remove_nested_property_path_on_temporal_node_writes_new_version() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
         .expect("CREATE NODE TYPE");
     db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
@@ -5334,7 +5340,7 @@ fn remove_nested_property_path_on_temporal_node_writes_new_version() {
 #[test]
 fn doc_push_on_temporal_node_writes_new_version_with_append() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Bag TEMPORAL")
         .expect("CREATE NODE TYPE");
     db.execute_cypher("ALTER LABEL Bag SET SCHEMA FLEXIBLE")
@@ -5383,7 +5389,7 @@ fn doc_push_on_temporal_node_writes_new_version_with_append() {
 #[test]
 fn doc_inc_on_temporal_node_writes_new_version_with_increment() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Counter TEMPORAL")
         .expect("CREATE NODE TYPE");
     db.execute_cypher("ALTER LABEL Counter SET SCHEMA FLEXIBLE")
@@ -5431,7 +5437,7 @@ fn doc_inc_on_temporal_node_writes_new_version_with_increment() {
 #[test]
 fn multiple_nested_set_items_on_temporal_node_produce_one_new_version() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
         .expect("CREATE NODE TYPE");
     db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
@@ -5476,7 +5482,7 @@ fn multiple_nested_set_items_on_temporal_node_produce_one_new_version() {
 /// variant on `valid_to` is special-cased as "no end" (open interval).
 #[test]
 fn temporal_create_rejects_valid_to_type_mismatch() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     // FLEXIBLE label so STRICT mode doesn't reject undeclared types first
     // (we want the temporal type guard to fire, not the schema-mode guard).
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
@@ -5507,7 +5513,7 @@ fn temporal_create_rejects_valid_to_type_mismatch() {
 /// property at the byte level; this verifies the end-to-end path.
 #[test]
 fn temporal_create_accepts_negative_valid_from() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Event TEMPORAL WITH (name: STRING, valid_from: INT)")
         .expect("CREATE NODE TYPE Event TEMPORAL");
 
@@ -5550,7 +5556,7 @@ fn temporal_create_accepts_negative_valid_from() {
 #[test]
 fn traverse_into_temporal_label_materialises_all_versions() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
         .expect("CREATE NODE TYPE Person TEMPORAL");
     db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
@@ -5605,7 +5611,7 @@ fn traverse_into_temporal_label_materialises_all_versions() {
 #[test]
 fn traverse_into_non_temporal_label_still_single_row() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person WITH (name: STRING)")
         .expect("CREATE Person");
     db.execute_cypher("CREATE NODE TYPE Org WITH (name: STRING)")
@@ -5629,7 +5635,7 @@ fn traverse_into_non_temporal_label_still_single_row() {
 #[test]
 fn varlen_traverse_into_temporal_label_fans_out_versions() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
         .expect("CREATE Person");
     db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
@@ -5663,7 +5669,7 @@ fn varlen_traverse_into_temporal_label_fans_out_versions() {
 #[test]
 fn traverse_into_multi_label_temporal_target_fans_out_versions() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
         .expect("CREATE Person");
     db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
@@ -5694,7 +5700,7 @@ fn traverse_into_multi_label_temporal_target_fans_out_versions() {
 #[test]
 fn doc_pull_on_temporal_node_writes_new_version_with_removed_element() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Bag TEMPORAL")
         .expect("CREATE NODE TYPE");
     db.execute_cypher("ALTER LABEL Bag SET SCHEMA FLEXIBLE")
@@ -5739,7 +5745,7 @@ fn doc_pull_on_temporal_node_writes_new_version_with_removed_element() {
 #[test]
 fn doc_add_to_set_on_temporal_node_writes_new_version_with_dedup() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Bag TEMPORAL")
         .expect("CREATE");
     db.execute_cypher("ALTER LABEL Bag SET SCHEMA FLEXIBLE")
@@ -5775,7 +5781,7 @@ fn doc_add_to_set_on_temporal_node_writes_new_version_with_dedup() {
 #[test]
 fn merge_properties_on_temporal_node_writes_new_version() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
         .expect("CREATE");
     db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
@@ -5816,7 +5822,7 @@ fn merge_properties_on_temporal_node_writes_new_version() {
 #[test]
 fn replace_properties_on_temporal_node_writes_new_version_with_full_replace() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
         .expect("CREATE");
     db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
@@ -5853,7 +5859,7 @@ fn replace_properties_on_temporal_node_writes_new_version_with_full_replace() {
 /// with an empty path vector.
 #[test]
 fn remove_empty_property_path_on_temporal_node_is_rejected() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
         .expect("CREATE");
     db.execute_cypher("CREATE (p:Person {name: 'A', valid_from: 100})")
@@ -5878,7 +5884,7 @@ fn remove_empty_property_path_on_temporal_node_is_rejected() {
 #[test]
 fn attach_document_with_multi_segment_path_into_temporal_target() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
         .expect("CREATE");
     db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
@@ -5924,7 +5930,7 @@ fn attach_document_with_multi_segment_path_into_temporal_target() {
 /// new node land at a non-temporal key silently?
 #[test]
 fn empirical_detach_document_into_temporal_label() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Address TEMPORAL WITH (city: STRING, valid_from: INT)")
         .expect("CREATE NODE TYPE Address TEMPORAL");
 
@@ -5971,7 +5977,7 @@ fn empirical_detach_document_into_temporal_label() {
 /// node stored at the 25-byte temporal key?
 #[test]
 fn empirical_attach_document_from_temporal_source() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Address TEMPORAL WITH (city: STRING, valid_from: INT)")
         .expect("CREATE NODE TYPE Address TEMPORAL");
 
@@ -6020,7 +6026,7 @@ fn empirical_attach_document_from_temporal_source() {
 #[test]
 fn attach_document_into_temporal_target_writes_new_version_with_property() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
         .expect("CREATE NODE TYPE Person TEMPORAL");
     db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
@@ -6062,7 +6068,7 @@ fn attach_document_into_temporal_target_writes_new_version_with_property() {
 #[test]
 fn detach_document_from_temporal_source_writes_new_version_without_property() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
         .expect("CREATE NODE TYPE Person TEMPORAL");
     db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
@@ -6136,7 +6142,7 @@ fn detach_document_from_temporal_source_writes_new_version_without_property() {
 /// temporal-flagged label's node under the non-temporal key.
 #[test]
 fn empirical_upsert_on_create_into_temporal_label() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
         .expect("CREATE NODE TYPE Person TEMPORAL");
 
@@ -6170,7 +6176,7 @@ fn empirical_upsert_on_create_into_temporal_label() {
 #[test]
 fn pattern_predicate_into_temporal_label_matches_any_version() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
         .expect("CREATE Person TEMPORAL");
     db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
@@ -6208,7 +6214,7 @@ fn pattern_predicate_into_temporal_label_matches_any_version() {
 #[test]
 fn negated_pattern_predicate_into_temporal_label_returns_when_no_match() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
         .expect("CREATE");
     db.execute_cypher("ALTER LABEL Person SET SCHEMA FLEXIBLE")
@@ -6246,7 +6252,7 @@ fn negated_pattern_predicate_into_temporal_label_returns_when_no_match() {
 #[test]
 fn temporal_set_valid_to_closes_version_in_place() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
     )
@@ -6278,7 +6284,7 @@ fn temporal_set_valid_to_closes_version_in_place() {
 /// re-open idiom.
 #[test]
 fn temporal_set_valid_to_null_reopens_version() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
     )
@@ -6308,7 +6314,7 @@ fn temporal_set_valid_to_null_reopens_version() {
 /// Mirror of the temporal-edge rule.
 #[test]
 fn temporal_set_valid_from_rejected_immutable() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT)")
         .expect("CREATE NODE TYPE Person TEMPORAL");
     db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100})")
@@ -6332,7 +6338,7 @@ fn temporal_set_valid_from_rejected_immutable() {
 #[test]
 fn temporal_set_property_close_and_open_new_version() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
     )
@@ -6418,7 +6424,7 @@ fn temporal_set_property_close_and_open_new_version() {
 #[test]
 fn temporal_set_multiple_items_one_new_version() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE NODE TYPE Person TEMPORAL WITH \
          (name: STRING, age: INT, valid_from: INT, valid_to: INT)",
@@ -6447,7 +6453,7 @@ fn temporal_set_multiple_items_one_new_version() {
 /// rejected — ambiguous semantics. User must split.
 #[test]
 fn temporal_set_mixed_valid_to_and_other_rejected() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
     )
@@ -6476,7 +6482,7 @@ fn temporal_set_mixed_valid_to_and_other_rejected() {
 /// invariant as CREATE.
 #[test]
 fn temporal_set_valid_to_rejects_inverted_interval() {
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher(
         "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
     )
@@ -6503,7 +6509,7 @@ fn temporal_set_valid_to_rejects_inverted_interval() {
 #[test]
 fn r172c_set_non_temporal_unaffected() {
     use coordinode_core::graph::types::Value;
-    let (mut db, _dir) = open_db();
+    let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Plain WITH (name: STRING)")
         .expect("CREATE NODE TYPE Plain");
     db.execute_cypher("CREATE (p:Plain {name: 'X'})")
