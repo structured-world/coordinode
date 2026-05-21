@@ -11,23 +11,18 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::Guard;
 
-fn open_engine() -> (StorageEngine, tempfile::TempDir) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "default",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )]);
-    let engine = StorageEngine::open(&config).expect("open engine");
-    (engine, dir)
+/// Logic-test fixture (memory backing). Returns `EngineFixture` —
+/// caller uses `&fx.engine`. Document-property tests verify CRUD +
+/// dot-notation projection semantics; no persistence requirement.
+fn open_engine() -> coordinode_test_fixtures::EngineFixture {
+    coordinode_test_fixtures::engine_for_logic()
 }
 
 /// Store a NodeRecord with Document property in storage, read back, verify exact match.
 #[test]
 fn document_property_storage_roundtrip() {
-    let (engine, _dir) = open_engine();
+    let fx = open_engine();
+    let engine = &fx.engine;
 
     // Build a node with a nested Document property
     let doc = rmpv::Value::Map(vec![
@@ -59,12 +54,12 @@ fn document_property_storage_roundtrip() {
     rec.set(2, PropertyValue::Document(doc.clone()));
 
     use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    LocalNodeStore::new(&engine)
+    LocalNodeStore::new(engine)
         .put(0, NodeId::from_raw(1), &rec)
         .expect("put to storage");
 
     // Read back
-    let restored = LocalNodeStore::new(&engine)
+    let restored = LocalNodeStore::new(engine)
         .get(0, NodeId::from_raw(1))
         .expect("get from storage")
         .expect("key should exist");
@@ -80,7 +75,8 @@ fn document_property_storage_roundtrip() {
 /// 5-level nested Document survives storage roundtrip.
 #[test]
 fn document_deep_nesting_storage_roundtrip() {
-    let (engine, _dir) = open_engine();
+    let fx = open_engine();
+    let engine = &fx.engine;
 
     let level5 = rmpv::Value::Map(vec![(
         rmpv::Value::String("value".into()),
@@ -95,11 +91,11 @@ fn document_deep_nesting_storage_roundtrip() {
     rec.set(1, PropertyValue::Document(level1.clone()));
 
     use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    LocalNodeStore::new(&engine)
+    LocalNodeStore::new(engine)
         .put(0, NodeId::from_raw(2), &rec)
         .expect("put to storage");
 
-    let restored = LocalNodeStore::new(&engine)
+    let restored = LocalNodeStore::new(engine)
         .get(0, NodeId::from_raw(2))
         .expect("get from storage")
         .expect("key should exist");
@@ -110,7 +106,8 @@ fn document_deep_nesting_storage_roundtrip() {
 /// Document with heterogeneous array (mixed types) — no homogeneity constraint.
 #[test]
 fn document_heterogeneous_array_storage() {
-    let (engine, _dir) = open_engine();
+    let fx = open_engine();
+    let engine = &fx.engine;
 
     let doc = rmpv::Value::Map(vec![(
         rmpv::Value::String("mixed".into()),
@@ -127,11 +124,11 @@ fn document_heterogeneous_array_storage() {
     rec.set(1, PropertyValue::Document(doc.clone()));
 
     use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    LocalNodeStore::new(&engine)
+    LocalNodeStore::new(engine)
         .put(0, NodeId::from_raw(3), &rec)
         .expect("put to storage");
 
-    let restored = LocalNodeStore::new(&engine)
+    let restored = LocalNodeStore::new(engine)
         .get(0, NodeId::from_raw(3))
         .expect("get from storage")
         .expect("key should exist");
@@ -142,7 +139,8 @@ fn document_heterogeneous_array_storage() {
 /// Node with both regular properties and Document coexist.
 #[test]
 fn document_mixed_with_regular_properties() {
-    let (engine, _dir) = open_engine();
+    let fx = open_engine();
+    let engine = &fx.engine;
 
     let doc = rmpv::Value::Map(vec![(
         rmpv::Value::String("setting".into()),
@@ -158,11 +156,11 @@ fn document_mixed_with_regular_properties() {
     rec.set(6, PropertyValue::Document(doc.clone()));
 
     use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    LocalNodeStore::new(&engine)
+    LocalNodeStore::new(engine)
         .put(0, NodeId::from_raw(4), &rec)
         .expect("put to storage");
 
-    let restored = LocalNodeStore::new(&engine)
+    let restored = LocalNodeStore::new(engine)
         .get(0, NodeId::from_raw(4))
         .expect("get from storage")
         .expect("key should exist");
@@ -337,8 +335,7 @@ fn document_dot_notation_eval_through_pipeline() {
 fn document_dot_notation_e2e_cypher_pipeline() {
     use coordinode_embed::Database;
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut db = Database::open(dir.path()).expect("open db");
+    let mut db = Database::open_in_memory().expect("open db");
 
     // Step 1: Create node with a placeholder 'config' field via Cypher
     // so the interner learns the field name

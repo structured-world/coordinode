@@ -603,21 +603,16 @@ impl MultiModalCoordinator for LocalMultiModalCoordinator {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
     use crate::engine::core::StorageEngine;
-    use tempfile::TempDir;
-
-    fn open_engine() -> (TempDir, StorageEngine) {
-        let dir = TempDir::new().expect("tempdir");
-        let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]);
-        let engine = StorageEngine::open(&cfg).expect("open");
-        (dir, engine)
+    /// Logic-test fixture — coordinator/OCC tests verify behaviour
+    /// without depending on disk semantics, so route through MemFs
+    /// for ~2× speed-up. Returns `(_backing, engine)` keeping the
+    /// same tuple shape as before (callers do `let (_dir, engine)
+    /// = open_engine();`); the first element binds to the MemFs
+    /// `Arc` lifetime guard now instead of a `TempDir`.
+    fn open_engine() -> (std::sync::Arc<lsm_tree::fs::MemFs>, StorageEngine) {
+        let (engine, fs) = crate::internal_test_helpers::memory_engine();
+        (fs, engine)
     }
 
     #[test]
