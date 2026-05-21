@@ -16837,12 +16837,12 @@ mod tests {
         )
         .expect("open");
         let id = NodeId::from_raw(77);
-        // Seed a temporal version so the read returns Some.
-        let temporal_key =
-            coordinode_core::graph::node::encode_temporal_node_key(0, id, 1234567890);
+        // Seed a temporal version so the read returns Some, via the
+        // typed Layer-4 `put_temporal` (raw-encoder-free fixture).
         let rec = NodeRecord::new("E");
-        engine
-            .put(Partition::Node, &temporal_key, &rec.to_msgpack().unwrap())
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        LocalNodeStore::new(&engine)
+            .put_temporal(0, id, 1234567890, &rec)
             .expect("seed");
 
         let mut interner = FieldInterner::new();
@@ -16858,14 +16858,13 @@ mod tests {
 
         let scope = ctx.occ_scope.as_ref().expect("scope");
         assert!(
-            scope.contains(Partition::Node, &temporal_key),
+            scope.contains_node_temporal(0, id, 1234567890),
             "OCC scope must contain the 25-byte temporal key, not the non-temporal one",
         );
         // Cross-check: non-temporal 16-byte key for the same id must NOT
         // be tracked — temporal reads are version-specific.
-        let non_temporal_key = encode_node_key(0, id);
         assert!(
-            !scope.contains(Partition::Node, &non_temporal_key),
+            !scope.contains_node(0, id),
             "temporal read must NOT track the non-temporal 16-byte key",
         );
     }
@@ -16899,11 +16898,10 @@ mod tests {
         let id = NodeId::from_raw(88);
         ctx.mvcc_put_node_temporal(0, id, 1000, &NodeRecord::new("E"))
             .expect("put");
-        let temporal_key = coordinode_core::graph::node::encode_temporal_node_key(0, id, 1000);
         match ctx.occ_scope.as_ref() {
             None => { /* fine — no scope materialised on pure write */ }
             Some(scope) => assert!(
-                !scope.contains(Partition::Node, &temporal_key),
+                !scope.contains_node_temporal(0, id, 1000),
                 "pure temporal write must NOT enter OCC scope",
             ),
         }
@@ -17011,7 +17009,11 @@ mod tests {
         let src = NodeId::from_raw(1);
         let tgt = NodeId::from_raw(2);
         let payload: Vec<(u32, Value)> = vec![(0, Value::Int(7))];
-        // Seed via direct engine put so the read populates the scope.
+        // Seed via direct engine.put on the raw key — the EdgeProp
+        // wire format here is the `Vec<(field_id, Value)>` shape the
+        // executor encodes (LocalEdgeStore::put_edge expects a
+        // different `EdgeProperties` shape, so we can't reuse it
+        // for fixture seeding without changing the on-disk format).
         let ep_key = encode_edgeprop_key("REL", src, tgt);
         engine
             .put(
@@ -17032,9 +17034,12 @@ mod tests {
             .expect("get")
             .expect("Some");
 
+        // Typed OCC-scope assertion — `contains_edge_props` builds
+        // the key internally so the assertion is raw-encoder-free
+        // even though the fixture seeding above is not.
         let scope = ctx.occ_scope.as_ref().expect("scope");
         assert!(
-            scope.contains(Partition::EdgeProp, &ep_key),
+            scope.contains_edge_props("REL", src, tgt),
             "OCC scope must contain the encoded EdgeProp key after a typed read",
         );
     }
@@ -17071,7 +17076,6 @@ mod tests {
                 &rmp_serde::to_vec(&payload).unwrap(),
             )
             .expect("seed");
-        let non_temporal_key = encode_edgeprop_key("REL", src, tgt);
 
         let mut interner = FieldInterner::new();
         let allocator = NodeIdAllocator::new(0);
@@ -17084,13 +17088,16 @@ mod tests {
             .expect("get")
             .expect("Some");
 
+        // Typed OCC-scope assertions — verify the temporal key is
+        // tracked but the non-temporal (short) one for the same
+        // pair is NOT.
         let scope = ctx.occ_scope.as_ref().expect("scope");
         assert!(
-            scope.contains(Partition::EdgeProp, &temporal_key),
+            scope.contains_edge_props_temporal("REL", src, tgt, 5000),
             "OCC scope must record the temporal (per-version) key",
         );
         assert!(
-            !scope.contains(Partition::EdgeProp, &non_temporal_key),
+            !scope.contains_edge_props("REL", src, tgt),
             "OCC scope must NOT record the short non-temporal key on a temporal read",
         );
     }
@@ -17127,11 +17134,10 @@ mod tests {
         ctx.mvcc_put_edge_props("REL", src, tgt, &payload)
             .expect("put");
 
-        let ep_key = encode_edgeprop_key("REL", src, tgt);
         match ctx.occ_scope.as_ref() {
             None => { /* no scope materialised on pure write — fine */ }
             Some(scope) => assert!(
-                !scope.contains(Partition::EdgeProp, &ep_key),
+                !scope.contains_edge_props("REL", src, tgt),
                 "pure edge-prop write must NOT enter OCC scope",
             ),
         }
@@ -17803,11 +17809,10 @@ mod tests {
         let rec = NodeRecord::new("Probe");
         ctx.mvcc_put_node(0, id, &rec).expect("put");
 
-        let expected_key = encode_node_key(0, id);
         match ctx.occ_scope.as_ref() {
             None => { /* fine — pure write created no scope */ }
             Some(scope) => assert!(
-                !scope.contains(Partition::Node, &expected_key),
+                !scope.contains_node(0, id),
                 "pure write must NOT enter OCC scope — would self-conflict on later read",
             ),
         }
@@ -17834,12 +17839,12 @@ mod tests {
             oracle.clone(),
         )
         .expect("open with oracle");
-        // Seed a node.
+        // Seed a node via the typed Layer-4 store.
         let id = NodeId::from_raw(99);
         let seed = NodeRecord::new("Probe");
-        let bytes = seed.to_msgpack().expect("encode");
-        let key = encode_node_key(0, id);
-        engine.put(Partition::Node, &key, &bytes).expect("seed");
+        LocalNodeStore::new(&engine)
+            .put(0, id, &seed)
+            .expect("seed");
 
         let mut interner = FieldInterner::new();
         let allocator = NodeIdAllocator::new(0);
@@ -17851,7 +17856,7 @@ mod tests {
         // OCC scope must contain the encoded node key.
         let scope = ctx.occ_scope.as_ref().expect("MVCC mode → scope present");
         assert!(
-            scope.contains(Partition::Node, &key),
+            scope.contains_node(0, id),
             "typed read must populate OCC scope under Node partition",
         );
     }

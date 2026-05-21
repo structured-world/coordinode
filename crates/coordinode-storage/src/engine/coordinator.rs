@@ -141,6 +141,59 @@ impl OccScope {
         }
     }
 
+    /// Typed variant of [`Self::contains`] for the
+    /// `(Partition::Node, encode_node_key(shard, id))` pair. Built
+    /// for the R165 OCC audit suite so test assertions don't have
+    /// to reach into the raw `encode_node_key` encoder (R166
+    /// encoder-lockdown follow-up).
+    pub fn contains_node(&self, shard: u16, id: coordinode_core::graph::node::NodeId) -> bool {
+        let key = coordinode_core::graph::node::encode_node_key(shard, id);
+        self.contains(Partition::Node, &key)
+    }
+
+    /// Typed variant of [`Self::contains`] for the per-version
+    /// temporal node key — matches what `mvcc_get_node_temporal`
+    /// records on the OCC scope.
+    pub fn contains_node_temporal(
+        &self,
+        shard: u16,
+        id: coordinode_core::graph::node::NodeId,
+        valid_from_ms: i64,
+    ) -> bool {
+        let key = coordinode_core::graph::node::encode_temporal_node_key(shard, id, valid_from_ms);
+        self.contains(Partition::Node, &key)
+    }
+
+    /// Typed variant of [`Self::contains`] for the non-temporal
+    /// edge-property key.
+    pub fn contains_edge_props(
+        &self,
+        edge_type: &str,
+        src: coordinode_core::graph::node::NodeId,
+        tgt: coordinode_core::graph::node::NodeId,
+    ) -> bool {
+        let key = coordinode_core::graph::edge::encode_edgeprop_key(edge_type, src, tgt);
+        self.contains(Partition::EdgeProp, &key)
+    }
+
+    /// Typed variant of [`Self::contains`] for the per-version
+    /// temporal edge-property key (25-byte form).
+    pub fn contains_edge_props_temporal(
+        &self,
+        edge_type: &str,
+        src: coordinode_core::graph::node::NodeId,
+        tgt: coordinode_core::graph::node::NodeId,
+        valid_from_ms: i64,
+    ) -> bool {
+        let key = coordinode_core::graph::edge::encode_temporal_edgeprop_key(
+            edge_type,
+            src,
+            tgt,
+            valid_from_ms,
+        );
+        self.contains(Partition::EdgeProp, &key)
+    }
+
     /// Borrow the tracked set under the lock — internal use only.
     /// Consumed by [`MultiModalCoordinator::validate_occ`].
     pub(crate) fn with_keys<R>(&self, f: impl FnOnce(&HashSet<(Partition, Vec<u8>)>) -> R) -> R {

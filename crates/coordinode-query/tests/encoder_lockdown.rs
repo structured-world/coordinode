@@ -46,18 +46,15 @@ const SCAN_FILES: &[&str] = &[
 /// CURRENT post-migration count; the gate fails if a future PR
 /// raises it. Update with the migration audit comment when lowering.
 const ALLOWED: &[(&str, usize)] = &[
-    // runner.rs current baseline: typed-helper internals call the raw
-    // encoders by construction (~15 calls across mvcc_*_node /
-    // mvcc_*_edge_props helpers), plus test fixtures in the cfg(test)
-    // module use them to build probe keys (~33 calls — the OCC-scope
-    // audit suite legitimately uses raw encoders to assert what key
-    // bytes the scope tracks, and the temporal-key audit tests pin
-    // 25-byte vs non-temporal key behaviour). Total = 48.
-    // Lowering this further requires migrating OCC-scope audit tests
-    // to assert via typed `OccScope::contains_typed(NodeId)` hooks
-    // (would need a modality-layer addition). Raising it = new raw-
-    // encoder usage in production code; reject.
-    ("src/executor/runner.rs", 48),
+    // runner.rs baseline (R166 audit-suite slice): the OCC-scope
+    // audit suite now uses typed `OccScope::contains_node[_temporal]`
+    // / `contains_edge_props[_temporal]` overloads (added to
+    // coordinode-storage in the same slice) so the assertions are
+    // raw-encoder-free. Remaining ~26 in cfg(test) seed-fixture
+    // setups (need raw keys to construct probe payloads with the
+    // EdgeProp `Vec<(field_id, Value)>` shape that LocalEdgeStore
+    // doesn't accept yet) + ~15 typed-helper internals. Total = 41.
+    ("src/executor/runner.rs", 41),
     // ops.rs — fully routed through LocalIndexStore after slice 12.
     ("src/index/ops.rs", 0),
     // build.rs (R166): cfg(test) `insert_node` helper now routes
