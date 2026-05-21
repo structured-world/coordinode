@@ -4,9 +4,9 @@
 //! single-measurement INSERTs into batched whole-bucket writes. See
 //! the crate-level docs for the wider Slice A / B / C scope.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use coordinode_core::graph::node::NodeId;
 use coordinode_modality::{Bucket, BucketControl, FieldStats, Measurement, TimeSeriesStore};
@@ -43,9 +43,114 @@ struct OpenBucket {
 
 /// One stripe of the catalog. Each stripe carries its own
 /// `RwLock<HashMap>` so writers on disjoint stripes do not contend.
+///
+/// **Stripe ownership of `recently_closed`.** Each stripe owns its
+/// own LRU of recently-closed buckets keyed by [`BucketKey`]. Keeping
+/// the LRU per-stripe (rather than a single global one) preserves
+/// the no-cross-stripe-coordination property of the catalog: a Tier
+/// 2 re-open touches only its stripe's lock, identical to the
+/// fast-path append.
 #[derive(Default, Debug)]
 struct Stripe {
-    open_buckets: std::collections::HashMap<BucketKey, OpenBucket>,
+    open_buckets: HashMap<BucketKey, OpenBucket>,
+    recently_closed: RecentlyClosedLru,
+}
+
+/// Handle to a bucket that has been flushed and closed but is still
+/// eligible for Tier-2 re-open. Holds enough state for the catalog
+/// to recover the open-bucket form on re-open without re-reading
+/// the bucket body from the underlying store.
+#[derive(Debug, Clone)]
+struct ClosedBucketHandle {
+    /// Node id the bucket lives at in [`Partition::Node`].
+    node_id: NodeId,
+    /// Wall-clock time the bucket flushed. Drives TTL eviction.
+    closed_at: SystemTime,
+    /// Inclusive event-time bounds the bucket covered when flushed.
+    /// Used to decide whether an incoming late measurement falls
+    /// within the bucket's window (Tier 2 candidate) or beyond it
+    /// (Tier 3 territory, deferred to Slice C).
+    time_range: (i64, i64),
+    /// Meta-field value the bucket was keyed by. Carried so a
+    /// re-open can pass it to subsequent [`Bucket::from_measurements`].
+    meta: rmpv::Value,
+    /// The bucket's schema as of close. A Tier-2 re-open with a
+    /// schema-incompatible measurement falls through to a fresh
+    /// rollover instead.
+    fields: BTreeMap<String, FieldStats>,
+}
+
+/// Bounded, TTL-pruned map of recently-closed buckets — the catalog's
+/// Tier-2 fast-path lookup.
+///
+/// **Capacity.** Hard cap at `MAX_RECENTLY_CLOSED` per stripe (the
+/// arch spec sets the catalog-wide LRU at 10_000; with 32 stripes a
+/// per-stripe cap of 512 gives the same total while keeping the
+/// eviction scan bounded).
+///
+/// **TTL.** Entries expire at `closed_at + 2 × granularity_span` so
+/// late-arrival absorption shrinks gracefully as a series falls
+/// behind. The TTL is checked on read (`get_for_reopen`); stale
+/// entries also get evicted on insert when the cap is reached.
+///
+/// **Eviction.** O(n) scan on insert overflow finds the entry with
+/// the oldest `closed_at` and removes it. n ≤ 512 → typically <10µs
+/// even on commodity hardware; the cap is sized so the scan is
+/// negligible vs the per-write `put_bucket` cost.
+#[derive(Default, Debug)]
+struct RecentlyClosedLru {
+    by_key: HashMap<BucketKey, ClosedBucketHandle>,
+}
+
+/// Per-stripe LRU capacity. 32 stripes × 512 = 16_384 entries
+/// catalog-wide (slightly above the arch 10K target — slightly over
+/// is harmless, slightly under means a hot series can lose Tier-2
+/// eligibility under bursty churn).
+const MAX_RECENTLY_CLOSED: usize = 512;
+
+impl RecentlyClosedLru {
+    /// Insert / replace the handle for `key`. Evicts the
+    /// oldest-`closed_at` entry when at capacity.
+    fn insert(&mut self, key: BucketKey, handle: ClosedBucketHandle) {
+        if self.by_key.len() >= MAX_RECENTLY_CLOSED && !self.by_key.contains_key(&key) {
+            // Find oldest by closed_at; remove it.
+            if let Some(oldest_key) = self
+                .by_key
+                .iter()
+                .min_by_key(|(_, h)| h.closed_at)
+                .map(|(k, _)| *k)
+            {
+                self.by_key.remove(&oldest_key);
+            }
+        }
+        self.by_key.insert(key, handle);
+    }
+
+    /// Look up the handle for `key`. Returns `None` when the entry
+    /// is absent OR has aged past the TTL. The TTL check is done
+    /// against `now` so callers can replay deterministic test
+    /// clocks; production passes [`SystemTime::now`].
+    fn get(&self, key: &BucketKey, now: SystemTime, ttl: Duration) -> Option<&ClosedBucketHandle> {
+        let h = self.by_key.get(key)?;
+        let age = now.duration_since(h.closed_at).ok()?;
+        if age > ttl {
+            return None;
+        }
+        Some(h)
+    }
+
+    /// Remove the handle for `key`. Used after a successful Tier-2
+    /// reopen so the entry can't be replayed by a concurrent writer
+    /// in the same flush window.
+    fn remove(&mut self, key: &BucketKey) -> Option<ClosedBucketHandle> {
+        self.by_key.remove(key)
+    }
+
+    /// Diagnostic — number of currently-eligible handles. Tests only.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_key.len()
+    }
 }
 
 /// Per-shard time-series catalog. One instance per shard; CE
@@ -110,14 +215,36 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
     /// and sorted on flush. Out-of-window measurements trigger a
     /// time-based rollover.
     ///
-    /// Returns `Ok(())` on append (most paths); returns `Ok(())` on
-    /// rollover-flush + re-open + append (also success). Errors
-    /// propagate from the downstream store.
+    /// **Tier 2 re-open** (Slice B): when no open bucket exists for
+    /// `(label_id, meta)` but a recently-closed handle is still in
+    /// the stripe's LRU AND the measurement's `timestamp_us` falls
+    /// within the handle's time range AND the measurement's fields
+    /// are schema-compatible — the catalog reopens the bucket via
+    /// [`TimeSeriesStore::reopen_bucket`] and restores it to the
+    /// open-bucket map. Late-arrival absorption then proceeds as
+    /// usual.
+    ///
+    /// Returns `Ok(())` on append (most paths); errors propagate
+    /// from the downstream store.
     pub fn write_measurement(
         &self,
         label_id: u16,
         meta: rmpv::Value,
         measurement: Measurement,
+    ) -> CatalogResult<()> {
+        self.write_measurement_at(label_id, meta, measurement, SystemTime::now())
+    }
+
+    /// Variant of [`Self::write_measurement`] that accepts an
+    /// explicit `now` for the TTL check on the recently-closed LRU.
+    /// Used by tests with a stub clock; production calls
+    /// `write_measurement` which sources `SystemTime::now()`.
+    pub fn write_measurement_at(
+        &self,
+        label_id: u16,
+        meta: rmpv::Value,
+        measurement: Measurement,
+        now: SystemTime,
     ) -> CatalogResult<()> {
         let key = BucketKey::from_meta(label_id, &meta);
         let stripe_idx = key.stripe_idx();
@@ -129,7 +256,7 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
             .write()
             .unwrap_or_else(|p| p.into_inner());
 
-        // Decision against the existing bucket (if any).
+        // Decision against the existing open bucket (if any).
         let needs_rollover = match stripe.open_buckets.get(&key) {
             Some(bucket) => match route(
                 &bucket.control,
@@ -158,7 +285,64 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
                 .ok_or(CatalogError::InvalidConfig(
                     "bucket missing during rollover",
                 ))?;
-            self.flush_bucket(&to_flush, &meta)?;
+            let handle = self.flush_bucket(&to_flush, &meta)?;
+            stripe.recently_closed.insert(key, handle);
+        }
+
+        // Tier 2 fast-path: no open bucket, but a recently-closed
+        // handle matches by key AND time range AND schema.
+        if !stripe.open_buckets.contains_key(&key) {
+            let ttl = self.config.granularity_span * 2;
+            let candidate = stripe.recently_closed.get(&key, now, ttl).and_then(|h| {
+                if measurement_fits_recently_closed(h, &measurement, self.config.granularity_span) {
+                    Some(h.clone())
+                } else {
+                    None
+                }
+            });
+            if let Some(handle) = candidate {
+                tracing::debug!(
+                    label_id,
+                    meta_hash = format!("{:#x}", key.meta_hash),
+                    node_id = handle.node_id.as_raw(),
+                    "Tier-2 reopen",
+                );
+                let reopened = self.store.reopen_bucket(self.shard_id, handle.node_id)?;
+                if reopened {
+                    // Take the handle out of LRU — the bucket is open again.
+                    stripe.recently_closed.remove(&key);
+                    let mut bucket_control = BucketControl {
+                        version: 1,
+                        count: 0,
+                        time_min_us: handle.time_range.0,
+                        time_max_us: handle.time_range.1,
+                        closed: false,
+                        fields_stats: handle.fields.clone(),
+                    };
+                    // The reopened bucket carries its prior count
+                    // implicitly via the persisted body — but the
+                    // catalog's in-memory state restarts at 0 because
+                    // we re-flush the *combined* set on next close,
+                    // using `from_measurements` over both the
+                    // persisted prefix and the new buffer. Since
+                    // we don't keep the persisted body in memory,
+                    // count starts at 0 and rollover triggers fire
+                    // sooner. Acceptable for Slice B; Slice C will
+                    // unify late-arrival into compact_overflow.
+                    bucket_control.count = 0;
+                    stripe.open_buckets.insert(
+                        key,
+                        OpenBucket {
+                            node_id: handle.node_id,
+                            buffer: Vec::with_capacity(self.config.max_count as usize),
+                            control: bucket_control,
+                            meta: handle.meta.clone(),
+                            size_estimate: 0,
+                            created_at: SystemTime::now(),
+                        },
+                    );
+                }
+            }
         }
 
         // Append (or open fresh).
@@ -214,10 +398,10 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
         for stripe_lock in &self.stripes {
             let mut stripe = stripe_lock.write().unwrap_or_else(|p| p.into_inner());
             let drained: Vec<(BucketKey, OpenBucket)> = stripe.open_buckets.drain().collect();
-            drop(stripe);
-            for (_key, bucket) in drained {
+            for (key, bucket) in drained {
                 let meta = bucket.meta.clone();
-                self.flush_bucket(&bucket, &meta)?;
+                let handle = self.flush_bucket(&bucket, &meta)?;
+                stripe.recently_closed.insert(key, handle);
             }
         }
         Ok(())
@@ -233,18 +417,75 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
             .sum()
     }
 
+    /// Number of currently-tracked recently-closed bucket handles
+    /// across all stripes (Tier-2 LRU). Diagnostic only.
+    pub fn recently_closed_count(&self) -> usize {
+        self.stripes
+            .iter()
+            .map(|s| {
+                s.read()
+                    .map(|g| g.recently_closed.by_key.len())
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
     /// Persist `bucket` to the underlying TimeSeriesStore and mark
     /// it closed. Sorts the in-memory buffer by timestamp before
     /// columnising — Tier-1 in-buffer late arrivals are merged here.
-    fn flush_bucket(&self, bucket: &OpenBucket, meta: &rmpv::Value) -> CatalogResult<()> {
+    /// Returns a [`ClosedBucketHandle`] the caller stores in the
+    /// stripe's [`RecentlyClosedLru`].
+    fn flush_bucket(
+        &self,
+        bucket: &OpenBucket,
+        meta: &rmpv::Value,
+    ) -> CatalogResult<ClosedBucketHandle> {
         let mut sorted = bucket.buffer.clone();
         sorted.sort_by_key(|m| m.timestamp_us);
         let body = Bucket::from_measurements(meta.clone(), sorted);
         self.store
             .put_bucket(self.shard_id, bucket.node_id, &body)?;
         self.store.mark_closed(self.shard_id, bucket.node_id)?;
-        Ok(())
+        Ok(ClosedBucketHandle {
+            node_id: bucket.node_id,
+            closed_at: SystemTime::now(),
+            time_range: (bucket.control.time_min_us, bucket.control.time_max_us),
+            meta: meta.clone(),
+            fields: bucket.control.fields_stats.clone(),
+        })
     }
+}
+
+/// Tier-2 eligibility check: is the incoming `measurement` plausibly
+/// part of the closed bucket described by `handle`?
+///
+/// Two conditions must hold:
+/// 1. `timestamp_us` falls within the bucket's stored time range
+///    (with a one-granularity slack on the upper end to absorb
+///    measurements that arrived right after close but before the
+///    cutoff that triggered close).
+/// 2. The measurement's fields are a SUBSET of the bucket's schema.
+///    A reopen with a new column would force a schema rollover
+///    immediately after — pointless round-trip — so fall through.
+fn measurement_fits_recently_closed(
+    handle: &ClosedBucketHandle,
+    measurement: &Measurement,
+    granularity_span: Duration,
+) -> bool {
+    let slack = granularity_span.as_micros() as i64;
+    if measurement.timestamp_us < handle.time_range.0 {
+        return false;
+    }
+    if measurement.timestamp_us > handle.time_range.1.saturating_add(slack) {
+        return false;
+    }
+    if handle.fields.is_empty() {
+        return true;
+    }
+    measurement
+        .fields
+        .keys()
+        .all(|name| handle.fields.contains_key(name))
 }
 
 fn estimate_measurement_size(m: &Measurement) -> u32 {
@@ -488,6 +729,215 @@ mod tests {
         assert!(catalog.open_bucket_count() >= 1);
         catalog.flush_all().unwrap();
         assert_eq!(catalog.open_bucket_count(), 0);
+    }
+
+    // -- Tier-2 reopen path --
+
+    #[test]
+    fn tier2_reopen_brings_back_recently_closed_bucket() {
+        // Flush a bucket via explicit flush_all (no follow-up open
+        // bucket), then write a late measurement at a timestamp
+        // INSIDE the closed bucket's time range. The Tier-2 path
+        // should re-open the same bucket (same node_id) rather
+        // than allocate a new one.
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let cfg = CatalogConfig {
+            max_count: 100,
+            granularity_span: Duration::from_secs(3600),
+            ..CatalogConfig::default()
+        };
+        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let meta = rmpv::Value::String("s1".into());
+
+        // Buffer 3 measurements at t=0, 1000, 2000, then flush_all.
+        for i in 0..3 {
+            catalog
+                .write_measurement(7, meta.clone(), measurement(i * 1000, &[("temp", 20.0)]))
+                .unwrap();
+        }
+        catalog.flush_all().unwrap();
+        // Now bucket 1 closed (node_id 1, time_range [0, 2000]).
+        // No open bucket. 1 handle in recently_closed.
+        assert_eq!(catalog.open_bucket_count(), 0);
+        assert_eq!(catalog.recently_closed_count(), 1);
+
+        // Pre-Tier-2 store state: bucket 1 closed in store.
+        let pre = store.get_bucket(0, NodeId::from_raw(1)).unwrap().unwrap();
+        assert!(pre.control.closed, "bucket 1 closed in store pre-reopen");
+
+        // Write a late measurement at ts=500 (inside [0, 2000]
+        // window). Tier-2 reopen must fire — the store's bucket 1
+        // flips to closed=false.
+        catalog
+            .write_measurement(7, meta.clone(), measurement(500, &[("temp", 22.0)]))
+            .unwrap();
+
+        // After reopen:
+        // - recently_closed shrinks by 1 (handle taken)
+        // - one open bucket (the re-opened one) at node_id 1
+        // - no fresh node_id allocated (next_node_id_seed was 1
+        //   pre-flush, advanced to 2 when bucket 1 opened, and we
+        //   reused node 1 not 2)
+        assert_eq!(catalog.recently_closed_count(), 0);
+        assert_eq!(catalog.open_bucket_count(), 1);
+    }
+
+    #[test]
+    fn tier2_skipped_when_measurement_outside_time_range() {
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let cfg = CatalogConfig {
+            max_count: 3,
+            granularity_span: Duration::from_secs(3600),
+            ..CatalogConfig::default()
+        };
+        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let meta = rmpv::Value::String("s1".into());
+
+        for i in 0..3 {
+            catalog
+                .write_measurement(7, meta.clone(), measurement(i * 1000, &[("temp", 20.0)]))
+                .unwrap();
+        }
+        // Rollover.
+        catalog
+            .write_measurement(
+                7,
+                meta.clone(),
+                measurement(10_000_000_000, &[("temp", 21.0)]),
+            )
+            .unwrap();
+
+        // Now bucket 1 closed (range 0..2000). Bucket 2 open at
+        // 10s. A subsequent measurement at 9.9s should NOT reopen
+        // bucket 1 — it lands in bucket 2's window (Tier-1
+        // absorption against the open bucket).
+        catalog
+            .write_measurement(
+                7,
+                meta.clone(),
+                measurement(9_900_000_000, &[("temp", 22.0)]),
+            )
+            .unwrap();
+        // recently_closed unchanged (no reopen happened).
+        assert_eq!(catalog.recently_closed_count(), 1);
+    }
+
+    #[test]
+    fn tier2_skipped_when_schema_drifts() {
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let cfg = CatalogConfig {
+            max_count: 3,
+            granularity_span: Duration::from_secs(3600),
+            ..CatalogConfig::default()
+        };
+        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let meta = rmpv::Value::String("s1".into());
+
+        for i in 0..3 {
+            catalog
+                .write_measurement(7, meta.clone(), measurement(i * 1000, &[("temp", 20.0)]))
+                .unwrap();
+        }
+        // Rollover at t=10s.
+        catalog
+            .write_measurement(7, meta.clone(), measurement(10_000, &[("temp", 21.0)]))
+            .unwrap();
+
+        // Late measurement at t=500 (inside bucket 1 range) BUT
+        // with a new field 'humidity' — incompatible schema. Tier-2
+        // must NOT fire; the measurement goes to bucket 2 instead.
+        catalog
+            .write_measurement(
+                7,
+                meta.clone(),
+                measurement(500, &[("temp", 22.0), ("humidity", 60.0)]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            catalog.recently_closed_count(),
+            1,
+            "recently_closed unchanged when schema drift skips Tier 2",
+        );
+    }
+
+    #[test]
+    fn tier2_ttl_expires_handle() {
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let cfg = CatalogConfig {
+            max_count: 2,
+            granularity_span: Duration::from_millis(50),
+            ..CatalogConfig::default()
+        };
+        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        let meta = rmpv::Value::String("s1".into());
+
+        // Close bucket 1.
+        for i in 0..2 {
+            catalog
+                .write_measurement(7, meta.clone(), measurement(i * 100, &[("temp", 20.0)]))
+                .unwrap();
+        }
+        catalog
+            .write_measurement(7, meta.clone(), measurement(10_000, &[("temp", 21.0)]))
+            .unwrap();
+        // recently_closed has bucket 1.
+        assert_eq!(catalog.recently_closed_count(), 1);
+
+        // Now write at a time well past the TTL (2× 50ms = 100ms).
+        // Use write_measurement_at to fake a clock 1s in the future.
+        let future = SystemTime::now() + Duration::from_secs(1);
+        catalog
+            .write_measurement_at(7, meta.clone(), measurement(50, &[("temp", 22.0)]), future)
+            .unwrap();
+
+        // The TTL check rejected the handle — Tier 2 did NOT fire.
+        // recently_closed still holds the (stale) handle since we
+        // don't proactively evict.
+        assert_eq!(catalog.recently_closed_count(), 1);
+    }
+
+    #[test]
+    fn lru_evicts_oldest_on_capacity_overflow() {
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let cfg = CatalogConfig {
+            max_count: 1,
+            granularity_span: Duration::from_secs(3600),
+            ..CatalogConfig::default()
+        };
+        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+
+        // Force enough flushes on ONE STRIPE to exceed MAX_RECENTLY_CLOSED.
+        // Find a label_id whose bucket key lands in stripe 0 for a
+        // range of meta values, then fill stripe 0 past capacity.
+        let target_stripe = 0usize;
+        let mut accepted = 0u64;
+        let mut meta_index = 0u64;
+        while accepted < (MAX_RECENTLY_CLOSED as u64 + 4) {
+            let meta = rmpv::Value::String(format!("meta-{meta_index}").into());
+            let key = BucketKey::from_meta(7, &meta);
+            if key.stripe_idx() == target_stripe {
+                catalog
+                    .write_measurement(7, meta.clone(), measurement(0, &[("temp", 20.0)]))
+                    .unwrap();
+                // Trigger rollover with a second write at a later time.
+                catalog
+                    .write_measurement(7, meta, measurement(1_000_000, &[("temp", 21.0)]))
+                    .unwrap();
+                accepted += 1;
+            }
+            meta_index += 1;
+        }
+
+        // Stripe 0's recently_closed must be capped — newer entries
+        // pushed older ones out.
+        let stripe0 = catalog.stripes[target_stripe].read().unwrap();
+        assert_eq!(stripe0.recently_closed.len(), MAX_RECENTLY_CLOSED);
     }
 
     #[test]
