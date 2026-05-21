@@ -36,19 +36,14 @@ use coordinode_query::executor::{execute, AdaptiveConfig, ExecutionContext, Writ
 use coordinode_query::planner::build_logical_plan;
 use coordinode_search::tantivy::multi_lang::{MultiLangConfig, MultiLanguageTextIndex};
 use coordinode_search::tantivy::TextIndex;
-use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 
-fn test_engine(dir: &std::path::Path) -> StorageEngine {
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "default",
-        dir,
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )]);
-    StorageEngine::open(&config).expect("open engine")
+/// Logic-test fixture (memory by default, disk via env). Most hybrid
+/// scoring contracts are pure query-plan + scorer behaviour with no
+/// persistence requirement.
+fn test_engine() -> coordinode_test_fixtures::EngineFixture {
+    coordinode_test_fixtures::engine_for_logic()
 }
 
 fn make_test_ctx<'a>(
@@ -364,8 +359,8 @@ fn contract_bm25_defaults_text_score_magnitudes() {
     // We assert ORDER exactly (deterministic) and MAGNITUDE ranges (loose
     // enough to survive implementation-detail drift in tantivy within the
     // same BM25 formula, tight enough to fail on a defaults change).
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     let docs = [
@@ -375,7 +370,7 @@ fn contract_bm25_defaults_text_score_magnitudes() {
     ];
     for (id, body) in docs {
         insert_node(
-            &engine,
+            engine,
             id,
             "Doc",
             &[("body", Value::String(body.to_string()))],
@@ -384,7 +379,7 @@ fn contract_bm25_defaults_text_score_magnitudes() {
     }
 
     // Wire a legacy tantivy index (single-index, default English analyzer).
-    let text_dir = dir.path().join("bm25_text");
+    let text_dir = fx.scratch_path().join("bm25_text");
     let mut text_idx = TextIndex::open_or_create(&text_dir, 15_000_000, None).unwrap();
     for (id, body) in docs {
         text_idx.add_document(id, body).unwrap();
@@ -395,7 +390,7 @@ fn contract_bm25_defaults_text_score_magnitudes() {
         "MATCH (d:Doc) WHERE text_match(d.body, \"rust\") \
          RETURN d.body AS body, text_score(d.body, \"rust\") AS score \
          ORDER BY score DESC",
-        &engine,
+        engine,
         &mut interner,
         &multi_idx,
     );
@@ -474,18 +469,18 @@ fn contract_bm25_is_not_runtime_configurable() {
     if let Ok(ast) = ast {
         if build_logical_plan(&ast).is_ok() {
             // Plan accepted — verify executor ignores the alleged k1 override.
-            let dir = tempfile::tempdir().unwrap();
-            let engine = test_engine(dir.path());
+            let fx = test_engine();
+            let engine = &fx.engine;
             let mut interner = FieldInterner::new();
             insert_node(
-                &engine,
+                engine,
                 1,
                 "Article",
                 &[("body", Value::String("x x x".to_string()))],
                 &mut interner,
             );
 
-            let text_dir = dir.path().join("k1_bm25");
+            let text_dir = fx.scratch_path().join("k1_bm25");
             let mut text_idx = TextIndex::open_or_create(&text_dir, 15_000_000, None).unwrap();
             text_idx.add_document(1, "x x x").unwrap();
             let multi_idx = MultiLanguageTextIndex::wrap(text_idx, MultiLangConfig::default());
@@ -493,14 +488,14 @@ fn contract_bm25_is_not_runtime_configurable() {
             let baseline = run_cypher_bm25(
                 "MATCH (a:Article) WHERE text_match(a.body, \"x\") \
                  RETURN text_score(a.body, \"x\") AS s",
-                &engine,
+                engine,
                 &mut interner,
                 &multi_idx,
             );
             let with_k1 = run_cypher_bm25(
                 "MATCH (a:Article) WHERE text_match(a.body, \"x\") \
                  RETURN text_score(a.body, \"x\", {k1: 2.0}) AS s",
-                &engine,
+                engine,
                 &mut interner,
                 &multi_idx,
             );
@@ -552,12 +547,12 @@ fn seed_chunk_corpus(engine: &StorageEngine, interner: &mut FieldInterner) {
 
 #[test]
 fn contract_return_types_are_frozen() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
-    seed_chunk_corpus(&engine, &mut interner);
+    seed_chunk_corpus(engine, &mut interner);
 
-    let text_dir = dir.path().join("rt_text");
+    let text_dir = fx.scratch_path().join("rt_text");
     let mut text_idx = TextIndex::open_or_create(&text_dir, 15_000_000, None).unwrap();
     text_idx.add_document(1, "rust rust rust").unwrap();
     text_idx.add_document(2, "rust programming").unwrap();
@@ -567,7 +562,7 @@ fn contract_return_types_are_frozen() {
     let rows = run_cypher_bm25(
         "MATCH (c:Chunk) WHERE text_match(c.body, \"rust\") \
          RETURN text_score(c.body, \"rust\") AS s",
-        &engine,
+        engine,
         &mut interner,
         &multi_idx,
     );
@@ -582,7 +577,7 @@ fn contract_return_types_are_frozen() {
         "MATCH (c:Chunk) WHERE text_match(c.body, \"rust\") \
            AND vector_distance(c.embedding, [1.0, 0.0]) < 1.0 \
          RETURN hybrid_score(c, \"rust\") AS s",
-        &engine,
+        engine,
         &mut interner,
         &multi_idx,
     );
@@ -594,7 +589,7 @@ fn contract_return_types_are_frozen() {
 
     // vector_distance / vector_similarity — exercised without text index.
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
     let _ = &mut ctx;
     drop(ctx);
 
@@ -606,7 +601,7 @@ fn contract_return_types_are_frozen() {
     .unwrap();
     let plan = build_logical_plan(&ast).unwrap();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
     let rows = execute(&plan, &mut ctx).expect("execute");
     assert!(
         rows.iter()
@@ -626,11 +621,11 @@ fn contract_return_types_are_frozen() {
 
 #[test]
 fn contract_hybrid_score_default_weights_are_0_65_0_35() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
     insert_node(
-        &engine,
+        engine,
         1,
         "Doc",
         &[
@@ -640,7 +635,7 @@ fn contract_hybrid_score_default_weights_are_0_65_0_35() {
         &mut interner,
     );
 
-    let text_dir = dir.path().join("hybrid_def");
+    let text_dir = fx.scratch_path().join("hybrid_def");
     let mut text_idx = TextIndex::open_or_create(&text_dir, 15_000_000, None).unwrap();
     text_idx.add_document(1, "rust rust rust").unwrap();
     let multi_idx = MultiLanguageTextIndex::wrap(text_idx, MultiLangConfig::default());
@@ -651,7 +646,7 @@ fn contract_hybrid_score_default_weights_are_0_65_0_35() {
         "MATCH (d:Doc) WHERE text_match(d.body, \"rust\") \
            AND vector_distance(d.embedding, [1.0, 0.0]) < 1.0 \
          RETURN hybrid_score(d, \"rust\") AS s",
-        &engine,
+        engine,
         &mut interner,
         &multi_idx,
     );
@@ -659,7 +654,7 @@ fn contract_hybrid_score_default_weights_are_0_65_0_35() {
         "MATCH (d:Doc) WHERE text_match(d.body, \"rust\") \
            AND vector_distance(d.embedding, [1.0, 0.0]) < 1.0 \
          RETURN hybrid_score(d, \"rust\", {vector: 0.65, text: 0.35}) AS s",
-        &engine,
+        engine,
         &mut interner,
         &multi_idx,
     );
@@ -680,15 +675,15 @@ fn contract_hybrid_score_default_weights_are_0_65_0_35() {
 
 #[test]
 fn contract_doc_score_default_weights_are_0_5_0_3_0_2() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
-    insert_node(&engine, 1, "Document", &[], &mut interner);
+    insert_node(engine, 1, "Document", &[], &mut interner);
     for i in 0..3 {
         let cid = 100 + i;
         insert_node(
-            &engine,
+            engine,
             cid,
             "Chunk",
             &[(
@@ -697,13 +692,13 @@ fn contract_doc_score_default_weights_are_0_5_0_3_0_2() {
             )],
             &mut interner,
         );
-        insert_edge(&engine, "HAS_CHUNK", 1, cid);
+        insert_edge(engine, "HAS_CHUNK", 1, cid);
     }
 
     let ast_default = parse("MATCH (d:Document) RETURN doc_score(d, [1.0, 0.0]) AS s").unwrap();
     let plan_default = build_logical_plan(&ast_default).unwrap();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
     let rows_default = execute(&plan_default, &mut ctx).expect("execute default");
     let s_default = match rows_default[0].get("s") {
         Some(Value::Float(f)) => *f,
@@ -716,7 +711,7 @@ fn contract_doc_score_default_weights_are_0_5_0_3_0_2() {
     .unwrap();
     let plan_explicit = build_logical_plan(&ast_explicit).unwrap();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-    let mut ctx = make_test_ctx(&engine, &mut interner, &allocator);
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
     let rows_explicit = execute(&plan_explicit, &mut ctx).expect("execute explicit");
     let s_explicit = match rows_explicit[0].get("s") {
         Some(Value::Float(f)) => *f,

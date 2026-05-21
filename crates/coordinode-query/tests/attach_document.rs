@@ -20,7 +20,6 @@ use coordinode_core::graph::types::Value;
 use coordinode_query::cypher::parse;
 use coordinode_query::executor::{execute, AdaptiveConfig, ExecutionContext, Row, WriteStats};
 use coordinode_query::planner::build_logical_plan;
-use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 
@@ -80,15 +79,12 @@ fn make_test_ctx<'a>(
     }
 }
 
-fn test_engine(dir: &std::path::Path) -> StorageEngine {
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "default",
-        dir,
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )]);
-    StorageEngine::open(&config).expect("open engine")
+/// Logic-test fixture — uses `engine_for_logic()` which honours
+/// `COORDINODE_TEST_BACKEND` (default: memory). ATTACH DOCUMENT
+/// tests exercise pure query semantics, not disk persistence, so
+/// memory backend is the right default.
+fn test_engine() -> coordinode_test_fixtures::EngineFixture {
+    coordinode_test_fixtures::engine_for_logic()
 }
 
 fn run(
@@ -201,14 +197,14 @@ fn read_prop(
 
 #[test]
 fn attach_document_basic() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Address node `a` (id=100) with two scalar properties; User node `u`
     // (id=1) with no `address` yet.
     insert_node(
-        &engine,
+        engine,
         &mut interner,
         100,
         "Address",
@@ -218,18 +214,18 @@ fn attach_document_basic() {
         ],
     );
     insert_node(
-        &engine,
+        engine,
         &mut interner,
         1,
         "User",
         &[("name", Value::String("Alice".into()))],
     );
-    insert_edge(&engine, "HAS_ADDRESS", 100, 1);
+    insert_edge(engine, "HAS_ADDRESS", 100, 1);
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
     let results = run(
         "ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address RETURN u",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -237,17 +233,17 @@ fn attach_document_basic() {
 
     // Address node must be gone.
     assert!(
-        !node_exists(&engine, 100),
+        !node_exists(engine, 100),
         "source Address node should be deleted after ATTACH"
     );
     // Edge must be gone.
     assert!(
-        !adj_contains(&engine, "HAS_ADDRESS", 100, 1),
+        !adj_contains(engine, "HAS_ADDRESS", 100, 1),
         "HAS_ADDRESS edge should be removed after ATTACH"
     );
 
     // `u.address` must now be a Document with city/zip.
-    let addr = read_prop(&engine, &interner, 1, "address").expect("address present");
+    let addr = read_prop(engine, &interner, 1, "address").expect("address present");
     let Value::Document(rmpv::Value::Map(entries)) = addr else {
         panic!("u.address should be a Document map");
     };
@@ -265,67 +261,67 @@ fn attach_document_basic() {
 
 #[test]
 fn attach_document_transfers_matching_edges() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Source Address node (100) has a SHIPS_TO edge to peer(200) that should
     // move onto User(1) during ATTACH.
     insert_node(
-        &engine,
+        engine,
         &mut interner,
         100,
         "Address",
         &[("city", Value::String("Prague".into()))],
     );
     insert_node(
-        &engine,
+        engine,
         &mut interner,
         1,
         "User",
         &[("name", Value::String("Alice".into()))],
     );
-    insert_node(&engine, &mut interner, 200, "Peer", &[]);
-    insert_edge(&engine, "HAS_ADDRESS", 100, 1);
-    insert_edge(&engine, "SHIPS_TO", 100, 200);
+    insert_node(engine, &mut interner, 200, "Peer", &[]);
+    insert_edge(engine, "HAS_ADDRESS", 100, 1);
+    insert_edge(engine, "SHIPS_TO", 100, 200);
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
     run(
         "ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address \
          TRANSFER EDGES ON a TO u WHERE type(r) = 'SHIPS_TO' \
          RETURN u",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
 
-    assert!(!node_exists(&engine, 100), "Address node should be deleted");
+    assert!(!node_exists(engine, 100), "Address node should be deleted");
     assert!(
-        !adj_contains(&engine, "SHIPS_TO", 100, 200),
+        !adj_contains(engine, "SHIPS_TO", 100, 200),
         "SHIPS_TO(100 → 200) must be removed after transfer"
     );
     assert!(
-        adj_contains(&engine, "SHIPS_TO", 1, 200),
+        adj_contains(engine, "SHIPS_TO", 1, 200),
         "SHIPS_TO(1 → 200) must exist after transfer"
     );
 }
 
 #[test]
 fn attach_document_conflict_without_replace_errors() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // User `u` already has an `address` → default (no REPLACE) must error.
     insert_node(
-        &engine,
+        engine,
         &mut interner,
         100,
         "Address",
         &[("city", Value::String("Prague".into()))],
     );
     insert_node(
-        &engine,
+        engine,
         &mut interner,
         1,
         "User",
@@ -334,12 +330,12 @@ fn attach_document_conflict_without_replace_errors() {
             Value::String("old address, not a document".into()),
         )],
     );
-    insert_edge(&engine, "HAS_ADDRESS", 100, 1);
+    insert_edge(engine, "HAS_ADDRESS", 100, 1);
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
     let err = run_err(
         "ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -353,26 +349,26 @@ fn attach_document_conflict_without_replace_errors() {
     // (In this executor, mvcc_flush is skipped on error path; verify the node
     // still exists from the engine's perspective.)
     assert!(
-        node_exists(&engine, 100),
+        node_exists(engine, 100),
         "source node should survive aborted ATTACH"
     );
 }
 
 #[test]
 fn attach_document_on_conflict_replace_overwrites() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     insert_node(
-        &engine,
+        engine,
         &mut interner,
         100,
         "Address",
         &[("city", Value::String("Prague".into()))],
     );
     insert_node(
-        &engine,
+        engine,
         &mut interner,
         1,
         "User",
@@ -381,18 +377,18 @@ fn attach_document_on_conflict_replace_overwrites() {
             Value::String("old string (to be replaced)".into()),
         )],
     );
-    insert_edge(&engine, "HAS_ADDRESS", 100, 1);
+    insert_edge(engine, "HAS_ADDRESS", 100, 1);
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
     run(
         "ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address \
          ON CONFLICT REPLACE",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
 
-    let addr = read_prop(&engine, &interner, 1, "address").expect("present");
+    let addr = read_prop(engine, &interner, 1, "address").expect("present");
     let Value::Document(rmpv::Value::Map(entries)) = addr else {
         panic!("u.address should be Document after REPLACE");
     };
@@ -402,40 +398,40 @@ fn attach_document_on_conflict_replace_overwrites() {
             .any(|(k, v)| k.as_str() == Some("city") && v == &rmpv::Value::String("Prague".into())),
         "REPLACE must overwrite with the new Document"
     );
-    assert!(!node_exists(&engine, 100));
+    assert!(!node_exists(engine, 100));
 }
 
 #[test]
 fn attach_document_on_remaining_fail_errors() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     // Address has an extra edge (SHIPS_TO → peer) that is NOT transferred →
     // ON REMAINING FAIL must abort.
     insert_node(
-        &engine,
+        engine,
         &mut interner,
         100,
         "Address",
         &[("city", Value::String("Prague".into()))],
     );
     insert_node(
-        &engine,
+        engine,
         &mut interner,
         1,
         "User",
         &[("name", Value::String("Alice".into()))],
     );
-    insert_node(&engine, &mut interner, 200, "Peer", &[]);
-    insert_edge(&engine, "HAS_ADDRESS", 100, 1);
-    insert_edge(&engine, "SHIPS_TO", 100, 200);
+    insert_node(engine, &mut interner, 200, "Peer", &[]);
+    insert_edge(engine, "HAS_ADDRESS", 100, 1);
+    insert_edge(engine, "SHIPS_TO", 100, 200);
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
     let err = run_err(
         "ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address \
          ON REMAINING FAIL",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
@@ -448,39 +444,39 @@ fn attach_document_on_remaining_fail_errors() {
 
 #[test]
 fn attach_document_on_remaining_fail_succeeds_when_all_transferred() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
+    let fx = test_engine();
+    let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
     insert_node(
-        &engine,
+        engine,
         &mut interner,
         100,
         "Address",
         &[("city", Value::String("Prague".into()))],
     );
     insert_node(
-        &engine,
+        engine,
         &mut interner,
         1,
         "User",
         &[("name", Value::String("Alice".into()))],
     );
-    insert_node(&engine, &mut interner, 200, "Peer", &[]);
-    insert_edge(&engine, "HAS_ADDRESS", 100, 1);
-    insert_edge(&engine, "SHIPS_TO", 100, 200);
+    insert_node(engine, &mut interner, 200, "Peer", &[]);
+    insert_edge(engine, "HAS_ADDRESS", 100, 1);
+    insert_edge(engine, "SHIPS_TO", 100, 200);
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
     run(
         "ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address \
          TRANSFER EDGES ON a TO u WHERE type(r) = 'SHIPS_TO' \
          ON REMAINING FAIL",
-        &engine,
+        engine,
         &mut interner,
         &allocator,
     );
 
     // Address deleted, edges moved.
-    assert!(!node_exists(&engine, 100));
-    assert!(adj_contains(&engine, "SHIPS_TO", 1, 200));
+    assert!(!node_exists(engine, 100));
+    assert!(adj_contains(engine, "SHIPS_TO", 1, 200));
 }

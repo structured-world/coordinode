@@ -69,15 +69,37 @@ use coordinode_storage::engine::core::StorageEngine;
 /// The lifetime-binding state (`TempDir` for disk, `MemFs` Arc for
 /// memory) is held alongside the engine so the engine has somewhere
 /// to write/read for the duration of the test.
+///
+/// Every fixture also carries an ancillary on-disk scratch tempdir
+/// (`scratch`) usable for state that lives OUTSIDE the engine —
+/// Tantivy text indexes, model files, JSON dumps. The scratch dir
+/// is on the host FS regardless of engine backend (memory engines
+/// keep their data in `MemFs` but the scratch tempdir is real),
+/// because Tantivy and similar consumers are disk-only and benefit
+/// from the same lifetime guard as the engine.
 pub struct EngineFixture {
     /// The configured engine. Public so tests use it directly.
     pub engine: StorageEngine,
     /// Backend-specific state. For disk: a `TempDir` whose lifetime
     /// must outlast every access through `engine`. For memory: an
-    /// `Arc<MemFs>` that keeps the in-memory FS alive (the engine
-    /// has its own reference, this is for symmetry + future
-    /// inspection hooks).
-    _backing: Backing,
+    /// `Arc<MemFs>` that keeps the in-memory FS alive. Field is not
+    /// read directly — its lifetime IS the value.
+    #[allow(dead_code)]
+    backing: Backing,
+    /// Ancillary on-disk scratch directory — same lifetime as the
+    /// engine. Tests use this for Tantivy index roots, etc. Always
+    /// present (memory engines get a real tempdir even though
+    /// their engine bytes live in MemFs).
+    scratch: tempfile::TempDir,
+}
+
+impl EngineFixture {
+    /// On-disk scratch path for ancillary state — Tantivy index
+    /// root, ML model files, dump fixtures. Same lifetime as the
+    /// engine. Available regardless of engine backend.
+    pub fn scratch_path(&self) -> &std::path::Path {
+        self.scratch.path()
+    }
 }
 
 /// Backend-specific state. Internal — tests interact only with
@@ -132,9 +154,11 @@ pub fn engine_for_disk() -> EngineFixture {
         Tier::Warm,
     )]);
     let engine = StorageEngine::open(&cfg).expect("open disk engine");
+    let scratch = tempfile::TempDir::new().expect("create scratch tempdir");
     EngineFixture {
         engine,
-        _backing: Backing::Disk(dir),
+        backing: Backing::Disk(dir),
+        scratch,
     }
 }
 
@@ -156,9 +180,11 @@ pub fn engine_for_memory() -> EngineFixture {
     )])
     .with_fs(Arc::clone(&fs) as Arc<dyn lsm_tree::fs::Fs>);
     let engine = StorageEngine::open(&cfg).expect("open memory engine");
+    let scratch = tempfile::TempDir::new().expect("create scratch tempdir");
     EngineFixture {
         engine,
-        _backing: Backing::Memory(fs),
+        backing: Backing::Memory(fs),
+        scratch,
     }
 }
 

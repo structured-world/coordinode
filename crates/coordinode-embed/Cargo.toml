@@ -25,6 +25,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 lsm-tree = { package = "coordinode-lsm-tree", version = "4", default-features = false }
 tempfile = { workspace = true }
+coordinode-test-fixtures = { workspace = true }
 metrics = { workspace = true }
 metrics-util = "0.20"
 
