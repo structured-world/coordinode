@@ -1,0 +1,20 @@
+[package]
+name = "coordinode-bench"
+description = "Benchmark harness — JSON result schema, hardware fingerprint, git commit metadata, runner utilities. Consumed by per-modality bench binaries under benches/* and the gh-pages reporting layer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false  # internal harness, never to crates.io
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+sysinfo = "0.32"
+clap = { version = "4", features = ["derive"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

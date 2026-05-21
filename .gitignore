@@ -80,3 +80,12 @@ docs/.vitepress/cache/
 docs/api/
 .yarn/cache/
 .yarn/install-state.gz
+
+# Bench results JSON files DO live in the repo — committed by the
+# CN bench CI job (push-to-main, self-hosted runner on
+# <bench-runner>) AND placed manually by the human after
+# off-cycle competitor re-baselining. Track them with
+# `git add bench-results/...` like any other file.
+# The local `out/` Docker volume from
+# benches/vector-ann/docker/compose.competitors.yml is gitignored:
+benches/vector-ann/docker/out/
