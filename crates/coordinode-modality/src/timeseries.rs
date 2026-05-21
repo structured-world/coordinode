@@ -441,6 +441,36 @@ pub trait TimeSeriesStore {
         merged: &Bucket,
         overflow_seqnos: &[u64],
     ) -> StoreResult<()>;
+
+    /// Enumerate every `(label_id, bucket_id)` pair that currently
+    /// has at least one overflow entry. Returns pairs in arbitrary
+    /// order. Used by the background overflow compactor driver to
+    /// discover candidate buckets without an external index — the
+    /// engine answers "which buckets are stale?" by scanning the
+    /// `ts_overflow:` prefix and folding to unique `(label, bucket)`
+    /// pairs.
+    ///
+    /// Cost: one prefix scan over `ts_overflow:`. The scan walks
+    /// every overflow entry but only stores one `(label, bucket)`
+    /// pair per group — memory is bounded by the number of stale
+    /// buckets, not the overflow volume.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use coordinode_modality::{LocalTimeSeriesStore, TimeSeriesStore};
+    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
+    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    /// #     "ep", std::path::Path::new("/tmp/x"),
+    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+    /// # let engine = StorageEngine::open(&cfg)?;
+    /// # let store = LocalTimeSeriesStore::new(&engine);
+    /// for (label_id, bucket_id) in store.list_overflow_buckets()? {
+    ///     println!("compact candidate: ({label_id}, {})", bucket_id.as_raw());
+    /// }
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
+    fn list_overflow_buckets(&self) -> StoreResult<Vec<(u32, NodeId)>>;
 }
 
 /// CE single-shard implementation of [`TimeSeriesStore`].
@@ -625,6 +655,41 @@ impl TimeSeriesStore for LocalTimeSeriesStore<'_> {
         }
         batch.commit()?;
         Ok(())
+    }
+
+    fn list_overflow_buckets(&self) -> StoreResult<Vec<(u32, NodeId)>> {
+        // Overflow keys are `ts_overflow:<label_id_u32_BE>:<bucket_id_u64_BE>:<seqno_u64_BE>`.
+        // After the OVERFLOW_PREFIX, the next 4 + 8 bytes uniquely
+        // identify the `(label_id, bucket_id)` pair. Scan, decode
+        // those two fields, fold to a set to drop duplicates from
+        // multiple overflow rows under the same bucket.
+        let iter = self.engine.prefix_scan(Partition::Idx, OVERFLOW_PREFIX)?;
+        let mut seen: std::collections::HashSet<(u32, u64)> = std::collections::HashSet::new();
+        for guard in iter {
+            let (key, _value) = guard.into_inner()?;
+            // Skip malformed entries instead of erroring — a corrupt
+            // overflow key shouldn't take down the compactor driver.
+            let suffix = match key.get(OVERFLOW_PREFIX.len()..) {
+                Some(s) if s.len() >= 12 => s,
+                _ => {
+                    tracing::warn!(
+                        "list_overflow_buckets: skipping malformed overflow key (len={})",
+                        key.len(),
+                    );
+                    continue;
+                }
+            };
+            let label_id = u32::from_be_bytes([suffix[0], suffix[1], suffix[2], suffix[3]]);
+            let bucket_raw = u64::from_be_bytes([
+                suffix[4], suffix[5], suffix[6], suffix[7], suffix[8], suffix[9], suffix[10],
+                suffix[11],
+            ]);
+            seen.insert((label_id, bucket_raw));
+        }
+        Ok(seen
+            .into_iter()
+            .map(|(l, b)| (l, NodeId::from_raw(b)))
+            .collect())
     }
 }
 
@@ -956,6 +1021,65 @@ mod tests {
         assert_eq!(only_a[0].arrival_seqno, 100);
         assert_eq!(only_b.len(), 1);
         assert_eq!(only_b[0].arrival_seqno, 200);
+    }
+
+    #[test]
+    fn list_overflow_buckets_returns_unique_pairs_across_multiple_entries() {
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+
+        let m = |ts: i64| Measurement {
+            timestamp_us: ts,
+            fields: BTreeMap::new(),
+        };
+
+        // Bucket A: label=7, bucket=42, two overflow entries.
+        let entry_a1 = OverflowEntry {
+            arrival_seqno: 1,
+            measurement: m(100),
+        };
+        let entry_a2 = OverflowEntry {
+            arrival_seqno: 2,
+            measurement: m(200),
+        };
+        store
+            .put_overflow(7, NodeId::from_raw(42), &entry_a1)
+            .unwrap();
+        store
+            .put_overflow(7, NodeId::from_raw(42), &entry_a2)
+            .unwrap();
+        // Bucket B: label=7, bucket=99, one entry.
+        let entry_b = OverflowEntry {
+            arrival_seqno: 1,
+            measurement: m(300),
+        };
+        store
+            .put_overflow(7, NodeId::from_raw(99), &entry_b)
+            .unwrap();
+        // Bucket C: label=8 (different label), bucket=42 (same bucket_id as A but
+        // different (label, bucket) pair), one entry.
+        let entry_c = OverflowEntry {
+            arrival_seqno: 1,
+            measurement: m(400),
+        };
+        store
+            .put_overflow(8, NodeId::from_raw(42), &entry_c)
+            .unwrap();
+
+        let mut listed = store.list_overflow_buckets().expect("list");
+        listed.sort_by_key(|a| (a.0, a.1.as_raw()));
+        assert_eq!(listed.len(), 3, "3 unique (label_id, bucket_id) pairs");
+        assert_eq!(listed[0], (7, NodeId::from_raw(42)));
+        assert_eq!(listed[1], (7, NodeId::from_raw(99)));
+        assert_eq!(listed[2], (8, NodeId::from_raw(42)));
+    }
+
+    #[test]
+    fn list_overflow_buckets_empty_when_no_overflow() {
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let listed = store.list_overflow_buckets().expect("list");
+        assert!(listed.is_empty());
     }
 
     #[test]

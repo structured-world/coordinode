@@ -547,6 +547,33 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
         Ok(true)
     }
 
+    /// Background compactor driver primitive: discover every bucket
+    /// with at least one overflow entry and run
+    /// [`Self::compact_if_needed`] against each. Returns the count
+    /// of buckets that actually compacted (i.e. were above
+    /// `OVERFLOW_COMPACT_THRESHOLD`).
+    ///
+    /// Production wires this into a periodic loop above the catalog
+    /// (a `tokio::time::interval` task per shard owns the schedule;
+    /// the catalog itself never spawns threads). Tests invoke
+    /// directly to verify the discover + compact cycle end to end.
+    ///
+    /// The discover step uses
+    /// [`TimeSeriesStore::list_overflow_buckets`], which is a single
+    /// prefix scan of `ts_overflow:` folded to unique
+    /// `(label_id, bucket_id)` pairs — cost scales with the number of
+    /// stale buckets, not the overflow volume.
+    pub fn compact_all_pending(&self) -> CatalogResult<usize> {
+        let candidates = self.store.list_overflow_buckets()?;
+        let mut compacted = 0usize;
+        for (label_id, bucket_id) in candidates {
+            if self.compact_if_needed(label_id, bucket_id)? {
+                compacted += 1;
+            }
+        }
+        Ok(compacted)
+    }
+
     /// Persist `bucket` to the underlying TimeSeriesStore and mark
     /// it closed. Sorts the in-memory buffer by timestamp before
     /// columnising — Tier-1 in-buffer late arrivals are merged here.
@@ -1212,6 +1239,109 @@ mod tests {
         // overflow entries (500..551). Sorted: 0, 500..551, 1000.
         assert_eq!(base.timestamps[0], 0);
         assert_eq!(base.timestamps[52], 1000);
+    }
+
+    #[test]
+    fn compact_all_pending_discovers_and_compacts_every_stale_bucket() {
+        // Seed two distinct closed buckets each with > 50 overflow
+        // entries (above the OVERFLOW_COMPACT_THRESHOLD). The
+        // background driver primitive must discover both via
+        // `list_overflow_buckets` and compact each one.
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let cfg = CatalogConfig {
+            max_count: 2,
+            granularity_span: Duration::from_millis(50),
+            ..CatalogConfig::default()
+        };
+        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+
+        // Bucket A under meta "sA": close + 51 overflow.
+        let meta_a = rmpv::Value::String("sA".into());
+        for i in 0..2 {
+            catalog
+                .write_measurement(7, meta_a.clone(), measurement(i * 1000, &[("v", 1.0)]))
+                .unwrap();
+        }
+        catalog.flush_all().unwrap();
+        let future = SystemTime::now() + Duration::from_secs(1);
+        for i in 0..51 {
+            catalog
+                .write_measurement_at(
+                    7,
+                    meta_a.clone(),
+                    measurement(500 + i, &[("v", 30.0 + (i as f64))]),
+                    future,
+                )
+                .unwrap();
+        }
+
+        // Bucket B under meta "sB": close + 51 overflow.
+        let meta_b = rmpv::Value::String("sB".into());
+        for i in 0..2 {
+            catalog
+                .write_measurement(7, meta_b.clone(), measurement(i * 1000, &[("v", 2.0)]))
+                .unwrap();
+        }
+        catalog.flush_all().unwrap();
+        for i in 0..51 {
+            catalog
+                .write_measurement_at(
+                    7,
+                    meta_b.clone(),
+                    measurement(500 + i, &[("v", 60.0 + (i as f64))]),
+                    future,
+                )
+                .unwrap();
+        }
+
+        // Bucket C: only 10 overflow entries (below threshold —
+        // must NOT compact).
+        let meta_c = rmpv::Value::String("sC".into());
+        for i in 0..2 {
+            catalog
+                .write_measurement(7, meta_c.clone(), measurement(i * 1000, &[("v", 3.0)]))
+                .unwrap();
+        }
+        catalog.flush_all().unwrap();
+        for i in 0..10 {
+            catalog
+                .write_measurement_at(
+                    7,
+                    meta_c.clone(),
+                    measurement(500 + i, &[("v", 90.0 + (i as f64))]),
+                    future,
+                )
+                .unwrap();
+        }
+
+        // Discover-and-compact: exactly 2 buckets compacted (A, B);
+        // C's overflow stays in place.
+        let compacted = catalog.compact_all_pending().unwrap();
+        assert_eq!(compacted, 2, "A and B compacted, C below threshold");
+
+        // Post-compact: A's and B's overflow sets empty; C's intact.
+        assert!(store
+            .scan_overflow(7, NodeId::from_raw(1))
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .scan_overflow(7, NodeId::from_raw(2))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.scan_overflow(7, NodeId::from_raw(3)).unwrap().len(),
+            10,
+        );
+    }
+
+    #[test]
+    fn compact_all_pending_no_op_when_overflow_set_empty() {
+        let (_dir, engine) = mk_engine();
+        let store = LocalTimeSeriesStore::new(&engine);
+        let cfg = CatalogConfig::arch_defaults();
+        let catalog = BucketCatalog::new(cfg, 0, &store, 1).unwrap();
+        assert_eq!(catalog.compact_all_pending().unwrap(), 0);
     }
 
     #[test]
