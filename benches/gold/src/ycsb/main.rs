@@ -41,79 +41,111 @@ fn main() {
 }
 
 fn print_report(a: &WorkloadResult, c: &WorkloadResult, baselines: &Baselines) {
-    let redis_a = baselines
-        .kv
+    // Primary competitor: MongoDB 8.x — the multi-model document-
+    // store baseline per the rewritten methodology doc. Redis is
+    // explicitly NOT a target (in-memory cache, different product).
+    let mongo_a = baselines
+        .document
         .ycsb
         .workload_a
-        .get("redis")
-        .expect("redis baseline for workload A");
-    let redis_c = baselines
-        .kv
+        .get("mongodb_8")
+        .expect("mongodb_8 baseline for workload A");
+    let mongo_c = baselines
+        .document
         .ycsb
         .workload_c
-        .get("redis")
-        .expect("redis baseline for workload C");
+        .get("mongodb_8")
+        .expect("mongodb_8 baseline for workload C");
+
+    let mongo_a_throughput = mongo_a
+        .throughput_ops_s
+        .expect("mongodb_8 workload_a throughput must be populated");
+    let mongo_a_p99 = mongo_a
+        .read_p99_us
+        .expect("mongodb_8 workload_a read_p99_us must be populated");
+    let mongo_c_throughput = mongo_c
+        .throughput_ops_s
+        .expect("mongodb_8 workload_c throughput must be populated");
+    let mongo_c_p99 = mongo_c
+        .read_p99_us
+        .expect("mongodb_8 workload_c read_p99_us must be populated");
 
     println!(
         "{}",
         report::format_header(a.preset.records, a.preset.operations),
     );
+    println!(
+        "\n⚠ DISCLAIMER — this is the INTERNAL REGRESSION BENCH only.\n\
+         CoordiNode is running embedded in-process here; MongoDB's number\n\
+         is networked client→server. The ratios below are NOT publishable\n\
+         marketing numbers — they measure engine micro-perf, not buyer-\n\
+         comparable workloads. For honest comparisons see the v0.4-alpha\n\
+         milestone gate in arch/benchmarks/methodology.md (requires the\n\
+         networked YCSB harness, not yet built).\n",
+    );
 
     println!(
         "{}",
         report::format_modality_block(
-            "KV (YCSB Workload A: 50% read / 50% update)",
+            "Document (YCSB Workload A: 50% read / 50% update)",
             &[
                 report::Row {
                     metric: "Throughput (ops/s)",
                     cn: a.throughput_ops_s(),
-                    leader: redis_a.throughput_ops_s,
+                    leader: mongo_a_throughput,
                     higher_is_better: true,
                 },
                 report::Row {
                     metric: "Read P99 (µs)",
                     cn: a.read_p99_us(),
-                    leader: redis_a.read_p99_us,
+                    leader: mongo_a_p99,
                     higher_is_better: false,
                 },
             ],
-            &format!("Redis ({})", redis_a.source),
+            &format!("MongoDB 8.x ({})", mongo_a.source),
         ),
     );
 
     println!(
         "{}",
         report::format_modality_block(
-            "KV (YCSB Workload C: 100% read)",
+            "Document (YCSB Workload C: 100% read)",
             &[
                 report::Row {
                     metric: "Throughput (ops/s)",
                     cn: c.throughput_ops_s(),
-                    leader: redis_c.throughput_ops_s,
+                    leader: mongo_c_throughput,
                     higher_is_better: true,
                 },
                 report::Row {
                     metric: "Read P99 (µs)",
                     cn: c.read_p99_us(),
-                    leader: redis_c.read_p99_us,
+                    leader: mongo_c_p99,
                     higher_is_better: false,
                 },
             ],
-            &format!("Redis ({})", redis_c.source),
+            &format!("MongoDB 8.x ({})", mongo_c.source),
         ),
     );
 
     let cn_score = report::geometric_mean(&[
-        report::throughput_ratio(a.throughput_ops_s(), redis_a.throughput_ops_s),
-        report::latency_ratio(a.read_p99_us(), redis_a.read_p99_us),
-        report::throughput_ratio(c.throughput_ops_s(), redis_c.throughput_ops_s),
-        report::latency_ratio(c.read_p99_us(), redis_c.read_p99_us),
+        report::throughput_ratio(a.throughput_ops_s(), mongo_a_throughput),
+        report::latency_ratio(a.read_p99_us(), mongo_a_p99),
+        report::throughput_ratio(c.throughput_ops_s(), mongo_c_throughput),
+        report::latency_ratio(c.read_p99_us(), mongo_c_p99),
     ]);
     println!(
         "\n┌─────────────────────────────────────────────────────────────┐\n\
-         │ Composite (KV partial — YCSB A + C):                        │\n\
-         │   Geometric mean of 4 ratios = {cn_score:.3}x vs Redis              │\n\
-         │   (LDBC, ann-benchmarks, BEIR, TSBS, SpatialBench pending)  │\n\
+         │ Document partial — YCSB A + C, internal regression bench    │\n\
+         │ vs MongoDB 8.x (networked baseline):                        │\n\
+         │   Geometric mean of 4 ratios = {cn_score:.3}x                       │\n\
+         │                                                             │\n\
+         │ Pending for v0.4-alpha gate per methodology.md:             │\n\
+         │   • Networked CoordiNode YCSB (gRPC client→server)          │\n\
+         │   • Vector vs OpenSearch / SurrealDB (ann-benchmarks SIFT1M)│\n\
+         │ Pending for v0.5-alpha:                                     │\n\
+         │   • LDBC SNB vs SurrealDB / ArangoDB / Neo4j                │\n\
+         │   • UniBench multi-model vs ArangoDB                        │\n\
          └─────────────────────────────────────────────────────────────┘",
     );
 }
