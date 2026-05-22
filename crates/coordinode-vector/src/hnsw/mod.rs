@@ -134,6 +134,14 @@ pub struct HnswConfig {
     /// Passed to `VectorLoader::load_vectors` so one loader serves all indexes.
     /// Empty string if unknown (non-offloaded indexes don't need this).
     pub property_name: String,
+    /// Expected upper bound on the number of vectors this index will hold.
+    /// Used at construction to pre-allocate the `nodes` and
+    /// `neighbours_atomic` vectors so the insert hot path never pays
+    /// `Vec` reallocation cost. Insert beyond `max_elements` is supported
+    /// (the vectors grow normally) but the first overflow re-allocation
+    /// pauses inserts briefly; size this generously when ingestion volume
+    /// is known. Default: 1_000_000.
+    pub max_elements: u32,
 }
 
 impl Default for HnswConfig {
@@ -150,6 +158,7 @@ impl Default for HnswConfig {
             calibration_threshold: 100,
             offload_vectors: false,
             property_name: String::new(),
+            max_elements: 1_000_000,
         }
     }
 }
@@ -292,11 +301,16 @@ impl HnswIndex {
             );
         }
         let level_mult = 1.0 / (config.m as f64).ln();
+        // Pre-size storage so steady-state inserts never pay reallocation
+        // cost on the hot path. `max_elements` is advisory — exceeding it
+        // is supported, the first overflow simply triggers Vec growth.
+        let capacity = config.max_elements as usize;
+        let id_to_idx = std::collections::HashMap::with_capacity(capacity);
         Self {
             config,
-            nodes: Vec::new(),
-            neighbours_atomic: Vec::new(),
-            id_to_idx: std::collections::HashMap::new(),
+            nodes: Vec::with_capacity(capacity),
+            neighbours_atomic: Vec::with_capacity(capacity),
+            id_to_idx,
             entry_point: None,
             max_level: 0,
             level_mult,
@@ -1644,6 +1658,7 @@ mod tests {
             calibration_threshold: 5, // Low threshold for testing
             offload_vectors: false,
             property_name: String::new(),
+            max_elements: 1_000_000,
         }
     }
 
@@ -1735,6 +1750,7 @@ mod tests {
             calibration_threshold: 10,
             offload_vectors: false,
             property_name: String::new(),
+            max_elements: 1_000_000,
         });
 
         let dim = 16;
@@ -1817,6 +1833,7 @@ mod tests {
             calibration_threshold: 50,
             offload_vectors: false,
             property_name: String::new(),
+            max_elements: 1_000_000,
         });
 
         for (i, v) in vectors.iter().enumerate() {
@@ -2116,6 +2133,7 @@ mod tests {
             calibration_threshold: 5, // Low threshold for testing
             offload_vectors: true,
             property_name: "embedding".to_string(),
+            max_elements: 1_000,
         }
     }
 
@@ -2357,6 +2375,7 @@ mod tests {
             calibration_threshold: 1_000,
             offload_vectors: false,
             property_name: String::new(),
+            max_elements: 1_000_000,
         });
 
         for i in 0..30u64 {
@@ -2390,5 +2409,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn max_elements_preallocates_node_storage() {
+        // C1 day 6: HnswConfig::max_elements drives Vec::with_capacity for
+        // nodes + neighbours_atomic so steady-state inserts don't pay
+        // reallocation cost on the hot path.
+        let cfg = HnswConfig {
+            max_elements: 50_000,
+            ..HnswConfig::default()
+        };
+        let idx = HnswIndex::new(cfg);
+
+        assert!(
+            idx.nodes.capacity() >= 50_000,
+            "nodes Vec capacity {} < max_elements 50_000",
+            idx.nodes.capacity()
+        );
+        assert!(
+            idx.neighbours_atomic.capacity() >= 50_000,
+            "neighbours_atomic Vec capacity {} < max_elements 50_000",
+            idx.neighbours_atomic.capacity()
+        );
+        // HashMap::with_capacity may round up; just assert it's non-zero.
+        assert!(idx.id_to_idx.capacity() >= 50_000);
+    }
+
+    #[test]
+    fn insert_within_max_elements_does_not_reallocate_node_vec() {
+        // The whole point of pre-allocation: stable Vec capacity through
+        // the full max_elements range of inserts.
+        let cfg = HnswConfig {
+            m: 4,
+            m_max0: 8,
+            max_elements: 200,
+            max_dimensions: 4,
+            ..HnswConfig::default()
+        };
+        let mut idx = HnswIndex::new(cfg);
+        let cap_before = idx.nodes.capacity();
+        for i in 0..200u64 {
+            let v: Vec<f32> = (0..4).map(|d| ((i * 7 + d) as f32).sin()).collect();
+            idx.insert(i, v);
+        }
+        assert_eq!(
+            idx.nodes.capacity(),
+            cap_before,
+            "nodes Vec reallocated within max_elements window",
+        );
     }
 }

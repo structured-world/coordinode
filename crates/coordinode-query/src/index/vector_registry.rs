@@ -75,6 +75,7 @@ impl VectorIndexRegistry {
             calibration_threshold: 1000,
             offload_vectors: config.offload_vectors,
             property_name: def.property().to_string(),
+            max_elements: 1_000_000,
         };
 
         let hnsw = HnswIndex::new(hnsw_config);
