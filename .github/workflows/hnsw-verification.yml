@@ -1,4 +1,4 @@
-name: Miri (UB scan)
+name: Lock-free HNSW verification
 
 on:
   push:
@@ -38,9 +38,47 @@ jobs:
         # atomic orderings, uninitialised reads, type-punning aliasing, etc.
         # Higher-level integration tests use rayon and would time out under
         # miri; they are covered by the proptest stress in the regular CI
-        # job and the loom interleaving suite (future work).
+        # job and the loom job below.
         env:
           MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-permissive-provenance
         run: |
           cd crates/coordinode-vector
           cargo +nightly miri test --lib hnsw::neighbours::tests --no-fail-fast
+
+  loom-neighbours:
+    name: Loom — AtomicNeighbourList interleavings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Loom uses a different build cfg, so cache separately from the
+          # regular build to avoid recompile churn on the main test job.
+          key: loom
+
+      - name: Run loom interleaving suite
+        # Loom permutes every observable order of atomic operations on the
+        # AtomicNeighbourList primitives — exhaustive verification that
+        # the Acquire/Release pairing on `len` correctly publishes slot
+        # writes to any subsequent reader, and that cas_append never loses
+        # writes under concurrent senders.
+        env:
+          RUSTFLAGS: --cfg loom
+        run: |
+          cargo nextest run \
+            --test loom_neighbours \
+            --release \
+            -p coordinode-vector \
+            --no-fail-fast
