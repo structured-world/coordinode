@@ -98,8 +98,11 @@ const qpsLogScale = ref<boolean>(true);
 const yMetric = ref<"qps" | "latency_us_p99">("qps");
 const enabledSubjects = ref<Set<string>>(new Set());
 
-// Ratio chart UI state
-type RatioMetric = "qps_at_0_95" | "recall_peak" | "p99_at_0_95";
+// Ratio chart UI state. Recall on its own is not a speedup metric —
+// it's the accuracy floor at which we measure speed. The canonical
+// ann-benchmarks operating point pins recall ≥ 0.95 and reports
+// throughput / latency there. Both metrics below are speed-at-quality.
+type RatioMetric = "qps_at_0_95" | "p99_at_0_95";
 const ratioMetric = ref<RatioMetric>("qps_at_0_95");
 // Which specialists are visible as ratio lines. CoordiNode is always the
 // numerator and never appears in this set; only competitor subjects.
@@ -133,11 +136,6 @@ function metricValue(rep: BenchReport, m: RatioMetric): number | null {
       ? rep.metrics.qps_at_recall_0_95
       : null;
   }
-  if (m === "recall_peak") {
-    return typeof rep.metrics.recall_at_k_peak === "number"
-      ? rep.metrics.recall_at_k_peak
-      : null;
-  }
   // p99_at_0_95: pick the sweep point closest to recall = 0.95.
   const sweep = rep.metrics.sweep ?? [];
   if (sweep.length === 0) return null;
@@ -151,6 +149,36 @@ function metricValue(rep: BenchReport, m: RatioMetric): number | null {
     }
   }
   return best.latency_us_p99;
+}
+
+// Companion recall for a commit — shown in the speedup-chart tooltip
+// next to the ratio so the reader can confirm the speed number was
+// measured at the canonical recall ≥ 0.95 operating point (or see how
+// far it drifted if a sweep point landed below).
+function commitRecall(rep: BenchReport, m: RatioMetric): number | null {
+  if (m === "qps_at_0_95") {
+    // qps_at_recall_0_95 is by definition the QPS at the sweep point
+    // whose recall ≥ 0.95; report 0.95 as the floor or the exact recall
+    // of the matched sweep point when known.
+    const sweep = rep.metrics.sweep ?? [];
+    if (sweep.length === 0) return null;
+    const ge = sweep.filter((p) => p.recall_at_k >= 0.95);
+    if (ge.length === 0) return Math.max(...sweep.map((p) => p.recall_at_k));
+    return Math.min(...ge.map((p) => p.recall_at_k));
+  }
+  // p99_at_0_95 — same sweep-point-nearest-0.95 logic.
+  const sweep = rep.metrics.sweep ?? [];
+  if (sweep.length === 0) return null;
+  let best = sweep[0]!;
+  let bestDelta = Math.abs(best.recall_at_k - 0.95);
+  for (const p of sweep) {
+    const d = Math.abs(p.recall_at_k - 0.95);
+    if (d < bestDelta) {
+      best = p;
+      bestDelta = d;
+    }
+  }
+  return best.recall_at_k;
 }
 
 // For QPS / recall, larger = better → ratio = CN / baseline.
@@ -292,8 +320,12 @@ const speedupOption = computed(() => {
       ts: r.timestamp,
       sha: r.git.sha_short,
       value: metricValue(r, m),
+      recall: commitRecall(r, m),
     }))
-    .filter((x): x is { ts: string; sha: string; value: number } => x.value !== null)
+    .filter(
+      (x): x is { ts: string; sha: string; value: number; recall: number | null } =>
+        x.value !== null,
+    )
     .sort((a, b) => a.ts.localeCompare(b.ts));
 
   // Pinned competitor scalar — there's exactly one JSON per competitor
@@ -322,31 +354,36 @@ const speedupOption = computed(() => {
     symbolSize: 8,
     data: cnRuns.map((r) => {
       const ratio = dir === "higher-better" ? r.value / baseValue : baseValue / r.value;
-      return [r.sha, ratio, r.ts];
+      return [r.sha, ratio, r.ts, r.recall];
     }),
     emphasis: { focus: "series" as const },
   }));
 
   const metricLabel =
-    m === "qps_at_0_95"
-      ? "QPS @ recall ≥ 0.95"
-      : m === "recall_peak"
-        ? "peak recall @ 10"
-        : "P99 latency @ recall ≥ 0.95";
+    m === "qps_at_0_95" ? "QPS @ recall ≥ 0.95" : "P99 latency @ recall ≥ 0.95";
 
   return {
     tooltip: {
       trigger: "item",
       formatter: (params: any) => {
-        const [sha, ratio, ts] = params.data as [string, number, string];
+        const [sha, ratio, ts, recall] = params.data as [
+          string,
+          number,
+          string,
+          number | null,
+        ];
         const verb = ratio >= 1 ? "faster than" : "slower than";
         const factor = ratio >= 1 ? ratio.toFixed(2) : (1 / ratio).toFixed(2);
-        return [
+        const lines = [
           `<b>${params.seriesName}</b>`,
           `Commit <code>${sha}</code> — ${new Date(ts).toLocaleString()}`,
           `Ratio: ${ratio.toFixed(3)}× (${factor}× ${verb} baseline)`,
           `Metric: ${metricLabel}`,
-        ].join("<br>");
+        ];
+        if (recall !== null) {
+          lines.push(`Recall @ 10 at this point: ${recall.toFixed(4)}`);
+        }
+        return lines.join("<br>");
       },
     },
     legend: {
@@ -553,12 +590,6 @@ onMounted(render);
             @click="ratioMetric = 'qps_at_0_95'"
           >
             QPS @ recall ≥ 0.95
-          </button>
-          <button
-            :class="['chip', ratioMetric === 'recall_peak' ? 'on' : 'off']"
-            @click="ratioMetric = 'recall_peak'"
-          >
-            Peak recall @ 10
           </button>
           <button
             :class="['chip', ratioMetric === 'p99_at_0_95' ? 'on' : 'off']"
