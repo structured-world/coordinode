@@ -1200,6 +1200,7 @@ dependencies = [
  "coordinode-storage",
  "criterion",
  "crossbeam-epoch",
+ "loom",
  "proptest",
  "rayon",
  "rmp-serde",
