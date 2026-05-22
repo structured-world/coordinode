@@ -304,20 +304,12 @@ impl Ord for Candidate {
 /// HNSW search calls the metric distance function thousands of times per query,
 /// always with the same query vector. Anything that depends only on the query
 /// (norms, projection sums, lookup tables) is computed once and stored here.
-/// Scratch buffers that hot paths would otherwise re-allocate per visit
-/// (the SQ8 dequantize destination) also live here.
 struct QueryCtx<'a> {
     /// The query vector.
     vec: &'a [f32],
     /// ‖query‖₂ — pre-computed once per search. Used by Cosine metric only;
     /// other metrics ignore this field.
     norm_l2: f32,
-    /// Reusable destination buffer for [`Sq8Params::dequantize_into`].
-    /// `RefCell` because [`QueryCtx`] is passed as `&QueryCtx` through
-    /// the search loop — interior mutability lets every call write into
-    /// the same allocation instead of producing a fresh `Vec<f32>` per
-    /// neighbour visit.
-    dequant_scratch: std::cell::RefCell<Vec<f32>>,
 }
 
 impl<'a> QueryCtx<'a> {
@@ -327,11 +319,7 @@ impl<'a> QueryCtx<'a> {
         } else {
             0.0
         };
-        Self {
-            vec,
-            norm_l2,
-            dequant_scratch: std::cell::RefCell::new(Vec::with_capacity(vec.len())),
-        }
+        Self { vec, norm_l2 }
     }
 }
 
@@ -1590,9 +1578,8 @@ impl HnswIndex {
     fn compute_distance(&self, ctx: &QueryCtx<'_>, node_idx: usize) -> f32 {
         if let Some(params) = &self.sq8_params {
             if let Some(quantized) = &self.nodes[node_idx].quantized {
-                let mut scratch = ctx.dequant_scratch.borrow_mut();
-                params.dequantize_into(quantized, &mut scratch);
-                return self.distance_for_metric(ctx, &scratch);
+                let dequantized = params.dequantize(quantized);
+                return self.distance_for_metric(ctx, &dequantized);
             }
         }
         self.compute_exact_distance(ctx, node_idx)
@@ -1608,9 +1595,8 @@ impl HnswIndex {
         // f32 offloaded — fall back to dequantized SQ8 (slightly less accurate)
         if let Some(ref params) = self.sq8_params {
             if let Some(ref quantized) = self.nodes[node_idx].quantized {
-                let mut scratch = ctx.dequant_scratch.borrow_mut();
-                params.dequantize_into(quantized, &mut scratch);
-                return self.distance_for_metric(ctx, &scratch);
+                let dequantized = params.dequantize(quantized);
+                return self.distance_for_metric(ctx, &dequantized);
             }
         }
         f32::INFINITY

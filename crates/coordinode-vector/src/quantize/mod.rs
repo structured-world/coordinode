@@ -90,133 +90,16 @@ impl Sq8Params {
     }
 
     /// Dequantize a uint8 vector back to float32 (approximate).
-    ///
-    /// Allocates a fresh `Vec<f32>` for the result — convenient for
-    /// one-shot calls outside hot paths. Search hot paths should use
-    /// [`Self::dequantize_into`] with a caller-owned scratch buffer to
-    /// eliminate per-vector allocation.
     pub fn dequantize(&self, quantized: &[u8]) -> Vec<f32> {
-        let mut out = Vec::with_capacity(self.dims());
-        self.dequantize_into(quantized, &mut out);
-        out
-    }
-
-    /// Dequantize into a caller-owned scratch buffer.
-    ///
-    /// HNSW search calls dequantize once per neighbour visit — hundreds to
-    /// thousands of times per query. With `dequantize` returning a fresh
-    /// `Vec<f32>` every call, that's a fresh allocation + drop per
-    /// neighbour. `dequantize_into` lets the caller reuse a single buffer
-    /// across the entire search.
-    ///
-    /// `out` is cleared and resized to `self.dims()` before being filled.
-    pub fn dequantize_into(&self, quantized: &[u8], out: &mut Vec<f32>) {
         assert_eq!(quantized.len(), self.dims(), "dimension mismatch");
-        out.clear();
-        out.reserve(self.dims());
-        // SAFETY: we just reserved capacity, and we fill every element below
-        // before any read can see it (no panic between set_len and fill).
-        // The scalar fallback path writes every index; SIMD paths do the
-        // same. This avoids the Vec<T>::push overhead of bounds checks per
-        // element which becomes measurable when called 100K+ times per sec.
-        unsafe {
-            out.set_len(self.dims());
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("avx2") {
-                unsafe {
-                    self.dequantize_into_avx2(quantized, out);
-                }
-                return;
-            }
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            unsafe {
-                self.dequantize_into_neon(quantized, out);
-            }
-            return;
-        }
-
-        #[allow(unreachable_code)]
-        self.dequantize_into_scalar(quantized, out);
-    }
-
-    #[inline]
-    fn dequantize_into_scalar(&self, quantized: &[u8], out: &mut [f32]) {
-        for (i, &q) in quantized.iter().enumerate() {
-            let range = self.maxs[i] - self.mins[i];
-            out[i] = (q as f32 / 255.0) * range + self.mins[i];
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn dequantize_into_avx2(&self, quantized: &[u8], out: &mut [f32]) {
-        use std::arch::x86_64::*;
-        let dims = quantized.len();
-        let chunks = dims / 8;
-        let inv255 = _mm256_set1_ps(1.0 / 255.0);
-
-        unsafe {
-            for c in 0..chunks {
-                let base = c * 8;
-                // Load 8 u8 → widen to 8 u32 → cast to 8 f32.
-                let bytes = _mm_loadl_epi64(quantized.as_ptr().add(base) as *const _);
-                let u32x8 = _mm256_cvtepu8_epi32(bytes);
-                let f32x8 = _mm256_cvtepi32_ps(u32x8);
-                let scaled = _mm256_mul_ps(f32x8, inv255);
-
-                // Per-dimension scale = (max - min), offset = min.
-                let maxs_v = _mm256_loadu_ps(self.maxs.as_ptr().add(base));
-                let mins_v = _mm256_loadu_ps(self.mins.as_ptr().add(base));
-                let range = _mm256_sub_ps(maxs_v, mins_v);
-                // (q / 255) * range + min — FMA.
-                let result = _mm256_fmadd_ps(scaled, range, mins_v);
-                _mm256_storeu_ps(out.as_mut_ptr().add(base), result);
-            }
-        }
-        // Tail.
-        for i in (chunks * 8)..dims {
-            let range = self.maxs[i] - self.mins[i];
-            out[i] = (quantized[i] as f32 / 255.0) * range + self.mins[i];
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "neon")]
-    unsafe fn dequantize_into_neon(&self, quantized: &[u8], out: &mut [f32]) {
-        use std::arch::aarch64::*;
-        let dims = quantized.len();
-        let chunks = dims / 4;
-        let inv255 = vdupq_n_f32(1.0 / 255.0);
-
-        unsafe {
-            for c in 0..chunks {
-                let base = c * 4;
-                // Load 4 u8 → widen via vmovl chain → f32x4.
-                let bytes = std::ptr::read_unaligned(quantized.as_ptr().add(base) as *const u32);
-                let v_u8 = vcreate_u8(bytes as u64);
-                let v_u16 = vget_low_u16(vmovl_u8(v_u8));
-                let v_u32 = vmovl_u16(v_u16);
-                let v_f32 = vcvtq_f32_u32(v_u32);
-                let scaled = vmulq_f32(v_f32, inv255);
-
-                let maxs_v = vld1q_f32(self.maxs.as_ptr().add(base));
-                let mins_v = vld1q_f32(self.mins.as_ptr().add(base));
-                let range = vsubq_f32(maxs_v, mins_v);
-                // FMA: scaled * range + mins.
-                let result = vfmaq_f32(mins_v, scaled, range);
-                vst1q_f32(out.as_mut_ptr().add(base), result);
-            }
-        }
-        for i in (chunks * 4)..dims {
-            let range = self.maxs[i] - self.mins[i];
-            out[i] = (quantized[i] as f32 / 255.0) * range + self.mins[i];
-        }
+        quantized
+            .iter()
+            .enumerate()
+            .map(|(i, &q)| {
+                let range = self.maxs[i] - self.mins[i];
+                (q as f32 / 255.0) * range + self.mins[i]
+            })
+            .collect()
     }
 }
 
