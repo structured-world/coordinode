@@ -65,44 +65,38 @@
   }
 }
 
-/* Benchmarks page is the widest consumer — give the .content area a
- * dedicated near-full-bleed layout. The class is applied per-page via
- * `pageClass: "benchmarks-wide"` in the page frontmatter. */
-.benchmarks-wide .VPDoc .container,
-.benchmarks-wide .VPDoc:not(.has-aside) .container {
-  max-width: min(96vw, 1880px);
+/* Benchmarks page — disable the right outline (`outline: false`, `aside: false`
+ * in frontmatter) AND give the content area a near-full-bleed layout. The
+ * class applies regardless of whether the layout has an aside; we want the
+ * widest possible canvas for the charts.
+ *
+ * The page still keeps the LEFT sidebar (`/benchmarks/` entries in config.mts)
+ * for navigation between modality anchors. */
+.benchmarks-wide .VPDoc .container {
+  max-width: min(96vw, 1880px) !important;
 }
 
-.benchmarks-wide .VPDoc:not(.has-aside) .container > .content {
-  max-width: min(94vw, 1760px);
+.benchmarks-wide .VPDoc .container > .content {
+  max-width: min(94vw, 1760px) !important;
 }
 
-/* The main VitePress nav bar stays inside the page container — widen it
- * in lock-step so the brand / nav links don't drift toward the centre on
- * a wider doc area. */
-@media (min-width: 1280px) {
-  .VPNavBar .container,
-  .VPNavBar.has-sidebar .content,
-  .VPNavBar .content-body {
-    max-width: 1360px;
-  }
+/* Belt-and-braces: hide any aside that snuck through frontmatter (some
+ * VitePress layouts re-mount the outline component). */
+.benchmarks-wide .VPDocAside,
+.benchmarks-wide .VPDoc.has-aside .aside {
+  display: none !important;
+}
+.benchmarks-wide .VPDoc.has-aside .content {
+  padding-right: 0 !important;
 }
 
-@media (min-width: 1600px) {
-  .VPNavBar .container,
-  .VPNavBar.has-sidebar .content,
-  .VPNavBar .content-body {
-    max-width: 1520px;
-  }
-}
-
-@media (min-width: 1920px) {
-  .VPNavBar .container,
-  .VPNavBar.has-sidebar .content,
-  .VPNavBar .content-body {
-    max-width: 1760px;
-  }
-}
+/* Earlier versions of this file pinned navbar container width to 1360 /
+ * 1520 / 1760 by viewport breakpoint. That fights with the default
+ * responsive nav rendering — items overlap when the navbar container is
+ * narrower than the menu width but the page itself is wider. We let
+ * VitePress's own defaults handle the navbar; the brand still aligns with
+ * the sidebar edge via VitePress's `.VPNavBar .container.has-sidebar`
+ * built-in rules. */
 
 /* Home hero stretches with the page on ultra-wide displays too. */
 @media (min-width: 1600px) {

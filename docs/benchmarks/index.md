@@ -2,6 +2,8 @@
 title: Benchmarks
 description: CoordiNode benchmark results across every modality — vector, graph, document, time-series, spatial, full-text. Compared against multi-model competitors and modality specialists on identical hardware.
 pageClass: benchmarks-wide
+outline: false
+aside: false
 ---
 
 <script setup>
