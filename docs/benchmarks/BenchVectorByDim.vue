@@ -56,52 +56,62 @@ interface Datapoint {
   notes?: string;
 }
 
-// Data registry — ONLY cited public numbers + our own bench measurements.
-// Mirrors arch/benchmarks/methodology.md § Modality 3.
+// Data registry — ONLY numbers measured on our bench host.
 //
-// Source rules:
-//  * CoordiNode entries: measured on our runner (Intel i9-9900K, 1 thread).
-//  * Competitor entries: cited from ann-benchmarks.com (Level A) and
-//    VectorDBBench (Level B) per documented methodology baselines.
-//  * NO "projected" / forward-looking estimates. The chart shows what
-//    actually exists; gaps are gaps. Numbers populate as bench runs land.
+// Hard rule: no cited / drawn / vendor-blog / leaderboard numbers. If a row
+// doesn't come from a JSON we wrote on <redacted>, it doesn't go in DATA.
+// Engines we plan to bench appear in the legend with status "running on
+// bench host" but contribute zero datapoints to the chart until their
+// measured JSON is committed to the bench-data branch.
+//
+// The single CoordiNode SIFT1M row below is the only measurement that
+// currently exists (commit f763f86, codec=none, M=32, ef_construction=200,
+// single thread). All other engines render as empty series with a status
+// pill linking to the ROADMAP for when their bench lands.
 const DATA: Datapoint[] = [
-  // === Level A: ann-benchmarks SIFT1M, d=128, recall ≥ 0.95, single CPU ===
-  // Cited from arch/benchmarks/methodology.md § Modality 3 Level A baselines.
-  // RAM not in ann-benchmarks output schema → null (chart RAM row stays empty).
-  { engine: "hnswlib", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 18000, ram_mb_per_1m: null, source: "ann-benchmarks.com" },
-  { engine: "FAISS-HNSW", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 15000, ram_mb_per_1m: null, source: "ann-benchmarks.com" },
-  { engine: "ScaNN", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 20000, ram_mb_per_1m: null, source: "ann-benchmarks.com" },
-  { engine: "Annoy", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 5000, ram_mb_per_1m: null, source: "ann-benchmarks.com" },
-  { engine: "pgvector (HNSW)", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 3000, ram_mb_per_1m: null, source: "ann-benchmarks.com" },
-
-  // CoordiNode SIFT1M — measured on our runner (Intel i9-9900K).
-  // Bench harness today records timing + recall, NOT RSS — the RSS-sampling
-  // addition is the next part of R868. ram_mb_per_1m stays null until that lands.
   { engine: "CoordiNode (current main)", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 1317, ram_mb_per_1m: null, source: "bench-host", notes: "f763f86 single-thread, codec=none, M=32, ef_construction=200" },
+];
 
-  // === Level B: VectorDBBench Cohere-768 (d=768, 1M vectors) ===
-  // Cited from arch/benchmarks/methodology.md § Modality 3 Level B baselines.
-  // Modality specialists as secondary anchors per documented methodology
-  // (primary multi-model competitors land here as we run the matrix on our host).
-  { engine: "Qdrant", dataset: "cohere-768-vdbbench", dim: 768, scale: 1_000_000, recall: 0.98, qps: 5000, ram_mb_per_1m: null, source: "VDBBench", notes: "p99 ~8 ms" },
-  { engine: "Milvus", dataset: "cohere-768-vdbbench", dim: 768, scale: 1_000_000, recall: 0.97, qps: 4000, ram_mb_per_1m: null, source: "VDBBench", notes: "p99 ~12 ms" },
-  { engine: "Weaviate", dataset: "cohere-768-vdbbench", dim: 768, scale: 1_000_000, recall: 0.96, qps: 3000, ram_mb_per_1m: null, source: "VDBBench", notes: "p99 ~15 ms" },
-  { engine: "Elasticsearch 8.x", dataset: "cohere-768-vdbbench", dim: 768, scale: 1_000_000, recall: 0.94, qps: 2000, ram_mb_per_1m: null, source: "VDBBench", notes: "p99 ~20 ms" },
-  { engine: "pgvector (HNSW)", dataset: "cohere-768-vdbbench", dim: 768, scale: 1_000_000, recall: 0.95, qps: 1500, ram_mb_per_1m: null, source: "VDBBench", notes: "p99 ~25 ms" },
+// Engines we will bench on our own runner via the ann-benchmarks Docker
+// harness on ro (<redacted>). The legend shows these as "pending bench
+// run" — no chart line until the measured JSON lands.
+const PENDING_ENGINES: { name: string; suite: string }[] = [
+  { name: "hnswlib", suite: "ann-benchmarks" },
+  { name: "FAISS-HNSW", suite: "ann-benchmarks" },
+  { name: "ScaNN", suite: "ann-benchmarks" },
+  { name: "Annoy", suite: "ann-benchmarks" },
+  { name: "pgvector (HNSW)", suite: "ann-benchmarks + VDBBench" },
+  { name: "Qdrant", suite: "ann-benchmarks + VDBBench" },
+  { name: "Milvus", suite: "ann-benchmarks + VDBBench" },
+  { name: "Weaviate", suite: "ann-benchmarks + VDBBench" },
+  { name: "Elasticsearch", suite: "ann-benchmarks + VDBBench" },
+  { name: "OpenSearch", suite: "VDBBench" },
+  { name: "SurrealDB 3.x", suite: "VDBBench" },
+  { name: "ArangoDB 3.12+", suite: "VDBBench" },
+  { name: "MongoDB 8.x", suite: "VDBBench" },
 ];
 
 // Controls
 const recallTarget = ref<0.9 | 0.95 | 0.99>(0.95);
 const scale = ref<number>(1_000_000);
 
-// Compute engines list (stable order, CoordiNode first, then alphabetical)
-const allEngines = computed(() => {
+// Compute engines list (stable order: CoordiNode first, then measured competitors,
+// then pending competitors). Pending engines render in the legend but have no
+// line on the chart until measured JSON arrives.
+const measuredEngines = computed(() => {
   const set = new Set<string>(DATA.map((d) => d.engine));
   const cn = [...set].filter((e) => e.startsWith("CoordiNode")).sort();
   const others = [...set].filter((e) => !e.startsWith("CoordiNode")).sort();
   return [...cn, ...others];
 });
+const pendingEngineNames = computed(() => PENDING_ENGINES.map((p) => p.name).filter((n) => !measuredEngines.value.includes(n)));
+const allEngines = computed(() => [...measuredEngines.value, ...pendingEngineNames.value]);
+function isPending(e: string): boolean {
+  return pendingEngineNames.value.includes(e);
+}
+function suiteFor(e: string): string {
+  return PENDING_ENGINES.find((p) => p.name === e)?.suite ?? "—";
+}
 const enabledEngines = ref<Set<string>>(new Set(allEngines.value));
 
 function toggleEngine(e: string): void {
@@ -183,7 +193,8 @@ const qpsChartOption = computed(() => {
       name: "Embedding dimension",
       nameLocation: "middle" as const,
       nameGap: 30,
-      data: [128, 200, 768, 1024, 1536, 3072],
+      // Dataset ladder we run on the bench host (ann-benchmarks dims + VDBBench).
+      data: [25, 50, 100, 128, 200, 256, 768, 784, 960, 1536],
       axisLabel: { formatter: (v: number) => `${v}d` },
     },
     yAxis: {
@@ -305,38 +316,44 @@ const ramChartOption = computed(() => {
           <td class="engine-name">{{ e }}</td>
           <td>
             <span v-if="isCoordinode(e)" class="status-pill status-current">measured on our runner</span>
-            <span v-else class="status-pill status-competitor">cited baseline</span>
+            <span v-else-if="isPending(e)" class="status-pill status-pending">pending bench run</span>
+            <span v-else class="status-pill status-competitor">measured (one-shot)</span>
           </td>
           <td class="source">
-            <span v-if="isCoordinode(e)">bench-host (i9-9900K)</span>
-            <span v-else>ann-benchmarks.com / VectorDBBench (per arch/benchmarks/methodology.md)</span>
+            <span v-if="isCoordinode(e)">bench-host (i9-9900K) — per-commit timeline</span>
+            <span v-else-if="isPending(e)">{{ suiteFor(e) }} on bench-host — one-shot snapshot</span>
+            <span v-else>bench-host (i9-9900K) — one-shot snapshot</span>
           </td>
         </tr>
       </tbody>
     </table>
 
     <p class="footnote">
-      <strong>Methodology.</strong> The full benchmark spec lives in
-      <code>arch/benchmarks/methodology.md</code>. CoordiNode bars come from measured runs
-      on our bench host (Intel i9-9900K, 8C/16T, 64 GB RAM, Fedora). Competitor bars cite
-      ann-benchmarks.com (Level A: SIFT1M / GloVe / GIST / NYTimes) and VectorDBBench
-      (Level B: Cohere-768 / OpenAI-1536). We do not invent or extrapolate; gaps in the
-      chart are real gaps — they fill in as the corresponding bench run lands.
+      <strong>What's on this chart.</strong> Only datapoints measured on our bench host
+      (Intel i9-9900K, 8C/16T, 64 GB RAM, Fedora 44) appear here. No vendor-blog numbers,
+      no leaderboard citations, no projections. Right now the chart has exactly one row:
+      CoordiNode at SIFT1M, recall ≥ 0.95. Every other engine renders as
+      <em>pending bench run</em> in the legend below until the corresponding ann-benchmarks
+      / VectorDBBench Docker run lands a JSON in the
+      <code>bench-data</code> branch on our self-hosted runner.
     </p>
     <p class="footnote">
-      <strong>RAM column status.</strong> Neither ann-benchmarks nor VDBBench publish
-      per-engine RSS in their leaderboard output, and our own harness records timing +
-      recall only. The RAM chart will populate as part of R868 once (a) our harness
-      samples RSS during the build phase, and (b) we re-run competitors in our own
-      Docker harness with RSS sampling enabled. Until then, the "MB per 1M vectors"
-      panel is empty — by design, not omission.
+      <strong>How competitor numbers will get here.</strong> The canonical
+      <a href="https://github.com/erikbern/ann-benchmarks">ann-benchmarks</a> Docker harness
+      runs uniform build+query for hnswlib / FAISS / ScaNN / Annoy / pgvector / Qdrant /
+      Milvus / Weaviate / Elasticsearch / OpenSearch on the public dataset ladder
+      (glove-25/50/100/200, sift-128, nytimes-256, fashion-mnist-784, gist-960). We run it
+      once per engine on the same bench host, record QPS @ recall ≥ 0.95 and ≥ 0.99,
+      build time, and index RSS, then commit the JSON to <code>bench-data</code>.
+      Competitor numbers are <em>one-shot snapshots</em> — they don't move per-commit.
+      Only the CoordiNode line on the "Engineering timeline" tab moves on every push to
+      <code>main</code>.
     </p>
     <p class="footnote">
-      <strong>Codec disclosure.</strong> CoordiNode SIFT1M (current main, f763f86) runs
-      <code>codec=none</code> (raw f32) at <code>M=32, ef_construction=200</code>, single
-      thread. hnswlib reference uses its default <code>M=16</code>, also single-thread,
-      per ann-benchmarks.com configuration. Higher M means a larger graph but better
-      recall headroom — comparability lives in the published recall target (≥ 0.95).
+      <strong>CoordiNode run config.</strong> SIFT1M (commit f763f86) ran
+      <code>codec=none</code> (raw f32), <code>M=32, ef_construction=200</code>, single
+      thread. Multi-dataset coverage (glove / nytimes / gist / fashion-mnist) and RSS
+      sampling are the in-flight half of R868.
     </p>
   </div>
 </template>
