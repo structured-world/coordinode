@@ -219,6 +219,43 @@ pub struct HnswIndex {
     rng_state: std::sync::atomic::AtomicU64,
 }
 
+/// Read-only result of the planning phase of an insert (C2, R858b).
+///
+/// Produced by [`HnswIndex::compute_insert_plan`] (takes `&self`) and
+/// consumed by [`HnswIndex::apply_insert_plan`] (takes `&mut self`). The
+/// type carries no references into the index, so it can outlive the
+/// borrow used to compute it — required for batch ingestion where N plans
+/// are computed in parallel under `&self` and then applied one-by-one
+/// under `&mut self`.
+#[derive(Debug, Clone)]
+pub(crate) struct InsertPlan {
+    /// Node ID being inserted (the user-facing identifier, not the index).
+    pub id: u64,
+    /// Layer the new node is being inserted at (top of its layer stack).
+    pub new_level: usize,
+    /// One [`LayerPlan`] per layer from `new_level` down to `0`.
+    /// Empty when [`InsertPlan::is_first_node`] is true.
+    pub per_layer: Vec<LayerPlan>,
+    /// `true` if this plan was computed against an empty index. The apply
+    /// path uses this to short-circuit the bidirectional connection loop.
+    pub is_first_node: bool,
+}
+
+/// Per-layer outcome of the planning phase: which existing nodes (by
+/// index into [`HnswIndex::nodes`]) the new node should connect to, plus
+/// the layer-specific max-fanout used for the bidirectional prune.
+#[derive(Debug, Clone)]
+pub(crate) struct LayerPlan {
+    pub level: usize,
+    /// Indices into [`HnswIndex::nodes`] of the chosen neighbours, ordered
+    /// nearest-first (which is also the source-of-truth for entry-point
+    /// hand-off between layers during apply).
+    pub selected_idxs: Vec<usize>,
+    /// Max neighbours per side at this layer — `m_max0` at layer 0,
+    /// `m` everywhere else.
+    pub max_conn: usize,
+}
+
 /// A search result with node ID and distance/similarity.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResult {
@@ -429,6 +466,15 @@ impl HnswIndex {
     /// graph position is rebuilt (G082 fix). This handles the `MATCH (n) SET
     /// n.emb = $new_vec` path where `on_vector_written` calls `insert()` for
     /// both CREATE and SET.
+    ///
+    /// Internally a two-phase operation since C2 (R858b):
+    /// 1. [`compute_insert_plan`] — read-only graph traversal that picks
+    ///    neighbours for each layer (no mutation, takes `&self`).
+    /// 2. [`apply_insert_plan`] — single-threaded mutation phase that
+    ///    publishes the new node + neighbour edges.
+    ///
+    /// Batch ingestion (next C2 day) parallelises step 1 across rayon
+    /// workers and then applies step 2 serially.
     pub fn insert(&mut self, id: u64, vector: Vec<f32>) {
         if let Some(&idx) = self.id_to_idx.get(&id) {
             // Node already indexed — update vector and reconnect in graph.
@@ -436,7 +482,89 @@ impl HnswIndex {
             return;
         }
 
+        let plan = self.compute_insert_plan(id, &vector);
+        self.apply_insert_plan(plan, vector);
+    }
+
+    /// Read-only planning phase of an insert. Picks the new node's layer,
+    /// runs the greedy descent + ef-search from the current entry point,
+    /// and records the chosen neighbour set per layer.
+    ///
+    /// Takes `&self` — multiple concurrent callers can plan in parallel
+    /// against the same (immutable) snapshot of the graph. The result is a
+    /// pure-data [`InsertPlan`] that [`apply_insert_plan`] consumes from a
+    /// single writer thread.
+    pub(crate) fn compute_insert_plan(&self, id: u64, vector: &[f32]) -> InsertPlan {
         let new_level = self.random_level();
+
+        // First-node fast path: no graph traversal possible, plan records
+        // empty neighbour sets so apply just pushes the seed node.
+        if self.nodes.is_empty() {
+            return InsertPlan {
+                id,
+                new_level,
+                per_layer: Vec::new(),
+                is_first_node: true,
+            };
+        }
+
+        let ep_idx = self.entry_point.unwrap_or(0);
+        let mut current_ep = ep_idx;
+        let top_level = self.max_level;
+
+        // Phase 1: greedy descent down to new_level + 1.
+        for level in (new_level + 1..=top_level).rev() {
+            current_ep = self.search_layer_greedy_query(vector, current_ep, level);
+        }
+
+        // Phase 2: select neighbours at every layer from new_level down to 0.
+        let lowest_planning_layer = new_level.min(top_level);
+        let mut per_layer = Vec::with_capacity(lowest_planning_layer + 1);
+        for level in (0..=lowest_planning_layer).rev() {
+            let ef = self.config.ef_construction;
+            let candidates = self.search_layer_query(vector, current_ep, ef, level);
+
+            let max_conn = if level == 0 {
+                self.config.m_max0
+            } else {
+                self.config.m
+            };
+            let selected: Vec<usize> = candidates
+                .into_iter()
+                .take(max_conn)
+                .map(|c| c.idx)
+                .collect();
+
+            if !selected.is_empty() {
+                current_ep = selected[0];
+            }
+
+            per_layer.push(LayerPlan {
+                level,
+                selected_idxs: selected,
+                max_conn,
+            });
+        }
+
+        InsertPlan {
+            id,
+            new_level,
+            per_layer,
+            is_first_node: false,
+        }
+    }
+
+    /// Mutation phase of an insert. Pushes the new node, allocates atomic
+    /// neighbour storage, then publishes outgoing + bidirectional edges
+    /// from the plan via the write helpers (`set_outgoing` /
+    /// `add_neighbour_to`). Single-writer — caller holds `&mut self`.
+    pub(crate) fn apply_insert_plan(&mut self, plan: InsertPlan, vector: Vec<f32>) {
+        let InsertPlan {
+            id,
+            new_level,
+            per_layer,
+            is_first_node,
+        } = plan;
         let idx = self.nodes.len();
 
         // Quantize if SQ8 is calibrated.
@@ -451,74 +579,47 @@ impl HnswIndex {
         self.id_to_idx.insert(id, idx);
 
         // Allocate atomic neighbour storage in lockstep — write helpers
-        // (`set_outgoing`, `add_neighbour_to`, …) index by (node, layer)
-        // and would panic on a missing entry. One empty AtomicNeighbourList
-        // per layer of the just-pushed node.
+        // index by (node, layer) and would panic on a missing entry.
         let mut atomic_layers = Vec::with_capacity(new_level + 1);
         for _ in 0..=new_level {
             atomic_layers.push(AtomicNeighbourList::new());
         }
         self.neighbours_atomic.push(atomic_layers);
 
-        if self.nodes.len() == 1 {
+        if is_first_node {
             self.entry_point = Some(idx);
             self.max_level = new_level;
-            // Calibrate + offload after first-node construction
             self.maybe_calibrate_and_offload(idx);
             return;
         }
 
-        let ep_idx = self.entry_point.unwrap_or(0);
-        let mut current_ep = ep_idx;
+        for layer in per_layer {
+            let LayerPlan {
+                level,
+                selected_idxs,
+                max_conn,
+            } = layer;
 
-        // Phase 1: Traverse from top layer down to new_level+1 (greedy search)
-        let top_level = self.max_level;
-        for level in (new_level + 1..=top_level).rev() {
-            current_ep = self.search_layer_greedy(idx, current_ep, level);
-        }
-
-        // Phase 2: Insert at layers new_level down to 0
-        for level in (0..=new_level.min(top_level)).rev() {
-            let ef = self.config.ef_construction;
-            let neighbors = self.search_layer(idx, current_ep, ef, level);
-
-            let max_conn = if level == 0 {
-                self.config.m_max0
-            } else {
-                self.config.m
-            };
-
-            // Select M nearest neighbors
-            let selected: Vec<usize> = neighbors
-                .into_iter()
-                .take(max_conn)
-                .map(|c| c.idx)
-                .collect();
-
-            // Connect new node to selected neighbors
-            let outgoing: Vec<u64> = selected.iter().map(|&n| self.nodes[n].id).collect();
+            // Outgoing: new_node → selected.
+            let outgoing: Vec<u64> = selected_idxs.iter().map(|&n| self.nodes[n].id).collect();
             self.set_outgoing(idx, level, &outgoing);
 
-            // Connect neighbors back to new node (bi-directional)
-            for &neighbor_idx in &selected {
+            // Bidirectional: selected → new_node (with optional prune).
+            for &neighbor_idx in &selected_idxs {
                 if level < self.neighbours_atomic[neighbor_idx].len() {
                     self.add_neighbour_to(neighbor_idx, level, id, max_conn);
                 }
             }
-
-            if !selected.is_empty() {
-                current_ep = selected[0];
-            }
         }
 
-        // Update entry point if new node has higher level
+        // Promote the new node to entry point if it pierced a new top layer.
         if new_level > self.max_level {
             self.max_level = new_level;
             self.entry_point = Some(idx);
         }
 
-        // Calibrate SQ8 + offload f32 AFTER construction is complete.
-        // Must be after graph building because search_layer needs f32 for the new node.
+        // SQ8 calibrate + offload happens after the topology is in place
+        // so search_layer can use f32 for the just-inserted node.
         self.maybe_calibrate_and_offload(idx);
     }
 
