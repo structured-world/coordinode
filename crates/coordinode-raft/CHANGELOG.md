@@ -3,6 +3,34 @@
 All notable changes to this crate are documented in this file.
 This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
+## [0.4.2](https://github.com/structured-world/coordinode/compare/v0.4.1...v0.4.2) - 2026-05-11
+
+#### Fixed
+
+- *(storage)* gate oplog purge on cross-partition flush watermark
+
+---
+
+## [0.4.1](https://github.com/structured-world/coordinode/compare/v0.4.0...v0.4.1) - 2026-04-18
+
+#### Added
+
+- *(raft)* wire MaxAssignedWatermark into apply_proposal path
+
+---
+
+## [0.3.18](https://github.com/structured-world/coordinode/compare/v0.3.17...v0.3.18) - 2026-04-16
+
+#### Added
+
+- *(server)* R150 — monolithic binary --mode=full, shared :7080, NodeInfoLayer
+
+#### Fixed
+
+- *(raft)* recover last_log_id from oplog on unclean shutdown restart
+
+---
+
 ## [0.3.12](https://github.com/structured-world/coordinode/compare/v0.3.11...v0.3.12) - 2026-04-14
 
 #### Added
