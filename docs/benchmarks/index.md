@@ -17,7 +17,7 @@ const ModalityTabs = defineAsyncComponent(() => import("./ModalityTabs.vue"));
 CoordiNode benchmarks use industry-standard suites (ann-benchmarks, LDBC SNB, YCSB, TSBS, Search Benchmark Game); every result is JSON-recorded with hardware fingerprint + Git SHA so the timeline is reproducible end-to-end.
 
 ::: tip Live data
-The charts below are generated from JSON files at [`bench-results/`](https://github.com/structured-world/coordinode/tree/main/bench-results) on every commit. CoordiNode results are produced automatically by CI on a dedicated bench host (Intel i9-9900K, 8C/16T) on every push to `main`. Competitor baselines (hnswlib, Faiss, MongoDB, etc.) are rerun manually on the same host per release.
+The charts below are generated from JSON files at [`bench-results/`](https://github.com/structured-world/coordinode/tree/main/bench-results) on every commit. CoordiNode results are produced automatically by CI on a dedicated bench host (Intel i9-9900K, 8C/16T) on every push to `main` — accumulating a full timeline. Competitor baselines (hnswlib, Faiss, MongoDB, etc.) are pinned to a specific version, run manually on the same host, and **replaced** when we re-bench against a newer build — no competitor history is kept in-repo, only the current head-to-head.
 :::
 
 <ClientOnly>
