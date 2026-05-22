@@ -3,6 +3,58 @@
 All notable changes to this crate are documented in this file.
 This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
+## [0.4.3](https://github.com/structured-world/coordinode/compare/v0.4.2...v0.4.3) - 2026-05-17
+
+#### Added
+
+- *(identity,placement,consistency)* u20/u44 NodeId, schema_revision, gRPC concern wire-through
+
+---
+
+## [0.4.0](https://github.com/structured-world/coordinode/compare/v0.3.20...v0.4.0) - 2026-04-17
+
+#### Added
+
+- *(query)* [**breaking**] add rrf_score Cypher function with RankFuse operator
+
+---
+
+## Unreleased
+
+---
+
+#### Removed (BREAKING)
+
+- *(proto)* `TextService.HybridTextVectorSearch` RPC, `HybridTextVectorSearchRequest` / `HybridTextVectorSearchResponse` / `HybridResult` messages, `POST /v1/query/text/hybrid` HTTP endpoint. Superseded by the general-purpose Cypher function `rrf_score([methods…], {vector, text})` invoked via `CypherService.ExecuteCypher`. The Cypher form supports N methods (not 2), edge vectors, configurable HNSW metrics, and composes with MATCH / WHERE / ORDER BY / LIMIT in a single plan. Callers: replace the RPC with an equivalent Cypher query.
+
+---
+
+## [0.3.18](https://github.com/structured-world/coordinode/compare/v0.3.17...v0.3.18) - 2026-04-16
+
+#### Added
+
+- *(server)* R150 — monolithic binary --mode=full, shared :7080, NodeInfoLayer
+
+---
+
+## [0.3.17](https://github.com/structured-world/coordinode/compare/v0.3.16...v0.3.17) - 2026-04-15
+
+#### Added
+
+- *(causal)* enforce writeConcern=MAJORITY in causal write sessions (G088)
+- *(consistency)* implement R142 causal consistency sessions
+
+---
+
+## [0.3.16](https://github.com/structured-world/coordinode/compare/v0.3.15...v0.3.16) - 2026-04-15
+
+#### Added
+
+- *(server)* gate REST proxy behind rest-proxy feature flag
+- *(server)* embed REST proxy in coordinode binary
+
+---
+
 ## [0.3.12](https://github.com/structured-world/coordinode/compare/v0.3.11...v0.3.12) - 2026-04-14
 
 #### Added

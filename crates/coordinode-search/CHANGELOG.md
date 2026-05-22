@@ -3,6 +3,14 @@
 All notable changes to this crate are documented in this file.
 This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
+## [0.4.1](https://github.com/structured-world/coordinode/compare/v0.4.0...v0.4.1) - 2026-04-18
+
+#### Added
+
+- *(search)* FTS MVCC snapshot filter via per-doc commit_ts + segment registry
+
+---
+
 ## [0.3.9](https://github.com/structured-world/coordinode/compare/v0.3.8...v0.3.9) - 2026-04-13
 
 #### Added
