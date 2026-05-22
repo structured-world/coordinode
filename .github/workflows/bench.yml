@@ -164,6 +164,11 @@ jobs:
           git config user.name  "coordinode-bench-bot"
           git config user.email "bench-bot@users.noreply.github.com"
 
+          # If the fetch above created a local bench-data branch, drop it
+          # — otherwise `git checkout --orphan bench-data` fails with
+          # "a branch named 'bench-data' already exists".
+          git branch -D bench-data 2>/dev/null || true
+
           # Recreate bench-data as a fresh orphan branch each run.
           git checkout --orphan bench-data
           git rm -rf . 2>/dev/null || true
