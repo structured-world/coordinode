@@ -117,11 +117,26 @@ def main() -> int:
     p.add_argument("--codec", default="none", help="Recorded for symmetry; hnswlib has no codec dimension")
     p.add_argument("--output", type=Path, default=Path("bench-results"))
     p.add_argument(
+        "--threads",
+        type=int,
+        default=1,
+        help="Thread cap for both build (add_items) and search (knn_query). MUST match the CoordiNode side for apples-to-apples comparison. Bench host is 8C/16T i9-9900K; 1 = single-thread, 4 = stable multi-thread (leaves headroom for OS / OMP overhead — 8 saturates and produces noisy numbers).",
+    )
+    p.add_argument(
         "--cn-sha",
         required=True,
         help="CoordiNode commit SHA this run is paired with — used in the filename so the dashboard correlates timepoints across subjects.",
     )
     args = p.parse_args()
+
+    # Pin thread count BEFORE importing/using hnswlib internals — the
+    # library reads OMP_NUM_THREADS at first index construction. Setting
+    # only set_num_threads() lets OpenMP spin up the default pool before
+    # we get a chance to constrain it.
+    os.environ["OMP_NUM_THREADS"] = str(args.threads)
+    os.environ["MKL_NUM_THREADS"] = str(args.threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(args.threads)
+    print(f"[hnswlib] threads={args.threads}", flush=True)
 
     print(f"[hnswlib] loading {args.train}", flush=True)
     train = read_fvecs(args.train)
@@ -146,8 +161,11 @@ def main() -> int:
     # Build
     index = hnswlib.Index(space=metric, dim=d)
     index.init_index(max_elements=n_train, ef_construction=args.ef_construction, M=args.m)
+    # Belt-and-braces: also pin via the runtime API in case the OMP env
+    # vars are honoured later than expected by the bundled wheel.
+    index.set_num_threads(args.threads)
     t0 = time.time()
-    index.add_items(train, np.arange(n_train, dtype=np.int64))
+    index.add_items(train, np.arange(n_train, dtype=np.int64), num_threads=args.threads)
     build_secs = time.time() - t0
     print(f"[hnswlib] build_secs={build_secs:.2f}", flush=True)
 
@@ -164,7 +182,7 @@ def main() -> int:
             for q_idx in range(n_test):
                 q = query[q_idx]
                 t = time.time()
-                labels, _ = index.knn_query(q.reshape(1, -1), k=args.k)
+                labels, _ = index.knn_query(q.reshape(1, -1), k=args.k, num_threads=args.threads)
                 latencies_us.append((time.time() - t) * 1e6)
                 gt_row = set(int(x) for x in gt[q_idx, : args.k])
                 for lab in labels[0]:
@@ -217,6 +235,7 @@ def main() -> int:
             "dataset_n_test": n_test,
             "dataset_dim": d,
             "k": args.k,
+            "threads": args.threads,
             "sweep": points,
             "recall_at_k_peak": max(p["recall_at_k"] for p in points),
             "qps_at_recall_peak": max(p["qps"] for p in points if p["recall_at_k"] == max(q["recall_at_k"] for q in points)),
@@ -230,7 +249,7 @@ def main() -> int:
     out_dir = args.output / "vector" / args.dataset_name
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = ts.strftime("%Y%m%d-%H%M%S")
-    out_path = out_dir / f"{short_sha}-hnswlib-{stamp}.json"
+    out_path = out_dir / f"{short_sha}-hnswlib-t{args.threads}-{stamp}.json"
     out_path.write_text(json.dumps(report, indent=2))
     print(f"[hnswlib] wrote {out_path}")
     return 0
