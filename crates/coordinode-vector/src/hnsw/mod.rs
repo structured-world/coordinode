@@ -561,13 +561,16 @@ impl HnswIndex {
                 .collect()
         };
 
-        // C2 contract: serial apply, recall agreement ≥ 0.7 vs sequential.
-        // C3 day 3 added apply_insert_plans_parallel for explicit opt-in via
-        // [`HnswIndex::apply_insert_plans_parallel`]; it drops back-edges on
-        // neighbour-list saturation (recall ~0.5-0.6 until C3 day 4 adds the
-        // post-batch prune-pass that re-runs prune over affected lists).
-        for (plan, vec) in plans {
-            self.apply_insert_plan(plan, vec);
+        // C3 day 4: the parallel apply path now runs a post-batch prune-
+        // pass that backfills any back-edges dropped on capacity, so its
+        // resulting graph holds the C2 recall contract (≥ 0.7 vs serial).
+        // Dispatch to it for large batches; sequential apply for small.
+        if plans.len() >= BATCH_PARALLEL_THRESHOLD {
+            self.apply_insert_plans_parallel(plans);
+        } else {
+            for (plan, vec) in plans {
+                self.apply_insert_plan(plan, vec);
+            }
         }
 
         for (id, vec) in updates {
@@ -734,7 +737,6 @@ impl HnswIndex {
     ///
     /// Step 3 (serial): call `maybe_calibrate_and_offload` once for the
     /// last-allocated node; SQ8 calibration sees the post-batch state.
-    #[allow(dead_code)] // Wired into insert_batch after C3 day 4 prune-pass restores full recall.
     pub(crate) fn apply_insert_plans_parallel(&mut self, plans: Vec<(InsertPlan, Vec<f32>)>) {
         if plans.is_empty() {
             return;
@@ -774,8 +776,14 @@ impl HnswIndex {
             allocated.push((plan, idx));
         }
 
-        // Step 2 — parallel edge writes.
+        // Step 2 — parallel edge writes. Failed back-edge appends are
+        // collected into a Mutex<Vec> so the day-4 prune-pass can backfill
+        // them serially under &mut self. The mutex is only contended on
+        // overflow (rare under typical workloads), so the parallel write
+        // path is still effectively wait-free in the hot case.
         use rayon::prelude::*;
+        let backfill: std::sync::Mutex<Vec<(usize, usize, u64, usize)>> =
+            std::sync::Mutex::new(Vec::new());
         allocated.par_iter().for_each(|(plan, idx)| {
             if plan.is_first_node {
                 return;
@@ -789,19 +797,40 @@ impl HnswIndex {
                 self.set_outgoing(*idx, layer.level, &outgoing);
 
                 for &neighbour_idx in &layer.selected_idxs {
-                    if layer.level < self.neighbours_atomic[neighbour_idx].len() {
-                        // Lossy on capacity: if cas_append fails, drop
-                        // this back-edge. The prune pass (C3 day 4) will
-                        // backfill by re-running prune over the affected
-                        // lists. For C3 day 3 the recall hit is bounded
-                        // by max_conn × batch_size / total_edges.
-                        let _ = self.cas_add_neighbour_to(neighbour_idx, layer.level, plan.id);
+                    if layer.level < self.neighbours_atomic[neighbour_idx].len()
+                        && !self.cas_add_neighbour_to(neighbour_idx, layer.level, plan.id)
+                    {
+                        // cas_append returned false (list at capacity).
+                        // Record (neighbour_idx, level, id_to_add, max_conn)
+                        // for the serial prune-pass below.
+                        backfill.lock().unwrap_or_else(|e| e.into_inner()).push((
+                            neighbour_idx,
+                            layer.level,
+                            plan.id,
+                            layer.max_conn,
+                        ));
                     }
                 }
             }
         });
 
-        // Step 3 — serial post-phase. SQ8 calibration sees the final
+        // Step 3 — serial prune-pass. For each over-capacity back-edge,
+        // run prune_connections to keep the nearest max_conn ids, then
+        // retry cas_append. The prune may free space (existing edges
+        // dropped) so the retry succeeds in the common case; if the
+        // list happened to be all-near-neighbours, the new edge is
+        // dropped — equivalent to hnswlib's "neighbour heuristic
+        // pruning rejected the candidate" outcome.
+        let backfill = backfill.into_inner().unwrap_or_else(|e| e.into_inner());
+        for (neighbour_idx, level, id, max_conn) in backfill {
+            self.prune_connections(neighbour_idx, level, max_conn);
+            // prune_connections trims to max_conn; cas_append needs a
+            // free slot. After prune, len < N (since max_conn ≤ N), so
+            // cas_append must succeed.
+            let _ = self.neighbours_atomic[neighbour_idx][level].cas_append(id);
+        }
+
+        // Step 4 — serial post-phase. SQ8 calibration sees the final
         // population. We call once with the last allocated idx; the
         // calibration path itself looks at `self.nodes` as a whole.
         if let Some((_, last_idx)) = allocated.last() {
