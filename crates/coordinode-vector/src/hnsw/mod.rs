@@ -518,12 +518,26 @@ impl HnswIndex {
         // per the standard HNSW batch-construction trade-off.
         const SEED_DENSITY: usize = 64;
 
+        // Dedupe within the batch — last-write-wins for repeated ids.
+        // Without this, two `(5, vec_a)` and `(5, vec_b)` entries both
+        // pass the `!contains_key(&id)` check (the index has no id=5
+        // yet), both land in `inserts`, and the parallel apply creates
+        // two `nodes[*].id == 5` entries while `id_to_idx[5]` records
+        // only the second — diverging `nodes.len()` from logical
+        // membership. Found by proptest (concurrent_proptest test
+        // suite, 2026-05-22).
+        let mut deduped: std::collections::HashMap<u64, Vec<f32>> =
+            std::collections::HashMap::with_capacity(items.len());
+        for (id, vec) in items {
+            deduped.insert(id, vec);
+        }
+
         // Partition into fresh inserts and updates of existing IDs.
         // Updates can't go through the plan/apply split because
         // `update_existing_node` rebuilds the node's edges in place.
         let mut updates = Vec::new();
         let mut inserts = Vec::new();
-        for (id, vec) in items {
+        for (id, vec) in deduped {
             if self.id_to_idx.contains_key(&id) {
                 updates.push((id, vec));
             } else {
