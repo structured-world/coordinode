@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, ref } from "vue";
 
+const BenchVectorByDim = defineAsyncComponent(() => import("./BenchVectorByDim.vue"));
 const BenchVectorAnn = defineAsyncComponent(() => import("./BenchVectorAnn.vue"));
 
 interface Competitor {
@@ -117,6 +118,7 @@ const modalities: Modality[] = [
 
 const active = ref(modalities[0]!.id);
 const current = computed(() => modalities.find((m) => m.id === active.value)!);
+const vectorView = ref<"product" | "engineering">("product");
 </script>
 
 <template>
@@ -147,7 +149,25 @@ const current = computed(() => modalities.find((m) => m.id === active.value)!);
       <!-- Live data slot -->
       <div v-if="current.id === 'vector'" class="panel-body">
         <ClientOnly>
-          <BenchVectorAnn />
+          <!-- Product view: pick dimension → read off chart -->
+          <div class="view-tabs">
+            <button
+              :class="['view-tab', vectorView === 'product' ? 'active' : '']"
+              @click="vectorView = 'product'"
+            >
+              Performance by dimension
+              <span class="view-tab-sub">— the chart you came here for</span>
+            </button>
+            <button
+              :class="['view-tab', vectorView === 'engineering' ? 'active' : '']"
+              @click="vectorView = 'engineering'"
+            >
+              Engineering timeline
+              <span class="view-tab-sub">— per-commit regression tracking</span>
+            </button>
+          </div>
+          <BenchVectorByDim v-if="vectorView === 'product'" />
+          <BenchVectorAnn v-else />
         </ClientOnly>
       </div>
 
@@ -284,6 +304,42 @@ const current = computed(() => modalities.find((m) => m.id === active.value)!);
 
 .placeholder-text strong {
   color: var(--vp-c-text-1);
+}
+
+.view-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0 0 1rem;
+}
+.view-tab {
+  appearance: none;
+  background: var(--vp-c-bg-soft);
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 6px;
+  padding: 0.55rem 1rem;
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--vp-c-text-2);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  transition: all 0.15s;
+}
+.view-tab:hover {
+  border-color: var(--vp-c-brand-1);
+  color: var(--vp-c-text-1);
+}
+.view-tab.active {
+  background: var(--vp-c-brand-soft);
+  color: var(--vp-c-brand-1);
+  border-color: var(--vp-c-brand-1);
+}
+.view-tab-sub {
+  font-size: 0.78rem;
+  font-weight: 400;
+  opacity: 0.7;
 }
 
 .planned-list {
