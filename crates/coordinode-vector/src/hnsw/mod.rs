@@ -299,6 +299,30 @@ impl Ord for Candidate {
     }
 }
 
+/// Per-search cached state.
+///
+/// HNSW search calls the metric distance function thousands of times per query,
+/// always with the same query vector. Anything that depends only on the query
+/// (norms, projection sums, lookup tables) is computed once and stored here.
+struct QueryCtx<'a> {
+    /// The query vector.
+    vec: &'a [f32],
+    /// ‖query‖₂ — pre-computed once per search. Used by Cosine metric only;
+    /// other metrics ignore this field.
+    norm_l2: f32,
+}
+
+impl<'a> QueryCtx<'a> {
+    fn new(vec: &'a [f32], metric: VectorMetric) -> Self {
+        let norm_l2 = if matches!(metric, VectorMetric::Cosine) {
+            metrics::norm_l2(vec)
+        } else {
+            0.0
+        };
+        Self { vec, norm_l2 }
+    }
+}
+
 /// Max-heap candidate (for maintaining top-K worst).
 #[derive(Clone)]
 struct FarCandidate {
@@ -923,6 +947,11 @@ impl HnswIndex {
             return Vec::new();
         }
 
+        // Cache query-side state once per search — for Cosine the query norm
+        // would otherwise be recomputed on every distance call (hundreds of
+        // times per level). Other metrics ignore the cached norm.
+        let qctx = QueryCtx::new(query, self.config.metric);
+
         let ep_idx = self.entry_point.unwrap_or(0);
         let mut current_ep = ep_idx;
 
@@ -946,7 +975,7 @@ impl HnswIndex {
             let mut reranked: Vec<SearchResult> = candidates
                 .into_iter()
                 .map(|c| {
-                    let exact_dist = self.compute_exact_distance(query, c.idx);
+                    let exact_dist = self.compute_exact_distance(&qctx, c.idx);
                     SearchResult {
                         id: self.nodes[c.idx].id,
                         score: exact_dist,
@@ -1011,12 +1040,15 @@ impl HnswIndex {
             return (Vec::new(), stats);
         }
 
+        // Cache query-side state once per search — same rationale as `search`.
+        let qctx = QueryCtx::new(query, self.config.metric);
+
         let ep_idx = self.entry_point.unwrap_or(0);
         let mut current_ep = ep_idx;
 
         // Traverse from top to layer 1 (greedy)
         for level in (1..=self.max_level).rev() {
-            current_ep = self.search_layer_greedy_query(query, current_ep, level);
+            current_ep = self.search_layer_greedy_ctx(&qctx, current_ep, level);
         }
 
         let mut visible_results: Vec<SearchResult> = Vec::new();
@@ -1031,7 +1063,7 @@ impl HnswIndex {
         for round in 0..=max_expansion_rounds {
             stats.expansion_rounds = round;
 
-            let candidates = self.search_layer_query(query, current_ep, current_ef, 0);
+            let candidates = self.search_layer_ctx(&qctx, current_ep, current_ef, 0);
 
             // Convert to SearchResult with exact distances (rerank if quantized)
             let results: Vec<SearchResult> = if self.is_quantized() {
@@ -1039,7 +1071,7 @@ impl HnswIndex {
                     .into_iter()
                     .map(|c| SearchResult {
                         id: self.nodes[c.idx].id,
-                        score: self.compute_exact_distance(query, c.idx),
+                        score: self.compute_exact_distance(&qctx, c.idx),
                     })
                     .collect();
                 reranked.sort_by(|a, b| {
@@ -1102,15 +1134,17 @@ impl HnswIndex {
             return Vec::new();
         }
 
+        let qctx = QueryCtx::new(query, self.config.metric);
+
         let ep_idx = self.entry_point.unwrap_or(0);
         let mut current_ep = ep_idx;
 
         for level in (1..=self.max_level).rev() {
-            current_ep = self.search_layer_greedy_query(query, current_ep, level);
+            current_ep = self.search_layer_greedy_ctx(&qctx, current_ep, level);
         }
 
         let ef = self.config.ef_search.max(self.config.rerank_candidates);
-        let candidates = self.search_layer_query(query, current_ep, ef, 0);
+        let candidates = self.search_layer_ctx(&qctx, current_ep, ef, 0);
 
         // Batch-load f32 vectors from storage for reranking
         let candidate_ids: Vec<u64> = candidates.iter().map(|c| self.nodes[c.idx].id).collect();
@@ -1121,7 +1155,7 @@ impl HnswIndex {
             .filter_map(|c| {
                 let node_id = self.nodes[c.idx].id;
                 let f32_vec = loaded.get(&node_id)?;
-                let exact_dist = self.distance_for_metric(query, f32_vec);
+                let exact_dist = self.distance_for_metric(&qctx, f32_vec);
                 Some(SearchResult {
                     id: node_id,
                     score: exact_dist,
@@ -1181,11 +1215,13 @@ impl HnswIndex {
             return (Vec::new(), stats);
         }
 
+        let qctx = QueryCtx::new(query, self.config.metric);
+
         let ep_idx = self.entry_point.unwrap_or(0);
         let mut current_ep = ep_idx;
 
         for level in (1..=self.max_level).rev() {
-            current_ep = self.search_layer_greedy_query(query, current_ep, level);
+            current_ep = self.search_layer_greedy_ctx(&qctx, current_ep, level);
         }
 
         let mut visible_results: Vec<SearchResult> = Vec::new();
@@ -1194,7 +1230,7 @@ impl HnswIndex {
 
         for round in 0..=max_expansion_rounds {
             stats.expansion_rounds = round;
-            let candidates = self.search_layer_query(query, current_ep, current_ef, 0);
+            let candidates = self.search_layer_ctx(&qctx, current_ep, current_ef, 0);
 
             // Batch-load f32 for reranking
             let candidate_ids: Vec<u64> = candidates.iter().map(|c| self.nodes[c.idx].id).collect();
@@ -1205,7 +1241,7 @@ impl HnswIndex {
                 .filter_map(|c| {
                     let node_id = self.nodes[c.idx].id;
                     let f32_vec = loaded.get(&node_id)?;
-                    let exact_dist = self.distance_for_metric(query, f32_vec);
+                    let exact_dist = self.distance_for_metric(&qctx, f32_vec);
                     Some(SearchResult {
                         id: node_id,
                         score: exact_dist,
@@ -1375,8 +1411,13 @@ impl HnswIndex {
     }
 
     fn search_layer_greedy_query(&self, query: &[f32], ep: usize, level: usize) -> usize {
+        let ctx = QueryCtx::new(query, self.config.metric);
+        self.search_layer_greedy_ctx(&ctx, ep, level)
+    }
+
+    fn search_layer_greedy_ctx(&self, ctx: &QueryCtx<'_>, ep: usize, level: usize) -> usize {
         let mut current = ep;
-        let mut current_dist = self.compute_distance(query, current);
+        let mut current_dist = self.compute_distance(ctx, current);
 
         // Per-call scratch buffer for the atomic neighbour snapshot. The
         // BFS reads at most one neighbour list per loop iteration, so we
@@ -1394,7 +1435,7 @@ impl HnswIndex {
                 self.neighbours_atomic[current][level].snapshot_into(&mut neighbours_scratch);
                 for &neighbor_id in &neighbours_scratch {
                     if let Some(&neighbor_idx) = self.id_to_idx.get(&neighbor_id) {
-                        let dist = self.compute_distance(query, neighbor_idx);
+                        let dist = self.compute_distance(ctx, neighbor_idx);
                         if dist < current_dist {
                             current = neighbor_idx;
                             current_dist = dist;
@@ -1426,7 +1467,18 @@ impl HnswIndex {
         ef: usize,
         level: usize,
     ) -> Vec<Candidate> {
-        let ep_dist = self.compute_distance(query, ep);
+        let ctx = QueryCtx::new(query, self.config.metric);
+        self.search_layer_ctx(&ctx, ep, ef, level)
+    }
+
+    fn search_layer_ctx(
+        &self,
+        ctx: &QueryCtx<'_>,
+        ep: usize,
+        ef: usize,
+        level: usize,
+    ) -> Vec<Candidate> {
+        let ep_dist = self.compute_distance(ctx, ep);
 
         let mut candidates = BinaryHeap::new(); // min-heap
         let mut results = BinaryHeap::new(); // max-heap (farthest first)
@@ -1480,7 +1532,7 @@ impl HnswIndex {
                         self.prefetch_node_vector(next_idx);
                     }
 
-                    let dist = self.compute_distance(query, neighbor_idx);
+                    let dist = self.compute_distance(ctx, neighbor_idx);
                     let farthest = results.peek().map(|r| r.distance).unwrap_or(f32::INFINITY);
 
                     if dist < farthest || results.len() < ef {
@@ -1517,46 +1569,51 @@ impl HnswIndex {
         result_vec
     }
 
-    /// Compute distance between query and a node.
+    /// Compute distance between the search query and a node.
     ///
     /// When SQ8 is active and the node has a quantized vector, distance is
     /// computed on the dequantized (approximate) vector — faster cache access
     /// due to 4x smaller working set, with slight accuracy trade-off.
     /// Falls back to exact f32 distance if the node is not yet quantized.
-    fn compute_distance(&self, query: &[f32], node_idx: usize) -> f32 {
+    fn compute_distance(&self, ctx: &QueryCtx<'_>, node_idx: usize) -> f32 {
         if let Some(params) = &self.sq8_params {
             if let Some(quantized) = &self.nodes[node_idx].quantized {
                 let dequantized = params.dequantize(quantized);
-                return self.distance_for_metric(query, &dequantized);
+                return self.distance_for_metric(ctx, &dequantized);
             }
         }
-        self.compute_exact_distance(query, node_idx)
+        self.compute_exact_distance(ctx, node_idx)
     }
 
-    /// Compute exact f32 distance between query and a node.
+    /// Compute exact f32 distance between the search query and a node.
     /// Used for final reranking after SQ8 candidate generation.
     /// Falls back to dequantized SQ8 if f32 is offloaded.
-    fn compute_exact_distance(&self, query: &[f32], node_idx: usize) -> f32 {
+    fn compute_exact_distance(&self, ctx: &QueryCtx<'_>, node_idx: usize) -> f32 {
         if let Some(ref node_vec) = self.nodes[node_idx].vector {
-            return self.distance_for_metric(query, node_vec);
+            return self.distance_for_metric(ctx, node_vec);
         }
         // f32 offloaded — fall back to dequantized SQ8 (slightly less accurate)
         if let Some(ref params) = self.sq8_params {
             if let Some(ref quantized) = self.nodes[node_idx].quantized {
                 let dequantized = params.dequantize(quantized);
-                return self.distance_for_metric(query, &dequantized);
+                return self.distance_for_metric(ctx, &dequantized);
             }
         }
         f32::INFINITY
     }
 
-    /// Compute distance using the configured metric.
-    fn distance_for_metric(&self, a: &[f32], b: &[f32]) -> f32 {
+    /// Compute distance using the configured metric, with query-side state
+    /// pre-computed in `ctx`. Cosine uses the cached ‖query‖₂; other metrics
+    /// ignore it and the field is set to a sentinel by `QueryCtx::new`.
+    #[inline]
+    fn distance_for_metric(&self, ctx: &QueryCtx<'_>, b: &[f32]) -> f32 {
         match self.config.metric {
-            VectorMetric::Cosine => 1.0 - metrics::cosine_similarity(a, b),
-            VectorMetric::L2 => metrics::euclidean_distance_squared(a, b),
-            VectorMetric::DotProduct => -metrics::dot_product(a, b),
-            VectorMetric::L1 => metrics::manhattan_distance(a, b),
+            VectorMetric::Cosine => {
+                1.0 - metrics::cosine_similarity_with_query_norm(ctx.vec, b, ctx.norm_l2)
+            }
+            VectorMetric::L2 => metrics::euclidean_distance_squared(ctx.vec, b),
+            VectorMetric::DotProduct => -metrics::dot_product(ctx.vec, b),
+            VectorMetric::L1 => metrics::manhattan_distance(ctx.vec, b),
         }
     }
 
@@ -1668,13 +1725,15 @@ impl HnswIndex {
         // Try exact f32 for both nodes
         if let (Some(ref va), Some(ref vb)) = (&self.nodes[a_idx].vector, &self.nodes[b_idx].vector)
         {
-            return self.distance_for_metric(va, vb);
+            let ctx = QueryCtx::new(va, self.config.metric);
+            return self.distance_for_metric(&ctx, vb);
         }
         // Fall back to SQ8 approximate distance
         if let Some(ref params) = self.sq8_params {
             let va = self.get_node_vector_or_dequantized(a_idx, params);
             let vb = self.get_node_vector_or_dequantized(b_idx, params);
-            return self.distance_for_metric(&va, &vb);
+            let ctx = QueryCtx::new(&va, self.config.metric);
+            return self.distance_for_metric(&ctx, &vb);
         }
         f32::INFINITY
     }

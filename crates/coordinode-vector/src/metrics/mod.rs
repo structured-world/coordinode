@@ -80,10 +80,21 @@ pub fn distance(a: &[f32], b: &[f32], metric: VectorMetric) -> f32 {
 /// Cosine similarity: dot(a,b) / (||a|| * ||b||).
 /// Returns value in [-1, 1]. Higher = more similar.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let dot = dot_product_inner(a, b);
     let norm_a = norm_l2(a);
-    let norm_b = norm_l2(b);
-    let denom = norm_a * norm_b;
+    cosine_similarity_with_query_norm(a, b, norm_a)
+}
+
+/// Cosine similarity where ‖a‖₂ is already known.
+///
+/// HNSW search calls the same distance function 100-1000+ times per query,
+/// always with the same `a` (the query vector). Without this entry point
+/// every call recomputes `dot(a, a).sqrt()` — that's a third of the FLOPs
+/// for the metric. The search loop caches the query norm once and passes
+/// it here; recall is bit-identical to [`cosine_similarity`].
+#[inline]
+pub fn cosine_similarity_with_query_norm(a: &[f32], b: &[f32], a_norm_l2: f32) -> f32 {
+    let dot = dot_product_inner(a, b);
+    let denom = a_norm_l2 * norm_l2(b);
     if denom < f32::EPSILON {
         return 0.0; // Zero vectors have no direction
     }
