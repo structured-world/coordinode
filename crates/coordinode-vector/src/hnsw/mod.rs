@@ -307,10 +307,10 @@ impl HnswIndex {
     /// Walk every node × layer and republish the legacy `connections`
     /// vector into the atomic mirror via [`AtomicNeighbourList::set`].
     ///
-    /// **C1 day 2 plumbing.** Called manually for tests + by the day-3
-    /// commit at the end of every `insert` / `update_existing_node`. Day 5
-    /// removes the legacy storage and this helper becomes the only writer.
-    #[allow(dead_code)] // Wired into insert/update_existing in C1 day 3.
+    /// **C1 day 2 plumbing.** Called from `insert` and `update_existing_node`
+    /// so the lock-free read path (wired in day 4) always sees the most
+    /// recent neighbour set. Day 5 removes the legacy storage and this
+    /// helper becomes the only writer.
     pub(crate) fn sync_neighbours_atomic_from_legacy(&mut self) {
         // Resize the outer Vec to match nodes.len().
         while self.neighbours_atomic.len() < self.nodes.len() {
@@ -480,6 +480,7 @@ impl HnswIndex {
             self.max_level = new_level;
             // Calibrate + offload after first-node construction
             self.maybe_calibrate_and_offload(idx);
+            self.sync_neighbours_atomic_from_legacy();
             return;
         }
 
@@ -540,6 +541,12 @@ impl HnswIndex {
         // Calibrate SQ8 + offload f32 AFTER construction is complete.
         // Must be after graph building because search_layer needs f32 for the new node.
         self.maybe_calibrate_and_offload(idx);
+
+        // Republish neighbour atomic mirror so the lock-free read path
+        // (wired in the next C1 step) observes the post-insert state.
+        // The first-node early-return above also syncs implicitly via the
+        // empty connections vec.
+        self.sync_neighbours_atomic_from_legacy();
     }
 
     /// Auto-calibrate SQ8 if threshold reached, then offload the just-inserted
@@ -947,6 +954,7 @@ impl HnswIndex {
             if self.is_offloaded() {
                 self.nodes[idx].vector = None;
             }
+            self.sync_neighbours_atomic_from_legacy();
             return;
         }
 
@@ -1013,6 +1021,10 @@ impl HnswIndex {
         if self.is_offloaded() {
             self.nodes[idx].vector = None;
         }
+
+        // Republish neighbour atomic mirror — the rebuild changed both the
+        // node's outgoing edges and every former neighbour's incoming edge.
+        self.sync_neighbours_atomic_from_legacy();
     }
 
     /// Greedy search on a single layer (for traversal from top layers).
@@ -2363,6 +2375,64 @@ mod tests {
                 assert_eq!(
                     buf, expected,
                     "node {node_idx} level {level} mirror diverges from legacy",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn atomic_mirror_auto_synced_after_each_insert() {
+        // C1 day 3a: insert/update_existing auto-call the sync helper.
+        // After every insert the atomic mirror must match the legacy
+        // connections without manual sync.
+        let mut idx = HnswIndex::new(HnswConfig {
+            m: 4,
+            m_max0: 8,
+            ef_construction: 20,
+            ef_search: 10,
+            metric: VectorMetric::L2,
+            max_dimensions: 4,
+            quantization: false,
+            rerank_candidates: 10,
+            calibration_threshold: 1_000,
+            offload_vectors: false,
+            property_name: String::new(),
+        });
+
+        let mut scratch = Vec::with_capacity(M_MAX0);
+        for i in 0..20u64 {
+            let v: Vec<f32> = (0..4).map(|d| ((i * 11 + d) as f32).sin()).collect();
+            idx.insert(i, v);
+
+            // After insert (no manual sync call), mirror == legacy.
+            assert_eq!(
+                idx.neighbours_atomic.len(),
+                idx.nodes.len(),
+                "after inserting node {i}, mirror node count diverged",
+            );
+            for (node_idx, node) in idx.nodes.iter().enumerate() {
+                for (level, conns) in node.connections.iter().enumerate() {
+                    idx.neighbours_atomic[node_idx][level].snapshot_into(&mut scratch);
+                    let expected: Vec<u64> = conns.iter().take(M_MAX0).copied().collect();
+                    assert_eq!(
+                        scratch, expected,
+                        "auto-sync drift at node {node_idx} level {level} after inserting {i}",
+                    );
+                }
+            }
+        }
+
+        // Re-insert an existing id triggers update_existing_node; sync
+        // path must hold there too.
+        let v: Vec<f32> = vec![0.5, -0.5, 0.5, -0.5];
+        idx.insert(7, v);
+        for (node_idx, node) in idx.nodes.iter().enumerate() {
+            for (level, conns) in node.connections.iter().enumerate() {
+                idx.neighbours_atomic[node_idx][level].snapshot_into(&mut scratch);
+                let expected: Vec<u64> = conns.iter().take(M_MAX0).copied().collect();
+                assert_eq!(
+                    scratch, expected,
+                    "auto-sync drift after update_existing at node {node_idx} level {level}",
                 );
             }
         }
