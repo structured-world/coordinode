@@ -462,4 +462,61 @@ mod tests {
         list.replace(&[99, 88, 77, 66]);
         assert_eq!(list.snapshot(), vec![99, 88, 77, 66]);
     }
+
+    #[test]
+    fn concurrent_cas_append_and_snapshot_no_torn_state() {
+        // Stress: one writer streams cas_append while N readers snapshot.
+        // Every observed id must be a valid input (no garbage from a
+        // half-written slot), and the writer's monotonic insert order
+        // must be preserved in the final snapshot (readers see a prefix).
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::thread;
+
+        const CAP: usize = 64;
+        let list: Arc<AtomicNeighbourList<CAP>> = Arc::new(AtomicNeighbourList::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let inputs: Vec<u64> = (1000..1000 + CAP as u64).collect();
+        let input_set: std::collections::HashSet<u64> = inputs.iter().copied().collect();
+
+        let mut reader_handles = Vec::new();
+        for _ in 0..6 {
+            let list = list.clone();
+            let stop = stop.clone();
+            let input_set = input_set.clone();
+            reader_handles.push(thread::spawn(move || {
+                let mut buf = Vec::with_capacity(CAP);
+                while !stop.load(Ordering::Relaxed) {
+                    list.snapshot_into(&mut buf);
+                    for &v in &buf {
+                        // Sentinel must not surface (snapshot filters it).
+                        assert_ne!(v, EMPTY);
+                        // Every observed id must be one of the writer's
+                        // inputs — no torn read of a half-stored slot.
+                        assert!(
+                            input_set.contains(&v),
+                            "garbage id {v} observed in snapshot",
+                        );
+                    }
+                }
+            }));
+        }
+
+        // Single writer streams all inputs.
+        for &v in &inputs {
+            assert!(list.cas_append(v));
+        }
+        // Capacity reached — further appends must fail.
+        assert!(!list.cas_append(99_999));
+
+        stop.store(true, Ordering::Relaxed);
+        for h in reader_handles {
+            h.join().expect("reader thread panicked");
+        }
+
+        // Final state: all CAP inputs present in insertion order.
+        let final_snap = list.snapshot();
+        assert_eq!(final_snap, inputs);
+    }
 }
