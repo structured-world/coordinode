@@ -1,33 +1,119 @@
 /**
  * Custom theme overrides for CoordiNode documentation.
+ *
+ * Width strategy: the benchmark dashboards have multi-column charts and a
+ * competitor table that should breathe on large screens.  We push the doc
+ * container wider than VitePress defaults at every breakpoint above 1280px
+ * and add an ultra-wide tier at 1920px so 4K / 5K displays stop wasting
+ * half the viewport on margins.
  */
 
-/* Widen content area on large screens */
-@media (min-width: 1440px) {
+/* Default desktop widening (≥ 1280px) */
+@media (min-width: 1280px) {
   .VPDoc .container {
-    max-width: 1104px;
+    max-width: 1200px;
   }
 
   .VPDoc:not(.has-aside) .container {
-    max-width: 1104px;
+    max-width: 1200px;
   }
 
   .VPDoc:not(.has-aside) .container > .content {
-    max-width: 900px;
+    max-width: 1000px;
+  }
+}
+
+@media (min-width: 1440px) {
+  .VPDoc .container {
+    max-width: 1360px;
+  }
+
+  .VPDoc:not(.has-aside) .container {
+    max-width: 1360px;
+  }
+
+  .VPDoc:not(.has-aside) .container > .content {
+    max-width: 1120px;
   }
 }
 
 @media (min-width: 1600px) {
   .VPDoc .container {
-    max-width: 1280px;
+    max-width: 1520px;
   }
 
   .VPDoc:not(.has-aside) .container {
-    max-width: 1280px;
+    max-width: 1520px;
   }
 
   .VPDoc:not(.has-aside) .container > .content {
-    max-width: 1040px;
+    max-width: 1280px;
+  }
+}
+
+@media (min-width: 1920px) {
+  .VPDoc .container {
+    max-width: 1760px;
+  }
+
+  .VPDoc:not(.has-aside) .container {
+    max-width: 1760px;
+  }
+
+  .VPDoc:not(.has-aside) .container > .content {
+    max-width: 1520px;
+  }
+}
+
+/* Benchmarks page is the widest consumer — give the .content area a
+ * dedicated near-full-bleed layout. The class is applied per-page via
+ * `pageClass: "benchmarks-wide"` in the page frontmatter. */
+.benchmarks-wide .VPDoc .container,
+.benchmarks-wide .VPDoc:not(.has-aside) .container {
+  max-width: min(96vw, 1880px);
+}
+
+.benchmarks-wide .VPDoc:not(.has-aside) .container > .content {
+  max-width: min(94vw, 1760px);
+}
+
+/* The main VitePress nav bar stays inside the page container — widen it
+ * in lock-step so the brand / nav links don't drift toward the centre on
+ * a wider doc area. */
+@media (min-width: 1280px) {
+  .VPNavBar .container,
+  .VPNavBar.has-sidebar .content,
+  .VPNavBar .content-body {
+    max-width: 1360px;
+  }
+}
+
+@media (min-width: 1600px) {
+  .VPNavBar .container,
+  .VPNavBar.has-sidebar .content,
+  .VPNavBar .content-body {
+    max-width: 1520px;
+  }
+}
+
+@media (min-width: 1920px) {
+  .VPNavBar .container,
+  .VPNavBar.has-sidebar .content,
+  .VPNavBar .content-body {
+    max-width: 1760px;
+  }
+}
+
+/* Home hero stretches with the page on ultra-wide displays too. */
+@media (min-width: 1600px) {
+  .VPHome .container {
+    max-width: 1520px;
+  }
+}
+
+@media (min-width: 1920px) {
+  .VPHome .container {
+    max-width: 1760px;
   }
 }
 
