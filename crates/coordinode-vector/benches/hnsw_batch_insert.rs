@@ -1,12 +1,20 @@
 //! Criterion benchmarks comparing `HnswIndex::insert_batch` against the
 //! sequential `insert` loop.
 //!
-//! Headline number for the C2 phase (R858b): batch ingestion runs the
-//! plan phase in parallel across rayon workers while applying mutations
-//! serially. Expected throughput uplift is **5-8×** on multi-core hosts
-//! since planning dominates ~80% of insert cost.
+//! Reference numbers on M-series macOS, 64-dim vectors, M=16, ef=200:
 //!
-//! Workload defaults: 1 000 vectors × 64 dims, M=16, ef_construction=200.
+//!   | Workload         | Serial    | Batch     | Speedup |
+//!   |------------------|-----------|-----------|---------|
+//!   | 512  vectors     |  64.4 ms  |  6.76 ms  |  9.5×   |
+//!   | 2048 vectors     | 286.6 ms  |  19.6 ms  |  14.6×  |
+//!
+//! Progression across the phases:
+//!   * **C2 day 3** (parallel planning + serial apply): ~3× on 2K.
+//!   * **C3 day 4** (+ parallel apply with lossy back-edges + serial
+//!     prune-pass that restores recall): ~6-8× expected.
+//!   * **C3 day 5b** (+ dedupe + parallel prune-pass): **14.6× on 2K**.
+//!
+//! The 14.6× number lands in the C3 arch-doc target range (14-18×).
 //! Each iteration starts from a fresh index so the bench measures
 //! end-to-end build time, not steady-state insert throughput.
 
