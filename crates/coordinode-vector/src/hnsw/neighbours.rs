@@ -118,7 +118,6 @@ impl<const N: usize> AtomicNeighbourList<N> {
     /// Callers MUST hold exclusive write access — e.g. via `&mut HnswIndex`.
     /// Concurrent calls to `set` are UB under C1 semantics; C3 introduces
     /// [`AtomicNeighbourList::replace`] for the multi-writer case.
-    #[allow(dead_code)] // Called from sync helper + tests; wired into hot path in C1 day 3.
     pub(crate) fn set(&self, new: &[u64]) {
         debug_assert!(
             new.len() <= N,

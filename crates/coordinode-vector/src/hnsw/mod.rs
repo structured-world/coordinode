@@ -182,11 +182,11 @@ pub struct HnswIndex {
     /// (today: empty until [`sync_neighbours_atomic_from_legacy`] is called)
     /// and consumed by the lock-free read path in the next C1 step.
     ///
-    /// Transitional: in C1 day 2 this field is dual-write scaffolding —
-    /// allocated on every insert with empty atomic lists, but no caller
-    /// reads from it yet. Day 3 (next commit) routes the search hot path
-    /// through this field; day 5 removes the legacy `connections`.
-    #[allow(dead_code)] // Wired into search path in C1 day 3.
+    /// Live read source for `search_layer_greedy_query` and
+    /// `search_layer_query` since C1 day 3b. Auto-published from legacy
+    /// `connections` at the end of every `insert` and `update_existing_node`
+    /// via [`HnswIndex::sync_neighbours_atomic_from_legacy`]. Day 5 removes
+    /// the legacy storage and this becomes the sole representation.
     neighbours_atomic: Vec<Vec<AtomicNeighbourList<M_MAX0>>>,
     /// Map from node ID to index in `nodes` vec.
     id_to_idx: std::collections::HashMap<u64, usize>,
@@ -1040,10 +1040,21 @@ impl HnswIndex {
         let mut current = ep;
         let mut current_dist = self.compute_distance(query, current);
 
+        // Per-call scratch buffer for the atomic neighbour snapshot. The
+        // BFS reads at most one neighbour list per loop iteration, so we
+        // recycle this single allocation across iterations rather than
+        // pay per-level allocation cost.
+        let mut neighbours_scratch: Vec<u64> = Vec::with_capacity(M_MAX0);
+
         loop {
             let mut changed = false;
-            if level < self.nodes[current].connections.len() {
-                for &neighbor_id in &self.nodes[current].connections[level] {
+            // Lock-free read from the atomic mirror. snapshot_into is
+            // wait-free: one Acquire load on `len` + that many Relaxed
+            // loads on the slot array. No mutex, no Arc clone, no lock
+            // contention with concurrent readers.
+            if level < self.neighbours_atomic[current].len() {
+                self.neighbours_atomic[current][level].snapshot_into(&mut neighbours_scratch);
+                for &neighbor_id in &neighbours_scratch {
                     if let Some(&neighbor_idx) = self.id_to_idx.get(&neighbor_id) {
                         let dist = self.compute_distance(query, neighbor_idx);
                         if dist < current_dist {
@@ -1099,14 +1110,17 @@ impl HnswIndex {
                 break;
             }
 
-            if level < self.nodes[closest.idx].connections.len() {
-                let connections = &self.nodes[closest.idx].connections[level];
+            if level < self.neighbours_atomic[closest.idx].len() {
+                // Lock-free atomic snapshot of the neighbour list — see
+                // search_layer_greedy_query for the memory-model rationale.
+                let mut connections: Vec<u64> = Vec::with_capacity(M_MAX0);
+                self.neighbours_atomic[closest.idx][level].snapshot_into(&mut connections);
 
                 // Resolve neighbor IDs → indices, filtering already-visited.
                 // Collect into temp vec to enable one-ahead prefetch pattern.
                 // Donor: hnswlib hnswalg.h:370-383 (one-ahead prefetch in inner loop)
                 let mut unvisited_neighbors: Vec<usize> = Vec::with_capacity(connections.len());
-                for &neighbor_id in connections {
+                for &neighbor_id in &connections {
                     if let Some(&neighbor_idx) = self.id_to_idx.get(&neighbor_id) {
                         if !visited.check_and_mark(neighbor_idx) {
                             unvisited_neighbors.push(neighbor_idx);
