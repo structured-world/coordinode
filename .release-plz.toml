@@ -65,3 +65,78 @@ git_tag_name = "coordinode-client-v{{ version }}"
 name = "coordinode-integration"
 release = false
 git_tag_name = "coordinode-integration-v{{ version }}"
+
+# Library crates added after the v0.3.x line — same treatment as
+# coordinode-client (release=false, unique git_tag_name so release-plz
+# does not adopt the workspace tag as their baseline and fail to find
+# them in the old worktree).
+
+[[package]]
+name = "coordinode-auth"
+release = false
+git_tag_name = "coordinode-auth-v{{ version }}"
+
+[[package]]
+name = "coordinode-bench"
+release = false
+git_tag_name = "coordinode-bench-v{{ version }}"
+
+[[package]]
+name = "coordinode-cluster"
+release = false
+git_tag_name = "coordinode-cluster-v{{ version }}"
+
+[[package]]
+name = "coordinode-core"
+release = false
+git_tag_name = "coordinode-core-v{{ version }}"
+
+[[package]]
+name = "coordinode-embed"
+release = false
+git_tag_name = "coordinode-embed-v{{ version }}"
+
+[[package]]
+name = "coordinode-modality"
+release = false
+git_tag_name = "coordinode-modality-v{{ version }}"
+
+[[package]]
+name = "coordinode-query"
+release = false
+git_tag_name = "coordinode-query-v{{ version }}"
+
+[[package]]
+name = "coordinode-raft"
+release = false
+git_tag_name = "coordinode-raft-v{{ version }}"
+
+[[package]]
+name = "coordinode-s3"
+release = false
+git_tag_name = "coordinode-s3-v{{ version }}"
+
+[[package]]
+name = "coordinode-search"
+release = false
+git_tag_name = "coordinode-search-v{{ version }}"
+
+[[package]]
+name = "coordinode-storage"
+release = false
+git_tag_name = "coordinode-storage-v{{ version }}"
+
+[[package]]
+name = "coordinode-test-fixtures"
+release = false
+git_tag_name = "coordinode-test-fixtures-v{{ version }}"
+
+[[package]]
+name = "coordinode-timeseries"
+release = false
+git_tag_name = "coordinode-timeseries-v{{ version }}"
+
+[[package]]
+name = "coordinode-vector"
+release = false
+git_tag_name = "coordinode-vector-v{{ version }}"
