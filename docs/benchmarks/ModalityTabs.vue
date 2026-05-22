@@ -7,6 +7,11 @@ interface Competitor {
   name: string;
   kind: "specialist" | "multi-model";
   license: string;
+  // Exact version benched. Specialist baselines are pinned: when we re-run
+  // a specialist on a newer release we DELETE the previous JSON from
+  // bench-results/ rather than keeping a timeline. The repo always
+  // reflects "CoordiNode <latest commit> vs <this exact competitor build>".
+  version?: string;
   note?: string;
 }
 
@@ -29,12 +34,12 @@ const modalities: Modality[] = [
     blurb:
       "1 000 000 SIFT1M base vectors, 10 000 queries, ground-truth top-100. HNSW M=32, ef_construction=200, ef_search sweep.",
     competitors: [
-      { name: "hnswlib", kind: "specialist", license: "Apache-2.0", note: "reference implementation" },
-      { name: "Faiss (HNSW)", kind: "specialist", license: "MIT" },
-      { name: "Qdrant", kind: "specialist", license: "Apache-2.0" },
-      { name: "Milvus", kind: "specialist", license: "Apache-2.0" },
-      { name: "pgvector", kind: "multi-model", license: "PostgreSQL" },
-      { name: "MongoDB Atlas Vector", kind: "multi-model", license: "SSPL" },
+      { name: "hnswlib", kind: "specialist", license: "Apache-2.0", version: "0.8.0", note: "reference implementation" },
+      { name: "Faiss (HNSW)", kind: "specialist", license: "MIT", version: "planned" },
+      { name: "Qdrant", kind: "specialist", license: "Apache-2.0", version: "planned" },
+      { name: "Milvus", kind: "specialist", license: "Apache-2.0", version: "planned" },
+      { name: "pgvector", kind: "multi-model", license: "PostgreSQL", version: "planned" },
+      { name: "MongoDB Atlas Vector", kind: "multi-model", license: "SSPL", version: "planned" },
     ],
   },
   {
@@ -46,10 +51,10 @@ const modalities: Modality[] = [
     blurb:
       "LDBC Social Network Benchmark, Interactive workload (short reads + complex reads + updates) at scale factor 1 and 10. Power@k throughput and tail latency.",
     competitors: [
-      { name: "Neo4j CE", kind: "specialist", license: "GPLv3" },
-      { name: "Memgraph CE", kind: "specialist", license: "BSL" },
-      { name: "JanusGraph", kind: "specialist", license: "Apache-2.0" },
-      { name: "ArangoDB CE", kind: "multi-model", license: "Apache-2.0 / BSL" },
+      { name: "Neo4j CE", kind: "specialist", license: "GPLv3", version: "planned" },
+      { name: "Memgraph CE", kind: "specialist", license: "BSL", version: "planned" },
+      { name: "JanusGraph", kind: "specialist", license: "Apache-2.0", version: "planned" },
+      { name: "ArangoDB CE", kind: "multi-model", license: "Apache-2.0 / BSL", version: "planned" },
     ],
   },
   {
@@ -61,9 +66,9 @@ const modalities: Modality[] = [
     blurb:
       "YCSB-A (50/50 read/update) and YCSB-C (100% read). Multi-region replication latency tracked separately. Json document model, secondary indexes.",
     competitors: [
-      { name: "MongoDB CE", kind: "specialist", license: "SSPL" },
-      { name: "Couchbase CE", kind: "specialist", license: "Apache-2.0" },
-      { name: "ArangoDB CE", kind: "multi-model", license: "Apache-2.0 / BSL" },
+      { name: "MongoDB CE", kind: "specialist", license: "SSPL", version: "planned" },
+      { name: "Couchbase CE", kind: "specialist", license: "Apache-2.0", version: "planned" },
+      { name: "ArangoDB CE", kind: "multi-model", license: "Apache-2.0 / BSL", version: "planned" },
     ],
   },
   {
@@ -75,10 +80,10 @@ const modalities: Modality[] = [
     blurb:
       "TSBS DevOps workload — load throughput plus 15 canonical query patterns. Ingest rate at sustained backpressure.",
     competitors: [
-      { name: "TimescaleDB", kind: "specialist", license: "Apache-2.0 / TSL" },
-      { name: "InfluxDB OSS", kind: "specialist", license: "MIT" },
-      { name: "QuestDB", kind: "specialist", license: "Apache-2.0" },
-      { name: "ClickHouse", kind: "multi-model", license: "Apache-2.0" },
+      { name: "TimescaleDB", kind: "specialist", license: "Apache-2.0 / TSL", version: "planned" },
+      { name: "InfluxDB OSS", kind: "specialist", license: "MIT", version: "planned" },
+      { name: "QuestDB", kind: "specialist", license: "Apache-2.0", version: "planned" },
+      { name: "ClickHouse", kind: "multi-model", license: "Apache-2.0", version: "planned" },
     ],
   },
   {
@@ -90,8 +95,8 @@ const modalities: Modality[] = [
     blurb:
       "Geometry containment, k-NN over geo points, bounding-box scans. R-tree index over Cartesian and geographic coordinates.",
     competitors: [
-      { name: "PostGIS", kind: "specialist", license: "GPLv2" },
-      { name: "MongoDB CE (geo)", kind: "multi-model", license: "SSPL" },
+      { name: "PostGIS", kind: "specialist", license: "GPLv2", version: "planned" },
+      { name: "MongoDB CE (geo)", kind: "multi-model", license: "SSPL", version: "planned" },
     ],
   },
   {
@@ -103,9 +108,9 @@ const modalities: Modality[] = [
     blurb:
       "Tantivy's published Search Benchmark Game — Wikipedia corpus, BM25 ranking, 50 query patterns. Index size and query latency at the 95th percentile.",
     competitors: [
-      { name: "OpenSearch", kind: "specialist", license: "Apache-2.0" },
-      { name: "Tantivy (stand-alone)", kind: "specialist", license: "MIT" },
-      { name: "Meilisearch", kind: "specialist", license: "MIT" },
+      { name: "OpenSearch", kind: "specialist", license: "Apache-2.0", version: "planned" },
+      { name: "Tantivy (stand-alone)", kind: "specialist", license: "MIT", version: "planned" },
+      { name: "Meilisearch", kind: "specialist", license: "MIT", version: "planned" },
     ],
   },
 ];
@@ -161,11 +166,20 @@ const current = computed(() => modalities.find((m) => m.id === active.value)!);
       <!-- Competitor matrix -->
       <div class="competitors">
         <h4 class="competitors-title">Competitors in this modality</h4>
+        <p class="competitors-policy">
+          Each competitor is benched at a single pinned version, recorded
+          in the JSON. When we re-run a baseline on a newer build we
+          <strong>replace</strong> the previous JSON in
+          <code>bench-results/</code> — no historical competitor timeline
+          accumulates. CoordiNode results, by contrast, advance on every
+          push to <code>main</code>.
+        </p>
         <table class="competitor-table">
           <thead>
             <tr>
               <th>Engine</th>
               <th>Type</th>
+              <th>Version benched</th>
               <th>License</th>
               <th>Note</th>
             </tr>
@@ -177,6 +191,10 @@ const current = computed(() => modalities.find((m) => m.id === active.value)!);
                 <span :class="['kind-pill', `kind-${c.kind}`]">
                   {{ c.kind === "specialist" ? "specialist" : "multi-model" }}
                 </span>
+              </td>
+              <td>
+                <code v-if="c.version && c.version !== 'planned'">{{ c.version }}</code>
+                <span v-else class="version-pending">planned</span>
               </td>
               <td><code>{{ c.license }}</code></td>
               <td class="note-cell">{{ c.note ?? "—" }}</td>
@@ -348,5 +366,21 @@ const current = computed(() => modalities.find((m) => m.id === active.value)!);
 .note-cell {
   color: var(--vp-c-text-2);
   font-size: 0.88rem;
+}
+
+.competitors-policy {
+  margin: 0 0 1rem;
+  padding: 0.75rem 1rem;
+  border-left: 3px solid var(--vp-c-brand-1);
+  background: var(--vp-c-bg-soft);
+  font-size: 0.9rem;
+  color: var(--vp-c-text-2);
+  line-height: 1.55;
+}
+
+.version-pending {
+  color: var(--vp-c-text-3);
+  font-style: italic;
+  font-size: 0.85rem;
 }
 </style>
