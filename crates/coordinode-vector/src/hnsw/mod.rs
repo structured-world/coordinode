@@ -1394,33 +1394,70 @@ impl HnswIndex {
         self.set_outgoing(node_idx, level, &kept);
     }
 
-    // ── Atomic neighbour write helpers (C1 day 5) ──────────────────────────
+    // ── Atomic neighbour write helpers (C1 day 5, refined C3 day 2) ────────
     //
     // Single source of truth: `neighbours_atomic`. The legacy
-    // `node.connections` is gone. C3 swaps `set_outgoing` / `add_neighbour_to`
-    // for CAS-based primitives (`AtomicNeighbourList::cas_append`, `replace`)
-    // — the call-site surface stays the same.
+    // `node.connections` is gone.
+    //
+    // **C3 day 2:** helpers that touch only `neighbours_atomic` now take
+    // `&self` instead of `&mut self`. The new node's atomic layer Vec is
+    // append-only at slot-creation time (`apply_insert_plan` pushes once),
+    // and once the layers exist their internal state mutates through atomic
+    // APIs that need only `&self`. This unlocks parallel apply for distinct
+    // node indices in the C3 concurrent insert path:
+    //
+    // * `set_outgoing(&self, idx, …)` is conflict-free across distinct
+    //   `idx` because the new-node's atomic list is freshly created by
+    //   the (single-writer) node-allocation phase.
+    // * `cas_add_neighbour_to(&self, neighbour_idx, …)` uses
+    //   `AtomicNeighbourList::cas_append` so multiple threads inserting
+    //   incoming edges into the same existing neighbour list never lose
+    //   each other's updates.
+    //
+    // The legacy `&mut self` `add_neighbour_to` / `remove_neighbour_from`
+    // / `clear_outgoing` paths are kept for the sequential C1/C2 callers
+    // (update_existing_node's rebuild, prune fallback).
 
     /// Replace the entire neighbour set at `(idx, level)` with `ids`.
     /// Truncates to `M_MAX0` on overflow (logged at construction time).
-    fn set_outgoing(&mut self, idx: usize, level: usize, ids: &[u64]) {
+    fn set_outgoing(&self, idx: usize, level: usize, ids: &[u64]) {
         let n = ids.len().min(M_MAX0);
         self.neighbours_atomic[idx][level].set(&ids[..n]);
+    }
+
+    /// Multi-writer append-edge primitive (C3). Tries to append `id` to
+    /// `(neighbour_idx, level)` via [`AtomicNeighbourList::cas_append`].
+    /// Returns `true` on success, `false` if the neighbour list is at
+    /// capacity (`m_max0`/`m`) and the caller must fall back to a single-
+    /// writer prune protocol.
+    ///
+    /// Today the only caller is C3's parallel apply path (next day's
+    /// commit). C2's serial apply continues to use [`add_neighbour_to`].
+    #[allow(dead_code)] // Wired into parallel apply in C3 day 3.
+    fn cas_add_neighbour_to(&self, neighbour_idx: usize, level: usize, id: u64) -> bool {
+        self.neighbours_atomic[neighbour_idx][level].cas_append(id)
     }
 
     /// Append `id` to `(neighbour_idx, level)`. If the resulting list
     /// exceeds `max_conn`, run `prune_connections` to shrink back to the
     /// nearest `max_conn` neighbours.
+    ///
+    /// Single-writer (C1/C2 path). The new node case uses `cas_append`
+    /// internally so cas-based callers can race with this safely on the
+    /// `len` counter, but the prune branch needs `&mut self` because
+    /// `prune_connections` reads vectors + reorders the list.
     fn add_neighbour_to(&mut self, neighbour_idx: usize, level: usize, id: u64, max_conn: usize) {
-        let mut snap = self.neighbours_atomic[neighbour_idx][level].snapshot();
-        snap.push(id);
-        if snap.len() > max_conn {
-            // Publish the over-full list first so `prune_connections` reads
-            // it via its own snapshot, then republishes the shrunk set.
-            self.set_outgoing(neighbour_idx, level, &snap);
-            self.prune_connections(neighbour_idx, level, max_conn);
+        if self.neighbours_atomic[neighbour_idx][level].cas_append(id) {
+            let len_now = self.neighbours_atomic[neighbour_idx][level].len();
+            if len_now > max_conn {
+                self.prune_connections(neighbour_idx, level, max_conn);
+            }
         } else {
-            self.set_outgoing(neighbour_idx, level, &snap);
+            // List full — force a prune and retry once.
+            self.prune_connections(neighbour_idx, level, max_conn);
+            // Best-effort: try once more after prune frees slots. If still
+            // full (e.g. max_conn already at capacity), drop this edge.
+            let _ = self.neighbours_atomic[neighbour_idx][level].cas_append(id);
         }
     }
 
