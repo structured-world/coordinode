@@ -27,6 +27,12 @@
 //! * **C4 (later)** — `loom` interleaving + `miri` UB scan campaign over
 //!   these primitives.
 
+// Atomics are routed through `loom` when the `--cfg loom` build flag is set,
+// so the model-checker can permute every observable interleaving. Under a
+// regular build we use `std::sync::atomic` and the cost is zero.
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(not(loom))]
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Sentinel value for an unused slot. Node IDs are dense `u64` starting from
@@ -48,7 +54,8 @@ pub(crate) const EMPTY: u64 = u64::MAX;
 /// * Exactly **one** writer at a time — enforced externally today by the
 ///   `&mut HnswIndex` borrow on insert. C3 will relax this via CAS.
 /// * No `Drop` side-effects — the type is a plain POD over atomics.
-pub(crate) struct AtomicNeighbourList<const N: usize> {
+#[doc(hidden)]
+pub struct AtomicNeighbourList<const N: usize> {
     /// Published length. Reads use `Acquire`; writes use `Release`.
     len: AtomicU32,
     /// Inline slots. All `EMPTY` at construction. Slot stores use `Relaxed`
@@ -59,10 +66,26 @@ pub(crate) struct AtomicNeighbourList<const N: usize> {
 
 impl<const N: usize> AtomicNeighbourList<N> {
     /// Construct an empty neighbour list. All slots are `EMPTY`.
+    ///
+    /// Const-constructible under regular builds (slot array literal). Under
+    /// `--cfg loom` the constructor is non-const because `loom::sync::
+    /// atomic::AtomicU64::new` is non-const (the model-checker needs to
+    /// register every atomic with its scheduler at runtime).
+    #[cfg(not(loom))]
     pub(crate) const fn new() -> Self {
         Self {
             len: AtomicU32::new(0),
             slots: [const { AtomicU64::new(EMPTY) }; N],
+        }
+    }
+
+    /// Loom-flavoured constructor (non-const, registers each atomic with
+    /// the model-checker scheduler).
+    #[cfg(loom)]
+    pub fn new() -> Self {
+        Self {
+            len: AtomicU32::new(0),
+            slots: std::array::from_fn(|_| AtomicU64::new(EMPTY)),
         }
     }
 
@@ -76,7 +99,7 @@ impl<const N: usize> AtomicNeighbourList<N> {
     /// Current published length. Acquire-ordered so that any slots in
     /// `0..len` are visible to subsequent reads.
     #[inline]
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.len.load(Ordering::Acquire) as usize
     }
 
@@ -88,7 +111,7 @@ impl<const N: usize> AtomicNeighbourList<N> {
     /// writers (C3), the returned set is a valid intermediate state of the
     /// list at some point during the call. C1 callers see the single-writer
     /// committed state.
-    pub(crate) fn snapshot_into(&self, out: &mut Vec<u64>) {
+    pub fn snapshot_into(&self, out: &mut Vec<u64>) {
         out.clear();
         let len = self.len.load(Ordering::Acquire) as usize;
         let len = len.min(N);
@@ -102,7 +125,7 @@ impl<const N: usize> AtomicNeighbourList<N> {
 
     /// Allocate-and-return variant of [`snapshot_into`]. Prefer the in-place
     /// variant on hot search paths to recycle the output buffer.
-    pub(crate) fn snapshot(&self) -> Vec<u64> {
+    pub fn snapshot(&self) -> Vec<u64> {
         let mut out = Vec::with_capacity(self.len());
         self.snapshot_into(&mut out);
         out
@@ -117,7 +140,7 @@ impl<const N: usize> AtomicNeighbourList<N> {
     /// Callers MUST hold exclusive write access — e.g. via `&mut HnswIndex`.
     /// Concurrent calls to `set` are UB under C1 semantics; C3 introduces
     /// [`AtomicNeighbourList::replace`] for the multi-writer case.
-    pub(crate) fn set(&self, new: &[u64]) {
+    pub fn set(&self, new: &[u64]) {
         debug_assert!(
             new.len() <= N,
             "AtomicNeighbourList<{}>::set received {} neighbours — would truncate",
@@ -174,7 +197,7 @@ impl<const N: usize> AtomicNeighbourList<N> {
     /// before we know we can't actually store there. The CAS-loop keeps
     /// `len` monotonic AND never above `N`.
     #[allow(dead_code)] // Wired into HnswIndex concurrent insert path in C3 day 2.
-    pub(crate) fn cas_append(&self, id: u64) -> bool {
+    pub fn cas_append(&self, id: u64) -> bool {
         loop {
             let current = self.len.load(Ordering::Acquire) as usize;
             if current >= N {
@@ -214,7 +237,7 @@ impl<const N: usize> AtomicNeighbourList<N> {
     /// counter + reader retry loop — deferred until a workload actually
     /// requires it.
     #[allow(dead_code)] // Wired into prune protocol in C3 day 2.
-    pub(crate) fn replace(&self, new: &[u64]) {
+    pub fn replace(&self, new: &[u64]) {
         self.set(new);
     }
 }

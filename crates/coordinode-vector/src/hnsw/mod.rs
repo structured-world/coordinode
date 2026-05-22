@@ -30,7 +30,13 @@
 mod neighbours;
 mod visited;
 
-pub(crate) use neighbours::AtomicNeighbourList;
+pub use neighbours::AtomicNeighbourList;
+
+// Loom integration tests live in `tests/loom_neighbours.rs` and need the
+// internal primitive in scope. We expose it publicly only under the model-
+// checker build flag — regular builds keep the type crate-private.
+#[cfg(loom)]
+pub use neighbours::AtomicNeighbourList as LoomAtomicNeighbourList;
 
 /// Compile-time cap on the inline neighbour slots per node per layer
 /// (`m_max0` in HNSW literature). The atomic neighbour list stores its

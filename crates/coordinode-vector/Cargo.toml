@@ -22,6 +22,14 @@ proptest = { workspace = true }
 rmp-serde = { workspace = true }
 tempfile = { workspace = true }
 
+# Loom is referenced inside `#[cfg(loom)]` blocks in src/hnsw/neighbours.rs,
+# so it must be a regular (non-dev) dep visible to the lib build.  All loom
+# code is gated by `#[cfg(loom)]`, so regular builds compile none of it.
+# The dep is small (~30 KB) and only impacts dependency resolution, not
+# compilation output, when --cfg loom is not set.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 [[bench]]
 name = "hnsw_search"
 harness = false
@@ -39,6 +47,9 @@ harness = false
 # All SIMD functions have scalar fallbacks and use runtime feature detection.
 [lints.rust]
 unsafe_code = "allow"
+# `loom` is a custom cfg flag enabled via `RUSTFLAGS="--cfg loom"` for the
+# model-checker test build only. Register it so rustc doesn't warn.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [lints.clippy]
 unwrap_used = "deny"
