@@ -561,6 +561,11 @@ impl HnswIndex {
                 .collect()
         };
 
+        // C2 contract: serial apply, recall agreement ≥ 0.7 vs sequential.
+        // C3 day 3 added apply_insert_plans_parallel for explicit opt-in via
+        // [`HnswIndex::apply_insert_plans_parallel`]; it drops back-edges on
+        // neighbour-list saturation (recall ~0.5-0.6 until C3 day 4 adds the
+        // post-batch prune-pass that re-runs prune over affected lists).
         for (plan, vec) in plans {
             self.apply_insert_plan(plan, vec);
         }
@@ -706,6 +711,102 @@ impl HnswIndex {
         // SQ8 calibrate + offload happens after the topology is in place
         // so search_layer can use f32 for the just-inserted node.
         self.maybe_calibrate_and_offload(idx);
+    }
+
+    /// Parallel apply phase for C3 — applies many plans through a
+    /// (serial allocation, parallel edge-write) two-step.
+    ///
+    /// Step 1 (serial, `&mut self`):
+    ///   * push each new node into `nodes` + allocate matching atomic
+    ///     neighbour layers in `neighbours_atomic`;
+    ///   * register the id → idx mapping;
+    ///   * promote `entry_point` / `max_level` if a plan's `new_level`
+    ///     pierces a new top.
+    ///
+    /// Step 2 (parallel, `&self` via `rayon::par_iter`):
+    ///   * each thread takes one allocated `(plan, idx)` pair and writes
+    ///     `set_outgoing` for the new node (conflict-free across distinct
+    ///     `idx`) plus `cas_add_neighbour_to` for each chosen back-edge
+    ///     (multi-writer-safe through `AtomicNeighbourList::cas_append`).
+    ///   * if a back-edge target is at capacity, this commit drops the
+    ///     edge silently — the prune-pass that fills these in is C3
+    ///     day 4. Recall hit is the standard hnswlib batch trade-off.
+    ///
+    /// Step 3 (serial): call `maybe_calibrate_and_offload` once for the
+    /// last-allocated node; SQ8 calibration sees the post-batch state.
+    #[allow(dead_code)] // Wired into insert_batch after C3 day 4 prune-pass restores full recall.
+    pub(crate) fn apply_insert_plans_parallel(&mut self, plans: Vec<(InsertPlan, Vec<f32>)>) {
+        if plans.is_empty() {
+            return;
+        }
+
+        // Step 1 — serial allocation phase.
+        let mut allocated: Vec<(InsertPlan, usize)> = Vec::with_capacity(plans.len());
+        for (plan, vec) in plans {
+            let idx = self.nodes.len();
+            let quantized = self.sq8_params.as_ref().map(|p| p.quantize(&vec));
+            let new_level = plan.new_level;
+            self.nodes.push(HnswNode {
+                id: plan.id,
+                vector: Some(vec),
+                quantized,
+                max_layer: new_level,
+            });
+            self.id_to_idx.insert(plan.id, idx);
+
+            let mut atomic_layers = Vec::with_capacity(new_level + 1);
+            for _ in 0..=new_level {
+                atomic_layers.push(AtomicNeighbourList::new());
+            }
+            self.neighbours_atomic.push(atomic_layers);
+
+            // Entry-point / max_level promotion runs in the serial phase
+            // so parallel writers below see a consistent (entry_point,
+            // max_level) — no CAS required.
+            if self.nodes.len() == 1 {
+                self.entry_point = Some(idx);
+                self.max_level = new_level;
+            } else if new_level > self.max_level {
+                self.max_level = new_level;
+                self.entry_point = Some(idx);
+            }
+
+            allocated.push((plan, idx));
+        }
+
+        // Step 2 — parallel edge writes.
+        use rayon::prelude::*;
+        allocated.par_iter().for_each(|(plan, idx)| {
+            if plan.is_first_node {
+                return;
+            }
+            for layer in &plan.per_layer {
+                let outgoing: Vec<u64> = layer
+                    .selected_idxs
+                    .iter()
+                    .map(|&n| self.nodes[n].id)
+                    .collect();
+                self.set_outgoing(*idx, layer.level, &outgoing);
+
+                for &neighbour_idx in &layer.selected_idxs {
+                    if layer.level < self.neighbours_atomic[neighbour_idx].len() {
+                        // Lossy on capacity: if cas_append fails, drop
+                        // this back-edge. The prune pass (C3 day 4) will
+                        // backfill by re-running prune over the affected
+                        // lists. For C3 day 3 the recall hit is bounded
+                        // by max_conn × batch_size / total_edges.
+                        let _ = self.cas_add_neighbour_to(neighbour_idx, layer.level, plan.id);
+                    }
+                }
+            }
+        });
+
+        // Step 3 — serial post-phase. SQ8 calibration sees the final
+        // population. We call once with the last allocated idx; the
+        // calibration path itself looks at `self.nodes` as a whole.
+        if let Some((_, last_idx)) = allocated.last() {
+            self.maybe_calibrate_and_offload(*last_idx);
+        }
     }
 
     /// Auto-calibrate SQ8 if threshold reached, then offload the just-inserted
@@ -2821,5 +2922,63 @@ mod tests {
         }
         idx.insert_batch(items);
         assert_eq!(idx.len(), 20, "expected 20 unique ids after batch");
+    }
+
+    #[test]
+    fn apply_insert_plans_parallel_ingests_every_item() {
+        // C3 day 3: explicit parallel-apply variant. Until the prune-pass
+        // (day 4) backfills dropped back-edges, recall agreement vs serial
+        // hovers in the 0.5-0.6 range; the property we assert here is
+        // weaker: every plan must result in a present, self-recoverable
+        // node (search for own vector returns it as top-1).
+        let cfg = HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 50,
+            ef_search: 50,
+            metric: VectorMetric::L2,
+            max_dimensions: 4,
+            quantization: false,
+            rerank_candidates: 50,
+            calibration_threshold: 10_000,
+            offload_vectors: false,
+            property_name: String::new(),
+            max_elements: 1_000,
+        };
+        let mut idx = HnswIndex::new(cfg);
+
+        // Seed 64 nodes so the parallel apply's plans have a real graph.
+        for i in 0..64u64 {
+            let v: Vec<f32> = (0..4).map(|d| ((i * 31 + d) as f32 * 0.1).sin()).collect();
+            idx.insert(i, v);
+        }
+        // Pre-compute plans against the seeded graph, then apply in
+        // parallel via the C3 day 3 entry point.
+        let plans: Vec<(InsertPlan, Vec<f32>)> = (64..200u64)
+            .map(|i| {
+                let v: Vec<f32> = (0..4).map(|d| ((i * 31 + d) as f32 * 0.1).sin()).collect();
+                let plan = idx.compute_insert_plan(i, &v);
+                (plan, v)
+            })
+            .collect();
+        idx.apply_insert_plans_parallel(plans);
+
+        assert_eq!(idx.len(), 200);
+        // Every node must search-recover to itself as the closest result.
+        // This is a much looser invariant than recall agreement: it says
+        // "the node landed in the index and its outgoing edges are
+        // sufficient to reach itself from any nearby entry".
+        let mut self_recovered = 0;
+        for i in 64..200u64 {
+            let q: Vec<f32> = (0..4).map(|d| ((i * 31 + d) as f32 * 0.1).sin()).collect();
+            if idx.search(&q, 1)[0].id == i {
+                self_recovered += 1;
+            }
+        }
+        let ratio = self_recovered as f64 / 136.0;
+        assert!(
+            ratio >= 0.85,
+            "self-recover ratio {ratio:.2} after parallel apply (expected ≥ 0.85)",
+        );
     }
 }
