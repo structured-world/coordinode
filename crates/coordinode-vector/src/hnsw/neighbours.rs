@@ -18,15 +18,14 @@
 //!
 //! # Where this lives in the C1 → C4 plan
 //!
-//! * **C1 (now)** — single-writer. `set` is called only from the insert path
-//!   while the caller still holds `&mut HnswIndex`. Search reads via
-//!   [`snapshot`] with no locking. Inserts are still sequential.
-//! * **C3 (later)** — multi-writer. [`replace`] and [`cas_append`] add CAS
-//!   write APIs. `next_id` becomes monotonic to avoid ABA.
-//! * **C4 (later)** — `loom` interleaving + `miri` UB scan.
-//!
-//! Today only the C1 surface is implemented; the C3 entry points are stubbed
-//! at the bottom of the file so the import surface is stable across phases.
+//! * **C1** — single-writer `set`. Caller holds `&mut HnswIndex` while
+//!   mutating; concurrent search reads via [`snapshot`] without locking.
+//! * **C3 (now)** — multi-writer [`cas_append`] for incoming-edge add
+//!   under concurrent inserters; [`replace`] for the prune protocol
+//!   (single-writer per-list, gated by HnswIndex). `set` remains the
+//!   bulk-replace primitive both helpers ultimately call.
+//! * **C4 (later)** — `loom` interleaving + `miri` UB scan campaign over
+//!   these primitives.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -142,26 +141,81 @@ impl<const N: usize> AtomicNeighbourList<N> {
         self.len.store(n as u32, Ordering::Release);
     }
 
-    // ─── C3 stubs (intentionally not yet wired) ────────────────────────────
-    //
-    // These will be implemented in R858c. They are declared here so the
-    // import surface is stable across phases — C2 and the C3 implementation
-    // PR can switch callers without re-exporting types.
+    // ─── C3 lock-free write primitives (R858c day 1) ──────────────────────
 
-    /// **C3 (not yet implemented).** Append `id` to the list under
-    /// concurrent writers. Returns `true` on success, `false` if the list
-    /// was full and the caller must run shrink-to-M heuristic.
-    #[allow(dead_code)]
-    pub(crate) fn cas_append(&self, _id: u64) -> bool {
-        unimplemented!("cas_append lands in R858c (C3)")
+    /// Append `id` to the list under concurrent writers. Returns `true` on
+    /// success, `false` if the list is full (caller must run a shrink/prune
+    /// protocol — see `HnswIndex::prune_connections`, which today runs
+    /// single-writer under `&mut self`).
+    ///
+    /// # Algorithm
+    ///
+    /// 1. CAS-loop on `len` to reserve a slot index — read current `len`,
+    ///    abort with `false` if at capacity, else `compare_exchange` to
+    ///    `len + 1`. Only the winning thread reaches step 2.
+    /// 2. The winner writes `id` to its reserved slot with `Release`
+    ///    ordering, making the new neighbour visible to subsequent
+    ///    snapshots.
+    ///
+    /// # Concurrent-reader semantics
+    ///
+    /// A snapshot taken between step 1 (reserve) and step 2 (write) sees
+    /// `len = new_len` but slot `current` is still `EMPTY`. The reader path
+    /// ([`snapshot_into`]) filters `EMPTY` out, so the transient state is
+    /// equivalent to the new entry "not yet visible" — readers either see
+    /// the old state (snapshot before reserve) or the new state (snapshot
+    /// after write). No torn read of a partially-populated entry can
+    /// happen because slot stores are atomic `u64`.
+    ///
+    /// # Why not `fetch_add`
+    ///
+    /// `fetch_add` would also work and is one instruction cheaper, but it
+    /// makes the over-capacity case messy: the bumped `len` is observable
+    /// before we know we can't actually store there. The CAS-loop keeps
+    /// `len` monotonic AND never above `N`.
+    #[allow(dead_code)] // Wired into HnswIndex concurrent insert path in C3 day 2.
+    pub(crate) fn cas_append(&self, id: u64) -> bool {
+        loop {
+            let current = self.len.load(Ordering::Acquire) as usize;
+            if current >= N {
+                return false;
+            }
+            let new_len = (current as u32) + 1;
+            match self.len.compare_exchange(
+                current as u32,
+                new_len,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    // We own slot `current`. Publish the id.
+                    self.slots[current].store(id, Ordering::Release);
+                    return true;
+                }
+                Err(_) => {
+                    // Another writer raced ahead; retry with the fresh len.
+                    std::hint::spin_loop();
+                }
+            }
+        }
     }
 
-    /// **C3 (not yet implemented).** Atomically replace the entire list under
-    /// concurrent writers using a per-node version counter to detect lost
-    /// updates.
-    #[allow(dead_code)]
-    pub(crate) fn replace(&self, _new: &[u64]) {
-        unimplemented!("replace lands in R858c (C3)")
+    /// Atomically replace the entire list contents.
+    ///
+    /// **Caller contract (C3 prune path):** this method is single-writer at
+    /// the per-list granularity. The HNSW prune protocol acquires a per-node
+    /// "prune-in-progress" gate before calling `replace`, so no other
+    /// `cas_append` or `replace` runs concurrently on the same list. Within
+    /// that gate, concurrent readers ([`snapshot_into`] etc) are still safe
+    /// — they observe either the pre-replace or post-replace contents, with
+    /// no torn intermediate (sequencing identical to [`set`]).
+    ///
+    /// For full multi-writer replace, this would need a per-list version
+    /// counter + reader retry loop — deferred until a workload actually
+    /// requires it.
+    #[allow(dead_code)] // Wired into prune protocol in C3 day 2.
+    pub(crate) fn replace(&self, new: &[u64]) {
+        self.set(new);
     }
 }
 
@@ -289,16 +343,123 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "lands in R858c")]
-    fn cas_append_unimplemented_in_c1() {
+    fn cas_append_grows_list_in_order() {
         let list: AtomicNeighbourList<8> = AtomicNeighbourList::new();
-        let _ = list.cas_append(42);
+        for i in 0..5u64 {
+            assert!(list.cas_append(i + 10), "append at {i} should succeed");
+        }
+        assert_eq!(list.snapshot(), vec![10, 11, 12, 13, 14]);
     }
 
     #[test]
-    #[should_panic(expected = "lands in R858c")]
-    fn replace_unimplemented_in_c1() {
+    fn cas_append_returns_false_when_full() {
+        let list: AtomicNeighbourList<4> = AtomicNeighbourList::new();
+        for i in 0..4u64 {
+            assert!(list.cas_append(i));
+        }
+        // Fifth append must fail.
+        assert!(!list.cas_append(99));
+        assert_eq!(list.len(), 4);
+        assert_eq!(list.snapshot(), vec![0, 1, 2, 3]);
+        // Re-attempting also fails; list state unchanged.
+        assert!(!list.cas_append(100));
+        assert_eq!(list.len(), 4);
+    }
+
+    #[test]
+    fn cas_append_concurrent_writers_keep_len_consistent() {
+        // C3 stress test: many threads call cas_append concurrently. Each
+        // appended id is unique. Final list size must equal (a) the number
+        // of attempted appends if that's ≤ capacity, or (b) capacity
+        // exactly with a stable subset of attempted ids.
+        use std::sync::Arc;
+        use std::thread;
+
+        const CAP: usize = 64;
+        let list: Arc<AtomicNeighbourList<CAP>> = Arc::new(AtomicNeighbourList::new());
+
+        let n_threads = 8;
+        let per_thread = 8; // 8 × 8 = 64 = CAP, fits exactly.
+
+        let mut handles = Vec::new();
+        for t in 0..n_threads {
+            let list = list.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..per_thread {
+                    let id = (t * 1_000 + i) as u64;
+                    // Spin until either succeeded or the list is full.
+                    let ok = list.cas_append(id);
+                    if !ok {
+                        // Capacity reached — that's a valid outcome under
+                        // contention; the test below verifies invariants.
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let snap = list.snapshot();
+        assert!(snap.len() <= CAP, "len {} > capacity {CAP}", snap.len(),);
+        // Every observed id must be unique — no duplicate slot assignment.
+        let mut seen = std::collections::HashSet::new();
+        for &id in &snap {
+            assert!(seen.insert(id), "duplicate id {id} in concurrent append");
+        }
+        // With 64 appends and 64 slots, all must land if no thread bailed
+        // early. (Threads only bail on `cas_append == false`, which only
+        // happens past capacity, which only happens after CAP successful
+        // appends → impossible here.)
+        assert_eq!(snap.len(), CAP, "all 64 unique ids must land");
+    }
+
+    #[test]
+    fn cas_append_concurrent_overflow_caps_at_capacity() {
+        // Variant: more appends than capacity. List must end with exactly
+        // CAP unique ids, every observed id originating from some thread.
+        use std::sync::Arc;
+        use std::thread;
+
+        const CAP: usize = 32;
+        let list: Arc<AtomicNeighbourList<CAP>> = Arc::new(AtomicNeighbourList::new());
+
+        let n_threads = 8;
+        let per_thread = 16; // 8 × 16 = 128 > 32.
+
+        let mut handles = Vec::new();
+        for t in 0..n_threads {
+            let list = list.clone();
+            handles.push(thread::spawn(move || {
+                let mut succeeded = 0;
+                for i in 0..per_thread {
+                    let id = (t * 1_000 + i) as u64;
+                    if list.cas_append(id) {
+                        succeeded += 1;
+                    }
+                }
+                succeeded
+            }));
+        }
+        let total_success: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total_success, CAP, "exactly CAP appends must succeed");
+
+        let snap = list.snapshot();
+        assert_eq!(snap.len(), CAP);
+        let unique: std::collections::HashSet<u64> = snap.into_iter().collect();
+        assert_eq!(unique.len(), CAP, "all entries unique");
+    }
+
+    #[test]
+    fn replace_overwrites_existing() {
+        // C3 day 1: replace is set() under the per-list single-writer gate.
+        // Tested as an alias here; concurrency contract documented on the
+        // method itself.
         let list: AtomicNeighbourList<8> = AtomicNeighbourList::new();
-        list.replace(&[1, 2, 3]);
+        list.cas_append(1);
+        list.cas_append(2);
+        list.cas_append(3);
+        list.replace(&[99, 88, 77, 66]);
+        assert_eq!(list.snapshot(), vec![99, 88, 77, 66]);
     }
 }
