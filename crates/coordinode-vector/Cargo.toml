@@ -11,6 +11,7 @@ publish.workspace = true
 coordinode-core = { workspace = true }
 coordinode-storage = { workspace = true }
 crossbeam-epoch = { workspace = true }
+rayon = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
