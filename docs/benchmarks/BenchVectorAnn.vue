@@ -98,6 +98,68 @@ const qpsLogScale = ref<boolean>(true);
 const yMetric = ref<"qps" | "latency_us_p99">("qps");
 const enabledSubjects = ref<Set<string>>(new Set());
 
+// Ratio chart UI state
+type RatioMetric = "qps_at_0_95" | "recall_peak" | "p99_at_0_95";
+const ratioMetric = ref<RatioMetric>("qps_at_0_95");
+// Which specialists are visible as ratio lines. CoordiNode is always the
+// numerator and never appears in this set; only competitor subjects.
+const ratioBaselines = ref<Set<string>>(new Set());
+
+const COORDINODE = "coordinode";
+const competitors = computed<string[]>(() =>
+  subjects.value.filter((s) => s.toLowerCase() !== COORDINODE),
+);
+
+watch(competitors, (list) => {
+  if (ratioBaselines.value.size === 0 && list.length > 0) {
+    ratioBaselines.value = new Set(list);
+  }
+});
+
+function toggleBaseline(subject: string) {
+  if (ratioBaselines.value.has(subject)) {
+    ratioBaselines.value.delete(subject);
+  } else {
+    ratioBaselines.value.add(subject);
+  }
+  ratioBaselines.value = new Set(ratioBaselines.value);
+}
+
+// Look up a single scalar metric on a report; for sweep-style metrics
+// (p99 at the 0.95 recall point) walk the sweep array.
+function metricValue(rep: BenchReport, m: RatioMetric): number | null {
+  if (m === "qps_at_0_95") {
+    return typeof rep.metrics.qps_at_recall_0_95 === "number"
+      ? rep.metrics.qps_at_recall_0_95
+      : null;
+  }
+  if (m === "recall_peak") {
+    return typeof rep.metrics.recall_at_k_peak === "number"
+      ? rep.metrics.recall_at_k_peak
+      : null;
+  }
+  // p99_at_0_95: pick the sweep point closest to recall = 0.95.
+  const sweep = rep.metrics.sweep ?? [];
+  if (sweep.length === 0) return null;
+  let best = sweep[0]!;
+  let bestDelta = Math.abs(best.recall_at_k - 0.95);
+  for (const p of sweep) {
+    const d = Math.abs(p.recall_at_k - 0.95);
+    if (d < bestDelta) {
+      best = p;
+      bestDelta = d;
+    }
+  }
+  return best.latency_us_p99;
+}
+
+// For QPS / recall, larger = better → ratio = CN / baseline.
+// For p99 latency, smaller = better → ratio = baseline / CN.
+// Both orientations make "> 1.0 means CoordiNode wins" hold true.
+function ratioDirection(m: RatioMetric): "higher-better" | "lower-better" {
+  return m === "p99_at_0_95" ? "lower-better" : "higher-better";
+}
+
 const subjects = computed<string[]>(() => {
   const s = new Set<string>();
   for (const r of reports.value) s.add(r.subject);
@@ -194,11 +256,12 @@ const paretoOption = computed(() => {
     grid: { top: 50, left: 60, right: 24, bottom: 56 },
     xAxis: {
       type: "value",
-      name: "Recall @ 10",
+      name: "Recall @ 10 (higher → more accurate)",
       nameLocation: "middle",
       nameGap: 30,
-      min: 0.7,
-      max: 1.0,
+      // ECharts auto-fits — never hard-coded bounds, otherwise data
+      // outside the window silently disappears.
+      scale: true,
     },
     yAxis: {
       type: yIsLog ? "log" : "value",
@@ -210,44 +273,79 @@ const paretoOption = computed(() => {
   };
 });
 
-// Timeline — peak recall @ 10 across CN commits. One line per
-// subject. CoordiNode moves with every push to main; competitor
-// lines stay flat between manual re-baselines.
-const timelineOption = computed(() => {
-  const subjectMap = new Map<
-    string,
-    { ts: string; recall: number; sha: string }[]
-  >();
-  for (const rep of visibleReports.value) {
-    if (typeof rep.metrics.recall_at_k_peak !== "number") continue;
-    const arr = subjectMap.get(rep.subject) ?? [];
-    arr.push({
-      ts: rep.timestamp,
-      recall: rep.metrics.recall_at_k_peak,
-      sha: rep.git.sha_short,
-    });
-    subjectMap.set(rep.subject, arr);
+// Speedup vs baselines — X is the CoordiNode commit timeline (one
+// dot per CN commit), Y is the ratio (CN metric / competitor metric)
+// for the selected metric.  Direction is normalised so that values
+// above 1.0 always mean "CoordiNode wins" — for QPS/recall that's
+// CN/baseline, for p99 latency that's baseline/CN.  One line per
+// toggled competitor; competitor baselines are pinned (a single
+// scalar per competitor) so each line is the CN curve scaled by the
+// inverse of that competitor's pinned scalar.
+const speedupOption = computed(() => {
+  const m = ratioMetric.value;
+  const dir = ratioDirection(m);
+
+  // CoordiNode commits, sorted by commit time.
+  const cnRuns = reports.value
+    .filter((r) => r.subject.toLowerCase() === COORDINODE)
+    .map((r) => ({
+      ts: r.timestamp,
+      sha: r.git.sha_short,
+      value: metricValue(r, m),
+    }))
+    .filter((x): x is { ts: string; sha: string; value: number } => x.value !== null)
+    .sort((a, b) => a.ts.localeCompare(b.ts));
+
+  // Pinned competitor scalar — there's exactly one JSON per competitor
+  // in bench-results/ (replaced on re-bench, never timelined).  If
+  // multiple files exist, pick the most recent.
+  const baselineValue = new Map<string, number>();
+  for (const r of reports.value) {
+    if (r.subject.toLowerCase() === COORDINODE) continue;
+    if (!ratioBaselines.value.has(r.subject)) continue;
+    const v = metricValue(r, m);
+    if (v === null) continue;
+    const existing = baselineValue.get(r.subject);
+    if (existing === undefined) {
+      baselineValue.set(r.subject, v);
+    }
   }
-  const series = [...subjectMap.entries()].map(([subject, rows]) => ({
-    name: subject,
+
+  // X category axis — commit short SHA, ordered left-to-right by time.
+  const xCategories = cnRuns.map((r) => r.sha);
+
+  const series = [...baselineValue.entries()].map(([competitor, baseValue]) => ({
+    name: `vs ${competitor}`,
     type: "line" as const,
-    smooth: true,
+    smooth: false,
     symbol: "circle",
     symbolSize: 8,
-    data: rows
-      .sort((a, b) => a.ts.localeCompare(b.ts))
-      .map((r) => [r.ts, r.recall, r.sha]),
+    data: cnRuns.map((r) => {
+      const ratio = dir === "higher-better" ? r.value / baseValue : baseValue / r.value;
+      return [r.sha, ratio, r.ts];
+    }),
     emphasis: { focus: "series" as const },
   }));
+
+  const metricLabel =
+    m === "qps_at_0_95"
+      ? "QPS @ recall ≥ 0.95"
+      : m === "recall_peak"
+        ? "peak recall @ 10"
+        : "P99 latency @ recall ≥ 0.95";
+
   return {
     tooltip: {
       trigger: "item",
       formatter: (params: any) => {
-        const [ts, recall, sha] = params.data as [string, number, string];
+        const [sha, ratio, ts] = params.data as [string, number, string];
+        const verb = ratio >= 1 ? "faster than" : "slower than";
+        const factor = ratio >= 1 ? ratio.toFixed(2) : (1 / ratio).toFixed(2);
         return [
-          `<b>${params.seriesName}</b> (${sha})`,
-          new Date(ts).toLocaleString(),
-          `Peak recall @ 10: ${recall.toFixed(4)}`,
+          `<b>${params.seriesName}</b>`,
+          `Commit <code>${sha}</code> — ${new Date(ts).toLocaleString()}`,
+          `Ratio: ${ratio.toFixed(3)}× (${factor}× ${verb} baseline)`,
+          `Metric: ${metricLabel}`,
         ].join("<br>");
       },
     },
@@ -256,26 +354,33 @@ const timelineOption = computed(() => {
       top: 0,
       textStyle: { color: "var(--vp-c-text-1)" },
     },
-    grid: { top: 50, left: 60, right: 24, bottom: 80 },
-    dataZoom: [
-      { type: "slider", height: 18, bottom: 12 },
-      { type: "inside" },
-    ],
+    grid: { top: 50, left: 60, right: 24, bottom: 60 },
     xAxis: {
-      type: "time",
-      name: "Commit time",
+      type: "category",
+      data: xCategories,
+      name: "CoordiNode commit (oldest → newest)",
       nameLocation: "middle",
-      nameGap: 30,
+      nameGap: 32,
+      axisLabel: {
+        rotate: xCategories.length > 12 ? 35 : 0,
+        fontFamily: "var(--vp-font-family-mono)",
+      },
     },
     yAxis: {
       type: "value",
-      name: "Peak recall @ 10",
+      name: "Ratio (>1 = CoordiNode wins)",
       nameLocation: "middle",
       nameGap: 50,
-      min: 0.85,
-      max: 1.0,
     },
-    series,
+    series: series.map((s) => ({
+      ...s,
+      markLine: {
+        symbol: "none",
+        silent: true,
+        lineStyle: { color: "var(--vp-c-text-3)", type: "dashed" },
+        data: [{ yAxis: 1, label: { formatter: "parity (1.0×)" } }],
+      },
+    })),
   };
 });
 
@@ -431,12 +536,50 @@ onMounted(render);
       <h3>Pareto frontier — Recall @ 10 vs {{ yMetric === "qps" ? "QPS" : "P99 latency" }}</h3>
       <v-chart class="echart" :option="paretoOption" autoresize />
 
-      <h3>Peak recall over time</h3>
+      <h3>Speedup vs baselines — by commit</h3>
       <p class="hint">
-        Drag the slider below the chart to zoom into a commit range.
-        Click an engine in the legend to hide/show its line.
+        Each dot is one CoordiNode commit (X-axis = commits left → right
+        by time). Y is the ratio of CoordiNode's metric to the pinned
+        competitor's metric — normalised so <strong>&gt; 1.0 always
+        means CoordiNode wins</strong>. Pick the metric to compare in
+        the tabs, and toggle which competitor lines you want on the
+        chart.
       </p>
-      <v-chart class="echart" :option="timelineOption" autoresize />
+      <div class="controls">
+        <div class="control-group">
+          <span class="control-label">Metric:</span>
+          <button
+            :class="['chip', ratioMetric === 'qps_at_0_95' ? 'on' : 'off']"
+            @click="ratioMetric = 'qps_at_0_95'"
+          >
+            QPS @ recall ≥ 0.95
+          </button>
+          <button
+            :class="['chip', ratioMetric === 'recall_peak' ? 'on' : 'off']"
+            @click="ratioMetric = 'recall_peak'"
+          >
+            Peak recall @ 10
+          </button>
+          <button
+            :class="['chip', ratioMetric === 'p99_at_0_95' ? 'on' : 'off']"
+            @click="ratioMetric = 'p99_at_0_95'"
+          >
+            P99 latency @ recall ≥ 0.95
+          </button>
+        </div>
+        <div class="control-group">
+          <span class="control-label">Compare against:</span>
+          <button
+            v-for="c in competitors"
+            :key="c"
+            :class="['chip', ratioBaselines.has(c) ? 'on' : 'off']"
+            @click="toggleBaseline(c)"
+          >
+            {{ c }}
+          </button>
+        </div>
+      </div>
+      <v-chart class="echart" :option="speedupOption" autoresize />
 
       <h3>QPS @ recall ≥ 0.95 — latest run per engine</h3>
       <v-chart class="echart bar" :option="barOption" autoresize />
