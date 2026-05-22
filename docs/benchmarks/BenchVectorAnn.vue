@@ -326,6 +326,14 @@ const barOption = computed(() => {
         label: {
           show: true,
           position: "top",
+          // ECharts defaults a contrasting text-border around bar labels;
+          // in dark mode that border reads as a doubled / blurry outline
+          // around white digits. Force the colour to follow the VitePress
+          // text variable and kill the border so it stays a clean single
+          // stroke in both themes.
+          color: "var(--vp-c-text-1)",
+          textBorderWidth: 0,
+          textBorderColor: "transparent",
           formatter: (p: any) =>
             (p.data.value as number).toLocaleString(undefined, {
               maximumFractionDigits: 0,
