@@ -814,51 +814,59 @@ impl HnswIndex {
             }
         });
 
-        // Step 3 — serial prune-pass with dedupe.
+        // Step 3 — parallel prune-pass with dedupe.
         //
-        // Hub-vertex amplification: when many new nodes pick the same hot
-        // neighbour, the lossy parallel phase fills the per-neighbour
-        // backfill bucket K times. A naive serial pass would call
-        // prune_connections (O(m_max0 × dim) distance work) K times on
-        // the same list. Group by (neighbour_idx, level) so each unique
-        // list pays the prune cost once and then cas_appends all K
-        // queued ids in one batch:
+        // Hub-vertex amplification: when many new nodes pick the same
+        // hot neighbour, the lossy parallel phase fills the
+        // per-neighbour backfill bucket K times. We group by
+        // (neighbour_idx, level) so each unique list pays prune cost
+        // once and then cas_appends all K queued ids in one batch:
         //
         //   O(K × prune) → O(prune + K) per hot list.
         //
-        // On a workload with H hot neighbours each contested by K
-        // writers, this trades K * H prune passes for H prunes plus
-        // K * H cheap cas_appends. Empirically the K factor on dense
-        // batches reaches 100+, so the win scales accordingly.
+        // Then the groups themselves are disjoint per neighbour_idx, so
+        // we run prune-pass via rayon par_iter — each thread touches a
+        // distinct neighbours_atomic[X][Y], no contention. This lifts
+        // the serial floor that would otherwise cap parallel speedup
+        // under Amdahl's law when hot vertices saturate.
         let mut backfill = backfill.into_inner().unwrap_or_else(|e| e.into_inner());
-        // Sort by (neighbour_idx, level) so consecutive entries belong to
-        // the same list — enables a single-pass group walk below without
-        // a hashmap allocation.
         backfill.sort_unstable_by_key(|&(nb, lvl, _, _)| (nb, lvl));
 
+        // Materialise the groups as `(neighbour_idx, level, max_conn,
+        // start..end)` so par_iter can dispatch each independently. We
+        // slice into the shared `backfill` vec below — no per-group
+        // allocation of ids.
+        let mut groups: Vec<(usize, usize, usize, std::ops::Range<usize>)> = Vec::new();
         let mut i = 0;
         while i < backfill.len() {
             let (neighbour_idx, level, _, max_conn) = backfill[i];
-            // Find the group end — all consecutive entries with the same
-            // (neighbour_idx, level).
             let mut j = i + 1;
             while j < backfill.len() && backfill[j].0 == neighbour_idx && backfill[j].1 == level {
                 j += 1;
             }
-
-            // One prune for this list — frees up to max_conn slots.
-            self.prune_connections(neighbour_idx, level, max_conn);
-
-            // Then cas_append every queued id for this neighbour. After
-            // prune, `len <= max_conn < N`, so the first (max_conn -
-            // current_len) appends succeed; any beyond capacity are
-            // dropped (equivalent to hnswlib's prune-rejected outcome).
-            for entry in &backfill[i..j] {
-                let _ = self.neighbours_atomic[neighbour_idx][level].cas_append(entry.2);
-            }
-
+            groups.push((neighbour_idx, level, max_conn, i..j));
             i = j;
         }
+
+        let backfill_ref = &backfill;
+        groups
+            .par_iter()
+            .for_each(|(neighbour_idx, level, max_conn, range)| {
+                // One prune for this list — single-writer per `(idx, level)`
+                // because the par_iter partitions groups by distinct
+                // neighbour_idx (and same neighbour_idx is funnelled into
+                // one group), so no other rayon worker touches this list.
+                self.prune_connections(*neighbour_idx, *level, *max_conn);
+
+                // Then cas_append every queued id for this neighbour.
+                // After prune, `len ≤ max_conn < N`, so the first
+                // `max_conn − current_len` appends succeed; any beyond
+                // capacity are dropped (matches hnswlib's prune-rejected
+                // outcome).
+                for entry in &backfill_ref[range.clone()] {
+                    let _ = self.neighbours_atomic[*neighbour_idx][*level].cas_append(entry.2);
+                }
+            });
 
         // Step 4 — serial post-phase. SQ8 calibration sees the final
         // population. We call once with the last allocated idx; the
@@ -1535,7 +1543,7 @@ impl HnswIndex {
     /// Prune connections to keep at most max_conn (keep nearest).
     /// Uses exact f32 distance for pruning when available, falls back to
     /// dequantized SQ8 distances when f32 vectors are offloaded.
-    fn prune_connections(&mut self, node_idx: usize, level: usize, max_conn: usize) {
+    fn prune_connections(&self, node_idx: usize, level: usize, max_conn: usize) {
         // Snapshot the current neighbour list, score each by distance to
         // node_idx, then keep the nearest `max_conn`.
         let neighbours = self.neighbours_atomic[node_idx][level].snapshot();
