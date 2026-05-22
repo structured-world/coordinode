@@ -39,118 +39,94 @@ commit_parsers = [
 ]
 
 # The shipped binary — only this crate gets a git tag and GitHub Release.
-# CHANGELOG.md is generated here (per-crate) AND by git-cliff at workspace level.
+# CHANGELOG.md is generated here (per-crate) AND aggregated workspace-wide.
 [[package]]
 name = "coordinode-server"
 git_tag_enable = true
 git_release_enable = true
 
-# Library crate — release-plz tracks changelog but does not create releases.
-# Changelog is derived from workspace CHANGELOG.md via scripts/split-changelog.py.
+# ─── Library crates ────────────────────────────────────────────────────
 #
-# git_tag_name must be package-specific so the workspace tag `v0.3.9` (owned by
-# coordinode-server) does NOT match this crate's release regex.  Without a unique
-# tag pattern, release-plz would find v0.3.9 as coordinode-client's baseline,
-# check out that commit, and fail with "package not found" because coordinode-client
-# did not exist in the workspace at that tag.
+# Every library crate gets a unique `git_tag_name`.  Reason: the workspace
+# release tag (`v0.4.x`) is owned by `coordinode-server`; without a unique
+# pattern release-plz would adopt that tag as the baseline for every other
+# crate, then fail to find the crate inside the old worktree (the crate
+# may not have existed at that point in history).
+#
+# We do NOT set `release = false` here — that flag excludes the crate from
+# the workspace CHANGELOG.md aggregation done by our fork
+# (release-plz#2791).  With just `git_tag_enable = false` (inherited from
+# the workspace block) the crate participates in the changelog but is not
+# tagged or released to GitHub.
+
 [[package]]
 name = "coordinode-client"
-release = false
 git_tag_name = "coordinode-client-v{{ version }}"
 
-# Test-only crate — not a releasable package. Excluded from release-plz
-# processing to avoid "package not found in workspace" errors: release-plz
-# checks out an old baseline tag where this crate did not yet exist.
 [[package]]
 name = "coordinode-integration"
-release = false
 git_tag_name = "coordinode-integration-v{{ version }}"
-
-# Library crates added after the v0.3.x line — same treatment as
-# coordinode-client (release=false, unique git_tag_name so release-plz
-# does not adopt the workspace tag as their baseline and fail to find
-# them in the old worktree).
 
 [[package]]
 name = "coordinode-auth"
-release = false
 git_tag_name = "coordinode-auth-v{{ version }}"
 
 [[package]]
 name = "coordinode-bench"
-release = false
 git_tag_name = "coordinode-bench-v{{ version }}"
 
 [[package]]
 name = "coordinode-cluster"
-release = false
 git_tag_name = "coordinode-cluster-v{{ version }}"
 
 [[package]]
 name = "coordinode-core"
-release = false
 git_tag_name = "coordinode-core-v{{ version }}"
 
 [[package]]
 name = "coordinode-embed"
-release = false
 git_tag_name = "coordinode-embed-v{{ version }}"
 
 [[package]]
 name = "coordinode-modality"
-release = false
 git_tag_name = "coordinode-modality-v{{ version }}"
 
 [[package]]
 name = "coordinode-query"
-release = false
 git_tag_name = "coordinode-query-v{{ version }}"
 
 [[package]]
 name = "coordinode-raft"
-release = false
 git_tag_name = "coordinode-raft-v{{ version }}"
 
 [[package]]
 name = "coordinode-s3"
-release = false
 git_tag_name = "coordinode-s3-v{{ version }}"
 
 [[package]]
 name = "coordinode-search"
-release = false
 git_tag_name = "coordinode-search-v{{ version }}"
 
 [[package]]
 name = "coordinode-storage"
-release = false
 git_tag_name = "coordinode-storage-v{{ version }}"
 
 [[package]]
 name = "coordinode-test-fixtures"
-release = false
 git_tag_name = "coordinode-test-fixtures-v{{ version }}"
 
 [[package]]
 name = "coordinode-timeseries"
-release = false
 git_tag_name = "coordinode-timeseries-v{{ version }}"
 
 [[package]]
 name = "coordinode-vector"
-release = false
 git_tag_name = "coordinode-vector-v{{ version }}"
-
-# Bench crates in benches/ — same treatment (release=false, unique tag) so
-# release-plz doesn't adopt the workspace tag as their baseline and fail to
-# find them in the old worktree.
 
 [[package]]
 name = "coordinode-gold-bench"
-release = false
 git_tag_name = "coordinode-gold-bench-v{{ version }}"
 
 [[package]]
 name = "coordinode-bench-vector-ann"
-release = false
 git_tag_name = "coordinode-bench-vector-ann-v{{ version }}"
