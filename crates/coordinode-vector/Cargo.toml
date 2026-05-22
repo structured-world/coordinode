@@ -24,6 +24,10 @@ tempfile = { workspace = true }
 name = "hnsw_search"
 harness = false
 
+[[bench]]
+name = "hnsw_parallel_search"
+harness = false
+
 # Cannot use workspace lints because SIMD intrinsics require unsafe.
 # This is the ONLY crate with unsafe_code = "allow".
 # All SIMD functions have scalar fallbacks and use runtime feature detection.
