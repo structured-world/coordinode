@@ -10,6 +10,7 @@ on:
       - 'scripts/build-bench-manifest.py'
       - 'package.json'
       - 'yarn.lock'
+      - '.yarnrc.yml'
       - '.github/workflows/docs.yml'
   # Re-run when bench-data branch updates (new bench JSONs arrive).
   # The bench-data branch is auto-pushed by .github/workflows/bench.yml
