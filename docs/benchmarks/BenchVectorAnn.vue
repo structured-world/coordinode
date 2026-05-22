@@ -93,6 +93,28 @@ const status = ref<"loading" | "empty" | "ok" | "error">("loading");
 const errorMsg = ref<string>("");
 const reports = ref<BenchReport[]>([]);
 
+// Engine roster for the clickable legend table under the charts.
+// Click any row to toggle that engine's lines on/off across every chart.
+// Kept in sync with `ModalityTabs.vue` Vector competitors — same source-of-
+// truth manifest, but the table lives in this component because clicking
+// must toggle visibility on charts that BenchVectorAnn owns.
+interface EngineMeta {
+  name: string;
+  kind: "coordinode" | "specialist" | "multi-model";
+  license: string;
+  status: "live" | "planned";
+  note?: string;
+}
+const ENGINES: EngineMeta[] = [
+  { name: "coordinode", kind: "coordinode", license: "AGPL-3.0", status: "live" },
+  { name: "hnswlib", kind: "specialist", license: "Apache-2.0", status: "live", note: "reference implementation" },
+  { name: "Faiss (HNSW)", kind: "specialist", license: "MIT", status: "planned" },
+  { name: "Qdrant", kind: "specialist", license: "Apache-2.0", status: "planned" },
+  { name: "Milvus", kind: "specialist", license: "Apache-2.0", status: "planned" },
+  { name: "pgvector", kind: "multi-model", license: "PostgreSQL", status: "planned" },
+  { name: "MongoDB Atlas Vector", kind: "multi-model", license: "SSPL", status: "planned" },
+];
+
 // UI state
 const qpsLogScale = ref<boolean>(true);
 const yMetric = ref<"qps" | "latency_us_p99">("qps");
@@ -533,19 +555,8 @@ onMounted(render);
     </div>
 
     <template v-if="status === 'ok'">
-      <!-- Subject toggle row — click engine name to hide/show. -->
+      <!-- Y-axis control row (engine toggles live in the legend table below) -->
       <div class="controls">
-        <div class="control-group">
-          <span class="control-label">Engines:</span>
-          <button
-            v-for="s in subjects"
-            :key="s"
-            :class="['chip', enabledSubjects.has(s) ? 'on' : 'off']"
-            @click="toggleSubject(s)"
-          >
-            {{ s }}
-          </button>
-        </div>
         <div class="control-group">
           <span class="control-label">Y-axis:</span>
           <button
@@ -614,6 +625,51 @@ onMounted(render);
 
       <h3>QPS @ recall ≥ 0.95 — latest run per engine</h3>
       <v-chart class="echart bar" :option="barOption" autoresize />
+
+      <!-- Clickable engine legend. Each row toggles that engine across
+           every chart above. Status pill ('live' / 'planned') shows whether
+           we have JSON yet; planned rows still toggle the chip but have no
+           series to render. -->
+      <h4 class="legend-title">Engines &amp; pinned versions <span class="legend-hint">— click row to toggle</span></h4>
+      <table class="engine-legend">
+        <thead>
+          <tr>
+            <th class="col-toggle">On</th>
+            <th>Engine</th>
+            <th>Type</th>
+            <th>License</th>
+            <th>Status</th>
+            <th>Note</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr
+            v-for="e in ENGINES"
+            :key="e.name"
+            :class="['legend-row', enabledSubjects.has(e.name) ? 'is-on' : 'is-off', e.status === 'planned' ? 'is-planned' : '']"
+            @click="e.status === 'live' && toggleSubject(e.name)"
+          >
+            <td class="col-toggle">
+              <span :class="['toggle-dot', enabledSubjects.has(e.name) ? 'on' : 'off']" :title="enabledSubjects.has(e.name) ? 'visible — click to hide' : 'hidden — click to show'">
+                {{ enabledSubjects.has(e.name) ? "●" : "○" }}
+              </span>
+            </td>
+            <td class="engine-name">{{ e.name }}</td>
+            <td>
+              <span :class="['kind-pill', `kind-${e.kind}`]">
+                {{ e.kind === "coordinode" ? "this engine" : e.kind }}
+              </span>
+            </td>
+            <td><code>{{ e.license }}</code></td>
+            <td>
+              <span :class="['status-pill', `status-${e.status}`]">
+                {{ e.status }}
+              </span>
+            </td>
+            <td class="note-cell">{{ e.note ?? "—" }}</td>
+          </tr>
+        </tbody>
+      </table>
     </template>
   </div>
 </template>
@@ -688,5 +744,123 @@ onMounted(render);
 }
 h3 {
   margin-top: 2rem;
+}
+
+/* Clickable engine legend under the charts. Whole row is the toggle
+ * surface — cursor:pointer + hover bg + a leading dot indicate state.
+ * Planned engines are visibly dimmed but still toggle the chip (when
+ * a JSON arrives the chart picks up the series automatically). */
+.legend-title {
+  margin-top: 2.5rem;
+  font-size: 1rem;
+  color: var(--vp-c-text-1);
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+.legend-hint {
+  font-size: 0.85rem;
+  font-weight: 400;
+  color: var(--vp-c-text-2);
+}
+.engine-legend {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+  margin-top: 0.5rem;
+}
+.engine-legend th,
+.engine-legend td {
+  text-align: left;
+  padding: 0.45rem 0.7rem;
+  border-bottom: 1px solid var(--vp-c-divider);
+}
+.engine-legend th {
+  font-weight: 600;
+  color: var(--vp-c-text-2);
+  background: var(--vp-c-bg-soft);
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.col-toggle {
+  width: 3rem;
+  text-align: center;
+  font-size: 1.05rem;
+}
+.legend-row {
+  cursor: pointer;
+  transition: background-color 0.12s;
+}
+.legend-row:hover {
+  background: var(--vp-c-bg-soft);
+}
+.legend-row.is-off {
+  opacity: 0.55;
+}
+.legend-row.is-planned {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.legend-row.is-planned:hover {
+  background: transparent;
+}
+.toggle-dot {
+  display: inline-block;
+  width: 1.1rem;
+  text-align: center;
+  font-weight: 700;
+}
+.toggle-dot.on {
+  color: var(--vp-c-brand-1);
+}
+.toggle-dot.off {
+  color: var(--vp-c-text-3);
+}
+.engine-name {
+  font-weight: 500;
+  color: var(--vp-c-text-1);
+}
+.kind-pill {
+  display: inline-block;
+  font-size: 0.78rem;
+  font-weight: 500;
+  padding: 0.12rem 0.5rem;
+  border-radius: 10px;
+  white-space: nowrap;
+}
+.kind-pill.kind-coordinode {
+  background: var(--vp-c-brand-soft);
+  color: var(--vp-c-brand-1);
+}
+.kind-pill.kind-specialist {
+  background: rgba(120, 144, 156, 0.16);
+  color: var(--vp-c-text-2);
+}
+.kind-pill.kind-multi-model {
+  background: var(--vp-c-purple-soft, rgba(159, 122, 234, 0.16));
+  color: var(--vp-c-purple-1, #9f7aea);
+}
+.status-pill {
+  display: inline-block;
+  font-size: 0.78rem;
+  font-weight: 500;
+  padding: 0.12rem 0.5rem;
+  border-radius: 10px;
+  white-space: nowrap;
+}
+.status-pill.status-live {
+  background: rgba(46, 160, 67, 0.16);
+  color: rgb(63, 185, 80);
+}
+.status-pill.status-planned {
+  background: var(--vp-c-bg-soft);
+  color: var(--vp-c-text-3);
+  border: 1px dashed var(--vp-c-divider);
+}
+.note-cell {
+  color: var(--vp-c-text-2);
+  font-size: 0.88rem;
 }
 </style>

@@ -203,6 +203,34 @@ export default defineConfig({
           ],
         },
       ],
+      "/benchmarks/": [
+        {
+          text: "Benchmarks",
+          items: [
+            { text: "Overview", link: "/benchmarks/" },
+          ],
+        },
+        {
+          text: "Modalities",
+          collapsed: false,
+          items: [
+            { text: "Vector (ann-benchmarks)", link: "/benchmarks/#vector" },
+            { text: "Graph (LDBC SNB)", link: "/benchmarks/#graph" },
+            { text: "Document (YCSB)", link: "/benchmarks/#document" },
+            { text: "Time-Series (TSBS)", link: "/benchmarks/#timeseries" },
+            { text: "Spatial (PostGIS-shape)", link: "/benchmarks/#spatial" },
+            { text: "Full-Text (SBG)", link: "/benchmarks/#fulltext" },
+          ],
+        },
+        {
+          text: "Methodology",
+          collapsed: false,
+          items: [
+            { text: "How to read the charts", link: "/benchmarks/#how-to-read-these-charts" },
+            { text: "Hardware fingerprint", link: "/benchmarks/#hardware-fingerprint" },
+          ],
+        },
+      ],
       "/sdk/": [
         {
           text: "SDKs",
