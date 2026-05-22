@@ -155,6 +155,13 @@ impl Default for HnswConfig {
 }
 
 /// A single element in the HNSW graph.
+///
+/// Per-layer neighbour lists are stored separately on
+/// [`HnswIndex::neighbours_atomic`] using lock-free
+/// [`AtomicNeighbourList`]s — never inside this struct. The node's layer
+/// count equals `neighbours_atomic[node_idx].len()`; the node's max layer
+/// is also captured in [`HnswNode::max_layer`] for cheap access from the
+/// update / rebuild paths.
 struct HnswNode {
     /// Node ID (maps to graph node ID).
     id: u64,
@@ -165,10 +172,10 @@ struct HnswNode {
     /// SQ8-quantized vector for memory-efficient HNSW traversal.
     /// `None` until SQ8 calibration is complete.
     quantized: Option<Vec<u8>>,
-    /// Connections per layer. Layer 0 has up to m_max0 connections.
-    connections: Vec<Vec<u64>>,
-    /// Maximum layer this element exists on.
-    _max_layer: usize,
+    /// Highest layer this element exists on. Same value as
+    /// `neighbours_atomic[node_idx].len() - 1`; cached here so the rebuild
+    /// path doesn't have to indirect through the mirror on every read.
+    max_layer: usize,
 }
 
 /// HNSW index: in-memory approximate nearest neighbor graph.
@@ -176,17 +183,13 @@ pub struct HnswIndex {
     config: HnswConfig,
     /// All nodes indexed by ID.
     nodes: Vec<HnswNode>,
-    /// Lock-free atomic mirror of each node's per-layer neighbour list.
-    /// Outer Vec indexed by node index (same as [`nodes`]); inner Vec indexed
-    /// by layer (same shape as [`HnswNode::connections`]). Populated lazily
-    /// (today: empty until [`sync_neighbours_atomic_from_legacy`] is called)
-    /// and consumed by the lock-free read path in the next C1 step.
-    ///
-    /// Live read source for `search_layer_greedy_query` and
-    /// `search_layer_query` since C1 day 3b. Auto-published from legacy
-    /// `connections` at the end of every `insert` and `update_existing_node`
-    /// via [`HnswIndex::sync_neighbours_atomic_from_legacy`]. Day 5 removes
-    /// the legacy storage and this becomes the sole representation.
+    /// Lock-free per-node-per-layer neighbour lists. Outer Vec indexed by
+    /// node index, inner Vec indexed by layer. Sole source of truth for
+    /// the graph topology — the search hot path reads from here via
+    /// [`AtomicNeighbourList::snapshot_into`] without locking; the write
+    /// path (insert / update_existing_node / prune_connections) mutates
+    /// through the four helpers (`set_outgoing`, `add_neighbour_to`,
+    /// `remove_neighbour_from`, `clear_outgoing`).
     neighbours_atomic: Vec<Vec<AtomicNeighbourList<M_MAX0>>>,
     /// Map from node ID to index in `nodes` vec.
     id_to_idx: std::collections::HashMap<u64, usize>,
@@ -301,42 +304,6 @@ impl HnswIndex {
             visited_pool: VisitedPool::new(),
             // Seed from address of self (varies per instance). Non-deterministic but fast.
             rng_state: std::sync::atomic::AtomicU64::new(0xdeadbeef_cafebabe),
-        }
-    }
-
-    /// Walk every node × layer and republish the legacy `connections`
-    /// vector into the atomic mirror via [`AtomicNeighbourList::set`].
-    ///
-    /// **C1 day 2 plumbing.** Called from `insert` and `update_existing_node`
-    /// so the lock-free read path (wired in day 4) always sees the most
-    /// recent neighbour set. Day 5 removes the legacy storage and this
-    /// helper becomes the only writer.
-    pub(crate) fn sync_neighbours_atomic_from_legacy(&mut self) {
-        // Resize the outer Vec to match nodes.len().
-        while self.neighbours_atomic.len() < self.nodes.len() {
-            let node_idx = self.neighbours_atomic.len();
-            let layer_count = self.nodes[node_idx].connections.len();
-            let layers: Vec<AtomicNeighbourList<M_MAX0>> = (0..layer_count)
-                .map(|_| AtomicNeighbourList::new())
-                .collect();
-            self.neighbours_atomic.push(layers);
-        }
-        // Truncate if (somehow) shorter — defensive; today we never delete
-        // nodes from the index.
-        self.neighbours_atomic.truncate(self.nodes.len());
-
-        // Publish each layer.
-        for (node_idx, node) in self.nodes.iter().enumerate() {
-            // Grow the per-node layers Vec if the node gained layers
-            // (e.g. update_existing_node re-running with a higher level).
-            while self.neighbours_atomic[node_idx].len() < node.connections.len() {
-                self.neighbours_atomic[node_idx].push(AtomicNeighbourList::new());
-            }
-            for (level, conns) in node.connections.iter().enumerate() {
-                // Clamp to the inline cap (warned at construction time).
-                let n = conns.len().min(M_MAX0);
-                self.neighbours_atomic[node_idx][level].set(&conns[..n]);
-            }
         }
     }
 
@@ -458,24 +425,18 @@ impl HnswIndex {
         let new_level = self.random_level();
         let idx = self.nodes.len();
 
-        let mut connections = Vec::with_capacity(new_level + 1);
-        for _ in 0..=new_level {
-            connections.push(Vec::new());
-        }
-
-        // Quantize if SQ8 is calibrated
+        // Quantize if SQ8 is calibrated.
         let quantized = self.sq8_params.as_ref().map(|p| p.quantize(&vector));
 
         self.nodes.push(HnswNode {
             id,
             vector: Some(vector),
             quantized,
-            connections,
-            _max_layer: new_level,
+            max_layer: new_level,
         });
         self.id_to_idx.insert(id, idx);
 
-        // Allocate the atomic mirror in lockstep — write helpers
+        // Allocate atomic neighbour storage in lockstep — write helpers
         // (`set_outgoing`, `add_neighbour_to`, …) index by (node, layer)
         // and would panic on a missing entry. One empty AtomicNeighbourList
         // per layer of the just-pushed node.
@@ -490,7 +451,6 @@ impl HnswIndex {
             self.max_level = new_level;
             // Calibrate + offload after first-node construction
             self.maybe_calibrate_and_offload(idx);
-            self.sync_neighbours_atomic_from_legacy();
             return;
         }
 
@@ -527,7 +487,7 @@ impl HnswIndex {
 
             // Connect neighbors back to new node (bi-directional)
             for &neighbor_idx in &selected {
-                if level < self.nodes[neighbor_idx].connections.len() {
+                if level < self.neighbours_atomic[neighbor_idx].len() {
                     self.add_neighbour_to(neighbor_idx, level, id, max_conn);
                 }
             }
@@ -546,12 +506,6 @@ impl HnswIndex {
         // Calibrate SQ8 + offload f32 AFTER construction is complete.
         // Must be after graph building because search_layer needs f32 for the new node.
         self.maybe_calibrate_and_offload(idx);
-
-        // Republish neighbour atomic mirror so the lock-free read path
-        // (wired in the next C1 step) observes the post-insert state.
-        // The first-node early-return above also syncs implicitly via the
-        // empty connections vec.
-        self.sync_neighbours_atomic_from_legacy();
     }
 
     /// Auto-calibrate SQ8 if threshold reached, then offload the just-inserted
@@ -928,15 +882,15 @@ impl HnswIndex {
     /// 5. Re-connect bidirectionally at each layer.
     fn update_existing_node(&mut self, idx: usize, vector: Vec<f32>) {
         let id = self.nodes[idx].id;
-        let n_levels = self.nodes[idx].connections.len();
+        let n_levels = self.neighbours_atomic[idx].len();
 
         // Step 1: Remove this node from every neighbour's connection list.
-        // Clone neighbour IDs first to avoid simultaneous mutable + immutable borrows.
+        // Snapshot first to avoid simultaneous mutable + immutable borrows.
         for level in 0..n_levels {
-            let neighbours: Vec<u64> = self.nodes[idx].connections[level].clone();
+            let neighbours = self.neighbours_atomic[idx][level].snapshot();
             for neighbour_id in neighbours {
                 if let Some(&neighbour_idx) = self.id_to_idx.get(&neighbour_id) {
-                    if level < self.nodes[neighbour_idx].connections.len() {
+                    if level < self.neighbours_atomic[neighbour_idx].len() {
                         self.remove_neighbour_from(neighbour_idx, level, id);
                     }
                 }
@@ -959,7 +913,6 @@ impl HnswIndex {
             if self.is_offloaded() {
                 self.nodes[idx].vector = None;
             }
-            self.sync_neighbours_atomic_from_legacy();
             return;
         }
 
@@ -976,7 +929,7 @@ impl HnswIndex {
             self.entry_point.unwrap_or(0)
         };
 
-        let node_level = self.nodes[idx]._max_layer;
+        let node_level = self.nodes[idx].max_layer;
         let top_level = self.max_level;
         let mut current_ep = ep_idx;
 
@@ -1008,7 +961,7 @@ impl HnswIndex {
 
             // Connect neighbours back (bi-directional).
             for &neighbour_idx in &selected {
-                if level < self.nodes[neighbour_idx].connections.len() {
+                if level < self.neighbours_atomic[neighbour_idx].len() {
                     self.add_neighbour_to(neighbour_idx, level, id, max_conn);
                 }
             }
@@ -1022,10 +975,6 @@ impl HnswIndex {
         if self.is_offloaded() {
             self.nodes[idx].vector = None;
         }
-
-        // Republish neighbour atomic mirror — the rebuild changed both the
-        // node's outgoing edges and every former neighbour's incoming edge.
-        self.sync_neighbours_atomic_from_legacy();
     }
 
     /// Greedy search on a single layer (for traversal from top layers).
@@ -1227,15 +1176,14 @@ impl HnswIndex {
     /// Uses exact f32 distance for pruning when available, falls back to
     /// dequantized SQ8 distances when f32 vectors are offloaded.
     fn prune_connections(&mut self, node_idx: usize, level: usize, max_conn: usize) {
-        // Score all current connections by distance to node_idx.
-        // Use index-based access to avoid clone (R852 fix: was clone() before).
-        let mut scored: Vec<(f32, u64)> =
-            Vec::with_capacity(self.nodes[node_idx].connections[level].len());
-        for i in 0..self.nodes[node_idx].connections[level].len() {
-            let neighbor_id = self.nodes[node_idx].connections[level][i];
-            if let Some(&neighbor_idx) = self.id_to_idx.get(&neighbor_id) {
+        // Snapshot the current neighbour list, score each by distance to
+        // node_idx, then keep the nearest `max_conn`.
+        let neighbours = self.neighbours_atomic[node_idx][level].snapshot();
+        let mut scored: Vec<(f32, u64)> = Vec::with_capacity(neighbours.len());
+        for neighbor_id in &neighbours {
+            if let Some(&neighbor_idx) = self.id_to_idx.get(neighbor_id) {
                 let dist = self.distance_between_nodes(node_idx, neighbor_idx);
-                scored.push((dist, neighbor_id));
+                scored.push((dist, *neighbor_id));
             }
         }
 
@@ -1246,62 +1194,46 @@ impl HnswIndex {
         self.set_outgoing(node_idx, level, &kept);
     }
 
-    // ── Granular write helpers (C1 day 4) ──────────────────────────────────
+    // ── Atomic neighbour write helpers (C1 day 5) ──────────────────────────
     //
-    // Every mutation to `nodes[idx].connections[level]` routes through one
-    // of these four helpers, each of which writes both the legacy storage
-    // AND publishes the new neighbour set to the atomic mirror. After this
-    // refactor the end-of-method `sync_neighbours_atomic_from_legacy` calls
-    // become belt-and-braces; they will be removed in C1 day 5 alongside
-    // the legacy storage itself.
-    //
-    // Helpers take `&mut self` because they mutate legacy storage, but the
-    // atomic publish goes through `&self`-accessible APIs on the mirror —
-    // the borrow split is explicit at each call site.
+    // Single source of truth: `neighbours_atomic`. The legacy
+    // `node.connections` is gone. C3 swaps `set_outgoing` / `add_neighbour_to`
+    // for CAS-based primitives (`AtomicNeighbourList::cas_append`, `replace`)
+    // — the call-site surface stays the same.
 
     /// Replace the entire neighbour set at `(idx, level)` with `ids`.
     /// Truncates to `M_MAX0` on overflow (logged at construction time).
     fn set_outgoing(&mut self, idx: usize, level: usize, ids: &[u64]) {
         let n = ids.len().min(M_MAX0);
-        let trimmed = &ids[..n];
-        // Legacy write.
-        self.nodes[idx].connections[level].clear();
-        self.nodes[idx].connections[level].extend_from_slice(trimmed);
-        // Atomic publish.
-        self.neighbours_atomic[idx][level].set(trimmed);
+        self.neighbours_atomic[idx][level].set(&ids[..n]);
     }
 
-    /// Push `id` into the neighbour list at `(neighbour_idx, level)` and
-    /// run `prune_connections` if the list exceeds `max_conn`. Either path
-    /// republishes the atomic mirror so concurrent readers (today: the
-    /// search hot path; later: C3 concurrent inserts) see the post-update
-    /// state.
+    /// Append `id` to `(neighbour_idx, level)`. If the resulting list
+    /// exceeds `max_conn`, run `prune_connections` to shrink back to the
+    /// nearest `max_conn` neighbours.
     fn add_neighbour_to(&mut self, neighbour_idx: usize, level: usize, id: u64, max_conn: usize) {
-        self.nodes[neighbour_idx].connections[level].push(id);
-        if self.nodes[neighbour_idx].connections[level].len() > max_conn {
-            // prune_connections publishes via set_outgoing internally.
+        let mut snap = self.neighbours_atomic[neighbour_idx][level].snapshot();
+        snap.push(id);
+        if snap.len() > max_conn {
+            // Publish the over-full list first so `prune_connections` reads
+            // it via its own snapshot, then republishes the shrunk set.
+            self.set_outgoing(neighbour_idx, level, &snap);
             self.prune_connections(neighbour_idx, level, max_conn);
         } else {
-            // No prune — clone the current legacy list and publish.
-            let ids: Vec<u64> = self.nodes[neighbour_idx].connections[level].clone();
-            let n = ids.len().min(M_MAX0);
-            self.neighbours_atomic[neighbour_idx][level].set(&ids[..n]);
+            self.set_outgoing(neighbour_idx, level, &snap);
         }
     }
 
     /// Remove every occurrence of `id` from `(idx, level)`. No-op if `id`
-    /// is absent. Republishes the atomic mirror.
+    /// is absent.
     fn remove_neighbour_from(&mut self, idx: usize, level: usize, id: u64) {
-        self.nodes[idx].connections[level].retain(|&nid| nid != id);
-        let ids: Vec<u64> = self.nodes[idx].connections[level].clone();
-        let n = ids.len().min(M_MAX0);
-        self.neighbours_atomic[idx][level].set(&ids[..n]);
+        let mut snap = self.neighbours_atomic[idx][level].snapshot();
+        snap.retain(|&nid| nid != id);
+        self.set_outgoing(idx, level, &snap);
     }
 
-    /// Clear the entire neighbour set at `(idx, level)`. Republishes the
-    /// atomic mirror as empty.
+    /// Clear the entire neighbour set at `(idx, level)`.
     fn clear_outgoing(&mut self, idx: usize, level: usize) {
-        self.nodes[idx].connections[level].clear();
         self.neighbours_atomic[idx][level].set(&[]);
     }
 
@@ -1582,8 +1514,8 @@ mod tests {
 
         // Count nodes per max layer
         let mut layer_counts = [0usize; 10];
-        for node in &index.nodes {
-            let max_layer = node.connections.len().saturating_sub(1);
+        for layers in &index.neighbours_atomic {
+            let max_layer = layers.len().saturating_sub(1);
             if max_layer < layer_counts.len() {
                 layer_counts[max_layer] += 1;
             }
@@ -2407,17 +2339,19 @@ mod tests {
     }
 
     #[test]
-    fn sync_neighbours_atomic_mirrors_legacy_connections() {
-        // C1 day 2: dual-storage scaffolding. After manual sync, the
-        // atomic mirror is byte-equivalent to the legacy Vec<Vec<u64>>.
-        // Day 3 will route search reads through the mirror.
+    fn atomic_neighbours_track_inserts_and_updates() {
+        // C1 day 5: atomic neighbour storage is the sole source of truth.
+        // Insert a fan of vectors, then mutate one via update_existing_node;
+        // verify every neighbour list (a) tracks the layer count of the
+        // node, (b) is bounded by m_max0, (c) only references node IDs
+        // present in the index.
         let mut idx = HnswIndex::new(HnswConfig {
             m: 4,
             m_max0: 8,
             ef_construction: 20,
             ef_search: 10,
             metric: VectorMetric::L2,
-            max_dimensions: 8,
+            max_dimensions: 4,
             quantization: false,
             rerank_candidates: 10,
             calibration_threshold: 1_000,
@@ -2425,127 +2359,36 @@ mod tests {
             property_name: String::new(),
         });
 
-        // Populate with a small graph so several layers + bidirectional
-        // connections exist.
         for i in 0..30u64 {
             let v: Vec<f32> = (0..4).map(|d| ((i * 13 + d) as f32).sin()).collect();
             idx.insert(i, v);
         }
+        // Re-insert one node to exercise update_existing_node.
+        idx.insert(7, vec![0.5, -0.5, 0.5, -0.5]);
 
-        idx.sync_neighbours_atomic_from_legacy();
-
-        // Atomic mirror matches the AoS shape exactly.
         assert_eq!(idx.neighbours_atomic.len(), idx.nodes.len());
 
-        let mut buf = Vec::with_capacity(M_MAX0);
-        for (node_idx, node) in idx.nodes.iter().enumerate() {
-            assert_eq!(
-                idx.neighbours_atomic[node_idx].len(),
-                node.connections.len(),
-                "node {node_idx} layer count mismatch",
-            );
-            for (level, conns) in node.connections.iter().enumerate() {
-                idx.neighbours_atomic[node_idx][level].snapshot_into(&mut buf);
-                let expected: Vec<u64> = conns.iter().take(M_MAX0).copied().collect();
-                assert_eq!(
-                    buf, expected,
-                    "node {node_idx} level {level} mirror diverges from legacy",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn atomic_mirror_auto_synced_after_each_insert() {
-        // C1 day 3a: insert/update_existing auto-call the sync helper.
-        // After every insert the atomic mirror must match the legacy
-        // connections without manual sync.
-        let mut idx = HnswIndex::new(HnswConfig {
-            m: 4,
-            m_max0: 8,
-            ef_construction: 20,
-            ef_search: 10,
-            metric: VectorMetric::L2,
-            max_dimensions: 4,
-            quantization: false,
-            rerank_candidates: 10,
-            calibration_threshold: 1_000,
-            offload_vectors: false,
-            property_name: String::new(),
-        });
-
         let mut scratch = Vec::with_capacity(M_MAX0);
-        for i in 0..20u64 {
-            let v: Vec<f32> = (0..4).map(|d| ((i * 11 + d) as f32).sin()).collect();
-            idx.insert(i, v);
-
-            // After insert (no manual sync call), mirror == legacy.
+        for (node_idx, layers) in idx.neighbours_atomic.iter().enumerate() {
+            // Node layer count tracks the node's max_layer + 1.
             assert_eq!(
-                idx.neighbours_atomic.len(),
-                idx.nodes.len(),
-                "after inserting node {i}, mirror node count diverged",
+                layers.len(),
+                idx.nodes[node_idx].max_layer + 1,
+                "node {node_idx} layer count diverged from max_layer + 1",
             );
-            for (node_idx, node) in idx.nodes.iter().enumerate() {
-                for (level, conns) in node.connections.iter().enumerate() {
-                    idx.neighbours_atomic[node_idx][level].snapshot_into(&mut scratch);
-                    let expected: Vec<u64> = conns.iter().take(M_MAX0).copied().collect();
-                    assert_eq!(
-                        scratch, expected,
-                        "auto-sync drift at node {node_idx} level {level} after inserting {i}",
+            for (level, list) in layers.iter().enumerate() {
+                list.snapshot_into(&mut scratch);
+                assert!(
+                    scratch.len() <= M_MAX0,
+                    "node {node_idx} level {level} exceeds m_max0 cap",
+                );
+                for nid in &scratch {
+                    assert!(
+                        idx.id_to_idx.contains_key(nid),
+                        "dangling neighbour {nid} at node {node_idx} level {level}",
                     );
                 }
             }
         }
-
-        // Re-insert an existing id triggers update_existing_node; sync
-        // path must hold there too.
-        let v: Vec<f32> = vec![0.5, -0.5, 0.5, -0.5];
-        idx.insert(7, v);
-        for (node_idx, node) in idx.nodes.iter().enumerate() {
-            for (level, conns) in node.connections.iter().enumerate() {
-                idx.neighbours_atomic[node_idx][level].snapshot_into(&mut scratch);
-                let expected: Vec<u64> = conns.iter().take(M_MAX0).copied().collect();
-                assert_eq!(
-                    scratch, expected,
-                    "auto-sync drift after update_existing at node {node_idx} level {level}",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn sync_is_idempotent_and_handles_resync() {
-        // Calling sync twice produces identical state; calling after
-        // additional inserts grows the mirror in lockstep.
-        let mut idx = HnswIndex::new(HnswConfig {
-            m: 4,
-            m_max0: 8,
-            ef_construction: 20,
-            ef_search: 10,
-            metric: VectorMetric::L2,
-            max_dimensions: 4,
-            quantization: false,
-            rerank_candidates: 10,
-            calibration_threshold: 1_000,
-            offload_vectors: false,
-            property_name: String::new(),
-        });
-
-        for i in 0..10u64 {
-            let v: Vec<f32> = (0..4).map(|d| ((i * 7 + d) as f32).cos()).collect();
-            idx.insert(i, v);
-        }
-        idx.sync_neighbours_atomic_from_legacy();
-        let mirror_len_first = idx.neighbours_atomic.len();
-        idx.sync_neighbours_atomic_from_legacy();
-        assert_eq!(idx.neighbours_atomic.len(), mirror_len_first);
-
-        // Add more nodes; sync must extend the mirror.
-        for i in 10..15u64 {
-            let v: Vec<f32> = (0..4).map(|d| ((i * 7 + d) as f32).cos()).collect();
-            idx.insert(i, v);
-        }
-        idx.sync_neighbours_atomic_from_legacy();
-        assert_eq!(idx.neighbours_atomic.len(), idx.nodes.len());
     }
 }
