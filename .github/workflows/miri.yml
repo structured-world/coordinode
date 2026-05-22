@@ -1,0 +1,46 @@
+name: Miri (UB scan)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/coordinode-vector/**'
+      - '.github/workflows/miri.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  miri-neighbours:
+    name: Miri — AtomicNeighbourList primitives
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install nightly toolchain with miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run miri on hnsw::neighbours::tests
+        # The neighbours module holds every atomic primitive of the lock-free
+        # HNSW write path (cas_append, snapshot_into, set, replace). Miri
+        # scans the abstract Rust machine for undefined behaviour — bad
+        # atomic orderings, uninitialised reads, type-punning aliasing, etc.
+        # Higher-level integration tests use rayon and would time out under
+        # miri; they are covered by the proptest stress in the regular CI
+        # job and the loom interleaving suite (future work).
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-permissive-provenance
+        run: |
+          cd crates/coordinode-vector
+          cargo +nightly miri test --lib hnsw::neighbours::tests --no-fail-fast
