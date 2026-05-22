@@ -475,6 +475,16 @@ impl HnswIndex {
         });
         self.id_to_idx.insert(id, idx);
 
+        // Allocate the atomic mirror in lockstep — write helpers
+        // (`set_outgoing`, `add_neighbour_to`, …) index by (node, layer)
+        // and would panic on a missing entry. One empty AtomicNeighbourList
+        // per layer of the just-pushed node.
+        let mut atomic_layers = Vec::with_capacity(new_level + 1);
+        for _ in 0..=new_level {
+            atomic_layers.push(AtomicNeighbourList::new());
+        }
+        self.neighbours_atomic.push(atomic_layers);
+
         if self.nodes.len() == 1 {
             self.entry_point = Some(idx);
             self.max_level = new_level;
@@ -512,18 +522,13 @@ impl HnswIndex {
                 .collect();
 
             // Connect new node to selected neighbors
-            self.nodes[idx].connections[level] =
-                selected.iter().map(|&n| self.nodes[n].id).collect();
+            let outgoing: Vec<u64> = selected.iter().map(|&n| self.nodes[n].id).collect();
+            self.set_outgoing(idx, level, &outgoing);
 
             // Connect neighbors back to new node (bi-directional)
             for &neighbor_idx in &selected {
                 if level < self.nodes[neighbor_idx].connections.len() {
-                    self.nodes[neighbor_idx].connections[level].push(id);
-
-                    // Prune if over max connections
-                    if self.nodes[neighbor_idx].connections[level].len() > max_conn {
-                        self.prune_connections(neighbor_idx, level, max_conn);
-                    }
+                    self.add_neighbour_to(neighbor_idx, level, id, max_conn);
                 }
             }
 
@@ -932,7 +937,7 @@ impl HnswIndex {
             for neighbour_id in neighbours {
                 if let Some(&neighbour_idx) = self.id_to_idx.get(&neighbour_id) {
                     if level < self.nodes[neighbour_idx].connections.len() {
-                        self.nodes[neighbour_idx].connections[level].retain(|&nid| nid != id);
+                        self.remove_neighbour_from(neighbour_idx, level, id);
                     }
                 }
             }
@@ -940,7 +945,7 @@ impl HnswIndex {
 
         // Step 2: Clear this node's outgoing connections (keep layer slot count).
         for level in 0..n_levels {
-            self.nodes[idx].connections[level].clear();
+            self.clear_outgoing(idx, level);
         }
 
         // Step 3: Update vector and quantized representation.
@@ -998,17 +1003,13 @@ impl HnswIndex {
                 .collect();
 
             // Connect this node to its new neighbours.
-            self.nodes[idx].connections[level] =
-                selected.iter().map(|&n| self.nodes[n].id).collect();
+            let outgoing: Vec<u64> = selected.iter().map(|&n| self.nodes[n].id).collect();
+            self.set_outgoing(idx, level, &outgoing);
 
             // Connect neighbours back (bi-directional).
             for &neighbour_idx in &selected {
                 if level < self.nodes[neighbour_idx].connections.len() {
-                    self.nodes[neighbour_idx].connections[level].push(id);
-
-                    if self.nodes[neighbour_idx].connections[level].len() > max_conn {
-                        self.prune_connections(neighbour_idx, level, max_conn);
-                    }
+                    self.add_neighbour_to(neighbour_idx, level, id, max_conn);
                 }
             }
 
@@ -1241,7 +1242,67 @@ impl HnswIndex {
         scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(max_conn);
 
-        self.nodes[node_idx].connections[level] = scored.into_iter().map(|(_, id)| id).collect();
+        let kept: Vec<u64> = scored.into_iter().map(|(_, id)| id).collect();
+        self.set_outgoing(node_idx, level, &kept);
+    }
+
+    // ── Granular write helpers (C1 day 4) ──────────────────────────────────
+    //
+    // Every mutation to `nodes[idx].connections[level]` routes through one
+    // of these four helpers, each of which writes both the legacy storage
+    // AND publishes the new neighbour set to the atomic mirror. After this
+    // refactor the end-of-method `sync_neighbours_atomic_from_legacy` calls
+    // become belt-and-braces; they will be removed in C1 day 5 alongside
+    // the legacy storage itself.
+    //
+    // Helpers take `&mut self` because they mutate legacy storage, but the
+    // atomic publish goes through `&self`-accessible APIs on the mirror —
+    // the borrow split is explicit at each call site.
+
+    /// Replace the entire neighbour set at `(idx, level)` with `ids`.
+    /// Truncates to `M_MAX0` on overflow (logged at construction time).
+    fn set_outgoing(&mut self, idx: usize, level: usize, ids: &[u64]) {
+        let n = ids.len().min(M_MAX0);
+        let trimmed = &ids[..n];
+        // Legacy write.
+        self.nodes[idx].connections[level].clear();
+        self.nodes[idx].connections[level].extend_from_slice(trimmed);
+        // Atomic publish.
+        self.neighbours_atomic[idx][level].set(trimmed);
+    }
+
+    /// Push `id` into the neighbour list at `(neighbour_idx, level)` and
+    /// run `prune_connections` if the list exceeds `max_conn`. Either path
+    /// republishes the atomic mirror so concurrent readers (today: the
+    /// search hot path; later: C3 concurrent inserts) see the post-update
+    /// state.
+    fn add_neighbour_to(&mut self, neighbour_idx: usize, level: usize, id: u64, max_conn: usize) {
+        self.nodes[neighbour_idx].connections[level].push(id);
+        if self.nodes[neighbour_idx].connections[level].len() > max_conn {
+            // prune_connections publishes via set_outgoing internally.
+            self.prune_connections(neighbour_idx, level, max_conn);
+        } else {
+            // No prune — clone the current legacy list and publish.
+            let ids: Vec<u64> = self.nodes[neighbour_idx].connections[level].clone();
+            let n = ids.len().min(M_MAX0);
+            self.neighbours_atomic[neighbour_idx][level].set(&ids[..n]);
+        }
+    }
+
+    /// Remove every occurrence of `id` from `(idx, level)`. No-op if `id`
+    /// is absent. Republishes the atomic mirror.
+    fn remove_neighbour_from(&mut self, idx: usize, level: usize, id: u64) {
+        self.nodes[idx].connections[level].retain(|&nid| nid != id);
+        let ids: Vec<u64> = self.nodes[idx].connections[level].clone();
+        let n = ids.len().min(M_MAX0);
+        self.neighbours_atomic[idx][level].set(&ids[..n]);
+    }
+
+    /// Clear the entire neighbour set at `(idx, level)`. Republishes the
+    /// atomic mirror as empty.
+    fn clear_outgoing(&mut self, idx: usize, level: usize) {
+        self.nodes[idx].connections[level].clear();
+        self.neighbours_atomic[idx][level].set(&[]);
     }
 
     /// Compute distance between two nodes in the graph.
