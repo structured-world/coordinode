@@ -52,57 +52,43 @@ interface Datapoint {
   recall: number; // target recall@10 the QPS is measured at
   qps: number;
   ram_mb_per_1m: number | null; // RAM cost normalised to 1M vectors
-  source: "bench-host" | "ann-benchmarks.com" | "vendor" | "pending";
+  source: "bench-host" | "ann-benchmarks.com" | "VDBBench";
   notes?: string;
 }
 
-// Hand-curated registry. Mix of:
-//  * CoordiNode numbers from our own bench-host (Intel i9-9900K, 1 thread)
-//    — only d=128 SIFT1M is measured today (commit f763f86, 2026-05-22)
-//  * Competitor numbers from ann-benchmarks.com public leaderboard
-//  * Vendor self-reports for Milvus 2.6 / ES BBQ where ann-benchmarks lags
+// Data registry — ONLY cited public numbers + our own bench measurements.
+// Mirrors arch/benchmarks/methodology.md § Modality 3.
 //
-// Every entry MUST cite a source. "pending" entries are roadmap placeholders.
+// Source rules:
+//  * CoordiNode entries: measured on our runner (Intel i9-9900K, 1 thread).
+//  * Competitor entries: cited from ann-benchmarks.com (Level A) and
+//    VectorDBBench (Level B) per documented methodology baselines.
+//  * NO "projected" / forward-looking estimates. The chart shows what
+//    actually exists; gaps are gaps. Numbers populate as bench runs land.
 const DATA: Datapoint[] = [
-  // --- d=128, SIFT1M, recall ≥ 0.95 ---
-  // CoordiNode current-main bench writes timing/recall but NOT RAM — the
-  // bench-vector-ann harness doesn't measure RSS today (R868 part 2 adds it).
-  // So ram_mb_per_1m is null for CoordiNode-measured entries.
-  { engine: "hnswlib", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 7042, ram_mb_per_1m: 540, source: "bench-host", notes: "single-thread reference impl, M=16 default" },
-  { engine: "CoordiNode (f32 baseline, current main)", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 1317, ram_mb_per_1m: null, source: "bench-host", notes: "f763f86, single-thread, codec=none, M=32; RAM measurement lands with R868" },
-  { engine: "CoordiNode (RaBitQ projected)", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 8000, ram_mb_per_1m: 40, source: "pending", notes: "projection after R860 land; based on Milvus 2.6 measured ratio" },
+  // === Level A: ann-benchmarks SIFT1M, d=128, recall ≥ 0.95, single CPU ===
+  // Cited from arch/benchmarks/methodology.md § Modality 3 Level A baselines.
+  // RAM not in ann-benchmarks output schema → null (chart RAM row stays empty).
+  { engine: "hnswlib", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 18000, ram_mb_per_1m: null, source: "ann-benchmarks.com" },
+  { engine: "FAISS-HNSW", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 15000, ram_mb_per_1m: null, source: "ann-benchmarks.com" },
+  { engine: "ScaNN", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 20000, ram_mb_per_1m: null, source: "ann-benchmarks.com" },
+  { engine: "Annoy", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 5000, ram_mb_per_1m: null, source: "ann-benchmarks.com" },
+  { engine: "pgvector (HNSW)", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 3000, ram_mb_per_1m: null, source: "ann-benchmarks.com" },
 
-  // --- d=200, Glove, recall ≥ 0.95 ---
-  { engine: "hnswlib", dataset: "glove-200-angular", dim: 200, scale: 1_183_514, recall: 0.95, qps: 4200, ram_mb_per_1m: 850, source: "ann-benchmarks.com" },
-  { engine: "Qdrant", dataset: "glove-200-angular", dim: 200, scale: 1_183_514, recall: 0.95, qps: 3100, ram_mb_per_1m: 920, source: "ann-benchmarks.com" },
-  { engine: "Milvus 2.6 (RaBitQ)", dataset: "glove-200-angular", dim: 200, scale: 1_183_514, recall: 0.95, qps: 9500, ram_mb_per_1m: 110, source: "vendor", notes: "vendor blog 2025-09" },
-  { engine: "CoordiNode (f32 baseline, current main)", dataset: "glove-200-angular", dim: 200, scale: 1_183_514, recall: 0.95, qps: 0, ram_mb_per_1m: null, source: "pending", notes: "R868 measurement TBD" },
-  { engine: "CoordiNode (RaBitQ projected)", dataset: "glove-200-angular", dim: 200, scale: 1_183_514, recall: 0.95, qps: 10500, ram_mb_per_1m: 60, source: "pending", notes: "R860 + R863 projection" },
+  // CoordiNode SIFT1M — measured on our runner (Intel i9-9900K).
+  // Bench harness today records timing + recall, NOT RSS — the RSS-sampling
+  // addition is the next part of R868. ram_mb_per_1m stays null until that lands.
+  { engine: "CoordiNode (current main)", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 1317, ram_mb_per_1m: null, source: "bench-host", notes: "f763f86 single-thread, codec=none, M=32, ef_construction=200" },
 
-  // --- d=768, BERT class, recall ≥ 0.95 ---
-  { engine: "hnswlib", dataset: "nytimes-256-angular×~~bert-768", dim: 768, scale: 1_000_000, recall: 0.95, qps: 1500, ram_mb_per_1m: 3100, source: "ann-benchmarks.com", notes: "extrapolation from nytimes-256 + d-scaling" },
-  { engine: "Qdrant", dataset: "bert-768", dim: 768, scale: 1_000_000, recall: 0.95, qps: 1200, ram_mb_per_1m: 3300, source: "vendor" },
-  { engine: "Milvus 2.6 (RaBitQ)", dataset: "bert-768", dim: 768, scale: 1_000_000, recall: 0.95, qps: 5200, ram_mb_per_1m: 200, source: "vendor" },
-  { engine: "CoordiNode (RaBitQ projected)", dataset: "bert-768", dim: 768, scale: 1_000_000, recall: 0.95, qps: 5800, ram_mb_per_1m: 120, source: "pending", notes: "R860 projection" },
-
-  // --- d=1024, Cohere v3, recall ≥ 0.95 ---
-  { engine: "hnswlib", dataset: "cohere-1024-angular", dim: 1024, scale: 1_000_000, recall: 0.95, qps: 1100, ram_mb_per_1m: 4100, source: "ann-benchmarks.com" },
-  { engine: "Qdrant", dataset: "cohere-1024-angular", dim: 1024, scale: 1_000_000, recall: 0.95, qps: 1060, ram_mb_per_1m: 4300, source: "vendor", notes: "Qdrant cluster (3 nodes) at 10M scale, normalised to 1M" },
-  { engine: "Milvus 2.6 (RaBitQ)", dataset: "cohere-1024-angular", dim: 1024, scale: 1_000_000, recall: 0.95, qps: 4800, ram_mb_per_1m: 140, source: "vendor", notes: "Milvus blog 2025-09: 3× FP32 baseline + 1/4 RAM" },
-  { engine: "Elasticsearch BBQ", dataset: "cohere-1024-angular", dim: 1024, scale: 1_000_000, recall: 0.95, qps: 4200, ram_mb_per_1m: 160, source: "vendor", notes: "ES BBQ benchmark blog" },
-  { engine: "CoordiNode (RaBitQ projected)", dataset: "cohere-1024-angular", dim: 1024, scale: 1_000_000, recall: 0.95, qps: 5500, ram_mb_per_1m: 130, source: "pending", notes: "R860 + R864 projection — beats FP32 incumbents 5×, matches Milvus 2.6 class with native graph/filter pushdown" },
-
-  // --- d=1536, OpenAI text-embedding-3-small / dbpedia-openai, recall ≥ 0.95 ---
-  { engine: "hnswlib", dataset: "dbpedia-openai-1536-angular", dim: 1536, scale: 1_000_000, recall: 0.95, qps: 760, ram_mb_per_1m: 6100, source: "ann-benchmarks.com" },
-  { engine: "Qdrant", dataset: "dbpedia-openai-1536-angular", dim: 1536, scale: 1_000_000, recall: 0.95, qps: 720, ram_mb_per_1m: 6300, source: "ann-benchmarks.com" },
-  { engine: "Milvus 2.6 (RaBitQ)", dataset: "dbpedia-openai-1536-angular", dim: 1536, scale: 1_000_000, recall: 0.95, qps: 3200, ram_mb_per_1m: 200, source: "vendor" },
-  { engine: "Elasticsearch BBQ", dataset: "dbpedia-openai-1536-angular", dim: 1536, scale: 1_000_000, recall: 0.95, qps: 2900, ram_mb_per_1m: 230, source: "vendor" },
-  { engine: "CoordiNode (RaBitQ projected)", dataset: "dbpedia-openai-1536-angular", dim: 1536, scale: 1_000_000, recall: 0.95, qps: 3800, ram_mb_per_1m: 180, source: "pending", notes: "R860 + R864 projection" },
-
-  // --- d=3072, OpenAI text-embedding-3-large, recall ≥ 0.95 ---
-  { engine: "hnswlib", dataset: "openai-3-large-3072", dim: 3072, scale: 1_000_000, recall: 0.95, qps: 320, ram_mb_per_1m: 12300, source: "vendor", notes: "scaled extrapolation from d=1536" },
-  { engine: "Milvus 2.6 (RaBitQ)", dataset: "openai-3-large-3072", dim: 3072, scale: 1_000_000, recall: 0.95, qps: 1800, ram_mb_per_1m: 400, source: "vendor" },
-  { engine: "CoordiNode (RaBitQ projected)", dataset: "openai-3-large-3072", dim: 3072, scale: 1_000_000, recall: 0.95, qps: 2200, ram_mb_per_1m: 380, source: "pending" },
+  // === Level B: VectorDBBench Cohere-768 (d=768, 1M vectors) ===
+  // Cited from arch/benchmarks/methodology.md § Modality 3 Level B baselines.
+  // Modality specialists as secondary anchors per documented methodology
+  // (primary multi-model competitors land here as we run the matrix on our host).
+  { engine: "Qdrant", dataset: "cohere-768-vdbbench", dim: 768, scale: 1_000_000, recall: 0.98, qps: 5000, ram_mb_per_1m: null, source: "VDBBench", notes: "p99 ~8 ms" },
+  { engine: "Milvus", dataset: "cohere-768-vdbbench", dim: 768, scale: 1_000_000, recall: 0.97, qps: 4000, ram_mb_per_1m: null, source: "VDBBench", notes: "p99 ~12 ms" },
+  { engine: "Weaviate", dataset: "cohere-768-vdbbench", dim: 768, scale: 1_000_000, recall: 0.96, qps: 3000, ram_mb_per_1m: null, source: "VDBBench", notes: "p99 ~15 ms" },
+  { engine: "Elasticsearch 8.x", dataset: "cohere-768-vdbbench", dim: 768, scale: 1_000_000, recall: 0.94, qps: 2000, ram_mb_per_1m: null, source: "VDBBench", notes: "p99 ~20 ms" },
+  { engine: "pgvector (HNSW)", dataset: "cohere-768-vdbbench", dim: 768, scale: 1_000_000, recall: 0.95, qps: 1500, ram_mb_per_1m: null, source: "VDBBench", notes: "p99 ~25 ms" },
 ];
 
 // Controls
@@ -123,12 +109,6 @@ function toggleEngine(e: string): void {
   if (next.has(e)) next.delete(e);
   else next.add(e);
   enabledEngines.value = next;
-}
-
-function isPending(e: string): boolean {
-  return DATA.some(
-    (d) => d.engine === e && d.scale === scale.value && d.recall === recallTarget.value && d.source === "pending",
-  );
 }
 
 function isCoordinode(e: string): boolean {
@@ -155,19 +135,17 @@ const seriesByEngine = computed(() => {
 });
 
 const lineColor = (engine: string): string => {
-  if (engine.startsWith("CoordiNode")) {
-    return engine.includes("projected") ? "#e85d2c" : "#c94d20";
-  }
+  if (engine.startsWith("CoordiNode")) return "#c94d20";
   if (engine.startsWith("hnswlib")) return "#7f8c8d";
+  if (engine.startsWith("FAISS")) return "#3b5998";
+  if (engine.startsWith("ScaNN")) return "#34a853";
+  if (engine.startsWith("Annoy")) return "#e8a33d";
+  if (engine.startsWith("pgvector")) return "#336791";
   if (engine.startsWith("Qdrant")) return "#dc382d";
   if (engine.startsWith("Milvus")) return "#00a1ea";
+  if (engine.startsWith("Weaviate")) return "#1a9e6e";
   if (engine.startsWith("Elastic")) return "#f6b352";
-  if (engine.startsWith("LanceDB")) return "#9b59b6";
   return "#34495e";
-};
-
-const lineStyle = (engine: string): "solid" | "dashed" => {
-  return engine.includes("projected") ? "dashed" : "solid";
 };
 
 const qpsChartOption = computed(() => {
@@ -177,7 +155,7 @@ const qpsChartOption = computed(() => {
     data: points.map((p) => [p.dim, p.qps]),
     showSymbol: true,
     symbolSize: 8,
-    lineStyle: { color: lineColor(engine), type: lineStyle(engine), width: engine.startsWith("CoordiNode") ? 3 : 2 },
+    lineStyle: { color: lineColor(engine), width: engine.startsWith("CoordiNode") ? 3 : 2 },
     itemStyle: { color: lineColor(engine) },
     emphasis: { focus: "series" as const },
   }));
@@ -194,7 +172,7 @@ const qpsChartOption = computed(() => {
           const pts = seriesByEngine.value.get(p.seriesName) ?? [];
           const pt = pts.find((x) => x.dim === dim);
           const note = pt?.notes ? ` <span style="opacity:.6">— ${pt.notes}</span>` : "";
-          const src = pt?.source === "bench-host" ? "✓ measured" : pt?.source === "pending" ? "⏳ projected" : `cite: ${pt?.source}`;
+          const src = pt?.source === "bench-host" ? "✓ measured on our runner" : `cite: ${pt?.source}`;
           return `<span style="color:${p.color}">●</span> ${p.seriesName}: <strong>${p.data[1].toLocaleString()}</strong> QPS <span style="opacity:.6">(${src})</span>${note}`;
         }).join("<br/>");
         return head + rows;
@@ -228,7 +206,7 @@ const ramChartOption = computed(() => {
       data: withRam.map((p) => [p.dim, p.ram as number]),
       showSymbol: true,
       symbolSize: 8,
-      lineStyle: { color: lineColor(engine), type: lineStyle(engine), width: engine.startsWith("CoordiNode") ? 3 : 2 },
+      lineStyle: { color: lineColor(engine), width: engine.startsWith("CoordiNode") ? 3 : 2 },
       itemStyle: { color: lineColor(engine) },
       emphasis: { focus: "series" as const },
     };
@@ -316,7 +294,7 @@ const ramChartOption = computed(() => {
         <tr
           v-for="e in allEngines"
           :key="e"
-          :class="['legend-row', enabledEngines.has(e) ? 'is-on' : 'is-off', isCoordinode(e) ? 'is-coordinode' : '', isPending(e) ? 'is-pending' : '']"
+          :class="['legend-row', enabledEngines.has(e) ? 'is-on' : 'is-off', isCoordinode(e) ? 'is-coordinode' : '']"
           @click="toggleEngine(e)"
         >
           <td class="col-toggle">
@@ -326,44 +304,39 @@ const ramChartOption = computed(() => {
           </td>
           <td class="engine-name">{{ e }}</td>
           <td>
-            <span v-if="isPending(e)" class="status-pill status-pending">projected · R860 / R868</span>
-            <span v-else-if="isCoordinode(e)" class="status-pill status-current">current main</span>
-            <span v-else class="status-pill status-competitor">competitor</span>
+            <span v-if="isCoordinode(e)" class="status-pill status-current">measured on our runner</span>
+            <span v-else class="status-pill status-competitor">cited baseline</span>
           </td>
           <td class="source">
-            <span v-if="isCoordinode(e) && !isPending(e)">bench-host (i9-9900K)</span>
-            <span v-else-if="isCoordinode(e) && isPending(e)">projection from RaBitQ paper + Milvus 2.6 ratios</span>
-            <span v-else>ann-benchmarks.com + vendor blogs</span>
+            <span v-if="isCoordinode(e)">bench-host (i9-9900K)</span>
+            <span v-else>ann-benchmarks.com / VectorDBBench (per arch/benchmarks/methodology.md)</span>
           </td>
         </tr>
       </tbody>
     </table>
 
     <p class="footnote">
-      <strong>Methodology.</strong> CoordiNode "current main" numbers come from a measured
-      bench on a shared host (Intel i9-9900K, 8C/16T, 64 GB RAM). Competitor numbers cite
-      their public source (ann-benchmarks.com leaderboard or vendor blog). "Projected"
-      CoordiNode entries are forward-looking estimates after the named ROADMAP task lands;
-      they get replaced by measured numbers as R868 (cross-dim bench harness) completes its
-      sweep.
+      <strong>Methodology.</strong> The full benchmark spec lives in
+      <code>arch/benchmarks/methodology.md</code>. CoordiNode bars come from measured runs
+      on our bench host (Intel i9-9900K, 8C/16T, 64 GB RAM, Fedora). Competitor bars cite
+      ann-benchmarks.com (Level A: SIFT1M / GloVe / GIST / NYTimes) and VectorDBBench
+      (Level B: Cohere-768 / OpenAI-1536). We do not invent or extrapolate; gaps in the
+      chart are real gaps — they fill in as the corresponding bench run lands.
     </p>
     <p class="footnote">
-      <strong>What's measured vs estimated, today.</strong> Our bench harness records timing
-      and recall, NOT process RAM. So the CoordiNode-current-main rows have no RAM datapoint
-      yet — they'll appear once R868 instruments RSS sampling. Competitor RAM numbers are
-      pulled from ann-benchmarks.com headers or vendor blogs, then normalised to "MB per 1M
-      vectors" so dim/scale scaling is comparable. Projected CoordiNode RAM (the dashed
-      RaBitQ-projected lines) extrapolates from RaBitQ's per-vector code size at the given
-      bit-width plus a fixed HNSW-graph overhead — same arithmetic Milvus / ES BBQ vendors
-      publish for their own numbers.
+      <strong>RAM column status.</strong> Neither ann-benchmarks nor VDBBench publish
+      per-engine RSS in their leaderboard output, and our own harness records timing +
+      recall only. The RAM chart will populate as part of R868 once (a) our harness
+      samples RSS during the build phase, and (b) we re-run competitors in our own
+      Docker harness with RSS sampling enabled. Until then, the "MB per 1M vectors"
+      panel is empty — by design, not omission.
     </p>
     <p class="footnote">
-      <strong>Codec disclosure.</strong> CoordiNode-current-main on SIFT1M uses
+      <strong>Codec disclosure.</strong> CoordiNode SIFT1M (current main, f763f86) runs
       <code>codec=none</code> (raw f32) at <code>M=32, ef_construction=200</code>, single
-      thread. hnswlib reference is its default <code>M=16</code>, same single-thread mode.
-      With higher M our graph is bigger; with RaBitQ (R860) our vectors become 32× smaller.
-      The "RaBitQ projected" line is what we expect after R860 ships — it crosses the
-      hnswlib RAM curve from above to below as dimensionality grows.
+      thread. hnswlib reference uses its default <code>M=16</code>, also single-thread,
+      per ann-benchmarks.com configuration. Higher M means a larger graph but better
+      recall headroom — comparability lives in the published recall target (≥ 0.95).
     </p>
   </div>
 </template>
