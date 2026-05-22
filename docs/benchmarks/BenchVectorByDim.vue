@@ -65,15 +65,18 @@ interface Datapoint {
 // Every entry MUST cite a source. "pending" entries are roadmap placeholders.
 const DATA: Datapoint[] = [
   // --- d=128, SIFT1M, recall ≥ 0.95 ---
-  { engine: "hnswlib", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 7042, ram_mb_per_1m: 540, source: "bench-host", notes: "single-thread reference impl" },
-  { engine: "CoordiNode (SQ8, current main)", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 1317, ram_mb_per_1m: 320, source: "bench-host", notes: "f763f86, single-thread" },
+  // CoordiNode current-main bench writes timing/recall but NOT RAM — the
+  // bench-vector-ann harness doesn't measure RSS today (R868 part 2 adds it).
+  // So ram_mb_per_1m is null for CoordiNode-measured entries.
+  { engine: "hnswlib", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 7042, ram_mb_per_1m: 540, source: "bench-host", notes: "single-thread reference impl, M=16 default" },
+  { engine: "CoordiNode (f32 baseline, current main)", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 1317, ram_mb_per_1m: null, source: "bench-host", notes: "f763f86, single-thread, codec=none, M=32; RAM measurement lands with R868" },
   { engine: "CoordiNode (RaBitQ projected)", dataset: "sift-128-euclidean", dim: 128, scale: 1_000_000, recall: 0.95, qps: 8000, ram_mb_per_1m: 40, source: "pending", notes: "projection after R860 land; based on Milvus 2.6 measured ratio" },
 
   // --- d=200, Glove, recall ≥ 0.95 ---
   { engine: "hnswlib", dataset: "glove-200-angular", dim: 200, scale: 1_183_514, recall: 0.95, qps: 4200, ram_mb_per_1m: 850, source: "ann-benchmarks.com" },
   { engine: "Qdrant", dataset: "glove-200-angular", dim: 200, scale: 1_183_514, recall: 0.95, qps: 3100, ram_mb_per_1m: 920, source: "ann-benchmarks.com" },
   { engine: "Milvus 2.6 (RaBitQ)", dataset: "glove-200-angular", dim: 200, scale: 1_183_514, recall: 0.95, qps: 9500, ram_mb_per_1m: 110, source: "vendor", notes: "vendor blog 2025-09" },
-  { engine: "CoordiNode (SQ8, current main)", dataset: "glove-200-angular", dim: 200, scale: 1_183_514, recall: 0.95, qps: 0, ram_mb_per_1m: null, source: "pending", notes: "R868 measurement TBD" },
+  { engine: "CoordiNode (f32 baseline, current main)", dataset: "glove-200-angular", dim: 200, scale: 1_183_514, recall: 0.95, qps: 0, ram_mb_per_1m: null, source: "pending", notes: "R868 measurement TBD" },
   { engine: "CoordiNode (RaBitQ projected)", dataset: "glove-200-angular", dim: 200, scale: 1_183_514, recall: 0.95, qps: 10500, ram_mb_per_1m: 60, source: "pending", notes: "R860 + R863 projection" },
 
   // --- d=768, BERT class, recall ≥ 0.95 ---
@@ -337,14 +340,30 @@ const ramChartOption = computed(() => {
     </table>
 
     <p class="footnote">
-      <strong>Methodology.</strong> Every CoordiNode number marked "current main" comes from
-      a measured bench on a shared host (Intel i9-9900K, 8C/16T, 64 GB RAM). Competitor
-      numbers cite their public source (ann-benchmarks.com leaderboard or vendor blog).
-      "Projected" CoordiNode entries are forward-looking estimates after the named
-      ROADMAP task lands; they will be replaced by measured numbers as R868 (cross-dim
-      bench harness) completes its sweep. We do not hide unfavourable numbers — the
-      d=128 SIFT1M cell shows our current single-thread QPS honestly, alongside the
-      projection of where RaBitQ + ACORN take us.
+      <strong>Methodology.</strong> CoordiNode "current main" numbers come from a measured
+      bench on a shared host (Intel i9-9900K, 8C/16T, 64 GB RAM). Competitor numbers cite
+      their public source (ann-benchmarks.com leaderboard or vendor blog). "Projected"
+      CoordiNode entries are forward-looking estimates after the named ROADMAP task lands;
+      they get replaced by measured numbers as R868 (cross-dim bench harness) completes its
+      sweep.
+    </p>
+    <p class="footnote">
+      <strong>What's measured vs estimated, today.</strong> Our bench harness records timing
+      and recall, NOT process RAM. So the CoordiNode-current-main rows have no RAM datapoint
+      yet — they'll appear once R868 instruments RSS sampling. Competitor RAM numbers are
+      pulled from ann-benchmarks.com headers or vendor blogs, then normalised to "MB per 1M
+      vectors" so dim/scale scaling is comparable. Projected CoordiNode RAM (the dashed
+      RaBitQ-projected lines) extrapolates from RaBitQ's per-vector code size at the given
+      bit-width plus a fixed HNSW-graph overhead — same arithmetic Milvus / ES BBQ vendors
+      publish for their own numbers.
+    </p>
+    <p class="footnote">
+      <strong>Codec disclosure.</strong> CoordiNode-current-main on SIFT1M uses
+      <code>codec=none</code> (raw f32) at <code>M=32, ef_construction=200</code>, single
+      thread. hnswlib reference is its default <code>M=16</code>, same single-thread mode.
+      With higher M our graph is bigger; with RaBitQ (R860) our vectors become 32× smaller.
+      The "RaBitQ projected" line is what we expect after R860 ships — it crosses the
+      hnswlib RAM curve from above to below as dimensionality grows.
     </p>
   </div>
 </template>
