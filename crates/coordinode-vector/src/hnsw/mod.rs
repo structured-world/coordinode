@@ -1698,11 +1698,31 @@ impl HnswIndex {
                 self.prune_connections(neighbour_idx, level, max_conn);
             }
         } else {
-            // List full — force a prune and retry once.
-            self.prune_connections(neighbour_idx, level, max_conn);
-            // Best-effort: try once more after prune frees slots. If still
-            // full (e.g. max_conn already at capacity), drop this edge.
-            let _ = self.neighbours_atomic[neighbour_idx][level].cas_append(id);
+            // List at the inline cap (`M_MAX0`). When `max_conn == M_MAX0`
+            // (default config: `m_max0 = 2 * m = 64` matches the compile-
+            // time cap on layer 0) the previous "force-prune + retry" path
+            // was a no-op — prune of N elements down to `max_conn == N`
+            // keeps everything, then `cas_append` still finds no slot and
+            // the new edge is silently dropped. That's the connectivity-
+            // collapse bug that drove SIFT1M recall to ~1.5%.
+            //
+            // Fix: do the prune in-memory with the new id included, so it
+            // competes fairly against existing neighbours. The kept set
+            // has ≤ `max_conn` elements (`≤ M_MAX0`) so `set_outgoing` is
+            // guaranteed to fit without truncation.
+            let mut snap = self.neighbours_atomic[neighbour_idx][level].snapshot();
+            snap.push(id);
+            let mut scored: Vec<(f32, u64)> = Vec::with_capacity(snap.len());
+            for &nid in &snap {
+                if let Some(&nidx) = self.id_to_idx.get(&nid) {
+                    let dist = self.distance_between_nodes(neighbour_idx, nidx);
+                    scored.push((dist, nid));
+                }
+            }
+            scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(max_conn);
+            let kept: Vec<u64> = scored.into_iter().map(|(_, nid)| nid).collect();
+            self.set_outgoing(neighbour_idx, level, &kept);
         }
     }
 
@@ -1910,6 +1930,79 @@ mod tests {
         for r in &results {
             assert!(r.id < 20);
         }
+    }
+
+    /// Mid-scale recall regression test.
+    ///
+    /// The 200-vector unit test is too small to expose connectivity bugs
+    /// in the lock-free insert path. At ~10K vectors the graph topology
+    /// becomes large enough that lost back-edges become visible as recall
+    /// drift. Override scale with `RECALL_N=<n>`.
+    ///
+    /// `#[ignore]` so default `cargo nextest run` stays fast; invoke via
+    /// `cargo nextest run hnsw::tests::recall_mid_scale_l2_10k --run-ignored only`
+    /// before any PR that touches HNSW insert or search.
+    #[test]
+    #[ignore = "mid-scale recall regression — run manually before HNSW PRs"]
+    fn recall_mid_scale_l2_10k() {
+        // Use the same M parameters as the SIFT1M bench so we exercise the
+        // `max_conn == M_MAX0` saturation path on layer 0. With smaller `m`
+        // the saturation branch is unreachable and the bug doesn't surface.
+        let mut index = HnswIndex::new(HnswConfig {
+            m: 32,
+            m_max0: 64,
+            ef_construction: 200,
+            ef_search: 64,
+            metric: VectorMetric::L2,
+            max_dimensions: 65_536,
+            ..Default::default()
+        });
+
+        let n = std::env::var("RECALL_N")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(10_000);
+        let dim = 64usize;
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|i| {
+                (0..dim)
+                    .map(|d| {
+                        let seed =
+                            (i.wrapping_mul(2_654_435_761).wrapping_add(d * 6_700_417)) as u32;
+                        let bits = (seed ^ (seed >> 13)) & 0x00FF_FFFF;
+                        (bits as f32 / 16_777_216.0) - 0.5
+                    })
+                    .collect()
+            })
+            .collect();
+
+        for (i, v) in vectors.iter().enumerate() {
+            index.insert(i as u64, v.clone());
+        }
+
+        let k = 10usize;
+        let queries: Vec<&[f32]> = (0..50).map(|i| vectors[i * 199 % n].as_slice()).collect();
+
+        let mut total_recall = 0.0f32;
+        for &q in &queries {
+            let mut gt: Vec<(f32, u64)> = vectors
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (metrics::euclidean_distance_squared(q, v), i as u64))
+                .collect();
+            gt.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let gt_set: HashSet<u64> = gt.iter().take(k).map(|&(_, id)| id).collect();
+
+            let results = index.search(q, k);
+            let res_set: HashSet<u64> = results.iter().map(|r| r.id).collect();
+            total_recall += gt_set.intersection(&res_set).count() as f32 / k as f32;
+        }
+        let avg_recall = total_recall / queries.len() as f32;
+        eprintln!("mid-scale recall@{k} on n={n} dim={dim}: {:.3}", avg_recall);
+        assert!(
+            avg_recall >= 0.90,
+            "mid-scale recall {avg_recall:.3} below 0.90 — graph connectivity regression at scale"
+        );
     }
 
     #[test]
