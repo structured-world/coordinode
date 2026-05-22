@@ -14,7 +14,7 @@ const BenchVectorAnn = defineAsyncComponent(() => import("./BenchVectorAnn.vue")
 
 # Benchmarks
 
-CoordiNode benchmarks follow [public, reproducible methodology](https://github.com/structured-world/coordinode/blob/main/arch/benchmarks/methodology.md) — every dataset is an industry-standard suite (ann-benchmarks, LDBC SNB, YCSB, TSBS, Search Benchmark Game), every result is JSON-recorded with hardware fingerprint + Git SHA so the timeline is reproducible end-to-end.
+CoordiNode benchmarks use industry-standard suites (ann-benchmarks, LDBC SNB, YCSB, TSBS, Search Benchmark Game); every result is JSON-recorded with hardware fingerprint + Git SHA so the timeline is reproducible end-to-end.
 
 ::: tip Live data
 The charts below are generated from JSON files at [`bench-results/`](https://github.com/structured-world/coordinode/tree/main/bench-results) on every commit. CoordiNode results are produced automatically by CI on a dedicated bench host (Intel i9-9900K, 8C/16T) on every push to `main`. Competitor baselines (hnswlib, Faiss, MongoDB, etc.) are rerun manually on the same host per release.
@@ -47,5 +47,3 @@ This is intentionally **modest desktop-class hardware** — when CoordiNode repo
 ## Other modalities
 
 Graph (LDBC SNB), spatial (PostGIS-shape), time-series (TSBS), full-text (Search Benchmark Game), document (YCSB A/C) — coming as the per-modality bench binaries land. The bench harness ([`crates/coordinode-bench`](https://github.com/structured-world/coordinode/tree/main/crates/coordinode-bench)) is modality-agnostic; adding a new dataset is a JSON + chart-spec addition.
-
-See the [methodology document](https://github.com/structured-world/coordinode/blob/main/arch/benchmarks/methodology.md) for the full multi-model competitor matrix and codec-fairness rules.
