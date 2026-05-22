@@ -140,3 +140,17 @@ git_tag_name = "coordinode-timeseries-v{{ version }}"
 name = "coordinode-vector"
 release = false
 git_tag_name = "coordinode-vector-v{{ version }}"
+
+# Bench crates in benches/ — same treatment (release=false, unique tag) so
+# release-plz doesn't adopt the workspace tag as their baseline and fail to
+# find them in the old worktree.
+
+[[package]]
+name = "coordinode-gold-bench"
+release = false
+git_tag_name = "coordinode-gold-bench-v{{ version }}"
+
+[[package]]
+name = "coordinode-bench-vector-ann"
+release = false
+git_tag_name = "coordinode-bench-vector-ann-v{{ version }}"
