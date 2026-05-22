@@ -151,7 +151,7 @@ const current = computed(() => modalities.find((m) => m.id === active.value)!);
         </ClientOnly>
       </div>
 
-      <!-- Coming-soon placeholder -->
+      <!-- Coming-soon placeholder + planned competitors as compact chips -->
       <div v-else class="panel-body coming-soon">
         <div class="placeholder">
           <div class="placeholder-icon">⏳</div>
@@ -161,46 +161,17 @@ const current = computed(() => modalities.find((m) => m.id === active.value)!);
             <code>{{ current.milestone }}</code>
           </div>
         </div>
-      </div>
-
-      <!-- Competitor matrix -->
-      <div class="competitors">
-        <h4 class="competitors-title">Competitors in this modality</h4>
-        <p class="competitors-policy">
-          Each competitor is benched at a single pinned version, recorded
-          in the JSON. When we re-run a baseline on a newer build we
-          <strong>replace</strong> the previous JSON in
-          <code>bench-results/</code> — no historical competitor timeline
-          accumulates. CoordiNode results, by contrast, advance on every
-          push to <code>main</code>.
-        </p>
-        <table class="competitor-table">
-          <thead>
-            <tr>
-              <th>Engine</th>
-              <th>Type</th>
-              <th>Version benched</th>
-              <th>License</th>
-              <th>Note</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="c in current.competitors" :key="c.name">
-              <td class="engine-name">{{ c.name }}</td>
-              <td>
-                <span :class="['kind-pill', `kind-${c.kind}`]">
-                  {{ c.kind === "specialist" ? "specialist" : "multi-model" }}
-                </span>
-              </td>
-              <td>
-                <code v-if="c.version && c.version !== 'planned'">{{ c.version }}</code>
-                <span v-else class="version-pending">planned</span>
-              </td>
-              <td><code>{{ c.license }}</code></td>
-              <td class="note-cell">{{ c.note ?? "—" }}</td>
-            </tr>
-          </tbody>
-        </table>
+        <div class="planned-list">
+          <span class="planned-label">Planned competitors:</span>
+          <span
+            v-for="c in current.competitors"
+            :key="c.name"
+            :class="['planned-chip', `kind-${c.kind}`]"
+            :title="`${c.kind} · ${c.license}${c.note ? ' · ' + c.note : ''}`"
+          >
+            {{ c.name }}
+          </span>
+        </div>
       </div>
     </div>
   </div>
@@ -315,72 +286,39 @@ const current = computed(() => modalities.find((m) => m.id === active.value)!);
   color: var(--vp-c-text-1);
 }
 
-.competitors-title {
-  margin: 1.5rem 0 0.75rem;
-  font-size: 1rem;
-  color: var(--vp-c-text-1);
+.planned-list {
+  margin-top: 1rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.6rem;
 }
 
-.competitor-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.92rem;
+.planned-label {
+  font-size: 0.85rem;
+  color: var(--vp-c-text-2);
 }
 
-.competitor-table th,
-.competitor-table td {
-  text-align: left;
-  padding: 0.55rem 0.75rem;
-  border-bottom: 1px solid var(--vp-c-divider);
-}
-
-.competitor-table th {
-  font-weight: 600;
-  color: var(--vp-c-text-1);
-  background: var(--vp-c-bg-soft);
-}
-
-.engine-name {
-  font-weight: 500;
-}
-
-.kind-pill {
+.planned-chip {
   display: inline-block;
-  font-size: 0.78rem;
+  font-size: 0.82rem;
   font-weight: 500;
-  padding: 0.12rem 0.5rem;
-  border-radius: 10px;
+  padding: 0.15rem 0.55rem;
+  border-radius: 12px;
+  cursor: help;
+  border: 1px solid var(--vp-c-divider);
   white-space: nowrap;
 }
 
-.kind-specialist {
+.planned-chip.kind-specialist {
   background: var(--vp-c-brand-soft);
   color: var(--vp-c-brand-1);
+  border-color: transparent;
 }
 
-.kind-multi-model {
+.planned-chip.kind-multi-model {
   background: var(--vp-c-purple-soft, rgba(159, 122, 234, 0.16));
   color: var(--vp-c-purple-1, #9f7aea);
-}
-
-.note-cell {
-  color: var(--vp-c-text-2);
-  font-size: 0.88rem;
-}
-
-.competitors-policy {
-  margin: 0 0 1rem;
-  padding: 0.75rem 1rem;
-  border-left: 3px solid var(--vp-c-brand-1);
-  background: var(--vp-c-bg-soft);
-  font-size: 0.9rem;
-  color: var(--vp-c-text-2);
-  line-height: 1.55;
-}
-
-.version-pending {
-  color: var(--vp-c-text-3);
-  font-style: italic;
-  font-size: 0.85rem;
+  border-color: transparent;
 }
 </style>
