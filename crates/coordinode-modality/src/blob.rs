@@ -45,7 +45,7 @@ pub trait BlobStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalBlobStore::new(engine);
+    /// # let store = LocalBlobStore::new(&engine);
     /// let id = ChunkId::from_data(b"hello");
     /// store.put_chunk(&id, b"hello")?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -65,7 +65,7 @@ pub trait BlobStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalBlobStore::new(engine);
+    /// # let store = LocalBlobStore::new(&engine);
     /// let chunks = vec![
     ///     (ChunkId::from_data(b"a"), b"a".to_vec()),
     ///     (ChunkId::from_data(b"b"), b"b".to_vec()),
@@ -89,7 +89,7 @@ pub trait BlobStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalBlobStore::new(engine);
+    /// # let store = LocalBlobStore::new(&engine);
     /// let id = ChunkId::from_data(b"hello");
     /// let _maybe_data = store.get_chunk(&id)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -109,7 +109,7 @@ pub trait BlobStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalBlobStore::new(engine);
+    /// # let store = LocalBlobStore::new(&engine);
     /// let blob_ref = BlobRef { total_size: 0, chunks: vec![] };
     /// store.put_blob_ref(NodeId::from_raw(1), 0, &blob_ref)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -128,7 +128,7 @@ pub trait BlobStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalBlobStore::new(engine);
+    /// # let store = LocalBlobStore::new(&engine);
     /// let _ref = store.get_blob_ref(NodeId::from_raw(1), 0)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -148,7 +148,7 @@ pub trait BlobStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalBlobStore::new(engine);
+    /// # let store = LocalBlobStore::new(&engine);
     /// store.delete_blob_ref(NodeId::from_raw(1), 0)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -174,7 +174,7 @@ impl<'a> LocalBlobStore<'a> {
     /// #     Media::Hdd, Durability::Durable, Tier::Warm,
     /// # )]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalBlobStore::new(engine);
+    /// let store = LocalBlobStore::new(&engine);
     /// let id = ChunkId::from_data(b"hello");
     /// store.put_chunk(&id, b"hello")?;
     /// assert_eq!(store.get_chunk(&id)?.as_deref(), Some(b"hello".as_slice()));

@@ -351,7 +351,7 @@ pub trait TimeSeriesStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalTimeSeriesStore::new(engine);
+    /// # let store = LocalTimeSeriesStore::new(&engine);
     /// let bucket = Bucket::from_measurements(
     ///     rmpv::Value::String("s1".into()),
     ///     vec![Measurement { timestamp_us: 0, ingestion_ts_us: None, fields: BTreeMap::new() }],
@@ -373,7 +373,7 @@ pub trait TimeSeriesStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalTimeSeriesStore::new(engine);
+    /// # let store = LocalTimeSeriesStore::new(&engine);
     /// let _bucket = store.get_bucket(0, NodeId::from_raw(1))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -394,7 +394,7 @@ pub trait TimeSeriesStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalTimeSeriesStore::new(engine);
+    /// # let store = LocalTimeSeriesStore::new(&engine);
     /// store.delete_bucket(0, NodeId::from_raw(1))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -414,7 +414,7 @@ pub trait TimeSeriesStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalTimeSeriesStore::new(engine);
+    /// # let store = LocalTimeSeriesStore::new(&engine);
     /// let _ok = store.mark_closed(0, NodeId::from_raw(1))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -442,7 +442,7 @@ pub trait TimeSeriesStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalTimeSeriesStore::new(engine);
+    /// # let store = LocalTimeSeriesStore::new(&engine);
     /// let _ok = store.reopen_bucket(0, NodeId::from_raw(1))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -464,7 +464,7 @@ pub trait TimeSeriesStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalTimeSeriesStore::new(engine);
+    /// # let store = LocalTimeSeriesStore::new(&engine);
     /// let entry = OverflowEntry {
     ///     arrival_seqno: 1,
     ///     measurement: Measurement { timestamp_us: 100, ingestion_ts_us: None, fields: BTreeMap::new() },
@@ -491,7 +491,7 @@ pub trait TimeSeriesStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalTimeSeriesStore::new(engine);
+    /// # let store = LocalTimeSeriesStore::new(&engine);
     /// let _entries = store.scan_overflow(7, NodeId::from_raw(1))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -512,7 +512,7 @@ pub trait TimeSeriesStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalTimeSeriesStore::new(engine);
+    /// # let store = LocalTimeSeriesStore::new(&engine);
     /// let merged = Bucket::from_measurements(rmpv::Value::Nil, vec![]);
     /// store.compact_overflow(0, 7, NodeId::from_raw(1), &merged, &[1, 2])?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -548,7 +548,7 @@ pub trait TimeSeriesStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalTimeSeriesStore::new(engine);
+    /// # let store = LocalTimeSeriesStore::new(&engine);
     /// for (label_id, bucket_id) in store.list_overflow_buckets()? {
     ///     println!("compact candidate: ({label_id}, {})", bucket_id.as_raw());
     /// }
@@ -583,7 +583,7 @@ impl<'a> LocalTimeSeriesStore<'a> {
     /// #     Media::Hdd, Durability::Durable, Tier::Warm,
     /// # )]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalTimeSeriesStore::new(engine);
+    /// let store = LocalTimeSeriesStore::new(&engine);
     /// let mut fields = BTreeMap::new();
     /// fields.insert("temp".into(), 22.5);
     /// let bucket = Bucket::from_measurements(

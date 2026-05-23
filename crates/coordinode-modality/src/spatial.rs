@@ -166,7 +166,7 @@ pub trait SpatialStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSpatialStore::new(engine);
+    /// # let store = LocalSpatialStore::new(&engine);
     /// let paris = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
     /// store.insert(1, NodeId::from_raw(1), &paris)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -186,7 +186,7 @@ pub trait SpatialStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSpatialStore::new(engine);
+    /// # let store = LocalSpatialStore::new(&engine);
     /// let p = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
     /// store.delete(1, NodeId::from_raw(1), &p)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -207,7 +207,7 @@ pub trait SpatialStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSpatialStore::new(engine);
+    /// # let store = LocalSpatialStore::new(&engine);
     /// let bbox = Bbox {
     ///     lower: Point::new_2d(Crs::Wgs84_2d, 2.0, 48.0),
     ///     upper: Point::new_2d(Crs::Wgs84_2d, 3.0, 49.0),
@@ -236,7 +236,7 @@ pub trait SpatialStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSpatialStore::new(engine);
+    /// # let store = LocalSpatialStore::new(&engine);
     /// let center = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
     /// let knn = store.knn_nearest(1, Crs::Wgs84_2d, &center, 5)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -269,7 +269,7 @@ impl<'a> LocalSpatialStore<'a> {
     /// #     Media::Hdd, Durability::Durable, Tier::Warm,
     /// # )]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalSpatialStore::new(engine);
+    /// let store = LocalSpatialStore::new(&engine);
     /// let paris = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
     /// store.insert(1, NodeId::from_raw(1), &paris)?;
     /// let bbox = Bbox {

@@ -103,6 +103,12 @@ impl<const N: usize> AtomicNeighbourList<N> {
         self.len.load(Ordering::Acquire) as usize
     }
 
+    /// Whether the list currently holds zero neighbours.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Snapshot the live neighbours into `out`, clearing it first.
     ///
     /// Wait-free, O(len). Returns the number of neighbours written.

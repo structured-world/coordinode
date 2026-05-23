@@ -46,7 +46,7 @@ pub trait SchemaStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSchemaStore::new(engine);
+    /// # let store = LocalSchemaStore::new(&engine);
     /// let _label = store.load_label("User")?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -66,7 +66,7 @@ pub trait SchemaStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSchemaStore::new(engine);
+    /// # let store = LocalSchemaStore::new(&engine);
     /// # let schema: LabelSchema = unimplemented!();
     /// store.save_label(&schema)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -87,7 +87,7 @@ pub trait SchemaStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSchemaStore::new(engine);
+    /// # let store = LocalSchemaStore::new(&engine);
     /// let _edge_type = store.load_edge_type("KNOWS")?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -106,7 +106,7 @@ pub trait SchemaStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSchemaStore::new(engine);
+    /// # let store = LocalSchemaStore::new(&engine);
     /// let schema = EdgeTypeSchema::new("KNOWS");
     /// store.save_edge_type(&schema)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -134,7 +134,7 @@ pub trait SchemaStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSchemaStore::new(engine);
+    /// # let store = LocalSchemaStore::new(&engine);
     /// for schema in store.list_labels()? {
     ///     println!("label {}", schema.name);
     /// }
@@ -170,7 +170,7 @@ impl<'a> LocalSchemaStore<'a> {
     /// #     Media::Hdd, Durability::Durable, Tier::Warm,
     /// # )]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalSchemaStore::new(engine);
+    /// let store = LocalSchemaStore::new(&engine);
     /// assert!(store.load_label("User")?.is_none());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```

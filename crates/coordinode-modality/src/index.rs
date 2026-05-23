@@ -49,7 +49,7 @@ pub trait IndexStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalIndexStore::new(engine);
+    /// # let store = LocalIndexStore::new(&engine);
     /// store.put_entry("by_name", &[Value::String("alice".into())], NodeId::from_raw(1))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -68,7 +68,7 @@ pub trait IndexStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalIndexStore::new(engine);
+    /// # let store = LocalIndexStore::new(&engine);
     /// store.delete_entry("by_name", &[Value::String("alice".into())], NodeId::from_raw(1))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -87,7 +87,7 @@ pub trait IndexStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalIndexStore::new(engine);
+    /// # let store = LocalIndexStore::new(&engine);
     /// let hits = store.scan_exact("by_name", &[Value::String("alice".into())])?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -108,7 +108,7 @@ pub trait IndexStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalIndexStore::new(engine);
+    /// # let store = LocalIndexStore::new(&engine);
     /// let _all = store.scan_all("by_name")?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -135,7 +135,7 @@ impl<'a> LocalIndexStore<'a> {
     /// #     Media::Hdd, Durability::Durable, Tier::Warm,
     /// # )]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalIndexStore::new(engine);
+    /// let store = LocalIndexStore::new(&engine);
     /// let key = [Value::String("alice".into())];
     /// store.put_entry("by_name", &key, NodeId::from_raw(1))?;
     /// let hits = store.scan_exact("by_name", &key)?;
