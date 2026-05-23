@@ -46,7 +46,7 @@ pub trait NodeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalNodeStore::new(engine);
+    /// # let store = LocalNodeStore::new(&engine);
     /// let id = NodeId::from_raw(1);
     /// assert!(store.get(0, id)?.is_none());
     /// store.put(0, id, &NodeRecord::new("User"))?;
@@ -69,7 +69,7 @@ pub trait NodeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalNodeStore::new(engine);
+    /// # let store = LocalNodeStore::new(&engine);
     /// store.put(0, NodeId::from_raw(1), &NodeRecord::new("User"))?;
     /// // Second write overwrites the first.
     /// store.put(0, NodeId::from_raw(1), &NodeRecord::new("Admin"))?;
@@ -90,7 +90,7 @@ pub trait NodeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalNodeStore::new(engine);
+    /// # let store = LocalNodeStore::new(&engine);
     /// // Deleting a never-existed key is a no-op (succeeds).
     /// store.delete(0, NodeId::from_raw(404))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -112,7 +112,7 @@ pub trait NodeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalNodeStore::new(engine);
+    /// # let store = LocalNodeStore::new(&engine);
     /// let id = NodeId::from_raw(1);
     /// store.put_temporal(0, id, 1000, &NodeRecord::new("v1"))?;
     /// store.put_temporal(0, id, 2000, &NodeRecord::new("v2"))?;
@@ -137,7 +137,7 @@ pub trait NodeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalNodeStore::new(engine);
+    /// # let store = LocalNodeStore::new(&engine);
     /// store.put_temporal(0, NodeId::from_raw(1), 1000, &NodeRecord::new("v1"))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -161,7 +161,7 @@ pub trait NodeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalNodeStore::new(engine);
+    /// # let store = LocalNodeStore::new(&engine);
     /// let versions = store.scan_versions(0, NodeId::from_raw(1))?;
     /// for (valid_from, _record) in &versions { let _ = valid_from; }
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -224,6 +224,7 @@ impl<'a> LocalNodeStore<'a> {
     /// use coordinode_modality::{LocalNodeStore, NodeStore};
     /// use coordinode_core::graph::node::{NodeId, NodeRecord};
     /// use coordinode_storage::engine::config::{
+    ///     Durability, EndpointConfig, Media, StorageConfig, Tier,
     /// };
     /// use coordinode_storage::engine::core::StorageEngine;
     ///
@@ -232,7 +233,7 @@ impl<'a> LocalNodeStore<'a> {
     ///     Media::Hdd, Durability::Durable, Tier::Warm,
     /// )]);
     /// let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalNodeStore::new(engine);
+    /// let store = LocalNodeStore::new(&engine);
     /// store.put(0, NodeId::from_raw(1), &NodeRecord::new("User"))?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```

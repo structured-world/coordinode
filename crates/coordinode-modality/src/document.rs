@@ -60,7 +60,7 @@ pub trait DocumentStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(engine);
+    /// # let store = LocalDocumentStore::new(&engine);
     /// store.set_path(
     ///     0, NodeId::from_raw(1), PathTarget::Extra,
     ///     vec!["a".into(), "b".into()],
@@ -89,7 +89,7 @@ pub trait DocumentStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(engine);
+    /// # let store = LocalDocumentStore::new(&engine);
     /// store.delete_path(0, NodeId::from_raw(1), PathTarget::Extra,
     ///                   vec!["a".into(), "b".into()])?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -115,7 +115,7 @@ pub trait DocumentStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(engine);
+    /// # let store = LocalDocumentStore::new(&engine);
     /// store.array_push(
     ///     0, NodeId::from_raw(1), PathTarget::Extra,
     ///     vec!["tags".into()],
@@ -145,7 +145,7 @@ pub trait DocumentStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(engine);
+    /// # let store = LocalDocumentStore::new(&engine);
     /// store.array_pull(0, NodeId::from_raw(1), PathTarget::Extra,
     ///                  vec!["tags".into()],
     ///                  rmpv::Value::String("rust".into()))?;
@@ -172,7 +172,7 @@ pub trait DocumentStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(engine);
+    /// # let store = LocalDocumentStore::new(&engine);
     /// store.array_add_to_set(0, NodeId::from_raw(1), PathTarget::Extra,
     ///                        vec!["tags".into()],
     ///                        rmpv::Value::String("rust".into()))?;
@@ -199,7 +199,7 @@ pub trait DocumentStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(engine);
+    /// # let store = LocalDocumentStore::new(&engine);
     /// store.increment(0, NodeId::from_raw(1), PathTarget::Extra, vec!["v".into()], 1.0)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -226,7 +226,7 @@ pub trait DocumentStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(engine);
+    /// # let store = LocalDocumentStore::new(&engine);
     /// store.remove_property(0, NodeId::from_raw(1), PathTarget::Extra, Some("name".into()))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -259,7 +259,7 @@ impl<'a> LocalDocumentStore<'a> {
     /// #     Media::Hdd, Durability::Durable, Tier::Warm,
     /// # )]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalDocumentStore::new(engine);
+    /// let store = LocalDocumentStore::new(&engine);
     /// store.set_path(
     ///     0,
     ///     NodeId::from_raw(1),

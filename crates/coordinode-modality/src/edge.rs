@@ -76,7 +76,7 @@ pub trait EdgeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalEdgeStore::new(engine);
+    /// # let store = LocalEdgeStore::new(&engine);
     /// store.put_edge("KNOWS", NodeId::from_raw(1), NodeId::from_raw(2), None)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -103,7 +103,7 @@ pub trait EdgeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalEdgeStore::new(engine);
+    /// # let store = LocalEdgeStore::new(&engine);
     /// let _props = store.get_props("KNOWS", NodeId::from_raw(1), NodeId::from_raw(2))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -128,7 +128,7 @@ pub trait EdgeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalEdgeStore::new(engine);
+    /// # let store = LocalEdgeStore::new(&engine);
     /// store.delete_edge("KNOWS", NodeId::from_raw(1), NodeId::from_raw(2))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -148,7 +148,7 @@ pub trait EdgeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalEdgeStore::new(engine);
+    /// # let store = LocalEdgeStore::new(&engine);
     /// let _targets = store.scan_neighbors_out("KNOWS", NodeId::from_raw(1))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -167,7 +167,7 @@ pub trait EdgeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalEdgeStore::new(engine);
+    /// # let store = LocalEdgeStore::new(&engine);
     /// let _sources = store.scan_neighbors_in("KNOWS", NodeId::from_raw(2))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -193,7 +193,7 @@ pub trait EdgeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalEdgeStore::new(engine);
+    /// # let store = LocalEdgeStore::new(&engine);
     /// let props = EdgeProperties::new();
     /// store.put_edge_temporal("E", NodeId::from_raw(1), NodeId::from_raw(2), 1000, &props)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
@@ -221,7 +221,7 @@ pub trait EdgeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalEdgeStore::new(engine);
+    /// # let store = LocalEdgeStore::new(&engine);
     /// let _at_now = store.get_props_at("E", NodeId::from_raw(1), NodeId::from_raw(2), 1500)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -246,7 +246,7 @@ pub trait EdgeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalEdgeStore::new(engine);
+    /// # let store = LocalEdgeStore::new(&engine);
     /// let _versions = store.scan_edge_versions("E", NodeId::from_raw(1), NodeId::from_raw(2))?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -271,7 +271,7 @@ pub trait EdgeStore {
     /// #     "ep", std::path::Path::new("/tmp/x"),
     /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalEdgeStore::new(engine);
+    /// # let store = LocalEdgeStore::new(&engine);
     /// store.delete_edge_temporal("E", NodeId::from_raw(1), NodeId::from_raw(2), 1000)?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
@@ -303,7 +303,7 @@ impl<'a> LocalEdgeStore<'a> {
     /// #     Media::Hdd, Durability::Durable, Tier::Warm,
     /// # )]);
     /// # let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalEdgeStore::new(engine);
+    /// let store = LocalEdgeStore::new(&engine);
     /// store.put_edge("KNOWS", NodeId::from_raw(1), NodeId::from_raw(2), None)?;
     /// let neighbours = store.scan_neighbors_out("KNOWS", NodeId::from_raw(1))?;
     /// assert_eq!(neighbours, vec![NodeId::from_raw(2)]);
