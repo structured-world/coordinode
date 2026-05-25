@@ -53,10 +53,17 @@ class CoordinodeDB(VectorDB):
 
     name = "CoordiNode"
     supported_filter_types: list[FilterOp] = [FilterOp.NonFilter]
-    # gRPC channels are thread-safe; multiple workers can share one
-    # connection.  The actual concurrency is bounded by the server's
-    # request scheduler, not by Python-side serialisation.
-    thread_safe = True
+    # The synchronous ``CoordinodeClient`` runs all RPCs through a
+    # single internal asyncio loop, which is NOT safe to call from
+    # multiple threads concurrently (you get
+    # `RuntimeError: This event loop is already running`).
+    # Concurrency at the server tier still works fine because VDBBench
+    # spawns multiple Python subprocesses for the search phase — each
+    # subprocess gets its own ``CoordinodeClient`` (its own loop) but
+    # WITHIN a subprocess we keep things serial. Set ``thread_safe =
+    # False`` to make VDBBench's concurrent runner clamp
+    # max_workers=1, then rely on subprocess-level parallelism.
+    thread_safe = False
 
     def __init__(
         self,
@@ -79,10 +86,20 @@ class CoordinodeDB(VectorDB):
         # CoordinodeClient accepts port=None → falls back to default (7080).
         self._port = db_config.get("port")
         self._label = collection_name or DEFAULT_LABEL
-        self._drop_old = bool(drop_old)
         # gRPC client lives only while inside ``init()``.  Re-opened in
         # every spawned subprocess.
         self._client: CoordinodeClient | None = None
+
+        # One-shot drop_old + ensure_schema in the PARENT process, so the
+        # state is captured before VDBBench pickles us for spawn workers.
+        # Doing it in ``init()`` would re-fire in every search subprocess
+        # and wipe the data we just inserted (DEADLINE_EXCEEDED on the
+        # delete, then empty index → recall ≈ 0).  This matches the
+        # chroma / lancedb adapter pattern.
+        with CoordinodeClient(self._host, self._port) as bootstrap:
+            if drop_old:
+                self._drop_old_data(bootstrap)
+            self._ensure_schema(bootstrap)
 
     # ── Schema bootstrap (idempotent across subprocesses) ──────────────
 
@@ -124,26 +141,13 @@ class CoordinodeDB(VectorDB):
 
     @contextmanager
     def init(self) -> Iterator[None]:
-        """Open the gRPC client. The first subprocess to enter init()
-        bootstraps schema + (optionally) drops old data; subsequent
-        subprocesses find the schema in place and only open their own
-        connection."""
+        """Open the gRPC client. Schema bootstrap + drop_old happen in
+        ``__init__`` so they fire EXACTLY ONCE in the parent process,
+        before VDBBench pickles us for spawn workers."""
         client = CoordinodeClient(self._host, self._port)
         client.__enter__()
         self._client = client
         try:
-            # Drop_old fires in EVERY init() call when set, which is
-            # wrong for the multi-subprocess search phase but correct
-            # for the initial load.  VDBBench passes drop_old=True only
-            # to the first task that opens the DB (per task_runner
-            # convention), so this matches that intent.
-            if self._drop_old:
-                self._drop_old_data(client)
-                # Reset the flag locally so re-entering init() inside
-                # the same Python process doesn't wipe data we just
-                # ingested.
-                self._drop_old = False
-            self._ensure_schema(client)
             yield
         finally:
             client.close()
@@ -196,11 +200,18 @@ class CoordinodeDB(VectorDB):
             raise NotImplementedError(
                 "CoordiNode gRPC adapter does not support filter pushdown yet"
             )
+        # The HnswScan optimiser triggers on
+        #   `vector_similarity(prop, q) ... ORDER BY s DESC LIMIT k`
+        # — using `vector_distance` ORDER BY ASC silently falls back
+        # to BruteForce (full-scan over every row) and collapses QPS to
+        # <1 even on small datasets. Stay on the similarity / DESC
+        # variant to keep the HNSW path live.
         rows = self._client.cypher(
             f"""
             MATCH (n:{self._label})
-            RETURN n.id AS id, vector_distance(n.vec, $q) AS d
-            ORDER BY d ASC LIMIT $k
+            WITH n, vector_similarity(n.vec, $q) AS s
+            ORDER BY s DESC LIMIT $k
+            RETURN n.id AS id, s
             """,
             {"q": list(query), "k": int(k)},
         )
