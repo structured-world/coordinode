@@ -72,6 +72,18 @@ jobs:
           persist-credentials: true
           submodules: recursive
 
+      - name: Load bench-host SSH key into agent
+        # webfactory/ssh-agent starts an ssh-agent for the duration of the
+        # job and loads the private key from BENCH_SSH_KEY into it; all
+        # subsequent ssh/rsync invocations pick it up automatically. Setup
+        # on the operator side: ssh-keygen -t ed25519 -f bench_deploy,
+        # paste bench_deploy.pub into /root/.ssh/authorized_keys on
+        # <redacted>, store bench_deploy contents as repo secret
+        # `BENCH_SSH_KEY` in structured-world/coordinode.
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.BENCH_SSH_KEY }}
+
       - name: Sync scripts + adapter to bench host
         run: |
           set -euo pipefail
