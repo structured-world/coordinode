@@ -404,8 +404,14 @@ where
     // the scan cadence.
     let tick_granularity = Duration::from_millis(100);
     loop {
-        // Run one refresh.
-        refresh_fn();
+        // Sleep BEFORE the first refresh so engine open completes
+        // without a concurrent scan competing with the user thread's
+        // initial writes + manual `refresh_capacity()`. Warm-load
+        // (in the open path) already hydrates the tracker from
+        // persisted Schema state; the first poll-based refresh is
+        // only useful after some wall-clock has passed, at which
+        // point on-disk state may have changed.
+        //
         // Sleep up to `interval`, checking the shutdown flag every
         // `tick_granularity`. Burns nothing if shutdown is already set.
         let mut elapsed = Duration::ZERO;
@@ -416,6 +422,8 @@ where
             std::thread::sleep(tick_granularity);
             elapsed += tick_granularity;
         }
+        // Now run the refresh — at the end of each interval, never at t=0.
+        refresh_fn();
     }
 }
 
@@ -647,13 +655,17 @@ mod tests {
         })
         .expect("scanner spawn");
 
-        // Sleep long enough to observe at least ~3 ticks (3 × 50 ms +
-        // scheduling slop).
-        std::thread::sleep(Duration::from_millis(250));
+        // Sleep long enough to observe at least 2 ticks. The scanner
+        // defers its first refresh by `interval` (see
+        // `first_tick_is_deferred_by_interval`), and the loop's
+        // shutdown-check granularity is 100 ms, so the effective
+        // cadence on a 50 ms interval is ~100 ms — yielding ≥2 ticks
+        // in 350 ms (first at ~100 ms, second at ~200 ms, third ~300).
+        std::thread::sleep(Duration::from_millis(350));
         let observed = count.load(Ordering::Relaxed);
         assert!(
-            observed >= 3,
-            "expected scanner to fire at least 3 times in 250 ms with 50 ms interval, got {observed}",
+            observed >= 2,
+            "expected scanner to fire at least 2 times in 350 ms with 50 ms interval, got {observed}",
         );
 
         // Drop → shutdown → join. Should return within
