@@ -62,6 +62,8 @@ jobs:
     env:
       BENCH_HOST: <redacted>
       BENCH_USER: root
+      SSH_OPTS: "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+      RSYNC_RSH: "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
       DATASETS: ${{ inputs.datasets || 'glove-25-angular,sift-128-euclidean,nytimes-256-angular,fashion-mnist-784-euclidean' }}
 
     steps:
@@ -86,7 +88,7 @@ jobs:
       - name: Run ann-benchmarks on bench host
         run: |
           set -euo pipefail
-          ssh "${BENCH_USER}@${BENCH_HOST}" bash <<EOF
+          ssh $SSH_OPTS "${BENCH_USER}@${BENCH_HOST}" bash <<EOF
           set -euo pipefail
           cd /opt/coordinode
           bash scripts/run-coordinode-ann-benchmarks.sh \
