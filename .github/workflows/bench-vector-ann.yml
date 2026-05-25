@@ -17,13 +17,11 @@
 #   4. Exports per-(dataset, M) JSONs into `bench-results/vector/`
 #   5. Force-pushes the merged tree to the `bench-data` orphan branch
 #
-# RUNNER PREREQUISITE — bench-host-ro is not yet registered as a self-hosted
-# GitHub Actions runner on the structured-world org.  Until ro is registered
-# (see /servers skill notes), this workflow will sit idle.  Until then, run
-# the orchestrator manually:
-#
-#   ssh root@<redacted> 'cd /opt/coordinode && \
-#     scripts/run-coordinode-ann-benchmarks.sh --sha $(git rev-parse HEAD)'
+# Architecture:
+#   * Runner: `gpu-private-systems` (org-level self-hosted).
+#   * Bench host: <redacted> — holds Docker layer cache, dataset cache,
+#     coordinode-python wheel cache. The runner ssh's there to drive the
+#     orchestrator script, then scp's bench-results JSON back.
 
 name: bench-vector-ann
 
@@ -58,13 +56,12 @@ jobs:
     name: ann-benchmarks (Docker, ro)
     runs-on:
       - self-hosted
-      - bench-host-ro
+      - gpu-private-systems
     timeout-minutes: 360       # full dataset ladder × 9 M values × 9 ef = hours
 
     env:
-      ANNB_ROOT: /opt/annb/ann-benchmarks
-      COORDINODE_REPO: /opt/coordinode
-      COORDINODE_PYTHON_REPO: /opt/coordinode-python
+      BENCH_HOST: <redacted>
+      BENCH_USER: root
       DATASETS: ${{ inputs.datasets || 'glove-25-angular,sift-128-euclidean,nytimes-256-angular,fashion-mnist-784-euclidean' }}
 
     steps:
@@ -73,39 +70,39 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
-          path: coordinode-src
 
-      - name: Sync coordinode to runner cache
-        # The orchestrator works against a long-lived checkout on the runner
-        # so cargo / docker layer caches persist across runs.  We rsync the
-        # action checkout (which is at the SHA we want) into that location.
+      - name: Sync scripts + adapter to bench host
         run: |
           set -euo pipefail
           rsync -a --delete \
-            --exclude='.git/objects/pack/' \
-            coordinode-src/ "$COORDINODE_REPO/"
-          # Carry the .git so subsequent git operations on the runner
-          # checkout know about origin and the SHA.
-          rsync -a coordinode-src/.git/ "$COORDINODE_REPO/.git/"
+            scripts/ann-benchmarks-to-json.py \
+            scripts/run-coordinode-ann-benchmarks.sh \
+            scripts/push-bench-data.sh \
+            "${BENCH_USER}@${BENCH_HOST}:/opt/coordinode/scripts/"
+          rsync -a --delete \
+            benches/ann-benchmarks-adapter/ \
+            "${BENCH_USER}@${BENCH_HOST}:/opt/coordinode/benches/ann-benchmarks-adapter/"
 
-      - name: Run ann-benchmarks
+      - name: Run ann-benchmarks on bench host
         run: |
           set -euo pipefail
-          bash "$COORDINODE_REPO/scripts/run-coordinode-ann-benchmarks.sh" \
+          ssh "${BENCH_USER}@${BENCH_HOST}" bash <<EOF
+          set -euo pipefail
+          cd /opt/coordinode
+          bash scripts/run-coordinode-ann-benchmarks.sh \
             --sha "${{ github.sha }}" \
-            --datasets "$DATASETS"
+            --datasets "${DATASETS}"
+          EOF
 
-      - name: Stage results into action workspace
-        # The orchestrator writes to $COORDINODE_REPO/bench-results/; copy
-        # back into the GitHub Actions workspace so the next step can use
-        # the standard `git status` checks.
+      - name: Pull bench-results JSON from bench host
         run: |
           set -euo pipefail
-          mkdir -p coordinode-src/bench-results
-          cp -R "$COORDINODE_REPO/bench-results/." coordinode-src/bench-results/
+          mkdir -p bench-results
+          rsync -a \
+            "${BENCH_USER}@${BENCH_HOST}:/opt/coordinode/bench-results/vector/" \
+            bench-results/vector/
 
       - name: Push results to bench-data branch
-        working-directory: coordinode-src
         run: |
           bash scripts/push-bench-data.sh
         env:
@@ -116,6 +113,6 @@ jobs:
         if: always()
         with:
           name: bench-vector-ann-${{ github.sha }}
-          path: coordinode-src/bench-results/vector/**/*.json
+          path: bench-results/vector/**/*.json
           retention-days: 90
           if-no-files-found: warn
