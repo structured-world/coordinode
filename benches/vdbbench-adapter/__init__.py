@@ -4,11 +4,11 @@
 # You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
 """VDBBench adapter for CoordiNode.
 
-In-process HNSW path via ``coordinode_embedded.Hnsw``. For the networked
-gRPC path against multi-tenant / server-class competitors (Milvus, Qdrant
-Cloud, Weaviate), wire ``coordinode_embedded.LocalClient`` or
-``CoordinodeClient`` from ``coordinode`` instead — same adapter shape,
-swap out the index handle.
+gRPC client against ``coordinode-server``. Schema + data live on the
+server, so the multi-subprocess spawn model VDBBench uses works
+naturally — every subprocess opens its own client to the shared
+server. For the in-process (library-tier) benchmark wired into
+ann-benchmarks see ``benches/ann-benchmarks-adapter/`` instead.
 """
 
 from .config import CoordinodeConfig, CoordinodeHnswConfig
