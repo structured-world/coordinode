@@ -46,6 +46,22 @@ use tracing::info;
 
 use crate::fvecs::{read_fvecs, read_ivecs};
 
+/// Read current process resident set size in KiB.
+///
+/// Linux-only via `/proc/self/status` (VmRSS line). Returns `None` on
+/// non-Linux hosts so the report degrades gracefully — the field is
+/// dropped from `metrics` rather than reported as a meaningless zero.
+/// The bench host (ro / <redacted>) is Linux, so the donor sweep
+/// always carries memory numbers; macOS dev runs simply omit them.
+fn read_rss_kib() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status
+        .lines()
+        .find(|l| l.starts_with("VmRSS:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
 /// Default ef_search sweep — covers low-recall (ef=16) to
 /// high-recall (ef=512) regions on SIFT/GloVe-scale datasets.
 const DEFAULT_EF_SWEEP: &[usize] = &[16, 32, 64, 128, 256, 512];
@@ -186,6 +202,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(?metric, "metric inferred from dataset name");
 
     // ── Build HNSW ──────────────────────────────────────────
+    // RSS BEFORE build: capture the baseline that includes the loaded
+    // dataset arrays (train + query + ground-truth) but no index.
+    // Difference (after_build - before_build) is the index footprint.
+    let rss_kib_before_build = read_rss_kib();
     let build_start = Instant::now();
     let m_max0 = args.m * 2;
     let config = HnswConfig {
@@ -212,9 +232,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let build_secs = build_start.elapsed().as_secs_f64();
-    info!(build_secs, "build complete");
+    let rss_kib_after_build = read_rss_kib();
+    info!(build_secs, rss_kib = ?rss_kib_after_build, "build complete");
 
     // ── ef sweep ────────────────────────────────────────────
+    let mut rss_kib_peak = rss_kib_after_build;
     let mut points = Vec::new();
     for ef in &sweep {
         index.set_ef_search(*ef);
@@ -227,6 +249,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "sweep point"
         );
         points.push(point);
+        // Search scratch buffers grow with ef_search — track the peak
+        // so the report carries both build-time and search-time RSS.
+        if let Some(rss) = read_rss_kib() {
+            rss_kib_peak = Some(rss_kib_peak.map_or(rss, |p| p.max(rss)));
+        }
     }
 
     // ── Write report ────────────────────────────────────────
@@ -242,6 +269,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     report.record("hnsw_m", args.m)?;
     report.record("hnsw_ef_construction", args.ef_construction)?;
     report.record("build_secs", build_secs)?;
+    if let Some(rss) = rss_kib_before_build {
+        report.record("rss_kib_before_build", rss)?;
+    }
+    if let Some(rss) = rss_kib_after_build {
+        report.record("rss_kib_after_build", rss)?;
+    }
+    if let Some(rss) = rss_kib_peak {
+        report.record("rss_kib_peak", rss)?;
+    }
     report.record("dataset_n_train", n_train)?;
     report.record("dataset_n_test", n_test)?;
     report.record("dataset_dim", d)?;
