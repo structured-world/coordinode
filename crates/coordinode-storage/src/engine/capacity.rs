@@ -682,4 +682,44 @@ mod tests {
         // Drop must still join cleanly.
         drop(scanner);
     }
+
+    /// Regression test for the warm-load race: the scanner's first tick
+    /// MUST be deferred by `interval`, not fire immediately on spawn.
+    ///
+    /// Why: at engine open, `load_persisted_capacity` warm-hydrates the
+    /// tracker from Schema. The user thread then starts writes + calls
+    /// `engine.refresh_capacity()` to publish a fresh measurement to
+    /// Schema. If the scanner also fires its first tick concurrently,
+    /// its slow disk scan can finish AFTER the user's manual refresh,
+    /// grab a higher seqno, and write a stale (or empty) measurement
+    /// that wins LSM merge on the next reopen — clobbering the value
+    /// the user just committed.
+    ///
+    /// Repro on the unwanted-immediate-tick code:
+    /// - spawn scanner with `interval = 1s`, counter `Arc<AtomicU32>`
+    /// - sleep 200 ms (well under interval)
+    /// - assert counter == 0 (no tick yet)
+    ///
+    /// Before the fix this assertion FAILS (counter == 1 because the
+    /// loop body calls refresh_fn() immediately).
+    #[test]
+    fn first_tick_is_deferred_by_interval() {
+        use std::sync::atomic::AtomicU32;
+        use std::thread;
+        let count = Arc::new(AtomicU32::new(0));
+        let count_c = Arc::clone(&count);
+        let scanner = CapacityScanner::start(Duration::from_secs(1), move || {
+            count_c.fetch_add(1, Ordering::Release);
+        })
+        .expect("spawn");
+        // Sleep well under `interval` so no scheduled tick is due yet.
+        thread::sleep(Duration::from_millis(200));
+        let observed = count.load(Ordering::Acquire);
+        scanner.shutdown();
+        drop(scanner);
+        assert_eq!(
+            observed, 0,
+            "scanner fired its first tick before `interval` elapsed (warm-load race)",
+        );
+    }
 }
