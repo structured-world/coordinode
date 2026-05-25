@@ -94,20 +94,25 @@ interface BenchReport {
 // Pending engines list: rendered in the legend with a "pending bench run"
 // pill when we have no JSON for them yet.  Lets readers see what's in flight
 // without us drawing numbers we don't have.
+//
+// Names MUST match the lowercase `subject` field of bench-results JSONs
+// produced by ``scripts/ann-benchmarks-to-json.py`` — otherwise the
+// "already measured, hide from pending" filter sees "Qdrant" ≠ "qdrant"
+// and shows the engine in BOTH measured + pending lists.
 const PENDING_ENGINES: { name: string; suite: string }[] = [
   { name: "hnswlib", suite: "ann-benchmarks" },
-  { name: "FAISS-HNSW", suite: "ann-benchmarks" },
-  { name: "ScaNN", suite: "ann-benchmarks" },
-  { name: "Annoy", suite: "ann-benchmarks" },
-  { name: "pgvector (HNSW)", suite: "ann-benchmarks + VDBBench" },
-  { name: "Qdrant", suite: "ann-benchmarks + VDBBench" },
-  { name: "Milvus", suite: "ann-benchmarks + VDBBench" },
-  { name: "Weaviate", suite: "ann-benchmarks + VDBBench" },
-  { name: "Elasticsearch", suite: "ann-benchmarks + VDBBench" },
-  { name: "OpenSearch", suite: "VDBBench" },
-  { name: "SurrealDB 3.x", suite: "VDBBench" },
-  { name: "ArangoDB 3.12+", suite: "VDBBench" },
-  { name: "MongoDB 8.x", suite: "VDBBench" },
+  { name: "faiss-hnsw", suite: "ann-benchmarks" },
+  { name: "scann", suite: "ann-benchmarks" },
+  { name: "annoy", suite: "ann-benchmarks" },
+  { name: "pgvector", suite: "ann-benchmarks + VDBBench" },
+  { name: "qdrant", suite: "ann-benchmarks + VDBBench" },
+  { name: "milvus", suite: "ann-benchmarks + VDBBench" },
+  { name: "weaviate", suite: "ann-benchmarks + VDBBench" },
+  { name: "elasticsearch", suite: "ann-benchmarks + VDBBench" },
+  { name: "opensearch", suite: "VDBBench" },
+  { name: "surrealdb", suite: "VDBBench" },
+  { name: "arangodb", suite: "VDBBench" },
+  { name: "mongodb", suite: "VDBBench" },
 ];
 
 // ── State ────────────────────────────────────────────────────────────────────
@@ -307,9 +312,25 @@ function isPending(s: string): boolean {
 }
 
 function displaySubject(s: string): string {
-  // Subjects we serialise as kebab-case in JSON but display capitalised.
-  if (s === "coordinode") return "CoordiNode";
-  return s;
+  // Subjects serialised as lowercase kebab in JSON but displayed with
+  // canonical capitalisation.  Keep in sync with PENDING_ENGINES.name.
+  const map: Record<string, string> = {
+    coordinode: "CoordiNode",
+    hnswlib: "hnswlib",
+    "faiss-hnsw": "FAISS-HNSW",
+    scann: "ScaNN",
+    annoy: "Annoy",
+    pgvector: "pgvector",
+    qdrant: "Qdrant",
+    milvus: "Milvus",
+    weaviate: "Weaviate",
+    elasticsearch: "Elasticsearch",
+    opensearch: "OpenSearch",
+    surrealdb: "SurrealDB",
+    arangodb: "ArangoDB",
+    mongodb: "MongoDB",
+  };
+  return map[s] ?? s;
 }
 
 // ── Chart options ────────────────────────────────────────────────────────────
@@ -366,7 +387,7 @@ const qpsChartOption = computed(() => {
       name: "Embedding dimension",
       nameLocation: "middle" as const,
       nameGap: 30,
-      data: [25, 50, 100, 128, 200, 256, 768, 784, 960, 1536],
+      data: [25, 50, 100, 128, 200, 256, 384, 768, 784, 960, 1024, 1536, 3072],
       axisLabel: { formatter: (v: number) => `${v}d` },
     },
     yAxis: {
@@ -484,12 +505,11 @@ const qpsChartOption = computed(() => {
       version.
     </p>
     <p class="footnote">
-      <strong>Methodology.</strong> Full spec lives in
-      <code>arch/benchmarks/methodology.md</code>. Adapter (the Cypher-bypass
-      PyO3 binding the harness imports) lives in
+      <strong>How this works.</strong> The Cypher-bypass PyO3 binding the
+      harness imports lives in
       <a href="https://github.com/structured-world/coordinode-python">coordinode-python</a>
-      under <code>coordinode-embedded</code>.  Bench orchestrator and ann-benchmarks
-      Docker integration are at
+      under <code>coordinode-embedded</code>.  Bench orchestrator and
+      ann-benchmarks Docker integration are at
       <code>benches/ann-benchmarks-adapter/</code> +
       <code>scripts/run-coordinode-ann-benchmarks.sh</code>.
     </p>

@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "timestamp": "2026-05-25T04:02:55.892694Z",
+  "git": {
+    "sha": "c94edcc",
+    "sha_short": "c94edcc",
+    "branch": "main",
+    "dirty": false,
+    "commit_date": "2026-05-24T00:10:55+03:00"
+  },
+  "hardware": {
+    "arch": "x86_64",
+    "cpu_brand": "Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz",
+    "cpu_cores": 8,
+    "cpu_threads": 16,
+    "ram_gb": 63,
+    "os_name": "Fedora Linux",
+    "os_version": "44"
+  },
+  "modality": "vector",
+  "benchmark": "ann-benchmarks",
+  "dataset": "random-3072-angular",
+  "subject": "annoy",
+  "codec": "none",
+  "version": "donor",
+  "metrics": {
+    "build_secs": 720.2175078392029,
+    "dataset_dim": null,
+    "dataset_n_test": null,
+    "dataset_n_train": null,
+    "hnsw_ef_construction": null,
+    "hnsw_m": -1,
+    "k": 10,
+    "qps_at_recall_peak": 35.23,
+    "recall_at_k_peak": 0.06722,
+    "sweep": [
+      {
+        "ef_search": 100,
+        "qps": 614.98,
+        "recall_at_k": 0.00395,
+        "latency_us_mean": 1626.07,
+        "latency_us_p50": 1624.11,
+        "latency_us_p95": 1742.36,
+        "latency_us_p99": 1792.91
+      },
+      {
+        "ef_search": 1000,
+        "qps": 615.71,
+        "recall_at_k": 0.00395,
+        "latency_us_mean": 1624.14,
+        "latency_us_p50": 1621.96,
+        "latency_us_p95": 1739.04,
+        "latency_us_p99": 1786.0
+      },
+      {
+        "ef_search": 10000,
+        "qps": 119.4,
+        "recall_at_k": 0.02046,
+        "latency_us_mean": 8375.17,
+        "latency_us_p50": 8521.56,
+        "latency_us_p95": 8730.89,
+        "latency_us_p99": 8800.28
+      },
+      {
+        "ef_search": 200,
+        "qps": 613.47,
+        "recall_at_k": 0.00395,
+        "latency_us_mean": 1630.06,
+        "latency_us_p50": 1628.4,
+        "latency_us_p95": 1746.19,
+        "latency_us_p99": 1794.1
+      },
+      {
+        "ef_search": 2000,
+        "qps": 382.7,
+        "recall_at_k": 0.00653,
+        "latency_us_mean": 2612.98,
+        "latency_us_p50": 2998.23,
+        "latency_us_p95": 3168.34,
+        "latency_us_p99": 3224.14
+      },
+      {
+        "ef_search": 20000,
+        "qps": 65.68,
+        "recall_at_k": 0.03645,
+        "latency_us_mean": 15225.69,
+        "latency_us_p50": 15280.25,
+        "latency_us_p95": 15563.01,
+        "latency_us_p99": 15663.39
+      },
+      {
+        "ef_search": 400,
+        "qps": 615.02,
+        "recall_at_k": 0.00395,
+        "latency_us_mean": 1625.96,
+        "latency_us_p50": 1623.63,
+        "latency_us_p95": 1741.41,
+        "latency_us_p99": 1790.77
+      },
+      {
+        "ef_search": 4000,
+        "qps": 244.25,
+        "recall_at_k": 0.01018,
+        "latency_us_mean": 4094.22,
+        "latency_us_p50": 4371.76,
+        "latency_us_p95": 4547.83,
+        "latency_us_p99": 4610.55
+      },
+      {
+        "ef_search": 40000,
+        "qps": 35.23,
+        "recall_at_k": 0.06722,
+        "latency_us_mean": 28385.23,
+        "latency_us_p50": 28385.64,
+        "latency_us_p95": 28827.68,
+        "latency_us_p99": 28985.03
+      }
+    ]
+  }
+}
