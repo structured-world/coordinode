@@ -52,7 +52,11 @@ class CoordinodeHnswConfig(BaseModel, DBCaseConfig):
     aliasing.
     """
 
-    metric_type: MetricType = MetricType.L2
+    # The three real LLM-embedding cases (Cohere, Bioasq, OpenAI) all
+    # use COSINE; default to that so a user passing nothing on the CLI
+    # gets correct recall out of the box. L2 / IP remain available
+    # for caller-provided custom datasets via --metric.
+    metric_type: MetricType = MetricType.COSINE
     M: Annotated[int, Field(ge=2, le=128)] = 16
     ef_construction: Annotated[int, Field(ge=8, le=2048)] = 200
     ef_search: Annotated[int, Field(ge=1, le=4096)] = 50
