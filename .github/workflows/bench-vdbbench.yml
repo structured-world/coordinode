@@ -50,6 +50,11 @@ env:
   # cached across runs).
   BENCH_HOST: 192.168.1.200
   BENCH_USER: root
+  # accept-new: trust the host's key the first time we see it, but reject
+  # if the fingerprint ever changes (MITM guard). Set instead of off so
+  # we don't silently accept a swapped host on a subsequent run.
+  SSH_OPTS: "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+  RSYNC_RSH: "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
 
 jobs:
   bench:
@@ -85,7 +90,7 @@ jobs:
       - name: Pin bench host's coordinode to this SHA + run VDBBench
         run: |
           set -euo pipefail
-          ssh "${BENCH_USER}@${BENCH_HOST}" bash <<'EOF'
+          ssh $SSH_OPTS "${BENCH_USER}@${BENCH_HOST}" bash <<'EOF'
           set -euo pipefail
           cd /opt/coordinode
           # Run the orchestrator — it handles checkout, build, server,
