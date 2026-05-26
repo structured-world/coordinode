@@ -1,13 +1,12 @@
 # ann-benchmarks Docker harness — measures CoordiNode HNSW vs library-tier
-# engines (hnswlib / FAISS / ScaNN / Annoy) on the canonical
-# ann-benchmarks.com datasets. Pushes the result JSON to the `bench-data`
-# orphan branch so the docs site picks it up.
+# engines (hnswlib / FAISS / ScaNN / Annoy) on the canonical ann-benchmarks
+# datasets. Same multi-job shape as bench-vdbbench:
+#   bench-matrix → bench-build → benchmark (matrix) → benchmark-aggregate → benchmark-pages.
 #
-# The self-hosted gpu-private-systems runner IS the bench host —
-# `/opt/coordinode` is the long-lived checkout, `/opt/annb/ann-benchmarks`
-# is the harness install with cached Docker images for every competitor,
-# coordinode-python wheel cache is on the same disk. Everything happens
-# on the runner; no ssh / no rsync.
+# The Docker images for every competitor live on the self-hosted runner
+# (<redacted> — "Home GPU server"). The benchmark job runs there;
+# aggregation + publish runs on ubuntu-latest because they only push
+# JSON to the bench-data branch.
 
 name: bench-vector-ann
 
@@ -21,42 +20,111 @@ on:
       - 'scripts/ann-benchmarks-to-json.py'
       - 'scripts/run-coordinode-ann-benchmarks.sh'
       - '.github/workflows/bench-vector-ann.yml'
-  workflow_dispatch:
-    inputs:
-      datasets:
-        description: 'Comma-separated ann-benchmarks dataset names'
-        required: false
-        default: 'glove-25-angular,sift-128-euclidean,nytimes-256-angular,fashion-mnist-784-euclidean'
+  workflow_dispatch: {}
 
 concurrency:
-  group: bench
+  group: bench-vector-ann
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  bench:
+  bench-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      datasets: ${{ steps.gen.outputs.datasets }}
+    steps:
+      - id: gen
+        run: |
+          # JSON array of ann-benchmarks datasets to bench against.
+          # `random-384-angular` / `random-3072-angular` are
+          # CoordiNode-generated synthetic gaussian-on-unit-sphere
+          # data for the LLM-aligned dimensions; the others are the
+          # public ann-benchmarks.com datasets.
+          cat <<'EOF' >> "$GITHUB_OUTPUT"
+          datasets=["sift-128-euclidean","random-384-angular","random-3072-angular"]
+          EOF
+
+  benchmark:
+    needs: bench-matrix
     runs-on:
       - self-hosted
       - gpu-private-systems
-    timeout-minutes: 360
-
+    timeout-minutes: 480
+    strategy:
+      fail-fast: false
+      matrix:
+        dataset: ${{ fromJSON(needs.bench-matrix.outputs.datasets) }}
     steps:
-      - name: Sync /opt/coordinode to this SHA + run ann-benchmarks + push results
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Run ann-benchmarks for ${{ matrix.dataset }}
+        env:
+          DATASET: ${{ matrix.dataset }}
         run: |
           set -euo pipefail
-          # See bench-vdbbench.yml for the safe.directory rationale.
-          git config --global --add safe.directory /opt/coordinode
-          cd /opt/coordinode
-          git fetch origin main
-          git checkout "$GITHUB_SHA"
-          git submodule update --init --recursive
-          bash scripts/run-coordinode-ann-benchmarks.sh \
-            --sha "$GITHUB_SHA" \
-            --datasets "$DATASETS"
-          bash scripts/push-bench-data.sh
+          # The orchestrator handles wheel build + adapter stage +
+          # Docker run.py + HDF5→JSON convert. We pass GITHUB_WORKSPACE
+          # as the coordinode repo so it picks up THIS commit's adapter
+          # and not whatever lives in /opt/coordinode.
+          COORDINODE_REPO="$GITHUB_WORKSPACE" \
+            bash scripts/run-coordinode-ann-benchmarks.sh \
+              --sha "$GITHUB_SHA" \
+              --datasets "$DATASET"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-shard-${{ matrix.dataset }}
+          path: bench-results/
+          retention-days: 7
+
+  benchmark-aggregate:
+    needs: benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bench-shard-*
+          path: shards/
+      - run: |
+          set -euo pipefail
+          mkdir -p bench-results/vector
+          find shards/ -type d -name vector -print0 | while IFS= read -r -d '' d; do
+            cp -R --no-preserve=mode "$d"/. bench-results/vector/
+          done
+          echo "aggregated $(find bench-results -name '*.json' | wc -l) JSON files"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-aggregated
+          path: bench-results/
+          retention-days: 30
+
+  benchmark-pages:
+    needs: benchmark-aggregate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - id: bot-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.bot-token.outputs.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: bench-aggregated
+          path: bench-results/
+      - name: Stage + push to bench-data branch
         env:
-          GITHUB_SHA: ${{ github.sha }}
-          DATASETS: ${{ inputs.datasets || 'glove-25-angular,sift-128-euclidean,nytimes-256-angular,fashion-mnist-784-euclidean' }}
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           COMMIT_MSG: "chore(bench): ann-benchmarks results @ ${{ github.sha }}"
+        run: |
+          set -euo pipefail
+          git config user.name 'sw-release-bot[bot]'
+          git config user.email '41898282+sw-release-bot[bot]@users.noreply.github.com'
+          bash scripts/push-bench-data.sh
