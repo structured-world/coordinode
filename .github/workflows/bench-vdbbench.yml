@@ -1,16 +1,12 @@
 # VDBBench (Zilliz) gRPC-tier benchmark — runs coordinode-server at
 # the freshly-pushed SHA against real LLM-embedding datasets
-# (OpenAI 1536d / Cohere 768d / Bioasq 1024d).
+# (OpenAI 1536d / Cohere 768d / Bioasq 1024d). Pushes the result JSON
+# to the `bench-data` orphan branch so the docs site picks it up.
 #
-# Architecture:
-#   * Runner: `gpu-private-systems` (the org-level self-hosted runner).
-#   * Bench host: 192.168.1.200 — has coordinode-server build cache,
-#     VDBBench checkout, dataset cache. The runner ssh's there to do
-#     the actual bench work, then scp's results back.
-#
-# Trigger:
-#   Push to main that touches anything affecting vector-search hot path
-#   (engine crates) or the benchmark scaffolding itself.
+# The self-hosted gpu-private-systems runner IS the bench host —
+# `/opt/coordinode` is the long-lived checkout, `/opt/vdbbench` is the
+# VDBBench install, coordinode-server build cache is on the same disk.
+# Everything happens on the runner; no ssh / no rsync.
 
 name: bench-vdbbench
 
@@ -35,8 +31,7 @@ on:
         default: 'Performance1536D50K'
 
 # Share the `bench` concurrency group with bench-vector-ann.yml so the
-# two never push to bench-data simultaneously and clobber each other's
-# tree.
+# two workflows never push to bench-data simultaneously.
 concurrency:
   group: bench
   cancel-in-progress: false
@@ -44,96 +39,26 @@ concurrency:
 permissions:
   contents: write
 
-env:
-  # ssh target — bench host owns the long-lived /opt/coordinode checkout,
-  # VDBBench install, and dataset cache (downloads from VDBBench's S3 are
-  # cached across runs).
-  BENCH_HOST: 192.168.1.200
-  BENCH_USER: root
-  # accept-new: trust the host's key the first time we see it, but reject
-  # if the fingerprint ever changes (MITM guard). Set instead of off so
-  # we don't silently accept a swapped host on a subsequent run.
-  SSH_OPTS: "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
-  RSYNC_RSH: "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
-
 jobs:
   bench:
-    name: VDBBench (gRPC, bench-host-ro)
     runs-on:
       - self-hosted
       - gpu-private-systems
-    timeout-minutes: 480       # smoke ~10 min; larger cases hours
+    timeout-minutes: 480
 
     steps:
-      - name: Checkout coordinode @ SHA
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
-          submodules: recursive
-
-      - name: Load bench-host SSH key into agent
-        # webfactory/ssh-agent starts an ssh-agent for the duration of the
-        # job and loads the private key from BENCH_SSH_KEY into it; all
-        # subsequent ssh/rsync invocations pick it up automatically. Setup
-        # on the operator side: ssh-keygen -t ed25519 -f bench_deploy,
-        # paste bench_deploy.pub into /root/.ssh/authorized_keys on
-        # 192.168.1.200, store bench_deploy contents as repo secret
-        # `BENCH_SSH_KEY` in structured-world/coordinode.
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.BENCH_SSH_KEY }}
-
-      - name: Sync scripts + adapter to bench host
+      - name: Sync /opt/coordinode to this SHA + run VDBBench + push results
         run: |
-          set -euo pipefail
-          # Push the SHA-pinned scripts + adapter to the bench host's
-          # coordinode checkout so the orchestrator (run-coordinode-vdbbench.sh)
-          # runs the exact code from this commit, not whatever lives on
-          # /opt/coordinode from a prior run.
-          rsync -a --delete \
-            scripts/vdbbench-to-json.py \
-            scripts/run-coordinode-vdbbench.sh \
-            "${BENCH_USER}@${BENCH_HOST}:/opt/coordinode/scripts/"
-          rsync -a --delete \
-            benches/vdbbench-adapter/ \
-            "${BENCH_USER}@${BENCH_HOST}:/opt/coordinode/benches/vdbbench-adapter/"
-
-      - name: Pin bench host's coordinode to this SHA + run VDBBench
-        run: |
-          set -euo pipefail
-          ssh $SSH_OPTS "${BENCH_USER}@${BENCH_HOST}" bash <<'EOF'
           set -euo pipefail
           cd /opt/coordinode
-          # Run the orchestrator — it handles checkout, build, server,
-          # VDBBench, and JSON conversion.
+          git fetch origin main
+          git checkout "$GITHUB_SHA"
+          git submodule update --init --recursive
           bash scripts/run-coordinode-vdbbench.sh \
-            --sha "${GITHUB_SHA}" \
-            --cases "${BENCH_CASES}"
-          EOF
+            --sha "$GITHUB_SHA" \
+            --cases "$BENCH_CASES"
+          bash scripts/push-bench-data.sh
         env:
           GITHUB_SHA: ${{ github.sha }}
           BENCH_CASES: ${{ inputs.cases || 'Performance1536D50K' }}
-
-      - name: Pull bench-results JSON from bench host
-        run: |
-          set -euo pipefail
-          mkdir -p bench-results
-          rsync -a \
-            "${BENCH_USER}@${BENCH_HOST}:/opt/coordinode/bench-results/vector/" \
-            bench-results/vector/
-
-      - name: Push results to bench-data branch
-        run: |
-          bash scripts/push-bench-data.sh
-        env:
           COMMIT_MSG: "chore(bench): VDBBench results @ ${{ github.sha }}"
-
-      - name: Upload workflow artifact (90-day retention)
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: bench-vdbbench-${{ github.sha }}
-          path: bench-results/vector/**/*.json
-          retention-days: 90
-          if-no-files-found: warn
