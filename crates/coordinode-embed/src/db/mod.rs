@@ -1348,10 +1348,15 @@ impl Database {
             ),
             read_timeout: std::time::Duration::from_millis(2000),
             params: std::collections::HashMap::new(),
+            pending_vector_writes: Vec::new(),
         };
 
         let start = Instant::now();
         let results = execute(&plan, &mut ctx)?;
+        // Flush HNSW writes accumulated during execute as a single
+        // batched insert per (label, property) — amortises the HNSW
+        // write-lock acquisition across the whole statement.
+        ctx.flush_pending_vector_writes();
         let duration_us = start.elapsed().as_micros() as u64;
 
         // Record execution in advisor registry with plan + optional source

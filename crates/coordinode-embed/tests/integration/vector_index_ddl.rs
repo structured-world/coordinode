@@ -25,6 +25,78 @@ fn open_db() -> (Database, tempfile::TempDir) {
     (db, dir)
 }
 
+// ── Bulk-insert HNSW batching ─────────────────────────────────────────
+
+/// UNWIND-driven CREATE batches N vectors into the HNSW index. After
+/// the batch, every inserted node must be searchable (recall = 1.0
+/// on its own vector). Regression for the executor-side write buffer
+/// that flushes per-(label, property) at end of execute().
+#[test]
+fn unwind_create_flushes_all_vectors_into_hnsw() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE VECTOR INDEX bulk_emb ON :Bulk(emb) OPTIONS {m: 8, ef_construction: 64, metric: \"l2\"}",
+    )
+    .expect("create vector index");
+
+    // Bulk-insert 32 distinct nodes via UNWIND $rows AS r CREATE …
+    // Same pattern the gRPC CreateNodesBatch handler uses.
+    let mut cypher_rows = String::from("[");
+    for i in 0..32 {
+        if i > 0 {
+            cypher_rows.push_str(", ");
+        }
+        // Each vector is the unit basis along its own index: e_i.
+        // Concrete values keep the test self-contained without
+        // parameter binding through the embedded API.
+        let mut v = [0.0f32; 32];
+        v[i] = 1.0;
+        cypher_rows.push_str(&format!("{{i: {i}, emb: ["));
+        for (j, x) in v.iter().enumerate() {
+            if j > 0 {
+                cypher_rows.push_str(", ");
+            }
+            cypher_rows.push_str(&format!("{x}"));
+        }
+        cypher_rows.push_str("]}");
+    }
+    cypher_rows.push(']');
+    let query = format!("UNWIND {cypher_rows} AS r CREATE (m:Bulk) SET m = r RETURN m");
+    let rows = db.execute_cypher(&query).expect("bulk create");
+    assert_eq!(rows.len(), 32, "bulk create returned wrong row count");
+
+    // Every inserted vector is its own nearest neighbour at k=1.
+    // If the batched flush missed any row, search would either miss
+    // it (returning some other node) or return fewer than the
+    // expected 32 candidates over the loop.
+    for i in 0..32 {
+        let mut v = [0.0f32; 32];
+        v[i] = 1.0;
+        let mut q = String::from("[");
+        for (j, x) in v.iter().enumerate() {
+            if j > 0 {
+                q.push_str(", ");
+            }
+            q.push_str(&format!("{x}"));
+        }
+        q.push(']');
+        let cypher = format!(
+            "MATCH (n:Bulk) WITH n, vector_similarity(n.emb, {q}) AS s \
+             ORDER BY s DESC LIMIT 1 RETURN n.i AS i"
+        );
+        let res = db.execute_cypher(&cypher).expect("vector search");
+        assert_eq!(res.len(), 1, "search for e_{i} returned no rows");
+        let got = match res[0].get("i") {
+            Some(Value::Int(x)) => *x,
+            other => panic!("unexpected result for e_{i}: {other:?}"),
+        };
+        assert_eq!(
+            got, i as i64,
+            "search for e_{i} returned node {got} — batched flush dropped a row"
+        );
+    }
+}
+
 // ── CREATE VECTOR INDEX DDL ───────────────────────────────────────────
 
 /// CREATE VECTOR INDEX returns metadata row with correct fields.

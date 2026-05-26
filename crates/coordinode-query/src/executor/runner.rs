@@ -462,6 +462,21 @@ pub struct ExecutionContext<'a> {
     /// functions such as `percentileCont(x, $p)` where `$p` is a bound parameter.
     /// Keys omit the `$` prefix (e.g., `"p"` for `$p`).
     pub params: HashMap<String, coordinode_core::graph::types::Value>,
+    /// Buffered HNSW inserts produced by CREATE operators in this
+    /// statement. Each entry is `(label, property, NodeId, vector)`.
+    /// Drained at the end of [`execute()`] via
+    /// [`Self::flush_pending_vector_writes`] which groups by
+    /// `(label, property)` and calls
+    /// `VectorIndexRegistry::on_vectors_written` once per group — so
+    /// a bulk INSERT (UNWIND … CREATE …) pays one HNSW write-lock
+    /// acquisition per index per batch instead of one per row.
+    ///
+    /// The non-batched single-row CREATE / SET / MERGE paths still
+    /// dispatch directly to `on_vector_written` for backward
+    /// compatibility; this buffer is only used by the CREATE-from-
+    /// CreateNode operator hot path (line ≈ 7290) which dominates
+    /// bulk loads.
+    pub pending_vector_writes: Vec<(String, String, NodeId, Vec<f32>)>,
 }
 
 /// Convert storage `Partition` to serializable `PartitionId`.
@@ -480,6 +495,40 @@ fn partition_to_id(p: Partition) -> PartitionId {
 }
 
 impl<'a> ExecutionContext<'a> {
+    /// Drain buffered HNSW inserts and apply them in one batched
+    /// write per (label, property) index. The CREATE-row hot path
+    /// inside [`execute_create_node`] appends to
+    /// `pending_vector_writes` instead of taking the HNSW write-lock
+    /// per insert; the caller (`execute_cypher_impl`) calls this
+    /// once after [`execute()`] returns to flush the batch.
+    ///
+    /// Safe to call repeatedly: a second call sees an empty buffer
+    /// and is a no-op.
+    pub fn flush_pending_vector_writes(&mut self) {
+        if self.pending_vector_writes.is_empty() {
+            return;
+        }
+        let Some(registry) = self.vector_index_registry else {
+            self.pending_vector_writes.clear();
+            return;
+        };
+        let drained = std::mem::take(&mut self.pending_vector_writes);
+        // Group by (label, property) so each HNSW index gets one
+        // write-lock + one insert_batch call.
+        type VectorBatchKey = (String, String);
+        type VectorBatchItems = Vec<(NodeId, Vec<f32>)>;
+        let mut grouped: HashMap<VectorBatchKey, VectorBatchItems> = HashMap::new();
+        for (label, property, node_id, vector) in drained {
+            grouped
+                .entry((label, property))
+                .or_default()
+                .push((node_id, vector));
+        }
+        for ((label, property), items) in grouped {
+            registry.on_vectors_written(&label, &property, items);
+        }
+    }
+
     /// L1+L2 cascade entry (the trigger architecture). Call before executing a trigger body.
     /// Increments depth + per-trigger fire count, appends to chain, and trips
     /// `CascadeOverflow` / `CascadeFanoutOverflow` when limits are exceeded.
@@ -7275,13 +7324,28 @@ fn execute_create_node(
         ctx.write_stats.nodes_created += 1;
         ctx.write_stats.properties_set += properties.len() as u64;
 
-        // Notify vector index registry of any vector properties.
+        // Buffer HNSW writes so they hit the index once per batch
+        // instead of once per row. The buffer is drained at the end
+        // of `execute()` by `ExecutionContext::flush_pending_vector_writes`
+        // which groups by (label, property) and calls
+        // `VectorIndexRegistry::on_vectors_written`. Existence of an
+        // index is still resolved here so we only buffer writes that
+        // would actually land somewhere — the registry lookup itself
+        // is cheap (RwLock::read on a HashMap).
         if let Some(registry) = ctx.vector_index_registry {
             if let Some(primary_label) = labels.first() {
                 for (prop_name, expr) in properties {
+                    if !registry.has_index(primary_label, prop_name) {
+                        continue;
+                    }
                     let val = eval_expr(expr, input_row);
                     if let Some(vec_data) = try_extract_vector(&val) {
-                        registry.on_vector_written(primary_label, node_id, prop_name, &vec_data);
+                        ctx.pending_vector_writes.push((
+                            primary_label.clone(),
+                            prop_name.clone(),
+                            node_id,
+                            vec_data,
+                        ));
                     }
                 }
             }
@@ -13618,6 +13682,7 @@ mod tests {
             ),
             read_timeout: std::time::Duration::from_millis(2000),
             params: std::collections::HashMap::new(),
+            pending_vector_writes: Vec::new(),
         }
     }
 
