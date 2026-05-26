@@ -70,15 +70,32 @@ jobs:
 
       - name: Run loom interleaving suite
         # Loom permutes every observable order of atomic operations on the
-        # AtomicNeighbourList primitives — exhaustive verification that
-        # the Acquire/Release pairing on `len` correctly publishes slot
-        # writes to any subsequent reader, and that cas_append never loses
-        # writes under concurrent senders.
+        # lock-free HNSW primitives — exhaustive verification that:
+        #
+        # * AtomicNeighbourList — Acquire/Release pairing on `len`
+        #   correctly publishes slot writes to any subsequent reader,
+        #   and `cas_append` never loses writes under concurrent senders.
+        # * EntryPoint — packed `(level, idx)` CAS-loop honours the
+        #   layer-promotion linearisability invariant from
+        #   arch/search/vector-parallel-insert.md §"Layer-promotion
+        #   linearisability": after every legal interleaving of two
+        #   concurrent `try_promote` callers, exactly one Installs on
+        #   the seed race, the highest level always wins on a mixed
+        #   race, and equal-level races are idempotent.
+        #
+        # Each test binary is invoked separately because loom is
+        # nondeterministic-fail when binaries share global state across
+        # `loom::model` runs in the same process.
         env:
           RUSTFLAGS: --cfg loom
         run: |
           cargo nextest run \
             --test loom_neighbours \
+            --release \
+            -p coordinode-vector \
+            --no-fail-fast
+          cargo nextest run \
+            --test loom_entry_point \
             --release \
             -p coordinode-vector \
             --no-fail-fast
