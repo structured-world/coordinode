@@ -28,6 +28,12 @@ ARG PYPI_VERSION=
 # `python -u run_algorithm.py` (the image's ENTRYPOINT) keeps working.
 # Only the coordinode adapter pays this cost; other algos stay on the
 # untouched base.
+# DEBIAN_FRONTEND=noninteractive — installing python3.11 pulls tzdata as
+# a transitive dep, which otherwise opens a debconf "Geographic area"
+# prompt and hangs the build forever. Cost the CI an entire bench cycle
+# stuck at 99% on this exact line. Never let apt go interactive in CI.
+ENV DEBIAN_FRONTEND=noninteractive
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends software-properties-common && \
     add-apt-repository -y ppa:deadsnakes/ppa && \
