@@ -22,11 +22,29 @@ set -euo pipefail
 REPO_ROOT=$(git rev-parse --show-toplevel)
 cd "$REPO_ROOT"
 
-NEW_FILES=$(git status --porcelain bench-results/ 2>/dev/null | awk '{print $2}' || true)
-if [[ -z "$NEW_FILES" ]]; then
-  echo "no new bench-results files staged in working tree — nothing to push"
+# `git status --porcelain bench-results/` was unreliable on the CI
+# pages job: `actions/download-artifact@v4` extracts the
+# bench-aggregated artifact into `bench-results/` AFTER the checkout
+# step, and on the runner `git status` then sometimes reports an
+# empty list even though new files are demonstrably present on disk.
+# Suspect cause is checkout's temp-HOME / safe.directory dance that
+# leaves the index out of sync with the post-extraction working tree.
+#
+# Switch to a deterministic filesystem ↔ HEAD diff: enumerate every
+# file under `bench-results/`, subtract every file HEAD has tracked
+# under the same prefix; anything left over is genuinely new. If
+# that set is empty we have nothing to push.
+NEW_FILES_COUNT=$(
+  comm -23 \
+    <(find bench-results -type f 2>/dev/null | sort -u) \
+    <(git ls-tree -r HEAD --name-only -- bench-results 2>/dev/null | sort -u) \
+    | wc -l | tr -d ' '
+)
+if [[ "$NEW_FILES_COUNT" == "0" ]]; then
+  echo "no new bench-results files present in working tree — nothing to push"
   exit 0
 fi
+echo "$NEW_FILES_COUNT new bench-results file(s) detected — proceeding"
 
 SNAPSHOT=$(mktemp -d)
 trap 'rm -rf "$SNAPSHOT"' EXIT
