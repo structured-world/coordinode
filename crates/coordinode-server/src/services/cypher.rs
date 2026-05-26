@@ -399,23 +399,48 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             timeout_ms: wc.timeout_ms,
         });
 
+        // Execute under a shared read lock by default. CypherService
+        // accepts any Cypher (CREATE / MATCH / SET / …); the
+        // shared path runs regular Cypher on `&self` concurrently
+        // and explicitly rejects session-SET commands. On rejection
+        // (SET requires exclusive access) we re-run under `.write()`
+        // through the `&mut self` API. This keeps the hot read path
+        // parallel without losing the embedded SET semantics.
         let exec_result = {
-            let mut db = self.database.write();
             let params = if req.parameters.is_empty() {
                 None
             } else {
                 Some(convert_params(&req.parameters))
             };
-            db.execute_cypher_full(
-                &req.query,
-                params,
-                source_ctx.as_ref(),
-                Some(executor_read_concern),
-                executor_write_concern,
-            )
-            .map_err(db_error_to_status)?
+            let shared_attempt = {
+                let db = self.database.read();
+                db.execute_cypher_shared(
+                    &req.query,
+                    params.clone(),
+                    source_ctx.as_ref(),
+                    Some(&executor_read_concern),
+                    executor_write_concern.as_ref(),
+                )
+            };
+            match shared_attempt {
+                Ok(r) => r,
+                Err(coordinode_embed::DatabaseError::Semantic(msg))
+                    if msg.contains("SET commands require exclusive Database access") =>
+                {
+                    let mut db = self.database.write();
+                    db.execute_cypher_full(
+                        &req.query,
+                        params,
+                        source_ctx.as_ref(),
+                        Some(executor_read_concern),
+                        executor_write_concern,
+                    )
+                    .map_err(db_error_to_status)?
+                }
+                Err(e) => return Err(db_error_to_status(e)),
+            }
         };
-        // Write guard released here, held only during query execution.
+        // Read / write guard released here, held only during query execution.
         let result_rows = exec_result.rows;
         let write_stats = exec_result.write_stats;
 
