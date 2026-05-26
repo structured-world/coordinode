@@ -3220,4 +3220,87 @@ mod tests {
             "self-recover ratio {ratio:.2} after parallel apply (expected ≥ 0.85)",
         );
     }
+
+    // Regression: HNSW search must return min(k, n) results regardless of
+    // ef_search. Standard HNSW invariant — the layer-0 beam must be at
+    // least `k` wide, otherwise low-ef configurations both truncate the
+    // result set AND cripple recall (visited pool too small to reach the
+    // true k-NN). Reproduces the recall gap vs Qdrant at ef_search ≪ k
+    // on the sift-128 ann-benchmarks run.
+    #[test]
+    fn search_returns_k_results_when_ef_below_k() {
+        let mut cfg = make_config(VectorMetric::L2);
+        cfg.ef_search = 4; // deliberately well below k
+        let mut index = HnswIndex::new(cfg);
+        for i in 0..50u64 {
+            let v = vec![(i as f32) * 0.1, ((i % 7) as f32) * 0.2, (i as f32).sin()];
+            index.insert(i, v);
+        }
+
+        // k=10, ef_search=4 — must still return 10 results.
+        let results = index.search(&[0.0, 0.0, 0.0], 10);
+        assert_eq!(results.len(), 10, "ef_search<k must not truncate top-k");
+    }
+
+    // Regression: recall@k must stay above a sane floor even when caller
+    // passes a small ef_search. Standard HNSW guarantees this by enforcing
+    // an effective beam of max(ef_search, k); without that floor recall
+    // collapses (observed on sift-128: 0.86 vs Qdrant 0.95 at ef=16,k=10).
+    #[test]
+    fn search_low_ef_recall_floor() {
+        let mut cfg = make_config(VectorMetric::L2);
+        cfg.m = 8;
+        cfg.m_max0 = 16;
+        cfg.ef_construction = 64;
+        cfg.ef_search = 4; // tiny — exercise the floor
+        let mut index = HnswIndex::new(cfg);
+
+        let n = 300usize;
+        let dim = 8;
+        let points: Vec<Vec<f32>> = (0..n)
+            .map(|i| {
+                (0..dim)
+                    .map(|d| (((i * 31 + d) as f32) * 0.137).sin())
+                    .collect()
+            })
+            .collect();
+        for (i, p) in points.iter().enumerate() {
+            index.insert(i as u64, p.clone());
+        }
+
+        let k = 10;
+        let mut hits = 0usize;
+        let mut total = 0usize;
+        for qi in (0..n).step_by(7) {
+            let q = &points[qi];
+            // Exact top-k by brute force.
+            let mut exact: Vec<(usize, f32)> = points
+                .iter()
+                .enumerate()
+                .map(|(j, v)| {
+                    let d = v
+                        .iter()
+                        .zip(q.iter())
+                        .map(|(a, b)| (a - b).powi(2))
+                        .sum::<f32>();
+                    (j, d)
+                })
+                .collect();
+            exact.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            let truth: HashSet<u64> = exact.iter().take(k).map(|(j, _)| *j as u64).collect();
+
+            let got = index.search(q, k);
+            for r in &got {
+                if truth.contains(&r.id) {
+                    hits += 1;
+                }
+            }
+            total += k;
+        }
+        let recall = hits as f64 / total as f64;
+        assert!(
+            recall >= 0.80,
+            "recall@k={k} at ef_search<k was {recall:.3}, expected ≥ 0.80",
+        );
+    }
 }
