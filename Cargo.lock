@@ -931,6 +931,7 @@ dependencies = [
  "coordinode-vector",
  "metrics",
  "metrics-util",
+ "parking_lot",
  "rmp-serde",
  "rmpv",
  "serde",

@@ -1391,7 +1391,7 @@ fn computed_ttl_subtree_target_field_deletes_target_not_anchor() {
         &db.engine_shared(),
         1,
         1000,
-        db.interner(),
+        &db.interner(),
     );
     assert_eq!(result.subtrees_removed, 1, "subtree removal counted");
     assert_eq!(result.nodes_deleted, 0, "node must survive");

@@ -83,6 +83,9 @@ rand = "0.10"
 # Parallelism
 rayon = "1.10"
 crossbeam-epoch = "0.9"
+# parking_lot: fast userspace-fast-path RwLock/Mutex, ~8-byte vs std's ~40-byte,
+# no futex syscall on the uncontended path. Std-only, std-tier consumers only.
+parking_lot = "0.12"
 
 # Async utilities
 futures-util = "0.3"

@@ -83,6 +83,20 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         }))
     }
 
+    async fn create_nodes_batch(
+        &self,
+        _request: Request<graph::CreateNodesBatchRequest>,
+    ) -> Result<Response<graph::CreateNodesBatchResponse>, Status> {
+        // Wired in a follow-up: under one transaction, batch HNSW index
+        // updates so the write lock is taken once per request instead
+        // of once per inserted vector. Stub returns Unimplemented to
+        // keep the trait satisfied while the rest of the batch path
+        // lands.
+        Err(Status::unimplemented(
+            "CreateNodesBatch is not yet wired; planned as part of the bulk-insert handler",
+        ))
+    }
+
     async fn get_node(
         &self,
         request: Request<graph::GetNodeRequest>,

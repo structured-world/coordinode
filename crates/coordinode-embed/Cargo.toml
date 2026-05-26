@@ -25,6 +25,7 @@ rmp-serde = { workspace = true }
 rmpv = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 lsm-tree = { package = "coordinode-lsm-tree", version = "4", default-features = false }
