@@ -300,6 +300,76 @@ pub struct Database {
     /// schemas for TTL properties and deletes expired nodes/fields/subtrees.
     /// Dropped on Database::drop (graceful shutdown).
     _ttl_reaper_handle: Option<coordinode_query::index::ttl_reaper::TtlReaperHandle>,
+    /// Per-query-string parse + plan cache. Repeated invocations of
+    /// the same Cypher text skip parse / semantic analysis / logical
+    /// plan build entirely; the per-call optimizer passes still run
+    /// on a clone of the cached plan so they stay sensitive to live
+    /// index registry state. See [`PlanCache`].
+    plan_cache: Arc<PlanCache>,
+}
+
+/// A query whose parse + analyze + logical-plan-build succeeded, kept
+/// around so repeated invocations of the same query string skip those
+/// steps entirely. The optimizer passes (index selection, VectorTopK
+/// annotation, predicate push-down) still run per call because they
+/// depend on the live index registry / storage statistics and would
+/// stale-bind if cached.
+#[derive(Debug, Clone)]
+struct CachedPlan {
+    /// Canonical form (literals scrubbed) — fed to the advisor.
+    canonical: String,
+    /// Stable fingerprint over the canonical form.
+    fingerprint: u64,
+    /// Logical plan from `planner::build_logical_plan(&ast)`. Cloned on
+    /// every cache hit so the per-call optimizer passes mutate a fresh
+    /// copy without invalidating the cache entry.
+    plan: planner::logical::LogicalPlan,
+}
+
+/// Bounded query-string → [`CachedPlan`] cache shared across all
+/// queries on this Database. Each `execute_cypher_*` entry-point hits
+/// this before parsing.
+///
+/// Sizing: 1024 entries fits the working set of typical benchmark
+/// workloads (a handful of distinct templates repeated millions of
+/// times) and OLTP services (a few hundred prepared queries). On
+/// overflow we evict one arbitrary entry — no LRU bookkeeping; the
+/// trade-off is correct for stable workloads and acceptable when
+/// the working set is small relative to the bound.
+///
+/// no-std: spin::RwLock + hashbrown::HashMap (drop-in).
+struct PlanCache {
+    inner: parking_lot::RwLock<std::collections::HashMap<String, Arc<CachedPlan>>>,
+    max_entries: usize,
+}
+
+impl PlanCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            inner: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            max_entries,
+        }
+    }
+
+    fn get(&self, query: &str) -> Option<Arc<CachedPlan>> {
+        self.inner.read().get(query).cloned()
+    }
+
+    fn put(&self, query: String, entry: Arc<CachedPlan>) {
+        let mut map = self.inner.write();
+        if map.len() >= self.max_entries && !map.contains_key(&query) {
+            // Bound the cache. Picking an arbitrary key is intentional:
+            // proper LRU costs a write-lock on every hit (to bump
+            // recency), which negates the read-concurrency win. For
+            // stable workloads (same N templates forever) eviction
+            // policy is irrelevant; for churning workloads, occasional
+            // re-build on miss costs ≈ one parse+plan.
+            if let Some(k) = map.keys().next().cloned() {
+                map.remove(&k);
+            }
+        }
+        map.insert(query, entry);
+    }
 }
 
 /// Per-call read/write semantics for a single Cypher query.
@@ -579,6 +649,11 @@ impl Database {
             nvme_write_buffer,
             _drain_handle: drain_handle,
             _ttl_reaper_handle: ttl_reaper_handle,
+            // 1024 entries is plenty for the workloads we benchmark
+            // against — they repeat a small number of templates. The
+            // bound prevents unbounded growth on adversarial inputs
+            // that produce a fresh query string per call.
+            plan_cache: Arc::new(PlanCache::new(1024)),
         })
     }
 
@@ -1116,24 +1191,41 @@ impl Database {
         // points before reaching here (so this impl can stay on
         // &self). Regular Cypher only past this point.
 
-        let ast = cypher::parse(query)?;
-
-        // Compute fingerprint for advisor tracking (before execution to capture
-        // the canonical form even if execution fails later).
-        let (canonical, fp) = normalize_and_fingerprint(&ast);
-
-        let errors = cypher::analyze(&ast, None);
-        if !errors.is_empty() {
-            return Err(DatabaseError::Semantic(
-                errors
-                    .iter()
-                    .map(|e| e.to_string())
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            ));
-        }
-
-        let mut plan = planner::build_logical_plan(&ast)?;
+        // Plan cache fast path: same query string → reuse parsed AST,
+        // canonical form, fingerprint, and unoptimized logical plan.
+        // Optimizer passes below still run on the cloned plan so they
+        // observe the current index registry / stats.
+        let (canonical, fp, mut plan) = match self.plan_cache.get(query) {
+            Some(cached) => (
+                cached.canonical.clone(),
+                cached.fingerprint,
+                cached.plan.clone(),
+            ),
+            None => {
+                let ast = cypher::parse(query)?;
+                let (canonical, fp) = normalize_and_fingerprint(&ast);
+                let errors = cypher::analyze(&ast, None);
+                if !errors.is_empty() {
+                    return Err(DatabaseError::Semantic(
+                        errors
+                            .iter()
+                            .map(|e| e.to_string())
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    ));
+                }
+                let plan = planner::build_logical_plan(&ast)?;
+                self.plan_cache.put(
+                    query.to_string(),
+                    Arc::new(CachedPlan {
+                        canonical: canonical.clone(),
+                        fingerprint: fp,
+                        plan: plan.clone(),
+                    }),
+                );
+                (canonical, fp, plan)
+            }
+        };
         // Inject the per-call vector consistency into the plan for EXPLAIN output.
         plan.vector_consistency = session.vector_consistency;
 
@@ -1807,6 +1899,74 @@ impl Database {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_cache_hit_returns_same_plan() {
+        // Same query string twice → second call must observe the cache
+        // entry created by the first. Asserted by introspecting
+        // PlanCache.inner directly.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = Database::open(dir.path()).expect("open");
+        db.execute_cypher("CREATE (n:Cached {k: 1}) RETURN n")
+            .expect("create");
+        db.execute_cypher("MATCH (n:Cached) RETURN n.k")
+            .expect("first match");
+        let after_first = db.plan_cache.inner.read().len();
+        db.execute_cypher("MATCH (n:Cached) RETURN n.k")
+            .expect("second match");
+        let after_second = db.plan_cache.inner.read().len();
+        assert_eq!(
+            after_first, after_second,
+            "second invocation of the same query must not grow the cache"
+        );
+        assert!(
+            after_second >= 1,
+            "cache must contain at least the MATCH plan"
+        );
+    }
+
+    #[test]
+    fn plan_cache_distinguishes_queries() {
+        // Different query strings → distinct cache entries.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = Database::open(dir.path()).expect("open");
+        db.execute_cypher("CREATE (n:A {k: 1}) RETURN n")
+            .expect("create A");
+        db.execute_cypher("CREATE (n:B {k: 1}) RETURN n")
+            .expect("create B");
+        db.execute_cypher("MATCH (n:A) RETURN n.k")
+            .expect("match A");
+        db.execute_cypher("MATCH (n:B) RETURN n.k")
+            .expect("match B");
+        let entries = db.plan_cache.inner.read().len();
+        assert!(
+            entries >= 4,
+            "expected ≥4 distinct cache entries, got {entries}"
+        );
+    }
+
+    #[test]
+    fn plan_cache_bounded_eviction() {
+        // Cache is bounded — pumping more distinct queries than the
+        // bound must keep len at the bound, not grow unboundedly.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = Database::open(dir.path()).expect("open");
+        // Shrink the bound for the test so we don't have to issue
+        // thousands of queries.
+        db.plan_cache = Arc::new(PlanCache::new(4));
+        for i in 0..16 {
+            // Each query string is unique (different label) so cache
+            // entries don't collide.
+            let q = format!("MATCH (n:L{i}) RETURN n");
+            // Don't care about result; this label has no data.
+            let _ = db.execute_cypher(&q);
+        }
+        let entries = db.plan_cache.inner.read().len();
+        assert!(
+            entries <= 4,
+            "cache exceeded max_entries=4: {entries} entries"
+        );
+    }
 
     #[test]
     fn open_database() {
