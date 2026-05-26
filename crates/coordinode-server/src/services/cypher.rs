@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+// no-std: spin::RwLock (drop-in).
+use parking_lot::RwLock;
 
 use tonic::{Request, Response, Status};
 
@@ -221,7 +224,7 @@ fn fence_error_to_status(err: ReadFenceError) -> Status {
 }
 
 pub struct CypherServiceImpl {
-    database: Arc<Mutex<Database>>,
+    database: Arc<RwLock<Database>>,
     query_registry: Arc<QueryRegistry>,
     nplus1_detector: Arc<NPlus1Detector>,
     /// Raft node for read fence (follower reads). `None` in standalone mode.
@@ -230,7 +233,7 @@ pub struct CypherServiceImpl {
 
 impl CypherServiceImpl {
     pub fn new(
-        database: Arc<Mutex<Database>>,
+        database: Arc<RwLock<Database>>,
         query_registry: Arc<QueryRegistry>,
         nplus1_detector: Arc<NPlus1Detector>,
     ) -> Self {
@@ -397,7 +400,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         });
 
         let exec_result = {
-            let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
+            let mut db = self.database.write();
             let params = if req.parameters.is_empty() {
                 None
             } else {
@@ -412,7 +415,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             )
             .map_err(db_error_to_status)?
         };
-        // Mutex released here — held only during query execution.
+        // Write guard released here, held only during query execution.
         let result_rows = exec_result.rows;
         let write_stats = exec_result.write_stats;
 
@@ -496,7 +499,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             .map_err(|e| Status::internal(format!("Plan error: {e}")))?;
 
         // Compute storage stats for accurate cost estimation (TTL-cached, MVCC-aware)
-        let stats = self.database.lock().ok().and_then(|db| db.compute_stats());
+        let stats = self.database.read().compute_stats();
         let stats_ref = stats
             .as_ref()
             .map(|s| s as &dyn coordinode_core::graph::stats::StorageStats);
@@ -639,7 +642,7 @@ mod tests {
     /// Helper: create a CypherServiceImpl with a real Database.
     fn test_service() -> (CypherServiceImpl, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let database = Arc::new(Mutex::new(
+        let database = Arc::new(RwLock::new(
             Database::open(dir.path()).expect("open database"),
         ));
         let registry = Arc::new(QueryRegistry::new());
@@ -741,7 +744,7 @@ mod tests {
 
         // Shared registry so we can inspect it after the query executes.
         let dir = tempfile::tempdir().expect("tempdir");
-        let database = Arc::new(Mutex::new(
+        let database = Arc::new(RwLock::new(
             Database::open(dir.path()).expect("open database"),
         ));
         let registry = Arc::new(QueryRegistry::new());
@@ -814,7 +817,7 @@ mod tests {
         use tokio_stream::wrappers::TcpListenerStream;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let database = Arc::new(Mutex::new(
+        let database = Arc::new(RwLock::new(
             Database::open(dir.path()).expect("open database"),
         ));
         let registry = Arc::new(QueryRegistry::new());
@@ -1395,7 +1398,7 @@ mod tests {
         use crate::services::schema::SchemaServiceImpl;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let database = Arc::new(Mutex::new(
+        let database = Arc::new(RwLock::new(
             Database::open(dir.path()).expect("open database"),
         ));
         let registry = Arc::new(QueryRegistry::new());
@@ -1734,7 +1737,7 @@ mod tests {
                 &engine,
             ));
         let db = Database::from_engine(dir.path(), engine, oracle, pipeline).expect("from_engine");
-        let database = std::sync::Arc::new(std::sync::Mutex::new(db));
+        let database = std::sync::Arc::new(parking_lot::RwLock::new(db));
         let registry = std::sync::Arc::new(QueryRegistry::new());
         let detector = std::sync::Arc::new(NPlus1Detector::new());
         let svc = CypherServiceImpl::new(

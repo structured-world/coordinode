@@ -1118,6 +1118,7 @@ dependencies = [
  "http",
  "metrics",
  "metrics-exporter-prometheus",
+ "parking_lot",
  "pin-project-lite",
  "prost",
  "rmpv",

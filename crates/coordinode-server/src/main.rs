@@ -227,7 +227,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 coordinode_raft::proposal::RaftProposalPipeline::new(Arc::clone(raft_node.raft())),
             );
 
-            let database = Arc::new(std::sync::Mutex::new(
+            // no-std: spin::RwLock (drop-in).
+            let database = Arc::new(parking_lot::RwLock::new(
                 coordinode_embed::Database::from_engine(
                     &data_dir,
                     Arc::clone(&engine),
@@ -273,10 +274,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|rn| services::cluster::ClusterServiceImpl::new(Arc::clone(rn)));
 
             // BlobService shares the same storage engine as the Database.
-            let blob_engine = database
-                .lock()
-                .map_err(|e| format!("failed to lock database for blob engine: {e}"))?
-                .engine_shared();
+            // Read guard is dropped immediately — only need engine_shared().
+            let blob_engine = database.read().engine_shared();
             let blob_service = services::blob::BlobServiceImpl::new(blob_engine);
 
             // Spawn operational HTTP server (default :7084, configurable via --ops-addr).

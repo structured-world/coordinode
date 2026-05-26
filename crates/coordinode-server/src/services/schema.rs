@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+// no-std: spin::RwLock (drop-in).
+use parking_lot::RwLock;
 
 use tonic::{Request, Response, Status};
 
@@ -241,11 +244,11 @@ fn property_type_to_proto(pt: &PropertyType) -> i32 {
 }
 
 pub struct SchemaServiceImpl {
-    database: Arc<Mutex<Database>>,
+    database: Arc<RwLock<Database>>,
 }
 
 impl SchemaServiceImpl {
-    pub fn new(database: Arc<Mutex<Database>>) -> Self {
+    pub fn new(database: Arc<RwLock<Database>>) -> Self {
         Self { database }
     }
 }
@@ -288,7 +291,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
         }
 
         let schema_revision = {
-            let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
+            let mut db = self.database.write();
             db.create_label_schema(schema)
                 .map_err(|e| db_err_to_status("create_label", e))?
         };
@@ -323,7 +326,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
         }
 
         let schema_revision = {
-            let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
+            let mut db = self.database.write();
             db.create_edge_type_schema(schema)
                 .map_err(|e| db_err_to_status("create_edge_type", e))?
         };
@@ -343,7 +346,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
         // then add any undeclared labels discovered from existing nodes.
         const SCHEMA_PREFIX: &[u8] = b"schema:label:";
 
-        let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
+        let mut db = self.database.write();
 
         // Pass 1: scan `schema:label:*` for persisted LabelSchema entries.
         let mut label_map: std::collections::BTreeMap<String, graph::Label> = {
@@ -447,7 +450,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
         // Strip the trailing `:<version>` suffix and dedup by name.
         const PREFIX: &[u8] = b"schema:edge_type:";
         let names: Vec<String> = {
-            let db = self.database.lock().unwrap_or_else(|e| e.into_inner());
+            let db = self.database.write();
             let iter = db
                 .engine()
                 .prefix_scan(Partition::Schema, PREFIX)
@@ -494,7 +497,7 @@ mod tests {
 
     fn test_service() -> (SchemaServiceImpl, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let database = Arc::new(Mutex::new(
+        let database = Arc::new(RwLock::new(
             Database::open(dir.path()).expect("open database"),
         ));
         (SchemaServiceImpl::new(database), dir)
@@ -520,7 +523,7 @@ mod tests {
 
         // Insert nodes with two different labels
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (n:Person {name: 'Alice'})")
                 .expect("create");
             db.execute_cypher("CREATE (n:City {name: 'Kyiv'})")
@@ -566,7 +569,7 @@ mod tests {
         let (svc, _dir) = test_service();
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (a:P {name: 'A'})-[:KNOWS]->(b:P {name: 'B'})")
                 .expect("create");
             db.execute_cypher("CREATE (c:P {name: 'C'})-[:LIKES]->(d:P {name: 'D'})")
@@ -633,7 +636,7 @@ mod tests {
 
         // Verify schema is in storage.
         use coordinode_storage::engine::partition::Partition;
-        let db = svc.database.lock().unwrap();
+        let db = svc.database.write();
         let key = coordinode_core::schema::definition::encode_label_schema_key("Article", 1);
         let bytes = db
             .engine()
@@ -670,14 +673,14 @@ mod tests {
 
         // First node — should succeed.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (c:Customer {email: 'x@test.com'})")
                 .expect("first create");
         }
 
         // Second node with same email — must fail.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             let result = db.execute_cypher("CREATE (c:Customer {email: 'x@test.com'})");
             assert!(
                 result.is_err(),
@@ -712,7 +715,7 @@ mod tests {
 
         // Create initial node.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (n:TestNode {id: 'x1'})")
                 .expect("create node");
         }
@@ -721,7 +724,7 @@ mod tests {
         // Bug: NodeScan misses the node → MERGE falls through to CREATE →
         //      B-tree unique index: "unique constraint violated on index testnode_id".
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             let result = db.execute_cypher(
                 "MERGE (n:TestNode {id: 'x1'}) ON MATCH SET n.id = 'x1' RETURN n.id",
             );
@@ -759,7 +762,7 @@ mod tests {
 
         // Verify in storage.
         use coordinode_storage::engine::partition::Partition;
-        let db = svc.database.lock().unwrap();
+        let db = svc.database.write();
         let key = coordinode_core::schema::definition::encode_edge_type_schema_key("FOLLOWS", 1);
         let bytes = db
             .engine()
@@ -905,7 +908,7 @@ mod tests {
             use coordinode_core::schema::definition::PropertyType;
             use coordinode_storage::engine::partition::Partition;
 
-            let db = svc.database.lock().unwrap();
+            let db = svc.database.write();
             let key = coordinode_core::schema::definition::encode_label_schema_key("Session", 1);
             let bytes = db
                 .engine()
@@ -940,7 +943,7 @@ mod tests {
         let expired_us = now_us - 120 * 1_000_000; // 120s ago → past 60s TTL
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher(&format!("CREATE (s:Session {{started_at: {expired_us}}})"))
                 .expect("create expired session");
             db.execute_cypher(&format!("CREATE (s:Session {{started_at: {now_us}}})"))
@@ -949,7 +952,7 @@ mod tests {
 
         // Verify both nodes exist before reaping.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             let rows = db
                 .execute_cypher("MATCH (s:Session) RETURN s.started_at AS ts")
                 .expect("match before reap");
@@ -958,7 +961,7 @@ mod tests {
 
         // Run TtlReaper directly — no background thread, no waiting.
         let result = {
-            let db = svc.database.lock().unwrap();
+            let db = svc.database.write();
             coordinode_query::index::ttl_reaper::reap_computed_ttl(&db.engine_shared(), 1, 1000)
         };
 
@@ -969,7 +972,7 @@ mod tests {
 
         // Verify only the fresh node remains.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             let rows = db
                 .execute_cypher("MATCH (s:Session) RETURN s.started_at AS ts")
                 .expect("match after reap");
@@ -1121,7 +1124,7 @@ mod tests {
             use coordinode_core::schema::definition::SchemaMode;
             use coordinode_storage::engine::partition::Partition;
 
-            let db = svc.database.lock().unwrap();
+            let db = svc.database.write();
             let key = coordinode_core::schema::definition::encode_label_schema_key("User", 1);
             let bytes = db
                 .engine()
@@ -1139,14 +1142,14 @@ mod tests {
 
         // CREATE a User node with the declared property.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (u:User {name: 'Alice'})")
                 .expect("CREATE with declared property must succeed on STRICT label");
         }
 
         // SET an unknown property on the STRICT label — must be rejected.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             let result =
                 db.execute_cypher("MATCH (u:User {name: 'Alice'}) SET u.unknown_field = 'boom'");
             assert!(
@@ -1185,14 +1188,14 @@ mod tests {
 
         // CREATE a Device node.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (d:Device {id: 'd1'})")
                 .expect("CREATE should succeed");
         }
 
         // SET an undeclared property — must succeed on FLEXIBLE label.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("MATCH (d:Device {id: 'd1'}) SET d.firmware_version = '1.2.3'")
                 .expect("SET undeclared property must succeed on FLEXIBLE label");
         }
@@ -1268,7 +1271,7 @@ mod tests {
         .expect("create_label should succeed");
 
         // CREATE with wrong type for declared property — must be rejected.
-        let mut db = svc.database.lock().unwrap();
+        let mut db = svc.database.write();
         let result = db.execute_cypher("CREATE (s:Sensor {reading: 'not_a_float'})");
         assert!(
             result.is_err(),
@@ -1299,7 +1302,7 @@ mod tests {
         .expect("create_label should succeed");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
 
             // Type mismatch on declared property — must be rejected even in VALIDATED.
             let result = db.execute_cypher("CREATE (l:Log {level: 'warn'})");
@@ -1339,14 +1342,14 @@ mod tests {
 
         // CREATE with only the declared property — must succeed.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (p:Product {sku: 'SKU-001'})")
                 .expect("CREATE with declared property must succeed on STRICT label");
         }
 
         // CREATE with an undeclared property — must be rejected.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             let result =
                 db.execute_cypher("CREATE (p:Product {sku: 'SKU-002', extra_field: 'forbidden'})");
             assert!(
@@ -1381,7 +1384,7 @@ mod tests {
         .expect("create_label should succeed");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
 
             // Create node with only the declared property.
             db.execute_cypher("CREATE (m:Metric {value: 3.14})")
@@ -1433,7 +1436,7 @@ mod tests {
         .expect("create_label should succeed");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
 
             // CREATE with required `title` present — must succeed.
             db.execute_cypher("CREATE (t:Task {title: 'Buy milk', priority: 1})")
@@ -1485,7 +1488,7 @@ mod tests {
         .expect("create_label should succeed");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
 
             // Create one STRICT node and one schemaless node.
             db.execute_cypher("CREATE (m:Monitored {host: 'server-01'})")
@@ -1539,14 +1542,14 @@ mod tests {
 
         // ON CREATE SET with declared property — must succeed (creates node).
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("MERGE (p:Product {sku: 'A1'}) ON CREATE SET p.price = 9.99")
                 .expect("MERGE ON CREATE SET with declared property must succeed");
         }
 
         // ON MATCH SET with unknown property — must fail (node now exists → ON MATCH path).
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             let result = db
                 .execute_cypher("MERGE (p:Product {sku: 'A1'}) ON MATCH SET p.unknown_field = 'x'");
             assert!(
@@ -1584,21 +1587,21 @@ mod tests {
         .expect("create_label Config");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (c:Config {host: 'localhost', port: 5432})")
                 .expect("create Config node");
         }
 
         // Replace with only declared keys — must succeed.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("MATCH (c:Config) SET c = {host: 'db.internal', port: 3306}")
                 .expect("SET n = {map} with declared keys must succeed");
         }
 
         // Replace introducing unknown key — must fail.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             let result = db
                 .execute_cypher("MATCH (c:Config) SET c = {host: 'x', port: 3306, extra: 'oops'}");
             assert!(
@@ -1636,21 +1639,21 @@ mod tests {
         .expect("create_label AppService");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (s:AppService {name: 'api', version: '1.0'})")
                 .expect("create AppService node");
         }
 
         // Merge with declared keys — must succeed.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("MATCH (s:AppService) SET s += {version: '2.0'}")
                 .expect("SET n += {map} with declared keys must succeed");
         }
 
         // Merge introducing unknown key — must fail.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             let result = db
                 .execute_cypher("MATCH (s:AppService) SET s += {version: '3.0', secret: 'leaked'}");
             assert!(
@@ -1689,7 +1692,7 @@ mod tests {
         .expect("create_label Gadget");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (g:Gadget {name: 'light', status: 'on'})")
                 .expect("create g1");
             db.execute_cypher("CREATE (g:Gadget {name: 'fan', status: 'off'})")
@@ -1698,7 +1701,7 @@ mod tests {
 
         // Without ON VIOLATION SKIP: setting unknown property on all Gadget nodes fails.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             let result = db.execute_cypher("MATCH (g:Gadget) SET g.firmware = 'v1'");
             assert!(
                 result.is_err(),
@@ -1709,7 +1712,7 @@ mod tests {
         // With ON VIOLATION SKIP: query succeeds; violating nodes are excluded from output.
         // 'firmware' is unknown → all Gadget nodes are skipped → empty result set.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             let rows = db
                 .execute_cypher(
                     "MATCH (g:Gadget) SET g.firmware = 'v1' ON VIOLATION SKIP RETURN g.name",
@@ -1724,7 +1727,7 @@ mod tests {
 
         // ON VIOLATION SKIP with a valid property: all nodes are updated, all returned.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             let rows = db
                 .execute_cypher(
                     "MATCH (g:Gadget) SET g.status = 'idle' ON VIOLATION SKIP RETURN g.name",
@@ -1754,13 +1757,13 @@ mod tests {
         .expect("create_label Device");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (d:Device {serial: 'SN-001'})")
                 .expect("create device");
         }
 
         // 'config' is not declared on Device (STRICT) — SET d.config.timeout = 30 must fail.
-        let mut db = svc.database.lock().unwrap();
+        let mut db = svc.database.write();
         let result =
             db.execute_cypher("MATCH (d:Device) SET d.config.timeout = 30 RETURN d.serial");
         assert!(
@@ -1789,14 +1792,14 @@ mod tests {
         .expect("create_label Shelf");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (s:Shelf {name: 'A1'})")
                 .expect("create shelf");
         }
 
         // 'items' is not declared on Shelf (STRICT) — doc_push on unknown root prop must fail.
         // Syntax: `SET doc_push(n.prop, val)` — function call IS the set item.
-        let mut db = svc.database.lock().unwrap();
+        let mut db = svc.database.write();
         let result = db.execute_cypher("MATCH (s:Shelf) SET doc_push(s.items, 'book')");
         assert!(
             result.is_err(),
@@ -1824,13 +1827,13 @@ mod tests {
         .expect("create_label Server");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (s:Server {host: 'db1'})")
                 .expect("create server");
         }
 
         // Replace with map that has extra unknown key 'datacenter' — must succeed in VALIDATED.
-        let mut db = svc.database.lock().unwrap();
+        let mut db = svc.database.write();
         let rows = db
             .execute_cypher(
                 "MATCH (s:Server) SET s = {host: 'db2', datacenter: 'eu-west-1'} RETURN s.host",
@@ -1864,13 +1867,13 @@ mod tests {
         .expect("create_label Cache");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (c:Cache {size: 100})")
                 .expect("create cache");
         }
 
         // Merge with unknown key 'policy' — must succeed in VALIDATED.
-        let mut db = svc.database.lock().unwrap();
+        let mut db = svc.database.write();
         let rows = db
             .execute_cypher("MATCH (c:Cache) SET c += {size: 200, policy: 'lru'} RETURN c.size")
             .expect("SET n += {map} with unknown key on VALIDATED label must succeed");
@@ -1887,12 +1890,12 @@ mod tests {
     async fn labels_function_subscript_access() {
         let (svc, _dir) = test_service();
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (n:Robot {name: 'R2D2'})")
                 .expect("create");
         }
 
-        let mut db = svc.database.lock().unwrap();
+        let mut db = svc.database.write();
         let rows = db
             .execute_cypher("MATCH (n:Robot) RETURN labels(n)[0] AS lbl")
             .expect("labels(n)[0] must be supported");
@@ -1925,13 +1928,13 @@ mod tests {
         .expect("create_label Sensor");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (s:Sensor {id: 'S1'})")
                 .expect("create sensor");
         }
 
         // 'readings' is not declared on Sensor (VALIDATED) — deep SET must succeed.
-        let mut db = svc.database.lock().unwrap();
+        let mut db = svc.database.write();
         let result = db.execute_cypher("MATCH (s:Sensor) SET s.readings.temp = 42 RETURN s.id");
         assert!(
             result.is_ok(),
@@ -1959,13 +1962,13 @@ mod tests {
         .expect("create_label Bin");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (b:Bin {tag: 'B1'})")
                 .expect("create bin");
         }
 
         // 'items' is not declared on Bin (VALIDATED) — doc_push must succeed.
-        let mut db = svc.database.lock().unwrap();
+        let mut db = svc.database.write();
         let result = db.execute_cypher("MATCH (b:Bin) SET doc_push(b.items, 'x')");
         assert!(
             result.is_ok(),
@@ -1993,7 +1996,7 @@ mod tests {
         .expect("create_label Relay");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (r:Relay {state: 'open'})")
                 .expect("create relay");
             db.execute_cypher("CREATE (r:Relay {state: 'closed'})")
@@ -2002,7 +2005,7 @@ mod tests {
 
         // 'config' is not declared — without SKIP the whole query fails.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             let result =
                 db.execute_cypher("MATCH (r:Relay) SET r.config.timeout = 30 RETURN r.state");
             assert!(
@@ -2013,7 +2016,7 @@ mod tests {
 
         // With ON VIOLATION SKIP: query succeeds, all violating nodes excluded → empty result.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             let rows = db
                 .execute_cypher(
                     "MATCH (r:Relay) SET r.config.timeout = 30 ON VIOLATION SKIP RETURN r.state",
@@ -2057,14 +2060,14 @@ mod tests {
         .expect("create_label Config");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (c:Config)").expect("create node");
         }
 
         // Three PropertyPath items on the same node in one statement.
         // Each uses schema_label_for_node — only the first should hit the engine;
         // items 2 and 3 should read the cached label.
-        let mut db = svc.database.lock().unwrap();
+        let mut db = svc.database.write();
         db.execute_cypher(
             "MATCH (c:Config) SET c.cfg.host = 'db1', c.cfg.port = 5432, c.cfg.ssl = true",
         )
@@ -2114,14 +2117,14 @@ mod tests {
         .expect("create_label Queue");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (q:Queue)").expect("create node");
         }
 
         // Three doc_push items on the same node in one statement.
         // 'jobs', 'errors', 'metrics' are all undeclared roots on VALIDATED →
         // all accepted. schema_label_for_node cache: 1 engine read for all three.
-        let mut db = svc.database.lock().unwrap();
+        let mut db = svc.database.write();
         db.execute_cypher(
             "MATCH (q:Queue) SET doc_push(q.jobs, 'job1'), doc_push(q.errors, 'err1'), doc_push(q.metrics, 42)",
         )

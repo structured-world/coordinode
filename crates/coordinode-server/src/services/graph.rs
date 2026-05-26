@@ -1,4 +1,8 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+// no-std: spin::RwLock (drop-in). parking_lot::RwLock chosen over
+// std::sync per ~/projects/sw/CLAUDE.md hot-path rule.
+use parking_lot::RwLock;
 
 use tonic::{Request, Response, Status};
 
@@ -16,11 +20,11 @@ fn cypher_ident(name: &str) -> String {
 }
 
 pub struct GraphServiceImpl {
-    database: Arc<Mutex<Database>>,
+    database: Arc<RwLock<Database>>,
 }
 
 impl GraphServiceImpl {
-    pub fn new(database: Arc<Mutex<Database>>) -> Self {
+    pub fn new(database: Arc<RwLock<Database>>) -> Self {
         Self { database }
     }
 }
@@ -61,7 +65,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         let cypher = format!("CREATE (n{label_part}{props_part}) RETURN n");
 
         let rows = {
-            let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
+            let mut db = self.database.write();
             db.execute_cypher_with_params(&cypher, params)
                 .map_err(|e| db_err_to_status("create_node", e))?
         };
@@ -111,7 +115,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         // `RETURN *` copies ALL columns from NodeScan: `n`, `n.__label__`, `n.<prop>`.
         // An explicit `RETURN n, n.__label__` would strip `n.*` properties in the Project step.
         let rows = {
-            let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
+            let mut db = self.database.write();
             db.execute_cypher_with_params("MATCH (n) WHERE n = $id RETURN *", params)
                 .map_err(|e| db_err_to_status("get_node", e))?
         };
@@ -192,7 +196,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         );
 
         let rows = {
-            let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
+            let mut db = self.database.write();
             db.execute_cypher_with_params(&cypher, params)
                 .map_err(|e| db_err_to_status("create_edge", e))?
         };
@@ -284,7 +288,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         };
 
         let rows = {
-            let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
+            let mut db = self.database.write();
             db.execute_cypher_with_params(&cypher, params)
                 .map_err(|e| db_err_to_status("traverse", e))?
         };
@@ -346,7 +350,7 @@ mod tests {
 
     fn test_service() -> (GraphServiceImpl, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let database = Arc::new(Mutex::new(
+        let database = Arc::new(RwLock::new(
             Database::open(dir.path()).expect("open database"),
         ));
         (GraphServiceImpl::new(database), dir)
@@ -471,7 +475,7 @@ mod tests {
         .expect("create should succeed");
 
         let rows = {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("MATCH (n:Thing {tag: 'persist-test'}) RETURN n.tag")
                 .expect("cypher should succeed")
         };
@@ -625,7 +629,7 @@ mod tests {
         use query::cypher_service_server::CypherService as _;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let database = Arc::new(Mutex::new(
+        let database = Arc::new(RwLock::new(
             Database::open(dir.path()).expect("open database"),
         ));
 
