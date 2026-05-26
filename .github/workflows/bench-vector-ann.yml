@@ -1,27 +1,13 @@
-# ann-benchmarks Docker harness bench — CoordiNode vs library-tier engines.
+# ann-benchmarks Docker harness — measures CoordiNode HNSW vs library-tier
+# engines (hnswlib / FAISS / ScaNN / Annoy) on the canonical
+# ann-benchmarks.com datasets. Pushes the result JSON to the `bench-data`
+# orphan branch so the docs site picks it up.
 #
-# Companion to `bench.yml` (which runs the Rust-side criterion-driven
-# vector-ann harness on gpu1).  This workflow drives the canonical
-# ann-benchmarks Docker harness on a dedicated bench host (ro /
-# <redacted>) so the resulting numbers are directly comparable with
-# what hnswlib / FAISS / Annoy / ScaNN / Qdrant / Milvus / Weaviate /
-# pgvector publish on ann-benchmarks.com.
-#
-# Each push to main:
-#   1. Builds the coordinode-embedded PyO3 wheel against the SHA being benched
-#      (submodule swap in the public coordinode-python repo)
-#   2. Stages the wheel + adapter (`benches/ann-benchmarks-adapter/`) into
-#      the ann-benchmarks workspace on ro
-#   3. Runs the ann-benchmarks Docker image for CoordiNode on the documented
-#      dataset ladder
-#   4. Exports per-(dataset, M) JSONs into `bench-results/vector/`
-#   5. Force-pushes the merged tree to the `bench-data` orphan branch
-#
-# Architecture:
-#   * Runner: `gpu-private-systems` (org-level self-hosted).
-#   * Bench host: <redacted> — holds Docker layer cache, dataset cache,
-#     coordinode-python wheel cache. The runner ssh's there to drive the
-#     orchestrator script, then scp's bench-results JSON back.
+# The self-hosted gpu-private-systems runner IS the bench host —
+# `/opt/coordinode` is the long-lived checkout, `/opt/annb/ann-benchmarks`
+# is the harness install with cached Docker images for every competitor,
+# coordinode-python wheel cache is on the same disk. Everything happens
+# on the runner; no ssh / no rsync.
 
 name: bench-vector-ann
 
@@ -42,8 +28,6 @@ on:
         required: false
         default: 'glove-25-angular,sift-128-euclidean,nytimes-256-angular,fashion-mnist-784-euclidean'
 
-# Share the same concurrency group as `bench.yml` — they both push to
-# `bench-data` with force, and serialising prevents lost commits.
 concurrency:
   group: bench
   cancel-in-progress: false
@@ -53,75 +37,24 @@ permissions:
 
 jobs:
   bench:
-    name: ann-benchmarks (Docker, ro)
     runs-on:
       - self-hosted
       - gpu-private-systems
-    timeout-minutes: 360       # full dataset ladder × 9 M values × 9 ef = hours
-
-    env:
-      BENCH_HOST: <redacted>
-      BENCH_USER: root
-      SSH_OPTS: "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
-      RSYNC_RSH: "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
-      DATASETS: ${{ inputs.datasets || 'glove-25-angular,sift-128-euclidean,nytimes-256-angular,fashion-mnist-784-euclidean' }}
+    timeout-minutes: 360
 
     steps:
-      - name: Checkout coordinode @ SHA
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
-
-      - name: Load bench-host SSH key into agent
-        # See bench-vdbbench.yml for the operator-side setup
-        # instructions for the BENCH_SSH_KEY secret.
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.BENCH_SSH_KEY }}
-
-      - name: Sync scripts + adapter to bench host
+      - name: Sync /opt/coordinode to this SHA + run ann-benchmarks + push results
         run: |
-          set -euo pipefail
-          rsync -a --delete \
-            scripts/ann-benchmarks-to-json.py \
-            scripts/run-coordinode-ann-benchmarks.sh \
-            scripts/push-bench-data.sh \
-            "${BENCH_USER}@${BENCH_HOST}:/opt/coordinode/scripts/"
-          rsync -a --delete \
-            benches/ann-benchmarks-adapter/ \
-            "${BENCH_USER}@${BENCH_HOST}:/opt/coordinode/benches/ann-benchmarks-adapter/"
-
-      - name: Run ann-benchmarks on bench host
-        run: |
-          set -euo pipefail
-          ssh $SSH_OPTS "${BENCH_USER}@${BENCH_HOST}" bash <<EOF
           set -euo pipefail
           cd /opt/coordinode
+          git fetch origin main
+          git checkout "$GITHUB_SHA"
+          git submodule update --init --recursive
           bash scripts/run-coordinode-ann-benchmarks.sh \
-            --sha "${{ github.sha }}" \
-            --datasets "${DATASETS}"
-          EOF
-
-      - name: Pull bench-results JSON from bench host
-        run: |
-          set -euo pipefail
-          mkdir -p bench-results
-          rsync -a \
-            "${BENCH_USER}@${BENCH_HOST}:/opt/coordinode/bench-results/vector/" \
-            bench-results/vector/
-
-      - name: Push results to bench-data branch
-        run: |
+            --sha "$GITHUB_SHA" \
+            --datasets "$DATASETS"
           bash scripts/push-bench-data.sh
         env:
+          GITHUB_SHA: ${{ github.sha }}
+          DATASETS: ${{ inputs.datasets || 'glove-25-angular,sift-128-euclidean,nytimes-256-angular,fashion-mnist-784-euclidean' }}
           COMMIT_MSG: "chore(bench): ann-benchmarks results @ ${{ github.sha }}"
-
-      - name: Upload workflow artifact (90-day retention)
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: bench-vector-ann-${{ github.sha }}
-          path: bench-results/vector/**/*.json
-          retention-days: 90
-          if-no-files-found: warn
