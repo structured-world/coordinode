@@ -960,12 +960,15 @@ impl HnswIndex {
             current_ep = self.search_layer_greedy_query(query, current_ep, level);
         }
 
-        // When quantized: fetch more candidates for reranking
-        let ef = if self.is_quantized() {
-            self.config.ef_search.max(self.config.rerank_candidates)
-        } else {
-            self.config.ef_search
-        };
+        // Effective layer-0 beam must be at least `k`. Without this floor
+        // a caller passing `ef_search < k` gets both a truncated top-k AND
+        // catastrophic recall — the visited pool is too small to reach the
+        // true k-NN. Standard HNSW (Malkov 2018, hnswlib, Qdrant, FAISS)
+        // all enforce this.
+        let mut ef = self.config.ef_search.max(k);
+        if self.is_quantized() {
+            ef = ef.max(self.config.rerank_candidates);
+        }
 
         // Search at layer 0 with ef candidates
         let candidates = self.search_layer_query(query, current_ep, ef, 0);
@@ -1143,7 +1146,12 @@ impl HnswIndex {
             current_ep = self.search_layer_greedy_ctx(&qctx, current_ep, level);
         }
 
-        let ef = self.config.ef_search.max(self.config.rerank_candidates);
+        // See `search()` for why the beam floor at `k` is mandatory.
+        let ef = self
+            .config
+            .ef_search
+            .max(self.config.rerank_candidates)
+            .max(k);
         let candidates = self.search_layer_ctx(&qctx, current_ep, ef, 0);
 
         // Batch-load f32 vectors from storage for reranking
