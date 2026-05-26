@@ -846,6 +846,23 @@ impl Database {
         }
     }
 
+    /// If the query is a recognized session-SET command, apply its
+    /// effect to the Database's defaults and return `true` (caller
+    /// should short-circuit and return an empty result set). Returns
+    /// `false` for regular Cypher.
+    ///
+    /// Lifts SET handling out of `execute_cypher_impl` so the impl
+    /// can stay on `&self`; this method needs `&mut self` because it
+    /// mutates the session default field.
+    fn try_apply_session_set(&mut self, query: &str) -> bool {
+        if let Some(mode) = Self::try_parse_session_set(query) {
+            self.vector_consistency = mode;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Execute a Cypher query with source location context.
     ///
     /// Same as `execute_cypher()` but also records the source call site
@@ -855,6 +872,9 @@ impl Database {
         query: &str,
         source: &SourceContext,
     ) -> Result<Vec<Row>, DatabaseError> {
+        if self.try_apply_session_set(query) {
+            return Ok(Vec::new());
+        }
         let session = self.capture_session();
         self.execute_cypher_impl(query, Some(source), None, &session)
             .map(|(rows, _)| rows)
@@ -875,6 +895,9 @@ impl Database {
         } else {
             Some(params)
         };
+        if self.try_apply_session_set(query) {
+            return Ok(Vec::new());
+        }
         let session = self.capture_session();
         self.execute_cypher_impl(query, Some(source), params, &session)
             .map(|(rows, _)| rows)
@@ -885,6 +908,9 @@ impl Database {
     /// Automatically tracks query fingerprint and execution time in the
     /// query advisor registry for performance analysis.
     pub fn execute_cypher(&mut self, query: &str) -> Result<Vec<Row>, DatabaseError> {
+        if self.try_apply_session_set(query) {
+            return Ok(Vec::new());
+        }
         let session = self.capture_session();
         self.execute_cypher_impl(query, None, None, &session)
             .map(|(rows, _)| rows)
@@ -904,6 +930,9 @@ impl Database {
         } else {
             Some(params)
         };
+        if self.try_apply_session_set(query) {
+            return Ok(Vec::new());
+        }
         let session = self.capture_session();
         self.execute_cypher_impl(query, None, params, &session)
             .map(|(rows, _)| rows)
@@ -928,6 +957,12 @@ impl Database {
         read_concern: Option<coordinode_core::txn::read_concern::ReadConcern>,
         write_concern: Option<coordinode_core::txn::write_concern::WriteConcern>,
     ) -> Result<CypherResult, DatabaseError> {
+        if self.try_apply_session_set(query) {
+            return Ok(CypherResult {
+                rows: Vec::new(),
+                write_stats: WriteStats::default(),
+            });
+        }
         let mut session = self.capture_session();
         if let Some(ref rc) = read_concern {
             rc.validate()
@@ -996,6 +1031,59 @@ impl Database {
     /// that exact MVCC timestamp instead of the latest applied state.
     /// Other levels behave like `Local` in embedded single-node mode
     /// (no replication lag to observe).
+    /// Execute a Cypher query under shared (non-exclusive) access.
+    ///
+    /// Available to callers that only hold `&Database` — typically
+    /// gRPC request handlers behind `Arc<RwLock<Database>>::read()`.
+    /// Builds a per-call [`QuerySession`] from the Database's session
+    /// defaults plus any wire-supplied `read_concern` / `write_concern`
+    /// overrides, then dispatches to the `&self` impl. Multiple
+    /// shared callers run in parallel; only `set_*` session-config
+    /// methods (and embedded SET commands) need `.write()`.
+    ///
+    /// Rejects session-SET commands because mutating
+    /// `self.vector_consistency` requires exclusive access — route
+    /// SET through the `&mut self` `execute_cypher_full` API.
+    /// Likewise, the one-shot `snapshot_read_ts` field on Database
+    /// is not consulted here: the gRPC path always carries the
+    /// snapshot timestamp on the wire via `read_concern.at_timestamp`.
+    pub fn execute_cypher_shared(
+        &self,
+        query: &str,
+        params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
+        source: Option<&SourceContext>,
+        read_concern: Option<&coordinode_core::txn::read_concern::ReadConcern>,
+        write_concern: Option<&coordinode_core::txn::write_concern::WriteConcern>,
+    ) -> Result<CypherResult, DatabaseError> {
+        if Self::try_parse_session_set(query).is_some() {
+            return Err(DatabaseError::Semantic(
+                "session SET commands require exclusive Database access; \
+                 use execute_cypher_full"
+                    .to_string(),
+            ));
+        }
+
+        let mut session = QuerySession {
+            read_concern: self.read_concern,
+            snapshot_read_ts: None,
+            write_concern: self.write_concern.clone(),
+            vector_consistency: self.vector_consistency,
+        };
+        if let Some(rc) = read_concern {
+            rc.validate()
+                .map_err(|e| DatabaseError::Semantic(e.to_string()))?;
+            session.read_concern = rc.level;
+            session.snapshot_read_ts = rc.at_timestamp;
+        }
+        if let Some(wc) = write_concern {
+            session.write_concern = wc.clone();
+        }
+
+        let params = params.and_then(|p| if p.is_empty() { None } else { Some(p) });
+        self.execute_cypher_impl(query, source, params, &session)
+            .map(|(rows, write_stats)| CypherResult { rows, write_stats })
+    }
+
     pub fn execute_cypher_with_read_concern(
         &mut self,
         query: &str,
@@ -1004,6 +1092,10 @@ impl Database {
         read_concern
             .validate()
             .map_err(|e| DatabaseError::Semantic(e.to_string()))?;
+
+        if self.try_apply_session_set(query) {
+            return Ok(Vec::new());
+        }
 
         let mut session = self.capture_session();
         session.read_concern = read_concern.level;
@@ -1014,18 +1106,15 @@ impl Database {
     }
 
     fn execute_cypher_impl(
-        &mut self,
+        &self,
         query: &str,
         source: Option<&SourceContext>,
         params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
         session: &QuerySession,
     ) -> Result<(Vec<Row>, WriteStats), DatabaseError> {
-        // Handle session SET commands before parsing as regular Cypher.
-        // Pattern: SET vector_consistency = 'mode'
-        if let Some(mode) = Self::try_parse_session_set(query) {
-            self.vector_consistency = mode;
-            return Ok((vec![], WriteStats::default()));
-        }
+        // SET-style session commands are handled by the public entry
+        // points before reaching here (so this impl can stay on
+        // &self). Regular Cypher only past this point.
 
         let ast = cypher::parse(query)?;
 
