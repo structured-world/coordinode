@@ -89,16 +89,94 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
 
     async fn create_nodes_batch(
         &self,
-        _request: Request<graph::CreateNodesBatchRequest>,
+        request: Request<graph::CreateNodesBatchRequest>,
     ) -> Result<Response<graph::CreateNodesBatchResponse>, Status> {
-        // Wired in a follow-up: under one transaction, batch HNSW index
-        // updates so the write lock is taken once per request instead
-        // of once per inserted vector. Stub returns Unimplemented to
-        // keep the trait satisfied while the rest of the batch path
-        // lands.
-        Err(Status::unimplemented(
-            "CreateNodesBatch is not yet wired; planned as part of the bulk-insert handler",
-        ))
+        let req = request.into_inner();
+
+        if req.nodes.is_empty() {
+            return Ok(Response::new(graph::CreateNodesBatchResponse {
+                nodes: vec![],
+            }));
+        }
+
+        // The Cypher path that powers this handler is a single
+        // `UNWIND $rows AS r CREATE (m:Label…) SET m = r RETURN m`
+        // — one parse (cached after the first batch), one logical
+        // plan, one execute. Cypher can't add labels dynamically per
+        // row, so all nodes in a batch must share the same label
+        // set. Mixed-label batches are an explicit InvalidArgument.
+        let labels = req.nodes[0].labels.clone();
+        for (i, n) in req.nodes.iter().enumerate().skip(1) {
+            if n.labels != labels {
+                return Err(Status::invalid_argument(format!(
+                    "create_nodes_batch: nodes[{i}].labels differs from nodes[0].labels; \
+                     batches must be label-homogeneous"
+                )));
+            }
+        }
+        let label_part: String = labels
+            .iter()
+            .map(|l| format!(":{}", cypher_ident(l)))
+            .collect();
+
+        // Build the $rows list parameter. Each element is a property
+        // map keyed by property name — Cypher's `SET m = r` then
+        // copies each entry into a node property.
+        let rows: Vec<Value> = req
+            .nodes
+            .iter()
+            .map(|n| {
+                let map: std::collections::BTreeMap<String, Value> = n
+                    .properties
+                    .iter()
+                    .map(|(k, v)| (k.clone(), proto_to_value_pub(v)))
+                    .collect();
+                Value::Map(map)
+            })
+            .collect();
+
+        let cypher = format!("UNWIND $rows AS r CREATE (m{label_part}) SET m = r RETURN m");
+        let mut params: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        params.insert("rows".to_string(), Value::Array(rows));
+
+        let result_rows = {
+            let mut db = self.database.write();
+            db.execute_cypher_with_params(&cypher, params)
+                .map_err(|e| db_err_to_status("create_nodes_batch", e))?
+        };
+
+        if result_rows.len() != req.nodes.len() {
+            return Err(Status::internal(format!(
+                "create_nodes_batch: executor returned {} rows, expected {}",
+                result_rows.len(),
+                req.nodes.len()
+            )));
+        }
+
+        let nodes: Result<Vec<graph::Node>, Status> = result_rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let node_id = match row.get("m") {
+                    Some(Value::Int(id)) => *id as u64,
+                    _ => {
+                        return Err(Status::internal(format!(
+                            "create_nodes_batch: row[{i}] missing node id"
+                        )))
+                    }
+                };
+                Ok(graph::Node {
+                    node_id,
+                    labels: labels.clone(),
+                    properties: req.nodes[i].properties.clone(),
+                    element_id: NodeId::from_raw(node_id).to_element_id(),
+                })
+            })
+            .collect();
+
+        Ok(Response::new(graph::CreateNodesBatchResponse {
+            nodes: nodes?,
+        }))
     }
 
     async fn get_node(
@@ -365,6 +443,83 @@ mod tests {
             Database::open(dir.path()).expect("open database"),
         ));
         (GraphServiceImpl::new(database), dir)
+    }
+
+    /// create_nodes_batch ingests N nodes in one request, returns them in
+    /// input order with well-formed identifiers. Verifies the single-RPC
+    /// batch path (UNWIND $rows AS r CREATE …) round-trips end-to-end.
+    #[tokio::test]
+    async fn create_nodes_batch_returns_all_nodes_in_order() {
+        let (svc, _dir) = test_service();
+
+        let mk = |i: u32| {
+            let mut props = std::collections::HashMap::new();
+            props.insert(
+                "i".to_string(),
+                common::PropertyValue {
+                    value: Some(common::property_value::Value::IntValue(i as i64)),
+                },
+            );
+            graph::CreateNodeRequest {
+                labels: vec!["BatchItem".to_string()],
+                properties: props,
+            }
+        };
+        let batch: Vec<_> = (0..5).map(mk).collect();
+
+        let resp = svc
+            .create_nodes_batch(Request::new(graph::CreateNodesBatchRequest {
+                nodes: batch,
+            }))
+            .await
+            .expect("create_nodes_batch should succeed");
+        let nodes = resp.into_inner().nodes;
+
+        assert_eq!(nodes.len(), 5, "must return one node per input");
+        // All ids non-zero, all distinct, labels propagated.
+        let mut seen = std::collections::HashSet::new();
+        for (i, n) in nodes.iter().enumerate() {
+            assert!(n.node_id > 0, "node[{i}] has zero id");
+            assert!(seen.insert(n.node_id), "duplicate id on node[{i}]");
+            assert_eq!(n.labels, vec!["BatchItem".to_string()]);
+            assert_eq!(n.element_id.len(), 13, "node[{i}] missing element_id");
+        }
+    }
+
+    /// Mixed-label batches are rejected with InvalidArgument because
+    /// Cypher can't add labels dynamically per UNWIND row.
+    #[tokio::test]
+    async fn create_nodes_batch_mixed_labels_rejected() {
+        let (svc, _dir) = test_service();
+        let resp = svc
+            .create_nodes_batch(Request::new(graph::CreateNodesBatchRequest {
+                nodes: vec![
+                    graph::CreateNodeRequest {
+                        labels: vec!["A".to_string()],
+                        properties: Default::default(),
+                    },
+                    graph::CreateNodeRequest {
+                        labels: vec!["B".to_string()],
+                        properties: Default::default(),
+                    },
+                ],
+            }))
+            .await;
+        let err = resp.expect_err("mixed labels must error");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// Empty batch is a valid no-op — returns empty list, no error.
+    #[tokio::test]
+    async fn create_nodes_batch_empty_is_noop() {
+        let (svc, _dir) = test_service();
+        let resp = svc
+            .create_nodes_batch(Request::new(graph::CreateNodesBatchRequest {
+                nodes: vec![],
+            }))
+            .await
+            .expect("empty batch must succeed");
+        assert!(resp.into_inner().nodes.is_empty());
     }
 
     /// create_node returns a non-zero node_id.
