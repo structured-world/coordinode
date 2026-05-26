@@ -6,6 +6,9 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+// no-std: spin::RwLock (drop-in, same API). parking_lot::RwLock is the
+// std-only hot-path-fast lock per ~/projects/sw/CLAUDE.md.
+use parking_lot::{RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
 use coordinode_core::graph::intern::FieldInterner;
@@ -172,6 +175,12 @@ fn try_extract_vector(val: &coordinode_core::graph::types::Value) -> Option<Vec<
 /// property name is provided per-call by the HNSW search method.
 pub struct StorageVectorLoader {
     engine: Arc<StorageEngine>,
+    // Snapshot of the interner at query start. Vector loaders look up
+    // property names that were registered when the HNSW index was
+    // built — names that always pre-date the query. Holding a snapshot
+    // here, rather than a shared `Arc<RwLock<…>>`, prevents a re-entrant
+    // read-after-write deadlock with the Database's execute path that
+    // holds the interner write-lock for the duration of execute.
     interner: FieldInterner,
     shard_id: u16,
 }
@@ -220,7 +229,15 @@ impl coordinode_vector::VectorLoader for StorageVectorLoader {
 /// Embedded database instance.
 pub struct Database {
     engine: Arc<StorageEngine>,
-    interner: FieldInterner,
+    // Wrapped in Arc<RwLock<…>> so concurrent gRPC handlers can hold a
+    // shared `Database` (under `Arc<RwLock<Database>>`) and still mutate
+    // the interner from any per-request execute path: lookup-heavy
+    // read paths take `.read()`, the rare "new property name" path
+    // takes `.write()`. FieldInterner itself stays alloc-clean in
+    // coordinode-core — the lock is bolted on here by the std-only
+    // consumer, per the tier policy.
+    // no-std: spin::RwLock (drop-in).
+    interner: Arc<RwLock<FieldInterner>>,
     allocator: NodeIdAllocator,
     shard_id: u16,
     /// Query fingerprint registry — tracks execution statistics per query pattern.
@@ -512,7 +529,7 @@ impl Database {
 
         Ok(Self {
             engine,
-            interner,
+            interner: Arc::new(RwLock::new(interner)),
             allocator,
             shard_id: 1,
             query_registry: Arc::new(QueryRegistry::new()),
@@ -1051,15 +1068,22 @@ impl Database {
             self.oracle.next()
         };
         let pipeline = LocalProposalPipeline::new(&self.engine);
-        let interner_len_before = self.interner.len();
+        // Snapshot of the current interner is handed to the vector
+        // loader (HNSW property lookups). The write-lock is then
+        // acquired for the duration of execute, so the executor can
+        // intern new property names without re-entering the same
+        // RwLock through the loader (parking_lot RwLock is not
+        // re-entrant — that would deadlock).
         let vector_loader = StorageVectorLoader::new(
             Arc::clone(&self.engine),
-            self.interner.clone(),
+            self.interner.read().clone(),
             self.shard_id,
         );
+        let mut interner_guard = self.interner.write();
+        let interner_len_before = interner_guard.len();
         let mut ctx = ExecutionContext {
             engine: &self.engine,
-            interner: &mut self.interner,
+            interner: &mut interner_guard,
             id_allocator: &self.allocator,
             shard_id: self.shard_id,
             adaptive: self.adaptive_config.clone(),
@@ -1133,12 +1157,22 @@ impl Database {
             }
         }
 
-        // Capture write_stats before dropping ctx (which borrows &mut self.interner).
+        // Capture write_stats before dropping ctx (which borrows the
+        // interner_guard via &mut *).
         let write_stats = ctx.write_stats.clone();
         let nodes_created = write_stats.nodes_created;
         let had_mutations = write_stats.has_mutations();
-        // Drop ctx to release &mut self.interner borrow.
+        // Drop ctx, then snapshot the interner state under the same
+        // write guard before releasing it so we don't race with another
+        // query that might intern between unlock and persist.
         drop(ctx);
+        let interner_len_after = interner_guard.len();
+        let interner_bytes = if interner_len_after > interner_len_before {
+            Some(interner_guard.to_bytes())
+        } else {
+            None
+        };
+        drop(interner_guard);
 
         // Persist a new ID batch if nodes were created and we're near the ceiling.
         if nodes_created > 0 {
@@ -1146,12 +1180,9 @@ impl Database {
         }
 
         // Persist field interner if new fields were interned during this query.
-        if self.interner.len() > interner_len_before {
-            self.engine.put(
-                Partition::Schema,
-                SCHEMA_KEY_FIELD_INTERNER,
-                &self.interner.to_bytes(),
-            )?;
+        if let Some(bytes) = interner_bytes {
+            self.engine
+                .put(Partition::Schema, SCHEMA_KEY_FIELD_INTERNER, &bytes)?;
         }
 
         // Invalidate cached storage statistics after any mutation so that
@@ -1415,7 +1446,7 @@ impl Database {
             }
         };
 
-        let field_id = self.interner.lookup(property);
+        let field_id = self.interner.read().lookup(property);
 
         for guard in iter {
             let Ok((_key, value)) = guard.into_inner() else {
@@ -1548,7 +1579,7 @@ impl Database {
                 None => continue,
             };
 
-            if let Some(field_id) = self.interner.lookup(&property) {
+            if let Some(field_id) = self.interner.read().lookup(&property) {
                 if let Some(val) = record.props.get(&field_id) {
                     if let Some(text) = val.as_str() {
                         self.text_index_registry
@@ -1575,9 +1606,22 @@ impl Database {
         &mut self.text_index_registry
     }
 
-    /// Get the field interner (maps field IDs ↔ names).
-    pub fn interner(&self) -> &FieldInterner {
-        &self.interner
+    /// Get a read-locked view of the field interner.
+    ///
+    /// Returned guard derefs to `&FieldInterner` so existing callers
+    /// using `db.interner().lookup(..)` / `db.interner().resolve(..)`
+    /// continue to work via deref coercion. Don't hold the guard
+    /// across long-running operations — writers (new property name
+    /// interns) wait until it's dropped.
+    pub fn interner(&self) -> RwLockReadGuard<'_, FieldInterner> {
+        self.interner.read()
+    }
+
+    /// Get an Arc-shared handle to the interner, for components that
+    /// need to keep their own snapshot or hand off ownership (e.g.
+    /// background reapers, cluster recovery).
+    pub fn interner_arc(&self) -> Arc<RwLock<FieldInterner>> {
+        Arc::clone(&self.interner)
     }
 
     /// Get the query advisor registry for performance analysis.

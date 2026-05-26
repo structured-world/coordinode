@@ -448,7 +448,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 coordinode_embed::backup::BackupFormat::Json => {
                     coordinode_embed::backup::export::export_json(
                         db.engine(),
-                        db.interner(),
+                        &db.interner(),
                         shard_id,
                         &snapshot,
                         &mut writer,
@@ -458,7 +458,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 coordinode_embed::backup::BackupFormat::Cypher => {
                     coordinode_embed::backup::export::export_cypher(
                         db.engine(),
-                        db.interner(),
+                        &db.interner(),
                         shard_id,
                         &snapshot,
                         &mut writer,
@@ -468,7 +468,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 coordinode_embed::backup::BackupFormat::Binary => {
                     coordinode_embed::backup::export::export_binary(
                         db.engine(),
-                        db.interner(),
+                        &db.interner(),
                         shard_id,
                         &snapshot,
                         &mut writer,

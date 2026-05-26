@@ -46,7 +46,7 @@ mod tests {
         let mut buf = Vec::new();
         let snapshot = db.engine().snapshot();
         let stats =
-            export::export_json(db.engine(), db.interner(), 1, &snapshot, &mut buf).unwrap();
+            export::export_json(db.engine(), &db.interner(), 1, &snapshot, &mut buf).unwrap();
 
         assert_eq!(stats.nodes, 2, "should export 2 nodes");
         assert_eq!(stats.edges, 1, "should export 1 edge");
@@ -73,7 +73,7 @@ mod tests {
         let mut buf = Vec::new();
         let snapshot = db.engine().snapshot();
         let stats =
-            export::export_cypher(db.engine(), db.interner(), 1, &snapshot, &mut buf).unwrap();
+            export::export_cypher(db.engine(), &db.interner(), 1, &snapshot, &mut buf).unwrap();
 
         assert_eq!(stats.nodes, 1);
         let output = String::from_utf8(buf).unwrap();
@@ -101,7 +101,7 @@ mod tests {
         let mut buf = Vec::new();
         let snapshot = db.engine().snapshot();
         let export_stats =
-            export::export_binary(db.engine(), db.interner(), 1, &snapshot, &mut buf).unwrap();
+            export::export_binary(db.engine(), &db.interner(), 1, &snapshot, &mut buf).unwrap();
         assert!(export_stats.nodes >= 2);
 
         // Restore to new database
@@ -126,7 +126,7 @@ mod tests {
         // Export JSON
         let mut buf = Vec::new();
         let snapshot = db.engine().snapshot();
-        export::export_json(db.engine(), db.interner(), 1, &snapshot, &mut buf).unwrap();
+        export::export_json(db.engine(), &db.interner(), 1, &snapshot, &mut buf).unwrap();
 
         // Restore to new database
         let dir2 = tempfile::tempdir().unwrap();
@@ -147,7 +147,7 @@ mod tests {
         let mut buf = Vec::new();
         let snapshot = db.engine().snapshot();
         let stats =
-            export::export_json(db.engine(), db.interner(), 1, &snapshot, &mut buf).unwrap();
+            export::export_json(db.engine(), &db.interner(), 1, &snapshot, &mut buf).unwrap();
 
         assert_eq!(stats.nodes, 0);
         assert_eq!(stats.edges, 0);
