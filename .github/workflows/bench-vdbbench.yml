@@ -1,12 +1,17 @@
-# VDBBench (Zilliz) gRPC-tier benchmark — runs coordinode-server at
-# the freshly-pushed SHA against real LLM-embedding datasets
-# (OpenAI 1536d / Cohere 768d / Bioasq 1024d). Pushes the result JSON
-# to the `bench-data` orphan branch so the docs site picks it up.
+# VDBBench (Zilliz) gRPC-tier benchmark.
 #
-# The self-hosted gpu-private-systems runner IS the bench host —
-# `/opt/coordinode` is the long-lived checkout, `/opt/vdbbench` is the
-# VDBBench install, coordinode-server build cache is on the same disk.
-# Everything happens on the runner; no ssh / no rsync.
+# Same shape as structured-zstd's bench pipeline:
+#   bench-matrix → bench-build → benchmark (matrix) → benchmark-aggregate → benchmark-pages.
+#
+# The expensive build runs once, then every case is one shard of the
+# `benchmark` matrix. Adding a new case (Cohere768D1M, Bioasq1024D1M,
+# OpenAI500K-1536D, etc.) is one line in `bench-matrix.outputs.cases` —
+# the rest of the pipeline scales out automatically.
+#
+# All bench work happens on the self-hosted `gpu-private-systems`
+# runner (which IS the bench host — 192.168.1.200, "Home GPU server"
+# per server-inventory). The merge + publish stages run on
+# ubuntu-latest because they only push JSON to a branch.
 
 name: bench-vdbbench
 
@@ -21,49 +26,169 @@ on:
       - 'crates/coordinode-server/**'
       - 'benches/vdbbench-adapter/**'
       - 'scripts/vdbbench-to-json.py'
-      - 'scripts/run-coordinode-vdbbench.sh'
+      - 'scripts/run-vdbbench-coordinode.py'
       - '.github/workflows/bench-vdbbench.yml'
-  workflow_dispatch:
-    inputs:
-      cases:
-        description: 'Comma-separated VDBBench case-type names'
-        required: false
-        default: 'Performance1536D50K'
+  workflow_dispatch: {}
 
-# Share the `bench` concurrency group with bench-vector-ann.yml so the
-# two workflows never push to bench-data simultaneously.
 concurrency:
-  group: bench
+  group: bench-vdbbench
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  bench:
+  bench-matrix:
+    # Canonical case inventory. Add new VDBBench cases here as engine
+    # perf allows the larger LLM-embedding sets:
+    #   Performance768D1M    — Cohere   768d × 1M
+    #   Performance1024D1M   — Bioasq  1024d × 1M
+    #   Performance1536D500K — OpenAI  1536d × 500K
+    runs-on: ubuntu-latest
+    outputs:
+      cases: ${{ steps.gen.outputs.cases }}
+    steps:
+      - id: gen
+        run: |
+          echo 'cases=["Performance1536D50K"]' >> "$GITHUB_OUTPUT"
+
+  bench-build:
+    needs: bench-matrix
+    runs-on:
+      - self-hosted
+      - gpu-private-systems
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: bench-vdbbench-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: bench-vdbbench-${{ runner.os }}-cargo-
+      - run: cargo build --release -p coordinode-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coordinode-server-binary
+          path: target/release/coordinode
+          retention-days: 7
+
+  benchmark:
+    needs: [bench-matrix, bench-build]
     runs-on:
       - self-hosted
       - gpu-private-systems
     timeout-minutes: 480
-
+    strategy:
+      fail-fast: false
+      matrix:
+        case: ${{ fromJSON(needs.bench-matrix.outputs.cases) }}
     steps:
-      - name: Sync /opt/coordinode to this SHA + run VDBBench + push results
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/download-artifact@v4
+        with:
+          name: coordinode-server-binary
+          path: bin/
+      - run: chmod +x bin/coordinode
+      - name: Run VDBBench case
+        env:
+          CASE: ${{ matrix.case }}
         run: |
           set -euo pipefail
-          # `/opt/coordinode` is owned by the operator who set up the
-          # bench host; the GHA runner runs under a different user.
-          # Git ≥ 2.36 refuses to operate on such trees unless they
-          # are marked safe — declare it once per job (idempotent).
-          git config --global --add safe.directory /opt/coordinode
-          cd /opt/coordinode
-          git fetch origin main
-          git checkout "$GITHUB_SHA"
-          git submodule update --init --recursive
-          bash scripts/run-coordinode-vdbbench.sh \
-            --sha "$GITHUB_SHA" \
-            --cases "$BENCH_CASES"
-          bash scripts/push-bench-data.sh
+          # The runtime-loader script registers our adapter via
+          # sys.path injection (so we don't need write access to
+          # /opt/vdbbench's clients/ tree), starts coordinode-server
+          # from this commit's binary in a tempdir, runs the case
+          # programmatically, and writes result JSON in bench-results/.
+          DATA_DIR="${RUNNER_TEMP}/coordinode-data-${{ matrix.case }}"
+          mkdir -p "$DATA_DIR"
+          ./bin/coordinode serve \
+            --addr 127.0.0.1:7090 \
+            --ops-addr 127.0.0.1:7094 \
+            --data "$DATA_DIR" \
+            --mode full \
+            > server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            ss -tln | grep -q ':7090\b' && break
+            sleep 1
+          done
+          mkdir -p bench-results
+          /opt/vdbbench/VectorDBBench/.venv/bin/python3 \
+            scripts/run-vdbbench-coordinode.py \
+              --case "$CASE" \
+              --host 127.0.0.1 --port 7090 \
+              --out-dir vdbbench-raw
+          python3 scripts/vdbbench-to-json.py \
+            --src vdbbench-raw \
+            --sha "${GITHUB_SHA}" \
+            --coordinode-repo "${GITHUB_WORKSPACE}" \
+            --version "${GITHUB_SHA:0:7}" \
+            --out-dir bench-results
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-shard-${{ matrix.case }}
+          path: bench-results/
+          retention-days: 7
+
+  benchmark-aggregate:
+    needs: benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bench-shard-*
+          path: shards/
+      - run: |
+          set -euo pipefail
+          mkdir -p bench-results
+          # Each shard's payload is bench-results/vector/<dataset>/*.json.
+          # cp -R --no-preserve=mode is what aggregates them into the
+          # combined tree without rejecting cross-device perms.
+          find shards/ -type d -name vector -print0 | while IFS= read -r -d '' d; do
+            cp -R --no-preserve=mode "$d"/* bench-results/vector/ 2>/dev/null || \
+              cp -R "$d"/. bench-results/vector/
+          done
+          find bench-results -name '*.json' | wc -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-aggregated
+          path: bench-results/
+          retention-days: 30
+
+  benchmark-pages:
+    needs: benchmark-aggregate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - id: bot-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.bot-token.outputs.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: bench-aggregated
+          path: bench-results/
+      - name: Stage + push to bench-data branch
         env:
-          GITHUB_SHA: ${{ github.sha }}
-          BENCH_CASES: ${{ inputs.cases || 'Performance1536D50K' }}
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           COMMIT_MSG: "chore(bench): VDBBench results @ ${{ github.sha }}"
+        run: |
+          set -euo pipefail
+          git config user.name 'sw-release-bot[bot]'
+          git config user.email '41898282+sw-release-bot[bot]@users.noreply.github.com'
+          bash scripts/push-bench-data.sh
