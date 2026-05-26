@@ -205,11 +205,39 @@ impl VectorIndexRegistry {
 
     /// Insert a vector into all applicable HNSW indexes for a node.
     ///
-    /// Called on node creation or vector property update.
+    /// Called on node creation or vector property update. For bulk
+    /// loads use [`Self::on_vectors_written`] to amortise the HNSW
+    /// write-lock across the whole batch instead of paying it per
+    /// inserted vector.
     pub fn on_vector_written(&self, label: &str, node_id: NodeId, property: &str, vector: &[f32]) {
         if let Some(handle) = self.get(label, property) {
             if let Ok(mut hnsw) = handle.write() {
                 hnsw.insert(node_id.as_raw(), vector.to_vec());
+            }
+        }
+    }
+
+    /// Batched variant: insert N vectors into the same (label,
+    /// property) HNSW index under a single write-lock acquisition,
+    /// then dispatch to [`HnswIndex::insert_batch`] which seeds
+    /// sequentially up to `SEED_DENSITY` and parallelises the rest
+    /// via rayon.
+    ///
+    /// Caller is responsible for grouping by (label, property) — a
+    /// mixed batch would otherwise need one write-lock per group,
+    /// negating the win for the cross-group case.
+    ///
+    /// `items` is consumed: each `(NodeId, Vec<f32>)` is forwarded
+    /// to the HNSW insert path without further copies.
+    pub fn on_vectors_written(&self, label: &str, property: &str, items: Vec<(NodeId, Vec<f32>)>) {
+        if items.is_empty() {
+            return;
+        }
+        if let Some(handle) = self.get(label, property) {
+            if let Ok(mut hnsw) = handle.write() {
+                let batch: Vec<(u64, Vec<f32>)> =
+                    items.into_iter().map(|(id, v)| (id.as_raw(), v)).collect();
+                hnsw.insert_batch(batch);
             }
         }
     }
