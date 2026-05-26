@@ -27,16 +27,24 @@
 //! - No cross-node HNSW graph sharing needed — data replicated via Raft,
 //!   HNSW built locally on each node.
 
+mod entry_point;
 mod neighbours;
 mod visited;
 
 pub use neighbours::AtomicNeighbourList;
 
-// Loom integration tests live in `tests/loom_neighbours.rs` and need the
-// internal primitive in scope. We expose it publicly only under the model-
-// checker build flag — regular builds keep the type crate-private.
+// Loom integration tests live in `tests/loom_neighbours.rs` and
+// `tests/loom_entry_point.rs`; they need the lock-free primitives in
+// scope. We expose the types publicly only under the model-checker
+// build flag — regular builds keep them crate-private.
+#[cfg(loom)]
+pub use entry_point::EntryPoint as LoomEntryPoint;
+#[cfg(loom)]
+pub use entry_point::PromoteOutcome as LoomPromoteOutcome;
 #[cfg(loom)]
 pub use neighbours::AtomicNeighbourList as LoomAtomicNeighbourList;
+
+use entry_point::EntryPoint;
 
 /// Compile-time cap on the inline neighbour slots per node per layer
 /// (`m_max0` in HNSW literature). The atomic neighbour list stores its
@@ -208,10 +216,21 @@ pub struct HnswIndex {
     neighbours_atomic: Vec<Vec<AtomicNeighbourList<M_MAX0>>>,
     /// Map from node ID to index in `nodes` vec.
     id_to_idx: std::collections::HashMap<u64, usize>,
-    /// Entry point: node index with the highest layer.
-    entry_point: Option<usize>,
-    /// Maximum layer in the graph.
-    max_level: usize,
+    /// Lock-free entry point: packed `(level, idx)` in a single
+    /// `AtomicU64` with `u64::MAX` as the "empty index" sentinel.
+    /// Multiple inserts that land on novel max-layers race through
+    /// [`EntryPoint::try_promote`] (CAS-loop on a single atomic, max
+    /// two iterations under realistic contention — see
+    /// `arch/search/vector-parallel-insert.md` §"Layer-promotion
+    /// race"). Replaces the previous `(Option<usize>, usize)` pair
+    /// that was mutated under `&mut self` in the batch allocation
+    /// phase, the last serialisation point on the lock-free insert
+    /// path before this commit.
+    ///
+    /// Read at every search start (top→bottom layer iteration). Write
+    /// on the first insert and on every novel-max-layer promotion;
+    /// no-op CAS otherwise.
+    entry_point: EntryPoint,
     /// Inverse of ln(M) for level generation.
     level_mult: f64,
     /// SQ8 calibration parameters. `None` until calibration_threshold vectors
@@ -378,8 +397,10 @@ impl HnswIndex {
             nodes: Vec::with_capacity(capacity),
             neighbours_atomic: Vec::with_capacity(capacity),
             id_to_idx,
-            entry_point: None,
-            max_level: 0,
+            entry_point: EntryPoint::new(),
+            // max_level is derived from entry_point.load() at every
+            // search start (top→bottom layer iteration). No separate
+            // field — the packed AtomicU64 carries it.
             level_mult,
             sq8_params: None,
             visited_pool: VisitedPool::new(),
@@ -634,20 +655,21 @@ impl HnswIndex {
     pub(crate) fn compute_insert_plan(&self, id: u64, vector: &[f32]) -> InsertPlan {
         let new_level = self.random_level();
 
-        // First-node fast path: no graph traversal possible, plan records
-        // empty neighbour sets so apply just pushes the seed node.
-        if self.nodes.is_empty() {
+        // EntryPoint stays empty until the first insert lands —
+        // `for_search()` returning None is the first-node fast path:
+        // no graph traversal possible, plan records empty neighbour
+        // sets so apply just pushes the seed node. Otherwise the
+        // single-load snapshot gives `(start_idx, top_level)` from
+        // ONE atomic read.
+        let Some((start_idx, top_level)) = self.entry_point.for_search() else {
             return InsertPlan {
                 id,
                 new_level,
                 per_layer: Vec::new(),
                 is_first_node: true,
             };
-        }
-
-        let ep_idx = self.entry_point.unwrap_or(0);
-        let mut current_ep = ep_idx;
-        let top_level = self.max_level;
+        };
+        let mut current_ep = start_idx;
 
         // Phase 1: greedy descent down to new_level + 1.
         for level in (new_level + 1..=top_level).rev() {
@@ -724,8 +746,10 @@ impl HnswIndex {
         self.neighbours_atomic.push(atomic_layers);
 
         if is_first_node {
-            self.entry_point = Some(idx);
-            self.max_level = new_level;
+            // First insert seeds the entry-point. try_promote on a
+            // fresh EntryPoint always succeeds — no other writer
+            // has touched it yet, and we're holding &mut self.
+            let _ = self.entry_point.try_promote(new_level as u8, idx as u64);
             self.maybe_calibrate_and_offload(idx);
             return;
         }
@@ -749,11 +773,12 @@ impl HnswIndex {
             }
         }
 
-        // Promote the new node to entry point if it pierced a new top layer.
-        if new_level > self.max_level {
-            self.max_level = new_level;
-            self.entry_point = Some(idx);
-        }
+        // Promote the new node to entry-point if it pierced a new top
+        // layer. CAS-loop returns `NotNeeded` when another insert has
+        // already promoted past us (possible from a concurrent batch
+        // arriving at try_promote first); in that case we leave the
+        // existing higher-layer entry-point alone.
+        let _ = self.entry_point.try_promote(new_level as u8, idx as u64);
 
         // SQ8 calibrate + offload happens after the topology is in place
         // so search_layer can use f32 for the just-inserted node.
@@ -806,16 +831,18 @@ impl HnswIndex {
             }
             self.neighbours_atomic.push(atomic_layers);
 
-            // Entry-point / max_level promotion runs in the serial phase
-            // so parallel writers below see a consistent (entry_point,
-            // max_level) — no CAS required.
-            if self.nodes.len() == 1 {
-                self.entry_point = Some(idx);
-                self.max_level = new_level;
-            } else if new_level > self.max_level {
-                self.max_level = new_level;
-                self.entry_point = Some(idx);
-            }
+            // Entry-point promotion through the lock-free CAS-loop.
+            // The first insert (`nodes.len() == 1`) hits an empty
+            // EntryPoint and unconditionally installs; every later
+            // plan only wins when its `new_level` strictly exceeds the
+            // current top. Either way the post-condition matches the
+            // arch doc's layer-promotion linearisability invariant:
+            // entry-point sits at the global max layer after the call
+            // returns. Still runs serially within this batch's
+            // allocation phase so the parallel writers below observe
+            // a consistent entry-point, but the primitive is now
+            // safe under cross-batch / cross-thread races too.
+            let _ = self.entry_point.try_promote(new_level as u8, idx as u64);
 
             allocated.push((plan, idx));
         }
@@ -943,20 +970,24 @@ impl HnswIndex {
     /// (dequantized) distances for candidate generation. The final top-K
     /// results are reranked using exact f32 distances.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
-        if self.is_empty() {
-            return Vec::new();
-        }
-
         // Cache query-side state once per search — for Cosine the query norm
         // would otherwise be recomputed on every distance call (hundreds of
         // times per level). Other metrics ignore the cached norm.
         let qctx = QueryCtx::new(query, self.config.metric);
 
-        let ep_idx = self.entry_point.unwrap_or(0);
-        let mut current_ep = ep_idx;
+        // Single-load entry-point snapshot — `for_search()` returns
+        // `(start_idx, top_level)` from ONE atomic read, so a
+        // concurrent `try_promote` cannot split idx and level into
+        // separate snapshots mid-search. The None branch IS the
+        // empty-index early-return (EntryPoint stays empty until
+        // the first insert lands).
+        let Some((start_idx, top_level)) = self.entry_point.for_search() else {
+            return Vec::new();
+        };
+        let mut current_ep = start_idx;
 
         // Traverse from top to layer 1 (greedy)
-        for level in (1..=self.max_level).rev() {
+        for level in (1..=top_level).rev() {
             current_ep = self.search_layer_greedy_query(query, current_ep, level);
         }
 
@@ -1039,18 +1070,18 @@ impl HnswIndex {
             ..Default::default()
         };
 
-        if self.is_empty() {
-            return (Vec::new(), stats);
-        }
-
         // Cache query-side state once per search — same rationale as `search`.
         let qctx = QueryCtx::new(query, self.config.metric);
 
-        let ep_idx = self.entry_point.unwrap_or(0);
-        let mut current_ep = ep_idx;
+        // Single-load entry-point snapshot doubles as the empty-index
+        // guard — see `search` above for the consistency rationale.
+        let Some((start_idx, top_level)) = self.entry_point.for_search() else {
+            return (Vec::new(), stats);
+        };
+        let mut current_ep = start_idx;
 
         // Traverse from top to layer 1 (greedy)
-        for level in (1..=self.max_level).rev() {
+        for level in (1..=top_level).rev() {
             current_ep = self.search_layer_greedy_ctx(&qctx, current_ep, level);
         }
 
@@ -1133,16 +1164,16 @@ impl HnswIndex {
             return self.search(query, k);
         }
 
-        if self.is_empty() {
-            return Vec::new();
-        }
-
         let qctx = QueryCtx::new(query, self.config.metric);
 
-        let ep_idx = self.entry_point.unwrap_or(0);
-        let mut current_ep = ep_idx;
+        // Single-load entry-point snapshot doubles as the empty-index
+        // guard — see `search` above for the consistency rationale.
+        let Some((start_idx, top_level)) = self.entry_point.for_search() else {
+            return Vec::new();
+        };
+        let mut current_ep = start_idx;
 
-        for level in (1..=self.max_level).rev() {
+        for level in (1..=top_level).rev() {
             current_ep = self.search_layer_greedy_ctx(&qctx, current_ep, level);
         }
 
@@ -1219,16 +1250,16 @@ impl HnswIndex {
             ..Default::default()
         };
 
-        if self.is_empty() {
-            return (Vec::new(), stats);
-        }
-
         let qctx = QueryCtx::new(query, self.config.metric);
 
-        let ep_idx = self.entry_point.unwrap_or(0);
-        let mut current_ep = ep_idx;
+        // Single-load entry-point snapshot doubles as the empty-index
+        // guard — see `search` above for the consistency rationale.
+        let Some((start_idx, top_level)) = self.entry_point.for_search() else {
+            return (Vec::new(), stats);
+        };
+        let mut current_ep = start_idx;
 
-        for level in (1..=self.max_level).rev() {
+        for level in (1..=top_level).rev() {
             current_ep = self.search_layer_greedy_ctx(&qctx, current_ep, level);
         }
 
@@ -1350,19 +1381,26 @@ impl HnswIndex {
 
         // Choose entry point: if the current entry_point IS this node, use any
         // other node (the graph is connected, so any peer suffices).
-        let ep_idx = if self.entry_point == Some(idx) {
-            // Find first node that is not `idx`.
-            self.id_to_idx
-                .values()
-                .find(|&&i| i != idx)
-                .copied()
-                .unwrap_or(0)
-        } else {
-            self.entry_point.unwrap_or(0)
+        // Single load: top_level and ep idx come from one snapshot.
+        let (ep_idx, top_level) = match self.entry_point.for_search() {
+            Some((ep, lvl)) if ep == idx => {
+                // Self is the entry-point — pick any peer.
+                let peer = self
+                    .id_to_idx
+                    .values()
+                    .find(|&&i| i != idx)
+                    .copied()
+                    .unwrap_or(0);
+                (peer, lvl)
+            }
+            Some((ep, lvl)) => (ep, lvl),
+            // Empty index — preserved by the prior `nodes[idx]` access
+            // which would have panicked already if the graph was empty.
+            // Defensive fallback so the function is total.
+            None => (0, 0),
         };
 
         let node_level = self.nodes[idx].max_layer;
-        let top_level = self.max_level;
         let mut current_ep = ep_idx;
 
         // Phase 1: Greedy descent from top layer down to node_level+1.
