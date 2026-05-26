@@ -302,6 +302,32 @@ pub struct Database {
     _ttl_reaper_handle: Option<coordinode_query::index::ttl_reaper::TtlReaperHandle>,
 }
 
+/// Per-call read/write semantics for a single Cypher query.
+///
+/// Built once at the entry point of every `execute_cypher_*` method
+/// from the Database's session defaults plus any one-shot overrides
+/// the caller supplied (e.g. gRPC `ReadConcern` / `WriteConcern` on
+/// the wire). Passed by reference into `execute_cypher_impl`, which
+/// reads its values instead of mutating `self.*` to install them
+/// for the duration of the call.
+///
+/// Owning the per-call values in a small struct here serves the
+/// concurrency story: as the impl path stops touching `&mut self`
+/// for concerns/consistency, the lock granularity at the gRPC
+/// service layer can shrink from "one Database mutex per request"
+/// to "Database held shared, only the actual write-paths take an
+/// exclusive lock".
+#[derive(Debug, Clone)]
+struct QuerySession {
+    read_concern: coordinode_core::txn::read_concern::ReadConcernLevel,
+    /// One-shot snapshot timestamp consumed by this query (already
+    /// taken out of `Database.snapshot_read_ts` when the session
+    /// was captured).
+    snapshot_read_ts: Option<u64>,
+    write_concern: coordinode_core::txn::write_concern::WriteConcern,
+    vector_consistency: VectorConsistencyMode,
+}
+
 /// Error from embedded database operations.
 #[derive(Debug, thiserror::Error)]
 pub enum DatabaseError {
@@ -807,6 +833,19 @@ impl Database {
         registry
     }
 
+    /// Snapshot the current session defaults into a [`QuerySession`].
+    ///
+    /// Consumes any one-shot `snapshot_read_ts` so a second query in
+    /// the same session sees the default (latest) read timestamp.
+    fn capture_session(&mut self) -> QuerySession {
+        QuerySession {
+            read_concern: self.read_concern,
+            snapshot_read_ts: self.snapshot_read_ts.take(),
+            write_concern: self.write_concern.clone(),
+            vector_consistency: self.vector_consistency,
+        }
+    }
+
     /// Execute a Cypher query with source location context.
     ///
     /// Same as `execute_cypher()` but also records the source call site
@@ -816,7 +855,8 @@ impl Database {
         query: &str,
         source: &SourceContext,
     ) -> Result<Vec<Row>, DatabaseError> {
-        self.execute_cypher_impl(query, Some(source), None)
+        let session = self.capture_session();
+        self.execute_cypher_impl(query, Some(source), None, &session)
             .map(|(rows, _)| rows)
     }
 
@@ -835,7 +875,8 @@ impl Database {
         } else {
             Some(params)
         };
-        self.execute_cypher_impl(query, Some(source), params)
+        let session = self.capture_session();
+        self.execute_cypher_impl(query, Some(source), params, &session)
             .map(|(rows, _)| rows)
     }
 
@@ -844,7 +885,8 @@ impl Database {
     /// Automatically tracks query fingerprint and execution time in the
     /// query advisor registry for performance analysis.
     pub fn execute_cypher(&mut self, query: &str) -> Result<Vec<Row>, DatabaseError> {
-        self.execute_cypher_impl(query, None, None)
+        let session = self.capture_session();
+        self.execute_cypher_impl(query, None, None, &session)
             .map(|(rows, _)| rows)
     }
 
@@ -862,7 +904,8 @@ impl Database {
         } else {
             Some(params)
         };
-        self.execute_cypher_impl(query, None, params)
+        let session = self.capture_session();
+        self.execute_cypher_impl(query, None, params, &session)
             .map(|(rows, _)| rows)
     }
 
@@ -874,8 +917,9 @@ impl Database {
     /// returns [`CypherResult`] with [`WriteStats`] so gRPC `QueryStats` can
     /// surface real mutation counts instead of hardcoded zeros.
     ///
-    /// `read_concern` and `write_concern` are one-shot overrides: prior
-    /// session-level values are restored on exit.
+    /// `read_concern` and `write_concern` are one-shot overrides
+    /// applied only to this call's [`QuerySession`]; session defaults
+    /// on the Database are not touched.
     pub fn execute_cypher_full(
         &mut self,
         query: &str,
@@ -884,27 +928,20 @@ impl Database {
         read_concern: Option<coordinode_core::txn::read_concern::ReadConcern>,
         write_concern: Option<coordinode_core::txn::write_concern::WriteConcern>,
     ) -> Result<CypherResult, DatabaseError> {
-        let prev_read_level = self.read_concern;
-        let prev_write_concern = self.write_concern.clone();
-
+        let mut session = self.capture_session();
         if let Some(ref rc) = read_concern {
             rc.validate()
                 .map_err(|e| DatabaseError::Semantic(e.to_string()))?;
-            self.read_concern = rc.level;
-            self.snapshot_read_ts = rc.at_timestamp;
+            session.read_concern = rc.level;
+            session.snapshot_read_ts = rc.at_timestamp;
         }
         if let Some(ref wc) = write_concern {
-            self.write_concern = wc.clone();
+            session.write_concern = wc.clone();
         }
 
         let params = params.and_then(|p| if p.is_empty() { None } else { Some(p) });
-        let result = self.execute_cypher_impl(query, source, params);
-
-        self.read_concern = prev_read_level;
-        self.write_concern = prev_write_concern;
-        self.snapshot_read_ts = None;
-
-        result.map(|(rows, write_stats)| CypherResult { rows, write_stats })
+        self.execute_cypher_impl(query, source, params, &session)
+            .map(|(rows, write_stats)| CypherResult { rows, write_stats })
     }
 
     /// Set session-level vector consistency mode.
@@ -968,17 +1005,12 @@ impl Database {
             .validate()
             .map_err(|e| DatabaseError::Semantic(e.to_string()))?;
 
-        let prev_level = self.read_concern;
-        self.read_concern = read_concern.level;
-        self.snapshot_read_ts = read_concern.at_timestamp;
+        let mut session = self.capture_session();
+        session.read_concern = read_concern.level;
+        session.snapshot_read_ts = read_concern.at_timestamp;
 
-        let result = self.execute_cypher_impl(query, None, None).map(|(r, _)| r);
-
-        // Restore session level (one-shot override)
-        self.read_concern = prev_level;
-        self.snapshot_read_ts = None;
-
-        result
+        self.execute_cypher_impl(query, None, None, &session)
+            .map(|(r, _)| r)
     }
 
     fn execute_cypher_impl(
@@ -986,6 +1018,7 @@ impl Database {
         query: &str,
         source: Option<&SourceContext>,
         params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
+        session: &QuerySession,
     ) -> Result<(Vec<Row>, WriteStats), DatabaseError> {
         // Handle session SET commands before parsing as regular Cypher.
         // Pattern: SET vector_consistency = 'mode'
@@ -1012,8 +1045,8 @@ impl Database {
         }
 
         let mut plan = planner::build_logical_plan(&ast)?;
-        // Inject session-level vector consistency into the plan for EXPLAIN output.
-        plan.vector_consistency = self.vector_consistency;
+        // Inject the per-call vector consistency into the plan for EXPLAIN output.
+        plan.vector_consistency = session.vector_consistency;
 
         // Apply index selection optimizer: rewrite Filter(NodeScan) → IndexScan
         // when a matching B-tree index is registered.
@@ -1056,10 +1089,11 @@ impl Database {
         //   and Linearizable use Raft commit_index / lease check.
         // - Snapshot with at_timestamp: pin to explicit MVCC timestamp.
         use coordinode_core::txn::read_concern::ReadConcernLevel;
-        let read_ts = if self.read_concern == ReadConcernLevel::Snapshot {
-            // Check for one-shot read concern with explicit timestamp
-            // (set via execute_cypher_with_read_concern)
-            if let Some(ts) = self.snapshot_read_ts.take() {
+        let read_ts = if session.read_concern == ReadConcernLevel::Snapshot {
+            // One-shot snapshot read; already captured into the
+            // session (Database.snapshot_read_ts was taken when
+            // the session was built).
+            if let Some(ts) = session.snapshot_read_ts {
                 Timestamp::from_raw(ts)
             } else {
                 self.oracle.next()
@@ -1105,13 +1139,13 @@ impl Database {
             }),
             mvcc_write_buffer: std::collections::HashMap::new(),
             occ_scope: None,
-            vector_consistency: self.vector_consistency,
+            vector_consistency: session.vector_consistency,
             vector_overfetch_factor: 1.2,
             vector_mvcc_stats: None,
             proposal_pipeline: Some(&pipeline),
             proposal_id_gen: Some(&self.proposal_id_gen),
-            read_concern: self.read_concern,
-            write_concern: self.write_concern.clone(),
+            read_concern: session.read_concern,
+            write_concern: session.write_concern.clone(),
             drain_buffer: Some(&self.drain_buffer),
             nvme_write_buffer: self.nvme_write_buffer.as_deref(),
             merge_adj_adds: std::collections::HashMap::new(),
