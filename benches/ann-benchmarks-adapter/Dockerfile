@@ -52,6 +52,17 @@ RUN pip install --no-cache-dir -r /home/app/requirements.txt
 
 COPY *.whl /tmp/wheels/
 
+# Bake the adapter module into the image at the location ann-benchmarks
+# expects when it instantiates the algorithm inside a spawned bench
+# container. The orchestrator script stages module.py, __init__.py
+# (and config.yml, alongside) next to this Dockerfile before
+# `docker build`; we copy them into
+# `/home/app/ann_benchmarks/algorithms/coordinode/` so the in-container
+# `importlib.import_module("ann_benchmarks.algorithms.coordinode.module")`
+# in `runner.py:instantiate_algorithm` resolves cleanly.
+COPY module.py /home/app/ann_benchmarks/algorithms/coordinode/module.py
+COPY __init__.py /home/app/ann_benchmarks/algorithms/coordinode/__init__.py
+
 RUN if [ -n "$PYPI_VERSION" ]; then \
       echo "Installing coordinode-embedded==${PYPI_VERSION} from PyPI"; \
       pip install --no-cache-dir "coordinode-embedded==${PYPI_VERSION}"; \
