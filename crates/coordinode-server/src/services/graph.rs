@@ -114,10 +114,19 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         // with the target id, which is the correct way to filter by internal node ID.
         // `RETURN *` copies ALL columns from NodeScan: `n`, `n.__label__`, `n.<prop>`.
         // An explicit `RETURN n, n.__label__` would strip `n.*` properties in the Project step.
+        // get_node is read-only — shared lock lets parallel reads
+        // proceed without blocking on each other.
         let rows = {
-            let mut db = self.database.write();
-            db.execute_cypher_with_params("MATCH (n) WHERE n = $id RETURN *", params)
-                .map_err(|e| db_err_to_status("get_node", e))?
+            let db = self.database.read();
+            db.execute_cypher_shared(
+                "MATCH (n) WHERE n = $id RETURN *",
+                Some(params),
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| db_err_to_status("get_node", e))?
+            .rows
         };
 
         let row = rows
@@ -287,10 +296,12 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             )
         };
 
+        // Traversal is read-only — shared lock for parallel reads.
         let rows = {
-            let mut db = self.database.write();
-            db.execute_cypher_with_params(&cypher, params)
+            let db = self.database.read();
+            db.execute_cypher_shared(&cypher, Some(params), None, None, None)
                 .map_err(|e| db_err_to_status("traverse", e))?
+                .rows
         };
 
         let nodes: Vec<graph::Node> = rows

@@ -135,10 +135,13 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         let mut params = std::collections::HashMap::new();
         params.insert("qv".to_string(), Value::Vector(query_vector.values.clone()));
 
+        // Shared read access: vector search is read-only and benefits
+        // from running in parallel with other queries.
         let rows = {
-            let mut db = self.database.write();
-            db.execute_cypher_with_params(&cypher, params)
+            let db = self.database.read();
+            db.execute_cypher_shared(&cypher, Some(params), None, None, None)
                 .map_err(|e| db_err_to_status("vector search", e))?
+                .rows
         };
 
         let results: Vec<query::VectorResult> =
@@ -191,10 +194,13 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         params.insert("start_id".to_string(), Value::Int(start_node_id as i64));
         params.insert("qv".to_string(), Value::Vector(query_vector.values.clone()));
 
+        // Hybrid search is read-only — take the shared read lock so
+        // concurrent search requests run in parallel.
         let rows = {
-            let mut db = self.database.write();
-            db.execute_cypher_with_params(&cypher, params)
+            let db = self.database.read();
+            db.execute_cypher_shared(&cypher, Some(params), None, None, None)
                 .map_err(|e| db_err_to_status("hybrid search", e))?
+                .rows
         };
 
         let results: Vec<query::VectorResult> =
