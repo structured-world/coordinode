@@ -110,7 +110,7 @@ echo "===> staged adapter to $ADAPTER_DST"
 # 5. ann-benchmarks runtime cwd: symlink the read-only ANNB_ROOT bits
 #    we need (ann_benchmarks/, data/, run.py, .venv) into $ANNB_CWD,
 #    then `cd $ANNB_CWD` so `results/` is the one writable mount.
-for name in ann_benchmarks data run.py .venv; do
+for name in ann_benchmarks data run.py .venv logging.conf; do
   ln -sfn "$ANNB_ROOT/$name" "$ANNB_CWD/$name"
 done
 
