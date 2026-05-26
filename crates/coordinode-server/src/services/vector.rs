@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+// no-std: spin::RwLock (drop-in).
+use parking_lot::RwLock;
 
 use tonic::{Request, Response, Status};
 
@@ -83,11 +86,11 @@ fn row_to_vector_result(
 }
 
 pub struct VectorServiceImpl {
-    database: Arc<Mutex<Database>>,
+    database: Arc<RwLock<Database>>,
 }
 
 impl VectorServiceImpl {
-    pub fn new(database: Arc<Mutex<Database>>) -> Self {
+    pub fn new(database: Arc<RwLock<Database>>) -> Self {
         Self { database }
     }
 }
@@ -133,7 +136,7 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         params.insert("qv".to_string(), Value::Vector(query_vector.values.clone()));
 
         let rows = {
-            let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
+            let mut db = self.database.write();
             db.execute_cypher_with_params(&cypher, params)
                 .map_err(|e| db_err_to_status("vector search", e))?
         };
@@ -189,7 +192,7 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         params.insert("qv".to_string(), Value::Vector(query_vector.values.clone()));
 
         let rows = {
-            let mut db = self.database.lock().unwrap_or_else(|e| e.into_inner());
+            let mut db = self.database.write();
             db.execute_cypher_with_params(&cypher, params)
                 .map_err(|e| db_err_to_status("hybrid search", e))?
         };
@@ -209,7 +212,7 @@ mod tests {
 
     fn test_service() -> (VectorServiceImpl, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let database = Arc::new(Mutex::new(
+        let database = Arc::new(RwLock::new(
             Database::open(dir.path()).expect("open database"),
         ));
         (VectorServiceImpl::new(database), dir)
@@ -287,7 +290,7 @@ mod tests {
 
         // Insert nodes with embeddings via Cypher (through the DB directly).
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (n:Vec {embedding: [1.0, 0.0, 0.0]})")
                 .expect("create node 1");
             db.execute_cypher("CREATE (n:Vec {embedding: [0.0, 1.0, 0.0]})")
@@ -334,7 +337,7 @@ mod tests {
     async fn vector_search_result_node_has_well_formed_element_id() {
         let (svc, _dir) = test_service();
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (n:VecEid {embedding: [1.0, 0.0, 0.0]})")
                 .expect("seed");
         }
@@ -401,7 +404,7 @@ mod tests {
         };
         database.create_vector_index("test_vec_idx", label, property, config);
 
-        let database = Arc::new(Mutex::new(database));
+        let database = Arc::new(RwLock::new(database));
         (VectorServiceImpl::new(database), dir)
     }
 
@@ -416,7 +419,7 @@ mod tests {
         // on_vector_written is called from the Cypher executor CREATE path,
         // which uses ctx.vector_index_registry to update the HNSW graph.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             for i in 0..20 {
                 let x = i as f64 / 20.0;
                 let cypher = format!("CREATE (n:Vec {{embedding: [{x}, 0.0, 0.0]}})");
@@ -476,7 +479,7 @@ mod tests {
 
         // Insert 10 nodes WITHOUT creating a vector index beforehand.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             for i in 0..10 {
                 let x = i as f64 / 10.0;
                 let cypher = format!("CREATE (n:NoIdx {{embedding: [{x}, 0.0, 0.0]}})");
@@ -520,7 +523,7 @@ mod tests {
         let (svc, _dir) = test_service();
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (n:PropTest {emb: [1.0, 0.0], score: 42})")
                 .expect("create node");
         }
@@ -579,7 +582,7 @@ mod tests {
 
         let start_id: u64;
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (h:Hub {name: 'hub'})")
                 .expect("hub");
             db.execute_cypher("CREATE (n:Member {name: 'alice', emb: [1.0, 0.0], rank: 7})")
@@ -654,7 +657,7 @@ mod tests {
 
         let start_id: u64;
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             // Hub
             db.execute_cypher("CREATE (h:HMetric {name: 'hub'})")
                 .expect("hub");
@@ -734,7 +737,7 @@ mod tests {
         let (svc, _dir) = test_service();
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (n:MetricTest {emb: [3.0, 0.0]})")
                 .expect("create node A");
             db.execute_cypher("CREATE (n:MetricTest {emb: [0.7, 0.7]})")
@@ -814,7 +817,7 @@ mod tests {
             .collect();
 
         for svc in [&svc_hnsw, &svc_brute] {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             for v in &vectors {
                 let cypher = format!(
                     "CREATE (n:Large {{vec: [{}, {}, {}, {}]}})",
@@ -918,7 +921,7 @@ mod tests {
         // 999 nodes — just below the 1000 threshold → always brute force.
         const N: usize = 999;
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             for i in 0..N {
                 let x = i as f64 / N as f64;
                 let cypher = format!("CREATE (n:Threshold {{v: [{x}, 0.0]}})");
@@ -965,7 +968,7 @@ mod tests {
         // Embeddings spread along the X axis so distances are predictable.
         const N_PERSONS: usize = 1100;
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (s:BigHub {name: 'hub'})")
                 .expect("create hub");
 
@@ -989,7 +992,7 @@ mod tests {
 
         // Get start_node_id.
         let start_id = {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             let rows = db
                 .execute_cypher("MATCH (s:BigHub {name: 'hub'}) RETURN s")
                 .expect("get hub id");
@@ -1065,7 +1068,7 @@ mod tests {
         // p3: embedding [0.0, 0.0, 1.0]
         // p4: embedding [0.5, 0.5, 0.0]
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (s:Hub {name: 'start'})")
                 .expect("create start");
             db.execute_cypher("CREATE (n:Person {name: 'p0', embedding: [1.0, 0.0, 0.0]})")
@@ -1091,7 +1094,7 @@ mod tests {
 
         // Get start_node_id via a Cypher query.
         let start_id = {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             let rows = db
                 .execute_cypher("MATCH (s:Hub {name: 'start'}) RETURN s")
                 .expect("get start id");
@@ -1144,7 +1147,7 @@ mod tests {
 
         // Create nodes under a DIFFERENT label — the query should find nothing.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (n:Other {embedding: [1.0, 0.0, 0.0]})")
                 .expect("create");
         }
@@ -1177,7 +1180,7 @@ mod tests {
 
         // Only 3 nodes in the dataset.
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (n:Small {v: [1.0, 0.0]})")
                 .expect("n1");
             db.execute_cypher("CREATE (n:Small {v: [0.0, 1.0]})")
@@ -1226,7 +1229,7 @@ mod tests {
             .collect();
 
         for svc in [&svc_hnsw, &svc_brute] {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             for v in &vectors {
                 let cypher = format!(
                     "CREATE (n:Item {{vec: [{}, {}, {}, {}]}})",

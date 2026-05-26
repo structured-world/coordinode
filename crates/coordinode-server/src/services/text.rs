@@ -12,7 +12,10 @@
 //! This service operates on the local node's index only — correct for CE.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+// no-std: spin::RwLock (drop-in).
+use parking_lot::RwLock;
 
 use tonic::{Request, Response, Status};
 
@@ -26,11 +29,11 @@ const DEFAULT_TEXT_LIMIT: usize = 10;
 const MAX_TEXT_LIMIT: usize = 1000;
 
 pub struct TextServiceImpl {
-    database: Arc<Mutex<Database>>,
+    database: Arc<RwLock<Database>>,
 }
 
 impl TextServiceImpl {
-    pub fn new(database: Arc<Mutex<Database>>) -> Self {
+    pub fn new(database: Arc<RwLock<Database>>) -> Self {
         Self { database }
     }
 }
@@ -66,10 +69,7 @@ impl query::text_service_server::TextService for TextServiceImpl {
             n => n,
         };
 
-        let db = self
-            .database
-            .lock()
-            .map_err(|_| Status::internal("database lock poisoned"))?;
+        let db = self.database.read();
 
         let registry = db.text_index_registry();
 
@@ -289,7 +289,7 @@ mod tests {
             .create_text_index("test_text_idx", label, property, TextIndexConfig::default())
             .expect("create text index");
 
-        let database = Arc::new(Mutex::new(database));
+        let database = Arc::new(RwLock::new(database));
         (TextServiceImpl::new(database), dir)
     }
 
@@ -355,7 +355,7 @@ mod tests {
         let (svc, _dir) = test_service_with_text_index("Article", "body");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher(
                 "CREATE (n:Article {body: 'Rust is a systems programming language for databases'})",
             )
@@ -408,7 +408,7 @@ mod tests {
         let (svc, _dir) = test_service_with_text_index("Doc", "content");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             for i in 0..10 {
                 let cypher = format!(
                     "CREATE (n:Doc {{content: 'the quick brown fox document number {i}'}})"
@@ -450,7 +450,7 @@ mod tests {
         let (svc, _dir) = test_service_with_text_index("Page", "body");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (n:Page {body: 'graph concepts and algorithms'})")
                 .expect("create page");
         }
@@ -492,7 +492,7 @@ mod tests {
         let (svc, _dir) = test_service_with_text_index("Note", "text");
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             // "graph" does not get stemmed by English Snowball → stored as "graph".
             db.execute_cypher("CREATE (n:Note {text: 'graph query concepts'})")
                 .expect("create note");
@@ -544,10 +544,10 @@ mod tests {
                 },
             )
             .expect("create ukrainian text index");
-        let svc = TextServiceImpl::new(Arc::new(Mutex::new(database)));
+        let svc = TextServiceImpl::new(Arc::new(RwLock::new(database)));
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             db.execute_cypher("CREATE (n:UkArticle {body: 'книга про програмування мовою Rust'})")
                 .expect("create article 1");
             db.execute_cypher("CREATE (n:UkArticle {body: 'рецепти приготування їжі на кухні'})")
@@ -601,10 +601,10 @@ mod tests {
         database
             .create_text_index("idx_body", "Post", "body", TextIndexConfig::default())
             .expect("create body index");
-        let svc = TextServiceImpl::new(Arc::new(Mutex::new(database)));
+        let svc = TextServiceImpl::new(Arc::new(RwLock::new(database)));
 
         {
-            let mut db = svc.database.lock().unwrap();
+            let mut db = svc.database.write();
             // node 1: "database" in title only
             db.execute_cypher(
                 "CREATE (n:Post {title: 'Introduction to database systems', body: 'general overview'})",
