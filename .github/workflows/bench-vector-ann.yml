@@ -46,6 +46,8 @@ jobs:
       - name: Sync /opt/coordinode to this SHA + run ann-benchmarks + push results
         run: |
           set -euo pipefail
+          # See bench-vdbbench.yml for the safe.directory rationale.
+          git config --global --add safe.directory /opt/coordinode
           cd /opt/coordinode
           git fetch origin main
           git checkout "$GITHUB_SHA"
