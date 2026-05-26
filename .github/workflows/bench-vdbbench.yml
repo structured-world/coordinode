@@ -50,6 +50,11 @@ jobs:
       - name: Sync /opt/coordinode to this SHA + run VDBBench + push results
         run: |
           set -euo pipefail
+          # `/opt/coordinode` is owned by the operator who set up the
+          # bench host; the GHA runner runs under a different user.
+          # Git ≥ 2.36 refuses to operate on such trees unless they
+          # are marked safe — declare it once per job (idempotent).
+          git config --global --add safe.directory /opt/coordinode
           cd /opt/coordinode
           git fetch origin main
           git checkout "$GITHUB_SHA"
