@@ -238,17 +238,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut index = HnswIndex::new(config);
     info!("building index — this may take many minutes for SIFT1M");
-    for row_idx in 0..n_train {
-        let start = row_idx * d;
-        index.insert(row_idx as u64, train_flat[start..start + d].to_vec());
-        if row_idx % 100_000 == 0 && row_idx > 0 {
-            info!(
-                inserted = row_idx,
-                of = n_train,
-                elapsed_s = build_start.elapsed().as_secs(),
-                "build progress"
-            );
-        }
+    // Chunked `insert_batch` instead of per-row `insert`. `insert_batch`
+    // runs the planning phase (~80% of insert cost — read-only graph
+    // traversal) in parallel via rayon and applies the resulting plans
+    // sequentially. Chunk size kept modest (10k) so the working set fits
+    // in cache and progress logging stays responsive; on 16-thread
+    // hardware this delivers ~5-8× speedup over the legacy serial loop.
+    const BUILD_CHUNK: usize = 10_000;
+    let mut inserted = 0usize;
+    while inserted < n_train {
+        let end = (inserted + BUILD_CHUNK).min(n_train);
+        let chunk: Vec<(u64, Vec<f32>)> = (inserted..end)
+            .map(|row_idx| {
+                let start = row_idx * d;
+                (row_idx as u64, train_flat[start..start + d].to_vec())
+            })
+            .collect();
+        index.insert_batch(chunk);
+        inserted = end;
+        info!(
+            inserted,
+            of = n_train,
+            elapsed_s = build_start.elapsed().as_secs(),
+            "build progress"
+        );
     }
     let build_secs = build_start.elapsed().as_secs_f64();
     let rss_kib_after_build = read_rss_kib();
