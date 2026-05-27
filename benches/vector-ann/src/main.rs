@@ -40,7 +40,7 @@ use std::time::Instant;
 use clap::Parser;
 use coordinode_bench::BenchReport;
 use coordinode_core::graph::types::VectorMetric;
-use coordinode_vector::hnsw::{HnswConfig, HnswIndex};
+use coordinode_vector::hnsw::{HnswConfig, HnswIndex, QuantizationCodec};
 use serde::Serialize;
 use tracing::info;
 
@@ -121,6 +121,13 @@ struct Args {
     /// Comma-separated ef_search sweep values (overrides default).
     #[arg(long)]
     ef_sweep: Option<String>,
+
+    /// In-RAM quantization codec: `none` (f32), `sq8`, or `rabitq`.
+    /// `rabitq` requires a cosine / angular dataset — on `-euclidean`
+    /// data the kernel currently falls back to f32 (the polarisation
+    /// identity for L2 is a follow-up). Default: `none`.
+    #[arg(long, default_value = "none")]
+    quantization: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -208,6 +215,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rss_kib_before_build = read_rss_kib();
     let build_start = Instant::now();
     let m_max0 = args.m * 2;
+    let quantization = match args.quantization.as_str() {
+        "none" => QuantizationCodec::None,
+        "sq8" => QuantizationCodec::Sq8,
+        "rabitq" => QuantizationCodec::RaBitQ { bits: 1 },
+        other => {
+            return Err(format!(
+                "--quantization: expected `none`, `sq8`, or `rabitq`, got `{other}`"
+            )
+            .into())
+        }
+    };
     let config = HnswConfig {
         m: args.m,
         m_max0,
@@ -215,6 +233,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ef_search: sweep[0],
         metric,
         max_dimensions: d as u32,
+        quantization,
         ..Default::default()
     };
     let mut index = HnswIndex::new(config);
@@ -268,6 +287,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     report.record("hnsw_m", args.m)?;
     report.record("hnsw_ef_construction", args.ef_construction)?;
+    report.record("quantization", args.quantization.clone())?;
     report.record("build_secs", build_secs)?;
     if let Some(rss) = rss_kib_before_build {
         report.record("rss_kib_before_build", rss)?;
