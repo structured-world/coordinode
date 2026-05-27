@@ -380,4 +380,44 @@ mod tests {
     fn calibrate_rejects_non_64_aligned_dims() {
         let _ = RaBitQParams::calibrate(100, 0);
     }
+
+    #[test]
+    fn params_serde_round_trip_preserves_rotation_and_codes() {
+        // The rotation matrix is durable index state — on segment reload we
+        // serialise it, hand it back via `HnswIndex::set_rabitq_params`, and
+        // re-encoded vectors must match the codes that were on disk. Verify
+        // the full cycle: encode → serialise params → deserialise → re-encode
+        // the same vector → bit-identical code.
+        let dims = 128u32;
+        let seed = 0xFEED_FACEu64;
+        let params = RaBitQParams::calibrate(dims, seed);
+        let v: Vec<f32> = (0..dims as usize)
+            .map(|i| ((i as f32) * 0.13).sin())
+            .collect();
+        let code_before = params.encode(&v);
+
+        let bytes = rmp_serde::to_vec(&params).expect("serialise params");
+        let params2: RaBitQParams = rmp_serde::from_slice(&bytes).expect("deserialise params");
+        assert_eq!(params2.dims(), dims);
+        assert_eq!(params2.seed(), seed);
+
+        let code_after = params2.encode(&v);
+        assert_eq!(
+            code_before, code_after,
+            "round-tripped params must encode identically"
+        );
+    }
+
+    #[test]
+    fn code_serde_round_trip_is_bit_identical() {
+        // Codes live on disk too (in-RAM index ↔ persisted segment). Verify
+        // a (de)serialise cycle round-trips the bit-string + scalars exactly.
+        let params = RaBitQParams::calibrate(256, 7);
+        let v: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.05).cos()).collect();
+        let code = params.encode(&v);
+
+        let bytes = rmp_serde::to_vec(&code).expect("serialise code");
+        let code2: RaBitQCode = rmp_serde::from_slice(&bytes).expect("deserialise code");
+        assert_eq!(code, code2);
+    }
 }
