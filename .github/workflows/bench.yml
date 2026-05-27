@@ -58,7 +58,11 @@ jobs:
     timeout-minutes: 180
 
     env:
-      DATASET_ROOT: <bench-data-root>/datasets
+      # Dataset root path is provided via GH Actions repo variable
+      # `BENCH_DATASET_ROOT` so the actual on-runner path is not
+      # encoded in this public workflow. Set it under repo Settings →
+      # Secrets and variables → Actions → Variables.
+      DATASET_ROOT: ${{ vars.BENCH_DATASET_ROOT }}
 
     steps:
       - name: Checkout
