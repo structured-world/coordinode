@@ -42,6 +42,10 @@ harness = false
 name = "hnsw_batch_insert"
 harness = false
 
+[[bench]]
+name = "rabitq_kernel"
+harness = false
+
 # Cannot use workspace lints because SIMD intrinsics require unsafe.
 # This is the ONLY crate with unsafe_code = "allow".
 # All SIMD functions have scalar fallbacks and use runtime feature detection.
