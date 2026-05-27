@@ -490,6 +490,21 @@ impl HnswIndex {
         self.config.offload_vectors && self.is_quantized()
     }
 
+    /// Manually set RaBitQ calibration parameters (e.g., from a saved
+    /// index). Encodes every existing node against the provided rotation,
+    /// overwriting any prior code. Required on segment reload: the rotation
+    /// matrix is part of the durable index — auto-calibrating on reload
+    /// would pick a different `R` and produce codes incomparable with the
+    /// ones already on disk.
+    pub fn set_rabitq_params(&mut self, params: RaBitQParams) {
+        for node in &mut self.nodes {
+            if let Some(ref v) = node.vector {
+                node.rabitq_code = Some(params.encode(v));
+            }
+        }
+        self.rabitq_params = Some(params);
+    }
+
     /// Manually set SQ8 calibration parameters (e.g., from a saved index).
     /// Quantizes all existing nodes that don't have quantized vectors yet.
     /// If `offload_vectors` is enabled, drops f32 after quantizing.
@@ -2711,6 +2726,67 @@ mod tests {
             recall >= 0.1,
             "RaBitQ recall {recall} below the wired-up sanity floor (0.1)",
         );
+    }
+
+    #[test]
+    fn set_rabitq_params_re_encodes_existing_nodes() {
+        // Simulates the segment-reload path: an index opens with no RaBitQ
+        // params (no calibration has run yet because the caller will inject
+        // the persisted params explicitly), then `set_rabitq_params` is
+        // called with the durable rotation matrix. Every existing node must
+        // come out with an encoded code matching what the saved rotation
+        // would have produced.
+        let dim = 64usize;
+        let n = 12usize;
+
+        let mut index = HnswIndex::new(HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 32,
+            ef_search: 16,
+            metric: VectorMetric::Cosine,
+            max_dimensions: dim as u32,
+            quantization: QuantizationCodec::RaBitQ { bits: 1 },
+            // Threshold above n so auto-calibration does NOT fire during inserts.
+            calibration_threshold: 10_000,
+            offload_vectors: false,
+            ..Default::default()
+        });
+
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|i| {
+                let raw: Vec<f32> = (0..dim)
+                    .map(|d| ((i * d + 3) as f32 * 0.07).sin())
+                    .collect();
+                let norm = metrics::norm_l2(&raw).max(f32::EPSILON);
+                raw.into_iter().map(|x| x / norm).collect()
+            })
+            .collect();
+        for (i, v) in vectors.iter().enumerate() {
+            index.insert(i as u64, v.clone());
+        }
+        assert!(
+            index.rabitq_params().is_none(),
+            "no auto-calibration expected"
+        );
+
+        // Inject persisted params (here freshly built; in production these
+        // would be loaded from disk alongside the segment).
+        let persisted = RaBitQParams::calibrate(dim as u32, 0xDEAD_BEEF);
+        index.set_rabitq_params(persisted.clone());
+
+        assert!(index.is_rabitq_active());
+        // Every node must now carry an encoded code, and that code must
+        // match the persisted rotation's encoding of its f32 vector.
+        for (i, node) in index.nodes.iter().enumerate() {
+            assert!(
+                node.rabitq_code.is_some(),
+                "node {i} missing rabitq code after set_rabitq_params"
+            );
+            let code = node.rabitq_code.as_ref().expect("checked is_some above");
+            let expected = persisted.encode(node.vector.as_ref().expect("f32 retained"));
+            assert_eq!(*code, expected, "node {i} code mismatch after reload");
+        }
     }
 
     #[test]
