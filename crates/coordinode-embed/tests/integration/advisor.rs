@@ -394,7 +394,7 @@ fn explain_suggest_skips_knn_suggestion_when_index_exists() {
             metric: VectorMetric::L2,
             m: 16,
             ef_construction: 200,
-            quantization: false,
+            quantization: coordinode_vector::hnsw::QuantizationCodec::None,
             offload_vectors: false,
         },
     );
@@ -436,7 +436,7 @@ fn explain_suggest_suggests_for_different_property_when_one_indexed() {
             metric: VectorMetric::L2,
             m: 16,
             ef_construction: 200,
-            quantization: false,
+            quantization: coordinode_vector::hnsw::QuantizationCodec::None,
             offload_vectors: false,
         },
     );

@@ -103,7 +103,11 @@ impl<'a> coordinode_core::graph::stats::StorageStats for CombinedStats<'a> {
         let def = self.vector.get_definition(label, property)?;
         let cfg = def.vector_config.as_ref()?;
         let base = cfg.m.max(8).saturating_mul(32);
-        let crossover = if cfg.quantization { base / 2 } else { base };
+        let crossover = if cfg.quantization.is_active() {
+            base / 2
+        } else {
+            base
+        };
         Some(crossover.clamp(64, 1024))
     }
 }
@@ -2894,7 +2898,7 @@ mod tests {
                 metric: coordinode_core::graph::types::VectorMetric::Cosine,
                 m: 12,
                 ef_construction: 200,
-                quantization: false,
+                quantization: coordinode_vector::hnsw::QuantizationCodec::None,
                 offload_vectors: false,
             },
         );
@@ -2949,7 +2953,7 @@ mod tests {
                 metric: coordinode_core::graph::types::VectorMetric::Cosine,
                 m: 12,
                 ef_construction: 200,
-                quantization: true,
+                quantization: coordinode_vector::hnsw::QuantizationCodec::Sq8,
                 offload_vectors: false,
             },
         );

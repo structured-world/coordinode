@@ -113,6 +113,33 @@ pub trait VectorLoader: Send + Sync {
 /// and quantization error may exceed recall benefit.
 const SQ8_MIN_VECTORS: usize = 1000;
 
+/// In-RAM quantization codec selector.
+///
+/// Per ADR-032, RaBitQ supersedes SQ8 as the primary in-RAM codec; SQ8 is
+/// retained for the Phase 1.5 cross-shard disk rerank pool. `None` means
+/// search runs entirely on f32 originals — appropriate for small indexes
+/// where quantization overhead exceeds savings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum QuantizationCodec {
+    /// f32 originals only; no quantized representation.
+    None,
+    /// SQ8 scalar quantization (1 byte / dim, ~4× compression).
+    /// Used by HNSW traversal when active; final top-K is reranked on f32.
+    Sq8,
+    /// RaBitQ 1-bit-per-dim with popcount distance kernel.
+    /// `bits=1` is the default (~30× compression, mandatory rerank);
+    /// `bits ∈ {2,3,4}` selects Extended-RaBitQ variants (separate task).
+    RaBitQ { bits: u8 },
+}
+
+impl QuantizationCodec {
+    /// True when this codec stores any quantized representation alongside
+    /// (or in place of) the f32 original.
+    pub fn is_active(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 /// HNSW index configuration.
 #[derive(Debug, Clone)]
 pub struct HnswConfig {
@@ -128,10 +155,8 @@ pub struct HnswConfig {
     pub metric: VectorMetric,
     /// Maximum vector dimensions.
     pub max_dimensions: u32,
-    /// Enable SQ8 scalar quantization for memory-efficient HNSW traversal.
-    /// When enabled, distance computation during HNSW search uses dequantized
-    /// (approximate) vectors. Final top-K results are reranked with exact f32.
-    pub quantization: bool,
+    /// In-RAM quantization codec for HNSW traversal. See [`QuantizationCodec`].
+    pub quantization: QuantizationCodec,
     /// Number of candidates to fetch before f32 reranking.
     /// Only used when `quantization` is enabled. Must be >= ef_search.
     /// Higher values improve recall at the cost of more f32 distance computations.
@@ -167,7 +192,7 @@ impl Default for HnswConfig {
             ef_search: 50,
             metric: VectorMetric::Cosine,
             max_dimensions: 65_536,
-            quantization: false,
+            quantization: QuantizationCodec::None,
             rerank_candidates: 100,
             calibration_threshold: 100,
             offload_vectors: false,
@@ -416,7 +441,7 @@ impl HnswIndex {
 
     /// Returns whether SQ8 quantization is active (calibrated and enabled).
     pub fn is_quantized(&self) -> bool {
-        self.config.quantization && self.sq8_params.is_some()
+        matches!(self.config.quantization, QuantizationCodec::Sq8) && self.sq8_params.is_some()
     }
 
     /// Returns whether f32 vectors are offloaded to disk.
@@ -951,7 +976,7 @@ impl HnswIndex {
     /// node's f32 if offloading is active. Called at the end of `insert()`.
     fn maybe_calibrate_and_offload(&mut self, just_inserted_idx: usize) {
         // Step 1: Auto-calibrate SQ8 when threshold reached
-        if self.config.quantization
+        if matches!(self.config.quantization, QuantizationCodec::Sq8)
             && self.sq8_params.is_none()
             && self.nodes.len() >= self.config.calibration_threshold
         {
@@ -2262,7 +2287,7 @@ mod tests {
             ef_search: 10,
             metric,
             max_dimensions: 65_536,
-            quantization: true,
+            quantization: QuantizationCodec::Sq8,
             rerank_candidates: 20,
             calibration_threshold: 5, // Low threshold for testing
             offload_vectors: false,
@@ -2354,7 +2379,7 @@ mod tests {
             ef_search: 20,
             metric: VectorMetric::L2,
             max_dimensions: 65_536,
-            quantization: true,
+            quantization: QuantizationCodec::Sq8,
             rerank_candidates: 50,
             calibration_threshold: 10,
             offload_vectors: false,
@@ -2425,7 +2450,7 @@ mod tests {
             ef_search: 30,
             metric: VectorMetric::L2,
             max_dimensions: 65_536,
-            quantization: false,
+            quantization: QuantizationCodec::None,
             ..Default::default()
         });
 
@@ -2437,7 +2462,7 @@ mod tests {
             ef_search: 30,
             metric: VectorMetric::L2,
             max_dimensions: 65_536,
-            quantization: true,
+            quantization: QuantizationCodec::Sq8,
             rerank_candidates: 50,
             calibration_threshold: 50,
             offload_vectors: false,
@@ -2519,7 +2544,7 @@ mod tests {
         use crate::quantize::Sq8Params;
 
         let mut index = HnswIndex::new(HnswConfig {
-            quantization: true,
+            quantization: QuantizationCodec::Sq8,
             calibration_threshold: 1000, // High threshold — won't auto-calibrate
             ..make_config(VectorMetric::L2)
         });
@@ -2569,7 +2594,7 @@ mod tests {
     #[test]
     fn sq8_disabled_by_default() {
         let config = HnswConfig::default();
-        assert!(!config.quantization);
+        assert!(!config.quantization.is_active());
 
         let mut index = HnswIndex::new(config);
         for i in 0..200u64 {
@@ -2737,7 +2762,7 @@ mod tests {
             ef_search: 50,
             metric,
             max_dimensions: 65_536,
-            quantization: true,
+            quantization: QuantizationCodec::Sq8,
             rerank_candidates: 20,
             calibration_threshold: 5, // Low threshold for testing
             offload_vectors: true,
@@ -2979,7 +3004,7 @@ mod tests {
             ef_search: 10,
             metric: VectorMetric::L2,
             max_dimensions: 4,
-            quantization: false,
+            quantization: QuantizationCodec::None,
             rerank_candidates: 10,
             calibration_threshold: 1_000,
             offload_vectors: false,
@@ -3089,7 +3114,7 @@ mod tests {
                 ef_search: 50,
                 metric: VectorMetric::L2,
                 max_dimensions: 8,
-                quantization: false,
+                quantization: QuantizationCodec::None,
                 rerank_candidates: 50,
                 calibration_threshold: 10_000,
                 offload_vectors: false,
@@ -3148,7 +3173,7 @@ mod tests {
             ef_search: 10,
             metric: VectorMetric::L2,
             max_dimensions: 4,
-            quantization: false,
+            quantization: QuantizationCodec::None,
             rerank_candidates: 10,
             calibration_threshold: 1_000,
             offload_vectors: false,
@@ -3181,7 +3206,7 @@ mod tests {
             ef_search: 10,
             metric: VectorMetric::L2,
             max_dimensions: 4,
-            quantization: false,
+            quantization: QuantizationCodec::None,
             rerank_candidates: 10,
             calibration_threshold: 1_000,
             offload_vectors: false,
@@ -3223,7 +3248,7 @@ mod tests {
             ef_search: 50,
             metric: VectorMetric::L2,
             max_dimensions: 4,
-            quantization: false,
+            quantization: QuantizationCodec::None,
             rerank_candidates: 50,
             calibration_threshold: 10_000,
             offload_vectors: false,

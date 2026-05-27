@@ -338,7 +338,7 @@ mod tests {
             metric: VectorMetric::Cosine,
             m: 16,
             ef_construction: 200,
-            quantization: false,
+            quantization: coordinode_vector::hnsw::QuantizationCodec::None,
             offload_vectors: false,
         }
     }

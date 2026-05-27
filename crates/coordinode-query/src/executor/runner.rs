@@ -13168,7 +13168,7 @@ fn execute_create_vector_index(
         metric,
         m,
         ef_construction,
-        quantization: false,
+        quantization: coordinode_vector::hnsw::QuantizationCodec::None,
         offload_vectors: false,
     };
     let def = crate::index::IndexDefinition::hnsw(name, label, property, config);

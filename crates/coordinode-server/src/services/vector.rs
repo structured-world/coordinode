@@ -405,7 +405,7 @@ mod tests {
             metric: VectorMetric::L2,
             m: 16,
             ef_construction: 200,
-            quantization: false,
+            quantization: coordinode_vector::hnsw::QuantizationCodec::None,
             offload_vectors: false,
         };
         database.create_vector_index("test_vec_idx", label, property, config);

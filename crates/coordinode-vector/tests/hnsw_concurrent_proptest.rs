@@ -20,7 +20,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use coordinode_core::graph::types::VectorMetric;
-use coordinode_vector::hnsw::{HnswConfig, HnswIndex};
+use coordinode_vector::hnsw::{HnswConfig, HnswIndex, QuantizationCodec};
 use proptest::prelude::*;
 
 fn make_config(m: usize, max_dim: u32, max_elements: u32) -> HnswConfig {
@@ -31,7 +31,7 @@ fn make_config(m: usize, max_dim: u32, max_elements: u32) -> HnswConfig {
         ef_search: 50,
         metric: VectorMetric::L2,
         max_dimensions: max_dim,
-        quantization: false,
+        quantization: QuantizationCodec::None,
         rerank_candidates: 50,
         calibration_threshold: 100_000,
         offload_vectors: false,

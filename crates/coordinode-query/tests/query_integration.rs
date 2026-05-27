@@ -9046,7 +9046,7 @@ fn setup_rrf_indices(
         metric: coordinode_core::graph::types::VectorMetric::Cosine,
         m: 16,
         ef_construction: 200,
-        quantization: false,
+        quantization: coordinode_vector::hnsw::QuantizationCodec::None,
         offload_vectors: false,
     };
     let vec_def = IndexDefinition::hnsw(
