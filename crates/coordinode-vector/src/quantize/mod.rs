@@ -1,11 +1,18 @@
-//! Scalar quantization (SQ8): compress float32 vectors to uint8.
+//! Vector quantization codecs.
+//!
+//! - [`Sq8Params`] / [`QuantizedVector`] — scalar quantization (u8 per dim, 4× compression).
+//!   Used for the Phase 1.5 disk rerank pool where cross-shard comparability matters.
+//! - [`rabitq`] — RaBitQ 1-bit-per-dim with popcount distance kernel. Primary in-RAM
+//!   codec per ADR-032 (per-shard rotation, ~30× compression, ~10× kernel speedup vs SQ8).
+//! - [`popcount`] — XOR + popcount kernel with runtime SIMD dispatch shared by RaBitQ
+//!   and any future binary codec.
 //!
 //! SQ8 maps each dimension independently using per-dimension min/max:
 //!   quantize:   u8 = round((f32 - min) / (max - min) * 255)
 //!   dequantize: f32 = u8 / 255 * (max - min) + min
-//!
-//! Provides 4x memory reduction with typically <2% recall loss.
-//! Calibration (min/max) must be computed from actual data, not assumed.
+
+pub mod popcount;
+pub mod rabitq;
 
 use serde::{Deserialize, Serialize};
 
