@@ -387,8 +387,14 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runs-on: ubuntu-latest
+            # amd64 Docker build moved to self-hosted runner — GH-hosted
+            # ubuntu-latest disk too small for the full workspace cargo
+            # build that the image's multi-stage Dockerfile performs.
+            runs-on:
+              - self-hosted
+              - gpu-private-systems
           - platform: linux/arm64
+            # arm64 stays on GH-hosted; we don't have an arm self-hosted runner.
             runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v6

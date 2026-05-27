@@ -42,7 +42,12 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    # GH-hosted ubuntu-latest has ~14 GB disk which the full workspace
+    # debug build exceeds (linker hits "No space left on device"). Moved
+    # to the org's self-hosted runner where target/ has room.
+    runs-on:
+      - self-hosted
+      - gpu-private-systems
     steps:
       - uses: actions/checkout@v4
         with:
@@ -62,7 +67,11 @@ jobs:
 
   build:
     name: Build
-    runs-on: ubuntu-latest
+    # See `test` job — release build is even larger than debug, won't
+    # fit on GH-hosted runner disk.
+    runs-on:
+      - self-hosted
+      - gpu-private-systems
     needs: [fmt, clippy, test]
     steps:
       - uses: actions/checkout@v4
