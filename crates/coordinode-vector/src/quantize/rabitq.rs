@@ -185,19 +185,33 @@ impl RaBitQParams {
         }
     }
 
-    /// Estimate the inner product / cosine similarity between two encoded
-    /// vectors using the RaBitQ 1-bit estimator.
+    /// Estimate the inner product (dot product) between two encoded vectors.
+    /// Higher = more similar. Suitable for `DotProduct` metric.
     ///
-    /// Higher = more similar (suitable for cosine / dot-product retrieval where
-    /// we want max-K). For an L2 / Euclidean variant, the caller can transform
-    /// the returned similarity using the standard `‖q-x‖² = ‖q‖² + ‖x‖² - 2·<q,x>`
-    /// identity with the norms recorded in each code.
-    pub fn estimate_similarity(&self, q: &RaBitQCode, x: &RaBitQCode) -> f32 {
+    /// For an L2 variant the caller can transform the returned value using
+    /// the polarisation identity `‖q-x‖² = ‖q‖² + ‖x‖² - 2·<q,x>` with the
+    /// norms recorded in each code.
+    pub fn estimate_inner_product(&self, q: &RaBitQCode, x: &RaBitQCode) -> f32 {
         debug_assert_eq!(q.code.len(), x.code.len(), "code length mismatch");
         let d = self.dims as f32;
         let pop = popcount::xor_popcount(&q.code, &x.code) as f32;
         let cos_term = 1.0 - 2.0 * pop / d;
         cos_term * q.norm * x.norm
+    }
+
+    /// Estimate the cosine distance `1 - cos_similarity` between two codes
+    /// without consulting the per-vector norms — purely a function of the
+    /// popcount and `D`. Result is in `[0, 2]`.
+    ///
+    /// This is the fast path the HNSW hot loop hits for cosine workloads:
+    /// one XOR + one popcount + a multiply + a subtract, no per-vector
+    /// scalar arithmetic.
+    pub fn estimate_cosine_distance(&self, q: &RaBitQCode, x: &RaBitQCode) -> f32 {
+        debug_assert_eq!(q.code.len(), x.code.len(), "code length mismatch");
+        let d = self.dims as f32;
+        let pop = popcount::xor_popcount(&q.code, &x.code) as f32;
+        // cos_sim_est = 1 - 2·popcount/D  →  distance = 1 - cos_sim_est = 2·popcount/D.
+        2.0 * pop / d
     }
 }
 
@@ -335,8 +349,8 @@ mod tests {
         let nc = p.encode(&near);
         let fc = p.encode(&far);
 
-        let sim_near = p.estimate_similarity(&qc, &nc);
-        let sim_far = p.estimate_similarity(&qc, &fc);
+        let sim_near = p.estimate_inner_product(&qc, &nc);
+        let sim_far = p.estimate_inner_product(&qc, &fc);
         assert!(
             sim_near > sim_far,
             "estimator must rank near above far: near={}, far={}",
