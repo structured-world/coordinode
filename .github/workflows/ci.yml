@@ -34,8 +34,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+      - name: Install protobuf compiler (skip if present)
+        # `protoc` is preinstalled on the self-hosted runner (Fedora,
+        # uses dnf — apt-get would not exist there and `sudo apt-get`
+        # would prompt for a password the workflow can't supply).
+        # GH-hosted ubuntu-latest still needs the install.
+        run: |
+          if command -v protoc >/dev/null 2>&1; then
+            echo "protoc already installed: $(protoc --version)"
+          else
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          fi
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (zero warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -53,8 +62,17 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+      - name: Install protobuf compiler (skip if present)
+        # `protoc` is preinstalled on the self-hosted runner (Fedora,
+        # uses dnf — apt-get would not exist there and `sudo apt-get`
+        # would prompt for a password the workflow can't supply).
+        # GH-hosted ubuntu-latest still needs the install.
+        run: |
+          if command -v protoc >/dev/null 2>&1; then
+            echo "protoc already installed: $(protoc --version)"
+          else
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          fi
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -78,8 +96,17 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+      - name: Install protobuf compiler (skip if present)
+        # `protoc` is preinstalled on the self-hosted runner (Fedora,
+        # uses dnf — apt-get would not exist there and `sudo apt-get`
+        # would prompt for a password the workflow can't supply).
+        # GH-hosted ubuntu-latest still needs the install.
+        run: |
+          if command -v protoc >/dev/null 2>&1; then
+            echo "protoc already installed: $(protoc --version)"
+          else
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          fi
       - uses: Swatinem/rust-cache@v2
       - name: Build (release)
         run: cargo build --release --all-features
