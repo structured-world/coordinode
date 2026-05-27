@@ -124,11 +124,12 @@ pub struct VectorIndexConfig {
     pub m: usize,
     /// HNSW ef_construction: candidate list size during build (default 200).
     pub ef_construction: usize,
-    /// Enable scalar quantization (SQ8) for 4x memory reduction.
-    pub quantization: bool,
-    /// When true and SQ8 quantization is active, f32 vectors are not retained
-    /// in HNSW memory. Reranking loads f32 from storage via VectorLoader.
-    /// Gives 4x RAM reduction at ~1-2ms rerank cost per search.
+    /// In-RAM quantization codec for HNSW traversal. See
+    /// [`coordinode_vector::hnsw::QuantizationCodec`].
+    pub quantization: coordinode_vector::hnsw::QuantizationCodec,
+    /// When `quantization` is `Sq8` and this flag is set, f32 vectors are
+    /// not retained in HNSW memory. Reranking loads f32 from storage via
+    /// VectorLoader. Gives 4x RAM reduction at ~1-2ms rerank cost per search.
     pub offload_vectors: bool,
 }
 
@@ -139,7 +140,7 @@ impl Default for VectorIndexConfig {
             metric: VectorMetric::Cosine,
             m: 16,
             ef_construction: 200,
-            quantization: false,
+            quantization: coordinode_vector::hnsw::QuantizationCodec::None,
             offload_vectors: false,
         }
     }

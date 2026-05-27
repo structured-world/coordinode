@@ -5,7 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use coordinode_core::graph::types::VectorMetric;
-use coordinode_vector::hnsw::{HnswConfig, HnswIndex};
+use coordinode_vector::hnsw::{HnswConfig, HnswIndex, QuantizationCodec};
 
 fn config(metric: VectorMetric) -> HnswConfig {
     HnswConfig {
@@ -136,7 +136,7 @@ fn len_and_is_empty() {
 fn sq8_config(metric: VectorMetric) -> HnswConfig {
     HnswConfig {
         metric,
-        quantization: true,
+        quantization: QuantizationCodec::Sq8,
         rerank_candidates: 100,
         calibration_threshold: 50,
         ..HnswConfig::default()
@@ -244,7 +244,7 @@ fn sq8_hnsw_cosine_768_dims() {
 fn sq8_calibration_lifecycle() {
     let mut index = HnswIndex::new(HnswConfig {
         metric: VectorMetric::L2,
-        quantization: true,
+        quantization: QuantizationCodec::Sq8,
         calibration_threshold: 20,
         rerank_candidates: 30,
         ..HnswConfig::default()
@@ -283,7 +283,7 @@ fn sq8_manual_calibration_integration() {
 
     let mut index = HnswIndex::new(HnswConfig {
         metric: VectorMetric::L2,
-        quantization: true,
+        quantization: QuantizationCodec::Sq8,
         calibration_threshold: 10000, // Won't auto-calibrate
         ..HnswConfig::default()
     });
@@ -1843,7 +1843,7 @@ fn g009_offloaded_hnsw_search_e2e_through_cypher() {
         VectorIndexConfig {
             dimensions: 3,
             metric: VectorMetric::L2,
-            quantization: true,
+            quantization: QuantizationCodec::Sq8,
             offload_vectors: true,
             ..VectorIndexConfig::default()
         },
@@ -1920,7 +1920,7 @@ fn g009_forced_offload_search_through_registry() {
         VectorIndexConfig {
             dimensions: 3,
             metric: VectorMetric::L2,
-            quantization: true,
+            quantization: QuantizationCodec::Sq8,
             offload_vectors: true,
             ..VectorIndexConfig::default()
         },
@@ -2019,7 +2019,7 @@ fn g009_forced_offload_cypher_e2e() {
         VectorIndexConfig {
             dimensions: 3,
             metric: VectorMetric::L2,
-            quantization: true,
+            quantization: QuantizationCodec::Sq8,
             offload_vectors: true,
             ..VectorIndexConfig::default()
         },
