@@ -942,14 +942,11 @@ impl StorageConfig {
         }
 
         // Blob partition: key-value separation for large blobs (>= 4KB default).
-        // Vector tiers: f32 = 4 KB per 1024d vector, SQ8 = 1 KB — both fit the
-        // "value-dominated row" pattern that KV separation is designed for
-        // (segregates large values into a separate file, keeps the main LSM
-        // bloom-able and seek-efficient).
-        if matches!(
-            part,
-            Partition::Blob | Partition::VectorF32 | Partition::VectorRerank
-        ) {
+        // VectorF32 truth tier: 4 KB per 1024d vector fits the
+        // "value-dominated row" pattern that KV separation is designed
+        // for (segregates large values into a separate file, keeps the
+        // main LSM bloom-able and seek-efficient).
+        if matches!(part, Partition::Blob | Partition::VectorF32) {
             config = config.with_kv_separation(Some(lsm_tree::KvSeparationOptions::default()));
         }
 

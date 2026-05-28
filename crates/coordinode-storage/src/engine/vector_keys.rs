@@ -1,24 +1,21 @@
-//! Key encoding for the vector storage tiers (ADR-033 revised).
+//! Key encoding for the vector storage tier (ADR-033 revised).
 //!
-//! Two partitions back the per-ADR-033 truth + rerank model:
+//! One partition holds the f32 source of truth per ADR-033:
 //!
 //! - [`Partition::VectorF32`][crate::engine::partition::Partition::VectorF32]
-//!   stores the f32 source-of-truth bytes (`dim × 4` bytes per vector). Every
-//!   derived layer regenerates from here on calibration or codec migration.
+//!   stores the f32 source-of-truth bytes (`dim × 4` bytes per vector).
+//!   In-RAM codecs (RaBitQ default, optional SQ8 / PolarQuant / PQ)
+//!   regenerate from this on calibration. Phase 1.5 cross-shard rerank
+//!   reads f32 directly here — no intermediate quantized disk tier
+//!   (matches Qdrant / Weaviate / ES BBQ pattern).
 //!
-//! - [`Partition::VectorRerank`][crate::engine::partition::Partition::VectorRerank]
-//!   stores the dimension-comparable quantized codec used for Phase 1.5
-//!   cross-shard rerank. Default codec is SQ8 (1 byte / dim); pluggable per
-//!   `disk_rerank_codec` schema knob.
-//!
-//! Key format is shared across both partitions:
+//! Key format:
 //!
 //! ```text
 //! ┌────────────┬───────────┬──────────────┬───────────┐
 //! │ prefix     │ label_id  │ property_id  │ node_id   │
 //! │ 4 bytes    │ 4 bytes   │ 4 bytes      │ 8 bytes   │
-//! │ "vec:" /   │ BE u32    │ BE u32       │ BE u64    │
-//! │ "vrn:"     │           │              │           │
+//! │ "vec:"     │ BE u32    │ BE u32       │ BE u64    │
 //! └────────────┴───────────┴──────────────┴───────────┘
 //! ```
 //!
@@ -28,7 +25,6 @@
 //! `multi_get` batches across contiguous node ids.
 
 const PREFIX_F32: &[u8; 4] = b"vec:";
-const PREFIX_RERANK: &[u8; 4] = b"vrn:";
 
 /// Total key length: `prefix(4) + label_id(4) + property_id(4) + node_id(8)`.
 pub const VECTOR_KEY_LEN: usize = 4 + 4 + 4 + 8;
@@ -38,24 +34,15 @@ pub fn encode_vec_f32_key(label_id: u32, property_id: u32, node_id: u64) -> [u8;
     encode(PREFIX_F32, label_id, property_id, node_id)
 }
 
-/// Encode a key for [`Partition::VectorRerank`].
-pub fn encode_vec_rerank_key(
-    label_id: u32,
-    property_id: u32,
-    node_id: u64,
-) -> [u8; VECTOR_KEY_LEN] {
-    encode(PREFIX_RERANK, label_id, property_id, node_id)
-}
-
-/// Decode a key produced by either `encode_vec_f32_key` or
-/// `encode_vec_rerank_key`. Returns `(label_id, property_id, node_id)` or
-/// `None` if the byte slice has the wrong length or an unknown prefix.
+/// Decode a key produced by `encode_vec_f32_key`. Returns
+/// `(label_id, property_id, node_id)` or `None` if the byte slice has
+/// the wrong length or an unknown prefix.
 pub fn decode_vector_key(key: &[u8]) -> Option<(u32, u32, u64)> {
     if key.len() != VECTOR_KEY_LEN {
         return None;
     }
     let prefix = &key[0..4];
-    if prefix != PREFIX_F32 && prefix != PREFIX_RERANK {
+    if prefix != PREFIX_F32 {
         return None;
     }
     let label_id = u32::from_be_bytes(key[4..8].try_into().ok()?);
@@ -69,12 +56,6 @@ pub fn decode_vector_key(key: &[u8]) -> Option<(u32, u32, u64)> {
 /// the trailing node-id range exhausted.
 pub fn vec_f32_index_prefix(label_id: u32, property_id: u32) -> [u8; 12] {
     encode_prefix(PREFIX_F32, label_id, property_id)
-}
-
-/// Prefix used to range-scan every quantized code of a given
-/// `(label, property)` — symmetric to `vec_f32_index_prefix`.
-pub fn vec_rerank_index_prefix(label_id: u32, property_id: u32) -> [u8; 12] {
-    encode_prefix(PREFIX_RERANK, label_id, property_id)
 }
 
 /// Encode f32 vector to little-endian byte slice for the truth tier value.
@@ -134,20 +115,6 @@ mod tests {
         assert_eq!(label, 7);
         assert_eq!(prop, 13);
         assert_eq!(node, 0xDEAD_BEEF_CAFE_F00D);
-    }
-
-    #[test]
-    fn rerank_key_round_trip() {
-        let key = encode_vec_rerank_key(1, 2, 3);
-        let (label, prop, node) = decode_vector_key(&key).expect("decode");
-        assert_eq!((label, prop, node), (1, 2, 3));
-    }
-
-    #[test]
-    fn f32_and_rerank_keys_dont_alias() {
-        let a = encode_vec_f32_key(1, 2, 3);
-        let b = encode_vec_rerank_key(1, 2, 3);
-        assert_ne!(a, b);
     }
 
     #[test]

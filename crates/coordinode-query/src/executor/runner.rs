@@ -492,7 +492,6 @@ fn partition_to_id(p: Partition) -> PartitionId {
         Partition::Raft => unreachable!("Raft partition is not exposed to the query layer"),
         Partition::Counter => PartitionId::Counter,
         Partition::VectorF32 => PartitionId::VectorF32,
-        Partition::VectorRerank => PartitionId::VectorRerank,
     }
 }
 
