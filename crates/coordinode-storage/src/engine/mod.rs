@@ -12,6 +12,7 @@ pub(crate) mod mvcc_gc;
 pub mod partition;
 pub mod routing;
 pub mod stats;
+pub mod vector_keys;
 
 /// Snapshot type: a sequence number used as a read visibility bound.
 ///

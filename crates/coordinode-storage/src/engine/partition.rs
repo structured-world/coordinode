@@ -43,6 +43,22 @@ pub enum Partition {
     /// Key format: `counter:<scope>:<id>` (e.g., `counter:degree:42`)
     /// Uses `CounterMerge` operator: base i64 + sum of delta operands.
     Counter,
+
+    /// `vec:` — f32 vector truth tier (ADR-033 revised).
+    /// Key format: `vec:<label_id>:<property_id>:<node_id>`
+    /// Value: dense f32 little-endian bytes (`dim × 4` bytes).
+    /// Every layer above (HNSW codes, SQ8 rerank, application-side
+    /// custom rerank) regenerates from this. Per-index opt-out via
+    /// `f32_storage = "off"` (extreme-density workloads only).
+    VectorF32,
+
+    /// `vrerank:` — quantized rerank tier (ADR-033 revised).
+    /// Key format: `vrerank:<label_id>:<property_id>:<node_id>`
+    /// Value: codec-specific bytes (SQ8 default = `dim × 1` byte;
+    /// PolarQuant ~`dim × 0.7` bytes; pluggable per `disk_rerank_codec`
+    /// schema knob). Dimension-comparable across shards so Phase 1.5
+    /// cross-shard rerank works under per-shard RaBitQ rotation.
+    VectorRerank,
 }
 
 impl From<coordinode_core::txn::proposal::PartitionId> for Partition {
@@ -57,6 +73,8 @@ impl From<coordinode_core::txn::proposal::PartitionId> for Partition {
             PartitionId::Schema => Self::Schema,
             PartitionId::Idx => Self::Idx,
             PartitionId::Counter => Self::Counter,
+            PartitionId::VectorF32 => Self::VectorF32,
+            PartitionId::VectorRerank => Self::VectorRerank,
         }
     }
 }
@@ -74,6 +92,8 @@ impl Partition {
             Self::Idx => "idx",
             Self::Raft => "raft",
             Self::Counter => "counter",
+            Self::VectorF32 => "vec",
+            Self::VectorRerank => "vrerank",
         }
     }
 
@@ -104,6 +124,8 @@ impl Partition {
             Self::Idx,
             Self::Raft,
             Self::Counter,
+            Self::VectorF32,
+            Self::VectorRerank,
         ]
     }
 }

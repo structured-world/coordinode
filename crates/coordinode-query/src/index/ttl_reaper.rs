@@ -532,6 +532,8 @@ fn to_partition(id: PartitionId) -> Partition {
         PartitionId::Schema => Partition::Schema,
         PartitionId::Idx => Partition::Idx,
         PartitionId::Counter => Partition::Counter,
+        PartitionId::VectorF32 => Partition::VectorF32,
+        PartitionId::VectorRerank => Partition::VectorRerank,
     }
 }
 

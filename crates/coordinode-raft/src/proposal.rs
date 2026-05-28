@@ -66,6 +66,8 @@ pub fn to_partition(id: PartitionId) -> Partition {
         PartitionId::Schema => Partition::Schema,
         PartitionId::Idx => Partition::Idx,
         PartitionId::Counter => Partition::Counter,
+        PartitionId::VectorF32 => Partition::VectorF32,
+        PartitionId::VectorRerank => Partition::VectorRerank,
     }
 }
 
@@ -84,6 +86,8 @@ pub fn to_partition_id(p: Partition) -> PartitionId {
         Partition::Idx => PartitionId::Idx,
         Partition::Raft => unreachable!("Raft partition is internal-only"),
         Partition::Counter => PartitionId::Counter,
+        Partition::VectorF32 => PartitionId::VectorF32,
+        Partition::VectorRerank => PartitionId::VectorRerank,
     }
 }
 

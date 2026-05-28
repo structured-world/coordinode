@@ -331,6 +331,8 @@ fn partition_to_u8(p: PartitionId) -> u8 {
         PartitionId::Schema => 5,
         PartitionId::Idx => 6,
         PartitionId::Counter => 7,
+        PartitionId::VectorF32 => 8,
+        PartitionId::VectorRerank => 9,
     }
 }
 
@@ -344,6 +346,8 @@ fn u8_to_partition(b: u8) -> Option<PartitionId> {
         5 => Some(PartitionId::Schema),
         6 => Some(PartitionId::Idx),
         7 => Some(PartitionId::Counter),
+        8 => Some(PartitionId::VectorF32),
+        9 => Some(PartitionId::VectorRerank),
         _ => None,
     }
 }

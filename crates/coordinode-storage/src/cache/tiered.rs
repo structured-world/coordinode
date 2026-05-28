@@ -750,6 +750,8 @@ fn partition_from_byte(b: u8) -> Partition {
         6 => Partition::Idx,
         7 => Partition::Raft,
         8 => Partition::Counter,
+        9 => Partition::VectorF32,
+        10 => Partition::VectorRerank,
         _ => Partition::Node,
     }
 }

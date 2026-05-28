@@ -206,6 +206,17 @@ pub enum PartitionId {
     Schema,
     Idx,
     Counter,
+    /// `vec:` — f32 vector truth tier. Per ADR-033 (revised), every
+    /// vector property's full-precision bytes live here as the
+    /// per-vector source of truth. Disabled per index via
+    /// `f32_storage = "off"` (one-way migration; default is on).
+    VectorF32,
+    /// `vrerank:` — quantized rerank layer (default SQ8). Per ADR-033
+    /// (revised), the dimension-comparable codec used for Phase 1.5
+    /// cross-shard rerank. Codec is per-index (`disk_rerank_codec`)
+    /// and swappable via online migration without touching the truth
+    /// tier above.
+    VectorRerank,
 }
 
 /// A batch of mutations to be proposed through Raft.
