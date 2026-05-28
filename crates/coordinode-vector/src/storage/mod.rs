@@ -28,6 +28,8 @@ use alloc::vec::Vec;
 
 extern crate alloc;
 
+pub mod lsm_backed;
+
 /// Errors that the storage backend can report through the vector tier
 /// API. Concrete variants are owned by the backend — the trait sees an
 /// opaque `Box<dyn Error>` so different backends (LSM, RAM, future
