@@ -244,7 +244,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // sequentially. Chunk size kept modest (10k) so the working set fits
     // in cache and progress logging stays responsive; on 16-thread
     // hardware this delivers ~5-8× speedup over the legacy serial loop.
-    const BUILD_CHUNK: usize = 10_000;
+    // 1k matches the upper bound in `insert_batch`'s docstring
+    // ("Recall convergence is unaffected at typical batch sizes ≤ 1k").
+    // Larger chunks (we tried 10k) collapse recall to ~0.02 on SIFT1M
+    // because plans in the chunk all reference the same stale graph
+    // snapshot and skew towards the same hubs.
+    const BUILD_CHUNK: usize = 1_000;
     let mut inserted = 0usize;
     while inserted < n_train {
         let end = (inserted + BUILD_CHUNK).min(n_train);
