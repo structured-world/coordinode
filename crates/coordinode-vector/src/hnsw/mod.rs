@@ -276,6 +276,13 @@ pub struct HnswIndex {
     /// Proper RNG gives correct exponential layer distribution (R852 fix).
     /// AtomicU64 for future concurrent insert support (R858).
     rng_state: std::sync::atomic::AtomicU64,
+    /// Optional persistent vector tier backing per ADR-033 (truth tier
+    /// f32 + quantized rerank tier). `None` for in-memory-only indexes
+    /// (tests, ad-hoc analytics); `Some` when the caller has wired up
+    /// LSM-backed storage. Writes through this handle log f32 on insert
+    /// and quantized bytes on (re)calibration; reads through it power
+    /// Phase 1.5 cross-shard rerank and application-side custom rerank.
+    vector_tier: Option<crate::storage::VectorTierHandle>,
 }
 
 /// Read-only result of the planning phase of an insert (C2, R858b).
@@ -460,7 +467,27 @@ impl HnswIndex {
             visited_pool: VisitedPool::new(),
             // Seed from address of self (varies per instance). Non-deterministic but fast.
             rng_state: std::sync::atomic::AtomicU64::new(0xdeadbeef_cafebabe),
+            vector_tier: None,
         }
+    }
+
+    /// Wire a persistent vector tier backend (truth f32 + quantized rerank
+    /// per ADR-033). After this call every successful insert writes the
+    /// f32 bytes to the truth tier, and every (re)calibration writes
+    /// quantized codes to the rerank tier. Failures during tier writes
+    /// are logged through `tracing::warn` but do NOT roll back the
+    /// in-RAM insert — the in-RAM graph is authoritative; the tier is
+    /// rebuilt from data on recovery (per ADR-018 + replication.md).
+    /// Pass `None` to disable (default state for in-memory tests).
+    pub fn set_vector_tier(&mut self, tier: Option<crate::storage::VectorTierHandle>) {
+        self.vector_tier = tier;
+    }
+
+    /// Whether persistent vector tier is wired. Used by tests + by the
+    /// upper layers to decide whether to skip the legacy Node-partition
+    /// vector-property write.
+    pub fn has_vector_tier(&self) -> bool {
+        self.vector_tier.is_some()
     }
 
     /// Returns the SQ8 calibration parameters, if calibrated.
@@ -555,7 +582,23 @@ impl HnswIndex {
         if let Some(params) = Sq8Params::calibrate(&refs) {
             for node in &mut self.nodes {
                 if let Some(ref v) = node.vector {
-                    node.quantized = Some(params.quantize(v));
+                    let code = params.quantize(v);
+                    // Calibration storm: emit each freshly-encoded SQ8 code
+                    // to the rerank tier. Cross-shard Phase 1.5 starts
+                    // working once every existing node has its code on
+                    // disk. Tier failures don't roll back the in-RAM
+                    // encoding — recovery rebuilds from data per
+                    // replication.md.
+                    if let Some(tier) = self.vector_tier.as_ref() {
+                        if let Err(e) = tier.put_quantized(node.id, &code) {
+                            warn!(
+                                node_id = node.id,
+                                error = %e,
+                                "vector_tier put_quantized during SQ8 calibration failed",
+                            );
+                        }
+                    }
+                    node.quantized = Some(code);
                 }
                 // Offload f32 after quantization if configured
                 if self.config.offload_vectors {
@@ -853,6 +896,21 @@ impl HnswIndex {
         // calibration via `auto_calibrate_rabitq`).
         let rabitq_code = self.rabitq_params.as_ref().map(|p| p.encode(&vector));
 
+        // Persist f32 truth tier + SQ8 rerank tier (when SQ8 is the active
+        // codec) per ADR-033. Tier writes never roll back the in-RAM insert
+        // — the in-RAM graph is authoritative; tiers regenerate from data
+        // on recovery (replication.md HNSW rebuild path).
+        if let Some(tier) = self.vector_tier.as_ref() {
+            if let Err(e) = tier.put_f32(id, &vector) {
+                warn!(node_id = id, error = %e, "vector_tier put_f32 failed");
+            }
+            if let Some(code) = quantized.as_deref() {
+                if let Err(e) = tier.put_quantized(id, code) {
+                    warn!(node_id = id, error = %e, "vector_tier put_quantized failed");
+                }
+            }
+        }
+
         self.nodes.push(HnswNode {
             id,
             vector: Some(vector),
@@ -943,6 +1001,19 @@ impl HnswIndex {
             let quantized = self.sq8_params.as_ref().map(|p| p.quantize(&vec));
             let rabitq_code = self.rabitq_params.as_ref().map(|p| p.encode(&vec));
             let new_level = plan.new_level;
+
+            // Persist tiers per ADR-033 (mirrors apply_insert_plan single-row path).
+            if let Some(tier) = self.vector_tier.as_ref() {
+                if let Err(e) = tier.put_f32(plan.id, &vec) {
+                    warn!(node_id = plan.id, error = %e, "vector_tier put_f32 failed");
+                }
+                if let Some(code) = quantized.as_deref() {
+                    if let Err(e) = tier.put_quantized(plan.id, code) {
+                        warn!(node_id = plan.id, error = %e, "vector_tier put_quantized failed");
+                    }
+                }
+            }
+
             self.nodes.push(HnswNode {
                 id: plan.id,
                 vector: Some(vec),
@@ -1500,6 +1571,21 @@ impl HnswIndex {
         // Step 3: Update vector and quantized representation.
         let quantized = self.sq8_params.as_ref().map(|p| p.quantize(&vector));
         let rabitq_code = self.rabitq_params.as_ref().map(|p| p.encode(&vector));
+
+        // Overwrite tier on existing-node update so the truth tier and
+        // rerank tier reflect the latest write (ADR-033 — tiers must
+        // mirror the in-RAM vector).
+        if let Some(tier) = self.vector_tier.as_ref() {
+            if let Err(e) = tier.put_f32(id, &vector) {
+                warn!(node_id = id, error = %e, "vector_tier put_f32 on update failed");
+            }
+            if let Some(code) = quantized.as_deref() {
+                if let Err(e) = tier.put_quantized(id, code) {
+                    warn!(node_id = id, error = %e, "vector_tier put_quantized on update failed");
+                }
+            }
+        }
+
         self.nodes[idx].vector = Some(vector);
         self.nodes[idx].quantized = quantized;
         self.nodes[idx].rabitq_code = rabitq_code;
@@ -2750,6 +2836,110 @@ mod tests {
             recall >= 0.1,
             "RaBitQ recall {recall} below the wired-up sanity floor (0.1)",
         );
+    }
+
+    #[test]
+    fn vector_tier_persists_f32_and_sq8_on_insert_and_calibration() {
+        use crate::storage::{VectorTierHandle, VectorTierStorage};
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        // Inline mock tier (same surface as the storage-crate impl).
+        struct Mock {
+            f32_store: Mutex<HashMap<(u32, u32, u64), Vec<f32>>>,
+            q_store: Mutex<HashMap<(u32, u32, u64), Vec<u8>>>,
+        }
+        impl VectorTierStorage for Mock {
+            fn put_f32(
+                &self,
+                l: u32,
+                p: u32,
+                n: u64,
+                v: &[f32],
+            ) -> Result<(), crate::storage::VectorTierError> {
+                self.f32_store.lock().unwrap().insert((l, p, n), v.to_vec());
+                Ok(())
+            }
+            fn put_quantized(
+                &self,
+                l: u32,
+                p: u32,
+                n: u64,
+                c: &[u8],
+            ) -> Result<(), crate::storage::VectorTierError> {
+                self.q_store.lock().unwrap().insert((l, p, n), c.to_vec());
+                Ok(())
+            }
+            fn multi_get_f32(
+                &self,
+                l: u32,
+                p: u32,
+                ids: &[u64],
+            ) -> Result<Vec<Option<Vec<f32>>>, crate::storage::VectorTierError> {
+                let g = self.f32_store.lock().unwrap();
+                Ok(ids.iter().map(|&n| g.get(&(l, p, n)).cloned()).collect())
+            }
+            fn multi_get_quantized(
+                &self,
+                l: u32,
+                p: u32,
+                ids: &[u64],
+            ) -> Result<Vec<Option<Vec<u8>>>, crate::storage::VectorTierError> {
+                let g = self.q_store.lock().unwrap();
+                Ok(ids.iter().map(|&n| g.get(&(l, p, n)).cloned()).collect())
+            }
+        }
+
+        let mock = std::sync::Arc::new(Mock {
+            f32_store: Mutex::new(HashMap::new()),
+            q_store: Mutex::new(HashMap::new()),
+        });
+
+        let mut index = HnswIndex::new(HnswConfig {
+            m: 4,
+            m_max0: 8,
+            ef_construction: 16,
+            ef_search: 16,
+            metric: VectorMetric::L2,
+            max_dimensions: 8,
+            quantization: QuantizationCodec::Sq8,
+            // Threshold low so calibration fires inside the test budget.
+            calibration_threshold: 4,
+            offload_vectors: false,
+            ..Default::default()
+        });
+        index.set_vector_tier(Some(VectorTierHandle::new(mock.clone(), 7, 13)));
+
+        // Insert 4 vectors — fourth one trips the SQ8 calibration.
+        let vectors: Vec<Vec<f32>> = (0..4)
+            .map(|i| (0..8).map(|d| ((i * 7 + d) as f32 * 0.1).sin()).collect())
+            .collect();
+        for (id, v) in vectors.iter().enumerate() {
+            index.insert(id as u64, v.clone());
+        }
+
+        // f32 tier: every insert persisted byte-exact.
+        let got_f32 = mock.multi_get_f32(7, 13, &[0, 1, 2, 3]).unwrap();
+        for (i, slot) in got_f32.iter().enumerate() {
+            assert_eq!(
+                slot.as_deref(),
+                Some(vectors[i].as_slice()),
+                "f32 mismatch at {i}"
+            );
+        }
+
+        // SQ8 rerank tier: every node has its code after calibration.
+        let got_q = mock.multi_get_quantized(7, 13, &[0, 1, 2, 3]).unwrap();
+        for (i, slot) in got_q.iter().enumerate() {
+            assert!(slot.is_some(), "missing sq8 code for {i}");
+            let code = slot.as_deref().expect("checked is_some above");
+            assert_eq!(code.len(), 8, "sq8 dim mismatch at {i}");
+        }
+
+        // Distinct (label, property) handles don't alias — a different
+        // handle into the same backend sees nothing.
+        let empty = mock.multi_get_f32(99, 99, &[0]).unwrap();
+        assert!(empty[0].is_none());
     }
 
     #[test]

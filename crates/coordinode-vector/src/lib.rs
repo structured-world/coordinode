@@ -5,6 +5,7 @@ pub mod health;
 pub mod hnsw;
 pub mod metrics;
 pub mod quantize;
+pub mod storage;
 
 pub use build_scheduler::{BuildPermit, HnswBuildScheduler, Priority};
 pub use health::{HealthSignal, IndexHealthState};
