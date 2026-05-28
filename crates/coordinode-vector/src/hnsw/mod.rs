@@ -1050,20 +1050,17 @@ impl HnswIndex {
         groups
             .par_iter()
             .for_each(|(neighbour_idx, level, max_conn, range)| {
-                // One prune for this list — single-writer per `(idx, level)`
-                // because the par_iter partitions groups by distinct
-                // neighbour_idx (and same neighbour_idx is funnelled into
-                // one group), so no other rayon worker touches this list.
-                self.prune_connections(*neighbour_idx, *level, *max_conn);
-
-                // Then cas_append every queued id for this neighbour.
-                // After prune, `len ≤ max_conn < N`, so the first
-                // `max_conn − current_len` appends succeed; any beyond
-                // capacity are dropped (matches hnswlib's prune-rejected
-                // outcome).
-                for entry in &backfill_ref[range.clone()] {
-                    let _ = self.neighbours_atomic[*neighbour_idx][*level].cas_append(entry.2);
-                }
+                // Collect the backfilled candidate ids for this
+                // (neighbour_idx, level) group and let the prune pass
+                // choose top-max_conn across the union of current
+                // neighbours and these queued candidates. The earlier
+                // "prune then cas_append" sequence dropped every backfill
+                // candidate because prune truncated *at* max_conn, leaving
+                // no room for the subsequent appends — the new closer
+                // candidates were silently discarded even when they
+                // should have replaced farther incumbents.
+                let extras: Vec<u64> = backfill_ref[range.clone()].iter().map(|e| e.2).collect();
+                self.prune_connections_with_extras(*neighbour_idx, *level, *max_conn, &extras);
             });
 
         // Step 4 — serial post-phase. SQ8 calibration sees the final
@@ -1819,14 +1816,41 @@ impl HnswIndex {
     /// Uses exact f32 distance for pruning when available, falls back to
     /// dequantized SQ8 distances when f32 vectors are offloaded.
     fn prune_connections(&self, node_idx: usize, level: usize, max_conn: usize) {
-        // Snapshot the current neighbour list, score each by distance to
-        // node_idx, then keep the nearest `max_conn`.
+        self.prune_connections_with_extras(node_idx, level, max_conn, &[]);
+    }
+
+    /// Prune `node_idx`'s neighbour list at `level` down to `max_conn`,
+    /// considering both the currently-attached neighbours AND a set of
+    /// `extras` queued candidates. Each entry is scored by distance to
+    /// `node_idx`; the nearest `max_conn` are kept.
+    ///
+    /// Folding the extras into the same selection pass is what fixes the
+    /// batched-apply recall collapse: the previous code pruned-then-
+    /// `cas_append`ed, but `prune` truncates *at* `max_conn` (not below),
+    /// so the subsequent append loop always saw a full list and dropped
+    /// every backfilled candidate. New nodes ended up with valid outgoing
+    /// edges but zero incoming back-edges from existing hubs, making the
+    /// graph unreachable from the entry point during search.
+    fn prune_connections_with_extras(
+        &self,
+        node_idx: usize,
+        level: usize,
+        max_conn: usize,
+        extras: &[u64],
+    ) {
         let neighbours = self.neighbours_atomic[node_idx][level].snapshot();
-        let mut scored: Vec<(f32, u64)> = Vec::with_capacity(neighbours.len());
-        for neighbor_id in &neighbours {
-            if let Some(&neighbor_idx) = self.id_to_idx.get(neighbor_id) {
+        // Dedupe via HashSet — extras can overlap with current neighbours
+        // when a backfill candidate raced to land before this prune pass.
+        let mut seen: std::collections::HashSet<u64> =
+            std::collections::HashSet::with_capacity(neighbours.len() + extras.len());
+        let mut scored: Vec<(f32, u64)> = Vec::with_capacity(neighbours.len() + extras.len());
+        for &neighbor_id in neighbours.iter().chain(extras.iter()) {
+            if !seen.insert(neighbor_id) {
+                continue;
+            }
+            if let Some(&neighbor_idx) = self.id_to_idx.get(&neighbor_id) {
                 let dist = self.distance_between_nodes(node_idx, neighbor_idx);
-                scored.push((dist, *neighbor_id));
+                scored.push((dist, neighbor_id));
             }
         }
 
@@ -3435,6 +3459,87 @@ mod tests {
         assert!(
             agreement >= 0.7,
             "serial/batched top-10 agreement = {agreement:.2} (expected ≥ 0.7)",
+        );
+    }
+
+    #[test]
+    fn insert_batch_chunked_preserves_recall_vs_brute_force() {
+        // Regression test for the apply-phase backfill bug: previously the
+        // prune-then-cas_append sequence dropped every backfilled
+        // candidate, leaving new nodes with valid outgoing edges but no
+        // incoming back-edges from existing hubs. At chunked-batch scale
+        // (SIFT1M: 1k items × 1000 calls) this collapsed search recall to
+        // ~0.02 across the entire ef_search sweep. Smaller in-tree test:
+        // 5k vectors, 1k chunks, recall@10 must clear a meaningful floor.
+        let dim = 16usize;
+        let n_train = 5_000usize;
+        let n_query = 50usize;
+        let k = 10usize;
+        let chunk = 1_000usize;
+
+        let cfg = HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 100,
+            ef_search: 64,
+            metric: VectorMetric::L2,
+            max_dimensions: dim as u32,
+            quantization: QuantizationCodec::None,
+            rerank_candidates: 64,
+            calibration_threshold: 100_000,
+            offload_vectors: false,
+            property_name: String::new(),
+            max_elements: n_train as u32,
+        };
+        fn make_vec(i: u64, dim: usize) -> Vec<f32> {
+            (0..dim)
+                .map(|d| ((i * 31 + d as u64) as f32 * 0.13).sin())
+                .collect()
+        }
+
+        let mut idx = HnswIndex::new(cfg);
+        let mut inserted = 0usize;
+        while inserted < n_train {
+            let end = (inserted + chunk).min(n_train);
+            let batch: Vec<(u64, Vec<f32>)> = (inserted..end)
+                .map(|i| (i as u64, make_vec(i as u64, dim)))
+                .collect();
+            idx.insert_batch(batch);
+            inserted = end;
+        }
+        assert_eq!(idx.len(), n_train);
+
+        // Recall@k against brute-force ground truth for held-out queries.
+        // Queries derived from corpus IDs near the middle of the batch
+        // boundary so they exercise nodes from multiple chunks.
+        let mut hits = 0u64;
+        let mut total = 0u64;
+        for q in (0..n_query).map(|i| (i * 73) as u64) {
+            let query = make_vec(q, dim);
+            let mut bf: Vec<(f32, u64)> = (0..n_train as u64)
+                .map(|i| {
+                    let v = make_vec(i, dim);
+                    let d = metrics::euclidean_distance_squared(&query, &v);
+                    (d, i)
+                })
+                .collect();
+            bf.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let gt: HashSet<u64> = bf.iter().take(k).map(|&(_, id)| id).collect();
+            let got: HashSet<u64> = idx.search(&query, k).into_iter().map(|r| r.id).collect();
+            hits += gt.intersection(&got).count() as u64;
+            total += k as u64;
+        }
+        let recall = hits as f64 / total as f64;
+        eprintln!(
+            "insert_batch chunked recall@{k} on {n_train} vectors / {n_query} queries: {recall:.3}"
+        );
+        // Floor of 0.5 catches the catastrophic-collapse regression
+        // (pre-fix observed ~0.02) without making the test fragile to
+        // small graph-quality variations across rng seeds.
+        assert!(
+            recall >= 0.5,
+            "chunked insert_batch recall {recall:.3} below floor 0.5 — \
+             apply-phase backfill regression?"
         );
     }
 
