@@ -13178,8 +13178,16 @@ fn execute_create_vector_index(
     crate::index::ops::save_index_definition(ctx.engine, &def)
         .map_err(|e| ExecutionError::Unsupported(format!("persist vector index '{name}': {e}")))?;
 
-    // Register the empty HNSW graph in memory.
-    registry.register(def);
+    // Register the empty HNSW graph in memory with its tier handle
+    // resolved from the executor's interner. Building the tier here
+    // (rather than inside `register`) keeps the registry free of any
+    // shared interner reference — register would otherwise need to
+    // re-enter the same parking_lot RwLock the executor already
+    // holds write-locked, which deadlocks on parking_lot.
+    let label_id = ctx.interner.intern(label);
+    let property_id = ctx.interner.intern(property);
+    let tier = registry.tier_handle(label_id, property_id);
+    registry.register_with_tier(def, tier);
 
     // Backfill existing nodes that have the indexed vector property.
     let node_prefix = {

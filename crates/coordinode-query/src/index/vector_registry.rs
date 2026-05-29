@@ -8,7 +8,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use coordinode_core::graph::node::NodeId;
+use coordinode_storage::engine::core::StorageEngine;
 use coordinode_vector::hnsw::{HnswConfig, HnswIndex, SearchResult};
+use coordinode_vector::storage::lsm_backed::LsmVectorTier;
+use coordinode_vector::storage::{VectorTierHandle, VectorTierStorage};
 use coordinode_vector::VectorLoader;
 
 use super::definition::IndexDefinition;
@@ -36,25 +39,74 @@ pub struct VectorIndexRegistry {
     indexes: RwLock<HashMap<VectorIndexKey, HnswHandle>>,
     /// Index definitions keyed by (label, property) for metadata lookup.
     definitions: RwLock<HashMap<VectorIndexKey, IndexDefinition>>,
+    /// Optional persistent f32 truth tier backend (ADR-033). When set,
+    /// callers obtain a `VectorTierHandle` via [`Self::tier_handle`]
+    /// using pre-resolved `(label_id, property_id)` and pass it to
+    /// [`Self::register_with_tier`]. The registry intentionally does
+    /// NOT carry an interner reference — interning lives at the
+    /// caller (executor, Database) so we never re-enter the same
+    /// `parking_lot` RwLock from inside an active write transaction.
+    tier_backend: Option<Arc<dyn VectorTierStorage>>,
 }
 
 impl VectorIndexRegistry {
-    /// Create an empty registry.
+    /// Create an empty registry with no persistent vector tier.
     pub fn new() -> Self {
         Self {
             indexes: RwLock::new(HashMap::new()),
             definitions: RwLock::new(HashMap::new()),
+            tier_backend: None,
         }
     }
 
-    /// Register a new vector index with an empty HNSW graph.
+    /// Create a registry that persists vector data to the
+    /// `Partition::VectorF32` truth tier on every insert.
     ///
-    /// Creates the HNSW structure from the index definition's config.
-    /// The caller is responsible for populating the index with existing
-    /// vectors (see `bulk_insert`).
+    /// The `engine` is shared with the rest of the embed / query
+    /// stack so registered HNSW indexes route their truth-tier
+    /// writes to the same LSM. Label / property interning is the
+    /// caller's job — pass resolved ids through [`Self::tier_handle`]
+    /// at register time so the insert path never touches a shared
+    /// interner lock.
+    pub fn with_vector_tier(engine: Arc<StorageEngine>) -> Self {
+        let backend: Arc<dyn VectorTierStorage> = Arc::new(LsmVectorTier::new(engine));
+        Self {
+            indexes: RwLock::new(HashMap::new()),
+            definitions: RwLock::new(HashMap::new()),
+            tier_backend: Some(backend),
+        }
+    }
+
+    /// Build a [`VectorTierHandle`] from pre-resolved
+    /// `(label_id, property_id)`. Returns `None` if no tier backend
+    /// is configured. The IDs MUST be obtained by the caller from
+    /// the same interner the storage layer uses for node properties
+    /// — the registry holds no interner reference of its own.
+    pub fn tier_handle(&self, label_id: u32, property_id: u32) -> Option<VectorTierHandle> {
+        let backend = self.tier_backend.as_ref()?.clone();
+        Some(VectorTierHandle::new(backend, label_id, property_id))
+    }
+
+    /// Register a new vector index with an empty HNSW graph and NO
+    /// persistent tier wiring. Equivalent to
+    /// `register_with_tier(def, None)`. The graph is in-RAM only —
+    /// f32 originals are not persisted, suitable for tests and
+    /// ad-hoc analytics.
+    pub fn register(&self, def: IndexDefinition) {
+        self.register_with_tier(def, None);
+    }
+
+    /// Register a new vector index with an empty HNSW graph and a
+    /// caller-provided tier handle. When `tier` is `Some`, every
+    /// insert into the resulting HNSW also writes the f32 original
+    /// to the LSM truth tier under
+    /// `vec:<label_id><property_id><node_id>` (ADR-033).
+    ///
+    /// The caller is responsible for populating the index with
+    /// existing vectors (see `bulk_insert`).
     ///
     /// Uses interior mutability — safe to call via `&self`.
-    pub fn register(&self, def: IndexDefinition) {
+    pub fn register_with_tier(&self, def: IndexDefinition, tier: Option<VectorTierHandle>) {
         let Some(config) = def.vector_config.as_ref() else {
             tracing::error!(
                 "register called with non-vector IndexDefinition: {}",
@@ -78,7 +130,13 @@ impl VectorIndexRegistry {
             max_elements: 1_000_000,
         };
 
-        let hnsw = HnswIndex::new(hnsw_config);
+        let mut hnsw = HnswIndex::new(hnsw_config);
+        // Bind the caller-resolved tier handle BEFORE the index is
+        // moved into the registry so subsequent inserts persist f32
+        // to disk per ADR-033. `None` keeps the index pure in-RAM
+        // (test path, ad-hoc analytics).
+        hnsw.set_vector_tier(tier);
+
         let key = (def.label.clone(), def.property().to_string());
         self.indexes
             .write()

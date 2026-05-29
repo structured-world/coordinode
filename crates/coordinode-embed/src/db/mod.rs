@@ -547,6 +547,11 @@ impl Database {
             }),
             None => FieldInterner::new(),
         };
+        // Wrap the interner in the shared Arc<RwLock<_>> early so the
+        // vector registry can use the same instance to resolve label /
+        // property ids when binding the per-index tier handle. The
+        // Database struct stores the same Arc below (line 632 region).
+        let shared_interner: Arc<RwLock<FieldInterner>> = Arc::new(RwLock::new(interner));
 
         // Load index registry from storage for EXPLAIN SUGGEST accuracy.
         let index_registry = coordinode_query::index::IndexRegistry::new();
@@ -555,14 +560,22 @@ impl Database {
         }
 
         // Load vector index definitions from schema: partition and rebuild
-        // HNSW graphs from stored vectors (eager rebuild).
+        // HNSW graphs from stored vectors (eager rebuild). The registry is
+        // tier-backed: every index it registers persists f32 to LSM per
+        // ADR-033. Interning happens inside `load_vector_indexes` under a
+        // brief write guard; the registry itself holds no interner ref
+        // (would cause reentrant write deadlocks against execute_cypher).
         let vector_index_registry =
-            Self::load_vector_indexes(&engine, &interner, 1 /* shard_id */);
+            Self::load_vector_indexes(engine.clone(), &shared_interner, 1 /* shard_id */);
 
         // Load text index definitions and rebuild tantivy indexes from stored nodes.
         let text_index_base = path.join("text_indexes");
-        let text_index_registry =
-            Self::load_text_indexes(&engine, &interner, 1 /* shard_id */, &text_index_base);
+        let text_index_registry = Self::load_text_indexes(
+            &engine,
+            &shared_interner.read(),
+            1, /* shard_id */
+            &text_index_base,
+        );
 
         let proposal_id_gen = Arc::new(ProposalIdGenerator::new());
 
@@ -619,7 +632,7 @@ impl Database {
                 Arc::clone(&engine),
                 1, // shard_id
                 ttl_reaper_config,
-                interner.clone(),
+                shared_interner.read().clone(),
                 Arc::clone(&pipeline),
                 Arc::clone(&proposal_id_gen),
             ))
@@ -629,7 +642,7 @@ impl Database {
 
         Ok(Self {
             engine,
-            interner: Arc::new(RwLock::new(interner)),
+            interner: shared_interner,
             allocator,
             shard_id: 1,
             query_registry: Arc::new(QueryRegistry::new()),
@@ -666,14 +679,20 @@ impl Database {
     ///
     /// Called during `Database::open()` for eager HNSW rebuild.
     fn load_vector_indexes(
-        engine: &StorageEngine,
-        interner: &FieldInterner,
+        engine: Arc<StorageEngine>,
+        interner_arc: &Arc<RwLock<FieldInterner>>,
         shard_id: u16,
     ) -> coordinode_query::index::VectorIndexRegistry {
         use coordinode_core::graph::node::NodeRecord;
         use coordinode_query::index::IndexType;
 
-        let registry = coordinode_query::index::VectorIndexRegistry::new();
+        // Tier-backed registry: every registered HNSW index gets a
+        // VectorTierHandle scoped to its `(label_id, property_id)`.
+        // Interning is done here (caller-side) so the registry never
+        // touches a shared interner lock and stays reentrancy-safe.
+        let registry =
+            coordinode_query::index::VectorIndexRegistry::with_vector_tier(engine.clone());
+        let engine = engine.as_ref();
 
         // Step 1: Scan schema:idx:* for HNSW index definitions.
         let iter = match engine.prefix_scan(Partition::Schema, b"schema:idx:") {
@@ -702,9 +721,18 @@ impl Database {
             return registry;
         }
 
-        // Step 2: Register all definitions (creates empty HNSW graphs).
-        for def in &hnsw_defs {
-            registry.register(def.clone());
+        // Step 2: Resolve (label, property) → interned ids in one short
+        // write-locked pass, build per-index tier handles, then register
+        // each HNSW with its tier bound. Lock scope is the for-loop body
+        // only; released before step 3's read pass.
+        {
+            let mut g = interner_arc.write();
+            for def in &hnsw_defs {
+                let label_id = g.intern(&def.label);
+                let property_id = g.intern(def.property());
+                let tier = registry.tier_handle(label_id, property_id);
+                registry.register_with_tier(def.clone(), tier);
+            }
         }
 
         // Step 3: Scan node: partition once, populating all HNSW indexes.
@@ -737,6 +765,11 @@ impl Database {
         // Track per-index vector counts for structured logging.
         let mut per_index_counts: std::collections::HashMap<(String, String), usize> =
             std::collections::HashMap::new();
+
+        // Step 3 takes the read guard for property-id lookups. Safe to
+        // co-exist with previous step because the write guard from
+        // step 2 was released at the end of its block scope above.
+        let interner = interner_arc.read();
 
         for guard in node_iter {
             let Ok((_key, value)) = guard.into_inner() else {
@@ -1575,8 +1608,17 @@ impl Database {
         // Register in both registries: VectorIndexRegistry holds the live HNSW
         // graph for query acceleration; IndexRegistry mirrors the definition so
         // advisors and planners can see all indexes (scalar + vector) through
-        // a single source of truth.
-        self.vector_index_registry.register(def.clone());
+        // a single source of truth. Tier handle is resolved locally so the
+        // registry never touches the shared interner lock.
+        let tier = {
+            let mut g = self.interner.write();
+            let label_id = g.intern(&def.label);
+            let property_id = g.intern(def.property());
+            self.vector_index_registry
+                .tier_handle(label_id, property_id)
+        };
+        self.vector_index_registry
+            .register_with_tier(def.clone(), tier);
         self.index_registry.register_in_memory(def);
     }
 
@@ -2349,11 +2391,13 @@ mod tests {
         let arc1 = db.engine_shared();
         let arc2 = db.engine_shared();
 
-        // Both point to the same allocation (Arc strong count = 5:
+        // Both point to the same allocation (Arc strong count = 6:
         // one in Database, one in OwnedLocalProposalPipeline (drain),
-        // one in TtlReaperHandle (background thread), two here).
-        assert_eq!(Arc::strong_count(&arc1), 5);
-        assert_eq!(Arc::strong_count(&arc2), 5);
+        // one in TtlReaperHandle (background thread), one in the
+        // LsmVectorTier backing VectorIndexRegistry (ADR-033 f32
+        // truth tier), two here).
+        assert_eq!(Arc::strong_count(&arc1), 6);
+        assert_eq!(Arc::strong_count(&arc2), 6);
 
         // Write through arc1, read through arc2
         arc1.put(
