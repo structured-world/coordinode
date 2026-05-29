@@ -273,7 +273,8 @@ impl RaBitQParams {
         );
 
         RaBitQExtCode {
-            levels,
+            packed: pack_levels(&levels, bits),
+            dims: d as u32,
             bits,
             norm,
             cross_term: sum_rotated * inv_sqrt_d,
@@ -291,12 +292,13 @@ impl RaBitQParams {
     /// Panics in debug if `q.bits != x.bits` or dimension mismatch.
     pub fn estimate_inner_product_ext(&self, q: &RaBitQExtCode, x: &RaBitQExtCode) -> f32 {
         debug_assert_eq!(q.bits, x.bits, "bit-width mismatch");
-        debug_assert_eq!(q.levels.len(), self.dims as usize, "q dimension mismatch");
-        debug_assert_eq!(x.levels.len(), self.dims as usize, "x dimension mismatch");
+        debug_assert_eq!(q.dims, self.dims, "q dimension mismatch");
+        debug_assert_eq!(x.dims, self.dims, "x dimension mismatch");
         let table = level_centroids(q.bits);
+        let d = self.dims as usize;
         let mut acc = 0.0f32;
-        for (lq, lx) in q.levels.iter().zip(x.levels.iter()) {
-            acc += table[*lq as usize] * table[*lx as usize];
+        for i in 0..d {
+            acc += table[q.level(i) as usize] * table[x.level(i) as usize];
         }
         acc * q.norm * x.norm
     }
@@ -308,12 +310,13 @@ impl RaBitQParams {
     pub fn estimate_cosine_distance_ext(&self, q: &RaBitQExtCode, x: &RaBitQExtCode) -> f32 {
         debug_assert_eq!(q.bits, x.bits, "bit-width mismatch");
         let table = level_centroids(q.bits);
+        let d = self.dims as usize;
         let mut dot = 0.0f32;
         let mut nq = 0.0f32;
         let mut nx = 0.0f32;
-        for (lq, lx) in q.levels.iter().zip(x.levels.iter()) {
-            let vq = table[*lq as usize];
-            let vx = table[*lx as usize];
+        for i in 0..d {
+            let vq = table[q.level(i) as usize];
+            let vx = table[x.level(i) as usize];
             dot += vq * vx;
             nq += vq * vq;
             nx += vx * vx;
@@ -327,17 +330,29 @@ impl RaBitQParams {
 ///
 /// Each dimension is uniformly scalar-quantized into `2^bits` levels
 /// (cut points at the quantiles of N(0, 1) — rotated isotropic data
-/// is approximately normal after divide-by-norm).
+/// is approximately normal after divide-by-norm). Level indices are
+/// packed at `bits` per dim into a `ceil(D × bits / 8)` byte buffer,
+/// matching the storage size quoted in the SIGMOD 2025 paper:
 ///
-/// Memory: `D + 8` bytes (one byte per dim packs all bits ≤ 4; lossless
-/// because levels are bounded by `2^bits ≤ 16`). True bit-packed
-/// representation (e.g. 4 dims/byte at 2-bit) is a future optimization
-/// for billion-vector deployments; current layout favours simplicity +
-/// cache-friendly sequential reads in the distance kernel.
+/// | bits | D=1024 packed | D=1024 (old 1 B/dim) |
+/// |------|---------------|----------------------|
+/// | 2    | 256 B         | 1024 B (-75%)        |
+/// | 3    | 384 B         | 1024 B (-62.5%)      |
+/// | 4    | 512 B         | 1024 B (-50%)        |
+///
+/// Distance kernel decodes a level on demand via [`Self::level`] —
+/// modestly more arithmetic per dim than an array index, paid back
+/// many times over by tighter cache behaviour at scale.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RaBitQExtCode {
-    /// One level index per dimension; `levels[i] ∈ [0, 2^bits)`.
-    pub levels: Vec<u8>,
+    /// Bit-packed level indices: `bits` bits per dim, dim 0 in the
+    /// LSBs of `packed[0]`, dims advance through the stream LSB-first.
+    /// Length is `ceil(dims × bits / 8)`.
+    pub packed: Vec<u8>,
+    /// Number of dimensions encoded. Stored explicitly because
+    /// `packed.len()` alone can't disambiguate trailing-bit padding
+    /// at non-multiple-of-8 dim×bits products.
+    pub dims: u32,
     /// Bit-width that produced this code. Required to pick the correct
     /// centroid lookup table at distance time.
     pub bits: u8,
@@ -352,8 +367,56 @@ pub struct RaBitQExtCode {
 impl RaBitQExtCode {
     /// Memory size on the wire / in RAM.
     pub fn size_bytes(&self) -> usize {
-        self.levels.len() + 8 // 8 bytes for f32 norm + f32 cross_term
+        self.packed.len() + 4 + 1 + 4 + 4 // dims:u32 + bits:u8 + norm:f32 + cross_term:f32
     }
+
+    /// Extract the level index at dimension `i`. Returns a value in
+    /// `[0, 2^bits)`. Out-of-range `i` returns 0 (sane fallback for
+    /// the kernel; callers should know their dim count).
+    #[inline]
+    pub fn level(&self, i: usize) -> u8 {
+        if i >= self.dims as usize {
+            return 0;
+        }
+        let bits = self.bits as usize;
+        let bit_idx = i * bits;
+        let byte_idx = bit_idx / 8;
+        let bit_offset = bit_idx % 8;
+        let mask = (1u16 << bits) - 1;
+        // Read 16 bits straddling the byte boundary so we don't have
+        // to special-case the 3-bit / cross-byte case.
+        let lo = self.packed[byte_idx] as u16;
+        let hi = if byte_idx + 1 < self.packed.len() {
+            self.packed[byte_idx + 1] as u16
+        } else {
+            0
+        };
+        let word = lo | (hi << 8);
+        ((word >> bit_offset) & mask) as u8
+    }
+}
+
+/// Pack `dims` level indices (each `< 2^bits`) into a bit-packed byte
+/// vector. `bits` MUST be in `{2,3,4}`; caller pre-validates.
+fn pack_levels(levels: &[u8], bits: u8) -> Vec<u8> {
+    let dims = levels.len();
+    let bits_n = bits as usize;
+    let total_bits = dims * bits_n;
+    let bytes = total_bits.div_ceil(8);
+    let mut out = vec![0u8; bytes];
+    for (i, &lvl) in levels.iter().enumerate() {
+        let bit_idx = i * bits_n;
+        let byte_idx = bit_idx / 8;
+        let bit_offset = bit_idx % 8;
+        // Spread the level across at most two bytes (3-bit at offset 6/7
+        // straddles; 2/4-bit never do because they divide evenly).
+        let v = (lvl as u16) << bit_offset;
+        out[byte_idx] |= (v & 0xFF) as u8;
+        if (bit_offset + bits_n) > 8 && byte_idx + 1 < out.len() {
+            out[byte_idx + 1] |= ((v >> 8) & 0xFF) as u8;
+        }
+    }
+    out
 }
 
 /// Quantize a single value (already divided by ‖x‖, so ~N(0, 1/D)) to a
@@ -677,31 +740,49 @@ mod tests {
         for bits in [2u8, 3, 4] {
             let c = p.encode_ext(&v, bits);
             assert_eq!(c.bits, bits);
-            assert_eq!(c.levels.len(), dims as usize);
-            let max = 1u8 << bits;
-            assert!(
-                c.levels.iter().all(|&l| l < max),
-                "bits={bits}: every level must be < {max}"
+            assert_eq!(c.dims, dims);
+            // packed length must match ceil(dims × bits / 8)
+            let expected_packed = (dims as usize * bits as usize).div_ceil(8);
+            assert_eq!(
+                c.packed.len(),
+                expected_packed,
+                "bits={bits}: packed length expected {expected_packed}, got {}",
+                c.packed.len()
             );
+            let max = 1u8 << bits;
+            for i in 0..dims as usize {
+                assert!(
+                    c.level(i) < max,
+                    "bits={bits}: level({i})={} must be < {max}",
+                    c.level(i)
+                );
+            }
             assert!(c.norm > 0.0);
         }
     }
 
     #[test]
     fn ext_code_size_matches_spec() {
-        // D=1024 → 1024 level bytes + 8 scalars = 1032 bytes at all bit
-        // widths. (One byte per dim. True 2/3/4-bit packing is a future
-        // deployment optimization — the arch doc 256/384/512 B numbers
-        // refer to that packed variant; this layout is correct-by-
-        // construction at slightly higher RAM cost.)
+        // True bit-packed layout per the SIGMOD 2025 paper:
+        //   bits=2 → 256 B packed + 13 B scalars (dims:u32 + bits:u8 + 2×f32) = 269 B
+        //   bits=3 → 384 B + 13 = 397 B
+        //   bits=4 → 512 B + 13 = 525 B
+        // The arch doc quotes the packed body only (256/384/512); the
+        // extra 13 B per code is scalar metadata + dims field for safe
+        // decoding when dims × bits doesn't fit cleanly in a byte.
         let p = RaBitQParams::calibrate(1024, 7);
         let v = vec![1.0f32; 1024];
-        for bits in [2u8, 3, 4] {
+        for (bits, packed_bytes) in [(2u8, 256), (3, 384), (4, 512)] {
             let c = p.encode_ext(&v, bits);
             assert_eq!(
+                c.packed.len(),
+                packed_bytes,
+                "bits={bits}: packed body must be {packed_bytes} B"
+            );
+            assert_eq!(
                 c.size_bytes(),
-                1032,
-                "bits={bits}: byte-per-dim layout expected"
+                packed_bytes + 13,
+                "bits={bits}: total size mismatch"
             );
         }
     }
