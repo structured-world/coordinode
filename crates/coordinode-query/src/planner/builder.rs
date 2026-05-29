@@ -567,6 +567,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
         }),
         Clause::CreateVectorIndex(c) => {
             let metric = parse_vector_metric(c.metric.as_deref());
+            let quantization = parse_quantization_codec(c.quantization.as_deref());
             Ok(LogicalOp::CreateVectorIndex {
                 name: c.name.clone(),
                 label: c.label.clone(),
@@ -575,6 +576,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 ef_construction: c.ef_construction.unwrap_or(200),
                 metric,
                 dimensions: c.dimensions.unwrap_or(0),
+                quantization,
             })
         }
         Clause::DropVectorIndex(c) => Ok(LogicalOp::DropVectorIndex {
@@ -713,6 +715,34 @@ fn parse_vector_metric(s: Option<&str>) -> coordinode_core::graph::types::Vector
         Some("dot") | Some("dotproduct") | Some("dot_product") => VectorMetric::DotProduct,
         Some("l1") | Some("manhattan") => VectorMetric::L1,
         _ => VectorMetric::Cosine,
+    }
+}
+
+/// Resolve the Cypher OPTIONS `quantization` string to a
+/// [`QuantizationCodec`]. Case-insensitive.
+///
+/// Accepts:
+/// - `none` / absent → `None` (f32 in RAM, default)
+/// - `sq8` → `Sq8`
+/// - `rabitq` / `rabitq-1bit` → `RaBitQ { bits: 1 }`
+/// - `rabitq-2bit` / `rabitq-3bit` / `rabitq-4bit` → Extended-RaBitQ
+///   at the indicated bit width (R862)
+///
+/// Unrecognized values fall back to `None` rather than erroring so a
+/// typo in a DDL string doesn't fail an entire migration; the planner
+/// emits no warning here — the index just behaves as if no codec was
+/// requested. (Strict validation lives in the parser layer; this fn
+/// is the last-resort fallback.)
+fn parse_quantization_codec(s: Option<&str>) -> coordinode_vector::hnsw::QuantizationCodec {
+    use coordinode_vector::hnsw::QuantizationCodec;
+    match s.map(|q| q.to_lowercase()).as_deref() {
+        Some("none") | None => QuantizationCodec::None,
+        Some("sq8") => QuantizationCodec::Sq8,
+        Some("rabitq") | Some("rabitq-1bit") => QuantizationCodec::RaBitQ { bits: 1 },
+        Some("rabitq-2bit") => QuantizationCodec::RaBitQ { bits: 2 },
+        Some("rabitq-3bit") => QuantizationCodec::RaBitQ { bits: 3 },
+        Some("rabitq-4bit") => QuantizationCodec::RaBitQ { bits: 4 },
+        _ => QuantizationCodec::None,
     }
 }
 

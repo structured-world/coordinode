@@ -289,6 +289,17 @@ pub struct CreateVectorIndexClause {
     pub metric: Option<String>,
     /// Vector dimensionality (required unless inferrable from data).
     pub dimensions: Option<u32>,
+    /// In-RAM quantization codec selector. Accepted values:
+    ///
+    /// - `"none"` (default — f32 originals stay in RAM)
+    /// - `"sq8"`
+    /// - `"rabitq"` (1-bit; default `bits=1`)
+    /// - `"rabitq-1bit"` / `"rabitq-2bit"` / `"rabitq-3bit"` /
+    ///   `"rabitq-4bit"` (Extended-RaBitQ R862 — higher bits trade
+    ///   RAM for recall)
+    ///
+    /// Case-insensitive. Unrecognized values fall back to `"none"`.
+    pub quantization: Option<String>,
 }
 
 /// CREATE EDGE TYPE clause.

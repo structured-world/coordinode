@@ -352,6 +352,11 @@ pub enum LogicalOp {
         metric: coordinode_core::graph::types::VectorMetric,
         /// Vector dimensionality (0 = infer from first vector seen).
         dimensions: u32,
+        /// In-RAM quantization codec, resolved from the Cypher OPTIONS
+        /// `quantization` field (or `None` default). Lifted to the
+        /// logical layer so the executor can pass it straight through
+        /// to `VectorIndexConfig` without re-parsing the string.
+        quantization: coordinode_vector::hnsw::QuantizationCodec,
     },
 
     /// DROP VECTOR INDEX: remove an HNSW vector index by name.
@@ -2010,9 +2015,10 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             ef_construction,
             metric,
             dimensions,
+            quantization,
         } => {
             output.push_str(&format!(
-                "{prefix}CreateVectorIndex({name} ON :{label}({property}), m={m}, ef={ef_construction}, metric={metric:?}, dim={dimensions})\n"
+                "{prefix}CreateVectorIndex({name} ON :{label}({property}), m={m}, ef={ef_construction}, metric={metric:?}, dim={dimensions}, quant={quantization:?})\n"
             ));
         }
         LogicalOp::DropVectorIndex { name } => {

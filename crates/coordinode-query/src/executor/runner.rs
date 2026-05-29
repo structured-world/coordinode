@@ -2719,6 +2719,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             ef_construction,
             metric,
             dimensions,
+            quantization,
         } => execute_create_vector_index(
             name,
             label,
@@ -2727,6 +2728,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             *ef_construction,
             *metric,
             *dimensions,
+            *quantization,
             ctx,
         ),
 
@@ -13148,6 +13150,7 @@ fn execute_create_vector_index(
     ef_construction: usize,
     metric: coordinode_core::graph::types::VectorMetric,
     dimensions: u32,
+    quantization: coordinode_vector::hnsw::QuantizationCodec,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let Some(registry) = ctx.vector_index_registry else {
@@ -13163,13 +13166,15 @@ fn execute_create_vector_index(
         )));
     }
 
-    // Build the index definition.
+    // Build the index definition. `quantization` is resolved earlier
+    // in the planner from the Cypher OPTIONS string; the executor
+    // just plugs it through.
     let config = crate::index::VectorIndexConfig {
         dimensions,
         metric,
         m,
         ef_construction,
-        quantization: coordinode_vector::hnsw::QuantizationCodec::None,
+        quantization,
         offload_vectors: false,
     };
     let def = crate::index::IndexDefinition::hnsw(name, label, property, config);

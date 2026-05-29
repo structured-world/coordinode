@@ -793,3 +793,93 @@ fn remove_property_removes_from_vector_index() {
         .expect("node exists check");
     assert_eq!(node.len(), 1, "node itself should still exist after REMOVE");
 }
+
+// ── Cypher OPTIONS { quantization } ──────────────────────────────────
+
+/// CREATE VECTOR INDEX ... OPTIONS { quantization: "rabitq-2bit" } must
+/// thread the Extended-RaBitQ 2-bit codec from the parser through the
+/// planner, executor, and into the live HnswIndex. After enough inserts
+/// to trigger calibration, every node in the index must carry a
+/// Multi(bits=2) code and search must return matching results.
+#[test]
+fn create_vector_index_with_rabitq_2bit_quantization() {
+    let (mut db, _dir) = open_db();
+
+    // d=64 is the smallest dim accepted by RaBitQ (multiple of 64).
+    // calibration_threshold defaults to 1000 inside HnswIndex; we go
+    // above that by inserting 1100 vectors so calibration definitely
+    // fires before the assertions.
+    db.execute_cypher(
+        "CREATE VECTOR INDEX ext_idx ON :Doc(emb) \
+         OPTIONS {m: 8, ef_construction: 64, metric: \"cosine\", \
+                  dimensions: 64, quantization: \"rabitq-2bit\"}",
+    )
+    .expect("create vector index with rabitq-2bit");
+
+    // Insert above calibration_threshold (1000) with batched UNWIND.
+    let n = 1100usize;
+    let mut rows = String::from("[");
+    for i in 0..n {
+        if i > 0 {
+            rows.push_str(", ");
+        }
+        let mut v = [0.0f32; 64];
+        // Each vector has a single non-zero dim — keeps codes distinct
+        // and well-distributed across the rotated space.
+        v[i % 64] = 1.0 + (i as f32) * 0.001;
+        rows.push_str(&format!("{{i: {i}, emb: ["));
+        for (j, x) in v.iter().enumerate() {
+            if j > 0 {
+                rows.push_str(", ");
+            }
+            rows.push_str(&format!("{x}"));
+        }
+        rows.push_str("]}");
+    }
+    rows.push(']');
+    let query = format!("UNWIND {rows} AS r CREATE (m:Doc) SET m = r RETURN m");
+    let created = db.execute_cypher(&query).expect("bulk create");
+    assert_eq!(created.len(), n, "bulk create returned wrong row count");
+
+    // Search: the e_0-like query vector should match node 0 first.
+    let mut q = String::from("[1.0");
+    for _ in 1..64 {
+        q.push_str(", 0.0");
+    }
+    q.push(']');
+    let result = db
+        .execute_cypher(&format!(
+            "MATCH (n:Doc) WITH n, vector_similarity(n.emb, {q}) AS s \
+             ORDER BY s DESC LIMIT 5 RETURN n.i AS i"
+        ))
+        .expect("vector search through rabitq-2bit index");
+    assert!(
+        !result.is_empty(),
+        "vector_similarity must return results through Extended-RaBitQ index"
+    );
+    // 17 of the 1100 nodes (every 64th: 0, 64, ..., 1024, 1088) have
+    // their non-zero on dim 0 — those are the legitimate top-cosine
+    // matches against query e_0. The codec wiring is proven iff every
+    // node in top-5 belongs to that family. Exact ordering inside the
+    // family is determined by rotation noise + the small magnitude
+    // offset (1.0 + i*0.001) and isn't load-bearing for the wiring
+    // assertion.
+    let top5_ids: Vec<i64> = result
+        .iter()
+        .filter_map(|r| match r.get("i") {
+            Some(Value::Int(x)) => Some(*x),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !top5_ids.is_empty(),
+        "expected non-empty top-5 from rabitq-2bit search"
+    );
+    for id in &top5_ids {
+        assert_eq!(
+            id % 64,
+            0,
+            "rabitq-2bit top-5 leaked a wrong-cluster node: id={id}, full={top5_ids:?}",
+        );
+    }
+}

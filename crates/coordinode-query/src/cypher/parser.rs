@@ -1365,6 +1365,7 @@ fn build_create_vector_index_clause(
     let mut ef_construction: Option<usize> = None;
     let mut metric: Option<String> = None;
     let mut dimensions: Option<u32> = None;
+    let mut quantization: Option<String> = None;
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
@@ -1392,6 +1393,7 @@ fn build_create_vector_index_clause(
                             "ef_construction" => ef_construction = val_str.parse().ok(),
                             "metric" => metric = Some(val_str),
                             "dimensions" => dimensions = val_str.parse().ok(),
+                            "quantization" => quantization = Some(val_str),
                             _ => {} // unknown options silently ignored
                         }
                     }
@@ -1415,6 +1417,7 @@ fn build_create_vector_index_clause(
         ef_construction,
         metric,
         dimensions,
+        quantization,
     })
 }
 
