@@ -326,7 +326,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(point) = points.iter().find(|p| p.recall_at_k >= 0.95) {
         report.record("qps_at_recall_0_95", point.qps)?;
     }
-    let path = report.write_json(&args.output)?;
+    let tag = format!("M{}", args.m);
+    let path = report.write_json(&args.output, Some(&tag))?;
     info!(path=?path, "report written");
     Ok(())
 }

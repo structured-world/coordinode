@@ -114,18 +114,30 @@ impl BenchReport {
     }
 
     /// Serialise to JSON file at the canonical path:
-    /// `<base>/<modality>/<dataset>/<sha>-<YYYYmmdd-HHMMSS>.json`.
+    /// `<base>/<modality>/<dataset>/<sha>-<subject>[-<tag>]-<YYYYmmdd-HHMMSS>.json`.
     /// Creates parent directories as needed.
     ///
-    /// The canonical naming lets the gh-pages reporting layer
-    /// glob `bench-results/<modality>/<dataset>/*.json` and sort
-    /// lexicographically by SHA-then-timestamp for the dynamics
-    /// chart.
-    pub fn write_json(&self, base: impl AsRef<Path>) -> BenchOpResult<std::path::PathBuf> {
+    /// `tag` distinguishes configurations of the same engine on the
+    /// same commit (e.g. `"M16"`, `"M24"`, `"M32"` for an HNSW M
+    /// sweep). When `None`, the filename matches the original
+    /// `<sha>-<subject>-<stamp>.json` shape.
+    pub fn write_json(
+        &self,
+        base: impl AsRef<Path>,
+        tag: Option<&str>,
+    ) -> BenchOpResult<std::path::PathBuf> {
         let dir = base.as_ref().join(&self.modality).join(&self.dataset);
         std::fs::create_dir_all(&dir)?;
         let stamp = self.timestamp.format("%Y%m%d-%H%M%S");
-        let file_name = format!("{}-{}-{}.json", &self.git.sha_short, &self.subject, stamp);
+        let file_name = match tag {
+            Some(t) if !t.is_empty() => {
+                format!(
+                    "{}-{}-{}-{}.json",
+                    &self.git.sha_short, &self.subject, t, stamp
+                )
+            }
+            _ => format!("{}-{}-{}.json", &self.git.sha_short, &self.subject, stamp),
+        };
         let path = dir.join(file_name);
         let bytes = serde_json::to_vec_pretty(self)?;
         std::fs::write(&path, bytes)?;
@@ -227,11 +239,37 @@ mod tests {
         )
         .expect("build");
         report.record("metric_a", 1.0_f64).expect("record");
-        let path = report.write_json(tmp.path()).expect("write");
+        let path = report.write_json(tmp.path(), None).expect("write");
         assert!(path.exists(), "JSON file must exist");
         // Round-trip verify file
         let bytes = std::fs::read(&path).expect("read");
         let back: BenchReport = serde_json::from_slice(&bytes).expect("decode");
         assert_eq!(back.metrics["metric_a"].as_f64(), Some(1.0));
+    }
+
+    #[test]
+    fn write_json_tag_appears_in_filename() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let report = BenchReport::new(
+            "vector",
+            "ann-benchmarks",
+            "sift-128-euclidean",
+            "coordinode",
+            "none",
+            "0.0.0",
+        )
+        .expect("build");
+        let with_tag = report.write_json(tmp.path(), Some("M24")).expect("write");
+        let bare = report.write_json(tmp.path(), None).expect("write");
+        let with_name = with_tag.file_name().unwrap().to_string_lossy().to_string();
+        let bare_name = bare.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            with_name.contains("-coordinode-M24-"),
+            "tag must appear between subject and timestamp: {with_name}"
+        );
+        assert!(
+            !bare_name.contains("-M24-"),
+            "untagged file must not carry M segment: {bare_name}"
+        );
     }
 }

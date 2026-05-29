@@ -96,7 +96,18 @@ jobs:
         # cargo invocation = one shared compile graph = fastest.
 
       # ── Vector (ann-benchmarks SIFT1M) ─────────────────────────
-      - name: Vector — SIFT1M sweep
+      #
+      # Sweep over HNSW M ∈ {16, 24, 32} so the docs UI can compare
+      # CoordiNode against competitors at the SAME graph density.
+      # hnswlib results in bench-data already come in three M values
+      # (`<sha>-hnswlib-M<m>-<ts>.json`). Single-M coordinode forced
+      # the "QPS at recall ≥ X" chart to mix M=24 hnswlib with M=32
+      # CoordiNode — different graph topology, not apples-to-apples.
+      #
+      # Filenames: `<sha>-coordinode-M<m>-<ts>.json`. Sequential —
+      # one cargo build, three runs sharing the dataset on the same
+      # host. Per run: ~5 min build + ~30 s queries on SIFT1M.
+      - name: Vector — SIFT1M M sweep (16, 24, 32)
         id: vector
         if: ${{ contains(inputs.modalities || 'vector,graph,spatial,timeseries,search,document', 'vector') }}
         run: |
@@ -105,15 +116,19 @@ jobs:
           for f in sift_base.fvecs sift_query.fvecs sift_groundtruth.ivecs; do
             test -f "$DS_DIR/$f" || { echo "::error::missing $DS_DIR/$f — see benches/vector-ann/README.md"; exit 1; }
           done
-          ./target/release/bench-vector-ann \
-            --train       "$DS_DIR/sift_base.fvecs" \
-            --query       "$DS_DIR/sift_query.fvecs" \
-            --groundtruth "$DS_DIR/sift_groundtruth.ivecs" \
-            --dataset-name sift-128-euclidean \
-            --m 32 \
-            --ef-construction 200 \
-            --codec none \
-            --output bench-results
+          for M in 16 24 32; do
+            echo "::group::SIFT1M M=$M"
+            ./target/release/bench-vector-ann \
+              --train       "$DS_DIR/sift_base.fvecs" \
+              --query       "$DS_DIR/sift_query.fvecs" \
+              --groundtruth "$DS_DIR/sift_groundtruth.ivecs" \
+              --dataset-name sift-128-euclidean \
+              --m "$M" \
+              --ef-construction 200 \
+              --codec none \
+              --output bench-results
+            echo "::endgroup::"
+          done
 
       # ── Future modality steps land here, one per modality ─────
       # - name: Graph — LDBC SNB SF1 Interactive

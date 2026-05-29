@@ -124,6 +124,10 @@ const reports = ref<BenchReport[]>([]);
 // Controls
 const recallTarget = ref<0.9 | 0.95 | 0.99>(0.95);
 const selectedCoordinodeSha = ref<string>("");   // empty = latest
+// M filter: null = "Any" (best-across-M, original behaviour); number =
+// only reports with hnsw_m === selected. Non-HNSW engines (Annoy) are
+// hidden whenever a specific M is selected — n_trees ≠ M, not comparable.
+const mFilter = ref<number | null>(null);
 
 // ── Manifest + report loading ────────────────────────────────────────────────
 
@@ -217,15 +221,34 @@ interface ChartPoint {
   is_coordinode: boolean;
 }
 
+// All HNSW M values seen in the data, sorted ascending — drives the M
+// filter chip strip. Non-HNSW reports (Annoy, IVF families) carry
+// hnsw_m=undefined and are excluded.
+const availableMs = computed<number[]>(() => {
+  const set = new Set<number>();
+  for (const r of reports.value) {
+    const m = r.metrics.hnsw_m;
+    if (typeof m === "number" && m > 0) set.add(m);
+  }
+  return [...set].sort((a, b) => a - b);
+});
+
 // Build chart points by collapsing reports → one point per (subject, dataset).
-// For each (subject, dataset) we KEEP the report with the highest operating-
-// point QPS at the active recall target across M sweeps — that's the engine's
-// best at that recall level.
+// In "Any M" mode we keep the highest-QPS report across all M sweeps (engine's
+// best at the recall target). When a specific M is selected we restrict to
+// matching reports first — apples-to-apples comparison at fixed graph density.
 const chartPoints = computed<ChartPoint[]>(() => {
   const cnSha = effectiveCoordinodeSha.value;
+  const mSel = mFilter.value;
   const groups = new Map<string, BenchReport[]>();
   for (const r of reports.value) {
     if (r.subject === "coordinode" && r.git.sha_short !== cnSha) continue;
+    if (mSel !== null) {
+      const m = r.metrics.hnsw_m;
+      // Hide non-HNSW (Annoy) and HNSW reports with a different M when
+      // an M filter is active — keeps the chart axis honest.
+      if (typeof m !== "number" || m !== mSel) continue;
+    }
     const key = `${r.subject}::${r.dataset}`;
     const arr = groups.get(key) ?? [];
     arr.push(r);
@@ -392,7 +415,9 @@ const qpsChartOption = computed(() => {
     },
     yAxis: {
       type: "log" as const,
-      name: `QPS at recall@10 ≥ ${recallTarget.value}`,
+      name: mFilter.value === null
+        ? `QPS at recall@10 ≥ ${recallTarget.value}`
+        : `QPS at recall@10 ≥ ${recallTarget.value} (HNSW M=${mFilter.value})`,
       nameLocation: "middle" as const,
       nameGap: 50,
       axisLabel: { formatter: (v: number) => v.toLocaleString() },
@@ -425,6 +450,25 @@ const qpsChartOption = computed(() => {
           ≥ {{ r }}
         </button>
       </div>
+      <div class="ctrl-group" v-if="availableMs.length">
+        <span class="ctrl-label">HNSW M:</span>
+        <button
+          :class="['chip', mFilter === null ? 'on' : 'off']"
+          @click="mFilter = null"
+          title="Best across all M sweeps — engine-vs-engine apples-to-oranges."
+        >
+          Any
+        </button>
+        <button
+          v-for="m in availableMs"
+          :key="m"
+          :class="['chip', mFilter === m ? 'on' : 'off']"
+          @click="mFilter = m"
+          :title="`Only reports with hnsw_m = ${m}. Non-HNSW engines (Annoy) hidden.`"
+        >
+          M={{ m }}
+        </button>
+      </div>
       <div class="ctrl-group">
         <span class="ctrl-label">CoordiNode commit:</span>
         <select v-model="selectedCoordinodeSha" class="select">
@@ -452,7 +496,11 @@ const qpsChartOption = computed(() => {
 
     <!-- Chart -->
     <template v-if="status === 'ok'">
-      <h3>QPS at recall@10 ≥ {{ recallTarget }} across dimensions</h3>
+      <h3>
+        QPS at recall@10 ≥ {{ recallTarget }} across dimensions
+        <span v-if="mFilter !== null" class="legend-hint">— HNSW M = {{ mFilter }}</span>
+        <span v-else class="legend-hint">— best across M (engine cross-comparison)</span>
+      </h3>
       <v-chart class="echart" :option="qpsChartOption" autoresize />
     </template>
 
