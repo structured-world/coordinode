@@ -116,6 +116,15 @@ jobs:
           for f in sift_base.fvecs sift_query.fvecs sift_groundtruth.ivecs; do
             test -f "$DS_DIR/$f" || { echo "::error::missing $DS_DIR/$f — see benches/vector-ann/README.md"; exit 1; }
           done
+          # No RaBitQ sweep on SIFT-128-euclidean: RaBitQ (1-bit and
+          # Extended-RaBitQ 2/3/4-bit) wants a cosine / angular metric;
+          # on L2 datasets the search path falls back to f32 and the
+          # report would mislead readers into thinking RaBitQ matches
+          # f32 recall everywhere. Once we ship per-commit angular
+          # datasets (e.g. glove-100-angular or gist-960-angular), add
+          # a second loop here with `--quantization=rabitq` × bit-width.
+          # For ad-hoc 2/3/4-bit measurements on an angular set,
+          # operators dispatch the workflow with a custom run line.
           for M in 16 24 32; do
             echo "::group::SIFT1M M=$M"
             ./target/release/bench-vector-ann \

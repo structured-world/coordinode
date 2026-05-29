@@ -128,6 +128,16 @@ struct Args {
     /// identity for L2 is a follow-up). Default: `none`.
     #[arg(long, default_value = "none")]
     quantization: String,
+
+    /// RaBitQ bit-width when `--quantization=rabitq`. `1` is the
+    /// classic SIGMOD 2024 sign-bit popcount kernel; `2..=4` selects
+    /// Extended-RaBitQ (R862) which trades RAM for recall — 2-bit
+    /// typically reaches the same recall as 1-bit + heavy rerank in
+    /// 2× the code size and no rerank.
+    ///
+    /// Ignored when `--quantization` is `none` or `sq8`.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))]
+    rabitq_bits: u8,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -218,7 +228,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let quantization = match args.quantization.as_str() {
         "none" => QuantizationCodec::None,
         "sq8" => QuantizationCodec::Sq8,
-        "rabitq" => QuantizationCodec::RaBitQ { bits: 1 },
+        "rabitq" => QuantizationCodec::RaBitQ {
+            bits: args.rabitq_bits,
+        },
         other => {
             return Err(format!(
                 "--quantization: expected `none`, `sq8`, or `rabitq`, got `{other}`"
@@ -299,6 +311,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     report.record("hnsw_m", args.m)?;
     report.record("hnsw_ef_construction", args.ef_construction)?;
     report.record("quantization", args.quantization.clone())?;
+    // Bit-width only meaningful for `rabitq`; record unconditionally so
+    // the dashboard can group/filter by it without per-row None handling.
+    if args.quantization == "rabitq" {
+        report.record("rabitq_bits", args.rabitq_bits)?;
+    }
     report.record("build_secs", build_secs)?;
     if let Some(rss) = rss_kib_before_build {
         report.record("rss_kib_before_build", rss)?;
@@ -326,7 +343,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(point) = points.iter().find(|p| p.recall_at_k >= 0.95) {
         report.record("qps_at_recall_0_95", point.qps)?;
     }
-    let tag = format!("M{}", args.m);
+    // Filename tag groups runs by (M, codec). Bit-width appended only
+    // for rabitq runs so the older `<sha>-coordinode-M<m>-<ts>.json`
+    // layout stays valid for `none` / `sq8` (no dashboard breakage).
+    let tag = match args.quantization.as_str() {
+        "rabitq" => format!("M{}-Q{}", args.m, args.rabitq_bits),
+        _ => format!("M{}", args.m),
+    };
     let path = report.write_json(&args.output, Some(&tag))?;
     info!(path=?path, "report written");
     Ok(())
