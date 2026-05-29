@@ -94,8 +94,22 @@ fn prefetch_read_data(ptr: *const u8) {
 use std::collections::HashMap;
 
 use crate::metrics;
-use crate::quantize::rabitq::{RaBitQCode, RaBitQParams};
+use crate::quantize::rabitq::{RaBitQCode, RaBitQExtCode, RaBitQParams};
 use crate::quantize::Sq8Params;
+
+/// Per-vector RaBitQ encoding. The variant is fixed at index calibration
+/// time from [`HnswConfig::quantization`] and must match across all nodes
+/// in the same index — mixing 1-bit and multi-bit codes in a single index
+/// is an invariant violation (different distance kernels, different code
+/// shapes, no shared comparison semantics).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RabitqEncoded {
+    /// 1-bit sign-bit code, popcount distance kernel (R860). Default codec.
+    OneBit(RaBitQCode),
+    /// 2/3/4-bit Extended-RaBitQ code, centroid-LUT distance kernel (R862).
+    /// `bits` is carried inside the [`RaBitQExtCode`].
+    Multi(RaBitQExtCode),
+}
 
 /// Provides f32 vectors from external storage for reranking when vectors
 /// are offloaded to disk. Implementations should batch-read from the
@@ -221,10 +235,11 @@ struct HnswNode {
     /// SQ8-quantized vector for memory-efficient HNSW traversal.
     /// `None` until SQ8 calibration is complete.
     quantized: Option<Vec<u8>>,
-    /// RaBitQ 1-bit code for popcount-based distance estimation.
-    /// `None` until RaBitQ calibration is complete. Active when the index
-    /// is configured with [`QuantizationCodec::RaBitQ`].
-    rabitq_code: Option<RaBitQCode>,
+    /// RaBitQ code (1-bit popcount kernel or 2/3/4-bit Extended-RaBitQ).
+    /// `None` until calibration is complete. Active when the index is
+    /// configured with [`QuantizationCodec::RaBitQ`]. The variant is
+    /// fixed at calibration time and never mixed within one index.
+    rabitq_code: Option<RabitqEncoded>,
     /// Highest layer this element exists on. Same value as
     /// `neighbours_atomic[node_idx].len() - 1`; cached here so the rebuild
     /// path doesn't have to indirect through the mirror on every read.
@@ -373,25 +388,39 @@ struct QueryCtx<'a> {
     /// Pre-encoded RaBitQ code, populated once per search when RaBitQ is
     /// the active codec. The HNSW hot loop reuses this across thousands of
     /// distance checks — encoding is `O(D²)` (matrix-vector multiply); paying
-    /// it per call would defeat the entire point of the popcount kernel.
-    rabitq_code: Option<RaBitQCode>,
+    /// it per call would defeat the entire point of the codec kernel.
+    ///
+    /// Variant matches `HnswConfig::quantization`: `OneBit` for `bits=1`
+    /// (popcount kernel), `Multi` for `bits ∈ {2,3,4}` (LUT kernel).
+    rabitq_code: Option<RabitqEncoded>,
 }
 
 impl<'a> QueryCtx<'a> {
-    fn new(vec: &'a [f32], metric: VectorMetric, rabitq: Option<&RaBitQParams>) -> Self {
+    fn new(
+        vec: &'a [f32],
+        metric: VectorMetric,
+        rabitq: Option<&RaBitQParams>,
+        codec: &QuantizationCodec,
+    ) -> Self {
         let norm_l2 = if matches!(metric, VectorMetric::Cosine) {
             metrics::norm_l2(vec)
         } else {
             0.0
         };
         // Encode against the active rotation matrix iff RaBitQ is calibrated
-        // AND the query's dimensionality matches. Mismatched dims fall back to
-        // the f32 distance path with no encode cost.
+        // AND the query's dimensionality matches. Mismatched dims fall back
+        // to the f32 distance path with no encode cost. Variant is chosen
+        // from `codec.bits` so it matches whatever the stored nodes carry.
         let rabitq_code = rabitq.and_then(|p| {
-            if vec.len() == p.dims() as usize {
-                Some(p.encode(vec))
-            } else {
-                None
+            if vec.len() != p.dims() as usize {
+                return None;
+            }
+            match codec {
+                QuantizationCodec::RaBitQ { bits: 1 } => Some(RabitqEncoded::OneBit(p.encode(vec))),
+                QuantizationCodec::RaBitQ { bits } if (2..=4).contains(bits) => {
+                    Some(RabitqEncoded::Multi(p.encode_ext(vec, *bits)))
+                }
+                _ => None,
             }
         });
         Self {
@@ -490,6 +519,26 @@ impl HnswIndex {
         self.vector_tier.is_some()
     }
 
+    /// Encode a vector to the active RaBitQ variant per
+    /// [`HnswConfig::quantization`]. Returns `None` if RaBitQ is not
+    /// the configured codec, dims mismatch, or `bits` is unsupported.
+    /// Single source of truth for "which variant lives in this index"
+    /// — used by every insert / calibration / search-side encode path.
+    fn encode_rabitq(&self, params: &RaBitQParams, vector: &[f32]) -> Option<RabitqEncoded> {
+        if vector.len() != params.dims() as usize {
+            return None;
+        }
+        match self.config.quantization {
+            QuantizationCodec::RaBitQ { bits: 1 } => {
+                Some(RabitqEncoded::OneBit(params.encode(vector)))
+            }
+            QuantizationCodec::RaBitQ { bits } if (2..=4).contains(&bits) => {
+                Some(RabitqEncoded::Multi(params.encode_ext(vector, bits)))
+            }
+            _ => None,
+        }
+    }
+
     /// Returns the SQ8 calibration parameters, if calibrated.
     pub fn sq8_params(&self) -> Option<&Sq8Params> {
         self.sq8_params.as_ref()
@@ -524,10 +573,25 @@ impl HnswIndex {
     /// would pick a different `R` and produce codes incomparable with the
     /// ones already on disk.
     pub fn set_rabitq_params(&mut self, params: RaBitQParams) {
-        for node in &mut self.nodes {
-            if let Some(ref v) = node.vector {
-                node.rabitq_code = Some(params.encode(v));
-            }
+        // Two-pass to satisfy the borrow checker: collect (idx, encoded)
+        // first using `&self` (encode_rabitq needs `&self.config`), then
+        // assign back via `&mut self`. The encoded vector is `Option<_>` —
+        // mismatched dims / disabled codec yield None and the slot stays
+        // empty (consistent with prior behaviour).
+        let encoded: Vec<(usize, Option<RabitqEncoded>)> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let enc = n
+                    .vector
+                    .as_deref()
+                    .and_then(|v| self.encode_rabitq(&params, v));
+                (i, enc)
+            })
+            .collect();
+        for (i, enc) in encoded {
+            self.nodes[i].rabitq_code = enc;
         }
         self.rabitq_params = Some(params);
     }
@@ -627,10 +691,22 @@ impl HnswIndex {
         let seed = 0x9E37_79B9_7F4A_7C15u64 ^ self.config.max_dimensions as u64;
         let params = RaBitQParams::calibrate(dims as u32, seed);
 
-        for node in &mut self.nodes {
-            if let Some(ref v) = node.vector {
-                node.rabitq_code = Some(params.encode(v));
-            }
+        // Two-pass borrow split — encode_rabitq needs `&self.config`
+        // while encoding, then we mutate node.rabitq_code separately.
+        let encoded: Vec<(usize, Option<RabitqEncoded>)> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let enc = n
+                    .vector
+                    .as_deref()
+                    .and_then(|v| self.encode_rabitq(&params, v));
+                (i, enc)
+            })
+            .collect();
+        for (i, enc) in encoded {
+            self.nodes[i].rabitq_code = enc;
         }
         self.rabitq_params = Some(params);
     }
@@ -881,8 +957,12 @@ impl HnswIndex {
         // already chosen at calibration time — codes from before vs after
         // calibration are not interchangeable, so this branch only fires
         // post-calibration (pre-calibration nodes get a code on first
-        // calibration via `auto_calibrate_rabitq`).
-        let rabitq_code = self.rabitq_params.as_ref().map(|p| p.encode(&vector));
+        // calibration via `auto_calibrate_rabitq`). Variant is picked
+        // from config so 1-bit vs 2/3/4-bit indexes stay homogeneous.
+        let rabitq_code = self
+            .rabitq_params
+            .as_ref()
+            .and_then(|p| self.encode_rabitq(p, &vector));
 
         // Persist f32 truth tier per ADR-033. Quantized codes (SQ8 /
         // RaBitQ / PolarQuant / PQ) stay in RAM only — Phase 1.5
@@ -984,7 +1064,10 @@ impl HnswIndex {
         for (plan, vec) in plans {
             let idx = self.nodes.len();
             let quantized = self.sq8_params.as_ref().map(|p| p.quantize(&vec));
-            let rabitq_code = self.rabitq_params.as_ref().map(|p| p.encode(&vec));
+            let rabitq_code = self
+                .rabitq_params
+                .as_ref()
+                .and_then(|p| self.encode_rabitq(p, &vec));
             let new_level = plan.new_level;
 
             // Persist f32 truth tier per ADR-033 (mirrors apply_insert_plan).
@@ -1156,7 +1239,12 @@ impl HnswIndex {
         // Cache query-side state once per search — for Cosine the query norm
         // would otherwise be recomputed on every distance call (hundreds of
         // times per level). Other metrics ignore the cached norm.
-        let qctx = QueryCtx::new(query, self.config.metric, self.rabitq_params.as_ref());
+        let qctx = QueryCtx::new(
+            query,
+            self.config.metric,
+            self.rabitq_params.as_ref(),
+            &self.config.quantization,
+        );
 
         // Single-load entry-point snapshot — `for_search()` returns
         // `(start_idx, top_level)` from ONE atomic read, so a
@@ -1254,7 +1342,12 @@ impl HnswIndex {
         };
 
         // Cache query-side state once per search — same rationale as `search`.
-        let qctx = QueryCtx::new(query, self.config.metric, self.rabitq_params.as_ref());
+        let qctx = QueryCtx::new(
+            query,
+            self.config.metric,
+            self.rabitq_params.as_ref(),
+            &self.config.quantization,
+        );
 
         // Single-load entry-point snapshot doubles as the empty-index
         // guard — see `search` above for the consistency rationale.
@@ -1347,7 +1440,12 @@ impl HnswIndex {
             return self.search(query, k);
         }
 
-        let qctx = QueryCtx::new(query, self.config.metric, self.rabitq_params.as_ref());
+        let qctx = QueryCtx::new(
+            query,
+            self.config.metric,
+            self.rabitq_params.as_ref(),
+            &self.config.quantization,
+        );
 
         // Single-load entry-point snapshot doubles as the empty-index
         // guard — see `search` above for the consistency rationale.
@@ -1433,7 +1531,12 @@ impl HnswIndex {
             ..Default::default()
         };
 
-        let qctx = QueryCtx::new(query, self.config.metric, self.rabitq_params.as_ref());
+        let qctx = QueryCtx::new(
+            query,
+            self.config.metric,
+            self.rabitq_params.as_ref(),
+            &self.config.quantization,
+        );
 
         // Single-load entry-point snapshot doubles as the empty-index
         // guard — see `search` above for the consistency rationale.
@@ -1550,7 +1653,10 @@ impl HnswIndex {
 
         // Step 3: Update vector and quantized representation.
         let quantized = self.sq8_params.as_ref().map(|p| p.quantize(&vector));
-        let rabitq_code = self.rabitq_params.as_ref().map(|p| p.encode(&vector));
+        let rabitq_code = self
+            .rabitq_params
+            .as_ref()
+            .and_then(|p| self.encode_rabitq(p, &vector));
 
         // Overwrite f32 truth tier on existing-node update so the
         // tier reflects the latest write (ADR-033).
@@ -1651,7 +1757,12 @@ impl HnswIndex {
     }
 
     fn search_layer_greedy_query(&self, query: &[f32], ep: usize, level: usize) -> usize {
-        let ctx = QueryCtx::new(query, self.config.metric, self.rabitq_params.as_ref());
+        let ctx = QueryCtx::new(
+            query,
+            self.config.metric,
+            self.rabitq_params.as_ref(),
+            &self.config.quantization,
+        );
         self.search_layer_greedy_ctx(&ctx, ep, level)
     }
 
@@ -1707,7 +1818,12 @@ impl HnswIndex {
         ef: usize,
         level: usize,
     ) -> Vec<Candidate> {
-        let ctx = QueryCtx::new(query, self.config.metric, self.rabitq_params.as_ref());
+        let ctx = QueryCtx::new(
+            query,
+            self.config.metric,
+            self.rabitq_params.as_ref(),
+            &self.config.quantization,
+        );
         self.search_layer_ctx(&ctx, ep, ef, level)
     }
 
@@ -1822,13 +1938,25 @@ impl HnswIndex {
     ///    representation of this node (pre-calibration).
     fn compute_distance(&self, ctx: &QueryCtx<'_>, node_idx: usize) -> f32 {
         // RaBitQ fast path — cosine metric only in this slice.
+        // Variants must match: a query encoded as Multi must hit a node
+        // also encoded as Multi (calibration sets all nodes uniformly).
+        // Mismatched variants fall through to f32 — keeps a partially
+        // recalibrated index queryable rather than panicking.
         if matches!(self.config.metric, VectorMetric::Cosine) {
             if let (Some(params), Some(qcode), Some(xcode)) = (
                 self.rabitq_params.as_ref(),
                 ctx.rabitq_code.as_ref(),
                 self.nodes[node_idx].rabitq_code.as_ref(),
             ) {
-                return params.estimate_cosine_distance(qcode, xcode);
+                match (qcode, xcode) {
+                    (RabitqEncoded::OneBit(q), RabitqEncoded::OneBit(x)) => {
+                        return params.estimate_cosine_distance(q, x);
+                    }
+                    (RabitqEncoded::Multi(q), RabitqEncoded::Multi(x)) if q.bits == x.bits => {
+                        return params.estimate_cosine_distance_ext(q, x);
+                    }
+                    _ => {}
+                }
             }
         }
         if let Some(params) = &self.sq8_params {
@@ -2027,14 +2155,24 @@ impl HnswIndex {
         // Try exact f32 for both nodes
         if let (Some(ref va), Some(ref vb)) = (&self.nodes[a_idx].vector, &self.nodes[b_idx].vector)
         {
-            let ctx = QueryCtx::new(va, self.config.metric, self.rabitq_params.as_ref());
+            let ctx = QueryCtx::new(
+                va,
+                self.config.metric,
+                self.rabitq_params.as_ref(),
+                &self.config.quantization,
+            );
             return self.distance_for_metric(&ctx, vb);
         }
         // Fall back to SQ8 approximate distance
         if let Some(ref params) = self.sq8_params {
             let va = self.get_node_vector_or_dequantized(a_idx, params);
             let vb = self.get_node_vector_or_dequantized(b_idx, params);
-            let ctx = QueryCtx::new(&va, self.config.metric, self.rabitq_params.as_ref());
+            let ctx = QueryCtx::new(
+                &va,
+                self.config.metric,
+                self.rabitq_params.as_ref(),
+                &self.config.quantization,
+            );
             return self.distance_for_metric(&ctx, &vb);
         }
         f32::INFINITY
@@ -2813,6 +2951,97 @@ mod tests {
     }
 
     #[test]
+    fn extended_rabitq_recall_sanity_cosine_2bit() {
+        // Wires-up test for 2-bit Extended-RaBitQ (R862): same shape as the
+        // 1-bit recall sanity check, but `quantization = RaBitQ { bits: 2 }`.
+        // Exercises the RabitqEncoded::Multi search path end-to-end:
+        // calibration → encode_ext → estimate_cosine_distance_ext → top-K.
+        let dim = 64usize;
+        let n = 80usize;
+        let k = 10usize;
+        let threshold = 30usize;
+
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|i| {
+                let raw: Vec<f32> = (0..dim)
+                    .map(|d| ((i * d + 11) as f32 * 0.07).cos())
+                    .collect();
+                let norm = metrics::norm_l2(&raw).max(f32::EPSILON);
+                raw.into_iter().map(|x| x / norm).collect()
+            })
+            .collect();
+
+        let mut index = HnswIndex::new(HnswConfig {
+            m: 16,
+            m_max0: 32,
+            ef_construction: 100,
+            ef_search: 64,
+            metric: VectorMetric::Cosine,
+            max_dimensions: dim as u32,
+            quantization: QuantizationCodec::RaBitQ { bits: 2 },
+            rerank_candidates: 64,
+            calibration_threshold: threshold,
+            offload_vectors: false,
+            property_name: String::new(),
+            max_elements: n as u32,
+        });
+
+        for (i, v) in vectors.iter().enumerate() {
+            index.insert(i as u64, v.clone());
+        }
+
+        assert!(
+            index.is_rabitq_active(),
+            "Extended-RaBitQ should be active after threshold reached"
+        );
+        // Every post-calibration node must carry a Multi(_) code with bits=2.
+        // Encode "variant + bits" as a single u8 (0 = OneBit, 2/3/4 = Multi)
+        // so the assertion lives in `assert_eq!` and avoids the `panic!` lint.
+        for (i, node) in index.nodes.iter().enumerate() {
+            let code = node.rabitq_code.as_ref().expect("rabitq code populated");
+            let bits = match code {
+                RabitqEncoded::Multi(c) => c.bits,
+                RabitqEncoded::OneBit(_) => 0,
+            };
+            assert_eq!(
+                bits, 2,
+                "node {i}: expected Multi(bits=2), got {bits} (0=OneBit, n=Multi)"
+            );
+        }
+
+        let query = &vectors[0];
+        let mut ground_truth: Vec<(f32, u64)> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let cos =
+                    metrics::cosine_similarity_with_query_norm(query, v, metrics::norm_l2(query));
+                (1.0 - cos, i as u64)
+            })
+            .collect();
+        ground_truth.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let gt_set: HashSet<u64> = ground_truth.iter().take(k).map(|&(_, id)| id).collect();
+
+        let results = index.search(query, k);
+        let result_set: HashSet<u64> = results.iter().map(|r| r.id).collect();
+        let recall = gt_set.intersection(&result_set).count() as f32 / k as f32;
+        eprintln!(
+            "Extended-RaBitQ 2-bit recall@{k} at d={dim}, n={n}: {:.0}%",
+            recall * 100.0
+        );
+
+        // At d=64 / n=80 the synthetic noise floor dominates regardless of
+        // bit width — this test proves wiring, not recall. The paper's
+        // 0.95-0.97 claim for 2-bit is at SIFT1M scale (d≥128, n≥10⁶).
+        // Same floor as the 1-bit companion test so a kernel regression
+        // in either path trips at least one assertion.
+        assert!(
+            recall >= 0.1,
+            "Extended-RaBitQ 2-bit recall {recall} below wired-up sanity floor (0.1)",
+        );
+    }
+
+    #[test]
     fn vector_tier_persists_f32_on_insert() {
         use crate::storage::{VectorTierHandle, VectorTierStorage};
         use std::collections::HashMap;
@@ -2942,7 +3171,11 @@ mod tests {
                 "node {i} missing rabitq code after set_rabitq_params"
             );
             let code = node.rabitq_code.as_ref().expect("checked is_some above");
-            let expected = persisted.encode(node.vector.as_ref().expect("f32 retained"));
+            // Test fixture configures 1-bit RaBitQ; assert the variant
+            // wraps an identical RaBitQCode after set_rabitq_params.
+            let expected = RabitqEncoded::OneBit(
+                persisted.encode(node.vector.as_ref().expect("f32 retained")),
+            );
             assert_eq!(*code, expected, "node {i} code mismatch after reload");
         }
     }
