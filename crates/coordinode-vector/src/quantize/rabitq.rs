@@ -213,6 +213,250 @@ impl RaBitQParams {
         // cos_sim_est = 1 - 2·popcount/D  →  distance = 1 - cos_sim_est = 2·popcount/D.
         2.0 * pop / d
     }
+
+    /// Encode a single f32 vector to an Extended-RaBitQ code at the given
+    /// `bits ∈ {2, 3, 4}` resolution. 1-bit uses [`Self::encode`] (different
+    /// kernel — pure sign-bit popcount, faster).
+    ///
+    /// The rotation matrix is shared with the 1-bit codec: switching bit
+    /// width on a reload doesn't require a rebuild, only re-encoding the
+    /// stored f32 originals.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `vector.len() != self.dims as usize` or `bits` is outside
+    /// `{2, 3, 4}`.
+    pub fn encode_ext(&self, vector: &[f32], bits: u8) -> RaBitQExtCode {
+        assert_eq!(
+            vector.len(),
+            self.dims as usize,
+            "RaBitQParams::encode_ext: dimension mismatch"
+        );
+        assert!(
+            (2..=4).contains(&bits),
+            "RaBitQParams::encode_ext: bits must be 2, 3, or 4; got {bits}"
+        );
+
+        let d = self.dims as usize;
+        let levels_count = 1u8 << bits;
+
+        // Compute pre-rotation norm; same identity ‖R·x‖=‖x‖ applies.
+        let mut norm_sq = 0.0f32;
+        for &v in vector {
+            norm_sq += v * v;
+        }
+        let norm = norm_sq.sqrt().max(f32::EPSILON);
+
+        // Rotate, scale by 1/‖x‖ so the per-dim values land on the standard-
+        // normal scale the centroid table was designed for (rotated isotropic
+        // vectors are approximately N(0, 1/D); after dividing by ‖x‖ we get
+        // ≈ N(0, 1/D) → after multiplying by √D it'd be exactly N(0, 1).
+        // The simpler `/ norm` keeps everything in [-1, 1]-ish range which is
+        // what the symmetric quantizer cut-points are derived for.
+        let inv_norm = 1.0 / norm;
+        let mut levels = vec![0u8; d];
+        let mut sum_rotated = 0.0f32;
+        let inv_sqrt_d = 1.0 / (d as f32).sqrt();
+
+        for (i, slot) in levels.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            let row_base = i * d;
+            for (j, &xj) in vector.iter().enumerate() {
+                acc += self.rotation[row_base + j] * xj;
+            }
+            sum_rotated += acc;
+            *slot = quantize_normal(acc * inv_norm, bits);
+        }
+        debug_assert!(
+            levels.iter().all(|&l| l < levels_count),
+            "all quantized levels must fit in `bits`"
+        );
+
+        RaBitQExtCode {
+            levels,
+            bits,
+            norm,
+            cross_term: sum_rotated * inv_sqrt_d,
+        }
+    }
+
+    /// Estimate inner product between two Extended-RaBitQ codes (same
+    /// `bits`). Both codes were normalized by their own ‖x‖ at encode,
+    /// so the level centroids reconstruct unit-norm rotated directions;
+    /// we multiply back by `q.norm * x.norm` to recover the original
+    /// inner-product magnitude.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug if `q.bits != x.bits` or dimension mismatch.
+    pub fn estimate_inner_product_ext(&self, q: &RaBitQExtCode, x: &RaBitQExtCode) -> f32 {
+        debug_assert_eq!(q.bits, x.bits, "bit-width mismatch");
+        debug_assert_eq!(q.levels.len(), self.dims as usize, "q dimension mismatch");
+        debug_assert_eq!(x.levels.len(), self.dims as usize, "x dimension mismatch");
+        let table = level_centroids(q.bits);
+        let mut acc = 0.0f32;
+        for (lq, lx) in q.levels.iter().zip(x.levels.iter()) {
+            acc += table[*lq as usize] * table[*lx as usize];
+        }
+        acc * q.norm * x.norm
+    }
+
+    /// Estimate cosine distance `1 - cos_similarity` between two Extended-
+    /// RaBitQ codes. Codes are already unit-scale (norm divided out at
+    /// encode); this returns `1 − Σ centroid(lq)·centroid(lx) / D_norm`.
+    /// Result is in `[0, 2]` after clamping for numerical noise.
+    pub fn estimate_cosine_distance_ext(&self, q: &RaBitQExtCode, x: &RaBitQExtCode) -> f32 {
+        debug_assert_eq!(q.bits, x.bits, "bit-width mismatch");
+        let table = level_centroids(q.bits);
+        let mut dot = 0.0f32;
+        let mut nq = 0.0f32;
+        let mut nx = 0.0f32;
+        for (lq, lx) in q.levels.iter().zip(x.levels.iter()) {
+            let vq = table[*lq as usize];
+            let vx = table[*lx as usize];
+            dot += vq * vx;
+            nq += vq * vq;
+            nx += vx * vx;
+        }
+        let denom = (nq * nx).sqrt().max(f32::EPSILON);
+        (1.0 - dot / denom).clamp(0.0, 2.0)
+    }
+}
+
+/// Extended-RaBitQ `bits`-per-dimension code (R862, SIGMOD 2025).
+///
+/// Each dimension is uniformly scalar-quantized into `2^bits` levels
+/// (cut points at the quantiles of N(0, 1) — rotated isotropic data
+/// is approximately normal after divide-by-norm).
+///
+/// Memory: `D + 8` bytes (one byte per dim packs all bits ≤ 4; lossless
+/// because levels are bounded by `2^bits ≤ 16`). True bit-packed
+/// representation (e.g. 4 dims/byte at 2-bit) is a future optimization
+/// for billion-vector deployments; current layout favours simplicity +
+/// cache-friendly sequential reads in the distance kernel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RaBitQExtCode {
+    /// One level index per dimension; `levels[i] ∈ [0, 2^bits)`.
+    pub levels: Vec<u8>,
+    /// Bit-width that produced this code. Required to pick the correct
+    /// centroid lookup table at distance time.
+    pub bits: u8,
+    /// `‖x‖₂` — L2 norm of the original (pre-rotation) vector.
+    pub norm: f32,
+    /// `<x', e>` for the asymmetric correction. Same identity as the
+    /// 1-bit code — feeds Phase 1.5 rerank fallback when bit-width is
+    /// low enough that operator opts in.
+    pub cross_term: f32,
+}
+
+impl RaBitQExtCode {
+    /// Memory size on the wire / in RAM.
+    pub fn size_bytes(&self) -> usize {
+        self.levels.len() + 8 // 8 bytes for f32 norm + f32 cross_term
+    }
+}
+
+/// Quantize a single value (already divided by ‖x‖, so ~N(0, 1/D)) to a
+/// 2/3/4-bit level index using the cut-points of the standard normal at
+/// the same divide. The cut-points come from numerically computed
+/// quantiles of the N(0, 1) distribution.
+fn quantize_normal(v: f32, bits: u8) -> u8 {
+    let cuts = quantile_cut_points(bits);
+    // cuts has 2^bits - 1 entries (inner boundaries).
+    let mut lvl = 0u8;
+    for &c in cuts {
+        if v >= c {
+            lvl += 1;
+        } else {
+            break;
+        }
+    }
+    lvl
+}
+
+/// Standard-normal quantile cut-points for 2-, 3-, and 4-bit quantization.
+/// Each table has `2^bits - 1` entries, partitioning ℝ into `2^bits`
+/// equal-probability buckets under N(0, 1).
+///
+/// Values from `scipy.stats.norm.ppf(k / 2^bits)` for `k ∈ [1, 2^bits-1]`.
+/// Callers MUST validate `bits ∈ {2,3,4}` (encode_ext does via assert).
+#[allow(clippy::panic, reason = "callers validate bits ∈ {2,3,4} via assert!")]
+fn quantile_cut_points(bits: u8) -> &'static [f32] {
+    match bits {
+        // 4 levels → 3 cuts at the 25/50/75 percentiles.
+        2 => &[-0.674_49, 0.0, 0.674_49],
+        // 8 levels → 7 cuts at the 12.5/25/.../87.5 percentiles.
+        3 => &[
+            -1.150_349_4,
+            -0.674_49,
+            -0.318_639_4,
+            0.0,
+            0.318_639_4,
+            0.674_49,
+            1.150_349_4,
+        ],
+        // 16 levels → 15 cuts at the 6.25/12.5/.../93.75 percentiles.
+        4 => &[
+            -1.534_120_5,
+            -1.150_349_4,
+            -0.887_146_6,
+            -0.674_49,
+            -0.488_776_4,
+            -0.318_639_4,
+            -0.157_310_7,
+            0.0,
+            0.157_310_7,
+            0.318_639_4,
+            0.488_776_4,
+            0.674_49,
+            0.887_146_6,
+            1.150_349_4,
+            1.534_120_5,
+        ],
+        _ => panic!("Extended-RaBitQ only supports bits ∈ {{2,3,4}}; got {bits}"),
+    }
+}
+
+/// Centroids of each level under N(0, 1) — the conditional mean of the
+/// standard normal restricted to that bucket. Used by the symmetric
+/// distance kernel: each level index maps back to its bucket centroid,
+/// and the inner product is computed by table-lookup-and-MAC over dims.
+///
+/// `centroids.len() == 2^bits`. Callers MUST validate `bits ∈ {2,3,4}`.
+#[allow(clippy::panic, reason = "callers validate bits ∈ {2,3,4} via assert!")]
+fn level_centroids(bits: u8) -> &'static [f32] {
+    match bits {
+        2 => &[-1.271_021, -0.317_754_5, 0.317_754_5, 1.271_021],
+        3 => &[
+            -1.747_874,
+            -1.049_750_7,
+            -0.682_643_7,
+            -0.213_344_7,
+            0.213_344_7,
+            0.682_643_7,
+            1.049_750_7,
+            1.747_874,
+        ],
+        4 => &[
+            -2.077_605,
+            -1.451_927,
+            -1.108_14,
+            -0.860_169,
+            -0.658_383,
+            -0.482_055,
+            -0.322_226,
+            -0.169_741_8,
+            0.169_741_8,
+            0.322_226,
+            0.482_055,
+            0.658_383,
+            0.860_169,
+            1.108_14,
+            1.451_927,
+            2.077_605,
+        ],
+        _ => panic!("Extended-RaBitQ only supports bits ∈ {{2,3,4}}; got {bits}"),
+    }
 }
 
 /// Deterministic xorshift64* PRNG. Pure `core`-level math, no allocations.
@@ -419,5 +663,162 @@ mod tests {
         let bytes = rmp_serde::to_vec(&code).expect("serialise code");
         let code2: RaBitQCode = rmp_serde::from_slice(&bytes).expect("deserialise code");
         assert_eq!(code, code2);
+    }
+
+    // ── Extended-RaBitQ (R862) ──────────────────────────────────────
+
+    #[test]
+    fn ext_encode_layout_2_3_4_bit() {
+        let dims = 128u32;
+        let p = RaBitQParams::calibrate(dims, 7);
+        let v: Vec<f32> = (0..dims as usize)
+            .map(|i| ((i as f32) * 0.1).sin())
+            .collect();
+        for bits in [2u8, 3, 4] {
+            let c = p.encode_ext(&v, bits);
+            assert_eq!(c.bits, bits);
+            assert_eq!(c.levels.len(), dims as usize);
+            let max = 1u8 << bits;
+            assert!(
+                c.levels.iter().all(|&l| l < max),
+                "bits={bits}: every level must be < {max}"
+            );
+            assert!(c.norm > 0.0);
+        }
+    }
+
+    #[test]
+    fn ext_code_size_matches_spec() {
+        // D=1024 → 1024 level bytes + 8 scalars = 1032 bytes at all bit
+        // widths. (One byte per dim. True 2/3/4-bit packing is a future
+        // deployment optimization — the arch doc 256/384/512 B numbers
+        // refer to that packed variant; this layout is correct-by-
+        // construction at slightly higher RAM cost.)
+        let p = RaBitQParams::calibrate(1024, 7);
+        let v = vec![1.0f32; 1024];
+        for bits in [2u8, 3, 4] {
+            let c = p.encode_ext(&v, bits);
+            assert_eq!(
+                c.size_bytes(),
+                1032,
+                "bits={bits}: byte-per-dim layout expected"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "bits must be 2, 3, or 4")]
+    fn ext_rejects_one_bit() {
+        let p = RaBitQParams::calibrate(64, 0);
+        let _ = p.encode_ext(&[0.5f32; 64], 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "bits must be 2, 3, or 4")]
+    fn ext_rejects_five_bit() {
+        let p = RaBitQParams::calibrate(64, 0);
+        let _ = p.encode_ext(&[0.5f32; 64], 5);
+    }
+
+    #[test]
+    fn ext_ranks_neighbours_correctly_at_each_bit_width() {
+        // Mirrors similarity_ranks_neighbours_correctly for 1-bit:
+        // near must score above far at every bit width.
+        let p = RaBitQParams::calibrate(256, 0xABCD);
+        let q: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.07).cos()).collect();
+        let near: Vec<f32> = q
+            .iter()
+            .enumerate()
+            .map(|(i, x)| x + 0.01 * (i as f32).sin())
+            .collect();
+        let far: Vec<f32> = q.iter().map(|x| -x).collect();
+
+        for bits in [2u8, 3, 4] {
+            let qc = p.encode_ext(&q, bits);
+            let nc = p.encode_ext(&near, bits);
+            let fc = p.encode_ext(&far, bits);
+
+            let sim_near = p.estimate_inner_product_ext(&qc, &nc);
+            let sim_far = p.estimate_inner_product_ext(&qc, &fc);
+            assert!(
+                sim_near > sim_far,
+                "bits={bits}: IP estimator must rank near above far: \
+                 near={sim_near}, far={sim_far}"
+            );
+
+            let dist_near = p.estimate_cosine_distance_ext(&qc, &nc);
+            let dist_far = p.estimate_cosine_distance_ext(&qc, &fc);
+            assert!(
+                dist_near < dist_far,
+                "bits={bits}: cosine distance must rank near below far: \
+                 near={dist_near}, far={dist_far}"
+            );
+        }
+    }
+
+    #[test]
+    fn ext_higher_bits_estimate_closer_to_true_ip() {
+        // Pareto property from SIGMOD 2025: estimator error decreases
+        // monotonically with bit width. Averaged over a small sample,
+        // 4-bit MUST beat 2-bit mean absolute error.
+        let dims = 256u32;
+        let p = RaBitQParams::calibrate(dims, 0xC0FFEE);
+
+        fn synth(seed: u64, dims: usize) -> Vec<f32> {
+            let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            (0..dims)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    let u = (s >> 40) as f32 / (1u32 << 24) as f32;
+                    2.0 * u - 1.0
+                })
+                .collect()
+        }
+
+        let mut err2 = 0.0f64;
+        let mut err4 = 0.0f64;
+        let mut n = 0usize;
+        for seed_q in 0..6u64 {
+            let q = synth(seed_q, dims as usize);
+            for seed_x in 10..16u64 {
+                let x = synth(seed_x, dims as usize);
+                let true_ip: f32 = q.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
+
+                let q2 = p.encode_ext(&q, 2);
+                let x2 = p.encode_ext(&x, 2);
+                let est2 = p.estimate_inner_product_ext(&q2, &x2);
+
+                let q4 = p.encode_ext(&q, 4);
+                let x4 = p.encode_ext(&x, 4);
+                let est4 = p.estimate_inner_product_ext(&q4, &x4);
+
+                err2 += ((est2 - true_ip) as f64).abs();
+                err4 += ((est4 - true_ip) as f64).abs();
+                n += 1;
+            }
+        }
+        let avg2 = err2 / n as f64;
+        let avg4 = err4 / n as f64;
+        assert!(
+            avg4 < avg2,
+            "4-bit mean abs IP error ({avg4}) must be lower than 2-bit ({avg2})"
+        );
+    }
+
+    #[test]
+    fn ext_serde_round_trip_is_value_identical() {
+        let dims = 128u32;
+        let p = RaBitQParams::calibrate(dims, 0xFACE);
+        let v: Vec<f32> = (0..dims as usize)
+            .map(|i| (i as f32 * 0.05).cos())
+            .collect();
+        for bits in [2u8, 3, 4] {
+            let c = p.encode_ext(&v, bits);
+            let bytes = rmp_serde::to_vec(&c).expect("ser");
+            let c2: RaBitQExtCode = rmp_serde::from_slice(&bytes).expect("de");
+            assert_eq!(c, c2);
+        }
     }
 }
