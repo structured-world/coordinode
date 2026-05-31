@@ -16,16 +16,25 @@ use tracing::info;
 pub fn log_simd_capabilities() {
     #[cfg(target_arch = "x86_64")]
     {
+        let avx512f = is_x86_feature_detected!("avx512f");
         let avx2 = is_x86_feature_detected!("avx2");
         let fma = is_x86_feature_detected!("fma");
         let sse4_2 = is_x86_feature_detected!("sse4.2");
 
-        if avx2 && fma {
+        if avx512f {
+            info!(
+                arch = "x86_64",
+                avx512f = true,
+                avx2 = avx2,
+                fma = fma,
+                "SIMD: using AVX-512F multi-accumulator kernel (16-wide f32, 32 dim/iter)"
+            );
+        } else if avx2 && fma {
             info!(
                 arch = "x86_64",
                 avx2 = true,
                 fma = true,
-                "SIMD: using AVX2+FMA for vector distance (8-wide f32)"
+                "SIMD: using AVX2+FMA multi-accumulator kernel (8-wide f32, 32 dim/iter)"
             );
         } else if sse4_2 {
             info!(
@@ -46,12 +55,19 @@ pub fn log_simd_capabilities() {
 
     #[cfg(target_arch = "aarch64")]
     {
-        // NEON is mandatory on aarch64
-        info!(
-            arch = "aarch64",
-            neon = true,
-            "SIMD: using NEON for vector distance (4-wide f32)"
-        );
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            info!(
+                arch = "aarch64",
+                neon = true,
+                "SIMD: using NEON multi-accumulator kernel (4-wide f32, 16 dim/iter)"
+            );
+        } else {
+            info!(
+                arch = "aarch64",
+                neon = false,
+                "SIMD: NEON not detected (unusual on aarch64), scalar fallback"
+            );
+        }
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -113,19 +129,37 @@ pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Squared Euclidean distance (avoids sqrt for comparison-only use).
+///
+/// Kernel dispatch (runtime — same binary covers every CPU of the
+/// target architecture):
+///
+/// | CPU feature                | Kernel           | f32/iter |
+/// |----------------------------|------------------|----------|
+/// | x86_64 AVX-512F (Zen4+, SPR) | `l2_squared_avx512` | 64 |
+/// | x86_64 AVX2 + FMA          | `l2_squared_avx2_mt` | 32 |
+/// | aarch64 NEON               | `l2_squared_neon_mt` | 16 |
+/// | scalar fallback            | `l2_squared_scalar`  | 1  |
+///
+/// The `_mt` suffix marks the multi-accumulator variants: 4 independent
+/// FMA chains run in parallel to saturate the FMA throughput of modern
+/// out-of-order cores (Skylake / Zen3+ / Apple M-series have 2+ FMA
+/// ports — single-accumulator code leaves half the FMA bandwidth idle).
 pub fn euclidean_distance_squared(a: &[f32], b: &[f32]) -> f32 {
-    // Runtime SIMD detection — binary works on ALL CPUs
     #[cfg(target_arch = "x86_64")]
     {
+        if is_x86_feature_detected!("avx512f") {
+            return unsafe { l2_squared_avx512(a, b) };
+        }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return unsafe { l2_squared_avx2(a, b) };
+            return unsafe { l2_squared_avx2_mt(a, b) };
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        // NEON is always available on aarch64
-        return unsafe { l2_squared_neon(a, b) };
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return unsafe { l2_squared_neon_mt(a, b) };
+        }
     }
 
     #[allow(unreachable_code)]
@@ -142,13 +176,15 @@ pub fn manhattan_distance(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            return unsafe { l1_avx2(a, b) };
+            return unsafe { l1_avx2_mt(a, b) };
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        return unsafe { l1_neon(a, b) };
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return unsafe { l1_neon_mt(a, b) };
+        }
     }
 
     #[allow(unreachable_code)]
@@ -165,14 +201,19 @@ pub fn norm_l2(a: &[f32]) -> f32 {
 fn dot_product_inner(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
+        if is_x86_feature_detected!("avx512f") {
+            return unsafe { dot_avx512(a, b) };
+        }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return unsafe { dot_avx2(a, b) };
+            return unsafe { dot_avx2_mt(a, b) };
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        return unsafe { dot_neon(a, b) };
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return unsafe { dot_neon_mt(a, b) };
+        }
     }
 
     #[allow(unreachable_code)]
@@ -197,23 +238,62 @@ fn l1_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).sum()
 }
 
-// --- SIMD: x86_64 AVX2 ---
+// --- SIMD: x86_64 AVX2 + FMA (multi-accumulator) ---
+//
+// All AVX2 kernels use 4 independent accumulators × 8 lanes = 32 f32
+// per main loop iteration. Rationale:
+// - Skylake / Coffee Lake (i9-9900K) has 2 FMA ports, FMA latency = 4
+//   cycles, throughput = 0.5 cycle/FMA. Single-accumulator code is
+//   bottlenecked by the FMA dependency chain (1 FMA every 4 cycles =
+//   25% of peak throughput). Four independent chains expose enough
+//   ILP that the issue unit can keep both FMA ports busy.
+// - Zen3 / Zen4 also benefit: 2 FMA ports, similar latency profile.
+// - Apple Rosetta / SDE emulation tolerates the wider issue width
+//   without slowdown (correctness preserved).
+//
+// Same code shape used for dot, l2_squared, l1 — they all reduce to a
+// FMA-chain over (va, vb) tuples with metric-specific arithmetic.
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+unsafe fn dot_avx2_mt(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     unsafe {
-        let mut sum = _mm256_setzero_ps();
-        let chunks = a.len() / 8;
-        for i in 0..chunks {
-            let va = _mm256_loadu_ps(a.as_ptr().add(i * 8));
-            let vb = _mm256_loadu_ps(b.as_ptr().add(i * 8));
-            sum = _mm256_fmadd_ps(va, vb, sum);
+        let mut s0 = _mm256_setzero_ps();
+        let mut s1 = _mm256_setzero_ps();
+        let mut s2 = _mm256_setzero_ps();
+        let mut s3 = _mm256_setzero_ps();
+
+        let main_chunks = a.len() / 32;
+        for i in 0..main_chunks {
+            let base = i * 32;
+            let a0 = _mm256_loadu_ps(a.as_ptr().add(base));
+            let b0 = _mm256_loadu_ps(b.as_ptr().add(base));
+            let a1 = _mm256_loadu_ps(a.as_ptr().add(base + 8));
+            let b1 = _mm256_loadu_ps(b.as_ptr().add(base + 8));
+            let a2 = _mm256_loadu_ps(a.as_ptr().add(base + 16));
+            let b2 = _mm256_loadu_ps(b.as_ptr().add(base + 16));
+            let a3 = _mm256_loadu_ps(a.as_ptr().add(base + 24));
+            let b3 = _mm256_loadu_ps(b.as_ptr().add(base + 24));
+
+            s0 = _mm256_fmadd_ps(a0, b0, s0);
+            s1 = _mm256_fmadd_ps(a1, b1, s1);
+            s2 = _mm256_fmadd_ps(a2, b2, s2);
+            s3 = _mm256_fmadd_ps(a3, b3, s3);
         }
+
+        // Tail at 8-wide granularity for dims that aren't multiples of 32.
+        let mut tail_off = main_chunks * 32;
+        while tail_off + 8 <= a.len() {
+            let va = _mm256_loadu_ps(a.as_ptr().add(tail_off));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(tail_off));
+            s0 = _mm256_fmadd_ps(va, vb, s0);
+            tail_off += 8;
+        }
+
+        let sum = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
         let mut result = hsum256_ps(sum);
-        // Handle remaining elements
-        for i in (chunks * 8)..a.len() {
+        for i in tail_off..a.len() {
             result += a[i] * b[i];
         }
         result
@@ -222,19 +302,49 @@ unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn l2_squared_avx2(a: &[f32], b: &[f32]) -> f32 {
+unsafe fn l2_squared_avx2_mt(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     unsafe {
-        let mut sum = _mm256_setzero_ps();
-        let chunks = a.len() / 8;
-        for i in 0..chunks {
-            let va = _mm256_loadu_ps(a.as_ptr().add(i * 8));
-            let vb = _mm256_loadu_ps(b.as_ptr().add(i * 8));
-            let diff = _mm256_sub_ps(va, vb);
-            sum = _mm256_fmadd_ps(diff, diff, sum);
+        let mut s0 = _mm256_setzero_ps();
+        let mut s1 = _mm256_setzero_ps();
+        let mut s2 = _mm256_setzero_ps();
+        let mut s3 = _mm256_setzero_ps();
+
+        let main_chunks = a.len() / 32;
+        for i in 0..main_chunks {
+            let base = i * 32;
+            let a0 = _mm256_loadu_ps(a.as_ptr().add(base));
+            let b0 = _mm256_loadu_ps(b.as_ptr().add(base));
+            let a1 = _mm256_loadu_ps(a.as_ptr().add(base + 8));
+            let b1 = _mm256_loadu_ps(b.as_ptr().add(base + 8));
+            let a2 = _mm256_loadu_ps(a.as_ptr().add(base + 16));
+            let b2 = _mm256_loadu_ps(b.as_ptr().add(base + 16));
+            let a3 = _mm256_loadu_ps(a.as_ptr().add(base + 24));
+            let b3 = _mm256_loadu_ps(b.as_ptr().add(base + 24));
+
+            let d0 = _mm256_sub_ps(a0, b0);
+            let d1 = _mm256_sub_ps(a1, b1);
+            let d2 = _mm256_sub_ps(a2, b2);
+            let d3 = _mm256_sub_ps(a3, b3);
+
+            s0 = _mm256_fmadd_ps(d0, d0, s0);
+            s1 = _mm256_fmadd_ps(d1, d1, s1);
+            s2 = _mm256_fmadd_ps(d2, d2, s2);
+            s3 = _mm256_fmadd_ps(d3, d3, s3);
         }
+
+        let mut tail_off = main_chunks * 32;
+        while tail_off + 8 <= a.len() {
+            let va = _mm256_loadu_ps(a.as_ptr().add(tail_off));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(tail_off));
+            let d = _mm256_sub_ps(va, vb);
+            s0 = _mm256_fmadd_ps(d, d, s0);
+            tail_off += 8;
+        }
+
+        let sum = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
         let mut result = hsum256_ps(sum);
-        for i in (chunks * 8)..a.len() {
+        for i in tail_off..a.len() {
             let d = a[i] - b[i];
             result += d * d;
         }
@@ -244,22 +354,140 @@ unsafe fn l2_squared_avx2(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn l1_avx2(a: &[f32], b: &[f32]) -> f32 {
+unsafe fn l1_avx2_mt(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     unsafe {
         let sign_mask = _mm256_set1_ps(-0.0f32);
-        let mut sum = _mm256_setzero_ps();
-        let chunks = a.len() / 8;
-        for i in 0..chunks {
-            let va = _mm256_loadu_ps(a.as_ptr().add(i * 8));
-            let vb = _mm256_loadu_ps(b.as_ptr().add(i * 8));
-            let diff = _mm256_sub_ps(va, vb);
-            let abs_diff = _mm256_andnot_ps(sign_mask, diff);
-            sum = _mm256_add_ps(sum, abs_diff);
+        let mut s0 = _mm256_setzero_ps();
+        let mut s1 = _mm256_setzero_ps();
+        let mut s2 = _mm256_setzero_ps();
+        let mut s3 = _mm256_setzero_ps();
+
+        let main_chunks = a.len() / 32;
+        for i in 0..main_chunks {
+            let base = i * 32;
+            let d0 = _mm256_sub_ps(
+                _mm256_loadu_ps(a.as_ptr().add(base)),
+                _mm256_loadu_ps(b.as_ptr().add(base)),
+            );
+            let d1 = _mm256_sub_ps(
+                _mm256_loadu_ps(a.as_ptr().add(base + 8)),
+                _mm256_loadu_ps(b.as_ptr().add(base + 8)),
+            );
+            let d2 = _mm256_sub_ps(
+                _mm256_loadu_ps(a.as_ptr().add(base + 16)),
+                _mm256_loadu_ps(b.as_ptr().add(base + 16)),
+            );
+            let d3 = _mm256_sub_ps(
+                _mm256_loadu_ps(a.as_ptr().add(base + 24)),
+                _mm256_loadu_ps(b.as_ptr().add(base + 24)),
+            );
+
+            s0 = _mm256_add_ps(s0, _mm256_andnot_ps(sign_mask, d0));
+            s1 = _mm256_add_ps(s1, _mm256_andnot_ps(sign_mask, d1));
+            s2 = _mm256_add_ps(s2, _mm256_andnot_ps(sign_mask, d2));
+            s3 = _mm256_add_ps(s3, _mm256_andnot_ps(sign_mask, d3));
         }
+
+        let mut tail_off = main_chunks * 32;
+        while tail_off + 8 <= a.len() {
+            let d = _mm256_sub_ps(
+                _mm256_loadu_ps(a.as_ptr().add(tail_off)),
+                _mm256_loadu_ps(b.as_ptr().add(tail_off)),
+            );
+            s0 = _mm256_add_ps(s0, _mm256_andnot_ps(sign_mask, d));
+            tail_off += 8;
+        }
+
+        let sum = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
         let mut result = hsum256_ps(sum);
-        for i in (chunks * 8)..a.len() {
+        for i in tail_off..a.len() {
             result += (a[i] - b[i]).abs();
+        }
+        result
+    }
+}
+
+// --- SIMD: x86_64 AVX-512F (16-wide, runtime-detected) ---
+//
+// AVX-512F is present on: Intel Sapphire Rapids+, Granite Rapids, Xeon
+// Scalable 4th gen+; AMD Zen4+ (Ryzen 7000 / Epyc Genoa). NOT on the
+// i9-9900K bench host — these paths are dead-code there at runtime,
+// but compile + monomorphize once so any future hardware upgrade picks
+// them up without rebuild. Two accumulators × 16 lanes = 32 f32/iter,
+// matching the AVX2 path's chunk size so the tail logic stays uniform.
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn dot_avx512(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let mut s0 = _mm512_setzero_ps();
+        let mut s1 = _mm512_setzero_ps();
+
+        let main_chunks = a.len() / 32;
+        for i in 0..main_chunks {
+            let base = i * 32;
+            let a0 = _mm512_loadu_ps(a.as_ptr().add(base));
+            let b0 = _mm512_loadu_ps(b.as_ptr().add(base));
+            let a1 = _mm512_loadu_ps(a.as_ptr().add(base + 16));
+            let b1 = _mm512_loadu_ps(b.as_ptr().add(base + 16));
+            s0 = _mm512_fmadd_ps(a0, b0, s0);
+            s1 = _mm512_fmadd_ps(a1, b1, s1);
+        }
+
+        let mut tail_off = main_chunks * 32;
+        while tail_off + 16 <= a.len() {
+            let va = _mm512_loadu_ps(a.as_ptr().add(tail_off));
+            let vb = _mm512_loadu_ps(b.as_ptr().add(tail_off));
+            s0 = _mm512_fmadd_ps(va, vb, s0);
+            tail_off += 16;
+        }
+
+        let sum = _mm512_add_ps(s0, s1);
+        let mut result = _mm512_reduce_add_ps(sum);
+        for i in tail_off..a.len() {
+            result += a[i] * b[i];
+        }
+        result
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn l2_squared_avx512(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let mut s0 = _mm512_setzero_ps();
+        let mut s1 = _mm512_setzero_ps();
+
+        let main_chunks = a.len() / 32;
+        for i in 0..main_chunks {
+            let base = i * 32;
+            let a0 = _mm512_loadu_ps(a.as_ptr().add(base));
+            let b0 = _mm512_loadu_ps(b.as_ptr().add(base));
+            let a1 = _mm512_loadu_ps(a.as_ptr().add(base + 16));
+            let b1 = _mm512_loadu_ps(b.as_ptr().add(base + 16));
+            let d0 = _mm512_sub_ps(a0, b0);
+            let d1 = _mm512_sub_ps(a1, b1);
+            s0 = _mm512_fmadd_ps(d0, d0, s0);
+            s1 = _mm512_fmadd_ps(d1, d1, s1);
+        }
+
+        let mut tail_off = main_chunks * 32;
+        while tail_off + 16 <= a.len() {
+            let va = _mm512_loadu_ps(a.as_ptr().add(tail_off));
+            let vb = _mm512_loadu_ps(b.as_ptr().add(tail_off));
+            let d = _mm512_sub_ps(va, vb);
+            s0 = _mm512_fmadd_ps(d, d, s0);
+            tail_off += 16;
+        }
+
+        let sum = _mm512_add_ps(s0, s1);
+        let mut result = _mm512_reduce_add_ps(sum);
+        for i in tail_off..a.len() {
+            let d = a[i] - b[i];
+            result += d * d;
         }
         result
     }
@@ -279,21 +507,58 @@ unsafe fn hsum256_ps(v: std::arch::x86_64::__m256) -> f32 {
     _mm_cvtss_f32(sums2)
 }
 
-// --- SIMD: aarch64 NEON ---
+// --- SIMD: aarch64 NEON (multi-accumulator) ---
+//
+// NEON is mandatory in ARMv8 so the runtime probe always succeeds on
+// real aarch64 hardware. We still gate behind `is_aarch64_feature_detected!`
+// for symmetry with the x86_64 path — keeps every binary "runtime
+// dispatch, not compile-time" per project policy.
+//
+// 4 independent accumulators × 4 lanes = 16 f32 per main iter. Apple
+// M-series and AWS Graviton 3 / 4 have multiple FMA units; this layout
+// keeps them all busy. On smaller cores (Cortex-A53) the extra parallel
+// chains have no negative effect — they just retire as fast as they're
+// issued.
 
 #[cfg(target_arch = "aarch64")]
-unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
+#[target_feature(enable = "neon")]
+unsafe fn dot_neon_mt(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
     unsafe {
-        let mut sum = vdupq_n_f32(0.0);
-        let chunks = a.len() / 4;
-        for i in 0..chunks {
-            let va = vld1q_f32(a.as_ptr().add(i * 4));
-            let vb = vld1q_f32(b.as_ptr().add(i * 4));
-            sum = vfmaq_f32(sum, va, vb);
+        let mut s0 = vdupq_n_f32(0.0);
+        let mut s1 = vdupq_n_f32(0.0);
+        let mut s2 = vdupq_n_f32(0.0);
+        let mut s3 = vdupq_n_f32(0.0);
+
+        let main_chunks = a.len() / 16;
+        for i in 0..main_chunks {
+            let base = i * 16;
+            let a0 = vld1q_f32(a.as_ptr().add(base));
+            let b0 = vld1q_f32(b.as_ptr().add(base));
+            let a1 = vld1q_f32(a.as_ptr().add(base + 4));
+            let b1 = vld1q_f32(b.as_ptr().add(base + 4));
+            let a2 = vld1q_f32(a.as_ptr().add(base + 8));
+            let b2 = vld1q_f32(b.as_ptr().add(base + 8));
+            let a3 = vld1q_f32(a.as_ptr().add(base + 12));
+            let b3 = vld1q_f32(b.as_ptr().add(base + 12));
+
+            s0 = vfmaq_f32(s0, a0, b0);
+            s1 = vfmaq_f32(s1, a1, b1);
+            s2 = vfmaq_f32(s2, a2, b2);
+            s3 = vfmaq_f32(s3, a3, b3);
         }
+
+        let mut tail_off = main_chunks * 16;
+        while tail_off + 4 <= a.len() {
+            let va = vld1q_f32(a.as_ptr().add(tail_off));
+            let vb = vld1q_f32(b.as_ptr().add(tail_off));
+            s0 = vfmaq_f32(s0, va, vb);
+            tail_off += 4;
+        }
+
+        let sum = vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3));
         let mut result = vaddvq_f32(sum);
-        for i in (chunks * 4)..a.len() {
+        for i in tail_off..a.len() {
             result += a[i] * b[i];
         }
         result
@@ -301,19 +566,50 @@ unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "aarch64")]
-unsafe fn l2_squared_neon(a: &[f32], b: &[f32]) -> f32 {
+#[target_feature(enable = "neon")]
+unsafe fn l2_squared_neon_mt(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
     unsafe {
-        let mut sum = vdupq_n_f32(0.0);
-        let chunks = a.len() / 4;
-        for i in 0..chunks {
-            let va = vld1q_f32(a.as_ptr().add(i * 4));
-            let vb = vld1q_f32(b.as_ptr().add(i * 4));
-            let diff = vsubq_f32(va, vb);
-            sum = vfmaq_f32(sum, diff, diff);
+        let mut s0 = vdupq_n_f32(0.0);
+        let mut s1 = vdupq_n_f32(0.0);
+        let mut s2 = vdupq_n_f32(0.0);
+        let mut s3 = vdupq_n_f32(0.0);
+
+        let main_chunks = a.len() / 16;
+        for i in 0..main_chunks {
+            let base = i * 16;
+            let a0 = vld1q_f32(a.as_ptr().add(base));
+            let b0 = vld1q_f32(b.as_ptr().add(base));
+            let a1 = vld1q_f32(a.as_ptr().add(base + 4));
+            let b1 = vld1q_f32(b.as_ptr().add(base + 4));
+            let a2 = vld1q_f32(a.as_ptr().add(base + 8));
+            let b2 = vld1q_f32(b.as_ptr().add(base + 8));
+            let a3 = vld1q_f32(a.as_ptr().add(base + 12));
+            let b3 = vld1q_f32(b.as_ptr().add(base + 12));
+
+            let d0 = vsubq_f32(a0, b0);
+            let d1 = vsubq_f32(a1, b1);
+            let d2 = vsubq_f32(a2, b2);
+            let d3 = vsubq_f32(a3, b3);
+
+            s0 = vfmaq_f32(s0, d0, d0);
+            s1 = vfmaq_f32(s1, d1, d1);
+            s2 = vfmaq_f32(s2, d2, d2);
+            s3 = vfmaq_f32(s3, d3, d3);
         }
+
+        let mut tail_off = main_chunks * 16;
+        while tail_off + 4 <= a.len() {
+            let va = vld1q_f32(a.as_ptr().add(tail_off));
+            let vb = vld1q_f32(b.as_ptr().add(tail_off));
+            let d = vsubq_f32(va, vb);
+            s0 = vfmaq_f32(s0, d, d);
+            tail_off += 4;
+        }
+
+        let sum = vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3));
         let mut result = vaddvq_f32(sum);
-        for i in (chunks * 4)..a.len() {
+        for i in tail_off..a.len() {
             let d = a[i] - b[i];
             result += d * d;
         }
@@ -322,20 +618,54 @@ unsafe fn l2_squared_neon(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "aarch64")]
-unsafe fn l1_neon(a: &[f32], b: &[f32]) -> f32 {
+#[target_feature(enable = "neon")]
+unsafe fn l1_neon_mt(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
     unsafe {
-        let mut sum = vdupq_n_f32(0.0);
-        let chunks = a.len() / 4;
-        for i in 0..chunks {
-            let va = vld1q_f32(a.as_ptr().add(i * 4));
-            let vb = vld1q_f32(b.as_ptr().add(i * 4));
-            let diff = vsubq_f32(va, vb);
-            let abs_diff = vabsq_f32(diff);
-            sum = vaddq_f32(sum, abs_diff);
+        let mut s0 = vdupq_n_f32(0.0);
+        let mut s1 = vdupq_n_f32(0.0);
+        let mut s2 = vdupq_n_f32(0.0);
+        let mut s3 = vdupq_n_f32(0.0);
+
+        let main_chunks = a.len() / 16;
+        for i in 0..main_chunks {
+            let base = i * 16;
+            let d0 = vsubq_f32(
+                vld1q_f32(a.as_ptr().add(base)),
+                vld1q_f32(b.as_ptr().add(base)),
+            );
+            let d1 = vsubq_f32(
+                vld1q_f32(a.as_ptr().add(base + 4)),
+                vld1q_f32(b.as_ptr().add(base + 4)),
+            );
+            let d2 = vsubq_f32(
+                vld1q_f32(a.as_ptr().add(base + 8)),
+                vld1q_f32(b.as_ptr().add(base + 8)),
+            );
+            let d3 = vsubq_f32(
+                vld1q_f32(a.as_ptr().add(base + 12)),
+                vld1q_f32(b.as_ptr().add(base + 12)),
+            );
+
+            s0 = vaddq_f32(s0, vabsq_f32(d0));
+            s1 = vaddq_f32(s1, vabsq_f32(d1));
+            s2 = vaddq_f32(s2, vabsq_f32(d2));
+            s3 = vaddq_f32(s3, vabsq_f32(d3));
         }
+
+        let mut tail_off = main_chunks * 16;
+        while tail_off + 4 <= a.len() {
+            let d = vsubq_f32(
+                vld1q_f32(a.as_ptr().add(tail_off)),
+                vld1q_f32(b.as_ptr().add(tail_off)),
+            );
+            s0 = vaddq_f32(s0, vabsq_f32(d));
+            tail_off += 4;
+        }
+
+        let sum = vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3));
         let mut result = vaddvq_f32(sum);
-        for i in (chunks * 4)..a.len() {
+        for i in tail_off..a.len() {
             result += (a[i] - b[i]).abs();
         }
         result
