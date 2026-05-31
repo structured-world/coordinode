@@ -1009,14 +1009,17 @@ impl HnswIndex {
                 max_conn,
             } = layer;
 
-            // Outgoing: new_node → selected.
-            let outgoing: Vec<u64> = selected_idxs.iter().map(|&n| self.nodes[n].id).collect();
+            // Outgoing: new_node → selected. We store internal indices
+            // (`idx`), not external `NodeId`s, so the search hot path can
+            // skip an `id_to_idx` HashMap lookup per neighbour visit (the
+            // dominant cost per profiler — see commit message).
+            let outgoing: Vec<u64> = selected_idxs.iter().map(|&n| n as u64).collect();
             self.set_outgoing(idx, level, &outgoing);
 
             // Bidirectional: selected → new_node (with optional prune).
             for &neighbor_idx in &selected_idxs {
                 if level < self.neighbours_atomic[neighbor_idx].len() {
-                    self.add_neighbour_to(neighbor_idx, level, id, max_conn);
+                    self.add_neighbour_to(neighbor_idx, level, idx as u64, max_conn);
                 }
             }
         }
@@ -1121,24 +1124,22 @@ impl HnswIndex {
                 return;
             }
             for layer in &plan.per_layer {
-                let outgoing: Vec<u64> = layer
-                    .selected_idxs
-                    .iter()
-                    .map(|&n| self.nodes[n].id)
-                    .collect();
+                // Store internal indices in neighbour lists — search hot
+                // path reads them directly without an id→idx HashMap hop.
+                let outgoing: Vec<u64> = layer.selected_idxs.iter().map(|&n| n as u64).collect();
                 self.set_outgoing(*idx, layer.level, &outgoing);
 
                 for &neighbour_idx in &layer.selected_idxs {
                     if layer.level < self.neighbours_atomic[neighbour_idx].len()
-                        && !self.cas_add_neighbour_to(neighbour_idx, layer.level, plan.id)
+                        && !self.cas_add_neighbour_to(neighbour_idx, layer.level, *idx as u64)
                     {
                         // cas_append returned false (list at capacity).
-                        // Record (neighbour_idx, level, id_to_add, max_conn)
+                        // Record (neighbour_idx, level, idx_to_add, max_conn)
                         // for the serial prune-pass below.
                         backfill.lock().unwrap_or_else(|e| e.into_inner()).push((
                             neighbour_idx,
                             layer.level,
-                            plan.id,
+                            *idx as u64,
                             layer.max_conn,
                         ));
                     }
@@ -1637,11 +1638,12 @@ impl HnswIndex {
         // Snapshot first to avoid simultaneous mutable + immutable borrows.
         for level in 0..n_levels {
             let neighbours = self.neighbours_atomic[idx][level].snapshot();
-            for neighbour_id in neighbours {
-                if let Some(&neighbour_idx) = self.id_to_idx.get(&neighbour_id) {
-                    if level < self.neighbours_atomic[neighbour_idx].len() {
-                        self.remove_neighbour_from(neighbour_idx, level, id);
-                    }
+            for neighbour_idx_u64 in neighbours {
+                let neighbour_idx = neighbour_idx_u64 as usize;
+                if neighbour_idx < self.nodes.len()
+                    && level < self.neighbours_atomic[neighbour_idx].len()
+                {
+                    self.remove_neighbour_from(neighbour_idx, level, idx as u64);
                 }
             }
         }
@@ -1725,14 +1727,16 @@ impl HnswIndex {
                 .map(|c| c.idx)
                 .collect();
 
-            // Connect this node to its new neighbours.
-            let outgoing: Vec<u64> = selected.iter().map(|&n| self.nodes[n].id).collect();
+            // Connect this node to its new neighbours. Store internal
+            // indices (idx, not NodeId) so the search hot path skips the
+            // id_to_idx HashMap hop.
+            let outgoing: Vec<u64> = selected.iter().map(|&n| n as u64).collect();
             self.set_outgoing(idx, level, &outgoing);
 
             // Connect neighbours back (bi-directional).
             for &neighbour_idx in &selected {
                 if level < self.neighbours_atomic[neighbour_idx].len() {
-                    self.add_neighbour_to(neighbour_idx, level, id, max_conn);
+                    self.add_neighbour_to(neighbour_idx, level, idx as u64, max_conn);
                 }
             }
 
@@ -1784,8 +1788,11 @@ impl HnswIndex {
             // contention with concurrent readers.
             if level < self.neighbours_atomic[current].len() {
                 self.neighbours_atomic[current][level].snapshot_into(&mut neighbours_scratch);
-                for &neighbor_id in &neighbours_scratch {
-                    if let Some(&neighbor_idx) = self.id_to_idx.get(&neighbor_id) {
+                for &neighbor_idx_u64 in &neighbours_scratch {
+                    // Stored u64s ARE internal indices now (HNSW search hot
+                    // path: no id_to_idx HashMap hop per neighbour).
+                    let neighbor_idx = neighbor_idx_u64 as usize;
+                    if neighbor_idx < self.nodes.len() {
                         let dist = self.compute_distance(ctx, neighbor_idx);
                         if dist < current_dist {
                             current = neighbor_idx;
@@ -1862,15 +1869,17 @@ impl HnswIndex {
                 let mut connections: Vec<u64> = Vec::with_capacity(M_MAX0);
                 self.neighbours_atomic[closest.idx][level].snapshot_into(&mut connections);
 
-                // Resolve neighbor IDs → indices, filtering already-visited.
-                // Collect into temp vec to enable one-ahead prefetch pattern.
-                // Donor: hnswlib hnswalg.h:370-383 (one-ahead prefetch in inner loop)
+                // Filter already-visited; the u64s stored in the neighbour
+                // list are internal indices (no id_to_idx HashMap hop —
+                // the prior design's dominant cost per profiler: 38% of
+                // CPU cycles spent in `HashMap::get` for this lookup).
+                // Donor: hnswlib hnswalg.h:370-383 (one-ahead prefetch).
                 let mut unvisited_neighbors: Vec<usize> = Vec::with_capacity(connections.len());
-                for &neighbor_id in &connections {
-                    if let Some(&neighbor_idx) = self.id_to_idx.get(&neighbor_id) {
-                        if !visited.check_and_mark(neighbor_idx) {
-                            unvisited_neighbors.push(neighbor_idx);
-                        }
+                let n_nodes = self.nodes.len();
+                for &neighbor_idx_u64 in &connections {
+                    let neighbor_idx = neighbor_idx_u64 as usize;
+                    if neighbor_idx < n_nodes && !visited.check_and_mark(neighbor_idx) {
+                        unvisited_neighbors.push(neighbor_idx);
                     }
                 }
 
@@ -2026,26 +2035,27 @@ impl HnswIndex {
         max_conn: usize,
         extras: &[u64],
     ) {
+        // Stored u64s ARE neighbour indices now (not NodeIds) — no
+        // id_to_idx hop. Dedupe via HashSet on those indices.
         let neighbours = self.neighbours_atomic[node_idx][level].snapshot();
-        // Dedupe via HashSet — extras can overlap with current neighbours
-        // when a backfill candidate raced to land before this prune pass.
         let mut seen: std::collections::HashSet<u64> =
             std::collections::HashSet::with_capacity(neighbours.len() + extras.len());
         let mut scored: Vec<(f32, u64)> = Vec::with_capacity(neighbours.len() + extras.len());
-        for &neighbor_id in neighbours.iter().chain(extras.iter()) {
-            if !seen.insert(neighbor_id) {
+        for &neighbor_idx_u64 in neighbours.iter().chain(extras.iter()) {
+            if !seen.insert(neighbor_idx_u64) {
                 continue;
             }
-            if let Some(&neighbor_idx) = self.id_to_idx.get(&neighbor_id) {
+            let neighbor_idx = neighbor_idx_u64 as usize;
+            if neighbor_idx < self.nodes.len() {
                 let dist = self.distance_between_nodes(node_idx, neighbor_idx);
-                scored.push((dist, neighbor_id));
+                scored.push((dist, neighbor_idx_u64));
             }
         }
 
         scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(max_conn);
 
-        let kept: Vec<u64> = scored.into_iter().map(|(_, id)| id).collect();
+        let kept: Vec<u64> = scored.into_iter().map(|(_, idx)| idx).collect();
         self.set_outgoing(node_idx, level, &kept);
     }
 
@@ -2122,11 +2132,13 @@ impl HnswIndex {
             // guaranteed to fit without truncation.
             let mut snap = self.neighbours_atomic[neighbour_idx][level].snapshot();
             snap.push(id);
+            // Stored u64s ARE neighbour indices — direct cast, no map hop.
             let mut scored: Vec<(f32, u64)> = Vec::with_capacity(snap.len());
-            for &nid in &snap {
-                if let Some(&nidx) = self.id_to_idx.get(&nid) {
+            for &nidx_u64 in &snap {
+                let nidx = nidx_u64 as usize;
+                if nidx < self.nodes.len() {
                     let dist = self.distance_between_nodes(neighbour_idx, nidx);
-                    scored.push((dist, nid));
+                    scored.push((dist, nidx_u64));
                 }
             }
             scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
