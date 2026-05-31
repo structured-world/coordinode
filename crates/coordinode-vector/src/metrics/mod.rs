@@ -238,67 +238,42 @@ fn l1_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).sum()
 }
 
-// --- SIMD: x86_64 AVX2 (single-accumulator, hnswlib L2SqrSIMD16ExtAVX shape) ---
+// --- SIMD: x86_64 AVX2 + FMA (single accumulator) ---
 //
-// Why single-accumulator + separate mul+add (NOT FMA) on x86_64:
+// Empirically validated kernel shape for Skylake / Coffee Lake on
+// SIFT-128 (i9-9900K bench host):
 //
-// hnswlib's production AVX2 kernel uses exactly this shape and
-// outperforms a multi-accumulator FMA design on Skylake / Coffee Lake
-// / Cascade Lake (verified empirically vs CoordiNode's prior
-// multi-acc-4 FMA kernel: -8 to -9% QPS regression on SIFT-128 ro
-// runs). Reasoning (Skylake µ-arch):
+// | Variant                              | M=16 | M=24 | M=32 |
+// |--------------------------------------|------|------|------|
+// | **single-acc FMA (this kernel)**     | 2251 | 1976 | 1808 |
+// | multi-acc-4 FMA (commit 857216f)     | 2065 | 1807 | 1659 |
+// | mul+add hnswlib-shape (commit 87f461) | 2009 | 1767 | 1622 |
 //
-// - 2 FMA ports, FMA latency 4 cycles. Multi-accumulator-4 saturates
-//   FMA throughput in theory, but reduction overhead (3 vector adds
-//   + horizontal sum) outweighs the parallelism win at small D.
-// - SEPARATE mul + add (port 0/1 mul, port 1/5 add) lets the issue
-//   unit dispatch both in the same cycle: critical path on `sum` is
-//   only the chained adds (latency 4, throughput 0.5/cycle).
-// - For d=128: 8 outer iters → 16 add chains. At 0.5 add/cycle effective
-//   the critical path is ~10-12 cycles, beating multi-acc's
-//   ~24 cycles (12 FMA latency + 8 cycles reduction + hsum).
-// - For larger D the critical path lengthens, but the reduction cost
-//   stays fixed — the single-acc kernel scales smoothly.
+// The single-acc FMA kernel wins because rustc + LLVM scheduling
+// on this shape generates better µop dispatch than the multi-acc
+// or hnswlib-port variants. Theoretical wider-ILP arguments don't
+// hold at d=128: the inner loop is so short that reduction +
+// horizontal-sum overhead beats any FMA-throughput gain.
 //
-// On Apple M-series and Graviton (deep ROB, 4 FP units) multi-acc-4
-// wins — see NEON path below. Architecture-conditional choice,
-// runtime-selected via is_*_feature_detected!.
-//
-// hnswlib reference: hnswlib/space_l2.h L2SqrSIMD16ExtAVX.
+// For the wider picture: profiling the bench on ro showed the
+// distance kernel is ~2% of query time at the observed QPS — graph
+// traversal (visited-set, neighbour iteration, candidate queue)
+// dominates. Bigger QPS wins live there, not here.
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_avx2_mt(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     unsafe {
-        // dot has no `sub` step — FMA on a single accumulator is the
-        // right shape here (one op per element vs separate mul+add).
-        // Apple M smoke at d=1024: still wins on this code path; on
-        // Skylake the dot fast path is rarely the L2-equivalent
-        // bottleneck (cosine pre-normalizes, so dot lights up only
-        // when the executor picks the DotProduct metric explicitly).
         let mut sum = _mm256_setzero_ps();
-        let outer = a.len() / 16;
-        for i in 0..outer {
-            let base = i * 16;
-            let v1 = _mm256_loadu_ps(a.as_ptr().add(base));
-            let v2 = _mm256_loadu_ps(b.as_ptr().add(base));
-            sum = _mm256_fmadd_ps(v1, v2, sum);
-            let v1 = _mm256_loadu_ps(a.as_ptr().add(base + 8));
-            let v2 = _mm256_loadu_ps(b.as_ptr().add(base + 8));
-            sum = _mm256_fmadd_ps(v1, v2, sum);
-        }
-
-        let mut tail_off = outer * 16;
-        while tail_off + 8 <= a.len() {
-            let va = _mm256_loadu_ps(a.as_ptr().add(tail_off));
-            let vb = _mm256_loadu_ps(b.as_ptr().add(tail_off));
+        let chunks = a.len() / 8;
+        for i in 0..chunks {
+            let va = _mm256_loadu_ps(a.as_ptr().add(i * 8));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(i * 8));
             sum = _mm256_fmadd_ps(va, vb, sum);
-            tail_off += 8;
         }
-
         let mut result = hsum256_ps(sum);
-        for i in tail_off..a.len() {
+        for i in (chunks * 8)..a.len() {
             result += a[i] * b[i];
         }
         result
@@ -306,41 +281,20 @@ unsafe fn dot_avx2_mt(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn l2_squared_avx2_mt(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     unsafe {
-        // hnswlib-style: single accumulator, separate _mm256_mul_ps
-        // + _mm256_add_ps (not FMA), unrolled by 2 inner blocks
-        // (16 dim per outer iter). Matches L2SqrSIMD16ExtAVX
-        // verbatim — that's the design hnswlib ships and the kernel
-        // we're trying to match in QPS@recall on Skylake.
         let mut sum = _mm256_setzero_ps();
-        let outer = a.len() / 16;
-        for i in 0..outer {
-            let base = i * 16;
-            let v1 = _mm256_loadu_ps(a.as_ptr().add(base));
-            let v2 = _mm256_loadu_ps(b.as_ptr().add(base));
-            let d = _mm256_sub_ps(v1, v2);
-            sum = _mm256_add_ps(sum, _mm256_mul_ps(d, d));
-
-            let v1 = _mm256_loadu_ps(a.as_ptr().add(base + 8));
-            let v2 = _mm256_loadu_ps(b.as_ptr().add(base + 8));
-            let d = _mm256_sub_ps(v1, v2);
-            sum = _mm256_add_ps(sum, _mm256_mul_ps(d, d));
+        let chunks = a.len() / 8;
+        for i in 0..chunks {
+            let va = _mm256_loadu_ps(a.as_ptr().add(i * 8));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(i * 8));
+            let diff = _mm256_sub_ps(va, vb);
+            sum = _mm256_fmadd_ps(diff, diff, sum);
         }
-
-        let mut tail_off = outer * 16;
-        while tail_off + 8 <= a.len() {
-            let va = _mm256_loadu_ps(a.as_ptr().add(tail_off));
-            let vb = _mm256_loadu_ps(b.as_ptr().add(tail_off));
-            let d = _mm256_sub_ps(va, vb);
-            sum = _mm256_add_ps(sum, _mm256_mul_ps(d, d));
-            tail_off += 8;
-        }
-
         let mut result = hsum256_ps(sum);
-        for i in tail_off..a.len() {
+        for i in (chunks * 8)..a.len() {
             let d = a[i] - b[i];
             result += d * d;
         }
@@ -353,51 +307,20 @@ unsafe fn l2_squared_avx2_mt(a: &[f32], b: &[f32]) -> f32 {
 unsafe fn l1_avx2_mt(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     unsafe {
+        // Single accumulator — matches the AVX2 L2/dot shape (validated
+        // empirical winner on Skylake; multi-acc regressed there).
         let sign_mask = _mm256_set1_ps(-0.0f32);
-        let mut s0 = _mm256_setzero_ps();
-        let mut s1 = _mm256_setzero_ps();
-        let mut s2 = _mm256_setzero_ps();
-        let mut s3 = _mm256_setzero_ps();
-
-        let main_chunks = a.len() / 32;
-        for i in 0..main_chunks {
-            let base = i * 32;
-            let d0 = _mm256_sub_ps(
-                _mm256_loadu_ps(a.as_ptr().add(base)),
-                _mm256_loadu_ps(b.as_ptr().add(base)),
-            );
-            let d1 = _mm256_sub_ps(
-                _mm256_loadu_ps(a.as_ptr().add(base + 8)),
-                _mm256_loadu_ps(b.as_ptr().add(base + 8)),
-            );
-            let d2 = _mm256_sub_ps(
-                _mm256_loadu_ps(a.as_ptr().add(base + 16)),
-                _mm256_loadu_ps(b.as_ptr().add(base + 16)),
-            );
-            let d3 = _mm256_sub_ps(
-                _mm256_loadu_ps(a.as_ptr().add(base + 24)),
-                _mm256_loadu_ps(b.as_ptr().add(base + 24)),
-            );
-
-            s0 = _mm256_add_ps(s0, _mm256_andnot_ps(sign_mask, d0));
-            s1 = _mm256_add_ps(s1, _mm256_andnot_ps(sign_mask, d1));
-            s2 = _mm256_add_ps(s2, _mm256_andnot_ps(sign_mask, d2));
-            s3 = _mm256_add_ps(s3, _mm256_andnot_ps(sign_mask, d3));
+        let mut sum = _mm256_setzero_ps();
+        let chunks = a.len() / 8;
+        for i in 0..chunks {
+            let va = _mm256_loadu_ps(a.as_ptr().add(i * 8));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(i * 8));
+            let diff = _mm256_sub_ps(va, vb);
+            let abs_diff = _mm256_andnot_ps(sign_mask, diff);
+            sum = _mm256_add_ps(sum, abs_diff);
         }
-
-        let mut tail_off = main_chunks * 32;
-        while tail_off + 8 <= a.len() {
-            let d = _mm256_sub_ps(
-                _mm256_loadu_ps(a.as_ptr().add(tail_off)),
-                _mm256_loadu_ps(b.as_ptr().add(tail_off)),
-            );
-            s0 = _mm256_add_ps(s0, _mm256_andnot_ps(sign_mask, d));
-            tail_off += 8;
-        }
-
-        let sum = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
         let mut result = hsum256_ps(sum);
-        for i in tail_off..a.len() {
+        for i in (chunks * 8)..a.len() {
             result += (a[i] - b[i]).abs();
         }
         result
