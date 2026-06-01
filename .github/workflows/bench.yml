@@ -180,6 +180,10 @@ jobs:
             for M in 16 32; do
               for QUANT in none rabitq; do
                 echo "::group::$NAME M=$M codec=$QUANT"
+                # Tighter ef sweep on cosine — the 12-point default
+                # (used for SIFT) makes each cosine run 30-60 min;
+                # 11 runs at that rate blows the CI budget. 6 points
+                # still cover the recall=0.95 inflection cleanly.
                 ./target/release/bench-vector-ann \
                   --train       "$BASE" \
                   --query       "$QUERY" \
@@ -189,6 +193,7 @@ jobs:
                   --ef-construction 200 \
                   --codec none \
                   --quantization "$QUANT" \
+                  --ef-sweep    "20,40,80,120,200,400" \
                   --output bench-results
                 echo "::endgroup::"
               done
