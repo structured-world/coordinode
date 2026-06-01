@@ -1932,53 +1932,65 @@ impl HnswIndex {
         ef: usize,
         level: usize,
     ) -> Vec<Candidate> {
-        let ep_dist = self.compute_distance(ctx, ep);
+        // Two-heap pattern: cheap frontier vs accurate threshold.
+        //
+        // The `candidates` (frontier) heap is keyed on the cheap distance
+        // — RaBitQ popcount when active, plain f32 otherwise. It drives
+        // which neighbour to expand next. Noise in this score only delays
+        // exploration; it cannot drop a true neighbour permanently from
+        // the result set.
+        //
+        // The `results` heap is keyed on the EXACT distance metric.
+        // `farthest_dist` (the worst score in the kept top-ef) gates the
+        // prune condition `dist < farthest_dist`, so it MUST be accurate
+        // — otherwise a noisy RaBitQ "worst" admits trash candidates and
+        // evicts true top-K, which is exactly the recall=0.30 plateau the
+        // glove bench produced on bd207af / 7b6fbe3 (single-precision
+        // navigation everywhere).
+        //
+        // Cost: one extra f32 compute per visited neighbour (~2x distance
+        // work). On glove M=16 ef=200 this drops QPS measurably but is
+        // the only way to recover the recall the SIGMOD 2024 reference
+        // implementation gets (0.85+) on the same data — its
+        // `searchBaseLayerST_AdaptiveRerankOpt` does the same f32-on-
+        // results trick under another name.
+        let cheap_ep = self.compute_distance(ctx, ep);
+        let exact_ep = self.compute_exact_distance(ctx, ep);
 
-        // Pre-size heaps to `ef + small slack`. With_capacity avoids the
-        // Vec-grow allocation cascade (1, 4, 8, 16, …, ef) that
-        // `BinaryHeap::new()` would otherwise do per query.
         let heap_cap = ef + 16;
         let mut candidates: BinaryHeap<Candidate> = BinaryHeap::with_capacity(heap_cap);
         let mut results: BinaryHeap<FarCandidate> = BinaryHeap::with_capacity(heap_cap);
         let mut visited = self.visited_pool.get(self.nodes.len());
 
-        // Hoisted scratch vecs reused across outer iterations — saves
-        // ~150 × 2 allocs per query (one per ef-search inner iteration).
-        // Inline-cap M_MAX0 (64) covers every neighbour list without
-        // realloc; `.clear()` resets without releasing the backing
-        // storage.
         let mut connections: Vec<u64> = Vec::with_capacity(M_MAX0);
         let mut unvisited_neighbors: Vec<usize> = Vec::with_capacity(M_MAX0);
 
         candidates.push(Candidate {
-            distance: ep_dist,
+            distance: cheap_ep,
             idx: ep as u32,
         });
         results.push(FarCandidate {
-            distance: ep_dist,
+            distance: exact_ep,
             idx: ep as u32,
         });
         visited.check_and_mark(ep);
 
-        // Cache the heap-top distance locally; refresh only on push/pop
-        // mutations. Saves `results.peek().map().unwrap_or()` indirection
-        // per neighbour visit (the inner loop runs ~2000× per query).
-        let mut farthest_dist = ep_dist;
+        let mut farthest_dist = exact_ep;
 
         while let Some(closest) = candidates.pop() {
+            // Termination: even the cheapest unvisited frontier candidate
+            // is already worse than the worst-kept top-ef result. With
+            // RaBitQ noise this can be conservative (we stop slightly
+            // early); the alternative — using exact dist on candidates —
+            // would defeat the kernel speedup.
             if closest.distance > farthest_dist {
                 break;
             }
 
             if level < self.neighbours_atomic[closest.idx as usize].len() {
-                // Lock-free atomic snapshot of the neighbour list — see
-                // search_layer_greedy_query for the memory-model rationale.
                 connections.clear();
                 self.neighbours_atomic[closest.idx as usize][level].snapshot_into(&mut connections);
 
-                // Filter already-visited; the u64s stored in the neighbour
-                // list are internal indices (no id_to_idx HashMap hop).
-                // Donor: hnswlib hnswalg.h:370-383 (one-ahead prefetch).
                 unvisited_neighbors.clear();
                 let n_nodes = self.nodes.len();
                 for &neighbor_idx_u64 in &connections {
@@ -1988,36 +2000,38 @@ impl HnswIndex {
                     }
                 }
 
-                // Prefetch first neighbor's vector data before entering distance loop.
-                // When f32 is offloaded, prefetch the quantized vector instead.
                 if let Some(&first) = unvisited_neighbors.first() {
                     self.prefetch_node_vector(first);
                 }
 
                 for (i, &neighbor_idx) in unvisited_neighbors.iter().enumerate() {
-                    // Prefetch NEXT neighbor's vector while computing distance for current.
-                    // Hides ~100ns L3 cache miss latency behind distance computation.
                     if i + 1 < unvisited_neighbors.len() {
                         let next_idx = unvisited_neighbors[i + 1];
                         self.prefetch_node_vector(next_idx);
                     }
 
-                    let dist = self.compute_distance(ctx, neighbor_idx);
+                    let cheap_dist = self.compute_distance(ctx, neighbor_idx);
 
-                    if dist < farthest_dist || results.len() < ef {
+                    if cheap_dist < farthest_dist || results.len() < ef {
+                        // Promising under the cheap metric — verify with
+                        // exact f32 before letting it into the kept top-ef.
+                        // The f32 path is also what gates `farthest_dist`,
+                        // so noise in the cheap metric cannot poison the
+                        // prune threshold downstream.
+                        let exact_dist = self.compute_exact_distance(ctx, neighbor_idx);
+
                         candidates.push(Candidate {
-                            distance: dist,
+                            distance: cheap_dist,
                             idx: neighbor_idx as u32,
                         });
                         results.push(FarCandidate {
-                            distance: dist,
+                            distance: exact_dist,
                             idx: neighbor_idx as u32,
                         });
 
                         if results.len() > ef {
-                            results.pop(); // Remove farthest
+                            results.pop();
                         }
-                        // Heap mutated — refresh the cached top.
                         if let Some(top) = results.peek() {
                             farthest_dist = top.distance;
                         }
@@ -2026,7 +2040,6 @@ impl HnswIndex {
             }
         }
 
-        // Convert to sorted vec (nearest first)
         let mut result_vec: Vec<Candidate> = results
             .into_iter()
             .map(|r| Candidate {
