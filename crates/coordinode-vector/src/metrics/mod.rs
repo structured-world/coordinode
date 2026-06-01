@@ -140,10 +140,12 @@ pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
 /// | aarch64 NEON               | `l2_squared_neon_mt` | 16 |
 /// | scalar fallback            | `l2_squared_scalar`  | 1  |
 ///
-/// The `_mt` suffix marks the multi-accumulator variants: 4 independent
-/// FMA chains run in parallel to saturate the FMA throughput of modern
-/// out-of-order cores (Skylake / Zen3+ / Apple M-series have 2+ FMA
-/// ports — single-accumulator code leaves half the FMA bandwidth idle).
+/// `#[inline]` is mandatory — the HNSW search hot loop calls this
+/// thousands of times per query, and the CPUID branch must hoist OUT
+/// of the loop (LLVM constant-folds `is_x86_feature_detected!` per
+/// monomorphization site when inlined). Without inline the call
+/// boundary plus per-call CPUID-cache load costs ~10 cycles each visit.
+#[inline]
 pub fn euclidean_distance_squared(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
@@ -167,11 +169,13 @@ pub fn euclidean_distance_squared(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Dot product: sum(a_i * b_i). Higher = more similar (for normalized vectors).
+#[inline]
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     dot_product_inner(a, b)
 }
 
 /// Manhattan (L1) distance: sum(|a_i - b_i|). Lower = more similar.
+#[inline]
 pub fn manhattan_distance(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
@@ -192,12 +196,14 @@ pub fn manhattan_distance(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// L2 norm: sqrt(sum(a_i^2)).
+#[inline]
 pub fn norm_l2(a: &[f32]) -> f32 {
     dot_product_inner(a, a).sqrt()
 }
 
 // --- Scalar implementations ---
 
+#[inline]
 fn dot_product_inner(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {

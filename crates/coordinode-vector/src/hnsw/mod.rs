@@ -1945,6 +1945,7 @@ impl HnswIndex {
     ///    f32. Faster than full f32 due to 4× smaller working set.
     /// 3. **Exact f32** fallback when neither codec has an encoded
     ///    representation of this node (pre-calibration).
+    #[inline(always)]
     fn compute_distance(&self, ctx: &QueryCtx<'_>, node_idx: usize) -> f32 {
         // RaBitQ fast path — cosine metric only in this slice.
         // Variants must match: a query encoded as Multi must hit a node
@@ -1980,6 +1981,7 @@ impl HnswIndex {
     /// Compute exact f32 distance between the search query and a node.
     /// Used for final reranking after SQ8 candidate generation.
     /// Falls back to dequantized SQ8 if f32 is offloaded.
+    #[inline(always)]
     fn compute_exact_distance(&self, ctx: &QueryCtx<'_>, node_idx: usize) -> f32 {
         if let Some(ref node_vec) = self.nodes[node_idx].vector {
             return self.distance_for_metric(ctx, node_vec);
@@ -1997,7 +1999,7 @@ impl HnswIndex {
     /// Compute distance using the configured metric, with query-side state
     /// pre-computed in `ctx`. Cosine uses the cached ‖query‖₂; other metrics
     /// ignore it and the field is set to a sentinel by `QueryCtx::new`.
-    #[inline]
+    #[inline(always)]
     fn distance_for_metric(&self, ctx: &QueryCtx<'_>, b: &[f32]) -> f32 {
         match self.config.metric {
             VectorMetric::Cosine => {
