@@ -95,109 +95,69 @@ jobs:
         # binaries to the workspace, append `-p <name>` here. One
         # cargo invocation = one shared compile graph = fastest.
 
-      # ── Vector (ann-benchmarks SIFT1M) ─────────────────────────
+      # ── Vector (per-commit smoke; budget ≤ 20 min total) ──────
       #
-      # Sweep over HNSW M ∈ {16, 24, 32} so the docs UI can compare
-      # CoordiNode against competitors at the SAME graph density.
-      # hnswlib results in bench-data already come in three M values
-      # (`<sha>-hnswlib-M<m>-<ts>.json`). Single-M coordinode forced
-      # the "QPS at recall ≥ X" chart to mix M=24 hnswlib with M=32
-      # CoordiNode — different graph topology, not apples-to-apples.
+      # Per-commit CI budget: the full vector sweep must finish in
+      # ≤ 20 minutes. Build of 1M-node HNSW at M=16 is ~5 min, and
+      # each ef_search sweep point runs ~30 s on a 10K query set.
+      # That leaves room for THREE focused runs at most.
       #
-      # Filenames: `<sha>-coordinode-M<m>-<ts>.json`. Sequential —
-      # one cargo build, three runs sharing the dataset on the same
-      # host. Per run: ~5 min build + ~30 s queries on SIFT1M.
-      - name: Vector — SIFT1M M sweep (16, 24, 32)
+      # Selection per commit, optimised for signal-per-second:
+      #   1. SIFT-128-L2 M=16  codec=none   — f32 distance regression
+      #      detector (NEON / AVX2 SIMD kernel correctness + speed).
+      #   2. glove-100-ang  M=16 codec=none   — cosine f32 baseline.
+      #   3. glove-100-ang  M=16 codec=rabitq — RaBitQ popcount kernel
+      #      on the SAME dataset, so the dashboard can show
+      #      "RaBitQ vs f32 at the same recall" side-by-side.
+      #
+      # ef sweep is the same 5-point inflection band [20, 40, 80,
+      # 120, 200] for every run — covers recall=0.95 cleanly without
+      # the high-recall tail that runs slowest.
+      #
+      # Bigger sweeps (M ∈ {16, 24, 32}, codec ∈ {none, rabitq, sq8,
+      # rabitq-2bit/3bit/4bit}, datasets random-1024-angular /
+      # gist-960-angular) live in a separate `workflow_dispatch` job
+      # that operators trigger on-demand or nightly.
+      - name: Vector — per-commit smoke (SIFT + glove)
         id: vector
         if: ${{ contains(inputs.modalities || 'vector,graph,spatial,timeseries,search,document', 'vector') }}
         run: |
           set -euo pipefail
+          EF_SWEEP="20,40,80,120,200"
+
+          # SIFT (L2 regression detector)
           DS_DIR="$DATASET_ROOT/sift"
           for f in sift_base.fvecs sift_query.fvecs sift_groundtruth.ivecs; do
-            test -f "$DS_DIR/$f" || { echo "::error::missing $DS_DIR/$f — see benches/vector-ann/README.md"; exit 1; }
+            test -f "$DS_DIR/$f" || { echo "::error::missing $DS_DIR/$f"; exit 1; }
           done
-          # SIFT is L2 / euclidean. Stays codec=none — RaBitQ requires
-          # cosine, which lives in the cosine block below (glove-100-
-          # angular + random-1024-angular). The SIFT timeline remains
-          # useful as the f32-distance-kernel regression detector.
-          for M in 16 24 32; do
-            echo "::group::SIFT1M M=$M"
+          echo "::group::SIFT-128-L2 M=16 codec=none"
+          ./target/release/bench-vector-ann \
+            --train       "$DS_DIR/sift_base.fvecs" \
+            --query       "$DS_DIR/sift_query.fvecs" \
+            --groundtruth "$DS_DIR/sift_groundtruth.ivecs" \
+            --dataset-name sift-128-euclidean \
+            --m 16 --ef-construction 200 \
+            --codec none --ef-sweep "$EF_SWEEP" \
+            --output bench-results
+          echo "::endgroup::"
+
+          # glove cosine: f32 + RaBitQ side-by-side
+          GLOVE_DIR="$DATASET_ROOT/glove-100-angular"
+          for f in glove_base.fvecs glove_query.fvecs glove_groundtruth.ivecs; do
+            test -f "$GLOVE_DIR/$f" || { echo "::error::missing $GLOVE_DIR/$f"; exit 1; }
+          done
+          for QUANT in none rabitq; do
+            echo "::group::glove-100-angular M=16 codec=$QUANT"
             ./target/release/bench-vector-ann \
-              --train       "$DS_DIR/sift_base.fvecs" \
-              --query       "$DS_DIR/sift_query.fvecs" \
-              --groundtruth "$DS_DIR/sift_groundtruth.ivecs" \
-              --dataset-name sift-128-euclidean \
-              --m "$M" \
-              --ef-construction 200 \
-              --codec none \
+              --train       "$GLOVE_DIR/glove_base.fvecs" \
+              --query       "$GLOVE_DIR/glove_query.fvecs" \
+              --groundtruth "$GLOVE_DIR/glove_groundtruth.ivecs" \
+              --dataset-name glove-100-angular \
+              --m 16 --ef-construction 200 \
+              --codec none --quantization "$QUANT" \
+              --ef-sweep "$EF_SWEEP" \
               --output bench-results
             echo "::endgroup::"
-          done
-
-      # ── Vector — cosine + RaBitQ (the production hot path) ────
-      #
-      # SIFT-128-L2 doesn't activate RaBitQ — the popcount kernel is
-      # cosine-only in the current dispatch. Production workloads
-      # (text embeddings: OpenAI, Cohere, voyage-3) all live in
-      # cosine + dim ≥ 384, where RaBitQ's 1-bit code + popcount
-      # distance gives the 8× RAM reduction and ~3× search throughput
-      # CoordiNode advertises. Bench has to measure THAT path.
-      #
-      # Two cosine datasets per commit:
-      #   - glove-100-angular   (1.18M × dim=100)   — small dim, public
-      #     reference dataset every competitor publishes against.
-      #   - random-1024-angular (100k × dim=1024)   — synthetic, large
-      #     dim, matches the text-embedding workload profile.
-      #
-      # Each dataset sweeps M ∈ {16, 32} × quantization ∈ {none, rabitq}
-      # so the dashboard can show f32 baseline vs RaBitQ side-by-side
-      # at the same recall target. RaBitQ runs use 1-bit (default);
-      # 2/3/4-bit Extended-RaBitQ sweeps land in a follow-up to keep
-      # per-commit CI under ~30 min.
-      - name: Vector — cosine + RaBitQ (glove + random-1024)
-        id: vector_cosine
-        if: ${{ contains(inputs.modalities || 'vector,graph,spatial,timeseries,search,document', 'vector') }}
-        run: |
-          set -euo pipefail
-          for DS in glove-100-angular random-1024-angular; do
-            case "$DS" in
-              glove-100-angular)
-                BASE="$DATASET_ROOT/glove-100-angular/glove_base.fvecs"
-                QUERY="$DATASET_ROOT/glove-100-angular/glove_query.fvecs"
-                GT="$DATASET_ROOT/glove-100-angular/glove_groundtruth.ivecs"
-                NAME="glove-100-angular"
-                ;;
-              random-1024-angular)
-                BASE="$DATASET_ROOT/random-1024-angular/random_base.fvecs"
-                QUERY="$DATASET_ROOT/random-1024-angular/random_query.fvecs"
-                GT="$DATASET_ROOT/random-1024-angular/random_groundtruth.ivecs"
-                NAME="random-1024-angular"
-                ;;
-            esac
-            for f in "$BASE" "$QUERY" "$GT"; do
-              test -f "$f" || { echo "::error::missing $f"; exit 1; }
-            done
-            for M in 16 32; do
-              for QUANT in none rabitq; do
-                echo "::group::$NAME M=$M codec=$QUANT"
-                # Tighter ef sweep on cosine — the 12-point default
-                # (used for SIFT) makes each cosine run 30-60 min;
-                # 11 runs at that rate blows the CI budget. 6 points
-                # still cover the recall=0.95 inflection cleanly.
-                ./target/release/bench-vector-ann \
-                  --train       "$BASE" \
-                  --query       "$QUERY" \
-                  --groundtruth "$GT" \
-                  --dataset-name "$NAME" \
-                  --m "$M" \
-                  --ef-construction 200 \
-                  --codec none \
-                  --quantization "$QUANT" \
-                  --ef-sweep    "20,40,80,120,200,400" \
-                  --output bench-results
-                echo "::endgroup::"
-              done
-            done
           done
 
       # ── Future modality steps land here, one per modality ─────
