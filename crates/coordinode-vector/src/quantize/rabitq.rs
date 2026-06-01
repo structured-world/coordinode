@@ -64,9 +64,12 @@ pub struct RaBitQCode {
     /// Sign-bit code packed into `D/64` u64 words (LSB-first within each word).
     /// `code[i / 64]` bit `(i % 64)` corresponds to dimension `i`.
     pub code: Vec<u64>,
-    /// `‖x‖₂` — L2 norm of the original (pre-rotation) vector.
+    /// `‖x‖₂` — L2 norm of the original (pre-rotation) vector. Doubles as `norm`
+    /// in the chroma-style distance reconstruction (we run with cluster
+    /// centroid c=0 in pure HNSW, so the residual r equals the data vector d).
     pub norm: f32,
-    /// `<x', e>` where `e` is a fixed unit vector — feeds the asymmetric correction.
+    /// `<x', e>` where `e` is a fixed unit vector — feeds the asymmetric
+    /// correction in the symmetric code×code helper.
     pub cross_term: f32,
     /// `Σ sign(R·x)[i]` precomputed = `2·popcount(code) − D_eff`. Used by the
     /// asymmetric distance kernel (paper Eq. 20) to recover `<g, r_q>` without
@@ -74,6 +77,26 @@ pub struct RaBitQCode {
     /// serialized before this field existed; recompute on first load.
     #[serde(default)]
     pub signed_sum: i32,
+    /// `correction = <g, n>` where `g[i] = ±0.5` is the sign-coded rotated
+    /// vector and `n = R·x / ‖x‖` is the unit-normalized rotated vector.
+    /// Equals `0.5 · ‖R·x‖_1 / ‖x‖_2` after the rotation step in `encode`.
+    ///
+    /// This is the per-vector scaling factor the paper Eq. 20 estimator needs
+    /// to make `<g, r_q>` comparable across DIFFERENT stored vectors. Without
+    /// it, `<g_a, r_q>` and `<g_b, r_q>` mix incompatible scales (each vector
+    /// has its own `‖R·x‖_1`) and the HNSW heap ranking across nodes is
+    /// effectively random — recall plateau at the LSH asymptote no matter
+    /// what bit width the query side uses. Chroma stores the same field in
+    /// its `CodeHeader1Bit`.
+    ///
+    /// Default `1.0` for codes that predate this field (treat as unscaled);
+    /// the next encode pass overwrites with the true value.
+    #[serde(default = "default_correction")]
+    pub correction: f32,
+}
+
+fn default_correction() -> f32 {
+    1.0
 }
 
 impl RaBitQCode {
@@ -240,6 +263,13 @@ impl RaBitQParams {
         let mut sum_rotated = 0.0f32;
         let inv_sqrt_d = 1.0 / (d_eff as f32).sqrt();
 
+        // L1 sum of rotated coordinates, accumulated during the rotation
+        // pass — needed for the per-vector `correction = 0.5 · ‖R·x‖_1 / ‖x‖`
+        // that scales `<g, r_q>` into a cross-vector-comparable inner
+        // product. Without this, paper Eq. 20 produces ranking-broken
+        // estimates because each stored vector's `g` lives in a different
+        // un-normalized scale (the LSH plateau we hit on glove-100-angular).
+        let mut sum_abs_rotated = 0.0f32;
         for i in 0..d_eff {
             let mut acc = 0.0f32;
             let row_base = i * d_eff;
@@ -249,6 +279,7 @@ impl RaBitQParams {
                 acc += self.rotation[row_base + j] * xj;
             }
             sum_rotated += acc;
+            sum_abs_rotated += acc.abs();
             if acc > 0.0 {
                 code[i / 64] |= 1u64 << (i % 64);
             }
@@ -260,11 +291,24 @@ impl RaBitQParams {
         let popcount: u32 = code.iter().map(|w| w.count_ones()).sum();
         let signed_sum = 2 * popcount as i32 - d_eff as i32;
 
+        // correction = <g, n> where g[i] = ±0.5 sign code, n = R·x / ‖x‖.
+        // = 0.5 · Σ sign(R·x[i]) · (R·x)[i] / ‖x‖
+        // = 0.5 · Σ |R·x[i]| / ‖x‖
+        // = 0.5 · ‖R·x‖_1 / ‖x‖_2
+        // For a zero vector we fall back to 1.0 to avoid NaN; encode never
+        // sees zero in practice (HNSW rejects empty vectors upstream).
+        let correction = if norm > f32::EPSILON {
+            0.5 * sum_abs_rotated / norm
+        } else {
+            1.0
+        };
+
         RaBitQCode {
             code,
             norm,
             cross_term: sum_rotated * inv_sqrt_d,
             signed_sum,
+            correction,
         }
     }
 
@@ -404,15 +448,40 @@ impl RaBitQParams {
 
     /// Cosine distance using the asymmetric 4-bit-query kernel.
     ///
-    /// `<g, r_q>` is monotonic in `<x, q>` for the rotation R (R orthonormal,
-    /// g ∝ sign-quantized R·x, r_q ≈ R·q). For HNSW ranking we only need
-    /// monotonicity. Returning `-<g, r_q>` is sufficient: lower = closer.
+    /// Implements the chroma `rabitq_distance_query` reconstruction (paper
+    /// §3.2) — `<g, r_q>` alone is NOT a valid cross-vector distance because
+    /// each stored code carries its own `correction = <g, n>` scaling factor.
+    /// The corrected estimate is:
     ///
-    /// This replaces the legacy `estimate_cosine_distance(code, code)` —
-    /// that symmetric 1-bit × 1-bit XOR popcount caps recall at the LSH
-    /// asymptote and is what the glove plateau measured.
+    /// ```text
+    /// r_dot_r_q ≈ ‖r‖ · <g, r_q> / correction      // per chroma Eq.
+    /// <d, q>    = c_dot_q + radial + r_dot_r_q     // pure HNSW: c=0,
+    ///                                                 radial=0, c_dot_q=0
+    ///                                                 → <d,q> = r_dot_r_q
+    /// ‖d‖²      = c_norm² + 2·radial + ‖r‖²        // pure HNSW: = ‖x‖²
+    /// cos_dist  = 1 − <d,q> / (‖d‖ · ‖q‖)
+    /// ```
+    ///
+    /// For pure HNSW (no IVF centroid, c=0, r=d) this simplifies to:
+    /// `cos_dist = 1 − (norm · g_dot_r_q / correction) / (norm · q.norm)
+    ///           = 1 − g_dot_r_q / (correction · q.norm)`
+    ///
+    /// This is the path the HNSW heap actually needs. Returning naked
+    /// `-<g, r_q>` (what an earlier revision did) produces monotonic-only
+    /// values WITHIN one query, but mixes per-vector scales ACROSS the
+    /// neighbour set — which is what kept glove recall pinned to ~0.23 at
+    /// N=50k even after switching from XOR popcount to paper Eq. 20.
     pub fn estimate_cosine_distance_q(&self, code: &RaBitQCode, query: &RaBitQQuery) -> f32 {
-        -self.estimate_inner_product_q(code, query)
+        let g_dot_r_q = self.estimate_inner_product_q(code, query);
+        // Pure HNSW path: c=0, radial=0, c_dot_q=0, d=r, ‖d‖=norm.
+        let denom = code.correction * query.norm.max(f32::EPSILON);
+        if denom.abs() < f32::EPSILON {
+            // Zero correction (collinear-along-axis sign code or all-zero
+            // rotated vector) — fall back to the unscaled monotonic form
+            // rather than producing NaN/Inf in the HNSW heap.
+            return -g_dot_r_q;
+        }
+        1.0 - g_dot_r_q / denom
     }
 
     /// Estimate the inner product (dot product) between two encoded vectors.
