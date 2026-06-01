@@ -2248,50 +2248,15 @@ impl HnswIndex {
         Vec::new()
     }
 
-    /// Prefetch a node's vector data into L1 cache. Targets f32 when
-    /// available, falls back to quantized vector when f32 is offloaded.
-    ///
-    /// Issues a prefetch hint for **every cache line** covering the
-    /// vector — the hardware streamer pulls in additional lines after
-    /// the first miss, but the typical L2/L3 access path stalls for
-    /// 50-150 cycles per line and one explicit hint per line measurably
-    /// shortens the window the distance kernel waits.
-    ///
-    /// For d=128 f32 (SIFT) that's 512 bytes = 8 cache lines = 8 PREFETCH
-    /// instructions, all issued in parallel and retired in the same
-    /// cycle on out-of-order cores (Skylake / Zen+ / Apple M-series).
+    /// Prefetch a node's vector data into L1 cache. Targets f32 when available,
+    /// falls back to quantized vector when f32 is offloaded.
     #[inline(always)]
     fn prefetch_node_vector(&self, idx: usize) {
-        // SAFETY (release builds): `idx` is bounds-checked at the call
-        // site via the `neighbor_idx < self.nodes.len()` filter inside
-        // search_layer_ctx; the get-unchecked path is fine and elides
-        // an extra branch on the prefetch hot path.
-        let node = match self.nodes.get(idx) {
-            Some(n) => n,
-            None => return,
-        };
-        if let Some(ref v) = node.vector {
-            prefetch_range_read(v.as_ptr() as *const u8, v.len() * 4);
-        } else if let Some(ref q) = node.quantized {
-            prefetch_range_read(q.as_ptr(), q.len());
+        if let Some(ref v) = self.nodes[idx].vector {
+            prefetch_read_data(v.as_ptr() as *const u8);
+        } else if let Some(ref q) = self.nodes[idx].quantized {
+            prefetch_read_data(q.as_ptr());
         }
-    }
-}
-
-/// Issue one [`prefetch_read_data`] hint per 64-byte cache line covering
-/// `[ptr, ptr+bytes)`. Branch-free loop unrolled to one prefetch per
-/// 64-byte stride; the prefetch instructions retire in parallel on every
-/// OOO core CoordiNode targets.
-#[inline(always)]
-fn prefetch_range_read(ptr: *const u8, bytes: usize) {
-    const LINE: usize = 64;
-    let lines = bytes.div_ceil(LINE);
-    let mut off = 0usize;
-    while off < lines * LINE {
-        // SAFETY: prefetch is hint-only, never faults — the memory pointed
-        // at need not even be mapped (CPU treats unmapped prefetch as nop).
-        prefetch_read_data(unsafe { ptr.add(off) });
-        off += LINE;
     }
 }
 
