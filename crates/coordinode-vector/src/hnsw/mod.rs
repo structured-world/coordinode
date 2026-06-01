@@ -1843,9 +1843,21 @@ impl HnswIndex {
     ) -> Vec<Candidate> {
         let ep_dist = self.compute_distance(ctx, ep);
 
-        let mut candidates = BinaryHeap::new(); // min-heap
-        let mut results = BinaryHeap::new(); // max-heap (farthest first)
+        // Pre-size heaps to `ef + small slack`. With_capacity avoids the
+        // Vec-grow allocation cascade (1, 4, 8, 16, …, ef) that
+        // `BinaryHeap::new()` would otherwise do per query.
+        let heap_cap = ef + 16;
+        let mut candidates: BinaryHeap<Candidate> = BinaryHeap::with_capacity(heap_cap);
+        let mut results: BinaryHeap<FarCandidate> = BinaryHeap::with_capacity(heap_cap);
         let mut visited = self.visited_pool.get(self.nodes.len());
+
+        // Hoisted scratch vecs reused across outer iterations — saves
+        // ~150 × 2 allocs per query (one per ef-search inner iteration).
+        // Inline-cap M_MAX0 (64) covers every neighbour list without
+        // realloc; `.clear()` resets without releasing the backing
+        // storage.
+        let mut connections: Vec<u64> = Vec::with_capacity(M_MAX0);
+        let mut unvisited_neighbors: Vec<usize> = Vec::with_capacity(M_MAX0);
 
         candidates.push(Candidate {
             distance: ep_dist,
@@ -1857,24 +1869,26 @@ impl HnswIndex {
         });
         visited.check_and_mark(ep);
 
+        // Cache the heap-top distance locally; refresh only on push/pop
+        // mutations. Saves `results.peek().map().unwrap_or()` indirection
+        // per neighbour visit (the inner loop runs ~2000× per query).
+        let mut farthest_dist = ep_dist;
+
         while let Some(closest) = candidates.pop() {
-            let farthest_result = results.peek().map(|r| r.distance).unwrap_or(f32::INFINITY);
-            if closest.distance > farthest_result {
+            if closest.distance > farthest_dist {
                 break;
             }
 
             if level < self.neighbours_atomic[closest.idx].len() {
                 // Lock-free atomic snapshot of the neighbour list — see
                 // search_layer_greedy_query for the memory-model rationale.
-                let mut connections: Vec<u64> = Vec::with_capacity(M_MAX0);
+                connections.clear();
                 self.neighbours_atomic[closest.idx][level].snapshot_into(&mut connections);
 
                 // Filter already-visited; the u64s stored in the neighbour
-                // list are internal indices (no id_to_idx HashMap hop —
-                // the prior design's dominant cost per profiler: 38% of
-                // CPU cycles spent in `HashMap::get` for this lookup).
+                // list are internal indices (no id_to_idx HashMap hop).
                 // Donor: hnswlib hnswalg.h:370-383 (one-ahead prefetch).
-                let mut unvisited_neighbors: Vec<usize> = Vec::with_capacity(connections.len());
+                unvisited_neighbors.clear();
                 let n_nodes = self.nodes.len();
                 for &neighbor_idx_u64 in &connections {
                     let neighbor_idx = neighbor_idx_u64 as usize;
@@ -1898,9 +1912,8 @@ impl HnswIndex {
                     }
 
                     let dist = self.compute_distance(ctx, neighbor_idx);
-                    let farthest = results.peek().map(|r| r.distance).unwrap_or(f32::INFINITY);
 
-                    if dist < farthest || results.len() < ef {
+                    if dist < farthest_dist || results.len() < ef {
                         candidates.push(Candidate {
                             distance: dist,
                             idx: neighbor_idx,
@@ -1912,6 +1925,10 @@ impl HnswIndex {
 
                         if results.len() > ef {
                             results.pop(); // Remove farthest
+                        }
+                        // Heap mutated — refresh the cached top.
+                        if let Some(top) = results.peek() {
+                            farthest_dist = top.distance;
                         }
                     }
                 }
