@@ -134,6 +134,23 @@ jobs:
             --output bench-results
           echo "::endgroup::"
 
+          # RaBitQ diagnostic on SIFT-128: dim=128 is already a multiple
+          # of 64 so the padding path is NOT exercised here. If SIFT-128
+          # RaBitQ recall is healthy but glove-100 RaBitQ recall is
+          # broken, the bug is in the padding logic. If BOTH are broken,
+          # the bug is in the codec itself.
+          echo "::group::SIFT-128-L2 M=16 codec=none quantization=rabitq"
+          ./target/release/bench-vector-ann \
+            --train       "$DS_DIR/sift_base.fvecs" \
+            --query       "$DS_DIR/sift_query.fvecs" \
+            --groundtruth "$DS_DIR/sift_groundtruth.ivecs" \
+            --dataset-name sift-128-euclidean \
+            --m 16 --ef-construction 200 \
+            --codec none --quantization rabitq \
+            --ef-sweep "$EF_SWEEP" \
+            --output bench-results
+          echo "::endgroup::"
+
           # glove-100-angular cosine: f32 + RaBitQ side-by-side
           GLOVE_DIR="$DATASET_ROOT/glove-100-angular"
           for f in glove_base.fvecs glove_query.fvecs glove_groundtruth.ivecs; do
