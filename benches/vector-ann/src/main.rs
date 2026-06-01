@@ -62,9 +62,17 @@ fn read_rss_kib() -> Option<u64> {
         .and_then(|s| s.parse::<u64>().ok())
 }
 
-/// Default ef_search sweep — covers low-recall (ef=16) to
-/// high-recall (ef=512) regions on SIFT/GloVe-scale datasets.
-const DEFAULT_EF_SWEEP: &[usize] = &[16, 32, 64, 128, 256, 512];
+/// Default ef_search sweep — covers low-recall (ef=10) to
+/// high-recall (ef=800) regions. Matches the ann-benchmarks
+/// hnswlib default sweep so QPS@recall comparisons stop being
+/// penalised by coarser granularity on our side: prior sweep
+/// `[16, 32, 64, 128, …]` jumped over the typical recall=0.95
+/// inflection point (recall=0.91 at ef=32, recall=0.96 at ef=64
+/// on SIFT-128 M=16) — the dashboard then picked the slower
+/// ef=64 cell as "QPS@recall≥0.95" while hnswlib reported the
+/// faster ef=80 cell sitting just above 0.95. Same code, denser
+/// sweep, fairer comparison.
+const DEFAULT_EF_SWEEP: &[usize] = &[10, 20, 40, 60, 80, 120, 160, 200, 300, 400, 600, 800];
 
 /// Number of query-replay rounds per sweep point. ann-benchmarks
 /// uses 10 by default — accumulates timing across replays and
