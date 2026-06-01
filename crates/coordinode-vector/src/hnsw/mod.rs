@@ -298,6 +298,22 @@ pub struct HnswIndex {
     /// and quantized bytes on (re)calibration; reads through it power
     /// Phase 1.5 cross-shard rerank and application-side custom rerank.
     vector_tier: Option<crate::storage::VectorTierHandle>,
+    /// Contiguous flat array of f32 vectors for the hot distance path.
+    /// `flat_vectors[idx * flat_dim .. idx * flat_dim + flat_dim]` is
+    /// node `idx`'s vector. Eliminates the per-visit
+    /// `nodes[idx].vector.as_ref().unwrap()` pointer chase that costs
+    /// one extra cache line on every distance call (HnswNode header +
+    /// heap-allocated Vec<f32> data = 2 cache misses; flat slice = 1).
+    ///
+    /// Empty when:
+    /// - the index has not yet observed any vector (no insert),
+    /// - `offload_vectors` is enabled and f32 has been dropped,
+    /// - dimensionality changes mid-flight (defensive fallback to per-
+    ///   node `Vec<f32>` storage in [`Self::compute_exact_distance`]).
+    flat_vectors: Vec<f32>,
+    /// Width of each row in [`Self::flat_vectors`]. `0` until the first
+    /// insert fixes the dimensionality.
+    flat_dim: u32,
 }
 
 /// Read-only result of the planning phase of an insert (C2, R858b).
@@ -487,6 +503,10 @@ impl HnswIndex {
         // cost on the hot path. `max_elements` is advisory — exceeding it
         // is supported, the first overflow simply triggers Vec growth.
         let capacity = config.max_elements as usize;
+        // Capture `max_dimensions` before the struct moves `config` so
+        // the `flat_vectors` reservation can size itself in the same
+        // initialiser.
+        let max_dim = config.max_dimensions as usize;
         let id_to_idx = std::collections::HashMap::with_capacity(capacity);
         Self {
             config,
@@ -504,6 +524,12 @@ impl HnswIndex {
             // Seed from address of self (varies per instance). Non-deterministic but fast.
             rng_state: std::sync::atomic::AtomicU64::new(0xdeadbeef_cafebabe),
             vector_tier: None,
+            // Reserve `capacity × max_dimensions` f32 slots up front so the
+            // hot-path read never races a realloc. `max_dimensions` is
+            // advisory; if the first inserted vector has a different
+            // length we resize once. capacity == 0 leaves flat empty.
+            flat_vectors: Vec::with_capacity(capacity.saturating_mul(max_dim)),
+            flat_dim: 0,
         }
     }
 
@@ -983,6 +1009,11 @@ impl HnswIndex {
             }
         }
 
+        // Mirror the f32 vector into the contiguous flat store so the
+        // hot distance path can index into a single Vec<f32> without
+        // chasing the per-node Option<Vec<f32>> pointer.
+        self.flat_extend(&vector);
+
         self.nodes.push(HnswNode {
             id,
             vector: Some(vector),
@@ -1086,6 +1117,10 @@ impl HnswIndex {
                     warn!(node_id = plan.id, error = %e, "vector_tier put_f32 failed");
                 }
             }
+
+            // Mirror into the flat fast-path storage (same rationale as
+            // the serial apply_insert_plan path above).
+            self.flat_extend(&vec);
 
             self.nodes.push(HnswNode {
                 id: plan.id,
@@ -1681,6 +1716,17 @@ impl HnswIndex {
             }
         }
 
+        // Update flat fast-path row for this node before swapping the
+        // per-node Vec — keeps both representations in sync.
+        if self.flat_dim != 0 && self.flat_dim as usize == vector.len() {
+            let dim = self.flat_dim as usize;
+            let start = idx * dim;
+            let end = start + dim;
+            if end <= self.flat_vectors.len() {
+                self.flat_vectors[start..end].copy_from_slice(&vector);
+            }
+        }
+
         self.nodes[idx].vector = Some(vector);
         self.nodes[idx].quantized = quantized;
         self.nodes[idx].rabitq_code = rabitq_code;
@@ -2011,8 +2057,28 @@ impl HnswIndex {
     /// Compute exact f32 distance between the search query and a node.
     /// Used for final reranking after SQ8 candidate generation.
     /// Falls back to dequantized SQ8 if f32 is offloaded.
+    ///
+    /// Fast path: read directly from the flat contiguous vector store
+    /// (one cache miss on the `flat_vectors` slice). The legacy
+    /// `nodes[idx].vector` path required two cache misses per call —
+    /// one for the HnswNode header, one for the heap-allocated
+    /// `Vec<f32>` data — and is the slow fallback when the flat store
+    /// hasn't been populated (e.g. partially constructed index, dim
+    /// mismatch between flat width and ctx.vec, offload+reload).
     #[inline(always)]
     fn compute_exact_distance(&self, ctx: &QueryCtx<'_>, node_idx: usize) -> f32 {
+        let dim = self.flat_dim as usize;
+        if dim != 0 && ctx.vec.len() == dim {
+            let start = node_idx * dim;
+            let end = start + dim;
+            if end <= self.flat_vectors.len() {
+                // SAFETY: bounds check on `end <= len` above; the
+                // slice is non-overlapping with the query so the
+                // distance kernel can vectorize freely.
+                let slice = unsafe { self.flat_vectors.get_unchecked(start..end) };
+                return self.distance_for_metric(ctx, slice);
+            }
+        }
         if let Some(ref node_vec) = self.nodes[node_idx].vector {
             return self.distance_for_metric(ctx, node_vec);
         }
@@ -2024,6 +2090,24 @@ impl HnswIndex {
             }
         }
         f32::INFINITY
+    }
+
+    /// Append `vector` to the contiguous flat fast-path store and
+    /// initialise `flat_dim` on first call.
+    #[inline]
+    fn flat_extend(&mut self, vector: &[f32]) {
+        if self.flat_dim == 0 {
+            self.flat_dim = vector.len() as u32;
+        } else if self.flat_dim as usize != vector.len() {
+            // Dim drift — defensively clear the flat store; from here
+            // on the read path falls back to the per-node Vec until a
+            // full rebuild (`HnswIndex::rebuild_flat_from_nodes`,
+            // future) resyncs both representations.
+            self.flat_vectors.clear();
+            self.flat_dim = 0;
+            return;
+        }
+        self.flat_vectors.extend_from_slice(vector);
     }
 
     /// Compute distance using the configured metric, with query-side state
