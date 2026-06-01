@@ -345,10 +345,16 @@ pub struct SearchResult {
 }
 
 /// Ordered candidate for min-heap (by distance, ascending).
-#[derive(Clone)]
+///
+/// Packed at 8 bytes total (f32 + u32) — halves the heap memory
+/// footprint vs a `usize`-idx layout (16 bytes after padding) so the
+/// BinaryHeap sift-up/down passes touch half as many cache lines.
+/// `max_elements: u32` in HnswConfig already bounds the per-shard
+/// node count below `u32::MAX`, so u32 idx is correctness-safe.
+#[derive(Clone, Copy)]
 struct Candidate {
     distance: f32,
-    idx: usize,
+    idx: u32,
 }
 
 impl PartialEq for Candidate {
@@ -431,11 +437,12 @@ impl<'a> QueryCtx<'a> {
     }
 }
 
-/// Max-heap candidate (for maintaining top-K worst).
-#[derive(Clone)]
+/// Max-heap candidate (for maintaining top-K worst). 8-byte packed —
+/// same layout rationale as [`Candidate`].
+#[derive(Clone, Copy)]
 struct FarCandidate {
     distance: f32,
-    idx: usize,
+    idx: u32,
 }
 
 impl PartialEq for FarCandidate {
@@ -916,7 +923,7 @@ impl HnswIndex {
             let selected: Vec<usize> = candidates
                 .into_iter()
                 .take(max_conn)
-                .map(|c| c.idx)
+                .map(|c| c.idx as usize)
                 .collect();
 
             if !selected.is_empty() {
@@ -1281,9 +1288,9 @@ impl HnswIndex {
             let mut reranked: Vec<SearchResult> = candidates
                 .into_iter()
                 .map(|c| {
-                    let exact_dist = self.compute_exact_distance(&qctx, c.idx);
+                    let exact_dist = self.compute_exact_distance(&qctx, c.idx as usize);
                     SearchResult {
-                        id: self.nodes[c.idx].id,
+                        id: self.nodes[c.idx as usize].id,
                         score: exact_dist,
                     }
                 })
@@ -1301,7 +1308,7 @@ impl HnswIndex {
                 .into_iter()
                 .take(k)
                 .map(|c| SearchResult {
-                    id: self.nodes[c.idx].id,
+                    id: self.nodes[c.idx as usize].id,
                     score: c.distance,
                 })
                 .collect()
@@ -1381,8 +1388,8 @@ impl HnswIndex {
                 let mut reranked: Vec<SearchResult> = candidates
                     .into_iter()
                     .map(|c| SearchResult {
-                        id: self.nodes[c.idx].id,
-                        score: self.compute_exact_distance(&qctx, c.idx),
+                        id: self.nodes[c.idx as usize].id,
+                        score: self.compute_exact_distance(&qctx, c.idx as usize),
                     })
                     .collect();
                 reranked.sort_by(|a, b| {
@@ -1395,7 +1402,7 @@ impl HnswIndex {
                 candidates
                     .into_iter()
                     .map(|c| SearchResult {
-                        id: self.nodes[c.idx].id,
+                        id: self.nodes[c.idx as usize].id,
                         score: c.distance,
                     })
                     .collect()
@@ -1468,13 +1475,16 @@ impl HnswIndex {
         let candidates = self.search_layer_ctx(&qctx, current_ep, ef, 0);
 
         // Batch-load f32 vectors from storage for reranking
-        let candidate_ids: Vec<u64> = candidates.iter().map(|c| self.nodes[c.idx].id).collect();
+        let candidate_ids: Vec<u64> = candidates
+            .iter()
+            .map(|c| self.nodes[c.idx as usize].id)
+            .collect();
         let loaded = loader.load_vectors(&candidate_ids, &self.config.property_name);
 
         let mut reranked: Vec<SearchResult> = candidates
             .into_iter()
             .filter_map(|c| {
-                let node_id = self.nodes[c.idx].id;
+                let node_id = self.nodes[c.idx as usize].id;
                 let f32_vec = loaded.get(&node_id)?;
                 let exact_dist = self.distance_for_metric(&qctx, f32_vec);
                 Some(SearchResult {
@@ -1559,13 +1569,16 @@ impl HnswIndex {
             let candidates = self.search_layer_ctx(&qctx, current_ep, current_ef, 0);
 
             // Batch-load f32 for reranking
-            let candidate_ids: Vec<u64> = candidates.iter().map(|c| self.nodes[c.idx].id).collect();
+            let candidate_ids: Vec<u64> = candidates
+                .iter()
+                .map(|c| self.nodes[c.idx as usize].id)
+                .collect();
             let loaded = loader.load_vectors(&candidate_ids, &self.config.property_name);
 
             let mut results: Vec<SearchResult> = candidates
                 .into_iter()
                 .filter_map(|c| {
-                    let node_id = self.nodes[c.idx].id;
+                    let node_id = self.nodes[c.idx as usize].id;
                     let f32_vec = loaded.get(&node_id)?;
                     let exact_dist = self.distance_for_metric(&qctx, f32_vec);
                     Some(SearchResult {
@@ -1724,7 +1737,7 @@ impl HnswIndex {
             let selected: Vec<usize> = neighbours
                 .into_iter()
                 .take(max_conn)
-                .map(|c| c.idx)
+                .map(|c| c.idx as usize)
                 .collect();
 
             // Connect this node to its new neighbours. Store internal
@@ -1861,11 +1874,11 @@ impl HnswIndex {
 
         candidates.push(Candidate {
             distance: ep_dist,
-            idx: ep,
+            idx: ep as u32,
         });
         results.push(FarCandidate {
             distance: ep_dist,
-            idx: ep,
+            idx: ep as u32,
         });
         visited.check_and_mark(ep);
 
@@ -1879,11 +1892,11 @@ impl HnswIndex {
                 break;
             }
 
-            if level < self.neighbours_atomic[closest.idx].len() {
+            if level < self.neighbours_atomic[closest.idx as usize].len() {
                 // Lock-free atomic snapshot of the neighbour list — see
                 // search_layer_greedy_query for the memory-model rationale.
                 connections.clear();
-                self.neighbours_atomic[closest.idx][level].snapshot_into(&mut connections);
+                self.neighbours_atomic[closest.idx as usize][level].snapshot_into(&mut connections);
 
                 // Filter already-visited; the u64s stored in the neighbour
                 // list are internal indices (no id_to_idx HashMap hop).
@@ -1916,11 +1929,11 @@ impl HnswIndex {
                     if dist < farthest_dist || results.len() < ef {
                         candidates.push(Candidate {
                             distance: dist,
-                            idx: neighbor_idx,
+                            idx: neighbor_idx as u32,
                         });
                         results.push(FarCandidate {
                             distance: dist,
-                            idx: neighbor_idx,
+                            idx: neighbor_idx as u32,
                         });
 
                         if results.len() > ef {
