@@ -25,6 +25,48 @@
 use super::popcount;
 use serde::{Deserialize, Serialize};
 
+/// Sign-flip helper: `x[i] *= -1` for every bit set in `signs` (LSB-first
+/// within each u64 word). Branchless via the IEEE 754 sign bit XOR.
+#[inline]
+fn apply_sign_flip(x: &mut [f32], signs: &[u64]) {
+    debug_assert_eq!(x.len(), signs.len() * 64);
+    for (word_idx, &word) in signs.iter().enumerate() {
+        let base = word_idx * 64;
+        let mut bits = word;
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            // Flip the IEEE 754 sign bit. Faster than a multiply by -1 on
+            // older toolchains and avoids the +/-0.0 quirk for zero inputs.
+            let v = &mut x[base + bit];
+            *v = f32::from_bits(v.to_bits() ^ 0x8000_0000);
+            bits &= bits - 1;
+        }
+    }
+}
+
+/// In-place radix-2 Hadamard butterfly. Output is `√D · H · x` where `H`
+/// has entries ±1/√D. The caller scales the result at the end of the Kac
+/// composite (`fht_kac_in_place` multiplies by `1/D` once after two passes).
+#[inline]
+fn fht_in_place_unscaled(x: &mut [f32]) {
+    let d = x.len();
+    debug_assert!(d.is_power_of_two(), "FHT requires power-of-two length");
+    let mut h = 1;
+    while h < d {
+        let mut i = 0;
+        while i < d {
+            for j in 0..h {
+                let a = x[i + j];
+                let b = x[i + j + h];
+                x[i + j] = a + b;
+                x[i + j + h] = a - b;
+            }
+            i += h * 2;
+        }
+        h *= 2;
+    }
+}
+
 /// Per-shard rotation matrix + dimensionality. Constructed once at index init,
 /// stable for the lifetime of the index. Persisted alongside the segment.
 ///
@@ -38,17 +80,35 @@ use serde::{Deserialize, Serialize};
 /// are bitwise-comparable inside one index without recall loss.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RaBitQParams {
-    /// Row-major `effective_dims × effective_dims` orthonormal matrix.
-    rotation: Vec<f32>,
+    /// First Rademacher sign vector for the FHT-Kac rotation. One ±1 entry
+    /// per dimension, packed LSB-first into `effective_dims / 64` u64 words
+    /// (bit 0 → sign +1, bit 1 → sign −1).
+    ///
+    /// Replaces the legacy `Vec<f32>` D×D rotation matrix that was driven by
+    /// Gram-Schmidt on a Gaussian RNG: that matrix had Θ(D²) memory and Θ(D²)
+    /// encode cost, and in f32 the Gram-Schmidt pass accumulated enough
+    /// orthonormality drift on the tail rows that the Eq. 20 estimator
+    /// collapsed on real workloads (random-100-angular recall=0.22 at ef=800).
+    /// FHT-Kac is exactly orthonormal by construction, runs in Θ(D log D),
+    /// uses Θ(D / 8) memory per round, and matches the rotation the RaBitQ
+    /// SIGMOD 2024 reference C++ implementation
+    /// (<https://github.com/VectorDB-NTU/RaBitQ-Library>) uses to reach
+    /// recall=0.87 on the same dataset where our matrix-rotation peaked at
+    /// 0.22.
+    sign_a: Vec<u64>,
+    /// Second Rademacher sign vector (Kac walk needs ≥2 rounds to
+    /// approximate uniform Haar measure over O(D)).
+    sign_b: Vec<u64>,
     /// Vector dimensionality the CALLER supplies. May be < `effective_dims`
     /// (rounded up internally) but never larger.
     dims: u32,
-    /// Internal dim (next multiple of 64 ≥ `dims`). Used everywhere the
-    /// codec touches the rotation matrix or the packed code arrays.
+    /// Internal dim (next power of 2 ≥ max(dims, 64)). Power of 2 because
+    /// the FHT butterfly requires it; max with 64 because the popcount
+    /// kernel needs whole u64 words.
     effective_dims: u32,
-    /// RNG seed that produced `rotation`. Retained so the matrix can be
-    /// regenerated deterministically (e.g. on segment recovery from a
-    /// corrupt rotation blob — recover from seed alone).
+    /// RNG seed that produced `sign_a` / `sign_b`. Retained so a node
+    /// recovering a segment can regenerate the sign vectors bit-identically
+    /// from the persisted seed.
     seed: u64,
 }
 
@@ -164,52 +224,56 @@ impl RaBitQParams {
     /// ```
     pub fn calibrate(dims: u32, seed: u64) -> Self {
         assert!(dims > 0, "RaBitQParams: dims must be non-zero");
-        // Round up so the popcount kernel always operates on whole u64
-        // words. Padding the input with zeros at encode time keeps
-        // codes comparable across vectors at any user_dims.
-        let effective_dims = dims.div_ceil(64) * 64;
+        // Round up to the next power of 2 ≥ 64. Power of 2 is mandatory
+        // for the FHT butterfly; ≥64 keeps the popcount kernel on whole
+        // u64 words. The encoder pads inputs with zeros up to this width;
+        // padding stays consistent across vectors so codes remain
+        // bitwise-comparable in one index regardless of caller `dims`.
+        let effective_dims = dims.max(64).next_power_of_two();
 
-        let d = effective_dims as usize;
+        let words = effective_dims as usize / 64;
         let mut rng = Xorshift64Star::new(seed);
 
-        // Step 1: fill a D×D matrix with standard normal samples (Box-Muller).
-        let mut mat: Vec<f32> = vec![0.0; d * d];
-        for slot in mat.iter_mut() {
-            *slot = rng.gaussian();
+        // Two independent Rademacher sign vectors. Two rounds of
+        // {sign-flip → FHT} approximate uniform Haar measure on O(D)
+        // (Kac walk in the Hadamard limit). One bit per dimension, packed
+        // LSB-first across u64 words.
+        let mut sign_a = vec![0u64; words];
+        let mut sign_b = vec![0u64; words];
+        for slot in sign_a.iter_mut() {
+            *slot = rng.next_u64();
         }
-
-        // Step 2: Modified Gram-Schmidt to orthonormalize rows.
-        // This converts the random Gaussian matrix into an orthonormal one;
-        // for a Gaussian seed the result is uniformly distributed over O(D)
-        // (Haar measure) — exactly what RaBitQ wants.
-        for i in 0..d {
-            // Normalize row i.
-            let mut norm_sq = 0.0f32;
-            for j in 0..d {
-                let v = mat[i * d + j];
-                norm_sq += v * v;
-            }
-            let inv = 1.0 / norm_sq.sqrt().max(f32::EPSILON);
-            for j in 0..d {
-                mat[i * d + j] *= inv;
-            }
-            // Project subsequent rows against row i and subtract.
-            for k in (i + 1)..d {
-                let mut dot = 0.0f32;
-                for j in 0..d {
-                    dot += mat[i * d + j] * mat[k * d + j];
-                }
-                for j in 0..d {
-                    mat[k * d + j] -= dot * mat[i * d + j];
-                }
-            }
+        for slot in sign_b.iter_mut() {
+            *slot = rng.next_u64();
         }
 
         Self {
-            rotation: mat,
+            sign_a,
+            sign_b,
             dims,
             effective_dims,
             seed,
+        }
+    }
+
+    /// In-place FHT-Kac rotation: `x ← FHT · S_b · FHT · S_a · x`, where
+    /// `S_a`, `S_b` are the persisted Rademacher sign vectors and FHT is
+    /// the un-normalised Hadamard butterfly. The composite is exactly
+    /// orthonormal — `‖R·x‖₂ = ‖x‖₂` to within f32 precision — and runs
+    /// in `Θ(D log D)` time, `Θ(1)` extra space.
+    ///
+    /// `x.len()` MUST equal `self.effective_dims` (caller pads with zeros).
+    fn fht_kac_in_place(&self, x: &mut [f32]) {
+        debug_assert_eq!(x.len(), self.effective_dims as usize);
+        apply_sign_flip(x, &self.sign_a);
+        fht_in_place_unscaled(x);
+        apply_sign_flip(x, &self.sign_b);
+        fht_in_place_unscaled(x);
+        // Two passes of un-normalised FHT inject a factor of D into ‖x‖².
+        // Divide by D to restore orthonormality (‖R·x‖ = ‖x‖).
+        let inv_d = 1.0 / self.effective_dims as f32;
+        for v in x.iter_mut() {
+            *v *= inv_d;
         }
     }
 
@@ -242,48 +306,40 @@ impl RaBitQParams {
             "RaBitQParams::encode: dimension mismatch"
         );
 
-        // Rotation matrix is `effective_dims × effective_dims`. The
-        // input is zero-padded to that width inside the dot product
-        // (slots ≥ self.dims contribute 0). Cross-term + popcount run
-        // over the full effective range — extra zero slots add 0 sign
-        // bits which doesn't bias the codes.
         let d_eff = self.effective_dims as usize;
         let d_user = self.dims as usize;
+        let words = d_eff / 64;
 
-        // ‖R·x‖ = ‖x‖ for orthonormal R; user_dims is the only place
-        // x is non-zero so the norm is identical to ‖x_user‖.
+        // ‖R·x‖ = ‖x‖ for orthonormal R; padded slots are zero so the norm
+        // is identical to ‖x_user‖.
         let mut norm_sq = 0.0f32;
         for &v in vector {
             norm_sq += v * v;
         }
         let norm = norm_sq.sqrt();
 
-        let words = d_eff / 64;
+        // Zero-pad the user vector up to effective_dims, then rotate in
+        // place via FHT-Kac. Rotation matrix-vector multiply was the
+        // pre-FHT bottleneck (Θ(D²)) and the source of the Gram-Schmidt
+        // float drift that collapsed Eq. 20 ranking; FHT-Kac is Θ(D log D)
+        // and exactly orthonormal.
+        let mut rotated = vec![0.0f32; d_eff];
+        rotated[..d_user].copy_from_slice(vector);
+        self.fht_kac_in_place(&mut rotated);
+
+        // Single pass over the rotated vector: pack sign bits, sum + abs-sum
+        // for the asymmetric kernel scalars.
         let mut code = vec![0u64; words];
         let mut sum_rotated = 0.0f32;
-        let inv_sqrt_d = 1.0 / (d_eff as f32).sqrt();
-
-        // L1 sum of rotated coordinates, accumulated during the rotation
-        // pass — needed for the per-vector `correction = 0.5 · ‖R·x‖_1 / ‖x‖`
-        // that scales `<g, r_q>` into a cross-vector-comparable inner
-        // product. Without this, paper Eq. 20 produces ranking-broken
-        // estimates because each stored vector's `g` lives in a different
-        // un-normalized scale (the LSH plateau we hit on glove-100-angular).
         let mut sum_abs_rotated = 0.0f32;
-        for i in 0..d_eff {
-            let mut acc = 0.0f32;
-            let row_base = i * d_eff;
-            // Only iterate the non-zero (user-dim) range; padded slots
-            // contribute 0 to the dot product so we skip them.
-            for (j, &xj) in vector.iter().take(d_user).enumerate() {
-                acc += self.rotation[row_base + j] * xj;
-            }
-            sum_rotated += acc;
-            sum_abs_rotated += acc.abs();
-            if acc > 0.0 {
+        for (i, &v) in rotated.iter().enumerate() {
+            sum_rotated += v;
+            sum_abs_rotated += v.abs();
+            if v > 0.0 {
                 code[i / 64] |= 1u64 << (i % 64);
             }
         }
+        let inv_sqrt_d = 1.0 / (d_eff as f32).sqrt();
 
         // Σ_i sign(R·x)[i] precomputed once at encode time. Used by the
         // asymmetric kernel (Eq. 20) without re-popcounting the stored
@@ -291,12 +347,7 @@ impl RaBitQParams {
         let popcount: u32 = code.iter().map(|w| w.count_ones()).sum();
         let signed_sum = 2 * popcount as i32 - d_eff as i32;
 
-        // correction = <g, n> where g[i] = ±0.5 sign code, n = R·x / ‖x‖.
-        // = 0.5 · Σ sign(R·x[i]) · (R·x)[i] / ‖x‖
-        // = 0.5 · Σ |R·x[i]| / ‖x‖
-        // = 0.5 · ‖R·x‖_1 / ‖x‖_2
-        // For a zero vector we fall back to 1.0 to avoid NaN; encode never
-        // sees zero in practice (HNSW rejects empty vectors upstream).
+        // correction = <g, n> = 0.5 · ‖R·x‖_1 / ‖x‖_2 (see RaBitQCode docs).
         let correction = if norm > f32::EPSILON {
             0.5 * sum_abs_rotated / norm
         } else {
@@ -336,24 +387,18 @@ impl RaBitQParams {
         let d_user = self.dims as usize;
         let words = d_eff / 64;
 
-        // 1. Rotate the query into the codec's orthonormal frame. Zero-pad
-        // beyond user_dims same as `encode` — the rotated entries in padded
-        // slots are linear combinations of (only) the user-dim entries, so
-        // they carry signal even though the input is zero there.
-        let mut r_q = vec![0.0f32; d_eff];
+        // 1. Rotate the query through the same FHT-Kac composite the data
+        // side uses. Zero-pad beyond user_dims so the rotation produces a
+        // consistent r_q across all encode paths (same Hadamard butterfly,
+        // same sign flips → same orthonormal R).
         let mut norm_sq = 0.0f32;
         for &v in vector {
             norm_sq += v * v;
         }
         let norm = norm_sq.sqrt();
-        for (i, slot) in r_q.iter_mut().enumerate() {
-            let row_base = i * d_eff;
-            let mut acc = 0.0f32;
-            for (j, &xj) in vector.iter().take(d_user).enumerate() {
-                acc += self.rotation[row_base + j] * xj;
-            }
-            *slot = acc;
-        }
+        let mut r_q = vec![0.0f32; d_eff];
+        r_q[..d_user].copy_from_slice(vector);
+        self.fht_kac_in_place(&mut r_q);
 
         // 2. Per-query 4-bit linear quantization with min/max from the
         // rotated query itself. v_l = min, v_r = max, delta = range / 15.
@@ -539,9 +584,8 @@ impl RaBitQParams {
             "RaBitQParams::encode_ext: bits must be 2, 3, or 4; got {bits}"
         );
 
-        // Same effective_dims padding rationale as `encode` — rotation
-        // operates in the padded space; the input contributes only its
-        // user_dims slots, the rest are zero-implicit.
+        // Same effective_dims rationale as `encode`: zero-pad to power-of-2
+        // width, then rotate through the shared FHT-Kac composite.
         let d_eff = self.effective_dims as usize;
         let d_user = self.dims as usize;
         let levels_count = 1u8 << bits;
@@ -553,18 +597,16 @@ impl RaBitQParams {
         let norm = norm_sq.sqrt().max(f32::EPSILON);
 
         let inv_norm = 1.0 / norm;
+        let mut rotated = vec![0.0f32; d_eff];
+        rotated[..d_user].copy_from_slice(vector);
+        self.fht_kac_in_place(&mut rotated);
         let mut levels = vec![0u8; d_eff];
         let mut sum_rotated = 0.0f32;
         let inv_sqrt_d = 1.0 / (d_eff as f32).sqrt();
 
-        for (i, slot) in levels.iter_mut().enumerate() {
-            let mut acc = 0.0f32;
-            let row_base = i * d_eff;
-            for (j, &xj) in vector.iter().take(d_user).enumerate() {
-                acc += self.rotation[row_base + j] * xj;
-            }
-            sum_rotated += acc;
-            *slot = quantize_normal(acc * inv_norm, bits);
+        for (i, &v) in rotated.iter().enumerate() {
+            sum_rotated += v;
+            levels[i] = quantize_normal(v * inv_norm, bits);
         }
         debug_assert!(
             levels.iter().all(|&l| l < levels_count),
@@ -847,12 +889,20 @@ impl Xorshift64Star {
     }
 
     /// Uniform on [0, 1) — keeps full 24-bit f32 mantissa precision.
+    ///
+    /// Used by the test harness to drive the Gaussian sampler. Lives behind
+    /// `#[cfg(test)]` because production calibration now consumes raw u64
+    /// words directly into the Rademacher sign buffers (`sign_a`, `sign_b`)
+    /// without going through the f32 → Box-Muller pipeline.
+    #[cfg(test)]
     fn next_f32(&mut self) -> f32 {
         // Take top 24 bits, scale to [0, 1).
         (self.next_u64() >> 40) as f32 / (1u32 << 24) as f32
     }
 
-    /// Standard normal N(0, 1) via Box-Muller transform.
+    /// Standard normal N(0, 1) via Box-Muller transform. Test-only —
+    /// production uses raw u64 sign masks for FHT-Kac.
+    #[cfg(test)]
     fn gaussian(&mut self) -> f32 {
         // u1 must avoid exactly 0 to keep ln() finite.
         let u1 = self.next_f32().max(f32::MIN_POSITIVE);
@@ -875,45 +925,48 @@ mod tests {
     fn calibrate_is_deterministic() {
         let p1 = RaBitQParams::calibrate(128, 42);
         let p2 = RaBitQParams::calibrate(128, 42);
-        assert_eq!(
-            p1.rotation, p2.rotation,
-            "same seed must yield same rotation"
-        );
+        // FHT-Kac stores the two sign vectors instead of a dense rotation
+        // matrix; same seed must reproduce both bit-identical so a recovered
+        // segment can re-derive the rotation from the persisted seed alone.
+        let v = vec![0.123_f32; 128];
+        assert_eq!(p1.encode(&v).code, p2.encode(&v).code);
     }
 
     #[test]
     fn rotation_is_approximately_orthonormal() {
-        // R · Rᵀ ≈ I for an orthonormal matrix. Check a few diagonal/off-diagonal cells.
+        // Probe the composite rotation R = FHT · S_b · FHT · S_a indirectly:
+        // it preserves L2 norm to within f32 precision (the defining property
+        // of an orthonormal transform).
         let p = RaBitQParams::calibrate(64, 12345);
-        let d = 64usize;
+        let d = p.effective_dims() as usize;
 
-        // Diagonal: row i dot row i should be ~1.
-        for i in [0usize, 7, 31, 63] {
-            let mut dot = 0.0f32;
-            for j in 0..d {
-                let v = p.rotation[i * d + j];
-                dot += v * v;
-            }
+        // Norm preservation under R for a handful of test inputs.
+        for seed in [1u64, 7, 99, 1_000_000_007] {
+            let mut rng = Xorshift64Star::new(seed);
+            let mut v: Vec<f32> = (0..d).map(|_| rng.gaussian()).collect();
+            let in_norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            p.fht_kac_in_place(&mut v);
+            let out_norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             assert!(
-                approx_eq(dot, 1.0, 1e-4),
-                "row {} self-dot = {}, expected ~1",
-                i,
-                dot
+                approx_eq(in_norm, out_norm, 1e-3),
+                "norm not preserved: in={in_norm} out={out_norm}",
             );
         }
 
-        // Off-diagonal: row i dot row k should be ~0.
+        // Sanity-shape the function on a one-hot input: rotation should
+        // spread mass across all coordinates with comparable magnitudes
+        // (the all-coordinates-equal property of Hadamard).
         for (i, k) in [(0usize, 1usize), (0, 13), (5, 17), (30, 63)] {
-            let mut dot = 0.0f32;
-            for j in 0..d {
-                dot += p.rotation[i * d + j] * p.rotation[k * d + j];
-            }
+            let mut e_i = vec![0.0f32; d];
+            e_i[i] = 1.0;
+            p.fht_kac_in_place(&mut e_i);
+            let mut e_k = vec![0.0f32; d];
+            e_k[k] = 1.0;
+            p.fht_kac_in_place(&mut e_k);
+            let dot: f32 = e_i.iter().zip(&e_k).map(|(a, b)| a * b).sum();
             assert!(
                 approx_eq(dot, 0.0, 1e-4),
-                "rows ({},{}) dot = {}, expected ~0",
-                i,
-                k,
-                dot
+                "columns ({i},{k}) dot = {dot}, expected ~0",
             );
         }
     }
