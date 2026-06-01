@@ -98,25 +98,20 @@ jobs:
       # ── Vector (per-commit smoke; budget ≤ 20 min total) ──────
       #
       # Selection per commit:
-      #   1. SIFT-128-L2 M=16    codec=none   — f32 regression detector.
-      #   2. random-128-ang M=16 codec=none   — cosine f32 baseline.
-      #   3. random-128-ang M=16 codec=rabitq — RaBitQ popcount kernel
+      #   1. SIFT-128-L2 M=16  codec=none   — f32 regression detector.
+      #   2. glove-100-ang M=16 codec=none   — real cosine f32 baseline.
+      #   3. glove-100-ang M=16 codec=rabitq — RaBitQ popcount kernel
       #      side-by-side on the same dataset.
       #
-      # Why random-128-angular over glove-100-angular: RaBitQ requires
-      # dim divisible by 64 (popcount kernel operates on u64 words).
-      # glove dim=100 fails that check → calibration silently skipped
-      # → RaBitQ run was measuring f32 (validated empirically on
-      # 2281ba0: codec=none and codec=rabitq returned identical QPS
-      # at every ef on glove M=16). random-128-angular at dim=128 is
-      # a multiple of 64 so the codec actually activates.
-      #
-      # Synthetic angular dataset: 200K unit vectors × dim=128, GT
-      # computed offline by prep_datasets.py against the full base
-      # (10K queries × top-100). dim=128 also matches the
-      # production-relevant text-embedding lower bound and pairs
-      # naturally with the SIFT-128 regression detector.
-      - name: Vector — per-commit smoke (SIFT + random-128-ang)
+      # glove dim=100 used to fail the RaBitQ multiple-of-64 guard. The
+      # codec now rounds dim up to the next multiple of 64 internally
+      # (encoder pads input vectors with zeros for the padded slots) so
+      # any dim > 0 is supported. glove gives a REAL angular dataset
+      # with meaningful nearest-neighbour structure — random Gaussian
+      # synthetic data hits the concentration-of-measure trap (no
+      # margin between top-K), making the QPS@recall comparison
+      # uninformative.
+      - name: Vector — per-commit smoke (SIFT + glove)
         id: vector
         if: ${{ contains(inputs.modalities || 'vector,graph,spatial,timeseries,search,document', 'vector') }}
         run: |
@@ -139,18 +134,18 @@ jobs:
             --output bench-results
           echo "::endgroup::"
 
-          # random-128-angular cosine: f32 + RaBitQ side-by-side
-          R128_DIR="$DATASET_ROOT/random-128-angular"
-          for f in random_base.fvecs random_query.fvecs random_groundtruth.ivecs; do
-            test -f "$R128_DIR/$f" || { echo "::error::missing $R128_DIR/$f"; exit 1; }
+          # glove-100-angular cosine: f32 + RaBitQ side-by-side
+          GLOVE_DIR="$DATASET_ROOT/glove-100-angular"
+          for f in glove_base.fvecs glove_query.fvecs glove_groundtruth.ivecs; do
+            test -f "$GLOVE_DIR/$f" || { echo "::error::missing $GLOVE_DIR/$f"; exit 1; }
           done
           for QUANT in none rabitq; do
-            echo "::group::random-128-angular M=16 codec=$QUANT"
+            echo "::group::glove-100-angular M=16 codec=$QUANT"
             ./target/release/bench-vector-ann \
-              --train       "$R128_DIR/random_base.fvecs" \
-              --query       "$R128_DIR/random_query.fvecs" \
-              --groundtruth "$R128_DIR/random_groundtruth.ivecs" \
-              --dataset-name random-128-angular \
+              --train       "$GLOVE_DIR/glove_base.fvecs" \
+              --query       "$GLOVE_DIR/glove_query.fvecs" \
+              --groundtruth "$GLOVE_DIR/glove_groundtruth.ivecs" \
+              --dataset-name glove-100-angular \
               --m 16 --ef-construction 200 \
               --codec none --quantization "$QUANT" \
               --ef-sweep "$EF_SWEEP" \

@@ -681,15 +681,10 @@ impl HnswIndex {
             Some(v) => v.len(),
             None => return,
         };
-        if !dims.is_multiple_of(64) {
-            warn!(
-                dims,
-                "RaBitQ calibration skipped: D must be a multiple of 64 \
-                 (popcount kernel operates on u64 words). Search falls back \
-                 to f32 distance for this index.",
-            );
-            return;
-        }
+        // RaBitQ now rounds dim up to the next multiple of 64 internally
+        // (encoder pads input vectors with zeros for the padded slots);
+        // any dims > 0 are accepted. The padded slots add 0 to popcount
+        // and 0 to ‖x‖, so codes stay comparable inside one index.
 
         // Seed derived from the configured dimensionality so two indexes with
         // the same shape get the same rotation across process restarts; this

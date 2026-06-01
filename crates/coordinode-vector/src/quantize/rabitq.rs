@@ -27,15 +27,28 @@ use serde::{Deserialize, Serialize};
 
 /// Per-shard rotation matrix + dimensionality. Constructed once at index init,
 /// stable for the lifetime of the index. Persisted alongside the segment.
+///
+/// The codec internally rounds `user_dims` UP to the next multiple of 64
+/// (`effective_dims`) so the popcount kernel always operates on whole u64
+/// words. Callers see `user_dims`; the encoder pads input vectors with
+/// zeros to `effective_dims` before rotation. Padding with zeros never
+/// changes the rotated vector's sign-bit pattern in the user_dims slots
+/// (rotation of zeros stays zeros), and the extra slots contribute zero
+/// to both the popcount and the L2 norm — so codes built at any user_dims
+/// are bitwise-comparable inside one index without recall loss.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RaBitQParams {
-    /// Row-major `D × D` orthonormal matrix. `rotation[i * dims + j]` is `R[i][j]`.
+    /// Row-major `effective_dims × effective_dims` orthonormal matrix.
     rotation: Vec<f32>,
-    /// Vector dimensionality `D`. Stored explicitly to avoid recomputing from len.
+    /// Vector dimensionality the CALLER supplies. May be < `effective_dims`
+    /// (rounded up internally) but never larger.
     dims: u32,
+    /// Internal dim (next multiple of 64 ≥ `dims`). Used everywhere the
+    /// codec touches the rotation matrix or the packed code arrays.
+    effective_dims: u32,
     /// RNG seed that produced `rotation`. Retained so the matrix can be
-    /// regenerated deterministically (e.g. on segment recovery from a corrupt
-    /// rotation blob — recover from seed alone).
+    /// regenerated deterministically (e.g. on segment recovery from a
+    /// corrupt rotation blob — recover from seed alone).
     seed: u64,
 }
 
@@ -77,12 +90,12 @@ impl RaBitQParams {
     /// ```
     pub fn calibrate(dims: u32, seed: u64) -> Self {
         assert!(dims > 0, "RaBitQParams: dims must be non-zero");
-        assert!(
-            dims.is_multiple_of(64),
-            "RaBitQParams: dims must be a multiple of 64 (popcount kernel operates on u64 words)"
-        );
+        // Round up so the popcount kernel always operates on whole u64
+        // words. Padding the input with zeros at encode time keeps
+        // codes comparable across vectors at any user_dims.
+        let effective_dims = dims.div_ceil(64) * 64;
 
-        let d = dims as usize;
+        let d = effective_dims as usize;
         let mut rng = Xorshift64Star::new(seed);
 
         // Step 1: fill a D×D matrix with standard normal samples (Box-Muller).
@@ -121,13 +134,21 @@ impl RaBitQParams {
         Self {
             rotation: mat,
             dims,
+            effective_dims,
             seed,
         }
     }
 
-    /// Dimensionality `D`.
+    /// User-visible dimensionality (what the caller supplied at calibration).
     pub fn dims(&self) -> u32 {
         self.dims
+    }
+
+    /// Padded dim used by the internal rotation matrix + packed code.
+    /// `effective_dims = dims.div_ceil(64) * 64`; equal to `dims` only
+    /// when `dims % 64 == 0`.
+    pub fn effective_dims(&self) -> u32 {
+        self.effective_dims
     }
 
     /// Seed that produced the rotation matrix (for deterministic recovery).
@@ -147,29 +168,33 @@ impl RaBitQParams {
             "RaBitQParams::encode: dimension mismatch"
         );
 
-        let d = self.dims as usize;
+        // Rotation matrix is `effective_dims × effective_dims`. The
+        // input is zero-padded to that width inside the dot product
+        // (slots ≥ self.dims contribute 0). Cross-term + popcount run
+        // over the full effective range — extra zero slots add 0 sign
+        // bits which doesn't bias the codes.
+        let d_eff = self.effective_dims as usize;
+        let d_user = self.dims as usize;
 
-        // Compute pre-rotation norm — needed unrotated because R is orthonormal
-        // so ‖R·x‖ = ‖x‖; cheaper to compute on the original.
+        // ‖R·x‖ = ‖x‖ for orthonormal R; user_dims is the only place
+        // x is non-zero so the norm is identical to ‖x_user‖.
         let mut norm_sq = 0.0f32;
         for &v in vector {
             norm_sq += v * v;
         }
         let norm = norm_sq.sqrt();
 
-        // Project: x' = R · x. Row-major R, output one f32 per dimension.
-        // Sign-quantize on the fly into a packed u64 buffer.
-        let words = d / 64;
+        let words = d_eff / 64;
         let mut code = vec![0u64; words];
-        // Cross-term: dot with the fixed unit vector e = (1/√D) · (1, 1, ..., 1).
-        // Equivalent to sum(x'[i]) / √D — captures the bias of the rotated vector.
         let mut sum_rotated = 0.0f32;
-        let inv_sqrt_d = 1.0 / (d as f32).sqrt();
+        let inv_sqrt_d = 1.0 / (d_eff as f32).sqrt();
 
-        for i in 0..d {
+        for i in 0..d_eff {
             let mut acc = 0.0f32;
-            let row_base = i * d;
-            for (j, &xj) in vector.iter().enumerate() {
+            let row_base = i * d_eff;
+            // Only iterate the non-zero (user-dim) range; padded slots
+            // contribute 0 to the dot product so we skip them.
+            for (j, &xj) in vector.iter().take(d_user).enumerate() {
                 acc += self.rotation[row_base + j] * xj;
             }
             sum_rotated += acc;
@@ -193,7 +218,9 @@ impl RaBitQParams {
     /// norms recorded in each code.
     pub fn estimate_inner_product(&self, q: &RaBitQCode, x: &RaBitQCode) -> f32 {
         debug_assert_eq!(q.code.len(), x.code.len(), "code length mismatch");
-        let d = self.dims as f32;
+        // Use effective_dims — the rotation runs in the padded space,
+        // so popcount and the cos-term scale are both over D_effective.
+        let d = self.effective_dims as f32;
         let pop = popcount::xor_popcount(&q.code, &x.code) as f32;
         let cos_term = 1.0 - 2.0 * pop / d;
         cos_term * q.norm * x.norm
@@ -208,7 +235,8 @@ impl RaBitQParams {
     /// scalar arithmetic.
     pub fn estimate_cosine_distance(&self, q: &RaBitQCode, x: &RaBitQCode) -> f32 {
         debug_assert_eq!(q.code.len(), x.code.len(), "code length mismatch");
-        let d = self.dims as f32;
+        // Same effective_dims rationale as estimate_inner_product.
+        let d = self.effective_dims as f32;
         let pop = popcount::xor_popcount(&q.code, &x.code) as f32;
         // cos_sim_est = 1 - 2·popcount/D  →  distance = 1 - cos_sim_est = 2·popcount/D.
         2.0 * pop / d
@@ -237,31 +265,28 @@ impl RaBitQParams {
             "RaBitQParams::encode_ext: bits must be 2, 3, or 4; got {bits}"
         );
 
-        let d = self.dims as usize;
+        // Same effective_dims padding rationale as `encode` — rotation
+        // operates in the padded space; the input contributes only its
+        // user_dims slots, the rest are zero-implicit.
+        let d_eff = self.effective_dims as usize;
+        let d_user = self.dims as usize;
         let levels_count = 1u8 << bits;
 
-        // Compute pre-rotation norm; same identity ‖R·x‖=‖x‖ applies.
         let mut norm_sq = 0.0f32;
         for &v in vector {
             norm_sq += v * v;
         }
         let norm = norm_sq.sqrt().max(f32::EPSILON);
 
-        // Rotate, scale by 1/‖x‖ so the per-dim values land on the standard-
-        // normal scale the centroid table was designed for (rotated isotropic
-        // vectors are approximately N(0, 1/D); after dividing by ‖x‖ we get
-        // ≈ N(0, 1/D) → after multiplying by √D it'd be exactly N(0, 1).
-        // The simpler `/ norm` keeps everything in [-1, 1]-ish range which is
-        // what the symmetric quantizer cut-points are derived for.
         let inv_norm = 1.0 / norm;
-        let mut levels = vec![0u8; d];
+        let mut levels = vec![0u8; d_eff];
         let mut sum_rotated = 0.0f32;
-        let inv_sqrt_d = 1.0 / (d as f32).sqrt();
+        let inv_sqrt_d = 1.0 / (d_eff as f32).sqrt();
 
         for (i, slot) in levels.iter_mut().enumerate() {
             let mut acc = 0.0f32;
-            let row_base = i * d;
-            for (j, &xj) in vector.iter().enumerate() {
+            let row_base = i * d_eff;
+            for (j, &xj) in vector.iter().take(d_user).enumerate() {
                 acc += self.rotation[row_base + j] * xj;
             }
             sum_rotated += acc;
@@ -274,7 +299,7 @@ impl RaBitQParams {
 
         RaBitQExtCode {
             packed: pack_levels(&levels, bits),
-            dims: d as u32,
+            dims: d_eff as u32,
             bits,
             norm,
             cross_term: sum_rotated * inv_sqrt_d,
@@ -292,10 +317,11 @@ impl RaBitQParams {
     /// Panics in debug if `q.bits != x.bits` or dimension mismatch.
     pub fn estimate_inner_product_ext(&self, q: &RaBitQExtCode, x: &RaBitQExtCode) -> f32 {
         debug_assert_eq!(q.bits, x.bits, "bit-width mismatch");
-        debug_assert_eq!(q.dims, self.dims, "q dimension mismatch");
-        debug_assert_eq!(x.dims, self.dims, "x dimension mismatch");
+        // Codes are sized at `effective_dims` (rotation+pack space).
+        debug_assert_eq!(q.dims, self.effective_dims, "q dimension mismatch");
+        debug_assert_eq!(x.dims, self.effective_dims, "x dimension mismatch");
         let table = level_centroids(q.bits);
-        let d = self.dims as usize;
+        let d = self.effective_dims as usize;
         let mut acc = 0.0f32;
         for i in 0..d {
             acc += table[q.level(i) as usize] * table[x.level(i) as usize];
@@ -310,7 +336,7 @@ impl RaBitQParams {
     pub fn estimate_cosine_distance_ext(&self, q: &RaBitQExtCode, x: &RaBitQExtCode) -> f32 {
         debug_assert_eq!(q.bits, x.bits, "bit-width mismatch");
         let table = level_centroids(q.bits);
-        let d = self.dims as usize;
+        let d = self.effective_dims as usize;
         let mut dot = 0.0f32;
         let mut nq = 0.0f32;
         let mut nx = 0.0f32;
@@ -683,9 +709,31 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "multiple of 64")]
-    fn calibrate_rejects_non_64_aligned_dims() {
-        let _ = RaBitQParams::calibrate(100, 0);
+    fn calibrate_pads_non_64_aligned_dims_internally() {
+        // Calibration accepts any dims > 0. The rotation matrix and
+        // packed code arrays are sized at the next multiple of 64 above
+        // the user-supplied dim; encode pads the input with implicit
+        // zeros so popcount stays a whole-u64-words operation.
+        let p = RaBitQParams::calibrate(100, 0);
+        assert_eq!(p.dims(), 100);
+        assert_eq!(p.effective_dims(), 128);
+        // Code length = effective_dims / 64 u64 words.
+        let v: Vec<f32> = (0..100).map(|i| (i as f32 - 50.0) * 0.01).collect();
+        let c = p.encode(&v);
+        assert_eq!(
+            c.code.len(),
+            2,
+            "code uses 2 u64 words at effective_dims=128"
+        );
+        // Roundtrip identity: encode the same vector twice → same code.
+        let c2 = p.encode(&v);
+        assert_eq!(c, c2);
+    }
+
+    #[test]
+    fn calibrate_rejects_zero_dims() {
+        let r = std::panic::catch_unwind(|| RaBitQParams::calibrate(0, 0));
+        assert!(r.is_err(), "dims=0 still panics");
     }
 
     #[test]
