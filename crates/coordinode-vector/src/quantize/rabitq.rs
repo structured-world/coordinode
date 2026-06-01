@@ -731,6 +731,106 @@ mod tests {
     }
 
     #[test]
+    fn padding_preserves_cosine_ranking_dim_100() {
+        // Regression: glove-100-angular bench on commit 8fa0f2f returned
+        // recall@10 = 0.17 plateau across the full ef sweep for codec=rabitq
+        // while codec=none reached 0.94. Hypothesis: the dim=100 → 128
+        // zero-padding logic in `encode` breaks cosine rank preservation.
+        //
+        // Theoretical claim being tested: for orthonormal R ∈ ℝ^{128×128},
+        // the first 100 columns M = R[:, 0:100] satisfy MᵀM = I_100, so M
+        // is an isometry ℝ^100 → ℝ^128 that preserves cosine similarity.
+        // RaBitQ sign bits of M·x should give the standard LSH separation
+        // arcsin(ρ)/π between true neighbours and random pairs. Recall@10
+        // on a 1000-vector corpus with a planted nearest neighbour should
+        // be ≥ 0.6, far above the broken 0.17 plateau.
+        //
+        // If THIS test fails (recall < 0.5), the bug is in `encode` or in
+        // `estimate_cosine_distance` and isolated from HNSW graph build /
+        // search. If it passes, the bug is elsewhere in the index path.
+        let dims = 100u32;
+        let n_base = 1000usize;
+        let n_query = 100usize;
+        let k = 10usize;
+        let seed = 0xC0FFEE_u64;
+
+        let params = RaBitQParams::calibrate(dims, seed);
+        assert_eq!(params.effective_dims(), 128);
+
+        // Generate unit-norm Gaussian vectors. For each query, plant one
+        // true near-neighbour at cosine ≈ 0.95 (a tight high-similarity
+        // pair like glove's top-1) so we have a known correct answer.
+        let mut rng = Xorshift64Star::new(0xBADC0DE);
+
+        let make_unit = |rng: &mut Xorshift64Star| -> Vec<f32> {
+            let mut v: Vec<f32> = (0..dims as usize).map(|_| rng.gaussian()).collect();
+            let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in v.iter_mut() {
+                *x /= n.max(f32::EPSILON);
+            }
+            v
+        };
+
+        let mut base: Vec<Vec<f32>> = (0..n_base).map(|_| make_unit(&mut rng)).collect();
+
+        // Plant the first `n_query` base vectors as the "true" nearest
+        // neighbours of the queries: query[i] = base[i] + small noise, both
+        // re-normalized. Cosine sim ≈ 1 - ‖noise‖²/2 ≈ 0.95 for noise=0.32.
+        let queries: Vec<Vec<f32>> = (0..n_query)
+            .map(|i| {
+                let mut q = base[i].clone();
+                for x in q.iter_mut() {
+                    *x += 0.32 * rng.gaussian() / (dims as f32).sqrt();
+                }
+                let n: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+                for x in q.iter_mut() {
+                    *x /= n.max(f32::EPSILON);
+                }
+                q
+            })
+            .collect();
+        // Re-normalize base just in case (defensive — already unit above).
+        for v in base.iter_mut() {
+            let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in v.iter_mut() {
+                *x /= n.max(f32::EPSILON);
+            }
+        }
+
+        // Encode all base vectors and queries.
+        let base_codes: Vec<RaBitQCode> = base.iter().map(|v| params.encode(v)).collect();
+        let query_codes: Vec<RaBitQCode> = queries.iter().map(|v| params.encode(v)).collect();
+
+        // For each query, find top-k by RaBitQ distance and check whether
+        // the planted true-NN (index i) is in the returned top-k.
+        let mut hits = 0usize;
+        for (qi, qc) in query_codes.iter().enumerate() {
+            let mut scored: Vec<(f32, usize)> = base_codes
+                .iter()
+                .enumerate()
+                .map(|(bi, bc)| (params.estimate_cosine_distance(qc, bc), bi))
+                .collect();
+            scored.sort_by(|a, b| {
+                a.0.partial_cmp(&b.0)
+                    .expect("RaBitQ distance values are finite")
+            });
+            if scored.iter().take(k).any(|(_, idx)| *idx == qi) {
+                hits += 1;
+            }
+        }
+        let recall = hits as f32 / n_query as f32;
+
+        // Loose threshold (0.5) — well above broken plateau 0.17, well
+        // below the f32-exact ceiling. Real RaBitQ on this workload
+        // should land 0.7-0.9.
+        assert!(
+            recall >= 0.5,
+            "RaBitQ recall@{k} on dim={dims} with padding = {recall:.3} \
+             (need ≥0.5; broken 8fa0f2f gave 0.17)"
+        );
+    }
+
+    #[test]
     fn calibrate_rejects_zero_dims() {
         let r = std::panic::catch_unwind(|| RaBitQParams::calibrate(0, 0));
         assert!(r.is_err(), "dims=0 still panics");
