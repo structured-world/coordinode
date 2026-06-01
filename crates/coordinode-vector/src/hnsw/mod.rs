@@ -402,6 +402,9 @@ struct QueryCtx<'a> {
 }
 
 impl<'a> QueryCtx<'a> {
+    /// Build a context for SEARCH-time queries: encodes the query against
+    /// the active RaBitQ rotation so the popcount kernel can score each
+    /// neighbour without per-call encoding cost.
     fn new(
         vec: &'a [f32],
         metric: VectorMetric,
@@ -433,6 +436,32 @@ impl<'a> QueryCtx<'a> {
             vec,
             norm_l2,
             rabitq_code,
+        }
+    }
+
+    /// Build a context for BUILD-time graph traversal. Skips RaBitQ
+    /// encoding so `compute_distance` falls through to the exact f32
+    /// metric for every candidate. This is what the RaBitQ SIGMOD 2024
+    /// paper and the Milvus / IVF-RaBitQ implementations do: construct
+    /// the HNSW graph on f32 truth, only compress at search time.
+    ///
+    /// Reason: noisy RaBitQ distance estimates corrupt neighbour
+    /// selection during the ~N×log(N) `search_layer_query` calls that
+    /// drive `compute_insert_plan`. At small N the noise is tolerable,
+    /// but at N≥10⁵ the cumulative selection error degrades graph
+    /// connectivity to the point where no search-time ef budget can
+    /// recover the true top-K (recall plateau independent of ef — what
+    /// the glove-100-angular bench showed at recall=0.17).
+    fn new_for_build(vec: &'a [f32], metric: VectorMetric) -> Self {
+        let norm_l2 = if matches!(metric, VectorMetric::Cosine) {
+            metrics::norm_l2(vec)
+        } else {
+            0.0
+        };
+        Self {
+            vec,
+            norm_l2,
+            rabitq_code: None,
         }
     }
 }
@@ -899,8 +928,18 @@ impl HnswIndex {
         let mut current_ep = start_idx;
 
         // Phase 1: greedy descent down to new_level + 1.
+        //
+        // Use the BUILD variant so neighbour selection runs on exact
+        // f32 distance, not the RaBitQ popcount estimate. With RaBitQ
+        // active in compute_distance, every `search_layer_*` call in
+        // build path would score candidates by `2·pop/D` — a noisy
+        // monotonic-but-not-equal function of the true cosine — and
+        // pick neighbours whose ranking is corrupted by that noise.
+        // At N≥10⁵ the cumulative error makes the graph unrecoverable
+        // (no ef_search can find the true top-K). See `QueryCtx::new_
+        // for_build` doc comment for the full reasoning.
         for level in (new_level + 1..=top_level).rev() {
-            current_ep = self.search_layer_greedy_query(vector, current_ep, level);
+            current_ep = self.search_layer_greedy_query_for_build(vector, current_ep, level);
         }
 
         // Phase 2: select neighbours at every layer from new_level down to 0.
@@ -908,7 +947,8 @@ impl HnswIndex {
         let mut per_layer = Vec::with_capacity(lowest_planning_layer + 1);
         for level in (0..=lowest_planning_layer).rev() {
             let ef = self.config.ef_construction;
-            let candidates = self.search_layer_query(vector, current_ep, ef, level);
+            // Same f32-build rationale as Phase 1 above.
+            let candidates = self.search_layer_query_for_build(vector, current_ep, ef, level);
 
             let max_conn = if level == 0 {
                 self.config.m_max0
@@ -1765,7 +1805,10 @@ impl HnswIndex {
     /// SQ8 if f32 was unexpectedly dropped.
     fn search_layer_greedy(&self, query_idx: usize, ep: usize, level: usize) -> usize {
         let query_vec = self.get_node_f32_or_dequantized(query_idx);
-        self.search_layer_greedy_query(&query_vec, ep, level)
+        // Build-path wrapper: callers are existing-node insert/reconnect
+        // loops, never search. Force f32 to keep graph quality consistent
+        // with the rest of construction (see `QueryCtx::new_for_build`).
+        self.search_layer_greedy_query_for_build(&query_vec, ep, level)
     }
 
     fn search_layer_greedy_query(&self, query: &[f32], ep: usize, level: usize) -> usize {
@@ -1775,6 +1818,14 @@ impl HnswIndex {
             self.rabitq_params.as_ref(),
             &self.config.quantization,
         );
+        self.search_layer_greedy_ctx(&ctx, ep, level)
+    }
+
+    /// Build-path variant of [`Self::search_layer_greedy_query`] that
+    /// forces exact f32 distance for every comparison. See
+    /// [`QueryCtx::new_for_build`] for why build must not use RaBitQ.
+    fn search_layer_greedy_query_for_build(&self, query: &[f32], ep: usize, level: usize) -> usize {
+        let ctx = QueryCtx::new_for_build(query, self.config.metric);
         self.search_layer_greedy_ctx(&ctx, ep, level)
     }
 
@@ -1823,7 +1874,8 @@ impl HnswIndex {
     /// Falls back to dequantized SQ8 if f32 was unexpectedly dropped.
     fn search_layer(&self, query_idx: usize, ep: usize, ef: usize, level: usize) -> Vec<Candidate> {
         let query_vec = self.get_node_f32_or_dequantized(query_idx);
-        self.search_layer_query(&query_vec, ep, ef, level)
+        // Build-path wrapper — see `search_layer_greedy` for rationale.
+        self.search_layer_query_for_build(&query_vec, ep, ef, level)
     }
 
     fn search_layer_query(
@@ -1839,6 +1891,20 @@ impl HnswIndex {
             self.rabitq_params.as_ref(),
             &self.config.quantization,
         );
+        self.search_layer_ctx(&ctx, ep, ef, level)
+    }
+
+    /// Build-path variant of [`Self::search_layer_query`] that forces
+    /// exact f32 distance. See [`QueryCtx::new_for_build`] for why
+    /// neighbour selection during construction must not use RaBitQ.
+    fn search_layer_query_for_build(
+        &self,
+        query: &[f32],
+        ep: usize,
+        ef: usize,
+        level: usize,
+    ) -> Vec<Candidate> {
+        let ctx = QueryCtx::new_for_build(query, self.config.metric);
         self.search_layer_ctx(&ctx, ep, ef, level)
     }
 
