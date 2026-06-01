@@ -146,6 +146,20 @@ struct Args {
     /// Ignored when `--quantization` is `none` or `sq8`.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))]
     rabitq_bits: u8,
+
+    /// Thread count for the rayon worker pool used by HNSW build
+    /// (`insert_batch` parallel plan + apply phases). `0` = take
+    /// the rayon default (one thread per logical core). Set to
+    /// a non-zero value for fair vs single-thread competitors
+    /// (`--threads 1` for hnswlib default) or fixed-budget scaling
+    /// sweeps (`--threads 4`).
+    ///
+    /// Search remains single-threaded inside this binary: `sweep_one`
+    /// loops queries sequentially, so per-query latency / QPS are
+    /// always reported on one core regardless of this flag. This
+    /// flag only governs the rayon pool used during graph construction.
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -174,6 +188,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
     info!(?args, "starting ann-benchmarks adapter");
+
+    // Pin the global rayon pool BEFORE any HNSW operation kicks in.
+    // First call to `rayon::current_num_threads()` lazily-inits the
+    // pool to one-thread-per-logical-core, so the builder must run
+    // first or it silently no-ops on the second attempt.
+    //
+    // Honoring this knob is what makes the bench thread-budget-fair:
+    // setting `--threads 1` matches single-thread competitors
+    // (hnswlib default), `--threads 4` matches the fixed-budget
+    // sweep against qdrant / hnswlib `set_num_threads(4)`. The
+    // value `0` opts back into rayon's heuristic.
+    if args.threads > 0 {
+        if let Err(e) = rayon::ThreadPoolBuilder::new()
+            .num_threads(args.threads)
+            .build_global()
+        {
+            return Err(format!(
+                "rayon ThreadPoolBuilder::build_global failed (already initialised?): {e}"
+            )
+            .into());
+        }
+        info!(
+            rayon_threads = args.threads,
+            "rayon pool pinned for build (search remains single-threaded)"
+        );
+    }
 
     let sweep: Vec<usize> = match &args.ef_sweep {
         Some(s) => s
@@ -319,6 +359,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     report.record("hnsw_m", args.m)?;
     report.record("hnsw_ef_construction", args.ef_construction)?;
     report.record("quantization", args.quantization.clone())?;
+    // Effective thread count used by the rayon build pool. Reported so
+    // downstream comparisons can group/filter (`1` vs `4` runs are not
+    // interchangeable for build-time wall-clock, even though search QPS
+    // is single-thread). `0` means rayon-default (logical-core count).
+    report.record("rayon_threads", args.threads)?;
+    report.record("rayon_threads_effective", rayon::current_num_threads())?;
     // Bit-width only meaningful for `rabitq`; record unconditionally so
     // the dashboard can group/filter by it without per-row None handling.
     if args.quantization == "rabitq" {

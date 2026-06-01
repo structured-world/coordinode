@@ -41,6 +41,10 @@ on:
         description: 'Comma-separated modality names to run (default: all known). E.g. "vector" to re-bench only vector.'
         required: false
         default: 'vector'
+      thread_sweep:
+        description: 'Comma-separated rayon thread counts to sweep for the vector bench (each value re-runs the full per-commit smoke set). Empty / "default" = single run at the per-commit cap. Example: "1,4" for fairness vs single-thread and 4-thread competitors.'
+        required: false
+        default: ''
 
 concurrency:
   group: bench
@@ -125,60 +129,85 @@ jobs:
       - name: Vector — per-commit smoke (SIFT + glove)
         id: vector
         if: ${{ contains(inputs.modalities || 'vector,graph,spatial,timeseries,search,document', 'vector') }}
+        env:
+          # If the workflow_dispatch input `thread_sweep` is set
+          # (e.g. "1,4"), iterate the whole smoke set for each value
+          # and tag the JSON output with the effective rayon thread
+          # count. Empty / default = single run honouring the global
+          # RAYON_NUM_THREADS cap (per-commit smoke budget).
+          THREAD_SWEEP: ${{ inputs.thread_sweep }}
         run: |
           set -euo pipefail
           EF_SWEEP="20,40,80,200,400,800"
+
+          # Build the list of `--threads` values to sweep. Empty input
+          # means "single run, take the per-commit cap" — represented
+          # as the sentinel `0` (which `bench-vector-ann` interprets
+          # as "rayon default = pick up RAYON_NUM_THREADS env / logical
+          # cores"). A non-empty input is parsed as a comma list.
+          if [ -z "${THREAD_SWEEP// /}" ] || [ "$THREAD_SWEEP" = "default" ]; then
+            THREAD_LIST="0"
+          else
+            THREAD_LIST="$(echo "$THREAD_SWEEP" | tr ',' ' ')"
+          fi
+          echo "::notice::vector thread sweep = ${THREAD_LIST}"
 
           # SIFT (L2 regression detector)
           DS_DIR="$DATASET_ROOT/sift"
           for f in sift_base.fvecs sift_query.fvecs sift_groundtruth.ivecs; do
             test -f "$DS_DIR/$f" || { echo "::error::missing $DS_DIR/$f"; exit 1; }
           done
-          echo "::group::SIFT-128-L2 M=16 codec=none"
-          ./target/release/bench-vector-ann \
-            --train       "$DS_DIR/sift_base.fvecs" \
-            --query       "$DS_DIR/sift_query.fvecs" \
-            --groundtruth "$DS_DIR/sift_groundtruth.ivecs" \
-            --dataset-name sift-128-euclidean \
-            --m 16 --ef-construction 200 \
-            --codec none --ef-sweep "$EF_SWEEP" \
-            --output bench-results
-          echo "::endgroup::"
 
-          # RaBitQ diagnostic on SIFT-128: dim=128 is already a multiple
-          # of 64 so the padding path is NOT exercised here. If SIFT-128
-          # RaBitQ recall is healthy but glove-100 RaBitQ recall is
-          # broken, the bug is in the padding logic. If BOTH are broken,
-          # the bug is in the codec itself.
-          echo "::group::SIFT-128-L2 M=16 codec=none quantization=rabitq"
-          ./target/release/bench-vector-ann \
-            --train       "$DS_DIR/sift_base.fvecs" \
-            --query       "$DS_DIR/sift_query.fvecs" \
-            --groundtruth "$DS_DIR/sift_groundtruth.ivecs" \
-            --dataset-name sift-128-euclidean \
-            --m 16 --ef-construction 200 \
-            --codec none --quantization rabitq \
-            --ef-sweep "$EF_SWEEP" \
-            --output bench-results
-          echo "::endgroup::"
-
-          # glove-100-angular cosine: f32 + RaBitQ side-by-side
+          # glove (cosine f32 + RaBitQ)
           GLOVE_DIR="$DATASET_ROOT/glove-100-angular"
           for f in glove_base.fvecs glove_query.fvecs glove_groundtruth.ivecs; do
             test -f "$GLOVE_DIR/$f" || { echo "::error::missing $GLOVE_DIR/$f"; exit 1; }
           done
-          for QUANT in none rabitq; do
-            echo "::group::glove-100-angular M=16 codec=$QUANT"
+
+          for T in $THREAD_LIST; do
+            echo "::group::SIFT-128-L2 M=16 codec=none threads=$T"
             ./target/release/bench-vector-ann \
-              --train       "$GLOVE_DIR/glove_base.fvecs" \
-              --query       "$GLOVE_DIR/glove_query.fvecs" \
-              --groundtruth "$GLOVE_DIR/glove_groundtruth.ivecs" \
-              --dataset-name glove-100-angular \
+              --train       "$DS_DIR/sift_base.fvecs" \
+              --query       "$DS_DIR/sift_query.fvecs" \
+              --groundtruth "$DS_DIR/sift_groundtruth.ivecs" \
+              --dataset-name sift-128-euclidean \
               --m 16 --ef-construction 200 \
-              --codec none --quantization "$QUANT" \
-              --ef-sweep "$EF_SWEEP" \
+              --codec none --ef-sweep "$EF_SWEEP" \
+              --threads "$T" \
               --output bench-results
             echo "::endgroup::"
+
+            # RaBitQ diagnostic on SIFT-128: dim=128 already aligned
+            # to 64 so the padding path is NOT exercised here. If
+            # glove RaBitQ recall is broken but SIFT is fine, the
+            # bug is in padding; if BOTH are broken, in the codec.
+            echo "::group::SIFT-128-L2 M=16 quantization=rabitq threads=$T"
+            ./target/release/bench-vector-ann \
+              --train       "$DS_DIR/sift_base.fvecs" \
+              --query       "$DS_DIR/sift_query.fvecs" \
+              --groundtruth "$DS_DIR/sift_groundtruth.ivecs" \
+              --dataset-name sift-128-euclidean \
+              --m 16 --ef-construction 200 \
+              --codec none --quantization rabitq \
+              --ef-sweep "$EF_SWEEP" \
+              --threads "$T" \
+              --output bench-results
+            echo "::endgroup::"
+
+            for QUANT in none rabitq; do
+              echo "::group::glove-100-angular M=16 codec=$QUANT threads=$T"
+              ./target/release/bench-vector-ann \
+                --train       "$GLOVE_DIR/glove_base.fvecs" \
+                --query       "$GLOVE_DIR/glove_query.fvecs" \
+                --groundtruth "$GLOVE_DIR/glove_groundtruth.ivecs" \
+                --dataset-name glove-100-angular \
+                --m 16 --ef-construction 200 \
+                --codec none --quantization "$QUANT" \
+                --ef-sweep "$EF_SWEEP" \
+                --threads "$T" \
+                --output bench-results
+              echo "::endgroup::"
+            done
           done
 
       # ── Future modality steps land here, one per modality ─────

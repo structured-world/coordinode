@@ -16,11 +16,11 @@ service mode via gRPC).
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from ann_benchmarks.algorithms.base.module import BaseANN
-from coordinode_embedded import Hnsw
-
 
 _METRIC_MAP = {
     "angular": "cosine",
@@ -45,16 +45,38 @@ class CoordiNode(BaseANN):
         self._metric = _METRIC_MAP[metric]
         self._M = int(method_param["M"])
         self._ef_construction = int(method_param["efConstruction"])
+
+        # Optional thread pin: comparable scaling against single-thread
+        # competitors (hnswlib default) and fixed-4-thread runs (qdrant
+        # `--num-threads 4`). Set BEFORE importing `coordinode_embedded`
+        # so the underlying rayon pool picks up RAYON_NUM_THREADS on
+        # its lazy first-touch init. ann-benchmarks runs each algo in
+        # a fresh Python process, so the env-var route is safe — no
+        # other call can have triggered rayon init in this interpreter.
+        # `0` / unset = rayon default (one worker per logical core).
+        self._num_threads = int(method_param.get("num_threads", 0))
+        if self._num_threads > 0:
+            os.environ["RAYON_NUM_THREADS"] = str(self._num_threads)
+
+        # Import AFTER setting the env var: the PyO3 shared library
+        # only initialises rayon on first par_iter, not on import, but
+        # ordering the import here keeps the dependency explicit.
+        from coordinode_embedded import Hnsw  # noqa: WPS433 (local import deliberate)
+
+        self._Hnsw = Hnsw
         self._ef_query: int | None = None
         self._index: Hnsw | None = None
-        self.name = f"CoordiNode(M={self._M}, efConstruction={self._ef_construction})"
+        threads_tag = f", threads={self._num_threads}" if self._num_threads > 0 else ""
+        self.name = (
+            f"CoordiNode(M={self._M}, efConstruction={self._ef_construction}{threads_tag})"
+        )
 
     def fit(self, X) -> None:
         # ann-benchmarks hands us a numpy ndarray (sometimes float64).  The
         # PyO3 binding requires float32 — convert if needed (cheap; one copy).
         X = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
         dim = int(X.shape[1])
-        self._index = Hnsw(
+        self._index = self._Hnsw(
             dim=dim,
             metric=self._metric,
             M=self._M,

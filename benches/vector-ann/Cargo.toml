@@ -17,6 +17,12 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = { workspace = true }
+# Used to pin the global rayon pool size for thread-budget-fair runs
+# (`--threads N`). HNSW build pulls rayon transitively through
+# `coordinode-vector`; we depend on it directly to call
+# `ThreadPoolBuilder::build_global` from main and to query
+# `current_num_threads` for the report.
+rayon = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

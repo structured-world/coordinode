@@ -5,6 +5,22 @@
 # canonical leaderboard runs).  Query ef sweep is the canonical
 # 10..800 ladder so recall@0.95 and recall@0.99 operating points
 # both fall inside it.
+#
+# Thread-fairness groups:
+#   M-N           - rayon default (one worker per logical core). Native
+#                   apples-to-apples vs hnswlib's `set_num_threads(...)`
+#                   default in ann-benchmarks (also all cores).
+#   M-N-t1        - `num_threads: 1` for single-thread parity vs single-
+#                   thread competitors. Produces a different graph (no
+#                   parallel-prune skew); QPS unchanged (search is
+#                   single-thread regardless of build pool).
+#   M-N-t4        - `num_threads: 4` matches the fixed-budget runs we
+#                   pin in our internal bench.yml CI smoke (i9-9900K
+#                   thread cap = 4) and competitors with explicit
+#                   `num_threads=4` configs.
+#
+# Disabled by default to keep the per-PR sweep small; enable when
+# running scaling comparisons or publishing the public dashboard.
 float:
   any:
   - base_args: ['@metric']
@@ -29,6 +45,20 @@ float:
       M-16:
         arg_groups: [{M: 16, efConstruction: 500}]
         args: {}
+        query_args: [[10, 20, 40, 80, 120, 200, 400, 600, 800]]
+      # Thread-fairness variants — disabled by default. Flip to false
+      # when running a scaling-comparison sweep against single-thread
+      # and 4-thread competitors. Both reuse M=16 to keep the chart
+      # axis comparable to the canonical leaderboard rows.
+      M-16-t1:
+        arg_groups: [{M: 16, efConstruction: 500, num_threads: 1}]
+        args: {}
+        disabled: true
+        query_args: [[10, 20, 40, 80, 120, 200, 400, 600, 800]]
+      M-16-t4:
+        arg_groups: [{M: 16, efConstruction: 500, num_threads: 4}]
+        args: {}
+        disabled: true
         query_args: [[10, 20, 40, 80, 120, 200, 400, 600, 800]]
       M-24:
         arg_groups: [{M: 24, efConstruction: 500}]

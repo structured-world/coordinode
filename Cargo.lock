@@ -864,6 +864,7 @@ dependencies = [
  "coordinode-bench",
  "coordinode-core",
  "coordinode-vector",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",
