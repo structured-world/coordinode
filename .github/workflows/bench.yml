@@ -116,15 +116,10 @@ jobs:
           for f in sift_base.fvecs sift_query.fvecs sift_groundtruth.ivecs; do
             test -f "$DS_DIR/$f" || { echo "::error::missing $DS_DIR/$f — see benches/vector-ann/README.md"; exit 1; }
           done
-          # No RaBitQ sweep on SIFT-128-euclidean: RaBitQ (1-bit and
-          # Extended-RaBitQ 2/3/4-bit) wants a cosine / angular metric;
-          # on L2 datasets the search path falls back to f32 and the
-          # report would mislead readers into thinking RaBitQ matches
-          # f32 recall everywhere. Once we ship per-commit angular
-          # datasets (e.g. glove-100-angular or gist-960-angular), add
-          # a second loop here with `--quantization=rabitq` × bit-width.
-          # For ad-hoc 2/3/4-bit measurements on an angular set,
-          # operators dispatch the workflow with a custom run line.
+          # SIFT is L2 / euclidean. Stays codec=none — RaBitQ requires
+          # cosine, which lives in the cosine block below (glove-100-
+          # angular + random-1024-angular). The SIFT timeline remains
+          # useful as the f32-distance-kernel regression detector.
           for M in 16 24 32; do
             echo "::group::SIFT1M M=$M"
             ./target/release/bench-vector-ann \
@@ -137,6 +132,67 @@ jobs:
               --codec none \
               --output bench-results
             echo "::endgroup::"
+          done
+
+      # ── Vector — cosine + RaBitQ (the production hot path) ────
+      #
+      # SIFT-128-L2 doesn't activate RaBitQ — the popcount kernel is
+      # cosine-only in the current dispatch. Production workloads
+      # (text embeddings: OpenAI, Cohere, voyage-3) all live in
+      # cosine + dim ≥ 384, where RaBitQ's 1-bit code + popcount
+      # distance gives the 8× RAM reduction and ~3× search throughput
+      # CoordiNode advertises. Bench has to measure THAT path.
+      #
+      # Two cosine datasets per commit:
+      #   - glove-100-angular   (1.18M × dim=100)   — small dim, public
+      #     reference dataset every competitor publishes against.
+      #   - random-1024-angular (100k × dim=1024)   — synthetic, large
+      #     dim, matches the text-embedding workload profile.
+      #
+      # Each dataset sweeps M ∈ {16, 32} × quantization ∈ {none, rabitq}
+      # so the dashboard can show f32 baseline vs RaBitQ side-by-side
+      # at the same recall target. RaBitQ runs use 1-bit (default);
+      # 2/3/4-bit Extended-RaBitQ sweeps land in a follow-up to keep
+      # per-commit CI under ~30 min.
+      - name: Vector — cosine + RaBitQ (glove + random-1024)
+        id: vector_cosine
+        if: ${{ contains(inputs.modalities || 'vector,graph,spatial,timeseries,search,document', 'vector') }}
+        run: |
+          set -euo pipefail
+          for DS in glove-100-angular random-1024-angular; do
+            case "$DS" in
+              glove-100-angular)
+                BASE="$DATASET_ROOT/glove-100-angular/glove_base.fvecs"
+                QUERY="$DATASET_ROOT/glove-100-angular/glove_query.fvecs"
+                GT="$DATASET_ROOT/glove-100-angular/glove_groundtruth.ivecs"
+                NAME="glove-100-angular"
+                ;;
+              random-1024-angular)
+                BASE="$DATASET_ROOT/random-1024-angular/random_base.fvecs"
+                QUERY="$DATASET_ROOT/random-1024-angular/random_query.fvecs"
+                GT="$DATASET_ROOT/random-1024-angular/random_groundtruth.ivecs"
+                NAME="random-1024-angular"
+                ;;
+            esac
+            for f in "$BASE" "$QUERY" "$GT"; do
+              test -f "$f" || { echo "::error::missing $f"; exit 1; }
+            done
+            for M in 16 32; do
+              for QUANT in none rabitq; do
+                echo "::group::$NAME M=$M codec=$QUANT"
+                ./target/release/bench-vector-ann \
+                  --train       "$BASE" \
+                  --query       "$QUERY" \
+                  --groundtruth "$GT" \
+                  --dataset-name "$NAME" \
+                  --m "$M" \
+                  --ef-construction 200 \
+                  --codec none \
+                  --quantization "$QUANT" \
+                  --output bench-results
+                echo "::endgroup::"
+              done
+            done
           done
 
       # ── Future modality steps land here, one per modality ─────
