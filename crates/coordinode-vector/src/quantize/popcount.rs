@@ -116,6 +116,111 @@ unsafe fn xor_popcount_neon(a: &[u64], b: &[u64]) -> u32 {
     sum
 }
 
+/// Compute `popcount(a AND b)` summed across all words.
+///
+/// Same shape as [`xor_popcount`] but with bitwise AND instead of XOR.
+/// Used by the asymmetric RaBitQ distance kernel (paper Equation 20):
+/// the data side is a 1-bit sign code, the query side is expanded into
+/// `B_Q = 4` bit planes, and each plane's contribution is `<<j` weighted
+/// AND+popcount against the data code. Four AND+popcount rounds per
+/// distance call (one per plane) gives the full paper formula in place
+/// of the pure-XOR shortcut, which is what unlocks recall on cosine
+/// workloads beyond the LSH-level plateau.
+///
+/// # Panics
+///
+/// Panics if `a.len() != b.len()`.
+#[inline]
+pub fn and_popcount(a: &[u64], b: &[u64]) -> u32 {
+    assert_eq!(a.len(), b.len(), "and_popcount: slice length mismatch");
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx512vpopcntdq")
+            && std::is_x86_feature_detected!("avx512f")
+        {
+            // SAFETY: feature detection above gates the intrinsic; same-length asserted.
+            return unsafe { and_popcount_avx512(a, b) };
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            // SAFETY: NEON is baseline on aarch64; feature detection gates the call.
+            return unsafe { and_popcount_neon(a, b) };
+        }
+    }
+
+    and_popcount_scalar(a, b)
+}
+
+/// Portable scalar AND+popcount — `core::*` only.
+#[inline]
+pub fn and_popcount_scalar(a: &[u64], b: &[u64]) -> u32 {
+    let mut sum: u32 = 0;
+    for i in 0..a.len() {
+        sum += (a[i] & b[i]).count_ones();
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vpopcntdq")]
+unsafe fn and_popcount_avx512(a: &[u64], b: &[u64]) -> u32 {
+    use std::arch::x86_64::{
+        _mm512_and_si512, _mm512_loadu_si512, _mm512_popcnt_epi64, _mm512_reduce_add_epi64,
+    };
+
+    let len = a.len();
+    let mut sum: i64 = 0;
+    let mut i = 0;
+
+    while i + 8 <= len {
+        let va = _mm512_loadu_si512(a.as_ptr().add(i) as *const _);
+        let vb = _mm512_loadu_si512(b.as_ptr().add(i) as *const _);
+        let vand = _mm512_and_si512(va, vb);
+        let vp = _mm512_popcnt_epi64(vand);
+        sum += _mm512_reduce_add_epi64(vp);
+        i += 8;
+    }
+
+    while i < len {
+        sum += (a[i] & b[i]).count_ones() as i64;
+        i += 1;
+    }
+
+    sum as u32
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn and_popcount_neon(a: &[u64], b: &[u64]) -> u32 {
+    use std::arch::aarch64::{vaddvq_u8, vandq_u8, vcntq_u8, vld1q_u8};
+
+    let len = a.len();
+    let mut sum: u32 = 0;
+    let mut i = 0;
+
+    while i + 2 <= len {
+        let pa = a.as_ptr().add(i) as *const u8;
+        let pb = b.as_ptr().add(i) as *const u8;
+        let va = vld1q_u8(pa);
+        let vb = vld1q_u8(pb);
+        let vand = vandq_u8(va, vb);
+        let vp = vcntq_u8(vand);
+        sum += vaddvq_u8(vp) as u32;
+        i += 2;
+    }
+
+    while i < len {
+        sum += (a[i] & b[i]).count_ones();
+        i += 1;
+    }
+
+    sum
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +282,37 @@ mod tests {
         let a = vec![0u64; 3];
         let b = vec![0u64; 4];
         let _ = xor_popcount(&a, &b);
+    }
+
+    #[test]
+    fn and_scalar_matches_naive() {
+        let a = vec![0u64, 0xFFFF_FFFF_FFFF_FFFF, 0xAAAA_AAAA_AAAA_AAAA];
+        let b = vec![0u64, 0xFFFF_FFFF_FFFF_FFFF, 0x5555_5555_5555_5555];
+        // AND: 0, FFFF.., 0 → popcount 0 + 64 + 0 = 64.
+        assert_eq!(and_popcount_scalar(&a, &b), 64);
+    }
+
+    #[test]
+    fn and_dispatch_matches_scalar_random() {
+        let a = random_u64s(0xDEAD_BEEF, 16);
+        let b = random_u64s(0xCAFE_F00D, 16);
+        assert_eq!(and_popcount(&a, &b), and_popcount_scalar(&a, &b));
+    }
+
+    #[test]
+    fn and_dispatch_matches_scalar_long_and_tail() {
+        let a = random_u64s(11, 128);
+        let b = random_u64s(13, 128);
+        assert_eq!(and_popcount(&a, &b), and_popcount_scalar(&a, &b));
+        let a9 = random_u64s(101, 9);
+        let b9 = random_u64s(103, 9);
+        assert_eq!(and_popcount(&a9, &b9), and_popcount_scalar(&a9, &b9));
+    }
+
+    #[test]
+    fn and_identical_inputs_match_popcount_self() {
+        let a = random_u64s(7, 16);
+        let expected: u32 = a.iter().map(|w| w.count_ones()).sum();
+        assert_eq!(and_popcount(&a, &a), expected);
     }
 }

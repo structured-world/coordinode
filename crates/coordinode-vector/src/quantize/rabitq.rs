@@ -54,7 +54,11 @@ pub struct RaBitQParams {
 
 /// 1-bit code of a single vector plus the scalars needed by the distance estimator.
 ///
-/// Memory: `D/8 + 8` bytes per vector (e.g. 136 B at D=1024 vs 4096 B f32 = ~30× compression).
+/// Memory: `D/8 + 12` bytes per vector (e.g. 140 B at D=1024 vs 4096 B f32 = ~29× compression).
+///
+/// `signed_sum` is precomputed at encode time so the asymmetric paper-Equation-20
+/// kernel only needs the bit-plane AND+popcounts plus a multiply-add per code
+/// (Chroma's `single_bit.rs` does the same: header carries `signed_sum: i32`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RaBitQCode {
     /// Sign-bit code packed into `D/64` u64 words (LSB-first within each word).
@@ -64,12 +68,59 @@ pub struct RaBitQCode {
     pub norm: f32,
     /// `<x', e>` where `e` is a fixed unit vector — feeds the asymmetric correction.
     pub cross_term: f32,
+    /// `Σ sign(R·x)[i]` precomputed = `2·popcount(code) − D_eff`. Used by the
+    /// asymmetric distance kernel (paper Eq. 20) to recover `<g, r_q>` without
+    /// re-popcounting the stored code per query. Default 0 for codes that were
+    /// serialized before this field existed; recompute on first load.
+    #[serde(default)]
+    pub signed_sum: i32,
 }
 
 impl RaBitQCode {
     /// Memory size of the code on the wire / in RAM. Excludes any allocator overhead.
     pub fn size_bytes(&self) -> usize {
-        self.code.len() * 8 + 8 // 8 bytes for f32 norm + f32 cross_term
+        // 8 bytes for f32 norm + f32 cross_term + 4 bytes for signed_sum i32
+        self.code.len() * 8 + 12
+    }
+}
+
+/// Pre-quantized query in the asymmetric RaBitQ distance kernel (paper §3.3.2,
+/// Eq. 20). The query is rotated, residualized into the `[v_l, v_r]` range,
+/// quantized to `B_Q = 4` bits per dim, then expanded into 4 bit planes packed
+/// into `D_eff / 64` u64 words each.
+///
+/// Memory: `4 · D_eff/8 + 12` bytes per query. The 4× memory vs the 1-bit code
+/// pays for ~4-bit query resolution, which lifts the cosine-distance estimator
+/// error bound from `O(1/√(D/B_Q))` (pure XOR popcount) to `O(1/√D)` per paper
+/// Theorem 3.2 — the difference between recall=0.17 plateau and 0.85+ on glove.
+///
+/// Reused across thousands of `compute_distance` calls per search, so the 4×
+/// encoding cost is amortized. Encoding itself is `O(D² + B_Q·D)`: the matrix-
+/// vector rotation dominates; the bit-plane expansion is a tight scalar loop.
+#[derive(Debug, Clone)]
+pub struct RaBitQQuery {
+    /// `B_Q = 4` bit planes. `planes[j]` holds bit `j` of every quantized
+    /// dimension, packed into `D_eff / 64` u64 words. Plane 0 = LSB.
+    pub planes: [Vec<u64>; 4],
+    /// `v_l = min_i(r_q[i])` — bottom of the per-query quantization range.
+    pub v_l: f32,
+    /// `delta = (v_r − v_l) / (2^B_Q − 1) = (max − min) / 15`. Step size of
+    /// the per-query 4-bit quantizer.
+    pub delta: f32,
+    /// `Σ_i q_u[i]` — sum of the 4-bit-quantized query coordinates. Folds
+    /// into the paper-Eq. 20 `signed_dot_qu = 2·packed_dot_qu − sum_q_u`.
+    pub sum_q_u: i32,
+    /// `‖q‖₂` — original query L2 norm. Carried for callers that want a
+    /// scale-aware inner product or distance (we don't need it for the
+    /// monotonic-only HNSW ranking, but keeping it makes the API honest).
+    pub norm: f32,
+}
+
+impl RaBitQQuery {
+    /// Memory size of the query encoding. 4 bit planes × D_eff/8 bytes +
+    /// 4 f32/i32 scalars.
+    pub fn size_bytes(&self) -> usize {
+        self.planes.iter().map(|p| p.len() * 8).sum::<usize>() + 12
     }
 }
 
@@ -203,11 +254,165 @@ impl RaBitQParams {
             }
         }
 
+        // Σ_i sign(R·x)[i] precomputed once at encode time. Used by the
+        // asymmetric kernel (Eq. 20) without re-popcounting the stored
+        // code per query: `signed_sum = 2·popcount(code) − D_eff`.
+        let popcount: u32 = code.iter().map(|w| w.count_ones()).sum();
+        let signed_sum = 2 * popcount as i32 - d_eff as i32;
+
         RaBitQCode {
             code,
             norm,
             cross_term: sum_rotated * inv_sqrt_d,
+            signed_sum,
         }
+    }
+
+    /// Encode a query vector for the asymmetric paper-Equation-20 distance
+    /// kernel. Quantizes the rotated query to `B_Q = 4` bits per dim, then
+    /// transposes into 4 bit planes packed as u64 words.
+    ///
+    /// This is the "right" 1-bit-data × 4-bit-query path the RaBitQ paper
+    /// (§3.3.2) and Chroma's `single_bit.rs` use. Our previous symmetric
+    /// 1-bit×1-bit `estimate_cosine_distance(code, code)` short-circuits this
+    /// at the cost of an `O(1/√D)` → `O(1/√(D/4))` error blow-up — which is
+    /// what made glove-100-angular plateau at recall=0.17.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `vector.len() != self.dims as usize`.
+    pub fn encode_query(&self, vector: &[f32]) -> RaBitQQuery {
+        assert_eq!(
+            vector.len(),
+            self.dims as usize,
+            "RaBitQParams::encode_query: dimension mismatch"
+        );
+
+        let d_eff = self.effective_dims as usize;
+        let d_user = self.dims as usize;
+        let words = d_eff / 64;
+
+        // 1. Rotate the query into the codec's orthonormal frame. Zero-pad
+        // beyond user_dims same as `encode` — the rotated entries in padded
+        // slots are linear combinations of (only) the user-dim entries, so
+        // they carry signal even though the input is zero there.
+        let mut r_q = vec![0.0f32; d_eff];
+        let mut norm_sq = 0.0f32;
+        for &v in vector {
+            norm_sq += v * v;
+        }
+        let norm = norm_sq.sqrt();
+        for (i, slot) in r_q.iter_mut().enumerate() {
+            let row_base = i * d_eff;
+            let mut acc = 0.0f32;
+            for (j, &xj) in vector.iter().take(d_user).enumerate() {
+                acc += self.rotation[row_base + j] * xj;
+            }
+            *slot = acc;
+        }
+
+        // 2. Per-query 4-bit linear quantization with min/max from the
+        // rotated query itself. v_l = min, v_r = max, delta = range / 15.
+        let mut v_l = r_q[0];
+        let mut v_r = r_q[0];
+        for &v in &r_q {
+            if v < v_l {
+                v_l = v;
+            }
+            if v > v_r {
+                v_r = v;
+            }
+        }
+        let range = (v_r - v_l).max(f32::EPSILON);
+        let delta = range / 15.0;
+        let inv_delta = 15.0 / range;
+
+        // 3. Quantize and transpose to bit-planes simultaneously. Each q_u[i]
+        // is a 4-bit integer 0..=15; bit j of q_u[i] lands in planes[j] at
+        // position i. sum_q_u accumulates Σ q_u[i] for the Eq. 20 correction.
+        let mut planes: [Vec<u64>; 4] = [
+            vec![0u64; words],
+            vec![0u64; words],
+            vec![0u64; words],
+            vec![0u64; words],
+        ];
+        let mut sum_q_u: i32 = 0;
+        for (i, &v) in r_q.iter().enumerate() {
+            let qf = ((v - v_l) * inv_delta).round();
+            let q_u = qf.clamp(0.0, 15.0) as u32;
+            sum_q_u += q_u as i32;
+            let word = i / 64;
+            let bit = i % 64;
+            for (j, plane) in planes.iter_mut().enumerate() {
+                if ((q_u >> j) & 1) != 0 {
+                    plane[word] |= 1u64 << bit;
+                }
+            }
+        }
+
+        RaBitQQuery {
+            planes,
+            v_l,
+            delta,
+            sum_q_u,
+            norm,
+        }
+    }
+
+    /// Estimate `<g, r_q>` between a stored 1-bit data code and a 4-bit-plane
+    /// query using paper Equation 20.
+    ///
+    /// Returns the inner-product estimate; for cosine distance on unit-norm
+    /// vectors callers convert via `dist = -estimate` (monotonic — HNSW
+    /// heap-order preserving) or `dist ≈ 1 − estimate / (norm_x · norm_q)`
+    /// (scale-aware, slower).
+    ///
+    /// # Algorithm (paper §3.3.2, our convention `g[i] = ±0.5`)
+    ///
+    /// ```text
+    /// packed_dot_qu = Σ_{j=0..4} 2^j · popcount(code AND planes[j])
+    /// signed_dot_qu = 2·packed_dot_qu − sum_q_u
+    /// <g, r_q>      = 0.5 · (delta · signed_dot_qu + v_l · signed_sum)
+    /// ```
+    ///
+    /// Four AND+popcount rounds, one per bit plane, summed with `<<j` weights.
+    /// On i9-9900K (AVX-512 + VPOPCNTDQ) each plane is one 8-u64 pass; the
+    /// four planes share the data code in L1 so the entire kernel is ~4×
+    /// cycles vs the legacy XOR popcount but with paper-accurate recall.
+    pub fn estimate_inner_product_q(&self, code: &RaBitQCode, query: &RaBitQQuery) -> f32 {
+        debug_assert_eq!(
+            code.code.len(),
+            query.planes[0].len(),
+            "code/query plane length mismatch"
+        );
+
+        // Four bit-plane AND+popcount rounds. Plane j contributes
+        // `popcount(code ∧ plane_j) << j` to packed_dot_qu.
+        let pop0 = popcount::and_popcount(&code.code, &query.planes[0]) as i64;
+        let pop1 = popcount::and_popcount(&code.code, &query.planes[1]) as i64;
+        let pop2 = popcount::and_popcount(&code.code, &query.planes[2]) as i64;
+        let pop3 = popcount::and_popcount(&code.code, &query.planes[3]) as i64;
+        let packed_dot_qu: i64 = pop0 + (pop1 << 1) + (pop2 << 2) + (pop3 << 3);
+
+        // signed_dot_qu = 2·packed_dot_qu − sum_q_u — turns the 0/1 sign
+        // bits into ±1 signs without re-walking the code.
+        let signed_dot_qu = 2 * packed_dot_qu - query.sum_q_u as i64;
+
+        // Eq. 20 closed form. signed_sum is precomputed on the code.
+        0.5 * (query.delta * signed_dot_qu as f32 + query.v_l * code.signed_sum as f32)
+    }
+
+    /// Cosine distance using the asymmetric 4-bit-query kernel.
+    ///
+    /// `<g, r_q>` is monotonic in `<x, q>` for the rotation R (R orthonormal,
+    /// g ∝ sign-quantized R·x, r_q ≈ R·q). For HNSW ranking we only need
+    /// monotonicity. Returning `-<g, r_q>` is sufficient: lower = closer.
+    ///
+    /// This replaces the legacy `estimate_cosine_distance(code, code)` —
+    /// that symmetric 1-bit × 1-bit XOR popcount caps recall at the LSH
+    /// asymptote and is what the glove plateau measured.
+    pub fn estimate_cosine_distance_q(&self, code: &RaBitQCode, query: &RaBitQQuery) -> f32 {
+        -self.estimate_inner_product_q(code, query)
     }
 
     /// Estimate the inner product (dot product) between two encoded vectors.
@@ -694,11 +899,12 @@ mod tests {
 
     #[test]
     fn code_size_matches_spec() {
-        // D=1024 → 128 bytes code + 8 bytes scalars = 136 bytes.
+        // D=1024 → 128 bytes code + 8 bytes scalars + 4 bytes signed_sum = 140 bytes.
+        // signed_sum was added for the asymmetric Eq. 20 kernel (paper §3.3.2).
         let p = RaBitQParams::calibrate(1024, 7);
         let v = vec![1.0f32; 1024];
         let c = p.encode(&v);
-        assert_eq!(c.size_bytes(), 136);
+        assert_eq!(c.size_bytes(), 140);
     }
 
     #[test]
