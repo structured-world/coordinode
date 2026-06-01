@@ -97,33 +97,31 @@ jobs:
 
       # ── Vector (per-commit smoke; budget ≤ 20 min total) ──────
       #
-      # Per-commit CI budget: the full vector sweep must finish in
-      # ≤ 20 minutes. Build of 1M-node HNSW at M=16 is ~5 min, and
-      # each ef_search sweep point runs ~30 s on a 10K query set.
-      # That leaves room for THREE focused runs at most.
+      # Selection per commit:
+      #   1. SIFT-128-L2 M=16    codec=none   — f32 regression detector.
+      #   2. random-128-ang M=16 codec=none   — cosine f32 baseline.
+      #   3. random-128-ang M=16 codec=rabitq — RaBitQ popcount kernel
+      #      side-by-side on the same dataset.
       #
-      # Selection per commit, optimised for signal-per-second:
-      #   1. SIFT-128-L2 M=16  codec=none   — f32 distance regression
-      #      detector (NEON / AVX2 SIMD kernel correctness + speed).
-      #   2. glove-100-ang  M=16 codec=none   — cosine f32 baseline.
-      #   3. glove-100-ang  M=16 codec=rabitq — RaBitQ popcount kernel
-      #      on the SAME dataset, so the dashboard can show
-      #      "RaBitQ vs f32 at the same recall" side-by-side.
+      # Why random-128-angular over glove-100-angular: RaBitQ requires
+      # dim divisible by 64 (popcount kernel operates on u64 words).
+      # glove dim=100 fails that check → calibration silently skipped
+      # → RaBitQ run was measuring f32 (validated empirically on
+      # 2281ba0: codec=none and codec=rabitq returned identical QPS
+      # at every ef on glove M=16). random-128-angular at dim=128 is
+      # a multiple of 64 so the codec actually activates.
       #
-      # ef sweep is the same 5-point inflection band [20, 40, 80,
-      # 120, 200] for every run — covers recall=0.95 cleanly without
-      # the high-recall tail that runs slowest.
-      #
-      # Bigger sweeps (M ∈ {16, 24, 32}, codec ∈ {none, rabitq, sq8,
-      # rabitq-2bit/3bit/4bit}, datasets random-1024-angular /
-      # gist-960-angular) live in a separate `workflow_dispatch` job
-      # that operators trigger on-demand or nightly.
-      - name: Vector — per-commit smoke (SIFT + glove)
+      # Synthetic angular dataset: 200K unit vectors × dim=128, GT
+      # computed offline by prep_datasets.py against the full base
+      # (10K queries × top-100). dim=128 also matches the
+      # production-relevant text-embedding lower bound and pairs
+      # naturally with the SIFT-128 regression detector.
+      - name: Vector — per-commit smoke (SIFT + random-128-ang)
         id: vector
         if: ${{ contains(inputs.modalities || 'vector,graph,spatial,timeseries,search,document', 'vector') }}
         run: |
           set -euo pipefail
-          EF_SWEEP="20,40,80,120,200"
+          EF_SWEEP="20,40,80,200,400,800"
 
           # SIFT (L2 regression detector)
           DS_DIR="$DATASET_ROOT/sift"
@@ -141,18 +139,18 @@ jobs:
             --output bench-results
           echo "::endgroup::"
 
-          # glove cosine: f32 + RaBitQ side-by-side
-          GLOVE_DIR="$DATASET_ROOT/glove-100-angular"
-          for f in glove_base.fvecs glove_query.fvecs glove_groundtruth.ivecs; do
-            test -f "$GLOVE_DIR/$f" || { echo "::error::missing $GLOVE_DIR/$f"; exit 1; }
+          # random-128-angular cosine: f32 + RaBitQ side-by-side
+          R128_DIR="$DATASET_ROOT/random-128-angular"
+          for f in random_base.fvecs random_query.fvecs random_groundtruth.ivecs; do
+            test -f "$R128_DIR/$f" || { echo "::error::missing $R128_DIR/$f"; exit 1; }
           done
           for QUANT in none rabitq; do
-            echo "::group::glove-100-angular M=16 codec=$QUANT"
+            echo "::group::random-128-angular M=16 codec=$QUANT"
             ./target/release/bench-vector-ann \
-              --train       "$GLOVE_DIR/glove_base.fvecs" \
-              --query       "$GLOVE_DIR/glove_query.fvecs" \
-              --groundtruth "$GLOVE_DIR/glove_groundtruth.ivecs" \
-              --dataset-name glove-100-angular \
+              --train       "$R128_DIR/random_base.fvecs" \
+              --query       "$R128_DIR/random_query.fvecs" \
+              --groundtruth "$R128_DIR/random_groundtruth.ivecs" \
+              --dataset-name random-128-angular \
               --m 16 --ef-construction 200 \
               --codec none --quantization "$QUANT" \
               --ef-sweep "$EF_SWEEP" \
