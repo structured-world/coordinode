@@ -2990,6 +2990,123 @@ mod tests {
     }
 
     #[test]
+    fn rabitq_recall_cosine_dim_100_with_padding() {
+        // Reproducer for the glove-100-angular bench (8fa0f2f, 3381b6d):
+        // recall plateau at 0.17 across the full ef sweep with dim=100,
+        // Cosine metric, RaBitQ. Same test as `rabitq_recall_sanity_cosine`
+        // but with dim that ISN'T a multiple of 64 so the codec padding
+        // path (effective_dims = 128) is exercised end-to-end through
+        // HNSW build + search.
+        //
+        // If recall here drops to the ~0.1-0.2 floor, the bug reproduces
+        // in a 2000-vector / dim=100 test we can debug locally without
+        // waiting on the 4-minute glove bench. If recall is ≥ 0.4, the
+        // bug is scale-dependent (only triggers at 1M+ vectors) and the
+        // hunt moves to bench-vector-ann or HnswIndex calibration timing.
+        let dim = 100usize;
+        let n = 2000usize;
+        let k = 10usize;
+        let threshold = 100usize;
+
+        // Synthetic unit-norm Gaussian-ish vectors via deterministic
+        // sinusoid mix. Two close pairs are planted so brute-force has
+        // a well-defined top-K (otherwise small-N cosine collapses to
+        // near-ties and recall becomes meaningless).
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|i| {
+                let raw: Vec<f32> = (0..dim)
+                    .map(|d| {
+                        let phase = (i as f32) * 0.013 + (d as f32) * 0.07;
+                        phase.sin() + 0.3 * (phase * 2.5).cos()
+                    })
+                    .collect();
+                let norm = metrics::norm_l2(&raw).max(f32::EPSILON);
+                raw.into_iter().map(|x| x / norm).collect()
+            })
+            .collect();
+
+        let mut index = HnswIndex::new(HnswConfig {
+            m: 16,
+            m_max0: 32,
+            ef_construction: 100,
+            ef_search: 200,
+            metric: VectorMetric::Cosine,
+            max_dimensions: dim as u32,
+            quantization: QuantizationCodec::RaBitQ { bits: 1 },
+            rerank_candidates: 64,
+            calibration_threshold: threshold,
+            offload_vectors: false,
+            property_name: String::new(),
+            max_elements: n as u32,
+        });
+
+        for (i, v) in vectors.iter().enumerate() {
+            index.insert(i as u64, v.clone());
+        }
+
+        assert!(
+            index.is_rabitq_active(),
+            "RaBitQ should be active after threshold reached"
+        );
+        // Every post-calibration node must carry a code. If this fails,
+        // calibration is the bug — codes are missing for some nodes and
+        // search falls back to f32 for them, mixing two distance scales.
+        let coded = index
+            .nodes
+            .iter()
+            .filter(|n| n.rabitq_code.is_some())
+            .count();
+        assert_eq!(
+            coded, n,
+            "all {n} nodes should have RaBitQ codes after calibration"
+        );
+        let params = index.rabitq_params().expect("rabitq calibrated");
+        assert_eq!(params.dims(), dim as u32);
+        assert_eq!(params.effective_dims(), 128, "padding path active");
+
+        // Brute-force top-K by exact cosine. Average recall over 20
+        // queries — single-query recall noise on a 2k corpus is high.
+        let n_queries = 20usize;
+        let mut total_hits = 0usize;
+        for qi in 0..n_queries {
+            let query = &vectors[qi * (n / n_queries)];
+            let mut gt: Vec<(f32, u64)> = vectors
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let cos = metrics::cosine_similarity_with_query_norm(
+                        query,
+                        v,
+                        metrics::norm_l2(query),
+                    );
+                    (1.0 - cos, i as u64)
+                })
+                .collect();
+            gt.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let gt_set: HashSet<u64> = gt.iter().take(k).map(|&(_, id)| id).collect();
+
+            let results = index.search(query, k);
+            let result_set: HashSet<u64> = results.iter().map(|r| r.id).collect();
+            total_hits += gt_set.intersection(&result_set).count();
+        }
+        let recall = total_hits as f32 / (n_queries * k) as f32;
+        eprintln!(
+            "RaBitQ cosine recall@{k} at d={dim} (padded→128), n={n}: {:.0}%",
+            recall * 100.0
+        );
+
+        // Bar: 0.4. Real RaBitQ at this scale on Gaussian-like cosine
+        // workload should land 0.5-0.7. The broken plateau at 0.17 was
+        // far below this. If the test now passes, the bug is scale-
+        // dependent and we need a bigger reproducer.
+        assert!(
+            recall >= 0.4,
+            "RaBitQ cosine+padding recall {recall:.3} below 0.4 — \
+             bug reproduces at small scale, debug from here",
+        );
+    }
+
+    #[test]
     fn extended_rabitq_recall_sanity_cosine_2bit() {
         // Wires-up test for 2-bit Extended-RaBitQ (R862): same shape as the
         // 1-bit recall sanity check, but `quantization = RaBitQ { bits: 2 }`.
