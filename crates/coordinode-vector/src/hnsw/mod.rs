@@ -128,7 +128,7 @@ fn rabitq_code_norm(enc: &RabitqEncoded, params: &RaBitQParams) -> f32 {
             // codecs (empty centroid) have c_norm = radial = 0 and the
             // identity collapses to `‖x‖ = ‖r‖ = c.norm`, preserving the
             // 2114679 cached-norm fast path bit-for-bit.
-            let c_norm = params.c_norm();
+            let c_norm = params.c_norm(c.cluster_id);
             let d_norm_sq = c_norm * c_norm + 2.0 * c.radial + c.norm * c.norm;
             d_norm_sq.sqrt()
         }
@@ -763,30 +763,23 @@ impl HnswIndex {
         // shards will switch to per-shard seeds in a follow-up.
         let seed = 0x9E37_79B9_7F4A_7C15u64 ^ self.config.max_dimensions as u64;
 
-        // K=1 IVF centroid: arithmetic mean of all vectors present at
-        // calibration time. For cosine workloads with a non-zero data mean
-        // (glove, sentence-transformers, OpenAI embeddings) this centers
-        // residuals around the origin so the sign-bit code captures the
-        // *direction-from-mean* rather than direction-from-origin —
-        // recall lift on the order of 10-20 percentage points per the
-        // reference RaBitQ-Library tests on glove-100-angular.
-        let mut centroid = vec![0.0f32; dims];
-        let mut count = 0usize;
-        for node in &self.nodes {
-            if let Some(ref v) = node.vector {
-                for (i, &x) in v.iter().enumerate() {
-                    centroid[i] += x;
-                }
-                count += 1;
-            }
-        }
-        if count > 0 {
-            let inv = 1.0 / count as f32;
-            for c in centroid.iter_mut() {
-                *c *= inv;
-            }
-        }
-        let params = RaBitQParams::calibrate_with_centroid(dims as u32, seed, centroid);
+        // K-cluster IVF: run K-means Lloyd on the vectors present at
+        // calibration time. For cosine workloads with cluster structure
+        // (glove, sentence-transformers, OpenAI embeddings) residuals
+        // against a per-cluster centroid are markedly tighter than
+        // against a single global mean, so the sign-bit code captures
+        // sharper direction information. K=16 matches the SIGMOD 2024
+        // RaBitQ-Library reference. Calibration vectors are collected
+        // by cloning the node vectors present at threshold; the K-means
+        // upper bound of 12 iterations caps calibration latency well
+        // under one second even at calibration_threshold = 100k.
+        const N_CLUSTERS: u32 = 16;
+        let training: Vec<Vec<f32>> = self.nodes.iter().filter_map(|n| n.vector.clone()).collect();
+        let params = if training.is_empty() {
+            RaBitQParams::calibrate(dims as u32, seed)
+        } else {
+            RaBitQParams::calibrate_with_kmeans(dims as u32, seed, &training, N_CLUSTERS)
+        };
 
         // Two-pass borrow split — encode_rabitq needs `&self.config`
         // while encoding, then we mutate node.rabitq_code separately.

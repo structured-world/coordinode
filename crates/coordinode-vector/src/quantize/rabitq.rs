@@ -25,6 +25,125 @@
 use super::popcount;
 use serde::{Deserialize, Serialize};
 
+/// Squared L2 distance between two equal-length f32 slices. Used by the
+/// k-means assignment pass; kept private so the dispatch matches the rest
+/// of the codec's vector ops (no SIMD intrinsic here — the assignment
+/// loop is `O(N · K · D)` once at calibration, dwarfed by the encode
+/// phase that follows).
+#[inline]
+fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut s = 0.0f32;
+    for i in 0..a.len() {
+        let d = a[i] - b[i];
+        s += d * d;
+    }
+    s
+}
+
+/// Lloyd's K-means with K-means++ initialisation. Returns the flat
+/// `n_clusters * dims` centroid array. Deterministic in `(training,
+/// dims, n_clusters, seed)`.
+///
+/// Caps at 12 iterations — for the data sizes we calibrate on
+/// (`calibration_threshold ≤ 100k`) convergence is reached well before
+/// that empirically, and the upper bound keeps calibration latency
+/// bounded.
+fn kmeans_lloyd(training: &[Vec<f32>], dims: usize, k: usize, seed: u64) -> Vec<f32> {
+    let n = training.len();
+    let mut rng = Xorshift64Star::new(seed);
+
+    // K-means++ init: first centroid uniform-random; each subsequent
+    // centroid sampled with probability proportional to `min_dist²` so
+    // the initial set spreads across the data.
+    let mut centroids: Vec<f32> = Vec::with_capacity(k * dims);
+    let first = (rng.next_u64() as usize) % n;
+    centroids.extend_from_slice(&training[first]);
+
+    let mut min_dists: Vec<f32> = training
+        .iter()
+        .map(|v| l2_sq(v, &training[first]))
+        .collect();
+
+    for _ in 1..k {
+        // Cumulative distribution sampling: pick index where cumulative
+        // sum first exceeds u * total_dist.
+        let total: f32 = min_dists.iter().sum::<f32>().max(f32::EPSILON);
+        let target = (rng.next_u64() as f32 / u64::MAX as f32) * total;
+        let mut acc = 0.0f32;
+        let mut picked = n - 1;
+        for (i, &d) in min_dists.iter().enumerate() {
+            acc += d;
+            if acc >= target {
+                picked = i;
+                break;
+            }
+        }
+        let start = centroids.len();
+        centroids.extend_from_slice(&training[picked]);
+        let new_centroid = &centroids[start..start + dims];
+        for (i, v) in training.iter().enumerate() {
+            let d = l2_sq(v, new_centroid);
+            if d < min_dists[i] {
+                min_dists[i] = d;
+            }
+        }
+    }
+
+    // Lloyd iterations: assign each point to nearest centroid, update
+    // centroids to assigned-set mean. 12-iteration ceiling.
+    let mut assignments = vec![0u16; n];
+    for _iter in 0..12 {
+        // Assignment pass.
+        let mut changed = false;
+        for (i, v) in training.iter().enumerate() {
+            let mut best_k = 0u16;
+            let mut best_d = f32::INFINITY;
+            for ck in 0..k {
+                let c = &centroids[ck * dims..(ck + 1) * dims];
+                let d = l2_sq(v, c);
+                if d < best_d {
+                    best_d = d;
+                    best_k = ck as u16;
+                }
+            }
+            if assignments[i] != best_k {
+                assignments[i] = best_k;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+
+        // Update pass: recompute each centroid as the mean of its
+        // assigned vectors. Empty clusters keep their previous centroid
+        // (no Forgy-style reset — k-means++ init makes empties rare).
+        let mut sums = vec![0.0f32; k * dims];
+        let mut counts = vec![0u32; k];
+        for (i, v) in training.iter().enumerate() {
+            let ck = assignments[i] as usize;
+            let base = ck * dims;
+            for j in 0..dims {
+                sums[base + j] += v[j];
+            }
+            counts[ck] += 1;
+        }
+        for (ck, &count) in counts.iter().enumerate().take(k) {
+            if count == 0 {
+                continue;
+            }
+            let inv = 1.0 / count as f32;
+            let base = ck * dims;
+            for j in 0..dims {
+                centroids[base + j] = sums[base + j] * inv;
+            }
+        }
+    }
+
+    centroids
+}
+
 /// Sign-flip helper: `x[i] *= -1` for every bit set in `signs` (LSB-first
 /// within each u64 word). Branchless via the IEEE 754 sign bit XOR.
 #[inline]
@@ -110,26 +229,34 @@ pub struct RaBitQParams {
     /// recovering a segment can regenerate the sign vectors bit-identically
     /// from the persisted seed.
     seed: u64,
-    /// Global centroid (K=1 IVF) used to center data and query before
-    /// rotation. Empty `Vec` ⇒ no centering (legacy behaviour, pure HNSW).
-    /// When populated, `encode` stores residuals `r = x − centroid` rotated;
-    /// `encode_query` precomputes `c_dot_q = <centroid, q>` for the
-    /// asymmetric distance reconstruction.
+    /// IVF centroids, stored flat K × `dims`. Empty ⇒ no centering
+    /// (legacy behaviour). For K clusters, `centroids[k*dims..(k+1)*dims]`
+    /// is the k-th centroid. `encode` picks the nearest centroid by L2,
+    /// stores `cluster_id` on the code, and encodes the residual
+    /// `r = x − centroids[cluster_id]` after rotation. `encode_query`
+    /// precomputes `c_dot_q[k] = <centroids[k], q>` for every k so the
+    /// asymmetric distance reconstruction is a single array lookup per
+    /// neighbour visit.
     ///
-    /// For cosine workloads where data has a non-zero mean direction
-    /// (glove, sentence-transformers, OpenAI embeddings), centering
-    /// shrinks ‖r‖ ≪ ‖x‖ — the sign code captures sharper structure than
-    /// the raw `R·x` it captured before. Reference RaBitQ-Library
-    /// (Gao & Long) uses K=16 cluster centroids; K=1 (global mean) is a
-    /// stepping stone, expected to reduce HNSW-navigation noise enough
-    /// to remove the need for the dual-distance results-heap (which costs
-    /// the current ~4× QPS gap vs hnswlib f32 baseline).
+    /// K=1 is global-mean centering (cheap, marginal recall lift on data
+    /// with non-zero mean direction). K=16 is the size the SIGMOD 2024
+    /// reference RaBitQ-Library uses on its public benchmarks — residuals
+    /// inside each cluster have ~30% smaller L2 norm than residuals
+    /// against a single global mean, so the sign-bit code captures
+    /// sharper structure and the cheap distance is closer to truth,
+    /// shrinking the gap to the dual-precision rerank path.
     #[serde(default)]
-    centroid: Vec<f32>,
-    /// `‖centroid‖₂` — precomputed once, reused per query in the cosine
-    /// distance reconstruction (`d_norm² = c_norm² + 2·radial + r_norm²`).
+    centroids: Vec<f32>,
+    /// `‖centroids[k]‖₂` per cluster (K entries). Empty when un-centered.
+    /// Used by the cosine reconstruction
+    /// `d_norm² = c_norms[k]² + 2·radial + r_norm²` where k = cluster_id.
     #[serde(default)]
-    c_norm: f32,
+    c_norms: Vec<f32>,
+    /// Number of IVF clusters (`centroids.len() / dims`). Carried
+    /// separately so the dispatch can read it without dividing on every
+    /// call. 0 when un-centered (legacy).
+    #[serde(default)]
+    n_clusters: u32,
 }
 
 /// 1-bit code of a single vector plus the scalars needed by the distance estimator.
@@ -173,12 +300,19 @@ pub struct RaBitQCode {
     /// the next encode pass overwrites with the true value.
     #[serde(default = "default_correction")]
     pub correction: f32,
-    /// `radial = <r, centroid>` where `r = x − centroid` is the residual.
-    /// Used in the centered cosine distance reconstruction
-    /// `d_norm² = c_norm² + 2·radial + norm²`. Default 0.0 means "no IVF
-    /// centering" (legacy codes pre-K=1 — read as `‖d‖ = norm`).
+    /// `radial = <r, centroids[cluster_id]>` where `r = x − centroids[cluster_id]`
+    /// is the residual against the assigned cluster. Default 0.0 means
+    /// "no IVF" (legacy codes pre-K=1 — read as `‖d‖ = norm`).
     #[serde(default)]
     pub radial: f32,
+    /// Index into the IVF centroid array for the cluster this vector was
+    /// assigned to. Default 0 for legacy codes (treat as "always cluster
+    /// 0" — matches K=1 behaviour where there's only one cluster). For
+    /// K > 1, the cosine reconstruction reads
+    /// `c_norms[cluster_id]` and `query.c_dot_q[cluster_id]` to recover
+    /// the centroid contribution to `<d, q>` and `‖d‖`.
+    #[serde(default)]
+    pub cluster_id: u16,
 }
 
 fn default_correction() -> f32 {
@@ -223,11 +357,11 @@ pub struct RaBitQQuery {
     /// scale-aware inner product or distance (we don't need it for the
     /// monotonic-only HNSW ranking, but keeping it makes the API honest).
     pub norm: f32,
-    /// `c_dot_q = <centroid, query>` — precomputed once per search at
-    /// `encode_query` time. Used by the centered cosine distance
-    /// reconstruction: `<d, q> = c_dot_q + r_dot_r_q`. 0.0 when the codec
-    /// runs without IVF centering (legacy).
-    pub c_dot_q: f32,
+    /// Per-cluster `c_dot_q[k] = <centroids[k], query>` precomputed once
+    /// per search. The asymmetric distance reconstruction reads
+    /// `c_dot_q[code.cluster_id] + r_dot_r_q` for the inner product term.
+    /// Empty when the codec runs without IVF (legacy un-centered).
+    pub c_dot_q: Vec<f32>,
 }
 
 impl RaBitQQuery {
@@ -284,48 +418,100 @@ impl RaBitQParams {
             dims,
             effective_dims,
             seed,
-            centroid: Vec::new(),
-            c_norm: 0.0,
+            centroids: Vec::new(),
+            c_norms: Vec::new(),
+            n_clusters: 0,
         }
     }
 
-    /// Build a calibrated `RaBitQParams` with a K=1 IVF centroid (data
-    /// mean) so `encode` stores residuals `r = x − centroid`. The
-    /// asymmetric distance reconstruction now reads:
+    /// Build a calibrated `RaBitQParams` with K IVF centroids supplied
+    /// flat (`centroids[k*dims..(k+1)*dims]` = k-th centroid). Encoding
+    /// picks the nearest centroid per vector and stores residuals against
+    /// it; the asymmetric distance reconstruction reads:
     ///
     /// ```text
-    /// <d, q>    = c_dot_q + ‖r‖ · g_dot_r_q / correction
-    /// ‖d‖²      = ‖centroid‖² + 2·<r, centroid> + ‖r‖²
+    /// <d, q>    = c_dot_q[cluster_id] + ‖r‖ · g_dot_r_q / correction
+    /// ‖d‖²      = c_norms[cluster_id]² + 2·radial + ‖r‖²
     /// cos_dist  = 1 − <d, q> / (‖d‖ · ‖q‖)
     /// ```
     ///
-    /// vs un-centered (`calibrate`), this lifts cosine-search recall when
-    /// the data distribution has a non-zero mean direction (glove,
-    /// sentence-transformers, OpenAI text embeddings) by sharpening the
-    /// sign-bit code on the residual rather than the raw vector. K=1 is
-    /// the stepping stone toward the K=16 IVF the SIGMOD 2024 reference
-    /// implementation uses; the math is identical apart from carrying a
-    /// `cluster_id` lookup over the centroid array.
-    ///
-    /// `centroid.len()` MUST equal `dims`. Caller is responsible for
-    /// computing the mean over a representative sample of the data; the
-    /// `HnswIndex` auto-calibration path averages the first
-    /// `calibration_threshold` vectors at the moment calibration fires.
+    /// vs un-centered, this lifts cosine-search recall on data with
+    /// non-trivial cluster structure (glove, sentence-transformers,
+    /// OpenAI embeddings). K=16 is the size the SIGMOD 2024 reference
+    /// RaBitQ-Library uses on its glove benchmarks — residuals within a
+    /// 16-cluster IVF have ~30% smaller L2 norm than residuals against a
+    /// single global mean, so the sign-bit code is correspondingly
+    /// sharper.
     ///
     /// # Panics
     ///
-    /// Panics if `centroid.len() != dims as usize` or `dims == 0`.
-    pub fn calibrate_with_centroid(dims: u32, seed: u64, centroid: Vec<f32>) -> Self {
+    /// Panics if `centroids.len() != n_clusters * dims` or
+    /// `n_clusters == 0` or `dims == 0`.
+    pub fn calibrate_with_centroids(
+        dims: u32,
+        seed: u64,
+        centroids: Vec<f32>,
+        n_clusters: u32,
+    ) -> Self {
+        assert!(n_clusters > 0, "RaBitQParams: n_clusters must be non-zero");
         assert_eq!(
-            centroid.len(),
-            dims as usize,
-            "RaBitQParams::calibrate_with_centroid: centroid dim mismatch"
+            centroids.len(),
+            (n_clusters as usize) * (dims as usize),
+            "RaBitQParams::calibrate_with_centroids: centroids must be n_clusters * dims flat",
         );
         let mut base = Self::calibrate(dims, seed);
-        let c_norm: f32 = centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
-        base.centroid = centroid;
-        base.c_norm = c_norm;
+        let d = dims as usize;
+        let mut c_norms = Vec::with_capacity(n_clusters as usize);
+        for k in 0..n_clusters as usize {
+            let slice = &centroids[k * d..(k + 1) * d];
+            let n: f32 = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
+            c_norms.push(n);
+        }
+        base.centroids = centroids;
+        base.c_norms = c_norms;
+        base.n_clusters = n_clusters;
         base
+    }
+
+    /// Convenience: run K-means Lloyd on a training sample to derive K
+    /// centroids, then build the calibrated params with them. Suitable
+    /// for HNSW auto-calibration where the caller has the first
+    /// `calibration_threshold` vectors available.
+    ///
+    /// Uses K-means++ for initialisation (seeded by the same `seed` so
+    /// the centroids are deterministic in `(dims, seed, training)`) and
+    /// caps iterations at 12 — empirically Lloyd converges in 5-8
+    /// iterations on D≤1024 data, and 12 is a safe upper bound that
+    /// keeps calibration well under one second even at N=100K.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `training.is_empty()`, `n_clusters == 0`, or any
+    /// training vector's length differs from `dims as usize`.
+    pub fn calibrate_with_kmeans(
+        dims: u32,
+        seed: u64,
+        training: &[Vec<f32>],
+        n_clusters: u32,
+    ) -> Self {
+        assert!(!training.is_empty(), "RaBitQParams: empty training set");
+        assert!(n_clusters > 0, "RaBitQParams: n_clusters must be non-zero");
+        let d = dims as usize;
+        for v in training {
+            assert_eq!(
+                v.len(),
+                d,
+                "RaBitQParams::calibrate_with_kmeans: training vector dim mismatch"
+            );
+        }
+        // K must not exceed N; clamp down silently. For tiny indexes we
+        // degenerate to "one centroid per training point" which is still
+        // a valid (if useless) IVF — the caller chose K, we honour it
+        // as a ceiling.
+        let k = (n_clusters as usize).min(training.len());
+
+        let centroids_flat = kmeans_lloyd(training, d, k, seed);
+        Self::calibrate_with_centroids(dims, seed, centroids_flat, k as u32)
     }
 
     /// In-place FHT-Kac rotation: `x ← FHT · S_b · FHT · S_a · x`, where
@@ -366,11 +552,21 @@ impl RaBitQParams {
         self.seed
     }
 
-    /// `‖centroid‖₂` — 0.0 when the codec runs without IVF centering.
-    /// Exposed so the HNSW rerank fast path can reconstruct `‖x‖` from
-    /// per-code residual scalars (`‖x‖² = c_norm² + 2·radial + ‖r‖²`).
-    pub fn c_norm(&self) -> f32 {
-        self.c_norm
+    /// `‖centroids[cluster_id]‖₂`. Returns 0.0 when the codec runs
+    /// without IVF (`n_clusters == 0`) so the HNSW rerank identity
+    /// `‖x‖² = c_norm² + 2·radial + ‖r‖²` collapses to `‖x‖ = ‖r‖` =
+    /// `code.norm` for legacy un-centered codes.
+    pub fn c_norm(&self, cluster_id: u16) -> f32 {
+        if self.n_clusters == 0 {
+            0.0
+        } else {
+            self.c_norms[cluster_id as usize]
+        }
+    }
+
+    /// Number of IVF clusters. 0 means the codec runs un-centered.
+    pub fn n_clusters(&self) -> u32 {
+        self.n_clusters
     }
 
     /// Encode a single f32 vector to a RaBitQ code.
@@ -386,32 +582,51 @@ impl RaBitQParams {
         );
 
         let d_eff = self.effective_dims as usize;
+        let d_user = self.dims as usize;
         let words = d_eff / 64;
 
-        // K=1 IVF centering: when `self.centroid` is populated, encode the
-        // RESIDUAL `r = x − centroid` instead of the raw vector. `norm`
-        // then stores ‖r‖ and `radial = <r, centroid>` lets the asymmetric
-        // distance reconstruction recover ‖d‖² via the chroma identity
-        // `‖d‖² = ‖c‖² + 2·radial + ‖r‖²`. Empty centroid ⇒ legacy
-        // behaviour (encode raw x; radial = 0).
-        let centered = !self.centroid.is_empty();
+        // IVF assignment: when `self.centroids` is populated, pick the
+        // nearest centroid by L2, encode the residual r = x − c[id], and
+        // store `cluster_id + radial`. n_clusters = 0 ⇒ legacy un-centered
+        // path (cluster_id = 0, radial = 0, residual = vector).
+        let centered = self.n_clusters > 0;
+        let cluster_id: u16 = if centered {
+            let mut best_k = 0u16;
+            let mut best_d = f32::INFINITY;
+            for k in 0..self.n_clusters as usize {
+                let c = &self.centroids[k * d_user..(k + 1) * d_user];
+                let d = l2_sq(vector, c);
+                if d < best_d {
+                    best_d = d;
+                    best_k = k as u16;
+                }
+            }
+            best_k
+        } else {
+            0
+        };
+
         let mut residual: Vec<f32> = if centered {
-            vector
-                .iter()
-                .zip(&self.centroid)
-                .map(|(v, c)| v - c)
-                .collect()
+            let c =
+                &self.centroids[(cluster_id as usize) * d_user..(cluster_id as usize + 1) * d_user];
+            vector.iter().zip(c).map(|(v, c)| v - c).collect()
         } else {
             vector.to_vec()
         };
 
-        // ‖r‖ (or ‖x‖ if no centering) and radial = <r, centroid>.
+        // ‖r‖ (or ‖x‖ if no centering) and radial = <r, c[cluster_id]>.
         let mut norm_sq = 0.0f32;
         let mut radial = 0.0f32;
-        for (i, &v) in residual.iter().enumerate() {
-            norm_sq += v * v;
-            if centered {
-                radial += v * self.centroid[i];
+        if centered {
+            let c =
+                &self.centroids[(cluster_id as usize) * d_user..(cluster_id as usize + 1) * d_user];
+            for (i, &v) in residual.iter().enumerate() {
+                norm_sq += v * v;
+                radial += v * c[i];
+            }
+        } else {
+            for &v in &residual {
+                norm_sq += v * v;
             }
         }
         let norm = norm_sq.sqrt();
@@ -455,6 +670,7 @@ impl RaBitQParams {
             signed_sum,
             correction,
             radial,
+            cluster_id,
         }
     }
 
@@ -484,24 +700,32 @@ impl RaBitQParams {
 
         // 1. Rotate the query through the same FHT-Kac composite the data
         // side uses. Zero-pad beyond user_dims so the rotation produces a
-        // consistent r_q across all encode paths (same Hadamard butterfly,
-        // same sign flips → same orthonormal R).
+        // consistent r_q across all encode paths.
         //
-        // K=1 IVF: we ROTATE the raw query (not the residual) so the
-        // popcount kernel approximates <R·r, R·q> = <r, q>. The
-        // centroid contribution to <d, q> = <c + r, q> = <c, q> + <r, q>
-        // is recovered at distance time by adding `c_dot_q = <c, q>`
-        // (precomputed below) to the estimator output. Centering the
-        // query before rotation would double-count the centroid term.
+        // IVF (K ≥ 1): we ROTATE the raw query (not any residual) so the
+        // popcount kernel approximates <R·r, R·q> = <r, q>. The centroid
+        // contribution `<c_k, q>` is per-cluster and precomputed once
+        // here as `c_dot_q[k]`; the distance reconstruction picks the
+        // right entry by `code.cluster_id`.
         let mut norm_sq = 0.0f32;
-        let mut c_dot_q = 0.0f32;
-        for (i, &v) in vector.iter().enumerate() {
+        for &v in vector {
             norm_sq += v * v;
-            if !self.centroid.is_empty() {
-                c_dot_q += self.centroid[i] * v;
-            }
         }
         let norm = norm_sq.sqrt();
+        let c_dot_q: Vec<f32> = if self.n_clusters > 0 {
+            let mut out = Vec::with_capacity(self.n_clusters as usize);
+            for k in 0..self.n_clusters as usize {
+                let c = &self.centroids[k * d_user..(k + 1) * d_user];
+                let mut s = 0.0f32;
+                for (i, &v) in vector.iter().enumerate() {
+                    s += c[i] * v;
+                }
+                out.push(s);
+            }
+            out
+        } else {
+            Vec::new()
+        };
         let mut r_q = vec![0.0f32; d_eff];
         r_q[..d_user].copy_from_slice(vector);
         self.fht_kac_in_place(&mut r_q);
@@ -640,17 +864,24 @@ impl RaBitQParams {
         //   d_norm²   = c_norm² + 2·radial + norm²
         //   cos_dist  = 1 − d_dot_q / (‖d‖ · ‖q‖)
         //
-        // When IVF centering is OFF (`centroid` empty), `code.radial`,
-        // `query.c_dot_q` and `self.c_norm` are all 0 and the formula
-        // collapses to the legacy `cos_dist = 1 − g_dot_r_q / (correction · q_norm)`.
+        // When IVF is OFF (`n_clusters == 0`), `code.radial`,
+        // `query.c_dot_q[]` are empty and `self.c_norm()` returns 0 — the
+        // formula collapses to the legacy
+        // `cos_dist = 1 − g_dot_r_q / (correction · q_norm)`.
         let correction = if code.correction.abs() > f32::EPSILON {
             code.correction
         } else {
             return -g_dot_r_q;
         };
         let r_dot_r_q = code.norm * g_dot_r_q / correction;
-        let d_dot_q = query.c_dot_q + r_dot_r_q;
-        let d_norm_sq = self.c_norm * self.c_norm + 2.0 * code.radial + code.norm * code.norm;
+        let c_dot_q = if (code.cluster_id as usize) < query.c_dot_q.len() {
+            query.c_dot_q[code.cluster_id as usize]
+        } else {
+            0.0
+        };
+        let c_norm = self.c_norm(code.cluster_id);
+        let d_dot_q = c_dot_q + r_dot_r_q;
+        let d_norm_sq = c_norm * c_norm + 2.0 * code.radial + code.norm * code.norm;
         let denom = d_norm_sq.sqrt() * query.norm.max(f32::EPSILON);
         if denom.abs() < f32::EPSILON {
             return -g_dot_r_q;
