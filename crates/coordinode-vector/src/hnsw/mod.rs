@@ -751,7 +751,31 @@ impl HnswIndex {
         // keeps RaBitQ codes stable when the segment is reopened. Different
         // shards will switch to per-shard seeds in a follow-up.
         let seed = 0x9E37_79B9_7F4A_7C15u64 ^ self.config.max_dimensions as u64;
-        let params = RaBitQParams::calibrate(dims as u32, seed);
+
+        // K=1 IVF centroid: arithmetic mean of all vectors present at
+        // calibration time. For cosine workloads with a non-zero data mean
+        // (glove, sentence-transformers, OpenAI embeddings) this centers
+        // residuals around the origin so the sign-bit code captures the
+        // *direction-from-mean* rather than direction-from-origin —
+        // recall lift on the order of 10-20 percentage points per the
+        // reference RaBitQ-Library tests on glove-100-angular.
+        let mut centroid = vec![0.0f32; dims];
+        let mut count = 0usize;
+        for node in &self.nodes {
+            if let Some(ref v) = node.vector {
+                for (i, &x) in v.iter().enumerate() {
+                    centroid[i] += x;
+                }
+                count += 1;
+            }
+        }
+        if count > 0 {
+            let inv = 1.0 / count as f32;
+            for c in centroid.iter_mut() {
+                *c *= inv;
+            }
+        }
+        let params = RaBitQParams::calibrate_with_centroid(dims as u32, seed, centroid);
 
         // Two-pass borrow split — encode_rabitq needs `&self.config`
         // while encoding, then we mutate node.rabitq_code separately.

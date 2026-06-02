@@ -110,6 +110,26 @@ pub struct RaBitQParams {
     /// recovering a segment can regenerate the sign vectors bit-identically
     /// from the persisted seed.
     seed: u64,
+    /// Global centroid (K=1 IVF) used to center data and query before
+    /// rotation. Empty `Vec` ⇒ no centering (legacy behaviour, pure HNSW).
+    /// When populated, `encode` stores residuals `r = x − centroid` rotated;
+    /// `encode_query` precomputes `c_dot_q = <centroid, q>` for the
+    /// asymmetric distance reconstruction.
+    ///
+    /// For cosine workloads where data has a non-zero mean direction
+    /// (glove, sentence-transformers, OpenAI embeddings), centering
+    /// shrinks ‖r‖ ≪ ‖x‖ — the sign code captures sharper structure than
+    /// the raw `R·x` it captured before. Reference RaBitQ-Library
+    /// (Gao & Long) uses K=16 cluster centroids; K=1 (global mean) is a
+    /// stepping stone, expected to reduce HNSW-navigation noise enough
+    /// to remove the need for the dual-distance results-heap (which costs
+    /// the current ~4× QPS gap vs hnswlib f32 baseline).
+    #[serde(default)]
+    centroid: Vec<f32>,
+    /// `‖centroid‖₂` — precomputed once, reused per query in the cosine
+    /// distance reconstruction (`d_norm² = c_norm² + 2·radial + r_norm²`).
+    #[serde(default)]
+    c_norm: f32,
 }
 
 /// 1-bit code of a single vector plus the scalars needed by the distance estimator.
@@ -153,6 +173,12 @@ pub struct RaBitQCode {
     /// the next encode pass overwrites with the true value.
     #[serde(default = "default_correction")]
     pub correction: f32,
+    /// `radial = <r, centroid>` where `r = x − centroid` is the residual.
+    /// Used in the centered cosine distance reconstruction
+    /// `d_norm² = c_norm² + 2·radial + norm²`. Default 0.0 means "no IVF
+    /// centering" (legacy codes pre-K=1 — read as `‖d‖ = norm`).
+    #[serde(default)]
+    pub radial: f32,
 }
 
 fn default_correction() -> f32 {
@@ -197,6 +223,11 @@ pub struct RaBitQQuery {
     /// scale-aware inner product or distance (we don't need it for the
     /// monotonic-only HNSW ranking, but keeping it makes the API honest).
     pub norm: f32,
+    /// `c_dot_q = <centroid, query>` — precomputed once per search at
+    /// `encode_query` time. Used by the centered cosine distance
+    /// reconstruction: `<d, q> = c_dot_q + r_dot_r_q`. 0.0 when the codec
+    /// runs without IVF centering (legacy).
+    pub c_dot_q: f32,
 }
 
 impl RaBitQQuery {
@@ -253,7 +284,48 @@ impl RaBitQParams {
             dims,
             effective_dims,
             seed,
+            centroid: Vec::new(),
+            c_norm: 0.0,
         }
+    }
+
+    /// Build a calibrated `RaBitQParams` with a K=1 IVF centroid (data
+    /// mean) so `encode` stores residuals `r = x − centroid`. The
+    /// asymmetric distance reconstruction now reads:
+    ///
+    /// ```text
+    /// <d, q>    = c_dot_q + ‖r‖ · g_dot_r_q / correction
+    /// ‖d‖²      = ‖centroid‖² + 2·<r, centroid> + ‖r‖²
+    /// cos_dist  = 1 − <d, q> / (‖d‖ · ‖q‖)
+    /// ```
+    ///
+    /// vs un-centered (`calibrate`), this lifts cosine-search recall when
+    /// the data distribution has a non-zero mean direction (glove,
+    /// sentence-transformers, OpenAI text embeddings) by sharpening the
+    /// sign-bit code on the residual rather than the raw vector. K=1 is
+    /// the stepping stone toward the K=16 IVF the SIGMOD 2024 reference
+    /// implementation uses; the math is identical apart from carrying a
+    /// `cluster_id` lookup over the centroid array.
+    ///
+    /// `centroid.len()` MUST equal `dims`. Caller is responsible for
+    /// computing the mean over a representative sample of the data; the
+    /// `HnswIndex` auto-calibration path averages the first
+    /// `calibration_threshold` vectors at the moment calibration fires.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `centroid.len() != dims as usize` or `dims == 0`.
+    pub fn calibrate_with_centroid(dims: u32, seed: u64, centroid: Vec<f32>) -> Self {
+        assert_eq!(
+            centroid.len(),
+            dims as usize,
+            "RaBitQParams::calibrate_with_centroid: centroid dim mismatch"
+        );
+        let mut base = Self::calibrate(dims, seed);
+        let c_norm: f32 = centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
+        base.centroid = centroid;
+        base.c_norm = c_norm;
+        base
     }
 
     /// In-place FHT-Kac rotation: `x ← FHT · S_b · FHT · S_a · x`, where
@@ -307,25 +379,40 @@ impl RaBitQParams {
         );
 
         let d_eff = self.effective_dims as usize;
-        let d_user = self.dims as usize;
         let words = d_eff / 64;
 
-        // ‖R·x‖ = ‖x‖ for orthonormal R; padded slots are zero so the norm
-        // is identical to ‖x_user‖.
+        // K=1 IVF centering: when `self.centroid` is populated, encode the
+        // RESIDUAL `r = x − centroid` instead of the raw vector. `norm`
+        // then stores ‖r‖ and `radial = <r, centroid>` lets the asymmetric
+        // distance reconstruction recover ‖d‖² via the chroma identity
+        // `‖d‖² = ‖c‖² + 2·radial + ‖r‖²`. Empty centroid ⇒ legacy
+        // behaviour (encode raw x; radial = 0).
+        let centered = !self.centroid.is_empty();
+        let mut residual: Vec<f32> = if centered {
+            vector
+                .iter()
+                .zip(&self.centroid)
+                .map(|(v, c)| v - c)
+                .collect()
+        } else {
+            vector.to_vec()
+        };
+
+        // ‖r‖ (or ‖x‖ if no centering) and radial = <r, centroid>.
         let mut norm_sq = 0.0f32;
-        for &v in vector {
+        let mut radial = 0.0f32;
+        for (i, &v) in residual.iter().enumerate() {
             norm_sq += v * v;
+            if centered {
+                radial += v * self.centroid[i];
+            }
         }
         let norm = norm_sq.sqrt();
 
-        // Zero-pad the user vector up to effective_dims, then rotate in
-        // place via FHT-Kac. Rotation matrix-vector multiply was the
-        // pre-FHT bottleneck (Θ(D²)) and the source of the Gram-Schmidt
-        // float drift that collapsed Eq. 20 ranking; FHT-Kac is Θ(D log D)
-        // and exactly orthonormal.
-        let mut rotated = vec![0.0f32; d_eff];
-        rotated[..d_user].copy_from_slice(vector);
-        self.fht_kac_in_place(&mut rotated);
+        // Zero-pad to effective_dims, then rotate via FHT-Kac.
+        residual.resize(d_eff, 0.0);
+        self.fht_kac_in_place(&mut residual);
+        let rotated = residual; // rename for clarity below
 
         // Single pass over the rotated vector: pack sign bits, sum + abs-sum
         // for the asymmetric kernel scalars.
@@ -341,13 +428,13 @@ impl RaBitQParams {
         }
         let inv_sqrt_d = 1.0 / (d_eff as f32).sqrt();
 
-        // Σ_i sign(R·x)[i] precomputed once at encode time. Used by the
+        // Σ_i sign(R·r)[i] precomputed once at encode time. Used by the
         // asymmetric kernel (Eq. 20) without re-popcounting the stored
         // code per query: `signed_sum = 2·popcount(code) − D_eff`.
         let popcount: u32 = code.iter().map(|w| w.count_ones()).sum();
         let signed_sum = 2 * popcount as i32 - d_eff as i32;
 
-        // correction = <g, n> = 0.5 · ‖R·x‖_1 / ‖x‖_2 (see RaBitQCode docs).
+        // correction = <g, n> = 0.5 · ‖R·r‖_1 / ‖r‖_2 (see RaBitQCode docs).
         let correction = if norm > f32::EPSILON {
             0.5 * sum_abs_rotated / norm
         } else {
@@ -360,6 +447,7 @@ impl RaBitQParams {
             cross_term: sum_rotated * inv_sqrt_d,
             signed_sum,
             correction,
+            radial,
         }
     }
 
@@ -391,9 +479,20 @@ impl RaBitQParams {
         // side uses. Zero-pad beyond user_dims so the rotation produces a
         // consistent r_q across all encode paths (same Hadamard butterfly,
         // same sign flips → same orthonormal R).
+        //
+        // K=1 IVF: we ROTATE the raw query (not the residual) so the
+        // popcount kernel approximates <R·r, R·q> = <r, q>. The
+        // centroid contribution to <d, q> = <c + r, q> = <c, q> + <r, q>
+        // is recovered at distance time by adding `c_dot_q = <c, q>`
+        // (precomputed below) to the estimator output. Centering the
+        // query before rotation would double-count the centroid term.
         let mut norm_sq = 0.0f32;
-        for &v in vector {
+        let mut c_dot_q = 0.0f32;
+        for (i, &v) in vector.iter().enumerate() {
             norm_sq += v * v;
+            if !self.centroid.is_empty() {
+                c_dot_q += self.centroid[i] * v;
+            }
         }
         let norm = norm_sq.sqrt();
         let mut r_q = vec![0.0f32; d_eff];
@@ -445,6 +544,7 @@ impl RaBitQParams {
             delta,
             sum_q_u,
             norm,
+            c_dot_q,
         }
     }
 
@@ -526,15 +626,29 @@ impl RaBitQParams {
     /// N=50k even after switching from XOR popcount to paper Eq. 20.
     pub fn estimate_cosine_distance_q(&self, code: &RaBitQCode, query: &RaBitQQuery) -> f32 {
         let g_dot_r_q = self.estimate_inner_product_q(code, query);
-        // Pure HNSW path: c=0, radial=0, c_dot_q=0, d=r, ‖d‖=norm.
-        let denom = code.correction * query.norm.max(f32::EPSILON);
+
+        // Chroma `rabitq_distance_query` reconstruction:
+        //   r_dot_r_q = norm · g_dot_r_q / correction
+        //   d_dot_q   = c_dot_q + r_dot_r_q
+        //   d_norm²   = c_norm² + 2·radial + norm²
+        //   cos_dist  = 1 − d_dot_q / (‖d‖ · ‖q‖)
+        //
+        // When IVF centering is OFF (`centroid` empty), `code.radial`,
+        // `query.c_dot_q` and `self.c_norm` are all 0 and the formula
+        // collapses to the legacy `cos_dist = 1 − g_dot_r_q / (correction · q_norm)`.
+        let correction = if code.correction.abs() > f32::EPSILON {
+            code.correction
+        } else {
+            return -g_dot_r_q;
+        };
+        let r_dot_r_q = code.norm * g_dot_r_q / correction;
+        let d_dot_q = query.c_dot_q + r_dot_r_q;
+        let d_norm_sq = self.c_norm * self.c_norm + 2.0 * code.radial + code.norm * code.norm;
+        let denom = d_norm_sq.sqrt() * query.norm.max(f32::EPSILON);
         if denom.abs() < f32::EPSILON {
-            // Zero correction (collinear-along-axis sign code or all-zero
-            // rotated vector) — fall back to the unscaled monotonic form
-            // rather than producing NaN/Inf in the HNSW heap.
             return -g_dot_r_q;
         }
-        1.0 - g_dot_r_q / denom
+        1.0 - d_dot_q / denom
     }
 
     /// Estimate the inner product (dot product) between two encoded vectors.
