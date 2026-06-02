@@ -80,6 +80,20 @@ impl<'a> VisitedListHandle<'a> {
         self.list.counters[id] = self.list.current_epoch;
         was_visited
     }
+
+    /// Pointer to the visited-counter cell for `id`. Exposed for the HNSW
+    /// search hot loop to issue a `_mm_prefetch` (or aarch64 equivalent)
+    /// against the next neighbour's epoch byte before reading it — that's
+    /// the pattern hnswlib uses to hide the visited-array L2/L3 miss
+    /// behind the prior neighbour's distance compute.
+    ///
+    /// Returns `None` when `id` is past the currently-allocated counter
+    /// array (caller should skip prefetch and fall through to the normal
+    /// `check_and_mark` path which will grow on demand).
+    #[inline]
+    pub(crate) fn counter_ptr(&self, id: usize) -> Option<*const u8> {
+        self.list.counters.get(id).map(|c| c as *const u8)
+    }
 }
 
 impl Drop for VisitedListHandle<'_> {

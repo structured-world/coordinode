@@ -2035,7 +2035,24 @@ impl HnswIndex {
 
                 unvisited_neighbors.clear();
                 let n_nodes = self.nodes.len();
-                for &neighbor_idx_u64 in &connections {
+                // hnswlib trick: prefetch the NEXT neighbour's visited
+                // counter byte one iteration ahead of the read. The
+                // counters array is `Vec<u8>` sized to N (1.18M bytes
+                // on glove) — random-access reads on a 1MB array spill
+                // out of L1 every iteration. Prefetching one ahead lets
+                // the cache line arrive in time for the
+                // `check_and_mark` random read on the next iteration.
+                //
+                // Donor: hnswlib `hnswalg.h:371-374`
+                //   _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
+                //   _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
+                for (i, &neighbor_idx_u64) in connections.iter().enumerate() {
+                    if i + 1 < connections.len() {
+                        let next_idx = connections[i + 1] as usize;
+                        if let Some(p) = visited.counter_ptr(next_idx) {
+                            prefetch_read_data(p);
+                        }
+                    }
                     let neighbor_idx = neighbor_idx_u64 as usize;
                     if neighbor_idx < n_nodes && !visited.check_and_mark(neighbor_idx) {
                         unvisited_neighbors.push(neighbor_idx);
