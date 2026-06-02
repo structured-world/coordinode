@@ -253,18 +253,6 @@ impl Default for HnswConfig {
 struct HnswNode {
     /// Node ID (maps to graph node ID).
     id: u64,
-    /// Original f32 vector data. Retained for exact reranking when in-memory.
-    /// `None` when vectors are offloaded to disk (see `HnswConfig::offload_vectors`).
-    /// When offloaded, reranking loads f32 from external storage via `VectorLoader`.
-    vector: Option<Vec<f32>>,
-    /// SQ8-quantized vector for memory-efficient HNSW traversal.
-    /// `None` until SQ8 calibration is complete.
-    quantized: Option<Vec<u8>>,
-    /// RaBitQ code (1-bit popcount kernel or 2/3/4-bit Extended-RaBitQ).
-    /// `None` until calibration is complete. Active when the index is
-    /// configured with [`QuantizationCodec::RaBitQ`]. The variant is
-    /// fixed at calibration time and never mixed within one index.
-    rabitq_code: Option<RabitqEncoded>,
     /// Highest layer this element exists on. Same value as
     /// `neighbours_atomic[node_idx].len() - 1`; cached here so the rebuild
     /// path doesn't have to indirect through the mirror on every read.
@@ -274,8 +262,33 @@ struct HnswNode {
 /// HNSW index: in-memory approximate nearest neighbor graph.
 pub struct HnswIndex {
     config: HnswConfig,
-    /// All nodes indexed by ID.
+    /// All nodes' light metadata (id + max_layer). The hot per-node payload
+    /// (f32 vector, SQ8 quantized, RaBitQ code) lives in the parallel
+    /// `node_vectors` / `node_quantized` / `node_rabitq_codes` arrays so a
+    /// search visit reads only the payload it actually needs. Before this
+    /// SoA split the whole `HnswNode` struct (id + 3× Option<Vec> + usize
+    /// = ~80 B) was loaded per visit; for a 1.18 M-node glove index that
+    /// pulled ~90 MiB of mostly-unused metadata into L1/L2 during search.
+    /// hnswlib's contiguous `data_level0_memory_` chose the opposite layout
+    /// for the same reason — one allocation, one prefetch covers everything
+    /// the inner loop needs. SoA is the Rust-friendly version of that
+    /// invariant: parallel arrays sized to `nodes.len()`, lock-step on
+    /// every push.
     nodes: Vec<HnswNode>,
+    /// Original f32 vector data, parallel to `nodes`. `None` when offloaded
+    /// to disk (see `HnswConfig::offload_vectors`). Read by the rerank path
+    /// (`compute_exact_distance`) and the build path (`distance_between_
+    /// nodes`).
+    node_vectors: Vec<Option<Vec<f32>>>,
+    /// SQ8-quantized vector, parallel to `nodes`. `None` until SQ8
+    /// calibration completes (or always None when SQ8 is disabled).
+    node_quantized: Vec<Option<Vec<u8>>>,
+    /// RaBitQ code (1-bit popcount kernel or 2/3/4-bit Extended-RaBitQ),
+    /// parallel to `nodes`. `None` until calibration completes; the
+    /// variant is fixed at calibration time and never mixed within one
+    /// index. This is the array the cosine-RaBitQ hot path hits on every
+    /// neighbour visit.
+    node_rabitq_codes: Vec<Option<RabitqEncoded>>,
     /// Lock-free per-node-per-layer neighbour lists. Outer Vec indexed by
     /// node index, inner Vec indexed by layer. Sole source of truth for
     /// the graph topology — the search hot path reads from here via
@@ -562,6 +575,9 @@ impl HnswIndex {
         Self {
             config,
             nodes: Vec::with_capacity(capacity),
+            node_vectors: Vec::with_capacity(capacity),
+            node_quantized: Vec::with_capacity(capacity),
+            node_rabitq_codes: Vec::with_capacity(capacity),
             neighbours_atomic: Vec::with_capacity(capacity),
             id_to_idx,
             entry_point: EntryPoint::new(),
@@ -657,19 +673,18 @@ impl HnswIndex {
         // mismatched dims / disabled codec yield None and the slot stays
         // empty (consistent with prior behaviour).
         let encoded: Vec<(usize, Option<RabitqEncoded>)> = self
-            .nodes
+            .node_vectors
             .iter()
             .enumerate()
-            .map(|(i, n)| {
-                let enc = n
-                    .vector
+            .map(|(i, v_opt)| {
+                let enc = v_opt
                     .as_deref()
                     .and_then(|v| self.encode_rabitq(&params, v));
                 (i, enc)
             })
             .collect();
         for (i, enc) in encoded {
-            self.nodes[i].rabitq_code = enc;
+            self.node_rabitq_codes[i] = enc;
         }
         self.rabitq_params = Some(params);
     }
@@ -678,12 +693,12 @@ impl HnswIndex {
     /// Quantizes all existing nodes that don't have quantized vectors yet.
     /// If `offload_vectors` is enabled, drops f32 after quantizing.
     pub fn set_sq8_params(&mut self, params: Sq8Params) {
-        for node in &mut self.nodes {
-            if let Some(ref v) = node.vector {
-                node.quantized = Some(params.quantize(v));
+        for idx in 0..self.nodes.len() {
+            if let Some(v) = self.node_vectors[idx].as_ref() {
+                self.node_quantized[idx] = Some(params.quantize(v));
             }
             if self.config.offload_vectors {
-                node.vector = None;
+                self.node_vectors[idx] = None;
             }
         }
         self.sq8_params = Some(params);
@@ -691,12 +706,12 @@ impl HnswIndex {
 
     /// Check if the node at `idx` has an in-memory f32 vector.
     pub fn has_f32_vector(&self, idx: usize) -> bool {
-        self.nodes.get(idx).is_some_and(|n| n.vector.is_some())
+        self.node_vectors.get(idx).is_some_and(|v| v.is_some())
     }
 
     /// Get a reference to the f32 vector at node index `idx`, if present.
     pub fn get_vector(&self, idx: usize) -> Option<&[f32]> {
-        self.nodes.get(idx).and_then(|n| n.vector.as_deref())
+        self.node_vectors.get(idx).and_then(|v| v.as_deref())
     }
 
     /// Auto-calibrate SQ8 from all currently stored vectors.
@@ -717,22 +732,18 @@ impl HnswIndex {
             );
         }
         let refs: Vec<&[f32]> = self
-            .nodes
+            .node_vectors
             .iter()
-            .filter_map(|n| n.vector.as_deref())
+            .filter_map(|v| v.as_deref())
             .collect();
         if let Some(params) = Sq8Params::calibrate(&refs) {
-            for node in &mut self.nodes {
-                if let Some(ref v) = node.vector {
+            for idx in 0..self.nodes.len() {
+                if let Some(v) = self.node_vectors[idx].as_ref() {
                     let code = params.quantize(v);
-                    // SQ8 is now an in-RAM codec only (per ADR-033
-                    // revised 2026-05-28). No disk tier — Phase 1.5
-                    // reads f32 directly from the truth tier.
-                    node.quantized = Some(code);
+                    self.node_quantized[idx] = Some(code);
                 }
-                // Offload f32 after quantization if configured
                 if self.config.offload_vectors {
-                    node.vector = None;
+                    self.node_vectors[idx] = None;
                 }
             }
             self.sq8_params = Some(params);
@@ -748,7 +759,7 @@ impl HnswIndex {
     /// one (R860 starting point; a per-shard seed comes with R-PUSH chains).
     fn auto_calibrate_rabitq(&mut self) {
         // Need at least one vector to infer D.
-        let dims = match self.nodes.iter().find_map(|n| n.vector.as_ref()) {
+        let dims = match self.node_vectors.iter().find_map(|v| v.as_ref()) {
             Some(v) => v.len(),
             None => return,
         };
@@ -774,7 +785,7 @@ impl HnswIndex {
         // upper bound of 12 iterations caps calibration latency well
         // under one second even at calibration_threshold = 100k.
         const N_CLUSTERS: u32 = 16;
-        let training: Vec<Vec<f32>> = self.nodes.iter().filter_map(|n| n.vector.clone()).collect();
+        let training: Vec<Vec<f32>> = self.node_vectors.iter().filter_map(|v| v.clone()).collect();
         let params = if training.is_empty() {
             RaBitQParams::calibrate(dims as u32, seed)
         } else {
@@ -784,19 +795,18 @@ impl HnswIndex {
         // Two-pass borrow split — encode_rabitq needs `&self.config`
         // while encoding, then we mutate node.rabitq_code separately.
         let encoded: Vec<(usize, Option<RabitqEncoded>)> = self
-            .nodes
+            .node_vectors
             .iter()
             .enumerate()
-            .map(|(i, n)| {
-                let enc = n
-                    .vector
+            .map(|(i, v_opt)| {
+                let enc = v_opt
                     .as_deref()
                     .and_then(|v| self.encode_rabitq(&params, v));
                 (i, enc)
             })
             .collect();
         for (i, enc) in encoded {
-            self.nodes[i].rabitq_code = enc;
+            self.node_rabitq_codes[i] = enc;
         }
         self.rabitq_params = Some(params);
     }
@@ -1079,11 +1089,12 @@ impl HnswIndex {
 
         self.nodes.push(HnswNode {
             id,
-            vector: Some(vector),
-            quantized,
-            rabitq_code,
             max_layer: new_level,
         });
+        // SoA payload pushes in lockstep — same idx, no extra clone.
+        self.node_vectors.push(Some(vector));
+        self.node_quantized.push(quantized);
+        self.node_rabitq_codes.push(rabitq_code);
         self.id_to_idx.insert(id, idx);
 
         // Allocate atomic neighbour storage in lockstep — write helpers
@@ -1183,11 +1194,11 @@ impl HnswIndex {
 
             self.nodes.push(HnswNode {
                 id: plan.id,
-                vector: Some(vec),
-                quantized,
-                rabitq_code,
                 max_layer: new_level,
             });
+            self.node_vectors.push(Some(vec));
+            self.node_quantized.push(quantized);
+            self.node_rabitq_codes.push(rabitq_code);
             self.id_to_idx.insert(plan.id, idx);
 
             let mut atomic_layers = Vec::with_capacity(new_level + 1);
@@ -1328,7 +1339,7 @@ impl HnswIndex {
         // Offload is only valid for SQ8 today; RaBitQ disk-rerank with SQ8 on
         // disk is the R861 follow-up.
         if self.is_offloaded() {
-            self.nodes[just_inserted_idx].vector = None;
+            self.node_vectors[just_inserted_idx] = None;
         }
     }
 
@@ -1775,15 +1786,15 @@ impl HnswIndex {
             }
         }
 
-        self.nodes[idx].vector = Some(vector);
-        self.nodes[idx].quantized = quantized;
-        self.nodes[idx].rabitq_code = rabitq_code;
+        self.node_vectors[idx] = Some(vector);
+        self.node_quantized[idx] = quantized;
+        self.node_rabitq_codes[idx] = rabitq_code;
 
         // Step 4: Re-insert into the graph from a valid entry point.
         // A single-node index has no connections to rebuild.
         if self.nodes.len() == 1 {
             if self.is_offloaded() {
-                self.nodes[idx].vector = None;
+                self.node_vectors[idx] = None;
             }
             return;
         }
@@ -1854,7 +1865,7 @@ impl HnswIndex {
 
         // Step 5: Offload f32 if offloading is active (calibration already done).
         if self.is_offloaded() {
-            self.nodes[idx].vector = None;
+            self.node_vectors[idx] = None;
         }
     }
 
@@ -2154,7 +2165,7 @@ impl HnswIndex {
             if let (Some(params), Some(qenc), Some(xcode)) = (
                 self.rabitq_params.as_ref(),
                 ctx.rabitq_query.as_ref(),
-                self.nodes[node_idx].rabitq_code.as_ref(),
+                self.node_rabitq_codes[node_idx].as_ref(),
             ) {
                 match (qenc, xcode) {
                     // 1-bit data × 4-bit-plane query — paper §3.3.2 kernel.
@@ -2173,7 +2184,7 @@ impl HnswIndex {
             }
         }
         if let Some(params) = &self.sq8_params {
-            if let Some(quantized) = &self.nodes[node_idx].quantized {
+            if let Some(quantized) = &self.node_quantized[node_idx] {
                 let dequantized = params.dequantize(quantized);
                 return self.distance_for_metric(ctx, &dequantized);
             }
@@ -2186,13 +2197,13 @@ impl HnswIndex {
     /// Falls back to dequantized SQ8 if f32 is offloaded.
     #[inline(always)]
     fn compute_exact_distance(&self, ctx: &QueryCtx<'_>, node_idx: usize) -> f32 {
-        if let Some(ref node_vec) = self.nodes[node_idx].vector {
+        if let Some(ref node_vec) = self.node_vectors[node_idx] {
             // Cosine fast path: rebuild `‖x‖` from per-code scalars when a
             // RaBitQ code is available, then feed the both-norms helper to
             // skip the `norm_l2(b)` pass per neighbour visit.
             if matches!(self.config.metric, VectorMetric::Cosine) {
                 if let (Some(enc), Some(params)) = (
-                    self.nodes[node_idx].rabitq_code.as_ref(),
+                    self.node_rabitq_codes[node_idx].as_ref(),
                     self.rabitq_params.as_ref(),
                 ) {
                     let b_norm = rabitq_code_norm(enc, params);
@@ -2209,7 +2220,7 @@ impl HnswIndex {
         }
         // f32 offloaded — fall back to dequantized SQ8 (slightly less accurate)
         if let Some(ref params) = self.sq8_params {
-            if let Some(ref quantized) = self.nodes[node_idx].quantized {
+            if let Some(ref quantized) = self.node_quantized[node_idx] {
                 let dequantized = params.dequantize(quantized);
                 return self.distance_for_metric(ctx, &dequantized);
             }
@@ -2388,7 +2399,7 @@ impl HnswIndex {
     /// Prefers exact f32 when available, falls back to dequantized SQ8.
     fn distance_between_nodes(&self, a_idx: usize, b_idx: usize) -> f32 {
         // Try exact f32 for both nodes
-        if let (Some(ref va), Some(ref vb)) = (&self.nodes[a_idx].vector, &self.nodes[b_idx].vector)
+        if let (Some(ref va), Some(ref vb)) = (&self.node_vectors[a_idx], &self.node_vectors[b_idx])
         {
             let ctx = QueryCtx::new(
                 va,
@@ -2417,11 +2428,11 @@ impl HnswIndex {
     /// Used by search_layer_greedy/search_layer during insert when the node
     /// should have f32 but may not if auto_calibrate offloaded early.
     fn get_node_f32_or_dequantized(&self, idx: usize) -> Vec<f32> {
-        if let Some(ref v) = self.nodes[idx].vector {
+        if let Some(ref v) = self.node_vectors[idx] {
             return v.clone();
         }
         if let Some(ref params) = self.sq8_params {
-            if let Some(ref q) = self.nodes[idx].quantized {
+            if let Some(ref q) = self.node_quantized[idx] {
                 return params.dequantize(q);
             }
         }
@@ -2430,10 +2441,10 @@ impl HnswIndex {
 
     /// Get a node's vector: f32 if available, otherwise dequantize from SQ8.
     fn get_node_vector_or_dequantized(&self, idx: usize, params: &Sq8Params) -> Vec<f32> {
-        if let Some(ref v) = self.nodes[idx].vector {
+        if let Some(ref v) = self.node_vectors[idx] {
             return v.clone();
         }
-        if let Some(ref q) = self.nodes[idx].quantized {
+        if let Some(ref q) = self.node_quantized[idx] {
             return params.dequantize(q);
         }
         Vec::new()
@@ -2461,7 +2472,7 @@ impl HnswIndex {
         // a prefetch for each — modern CPUs absorb both into the
         // outstanding-miss queue.
         if matches!(self.config.metric, VectorMetric::Cosine) {
-            if let Some(ref enc) = self.nodes[idx].rabitq_code {
+            if let Some(ref enc) = self.node_rabitq_codes[idx] {
                 let code_words = match enc {
                     RabitqEncoded::OneBit(c) => c.code.as_ptr() as *const u8,
                     RabitqEncoded::Multi(c) => c.packed.as_ptr(),
@@ -2469,9 +2480,9 @@ impl HnswIndex {
                 prefetch_read_data(code_words);
             }
         }
-        if let Some(ref v) = self.nodes[idx].vector {
+        if let Some(ref v) = self.node_vectors[idx] {
             prefetch_read_data(v.as_ptr() as *const u8);
-        } else if let Some(ref q) = self.nodes[idx].quantized {
+        } else if let Some(ref q) = self.node_quantized[idx] {
             prefetch_read_data(q.as_ptr());
         }
     }
@@ -2937,8 +2948,8 @@ mod tests {
         assert!(index.sq8_params().is_some());
 
         // All nodes should now have quantized vectors
-        for node in &index.nodes {
-            assert!(node.quantized.is_some());
+        for q in &index.node_quantized {
+            assert!(q.is_some());
         }
     }
 
@@ -2954,8 +2965,8 @@ mod tests {
 
         // Insert after calibration
         index.insert(100, vec![2.5, 0.5]);
-        let node = &index.nodes[*index.id_to_idx.get(&100).expect("inserted")];
-        assert!(node.quantized.is_some());
+        let idx = *index.id_to_idx.get(&100).expect("inserted");
+        assert!(index.node_quantized[idx].is_some());
     }
 
     #[test]
@@ -3173,9 +3184,9 @@ mod tests {
         assert!(index.rabitq_params().is_some());
         // Every post-calibration node carries an encoded code.
         let coded = index
-            .nodes
+            .node_rabitq_codes
             .iter()
-            .filter(|n| n.rabitq_code.is_some())
+            .filter(|c| c.is_some())
             .count();
         assert_eq!(coded, n, "all {n} nodes should have RaBitQ codes");
 
@@ -3274,9 +3285,9 @@ mod tests {
         // calibration is the bug — codes are missing for some nodes and
         // search falls back to f32 for them, mixing two distance scales.
         let coded = index
-            .nodes
+            .node_rabitq_codes
             .iter()
-            .filter(|n| n.rabitq_code.is_some())
+            .filter(|c| c.is_some())
             .count();
         assert_eq!(
             coded, n,
@@ -3376,8 +3387,8 @@ mod tests {
         // Every post-calibration node must carry a Multi(_) code with bits=2.
         // Encode "variant + bits" as a single u8 (0 = OneBit, 2/3/4 = Multi)
         // so the assertion lives in `assert_eq!` and avoids the `panic!` lint.
-        for (i, node) in index.nodes.iter().enumerate() {
-            let code = node.rabitq_code.as_ref().expect("rabitq code populated");
+        for (i, code_opt) in index.node_rabitq_codes.iter().enumerate() {
+            let code = code_opt.as_ref().expect("rabitq code populated");
             let bits = match code {
                 RabitqEncoded::Multi(c) => c.bits,
                 RabitqEncoded::OneBit(_) => 0,
@@ -3544,16 +3555,15 @@ mod tests {
         assert!(index.is_rabitq_active());
         // Every node must now carry an encoded code, and that code must
         // match the persisted rotation's encoding of its f32 vector.
-        for (i, node) in index.nodes.iter().enumerate() {
+        for i in 0..index.nodes.len() {
+            let code_opt = &index.node_rabitq_codes[i];
             assert!(
-                node.rabitq_code.is_some(),
+                code_opt.is_some(),
                 "node {i} missing rabitq code after set_rabitq_params"
             );
-            let code = node.rabitq_code.as_ref().expect("checked is_some above");
-            // Test fixture configures 1-bit RaBitQ; assert the variant
-            // wraps an identical RaBitQCode after set_rabitq_params.
+            let code = code_opt.as_ref().expect("checked is_some above");
             let expected = RabitqEncoded::OneBit(
-                persisted.encode(node.vector.as_ref().expect("f32 retained")),
+                persisted.encode(index.node_vectors[i].as_ref().expect("f32 retained")),
             );
             assert_eq!(*code, expected, "node {i} code mismatch after reload");
         }
@@ -3572,15 +3582,15 @@ mod tests {
 
         assert!(index.is_quantized());
 
-        for node in &index.nodes {
-            let v = node
-                .vector
+        for i in 0..index.nodes.len() {
+            let v = index.node_vectors[i]
                 .as_ref()
                 .expect("f32 should be retained (offload_vectors=false)");
             assert_eq!(v.len(), dims as usize);
-            let q = node.quantized.as_ref().expect("should be quantized");
+            let q = index.node_quantized[i]
+                .as_ref()
+                .expect("should be quantized");
             assert_eq!(q.len(), dims as usize);
-            // f32 = 4 bytes per dim, u8 = 1 byte per dim → 4x savings
             assert_eq!(v.len() * std::mem::size_of::<f32>(), q.len() * 4);
         }
     }
@@ -3610,8 +3620,8 @@ mod tests {
 
         assert!(index.is_quantized());
         // All existing nodes should now be quantized
-        for node in &index.nodes {
-            assert!(node.quantized.is_some());
+        for q in &index.node_quantized {
+            assert!(q.is_some());
         }
 
         // Search should work with quantization
@@ -3859,14 +3869,14 @@ mod tests {
         assert!(index.is_offloaded(), "should be in offload mode");
 
         // Verify f32 vectors are dropped from in-memory nodes
-        for node in &index.nodes {
+        for (i, node) in index.nodes.iter().enumerate() {
             assert!(
-                node.vector.is_none(),
+                index.node_vectors[i].is_none(),
                 "f32 should be None when offloaded (node {})",
                 node.id
             );
             assert!(
-                node.quantized.is_some(),
+                index.node_quantized[i].is_some(),
                 "quantized should be present (node {})",
                 node.id
             );
@@ -3968,14 +3978,14 @@ mod tests {
 
         // Count f32 memory: offloaded should have 0, retained should have n*dims*4
         let offloaded_f32_bytes: usize = offloaded
-            .nodes
+            .node_vectors
             .iter()
-            .map(|n| n.vector.as_ref().map_or(0, |v| v.len() * 4))
+            .map(|v| v.as_ref().map_or(0, |x| x.len() * 4))
             .sum();
         let retained_f32_bytes: usize = retained
-            .nodes
+            .node_vectors
             .iter()
-            .map(|n| n.vector.as_ref().map_or(0, |v| v.len() * 4))
+            .map(|v| v.as_ref().map_or(0, |x| x.len() * 4))
             .sum();
 
         assert_eq!(offloaded_f32_bytes, 0, "offloaded should have 0 f32 bytes");
