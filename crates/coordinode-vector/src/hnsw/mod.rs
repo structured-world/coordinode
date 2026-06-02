@@ -215,7 +215,7 @@ pub struct HnswConfig {
     pub property_name: String,
     /// Expected upper bound on the number of vectors this index will hold.
     /// Used at construction to pre-allocate the `nodes` and
-    /// `neighbours_atomic` vectors so the insert hot path never pays
+    /// `neighbours_l0` / `neighbours_upper` vectors so the insert hot path never pays
     /// `Vec` reallocation cost. Insert beyond `max_elements` is supported
     /// (the vectors grow normally) but the first overflow re-allocation
     /// pauses inserts briefly; size this generously when ingestion volume
@@ -245,17 +245,18 @@ impl Default for HnswConfig {
 /// A single element in the HNSW graph.
 ///
 /// Per-layer neighbour lists are stored separately on
-/// [`HnswIndex::neighbours_atomic`] using lock-free
+/// [`HnswIndex::neighbours_l0`] (hot path, layer 0) and
+/// [`HnswIndex::neighbours_upper`] (cold path, layers ≥1) using lock-free
 /// [`AtomicNeighbourList`]s — never inside this struct. The node's layer
-/// count equals `neighbours_atomic[node_idx].len()`; the node's max layer
+/// count equals `HnswIndex::node_levels(node_idx)`; the node's max layer
 /// is also captured in [`HnswNode::max_layer`] for cheap access from the
 /// update / rebuild paths.
 struct HnswNode {
     /// Node ID (maps to graph node ID).
     id: u64,
     /// Highest layer this element exists on. Same value as
-    /// `neighbours_atomic[node_idx].len() - 1`; cached here so the rebuild
-    /// path doesn't have to indirect through the mirror on every read.
+    /// `node_levels(node_idx) - 1`; cached here so the rebuild path
+    /// doesn't have to indirect through the mirror on every read.
     max_layer: usize,
 }
 
@@ -289,14 +290,24 @@ pub struct HnswIndex {
     /// index. This is the array the cosine-RaBitQ hot path hits on every
     /// neighbour visit.
     node_rabitq_codes: Vec<Option<RabitqEncoded>>,
-    /// Lock-free per-node-per-layer neighbour lists. Outer Vec indexed by
-    /// node index, inner Vec indexed by layer. Sole source of truth for
-    /// the graph topology — the search hot path reads from here via
-    /// [`AtomicNeighbourList::snapshot_into`] without locking; the write
-    /// path (insert / update_existing_node / prune_connections) mutates
-    /// through the four helpers (`set_outgoing`, `add_neighbour_to`,
-    /// `remove_neighbour_from`, `clear_outgoing`).
-    neighbours_atomic: Vec<Vec<AtomicNeighbourList<M_MAX0>>>,
+    /// Lock-free layer-0 neighbour lists, one entry per node. Flat `Vec`
+    /// indexed by node index — a search visit reads `neighbours_l0[idx]`
+    /// with ONE pointer-stride into a contiguous heap allocation, no inner
+    /// `Vec` heap chase. Mirrors the d365611 SmallVec inline pattern for
+    /// RaBitQ codes: the same `Vec<Vec<…>>` double-indirection that hurt
+    /// code reads also showed up here on the dominant visit-time lookup
+    /// (every neighbour walk touches layer 0; upper layers only fire on
+    /// the top-down descent in `search_layer`).
+    neighbours_l0: Vec<AtomicNeighbourList<M_MAX0>>,
+    /// Lock-free upper-layer neighbour lists. `neighbours_upper[idx]`
+    /// holds layers 1..=top_level for node `idx` (length =
+    /// `nodes[idx].max_layer`). Cold path — only walked during the
+    /// top-down greedy descent in `search_layer_greedy`, never on the
+    /// per-visit `search_layer` candidate expansion that dominates QPS.
+    /// Keeping upper layers in `Vec<Vec<…>>` avoids paying the
+    /// O(total_layers) hot-path penalty across nodes whose `max_layer ==
+    /// 0` (the overwhelming majority on default `level_mult = 1/ln(M)`).
+    neighbours_upper: Vec<Vec<AtomicNeighbourList<M_MAX0>>>,
     /// Map from node ID to index in `nodes` vec.
     id_to_idx: std::collections::HashMap<u64, usize>,
     /// Lock-free entry point: packed `(level, idx)` in a single
@@ -578,7 +589,8 @@ impl HnswIndex {
             node_vectors: Vec::with_capacity(capacity),
             node_quantized: Vec::with_capacity(capacity),
             node_rabitq_codes: Vec::with_capacity(capacity),
-            neighbours_atomic: Vec::with_capacity(capacity),
+            neighbours_l0: Vec::with_capacity(capacity),
+            neighbours_upper: Vec::with_capacity(capacity),
             id_to_idx,
             entry_point: EntryPoint::new(),
             // max_level is derived from entry_point.load() at every
@@ -1099,11 +1111,14 @@ impl HnswIndex {
 
         // Allocate atomic neighbour storage in lockstep — write helpers
         // index by (node, layer) and would panic on a missing entry.
-        let mut atomic_layers = Vec::with_capacity(new_level + 1);
-        for _ in 0..=new_level {
-            atomic_layers.push(AtomicNeighbourList::new());
+        // Layer 0 goes in the flat hot vec; upper layers (if any) in the
+        // cold per-node Vec.
+        self.neighbours_l0.push(AtomicNeighbourList::new());
+        let mut upper = Vec::with_capacity(new_level);
+        for _ in 0..new_level {
+            upper.push(AtomicNeighbourList::new());
         }
-        self.neighbours_atomic.push(atomic_layers);
+        self.neighbours_upper.push(upper);
 
         if is_first_node {
             // First insert seeds the entry-point. try_promote on a
@@ -1130,7 +1145,7 @@ impl HnswIndex {
 
             // Bidirectional: selected → new_node (with optional prune).
             for &neighbor_idx in &selected_idxs {
-                if level < self.neighbours_atomic[neighbor_idx].len() {
+                if level < self.node_levels(neighbor_idx) {
                     self.add_neighbour_to(neighbor_idx, level, idx as u64, max_conn);
                 }
             }
@@ -1153,7 +1168,7 @@ impl HnswIndex {
     ///
     /// Step 1 (serial, `&mut self`):
     ///   * push each new node into `nodes` + allocate matching atomic
-    ///     neighbour layers in `neighbours_atomic`;
+    ///     neighbour layers in `neighbours_l0` / `neighbours_upper`;
     ///   * register the id → idx mapping;
     ///   * promote `entry_point` / `max_level` if a plan's `new_level`
     ///     pierces a new top.
@@ -1201,11 +1216,12 @@ impl HnswIndex {
             self.node_rabitq_codes.push(rabitq_code);
             self.id_to_idx.insert(plan.id, idx);
 
-            let mut atomic_layers = Vec::with_capacity(new_level + 1);
-            for _ in 0..=new_level {
-                atomic_layers.push(AtomicNeighbourList::new());
+            self.neighbours_l0.push(AtomicNeighbourList::new());
+            let mut upper = Vec::with_capacity(new_level);
+            for _ in 0..new_level {
+                upper.push(AtomicNeighbourList::new());
             }
-            self.neighbours_atomic.push(atomic_layers);
+            self.neighbours_upper.push(upper);
 
             // Entry-point promotion through the lock-free CAS-loop.
             // The first insert (`nodes.len() == 1`) hits an empty
@@ -1242,7 +1258,7 @@ impl HnswIndex {
                 self.set_outgoing(*idx, layer.level, &outgoing);
 
                 for &neighbour_idx in &layer.selected_idxs {
-                    if layer.level < self.neighbours_atomic[neighbour_idx].len()
+                    if layer.level < self.node_levels(neighbour_idx)
                         && !self.cas_add_neighbour_to(neighbour_idx, layer.level, *idx as u64)
                     {
                         // cas_append returned false (list at capacity).
@@ -1271,7 +1287,7 @@ impl HnswIndex {
         //
         // Then the groups themselves are disjoint per neighbour_idx, so
         // we run prune-pass via rayon par_iter — each thread touches a
-        // distinct neighbours_atomic[X][Y], no contention. This lifts
+        // distinct neighbour list at (X, Y), no contention. This lifts
         // the serial floor that would otherwise cap parallel speedup
         // under Amdahl's law when hot vertices saturate.
         let mut backfill = backfill.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -1750,17 +1766,15 @@ impl HnswIndex {
     /// 5. Re-connect bidirectionally at each layer.
     fn update_existing_node(&mut self, idx: usize, vector: Vec<f32>) {
         let id = self.nodes[idx].id;
-        let n_levels = self.neighbours_atomic[idx].len();
+        let n_levels = self.node_levels(idx);
 
         // Step 1: Remove this node from every neighbour's connection list.
         // Snapshot first to avoid simultaneous mutable + immutable borrows.
         for level in 0..n_levels {
-            let neighbours = self.neighbours_atomic[idx][level].snapshot();
+            let neighbours = self.neighbours_at(idx, level).snapshot();
             for neighbour_idx_u64 in neighbours {
                 let neighbour_idx = neighbour_idx_u64 as usize;
-                if neighbour_idx < self.nodes.len()
-                    && level < self.neighbours_atomic[neighbour_idx].len()
-                {
+                if neighbour_idx < self.nodes.len() && level < self.node_levels(neighbour_idx) {
                     self.remove_neighbour_from(neighbour_idx, level, idx as u64);
                 }
             }
@@ -1853,7 +1867,7 @@ impl HnswIndex {
 
             // Connect neighbours back (bi-directional).
             for &neighbour_idx in &selected {
-                if level < self.neighbours_atomic[neighbour_idx].len() {
+                if level < self.node_levels(neighbour_idx) {
                     self.add_neighbour_to(neighbour_idx, level, idx as u64, max_conn);
                 }
             }
@@ -1915,8 +1929,9 @@ impl HnswIndex {
             // wait-free: one Acquire load on `len` + that many Relaxed
             // loads on the slot array. No mutex, no Arc clone, no lock
             // contention with concurrent readers.
-            if level < self.neighbours_atomic[current].len() {
-                self.neighbours_atomic[current][level].snapshot_into(&mut neighbours_scratch);
+            if level < self.node_levels(current) {
+                self.neighbours_at(current, level)
+                    .snapshot_into(&mut neighbours_scratch);
                 for &neighbor_idx_u64 in &neighbours_scratch {
                     // Stored u64s ARE internal indices now (HNSW search hot
                     // path: no id_to_idx HashMap hop per neighbour).
@@ -2040,9 +2055,10 @@ impl HnswIndex {
                 break;
             }
 
-            if level < self.neighbours_atomic[closest.idx as usize].len() {
+            if level < self.node_levels(closest.idx as usize) {
                 connections.clear();
-                self.neighbours_atomic[closest.idx as usize][level].snapshot_into(&mut connections);
+                self.neighbours_at(closest.idx as usize, level)
+                    .snapshot_into(&mut connections);
 
                 unvisited_neighbors.clear();
                 let n_nodes = self.nodes.len();
@@ -2271,7 +2287,7 @@ impl HnswIndex {
     ) {
         // Stored u64s ARE neighbour indices now (not NodeIds) — no
         // id_to_idx hop. Dedupe via HashSet on those indices.
-        let neighbours = self.neighbours_atomic[node_idx][level].snapshot();
+        let neighbours = self.neighbours_at(node_idx, level).snapshot();
         let mut seen: std::collections::HashSet<u64> =
             std::collections::HashSet::with_capacity(neighbours.len() + extras.len());
         let mut scored: Vec<(f32, u64)> = Vec::with_capacity(neighbours.len() + extras.len());
@@ -2295,10 +2311,10 @@ impl HnswIndex {
 
     // ── Atomic neighbour write helpers (C1 day 5, refined C3 day 2) ────────
     //
-    // Single source of truth: `neighbours_atomic`. The legacy
-    // `node.connections` is gone.
+    // Single source of truth: `neighbours_l0` + `neighbours_upper`. The
+    // legacy `node.connections` is gone.
     //
-    // **C3 day 2:** helpers that touch only `neighbours_atomic` now take
+    // **C3 day 2:** helpers that touch only the atomic neighbour storage now take
     // `&self` instead of `&mut self`. The new node's atomic layer Vec is
     // append-only at slot-creation time (`apply_insert_plan` pushes once),
     // and once the layers exist their internal state mutates through atomic
@@ -2317,11 +2333,34 @@ impl HnswIndex {
     // / `clear_outgoing` paths are kept for the sequential C1/C2 callers
     // (update_existing_node's rebuild, prune fallback).
 
+    /// Resolve `(node, layer)` to the underlying
+    /// [`AtomicNeighbourList`]. Layer 0 lives in the flat hot-path
+    /// `neighbours_l0` vec; layers ≥1 live in `neighbours_upper[idx]`
+    /// (cold path). One source of truth so call-sites read the same
+    /// addressing rule whether they're hot (per-visit) or cold
+    /// (top-down descent / rebuild).
+    #[inline]
+    fn neighbours_at(&self, idx: usize, level: usize) -> &AtomicNeighbourList<M_MAX0> {
+        if level == 0 {
+            &self.neighbours_l0[idx]
+        } else {
+            &self.neighbours_upper[idx][level - 1]
+        }
+    }
+
+    /// Number of layers the node participates in (`top_level + 1`).
+    /// Replaces the legacy `neighbours_atomic[idx].len()` idiom from
+    /// before the layer-0 / upper-layer split.
+    #[inline]
+    fn node_levels(&self, idx: usize) -> usize {
+        1 + self.neighbours_upper[idx].len()
+    }
+
     /// Replace the entire neighbour set at `(idx, level)` with `ids`.
     /// Truncates to `M_MAX0` on overflow (logged at construction time).
     fn set_outgoing(&self, idx: usize, level: usize, ids: &[u64]) {
         let n = ids.len().min(M_MAX0);
-        self.neighbours_atomic[idx][level].set(&ids[..n]);
+        self.neighbours_at(idx, level).set(&ids[..n]);
     }
 
     /// Multi-writer append-edge primitive (C3). Tries to append `id` to
@@ -2334,7 +2373,7 @@ impl HnswIndex {
     /// commit). C2's serial apply continues to use [`add_neighbour_to`].
     #[allow(dead_code)] // Wired into parallel apply in C3 day 3.
     fn cas_add_neighbour_to(&self, neighbour_idx: usize, level: usize, id: u64) -> bool {
-        self.neighbours_atomic[neighbour_idx][level].cas_append(id)
+        self.neighbours_at(neighbour_idx, level).cas_append(id)
     }
 
     /// Append `id` to `(neighbour_idx, level)`. If the resulting list
@@ -2346,8 +2385,8 @@ impl HnswIndex {
     /// `len` counter, but the prune branch needs `&mut self` because
     /// `prune_connections` reads vectors + reorders the list.
     fn add_neighbour_to(&mut self, neighbour_idx: usize, level: usize, id: u64, max_conn: usize) {
-        if self.neighbours_atomic[neighbour_idx][level].cas_append(id) {
-            let len_now = self.neighbours_atomic[neighbour_idx][level].len();
+        if self.neighbours_at(neighbour_idx, level).cas_append(id) {
+            let len_now = self.neighbours_at(neighbour_idx, level).len();
             if len_now > max_conn {
                 self.prune_connections(neighbour_idx, level, max_conn);
             }
@@ -2364,7 +2403,7 @@ impl HnswIndex {
             // competes fairly against existing neighbours. The kept set
             // has ≤ `max_conn` elements (`≤ M_MAX0`) so `set_outgoing` is
             // guaranteed to fit without truncation.
-            let mut snap = self.neighbours_atomic[neighbour_idx][level].snapshot();
+            let mut snap = self.neighbours_at(neighbour_idx, level).snapshot();
             snap.push(id);
             // Stored u64s ARE neighbour indices — direct cast, no map hop.
             let mut scored: Vec<(f32, u64)> = Vec::with_capacity(snap.len());
@@ -2385,14 +2424,14 @@ impl HnswIndex {
     /// Remove every occurrence of `id` from `(idx, level)`. No-op if `id`
     /// is absent.
     fn remove_neighbour_from(&mut self, idx: usize, level: usize, id: u64) {
-        let mut snap = self.neighbours_atomic[idx][level].snapshot();
+        let mut snap = self.neighbours_at(idx, level).snapshot();
         snap.retain(|&nid| nid != id);
         self.set_outgoing(idx, level, &snap);
     }
 
     /// Clear the entire neighbour set at `(idx, level)`.
     fn clear_outgoing(&mut self, idx: usize, level: usize) {
-        self.neighbours_atomic[idx][level].set(&[]);
+        self.neighbours_at(idx, level).set(&[]);
     }
 
     /// Compute distance between two nodes in the graph.
@@ -2466,11 +2505,26 @@ impl HnswIndex {
         // Cosine + RaBitQ is the only path where this distinction
         // matters in practice; other codecs fall through to the legacy
         // vector / quantized prefetch.
-        // Cosine + RaBitQ hot path needs BOTH the RaBitQ code (cheap
-        // distance frontier) AND the original f32 vector (results-heap
-        // exact rerank). They live in independent allocations, so issue
-        // a prefetch for each — modern CPUs absorb both into the
-        // outstanding-miss queue.
+        // Profile of d365611 (perf record glove M=16 cosine RaBitQ
+        // ef={200,800}) showed this helper at 33.7% of search_layer_ctx
+        // cycles. The prefetch INSTRUCTIONS are near-free; the cost is
+        // the SoA cache misses the helper performs to DECIDE what to
+        // prefetch — `node_rabitq_codes[idx]` (Option<RabitqEncoded>),
+        // `node_vectors[idx]` (Option<Vec<f32>>), `node_quantized[idx]`
+        // (Option<Vec<u8>>) — three independent allocations sized at
+        // ~1.18M slots each on glove. Reading three of them per
+        // neighbour visit pulls three cache lines just to issue one
+        // prefetch hint, which is the opposite of the intended win.
+        //
+        // Fix: on the cosine + RaBitQ hot path the distance kernel
+        // reads ONLY `code` (the popcount frontier). The original f32
+        // vector is consumed by the results-heap exact rerank — which
+        // happens after `search_layer_ctx` returns, only on the
+        // top-ef candidates, not on every visit. So skip the f32 /
+        // quantized lookup entirely when we know the kernel is going
+        // to do RaBitQ. Cuts the helper's SoA-read cost in half
+        // (one cache line + one Option discriminant + one enum match
+        // instead of two cache lines + two Option discriminants).
         if matches!(self.config.metric, VectorMetric::Cosine) {
             if let Some(ref enc) = self.node_rabitq_codes[idx] {
                 let code_words = match enc {
@@ -2478,6 +2532,7 @@ impl HnswIndex {
                     RabitqEncoded::Multi(c) => c.packed.as_ptr(),
                 };
                 prefetch_read_data(code_words);
+                return;
             }
         }
         if let Some(ref v) = self.node_vectors[idx] {
@@ -2783,8 +2838,8 @@ mod tests {
 
         // Count nodes per max layer
         let mut layer_counts = [0usize; 10];
-        for layers in &index.neighbours_atomic {
-            let max_layer = layers.len().saturating_sub(1);
+        for idx in 0..index.nodes.len() {
+            let max_layer = index.node_levels(idx).saturating_sub(1);
             if max_layer < layer_counts.len() {
                 layer_counts[max_layer] += 1;
             }
@@ -4075,18 +4130,20 @@ mod tests {
         // Re-insert one node to exercise update_existing_node.
         idx.insert(7, vec![0.5, -0.5, 0.5, -0.5]);
 
-        assert_eq!(idx.neighbours_atomic.len(), idx.nodes.len());
+        assert_eq!(idx.neighbours_l0.len(), idx.nodes.len());
+        assert_eq!(idx.neighbours_upper.len(), idx.nodes.len());
 
         let mut scratch = Vec::with_capacity(M_MAX0);
-        for (node_idx, layers) in idx.neighbours_atomic.iter().enumerate() {
+        for node_idx in 0..idx.nodes.len() {
             // Node layer count tracks the node's max_layer + 1.
             assert_eq!(
-                layers.len(),
+                idx.node_levels(node_idx),
                 idx.nodes[node_idx].max_layer + 1,
                 "node {node_idx} layer count diverged from max_layer + 1",
             );
-            for (level, list) in layers.iter().enumerate() {
-                list.snapshot_into(&mut scratch);
+            for level in 0..idx.node_levels(node_idx) {
+                idx.neighbours_at(node_idx, level)
+                    .snapshot_into(&mut scratch);
                 assert!(
                     scratch.len() <= M_MAX0,
                     "node {node_idx} level {level} exceeds m_max0 cap",
@@ -4104,8 +4161,8 @@ mod tests {
     #[test]
     fn max_elements_preallocates_node_storage() {
         // C1 day 6: HnswConfig::max_elements drives Vec::with_capacity for
-        // nodes + neighbours_atomic so steady-state inserts don't pay
-        // reallocation cost on the hot path.
+        // nodes + neighbours_l0 / neighbours_upper so steady-state inserts
+        // don't pay reallocation cost on the hot path.
         let cfg = HnswConfig {
             max_elements: 50_000,
             ..HnswConfig::default()
@@ -4118,9 +4175,9 @@ mod tests {
             idx.nodes.capacity()
         );
         assert!(
-            idx.neighbours_atomic.capacity() >= 50_000,
-            "neighbours_atomic Vec capacity {} < max_elements 50_000",
-            idx.neighbours_atomic.capacity()
+            idx.neighbours_l0.capacity() >= 50_000,
+            "neighbours_l0 Vec capacity {} < max_elements 50_000",
+            idx.neighbours_l0.capacity()
         );
         // HashMap::with_capacity may round up; just assert it's non-zero.
         assert!(idx.id_to_idx.capacity() >= 50_000);
