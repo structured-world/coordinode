@@ -2408,6 +2408,32 @@ impl HnswIndex {
     /// falls back to quantized vector when f32 is offloaded.
     #[inline(always)]
     fn prefetch_node_vector(&self, idx: usize) {
+        // Tier the prefetch to whichever representation the hot loop is
+        // going to read first. When RaBitQ is active the distance kernel
+        // touches `code.code` (the u64 sign-bit array) and `code.norm /
+        // correction / radial` scalars first — long before the f32
+        // rerank's `node.vector` load. Prefetching the wrong allocation
+        // costs one cache miss per neighbour visit, which on glove M=16
+        // ef=200 the e554e72 profile measured as ~7% of search cycles
+        // hidden inside `search_layer_ctx`'s self-time.
+        //
+        // Cosine + RaBitQ is the only path where this distinction
+        // matters in practice; other codecs fall through to the legacy
+        // vector / quantized prefetch.
+        // Cosine + RaBitQ hot path needs BOTH the RaBitQ code (cheap
+        // distance frontier) AND the original f32 vector (results-heap
+        // exact rerank). They live in independent allocations, so issue
+        // a prefetch for each — modern CPUs absorb both into the
+        // outstanding-miss queue.
+        if matches!(self.config.metric, VectorMetric::Cosine) {
+            if let Some(ref enc) = self.nodes[idx].rabitq_code {
+                let code_words = match enc {
+                    RabitqEncoded::OneBit(c) => c.code.as_ptr() as *const u8,
+                    RabitqEncoded::Multi(c) => c.packed.as_ptr(),
+                };
+                prefetch_read_data(code_words);
+            }
+        }
         if let Some(ref v) = self.nodes[idx].vector {
             prefetch_read_data(v.as_ptr() as *const u8);
         } else if let Some(ref q) = self.nodes[idx].quantized {
