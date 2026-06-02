@@ -221,6 +221,139 @@ unsafe fn and_popcount_neon(a: &[u64], b: &[u64]) -> u32 {
     sum
 }
 
+/// Fused 4-plane AND+popcount for the asymmetric RaBitQ kernel.
+///
+/// Reads the data code's u64 words **once** and ANDs each word against
+/// the matching word from all four query bit planes in tight succession.
+/// Returns `(pop0, pop1, pop2, pop3)` — the popcount sums per plane,
+/// which the caller weights by `<<j` to form `packed_dot_qu`.
+///
+/// vs four independent `and_popcount` calls (one per plane), this
+/// eliminates three cache-line passes over the code and three rounds
+/// of dispatch overhead. On the HNSW search hot path
+/// `estimate_inner_product_q` runs once per visited neighbour
+/// (typically 2-10k visits per query), so the savings compound. Profile
+/// on the i9-9900K (AVX2 + VPOPCNT-free, no AVX-512) showed
+/// `estimate_inner_product_q` at 21% of search cycles before this fused
+/// kernel landed — the dominant single function in the hot loop.
+///
+/// All five slices MUST have the same length.
+///
+/// # Panics
+///
+/// Panics if any plane length differs from `code.len()`.
+#[inline]
+pub fn and_popcount_4planes(
+    code: &[u64],
+    p0: &[u64],
+    p1: &[u64],
+    p2: &[u64],
+    p3: &[u64],
+) -> (u32, u32, u32, u32) {
+    assert_eq!(
+        p0.len(),
+        code.len(),
+        "and_popcount_4planes: plane0 length mismatch"
+    );
+    assert_eq!(
+        p1.len(),
+        code.len(),
+        "and_popcount_4planes: plane1 length mismatch"
+    );
+    assert_eq!(
+        p2.len(),
+        code.len(),
+        "and_popcount_4planes: plane2 length mismatch"
+    );
+    assert_eq!(
+        p3.len(),
+        code.len(),
+        "and_popcount_4planes: plane3 length mismatch"
+    );
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx512vpopcntdq")
+            && std::is_x86_feature_detected!("avx512f")
+        {
+            // SAFETY: feature detection gates the intrinsic.
+            return unsafe { and_popcount_4planes_avx512(code, p0, p1, p2, p3) };
+        }
+    }
+
+    and_popcount_4planes_scalar(code, p0, p1, p2, p3)
+}
+
+/// Portable scalar fused kernel — `core::*` only. The inner loop loads
+/// each `code[i]` once and ANDs it against `p0[i]..p3[i]` in succession,
+/// keeping the code word in a register the whole time.
+#[inline]
+pub fn and_popcount_4planes_scalar(
+    code: &[u64],
+    p0: &[u64],
+    p1: &[u64],
+    p2: &[u64],
+    p3: &[u64],
+) -> (u32, u32, u32, u32) {
+    let mut s0 = 0u32;
+    let mut s1 = 0u32;
+    let mut s2 = 0u32;
+    let mut s3 = 0u32;
+    for i in 0..code.len() {
+        let x = code[i];
+        s0 += (x & p0[i]).count_ones();
+        s1 += (x & p1[i]).count_ones();
+        s2 += (x & p2[i]).count_ones();
+        s3 += (x & p3[i]).count_ones();
+    }
+    (s0, s1, s2, s3)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vpopcntdq")]
+unsafe fn and_popcount_4planes_avx512(
+    code: &[u64],
+    p0: &[u64],
+    p1: &[u64],
+    p2: &[u64],
+    p3: &[u64],
+) -> (u32, u32, u32, u32) {
+    use std::arch::x86_64::{
+        _mm512_and_si512, _mm512_loadu_si512, _mm512_popcnt_epi64, _mm512_reduce_add_epi64,
+    };
+
+    let len = code.len();
+    let mut s0: i64 = 0;
+    let mut s1: i64 = 0;
+    let mut s2: i64 = 0;
+    let mut s3: i64 = 0;
+    let mut i = 0;
+
+    while i + 8 <= len {
+        let vx = _mm512_loadu_si512(code.as_ptr().add(i) as *const _);
+        let v0 = _mm512_loadu_si512(p0.as_ptr().add(i) as *const _);
+        let v1 = _mm512_loadu_si512(p1.as_ptr().add(i) as *const _);
+        let v2 = _mm512_loadu_si512(p2.as_ptr().add(i) as *const _);
+        let v3 = _mm512_loadu_si512(p3.as_ptr().add(i) as *const _);
+        s0 += _mm512_reduce_add_epi64(_mm512_popcnt_epi64(_mm512_and_si512(vx, v0)));
+        s1 += _mm512_reduce_add_epi64(_mm512_popcnt_epi64(_mm512_and_si512(vx, v1)));
+        s2 += _mm512_reduce_add_epi64(_mm512_popcnt_epi64(_mm512_and_si512(vx, v2)));
+        s3 += _mm512_reduce_add_epi64(_mm512_popcnt_epi64(_mm512_and_si512(vx, v3)));
+        i += 8;
+    }
+
+    while i < len {
+        let x = code[i];
+        s0 += (x & p0[i]).count_ones() as i64;
+        s1 += (x & p1[i]).count_ones() as i64;
+        s2 += (x & p2[i]).count_ones() as i64;
+        s3 += (x & p3[i]).count_ones() as i64;
+        i += 1;
+    }
+
+    (s0 as u32, s1 as u32, s2 as u32, s3 as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

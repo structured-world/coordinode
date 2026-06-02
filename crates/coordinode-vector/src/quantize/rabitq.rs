@@ -475,13 +475,21 @@ impl RaBitQParams {
             "code/query plane length mismatch"
         );
 
-        // Four bit-plane AND+popcount rounds. Plane j contributes
-        // `popcount(code ∧ plane_j) << j` to packed_dot_qu.
-        let pop0 = popcount::and_popcount(&code.code, &query.planes[0]) as i64;
-        let pop1 = popcount::and_popcount(&code.code, &query.planes[1]) as i64;
-        let pop2 = popcount::and_popcount(&code.code, &query.planes[2]) as i64;
-        let pop3 = popcount::and_popcount(&code.code, &query.planes[3]) as i64;
-        let packed_dot_qu: i64 = pop0 + (pop1 << 1) + (pop2 << 2) + (pop3 << 3);
+        // Fused 4-plane AND+popcount: one pass over the data code, AND
+        // against all four query bit planes in tight succession. Replaces
+        // four separate `and_popcount` calls — one cache pass instead of
+        // four, one dispatch instead of four. Profile on i9-9900K had
+        // this kernel at 21% of search cycles via the unfused path; the
+        // fused variant pulls the redundant passes out entirely.
+        let (pop0, pop1, pop2, pop3) = popcount::and_popcount_4planes(
+            &code.code,
+            &query.planes[0],
+            &query.planes[1],
+            &query.planes[2],
+            &query.planes[3],
+        );
+        let packed_dot_qu: i64 =
+            pop0 as i64 + ((pop1 as i64) << 1) + ((pop2 as i64) << 2) + ((pop3 as i64) << 3);
 
         // signed_dot_qu = 2·packed_dot_qu − sum_q_u — turns the 0/1 sign
         // bits into ±1 signs without re-walking the code.
