@@ -111,6 +111,20 @@ pub enum RabitqEncoded {
     Multi(RaBitQExtCode),
 }
 
+/// Pull the precomputed `‖x‖` out of whichever encoded variant a node
+/// carries. The cosine-rerank fast path in `compute_exact_distance` uses
+/// this to skip the per-neighbour `norm_l2(b)` pass — the f32 dot
+/// product already lives in the hot path; computing `b`'s norm again
+/// per call was pure waste once we started doing dual-distance (RaBitQ
+/// frontier + f32 results-heap).
+#[inline]
+fn rabitq_code_norm(enc: &RabitqEncoded) -> f32 {
+    match enc {
+        RabitqEncoded::OneBit(c) => c.norm,
+        RabitqEncoded::Multi(c) => c.norm,
+    }
+}
+
 /// Provides f32 vectors from external storage for reranking when vectors
 /// are offloaded to disk. Implementations should batch-read from the
 /// backing store (e.g., LSM-tree node: partition).
@@ -2110,6 +2124,24 @@ impl HnswIndex {
     #[inline(always)]
     fn compute_exact_distance(&self, ctx: &QueryCtx<'_>, node_idx: usize) -> f32 {
         if let Some(ref node_vec) = self.nodes[node_idx].vector {
+            // Cosine fast path: if the node has a RaBitQ code, its `norm`
+            // field is the precomputed ‖b‖ — feed it into the both-norms
+            // helper so we skip the `norm_l2(b)` pass per neighbour visit.
+            if matches!(self.config.metric, VectorMetric::Cosine) {
+                if let Some(b_norm) = self.nodes[node_idx]
+                    .rabitq_code
+                    .as_ref()
+                    .map(rabitq_code_norm)
+                {
+                    return 1.0
+                        - metrics::cosine_similarity_with_both_norms(
+                            ctx.vec,
+                            node_vec,
+                            ctx.norm_l2,
+                            b_norm,
+                        );
+                }
+            }
             return self.distance_for_metric(ctx, node_vec);
         }
         // f32 offloaded — fall back to dequantized SQ8 (slightly less accurate)

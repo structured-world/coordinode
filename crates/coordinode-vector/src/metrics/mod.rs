@@ -117,6 +117,30 @@ pub fn cosine_similarity_with_query_norm(a: &[f32], b: &[f32], a_norm_l2: f32) -
     dot / denom
 }
 
+/// Cosine similarity where BOTH norms are already known.
+///
+/// `cosine_similarity_with_query_norm` still has to walk `b` twice — once
+/// for `dot(a, b)`, once for `norm_l2(b)`. In HNSW search the second pass
+/// is pure waste when the node vector's norm was precomputed at index
+/// time (e.g. stored on `RaBitQCode.norm` for cosine workloads). This
+/// entry point skips it and saves D add+mul ops per neighbour visit. For
+/// glove M=16 ef=200 that's ~10% of the total search cycles measured via
+/// `perf record`.
+#[inline]
+pub fn cosine_similarity_with_both_norms(
+    a: &[f32],
+    b: &[f32],
+    a_norm_l2: f32,
+    b_norm_l2: f32,
+) -> f32 {
+    let dot = dot_product_inner(a, b);
+    let denom = a_norm_l2 * b_norm_l2;
+    if denom < f32::EPSILON {
+        return 0.0;
+    }
+    dot / denom
+}
+
 /// Cosine distance: 1 - cosine_similarity. Range [0, 2]. Lower = more similar.
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     1.0 - cosine_similarity(a, b)
