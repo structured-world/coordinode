@@ -2057,25 +2057,43 @@ impl HnswIndex {
                     if cheap_dist < farthest_dist || results.len() < ef {
                         // Promising under the cheap metric — verify with
                         // exact f32 before letting it into the kept top-ef.
-                        // The f32 path is also what gates `farthest_dist`,
-                        // so noise in the cheap metric cannot poison the
-                        // prune threshold downstream.
                         let exact_dist = self.compute_exact_distance(ctx, neighbor_idx);
 
                         candidates.push(Candidate {
                             distance: cheap_dist,
                             idx: neighbor_idx as u32,
                         });
-                        results.push(FarCandidate {
-                            distance: exact_dist,
-                            idx: neighbor_idx as u32,
-                        });
 
-                        if results.len() > ef {
-                            results.pop();
-                        }
-                        if let Some(top) = results.peek() {
-                            farthest_dist = top.distance;
+                        // Fixed-length results: peek_mut + in-place swap when
+                        // full, single push during fill. The push+pop pattern
+                        // we used before paid two `O(log ef)` percolations per
+                        // overflow update (one to insert, one to evict); the
+                        // peek_mut+swap pattern (Qdrant's
+                        // `FixedLengthPriorityQueue::push`) does one
+                        // re-sift-on-drop and the work is amortised to a single
+                        // percolation. At ef=800 each overflow now costs ~10
+                        // swaps instead of ~20.
+                        if results.len() < ef {
+                            results.push(FarCandidate {
+                                distance: exact_dist,
+                                idx: neighbor_idx as u32,
+                            });
+                            if let Some(top) = results.peek() {
+                                farthest_dist = top.distance;
+                            }
+                        } else {
+                            if let Some(mut top) = results.peek_mut() {
+                                if exact_dist < top.distance {
+                                    *top = FarCandidate {
+                                        distance: exact_dist,
+                                        idx: neighbor_idx as u32,
+                                    };
+                                }
+                                // peek_mut sifts on drop here.
+                            }
+                            if let Some(top) = results.peek() {
+                                farthest_dist = top.distance;
+                            }
                         }
                     }
                 }
