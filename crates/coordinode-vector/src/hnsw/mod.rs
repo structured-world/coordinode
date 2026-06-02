@@ -118,9 +118,20 @@ pub enum RabitqEncoded {
 /// per call was pure waste once we started doing dual-distance (RaBitQ
 /// frontier + f32 results-heap).
 #[inline]
-fn rabitq_code_norm(enc: &RabitqEncoded) -> f32 {
+fn rabitq_code_norm(enc: &RabitqEncoded, params: &RaBitQParams) -> f32 {
     match enc {
-        RabitqEncoded::OneBit(c) => c.norm,
+        RabitqEncoded::OneBit(c) => {
+            // K=1 IVF: `c.norm = ‖r‖`, NOT `‖x‖`. Reconstruct the true
+            // data-vector norm via the chroma identity
+            // `‖x‖² = ‖centroid‖² + 2·radial + ‖r‖²` so the f32 cosine
+            // rerank denominator (‖q‖·‖x‖) stays exact. Un-centered
+            // codecs (empty centroid) have c_norm = radial = 0 and the
+            // identity collapses to `‖x‖ = ‖r‖ = c.norm`, preserving the
+            // 2114679 cached-norm fast path bit-for-bit.
+            let c_norm = params.c_norm();
+            let d_norm_sq = c_norm * c_norm + 2.0 * c.radial + c.norm * c.norm;
+            d_norm_sq.sqrt()
+        }
         RabitqEncoded::Multi(c) => c.norm,
     }
 }
@@ -2148,15 +2159,15 @@ impl HnswIndex {
     #[inline(always)]
     fn compute_exact_distance(&self, ctx: &QueryCtx<'_>, node_idx: usize) -> f32 {
         if let Some(ref node_vec) = self.nodes[node_idx].vector {
-            // Cosine fast path: if the node has a RaBitQ code, its `norm`
-            // field is the precomputed ‖b‖ — feed it into the both-norms
-            // helper so we skip the `norm_l2(b)` pass per neighbour visit.
+            // Cosine fast path: rebuild `‖x‖` from per-code scalars when a
+            // RaBitQ code is available, then feed the both-norms helper to
+            // skip the `norm_l2(b)` pass per neighbour visit.
             if matches!(self.config.metric, VectorMetric::Cosine) {
-                if let Some(b_norm) = self.nodes[node_idx]
-                    .rabitq_code
-                    .as_ref()
-                    .map(rabitq_code_norm)
-                {
+                if let (Some(enc), Some(params)) = (
+                    self.nodes[node_idx].rabitq_code.as_ref(),
+                    self.rabitq_params.as_ref(),
+                ) {
+                    let b_norm = rabitq_code_norm(enc, params);
                     return 1.0
                         - metrics::cosine_similarity_with_both_norms(
                             ctx.vec,

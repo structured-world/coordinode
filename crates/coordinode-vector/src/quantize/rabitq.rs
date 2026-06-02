@@ -366,6 +366,13 @@ impl RaBitQParams {
         self.seed
     }
 
+    /// `‖centroid‖₂` — 0.0 when the codec runs without IVF centering.
+    /// Exposed so the HNSW rerank fast path can reconstruct `‖x‖` from
+    /// per-code residual scalars (`‖x‖² = c_norm² + 2·radial + ‖r‖²`).
+    pub fn c_norm(&self) -> f32 {
+        self.c_norm
+    }
+
     /// Encode a single f32 vector to a RaBitQ code.
     ///
     /// # Panics
