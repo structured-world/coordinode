@@ -24,6 +24,15 @@
 
 use super::popcount;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
+
+/// Inline-up-to-4-u64-words storage for the RaBitQ sign-bit code. Covers
+/// every `effective_dims ≤ 256` (the most common HNSW workload, including
+/// glove-100-angular padded to 128) without a heap allocation, so reading
+/// the code on a hot HNSW visit is a struct-field load instead of a
+/// pointer-chase through `Vec`'s heap buffer. For larger D the SmallVec
+/// spills to heap with the same semantics as `Vec<u64>`.
+pub type CodeWords = SmallVec<[u64; 4]>;
 
 /// Squared L2 distance between two equal-length f32 slices. Used by the
 /// k-means assignment pass; kept private so the dispatch matches the rest
@@ -269,8 +278,11 @@ pub struct RaBitQParams {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RaBitQCode {
     /// Sign-bit code packed into `D/64` u64 words (LSB-first within each word).
-    /// `code[i / 64]` bit `(i % 64)` corresponds to dimension `i`.
-    pub code: Vec<u64>,
+    /// `code[i / 64]` bit `(i % 64)` corresponds to dimension `i`. Backed by
+    /// [`CodeWords`] (inline up to 4 u64 = covers `D ≤ 256`) so the hot
+    /// HNSW search path reads the bits directly from the struct slot
+    /// instead of dereferencing a heap pointer per visit.
+    pub code: CodeWords,
     /// `‖x‖₂` — L2 norm of the original (pre-rotation) vector. Doubles as `norm`
     /// in the chroma-style distance reconstruction (we run with cluster
     /// centroid c=0 in pure HNSW, so the residual r equals the data vector d).
@@ -637,8 +649,9 @@ impl RaBitQParams {
         let rotated = residual; // rename for clarity below
 
         // Single pass over the rotated vector: pack sign bits, sum + abs-sum
-        // for the asymmetric kernel scalars.
-        let mut code = vec![0u64; words];
+        // for the asymmetric kernel scalars. SmallVec is sized at 4 u64
+        // inline; covers D ≤ 256 with no heap allocation.
+        let mut code: CodeWords = SmallVec::from_elem(0u64, words);
         let mut sum_rotated = 0.0f32;
         let mut sum_abs_rotated = 0.0f32;
         for (i, &v) in rotated.iter().enumerate() {
