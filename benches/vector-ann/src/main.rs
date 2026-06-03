@@ -169,6 +169,16 @@ struct Args {
     /// at fixed recall on the search side.
     #[arg(long, default_value_t = 1.0)]
     alpha_pruning: f32,
+
+    /// Rerank strategy on the RaBitQ search path. `inline` (default)
+    /// keeps the traditional CoordiNode per-visit exact f32 rerank that
+    /// preserves the highest recall but doubles per-visit work.
+    /// `end-of-search` follows qdrant Binary Quantization / chroma /
+    /// DiskANN: traverse on cheap distances alone, then rerank the
+    /// final ef-sized result heap once. `none` skips rerank entirely
+    /// — fastest, lowest recall ceiling.
+    #[arg(long, default_value = "inline")]
+    rerank_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -304,6 +314,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_dimensions: d as u32,
         quantization,
         alpha_pruning: args.alpha_pruning,
+        rerank_mode: match args.rerank_mode.as_str() {
+            "inline" => coordinode_vector::hnsw::RerankMode::Inline,
+            "end-of-search" => coordinode_vector::hnsw::RerankMode::EndOfSearch,
+            "none" => coordinode_vector::hnsw::RerankMode::None,
+            other => {
+                return Err(format!(
+                    "--rerank-mode: expected `inline`, `end-of-search`, or `none`, got `{other}`"
+                )
+                .into())
+            }
+        },
         ..Default::default()
     };
     let mut index = HnswIndex::new(config);
@@ -372,6 +393,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // built with α=1.0 (legacy "take M closest") vs α>1.0 (Vamana-style
     // diverse graph).
     report.record("hnsw_alpha_pruning", args.alpha_pruning as f64)?;
+    report.record("hnsw_rerank_mode", args.rerank_mode.clone())?;
     report.record("quantization", args.quantization.clone())?;
     // Effective thread count used by the rayon build pool. Reported so
     // downstream comparisons can group/filter (`1` vs `4` runs are not

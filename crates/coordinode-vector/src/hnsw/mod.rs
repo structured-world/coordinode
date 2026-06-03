@@ -180,6 +180,42 @@ impl QuantizationCodec {
     }
 }
 
+/// Reranking strategy on the RaBitQ search path (`quantization = RaBitQ`).
+///
+/// CoordiNode's traditional behaviour was [`RerankMode::Inline`]: every
+/// neighbour visit computes the cheap RaBitQ-popcount distance AND an
+/// exact f32 cosine in the same pass, so the `farthest_dist` termination
+/// gate uses the exact metric. That trades ~2× per-visit work for the
+/// best recall — the cron's recall-0.95 target on glove-100-angular only
+/// ever hit it under inline rerank.
+///
+/// [`RerankMode::EndOfSearch`] follows the qdrant Binary Quantization
+/// (`rescore: true`) / DiskANN / RaBitQ SIGMOD 2024 reference pattern:
+/// run the whole HNSW traversal on cheap distances alone, then rerank
+/// the final ef-sized result heap once at the end. Per-visit cost drops
+/// to popcount + one Vec lookup (vs popcount + dot + two Vec lookups
+/// under Inline), at the cost of using a noisy threshold during the
+/// traversal — recall depends on how representative the cheap distance
+/// ranking is.
+///
+/// [`RerankMode::None`] skips rerank entirely — fastest, recall ceiling
+/// is whatever the RaBitQ popcount estimator delivers on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RerankMode {
+    /// Exact f32 rerank on every neighbour visit. Preserves the highest
+    /// recall but pays the structural ~2× per-visit cost.
+    #[default]
+    Inline,
+    /// Single-pass HNSW search on cheap distances, then exact rerank of
+    /// the final ef-sized result heap. Industry-standard pattern (qdrant,
+    /// chroma, DiskANN). Per-visit cost is ~1 distance call instead of 2.
+    EndOfSearch,
+    /// No rerank — return the cheap-distance top-ef ranking as-is.
+    /// Lowest cost, lowest recall ceiling. Intended for QPS-critical
+    /// workloads where the popcount estimator is already accurate enough.
+    None,
+}
+
 /// HNSW index configuration.
 #[derive(Debug, Clone)]
 pub struct HnswConfig {
@@ -213,6 +249,12 @@ pub struct HnswConfig {
     /// Passed to `VectorLoader::load_vectors` so one loader serves all indexes.
     /// Empty string if unknown (non-offloaded indexes don't need this).
     pub property_name: String,
+    /// Rerank strategy on the RaBitQ search path. See [`RerankMode`].
+    /// Default [`RerankMode::Inline`] preserves the historical recall
+    /// trade. Bench / production callers wanting the qdrant-style
+    /// end-of-search rerank pattern opt into [`RerankMode::EndOfSearch`];
+    /// QPS-critical low-recall workloads can opt into [`RerankMode::None`].
+    pub rerank_mode: RerankMode,
     /// α parameter for the RobustPrune neighbour-selection heuristic
     /// (Vamana paper / DiskANN, Algorithm 3). When `alpha_pruning > 1.0`,
     /// the construction phase replaces "take M closest" with α-pruning:
@@ -256,6 +298,7 @@ impl Default for HnswConfig {
             calibration_threshold: 100,
             offload_vectors: false,
             property_name: String::new(),
+            rerank_mode: RerankMode::Inline,
             alpha_pruning: 1.0,
             max_elements: 1_000_000,
         }
@@ -2026,6 +2069,167 @@ impl HnswIndex {
         ef: usize,
         level: usize,
     ) -> Vec<Candidate> {
+        // Dispatch on the configured rerank policy. Inline (the legacy
+        // default) keeps the two-heap two-distance design that preserves
+        // glove-class recall. EndOfSearch / None drop the per-visit f32
+        // call and reach much higher QPS at the cost of using a noisy
+        // cheap threshold during traversal; see [`RerankMode`].
+        match self.config.rerank_mode {
+            RerankMode::Inline => self.search_layer_ctx_inline_rerank(ctx, ep, ef, level),
+            RerankMode::EndOfSearch => {
+                self.search_layer_ctx_end_of_search_rerank(ctx, ep, ef, level)
+            }
+            RerankMode::None => self.search_layer_ctx_no_rerank(ctx, ep, ef, level),
+        }
+    }
+
+    /// Cheap-distance HNSW traversal with NO rerank. Returns whatever the
+    /// configured `compute_distance` (RaBitQ popcount when active) ranks
+    /// as top-ef. Lowest cost per visit (one distance call, one Vec
+    /// lookup); recall is bounded by the cheap estimator's accuracy.
+    fn search_layer_ctx_no_rerank(
+        &self,
+        ctx: &QueryCtx<'_>,
+        ep: usize,
+        ef: usize,
+        level: usize,
+    ) -> Vec<Candidate> {
+        let ep_dist = self.compute_distance(ctx, ep);
+
+        let heap_cap = ef + 16;
+        let mut candidates: BinaryHeap<Candidate> = BinaryHeap::with_capacity(heap_cap);
+        let mut results: BinaryHeap<FarCandidate> = BinaryHeap::with_capacity(heap_cap);
+        let mut visited = self.visited_pool.get(self.nodes.len());
+
+        let mut connections: Vec<u64> = Vec::with_capacity(M_MAX0);
+        let mut unvisited_neighbors: Vec<usize> = Vec::with_capacity(M_MAX0);
+
+        candidates.push(Candidate {
+            distance: ep_dist,
+            idx: ep as u32,
+        });
+        results.push(FarCandidate {
+            distance: ep_dist,
+            idx: ep as u32,
+        });
+        visited.check_and_mark(ep);
+
+        let mut farthest_dist = ep_dist;
+
+        while let Some(closest) = candidates.pop() {
+            if closest.distance > farthest_dist {
+                break;
+            }
+            if level >= self.node_levels(closest.idx as usize) {
+                continue;
+            }
+            connections.clear();
+            self.neighbours_at(closest.idx as usize, level)
+                .snapshot_into(&mut connections);
+
+            unvisited_neighbors.clear();
+            let n_nodes = self.nodes.len();
+            for (i, &neighbor_idx_u64) in connections.iter().enumerate() {
+                if i + 1 < connections.len() {
+                    let next_idx = connections[i + 1] as usize;
+                    if let Some(p) = visited.counter_ptr(next_idx) {
+                        prefetch_read_data(p);
+                    }
+                }
+                let neighbor_idx = neighbor_idx_u64 as usize;
+                if neighbor_idx < n_nodes && !visited.check_and_mark(neighbor_idx) {
+                    unvisited_neighbors.push(neighbor_idx);
+                }
+            }
+
+            if let Some(&first) = unvisited_neighbors.first() {
+                self.prefetch_node_vector(first);
+            }
+
+            for (i, &neighbor_idx) in unvisited_neighbors.iter().enumerate() {
+                if i + 1 < unvisited_neighbors.len() {
+                    self.prefetch_node_vector(unvisited_neighbors[i + 1]);
+                }
+
+                let dist = self.compute_distance(ctx, neighbor_idx);
+
+                if dist < farthest_dist || results.len() < ef {
+                    candidates.push(Candidate {
+                        distance: dist,
+                        idx: neighbor_idx as u32,
+                    });
+                    if results.len() < ef {
+                        results.push(FarCandidate {
+                            distance: dist,
+                            idx: neighbor_idx as u32,
+                        });
+                    } else if let Some(mut top) = results.peek_mut() {
+                        if dist < top.distance {
+                            *top = FarCandidate {
+                                distance: dist,
+                                idx: neighbor_idx as u32,
+                            };
+                        }
+                    }
+                    if let Some(top) = results.peek() {
+                        farthest_dist = top.distance;
+                    }
+                }
+            }
+        }
+
+        let mut result_vec: Vec<Candidate> = results
+            .into_iter()
+            .map(|r| Candidate {
+                distance: r.distance,
+                idx: r.idx,
+            })
+            .collect();
+        result_vec.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        result_vec
+    }
+
+    /// Cheap-distance HNSW traversal followed by ONE exact f32 rerank
+    /// pass on the final ef-sized result heap. Industry-standard pattern
+    /// (qdrant `rescore: true`, chroma single_bit, DiskANN, RaBitQ paper
+    /// §4). Per-visit cost during traversal drops to popcount + one Vec
+    /// lookup; the exact-distance work is amortised to ef calls at the
+    /// very end, instead of being paid per visit.
+    fn search_layer_ctx_end_of_search_rerank(
+        &self,
+        ctx: &QueryCtx<'_>,
+        ep: usize,
+        ef: usize,
+        level: usize,
+    ) -> Vec<Candidate> {
+        let mut result_vec = self.search_layer_ctx_no_rerank(ctx, ep, ef, level);
+        // End-of-search rerank: replace every candidate's distance with
+        // the exact f32 value, then sort by it. This is the only place
+        // the f32 vector is read on the RaBitQ + EndOfSearch path, so
+        // its memory-bandwidth bill is paid once per query per ef slot,
+        // not once per neighbour visit.
+        for c in result_vec.iter_mut() {
+            c.distance = self.compute_exact_distance(ctx, c.idx as usize);
+        }
+        result_vec.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        result_vec
+    }
+
+    fn search_layer_ctx_inline_rerank(
+        &self,
+        ctx: &QueryCtx<'_>,
+        ep: usize,
+        ef: usize,
+        level: usize,
+    ) -> Vec<Candidate> {
         // Two-heap pattern: cheap frontier vs accurate threshold.
         //
         // The `candidates` (frontier) heap is keyed on the cheap distance
@@ -2655,6 +2859,63 @@ mod tests {
     }
 
     #[test]
+    fn rerank_mode_end_of_search_returns_results_on_cosine_rabitq() {
+        // Smoke test that EndOfSearch dispatch produces the right shape
+        // — populated result set, top hit on a known-good query is
+        // itself. Recall correctness is exercised more thoroughly in
+        // the heavy rabitq_recall_* tests; this one just guards against
+        // the new dispatch arm returning empty / panicking.
+        let mut cfg = make_config(VectorMetric::Cosine);
+        cfg.quantization = QuantizationCodec::RaBitQ { bits: 1 };
+        cfg.rerank_mode = RerankMode::EndOfSearch;
+        cfg.calibration_threshold = 16;
+        let mut index = HnswIndex::new(cfg);
+        for i in 0..32u64 {
+            let v: Vec<f32> = (0..16)
+                .map(|d| ((i as f32 * 0.3) + d as f32 * 0.1).sin())
+                .collect();
+            index.insert(i, v);
+        }
+        for i in 0..32u64 {
+            let v: Vec<f32> = (0..16)
+                .map(|d| ((i as f32 * 0.3) + d as f32 * 0.1).sin())
+                .collect();
+            let results = index.search(&v, 1);
+            assert_eq!(
+                results.first().map(|r| r.id),
+                Some(i),
+                "EndOfSearch rerank must still find a node's own self at rank 1 (i={i})",
+            );
+        }
+    }
+
+    #[test]
+    fn rerank_mode_none_returns_results_on_cosine_rabitq() {
+        // Smoke test that the None (no rerank) path produces a populated
+        // result set on a tiny RaBitQ index. Recall will be lower than
+        // Inline / EndOfSearch but the search must not panic or return
+        // empty.
+        let mut cfg = make_config(VectorMetric::Cosine);
+        cfg.quantization = QuantizationCodec::RaBitQ { bits: 1 };
+        cfg.rerank_mode = RerankMode::None;
+        cfg.calibration_threshold = 16;
+        let mut index = HnswIndex::new(cfg);
+        for i in 0..32u64 {
+            let v: Vec<f32> = (0..16)
+                .map(|d| ((i as f32 * 0.3) + d as f32 * 0.1).sin())
+                .collect();
+            index.insert(i, v);
+        }
+        let q: Vec<f32> = (0..16).map(|d| (d as f32 * 0.1).sin()).collect();
+        let results = index.search(&q, 3);
+        assert!(
+            !results.is_empty(),
+            "None rerank mode must still return search results",
+        );
+        assert!(results.len() <= 3, "search must respect the k bound");
+    }
+
+    #[test]
     fn robust_prune_default_alpha_one_is_noop() {
         // α=1.0 must degenerate to legacy "take M closest" — neighbour
         // selection should be identical to the simple strategy. We
@@ -3111,6 +3372,7 @@ mod tests {
             calibration_threshold: 5, // Low threshold for testing
             offload_vectors: false,
             property_name: String::new(),
+            rerank_mode: RerankMode::Inline,
             alpha_pruning: 1.0,
             max_elements: 1_000_000,
         }
@@ -3204,6 +3466,7 @@ mod tests {
             calibration_threshold: 10,
             offload_vectors: false,
             property_name: String::new(),
+            rerank_mode: RerankMode::Inline,
             alpha_pruning: 1.0,
             max_elements: 1_000_000,
         });
@@ -3288,6 +3551,7 @@ mod tests {
             calibration_threshold: 50,
             offload_vectors: false,
             property_name: String::new(),
+            rerank_mode: RerankMode::Inline,
             alpha_pruning: 1.0,
             max_elements: 1_000_000,
         });
@@ -3371,6 +3635,7 @@ mod tests {
             calibration_threshold: threshold,
             offload_vectors: false,
             property_name: String::new(),
+            rerank_mode: RerankMode::Inline,
             alpha_pruning: 1.0,
             max_elements: n as u32,
         });
@@ -3472,6 +3737,7 @@ mod tests {
             calibration_threshold: threshold,
             offload_vectors: false,
             property_name: String::new(),
+            rerank_mode: RerankMode::Inline,
             alpha_pruning: 1.0,
             max_elements: n as u32,
         });
@@ -3576,6 +3842,7 @@ mod tests {
             calibration_threshold: threshold,
             offload_vectors: false,
             property_name: String::new(),
+            rerank_mode: RerankMode::Inline,
             alpha_pruning: 1.0,
             max_elements: n as u32,
         });
@@ -4027,6 +4294,7 @@ mod tests {
             calibration_threshold: 5, // Low threshold for testing
             offload_vectors: true,
             property_name: "embedding".to_string(),
+            rerank_mode: RerankMode::Inline,
             alpha_pruning: 1.0,
             max_elements: 1_000,
         }
@@ -4270,6 +4538,7 @@ mod tests {
             calibration_threshold: 1_000,
             offload_vectors: false,
             property_name: String::new(),
+            rerank_mode: RerankMode::Inline,
             alpha_pruning: 1.0,
             max_elements: 1_000_000,
         });
@@ -4383,6 +4652,7 @@ mod tests {
                 calibration_threshold: 10_000,
                 offload_vectors: false,
                 property_name: String::new(),
+                rerank_mode: RerankMode::Inline,
                 alpha_pruning: 1.0,
                 max_elements: 1_000,
             }
@@ -4454,6 +4724,7 @@ mod tests {
             calibration_threshold: 100_000,
             offload_vectors: false,
             property_name: String::new(),
+            rerank_mode: RerankMode::Inline,
             alpha_pruning: 1.0,
             max_elements: n_train as u32,
         };
@@ -4525,6 +4796,7 @@ mod tests {
             calibration_threshold: 1_000,
             offload_vectors: false,
             property_name: String::new(),
+            rerank_mode: RerankMode::Inline,
             alpha_pruning: 1.0,
             max_elements: 100,
         };
@@ -4559,6 +4831,7 @@ mod tests {
             calibration_threshold: 1_000,
             offload_vectors: false,
             property_name: String::new(),
+            rerank_mode: RerankMode::Inline,
             alpha_pruning: 1.0,
             max_elements: 100,
         };
@@ -4602,6 +4875,7 @@ mod tests {
             calibration_threshold: 10_000,
             offload_vectors: false,
             property_name: String::new(),
+            rerank_mode: RerankMode::Inline,
             alpha_pruning: 1.0,
             max_elements: 1_000,
         };

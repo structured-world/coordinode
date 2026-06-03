@@ -227,6 +227,29 @@ jobs:
               --threads "$T" \
               --output bench-results
             echo "::endgroup::"
+
+            # Gap #2 (E+C) RerankMode sweep on glove RaBitQ.
+            # `inline` is the legacy default already covered by the
+            # alpha=1.0 and alpha=1.2 runs above. Run `end-of-search`
+            # (qdrant / chroma / DiskANN pattern: one rerank at the
+            # very end instead of per visit) and `none` (no rerank
+            # at all) so the dashboard can compare the recall/QPS
+            # curve shift directly. Both run with α=1.0 to keep the
+            # only knob varied vs the existing α=1.0 row.
+            for MODE in end-of-search none; do
+              echo "::group::glove-100-angular M=16 quantization=rabitq rerank_mode=$MODE threads=$T"
+              ./target/release/bench-vector-ann \
+                --train       "$GLOVE_DIR/glove_base.fvecs" \
+                --query       "$GLOVE_DIR/glove_query.fvecs" \
+                --groundtruth "$GLOVE_DIR/glove_groundtruth.ivecs" \
+                --dataset-name glove-100-angular \
+                --m 16 --ef-construction 200 \
+                --codec none --quantization rabitq --rerank-mode "$MODE" \
+                --ef-sweep "$EF_SWEEP" \
+                --threads "$T" \
+                --output bench-results
+              echo "::endgroup::"
+            done
           done
 
       # ── Future modality steps land here, one per modality ─────
