@@ -431,7 +431,56 @@ at matched recall) is what the d67fc2d oversampling knob and Gap #1
 # ─── Verified hnswlib runs ──────────────────────────────────────────────────
 
 [[hnswlib.glove_100_angular]]
-sha = "ff380c9"
+sha = "c8776d2"  # re-run with extended ef sweep so recall ≥ 0.95 is in the table
+threads = 1
+m = 16
+ef_construction = 200
+dataset = "glove-100-angular"
+dataset_n_train = 1_183_514
+dataset_n_test = 10_000
+k = 10
+build_secs = 412.25
+source_json = "bench-results/vector/glove-100-angular/c8776d2-hnswlib-t1-20260603-213851.json"
+how_pinned = "Docker --cpus=1 + OMP/MKL/OpenBLAS env pinned to 1 + hnswlib set_num_threads(1) + per-call num_threads=1 (benches/vector-ann/docker/hnswlib_runner.py)"
+# Recall ≥ 0.95 points only (full sweep in the JSON):
+recall_at_ef1200 = 0.9615  # qps =  575  ← FIRST row to cross 0.95
+recall_at_ef1600 = 0.9706  # qps =  439
+recall_at_ef2000 = 0.9765  # qps =  285
+# Pre-0.95 reference points (kept for trajectory):
+recall_at_ef800  = 0.9462  # qps =  717  ← THE ROW THE OLD ff380c9 RUN REPORTED AS 937. Same recall, different QPS — ~22% run-to-run noise on the i9-9900K ro runner under shared load. Treat any single number with ±20% caveat.
+recall_at_ef400  = 0.9122  # qps = 1412
+notes = """
+Re-ran hnswlib on glove with an extended ef sweep so the table has a
+row that actually crosses recall ≥ 0.95. The previous ff380c9 run
+stopped at ef=800 / recall 0.9462 — below target — so its 937 QPS
+number was misleading anyone who treated it as the "hnswlib at recall
+0.95" reference. It was at recall 0.946.
+
+Honest recall ≥ 0.95 single-thread glove M=16 head-to-head with this
+row in the table:
+
+  hnswlib    f32 ef=1200:   575 QPS @ recall 0.9615   ← BEST at recall ≥ 0.95
+  qdrant     f32 ef=400:    246 QPS @ recall 0.9577
+  CoordiNode RaBitQ inline alpha=1.2 ef=800: 139 QPS @ recall 0.9510
+
+  → CoordiNode is 4.1x behind hnswlib f32 at matched recall.
+  → CoordiNode is 1.77x behind qdrant f32 at matched recall.
+  → hnswlib is 2.34x ahead of qdrant.
+
+Run-to-run noise caveat: the ff380c9 ef=800 row reported 937 QPS at
+the same recall the c8776d2 row above reports 717 QPS for — a ~22%
+difference on the same hardware under shared load. Several runs with
+median taken would tighten the comparison; not redone here because the
+trajectory and ordering are clear without it.
+
+Closing the 4.1x gap to hnswlib needs the orthogonal Gap #1 work
+(HNSW engine layout) that's queued as task #182 — independent of the
+RerankMode / oversample work that's closing the second factor against
+qdrant.
+"""
+
+[[hnswlib.glove_100_angular]]
+sha = "ff380c9"   # ARCHIVED — first hnswlib glove run, ef sweep stopped before recall 0.95
 threads = 1
 m = 16
 ef_construction = 200
