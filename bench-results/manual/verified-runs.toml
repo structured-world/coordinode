@@ -80,6 +80,91 @@ sweep = [
 ]
 
 [[coordinode.glove_100_angular]]
+sha = "5248f69"
+codec = "rabitq-1bit"
+dataset = "glove-100-angular"
+dataset_n_train = 1_183_514
+dataset_n_test = 10_000
+k = 10
+m = 16
+m_max0 = 32
+ef_construction = 200
+alpha_pruning = 1.0
+rerank_mode = "end-of-search"   # Gap #2 (E+C) fix — qdrant / chroma / DiskANN pattern
+build_threads = 4
+search_threads = 1
+build_secs = 315
+source_json = "bench-results/vector/glove-100-angular/5248f69-coordinode-M16-Q1-20260603-201135.json"
+sweep = [
+  { ef =  20, recall_at_10 = 0.3048, qps = 7562.89 },
+  { ef =  40, recall_at_10 = 0.4514, qps = 4831.05 },
+  { ef =  80, recall_at_10 = 0.5969, qps = 3040.60 },
+  { ef = 200, recall_at_10 = 0.7552, qps = 1503.02 },
+  { ef = 400, recall_at_10 = 0.8369, qps =  803.43 },
+  { ef = 800, recall_at_10 = 0.8969, qps =  454.22 },
+]
+notes = """
+First end-of-search rerank measurement. Cheap-distance HNSW traversal
+followed by one exact f32 rerank pass on the final ef-sized result
+heap — qdrant Binary Quantization (`rescore: true`) / chroma
+RaBitQ-Library / DiskANN / RaBitQ SIGMOD 2024 §4 pattern.
+
+QPS impact on the matched-thread comparison:
+- inline   α=1.0 ef=800: 158 QPS @ recall 0.9409
+- inline   α=1.2 ef=800: 139 QPS @ recall 0.9510
+- end-of-search α=1.0 ef=800: 454 QPS @ recall 0.8969
+  → +188% QPS vs inline α=1.0 at ef=800, ~5pt recall trade
+
+The recall trade is because the HNSW termination gate uses the noisy
+RaBitQ popcount distance instead of the exact f32. To hit recall ≥
+0.95 with end-of-search, the ef has to climb past 800 (extrapolated
+~1600 for parity, QPS roughly halved to ~227 — still ~+63% over the
+inline α=1.2 row that crosses recall 0.95 at ef=800).
+
+Next Gap #2 step: add an `oversample_factor` knob so the search
+traverses with frontier_ef = oversample × user_ef, then end-of-search
+rerank picks user_ef from the larger candidate set. This is the
+qdrant `oversampling` parameter.
+"""
+
+[[coordinode.glove_100_angular]]
+sha = "5248f69"
+codec = "rabitq-1bit"
+dataset = "glove-100-angular"
+dataset_n_train = 1_183_514
+dataset_n_test = 10_000
+k = 10
+m = 16
+m_max0 = 32
+ef_construction = 200
+alpha_pruning = 1.0
+rerank_mode = "none"   # Gap #2 diagnostic — no f32 rerank at all
+build_threads = 4
+search_threads = 1
+build_secs = 293
+source_json = "bench-results/vector/glove-100-angular/5248f69-coordinode-M16-Q1-20260603-202356.json"
+sweep = [
+  { ef =  20, recall_at_10 = 0.2217, qps = 7658.49 },
+  { ef =  40, recall_at_10 = 0.2586, qps = 4935.20 },
+  { ef =  80, recall_at_10 = 0.2861, qps = 3020.50 },
+  { ef = 200, recall_at_10 = 0.3043, qps = 1551.00 },
+  { ef = 400, recall_at_10 = 0.3074, qps =  897.25 },
+  { ef = 800, recall_at_10 = 0.3075, qps =  488.06 },
+]
+notes = """
+Diagnostic row — no rerank at all. Recall flatlines at ~0.31
+regardless of ef, confirming the RaBitQ popcount estimator alone is
+too noisy on glove D=100 to deliver high recall. Some form of exact
+rerank — either inline per-visit or end-of-search batch — is
+mandatory for the cron's recall ≥ 0.95 target.
+
+QPS at ef=800 = 488 = ceiling of what a pure cheap-distance search
+can do on this hardware/dataset. Confirms the end-of-search row above
+(454 QPS at the same ef) pays only ~7% for the rerank pass itself —
+the rest of the visit-time cost is the popcount + graph traversal.
+"""
+
+[[coordinode.glove_100_angular]]
 sha = "b1004cd"  # CI workflow added α=1.2 sweep alongside α=1.0; this row is the α=1.2 run
 codec = "rabitq-1bit"
 dataset = "glove-100-angular"
