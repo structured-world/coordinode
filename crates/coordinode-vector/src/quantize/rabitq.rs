@@ -175,8 +175,33 @@ fn apply_sign_flip(x: &mut [f32], signs: &[u64]) {
 /// In-place radix-2 Hadamard butterfly. Output is `√D · H · x` where `H`
 /// has entries ±1/√D. The caller scales the result at the end of the Kac
 /// composite (`fht_kac_in_place` multiplies by `1/D` once after two passes).
+///
+/// Runtime-dispatched: AVX2 on x86_64 (8 f32 lanes per add/sub), NEON on
+/// aarch64 (4 lanes), scalar fallback otherwise. The per-stride 8-element
+/// inner loops dominate `D ≥ 8` (every stage with `h ≥ 8`), so SIMD on
+/// `D = 128` saves ~5× cycles on the four widest stages.
 #[inline]
 fn fht_in_place_unscaled(x: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { fht_in_place_unscaled_avx2(x) };
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return unsafe { fht_in_place_unscaled_neon(x) };
+        }
+    }
+
+    #[allow(unreachable_code)]
+    fht_in_place_unscaled_scalar(x);
+}
+
+#[inline]
+fn fht_in_place_unscaled_scalar(x: &mut [f32]) {
     let d = x.len();
     debug_assert!(d.is_power_of_two(), "FHT requires power-of-two length");
     let mut h = 1;
@@ -188,6 +213,78 @@ fn fht_in_place_unscaled(x: &mut [f32]) {
                 let b = x[i + j + h];
                 x[i + j] = a + b;
                 x[i + j + h] = a - b;
+            }
+            i += h * 2;
+        }
+        h *= 2;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fht_in_place_unscaled_avx2(x: &mut [f32]) {
+    use std::arch::x86_64::{_mm256_add_ps, _mm256_loadu_ps, _mm256_storeu_ps, _mm256_sub_ps};
+    let d = x.len();
+    debug_assert!(d.is_power_of_two(), "FHT requires power-of-two length");
+    let ptr = x.as_mut_ptr();
+    let mut h = 1;
+    while h < d {
+        let mut i = 0;
+        while i < d {
+            if h >= 8 {
+                // Vectorised stage: process 8 f32 per add/sub pair.
+                let mut j = 0;
+                while j < h {
+                    let a = _mm256_loadu_ps(ptr.add(i + j));
+                    let b = _mm256_loadu_ps(ptr.add(i + j + h));
+                    _mm256_storeu_ps(ptr.add(i + j), _mm256_add_ps(a, b));
+                    _mm256_storeu_ps(ptr.add(i + j + h), _mm256_sub_ps(a, b));
+                    j += 8;
+                }
+            } else {
+                // Scalar tail for the narrow stages (h ∈ {1,2,4}).
+                for j in 0..h {
+                    let a = *ptr.add(i + j);
+                    let b = *ptr.add(i + j + h);
+                    *ptr.add(i + j) = a + b;
+                    *ptr.add(i + j + h) = a - b;
+                }
+            }
+            i += h * 2;
+        }
+        h *= 2;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn fht_in_place_unscaled_neon(x: &mut [f32]) {
+    use std::arch::aarch64::{vaddq_f32, vld1q_f32, vst1q_f32, vsubq_f32};
+    let d = x.len();
+    debug_assert!(d.is_power_of_two(), "FHT requires power-of-two length");
+    let ptr = x.as_mut_ptr();
+    let mut h = 1;
+    while h < d {
+        let mut i = 0;
+        while i < d {
+            if h >= 4 {
+                // Vectorised stage: process 4 f32 per add/sub pair.
+                let mut j = 0;
+                while j < h {
+                    let a = vld1q_f32(ptr.add(i + j));
+                    let b = vld1q_f32(ptr.add(i + j + h));
+                    vst1q_f32(ptr.add(i + j), vaddq_f32(a, b));
+                    vst1q_f32(ptr.add(i + j + h), vsubq_f32(a, b));
+                    j += 4;
+                }
+            } else {
+                // Scalar tail for the narrow stages (h ∈ {1,2}).
+                for j in 0..h {
+                    let a = *ptr.add(i + j);
+                    let b = *ptr.add(i + j + h);
+                    *ptr.add(i + j) = a + b;
+                    *ptr.add(i + j + h) = a - b;
+                }
             }
             i += h * 2;
         }
