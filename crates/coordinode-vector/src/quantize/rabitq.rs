@@ -356,17 +356,7 @@ impl RaBitQCode {
 pub struct RaBitQQuery {
     /// `B_Q = 4` bit planes. `planes[j]` holds bit `j` of every quantized
     /// dimension, packed into `D_eff / 64` u64 words. Plane 0 = LSB.
-    ///
-    /// Inline-up-to-4-u64-words storage per plane — covers every
-    /// `effective_dims ≤ 256` (the common HNSW workload, including
-    /// glove-100 padded to 128 = 2 words/plane) without a heap
-    /// allocation. The 4 heap allocations the previous `[Vec<u64>; 4]`
-    /// shape paid per `encode_query` showed up at ~4.5% of total bench
-    /// cycles on the 14ec191 profile (10k queries × 4 allocations =
-    /// 40k allocator round-trips on the search hot path); SmallVec
-    /// inline keeps the planes on the caller's stack frame and lets the
-    /// allocator slot stay cold.
-    pub planes: [CodeWords; 4],
+    pub planes: [Vec<u64>; 4],
     /// `v_l = min_i(r_q[i])` — bottom of the per-query quantization range.
     pub v_l: f32,
     /// `delta = (v_r − v_l) / (2^B_Q − 1) = (max − min) / 15`. Step size of
@@ -772,15 +762,11 @@ impl RaBitQParams {
         // 3. Quantize and transpose to bit-planes simultaneously. Each q_u[i]
         // is a 4-bit integer 0..=15; bit j of q_u[i] lands in planes[j] at
         // position i. sum_q_u accumulates Σ q_u[i] for the Eq. 20 correction.
-        // Inline-allocate the four bit-planes via SmallVec — for D_eff ≤ 256
-        // (the common case, includes glove-100 padded to 128) each plane
-        // fits in the SmallVec's 4-u64 inline buffer, no heap touch on the
-        // per-query encode path.
-        let mut planes: [CodeWords; 4] = [
-            CodeWords::from_elem(0u64, words),
-            CodeWords::from_elem(0u64, words),
-            CodeWords::from_elem(0u64, words),
-            CodeWords::from_elem(0u64, words),
+        let mut planes: [Vec<u64>; 4] = [
+            vec![0u64; words],
+            vec![0u64; words],
+            vec![0u64; words],
+            vec![0u64; words],
         ];
         let mut sum_q_u: i32 = 0;
         for (i, &v) in r_q.iter().enumerate() {
