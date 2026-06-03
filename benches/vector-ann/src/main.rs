@@ -160,6 +160,15 @@ struct Args {
     /// flag only governs the rayon pool used during graph construction.
     #[arg(long, default_value_t = 0)]
     threads: usize,
+
+    /// RobustPrune α parameter for neighbour selection during HNSW
+    /// construction. `1.0` (default) keeps the original "take M closest"
+    /// strategy. `> 1.0` (Vamana paper recommends `1.2`) enables the
+    /// RobustPrune heuristic — sparser, more diverse graph at the cost
+    /// of higher build time, for lower fanout per query and higher QPS
+    /// at fixed recall on the search side.
+    #[arg(long, default_value_t = 1.0)]
+    alpha_pruning: f32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -294,6 +303,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         metric,
         max_dimensions: d as u32,
         quantization,
+        alpha_pruning: args.alpha_pruning,
         ..Default::default()
     };
     let mut index = HnswIndex::new(config);
@@ -358,6 +368,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     report.record("hnsw_m", args.m)?;
     report.record("hnsw_ef_construction", args.ef_construction)?;
+    // RobustPrune α; recorded so the dashboard can filter / group runs
+    // built with α=1.0 (legacy "take M closest") vs α>1.0 (Vamana-style
+    // diverse graph).
+    report.record("hnsw_alpha_pruning", args.alpha_pruning as f64)?;
     report.record("quantization", args.quantization.clone())?;
     // Effective thread count used by the rayon build pool. Reported so
     // downstream comparisons can group/filter (`1` vs `4` runs are not

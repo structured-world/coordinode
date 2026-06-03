@@ -213,6 +213,25 @@ pub struct HnswConfig {
     /// Passed to `VectorLoader::load_vectors` so one loader serves all indexes.
     /// Empty string if unknown (non-offloaded indexes don't need this).
     pub property_name: String,
+    /// α parameter for the RobustPrune neighbour-selection heuristic
+    /// (Vamana paper / DiskANN, Algorithm 3). When `alpha_pruning > 1.0`,
+    /// the construction phase replaces "take M closest" with α-pruning:
+    /// for each kept neighbour `p*`, drop any candidate `p'` where
+    /// `α · d(p*, p') ≤ d(p, p')` — i.e. p' is closer to p* than (1/α)×
+    /// to the inserted node. This produces a sparser, more *diverse*
+    /// graph: fewer redundant edges → lower fanout per query → fewer
+    /// hops to reach the same recall → higher QPS at fixed recall.
+    ///
+    /// Vamana paper §3 recommends `α = 1.2` as the production default.
+    /// `α = 1.0` is a no-op (degenerates to "take M closest", the
+    /// original HNSW behaviour). The cost is O(R · |V|) extra
+    /// `distance_between_nodes` calls per insert (R = max_conn,
+    /// |V| = ef_construction) — a build-time tax for a search-time
+    /// win.
+    ///
+    /// Default `1.0` (off) so existing recall thresholds in tests don't
+    /// shift unexpectedly; production / bench callers opt in.
+    pub alpha_pruning: f32,
     /// Expected upper bound on the number of vectors this index will hold.
     /// Used at construction to pre-allocate the `nodes` and
     /// `neighbours_l0` / `neighbours_upper` vectors so the insert hot path never pays
@@ -237,6 +256,7 @@ impl Default for HnswConfig {
             calibration_threshold: 100,
             offload_vectors: false,
             property_name: String::new(),
+            alpha_pruning: 1.0,
             max_elements: 1_000_000,
         }
     }
@@ -1036,11 +1056,17 @@ impl HnswIndex {
             } else {
                 self.config.m
             };
-            let selected: Vec<usize> = candidates
-                .into_iter()
-                .take(max_conn)
-                .map(|c| c.idx as usize)
-                .collect();
+            // RobustPrune when alpha > 1.0; legacy "take M closest"
+            // otherwise. Both feed the same downstream insert plan path.
+            let selected: Vec<usize> = if self.config.alpha_pruning > 1.0 {
+                self.select_neighbours_robust_prune(&candidates, max_conn)
+            } else {
+                candidates
+                    .into_iter()
+                    .take(max_conn)
+                    .map(|c| c.idx as usize)
+                    .collect()
+            };
 
             if !selected.is_empty() {
                 current_ep = selected[0];
@@ -2436,6 +2462,72 @@ impl HnswIndex {
 
     /// Compute distance between two nodes in the graph.
     /// Prefers exact f32 when available, falls back to dequantized SQ8.
+    /// RobustPrune neighbour selection (Vamana paper §3, Algorithm 3).
+    ///
+    /// `candidates` come from `search_layer_query_for_build` ordered by
+    /// distance to the inserted node `p` (lower = closer). Iterate in
+    /// closest-first order: each pick `p*` joins the kept set, then we
+    /// drop every later candidate `p'` for which `α · d(p*, p') ≤ d(p, p')`
+    /// — these are the redundant edges (p' is closer to p* than 1/α the
+    /// way back to p, so the edge `p → p'` would just retrace
+    /// `p → p* → p'`). Stops when `kept.len() == max_conn`.
+    ///
+    /// Cost is `O(max_conn · candidates.len())` `distance_between_nodes`
+    /// calls — for default ef_construction=200, max_conn=32 that's ~6.4k
+    /// extra distance evaluations per insert, paid once at build time
+    /// for a graph-quality win every search reads.
+    fn select_neighbours_robust_prune(
+        &self,
+        candidates: &[Candidate],
+        max_conn: usize,
+    ) -> Vec<usize> {
+        if max_conn == 0 || candidates.is_empty() {
+            return Vec::new();
+        }
+        let alpha = self.config.alpha_pruning;
+
+        // Sort by ascending distance to inserted node (lower = closer).
+        // `Candidate.distance` is min-heap-ordered in the source but we
+        // copy out so we can mark pruned entries and pop in closest-first
+        // order without owning a heap.
+        let mut pool: Vec<Candidate> = candidates.to_vec();
+        pool.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut kept: Vec<usize> = Vec::with_capacity(max_conn);
+        let mut pruned = vec![false; pool.len()];
+
+        for i in 0..pool.len() {
+            if pruned[i] {
+                continue;
+            }
+            let p_star = pool[i].idx as usize;
+            kept.push(p_star);
+            if kept.len() == max_conn {
+                break;
+            }
+            // Prune later candidates that fail the α-test against p_star.
+            for j in (i + 1)..pool.len() {
+                if pruned[j] {
+                    continue;
+                }
+                let p_prime = pool[j].idx as usize;
+                // d(p, p') — distance from inserted node to p'.
+                let d_p_pprime = pool[j].distance;
+                // d(p*, p') — pairwise distance between two candidates.
+                let d_pstar_pprime = self.distance_between_nodes(p_star, p_prime);
+                if alpha * d_pstar_pprime <= d_p_pprime {
+                    pruned[j] = true;
+                }
+            }
+        }
+
+        kept
+    }
+
     fn distance_between_nodes(&self, a_idx: usize, b_idx: usize) -> f32 {
         // Try exact f32 for both nodes
         if let (Some(ref va), Some(ref vb)) = (&self.node_vectors[a_idx], &self.node_vectors[b_idx])
@@ -2559,6 +2651,57 @@ mod tests {
             metric,
             max_dimensions: 65_536,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn robust_prune_default_alpha_one_is_noop() {
+        // α=1.0 must degenerate to legacy "take M closest" — neighbour
+        // selection should be identical to the simple strategy. We
+        // smoke-test by running an insert + immediate search and
+        // verifying recall on a small known-good dataset.
+        let mut cfg = make_config(VectorMetric::L2);
+        cfg.alpha_pruning = 1.0;
+        let mut index = HnswIndex::new(cfg);
+        for i in 0..50u64 {
+            let v = vec![i as f32, (i * 2) as f32];
+            index.insert(i, v);
+        }
+        // Nearest neighbour of (0, 0) in this set is id=0 at distance 0.
+        let results = index.search(&[0.0, 0.0], 5);
+        assert!(!results.is_empty(), "α=1.0 must return non-empty result");
+        assert_eq!(
+            results[0].id, 0,
+            "α=1.0 default must find the exact nearest neighbour",
+        );
+    }
+
+    #[test]
+    fn robust_prune_alpha_greater_one_still_recalls_query() {
+        // α > 1.0 produces a sparser graph; check that the recall
+        // contract still holds on a small dataset where every query is
+        // its own nearest neighbour. This is the smoke test that the
+        // pruning loop doesn't accidentally strand the inserted node
+        // (e.g. by selecting zero neighbours).
+        let mut cfg = make_config(VectorMetric::L2);
+        cfg.alpha_pruning = 1.2;
+        let mut index = HnswIndex::new(cfg);
+        let n = 50u64;
+        for i in 0..n {
+            let v = vec![i as f32, (i * 2) as f32];
+            index.insert(i, v);
+        }
+        // Each inserted point queried against itself must rank itself
+        // #1 — this fails if RobustPrune over-prunes and disconnects
+        // the inserted node from the graph.
+        for i in 0..n {
+            let v = vec![i as f32, (i * 2) as f32];
+            let results = index.search(&v, 1);
+            assert_eq!(
+                results.first().map(|r| r.id),
+                Some(i),
+                "α=1.2 must still find a node's own self at rank 1 (i={i})",
+            );
         }
     }
 
@@ -2968,6 +3111,7 @@ mod tests {
             calibration_threshold: 5, // Low threshold for testing
             offload_vectors: false,
             property_name: String::new(),
+            alpha_pruning: 1.0,
             max_elements: 1_000_000,
         }
     }
@@ -3060,6 +3204,7 @@ mod tests {
             calibration_threshold: 10,
             offload_vectors: false,
             property_name: String::new(),
+            alpha_pruning: 1.0,
             max_elements: 1_000_000,
         });
 
@@ -3143,6 +3288,7 @@ mod tests {
             calibration_threshold: 50,
             offload_vectors: false,
             property_name: String::new(),
+            alpha_pruning: 1.0,
             max_elements: 1_000_000,
         });
 
@@ -3225,6 +3371,7 @@ mod tests {
             calibration_threshold: threshold,
             offload_vectors: false,
             property_name: String::new(),
+            alpha_pruning: 1.0,
             max_elements: n as u32,
         });
 
@@ -3325,6 +3472,7 @@ mod tests {
             calibration_threshold: threshold,
             offload_vectors: false,
             property_name: String::new(),
+            alpha_pruning: 1.0,
             max_elements: n as u32,
         });
 
@@ -3428,6 +3576,7 @@ mod tests {
             calibration_threshold: threshold,
             offload_vectors: false,
             property_name: String::new(),
+            alpha_pruning: 1.0,
             max_elements: n as u32,
         });
 
@@ -3878,6 +4027,7 @@ mod tests {
             calibration_threshold: 5, // Low threshold for testing
             offload_vectors: true,
             property_name: "embedding".to_string(),
+            alpha_pruning: 1.0,
             max_elements: 1_000,
         }
     }
@@ -4120,6 +4270,7 @@ mod tests {
             calibration_threshold: 1_000,
             offload_vectors: false,
             property_name: String::new(),
+            alpha_pruning: 1.0,
             max_elements: 1_000_000,
         });
 
@@ -4232,6 +4383,7 @@ mod tests {
                 calibration_threshold: 10_000,
                 offload_vectors: false,
                 property_name: String::new(),
+                alpha_pruning: 1.0,
                 max_elements: 1_000,
             }
         }
@@ -4302,6 +4454,7 @@ mod tests {
             calibration_threshold: 100_000,
             offload_vectors: false,
             property_name: String::new(),
+            alpha_pruning: 1.0,
             max_elements: n_train as u32,
         };
         fn make_vec(i: u64, dim: usize) -> Vec<f32> {
@@ -4372,6 +4525,7 @@ mod tests {
             calibration_threshold: 1_000,
             offload_vectors: false,
             property_name: String::new(),
+            alpha_pruning: 1.0,
             max_elements: 100,
         };
         let mut idx = HnswIndex::new(cfg);
@@ -4405,6 +4559,7 @@ mod tests {
             calibration_threshold: 1_000,
             offload_vectors: false,
             property_name: String::new(),
+            alpha_pruning: 1.0,
             max_elements: 100,
         };
         let mut idx = HnswIndex::new(cfg);
@@ -4447,6 +4602,7 @@ mod tests {
             calibration_threshold: 10_000,
             offload_vectors: false,
             property_name: String::new(),
+            alpha_pruning: 1.0,
             max_elements: 1_000,
         };
         let mut idx = HnswIndex::new(cfg);

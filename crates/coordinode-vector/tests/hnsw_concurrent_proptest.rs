@@ -36,6 +36,7 @@ fn make_config(m: usize, max_dim: u32, max_elements: u32) -> HnswConfig {
         calibration_threshold: 100_000,
         offload_vectors: false,
         property_name: String::new(),
+        alpha_pruning: 1.0,
         max_elements,
     }
 }
