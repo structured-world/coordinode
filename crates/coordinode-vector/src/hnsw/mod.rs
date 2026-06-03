@@ -2525,15 +2525,25 @@ impl HnswIndex {
         // to do RaBitQ. Cuts the helper's SoA-read cost in half
         // (one cache line + one Option discriminant + one enum match
         // instead of two cache lines + two Option discriminants).
-        if matches!(self.config.metric, VectorMetric::Cosine) {
-            if let Some(ref enc) = self.node_rabitq_codes[idx] {
-                let code_words = match enc {
-                    RabitqEncoded::OneBit(c) => c.code.as_ptr() as *const u8,
-                    RabitqEncoded::Multi(c) => c.packed.as_ptr(),
-                };
-                prefetch_read_data(code_words);
-                return;
-            }
+        // On cosine + RaBitQ the prefetch lookup itself was 32.3% of
+        // search_layer_ctx cycles on the 14ec191 profile — most of that
+        // is reading `node_rabitq_codes[idx]` (Vec<Option<RabitqEncoded>>
+        // = 40+ bytes per slot, 47 MiB total on glove → L3 thrash) just
+        // to discover the SmallVec inline buffer's address. The earlier
+        // 91abbdc attempt to cache raw pointers in a flat Vec regressed
+        // -7% because `Vec::with_capacity` doesn't survive growth past
+        // `max_elements` and pointers went stale.
+        //
+        // Step back: on the cosine + RaBitQ hot path the distance
+        // kernel reads `code` in the very next iteration after this
+        // helper returns. The hardware prefetcher tracks the
+        // neighbour-list iteration stride well; the manual prefetch's
+        // lookup cost outweighs the L3-miss savings. Skip the helper
+        // entirely on this path. Single branch on `rabitq_params` (Bool
+        // check on the index-wide state, not per-node) keeps the cost
+        // at ~1 ns per visit instead of ~40 ns.
+        if matches!(self.config.metric, VectorMetric::Cosine) && self.rabitq_params.is_some() {
+            return;
         }
         if let Some(ref v) = self.node_vectors[idx] {
             prefetch_read_data(v.as_ptr() as *const u8);
