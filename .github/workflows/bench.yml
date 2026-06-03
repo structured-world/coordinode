@@ -250,6 +250,31 @@ jobs:
                 --output bench-results
               echo "::endgroup::"
             done
+
+            # Gap #2 oversample sweep on glove RaBitQ end-of-search.
+            # The 5248f69 measurement showed end-of-search at oversample
+            # 1.0 closing 2/3 of the per-visit QPS gap but landing recall
+            # 0.90 at ef=800 — 5pt under the cron's 0.95 target. The
+            # qdrant-equivalent `oversampling` parameter inflates the
+            # cheap-distance frontier so the rerank picks user_ef from a
+            # larger pool. Sweep {1.5, 2.0, 3.0} so the dashboard sees the
+            # whole recall/QPS curve and we can pick the production
+            # default empirically.
+            for OS in 1.5 2.0 3.0; do
+              echo "::group::glove-100-angular M=16 quantization=rabitq rerank_mode=end-of-search oversample=$OS threads=$T"
+              ./target/release/bench-vector-ann \
+                --train       "$GLOVE_DIR/glove_base.fvecs" \
+                --query       "$GLOVE_DIR/glove_query.fvecs" \
+                --groundtruth "$GLOVE_DIR/glove_groundtruth.ivecs" \
+                --dataset-name glove-100-angular \
+                --m 16 --ef-construction 200 \
+                --codec none --quantization rabitq \
+                --rerank-mode end-of-search --rerank-oversample "$OS" \
+                --ef-sweep "$EF_SWEEP" \
+                --threads "$T" \
+                --output bench-results
+              echo "::endgroup::"
+            done
           done
 
       # ── Future modality steps land here, one per modality ─────

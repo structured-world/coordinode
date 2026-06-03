@@ -255,6 +255,22 @@ pub struct HnswConfig {
     /// end-of-search rerank pattern opt into [`RerankMode::EndOfSearch`];
     /// QPS-critical low-recall workloads can opt into [`RerankMode::None`].
     pub rerank_mode: RerankMode,
+    /// Oversampling factor for [`RerankMode::EndOfSearch`]. The search
+    /// traverses the graph with `frontier_ef = ceil(ef * factor)` so
+    /// the cheap-distance heap accumulates a larger candidate pool,
+    /// then the exact f32 rerank picks the best `ef` of those. Direct
+    /// equivalent of qdrant's `oversampling` parameter; chroma and
+    /// DiskANN expose the same knob under different names.
+    ///
+    /// `factor = 1.0` (default) means "no oversampling" — frontier and
+    /// rerank pool are both `ef`. `factor = 2.0` doubles the frontier;
+    /// recall climbs back toward inline-rerank parity at a modest QPS
+    /// cost (the extra cheap-distance work scales linearly, the rerank
+    /// pass scales linearly with the factor, but the f32 dot per
+    /// candidate is amortised over the bigger window).
+    ///
+    /// Ignored when `rerank_mode != RerankMode::EndOfSearch`.
+    pub rerank_oversample_factor: f32,
     /// α parameter for the RobustPrune neighbour-selection heuristic
     /// (Vamana paper / DiskANN, Algorithm 3). When `alpha_pruning > 1.0`,
     /// the construction phase replaces "take M closest" with α-pruning:
@@ -299,6 +315,7 @@ impl Default for HnswConfig {
             offload_vectors: false,
             property_name: String::new(),
             rerank_mode: RerankMode::Inline,
+            rerank_oversample_factor: 1.0,
             alpha_pruning: 1.0,
             max_elements: 1_000_000,
         }
@@ -2206,7 +2223,15 @@ impl HnswIndex {
         ef: usize,
         level: usize,
     ) -> Vec<Candidate> {
-        let mut result_vec = self.search_layer_ctx_no_rerank(ctx, ep, ef, level);
+        // Oversample: traverse the graph with a larger cheap-distance
+        // frontier so the rerank pool sees more candidates. qdrant's
+        // `oversampling` parameter equivalent — `factor = 1.0` (default)
+        // collapses to the original "ef in, ef out" behaviour.
+        let factor = self.config.rerank_oversample_factor.max(1.0);
+        let frontier_ef = ((ef as f32) * factor).ceil() as usize;
+
+        let mut result_vec = self.search_layer_ctx_no_rerank(ctx, ep, frontier_ef, level);
+
         // End-of-search rerank: replace every candidate's distance with
         // the exact f32 value, then sort by it. This is the only place
         // the f32 vector is read on the RaBitQ + EndOfSearch path, so
@@ -2220,6 +2245,9 @@ impl HnswIndex {
                 .partial_cmp(&b.distance)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        // Truncate to user-requested ef — the oversample factor inflated
+        // the frontier only, the caller still wants `ef` results.
+        result_vec.truncate(ef);
         result_vec
     }
 
@@ -2890,6 +2918,43 @@ mod tests {
     }
 
     #[test]
+    fn rerank_mode_end_of_search_oversample_returns_results() {
+        // Smoke test: oversample factor > 1.0 inflates the frontier but
+        // the final result set still respects the user's k bound and
+        // top hit on a known-good query is itself.
+        let mut cfg = make_config(VectorMetric::Cosine);
+        cfg.quantization = QuantizationCodec::RaBitQ { bits: 1 };
+        cfg.rerank_mode = RerankMode::EndOfSearch;
+        cfg.rerank_oversample_factor = 2.5;
+        cfg.calibration_threshold = 16;
+        let mut index = HnswIndex::new(cfg);
+        for i in 0..32u64 {
+            let v: Vec<f32> = (0..16)
+                .map(|d| ((i as f32 * 0.3) + d as f32 * 0.1).sin())
+                .collect();
+            index.insert(i, v);
+        }
+        for i in 0..32u64 {
+            let v: Vec<f32> = (0..16)
+                .map(|d| ((i as f32 * 0.3) + d as f32 * 0.1).sin())
+                .collect();
+            let results = index.search(&v, 1);
+            assert_eq!(
+                results.first().map(|r| r.id),
+                Some(i),
+                "EndOfSearch + oversample must still find a node's own self at rank 1 (i={i})",
+            );
+        }
+        // k bound preserved.
+        let q: Vec<f32> = (0..16).map(|d| (d as f32 * 0.1).sin()).collect();
+        let results = index.search(&q, 4);
+        assert!(
+            results.len() <= 4,
+            "search must respect the k bound even with oversample",
+        );
+    }
+
+    #[test]
     fn rerank_mode_none_returns_results_on_cosine_rabitq() {
         // Smoke test that the None (no rerank) path produces a populated
         // result set on a tiny RaBitQ index. Recall will be lower than
@@ -3373,6 +3438,7 @@ mod tests {
             offload_vectors: false,
             property_name: String::new(),
             rerank_mode: RerankMode::Inline,
+            rerank_oversample_factor: 1.0,
             alpha_pruning: 1.0,
             max_elements: 1_000_000,
         }
@@ -3467,6 +3533,7 @@ mod tests {
             offload_vectors: false,
             property_name: String::new(),
             rerank_mode: RerankMode::Inline,
+            rerank_oversample_factor: 1.0,
             alpha_pruning: 1.0,
             max_elements: 1_000_000,
         });
@@ -3552,6 +3619,7 @@ mod tests {
             offload_vectors: false,
             property_name: String::new(),
             rerank_mode: RerankMode::Inline,
+            rerank_oversample_factor: 1.0,
             alpha_pruning: 1.0,
             max_elements: 1_000_000,
         });
@@ -3636,6 +3704,7 @@ mod tests {
             offload_vectors: false,
             property_name: String::new(),
             rerank_mode: RerankMode::Inline,
+            rerank_oversample_factor: 1.0,
             alpha_pruning: 1.0,
             max_elements: n as u32,
         });
@@ -3738,6 +3807,7 @@ mod tests {
             offload_vectors: false,
             property_name: String::new(),
             rerank_mode: RerankMode::Inline,
+            rerank_oversample_factor: 1.0,
             alpha_pruning: 1.0,
             max_elements: n as u32,
         });
@@ -3843,6 +3913,7 @@ mod tests {
             offload_vectors: false,
             property_name: String::new(),
             rerank_mode: RerankMode::Inline,
+            rerank_oversample_factor: 1.0,
             alpha_pruning: 1.0,
             max_elements: n as u32,
         });
@@ -4295,6 +4366,7 @@ mod tests {
             offload_vectors: true,
             property_name: "embedding".to_string(),
             rerank_mode: RerankMode::Inline,
+            rerank_oversample_factor: 1.0,
             alpha_pruning: 1.0,
             max_elements: 1_000,
         }
@@ -4539,6 +4611,7 @@ mod tests {
             offload_vectors: false,
             property_name: String::new(),
             rerank_mode: RerankMode::Inline,
+            rerank_oversample_factor: 1.0,
             alpha_pruning: 1.0,
             max_elements: 1_000_000,
         });
@@ -4653,6 +4726,7 @@ mod tests {
                 offload_vectors: false,
                 property_name: String::new(),
                 rerank_mode: RerankMode::Inline,
+                rerank_oversample_factor: 1.0,
                 alpha_pruning: 1.0,
                 max_elements: 1_000,
             }
@@ -4725,6 +4799,7 @@ mod tests {
             offload_vectors: false,
             property_name: String::new(),
             rerank_mode: RerankMode::Inline,
+            rerank_oversample_factor: 1.0,
             alpha_pruning: 1.0,
             max_elements: n_train as u32,
         };
@@ -4797,6 +4872,7 @@ mod tests {
             offload_vectors: false,
             property_name: String::new(),
             rerank_mode: RerankMode::Inline,
+            rerank_oversample_factor: 1.0,
             alpha_pruning: 1.0,
             max_elements: 100,
         };
@@ -4832,6 +4908,7 @@ mod tests {
             offload_vectors: false,
             property_name: String::new(),
             rerank_mode: RerankMode::Inline,
+            rerank_oversample_factor: 1.0,
             alpha_pruning: 1.0,
             max_elements: 100,
         };
@@ -4876,6 +4953,7 @@ mod tests {
             offload_vectors: false,
             property_name: String::new(),
             rerank_mode: RerankMode::Inline,
+            rerank_oversample_factor: 1.0,
             alpha_pruning: 1.0,
             max_elements: 1_000,
         };

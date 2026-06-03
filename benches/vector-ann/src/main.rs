@@ -179,6 +179,17 @@ struct Args {
     /// — fastest, lowest recall ceiling.
     #[arg(long, default_value = "inline")]
     rerank_mode: String,
+
+    /// Oversampling factor for `--rerank-mode end-of-search` (qdrant
+    /// `oversampling` equivalent). Search traverses with
+    /// `frontier_ef = ceil(ef * factor)` candidates, then the exact f32
+    /// rerank picks the best `ef`. `1.0` (default) collapses to
+    /// "ef in, ef out". `2.0` doubles the frontier; recall climbs back
+    /// toward inline-rerank parity at a modest QPS cost.
+    ///
+    /// Ignored when `--rerank-mode` is not `end-of-search`.
+    #[arg(long, default_value_t = 1.0)]
+    rerank_oversample: f32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -314,6 +325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_dimensions: d as u32,
         quantization,
         alpha_pruning: args.alpha_pruning,
+        rerank_oversample_factor: args.rerank_oversample,
         rerank_mode: match args.rerank_mode.as_str() {
             "inline" => coordinode_vector::hnsw::RerankMode::Inline,
             "end-of-search" => coordinode_vector::hnsw::RerankMode::EndOfSearch,
@@ -394,6 +406,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // diverse graph).
     report.record("hnsw_alpha_pruning", args.alpha_pruning as f64)?;
     report.record("hnsw_rerank_mode", args.rerank_mode.clone())?;
+    report.record("hnsw_rerank_oversample", args.rerank_oversample as f64)?;
     report.record("quantization", args.quantization.clone())?;
     // Effective thread count used by the rayon build pool. Reported so
     // downstream comparisons can group/filter (`1` vs `4` runs are not

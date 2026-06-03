@@ -75,6 +75,7 @@ fn rabitq_inserts_persist_originals_through_tier() {
         offload_vectors: false,
         property_name: String::new(),
         rerank_mode: coordinode_vector::hnsw::RerankMode::Inline,
+        rerank_oversample_factor: 1.0,
         alpha_pruning: 1.0,
         max_elements: N as u32,
     });
