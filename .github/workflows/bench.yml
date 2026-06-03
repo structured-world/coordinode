@@ -208,6 +208,25 @@ jobs:
                 --output bench-results
               echo "::endgroup::"
             done
+
+            # R863 RobustPrune α-pruning sweep on glove RaBitQ.
+            # Vamana paper recommends α=1.2 as the production default —
+            # the diversification trades extra build time for higher
+            # search QPS at fixed recall. Run alongside the α=1.0
+            # (legacy "take M closest") baseline above so the dashboard
+            # can plot the curve shift directly.
+            echo "::group::glove-100-angular M=16 quantization=rabitq alpha=1.2 threads=$T"
+            ./target/release/bench-vector-ann \
+              --train       "$GLOVE_DIR/glove_base.fvecs" \
+              --query       "$GLOVE_DIR/glove_query.fvecs" \
+              --groundtruth "$GLOVE_DIR/glove_groundtruth.ivecs" \
+              --dataset-name glove-100-angular \
+              --m 16 --ef-construction 200 \
+              --codec none --quantization rabitq --alpha-pruning 1.2 \
+              --ef-sweep "$EF_SWEEP" \
+              --threads "$T" \
+              --output bench-results
+            echo "::endgroup::"
           done
 
       # ── Future modality steps land here, one per modality ─────
