@@ -387,6 +387,47 @@ At higher recall the margin narrows:
   → CoordiNode 1.40× faster at recall 0.998
 """
 
+[[qdrant.glove_100_angular]]
+sha = "d67fc2d"
+threads = 1
+m = 16                # qdrant config.yml run_groups.default.args
+ef_construction = 256
+dataset = "glove-100-angular"
+dataset_n_train = 1_183_514
+dataset_n_test = 10_000
+k = 10
+build_secs = 1122.05
+source_json = "bench-results/vector/glove-100-angular/d67fc2d-qdrant-t1-20260603-211202.json"
+how_pinned = "ann_benchmarks/runner.py:341 set Docker cpuset_cpus=\"<single id>\" via main.py:73; observed via `docker inspect <container> --format '{{.HostConfig.CpusetCpus}}'` → 1; live `docker stats` capped at ~90% of one logical core during the run"
+# Recall ≥ 0.95 points only (full sweep in the JSON):
+recall_at_ef400 = 0.9577  # qps 245.79  ← BEST single-thread row at recall ≥ 0.95
+recall_at_ef600 = 0.9714  # qps 173.13
+recall_at_ef800 = 0.9785  # qps 133.35
+notes = """
+First qdrant glove-100-angular t=1 run. Confirms the cgroup
+single-CPU pin works identically to the sift-128 verification:
+`docker inspect` reported CpusetCpus=1, live `docker stats` capped
+at ~90% of one logical core.
+
+Recall ≥ 0.95 comparison single-thread glove M=16:
+
+  qdrant     f32 ef=400:  246 QPS @ recall 0.9577   ← best at recall ≥ 0.95
+  CoordiNode RaBitQ inline α=1.2 ef=800: 139 QPS @ recall 0.9510
+
+  → qdrant 1.77× faster than CoordiNode RaBitQ at matched recall.
+
+The hnswlib glove t=1 row below tops out at recall 0.9462 @ ef=800
+in its existing sweep — recall did NOT cross 0.95, so the 937 QPS
+number it advertises is at a LOWER recall than this qdrant row and
+the CoordiNode rows above. A fresh hnswlib run with a wider ef sweep
+(ef ∈ {1200, 1600}) is needed for a clean head-to-head at recall ≥
+0.95.
+
+Closing the residual Gap #2 (~1.77× behind qdrant on cosine RaBitQ
+at matched recall) is what the d67fc2d oversampling knob and Gap #1
+(HNSW engine layout) are queued to attack next.
+"""
+
 # ─── Verified hnswlib runs ──────────────────────────────────────────────────
 
 [[hnswlib.glove_100_angular]]
