@@ -89,15 +89,38 @@ dataset_n_test = 10_000
 k = 10
 m = 16                   # config.yml run_groups.default.args
 ef_construction = 256    # config.yml run_groups.default.args (CoordiNode uses 200)
-build_threads = "all logical CPUs (qdrant docker default, 16 on ro)"
-search_threads = "all logical CPUs (qdrant docker default, no QDRANT__SERVICE__MAX_REQUEST_THREADS cap)"
+build_threads = "UNKNOWN"
+search_threads = "UNKNOWN"
 source_json = "bench-results/vector/sift-128-euclidean/c94edcc-qdrant-M-1-20260525-040243.json"
 recall_at_k_peak = 0.97123
-qps_at_recall_peak = 1536.42  # ← THIS NUMBER ASSUMES SERVER-WIDE PARALLELISM. NOT comparable to CoordiNode search_threads=1 above.
+qps_at_recall_peak = 1536.42
 notes = """
-hnsw_m and hnsw_ef_construction recorded as `-1` / `None` in JSON metadata
-because qdrant doesn't expose those back through the wire format. Values
-above are pulled from config.yml. Build time recorded as 618s.
+THIS ROW IS UNVERIFIED FOR THREADS.
+
+The JSON came from a manual run of the upstream ann-benchmarks Docker
+harness (/opt/annb/ann-benchmarks) on ro, NOT from this repo's
+compose.competitors.yml (which only contains the hnswlib service). The
+metadata did not capture the host thread cap or any
+QDRANT__SERVICE__MAX_REQUEST_THREADS env override, and the bench JSON
+itself lacks a `threads` field, so any "qdrant used N threads"
+statement attached to this number is a guess.
+
+Until a re-run with EXPLICITLY pinned threads (Docker `--cpus 4` or
+qdrant env var) lands a fresh JSON that records the cap, do NOT cite
+this row in any cross-engine comparison. The qps 1536.42 stays here
+for archival but cannot be paired with the CoordiNode search_threads=1
+sift-128 row above to claim "CoordiNode is N× faster".
+
+Required follow-up to make this comparable:
+- Add qdrant service to benches/vector-ann/docker/compose.competitors.yml
+  with `cpus: 4.0` and `QDRANT__SERVICE__MAX_REQUEST_THREADS=4` env.
+- Re-run sift-128 + glove-100 + random-1024 on the new compose.
+- Append the fresh row here with the recorded thread cap.
+
+hnsw_m / hnsw_ef_construction came back as `-1` / `None` in the JSON
+because the qdrant gRPC API doesn't expose them in the response. Values
+shown above are pulled from the ann-benchmarks `config.yml`. Build
+time recorded as 618s.
 """
 
 # ─── Honest cross-engine comparisons ────────────────────────────────────────
@@ -129,3 +152,60 @@ above are pulled from config.yml. Build time recorded as 618s.
 
 # No rows here yet — bench harness needs to bring competitors down to a
 # single search thread (or scale CoordiNode up) before any verdict lands.
+
+# ─── Verified runs that exist as separate JSONs (filename carries -t<N>) ─
+
+[[hnswlib.sift_128_euclidean]]
+sha = "9d38295"
+threads = 1
+m = 32
+ef_construction = 200
+dataset = "sift-128-euclidean"
+dataset_n_train = 1_000_000
+recall_at_k_peak = 0.99925
+qps_at_recall_peak = 1242.02
+build_secs = 338.66
+source_json = "bench-results/vector/sift-128-euclidean/9d38295-hnswlib-t1-20260522-054150.json"
+how_pinned = "Docker --cpus=1 + OMP/MKL/OpenBLAS env pinned to 1 + hnswlib set_num_threads(1) + per-call num_threads=1 (33e77ec commit message + benches/vector-ann/docker/hnswlib_runner.py)"
+
+[[hnswlib.sift_128_euclidean]]
+sha = "91a15d0"
+threads = 4
+m = 32
+ef_construction = 200
+dataset = "sift-128-euclidean"
+dataset_n_train = 1_000_000
+recall_at_k_peak = 0.99917
+qps_at_recall_peak = 1242.47   # essentially identical to t=1: hnswlib internal OMP parallelism doesn't help when queries are submitted serially
+build_secs = 110.99            # 3× faster build (real multi-thread effect on add_items)
+source_json = "bench-results/vector/sift-128-euclidean/91a15d0-hnswlib-t4-20260522-054902.json"
+how_pinned = "Docker --cpus=4 + OMP/MKL/OpenBLAS env pinned to 4 + hnswlib set_num_threads(4) + per-call num_threads=4 (e83b706 commit message)"
+
+# ─── Re-run queue (numbers below this line need verification) ───────────────
+#
+# These rows previously appeared in the legacy `[[qdrant.sift_128_euclidean]]`
+# block above with thread topology guessed. ALL of them need a fresh run with
+# EXPLICITLY pinned threads, both t=1 and t=4, the way hnswlib already has.
+# Until those JSONs land in bench-results/vector/<dataset>/ with `-t<N>`
+# in the filename, do not cite the existing numbers.
+#
+# Pending verification:
+#   [ ] qdrant      sift-128-euclidean       t=1, t=4
+#   [ ] qdrant      glove-100-angular        t=1, t=4
+#   [ ] qdrant      random-1024-angular      t=1, t=4
+#   [ ] pgvector    sift-128-euclidean       t=1, t=4
+#   [ ] pgvector    glove-100-angular        t=1, t=4
+#   [ ] annoy       sift-128-euclidean       t=1, t=4
+#   [ ] annoy       glove-100-angular        t=1, t=4
+#   [ ] hnswlib     glove-100-angular        t=1, t=4   (only sift-128 done so far)
+#   [ ] CoordiNode  glove-100-angular RaBitQ t=4        (we have t=1 via sweep_one; need a multi-thread search variant)
+#
+# Existing JSONs that DO NOT cleanly satisfy the audit (kept for archive,
+# excluded from any verdict until a `-t<N>` re-run replaces them):
+#   bench-results/vector/sift-128-euclidean/c94edcc-qdrant-M-1-20260525-040243.json
+#   bench-results/vector/random-384-angular/c94edcc-{qdrant,hnswlib,pgvector,annoy}-*.json
+#
+# random-384-angular runs additionally have recall ≈ 0.12 across ALL engines
+# (synthetic random dataset has no real clusters), so even with verified
+# thread topology those rows would not produce meaningful recall@k≥0.95
+# comparisons.
