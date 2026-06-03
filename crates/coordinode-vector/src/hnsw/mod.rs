@@ -290,36 +290,6 @@ pub struct HnswIndex {
     /// index. This is the array the cosine-RaBitQ hot path hits on every
     /// neighbour visit.
     node_rabitq_codes: Vec<Option<RabitqEncoded>>,
-    /// Flat cache of raw pointers to each node's RaBitQ code words. `0`
-    /// (null) means no code (pre-calibration / uncodable). Parallel to
-    /// `node_rabitq_codes`; populated whenever a slot transitions from
-    /// `None` → `Some` (insert after calibration, calibrate-and-encode
-    /// pass, update_existing_node re-encode). On the cosine + RaBitQ
-    /// hot path the prefetch helper reads ONLY this Vec — 8 bytes per
-    /// node (1.18M × 8 = 9 MiB fits L2), instead of the full
-    /// `Vec<Option<RabitqEncoded>>` slot (40+ bytes per node = 47 MiB
-    /// L3 thrash).
-    ///
-    /// Per d365611 profile, the dominant cost of prefetch_node_vector
-    /// after the f32-skip fix was the SoA load on
-    /// `node_rabitq_codes[idx]` to discover what to prefetch — 32.3% of
-    /// search_layer_ctx cycles. This cache cuts that to a single
-    /// 8-byte load.
-    ///
-    /// Pointer stability invariants:
-    /// * `node_rabitq_codes` Vec is pre-allocated to `max_elements`, so
-    ///   it never reallocates on insert; element addresses are stable.
-    /// * Inside each `RabitqEncoded::OneBit(code)` the `code` field is a
-    ///   `SmallVec<[u64; 4]>` whose inline buffer lives DIRECTLY inside
-    ///   the `RabitqEncoded` struct (no separate heap allocation for
-    ///   `D ≤ 256`). The stored pointer = address of inline word 0 =
-    ///   stable across reads as long as the parent slot doesn't move.
-    /// * `update_existing_node` replaces the slot in place — new inline
-    ///   buffer lives at the same address — pointer stays valid.
-    /// * `RabitqEncoded::Multi` uses a heap `Vec<u8>` whose pointer is
-    ///   stable until the Vec itself reallocates (we never grow it
-    ///   in-place after the initial encode).
-    rabitq_code_ptr: Vec<usize>,
     /// Lock-free layer-0 neighbour lists, one entry per node. Flat `Vec`
     /// indexed by node index — a search visit reads `neighbours_l0[idx]`
     /// with ONE pointer-stride into a contiguous heap allocation, no inner
@@ -619,7 +589,6 @@ impl HnswIndex {
             node_vectors: Vec::with_capacity(capacity),
             node_quantized: Vec::with_capacity(capacity),
             node_rabitq_codes: Vec::with_capacity(capacity),
-            rabitq_code_ptr: Vec::with_capacity(capacity),
             neighbours_l0: Vec::with_capacity(capacity),
             neighbours_upper: Vec::with_capacity(capacity),
             id_to_idx,
@@ -727,7 +696,6 @@ impl HnswIndex {
             })
             .collect();
         for (i, enc) in encoded {
-            self.rabitq_code_ptr[i] = Self::rabitq_ptr_of(&enc);
             self.node_rabitq_codes[i] = enc;
         }
         self.rabitq_params = Some(params);
@@ -850,7 +818,6 @@ impl HnswIndex {
             })
             .collect();
         for (i, enc) in encoded {
-            self.rabitq_code_ptr[i] = Self::rabitq_ptr_of(&enc);
             self.node_rabitq_codes[i] = enc;
         }
         self.rabitq_params = Some(params);
@@ -1139,7 +1106,6 @@ impl HnswIndex {
         // SoA payload pushes in lockstep — same idx, no extra clone.
         self.node_vectors.push(Some(vector));
         self.node_quantized.push(quantized);
-        self.rabitq_code_ptr.push(Self::rabitq_ptr_of(&rabitq_code));
         self.node_rabitq_codes.push(rabitq_code);
         self.id_to_idx.insert(id, idx);
 
@@ -1247,7 +1213,6 @@ impl HnswIndex {
             });
             self.node_vectors.push(Some(vec));
             self.node_quantized.push(quantized);
-            self.rabitq_code_ptr.push(Self::rabitq_ptr_of(&rabitq_code));
             self.node_rabitq_codes.push(rabitq_code);
             self.id_to_idx.insert(plan.id, idx);
 
@@ -1837,7 +1802,6 @@ impl HnswIndex {
 
         self.node_vectors[idx] = Some(vector);
         self.node_quantized[idx] = quantized;
-        self.rabitq_code_ptr[idx] = Self::rabitq_ptr_of(&rabitq_code);
         self.node_rabitq_codes[idx] = rabitq_code;
 
         // Step 4: Re-insert into the graph from a valid entry point.
@@ -2562,17 +2526,12 @@ impl HnswIndex {
         // (one cache line + one Option discriminant + one enum match
         // instead of two cache lines + two Option discriminants).
         if matches!(self.config.metric, VectorMetric::Cosine) {
-            // Single 8-byte load on the contiguous `rabitq_code_ptr` Vec
-            // — 9 MiB total on a 1.18M-node glove index, fits L2. The
-            // legacy `node_rabitq_codes[idx]` walk read an Option +
-            // enum tag + SmallVec pointer (40+ bytes per slot = 47 MiB,
-            // L3 thrash) just to discover what to prefetch. The 14ec191
-            // profile measured that read at 32.3% of search_layer_ctx
-            // cycles even after the f32-skip fix; this cache eliminates
-            // it.
-            let ptr = self.rabitq_code_ptr[idx];
-            if ptr != 0 {
-                prefetch_read_data(ptr as *const u8);
+            if let Some(ref enc) = self.node_rabitq_codes[idx] {
+                let code_words = match enc {
+                    RabitqEncoded::OneBit(c) => c.code.as_ptr() as *const u8,
+                    RabitqEncoded::Multi(c) => c.packed.as_ptr(),
+                };
+                prefetch_read_data(code_words);
                 return;
             }
         }
@@ -2580,24 +2539,6 @@ impl HnswIndex {
             prefetch_read_data(v.as_ptr() as *const u8);
         } else if let Some(ref q) = self.node_quantized[idx] {
             prefetch_read_data(q.as_ptr());
-        }
-    }
-
-    /// Extract the raw code pointer for the `rabitq_code_ptr` flat
-    /// cache. Returns `0` (null) when the slot has no code.
-    ///
-    /// The returned `usize` is `code.as_ptr() as usize` for OneBit /
-    /// `packed.as_ptr() as usize` for Multi. Stability is documented on
-    /// the `rabitq_code_ptr` field — TL;DR: stable as long as the slot
-    /// is replaced in place (we never `Vec::push` after slot creation)
-    /// AND the parent `node_rabitq_codes` Vec doesn't reallocate (we
-    /// pre-allocate to `max_elements`).
-    #[inline]
-    fn rabitq_ptr_of(enc: &Option<RabitqEncoded>) -> usize {
-        match enc {
-            Some(RabitqEncoded::OneBit(c)) => c.code.as_ptr() as usize,
-            Some(RabitqEncoded::Multi(c)) => c.packed.as_ptr() as usize,
-            None => 0,
         }
     }
 }
