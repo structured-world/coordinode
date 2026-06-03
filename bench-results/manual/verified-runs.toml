@@ -387,6 +387,42 @@ At higher recall the margin narrows:
   → CoordiNode 1.40× faster at recall 0.998
 """
 
+[[pgvector.glove_100_angular]]
+sha = "c953a05"
+threads = 1
+m = 16                  # ann-benchmarks pgvector config.yml default
+ef_construction = 256
+dataset = "glove-100-angular"
+dataset_n_train = 1_183_514
+dataset_n_test = 10_000
+k = 10
+build_secs = 1957.13
+source_json = "bench-results/vector/glove-100-angular/c953a05-pgvector-t1-20260603-221736.json"
+how_pinned = "Docker cpuset_cpus=\"<single id>\" via ann_benchmarks/runner.py:341 + main.py:73 (no --batch passed → single-CPU pin)"
+recall_at_ef800 = 0.9535  # qps = 103.77  ← BEST at recall ≥ 0.95
+notes = """
+pgvector on glove t=1 lands behind CoordiNode RaBitQ at matched recall.
+At ef=800 recall reaches 0.9535 with 104 QPS — vs CoordiNode RaBitQ
+inline α=1.2 at recall 0.9510 with 139 QPS (and CoordiNode's
+EndOfSearch path likely beats both numbers further after oversample
+tuning).
+
+Recall ≥ 0.95 single-thread glove M=16 leaderboard:
+
+  1. hnswlib    f32                       575 QPS @ recall 0.9615
+  2. qdrant     f32                       246 QPS @ recall 0.9577
+  3. CoordiNode RaBitQ inline alpha=1.2   139 QPS @ recall 0.9510
+  4. pgvector   f32                       104 QPS @ recall 0.9535
+  5. annoy                                does not reach recall 0.95
+                                          in the default ann-benchmarks
+                                          tree/search_k sweep on glove.
+
+So CoordiNode is in the middle of the pack, ahead of pgvector and
+annoy and behind qdrant and hnswlib. Closing the residual 1.77× to
+qdrant is what d67fc2d's oversample sweep is bench-pending; closing
+the 4.1× to hnswlib needs the Gap #1 layout work.
+"""
+
 [[qdrant.glove_100_angular]]
 sha = "d67fc2d"
 threads = 1
