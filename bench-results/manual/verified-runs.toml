@@ -302,7 +302,54 @@ At higher recall the margin narrows:
   → CoordiNode 1.40× faster at recall 0.998
 """
 
-# ─── Verified hnswlib runs (pre-existing) ───────────────────────────────────
+# ─── Verified hnswlib runs ──────────────────────────────────────────────────
+
+[[hnswlib.glove_100_angular]]
+sha = "ff380c9"
+threads = 1
+m = 16
+ef_construction = 200
+dataset = "glove-100-angular"
+dataset_n_train = 1_183_514
+dataset_n_test = 10_000
+k = 10
+build_secs = 412.25
+source_json = "bench-results/vector/glove-100-angular/ff380c9-hnswlib-t1-20260603-132417.json"
+how_pinned = "Docker --cpus=1 + OMP/MKL/OpenBLAS env pinned to 1 + hnswlib set_num_threads(1) + per-call num_threads=1 (benches/vector-ann/docker/hnswlib_runner.py)"
+sweep = [
+  { ef =  20, recall_at_10 = 0.5980, qps = 17983 },
+  { ef =  40, recall_at_10 = 0.7051, qps = 11378 },
+  { ef =  80, recall_at_10 = 0.7889, qps =  6838 },
+  { ef = 200, recall_at_10 = 0.8666, qps =  3251 },
+  { ef = 400, recall_at_10 = 0.9122, qps =  1768 },
+  { ef = 800, recall_at_10 = 0.9462, qps =   937 },
+]
+notes = """
+First hnswlib glove-100-angular t=1 measurement. Recall curve sits
+just below CoordiNode f32 / RaBitQ at the same ef (hnswlib peaks at
+0.9462 @ ef=800, CoordiNode f32 hits 0.9416 and α=1.2 RaBitQ hits
+0.9499 at the same ef).
+
+Throughput head-to-head at matched single-thread on glove M=16 ef=800:
+  hnswlib  f32            = 937 QPS @ recall 0.9462
+  CoordiNode f32          = 407 QPS @ recall 0.9416   (2.3× slower)
+  CoordiNode RaBitQ α=1.0 = 162 QPS @ recall 0.9448   (5.8× slower)
+  CoordiNode RaBitQ α=1.2 = 142 QPS @ recall 0.9499   (6.6× slower)
+
+Two separate gaps are visible here:
+1. CoordiNode HNSW search is 2.3× slower than hnswlib on f32 — that's
+   the prefetch/traversal/distance-loop side that the recent
+   optimisation arc (14ec191 InlineLayer0 + skip f32 prefetch landed,
+   91abbdc + b5dc4e1 + c952bc0 reverted) has been chasing.
+2. CoordiNode RaBitQ search is 2.5× slower than CoordiNode f32 on the
+   same dataset (407 → 162 at ef=800). RaBitQ's whole point is being
+   FASTER than f32 — 1-bit popcount should run an order of magnitude
+   ahead of f32 AVX2. The RaBitQ pipeline (encode_query per query +
+   bit-plane assembly + rerank pool) is currently costing more than
+   the kernel saves on a D=100-padded-to-128 dataset.
+"""
+
+# ─── Verified hnswlib runs (sift-128 — pre-existing) ────────────────────────
 
 [[hnswlib.sift_128_euclidean]]
 sha = "91a15d0"
