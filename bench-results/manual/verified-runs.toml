@@ -215,6 +215,51 @@ build_secs = 338.66
 source_json = "bench-results/vector/sift-128-euclidean/9d38295-hnswlib-t1-20260522-054150.json"
 how_pinned = "Docker --cpus=1 + OMP/MKL/OpenBLAS env pinned to 1 + hnswlib set_num_threads(1) + per-call num_threads=1 (33e77ec commit message + benches/vector-ann/docker/hnswlib_runner.py)"
 
+[[qdrant.sift_128_euclidean]]
+sha = "70987b5"  # CoordiNode HEAD when re-run was kicked off
+threads = 1
+m = 16          # qdrant config.yml run_groups.default.args (cannot read back via gRPC)
+ef_construction = 256
+dataset = "sift-128-euclidean"
+dataset_n_train = 1_000_000
+dataset_n_test = 10_000
+k = 10
+# Recall ≥ 0.95 / peak entries lifted from the sweep (full sweep in the JSON):
+recall_at_ef32   = 0.9712     # qps = 1536.42   ← exact reproduction of legacy c94edcc number
+recall_at_ef64   = 0.9919     # qps = 1161.93
+recall_at_ef128  = 0.9977     # qps =  803.51
+recall_at_ef256  = 0.9990     # qps =  517.18
+recall_at_ef512  = 0.9992     # qps =  317.74
+recall_at_ef768  = 0.9993     # qps =  235.81
+build_secs = 618.06
+source_json = "bench-results/vector/sift-128-euclidean/70987b5-qdrant-t1-20260603-113411.json"
+how_pinned = "ann_benchmarks/runner.py:341 set Docker cpuset_cpus=\"<single id>\" via main.py:73; observed via `docker inspect <container> --format '{{.HostConfig.CpusetCpus}}'` → 1; live `docker stats` capped at 97.72% of one logical core, 36 internal worker PIDs all sharing that single CPU"
+notes = """
+Re-ran the c94edcc invocation (`python run.py --dataset sift-128-
+euclidean --algorithm qdrant --force --runs 1 --timeout 7200`) on
+ro on 2026-06-03 with the head of main at 70987b5 (CoordiNode side
+unchanged for this row — qdrant doesn't depend on it). Peak QPS at
+recall 0.9712, ef=32 reproduces c94edcc's 1536.42 exactly — the
+docker harness path was deterministic on this dataset.
+
+The ann-benchmarks sweep covers ef ∈ {8,16,32,64,128,256,512,768}
+with rescore on/off, so the JSON has ~120 rows; only the 6 ef
+values where recall ≥ 0.95 are summarised above. Direct
+read-and-compare against CoordiNode rows is via this matched
+single-thread tier:
+
+  CoordiNode  4233 QPS @ recall 0.9732 (ef= 80)   (single thread)
+  qdrant      1536 QPS @ recall 0.9712 (ef= 32)   (single thread)
+  → CoordiNode 2.75× faster at matched recall
+
+At higher recall the margin narrows:
+  CoordiNode  1127 QPS @ recall 0.9976 (ef=400)
+  qdrant       803 QPS @ recall 0.9977 (ef=128)
+  → CoordiNode 1.40× faster at recall 0.998
+"""
+
+# ─── Verified hnswlib runs (pre-existing) ───────────────────────────────────
+
 [[hnswlib.sift_128_euclidean]]
 sha = "91a15d0"
 threads = 4
