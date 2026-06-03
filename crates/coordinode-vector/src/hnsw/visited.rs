@@ -81,6 +81,41 @@ impl<'a> VisitedListHandle<'a> {
         was_visited
     }
 
+    /// Unchecked variant: the caller guarantees `id < counters.len()` (by
+    /// having passed the `num_elements` known to the pool and bounds-
+    /// checking the id against `nodes.len()` before the call).
+    ///
+    /// Profile of the EndOfSearch path on glove-100-angular M=16 ef=800
+    /// (e5e10ab + d67fc2d, perf record on i9-9900K) put the per-visit
+    /// inner loop's bounds-check `testq` at ~32% of `search_layer_ctx_
+    /// no_rerank` and the visited-byte store at ~10%. The bounds checks
+    /// inside [`check_and_mark`] (the `id >= len` resize gate and the
+    /// implicit `Vec` index bounds check) are PURE overhead on the hot
+    /// path — the pool already resized to `num_elements` in
+    /// [`VisitedPool::get`], and `search_layer_ctx_no_rerank` already
+    /// gates `neighbor_idx < n_nodes` before calling. Skipping those
+    /// two checks here saves ~10 ns × thousands of calls per query.
+    ///
+    /// # Safety
+    ///
+    /// `id` must be strictly less than `counters.len()`. Caller's pool
+    /// resize + nodes.len() guard cover that on the search hot path.
+    #[inline]
+    pub(crate) unsafe fn check_and_mark_unchecked(&mut self, id: usize) -> bool {
+        debug_assert!(
+            id < self.list.counters.len(),
+            "check_and_mark_unchecked: id {id} >= counters.len() {}",
+            self.list.counters.len(),
+        );
+        // SAFETY: caller invariant: id < self.list.counters.len().
+        unsafe {
+            let counter = self.list.counters.get_unchecked_mut(id);
+            let was_visited = *counter == self.list.current_epoch;
+            *counter = self.list.current_epoch;
+            was_visited
+        }
+    }
+
     /// Pointer to the visited-counter cell for `id`. Exposed for the HNSW
     /// search hot loop to issue a `_mm_prefetch` (or aarch64 equivalent)
     /// against the next neighbour's epoch byte before reading it — that's

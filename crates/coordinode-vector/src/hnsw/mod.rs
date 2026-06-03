@@ -2154,8 +2154,13 @@ impl HnswIndex {
                     }
                 }
                 let neighbor_idx = neighbor_idx_u64 as usize;
-                if neighbor_idx < n_nodes && !visited.check_and_mark(neighbor_idx) {
-                    unvisited_neighbors.push(neighbor_idx);
+                if neighbor_idx < n_nodes {
+                    // SAFETY: visited_pool.get(self.nodes.len()) has
+                    // already resized counters >= n_nodes; the neighbor
+                    // gate above just bounded neighbor_idx < n_nodes.
+                    if !unsafe { visited.check_and_mark_unchecked(neighbor_idx) } {
+                        unvisited_neighbors.push(neighbor_idx);
+                    }
                 }
             }
 
@@ -2339,8 +2344,13 @@ impl HnswIndex {
                         }
                     }
                     let neighbor_idx = neighbor_idx_u64 as usize;
-                    if neighbor_idx < n_nodes && !visited.check_and_mark(neighbor_idx) {
-                        unvisited_neighbors.push(neighbor_idx);
+                    if neighbor_idx < n_nodes {
+                        // SAFETY: visited_pool.get(self.nodes.len())
+                        // resized counters >= n_nodes; neighbor_idx <
+                        // n_nodes per the gate above.
+                        if !unsafe { visited.check_and_mark_unchecked(neighbor_idx) } {
+                            unvisited_neighbors.push(neighbor_idx);
+                        }
                     }
                 }
 
