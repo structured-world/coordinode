@@ -1,0 +1,131 @@
+# Manually-verified bench runs with FULL conditions.
+#
+# Every QPS / recall number in this file is recorded together with the EXACT
+# conditions it was measured under: dataset, hardware, thread topology (build
+# AND search), HNSW params, and source JSON. Do NOT compare numbers across
+# rows unless every condition in the `conditions` table matches.
+#
+# WHY this file exists: ad-hoc cross-comparisons (e.g. "CoordiNode 4233 QPS
+# vs qdrant 1536 QPS = 2.7× win") have already burned us once when the
+# threads-per-search didn't match. CoordiNode `bench-vector-ann` runs search
+# single-threaded (`sweep_one` loops queries sequentially per the code
+# comments in benches/vector-ann/src/main.rs:155-160), while qdrant's
+# `qdrant/qdrant:v1.5.1` Docker image with no thread-cap env var runs the
+# search worker pool across ALL logical CPUs of the host. Comparing those
+# two numbers as "QPS" without a thread caveat is meaningless.
+#
+# Append rows only — never edit a historical row, because the JSON paths
+# under `bench-results/vector/` may rotate or get pruned. If you re-bench
+# the same config to verify, add a fresh row with a new timestamp.
+
+# ─── Hardware ───────────────────────────────────────────────────────────────
+[hardware.ro]
+hostname = "ro.private.systems"  # 192.168.1.200
+cpu = "Intel i9-9900K"            # 8 cores / 16 threads, AVX2 + FMA, NO AVX-512
+cores_physical = 8
+threads_logical = 16
+notes = """
+Bench host. All CI vector benches and donor competitor runs happen here.
+For honest per-core comparisons, restrict competitor server processes to
+one thread (or measure CoordiNode multi-thread search through a wrapper).
+"""
+
+# ─── CoordiNode runs ────────────────────────────────────────────────────────
+
+[[coordinode.sift_128_euclidean]]
+sha = "d365611"
+codec = "none (f32)"
+dataset = "sift-128-euclidean"
+dataset_n_train = 1_000_000
+dataset_n_test = 10_000
+k = 10
+m = 16
+m_max0 = 32       # 2*M default
+ef_construction = 200
+alpha_pruning = 1.0
+build_threads = 4   # rayon_threads_effective = 4 in JSON
+search_threads = 1  # bench-vector-ann sweep_one is sequential; see main.rs:155-160
+source_json = "bench-results/vector/sift-128-euclidean/d365611-coordinode-M16-20260602-213042.json"
+sweep = [
+  { ef =  20, recall_at_10 = 0.8615, qps = 11580.0 },
+  { ef =  40, recall_at_10 = 0.9336, qps =  7180.4 },
+  { ef =  80, recall_at_10 = 0.9732, qps =  4233.3 },
+  { ef = 200, recall_at_10 = 0.9933, qps =  2005.5 },
+  { ef = 400, recall_at_10 = 0.9976, qps =  1127.1 },
+  { ef = 800, recall_at_10 = 0.9987, qps =   633.3 },
+]
+
+[[coordinode.glove_100_angular]]
+sha = "45b87bf"  # R863 default α=1.0 = no-op (== 8ef4ea2 == 14ec191 modulo run noise)
+codec = "rabitq-1bit"
+dataset = "glove-100-angular"
+dataset_n_train = 1_183_514
+dataset_n_test = 10_000
+k = 10
+m = 16
+m_max0 = 32
+ef_construction = 200
+alpha_pruning = 1.0       # R863 RobustPrune disabled (default)
+build_threads = 4
+search_threads = 1
+source_json = "bench-results/vector/glove-100-angular/45b87bf-coordinode-M16-Q1-20260603-093756.json"
+sweep = [
+  { ef =  20, recall_at_10 = 0.6782, qps = 2476.16 },
+  { ef =  40, recall_at_10 = 0.7719, qps = 1577.70 },
+  { ef =  80, recall_at_10 = 0.8363, qps =  981.68 },
+  { ef = 200, recall_at_10 = 0.8947, qps =  486.00 },
+  { ef = 400, recall_at_10 = 0.9248, qps =  282.78 },
+  { ef = 800, recall_at_10 = 0.9452, qps =  161.12 },
+]
+
+# ─── Competitor runs (from ann-benchmarks Docker harness, c94edcc snapshot) ─
+
+[[qdrant.sift_128_euclidean]]
+docker_image = "qdrant/qdrant:v1.5.1"
+client_version = "qdrant-client==1.5.4"
+dataset = "sift-128-euclidean"
+dataset_n_train = 1_000_000
+dataset_n_test = 10_000
+k = 10
+m = 16                   # config.yml run_groups.default.args
+ef_construction = 256    # config.yml run_groups.default.args (CoordiNode uses 200)
+build_threads = "all logical CPUs (qdrant docker default, 16 on ro)"
+search_threads = "all logical CPUs (qdrant docker default, no QDRANT__SERVICE__MAX_REQUEST_THREADS cap)"
+source_json = "bench-results/vector/sift-128-euclidean/c94edcc-qdrant-M-1-20260525-040243.json"
+recall_at_k_peak = 0.97123
+qps_at_recall_peak = 1536.42  # ← THIS NUMBER ASSUMES SERVER-WIDE PARALLELISM. NOT comparable to CoordiNode search_threads=1 above.
+notes = """
+hnsw_m and hnsw_ef_construction recorded as `-1` / `None` in JSON metadata
+because qdrant doesn't expose those back through the wire format. Values
+above are pulled from config.yml. Build time recorded as 618s.
+"""
+
+# ─── Honest cross-engine comparisons ────────────────────────────────────────
+#
+# A claim like "CoordiNode is N× faster than qdrant" is only valid when
+# this section records it under matched conditions. Right now the only
+# directly-recorded comparison row is:
+#
+#   sift-128 f32 single-thread CoordiNode = 4233 QPS @ recall 0.973
+#   sift-128 f32 multi-thread (16t)  qdrant   = 1536 QPS @ recall 0.971
+#
+# Per-engine throughput is in the same ballpark, but qdrant uses 16× more
+# CPU. If we divide qdrant by its thread count for per-core throughput:
+#   1536 / 16 ≈ 96 QPS/thread
+#   CoordiNode 4233 / 1 = 4233 QPS/thread → ~44× per-core advantage
+# but that's a synthetic projection; we have no measurement of qdrant
+# pinned to 1 thread on ro.
+#
+# Real verdicts (head-to-head, matched conditions) MUST be recorded under
+# `comparisons` once measured. NEVER fold the unverified per-core
+# projection into a top-line claim.
+
+# [[comparisons]]
+# date = "2026-MM-DD"
+# matched = "sift-128-euclidean, k=10, m=16, search_threads=1"
+# coordinode = { sha = "...", qps = ..., recall = ... }
+# qdrant     = { docker_tag = "...", qps = ..., recall = ... }
+# verdict = "..."
+
+# No rows here yet — bench harness needs to bring competitors down to a
+# single search thread (or scale CoordiNode up) before any verdict lands.
