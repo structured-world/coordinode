@@ -1200,6 +1200,40 @@ impl HnswIndex {
         }
     }
 
+    /// Read the layer-0 neighbour id snapshot into `out` from the
+    /// contiguous store when present, falling back to the SoA
+    /// `AtomicNeighbourList` otherwise. Keeps the search hot path on a
+    /// single allocation per node so concurrent workers visiting the same
+    /// graph share L3 fills, the cache-locality property that drives
+    /// hnswlib's super-linear MT4 scaling on sift-128 f32.
+    #[inline]
+    fn read_layer0_neighbours_into(&self, idx: usize, out: &mut Vec<u64>) {
+        out.clear();
+        if let Some(inline) = self.inline_layer0.as_ref() {
+            if idx < inline.capacity() {
+                // SAFETY: idx < inline.capacity() by the gate above; slots
+                // bounded by inline.m_max0() which the constructor enforces
+                // is the in-bounds slot count.
+                unsafe {
+                    let raw_len = inline
+                        .neighbour_len(idx)
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                        as usize;
+                    let len = raw_len.min(inline.m_max0());
+                    out.reserve(len);
+                    for slot in 0..len {
+                        let id = inline
+                            .neighbour(idx, slot)
+                            .load(core::sync::atomic::Ordering::Relaxed);
+                        out.push(id);
+                    }
+                }
+                return;
+            }
+        }
+        self.neighbours_l0[idx].snapshot_into(out);
+    }
+
     /// Read-only view of the contiguous layer-0 store, for parity tests
     /// and the follow-up search-side switch.
     #[cfg_attr(
@@ -2255,9 +2289,13 @@ impl HnswIndex {
             if level >= self.node_levels(closest.idx as usize) {
                 continue;
             }
-            connections.clear();
-            self.neighbours_at(closest.idx as usize, level)
-                .snapshot_into(&mut connections);
+            if level == 0 {
+                self.read_layer0_neighbours_into(closest.idx as usize, &mut connections);
+            } else {
+                connections.clear();
+                self.neighbours_at(closest.idx as usize, level)
+                    .snapshot_into(&mut connections);
+            }
 
             unvisited_neighbors.clear();
             for (i, &neighbor_idx_u64) in connections.iter().enumerate() {
@@ -2439,9 +2477,13 @@ impl HnswIndex {
             }
 
             if level < self.node_levels(closest.idx as usize) {
-                connections.clear();
-                self.neighbours_at(closest.idx as usize, level)
-                    .snapshot_into(&mut connections);
+                if level == 0 {
+                    self.read_layer0_neighbours_into(closest.idx as usize, &mut connections);
+                } else {
+                    connections.clear();
+                    self.neighbours_at(closest.idx as usize, level)
+                        .snapshot_into(&mut connections);
+                }
 
                 unvisited_neighbors.clear();
                 // hnswlib trick: prefetch the NEXT neighbour's visited
