@@ -213,16 +213,23 @@ jobs:
             # The previous CI bench accumulated 7 RaBitQ sweeps over time
             # and started exceeding the GitHub Actions 5h timeout (d67fc2d
             # cancelled at 3h, c953a05 cancelled at 5h6m). Trimmed to the
-            # 2 oversample rows that ACTUALLY produce new data after
+            # 3 oversample rows that ACTUALLY produce new data after
             # baselines were captured in 5248f69:
-            #   - end-of-search oversample=2.0   ← production candidate
-            #   - end-of-search oversample=3.0   ← recall headroom
+            #   - end-of-search oversample=2.0   ← qdrant-parity row (peak r≈0.945)
+            #   - end-of-search oversample=2.5   ← sweet-spot probe between 2.0/3.0
+            #   - end-of-search oversample=3.0   ← recall headroom (r≈0.965)
+            # 0adfc54 confirmed os=2.0 lands at recall 0.945 (just under
+            # the ≥0.95 cutoff) and os=3.0 lands at 0.965 with QPS 162.
+            # qdrant ref @ ≥0.95 is 246 QPS — os=2.5 might cross 0.95
+            # while keeping QPS materially above the os=3.0 floor.
             # The α=1.0 inline baseline, α=1.2 inline, end-of-search
             # oversample=1.0 default, and `none` recall-ceiling rows are
             # already in bench-data under 5248f69 / b1004cd / 45b87bf —
             # do NOT re-run them in CI on every push. Bring them back if
-            # the recall surface drifts.
-            for OS in 2.0 3.0; do
+            # the recall surface drifts. Total budget: 3 RaBitQ rows ×
+            # ~25min + f32 row + α=1.0 baseline = ~2h30m, well under
+            # the 5h GitHub Actions ceiling.
+            for OS in 2.0 2.5 3.0; do
               echo "::group::glove-100-angular M=16 quantization=rabitq rerank_mode=end-of-search oversample=$OS threads=$T"
               ./target/release/bench-vector-ann \
                 --train       "$GLOVE_DIR/glove_base.fvecs" \
