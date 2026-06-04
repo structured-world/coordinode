@@ -1213,6 +1213,41 @@ impl HnswIndex {
         self.inline_layer0.as_ref()
     }
 
+    /// Refresh the layer-0 neighbour ids and `neighbour_len` for node
+    /// `idx` in the contiguous store from the authoritative SoA
+    /// `AtomicNeighbourList`. Called from every layer-0 mutator
+    /// (`set_outgoing`, `cas_add_neighbour_to`, `add_neighbour_to`) so the
+    /// inline store stays in sync with SoA. Search still reads SoA, so
+    /// brief transient divergence under concurrent back-edge writers
+    /// resolves itself on the next mirror call from any writer; the
+    /// search-side switch on the same plan adds the synchronisation that
+    /// removes the race entirely.
+    fn mirror_layer0_neighbours_to_inline(&self, idx: usize) {
+        let Some(inline) = self.inline_layer0.as_ref() else {
+            return;
+        };
+        if idx >= inline.capacity() {
+            return;
+        }
+        let list = &self.neighbours_l0[idx];
+        let mut snap: Vec<u64> = Vec::with_capacity(M_MAX0);
+        list.snapshot_into(&mut snap);
+        let take = snap.len().min(inline.m_max0());
+        let len_byte = u8::try_from(take).unwrap_or(u8::MAX);
+        // SAFETY: idx < inline.capacity() per the gate above. Slot writes
+        // are bounded by inline.m_max0() which the constructor guarantees
+        // is the in-bounds slot count.
+        unsafe {
+            for (slot, &id) in snap.iter().enumerate().take(take) {
+                inline.set_neighbour(idx, slot, id);
+            }
+            for slot in take..inline.m_max0() {
+                inline.set_neighbour(idx, slot, 0);
+            }
+            inline.set_neighbour_len(idx, len_byte);
+        }
+    }
+
     pub(crate) fn apply_insert_plan(&mut self, plan: InsertPlan, vector: Vec<f32>) {
         let InsertPlan {
             id,
@@ -2713,6 +2748,9 @@ impl HnswIndex {
     fn set_outgoing(&self, idx: usize, level: usize, ids: &[u64]) {
         let n = ids.len().min(M_MAX0);
         self.neighbours_at(idx, level).set(&ids[..n]);
+        if level == 0 {
+            self.mirror_layer0_neighbours_to_inline(idx);
+        }
     }
 
     /// Multi-writer append-edge primitive (C3). Tries to append `id` to
@@ -2725,7 +2763,11 @@ impl HnswIndex {
     /// commit). C2's serial apply continues to use [`add_neighbour_to`].
     #[allow(dead_code)] // Wired into parallel apply in C3 day 3.
     fn cas_add_neighbour_to(&self, neighbour_idx: usize, level: usize, id: u64) -> bool {
-        self.neighbours_at(neighbour_idx, level).cas_append(id)
+        let ok = self.neighbours_at(neighbour_idx, level).cas_append(id);
+        if ok && level == 0 {
+            self.mirror_layer0_neighbours_to_inline(neighbour_idx);
+        }
+        ok
     }
 
     /// Append `id` to `(neighbour_idx, level)`. If the resulting list
@@ -2741,6 +2783,10 @@ impl HnswIndex {
             let len_now = self.neighbours_at(neighbour_idx, level).len();
             if len_now > max_conn {
                 self.prune_connections(neighbour_idx, level, max_conn);
+                // prune_connections funnels through set_outgoing, which
+                // mirrors. Done.
+            } else if level == 0 {
+                self.mirror_layer0_neighbours_to_inline(neighbour_idx);
             }
         } else {
             // List at the inline cap (`M_MAX0`). When `max_conn == M_MAX0`
@@ -3018,6 +3064,48 @@ mod tests {
                     .as_ref()
                     .expect("SoA vector present");
                 assert_eq!(inline_vec, *soa_vec, "vector mismatch at idx={idx}");
+            }
+        }
+    }
+
+    #[test]
+    fn inline_layer0_mirrors_soa_layer0_neighbours() {
+        // Insert enough nodes for the build to populate non-trivial layer-0
+        // neighbour lists. After the build, every node's layer-0 neighbour
+        // ids and length must match between SoA and the contiguous store.
+        let mut cfg = make_config(VectorMetric::L2);
+        cfg.max_elements = 64;
+        let mut index = HnswIndex::new(cfg);
+        for i in 0..32u64 {
+            let v: Vec<f32> = (0..8)
+                .map(|d| ((i as f32) * 0.7 + (d as f32) * 0.13).sin())
+                .collect();
+            index.insert(i, v);
+        }
+        let inline = index
+            .inline_layer0()
+            .expect("inline store must be populated");
+        for idx in 0..index.nodes.len() {
+            let soa = &index.neighbours_l0[idx];
+            let mut soa_snap: Vec<u64> = Vec::with_capacity(M_MAX0);
+            soa.snapshot_into(&mut soa_snap);
+            let soa_len = soa_snap.len();
+            // SAFETY: idx < inline.capacity() and slots < m_max0.
+            unsafe {
+                let inline_len = inline
+                    .neighbour_len(idx)
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    as usize;
+                assert_eq!(inline_len, soa_len, "neighbour_len mismatch at idx={idx}");
+                for (slot, &expected) in soa_snap.iter().enumerate().take(soa_len) {
+                    let inline_id = inline
+                        .neighbour(idx, slot)
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    assert_eq!(
+                        inline_id, expected,
+                        "neighbour id mismatch at idx={idx} slot={slot}"
+                    );
+                }
             }
         }
     }
