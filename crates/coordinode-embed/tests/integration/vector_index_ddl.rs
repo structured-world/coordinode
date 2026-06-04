@@ -800,7 +800,7 @@ fn remove_property_removes_from_vector_index() {
 /// thread the Extended-RaBitQ 2-bit codec from the parser through the
 /// planner, executor, and into the live HnswIndex. After enough inserts
 /// to trigger calibration, every node in the index must carry a
-/// Multi(bits=2) code and search must return matching results.
+/// Multi(bits=2) code and search must navigate to the right cluster.
 #[test]
 fn create_vector_index_with_rabitq_2bit_quantization() {
     let (mut db, _dir) = open_db();
@@ -811,22 +811,48 @@ fn create_vector_index_with_rabitq_2bit_quantization() {
     // fires before the assertions.
     db.execute_cypher(
         "CREATE VECTOR INDEX ext_idx ON :Doc(emb) \
-         OPTIONS {m: 8, ef_construction: 64, metric: \"cosine\", \
+         OPTIONS {m: 16, ef_construction: 200, metric: \"cosine\", \
                   dimensions: 64, quantization: \"rabitq-2bit\"}",
     )
     .expect("create vector index with rabitq-2bit");
 
-    // Insert above calibration_threshold (1000) with batched UNWIND.
-    let n = 1100usize;
+    // Workload: K well-separated dense clusters in 64-D, ~N/K vectors per
+    // cluster as centroid + per-coordinate deterministic noise. Single-
+    // non-zero unit vectors are an adversarial case for low-bit RaBitQ
+    // (rotated codes for orthogonal directions become indistinguishable
+    // under the cheap-distance kernel at default ef_search), so the
+    // workload here mirrors the production embedding shape: dense
+    // values with cluster structure.
+    const N: usize = 1100;
+    const K: usize = 7;
+    let cluster_centroid = |k: usize| -> [f32; 64] {
+        let mut c = [0.0f32; 64];
+        for (d, slot) in c.iter_mut().enumerate() {
+            // 7-step zigzag per cluster on each dim. With K = 7 every
+            // (k + d) % 7 row of the pattern is distinct, so clusters
+            // stay linearly independent and well-separated after L2
+            // normalisation. K must equal the modulus, otherwise
+            // (k = M, k = 0) collapse to the same centroid.
+            *slot = ((k + d) % 7) as f32 - 3.0;
+        }
+        c
+    };
+
     let mut rows = String::from("[");
-    for i in 0..n {
+    for i in 0..N {
         if i > 0 {
             rows.push_str(", ");
         }
+        let k = i % K;
+        let centroid = cluster_centroid(k);
         let mut v = [0.0f32; 64];
-        // Each vector has a single non-zero dim — keeps codes distinct
-        // and well-distributed across the rotated space.
-        v[i % 64] = 1.0 + (i as f32) * 0.001;
+        for (d, slot) in v.iter_mut().enumerate() {
+            // Deterministic per-(node,dim) noise keeps codes distinct
+            // within a cluster without making any node closer to a
+            // different cluster's centroid than to its own.
+            let noise = ((i * (d + 1)) % 13) as f32 * 0.01 - 0.06;
+            *slot = centroid[d] + noise;
+        }
         rows.push_str(&format!("{{i: {i}, emb: ["));
         for (j, x) in v.iter().enumerate() {
             if j > 0 {
@@ -837,14 +863,18 @@ fn create_vector_index_with_rabitq_2bit_quantization() {
         rows.push_str("]}");
     }
     rows.push(']');
-    let query = format!("UNWIND {rows} AS r CREATE (m:Doc) SET m = r RETURN m");
-    let created = db.execute_cypher(&query).expect("bulk create");
-    assert_eq!(created.len(), n, "bulk create returned wrong row count");
+    let create_query = format!("UNWIND {rows} AS r CREATE (m:Doc) SET m = r RETURN m");
+    let created = db.execute_cypher(&create_query).expect("bulk create");
+    assert_eq!(created.len(), N, "bulk create returned wrong row count");
 
-    // Search: the e_0-like query vector should match node 0 first.
-    let mut q = String::from("[1.0");
-    for _ in 1..64 {
-        q.push_str(", 0.0");
+    // Query = cluster-0 centroid (matches noisy nodes with i % K == 0).
+    let query_centroid = cluster_centroid(0);
+    let mut q = String::from("[");
+    for (j, x) in query_centroid.iter().enumerate() {
+        if j > 0 {
+            q.push_str(", ");
+        }
+        q.push_str(&format!("{x}"));
     }
     q.push(']');
     let result = db
@@ -857,13 +887,10 @@ fn create_vector_index_with_rabitq_2bit_quantization() {
         !result.is_empty(),
         "vector_similarity must return results through Extended-RaBitQ index"
     );
-    // 17 of the 1100 nodes (every 64th: 0, 64, ..., 1024, 1088) have
-    // their non-zero on dim 0 — those are the legitimate top-cosine
-    // matches against query e_0. The codec wiring is proven iff every
-    // node in top-5 belongs to that family. Exact ordering inside the
-    // family is determined by rotation noise + the small magnitude
-    // offset (1.0 + i*0.001) and isn't load-bearing for the wiring
-    // assertion.
+    // N/K = 157 nodes belong to cluster 0 (id % K == 0). The codec
+    // wiring is proven iff the top-5 search results all land in that
+    // cluster. Intra-cluster ordering depends on the per-node noise
+    // and isn't load-bearing for the wiring assertion.
     let top5_ids: Vec<i64> = result
         .iter()
         .filter_map(|r| match r.get("i") {
@@ -877,7 +904,7 @@ fn create_vector_index_with_rabitq_2bit_quantization() {
     );
     for id in &top5_ids {
         assert_eq!(
-            id % 64,
+            (*id as usize) % K,
             0,
             "rabitq-2bit top-5 leaked a wrong-cluster node: id={id}, full={top5_ids:?}",
         );
