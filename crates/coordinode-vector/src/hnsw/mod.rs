@@ -28,6 +28,7 @@
 //!   HNSW built locally on each node.
 
 mod entry_point;
+mod inline_layer0;
 mod neighbours;
 mod visited;
 
