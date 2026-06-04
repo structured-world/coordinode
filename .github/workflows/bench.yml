@@ -209,58 +209,20 @@ jobs:
               echo "::endgroup::"
             done
 
-            # R863 RobustPrune α-pruning sweep on glove RaBitQ.
-            # Vamana paper recommends α=1.2 as the production default —
-            # the diversification trades extra build time for higher
-            # search QPS at fixed recall. Run alongside the α=1.0
-            # (legacy "take M closest") baseline above so the dashboard
-            # can plot the curve shift directly.
-            echo "::group::glove-100-angular M=16 quantization=rabitq alpha=1.2 threads=$T"
-            ./target/release/bench-vector-ann \
-              --train       "$GLOVE_DIR/glove_base.fvecs" \
-              --query       "$GLOVE_DIR/glove_query.fvecs" \
-              --groundtruth "$GLOVE_DIR/glove_groundtruth.ivecs" \
-              --dataset-name glove-100-angular \
-              --m 16 --ef-construction 200 \
-              --codec none --quantization rabitq --alpha-pruning 1.2 \
-              --ef-sweep "$EF_SWEEP" \
-              --threads "$T" \
-              --output bench-results
-            echo "::endgroup::"
-
-            # Gap #2 (E+C) RerankMode sweep on glove RaBitQ.
-            # `inline` is the legacy default already covered by the
-            # alpha=1.0 and alpha=1.2 runs above. Run `end-of-search`
-            # (qdrant / chroma / DiskANN pattern: one rerank at the
-            # very end instead of per visit) and `none` (no rerank
-            # at all) so the dashboard can compare the recall/QPS
-            # curve shift directly. Both run with α=1.0 to keep the
-            # only knob varied vs the existing α=1.0 row.
-            for MODE in end-of-search none; do
-              echo "::group::glove-100-angular M=16 quantization=rabitq rerank_mode=$MODE threads=$T"
-              ./target/release/bench-vector-ann \
-                --train       "$GLOVE_DIR/glove_base.fvecs" \
-                --query       "$GLOVE_DIR/glove_query.fvecs" \
-                --groundtruth "$GLOVE_DIR/glove_groundtruth.ivecs" \
-                --dataset-name glove-100-angular \
-                --m 16 --ef-construction 200 \
-                --codec none --quantization rabitq --rerank-mode "$MODE" \
-                --ef-sweep "$EF_SWEEP" \
-                --threads "$T" \
-                --output bench-results
-              echo "::endgroup::"
-            done
-
-            # Gap #2 oversample sweep on glove RaBitQ end-of-search.
-            # The 5248f69 measurement showed end-of-search at oversample
-            # 1.0 closing 2/3 of the per-visit QPS gap but landing recall
-            # 0.90 at ef=800 — 5pt under the cron's 0.95 target. The
-            # qdrant-equivalent `oversampling` parameter inflates the
-            # cheap-distance frontier so the rerank picks user_ef from a
-            # larger pool. Sweep {1.5, 2.0, 3.0} so the dashboard sees the
-            # whole recall/QPS curve and we can pick the production
-            # default empirically.
-            for OS in 1.5 2.0 3.0; do
+            # Gap #2 (E+C) RerankMode + oversample sweep on glove RaBitQ.
+            # The previous CI bench accumulated 7 RaBitQ sweeps over time
+            # and started exceeding the GitHub Actions 5h timeout (d67fc2d
+            # cancelled at 3h, c953a05 cancelled at 5h6m). Trimmed to the
+            # 2 oversample rows that ACTUALLY produce new data after
+            # baselines were captured in 5248f69:
+            #   - end-of-search oversample=2.0   ← production candidate
+            #   - end-of-search oversample=3.0   ← recall headroom
+            # The α=1.0 inline baseline, α=1.2 inline, end-of-search
+            # oversample=1.0 default, and `none` recall-ceiling rows are
+            # already in bench-data under 5248f69 / b1004cd / 45b87bf —
+            # do NOT re-run them in CI on every push. Bring them back if
+            # the recall surface drifts.
+            for OS in 2.0 3.0; do
               echo "::group::glove-100-angular M=16 quantization=rabitq rerank_mode=end-of-search oversample=$OS threads=$T"
               ./target/release/bench-vector-ann \
                 --train       "$GLOVE_DIR/glove_base.fvecs" \
