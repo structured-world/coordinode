@@ -428,6 +428,17 @@ pub struct HnswIndex {
     /// and quantized bytes on (re)calibration; reads through it power
     /// Phase 1.5 cross-shard rerank and application-side custom rerank.
     vector_tier: Option<crate::storage::VectorTierHandle>,
+    /// Contiguous per-node store covering layer-0 neighbours, f32 vector,
+    /// RaBitQ code and external label in a single stride-addressable
+    /// allocation. Mirrors the hnswlib `data_level0_memory_` layout that
+    /// shows super-linear MT4 scaling on sift-128 f32 search (worker
+    /// threads share L3 fills on common neighbour visits, whereas the
+    /// SoA fields above keep cache lines uncorrelated). Allocated on
+    /// the first insert once the vector dim is known. Populated as
+    /// write-through alongside the SoA fields; the search side reads
+    /// remain on SoA today, the follow-up commit on the same plan
+    /// switches the layer-0 neighbour read to this store.
+    inline_layer0: Option<inline_layer0::InlineLayer0>,
 }
 
 /// Read-only result of the planning phase of an insert (C2, R858b).
@@ -684,6 +695,7 @@ impl HnswIndex {
             // Seed from address of self (varies per instance). Non-deterministic but fast.
             rng_state: std::sync::atomic::AtomicU64::new(0xdeadbeef_cafebabe),
             vector_tier: None,
+            inline_layer0: None,
         }
     }
 
@@ -1152,6 +1164,55 @@ impl HnswIndex {
     /// neighbour storage, then publishes outgoing + bidirectional edges
     /// from the plan via the write helpers (`set_outgoing` /
     /// `add_neighbour_to`). Single-writer — caller holds `&mut self`.
+    /// Mirror `(id, vector)` for node `idx` into the contiguous layer-0
+    /// store. Lazy-allocates the store on the first call once `dim` is
+    /// known; subsequent calls reuse it. No-op when the store is already
+    /// allocated for a different dim (programmer error elsewhere) or when
+    /// `idx` overruns the pre-allocated capacity; this keeps the SoA path
+    /// authoritative until the search-side switch lands.
+    ///
+    /// Neighbour ids and RaBitQ codes are NOT written here; they hook in
+    /// from the dedicated CAS neighbour-write path and from
+    /// `auto_calibrate_rabitq` respectively, in follow-up commits on the
+    /// same plan. Writing them now without the matching reads would just
+    /// double the build-time cost.
+    fn mirror_inline_layer0(&mut self, idx: usize, id: u64, vector: &[f32]) {
+        let dim = vector.len();
+        if dim == 0 {
+            return;
+        }
+        if self.inline_layer0.is_none() {
+            let capacity = (self.config.max_elements as usize).max(idx + 1);
+            self.inline_layer0 = Some(inline_layer0::InlineLayer0::new(capacity, M_MAX0, dim));
+        }
+        let Some(inline) = self.inline_layer0.as_mut() else {
+            return;
+        };
+        if inline.dim() != dim || idx >= inline.capacity() {
+            return;
+        }
+        // SAFETY: idx < capacity (checked above), vector.len() == dim
+        // (checked above), and we hold &mut self so no other reader
+        // observes the partial write.
+        unsafe {
+            inline.set_label(idx, id);
+            inline.set_vector_f32(idx, vector);
+        }
+    }
+
+    /// Read-only view of the contiguous layer-0 store, for parity tests
+    /// and the follow-up search-side switch.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "consumer of this accessor lands with the search-side switch on the same plan"
+        )
+    )]
+    pub(crate) fn inline_layer0(&self) -> Option<&inline_layer0::InlineLayer0> {
+        self.inline_layer0.as_ref()
+    }
+
     pub(crate) fn apply_insert_plan(&mut self, plan: InsertPlan, vector: Vec<f32>) {
         let InsertPlan {
             id,
@@ -1190,6 +1251,10 @@ impl HnswIndex {
             id,
             max_layer: new_level,
         });
+        // Mirror into the contiguous layer-0 store before moving `vector`.
+        // No-op until the field has been allocated AND we are inside
+        // capacity; the SoA path below remains authoritative either way.
+        self.mirror_inline_layer0(idx, id, &vector);
         // SoA payload pushes in lockstep — same idx, no extra clone.
         self.node_vectors.push(Some(vector));
         self.node_quantized.push(quantized);
@@ -1298,6 +1363,8 @@ impl HnswIndex {
                 id: plan.id,
                 max_layer: new_level,
             });
+            // Mirror into the contiguous layer-0 store before moving `vec`.
+            self.mirror_inline_layer0(idx, plan.id, &vec);
             self.node_vectors.push(Some(vec));
             self.node_quantized.push(quantized);
             self.node_rabitq_codes.push(rabitq_code);
@@ -2910,6 +2977,79 @@ mod tests {
             metric,
             max_dimensions: 65_536,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn inline_layer0_is_lazy_until_first_insert() {
+        let index = HnswIndex::new(make_config(VectorMetric::L2));
+        assert!(
+            index.inline_layer0().is_none(),
+            "inline_layer0 must not allocate until the first insert observes a vector dim"
+        );
+    }
+
+    #[test]
+    fn inline_layer0_mirrors_soa_on_per_item_insert() {
+        let mut cfg = make_config(VectorMetric::L2);
+        // Cap small so the test does not allocate 100s of MB for the
+        // contiguous store; idx values stay below this.
+        cfg.max_elements = 32;
+        let mut index = HnswIndex::new(cfg);
+        let payload = |i: u64| -> Vec<f32> {
+            (0..8)
+                .map(|d| (i as f32) * 0.5 + (d as f32) * 0.01)
+                .collect()
+        };
+        for i in 0..8u64 {
+            index.insert(i, payload(i));
+        }
+        let inline = index
+            .inline_layer0()
+            .expect("inline store must be populated after the first insert");
+        for idx in 0..8 {
+            // SAFETY: idx < 8 < inline.capacity() (32).
+            unsafe {
+                let label = inline.label(idx).load(std::sync::atomic::Ordering::Relaxed);
+                let expected_id = index.nodes[idx].id;
+                assert_eq!(label, expected_id, "label mismatch at idx={idx}");
+                let inline_vec: Vec<f32> = inline.vector_f32(idx).to_vec();
+                let soa_vec = index.node_vectors[idx]
+                    .as_ref()
+                    .expect("SoA vector present");
+                assert_eq!(inline_vec, *soa_vec, "vector mismatch at idx={idx}");
+            }
+        }
+    }
+
+    #[test]
+    fn inline_layer0_mirrors_soa_on_batch_insert() {
+        let mut cfg = make_config(VectorMetric::L2);
+        cfg.max_elements = 64;
+        let mut index = HnswIndex::new(cfg);
+        // Above BATCH_PARALLEL_THRESHOLD so the rayon-planned path fires.
+        let items: Vec<(u64, Vec<f32>)> = (0..32u64)
+            .map(|i| {
+                let v: Vec<f32> = (0..8).map(|d| -(i as f32) + (d as f32) * 0.1).collect();
+                (i, v)
+            })
+            .collect();
+        index.insert_batch(items);
+        let inline = index
+            .inline_layer0()
+            .expect("inline store must be populated after a batch insert");
+        for idx in 0..index.nodes.len() {
+            // SAFETY: idx < nodes.len() < inline.capacity() (64).
+            unsafe {
+                let label = inline.label(idx).load(std::sync::atomic::Ordering::Relaxed);
+                let expected_id = index.nodes[idx].id;
+                assert_eq!(label, expected_id, "label mismatch at idx={idx}");
+                let inline_vec: Vec<f32> = inline.vector_f32(idx).to_vec();
+                let soa_vec = index.node_vectors[idx]
+                    .as_ref()
+                    .expect("SoA vector present");
+                assert_eq!(inline_vec, *soa_vec, "vector mismatch at idx={idx}");
+            }
         }
     }
 

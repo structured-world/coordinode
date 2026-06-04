@@ -174,6 +174,14 @@ impl InlineLayer0 {
         self.m_max0
     }
 
+    /// Vector dimension this layer was configured for. Derived from
+    /// `f32_bytes / 4` so the value matches what `set_vector_f32` and
+    /// `vector_f32` operate on.
+    #[inline]
+    pub fn dim(&self) -> usize {
+        self.f32_bytes / 4
+    }
+
     /// Base byte pointer for the per-node block at `idx`.
     ///
     /// # Safety
