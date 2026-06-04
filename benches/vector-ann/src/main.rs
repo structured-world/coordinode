@@ -190,6 +190,18 @@ struct Args {
     /// Ignored when `--rerank-mode` is not `end-of-search`.
     #[arg(long, default_value_t = 1.0)]
     rerank_oversample: f32,
+
+    /// If > 0, take only the first N base vectors from the training
+    /// set and recompute ground-truth via brute-force kNN against
+    /// that subset. The effective dataset name in the report gets
+    /// `-Nk` injected before the `-euclidean` / `-angular` suffix
+    /// (e.g. `sift-128-euclidean` -> `sift-128-100k-euclidean`) so
+    /// the dashboard keeps subset runs separate from full-dataset
+    /// runs. Use 100_000 on per-commit CI to keep wall-clock under
+    /// ~20 minutes; competitors must run with the same N for
+    /// apples-to-apples comparison. `0` (default) = full dataset.
+    #[arg(long, default_value_t = 0)]
+    subset_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -255,11 +267,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Load dataset ────────────────────────────────────────
     info!(train=?args.train, "loading training set");
-    let (train_dim, train_flat) = read_fvecs(&args.train)?;
+    let (train_dim, mut train_flat) = read_fvecs(&args.train)?;
     info!(query=?args.query, "loading query set");
     let (query_dim, query_flat) = read_fvecs(&args.query)?;
     info!(gt=?args.groundtruth, "loading ground-truth");
-    let (gt_k, gt_flat) = read_ivecs(&args.groundtruth)?;
+    let (mut gt_k, mut gt_flat) = read_ivecs(&args.groundtruth)?;
 
     if train_dim != query_dim {
         return Err(format!(
@@ -268,7 +280,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     let d = train_dim;
-    let n_train = train_flat.len() / d;
+    let mut n_train = train_flat.len() / d;
     let n_test = query_flat.len() / d;
     let gt_n = gt_flat.len() / gt_k;
     if gt_n != n_test {
@@ -283,10 +295,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Detect metric from dataset name ─────────────────────
     // ann-benchmarks naming convention: `<set>-<dim>-<metric>`.
     // `euclidean` → L2, `angular` → Cosine (after normalising).
-    let metric = if args.dataset_name.ends_with("-euclidean") {
-        VectorMetric::L2
+    let metric_suffix = if args.dataset_name.ends_with("-euclidean") {
+        "-euclidean"
     } else if args.dataset_name.ends_with("-angular") {
-        VectorMetric::Cosine
+        "-angular"
     } else {
         return Err(format!(
             "cannot detect metric from dataset name {:?} (expected suffix `-euclidean` or `-angular`)",
@@ -294,7 +306,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     };
+    let metric = match metric_suffix {
+        "-euclidean" => VectorMetric::L2,
+        _ => VectorMetric::Cosine,
+    };
     info!(?metric, "metric inferred from dataset name");
+
+    // ── Optional subsampling ────────────────────────────────
+    // For per-commit CI: shrink the base set to the first N vectors
+    // and recompute ground-truth against that subset. Wall-clock
+    // drops ~10× without changing the relative ranking against
+    // competitors (which must run the same N). Brute-force kNN
+    // for gt recompute is parallel over queries; on 100k base it
+    // takes a few seconds at most.
+    let dataset_name = if args.subset_size > 0 && args.subset_size < n_train {
+        info!(
+            full_n = n_train,
+            subset_n = args.subset_size,
+            "subsampling training set + recomputing groundtruth"
+        );
+        train_flat.truncate(args.subset_size * d);
+        n_train = args.subset_size;
+        let new_gt_k = args.k.max(10);
+        let gt_recompute_start = Instant::now();
+        gt_flat = brute_force_gt(&train_flat, &query_flat, d, new_gt_k, metric);
+        gt_k = new_gt_k;
+        info!(
+            new_gt_k,
+            gt_recompute_secs = gt_recompute_start.elapsed().as_secs_f64(),
+            "groundtruth recomputed for subset"
+        );
+        let stem = args
+            .dataset_name
+            .strip_suffix(metric_suffix)
+            .unwrap_or(args.dataset_name.as_str());
+        let k_thousand = args.subset_size / 1_000;
+        format!("{stem}-{k_thousand}k{metric_suffix}")
+    } else {
+        args.dataset_name.clone()
+    };
 
     // ── Build HNSW ──────────────────────────────────────────
     // RSS BEFORE build: capture the baseline that includes the loaded
@@ -394,11 +444,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut report = BenchReport::new(
         "vector",
         "ann-benchmarks",
-        &args.dataset_name,
+        &dataset_name,
         "coordinode",
         &args.codec,
         version,
     )?;
+    // Record subset_size so the dashboard can distinguish per-commit
+    // smoke runs (100k) from periodic full-dataset runs (0 / 1M+)
+    // even within the same dataset family.
+    report.record("subset_size", args.subset_size)?;
     report.record("hnsw_m", args.m)?;
     report.record("hnsw_ef_construction", args.ef_construction)?;
     // RobustPrune α; recorded so the dashboard can filter / group runs
@@ -526,4 +580,88 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     }
     let idx = ((sorted.len() as f64) * p).floor() as usize;
     sorted[idx.min(sorted.len() - 1)]
+}
+
+/// Brute-force kNN for ground-truth recomputation on a subsampled
+/// training set. Runs `n_query` queries in parallel via rayon; each
+/// query computes the distance to every training vector and keeps
+/// the top-`k` by smaller-is-closer ordering. Result layout matches
+/// `read_ivecs`: row-major `Vec<i32>` of length `n_query * k`.
+fn brute_force_gt(
+    train: &[f32],
+    queries: &[f32],
+    d: usize,
+    k: usize,
+    metric: VectorMetric,
+) -> Vec<i32> {
+    use rayon::prelude::*;
+
+    let n_train = train.len() / d;
+    let n_query = queries.len() / d;
+    let mut result = vec![0i32; n_query * k];
+
+    result
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(q_idx, out)| {
+            let q = &queries[q_idx * d..(q_idx + 1) * d];
+            let mut scored: Vec<(f32, i32)> = (0..n_train)
+                .map(|i| {
+                    let v = &train[i * d..(i + 1) * d];
+                    let score = match metric {
+                        VectorMetric::L2 => l2_sq(q, v),
+                        VectorMetric::L1 => l1(q, v),
+                        // Cosine similarity / dot product both ordered
+                        // descending; negate so smaller-is-closer
+                        // matches the L2 / L1 path.
+                        VectorMetric::Cosine => -cosine_sim(q, v),
+                        VectorMetric::DotProduct => -dot(q, v),
+                    };
+                    (score, i as i32)
+                })
+                .collect();
+            let take = k.min(scored.len());
+            if take < scored.len() {
+                scored.select_nth_unstable_by(take, |a, b| a.0.total_cmp(&b.0));
+            }
+            scored[..take].sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (i, (_, idx)) in scored[..take].iter().enumerate() {
+                out[i] = *idx;
+            }
+        });
+
+    result
+}
+
+fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            let d = *x - *y;
+            d * d
+        })
+        .sum()
+}
+
+fn l1(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| (*x - *y).abs()).sum()
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| *x * *y).sum()
+}
+
+fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += *x * *y;
+        na += *x * *x;
+        nb += *y * *y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
 }

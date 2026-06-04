@@ -42,9 +42,13 @@ on:
         required: false
         default: 'vector'
       thread_sweep:
-        description: 'Comma-separated rayon thread counts to sweep for the vector bench (each value re-runs the full per-commit smoke set). Empty / "default" = single run at the per-commit cap. Example: "1,4" for fairness vs single-thread and 4-thread competitors.'
+        description: 'Comma-separated rayon thread counts to sweep for the vector bench (each value re-runs the full per-commit smoke set). Empty / "default" = ST + MT4 sweep ("1,4"). Example: "1" for single-thread only.'
         required: false
         default: ''
+      subset_size:
+        description: 'First N base vectors to use from each dataset (groundtruth recomputed brute-force). 100000 (default) keeps per-commit wall-clock under ~30 min. Set to 0 for full 1M dataset (marketing-grade, ~2 h).'
+        required: false
+        default: '100000'
 
 concurrency:
   group: bench
@@ -133,20 +137,26 @@ jobs:
           # If the workflow_dispatch input `thread_sweep` is set
           # (e.g. "1,4"), iterate the whole smoke set for each value
           # and tag the JSON output with the effective rayon thread
-          # count. Empty / default = single run honouring the global
-          # RAYON_NUM_THREADS cap (per-commit smoke budget).
+          # count. Empty / default = ST + MT4 sweep so each push
+          # produces both single-thread and 4-thread numbers, which
+          # is the minimum needed to compute parallel efficiency
+          # E_core(4) = QPS_MT4 / (4 * QPS_ST) against competitors.
           THREAD_SWEEP: ${{ inputs.thread_sweep }}
+          # First N base vectors per dataset (groundtruth recomputed
+          # brute-force inside bench-vector-ann). 100k by default for
+          # per-commit smoke; set to 0 / empty for full 1M dataset.
+          SUBSET_SIZE: ${{ inputs.subset_size || '100000' }}
         run: |
           set -euo pipefail
           EF_SWEEP="20,40,80,200,400,800"
 
           # Build the list of `--threads` values to sweep. Empty input
-          # means "single run, take the per-commit cap" — represented
-          # as the sentinel `0` (which `bench-vector-ann` interprets
-          # as "rayon default = pick up RAYON_NUM_THREADS env / logical
-          # cores"). A non-empty input is parsed as a comma list.
+          # defaults to "1 4" so per-commit numbers cover both the
+          # ST baseline (matches hnswlib default) and the MT4 budget
+          # (matches qdrant / hnswlib `set_num_threads(4)`). A non-
+          # empty input is parsed as a comma list.
           if [ -z "${THREAD_SWEEP// /}" ] || [ "$THREAD_SWEEP" = "default" ]; then
-            THREAD_LIST="0"
+            THREAD_LIST="1 4"
           else
             THREAD_LIST="$(echo "$THREAD_SWEEP" | tr ',' ' ')"
           fi
@@ -174,6 +184,7 @@ jobs:
               --m 16 --ef-construction 200 \
               --codec none --ef-sweep "$EF_SWEEP" \
               --threads "$T" \
+              --subset-size "$SUBSET_SIZE" \
               --output bench-results
             echo "::endgroup::"
 
@@ -191,6 +202,7 @@ jobs:
               --codec none --quantization rabitq \
               --ef-sweep "$EF_SWEEP" \
               --threads "$T" \
+              --subset-size "$SUBSET_SIZE" \
               --output bench-results
             echo "::endgroup::"
 
@@ -205,6 +217,7 @@ jobs:
                 --codec none --quantization "$QUANT" \
                 --ef-sweep "$EF_SWEEP" \
                 --threads "$T" \
+                --subset-size "$SUBSET_SIZE" \
                 --output bench-results
               echo "::endgroup::"
             done
@@ -241,6 +254,7 @@ jobs:
                 --rerank-mode end-of-search --rerank-oversample "$OS" \
                 --ef-sweep "$EF_SWEEP" \
                 --threads "$T" \
+                --subset-size "$SUBSET_SIZE" \
                 --output bench-results
               echo "::endgroup::"
             done
