@@ -128,6 +128,7 @@ impl VectorIndexRegistry {
             offload_vectors: config.offload_vectors,
             property_name: def.property().to_string(),
             max_elements: 1_000_000,
+            ..HnswConfig::default()
         };
 
         let mut hnsw = HnswIndex::new(hnsw_config);
