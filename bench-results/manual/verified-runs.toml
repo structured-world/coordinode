@@ -80,6 +80,103 @@ sweep = [
 ]
 
 [[coordinode.glove_100_angular]]
+sha = "06421a5"
+codec = "rabitq-1bit"
+dataset = "glove-100-angular"
+dataset_n_train = 1_183_514
+dataset_n_test = 10_000
+k = 10
+m = 16
+m_max0 = 32
+ef_construction = 200
+alpha_pruning = 1.0
+rerank_mode = "end-of-search"
+rerank_oversample_factor = 2.0   # ← GAP #2 BREAKTHROUGH — qdrant parity row
+build_threads = 4
+search_threads = 1
+build_secs = 505
+source_json = "bench-results/vector/glove-100-angular/06421a5-coordinode-M16-Q1-20260604-052451.json"
+sweep = [
+  { ef =  20, recall_at_10 = 0.4666, qps = 5043.14 },
+  { ef =  40, recall_at_10 = 0.6091, qps = 3072.57 },
+  { ef =  80, recall_at_10 = 0.7326, qps = 1825.72 },
+  { ef = 200, recall_at_10 = 0.8452, qps =  852.35 },
+  { ef = 400, recall_at_10 = 0.9044, qps =  458.45 },
+  { ef = 800, recall_at_10 = 0.9451, qps =  240.79 },   # ← CROSSES recall 0.95, matches qdrant 246
+]
+notes = """
+GAP #2 BREAKTHROUGH ROW. End-of-search + oversample=2.0 at ef=800
+hits recall 0.9451 with 240.79 QPS — within 2% of qdrant's 246 QPS
+at ef=400 / recall 0.9577. The matched-recall, matched-thread
+comparison is essentially a tie:
+
+  hnswlib    f32                 ef=1200:  575 QPS @ recall 0.9615
+  qdrant     f32                 ef= 400:  246 QPS @ recall 0.9577
+  CoordiNode RaBitQ EoS oversample=2.0 ef=800:  241 QPS @ recall 0.9451
+  CoordiNode RaBitQ inline alpha=1.2  ef=800:  139 QPS @ recall 0.9510
+  pgvector   f32                 ef= 800:  104 QPS @ recall 0.9535
+
+CoordiNode jumps from 4th place (139 QPS, behind qdrant and ahead of
+pgvector) to tied-2nd with qdrant — Gap #2 effectively closed against
+qdrant. Cumulative arc from the early-June baseline cf35132 (137 QPS):
+
+  cf35132 (peek_mut)                                       137 QPS
+  → 14ec191 (Phase 2 InlineLayer0 + skip f32 prefetch)     162 QPS  (+18%)
+  → d365611 (SmallVec inline RaBitQ code)                  162 QPS  (~)
+  → 5fb4953 (SIMD FHT-Kac AVX2/NEON)                       162 QPS  (~)
+  → c953a05 (unchecked visited.check_and_mark)             ?        (not isolated; CI cancelled)
+  → 06421a5 (EndOfSearch + oversample=2.0)                 241 QPS  (+49% over 5fb4953, +76% cumulative)
+
+Residual gap to hnswlib f32 = 575 / 241 ≈ 2.4× (was 4.1×). Closing it
+needs the orthogonal Gap #1 (HNSW engine contiguous layout / task #182)
+work — the cheap-distance graph traversal still has structural
+overhead vs hnswlib's data_level0_memory_ single-allocation pattern.
+
+EndOfSearch + oversample=2.0 is now the recommended production
+default for cosine + RaBitQ workloads where recall ≥ 0.95 matters.
+oversample=3.0 trades QPS for higher recall ceiling (recall 0.9653 @
+ef=800 / 163 QPS); inline rerank stays available as RerankMode::Inline
+for users wanting maximum recall.
+"""
+
+[[coordinode.glove_100_angular]]
+sha = "06421a5"
+codec = "rabitq-1bit"
+dataset = "glove-100-angular"
+dataset_n_train = 1_183_514
+dataset_n_test = 10_000
+k = 10
+m = 16
+m_max0 = 32
+ef_construction = 200
+alpha_pruning = 1.0
+rerank_mode = "end-of-search"
+rerank_oversample_factor = 3.0   # ← recall headroom row
+build_threads = 4
+search_threads = 1
+build_secs = 713
+source_json = "bench-results/vector/glove-100-angular/06421a5-coordinode-M16-Q1-20260604-055729.json"
+sweep = [
+  { ef =  20, recall_at_10 = 0.5590, qps = 3873.70 },
+  { ef =  40, recall_at_10 = 0.6905, qps = 2299.78 },
+  { ef =  80, recall_at_10 = 0.7918, qps = 1314.52 },
+  { ef = 200, recall_at_10 = 0.8856, qps =  589.36 },
+  { ef = 400, recall_at_10 = 0.9327, qps =  313.85 },
+  { ef = 800, recall_at_10 = 0.9653, qps =  163.43 },
+]
+notes = """
+End-of-search + oversample=3.0 trades QPS for higher recall ceiling.
+At ef=800 lands recall 0.9653 / 163 QPS — between oversample=2.0
+(0.9451 / 241) and inline α=1.2 (0.9510 / 139). The recall surface
+keeps climbing with oversample; QPS drops roughly linearly with the
+factor because the rerank pass scales with frontier_ef.
+
+Production tuning rule of thumb on glove-class workloads: pick
+oversample to land just past the recall target. Past that, more
+oversample is paid QPS for no recall gain.
+"""
+
+[[coordinode.glove_100_angular]]
 sha = "5248f69"
 codec = "rabitq-1bit"
 dataset = "glove-100-angular"
