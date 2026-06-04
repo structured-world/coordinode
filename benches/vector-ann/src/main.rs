@@ -154,10 +154,10 @@ struct Args {
     /// (`--threads 1` for hnswlib default) or fixed-budget scaling
     /// sweeps (`--threads 4`).
     ///
-    /// Search remains single-threaded inside this binary: `sweep_one`
-    /// loops queries sequentially, so per-query latency / QPS are
-    /// always reported on one core regardless of this flag. This
-    /// flag only governs the rayon pool used during graph construction.
+    /// This flag only governs the rayon pool used during HNSW graph
+    /// construction. To run search concurrently across multiple
+    /// workers and measure aggregate throughput / parallel
+    /// efficiency, use `--search-threads N` (independent flag).
     #[arg(long, default_value_t = 0)]
     threads: usize,
 
@@ -190,6 +190,22 @@ struct Args {
     /// Ignored when `--rerank-mode` is not `end-of-search`.
     #[arg(long, default_value_t = 1.0)]
     rerank_oversample: f32,
+
+    /// Number of OS threads to drive concurrent search calls during
+    /// the ef sweep. `1` (default) preserves the original sequential
+    /// ann-benchmarks methodology (per-query latency on a single
+    /// core). `N>1` rebuilds the inner search loop with a local
+    /// rayon pool and dispatches queries across `N` workers; the
+    /// reported QPS is the aggregate throughput, NOT per-thread.
+    /// Used to derive parallel efficiency
+    ///   `E_core(N) = QPS(search_threads=N) / (N * QPS(search_threads=1))`
+    /// against competitors with the same configuration.
+    ///
+    /// Independent from `--threads` which governs the HNSW BUILD
+    /// rayon pool. Typically set both to the same N for a clean
+    /// fixed-budget comparison.
+    #[arg(long, default_value_t = 1)]
+    search_threads: usize,
 
     /// If > 0, take only the first N base vectors from the training
     /// set and recompute ground-truth via brute-force kNN against
@@ -423,7 +439,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut points = Vec::new();
     for ef in &sweep {
         index.set_ef_search(*ef);
-        let point = sweep_one(&index, &query_flat, &gt_flat, d, gt_k, n_test, args.k)?;
+        let point = sweep_one(
+            &index,
+            &query_flat,
+            &gt_flat,
+            d,
+            gt_k,
+            n_test,
+            args.k,
+            args.search_threads,
+        )?;
         info!(
             ef_search = ef,
             recall_at_k = point.recall_at_k,
@@ -462,12 +487,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     report.record("hnsw_rerank_mode", args.rerank_mode.clone())?;
     report.record("hnsw_rerank_oversample", args.rerank_oversample as f64)?;
     report.record("quantization", args.quantization.clone())?;
-    // Effective thread count used by the rayon build pool. Reported so
-    // downstream comparisons can group/filter (`1` vs `4` runs are not
-    // interchangeable for build-time wall-clock, even though search QPS
-    // is single-thread). `0` means rayon-default (logical-core count).
+    // Effective thread count used by the rayon BUILD pool. `0` means
+    // rayon-default (logical-core count).
     report.record("rayon_threads", args.threads)?;
     report.record("rayon_threads_effective", rayon::current_num_threads())?;
+    // Threads driving the SEARCH path (independent from build pool).
+    // `1` = sequential per-query timing (ann-benchmarks convention).
+    // `N>1` = aggregate throughput across N concurrent workers; pair
+    // with the same N in competitor runs to derive E_core(N).
+    report.record("search_threads", args.search_threads)?;
     // Bit-width only meaningful for `rabitq`; record unconditionally so
     // the dashboard can group/filter by it without per-row None handling.
     if args.quantization == "rabitq" {
@@ -520,6 +548,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// `query_flat[q_idx * dim..(q_idx + 1) * dim]` is the q-th query,
 /// `gt_flat[q_idx * gt_k..(q_idx + 1) * gt_k]` is the q-th
 /// ground-truth row.
+#[allow(clippy::too_many_arguments)]
 fn sweep_one(
     index: &HnswIndex,
     query_flat: &[f32],
@@ -528,35 +557,89 @@ fn sweep_one(
     gt_k: usize,
     n_test: usize,
     k: usize,
+    search_threads: usize,
 ) -> Result<SweepPoint, Box<dyn std::error::Error>> {
-    let mut hits = 0u64;
-    let mut total = 0u64;
-    let mut latencies_us = Vec::with_capacity(n_test * REPLAY_ROUNDS);
+    let total_queries = n_test * REPLAY_ROUNDS;
     let timer = Instant::now();
-    for _round in 0..REPLAY_ROUNDS {
-        for q_idx in 0..n_test {
-            let q_start = q_idx * dim;
-            let query = &query_flat[q_start..q_start + dim];
-            let t = Instant::now();
-            let results = index.search(query, k);
-            let elapsed_us = t.elapsed().as_micros() as f64;
-            latencies_us.push(elapsed_us);
-            // Recall@k: count overlap between returned ids and
-            // ground-truth top-k ids. Ground-truth rows have
-            // `gt_k` entries; we only check the first `k` of them.
-            let gt_start = q_idx * gt_k;
-            let gt: std::collections::HashSet<i64> = gt_flat[gt_start..gt_start + k]
-                .iter()
-                .map(|x| i64::from(*x))
-                .collect();
-            for r in results.iter().take(k) {
-                if gt.contains(&(r.id as i64)) {
-                    hits += 1;
+
+    let (mut latencies_us, hits, total) = if search_threads <= 1 {
+        // Sequential single-thread path. Preserves the original
+        // ann-benchmarks per-query-latency-on-one-core convention.
+        let mut latencies_us = Vec::with_capacity(total_queries);
+        let mut hits = 0u64;
+        let mut total = 0u64;
+        for _round in 0..REPLAY_ROUNDS {
+            for q_idx in 0..n_test {
+                let q_start = q_idx * dim;
+                let query = &query_flat[q_start..q_start + dim];
+                let t = Instant::now();
+                let results = index.search(query, k);
+                let elapsed_us = t.elapsed().as_micros() as f64;
+                latencies_us.push(elapsed_us);
+                let gt_start = q_idx * gt_k;
+                let gt: std::collections::HashSet<i64> = gt_flat[gt_start..gt_start + k]
+                    .iter()
+                    .map(|x| i64::from(*x))
+                    .collect();
+                for r in results.iter().take(k) {
+                    if gt.contains(&(r.id as i64)) {
+                        hits += 1;
+                    }
                 }
+                total += k as u64;
             }
-            total += k as u64;
         }
-    }
+        (latencies_us, hits, total)
+    } else {
+        // Multi-thread path: a local rayon pool dispatches queries
+        // across `search_threads` workers. The reported wall time
+        // covers the WHOLE parallel section, so QPS = total /
+        // wall yields the aggregate throughput across all threads;
+        // E_core(N) = QPS(N) / (N * QPS(1)) is the scaling figure.
+        // Per-query latency is captured inside each worker so the
+        // P50/P95/P99 still describe per-call cost (which under MT
+        // load will include any contention on shared state inside
+        // HnswIndex::search).
+        use rayon::prelude::*;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(search_threads)
+            .build()
+            .map_err(|e| format!("search thread pool: {e}"))?;
+        let per_query: Vec<(f64, u64, u64)> = pool.install(|| {
+            (0..total_queries)
+                .into_par_iter()
+                .map(|i| {
+                    let q_idx = i % n_test;
+                    let q_start = q_idx * dim;
+                    let query = &query_flat[q_start..q_start + dim];
+                    let t = Instant::now();
+                    let results = index.search(query, k);
+                    let elapsed_us = t.elapsed().as_micros() as f64;
+                    let gt_start = q_idx * gt_k;
+                    let gt: std::collections::HashSet<i64> = gt_flat[gt_start..gt_start + k]
+                        .iter()
+                        .map(|x| i64::from(*x))
+                        .collect();
+                    let local_hits: u64 = results
+                        .iter()
+                        .take(k)
+                        .filter(|r| gt.contains(&(r.id as i64)))
+                        .count() as u64;
+                    (elapsed_us, local_hits, k as u64)
+                })
+                .collect()
+        });
+        let mut latencies_us = Vec::with_capacity(per_query.len());
+        let mut hits = 0u64;
+        let mut total = 0u64;
+        for (l, h, t) in per_query {
+            latencies_us.push(l);
+            hits += h;
+            total += t;
+        }
+        (latencies_us, hits, total)
+    };
+
     let wall = timer.elapsed().as_secs_f64();
     latencies_us.sort_by(|a, b| a.total_cmp(b));
     let qps = (n_test as f64 * REPLAY_ROUNDS as f64) / wall;

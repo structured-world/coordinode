@@ -184,6 +184,7 @@ jobs:
               --m 16 --ef-construction 200 \
               --codec none --ef-sweep "$EF_SWEEP" \
               --threads "$T" \
+              --search-threads "$T" \
               --subset-size "$SUBSET_SIZE" \
               --output bench-results
             echo "::endgroup::"
@@ -202,6 +203,7 @@ jobs:
               --codec none --quantization rabitq \
               --ef-sweep "$EF_SWEEP" \
               --threads "$T" \
+              --search-threads "$T" \
               --subset-size "$SUBSET_SIZE" \
               --output bench-results
             echo "::endgroup::"
@@ -217,6 +219,7 @@ jobs:
                 --codec none --quantization "$QUANT" \
                 --ef-sweep "$EF_SWEEP" \
                 --threads "$T" \
+                --search-threads "$T" \
                 --subset-size "$SUBSET_SIZE" \
                 --output bench-results
               echo "::endgroup::"
@@ -254,6 +257,7 @@ jobs:
                 --rerank-mode end-of-search --rerank-oversample "$OS" \
                 --ef-sweep "$EF_SWEEP" \
                 --threads "$T" \
+                --search-threads "$T" \
                 --subset-size "$SUBSET_SIZE" \
                 --output bench-results
               echo "::endgroup::"
