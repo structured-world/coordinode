@@ -2116,7 +2116,12 @@ impl HnswIndex {
         let heap_cap = ef + 16;
         let mut candidates: BinaryHeap<Candidate> = BinaryHeap::with_capacity(heap_cap);
         let mut results: BinaryHeap<FarCandidate> = BinaryHeap::with_capacity(heap_cap);
-        let mut visited = self.visited_pool.get(self.nodes.len());
+        // Lifted out of the `while let Some(...)` loop body — `nodes.len()`
+        // is invariant for the duration of a search call (insert is
+        // exclusive on `&mut self`, search holds `&self`). Saves one
+        // field load per inner iteration.
+        let n_nodes = self.nodes.len();
+        let mut visited = self.visited_pool.get(n_nodes);
 
         let mut connections: Vec<u64> = Vec::with_capacity(M_MAX0);
         let mut unvisited_neighbors: Vec<usize> = Vec::with_capacity(M_MAX0);
@@ -2145,7 +2150,6 @@ impl HnswIndex {
                 .snapshot_into(&mut connections);
 
             unvisited_neighbors.clear();
-            let n_nodes = self.nodes.len();
             for (i, &neighbor_idx_u64) in connections.iter().enumerate() {
                 if i + 1 < connections.len() {
                     let next_idx = connections[i + 1] as usize;
@@ -2291,7 +2295,12 @@ impl HnswIndex {
         let heap_cap = ef + 16;
         let mut candidates: BinaryHeap<Candidate> = BinaryHeap::with_capacity(heap_cap);
         let mut results: BinaryHeap<FarCandidate> = BinaryHeap::with_capacity(heap_cap);
-        let mut visited = self.visited_pool.get(self.nodes.len());
+        // Lifted out of the `while let Some(...)` loop body — `nodes.len()`
+        // is invariant for the duration of a search call (insert is
+        // exclusive on `&mut self`, search holds `&self`). Saves one
+        // field load per inner iteration.
+        let n_nodes = self.nodes.len();
+        let mut visited = self.visited_pool.get(n_nodes);
 
         let mut connections: Vec<u64> = Vec::with_capacity(M_MAX0);
         let mut unvisited_neighbors: Vec<usize> = Vec::with_capacity(M_MAX0);
@@ -2324,7 +2333,6 @@ impl HnswIndex {
                     .snapshot_into(&mut connections);
 
                 unvisited_neighbors.clear();
-                let n_nodes = self.nodes.len();
                 // hnswlib trick: prefetch the NEXT neighbour's visited
                 // counter byte one iteration ahead of the read. The
                 // counters array is `Vec<u8>` sized to N (1.18M bytes
