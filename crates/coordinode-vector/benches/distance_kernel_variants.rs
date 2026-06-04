@@ -47,6 +47,10 @@ fn l2_prod(a: &[f32], b: &[f32]) -> f32 {
 // Variant B: single-acc + FMA. Tight loop, low reduction overhead.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+#[allow(
+    unused_unsafe,
+    reason = "kept for forward-compat with edition 2024 unsafe_op_in_unsafe_fn"
+)]
 unsafe fn l2_single_fma_avx2(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     unsafe {
@@ -71,6 +75,10 @@ unsafe fn l2_single_fma_avx2(a: &[f32], b: &[f32]) -> f32 {
 // unrolled by 2 inner blocks. Matches L2SqrSIMD16ExtAVX verbatim.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(
+    unused_unsafe,
+    reason = "kept for forward-compat with edition 2024 unsafe_op_in_unsafe_fn"
+)]
 unsafe fn l2_hnswlib_avx2(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     unsafe {
@@ -100,6 +108,10 @@ unsafe fn l2_hnswlib_avx2(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(
+    unused_unsafe,
+    reason = "kept for forward-compat with edition 2024 unsafe_op_in_unsafe_fn"
+)]
 unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
     use std::arch::x86_64::*;
     unsafe {
@@ -116,6 +128,10 @@ unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+#[allow(
+    unused_unsafe,
+    reason = "kept for forward-compat with edition 2024 unsafe_op_in_unsafe_fn"
+)]
 unsafe fn l2_single_fma_neon(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
     unsafe {
@@ -140,6 +156,10 @@ unsafe fn l2_single_fma_neon(a: &[f32], b: &[f32]) -> f32 {
 // unrolled by 4 (process 16 dim/iter to match SSE/AVX shape).
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+#[allow(
+    unused_unsafe,
+    reason = "kept for forward-compat with edition 2024 unsafe_op_in_unsafe_fn"
+)]
 unsafe fn l2_hnswlib_neon(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
     unsafe {
