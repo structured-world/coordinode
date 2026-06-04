@@ -2139,7 +2139,14 @@ impl HnswIndex {
         let mut farthest_dist = ep_dist;
 
         while let Some(closest) = candidates.pop() {
-            if closest.distance > farthest_dist {
+            // Standard HNSW termination (Malkov 2018, hnswlib `hnswalg.h`):
+            // only stop when the cheap-frontier minimum is worse than the
+            // top-ef worst AND we already have `ef` results. Without the
+            // size gate, a tiny index (results.len() < ef forever) or an
+            // entry-point whose cheap distance overestimates exact would
+            // break out on iteration 1 and return just the seeded EP. That
+            // was the SQ8 manual-calibration test regression.
+            if closest.distance > farthest_dist && results.len() >= ef {
                 break;
             }
             if level >= self.node_levels(closest.idx as usize) {
@@ -2318,12 +2325,13 @@ impl HnswIndex {
         let mut farthest_dist = exact_ep;
 
         while let Some(closest) = candidates.pop() {
-            // Termination: even the cheapest unvisited frontier candidate
-            // is already worse than the worst-kept top-ef result. With
-            // RaBitQ noise this can be conservative (we stop slightly
-            // early); the alternative — using exact dist on candidates —
-            // would defeat the kernel speedup.
-            if closest.distance > farthest_dist {
+            // Standard HNSW termination (Malkov 2018, hnswlib `hnswalg.h`):
+            // only stop when the cheap-frontier minimum is worse than the
+            // top-ef worst AND we already have `ef` results. Without the
+            // size gate, a tiny index or an entry-point whose cheap
+            // distance overestimates exact would break out on iteration 1
+            // and return just the seeded EP.
+            if closest.distance > farthest_dist && results.len() >= ef {
                 break;
             }
 
