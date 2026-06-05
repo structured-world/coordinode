@@ -23,12 +23,6 @@ thiserror = { workspace = true }
 # `ThreadPoolBuilder::build_global` from main and to query
 # `current_num_threads` for the report.
 rayon = { workspace = true }
-# Replaces the system allocator so the per-query Vec / BinaryHeap
-# allocations in the HNSW search hot path hit a thread-local arena
-# instead of the contended glibc malloc fast path under MT4. Probes
-# the hypothesis that the residual sift f32 MT4 gap vs hnswlib is
-# allocator pressure rather than algorithmic / kernel cost.
-mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -236,14 +236,6 @@ struct SweepPoint {
     latency_us_p99: f64,
 }
 
-/// Replace the system allocator with mimalloc for the duration of
-/// the bench run. Vector / BinaryHeap allocations on the per-query
-/// search path use thread-local arenas instead of the contended
-/// glibc malloc, which matters for the MT4 sweep where all 4 worker
-/// threads otherwise share one allocator fast path.
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
