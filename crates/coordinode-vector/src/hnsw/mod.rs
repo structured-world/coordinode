@@ -1200,6 +1200,27 @@ impl HnswIndex {
         }
     }
 
+    /// Borrow the per-node f32 vector for `idx` from the contiguous
+    /// store when present, falling back to the SoA `node_vectors` slot
+    /// otherwise. Returns `None` when neither path holds an f32 payload
+    /// (offloaded SQ8 or pre-insert states); callers that need a non-
+    /// `None` value already handle the `None` arm.
+    #[inline]
+    fn read_node_f32(&self, idx: usize) -> Option<&[f32]> {
+        if let Some(inline) = self.inline_layer0.as_ref() {
+            if idx < inline.capacity() {
+                // SAFETY: `idx < inline.capacity()` per the gate above;
+                // payload bytes were installed by `mirror_inline_layer0`
+                // under `&mut self`, after which we only ever take
+                // `&self` references that observe the post-write state.
+                unsafe {
+                    return Some(inline.vector_f32(idx));
+                }
+            }
+        }
+        self.node_vectors.get(idx).and_then(|v| v.as_deref())
+    }
+
     /// Read the layer-0 neighbour id snapshot into `out` from the
     /// contiguous store when present, falling back to the SoA
     /// `AtomicNeighbourList` otherwise. Keeps the search hot path on a
@@ -2023,6 +2044,10 @@ impl HnswIndex {
             }
         }
 
+        // Refresh the contiguous-store payload alongside the SoA write so
+        // a subsequent search reads the updated vector and not a stale
+        // mirror left over from the original insert.
+        self.mirror_inline_layer0(idx, id, &vector);
         self.node_vectors[idx] = Some(vector);
         self.node_quantized[idx] = quantized;
         self.node_rabitq_codes[idx] = rabitq_code;
@@ -2642,7 +2667,7 @@ impl HnswIndex {
     /// Falls back to dequantized SQ8 if f32 is offloaded.
     #[inline(always)]
     fn compute_exact_distance(&self, ctx: &QueryCtx<'_>, node_idx: usize) -> f32 {
-        if let Some(ref node_vec) = self.node_vectors[node_idx] {
+        if let Some(node_vec) = self.read_node_f32(node_idx) {
             // Cosine fast path: rebuild `‖x‖` from per-code scalars when a
             // RaBitQ code is available, then feed the both-norms helper to
             // skip the `norm_l2(b)` pass per neighbour visit.
