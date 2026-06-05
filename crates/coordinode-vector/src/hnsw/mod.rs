@@ -1215,25 +1215,33 @@ impl HnswIndex {
         }
     }
 
-    /// Borrow the per-node f32 vector for `idx` from the contiguous
-    /// store when present, falling back to the SoA `node_vectors` slot
-    /// otherwise. Returns `None` when neither path holds an f32 payload
-    /// (offloaded SQ8 or pre-insert states); callers that need a non-
-    /// `None` value already handle the `None` arm.
+    /// Borrow the per-node f32 vector for `idx`. Prefers the SoA
+    /// `node_vectors` slot because measurements on real cosine and
+    /// euclidean workloads (sift-128, glove-100, M=16) showed the
+    /// contiguous per-node block layout regresses f32 search QPS
+    /// 13-16% under both ST and MT4 versus reading from SoA. The
+    /// contiguous store still owns the f32 mirror for the RaBitQ
+    /// search path (which benefits from co-locating code + scalars)
+    /// and as a fallback for nodes whose SoA slot is unavailable.
+    /// Returns `None` when neither path holds an f32 payload
+    /// (offloaded SQ8 or pre-insert states); callers that need a
+    /// non-`None` value already handle the `None` arm.
     #[inline]
     fn read_node_f32(&self, idx: usize) -> Option<&[f32]> {
+        if let Some(vec) = self.node_vectors.get(idx).and_then(|v| v.as_deref()) {
+            return Some(vec);
+        }
         if let Some(inline) = self.inline_layer0.as_ref() {
             if idx < inline.capacity() {
-                // SAFETY: `idx < inline.capacity()` per the gate above;
-                // payload bytes were installed by `mirror_inline_layer0`
-                // under `&mut self`, after which we only ever take
-                // `&self` references that observe the post-write state.
+                // SAFETY: idx < capacity per the gate above; payload
+                // bytes were installed under &mut self and we only ever
+                // take &self after that.
                 unsafe {
                     return Some(inline.vector_f32(idx));
                 }
             }
         }
-        self.node_vectors.get(idx).and_then(|v| v.as_deref())
+        None
     }
 
     /// Read the layer-0 neighbour id snapshot into `out` from the
