@@ -148,7 +148,7 @@ jobs:
           SUBSET_SIZE: ${{ inputs.subset_size || '100000' }}
         run: |
           set -euo pipefail
-          EF_SWEEP="20,40,80,200,400,800"
+          EF_SWEEP="20,40,80,200,400,800,1200,1600,2000"
 
           # Build the list of `--threads` values to sweep. Empty input
           # defaults to "1 4" so per-commit numbers cover both the
