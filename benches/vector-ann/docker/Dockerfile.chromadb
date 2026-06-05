@@ -1,0 +1,27 @@
+# chromadb competitor adapter — produces CoordiNode JSON schema.
+#
+# Built ONCE per release (image lives on the runner under /srv/
+# coordinode-bench/competitor-images/). Re-invoke manually when:
+# - chromadb publishes a new version (pin the release tag below)
+# - methodology changes that need rerunning the baseline
+#
+# Not part of CI. Output JSON is moved into the repo's
+# bench-results/ directory by the human running the benchmark.
+
+FROM python:3.13-slim
+
+ARG CHROMADB_VERSION=0.5.20
+
+# chromadb pulls in hnswlib transitively; pin so the comparison is
+# a single moving target. numpy + psutil are runner deps shared
+# with the hnswlib adapter.
+RUN pip install --no-cache-dir \
+        "chromadb==${CHROMADB_VERSION}" \
+        "numpy>=2.0" \
+        "psutil>=6.0"
+
+WORKDIR /bench
+
+COPY chromadb_runner.py /bench/
+
+ENTRYPOINT ["python3", "/bench/chromadb_runner.py"]

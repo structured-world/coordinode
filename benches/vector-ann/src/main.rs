@@ -72,7 +72,9 @@ fn read_rss_kib() -> Option<u64> {
 /// ef=64 cell as "QPS@recall≥0.95" while hnswlib reported the
 /// faster ef=80 cell sitting just above 0.95. Same code, denser
 /// sweep, fairer comparison.
-const DEFAULT_EF_SWEEP: &[usize] = &[10, 20, 40, 60, 80, 120, 160, 200, 300, 400, 600, 800];
+const DEFAULT_EF_SWEEP: &[usize] = &[
+    10, 20, 40, 60, 80, 120, 160, 200, 300, 400, 600, 800, 1000, 1200, 1600, 2000,
+];
 
 /// Number of query-replay rounds per sweep point. ann-benchmarks
 /// uses 10 by default — accumulates timing across replays and

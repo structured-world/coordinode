@@ -35,6 +35,18 @@ services:
       - ./out:/out
     # No always-on container; entrypoint is the runner, we run it once.
 
+  chromadb:
+    build:
+      context: .
+      dockerfile: Dockerfile.chromadb
+    image: coordinode-bench-chromadb:latest
+    volumes:
+      - <bench-data-root>/datasets:/data:ro
+      - ./out:/out
+    # Same one-shot pattern as hnswlib. The runner produces a
+    # `<sha>-chromadb-t<threads>-<stamp>.json` under /out/vector/...
+    # which the human moves into bench-results/.
+
   # Future competitor adapters land here as additional services.
   # Each must produce JSON matching crates/coordinode-bench BenchReport
   # schema with the `subject` field set to the competitor name. See
