@@ -27,6 +27,7 @@
 //! - No cross-node HNSW graph sharing needed — data replicated via Raft,
 //!   HNSW built locally on each node.
 
+mod data_level0;
 mod entry_point;
 mod inline_layer0;
 mod neighbours;
