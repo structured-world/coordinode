@@ -59,6 +59,33 @@
 
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
+/// 24-byte scalar header that travels alongside the packed RaBitQ code
+/// in the contiguous store. Covers every numeric field the HNSW search
+/// hot path reads on a neighbour visit, for every supported RaBitQ
+/// variant:
+/// - 1-bit (`RaBitQCode`): `norm`, `cross_term`, `signed_sum`, `correction`,
+///   `radial`, `cluster_id` — the full chroma-style estimator inputs.
+/// - Extended 2/3/4-bit (`RaBitQExtCode`): `norm` and `cross_term` are
+///   meaningful; the other slots stay zero.
+///
+/// The layout is `#[repr(C)]` so a `core::ptr::read_unaligned` against
+/// the stored bytes reconstructs the exact field positions. The
+/// trailing `_pad` rounds the size up to a multiple of 4 so the
+/// following `f32_vector` slot stays 4-aligned without per-call work.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct RaBitQScalars {
+    pub norm: f32,
+    pub cross_term: f32,
+    pub signed_sum: i32,
+    pub correction: f32,
+    pub radial: f32,
+    pub cluster_id: u16,
+    pub _pad: u16,
+}
+
+const RABITQ_SCALARS_BYTES: usize = core::mem::size_of::<RaBitQScalars>();
+
 /// Single contiguous-stride store for HNSW layer-0 per-node data.
 ///
 /// See module docs for the per-node block layout. Accessor methods are
@@ -75,14 +102,21 @@ pub struct InlineLayer0 {
     m_max0: usize,
     /// Number of nodes the allocation can hold.
     capacity: usize,
-    /// Bytes occupied by the RaBitQ 1-bit code (`dim.div_ceil(8)`).
+    /// Bytes occupied by the packed RaBitQ code (`(dim * bits).div_ceil(8)`).
+    /// `bits` is captured at construction time on `rabitq_bits` below.
     rabitq_bytes: usize,
     /// Bytes occupied by the f32 vector (`dim * 4`).
     f32_bytes: usize,
+    /// Bit-width of the stored RaBitQ code. `1` for the SIGMOD 2024 sign-
+    /// bit codec, `2..=4` for the Extended-RaBitQ codec.
+    rabitq_bits: u8,
     /// Pre-computed offset of `neighbour_len` within a per-node block.
     neighbour_len_offset: usize,
     /// Pre-computed offset of `rabitq_code` within a per-node block.
     rabitq_offset: usize,
+    /// Pre-computed offset of the `RaBitQScalars` header within a per-
+    /// node block (immediately follows the packed code, aligned to 4).
+    rabitq_scalars_offset: usize,
     /// Pre-computed offset of `f32_vector` within a per-node block.
     f32_offset: usize,
     /// Pre-computed offset of `label` within a per-node block.
@@ -105,26 +139,61 @@ impl InlineLayer0 {
     /// alignment guarantees (`u64` for backing) are encoded by using
     /// `Box<[u64]>` as the underlying storage; a non-aligned variant is
     /// impossible to construct.
+    /// Backwards-compatible constructor that defaults to the 1-bit RaBitQ
+    /// layout (`bits = 1`). Equivalent to
+    /// `new_with_rabitq_bits(capacity, m_max0, dim, 1)`.
+    pub fn new(capacity: usize, m_max0: usize, dim: usize) -> Self {
+        Self::new_with_rabitq_bits(capacity, m_max0, dim, 1)
+    }
+
+    /// Allocate a fresh layer-0 store sized for `capacity` nodes with
+    /// `m_max0` neighbour slots, a `dim`-dimensional f32 vector and an
+    /// `rabitq_bits`-wide packed code per node. `rabitq_bits` must be in
+    /// `{1, 2, 3, 4}`. The backing memory is zeroed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dim == 0`, `capacity == 0`, `m_max0 == 0`, or
+    /// `rabitq_bits` is outside `1..=4`.
     #[allow(
         clippy::expect_used,
         reason = "construction path with checked arithmetic; failures are programmer errors and must abort"
     )]
-    pub fn new(capacity: usize, m_max0: usize, dim: usize) -> Self {
+    pub fn new_with_rabitq_bits(
+        capacity: usize,
+        m_max0: usize,
+        dim: usize,
+        rabitq_bits: u8,
+    ) -> Self {
         assert!(capacity > 0, "capacity must be > 0");
         assert!(m_max0 > 0, "m_max0 must be > 0");
         assert!(dim > 0, "dim must be > 0");
+        assert!(
+            (1..=4).contains(&rabitq_bits),
+            "rabitq_bits must be in 1..=4, got {rabitq_bits}"
+        );
 
-        let rabitq_bytes = dim.div_ceil(8);
+        let rabitq_bytes = dim
+            .checked_mul(rabitq_bits as usize)
+            .expect("dim * bits overflows usize")
+            .div_ceil(8);
         let f32_bytes = dim.checked_mul(4).expect("dim * 4 overflows usize");
 
         // Layout: neighbours [AtomicU64; m_max0], neighbour_len AtomicU8,
-        // rabitq_code [u8; rabitq_bytes], f32_vector [f32; dim], label u64.
+        // rabitq_code [u8; rabitq_bytes], RaBitQScalars (24 B, 4-aligned),
+        // f32_vector [f32; dim], label u64.
         let neighbour_len_offset = m_max0.checked_mul(8).expect("m_max0 * 8 overflows usize");
         let rabitq_offset = align_up(neighbour_len_offset + 1, 8);
-        let f32_offset = align_up(
+        let rabitq_scalars_offset = align_up(
             rabitq_offset
                 .checked_add(rabitq_bytes)
                 .expect("rabitq end offset overflows usize"),
+            4,
+        );
+        let f32_offset = align_up(
+            rabitq_scalars_offset
+                .checked_add(RABITQ_SCALARS_BYTES)
+                .expect("rabitq scalars end overflows usize"),
             4,
         );
         let label_offset = align_up(
@@ -149,8 +218,10 @@ impl InlineLayer0 {
             capacity,
             rabitq_bytes,
             f32_bytes,
+            rabitq_bits,
             neighbour_len_offset,
             rabitq_offset,
+            rabitq_scalars_offset,
             f32_offset,
             label_offset,
         }
@@ -180,6 +251,51 @@ impl InlineLayer0 {
     #[inline]
     pub fn dim(&self) -> usize {
         self.f32_bytes / 4
+    }
+
+    /// Bit-width of the stored RaBitQ code (1, 2, 3 or 4).
+    #[inline]
+    pub fn rabitq_bits(&self) -> u8 {
+        self.rabitq_bits
+    }
+
+    /// Read the per-node RaBitQ scalar header for node `idx`.
+    ///
+    /// # Safety
+    ///
+    /// `idx < self.capacity()`. Same writer-coexistence rules as
+    /// [`Self::rabitq`] and [`Self::vector_f32`]: payload bytes are
+    /// installed under `&mut self`, search-time reads happen under
+    /// `&self` after the writer phase released its borrow.
+    #[inline]
+    pub unsafe fn rabitq_scalars(&self, idx: usize) -> RaBitQScalars {
+        // SAFETY: idx in-range per caller contract; rabitq_scalars_offset
+        // sits inside the per-node block and is 4-aligned, the natural
+        // alignment of `RaBitQScalars`. `read_unaligned` is paranoid for
+        // future layout changes; reads of an aligned `#[repr(C)]` struct
+        // are sound.
+        unsafe {
+            let p = self.node_base_ptr(idx).add(self.rabitq_scalars_offset) as *const RaBitQScalars;
+            core::ptr::read_unaligned(p)
+        }
+    }
+
+    /// Install the per-node RaBitQ scalar header for node `idx`.
+    ///
+    /// # Safety
+    ///
+    /// `idx < self.capacity()`. Caller must hold `&mut self` for the
+    /// duration of the write, which Rust's borrow checker enforces.
+    #[inline]
+    pub unsafe fn set_rabitq_scalars(&mut self, idx: usize, scalars: RaBitQScalars) {
+        // SAFETY: see method doc. `write_unaligned` is paranoid; the
+        // destination is 4-aligned by construction.
+        unsafe {
+            let p = (self.backing.as_mut_ptr() as *mut u8)
+                .add(idx * self.stride_bytes + self.rabitq_scalars_offset)
+                as *mut RaBitQScalars;
+            core::ptr::write_unaligned(p, scalars);
+        }
     }
 
     /// Base byte pointer for the per-node block at `idx`.
@@ -399,12 +515,92 @@ mod tests {
     fn new_computes_stride_for_small_dim() {
         let l = InlineLayer0::new(4, 16, 128);
         // 16 * 8 = 128 neighbour bytes, +1 len -> aligned to 136 (rabitq_offset).
-        // rabitq_bytes = 128/8 = 16, end = 152, aligned to 152 (f32_offset).
-        // f32_bytes = 128 * 4 = 512, end = 664, aligned to 664 (label_offset).
-        // label = 8, end = 672, stride aligned-up = 672.
-        assert_eq!(l.stride_bytes(), 672);
+        // rabitq_bytes = 128/8 = 16 (1-bit), end = 152, aligned to 152
+        // (rabitq_scalars_offset). scalars = 24, end = 176, aligned to 176
+        // (f32_offset). f32_bytes = 128 * 4 = 512, end = 688, aligned to 688
+        // (label_offset). label = 8, end = 696, stride aligned-up = 696.
+        assert_eq!(l.stride_bytes(), 696);
         assert_eq!(l.capacity(), 4);
         assert_eq!(l.m_max0(), 16);
+        assert_eq!(l.rabitq_bits(), 1);
+    }
+
+    #[test]
+    fn new_with_bits_changes_rabitq_byte_budget() {
+        let l1 = InlineLayer0::new_with_rabitq_bits(2, 16, 128, 1);
+        let l2 = InlineLayer0::new_with_rabitq_bits(2, 16, 128, 2);
+        let l4 = InlineLayer0::new_with_rabitq_bits(2, 16, 128, 4);
+        // 1-bit: 128/8 = 16; 2-bit: 256/8 = 32; 4-bit: 512/8 = 64.
+        // Stride grows monotonically with bits (extra bytes between code and
+        // the rest of the block).
+        assert!(l1.stride_bytes() < l2.stride_bytes());
+        assert!(l2.stride_bytes() < l4.stride_bytes());
+        assert_eq!(l1.rabitq_bits(), 1);
+        assert_eq!(l2.rabitq_bits(), 2);
+        assert_eq!(l4.rabitq_bits(), 4);
+    }
+
+    #[test]
+    fn rabitq_scalars_round_trip() {
+        let mut layer = InlineLayer0::new(4, 16, 128);
+        let scalars = RaBitQScalars {
+            norm: 1.234_5,
+            cross_term: -0.5,
+            signed_sum: 17,
+            correction: 0.875,
+            radial: -2.0,
+            cluster_id: 13,
+            _pad: 0,
+        };
+        // SAFETY: idx < 4.
+        unsafe {
+            layer.set_rabitq_scalars(0, scalars);
+            layer.set_rabitq_scalars(3, RaBitQScalars::default());
+            assert_eq!(layer.rabitq_scalars(0), scalars);
+            assert_eq!(layer.rabitq_scalars(3), RaBitQScalars::default());
+            // Untouched idx stays zero.
+            assert_eq!(layer.rabitq_scalars(1), RaBitQScalars::default());
+        }
+    }
+
+    #[test]
+    fn rabitq_scalars_independent_of_other_payloads() {
+        let mut layer = InlineLayer0::new(4, 16, 64);
+        let scalars = RaBitQScalars {
+            norm: 3.5,
+            cross_term: 2.25,
+            signed_sum: -42,
+            correction: 0.5,
+            radial: 1.0,
+            cluster_id: 7,
+            _pad: 0,
+        };
+        let code: Vec<u8> = (0..8).map(|i| i ^ 0xA5).collect(); // 1-bit at dim=64 -> 8 bytes
+        let vec: Vec<f32> = (0..64).map(|i| (i as f32) * 0.01).collect();
+        // SAFETY: idx < 4, code matches rabitq_bytes (8), vec matches dim (64).
+        unsafe {
+            layer.set_rabitq_scalars(2, scalars);
+            layer.set_rabitq(2, &code);
+            layer.set_vector_f32(2, &vec);
+            layer.set_label(2, 0xDEAD_BEEF);
+
+            assert_eq!(layer.rabitq_scalars(2), scalars);
+            assert_eq!(layer.rabitq(2), &code[..]);
+            assert_eq!(layer.vector_f32(2), &vec[..]);
+            assert_eq!(layer.label(2).load(Ordering::Relaxed), 0xDEAD_BEEF);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "rabitq_bits must be in 1..=4")]
+    fn new_with_bits_rejects_zero() {
+        let _ = InlineLayer0::new_with_rabitq_bits(2, 16, 64, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "rabitq_bits must be in 1..=4")]
+    fn new_with_bits_rejects_five() {
+        let _ = InlineLayer0::new_with_rabitq_bits(2, 16, 64, 5);
     }
 
     #[test]
