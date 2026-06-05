@@ -789,6 +789,7 @@ impl HnswIndex {
             })
             .collect();
         for (i, enc) in encoded {
+            self.mirror_rabitq_to_inline(i, enc.as_ref());
             self.node_rabitq_codes[i] = enc;
         }
         self.rabitq_params = Some(params);
@@ -911,6 +912,7 @@ impl HnswIndex {
             })
             .collect();
         for (i, enc) in encoded {
+            self.mirror_rabitq_to_inline(i, enc.as_ref());
             self.node_rabitq_codes[i] = enc;
         }
         self.rabitq_params = Some(params);
@@ -1183,7 +1185,20 @@ impl HnswIndex {
         }
         if self.inline_layer0.is_none() {
             let capacity = (self.config.max_elements as usize).max(idx + 1);
-            self.inline_layer0 = Some(inline_layer0::InlineLayer0::new(capacity, M_MAX0, dim));
+            // Pick the RaBitQ packed-code width from the configured codec
+            // so a later calibration can mirror into the contiguous store
+            // without a layout mismatch. Non-RaBitQ configs use 1 bit (the
+            // minimum legal value) since the code slot stays unused.
+            let rabitq_bits = match self.config.quantization {
+                QuantizationCodec::RaBitQ { bits } => bits,
+                _ => 1,
+            };
+            self.inline_layer0 = Some(inline_layer0::InlineLayer0::new_with_rabitq_bits(
+                capacity,
+                M_MAX0,
+                dim,
+                rabitq_bits,
+            ));
         }
         let Some(inline) = self.inline_layer0.as_mut() else {
             return;
@@ -1253,6 +1268,85 @@ impl HnswIndex {
             }
         }
         self.neighbours_l0[idx].snapshot_into(out);
+    }
+
+    /// Mirror the RaBitQ code (packed bytes) and scalar header for node
+    /// `idx` into the contiguous store. Skips silently when:
+    /// - the contiguous store is not allocated yet,
+    /// - the store's `rabitq_bits` does not match the active codec
+    ///   (e.g. lazy alloc happened before calibration set bits),
+    /// - `idx` exceeds the pre-allocated capacity, or
+    /// - the encoded variant is `None`.
+    ///
+    /// SoA remains authoritative for search reads, so a missed mirror is
+    /// a perf miss, not a correctness bug.
+    fn mirror_rabitq_to_inline(&mut self, idx: usize, enc: Option<&RabitqEncoded>) {
+        let Some(enc) = enc else { return };
+        let Some(inline) = self.inline_layer0.as_mut() else {
+            return;
+        };
+        if idx >= inline.capacity() {
+            return;
+        }
+        match enc {
+            RabitqEncoded::OneBit(code) => {
+                if inline.rabitq_bits() != 1 {
+                    return;
+                }
+                // `CodeWords` derefs to `&[u64]`; reinterpret as bytes for
+                // the packed-code slot.
+                let words: &[u64] = code.code.as_slice();
+                let byte_len = core::mem::size_of_val(words);
+                // SAFETY: `words` outlives the slice borrow; reinterpreting
+                // an aligned `&[u64]` as `&[u8]` is sound.
+                let byte_slice =
+                    unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, byte_len) };
+                let scalars = inline_layer0::RaBitQScalars {
+                    norm: code.norm,
+                    cross_term: code.cross_term,
+                    signed_sum: code.signed_sum,
+                    correction: code.correction,
+                    radial: code.radial,
+                    cluster_id: code.cluster_id,
+                    _pad: 0,
+                };
+                // SAFETY: idx < capacity per the gate above; the byte
+                // count is capped at the inline rabitq slot length.
+                unsafe {
+                    let dst_len = inline.rabitq(idx).len();
+                    let take = byte_slice.len().min(dst_len);
+                    if take > 0 {
+                        let mut tmp = vec![0u8; dst_len];
+                        tmp[..take].copy_from_slice(&byte_slice[..take]);
+                        inline.set_rabitq(idx, &tmp);
+                    }
+                    inline.set_rabitq_scalars(idx, scalars);
+                }
+            }
+            RabitqEncoded::Multi(code) => {
+                if inline.rabitq_bits() != code.bits {
+                    return;
+                }
+                let scalars = inline_layer0::RaBitQScalars {
+                    norm: code.norm,
+                    cross_term: code.cross_term,
+                    signed_sum: 0,
+                    correction: 0.0,
+                    radial: 0.0,
+                    cluster_id: 0,
+                    _pad: 0,
+                };
+                // SAFETY: idx < capacity; `code.packed` is the canonical
+                // byte layout for the configured (dim, bits) pair.
+                unsafe {
+                    let dst_len = inline.rabitq(idx).len();
+                    if code.packed.len() == dst_len {
+                        inline.set_rabitq(idx, &code.packed);
+                    }
+                    inline.set_rabitq_scalars(idx, scalars);
+                }
+            }
+        }
     }
 
     /// Read-only view of the contiguous layer-0 store, for parity tests
@@ -1348,7 +1442,10 @@ impl HnswIndex {
         // SoA payload pushes in lockstep — same idx, no extra clone.
         self.node_vectors.push(Some(vector));
         self.node_quantized.push(quantized);
+        let rabitq_for_mirror = rabitq_code.clone();
         self.node_rabitq_codes.push(rabitq_code);
+        let mirror_idx = self.node_rabitq_codes.len() - 1;
+        self.mirror_rabitq_to_inline(mirror_idx, rabitq_for_mirror.as_ref());
         self.id_to_idx.insert(id, idx);
 
         // Allocate atomic neighbour storage in lockstep — write helpers
@@ -1457,7 +1554,10 @@ impl HnswIndex {
             self.mirror_inline_layer0(idx, plan.id, &vec);
             self.node_vectors.push(Some(vec));
             self.node_quantized.push(quantized);
+            let rabitq_for_mirror = rabitq_code.clone();
             self.node_rabitq_codes.push(rabitq_code);
+            let mirror_idx = self.node_rabitq_codes.len() - 1;
+            self.mirror_rabitq_to_inline(mirror_idx, rabitq_for_mirror.as_ref());
             self.id_to_idx.insert(plan.id, idx);
 
             self.neighbours_l0.push(AtomicNeighbourList::new());
@@ -2050,7 +2150,9 @@ impl HnswIndex {
         self.mirror_inline_layer0(idx, id, &vector);
         self.node_vectors[idx] = Some(vector);
         self.node_quantized[idx] = quantized;
+        let rabitq_for_mirror = rabitq_code.clone();
         self.node_rabitq_codes[idx] = rabitq_code;
+        self.mirror_rabitq_to_inline(idx, rabitq_for_mirror.as_ref());
 
         // Step 4: Re-insert into the graph from a valid entry point.
         // A single-node index has no connections to rebuild.
