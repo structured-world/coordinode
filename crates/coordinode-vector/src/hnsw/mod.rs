@@ -30,6 +30,7 @@
 mod entry_point;
 mod inline_layer0;
 mod neighbours;
+mod search_scratch;
 mod visited;
 
 pub use neighbours::AtomicNeighbourList;
@@ -63,6 +64,7 @@ pub const M_MAX0: usize = 64;
 use std::collections::BinaryHeap;
 
 use coordinode_core::graph::types::VectorMetric;
+use search_scratch::SearchScratchPool;
 use tracing::warn;
 use visited::VisitedPool;
 
@@ -417,6 +419,14 @@ pub struct HnswIndex {
     rabitq_params: Option<RaBitQParams>,
     /// Pool of reusable visited lists for search. Avoids per-search allocation.
     visited_pool: VisitedPool,
+    /// Pool of reusable search scratch buffers (candidate / result
+    /// storage + connection / unvisited indices). Avoids the per-query
+    /// allocator round-trip that becomes a choke point under MT4.
+    #[allow(
+        dead_code,
+        reason = "consumer lands in the search-side wiring chunk on the same plan"
+    )]
+    search_scratch_pool: SearchScratchPool,
     /// RNG state for random level selection (xorshift64).
     /// Proper RNG gives correct exponential layer distribution (R852 fix).
     /// AtomicU64 for future concurrent insert support (R858).
@@ -692,6 +702,7 @@ impl HnswIndex {
             sq8_params: None,
             rabitq_params: None,
             visited_pool: VisitedPool::new(),
+            search_scratch_pool: SearchScratchPool::new(),
             // Seed from address of self (varies per instance). Non-deterministic but fast.
             rng_state: std::sync::atomic::AtomicU64::new(0xdeadbeef_cafebabe),
             vector_tier: None,
