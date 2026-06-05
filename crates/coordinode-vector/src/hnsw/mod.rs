@@ -450,6 +450,19 @@ pub struct HnswIndex {
     /// remain on SoA today, the follow-up commit on the same plan
     /// switches the layer-0 neighbour read to this store.
     inline_layer0: Option<inline_layer0::InlineLayer0>,
+    /// f32-only contiguous layer-0 block (hnswlib `data_level0_memory_`
+    /// parity). When present, holds the f32 vector of every node in one
+    /// `Box<[u8]>` indexed by `base + idx * stride`. The search hot
+    /// path's `prefetch_node_vector` and the rerank `read_node_f32`
+    /// prefer this store, avoiding the SoA double-indirection that
+    /// makes the prefetch helper itself do two cache misses to decide
+    /// what to prefetch.
+    ///
+    /// Mirrors the f32 vector ONLY. Neighbour ids stay in
+    /// `neighbours_l0` (`AtomicNeighbourList`) so multi-writer
+    /// back-edge appends keep working without atomic neighbours in
+    /// this block.
+    data_level0: Option<data_level0::DataLevel0Block>,
 }
 
 /// Read-only result of the planning phase of an insert (C2, R858b).
@@ -708,6 +721,7 @@ impl HnswIndex {
             rng_state: std::sync::atomic::AtomicU64::new(0xdeadbeef_cafebabe),
             vector_tier: None,
             inline_layer0: None,
+            data_level0: None,
         }
     }
 
@@ -1190,6 +1204,34 @@ impl HnswIndex {
     /// `auto_calibrate_rabitq` respectively, in follow-up commits on the
     /// same plan. Writing them now without the matching reads would just
     /// double the build-time cost.
+    /// Mirror the f32 vector for node `idx` into the dedicated
+    /// `data_level0` contiguous block. Lazy-allocates on first call once
+    /// `dim` is known. Writes ONLY the f32 vector; neighbour ids stay
+    /// in `neighbours_l0` (`AtomicNeighbourList`) because multi-writer
+    /// back-edge appends need atomics that the f32-only block does not
+    /// carry.
+    fn mirror_data_level0_vector(&mut self, idx: usize, vector: &[f32]) {
+        let dim = vector.len();
+        if dim == 0 {
+            return;
+        }
+        if self.data_level0.is_none() {
+            let capacity = (self.config.max_elements as usize).max(idx + 1);
+            self.data_level0 = Some(data_level0::DataLevel0Block::new(capacity, M_MAX0, dim));
+        }
+        let Some(block) = self.data_level0.as_mut() else {
+            return;
+        };
+        if idx >= block.capacity() || vector.len() != block.dim() {
+            return;
+        }
+        // SAFETY: idx < capacity and vector.len() == block.dim() per the
+        // gates above; block was allocated with the same dim.
+        unsafe {
+            block.set_vector(idx, vector);
+        }
+    }
+
     fn mirror_inline_layer0(&mut self, idx: usize, id: u64, vector: &[f32]) {
         let dim = vector.len();
         if dim == 0 {
@@ -1240,6 +1282,22 @@ impl HnswIndex {
     /// non-`None` value already handle the `None` arm.
     #[inline]
     fn read_node_f32(&self, idx: usize) -> Option<&[f32]> {
+        // Prefer the dedicated f32-only contiguous block when present:
+        // single ALU op for the address, no SoA double-indirection.
+        // Matches hnswlib's `getDataByInternalId` shape and is the
+        // companion read for the prefetch issued in
+        // `prefetch_node_vector`.
+        if let Some(block) = self.data_level0.as_ref() {
+            if idx < block.capacity() {
+                // SAFETY: idx < capacity per the gate above; the block
+                // was sized for `dim` f32 values at construction; the
+                // borrow lifetime is tied to `&self`.
+                unsafe {
+                    let ptr = block.vector_ptr(idx);
+                    return Some(core::slice::from_raw_parts(ptr, block.dim()));
+                }
+            }
+        }
         if let Some(vec) = self.node_vectors.get(idx).and_then(|v| v.as_deref()) {
             return Some(vec);
         }
@@ -1459,6 +1517,7 @@ impl HnswIndex {
         // No-op until the field has been allocated AND we are inside
         // capacity; the SoA path below remains authoritative either way.
         self.mirror_inline_layer0(idx, id, &vector);
+        self.mirror_data_level0_vector(idx, &vector);
         // SoA payload pushes in lockstep — same idx, no extra clone.
         self.node_vectors.push(Some(vector));
         self.node_quantized.push(quantized);
@@ -1570,8 +1629,9 @@ impl HnswIndex {
                 id: plan.id,
                 max_layer: new_level,
             });
-            // Mirror into the contiguous layer-0 store before moving `vec`.
+            // Mirror into the contiguous layer-0 stores before moving `vec`.
             self.mirror_inline_layer0(idx, plan.id, &vec);
+            self.mirror_data_level0_vector(idx, &vec);
             self.node_vectors.push(Some(vec));
             self.node_quantized.push(quantized);
             let rabitq_for_mirror = rabitq_code.clone();
@@ -2168,6 +2228,7 @@ impl HnswIndex {
         // a subsequent search reads the updated vector and not a stale
         // mirror left over from the original insert.
         self.mirror_inline_layer0(idx, id, &vector);
+        self.mirror_data_level0_vector(idx, &vector);
         self.node_vectors[idx] = Some(vector);
         self.node_quantized[idx] = quantized;
         let rabitq_for_mirror = rabitq_code.clone();
@@ -3225,6 +3286,16 @@ impl HnswIndex {
                     RabitqEncoded::Multi(c) => c.packed.as_ptr(),
                 };
                 prefetch_read_data(code_words);
+                return;
+            }
+        }
+        // Prefer the contiguous f32-only block when present: prefetch
+        // target address is `base + idx * stride` — one ALU op, zero
+        // SoA cache misses. Matches hnswlib's `_mm_prefetch(data_level0_memory_
+        // + idx * size_data_per_element_)` shape.
+        if let Some(block) = self.data_level0.as_ref() {
+            if idx < block.capacity() {
+                block.prefetch(idx);
                 return;
             }
         }

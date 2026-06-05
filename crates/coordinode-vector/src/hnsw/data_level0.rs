@@ -264,20 +264,24 @@ impl DataLevel0Block {
         unsafe { self.node_base(idx).add(self.vector_offset) as *const f32 }
     }
 
-    /// Issue an `_mm_prefetch` (or arch equivalent) for the per-node
-    /// block of `idx`. No-op on unsupported architectures. Safe wrapper:
-    /// `idx >= capacity` simply skips the hint instead of panicking,
-    /// matching hnswlib's behaviour on the hot path.
+    /// Issue an `_mm_prefetch` (or arch equivalent) for the **f32 vector**
+    /// portion of node `idx`'s per-node block. Targets `vector_offset`
+    /// (offset 260 at sift d=128) so the warmed cache line is the one
+    /// the rerank f32 read will actually touch — not the leading
+    /// neighbour-count / neighbour-ids cache line that the f32 path
+    /// never reads. No-op on unsupported architectures. Safe wrapper:
+    /// `idx >= capacity` skips the hint instead of panicking.
     #[inline(always)]
     pub(super) fn prefetch(&self, idx: usize) {
         if idx >= self.capacity {
             return;
         }
-        // SAFETY: `idx < capacity` gate above; `node_base` returns a
-        // pointer inside the backing slice. Prefetch is a hint, not a
-        // load — the pointer is never dereferenced by this function.
+        // SAFETY: `idx < capacity` gate above; `vector_offset` lies
+        // inside the per-node block by construction. Prefetch is a
+        // hint, not a load — the pointer is never dereferenced by
+        // this function.
         unsafe {
-            super::prefetch_read_data(self.node_base(idx));
+            super::prefetch_read_data(self.vector_ptr(idx) as *const u8);
         }
     }
 }
