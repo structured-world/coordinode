@@ -2734,6 +2734,46 @@ impl HnswIndex {
         // Mismatched variants fall through to f32 — keeps a partially
         // recalibrated index queryable rather than panicking.
         if matches!(self.config.metric, VectorMetric::Cosine) {
+            // Contiguous-store fast path: read packed code + scalars from
+            // the per-node block instead of dereferencing the SoA
+            // `node_rabitq_codes[idx]`. Gated on byte-length match between
+            // the inline slot and the query bit-planes so dims whose
+            // effective code width differs from `dim/8` (e.g. dim=100
+            // padded to 128) cleanly fall through to the SoA path.
+            if let (Some(params), Some(RabitqQuery::OneBit(q)), Some(inline)) = (
+                self.rabitq_params.as_ref(),
+                ctx.rabitq_query.as_ref(),
+                self.inline_layer0.as_ref(),
+            ) {
+                let slot_words = inline.rabitq_byte_len() / 8;
+                if inline.rabitq_bits() == 1
+                    && inline.rabitq_byte_len().is_multiple_of(8)
+                    && slot_words == q.planes[0].len()
+                    && node_idx < inline.capacity()
+                {
+                    // SAFETY: node_idx < capacity; the rabitq slot is
+                    // 8-byte aligned by construction (rabitq_offset
+                    // aligned in `new_with_rabitq_bits`) and we verified
+                    // the byte length is a multiple of 8 above. The
+                    // slice borrow lives for the duration of the call.
+                    let scalars = unsafe { inline.rabitq_scalars(node_idx) };
+                    if scalars.norm > 0.0 {
+                        let bytes = unsafe { inline.rabitq(node_idx) };
+                        let code_words: &[u64] = unsafe {
+                            core::slice::from_raw_parts(bytes.as_ptr() as *const u64, slot_words)
+                        };
+                        return params.estimate_cosine_distance_q_from_slice(
+                            code_words,
+                            scalars.norm,
+                            scalars.signed_sum,
+                            scalars.correction,
+                            scalars.radial,
+                            scalars.cluster_id,
+                            q,
+                        );
+                    }
+                }
+            }
             if let (Some(params), Some(qenc), Some(xcode)) = (
                 self.rabitq_params.as_ref(),
                 ctx.rabitq_query.as_ref(),

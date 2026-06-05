@@ -999,6 +999,67 @@ impl RaBitQParams {
         1.0 - d_dot_q / denom
     }
 
+    /// Slice-based sibling of [`Self::estimate_cosine_distance_q`].
+    ///
+    /// Takes the 1-bit code as a raw `&[u64]` slice and the scalar fields
+    /// (`norm`, `signed_sum`, `correction`, `radial`, `cluster_id`) as
+    /// loose parameters instead of as a `&RaBitQCode` reference. Used by
+    /// the contiguous layer-0 store so the search hot path reads code
+    /// words and scalars directly from the per-node memory block without
+    /// materialising a `RaBitQCode` per neighbour visit.
+    ///
+    /// The formula is identical to the reference path (see
+    /// [`Self::estimate_cosine_distance_q`] for the chroma
+    /// `rabitq_distance_query` reconstruction).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "scalar params are read directly from the inline per-node block; bundling them into a struct would add a copy in the hot path"
+    )]
+    pub fn estimate_cosine_distance_q_from_slice(
+        &self,
+        code_words: &[u64],
+        norm: f32,
+        signed_sum: i32,
+        correction: f32,
+        radial: f32,
+        cluster_id: u16,
+        query: &RaBitQQuery,
+    ) -> f32 {
+        debug_assert_eq!(
+            code_words.len(),
+            query.planes[0].len(),
+            "code/query plane length mismatch"
+        );
+        let (pop0, pop1, pop2, pop3) = popcount::and_popcount_4planes(
+            code_words,
+            &query.planes[0],
+            &query.planes[1],
+            &query.planes[2],
+            &query.planes[3],
+        );
+        let packed_dot_qu: i64 =
+            pop0 as i64 + ((pop1 as i64) << 1) + ((pop2 as i64) << 2) + ((pop3 as i64) << 3);
+        let signed_dot_qu = 2 * packed_dot_qu - query.sum_q_u as i64;
+        let g_dot_r_q = 0.5 * (query.delta * signed_dot_qu as f32 + query.v_l * signed_sum as f32);
+        if correction.abs() <= f32::EPSILON {
+            return -g_dot_r_q;
+        }
+        let r_dot_r_q = norm * g_dot_r_q / correction;
+        let c_dot_q = if (cluster_id as usize) < query.c_dot_q.len() {
+            query.c_dot_q[cluster_id as usize]
+        } else {
+            0.0
+        };
+        let c_norm = self.c_norm(cluster_id);
+        let d_dot_q = c_dot_q + r_dot_r_q;
+        let d_norm_sq = c_norm * c_norm + 2.0 * radial + norm * norm;
+        let denom = d_norm_sq.sqrt() * query.norm.max(f32::EPSILON);
+        if denom.abs() < f32::EPSILON {
+            return -g_dot_r_q;
+        }
+        1.0 - d_dot_q / denom
+    }
+
     /// Estimate the inner product (dot product) between two encoded vectors.
     /// Higher = more similar. Suitable for `DotProduct` metric.
     ///
@@ -1832,6 +1893,43 @@ mod tests {
             avg4 < avg2,
             "4-bit mean abs IP error ({avg4}) must be lower than 2-bit ({avg2})"
         );
+    }
+
+    #[test]
+    fn from_slice_kernel_matches_reference_path() {
+        // The contiguous-store search hot path calls
+        // `estimate_cosine_distance_q_from_slice` with raw code words
+        // and scalar parameters lifted out of an inline per-node block.
+        // For every neighbour, the returned distance must agree with
+        // the reference `estimate_cosine_distance_q(&code, &query)` to
+        // the last bit — any drift here biases the HNSW heap and would
+        // show up as recall regression at the head of the result set.
+        let dims = 128u32;
+        let p = RaBitQParams::calibrate(dims, 0xC0DE);
+        let query_vec: Vec<f32> = (0..dims as usize)
+            .map(|i| (i as f32 * 0.07).sin())
+            .collect();
+        let q = p.encode_query(&query_vec);
+        for seed in 0..8u32 {
+            let v: Vec<f32> = (0..dims as usize)
+                .map(|i| ((i as f32 + seed as f32) * 0.11).cos())
+                .collect();
+            let code = p.encode(&v);
+            let reference = p.estimate_cosine_distance_q(&code, &q);
+            let from_slice = p.estimate_cosine_distance_q_from_slice(
+                code.code.as_slice(),
+                code.norm,
+                code.signed_sum,
+                code.correction,
+                code.radial,
+                code.cluster_id,
+                &q,
+            );
+            assert!(
+                (reference - from_slice).abs() < 1e-6,
+                "from_slice drift: reference={reference}, from_slice={from_slice}",
+            );
+        }
     }
 
     #[test]

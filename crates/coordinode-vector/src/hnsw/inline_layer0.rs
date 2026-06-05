@@ -259,6 +259,16 @@ impl InlineLayer0 {
         self.rabitq_bits
     }
 
+    /// Byte length of the packed RaBitQ code slot per node.
+    ///
+    /// Equal to `(dim * rabitq_bits).div_ceil(8)`. The contiguous search
+    /// fast path uses this to confirm the inline slot is sized to match
+    /// the query's bit-plane length before reinterpreting bytes as `&[u64]`.
+    #[inline]
+    pub fn rabitq_byte_len(&self) -> usize {
+        self.rabitq_bytes
+    }
+
     /// Read the per-node RaBitQ scalar header for node `idx`.
     ///
     /// # Safety
