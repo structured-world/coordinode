@@ -37,10 +37,10 @@ mod fvecs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use coordinode_bench::BenchReport;
 use coordinode_core::graph::types::VectorMetric;
-use coordinode_vector::hnsw::{HnswConfig, HnswIndex, QuantizationCodec};
+use coordinode_vector::hnsw::{HnswConfig, HnswIndex, QuantizationCodec, SearchMode};
 use serde::Serialize;
 use tracing::info;
 
@@ -220,6 +220,31 @@ struct Args {
     /// apples-to-apples comparison. `0` (default) = full dataset.
     #[arg(long, default_value_t = 0)]
     subset_size: usize,
+
+    /// Search strategy. `hnsw` (default) walks the index graph using
+    /// the configured `ef_search`. `exact` performs a brute-force
+    /// linear scan over every indexed vector and returns recall=1.0
+    /// top-k. Use `exact` to publish a r=1.0 baseline alongside the
+    /// approximate sweep for comparison against qdrant exact mode.
+    /// In exact mode the ef sweep collapses to a single placeholder
+    /// point because `ef_search` has no effect on brute force.
+    #[arg(long, value_enum, default_value_t = SearchModeArg::Hnsw)]
+    search_mode: SearchModeArg,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum SearchModeArg {
+    Hnsw,
+    Exact,
+}
+
+impl From<SearchModeArg> for SearchMode {
+    fn from(a: SearchModeArg) -> Self {
+        match a {
+            SearchModeArg::Hnsw => SearchMode::Hnsw,
+            SearchModeArg::Exact => SearchMode::Exact,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -275,12 +300,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let sweep: Vec<usize> = match &args.ef_sweep {
-        Some(s) => s
-            .split(',')
-            .map(|x| x.trim().parse::<usize>())
-            .collect::<Result<Vec<_>, _>>()?,
-        None => DEFAULT_EF_SWEEP.to_vec(),
+    let search_mode = SearchMode::from(args.search_mode);
+    // In exact mode `ef_search` is inert (brute-force ignores the
+    // graph entirely), so collapse the sweep to a single placeholder
+    // point. The ef value in the JSON is left at 0 to signal "n/a".
+    let sweep: Vec<usize> = if matches!(search_mode, SearchMode::Exact) {
+        vec![0]
+    } else {
+        match &args.ef_sweep {
+            Some(s) => s
+                .split(',')
+                .map(|x| x.trim().parse::<usize>())
+                .collect::<Result<Vec<_>, _>>()?,
+            None => DEFAULT_EF_SWEEP.to_vec(),
+        }
     };
 
     // ── Load dataset ────────────────────────────────────────
@@ -440,7 +473,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rss_kib_peak = rss_kib_after_build;
     let mut points = Vec::new();
     for ef in &sweep {
-        index.set_ef_search(*ef);
+        if !matches!(search_mode, SearchMode::Exact) {
+            index.set_ef_search(*ef);
+        }
         let point = sweep_one(
             &index,
             &query_flat,
@@ -450,6 +485,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             n_test,
             args.k,
             args.search_threads,
+            search_mode,
         )?;
         info!(
             ef_search = ef,
@@ -560,6 +596,7 @@ fn sweep_one(
     n_test: usize,
     k: usize,
     search_threads: usize,
+    search_mode: SearchMode,
 ) -> Result<SweepPoint, Box<dyn std::error::Error>> {
     let total_queries = n_test * REPLAY_ROUNDS;
     let timer = Instant::now();
@@ -575,7 +612,7 @@ fn sweep_one(
                 let q_start = q_idx * dim;
                 let query = &query_flat[q_start..q_start + dim];
                 let t = Instant::now();
-                let results = index.search(query, k);
+                let results = index.search_with_mode(query, k, search_mode);
                 let elapsed_us = t.elapsed().as_micros() as f64;
                 latencies_us.push(elapsed_us);
                 let gt_start = q_idx * gt_k;
@@ -615,7 +652,7 @@ fn sweep_one(
                     let q_start = q_idx * dim;
                     let query = &query_flat[q_start..q_start + dim];
                     let t = Instant::now();
-                    let results = index.search(query, k);
+                    let results = index.search_with_mode(query, k, search_mode);
                     let elapsed_us = t.elapsed().as_micros() as f64;
                     let gt_start = q_idx * gt_k;
                     let gt: std::collections::HashSet<i64> = gt_flat[gt_start..gt_start + k]
