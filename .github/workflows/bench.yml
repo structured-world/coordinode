@@ -204,6 +204,26 @@ jobs:
               --output bench-results
             echo "::endgroup::"
 
+            # SIFT M=24 probe: regression detector for M-scaling. A
+            # previous bug had the engine getting SLOWER as M grew
+            # past 16 (sift M16 4064 vs M24 3676 vs M32 3434 QPS) and
+            # the lean push needs to catch that drift on every commit.
+            # One extra cell per thread config (~30s ST, ~10s MT4) at
+            # 50k subset, fits inside the 20-min budget with room.
+            echo "::group::SIFT-128-L2 M=24 codec=none threads=$T"
+            ./target/release/bench-vector-ann \
+              --train       "$DS_DIR/sift_base.fvecs" \
+              --query       "$DS_DIR/sift_query.fvecs" \
+              --groundtruth "$DS_DIR/sift_groundtruth.ivecs" \
+              --dataset-name sift-128-euclidean \
+              --m 24 --ef-construction 200 \
+              --codec none --ef-sweep "$EF_SWEEP" \
+              --threads "$T" \
+              --search-threads "$T" \
+              --subset-size "$SUBSET_SIZE" \
+              --output bench-results
+            echo "::endgroup::"
+
             # RaBitQ diagnostic on SIFT-128 (manual only — padding path
             # not exercised here; only kept for full marketing matrix).
             if [ "$FULL_SWEEP" = "true" ]; then
