@@ -11,3 +11,4 @@ pub use build_scheduler::{BuildPermit, HnswBuildScheduler, Priority};
 pub use health::{HealthSignal, IndexHealthState};
 // Re-export VectorLoader trait for external implementations.
 pub use hnsw::VectorLoader;
+pub use hnsw::{SearchMode, SearchResult};

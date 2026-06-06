@@ -509,6 +509,22 @@ pub struct SearchResult {
     pub score: f32,
 }
 
+/// Search strategy. Callers can opt into recall=1.0 brute-force kNN
+/// instead of the HNSW approximate path, matching qdrant's
+/// `SearchParams(exact=True)` semantics. The HNSW index continues to
+/// own the stored vectors either way, so exact search reads the same
+/// data without an auxiliary index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    /// Graph traversal using the index's configured `ef_search`. Fast,
+    /// approximate, typical recall 0.95-0.99 depending on `M` and `ef`.
+    Hnsw,
+    /// Linear scan over every indexed vector. Slow, exact, recall=1.0.
+    /// Use when correctness matters more than throughput, or when the
+    /// per-label index is small enough that brute force wins outright.
+    Exact,
+}
+
 /// Ordered candidate for min-heap (by distance, ascending).
 ///
 /// Packed at 8 bytes total (f32 + u32) — halves the heap memory
@@ -1858,6 +1874,74 @@ impl HnswIndex {
                 })
                 .collect()
         }
+    }
+
+    /// Search with explicit mode selection. `SearchMode::Hnsw` matches
+    /// `search()`; `SearchMode::Exact` performs a brute-force linear scan
+    /// over every indexed vector and returns recall=1.0 top-k. Both modes
+    /// share the same stored vectors (no auxiliary index) and the same
+    /// distance kernels, so callers can mix exact and approximate queries
+    /// against one collection without reloading the data.
+    pub fn search_with_mode(&self, query: &[f32], k: usize, mode: SearchMode) -> Vec<SearchResult> {
+        match mode {
+            SearchMode::Hnsw => self.search(query, k),
+            SearchMode::Exact => self.search_exact(query, k),
+        }
+    }
+
+    /// Brute-force exact k-NN over every indexed vector.
+    ///
+    /// Iterates `0..nodes.len()`, computes the exact f32 distance for each,
+    /// and heap-selects the top-k. No graph traversal, no `ef_search`. The
+    /// cost is linear in the index size and independent of `M`, so it is
+    /// the right choice when the per-label collection is small enough that
+    /// HNSW overhead exceeds a straight scan, or when recall=1.0 is a hard
+    /// requirement (regulatory queries, ground-truth validation).
+    fn search_exact(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
+        let n = self.nodes.len();
+        if n == 0 || k == 0 {
+            return Vec::new();
+        }
+        let qctx = QueryCtx::new(
+            query,
+            self.config.metric,
+            self.rabitq_params.as_ref(),
+            &self.config.quantization,
+        );
+        // Max-heap keyed by distance; pop the current worst when the heap
+        // grows past k. `FarCandidate` already implements `Ord` with
+        // ascending distance, which makes `BinaryHeap` behave as a
+        // max-heap over distance — exactly the shape we want for a
+        // k-smallest selector.
+        let mut heap: BinaryHeap<FarCandidate> = BinaryHeap::with_capacity(k + 1);
+        for idx in 0..n {
+            let distance = self.compute_exact_distance(&qctx, idx);
+            let cand = FarCandidate {
+                distance,
+                idx: idx as u32,
+            };
+            if heap.len() < k {
+                heap.push(cand);
+            } else if let Some(top) = heap.peek() {
+                if cand.distance < top.distance {
+                    heap.pop();
+                    heap.push(cand);
+                }
+            }
+        }
+        let mut out: Vec<SearchResult> = heap
+            .into_iter()
+            .map(|c| SearchResult {
+                id: self.nodes[c.idx as usize].id,
+                score: c.distance,
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out
     }
 
     /// Search with MVCC snapshot visibility checking.
@@ -5204,6 +5288,107 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn search_exact_returns_recall_1_top_k() {
+        // Build a small L2 index with 200 random-ish vectors, then ask
+        // search_with_mode(Exact) for the top-10 of a chosen query and
+        // confirm the result exactly matches a brute-force reference.
+        // The HNSW path can drop true neighbours under low ef; the exact
+        // path must not.
+        let cfg = HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 40,
+            ef_search: 20,
+            max_elements: 200,
+            metric: VectorMetric::L2,
+            ..HnswConfig::default()
+        };
+        let mut idx = HnswIndex::new(cfg);
+        let mut all: Vec<(u64, Vec<f32>)> = Vec::with_capacity(200);
+        for i in 0..200u64 {
+            // Deterministic spread; uses the id as a coordinate seed so
+            // distances are well-separated and the top-k is unambiguous.
+            let v: Vec<f32> = (0..8)
+                .map(|d| ((i * 13 + d as u64) % 97) as f32 / 17.0)
+                .collect();
+            idx.insert(i, v.clone());
+            all.push((i, v));
+        }
+        // Query is offset from every inserted vector so distances are
+        // unique and the top-k ordering is unambiguous (no tie-break
+        // ambiguity to assert against).
+        let query: Vec<f32> = (0..8).map(|d| 0.31 + d as f32 * 0.07).collect();
+
+        let mut reference: Vec<(u64, f32)> = all
+            .iter()
+            .map(|(id, v)| {
+                let d2: f32 = query
+                    .iter()
+                    .zip(v.iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum();
+                (*id, d2)
+            })
+            .collect();
+        reference.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        reference.truncate(10);
+        let reference_ids: Vec<u64> = reference.iter().map(|(id, _)| *id).collect();
+
+        let got = idx.search_with_mode(&query, 10, SearchMode::Exact);
+        assert_eq!(got.len(), 10);
+        // Set equality on ids: brute-force and exact must agree on the
+        // top-k membership. Order within tied scores is implementation
+        // defined and not part of the contract — the synthetic spread
+        // happens to produce a few collisions across ids.
+        let got_set: std::collections::HashSet<u64> = got.iter().map(|r| r.id).collect();
+        let ref_set: std::collections::HashSet<u64> = reference_ids.iter().copied().collect();
+        assert_eq!(
+            got_set, ref_set,
+            "exact search must return the full brute-force top-k"
+        );
+        // Returned scores must be non-decreasing (sorted ascending).
+        for w in got.windows(2) {
+            assert!(
+                w[0].score <= w[1].score + 1e-5,
+                "exact result not sorted: {} then {}",
+                w[0].score,
+                w[1].score
+            );
+        }
+        // Top-1 score equals the brute-force minimum.
+        assert!(
+            (got[0].score - reference[0].1).abs() < 1e-4,
+            "top-1 distance {} differs from brute-force {}",
+            got[0].score,
+            reference[0].1
+        );
+
+        // Hnsw mode keeps working untouched.
+        let hnsw_got = idx.search_with_mode(&query, 5, SearchMode::Hnsw);
+        assert_eq!(hnsw_got.len(), 5);
+    }
+
+    #[test]
+    fn search_exact_handles_empty_index_and_zero_k() {
+        let cfg = HnswConfig {
+            metric: VectorMetric::L2,
+            ..HnswConfig::default()
+        };
+        let idx = HnswIndex::new(cfg);
+        let q = vec![0.0; 4];
+        assert!(idx.search_with_mode(&q, 10, SearchMode::Exact).is_empty());
+
+        let cfg2 = HnswConfig {
+            metric: VectorMetric::L2,
+            max_elements: 4,
+            ..HnswConfig::default()
+        };
+        let mut idx2 = HnswIndex::new(cfg2);
+        idx2.insert(0, vec![1.0, 0.0, 0.0, 0.0]);
+        assert!(idx2.search_with_mode(&q, 0, SearchMode::Exact).is_empty());
     }
 
     #[test]
