@@ -43,6 +43,7 @@ Thumbs.db
 # Internal planning & fix logs
 /fjall-fixes-plan.md
 *.plan.md
+/memory/
 
 # Local cargo overrides (path deps for development)
 .cargo/config.toml
