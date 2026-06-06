@@ -566,12 +566,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(point) = points.iter().find(|p| p.recall_at_k >= 0.95) {
         report.record("qps_at_recall_0_95", point.qps)?;
     }
-    // Filename tag groups runs by (M, codec). Bit-width appended only
-    // for rabitq runs so the older `<sha>-coordinode-M<m>-<ts>.json`
-    // layout stays valid for `none` / `sq8` (no dashboard breakage).
+    // Filename tag groups runs by (M, codec, search-mode). Bit-width
+    // appended only for rabitq runs so the older
+    // `<sha>-coordinode-M<m>-<ts>.json` layout stays valid for `none`
+    // / `sq8` (no dashboard breakage). Exact mode gets an `-X` suffix
+    // so brute-force baselines never overwrite HNSW runs with the
+    // same M and codec at the same timestamp.
     let tag = match args.quantization.as_str() {
         "rabitq" => format!("M{}-Q{}", args.m, args.rabitq_bits),
         _ => format!("M{}", args.m),
+    };
+    let tag = match args.search_mode {
+        SearchModeArg::Exact => format!("{tag}-X"),
+        SearchModeArg::Hnsw => tag,
     };
     let path = report.write_json(&args.output, Some(&tag))?;
     info!(path=?path, "report written");
