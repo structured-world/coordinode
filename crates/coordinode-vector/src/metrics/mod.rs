@@ -250,10 +250,12 @@ fn dot_product_inner(a: &[f32], b: &[f32]) -> f32 {
     dot_scalar(a, b)
 }
 
+#[inline]
 fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
+#[inline]
 fn l2_squared_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b.iter())
@@ -291,6 +293,7 @@ fn l1_scalar(a: &[f32], b: &[f32]) -> f32 {
 // dominates. Bigger QPS wins live there, not here.
 
 #[cfg(target_arch = "x86_64")]
+#[inline]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_avx2_mt(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
@@ -311,6 +314,7 @@ unsafe fn dot_avx2_mt(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[inline]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn l2_squared_avx2_mt(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
@@ -375,6 +379,7 @@ unsafe fn l1_avx2_mt(a: &[f32], b: &[f32]) -> f32 {
 // when D is small.
 
 #[cfg(target_arch = "x86_64")]
+#[inline]
 #[target_feature(enable = "avx512f")]
 unsafe fn dot_avx512(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
@@ -395,6 +400,7 @@ unsafe fn dot_avx512(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[inline]
 #[target_feature(enable = "avx512f")]
 unsafe fn l2_squared_avx512(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
@@ -444,6 +450,7 @@ unsafe fn hsum256_ps(v: std::arch::x86_64::__m256) -> f32 {
 // issued.
 
 #[cfg(target_arch = "aarch64")]
+#[inline]
 #[target_feature(enable = "neon")]
 unsafe fn dot_neon_mt(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
@@ -489,6 +496,7 @@ unsafe fn dot_neon_mt(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[inline]
 #[target_feature(enable = "neon")]
 unsafe fn l2_squared_neon_mt(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
