@@ -455,6 +455,7 @@ jobs:
         if: ${{ inputs.run_competitors }}
         env:
           SUBSET_SIZE: ${{ inputs.subset_size || '100000' }}
+          HIGH_D_DIMENSIONS: ${{ inputs.high_d_dimensions }}
         run: |
           set -euo pipefail
           cd benches/vector-ann
@@ -497,6 +498,49 @@ jobs:
               done
             done
           done
+          # Optional: also run qdrant against any high-D tier the
+          # workflow input enabled. chromadb's HNSW client tops out at
+          # the 1k-D range in practice, so we leave it on sift+glove
+          # only. qdrant handles 8k+ dim natively. The high-D tier
+          # directories must already be provisioned by the bench-host
+          # via fetch_high_d.sh — missing tiers log a warning, no
+          # failure.
+          if [ -n "${HIGH_D_DIMENSIONS:-}" ]; then
+            for D in $(echo "$HIGH_D_DIMENSIONS" | tr ',' ' '); do
+              TIER_DIR="$DATASET_ROOT/high-d/$D"
+              if [ ! -d "$TIER_DIR" ]; then
+                echo "::warning::qdrant high-d tier $D not provisioned at $TIER_DIR — skip"
+                continue
+              fi
+              BASE=$(ls "$TIER_DIR"/*_base.fvecs 2>/dev/null | head -1 || true)
+              QUERY=$(ls "$TIER_DIR"/*_query.fvecs 2>/dev/null | head -1 || true)
+              TRUTH=$(ls "$TIER_DIR"/*_groundtruth.ivecs 2>/dev/null | head -1 || true)
+              if [ -z "$BASE" ] || [ -z "$QUERY" ] || [ -z "$TRUTH" ]; then
+                echo "::warning::qdrant tier $D missing fvecs/ivecs in $TIER_DIR — skip"
+                continue
+              fi
+              # docker compose mounts $DATASET_ROOT to /data, so derive
+              # the in-container paths by stripping the host prefix.
+              BASE_IN=${BASE#$DATASET_ROOT}
+              QUERY_IN=${QUERY#$DATASET_ROOT}
+              TRUTH_IN=${TRUTH#$DATASET_ROOT}
+              DSNAME="high-d-${D}-angular"
+              for T in 1 4; do
+                echo "::group::qdrant $DSNAME threads=$T"
+                docker compose -f /tmp/compose/competitors.yml run --rm qdrant \
+                  --train       "/data${BASE_IN}" \
+                  --query       "/data${QUERY_IN}" \
+                  --groundtruth "/data${TRUTH_IN}" \
+                  --dataset-name "$DSNAME" \
+                  --m 16 --ef-construction 200 \
+                  --threads "$T" \
+                  --cn-sha "$CN_SHA" \
+                  --output /out
+                echo "::endgroup::"
+              done
+            done
+          fi
+
           # Fold competitor JSON into the same bench-results tree the
           # CN run wrote into, so the bench-data push picks them up.
           if [ -d out/vector ]; then
