@@ -46,9 +46,14 @@ on:
         required: false
         default: ''
       subset_size:
-        description: 'First N base vectors to use from each dataset (groundtruth recomputed brute-force). 100000 (default) keeps per-commit wall-clock under ~30 min. Set to 0 for full 1M dataset (marketing-grade, ~2 h).'
+        description: 'First N base vectors to use from each dataset (groundtruth recomputed brute-force). 50000 (default) keeps per-commit wall-clock under 20 min. Set to 100000+ for the full marketing matrix when full_sweep=true.'
         required: false
-        default: '100000'
+        default: '50000'
+      full_sweep:
+        description: 'Run the full marketing matrix (both datasets x f32+rabitq x RaBitQ rerank-oversample sweep). Off by default: push triggers a lean regression detector that must finish in 20 min. Manual runs can opt into the full matrix.'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: bench
@@ -63,7 +68,7 @@ jobs:
     runs-on:
       - self-hosted
       - gpu-private-systems
-    timeout-minutes: 180
+    timeout-minutes: ${{ inputs.full_sweep && 180 || 20 }}
 
     env:
       # Dataset root path is provided via GH Actions repo variable
@@ -143,12 +148,22 @@ jobs:
           # E_core(4) = QPS_MT4 / (4 * QPS_ST) against competitors.
           THREAD_SWEEP: ${{ inputs.thread_sweep }}
           # First N base vectors per dataset (groundtruth recomputed
-          # brute-force inside bench-vector-ann). 100k by default for
-          # per-commit smoke; set to 0 / empty for full 1M dataset.
-          SUBSET_SIZE: ${{ inputs.subset_size || '100000' }}
+          # brute-force inside bench-vector-ann). 50k by default for
+          # the lean push gate (must complete inside 20 min); manual
+          # runs override to 100k+ for marketing-grade numbers.
+          SUBSET_SIZE: ${{ inputs.subset_size || '50000' }}
+          # Lean (push) vs full marketing matrix (manual). Push trigger
+          # gives an empty string for boolean inputs, which we treat as
+          # lean. Lean = sift+glove f32 only, no RaBitQ sweep.
+          FULL_SWEEP: ${{ inputs.full_sweep && 'true' || 'false' }}
         run: |
           set -euo pipefail
-          EF_SWEEP="20,40,80,200,400,800"
+          if [ "$FULL_SWEEP" = "true" ]; then
+            EF_SWEEP="20,40,80,200,400,800"
+          else
+            EF_SWEEP="40,80,200,400"
+          fi
+          echo "::notice::vector mode = $( [ "$FULL_SWEEP" = "true" ] && echo full-sweep || echo lean ), ef sweep = $EF_SWEEP, subset = $SUBSET_SIZE"
 
           # Build the list of `--threads` values to sweep. Empty input
           # defaults to "1 4" so per-commit numbers cover both the
@@ -189,26 +204,33 @@ jobs:
               --output bench-results
             echo "::endgroup::"
 
-            # RaBitQ diagnostic on SIFT-128: dim=128 already aligned
-            # to 64 so the padding path is NOT exercised here. If
-            # glove RaBitQ recall is broken but SIFT is fine, the
-            # bug is in padding; if BOTH are broken, in the codec.
-            echo "::group::SIFT-128-L2 M=16 quantization=rabitq threads=$T"
-            ./target/release/bench-vector-ann \
-              --train       "$DS_DIR/sift_base.fvecs" \
-              --query       "$DS_DIR/sift_query.fvecs" \
-              --groundtruth "$DS_DIR/sift_groundtruth.ivecs" \
-              --dataset-name sift-128-euclidean \
-              --m 16 --ef-construction 200 \
-              --codec none --quantization rabitq \
-              --ef-sweep "$EF_SWEEP" \
-              --threads "$T" \
-              --search-threads "$T" \
-              --subset-size "$SUBSET_SIZE" \
-              --output bench-results
-            echo "::endgroup::"
+            # RaBitQ diagnostic on SIFT-128 (manual only — padding path
+            # not exercised here; only kept for full marketing matrix).
+            if [ "$FULL_SWEEP" = "true" ]; then
+              echo "::group::SIFT-128-L2 M=16 quantization=rabitq threads=$T"
+              ./target/release/bench-vector-ann \
+                --train       "$DS_DIR/sift_base.fvecs" \
+                --query       "$DS_DIR/sift_query.fvecs" \
+                --groundtruth "$DS_DIR/sift_groundtruth.ivecs" \
+                --dataset-name sift-128-euclidean \
+                --m 16 --ef-construction 200 \
+                --codec none --quantization rabitq \
+                --ef-sweep "$EF_SWEEP" \
+                --threads "$T" \
+                --search-threads "$T" \
+                --subset-size "$SUBSET_SIZE" \
+                --output bench-results
+              echo "::endgroup::"
+            fi
 
-            for QUANT in none rabitq; do
+            # Push gate: glove f32 only. RaBitQ pipeline lives behind
+            # FULL_SWEEP so the push job stays inside the 20-min budget.
+            if [ "$FULL_SWEEP" = "true" ]; then
+              QUANT_LIST="none rabitq"
+            else
+              QUANT_LIST="none"
+            fi
+            for QUANT in $QUANT_LIST; do
               echo "::group::glove-100-angular M=16 codec=$QUANT threads=$T"
               ./target/release/bench-vector-ann \
                 --train       "$GLOVE_DIR/glove_base.fvecs" \
@@ -226,6 +248,11 @@ jobs:
             done
 
             # Gap #2 (E+C) RerankMode + oversample sweep on glove RaBitQ.
+            # Manual-only: this matrix is for marketing recall/QPS curves,
+            # not regression detection, so it's gated behind FULL_SWEEP.
+            if [ "$FULL_SWEEP" != "true" ]; then
+              continue
+            fi
             # The previous CI bench accumulated 7 RaBitQ sweeps over time
             # and started exceeding the GitHub Actions 5h timeout (d67fc2d
             # cancelled at 3h, c953a05 cancelled at 5h6m). Trimmed to the
