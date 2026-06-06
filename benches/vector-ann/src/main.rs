@@ -650,7 +650,13 @@ fn sweep_one(
         // join boundary.
         let chunk = total_queries.div_ceil(search_threads);
         let workers: Vec<_> = std::thread::scope(|scope| {
-            (0..search_threads)
+            // Spawn ALL workers first, THEN join. A naive
+            // `(0..N).map(spawn).map(join).collect()` chain runs the
+            // workers serially because the iterator is lazy: each
+            // `spawn` immediately threads through the next `join`
+            // before the following item is requested. Materialise the
+            // handle vector to force concurrent kick-off.
+            let handles: Vec<_> = (0..search_threads)
                 .map(|w| {
                     let start = w * chunk;
                     let end = ((w + 1) * chunk).min(total_queries);
@@ -681,6 +687,9 @@ fn sweep_one(
                         (lat, hits, total)
                     })
                 })
+                .collect();
+            handles
+                .into_iter()
                 .map(|h| h.join().unwrap_or_else(|_| (Vec::new(), 0u64, 0u64)))
                 .collect()
         });
