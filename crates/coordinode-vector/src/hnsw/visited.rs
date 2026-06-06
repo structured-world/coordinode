@@ -10,7 +10,7 @@
 //! - hnswlib `visited_list_pool.h:8-31` — epoch counter pattern
 //! - Qdrant `lib/segment/src/index/visited_pool.rs:19-84` — Rust adaptation with RAII
 
-use std::sync::Mutex;
+use std::cell::RefCell;
 
 /// Reusable visited list with epoch-based reset.
 ///
@@ -144,35 +144,37 @@ impl Drop for VisitedListHandle<'_> {
 /// Pool of reusable `VisitedList` instances.
 ///
 /// Avoids allocating a new Vec on every search. Lists are recycled:
-/// `get()` pops from pool (or creates new), `Drop` on handle returns it.
+/// `get()` pops from a thread-local cache (or creates new), `Drop` on
+/// the handle returns the list to the same thread-local cache.
 ///
-/// Thread-safety: `Mutex<Vec<VisitedList>>`. In current single-threaded
-/// search (R858 adds concurrency later), mutex is uncontended = ~25ns.
+/// Thread-safety: a single shared `Mutex<Vec<VisitedList>>` was the
+/// previous storage shape and the MT search path serialised on its
+/// per-query acquire / release. Switching to one cache per OS thread
+/// removes the contention entirely: a worker reaches into its own
+/// RefCell, no other thread ever touches it.
 pub(crate) struct VisitedPool {
-    pool: Mutex<Vec<VisitedList>>,
-    /// Maximum number of lists to keep in pool (prevent memory leak).
+    /// Maximum number of lists to keep in each thread-local cache
+    /// (prevent unbounded growth on long-running workers).
     max_pool_size: usize,
+}
+
+thread_local! {
+    static THREAD_POOL: RefCell<Vec<VisitedList>> = const { RefCell::new(Vec::new()) };
 }
 
 impl VisitedPool {
     /// Create a new pool.
     pub(crate) fn new() -> Self {
-        Self {
-            pool: Mutex::new(Vec::with_capacity(4)),
-            max_pool_size: 16,
-        }
+        Self { max_pool_size: 16 }
     }
 
     /// Get a visited list handle for `num_elements` nodes.
     ///
-    /// Pops from pool if available, otherwise creates new.
-    /// The returned handle advances the epoch automatically.
+    /// Pops from the calling thread's cache if available, otherwise
+    /// allocates fresh. The returned handle advances the epoch.
     pub(crate) fn get(&self, num_elements: usize) -> VisitedListHandle<'_> {
-        let mut list = self
-            .pool
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .pop()
+        let mut list = THREAD_POOL
+            .with(|cell| cell.borrow_mut().pop())
             .unwrap_or_else(|| VisitedList::new(num_elements));
 
         list.resize(num_elements);
@@ -186,14 +188,14 @@ impl VisitedPool {
     }
 
     fn return_back(&self, list: VisitedList) {
-        let mut pool = self
-            .pool
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if pool.len() < self.max_pool_size {
-            pool.push(list);
-        }
-        // else: drop the list (pool full)
+        let max = self.max_pool_size;
+        THREAD_POOL.with(|cell| {
+            let mut pool = cell.borrow_mut();
+            if pool.len() < max {
+                pool.push(list);
+            }
+            // else: drop the list (cache full for this thread)
+        });
     }
 }
 
@@ -270,56 +272,61 @@ mod tests {
         assert!(handle.is_visited(100));
     }
 
+    /// Read the calling thread's pool size — only valid in single-thread
+    /// tests where the pool is observed from the same OS thread that
+    /// drives it.
+    fn thread_pool_size() -> usize {
+        THREAD_POOL.with(|cell| cell.borrow().len())
+    }
+
+    /// Reset the calling thread's cache so a test starts with a clean
+    /// per-thread slate. Without this, the cache survives across tests
+    /// run on the same thread.
+    fn clear_thread_pool() {
+        THREAD_POOL.with(|cell| cell.borrow_mut().clear());
+    }
+
     #[test]
     fn test_pool_recycles() {
+        clear_thread_pool();
         let pool = VisitedPool::new();
 
-        // Create and drop a handle — list returned to pool
+        // Create and drop a handle — list returned to the thread cache.
         {
             let mut handle = pool.get(1000);
             handle.check_and_mark(500);
         }
+        assert_eq!(thread_pool_size(), 1);
 
-        // Pool should have 1 list (returned from the handle above)
-        let pool_size = pool.pool.lock().unwrap().len();
-        assert_eq!(pool_size, 1);
-
-        // Getting from pool reuses existing list (pops from pool)
+        // Getting reuses the cached list (pops from cache).
         let handle = pool.get(1000);
-        let pool_size = pool.pool.lock().unwrap().len();
-        assert_eq!(pool_size, 0); // one was taken
+        assert_eq!(thread_pool_size(), 0);
 
-        // Dropping returns it back
+        // Dropping returns it back.
         drop(handle);
-        let pool_size = pool.pool.lock().unwrap().len();
-        assert_eq!(pool_size, 1); // returned
+        assert_eq!(thread_pool_size(), 1);
 
-        // Create 3 concurrent handles — forces 3 allocations
-        let h1 = pool.get(1000); // takes from pool (size 0)
-        let h2 = pool.get(1000); // pool empty → new allocation
-        let h3 = pool.get(1000); // pool empty → new allocation
-
-        let pool_size = pool.pool.lock().unwrap().len();
-        assert_eq!(pool_size, 0); // all taken
+        // Three concurrent handles drain the cache and trigger fresh
+        // allocations.
+        let h1 = pool.get(1000);
+        let h2 = pool.get(1000);
+        let h3 = pool.get(1000);
+        assert_eq!(thread_pool_size(), 0);
 
         drop(h1);
         drop(h2);
         drop(h3);
-
-        let pool_size = pool.pool.lock().unwrap().len();
-        assert_eq!(pool_size, 3); // all 3 returned
+        assert_eq!(thread_pool_size(), 3);
     }
 
     #[test]
     fn test_pool_max_size() {
-        let pool = VisitedPool::new(); // max_pool_size = 16
+        clear_thread_pool();
+        let pool = VisitedPool::new();
 
-        // Create 20 handles, drop them all
         let handles: Vec<_> = (0..20).map(|_| pool.get(10)).collect();
         drop(handles);
 
-        // Pool capped at max_pool_size
-        let pool_size = pool.pool.lock().unwrap().len();
-        assert!(pool_size <= pool.max_pool_size);
+        assert!(thread_pool_size() <= pool.max_pool_size);
     }
 }
