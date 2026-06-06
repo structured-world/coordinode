@@ -637,49 +637,59 @@ fn sweep_one(
         }
         (latencies_us, hits, total)
     } else {
-        // Multi-thread path: a local rayon pool dispatches queries
-        // across `search_threads` workers. The reported wall time
-        // covers the WHOLE parallel section, so QPS = total /
-        // wall yields the aggregate throughput across all threads;
-        // E_core(N) = QPS(N) / (N * QPS(1)) is the scaling figure.
-        // Per-query latency is captured inside each worker so the
-        // P50/P95/P99 still describe per-call cost (which under MT
-        // load will include any contention on shared state inside
-        // HnswIndex::search).
-        use rayon::prelude::*;
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(search_threads)
-            .build()
-            .map_err(|e| format!("search thread pool: {e}"))?;
-        let per_query: Vec<(f64, u64, u64)> = pool.install(|| {
-            (0..total_queries)
-                .into_par_iter()
-                .map(|i| {
-                    let q_idx = i % n_test;
-                    let q_start = q_idx * dim;
-                    let query = &query_flat[q_start..q_start + dim];
-                    let t = Instant::now();
-                    let results = index.search_with_mode(query, k, search_mode);
-                    let elapsed_us = t.elapsed().as_micros() as f64;
-                    let gt_start = q_idx * gt_k;
-                    let gt: std::collections::HashSet<i64> = gt_flat[gt_start..gt_start + k]
-                        .iter()
-                        .map(|x| i64::from(*x))
-                        .collect();
-                    let local_hits: u64 = results
-                        .iter()
-                        .take(k)
-                        .filter(|r| gt.contains(&(r.id as i64)))
-                        .count() as u64;
-                    (elapsed_us, local_hits, k as u64)
+        // Multi-thread path: N explicit worker threads each pull a
+        // contiguous slice of the query stream and walk it in a tight
+        // loop. The previous rayon `par_iter` shape spawned a fresh
+        // task per query (100k tasks per ef point at the standard
+        // 10k queries x 10 replay rounds) and the work-stealing tax
+        // showed up as a 24% sift MT4 gap vs hnswlib's straight
+        // worker model. With chunked workers the per-query overhead
+        // is one branch + one slice index, and the engine path is
+        // unchanged. E_core(N) = QPS(N) / (N * QPS(1)) is still the
+        // scaling figure, computed off the wall-clock around the
+        // join boundary.
+        let chunk = total_queries.div_ceil(search_threads);
+        let workers: Vec<_> = std::thread::scope(|scope| {
+            (0..search_threads)
+                .map(|w| {
+                    let start = w * chunk;
+                    let end = ((w + 1) * chunk).min(total_queries);
+                    scope.spawn(move || {
+                        let mut lat = Vec::with_capacity(end.saturating_sub(start));
+                        let mut hits: u64 = 0;
+                        let mut total: u64 = 0;
+                        for i in start..end {
+                            let q_idx = i % n_test;
+                            let q_start = q_idx * dim;
+                            let query = &query_flat[q_start..q_start + dim];
+                            let t = Instant::now();
+                            let results = index.search_with_mode(query, k, search_mode);
+                            lat.push(t.elapsed().as_micros() as f64);
+                            let gt_start = q_idx * gt_k;
+                            let gt: std::collections::HashSet<i64> = gt_flat
+                                [gt_start..gt_start + k]
+                                .iter()
+                                .map(|x| i64::from(*x))
+                                .collect();
+                            for r in results.iter().take(k) {
+                                if gt.contains(&(r.id as i64)) {
+                                    hits += 1;
+                                }
+                            }
+                            total += k as u64;
+                        }
+                        (lat, hits, total)
+                    })
                 })
+                .map(|h| h.join().unwrap_or_else(|_| (Vec::new(), 0u64, 0u64)))
                 .collect()
         });
-        let mut latencies_us = Vec::with_capacity(per_query.len());
+        let cap: usize = workers.iter().map(|(l, _, _)| l.len()).sum();
+        let mut latencies_us = Vec::with_capacity(cap);
         let mut hits = 0u64;
         let mut total = 0u64;
-        for (l, h, t) in per_query {
-            latencies_us.push(l);
+        for (mut l, h, t) in workers {
+            latencies_us.append(&mut l);
             hits += h;
             total += t;
         }
