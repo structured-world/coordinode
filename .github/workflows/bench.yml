@@ -64,6 +64,10 @@ on:
         type: boolean
         required: false
         default: false
+      high_d_dimensions:
+        description: 'Comma-list of embedding dimensions to bench from the high-D dataset tier (e.g. "1536,3072,4096,8192"). Each tier expects a fvecs triplet under $DATASET_ROOT/high-d/<d>/*_{base,query,groundtruth}.{fvecs,ivecs}; run benches/vector-ann/scripts/fetch_high_d.sh on the runner once to provision. Empty = skip. Runs ST + MT4 at M=16.'
+        required: false
+        default: ''
 
 concurrency:
   group: bench
@@ -386,6 +390,56 @@ jobs:
               --subset-size "$SUBSET_SIZE" \
               --output bench-results
             echo "::endgroup::"
+          done
+
+      # ── Modern embedding-dim tiers (1536 / 3072 / 4096 / 8192) ─
+      #
+      # Each dimension corresponds to a current production embedding
+      # model class: text-embedding-3-small (1536), text-embedding-3-large
+      # (3072), NV-Embed-v2 (4096), Stella en 1.5B v5 (8192). Datasets
+      # are prepared on the runner via fetch_high_d.sh; missing tier is
+      # a warning, not a failure, so the workflow remains tolerant of a
+      # partially-provisioned host. Dataset name in the JSON carries the
+      # dimension so the dashboard splits cells cleanly.
+      - name: Vector high-D dimension tiers
+        if: ${{ inputs.high_d_dimensions != '' }}
+        env:
+          THREAD_SWEEP: ${{ inputs.thread_sweep }}
+          DIMENSIONS: ${{ inputs.high_d_dimensions }}
+        run: |
+          set -euo pipefail
+          if [ -z "${THREAD_SWEEP// /}" ] || [ "$THREAD_SWEEP" = "default" ]; then
+            THREAD_LIST="1 4"
+          else
+            THREAD_LIST="$(echo "$THREAD_SWEEP" | tr ',' ' ')"
+          fi
+          for D in $(echo "$DIMENSIONS" | tr ',' ' '); do
+            TIER_DIR="$DATASET_ROOT/high-d/$D"
+            if [ ! -d "$TIER_DIR" ]; then
+              echo "::warning::high-d tier $D not provisioned at $TIER_DIR — skip (run fetch_high_d.sh $D on the runner)"
+              continue
+            fi
+            BASE=$(ls "$TIER_DIR"/*_base.fvecs 2>/dev/null | head -1 || true)
+            QUERY=$(ls "$TIER_DIR"/*_query.fvecs 2>/dev/null | head -1 || true)
+            TRUTH=$(ls "$TIER_DIR"/*_groundtruth.ivecs 2>/dev/null | head -1 || true)
+            if [ -z "$BASE" ] || [ -z "$QUERY" ] || [ -z "$TRUTH" ]; then
+              echo "::warning::tier $D missing one of base/query/groundtruth in $TIER_DIR — skip"
+              continue
+            fi
+            DSNAME="high-d-${D}-angular"
+            for T in $THREAD_LIST; do
+              echo "::group::$DSNAME M=16 codec=none threads=$T"
+              ./target/release/bench-vector-ann \
+                --train       "$BASE" \
+                --query       "$QUERY" \
+                --groundtruth "$TRUTH" \
+                --dataset-name "$DSNAME" \
+                --m 16 --ef-construction 200 \
+                --codec none --ef-sweep "40,80,200,400,800" \
+                --threads "$T" --search-threads "$T" \
+                --output bench-results
+              echo "::endgroup::"
+            done
           done
 
       # ── Competitor adapters: qdrant + chromadb on the same host ──
