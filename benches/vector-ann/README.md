@@ -149,6 +149,81 @@ Each `SweepPoint`:
 
 ---
 
+## High-dimension tiers (1536 / 3072 / 4096 / 8192)
+
+Modern production embeddings live well above the 100-1000 dim range
+the original SIFT-class datasets cover. The workflow can sweep across
+four extra dimension tiers, each picked to track one current model
+class:
+
+| Tier | Source model class | Dataset shape |
+|---|---|---|
+| **1536** | OpenAI text-embedding-3-small / ada-002 | 1M x 1536, dbpedia-openai-1000k-angular HDF5 |
+| **3072** | OpenAI text-embedding-3-large | 100k x 3072 synthetic, brute-force groundtruth |
+| **4096** | NV-Embed-v2 / E5-Mistral / Qwen3-emb | 100k x 4096 synthetic |
+| **8192** | Stella en 1.5B v5 | 50k x 8192 synthetic |
+
+Tier 1 uses a real public corpus; the others are deterministically
+seeded N(0,1) L2-normalised vectors because no widely-published
+evaluation corpus exists at those dims yet. Synthetic groundtruth is
+brute-force exact, so recall measurements are valid.
+
+### Provisioning the runner (one-shot)
+
+```bash
+ssh <bench-runner>
+cd /opt/coordinode
+export DATASET_ROOT=<bench-data-root>/datasets
+bash benches/vector-ann/scripts/fetch_high_d.sh all
+```
+
+Disk: ~6 GB for the 1536 download plus a few hundred MB per
+synthetic tier. The script is idempotent — re-runs skip tiers that
+already have the fvecs triplet on disk.
+
+To provision a single tier only, pass the dim:
+
+```bash
+bash benches/vector-ann/scripts/fetch_high_d.sh 1536
+```
+
+### Triggering a bench
+
+After provisioning, manual `workflow_dispatch` with the
+`high_d_dimensions` input picks up whichever tiers are present:
+
+```bash
+gh workflow run bench --ref main \
+  -f full_sweep=true \
+  -f subset_size=100000 \
+  -f thread_sweep=1,4 \
+  -f high_d_dimensions=1536,3072,4096,8192 \
+  -f run_competitors=true
+```
+
+Missing tier directories log a warning and the step continues, so a
+half-provisioned host stays usable. JSON output uses dataset names
+`high-d-1536-angular`, `high-d-3072-angular`, etc. — the dashboard
+splits them automatically by dataset key.
+
+The competitor step (`run_competitors=true`) extends qdrant to the
+same high-D tiers; chromadb stays on sift+glove because its HNSW
+client tops out at lower D in practice.
+
+### Adding a new tier
+
+1. Pick the dimension and either a public HDF5 URL or accept the
+   synthetic default.
+2. Add a `prepare_<dim>` function in `scripts/fetch_high_d.sh`.
+3. Re-run the fetch script on the host.
+4. Pass the new dim through `high_d_dimensions` in the workflow.
+
+No workflow change is required — the run step iterates the
+comma-list dynamically and probes for any
+`$DATASET_ROOT/high-d/<dim>/*_base.fvecs` triplet.
+
+---
+
 ## Why `.fvecs`, not HDF5?
 
 Texmex `.fvecs` / `.ivecs` is the **original** distribution format for SIFT1M, GIST, etc. ann-benchmarks.com later converts to HDF5 for tooling convenience, but every Rust HDF5 binding either pulls in `libhdf5` C deps or has a maintenance lag. `.fvecs` is a 5-line binary parser ([`src/fvecs.rs`](src/fvecs.rs)) — zero external dependencies, same numeric content as the HDF5 equivalent.
