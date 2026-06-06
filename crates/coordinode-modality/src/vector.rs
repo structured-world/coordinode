@@ -30,7 +30,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use coordinode_vector::hnsw::{HnswConfig, HnswIndex, SearchResult, VectorLoader};
+use coordinode_vector::hnsw::{HnswConfig, HnswIndex, SearchMode, SearchResult, VectorLoader};
 
 use crate::error::{StoreError, StoreResult};
 
@@ -111,6 +111,31 @@ pub trait VectorStore: Send + Sync {
         query: &[f32],
         k: usize,
         loader: Option<&dyn VectorLoader>,
+    ) -> StoreResult<Vec<SearchResult>>;
+
+    /// KNN search with an explicit strategy. `SearchMode::Hnsw` follows
+    /// the graph using the index's configured `ef_search` (matches
+    /// [`knn_search`]). `SearchMode::Exact` runs a brute-force linear
+    /// scan over every stored vector and returns recall=1.0 top-k. The
+    /// store owns one set of vectors; both modes read the same data.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use coordinode_modality::{LocalVectorStore, VectorStore};
+    /// # use coordinode_vector::hnsw::{HnswConfig, SearchMode};
+    /// let store = LocalVectorStore::new(HnswConfig::default());
+    /// store.insert(1, vec![1.0, 0.0, 0.0])?;
+    /// store.insert(2, vec![0.0, 1.0, 0.0])?;
+    /// let hits = store.knn_search_with_mode(&[1.0, 0.0, 0.0], 2, SearchMode::Exact)?;
+    /// assert_eq!(hits[0].id, 1);
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
+    fn knn_search_with_mode(
+        &self,
+        query: &[f32],
+        k: usize,
+        mode: SearchMode,
     ) -> StoreResult<Vec<SearchResult>>;
 
     /// Bulk-insert vectors. Returns the number inserted.
@@ -240,6 +265,15 @@ impl VectorStore for LocalVectorStore {
             None => guard.search(query, k),
         };
         Ok(results)
+    }
+
+    fn knn_search_with_mode(
+        &self,
+        query: &[f32],
+        k: usize,
+        mode: SearchMode,
+    ) -> StoreResult<Vec<SearchResult>> {
+        Ok(self.read()?.search_with_mode(query, k, mode))
     }
 
     fn bulk_insert(
