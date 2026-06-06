@@ -54,6 +54,16 @@ on:
         type: boolean
         required: false
         default: false
+      run_competitors:
+        description: 'After the CN sweep, run qdrant and chromadb adapters on the same hardware (docker compose). Adds ~30-60 min wall-clock to the manual job. Both subjects produce JSON that lands next to the CN reports in bench-data.'
+        type: boolean
+        required: false
+        default: false
+      high_d_probe:
+        description: 'Add the gist-960-euclidean high-dimension dataset to the sweep. Only fires when the dataset is present on the runner — missing dataset = warning, not a failure. CN ST + MT4, M=16 f32. Adds ~10-15 min on top of the regular sweep.'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: bench
@@ -335,6 +345,110 @@ jobs:
               echo "::endgroup::"
             done
           done
+
+      # ── High-D probe: gist-960-euclidean (manual opt-in) ─────
+      #
+      # Higher dimensions stress the distance kernel SIMD width and the
+      # graph walk's cache footprint, which is where MT4 efficiency
+      # tends to fall first. Off by default; enable with the
+      # `high_d_probe` workflow input. Missing dataset = warning, not
+      # a failure — the runner box decides what's stored.
+      - name: Vector high-D probe — gist-960-euclidean
+        if: ${{ inputs.high_d_probe }}
+        env:
+          THREAD_SWEEP: ${{ inputs.thread_sweep }}
+          SUBSET_SIZE: ${{ inputs.subset_size || '100000' }}
+        run: |
+          set -euo pipefail
+          GIST_DIR="$DATASET_ROOT/gist-960-euclidean"
+          if [ ! -d "$GIST_DIR" ]; then
+            echo "::warning::gist-960-euclidean dataset not found at $GIST_DIR — skip"
+            exit 0
+          fi
+          for f in gist_base.fvecs gist_query.fvecs gist_groundtruth.ivecs; do
+            test -f "$GIST_DIR/$f" || { echo "::warning::missing $GIST_DIR/$f — skip"; exit 0; }
+          done
+          if [ -z "${THREAD_SWEEP// /}" ] || [ "$THREAD_SWEEP" = "default" ]; then
+            THREAD_LIST="1 4"
+          else
+            THREAD_LIST="$(echo "$THREAD_SWEEP" | tr ',' ' ')"
+          fi
+          for T in $THREAD_LIST; do
+            echo "::group::gist-960-euclidean M=16 codec=none threads=$T"
+            ./target/release/bench-vector-ann \
+              --train       "$GIST_DIR/gist_base.fvecs" \
+              --query       "$GIST_DIR/gist_query.fvecs" \
+              --groundtruth "$GIST_DIR/gist_groundtruth.ivecs" \
+              --dataset-name gist-960-euclidean \
+              --m 16 --ef-construction 200 \
+              --codec none --ef-sweep "40,80,200,400,800" \
+              --threads "$T" --search-threads "$T" \
+              --subset-size "$SUBSET_SIZE" \
+              --output bench-results
+            echo "::endgroup::"
+          done
+
+      # ── Competitor adapters: qdrant + chromadb on the same host ──
+      #
+      # The runner IS the bench host (gpu-private-systems), so a
+      # docker compose run in this workflow step measures on the same
+      # CPU/RAM as the CN run above. Builds the images once per run
+      # (cached layer on the runner), then drives sift+glove for both
+      # subjects across ST + MT4. Output lands in `out/` which we move
+      # into `bench-results/` so it gets picked up by the existing
+      # bench-data push step. Gated behind workflow_dispatch only.
+      - name: Competitor adapters (qdrant + chromadb)
+        if: ${{ inputs.run_competitors }}
+        env:
+          SUBSET_SIZE: ${{ inputs.subset_size || '100000' }}
+        run: |
+          set -euo pipefail
+          cd benches/vector-ann
+          # Patch the placeholder dataset path in compose.competitors.yml
+          # to the actual runner-side root so docker mounts resolve.
+          # The file ships with `<bench-data-root>/datasets` as a doc
+          # placeholder; here we rewrite that to `$DATASET_ROOT` for
+          # the run. (Sed touches a copy in /tmp, not the repo file.)
+          mkdir -p /tmp/compose
+          sed "s|<bench-data-root>/datasets|$DATASET_ROOT|g" \
+            docker/compose.competitors.yml > /tmp/compose/competitors.yml
+          mkdir -p out
+          docker compose -f /tmp/compose/competitors.yml build qdrant chromadb
+
+          CN_SHA=$(git rev-parse HEAD)
+          for SUBJ in qdrant chromadb; do
+            for DSET in \
+              "sift-128-euclidean:sift" \
+              "glove-100-angular:glove-100-angular"; do
+              DSNAME="${DSET%%:*}"
+              DSPATH="${DSET##*:}"
+              # Choose the dataset-side file prefix (sift uses `sift_*`,
+              # glove uses `glove_*`).
+              case "$DSPATH" in
+                sift) PFX=sift ;;
+                glove-100-angular) PFX=glove ;;
+              esac
+              for T in 1 4; do
+                echo "::group::$SUBJ $DSNAME threads=$T"
+                docker compose -f /tmp/compose/competitors.yml run --rm "$SUBJ" \
+                  --train       "/data/$DSPATH/${PFX}_base.fvecs" \
+                  --query       "/data/$DSPATH/${PFX}_query.fvecs" \
+                  --groundtruth "/data/$DSPATH/${PFX}_groundtruth.ivecs" \
+                  --dataset-name "$DSNAME" \
+                  --m 16 --ef-construction 200 \
+                  --threads "$T" \
+                  --cn-sha "$CN_SHA" \
+                  --output /out
+                echo "::endgroup::"
+              done
+            done
+          done
+          # Fold competitor JSON into the same bench-results tree the
+          # CN run wrote into, so the bench-data push picks them up.
+          if [ -d out/vector ]; then
+            mkdir -p ../../bench-results/vector
+            cp -r out/vector/* ../../bench-results/vector/
+          fi
 
       # ── Future modality steps land here, one per modality ─────
       # - name: Graph — LDBC SNB SF1 Interactive
