@@ -247,28 +247,30 @@ jobs:
               echo "::endgroup::"
             done
 
-            # Exact baseline: brute-force linear scan, recall=1.0 by
-            # construction. Same surface as qdrant exact mode for
-            # head-to-head comparison. Cheap on a 50k subset (single
-            # pass over the vector set per query, no ef sweep), so it
-            # runs on every push within the lean budget.
-            for DSET in "sift-128-euclidean:$DS_DIR/sift" "glove-100-angular:$GLOVE_DIR/glove"; do
-              DSNAME="${DSET%%:*}"
-              DSPATH="${DSET##*:}"
-              echo "::group::$DSNAME M=16 search-mode=exact threads=$T"
-              ./target/release/bench-vector-ann \
-                --train       "${DSPATH}_base.fvecs" \
-                --query       "${DSPATH}_query.fvecs" \
-                --groundtruth "${DSPATH}_groundtruth.ivecs" \
-                --dataset-name "$DSNAME" \
-                --m 16 --ef-construction 200 \
-                --codec none --search-mode exact \
-                --threads "$T" \
-                --search-threads "$T" \
-                --subset-size "$SUBSET_SIZE" \
-                --output bench-results
-              echo "::endgroup::"
-            done
+            # Exact recall=1.0 baseline cells live behind FULL_SWEEP.
+            # Initial attempt to run them on every push pushed the lean
+            # job past the 20-min wall, so they migrate to the manual
+            # full-matrix workflow instead. The `--search-mode exact`
+            # CLI flag stays available for ad-hoc runs.
+            if [ "$FULL_SWEEP" = "true" ]; then
+              for DSET in "sift-128-euclidean:$DS_DIR/sift" "glove-100-angular:$GLOVE_DIR/glove"; do
+                DSNAME="${DSET%%:*}"
+                DSPATH="${DSET##*:}"
+                echo "::group::$DSNAME M=16 search-mode=exact threads=$T"
+                ./target/release/bench-vector-ann \
+                  --train       "${DSPATH}_base.fvecs" \
+                  --query       "${DSPATH}_query.fvecs" \
+                  --groundtruth "${DSPATH}_groundtruth.ivecs" \
+                  --dataset-name "$DSNAME" \
+                  --m 16 --ef-construction 200 \
+                  --codec none --search-mode exact \
+                  --threads "$T" \
+                  --search-threads "$T" \
+                  --subset-size "$SUBSET_SIZE" \
+                  --output bench-results
+                echo "::endgroup::"
+              done
+            fi
 
             # Gap #2 (E+C) RerankMode + oversample sweep on glove RaBitQ.
             # Manual-only: this matrix is for marketing recall/QPS curves,
