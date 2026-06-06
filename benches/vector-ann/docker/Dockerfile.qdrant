@@ -1,0 +1,27 @@
+# qdrant competitor adapter — produces CoordiNode JSON schema.
+#
+# Built ONCE per release. Re-invoke manually when:
+# - qdrant publishes a new version (pin the release tag below)
+# - methodology changes that need rerunning the baseline
+#
+# Not part of CI. Output JSON is moved into the repo's
+# bench-results/ directory by the human running the benchmark.
+
+FROM python:3.13-slim
+
+ARG QDRANT_CLIENT_VERSION=1.13.0
+
+# qdrant-client ships a pure-python HTTP client. The runner uses
+# `:memory:` mode (qdrant-client embeds a local store) so no
+# qdrant server container is required; this keeps the comparison
+# in-process the same way hnswlib / chromadb adapters work.
+RUN pip install --no-cache-dir \
+        "qdrant-client==${QDRANT_CLIENT_VERSION}" \
+        "numpy>=2.0" \
+        "psutil>=6.0"
+
+WORKDIR /bench
+
+COPY qdrant_runner.py /bench/
+
+ENTRYPOINT ["python3", "/bench/qdrant_runner.py"]

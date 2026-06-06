@@ -47,15 +47,28 @@ services:
     # `<sha>-chromadb-t<threads>-<stamp>.json` under /out/vector/...
     # which the human moves into bench-results/.
 
+  qdrant:
+    build:
+      context: .
+      dockerfile: Dockerfile.qdrant
+    image: coordinode-bench-qdrant:latest
+    volumes:
+      - <bench-data-root>/datasets:/data:ro
+      - ./out:/out
+    # qdrant adapter uses `:memory:` mode (no separate qdrant server
+    # container). Forces HNSW via full_scan_threshold=0 and passes
+    # per-query hnsw_ef so the recall/QPS curve actually responds to
+    # the ef sweep. Run twice per dataset (--threads 1 and 4) for
+    # E_core(4) parallel-efficiency comparison vs hnswlib + CN.
+
   # Future competitor adapters land here as additional services.
   # Each must produce JSON matching crates/coordinode-bench BenchReport
   # schema with the `subject` field set to the competitor name. See
   # docker/hnswlib_runner.py for the canonical implementation
   # template.
   #
-  # Planned but NOT shipped in this PR (Stage 2 follow-ups):
+  # Planned but NOT shipped (Stage 2 follow-ups):
   # - faiss-cpu          (specialist anchor)
   # - mongodb-8-vector   (multi-model competitor)
   # - opensearch-2-knn   (multi-model competitor)
-  # - surrealdb-3-hnsw   (multi-model competitor — the marketing
-  #                       head-to-head per arch/benchmarks/methodology.md)
+  # - surrealdb-3-hnsw   (multi-model competitor)
