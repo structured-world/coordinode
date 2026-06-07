@@ -93,6 +93,42 @@ def hardware_fingerprint() -> dict:
     }
 
 
+def _brute_force_groundtruth(
+    train: np.ndarray, query: np.ndarray, k: int, metric: str
+) -> np.ndarray:
+    """Exact top-K nearest neighbour ids per query, computed in chunks.
+
+    Used when --subset-size shrinks train to a different point set than
+    the shipped ivecs groundtruth covers. Returns ivecs-style (n_test, k).
+    """
+    n_test = query.shape[0]
+    n_train = train.shape[0]
+    chunk = max(1, 10_000_000 // max(1, n_train))
+    out = np.empty((n_test, k), dtype=np.int32)
+    if metric == "cosine":
+        train_n = train / np.linalg.norm(train, axis=1, keepdims=True).clip(min=1e-12)
+        query_n = query / np.linalg.norm(query, axis=1, keepdims=True).clip(min=1e-12)
+    else:
+        train_n = train
+        query_n = query
+    for start in range(0, n_test, chunk):
+        end = min(start + chunk, n_test)
+        if metric == "cosine":
+            sim = query_n[start:end] @ train_n.T
+            top = np.argpartition(-sim, k - 1, axis=1)[:, :k]
+            order = np.argsort(-np.take_along_axis(sim, top, axis=1), axis=1)
+        else:
+            d2 = (
+                (query[start:end] ** 2).sum(1, keepdims=True)
+                - 2 * (query[start:end] @ train.T)
+                + (train ** 2).sum(1)[None, :]
+            )
+            top = np.argpartition(d2, k - 1, axis=1)[:, :k]
+            order = np.argsort(np.take_along_axis(d2, top, axis=1), axis=1)
+        out[start:end] = np.take_along_axis(top, order, axis=1).astype(np.int32)
+    return out
+
+
 def detect_metric(dataset_name: str) -> str:
     if dataset_name.endswith("-euclidean"):
         return "l2"
@@ -114,6 +150,12 @@ def main() -> int:
     p.add_argument("--ef-construction", type=int, default=200)
     p.add_argument("--ef-sweep", default=",".join(str(x) for x in DEFAULT_EF_SWEEP))
     p.add_argument("--k", type=int, default=10)
+    p.add_argument(
+        "--subset-size",
+        type=int,
+        default=0,
+        help="If >0, use only the first N training vectors. Lets us match the CN-side subset for apples-to-apples comparison without re-downloading datasets.",
+    )
     p.add_argument("--codec", default="none", help="Recorded for symmetry; hnswlib has no codec dimension")
     p.add_argument("--output", type=Path, default=Path("bench-results"))
     p.add_argument(
@@ -144,6 +186,17 @@ def main() -> int:
     query = read_fvecs(args.query)
     print(f"[hnswlib] loading {args.groundtruth}", flush=True)
     gt = read_ivecs(args.groundtruth)
+
+    if args.subset_size > 0 and args.subset_size < train.shape[0]:
+        print(
+            f"[hnswlib] subset {args.subset_size}/{train.shape[0]} train vectors; recomputing brute-force groundtruth",
+            flush=True,
+        )
+        train = train[: args.subset_size]
+        # Original ivecs groundtruth indexes into the full corpus; when
+        # we shrink train, those labels are invalid. Recompute exact
+        # top-K against the subset so recall is meaningful.
+        gt = _brute_force_groundtruth(train, query, args.k, detect_metric(args.dataset_name))
 
     n_train, d = train.shape
     n_test, q_d = query.shape
