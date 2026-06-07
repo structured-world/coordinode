@@ -107,6 +107,33 @@ def hardware_fingerprint() -> dict:
     }
 
 
+def _brute_force_groundtruth(
+    train: np.ndarray, query: np.ndarray, k: int, metric: str
+) -> np.ndarray:
+    n_test = query.shape[0]
+    out = np.empty((n_test, k), dtype=np.int32)
+    if metric == "cosine":
+        train_n = train / np.linalg.norm(train, axis=1, keepdims=True).clip(min=1e-12)
+        query_n = query / np.linalg.norm(query, axis=1, keepdims=True).clip(min=1e-12)
+    chunk = max(1, 10_000_000 // max(1, train.shape[0]))
+    for start in range(0, n_test, chunk):
+        end = min(start + chunk, n_test)
+        if metric == "cosine":
+            sim = query_n[start:end] @ train_n.T
+            top = np.argpartition(-sim, k - 1, axis=1)[:, :k]
+            order = np.argsort(-np.take_along_axis(sim, top, axis=1), axis=1)
+        else:
+            d2 = (
+                (query[start:end] ** 2).sum(1, keepdims=True)
+                - 2 * (query[start:end] @ train.T)
+                + (train ** 2).sum(1)[None, :]
+            )
+            top = np.argpartition(d2, k - 1, axis=1)[:, :k]
+            order = np.argsort(np.take_along_axis(d2, top, axis=1), axis=1)
+        out[start:end] = np.take_along_axis(top, order, axis=1).astype(np.int32)
+    return out
+
+
 def detect_metric(dataset_name: str) -> Distance:
     if dataset_name.endswith("-euclidean"):
         return Distance.EUCLID
@@ -128,6 +155,12 @@ def main() -> int:
     p.add_argument("--ef-construction", type=int, default=200)
     p.add_argument("--ef-sweep", default=",".join(str(x) for x in DEFAULT_EF_SWEEP))
     p.add_argument("--k", type=int, default=10)
+    p.add_argument(
+        "--subset-size",
+        type=int,
+        default=0,
+        help="If >0, use only the first N training vectors. Matches CN-side subset for apples-to-apples comparison.",
+    )
     p.add_argument(
         "--codec",
         default="none",
@@ -153,6 +186,20 @@ def main() -> int:
     query = read_fvecs(args.query)
     print(f"[qdrant] loading {args.groundtruth}", flush=True)
     gt = read_ivecs(args.groundtruth)
+
+    if args.subset_size > 0 and args.subset_size < train.shape[0]:
+        print(
+            f"[qdrant] subset {args.subset_size}/{train.shape[0]} train vectors; recomputing brute-force groundtruth",
+            flush=True,
+        )
+        train = train[: args.subset_size]
+        m_str = "cosine" if args.dataset_name.endswith("-angular") else "euclidean"
+        gt = _brute_force_groundtruth(train, query, args.k, m_str)
+        suffix = f"{args.subset_size // 1000}k"
+        parts = args.dataset_name.rsplit("-", 1)
+        args.dataset_name = (
+            f"{parts[0]}-{suffix}-{parts[1]}" if len(parts) == 2 else f"{args.dataset_name}-{suffix}"
+        )
 
     n_train, d = train.shape
     n_test, q_d = query.shape
