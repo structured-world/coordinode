@@ -45,15 +45,6 @@ on:
         description: 'Comma-separated rayon thread counts to sweep for the vector bench (each value re-runs the full per-commit smoke set). Empty / "default" = ST + MT4 sweep ("1,4"). Example: "1" for single-thread only.'
         required: false
         default: ''
-      subset_size:
-        description: 'First N base vectors to use from each dataset (groundtruth recomputed brute-force). 50000 (default) keeps per-commit wall-clock under 20 min. Set to 100000+ for the full marketing matrix when full_sweep=true.'
-        required: false
-        default: '50000'
-      full_sweep:
-        description: 'Run the full marketing matrix (both datasets x f32+rabitq x RaBitQ rerank-oversample sweep). Off by default: push triggers a lean regression detector that must finish in 20 min. Manual runs can opt into the full matrix.'
-        type: boolean
-        required: false
-        default: false
       run_competitors:
         description: 'After the CN sweep, run qdrant and chromadb adapters on the same hardware (docker compose). Adds ~30-60 min wall-clock to the manual job. Both subjects produce JSON that lands next to the CN reports in bench-data.'
         type: boolean
@@ -82,7 +73,7 @@ jobs:
     runs-on:
       - self-hosted
       - gpu-private-systems
-    timeout-minutes: ${{ inputs.full_sweep && 180 || 20 }}
+    timeout-minutes: 20
 
     env:
       # Dataset root path is provided via GH Actions repo variable
@@ -161,23 +152,16 @@ jobs:
           # is the minimum needed to compute parallel efficiency
           # E_core(4) = QPS_MT4 / (4 * QPS_ST) against competitors.
           THREAD_SWEEP: ${{ inputs.thread_sweep }}
-          # First N base vectors per dataset (groundtruth recomputed
-          # brute-force inside bench-vector-ann). 50k by default for
-          # the lean push gate (must complete inside 20 min); manual
-          # runs override to 100k+ for marketing-grade numbers.
-          SUBSET_SIZE: ${{ inputs.subset_size || '50000' }}
-          # Lean (push) vs full marketing matrix (manual). Push trigger
-          # gives an empty string for boolean inputs, which we treat as
-          # lean. Lean = sift+glove f32 only, no RaBitQ sweep.
-          FULL_SWEEP: ${{ inputs.full_sweep && 'true' || 'false' }}
+          # Subset is HARD-locked at 50k to keep wall-clock under the
+          # 20-min job ceiling. Larger numbers stretch into multi-hour
+          # runs which kill the dev feedback loop and have been
+          # explicitly banned by the project owner. Use a separate
+          # offline tool if a one-shot bigger sweep is ever needed.
+          SUBSET_SIZE: '50000'
         run: |
           set -euo pipefail
-          if [ "$FULL_SWEEP" = "true" ]; then
-            EF_SWEEP="20,40,80,200,400,800"
-          else
-            EF_SWEEP="40,80,200,400"
-          fi
-          echo "::notice::vector mode = $( [ "$FULL_SWEEP" = "true" ] && echo full-sweep || echo lean ), ef sweep = $EF_SWEEP, subset = $SUBSET_SIZE"
+          EF_SWEEP="40,80,200,400"
+          echo "::notice::vector ef sweep = $EF_SWEEP, subset = $SUBSET_SIZE"
 
           # Build the list of `--threads` values to sweep. Empty input
           # defaults to "1 4" so per-commit numbers cover both the
@@ -238,116 +222,20 @@ jobs:
               --output bench-results
             echo "::endgroup::"
 
-            # RaBitQ diagnostic on SIFT-128 (manual only — padding path
-            # not exercised here; only kept for full marketing matrix).
-            if [ "$FULL_SWEEP" = "true" ]; then
-              echo "::group::SIFT-128-L2 M=16 quantization=rabitq threads=$T"
-              ./target/release/bench-vector-ann \
-                --train       "$DS_DIR/sift_base.fvecs" \
-                --query       "$DS_DIR/sift_query.fvecs" \
-                --groundtruth "$DS_DIR/sift_groundtruth.ivecs" \
-                --dataset-name sift-128-euclidean \
-                --m 16 --ef-construction 200 \
-                --codec none --quantization rabitq \
-                --ef-sweep "$EF_SWEEP" \
-                --threads "$T" \
-                --search-threads "$T" \
-                --subset-size "$SUBSET_SIZE" \
-                --output bench-results
-              echo "::endgroup::"
-            fi
-
-            # Push gate: glove f32 only. RaBitQ pipeline lives behind
-            # FULL_SWEEP so the push job stays inside the 20-min budget.
-            if [ "$FULL_SWEEP" = "true" ]; then
-              QUANT_LIST="none rabitq"
-            else
-              QUANT_LIST="none"
-            fi
-            for QUANT in $QUANT_LIST; do
-              echo "::group::glove-100-angular M=16 codec=$QUANT threads=$T"
-              ./target/release/bench-vector-ann \
-                --train       "$GLOVE_DIR/glove_base.fvecs" \
-                --query       "$GLOVE_DIR/glove_query.fvecs" \
-                --groundtruth "$GLOVE_DIR/glove_groundtruth.ivecs" \
-                --dataset-name glove-100-angular \
-                --m 16 --ef-construction 200 \
-                --codec none --quantization "$QUANT" \
-                --ef-sweep "$EF_SWEEP" \
-                --threads "$T" \
-                --search-threads "$T" \
-                --subset-size "$SUBSET_SIZE" \
-                --output bench-results
-              echo "::endgroup::"
-            done
-
-            # Exact recall=1.0 baseline cells live behind FULL_SWEEP.
-            # Initial attempt to run them on every push pushed the lean
-            # job past the 20-min wall, so they migrate to the manual
-            # full-matrix workflow instead. The `--search-mode exact`
-            # CLI flag stays available for ad-hoc runs.
-            if [ "$FULL_SWEEP" = "true" ]; then
-              for DSET in "sift-128-euclidean:$DS_DIR/sift" "glove-100-angular:$GLOVE_DIR/glove"; do
-                DSNAME="${DSET%%:*}"
-                DSPATH="${DSET##*:}"
-                echo "::group::$DSNAME M=16 search-mode=exact threads=$T"
-                ./target/release/bench-vector-ann \
-                  --train       "${DSPATH}_base.fvecs" \
-                  --query       "${DSPATH}_query.fvecs" \
-                  --groundtruth "${DSPATH}_groundtruth.ivecs" \
-                  --dataset-name "$DSNAME" \
-                  --m 16 --ef-construction 200 \
-                  --codec none --search-mode exact \
-                  --threads "$T" \
-                  --search-threads "$T" \
-                  --subset-size "$SUBSET_SIZE" \
-                  --output bench-results
-                echo "::endgroup::"
-              done
-            fi
-
-            # Gap #2 (E+C) RerankMode + oversample sweep on glove RaBitQ.
-            # Manual-only: this matrix is for marketing recall/QPS curves,
-            # not regression detection, so it's gated behind FULL_SWEEP.
-            if [ "$FULL_SWEEP" != "true" ]; then
-              continue
-            fi
-            # The previous CI bench accumulated 7 RaBitQ sweeps over time
-            # and started exceeding the GitHub Actions 5h timeout (d67fc2d
-            # cancelled at 3h, c953a05 cancelled at 5h6m). Trimmed to the
-            # 3 oversample rows that ACTUALLY produce new data after
-            # baselines were captured in 5248f69:
-            #   - end-of-search oversample=2.0   ← qdrant-parity row (peak r≈0.945)
-            #   - end-of-search oversample=2.5   ← sweet-spot probe between 2.0/3.0
-            #   - end-of-search oversample=3.0   ← recall headroom (r≈0.965)
-            # 0adfc54 confirmed os=2.0 lands at recall 0.945 (just under
-            # the ≥0.95 cutoff) and os=3.0 lands at 0.965 with QPS 162.
-            # qdrant ref @ ≥0.95 is 246 QPS — os=2.5 might cross 0.95
-            # while keeping QPS materially above the os=3.0 floor.
-            # The α=1.0 inline baseline, α=1.2 inline, end-of-search
-            # oversample=1.0 default, and `none` recall-ceiling rows are
-            # already in bench-data under 5248f69 / b1004cd / 45b87bf —
-            # do NOT re-run them in CI on every push. Bring them back if
-            # the recall surface drifts. Total budget: 3 RaBitQ rows ×
-            # ~25min + f32 row + α=1.0 baseline = ~2h30m, well under
-            # the 5h GitHub Actions ceiling.
-            for OS in 2.0 2.5 3.0; do
-              echo "::group::glove-100-angular M=16 quantization=rabitq rerank_mode=end-of-search oversample=$OS threads=$T"
-              ./target/release/bench-vector-ann \
-                --train       "$GLOVE_DIR/glove_base.fvecs" \
-                --query       "$GLOVE_DIR/glove_query.fvecs" \
-                --groundtruth "$GLOVE_DIR/glove_groundtruth.ivecs" \
-                --dataset-name glove-100-angular \
-                --m 16 --ef-construction 200 \
-                --codec none --quantization rabitq \
-                --rerank-mode end-of-search --rerank-oversample "$OS" \
-                --ef-sweep "$EF_SWEEP" \
-                --threads "$T" \
-                --search-threads "$T" \
-                --subset-size "$SUBSET_SIZE" \
-                --output bench-results
-              echo "::endgroup::"
-            done
+            echo "::group::glove-100-angular M=16 codec=none threads=$T"
+            ./target/release/bench-vector-ann \
+              --train       "$GLOVE_DIR/glove_base.fvecs" \
+              --query       "$GLOVE_DIR/glove_query.fvecs" \
+              --groundtruth "$GLOVE_DIR/glove_groundtruth.ivecs" \
+              --dataset-name glove-100-angular \
+              --m 16 --ef-construction 200 \
+              --codec none \
+              --ef-sweep "$EF_SWEEP" \
+              --threads "$T" \
+              --search-threads "$T" \
+              --subset-size "$SUBSET_SIZE" \
+              --output bench-results
+            echo "::endgroup::"
           done
 
       # ── High-D probe: gist-960-euclidean (manual opt-in) ─────
@@ -361,7 +249,7 @@ jobs:
         if: ${{ inputs.high_d_probe }}
         env:
           THREAD_SWEEP: ${{ inputs.thread_sweep }}
-          SUBSET_SIZE: ${{ inputs.subset_size || '100000' }}
+          SUBSET_SIZE: '50000'
         run: |
           set -euo pipefail
           GIST_DIR="$DATASET_ROOT/gist-960-euclidean"
@@ -454,7 +342,7 @@ jobs:
       - name: Competitor adapters (qdrant + chromadb)
         if: ${{ inputs.run_competitors }}
         env:
-          SUBSET_SIZE: ${{ inputs.subset_size || '100000' }}
+          SUBSET_SIZE: '50000'
           HIGH_D_DIMENSIONS: ${{ inputs.high_d_dimensions }}
         run: |
           set -euo pipefail
