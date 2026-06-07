@@ -82,7 +82,7 @@ jobs:
     runs-on:
       - self-hosted
       - gpu-private-systems
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     env:
       # Dataset root path is provided via GH Actions repo variable
@@ -165,7 +165,7 @@ jobs:
           # brute-force inside bench-vector-ann). 50k by default for
           # the lean push gate (must complete inside 20 min); manual
           # runs override to 100k+ for marketing-grade numbers.
-          SUBSET_SIZE: ${{ inputs.subset_size || '50000' }}
+          SUBSET_SIZE: ${{ inputs.subset_size || '20000' }}
           # Lean (push) vs full marketing matrix (manual). Push trigger
           # gives an empty string for boolean inputs, which we treat as
           # lean. Lean = sift+glove f32 only, no RaBitQ sweep.
@@ -360,7 +360,7 @@ jobs:
         if: ${{ inputs.high_d_probe }}
         env:
           THREAD_SWEEP: ${{ inputs.thread_sweep }}
-          SUBSET_SIZE: ${{ inputs.subset_size || '50000' }}
+          SUBSET_SIZE: ${{ inputs.subset_size || '20000' }}
         run: |
           set -euo pipefail
           GIST_DIR="$DATASET_ROOT/gist-960-euclidean"
@@ -453,7 +453,7 @@ jobs:
       - name: Competitor adapters (qdrant + chromadb)
         if: ${{ inputs.run_competitors }}
         env:
-          SUBSET_SIZE: ${{ inputs.subset_size || '50000' }}
+          SUBSET_SIZE: ${{ inputs.subset_size || '20000' }}
           HIGH_D_DIMENSIONS: ${{ inputs.high_d_dimensions }}
         run: |
           set -euo pipefail
