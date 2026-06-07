@@ -187,6 +187,12 @@ def main() -> int:
 
     # Sweep
     sweep_values = [int(x) for x in args.ef_sweep.split(",")]
+    def single_search(q_vec):
+        return collection.query(
+            query_embeddings=[q_vec.tolist()],
+            n_results=args.k,
+        )
+
     points = []
     for ef in sweep_values:
         # chromadb exposes ef_search through collection.modify; the
@@ -196,20 +202,38 @@ def main() -> int:
         hits = 0
         total = 0
         wall_start = time.time()
-        for _round in range(REPLAY_ROUNDS):
-            for q_idx in range(n_test):
-                q = query[q_idx]
-                t = time.time()
-                result = collection.query(
-                    query_embeddings=[q.tolist()],
-                    n_results=args.k,
-                )
-                latencies_us.append((time.time() - t) * 1e6)
-                gt_row = set(int(x) for x in gt[q_idx, : args.k])
-                for lab in result["ids"][0]:
-                    if int(lab) in gt_row:
-                        hits += 1
-                total += args.k
+        if args.threads == 1:
+            for _round in range(REPLAY_ROUNDS):
+                for q_idx in range(n_test):
+                    q = query[q_idx]
+                    t = time.time()
+                    result = single_search(q)
+                    latencies_us.append((time.time() - t) * 1e6)
+                    gt_row = set(int(x) for x in gt[q_idx, : args.k])
+                    for lab in result["ids"][0]:
+                        if int(lab) in gt_row:
+                            hits += 1
+                    total += args.k
+        else:
+            # MT: ThreadPoolExecutor with N workers each issuing
+            # independent collection.query calls. chromadb's HNSW
+            # search releases the GIL inside C++ so real wall-clock
+            # parallelism is achievable up to the runtime thread cap.
+            from concurrent.futures import ThreadPoolExecutor
+
+            for _round in range(REPLAY_ROUNDS):
+                with ThreadPoolExecutor(max_workers=args.threads) as pool:
+                    t_round = time.time()
+                    results = list(pool.map(single_search, (query[i] for i in range(n_test))))
+                    round_wall_us = (time.time() - t_round) * 1e6
+                per_query_us = round_wall_us / n_test
+                latencies_us.extend([per_query_us] * n_test)
+                for q_idx, result in enumerate(results):
+                    gt_row = set(int(x) for x in gt[q_idx, : args.k])
+                    for lab in result["ids"][0]:
+                        if int(lab) in gt_row:
+                            hits += 1
+                    total += args.k
         wall = time.time() - wall_start
         latencies_us.sort()
         n = len(latencies_us)
