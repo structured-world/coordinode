@@ -82,7 +82,7 @@ jobs:
     runs-on:
       - self-hosted
       - gpu-private-systems
-    timeout-minutes: ${{ inputs.full_sweep && 180 || 20 }}
+    timeout-minutes: 20
 
     env:
       # Dataset root path is provided via GH Actions repo variable
@@ -172,11 +172,10 @@ jobs:
           FULL_SWEEP: ${{ inputs.full_sweep && 'true' || 'false' }}
         run: |
           set -euo pipefail
-          if [ "$FULL_SWEEP" = "true" ]; then
-            EF_SWEEP="20,40,80,200,400,800"
-          else
-            EF_SWEEP="40,80,200,400"
-          fi
+          # ef sweep and subset are HARD-locked to keep each cell under
+          # the 20-min job ceiling. full_sweep widens the cell SURFACE
+          # (extra codec / mode rows) but never the per-cell workload.
+          EF_SWEEP="40,80,200,400"
           echo "::notice::vector mode = $( [ "$FULL_SWEEP" = "true" ] && echo full-sweep || echo lean ), ef sweep = $EF_SWEEP, subset = $SUBSET_SIZE"
 
           # Build the list of `--threads` values to sweep. Empty input
@@ -361,7 +360,7 @@ jobs:
         if: ${{ inputs.high_d_probe }}
         env:
           THREAD_SWEEP: ${{ inputs.thread_sweep }}
-          SUBSET_SIZE: ${{ inputs.subset_size || '100000' }}
+          SUBSET_SIZE: ${{ inputs.subset_size || '50000' }}
         run: |
           set -euo pipefail
           GIST_DIR="$DATASET_ROOT/gist-960-euclidean"
@@ -454,7 +453,7 @@ jobs:
       - name: Competitor adapters (qdrant + chromadb)
         if: ${{ inputs.run_competitors }}
         env:
-          SUBSET_SIZE: ${{ inputs.subset_size || '100000' }}
+          SUBSET_SIZE: ${{ inputs.subset_size || '50000' }}
           HIGH_D_DIMENSIONS: ${{ inputs.high_d_dimensions }}
         run: |
           set -euo pipefail
