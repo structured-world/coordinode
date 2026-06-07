@@ -178,17 +178,38 @@ def main() -> int:
         hits = 0
         total = 0
         wall_start = time.time()
-        for _round in range(REPLAY_ROUNDS):
-            for q_idx in range(n_test):
-                q = query[q_idx]
+        if args.threads == 1:
+            # Single-thread: per-query measurement gives p50/p95/p99 latency.
+            for _round in range(REPLAY_ROUNDS):
+                for q_idx in range(n_test):
+                    q = query[q_idx]
+                    t = time.time()
+                    labels, _ = index.knn_query(q.reshape(1, -1), k=args.k, num_threads=1)
+                    latencies_us.append((time.time() - t) * 1e6)
+                    gt_row = set(int(x) for x in gt[q_idx, : args.k])
+                    for lab in labels[0]:
+                        if int(lab) in gt_row:
+                            hits += 1
+                    total += args.k
+        else:
+            # Multi-thread: batched knn_query so hnswlib's OpenMP loop
+            # actually distributes queries across `args.threads` cores.
+            # Per-query latency loses meaning here so we synthesise it
+            # from total wall / n_queries; the QPS number is wall-honest.
+            for _round in range(REPLAY_ROUNDS):
                 t = time.time()
-                labels, _ = index.knn_query(q.reshape(1, -1), k=args.k, num_threads=args.threads)
-                latencies_us.append((time.time() - t) * 1e6)
-                gt_row = set(int(x) for x in gt[q_idx, : args.k])
-                for lab in labels[0]:
-                    if int(lab) in gt_row:
-                        hits += 1
-                total += args.k
+                labels_batch, _ = index.knn_query(
+                    query, k=args.k, num_threads=args.threads
+                )
+                round_wall_us = (time.time() - t) * 1e6
+                per_query_us = round_wall_us / n_test
+                latencies_us.extend([per_query_us] * n_test)
+                for q_idx in range(n_test):
+                    gt_row = set(int(x) for x in gt[q_idx, : args.k])
+                    for lab in labels_batch[q_idx]:
+                        if int(lab) in gt_row:
+                            hits += 1
+                    total += args.k
         wall = time.time() - wall_start
         latencies_us.sort()
         n = len(latencies_us)
