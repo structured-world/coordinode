@@ -373,6 +373,15 @@ pub struct HnswIndex {
     /// time; we store the norm separately so the f32 vector stays in
     /// its original scale for the rerank + SQ8 paths.
     node_norms: Vec<f32>,
+    /// Pre-normalised f32 vector per node (`vector / ‖vector‖₂`). Cosine
+    /// search reads this together with the pre-normalised query and
+    /// collapses distance to `1 - dot(qn, bn)`, dropping both the
+    /// `norm_l2(b)` pass AND the per-visit divide that
+    /// `cosine_similarity_with_both_norms` still pays. Original f32
+    /// vector stays in `node_vectors` for rerank / SQ8 paths that need
+    /// the un-normalised magnitudes. `None` when the metric is not
+    /// Cosine or the vector was a zero vector.
+    node_vectors_normalized: Vec<Option<Vec<f32>>>,
     /// SQ8-quantized vector, parallel to `nodes`. `None` until SQ8
     /// calibration completes (or always None when SQ8 is disabled).
     node_quantized: Vec<Option<Vec<u8>>>,
@@ -580,6 +589,11 @@ struct QueryCtx<'a> {
     /// ‖query‖₂ — pre-computed once per search. Used by Cosine metric only;
     /// other metrics ignore this field.
     norm_l2: f32,
+    /// Pre-normalised query (`query / ‖query‖₂`). Populated for Cosine,
+    /// `None` for other metrics. Lets cosine distance collapse to
+    /// `1 - dot(qn, bn)` against pre-normalised node vectors, removing
+    /// the division on every neighbour visit.
+    vec_normalized: Option<Vec<f32>>,
     /// Pre-encoded RaBitQ representation for the active codec, populated
     /// once per search and reused across thousands of `compute_distance`
     /// calls. Encoding is `O(D²)` (matrix-vector); paying it per call
@@ -619,6 +633,11 @@ impl<'a> QueryCtx<'a> {
         } else {
             0.0
         };
+        let vec_normalized = if matches!(metric, VectorMetric::Cosine) && norm_l2 > f32::EPSILON {
+            Some(vec.iter().map(|x| x / norm_l2).collect())
+        } else {
+            None
+        };
         // Encode against the active rotation matrix iff RaBitQ is calibrated
         // AND the query's dimensionality matches. Mismatched dims fall back
         // to the f32 distance path with no encode cost. 1-bit uses the
@@ -641,6 +660,7 @@ impl<'a> QueryCtx<'a> {
         Self {
             vec,
             norm_l2,
+            vec_normalized,
             rabitq_query,
         }
     }
@@ -664,9 +684,15 @@ impl<'a> QueryCtx<'a> {
         } else {
             0.0
         };
+        let vec_normalized = if matches!(metric, VectorMetric::Cosine) && norm_l2 > f32::EPSILON {
+            Some(vec.iter().map(|x| x / norm_l2).collect())
+        } else {
+            None
+        };
         Self {
             vec,
             norm_l2,
+            vec_normalized,
             rabitq_query: None,
         }
     }
@@ -728,6 +754,7 @@ impl HnswIndex {
             nodes: Vec::with_capacity(capacity),
             node_vectors: Vec::with_capacity(capacity),
             node_norms: Vec::with_capacity(capacity),
+            node_vectors_normalized: Vec::with_capacity(capacity),
             node_quantized: Vec::with_capacity(capacity),
             node_rabitq_codes: Vec::with_capacity(capacity),
             neighbours_l0: Vec::with_capacity(capacity),
@@ -1544,7 +1571,15 @@ impl HnswIndex {
         self.mirror_inline_layer0(idx, id, &vector);
         self.mirror_data_level0_vector(idx, &vector);
         // SoA payload pushes in lockstep — same idx, no extra clone.
-        self.node_norms.push(metrics::norm_l2(&vector));
+        let v_norm = metrics::norm_l2(&vector);
+        self.node_norms.push(v_norm);
+        let v_normalized =
+            if matches!(self.config.metric, VectorMetric::Cosine) && v_norm > f32::EPSILON {
+                Some(vector.iter().map(|x| x / v_norm).collect())
+            } else {
+                None
+            };
+        self.node_vectors_normalized.push(v_normalized);
         self.node_vectors.push(Some(vector));
         self.node_quantized.push(quantized);
         let rabitq_for_mirror = rabitq_code.clone();
@@ -1658,7 +1693,15 @@ impl HnswIndex {
             // Mirror into the contiguous layer-0 stores before moving `vec`.
             self.mirror_inline_layer0(idx, plan.id, &vec);
             self.mirror_data_level0_vector(idx, &vec);
-            self.node_norms.push(metrics::norm_l2(&vec));
+            let v_norm = metrics::norm_l2(&vec);
+            self.node_norms.push(v_norm);
+            let v_normalized =
+                if matches!(self.config.metric, VectorMetric::Cosine) && v_norm > f32::EPSILON {
+                    Some(vec.iter().map(|x| x / v_norm).collect())
+                } else {
+                    None
+                };
+            self.node_vectors_normalized.push(v_normalized);
             self.node_vectors.push(Some(vec));
             self.node_quantized.push(quantized);
             let rabitq_for_mirror = rabitq_code.clone();
@@ -2324,6 +2367,14 @@ impl HnswIndex {
         // mirror left over from the original insert.
         self.mirror_inline_layer0(idx, id, &vector);
         self.mirror_data_level0_vector(idx, &vector);
+        let v_norm = metrics::norm_l2(&vector);
+        self.node_norms[idx] = v_norm;
+        self.node_vectors_normalized[idx] =
+            if matches!(self.config.metric, VectorMetric::Cosine) && v_norm > f32::EPSILON {
+                Some(vector.iter().map(|x| x / v_norm).collect())
+            } else {
+                None
+            };
         self.node_vectors[idx] = Some(vector);
         self.node_quantized[idx] = quantized;
         let rabitq_for_mirror = rabitq_code.clone();
@@ -2985,6 +3036,19 @@ impl HnswIndex {
     /// Falls back to dequantized SQ8 if f32 is offloaded.
     #[inline(always)]
     fn compute_exact_distance(&self, ctx: &QueryCtx<'_>, node_idx: usize) -> f32 {
+        // Cosine ultra-fast path: both query and node already normalised.
+        // Distance collapses to `1 - dot(qn, bn)` — no norm pass on b,
+        // no divide. Hnswlib achieves the same by normalising vectors at
+        // insert time; we cache the normalised form alongside the raw
+        // f32 so rerank / SQ8 paths can still see the original.
+        if matches!(self.config.metric, VectorMetric::Cosine) {
+            if let (Some(qn), Some(Some(bn))) = (
+                ctx.vec_normalized.as_deref(),
+                self.node_vectors_normalized.get(node_idx),
+            ) {
+                return 1.0 - metrics::dot_product(qn, bn);
+            }
+        }
         if let Some(node_vec) = self.read_node_f32(node_idx) {
             // Cosine fast path: rebuild `‖x‖` from per-code scalars when a
             // RaBitQ code is available, then feed the both-norms helper to
