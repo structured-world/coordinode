@@ -2640,15 +2640,6 @@ impl HnswIndex {
                     if let Some(top) = results.peek() {
                         farthest_dist = top.distance;
                     }
-                    // Prefetch the new closest candidate's vector data
-                    // for the NEXT iteration of the outer while loop:
-                    // candidates is a min-heap, so after this push the
-                    // top() is likely the candidate the next pop() will
-                    // return. Hnswlib does the same after every
-                    // candidate insert (`hnswalg.h` lines 401-403).
-                    if let Some(top) = candidates.peek() {
-                        self.prefetch_node_vector(top.idx as usize);
-                    }
                 }
             }
         }
