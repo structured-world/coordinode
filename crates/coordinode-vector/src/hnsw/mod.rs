@@ -2893,16 +2893,6 @@ impl HnswIndex {
     ///    representation of this node (pre-calibration).
     #[inline(always)]
     fn compute_distance(&self, ctx: &QueryCtx<'_>, node_idx: usize) -> f32 {
-        // Fast path: no quantization is configured. Skip the entire
-        // RaBitQ + SQ8 inspection chain (each step here costs a few
-        // predictable-but-real branches + a `[]` bounds check on the
-        // SoA `node_rabitq_codes` / `node_quantized` arrays per visit).
-        // For the default glove/sift codec=none bench this fires on
-        // every neighbour visit and the deleted work compounds across
-        // hundreds of visits per query.
-        if self.rabitq_params.is_none() && self.sq8_params.is_none() {
-            return self.compute_exact_distance(ctx, node_idx);
-        }
         // RaBitQ fast path — cosine metric only in this slice.
         // Variants must match: a query encoded as Multi must hit a node
         // also encoded as Multi (calibration sets all nodes uniformly).
