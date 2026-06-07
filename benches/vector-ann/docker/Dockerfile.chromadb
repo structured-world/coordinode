@@ -12,13 +12,18 @@ FROM python:3.13-slim
 
 ARG CHROMADB_VERSION=0.5.20
 
-# chromadb pulls in hnswlib transitively; pin so the comparison is
-# a single moving target. numpy + psutil are runner deps shared
-# with the hnswlib adapter.
-RUN pip install --no-cache-dir \
-        "chromadb==${CHROMADB_VERSION}" \
-        "numpy>=2.0" \
-        "psutil>=6.0"
+# chromadb pulls in chroma-hnswlib transitively, which has no
+# manylinux wheel for python 3.13 yet and falls back to a from-source
+# build that needs a C++11 toolchain. Install gcc/g++ then drop them
+# from the final layer to keep the image small.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && pip install --no-cache-dir \
+           "chromadb==${CHROMADB_VERSION}" \
+           "numpy>=2.0" \
+           "psutil>=6.0" \
+    && apt-get purge -y --auto-remove build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /bench
 
