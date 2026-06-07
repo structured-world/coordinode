@@ -462,11 +462,15 @@ jobs:
           # Patch the placeholder dataset path in compose.competitors.yml
           # to the actual runner-side root so docker mounts resolve.
           # The file ships with `<bench-data-root>/datasets` as a doc
-          # placeholder; here we rewrite that to `$DATASET_ROOT` for
-          # the run. (Sed touches a copy in /tmp, not the repo file.)
+          # placeholder; here we rewrite that to $DATASET_ROOT for the
+          # run. Copy the whole docker/ tree so build context (Dockerfiles
+          # + runner scripts) lives next to the patched compose file.
+          rm -rf /tmp/compose
           mkdir -p /tmp/compose
-          sed "s|<bench-data-root>/datasets|$DATASET_ROOT|g" \
-            docker/compose.competitors.yml > /tmp/compose/competitors.yml
+          cp -R docker/. /tmp/compose/
+          sed -i "s|<bench-data-root>/datasets|$DATASET_ROOT|g" \
+            /tmp/compose/compose.competitors.yml
+          mv /tmp/compose/compose.competitors.yml /tmp/compose/competitors.yml
           mkdir -p out
           docker compose -f /tmp/compose/competitors.yml build qdrant chromadb
 
