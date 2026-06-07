@@ -365,6 +365,14 @@ pub struct HnswIndex {
     /// (`compute_exact_distance`) and the build path (`distance_between_
     /// nodes`).
     node_vectors: Vec<Option<Vec<f32>>>,
+    /// Pre-computed L2 norm per node, parallel to `nodes`. Cosine search
+    /// uses this to skip a per-visit pass over the neighbour vector
+    /// (`norm_l2(b)` inside `cosine_similarity_with_query_norm`), so the
+    /// hot loop reads each node's data ONCE per visit instead of twice.
+    /// Hnswlib achieves the same by normalising input vectors at insert
+    /// time; we store the norm separately so the f32 vector stays in
+    /// its original scale for the rerank + SQ8 paths.
+    node_norms: Vec<f32>,
     /// SQ8-quantized vector, parallel to `nodes`. `None` until SQ8
     /// calibration completes (or always None when SQ8 is disabled).
     node_quantized: Vec<Option<Vec<u8>>>,
@@ -719,6 +727,7 @@ impl HnswIndex {
             config,
             nodes: Vec::with_capacity(capacity),
             node_vectors: Vec::with_capacity(capacity),
+            node_norms: Vec::with_capacity(capacity),
             node_quantized: Vec::with_capacity(capacity),
             node_rabitq_codes: Vec::with_capacity(capacity),
             neighbours_l0: Vec::with_capacity(capacity),
@@ -1535,6 +1544,7 @@ impl HnswIndex {
         self.mirror_inline_layer0(idx, id, &vector);
         self.mirror_data_level0_vector(idx, &vector);
         // SoA payload pushes in lockstep — same idx, no extra clone.
+        self.node_norms.push(metrics::norm_l2(&vector));
         self.node_vectors.push(Some(vector));
         self.node_quantized.push(quantized);
         let rabitq_for_mirror = rabitq_code.clone();
@@ -1648,6 +1658,7 @@ impl HnswIndex {
             // Mirror into the contiguous layer-0 stores before moving `vec`.
             self.mirror_inline_layer0(idx, plan.id, &vec);
             self.mirror_data_level0_vector(idx, &vec);
+            self.node_norms.push(metrics::norm_l2(&vec));
             self.node_vectors.push(Some(vec));
             self.node_quantized.push(quantized);
             let rabitq_for_mirror = rabitq_code.clone();
@@ -2991,6 +3002,21 @@ impl HnswIndex {
                             ctx.norm_l2,
                             b_norm,
                         );
+                }
+                // Cached f32 norm available even without RaBitQ — skip the
+                // per-visit `norm_l2(b)` pass. Falls through to the legacy
+                // single-norm helper when the cache slot is missing
+                // (e.g. node inserted before the field landed).
+                if let Some(&b_norm) = self.node_norms.get(node_idx) {
+                    if b_norm.is_finite() && b_norm > 0.0 {
+                        return 1.0
+                            - metrics::cosine_similarity_with_both_norms(
+                                ctx.vec,
+                                node_vec,
+                                ctx.norm_l2,
+                                b_norm,
+                            );
+                    }
                 }
             }
             return self.distance_for_metric(ctx, node_vec);
