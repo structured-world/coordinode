@@ -12,10 +12,14 @@ FROM python:3.13-slim
 
 ARG HNSWLIB_VERSION=0.8.0
 
-RUN pip install --no-cache-dir \
-        "hnswlib==${HNSWLIB_VERSION}" \
-        "numpy>=2.0" \
-        "psutil>=6.0"
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && pip install --no-cache-dir \
+           "hnswlib==${HNSWLIB_VERSION}" \
+           "numpy>=2.0" \
+           "psutil>=6.0" \
+    && apt-get purge -y --auto-remove build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /bench
 
