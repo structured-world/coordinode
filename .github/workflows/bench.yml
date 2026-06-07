@@ -471,7 +471,14 @@ jobs:
             /tmp/compose/compose.competitors.yml
           mv /tmp/compose/compose.competitors.yml /tmp/compose/competitors.yml
           mkdir -p out
-          docker compose -f /tmp/compose/competitors.yml build qdrant chromadb
+          # Images must be pre-built on the runner host once (chroma-hnswlib
+          # source build from C++ takes ~10 min and blows the 30-min job
+          # ceiling when done inside CI). Build them manually after a
+          # competitor pin change:
+          #   ssh <runner>
+          #   cd /opt/coordinode/benches/vector-ann
+          #   docker compose -f docker/compose.competitors.yml build qdrant chromadb
+          # Missing image = fail-fast on the docker compose run line below.
 
           CN_SHA=$(git rev-parse HEAD)
           for SUBJ in qdrant chromadb; do
