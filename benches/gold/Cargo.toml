@@ -1,10 +1,14 @@
+[workspace]
+# Standalone workspace so the main production workspace (and Docker image)
+# doesn't need to resolve this crate. Run via `cd benches/gold && cargo …`.
+
 [package]
 name = "coordinode-gold-bench"
 description = "Gold benchmark suite (L2 from arch/benchmarks/methodology.md): YCSB, LDBC SNB, ann-benchmarks, TSBS, SpatialBench against published competitor baselines. Outputs the structured per-modality + composite score report."
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
+version = "0.4.3"
+edition = "2021"
+rust-version = "1.90"
+license = "AGPL-3.0-only"
 publish = false  # internal benchmark harness; not for crates.io
 
 [[bin]]
@@ -16,10 +20,10 @@ name = "gold-report"
 path = "src/report/main.rs"
 
 [dependencies]
-coordinode-storage = { workspace = true }
-coordinode-modality = { workspace = true }
-coordinode-core = { workspace = true }
-rand = { workspace = true }
-serde = { workspace = true }
+coordinode-storage = { path = "../../crates/coordinode-storage" }
+coordinode-modality = { path = "../../crates/coordinode-modality" }
+coordinode-core = { path = "../../crates/coordinode-core" }
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
 toml = "0.9"
-tempfile = { workspace = true }
+tempfile = "3"

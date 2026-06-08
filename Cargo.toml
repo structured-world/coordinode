@@ -17,9 +17,12 @@ members = [
     "crates/coordinode-client",
     "crates/coordinode-test-fixtures",
     "crates/coordinode-bench",
-    "benches/gold",
     "benches/vector-ann",
     "tests/integration",
+]
+exclude = [
+    # Standalone bench workspaces. Build via `cd benches/<name> && cargo build`.
+    "benches/gold",
 ]
 
 [workspace.package]
