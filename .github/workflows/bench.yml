@@ -146,7 +146,7 @@ jobs:
       # uninformative.
       - name: Vector — per-commit smoke (SIFT + glove)
         id: vector
-        if: ${{ contains(inputs.modalities || 'vector,graph,spatial,timeseries,search,document', 'vector') }}
+        if: ${{ contains(inputs.modalities || 'vector,graph,spatial,timeseries,search,document', 'vector') && inputs.high_d_dimensions == '' }}
         env:
           # If the workflow_dispatch input `thread_sweep` is set
           # (e.g. "1,4"), iterate the whole smoke set for each value
