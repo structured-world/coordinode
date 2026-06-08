@@ -438,6 +438,11 @@ jobs:
                 --subset-size 20000 \
                 --output bench-results
               echo "::endgroup::"
+              # Quantization sweep skipped on dim > 4096 — RaBitQ/SQ8 build +
+              # search at 8192-dim with 5-point ef sweep doesn't fit a single
+              # cell into the 30-min job timeout. Re-enable per-dim later if
+              # we widen the budget or shrink the ef sweep.
+              if [ "$D" -gt 4096 ]; then continue; fi
               for QUANT in rabitq sq8; do
                 echo "::group::$DSNAME M=16 quantization=$QUANT threads=$T"
                 ./target/release/bench-vector-ann \
