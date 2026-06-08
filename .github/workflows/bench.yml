@@ -434,6 +434,21 @@ jobs:
                 --subset-size 20000 \
                 --output bench-results
               echo "::endgroup::"
+              for QUANT in rabitq sq8; do
+                echo "::group::$DSNAME M=16 quantization=$QUANT threads=$T"
+                ./target/release/bench-vector-ann \
+                  --train       "$BASE" \
+                  --query       "$QUERY" \
+                  --groundtruth "$TRUTH" \
+                  --dataset-name "$DSNAME" \
+                  --m 16 --ef-construction 200 \
+                  --codec none --quantization "$QUANT" \
+                  --ef-sweep "80,200,400,800,1600" \
+                  --threads "$T" --search-threads "$T" \
+                  --subset-size 20000 \
+                  --output bench-results
+                echo "::endgroup::"
+              done
             done
           done
 
