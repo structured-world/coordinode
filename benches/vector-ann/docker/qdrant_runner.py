@@ -57,9 +57,16 @@ import numpy as np
 import psutil
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
+    BinaryQuantization,
+    BinaryQuantizationConfig,
     Distance,
     HnswConfigDiff,
     PointStruct,
+    ProductQuantization,
+    ProductQuantizationConfig,
+    ScalarQuantization,
+    ScalarQuantizationConfig,
+    ScalarType,
     SearchParams,
     VectorParams,
 )
@@ -164,7 +171,17 @@ def main() -> int:
     p.add_argument(
         "--codec",
         default="none",
-        help="Recorded for symmetry; this adapter does not exercise quantization.",
+        help="Recorded for symmetry; engine-side quantization driven by --quantization.",
+    )
+    p.add_argument(
+        "--quantization",
+        choices=("none", "binary", "scalar", "product"),
+        default="none",
+        help=(
+            "Engine-side quantization. 'binary' = 1-bit (analogue of CN RaBitQ), "
+            "'scalar' = int8 (analogue of CN SQ8), 'product' = PQ. "
+            "Codec field in output stays consumer-controlled via --codec for dashboard labelling."
+        ),
     )
     p.add_argument("--output", type=Path, default=Path("bench-results"))
     p.add_argument(
@@ -225,6 +242,19 @@ def main() -> int:
     # to use the HNSW index even on small collections where it would
     # otherwise fall back to exact search and produce the bogus flat
     # r=1.0 curve seen in the previous adapter's output.
+    if args.quantization == "binary":
+        quant = BinaryQuantization(binary=BinaryQuantizationConfig(always_ram=True))
+    elif args.quantization == "scalar":
+        quant = ScalarQuantization(
+            scalar=ScalarQuantizationConfig(type=ScalarType.INT8, always_ram=True)
+        )
+    elif args.quantization == "product":
+        quant = ProductQuantization(
+            product=ProductQuantizationConfig(compression="x16", always_ram=True)
+        )
+    else:
+        quant = None
+    print(f"[qdrant] quantization={args.quantization}", flush=True)
     client.create_collection(
         collection_name="bench",
         vectors_config=VectorParams(size=d, distance=metric),
@@ -234,6 +264,7 @@ def main() -> int:
             full_scan_threshold=0,
             max_indexing_threads=args.threads,
         ),
+        quantization_config=quant,
     )
     t0 = time.time()
     batch = 10_000
@@ -322,7 +353,7 @@ def main() -> int:
         "benchmark": "ann-benchmarks",
         "dataset": args.dataset_name,
         "subject": "qdrant",
-        "codec": args.codec,
+        "codec": args.codec if args.quantization == "none" else args.quantization,
         "version": "1.13.0",
         "metrics": {
             "hnsw_m": args.m,
