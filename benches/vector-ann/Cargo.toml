@@ -1,31 +1,39 @@
+[workspace]
+# Standalone workspace so the main production workspace (and Docker image)
+# doesn't need to resolve this crate. Build via:
+#
+#   cd benches/vector-ann && cargo build --release --bin bench-vector-ann
+#
+# Artifact lands in `benches/vector-ann/target/release/bench-vector-ann`.
+
 [package]
 name = "coordinode-bench-vector-ann"
 description = "ann-benchmarks SIFT1M / GloVe / Deep-image adapter for CoordiNode HNSW — recall@k + QPS sweep against ann-benchmarks.com datasets. Outputs canonical JSON (coordinode-bench schema). Competitors (hnswlib, faiss, Annoy) run in Docker on the same host; results placed manually in `bench-results/`."
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
+version = "0.4.3"
+edition = "2021"
+rust-version = "1.90"
+license = "AGPL-3.0-only"
 publish = false
 
 [dependencies]
-coordinode-vector = { workspace = true }
-coordinode-bench = { workspace = true }
-coordinode-core = { workspace = true }
+coordinode-vector = { path = "../../crates/coordinode-vector" }
+coordinode-bench = { path = "../../crates/coordinode-bench" }
+coordinode-core = { path = "../../crates/coordinode-core" }
 clap = { version = "4", features = ["derive"] }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-tracing = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-thiserror = { workspace = true }
+thiserror = "2"
 # Used to pin the global rayon pool size for thread-budget-fair runs
 # (`--threads N`). HNSW build pulls rayon transitively through
 # `coordinode-vector`; we depend on it directly to call
 # `ThreadPoolBuilder::build_global` from main and to query
 # `current_num_threads` for the report.
-rayon = { workspace = true }
+rayon = "1.10"
 
 [dev-dependencies]
-tempfile = { workspace = true }
+tempfile = "3"
 
 [[bin]]
 name = "bench-vector-ann"

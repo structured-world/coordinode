@@ -123,10 +123,14 @@ jobs:
             bench-${{ runner.os }}-cargo-
 
       - name: Build all bench binaries
-        run: cargo build --release --bins -p coordinode-bench-vector-ann
-        # As we add graph / spatial / ts / search / doc bench
-        # binaries to the workspace, append `-p <name>` here. One
-        # cargo invocation = one shared compile graph = fastest.
+        # Bench crates live in their own standalone workspaces so the
+        # production Cargo.toml does not pull them in. Build each in
+        # place; the artefact lands inside that subdirectory's target/.
+        run: |
+          cargo build --release --bin bench-vector-ann \
+            --manifest-path benches/vector-ann/Cargo.toml
+          mkdir -p target/release
+          cp benches/vector-ann/target/release/bench-vector-ann target/release/bench-vector-ann
 
       # ── Vector (per-commit smoke; budget ≤ 20 min total) ──────
       #
