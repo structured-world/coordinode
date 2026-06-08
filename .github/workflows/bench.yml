@@ -429,8 +429,9 @@ jobs:
                 --groundtruth "$TRUTH" \
                 --dataset-name "$DSNAME" \
                 --m 16 --ef-construction 200 \
-                --codec none --ef-sweep "40,80,200,400,800" \
+                --codec none --ef-sweep "40,80,200,400" \
                 --threads "$T" --search-threads "$T" \
+                --subset-size 20000 \
                 --output bench-results
               echo "::endgroup::"
             done

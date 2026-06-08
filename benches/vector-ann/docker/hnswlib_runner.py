@@ -197,6 +197,15 @@ def main() -> int:
         # we shrink train, those labels are invalid. Recompute exact
         # top-K against the subset so recall is meaningful.
         gt = _brute_force_groundtruth(train, query, args.k, detect_metric(args.dataset_name))
+        # Suffix-tag the dataset name so the dashboard keeps subset runs
+        # separate from full-dataset runs. Matches the CoordiNode side
+        # which does the same renaming when --subset-size kicks in.
+        suffix = f"{args.subset_size // 1000}k"
+        parts = args.dataset_name.rsplit("-", 1)
+        if len(parts) == 2:
+            args.dataset_name = f"{parts[0]}-{suffix}-{parts[1]}"
+        else:
+            args.dataset_name = f"{args.dataset_name}-{suffix}"
 
     n_train, d = train.shape
     n_test, q_d = query.shape
