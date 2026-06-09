@@ -32,10 +32,12 @@
 //! on the target (graph-bytes mode still ships the f32 source of
 //! truth; serialised neighbours alone are not a complete index).
 
+use coordinode_storage::engine::config::Tier;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::types::{EndpointId, ShardId};
+use crate::topology::ClusterTopology;
+use crate::types::{CrushRule, EndpointId, Modality, ShardId};
 
 /// One end-to-end migration proposal: move this shard from this
 /// endpoint to that endpoint, using this transfer mode, at this
@@ -259,6 +261,90 @@ pub fn pick_recommended_mode(payload: PayloadEstimate, inputs: CostInputs) -> Tr
     }
 }
 
+/// Migration planner trait: given a context describing the trigger
+/// (source endpoint, shard, payload, cost inputs), propose the
+/// cheapest single migration. Single-method trait so the EE
+/// implementation can layer over an entirely different topology
+/// without inheriting the CE planner's local-tier logic.
+pub trait MigrationPlanner: Send + Sync {
+    /// Propose a migration for the trigger encoded in `ctx`. Returns
+    /// [`MigrationPlannerError::NoCandidates`] when there is no
+    /// other endpoint at the same tier that could take the shard.
+    fn plan(&self, ctx: &PlannerContext) -> Result<MigrationPlan, MigrationPlannerError>;
+}
+
+/// CE migration planner over a [`ClusterTopology`]. Enumerates
+/// candidate targets via [`ClusterTopology::placement_candidates`]
+/// with [`CrushRule::LocalTier`], filters the source out, picks the
+/// candidate with the lowest total cost.
+///
+/// `tier` and `modality` are captured at construction time because
+/// the trigger that wakes the planner is typically a capacity event
+/// scoped to a specific endpoint tier (overfull NVMe -> spill to
+/// another NVMe at the same tier).
+pub struct LocalMigrationPlanner<T: ClusterTopology> {
+    topology: T,
+    tier: Tier,
+    modality: Modality,
+}
+
+impl<T: ClusterTopology> LocalMigrationPlanner<T> {
+    /// Build a planner over the given topology, scoped to the tier
+    /// and modality of the source endpoint.
+    pub fn new(topology: T, tier: Tier, modality: Modality) -> Self {
+        Self {
+            topology,
+            tier,
+            modality,
+        }
+    }
+
+    /// Borrow the underlying topology (handy for tests / EXPLAIN).
+    pub fn topology(&self) -> &T {
+        &self.topology
+    }
+}
+
+impl<T: ClusterTopology> MigrationPlanner for LocalMigrationPlanner<T> {
+    fn plan(&self, ctx: &PlannerContext) -> Result<MigrationPlan, MigrationPlannerError> {
+        let candidates = self
+            .topology
+            .placement_candidates(&CrushRule::local_tier(), self.modality, self.tier)
+            .map_err(|_| MigrationPlannerError::NoCandidates)?;
+
+        if !candidates.iter().any(|ep| ep == &ctx.source) {
+            return Err(MigrationPlannerError::SourceNotInTopology(
+                ctx.source.clone(),
+            ));
+        }
+
+        let mut best: Option<(EndpointId, TransferMode, MigrationCost, f64)> = None;
+        for candidate in candidates.into_iter().filter(|ep| ep != &ctx.source) {
+            let mode = pick_recommended_mode(ctx.payload, ctx.costs);
+            let cost = estimate_cost(mode, ctx.payload, ctx.costs);
+            let total = cost.total_secs();
+            let take = match &best {
+                None => true,
+                Some((_, _, _, best_total)) => total < *best_total,
+            };
+            if take {
+                best = Some((candidate, mode, cost, total));
+            }
+        }
+
+        let (target, mode, cost, total) = best.ok_or(MigrationPlannerError::NoCandidates)?;
+        Ok(MigrationPlan {
+            source: ctx.source.clone(),
+            target,
+            shard: ctx.shard,
+            payload: ctx.payload,
+            recommended_mode: mode,
+            cost_breakdown: cost,
+            estimated_total_secs: total,
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -458,6 +544,108 @@ mod tests {
             pick_recommended_mode(payload, inputs),
             TransferMode::RebuildFromData
         );
+    }
+
+    #[test]
+    fn planner_returns_no_candidates_on_single_node_topology() {
+        use crate::topology::SingleNodeTopology;
+        use crate::types::{Modality, TopologyTree};
+        let tree = TopologyTree::single_endpoint("ep-only", Tier::Warm);
+        let topology = SingleNodeTopology::from_tree(tree);
+        let planner = LocalMigrationPlanner::new(topology, Tier::Warm, Modality::Vector);
+        let ctx = PlannerContext {
+            source: "ep-only".to_string(),
+            shard: ShardId::ZERO,
+            payload: sample_payload(),
+            costs: sample_costs(),
+        };
+        let err = planner.plan(&ctx).expect_err("must reject single-node");
+        assert!(matches!(err, MigrationPlannerError::NoCandidates));
+    }
+
+    #[test]
+    fn planner_picks_lowest_cost_other_endpoint_on_three_endpoint_topology() {
+        use crate::topology::SingleNodeTopology;
+        use crate::types::{FailureDomain, Modality, TopologyTree};
+        let tree = TopologyTree {
+            endpoints: vec![
+                FailureDomain::local("ep-a", Tier::Warm),
+                FailureDomain::local("ep-b", Tier::Warm),
+                FailureDomain::local("ep-c", Tier::Warm),
+            ],
+        };
+        let topology = SingleNodeTopology::from_tree(tree);
+        let planner = LocalMigrationPlanner::new(topology, Tier::Warm, Modality::Vector);
+        let ctx = PlannerContext {
+            source: "ep-a".to_string(),
+            shard: ShardId::ZERO,
+            payload: sample_payload(),
+            costs: sample_costs(),
+        };
+        let plan = planner.plan(&ctx).expect("must produce a plan");
+        // Source filtered out; target is one of the other two.
+        assert_ne!(plan.target, "ep-a");
+        assert!(plan.target == "ep-b" || plan.target == "ep-c");
+        // Cost components match the cost model for the recommended mode.
+        let expected_cost = estimate_cost(plan.recommended_mode, ctx.payload, ctx.costs);
+        assert_eq!(plan.cost_breakdown, expected_cost);
+        assert!(
+            (plan.estimated_total_secs - expected_cost.total_secs()).abs() < 1e-9,
+            "estimated_total_secs must equal the breakdown total",
+        );
+    }
+
+    #[test]
+    fn planner_rejects_source_not_in_topology() {
+        use crate::topology::SingleNodeTopology;
+        use crate::types::{FailureDomain, Modality, TopologyTree};
+        let tree = TopologyTree {
+            endpoints: vec![
+                FailureDomain::local("ep-x", Tier::Warm),
+                FailureDomain::local("ep-y", Tier::Warm),
+            ],
+        };
+        let topology = SingleNodeTopology::from_tree(tree);
+        let planner = LocalMigrationPlanner::new(topology, Tier::Warm, Modality::Vector);
+        let ctx = PlannerContext {
+            source: "ep-not-here".to_string(),
+            shard: ShardId::ZERO,
+            payload: sample_payload(),
+            costs: sample_costs(),
+        };
+        let err = planner.plan(&ctx).expect_err("source absent must reject");
+        assert!(matches!(err, MigrationPlannerError::SourceNotInTopology(_)));
+    }
+
+    #[test]
+    fn planner_filters_by_tier() {
+        use crate::topology::SingleNodeTopology;
+        use crate::types::{FailureDomain, Modality, TopologyTree};
+        // Source at Warm, but the planner is asked for Hot candidates.
+        // Topology has one Warm and one Hot endpoint; the Hot endpoint
+        // is the only candidate, but source is Warm and so the
+        // "source in topology" check fails before we even get to pick.
+        // That's the expected behaviour: tier mismatches surface as
+        // SourceNotInTopology rather than NoCandidates, because the
+        // caller shouldn't be running the planner against the wrong
+        // tier in the first place.
+        let tree = TopologyTree {
+            endpoints: vec![
+                FailureDomain::local("ep-warm", Tier::Warm),
+                FailureDomain::local("ep-hot-1", Tier::Hot),
+                FailureDomain::local("ep-hot-2", Tier::Hot),
+            ],
+        };
+        let topology = SingleNodeTopology::from_tree(tree);
+        let planner = LocalMigrationPlanner::new(topology, Tier::Hot, Modality::Vector);
+        let ctx = PlannerContext {
+            source: "ep-hot-1".to_string(),
+            shard: ShardId::ZERO,
+            payload: sample_payload(),
+            costs: sample_costs(),
+        };
+        let plan = planner.plan(&ctx).expect("hot peer must be picked");
+        assert_eq!(plan.target, "ep-hot-2");
     }
 
     #[test]
