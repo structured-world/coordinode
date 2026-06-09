@@ -35,6 +35,7 @@ const RAW_ENCODER_NEEDLES: &[&str] = &[
 /// gate cannot accidentally start covering crates outside our scope.
 const SCAN_FILES: &[&str] = &[
     "src/executor/runner.rs",
+    "src/executor/vector_predicate.rs",
     "src/index/ops.rs",
     "src/index/build.rs",
     "src/index/ttl.rs",
@@ -55,6 +56,12 @@ const ALLOWED: &[(&str, usize)] = &[
     // EdgeProp `Vec<(field_id, Value)>` shape that LocalEdgeStore
     // doesn't accept yet) + ~15 typed-helper internals. Total = 41.
     ("src/executor/runner.rs", 41),
+    // vector_predicate.rs: one raw encode_node_key call on the
+    // ACORN-filtered hot path (predicate evaluator point-get); two
+    // additional uses live inside the cfg(test) module that builds
+    // direct engine.put fixtures for the round-trip and corrupt-record
+    // tests. Total = 3.
+    ("src/executor/vector_predicate.rs", 3),
     // ops.rs — fully routed through LocalIndexStore after slice 12.
     ("src/index/ops.rs", 0),
     // build.rs (R166): cfg(test) `insert_node` helper now routes

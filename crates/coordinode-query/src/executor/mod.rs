@@ -6,6 +6,7 @@
 pub mod eval;
 pub mod row;
 pub mod runner;
+pub mod vector_predicate;
 
 pub use row::Row;
 pub use runner::{
