@@ -84,12 +84,80 @@
 //!         hnsw_build_rate_nodes_per_sec: 5_000.0,
 //!         neighbour_byte_cost: 64.0,
 //!     },
+//!     online_policy_override: None,
 //! };
 //!
 //! let plan = planner.plan(&ctx).expect("plan must materialise");
 //! assert_eq!(plan.source, "ep-a");
 //! assert!(plan.target == "ep-b" || plan.target == "ep-c");
 //! assert!(plan.estimated_total_secs.is_finite());
+//! ```
+//!
+//! ### Online-during-rebuild policy
+//!
+//! [`OnlineDuringRebuild`] picks the contract that the migration
+//! target honours for reads against the moved shard while its HNSW
+//! graph is still being rebuilt:
+//!
+//! - `Block`: target rejects searches until the rebuild finishes.
+//!   Strongest correctness, worst tail latency.
+//! - `PartialRecall`: target serves against the partially-rebuilt
+//!   graph, surfaces a partial-result flag to the caller. Default.
+//! - `Offline`: target answers no search for the shard until the
+//!   rebuild completes; reads fall back to the source via routing.
+//!
+//! The policy is resolved at plan time with precedence
+//! `context override > planner default > enum default`. Use
+//! [`LocalMigrationPlanner::with_online_policy`] to set the
+//! planner-side default; use [`PlannerContext::online_policy_override`]
+//! to pick a per-plan value.
+//!
+//! ```
+//! use coordinode_cluster::{
+//!     CostInputs, FailureDomain, LocalMigrationPlanner, MigrationPlanner, Modality,
+//!     OnlineDuringRebuild, PayloadEstimate, PlannerContext, ShardId, SingleNodeTopology,
+//!     TopologyTree,
+//! };
+//! use coordinode_storage::engine::config::Tier;
+//!
+//! let tree = TopologyTree {
+//!     endpoints: vec![
+//!         FailureDomain::local("ep-a", Tier::Warm),
+//!         FailureDomain::local("ep-b", Tier::Warm),
+//!     ],
+//! };
+//! let topology = SingleNodeTopology::from_tree(tree);
+//! let planner = LocalMigrationPlanner::new(topology, Tier::Warm, Modality::Vector)
+//!     .with_online_policy(OnlineDuringRebuild::Block);
+//!
+//! // Planner-side default: every plan inherits Block when the
+//! // context does not override.
+//! let plan = planner.plan(&PlannerContext {
+//!     source: "ep-a".to_string(),
+//!     shard: ShardId::ZERO,
+//!     payload: PayloadEstimate { bytes: 1_000, node_count: 100, ef_construction: 200 },
+//!     costs: CostInputs {
+//!         bandwidth_bytes_per_sec: 1.0e8,
+//!         hnsw_build_rate_nodes_per_sec: 5_000.0,
+//!         neighbour_byte_cost: 64.0,
+//!     },
+//!     online_policy_override: None,
+//! }).expect("plan");
+//! assert_eq!(plan.online_during_rebuild, OnlineDuringRebuild::Block);
+//!
+//! // Per-context override beats the planner default.
+//! let plan = planner.plan(&PlannerContext {
+//!     source: "ep-a".to_string(),
+//!     shard: ShardId::ZERO,
+//!     payload: PayloadEstimate { bytes: 1_000, node_count: 100, ef_construction: 200 },
+//!     costs: CostInputs {
+//!         bandwidth_bytes_per_sec: 1.0e8,
+//!         hnsw_build_rate_nodes_per_sec: 5_000.0,
+//!         neighbour_byte_cost: 64.0,
+//!     },
+//!     online_policy_override: Some(OnlineDuringRebuild::Offline),
+//! }).expect("plan");
+//! assert_eq!(plan.online_during_rebuild, OnlineDuringRebuild::Offline);
 //! ```
 //!
 //! ## Topology + routing example
