@@ -987,6 +987,7 @@ pub fn annotate_vector_top_k(
             function,
             k,
             distance_alias,
+            predicate,
             ..
         } => {
             // Determine (variable, property) from the vector expression.
@@ -1035,6 +1036,7 @@ pub fn annotate_vector_top_k(
                 k,
                 distance_alias,
                 hnsw_index,
+                predicate,
             }
         }
 
@@ -1765,6 +1767,7 @@ fn rewrite_top_k_at_root(op: LogicalOp) -> LogicalOp {
             k,
             distance_alias: None,
             hnsw_index: None,
+            predicate: None,
         };
     }
 
@@ -1816,6 +1819,7 @@ fn rewrite_top_k_at_root(op: LogicalOp) -> LogicalOp {
                             k,
                             distance_alias: Some(alias),
                             hnsw_index: None,
+                            predicate: None,
                         };
 
                         return LogicalOp::Project {

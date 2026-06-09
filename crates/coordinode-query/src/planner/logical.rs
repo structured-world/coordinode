@@ -62,6 +62,26 @@ pub struct TemporalFilter {
     pub lower_ms: Option<i64>,
 }
 
+/// Cheap-to-evaluate predicate over a single node, pushed into the HNSW
+/// search path so the traversal can skip non-matching branches.
+///
+/// Restricted on purpose: every variant must be evaluable from a node id
+/// alone (after one point-get on `Partition::Node`), without joins or
+/// secondary scans. Anything more expensive belongs in a regular
+/// post-filter and not in this descriptor.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VectorPredicate {
+    /// Node carries this primary label.
+    LabelEq(String),
+    /// Node has a property whose value equals the literal.
+    PropertyEq {
+        property: String,
+        value: coordinode_core::graph::types::Value,
+    },
+    /// Conjunction of two predicates; both must hold.
+    And(Box<VectorPredicate>, Box<VectorPredicate>),
+}
+
 /// A logical operator in the query plan tree.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalOp {
@@ -516,6 +536,15 @@ pub enum LogicalOp {
         ///
         /// `None` → "BruteForce" in EXPLAIN; executor falls back to `__label__` detection.
         hnsw_index: Option<String>,
+        /// Pushed-down graph predicate for ACORN-style filtered search.
+        ///
+        /// Set by the planner when a sibling MATCH / WHERE clause restricts the
+        /// candidate set to a label or a small property predicate that can be
+        /// evaluated cheaply from a node id. When set, the executor routes
+        /// through `HnswIndex::search_with_visibility` with a closure built
+        /// from this descriptor, so the HNSW traversal can prune branches that
+        /// can't pass the predicate. None falls back to the unfiltered search.
+        predicate: Option<VectorPredicate>,
     },
 
     /// Full-text search filter: evaluates text_match() per row.
@@ -2210,5 +2239,71 @@ mod tests {
             EdgeVectorStrategy::VectorFirst.to_string(),
             "Vector-First (HNSW)"
         );
+    }
+
+    // --- VectorPredicate descriptor tests ---
+
+    #[test]
+    fn vector_predicate_label_eq_constructs() {
+        let p = VectorPredicate::LabelEq("Item".into());
+        match p {
+            VectorPredicate::LabelEq(l) => assert_eq!(l, "Item"),
+            _ => panic!("expected LabelEq"),
+        }
+    }
+
+    #[test]
+    fn vector_predicate_property_eq_carries_value() {
+        let p = VectorPredicate::PropertyEq {
+            property: "category".into(),
+            value: coordinode_core::graph::types::Value::String("electronics".into()),
+        };
+        match p {
+            VectorPredicate::PropertyEq { property, value } => {
+                assert_eq!(property, "category");
+                assert_eq!(
+                    value,
+                    coordinode_core::graph::types::Value::String("electronics".into())
+                );
+            }
+            _ => panic!("expected PropertyEq"),
+        }
+    }
+
+    #[test]
+    fn vector_predicate_and_nests() {
+        let p = VectorPredicate::And(
+            Box::new(VectorPredicate::LabelEq("Item".into())),
+            Box::new(VectorPredicate::PropertyEq {
+                property: "active".into(),
+                value: coordinode_core::graph::types::Value::Bool(true),
+            }),
+        );
+        match p {
+            VectorPredicate::And(left, right) => {
+                assert!(matches!(*left, VectorPredicate::LabelEq(_)));
+                assert!(matches!(*right, VectorPredicate::PropertyEq { .. }));
+            }
+            _ => panic!("expected And"),
+        }
+    }
+
+    #[test]
+    fn vector_top_k_predicate_defaults_to_none() {
+        let op = LogicalOp::VectorTopK {
+            input: Box::new(LogicalOp::Empty),
+            vector_expr: Expr::Variable("n".into()),
+            query_vector: Expr::Variable("q".into()),
+            function: "vector_distance".into(),
+            k: 5,
+            distance_alias: None,
+            hnsw_index: None,
+            predicate: None,
+        };
+        if let LogicalOp::VectorTopK { predicate, .. } = op {
+            assert!(predicate.is_none());
+        } else {
+            panic!("expected VectorTopK");
+        }
     }
 }

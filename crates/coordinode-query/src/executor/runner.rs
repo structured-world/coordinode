@@ -2558,6 +2558,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             k,
             distance_alias,
             hnsw_index,
+            predicate: _,
         } => {
             let rows = execute_op(input, ctx)?;
 
