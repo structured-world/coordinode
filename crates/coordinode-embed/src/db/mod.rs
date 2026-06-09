@@ -1335,6 +1335,7 @@ impl Database {
         let interner_len_before = interner_guard.len();
         let mut ctx = ExecutionContext {
             engine: &self.engine,
+            engine_arc: Some(Arc::clone(&self.engine)),
             interner: &mut interner_guard,
             id_allocator: &self.allocator,
             shard_id: self.shard_id,

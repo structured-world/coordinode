@@ -4,7 +4,7 @@
 //! Future optimization: streaming iterator model.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
 
@@ -238,6 +238,15 @@ impl WriteStats {
 /// compatibility with existing tests.
 pub struct ExecutionContext<'a> {
     pub engine: &'a StorageEngine,
+    /// Optional `Arc` handle to the same engine the borrow above points at.
+    ///
+    /// Set by callers that already own an `Arc<StorageEngine>` (the embed /
+    /// server stack) and want to enable execution paths that need owned
+    /// engine handles for background work — first consumer is the HNSW
+    /// backfill task spawned by `CREATE VECTOR INDEX`. Construction sites
+    /// that build an ExecutionContext from a borrowed-only test engine
+    /// leave this `None`, which forces the legacy synchronous backfill.
+    pub engine_arc: Option<Arc<StorageEngine>>,
     pub interner: &'a mut FieldInterner,
     /// Node ID allocator for CREATE operations.
     pub id_allocator: &'a NodeIdAllocator,
@@ -13648,6 +13657,7 @@ mod tests {
     ) -> ExecutionContext<'a> {
         ExecutionContext {
             engine,
+            engine_arc: None,
             interner,
             id_allocator: allocator,
             shard_id: 1,

@@ -28,6 +28,7 @@ pub fn make_ctx_legacy<'a>(
 ) -> ExecutionContext<'a> {
     ExecutionContext {
         engine,
+        engine_arc: None,
         interner,
         id_allocator: allocator,
         shard_id: 1,
@@ -89,6 +90,7 @@ pub fn make_ctx_mvcc<'a>(
 ) -> ExecutionContext<'a> {
     ExecutionContext {
         engine,
+        engine_arc: None,
         interner,
         id_allocator: allocator,
         shard_id: 0,
@@ -151,6 +153,7 @@ pub fn make_ctx_with_pipeline<'a>(
 ) -> ExecutionContext<'a> {
     ExecutionContext {
         engine,
+        engine_arc: None,
         interner,
         id_allocator: allocator,
         shard_id: 0,

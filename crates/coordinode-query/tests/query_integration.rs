@@ -32,6 +32,7 @@ fn make_test_ctx<'a>(
 ) -> ExecutionContext<'a> {
     ExecutionContext {
         engine,
+        engine_arc: None,
         interner,
         id_allocator: allocator,
         shard_id: 1,
