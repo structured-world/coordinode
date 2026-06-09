@@ -60,11 +60,16 @@
 #![deny(missing_docs)]
 
 pub mod error;
+pub mod migration;
 pub mod routing;
 pub mod topology;
 pub mod types;
 
 pub use error::{TopologyError, TopologyResult};
+pub use migration::{
+    CostInputs, MigrationCost, MigrationPlan, MigrationPlannerError, PayloadEstimate,
+    PlannerContext, TransferMode,
+};
 pub use routing::{ShardRouting, SingleShardRouting};
 pub use topology::{ClusterTopology, SingleNodeTopology};
 pub use types::{
