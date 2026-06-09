@@ -2960,23 +2960,65 @@ fn find_last_variable(op: &LogicalOp) -> String {
 // R-HYB2b: rrf_score planner post-pass
 // =============================================================================
 
-/// Signature captured from the first `rrf_score(...)` call-site encountered.
-/// Multiple call-sites must all produce identical signatures.
+/// Signature captured from the first `rrf_score(...)` / `cc_score(...)` /
+/// `dbsf_score(...)` call-site encountered. Multiple call-sites must all
+/// produce identical signatures (same method list, same query parts, same
+/// fusion variant).
 #[derive(Debug, Clone, PartialEq)]
 struct RrfCallSig {
     methods: Vec<Expr>,
     query_vector: Option<Expr>,
     query_text: Option<Expr>,
+    fusion: crate::planner::logical::FusionStrategy,
 }
 
-/// Recognise a top-level `rrf_score(args...)` FunctionCall expression.
-fn match_rrf_score(expr: &Expr) -> Option<&[Expr]> {
+/// Tags the three fusion scalars by name so the parser can dispatch the
+/// correct argument shape (RRF: 2 args, CC/DBSF: 3 args including weights).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FusionScalar {
+    Rrf,
+    Cc,
+    Dbsf,
+}
+
+impl FusionScalar {
+    fn fn_name(self) -> &'static str {
+        match self {
+            Self::Rrf => "rrf_score",
+            Self::Cc => "cc_score",
+            Self::Dbsf => "dbsf_score",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "rrf_score" => Some(Self::Rrf),
+            "cc_score" => Some(Self::Cc),
+            "dbsf_score" => Some(Self::Dbsf),
+            _ => None,
+        }
+    }
+}
+
+/// Recognise a top-level fusion-scalar FunctionCall. Returns the scalar
+/// kind + its argument slice so the parser can validate arity per kind.
+fn match_fusion_call(expr: &Expr) -> Option<(FusionScalar, &[Expr])> {
     if let Expr::FunctionCall { name, args, .. } = expr {
-        if name == "rrf_score" {
-            return Some(args);
+        if let Some(kind) = FusionScalar::from_name(name) {
+            return Some((kind, args));
         }
     }
     None
+}
+
+/// Backwards-compat shim: the rest of the RRF-era code paths still call
+/// this name with the implicit `rrf_score` assumption. Delegates to the
+/// generalised matcher and forwards only the args for `rrf_score`.
+fn match_rrf_score(expr: &Expr) -> Option<&[Expr]> {
+    match match_fusion_call(expr) {
+        Some((FusionScalar::Rrf, args)) => Some(args),
+        _ => None,
+    }
 }
 
 /// Walk an expression tree and return `true` if any subexpression is a
@@ -2993,7 +3035,7 @@ fn collect_rrf_presence(expr: &Expr, hit: &mut bool) {
     }
     match expr {
         Expr::FunctionCall { name, args, .. } => {
-            if name == "rrf_score" {
+            if FusionScalar::from_name(name).is_some() {
                 *hit = true;
                 return;
             }
@@ -3050,11 +3092,18 @@ fn collect_rrf_presence(expr: &Expr, hit: &mut bool) {
     }
 }
 
-/// Parse and validate a single `rrf_score(args...)` call, producing a
-/// canonical signature. Rejects arity != 2, non-list first arg, and
-/// non-map-literal second arg.
-fn parse_rrf_signature(args: &[Expr]) -> Result<RrfCallSig, PlanError> {
-    if args.len() != 2 {
+/// Parse and validate a fusion-scalar call. RRF takes two args
+/// (methods + query map); CC and DBSF take three (methods + query map +
+/// weights map). All three reject empty method lists and unknown query
+/// map keys; CC and DBSF additionally require that every weight be a
+/// finite non-negative number, and that the weights map name only the
+/// supported categories (`vector` / `text`).
+fn parse_fusion_signature(kind: FusionScalar, args: &[Expr]) -> Result<RrfCallSig, PlanError> {
+    let expected_arity = match kind {
+        FusionScalar::Rrf => 2,
+        FusionScalar::Cc | FusionScalar::Dbsf => 3,
+    };
+    if args.len() != expected_arity {
         return Err(PlanError::RrfScoreArity);
     }
     let methods_expr = &args[0];
@@ -3113,11 +3162,105 @@ fn parse_rrf_signature(args: &[Expr]) -> Result<RrfCallSig, PlanError> {
         }
     };
 
+    let fusion = match kind {
+        FusionScalar::Rrf => crate::planner::logical::FusionStrategy::Rrf { k: 60 },
+        FusionScalar::Cc => {
+            let weights = parse_fusion_weights(&args[2], kind)?;
+            crate::planner::logical::FusionStrategy::ConvexCombination { weights }
+        }
+        FusionScalar::Dbsf => {
+            let weights = parse_fusion_weights(&args[2], kind)?;
+            crate::planner::logical::FusionStrategy::Dbsf { weights }
+        }
+    };
+
     Ok(RrfCallSig {
         methods,
         query_vector,
         query_text,
+        fusion,
     })
+}
+
+/// Parse the third (weights) argument of `cc_score` / `dbsf_score`. Must
+/// be a `MapLiteral` over the supported categories (`vector`, `text`)
+/// with finite non-negative numeric values. Empty maps are rejected.
+fn parse_fusion_weights(
+    expr: &Expr,
+    kind: FusionScalar,
+) -> Result<std::collections::BTreeMap<String, f64>, PlanError> {
+    let fields = match expr {
+        Expr::MapLiteral(fields) => fields,
+        other => {
+            return Err(PlanError::RrfScoreQueryShape {
+                got: format!(
+                    "{}: weights must be a map literal, got {other:?}",
+                    kind.fn_name()
+                ),
+            });
+        }
+    };
+    let mut weights = std::collections::BTreeMap::new();
+    for (key, value) in fields {
+        let key_str = match key.as_str() {
+            "vector" | "text" => key.clone(),
+            other => {
+                return Err(PlanError::RrfScoreQueryShape {
+                    got: format!(
+                        "{}: weights has unknown key `{other}` (expected `vector` and/or `text`)",
+                        kind.fn_name()
+                    ),
+                });
+            }
+        };
+        let w = match value {
+            Expr::Literal(coordinode_core::graph::types::Value::Float(f)) => *f,
+            Expr::Literal(coordinode_core::graph::types::Value::Int(i)) => *i as f64,
+            // `-0.1` arrives from the parser as UnaryOp::Neg(Literal(...)); fold it
+            // so the non-negative check below catches negative literals cleanly.
+            Expr::UnaryOp {
+                op: crate::cypher::ast::UnaryOperator::Neg,
+                expr: inner,
+            } => match inner.as_ref() {
+                Expr::Literal(coordinode_core::graph::types::Value::Float(f)) => -*f,
+                Expr::Literal(coordinode_core::graph::types::Value::Int(i)) => -(*i as f64),
+                _ => {
+                    return Err(PlanError::RrfScoreQueryShape {
+                        got: format!(
+                            "{}: weight for `{key_str}` must be a numeric literal, got {value:?}",
+                            kind.fn_name()
+                        ),
+                    });
+                }
+            },
+            other => {
+                return Err(PlanError::RrfScoreQueryShape {
+                    got: format!(
+                        "{}: weight for `{key_str}` must be a numeric literal, got {other:?}",
+                        kind.fn_name()
+                    ),
+                });
+            }
+        };
+        if !w.is_finite() || w < 0.0 {
+            return Err(PlanError::RrfScoreQueryShape {
+                got: format!(
+                    "{}: weight for `{key_str}` must be a finite non-negative number, got {w}",
+                    kind.fn_name()
+                ),
+            });
+        }
+        weights.insert(key_str, w);
+    }
+    if weights.is_empty() {
+        return Err(PlanError::RrfScoreQueryShape {
+            got: format!(
+                "{}: weights map is empty (needs at least one of `vector`, `text`)",
+                kind.fn_name()
+            ),
+        });
+    }
+    Ok(weights)
 }
 
 /// Collect the RRF signature (if any) from an expression. Errors if multiple
@@ -3127,8 +3270,8 @@ fn collect_rrf_sig_in_expr(
     found: &mut Option<RrfCallSig>,
     location: &str,
 ) -> Result<(), PlanError> {
-    if let Some(args) = match_rrf_score(expr) {
-        let sig = parse_rrf_signature(args)?;
+    if let Some((kind, args)) = match_fusion_call(expr) {
+        let sig = parse_fusion_signature(kind, args)?;
         match found {
             None => *found = Some(sig),
             Some(existing) if *existing == sig => {}
@@ -3138,8 +3281,8 @@ fn collect_rrf_sig_in_expr(
                 });
             }
         }
-        // Do not recurse into the args; nested rrf_score inside an rrf_score
-        // list is pathological and will hit the arity/shape guard.
+        // Do not recurse into the args; nested fusion call inside another
+        // fusion call's list is pathological and will hit the arity guard.
         return Ok(());
     }
     match expr {
@@ -3198,12 +3341,20 @@ fn collect_rrf_sig_in_expr(
     Ok(())
 }
 
-/// Substitute every `rrf_score(...)` FunctionCall in `expr` with
-/// `Variable("__rrf_score__")`.
+/// Substitute every fusion-scalar FunctionCall in `expr` with the
+/// appropriate fused-score column variable. `rrf_score` rewrites to the
+/// historical `__rrf_score__`; `cc_score` and `dbsf_score` rewrite to the
+/// universal `__hybrid_score__` column the executor now emits regardless
+/// of strategy. RRF also writes `__hybrid_score__` so callers can sort
+/// uniformly when reading the fused result.
 fn rewrite_rrf_in_expr(expr: &mut Expr) {
     if let Expr::FunctionCall { name, .. } = expr {
-        if name == "rrf_score" {
-            *expr = Expr::Variable("__rrf_score__".to_string());
+        if let Some(kind) = FusionScalar::from_name(name) {
+            let column = match kind {
+                FusionScalar::Rrf => "__rrf_score__",
+                FusionScalar::Cc | FusionScalar::Dbsf => "__hybrid_score__",
+            };
+            *expr = Expr::Variable(column.to_string());
             return;
         }
     }
@@ -3448,7 +3599,7 @@ fn wrap_rank_fuse(op: LogicalOp, sig: &RrfCallSig, sort_touches_rrf: &mut bool) 
                 query_vector: sig.query_vector.clone(),
                 query_text: sig.query_text.clone(),
                 shard_overfetch_cap: None,
-                fusion: crate::planner::logical::FusionStrategy::default(),
+                fusion: sig.fusion.clone(),
             };
             LogicalOp::Project {
                 input: Box::new(fused_input),

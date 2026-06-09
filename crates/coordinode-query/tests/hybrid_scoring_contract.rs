@@ -726,3 +726,77 @@ fn contract_doc_score_default_weights_are_0_5_0_3_0_2() {
          default={s_default}, explicit={s_explicit}"
     );
 }
+
+// ── cc_score / dbsf_score parser contract ────────────────────────────────
+
+#[test]
+fn cc_score_parses_with_methods_query_and_weights() {
+    let ast = parse(
+        "MATCH (c:Chunk) \
+         RETURN cc_score([c.embedding, c.body], \
+                          {vector: [1.0, 0.0], text: \"x\"}, \
+                          {vector: 0.6, text: 0.4}) AS s",
+    )
+    .expect("parse");
+    build_logical_plan(&ast).expect("cc_score with weights must build");
+}
+
+#[test]
+fn cc_score_rejects_missing_weights_arg() {
+    // 2-arg cc_score has no weights → must be rejected.
+    let ast = parse(
+        "MATCH (c:Chunk) \
+         RETURN cc_score([c.embedding, c.body], \
+                          {vector: [1.0, 0.0], text: \"x\"}) AS s",
+    )
+    .expect("parse");
+    assert!(
+        build_logical_plan(&ast).is_err(),
+        "cc_score requires a 3rd weights map argument",
+    );
+}
+
+#[test]
+fn dbsf_score_parses_with_methods_query_and_weights() {
+    let ast = parse(
+        "MATCH (c:Chunk) \
+         RETURN dbsf_score([c.embedding, c.body], \
+                            {vector: [1.0, 0.0], text: \"x\"}, \
+                            {vector: 0.5, text: 0.5}) AS s",
+    )
+    .expect("parse");
+    build_logical_plan(&ast).expect("dbsf_score with weights must build");
+}
+
+#[test]
+fn cc_score_rejects_negative_weight() {
+    let ast = parse(
+        "MATCH (c:Chunk) \
+         RETURN cc_score([c.embedding, c.body], \
+                          {vector: [1.0, 0.0], text: \"x\"}, \
+                          {vector: -0.1, text: 1.1}) AS s",
+    )
+    .expect("parse");
+    let err = build_logical_plan(&ast).expect_err("negative weight must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("non-negative"),
+        "error must call out non-negative requirement: {msg}",
+    );
+}
+
+#[test]
+fn cc_score_rejects_unknown_weight_key() {
+    let ast = parse(
+        "MATCH (c:Chunk) \
+         RETURN cc_score([c.embedding, c.body], \
+                          {vector: [1.0, 0.0], text: \"x\"}, \
+                          {colbert: 0.5}) AS s",
+    )
+    .expect("parse");
+    let err = build_logical_plan(&ast).expect_err("unknown weight key must be rejected");
+    assert!(
+        err.to_string().contains("unknown key"),
+        "error must call out the unknown weight key",
+    );
+}
