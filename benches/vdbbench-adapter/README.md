@@ -30,9 +30,12 @@ boundary that breaks an in-process adapter.
 | `coordinode.py` | `CoordinodeDB` — `VectorDB` implementation: idempotent schema bootstrap, batched UNWIND-driven inserts, gRPC-thread-safe search |
 | `cli.py`        | `vectordbbench coordinodehnsw` click command |
 
-Filter pushdown is **not** wired yet (`supported_filter_types =
-[FilterOp.NonFilter]`). When that lands, the adapter can advertise
-`FilterOp.NumGE` etc. and dispatch via Cypher `WHERE` clauses.
+Filter pushdown is wired for `FilterOp.NumGE`: the adapter injects a
+`WHERE n.<field> >= $threshold` clause, and the CoordiNode planner pushes
+the predicate into the HNSW traversal as a `PropertyCmp` leaf so the
+ANN search prunes non-matching candidates while it walks the graph.
+Other `FilterOp` variants raise `NotImplementedError` until the
+corresponding planner support lands.
 
 ## Prerequisites
 

@@ -52,7 +52,12 @@ class CoordinodeDB(VectorDB):
     """gRPC client wrapper. One server, many subprocesses."""
 
     name = "CoordiNode"
-    supported_filter_types: list[FilterOp] = [FilterOp.NonFilter]
+    # CoordiNode's planner pushes label + property comparisons into the
+    # HNSW traversal (ACORN-style); the adapter advertises the filters that
+    # the planner currently handles. NumGE is the canonical VDBBench
+    # numeric range filter (e.g. "id >= 100"), implemented server-side by
+    # the predicate evaluator with Int/Float widening.
+    supported_filter_types: list[FilterOp] = [FilterOp.NonFilter, FilterOp.NumGE]
     # The synchronous ``CoordinodeClient`` runs all RPCs through a
     # single internal asyncio loop, which is NOT safe to call from
     # multiple threads concurrently (you get
@@ -196,24 +201,43 @@ class CoordinodeDB(VectorDB):
     ) -> list[int]:
         if self._client is None:
             raise RuntimeError("search_embedding before init()")
-        if filters is not None and filters.type is not FilterOp.NonFilter:
-            raise NotImplementedError(
-                "CoordiNode gRPC adapter does not support filter pushdown yet"
-            )
         # The HnswScan optimiser triggers on
         #   `vector_similarity(prop, q) ... ORDER BY s DESC LIMIT k`
         # — using `vector_distance` ORDER BY ASC silently falls back
         # to BruteForce (full-scan over every row) and collapses QPS to
         # <1 even on small datasets. Stay on the similarity / DESC
         # variant to keep the HNSW path live.
+        where_clause = ""
+        params: dict[str, Any] = {"q": list(query), "k": int(k)}
+        if filters is not None and filters.type is not FilterOp.NonFilter:
+            if filters.type is FilterOp.NumGE:
+                # VDBBench's NumGE filter binds a single integer threshold
+                # against a property; the canonical field name varies by
+                # workload but `int_field` / `id` is the convention used
+                # by the official Cohere / OpenAI workloads. Cypher's
+                # planner harvests `n.id >= $threshold` as a PropertyCmp
+                # leaf and pushes it into the HNSW visibility closure.
+                threshold = getattr(filters, "int_value", None)
+                field_name = getattr(filters, "int_field", "id")
+                if threshold is None:
+                    raise NotImplementedError(
+                        "FilterOp.NumGE without int_value is not supported"
+                    )
+                where_clause = f"WHERE n.{field_name} >= $threshold"
+                params["threshold"] = int(threshold)
+            else:
+                raise NotImplementedError(
+                    f"CoordiNode adapter does not yet support {filters.type}"
+                )
         rows = self._client.cypher(
             f"""
             MATCH (n:{self._label})
+            {where_clause}
             WITH n, vector_similarity(n.vec, $q) AS s
             ORDER BY s DESC LIMIT $k
             RETURN n.id AS id, s
             """,
-            {"q": list(query), "k": int(k)},
+            params,
         )
         return [int(r["id"]) for r in rows]
 
