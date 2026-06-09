@@ -24,7 +24,75 @@
 //! full CRUSH placement rules. The query / storage layers above
 //! depend on the trait, so neither swap requires call-site changes.
 //!
-//! ## Example
+//! ## Migration planner
+//!
+//! On top of the topology + routing traits, the [`migration`] module
+//! ships the data plane that decides when to move a shard from one
+//! endpoint to another:
+//!
+//! - [`MigrationPlanner`] is a one-method trait. Implementations
+//!   propose a single migration for the trigger encoded in
+//!   [`PlannerContext`]. The EE topology will plug a CRUSH-aware
+//!   implementation in here.
+//! - [`LocalMigrationPlanner`] is the CE implementation. It
+//!   enumerates candidate targets via
+//!   [`ClusterTopology::placement_candidates`] at the configured
+//!   tier, filters the source endpoint out, and picks the candidate
+//!   with the lowest total cost.
+//! - [`MigrationCost`] decomposes the cost in seconds as
+//!   `network + rebuild + graph_serialise`. The HNSW rebuild
+//!   contribution lives as its own line item rather than being
+//!   folded into a single total, so an operator can see at a glance
+//!   whether the bottleneck is bandwidth or CPU at the destination.
+//! - [`TransferMode`] captures the two ways a shard can physically
+//!   move: ship the f32 truth tier and rebuild HNSW on the target,
+//!   or also ship the serialised HNSW graph bytes. The planner picks
+//!   the cheaper one via [`pick_recommended_mode`].
+//!
+//! ### Migration planner example
+//!
+//! ```
+//! use coordinode_cluster::{
+//!     CostInputs, FailureDomain, LocalMigrationPlanner, MigrationPlanner, Modality,
+//!     PayloadEstimate, PlannerContext, ShardId, SingleNodeTopology, TopologyTree,
+//! };
+//! use coordinode_storage::engine::config::Tier;
+//!
+//! // Three Warm-tier endpoints, mirroring three storage nodes.
+//! let tree = TopologyTree {
+//!     endpoints: vec![
+//!         FailureDomain::local("ep-a", Tier::Warm),
+//!         FailureDomain::local("ep-b", Tier::Warm),
+//!         FailureDomain::local("ep-c", Tier::Warm),
+//!     ],
+//! };
+//! let topology = SingleNodeTopology::from_tree(tree);
+//! let planner = LocalMigrationPlanner::new(topology, Tier::Warm, Modality::Vector);
+//!
+//! // Capacity gate fired on ep-a; build a context describing the
+//! // shard payload and the link cost inputs.
+//! let ctx = PlannerContext {
+//!     source: "ep-a".to_string(),
+//!     shard: ShardId::ZERO,
+//!     payload: PayloadEstimate {
+//!         bytes: 4_000_000,
+//!         node_count: 10_000,
+//!         ef_construction: 200,
+//!     },
+//!     costs: CostInputs {
+//!         bandwidth_bytes_per_sec: 100_000_000.0,
+//!         hnsw_build_rate_nodes_per_sec: 5_000.0,
+//!         neighbour_byte_cost: 64.0,
+//!     },
+//! };
+//!
+//! let plan = planner.plan(&ctx).expect("plan must materialise");
+//! assert_eq!(plan.source, "ep-a");
+//! assert!(plan.target == "ep-b" || plan.target == "ep-c");
+//! assert!(plan.estimated_total_secs.is_finite());
+//! ```
+//!
+//! ## Topology + routing example
 //!
 //! ```
 //! use coordinode_cluster::{
