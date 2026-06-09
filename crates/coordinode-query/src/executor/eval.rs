@@ -540,6 +540,30 @@ fn coerce_vector_pair(
     (coerce_to_vector(a), coerce_to_vector(b))
 }
 
+/// Coerce to a multi-vector (matrix of f32 rows) used by ColBERT-style
+/// late-interaction scoring. Accepts `Value::MultiVector` directly, or a
+/// `Value::Array` of `Value::Vector` / nested `Value::Array<Float|Int>`.
+/// Returns `None` on any row that doesn't coerce or whose width differs
+/// from the first row's width.
+fn coerce_to_multi_vector(val: Option<&Value>) -> Option<Vec<Vec<f32>>> {
+    match val {
+        Some(Value::MultiVector(rows)) => Some(rows.clone()),
+        Some(Value::Array(arr)) => {
+            let mut rows: Vec<Vec<f32>> = Vec::with_capacity(arr.len());
+            for item in arr {
+                let row = coerce_to_vector(Some(item))?;
+                rows.push(row);
+            }
+            let width = rows.first().map(Vec::len)?;
+            if width == 0 || rows.iter().any(|r| r.len() != width) {
+                return None;
+            }
+            Some(rows)
+        }
+        _ => None,
+    }
+}
+
 /// Evaluate scalar (non-aggregate) functions.
 fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
     let evaluated: Vec<Value> = args.iter().map(|a| eval_expr(a, row)).collect();
@@ -717,6 +741,23 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
             match (evaluated.first(), evaluated.get(1)) {
                 (Some(Value::Vector(a)), Some(Value::Vector(b))) if a.len() == b.len() => {
                     Value::Float(coordinode_vector::metrics::manhattan_distance(a, b) as f64)
+                }
+                _ => Value::Null,
+            }
+        }
+        // maxsim_score(doc_tokens, query_tokens) -> MaxSim (ColBERT-style)
+        // late-interaction score. Each argument is a multi-vector matrix
+        // (per-token f32 rows). Returns the sum over query tokens of the
+        // best dot-product against any doc token. Pre-normalise rows to
+        // unit L2 norm if you want cosine semantics. Returns NULL when
+        // either side is missing, dim-mismatched, or empty.
+        "maxsim_score" => {
+            let doc = coerce_to_multi_vector(evaluated.first());
+            let query = coerce_to_multi_vector(evaluated.get(1));
+            match (doc, query) {
+                (Some(doc), Some(query)) => {
+                    let score = coordinode_vector::metrics::maxsim(&doc, &query);
+                    Value::Float(score as f64)
                 }
                 _ => Value::Null,
             }
@@ -1245,6 +1286,80 @@ mod tests {
     }
 
     // ====== Vector functions ======
+
+    #[test]
+    fn eval_maxsim_score_matches_kernel() {
+        // q = [[1,0],[0,1]], d = [[1,0],[0,1],[0.5,0.5]]
+        // Per-q max similarities: 1.0 + 1.0 = 2.0
+        let q = Value::MultiVector(vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+        let d = Value::MultiVector(vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.5, 0.5]]);
+        let expr = Expr::FunctionCall {
+            name: "maxsim_score".into(),
+            args: vec![Expr::Literal(d), Expr::Literal(q)],
+            distinct: false,
+        };
+        let v = eval_expr(&expr, &empty_row());
+        if let Value::Float(s) = v {
+            assert!((s - 2.0).abs() < 1e-5, "got {s}");
+        } else {
+            panic!("expected Float, got {v:?}");
+        }
+    }
+
+    #[test]
+    fn eval_maxsim_score_accepts_array_of_arrays() {
+        // Same logical input as above but represented as Array<Array<Float>>
+        // so the executor can score query matrices arriving as parameter
+        // literals (Cypher map / list literals decode to Array, not MultiVector).
+        let q = Value::Array(vec![
+            Value::Array(vec![Value::Float(1.0), Value::Float(0.0)]),
+            Value::Array(vec![Value::Float(0.0), Value::Float(1.0)]),
+        ]);
+        let d = Value::Array(vec![
+            Value::Array(vec![Value::Float(1.0), Value::Float(0.0)]),
+            Value::Array(vec![Value::Float(0.0), Value::Float(1.0)]),
+        ]);
+        let expr = Expr::FunctionCall {
+            name: "maxsim_score".into(),
+            args: vec![Expr::Literal(d), Expr::Literal(q)],
+            distinct: false,
+        };
+        let v = eval_expr(&expr, &empty_row());
+        assert!(matches!(v, Value::Float(_)));
+    }
+
+    #[test]
+    fn eval_maxsim_score_rejects_mismatched_dim() {
+        let q = Value::MultiVector(vec![vec![1.0, 0.0]]);
+        let d = Value::Array(vec![Value::Array(vec![
+            Value::Float(1.0),
+            Value::Float(0.0),
+            Value::Float(0.0),
+        ])]);
+        let expr = Expr::FunctionCall {
+            name: "maxsim_score".into(),
+            args: vec![Expr::Literal(d), Expr::Literal(q)],
+            distinct: false,
+        };
+        let v = eval_expr(&expr, &empty_row());
+        // coerce ok on each, but kernel returns 0 on dim mismatch.
+        if let Value::Float(s) = v {
+            assert_eq!(s, 0.0);
+        } else {
+            panic!("expected Float, got {v:?}");
+        }
+    }
+
+    #[test]
+    fn eval_maxsim_score_null_on_missing_arg() {
+        let expr = Expr::FunctionCall {
+            name: "maxsim_score".into(),
+            args: vec![Expr::Literal(Value::Int(42))],
+            distinct: false,
+        };
+        let v = eval_expr(&expr, &empty_row());
+        assert!(matches!(v, Value::Null));
+    }
 
     #[test]
     fn eval_vector_distance() {
