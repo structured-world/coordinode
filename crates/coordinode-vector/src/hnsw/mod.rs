@@ -27,6 +27,7 @@
 //! - No cross-node HNSW graph sharing needed — data replicated via Raft,
 //!   HNSW built locally on each node.
 
+mod bulk_build;
 mod data_level0;
 mod entry_point;
 mod inline_layer0;
@@ -1125,6 +1126,29 @@ impl HnswIndex {
             // Routes to update_existing_node via the insert() shim.
             self.insert(id, vec);
         }
+    }
+
+    /// Bulk-build path for static corpora where every vector is known
+    /// at call time.
+    ///
+    /// Below `BULK_BUILD_THRESHOLD` items, the rayon orchestration
+    /// overhead of the cluster-and-stitch algorithm exceeds the
+    /// per-cluster parallel win, so the call falls through to
+    /// [`Self::insert_batch`] verbatim. Above that threshold the call
+    /// delegates to the dedicated `bulk_build` module which implements
+    /// the ParlayANN-style sample-cluster-stitch topology.
+    ///
+    /// For now both branches resolve to `insert_batch` so behaviour is
+    /// observationally identical; only the dispatch surface and the
+    /// fallback threshold land here. Later commits replace the
+    /// upper branch with the real algorithm without touching this
+    /// entry point.
+    pub fn bulk_build(&mut self, items: Vec<(u64, Vec<f32>)>) {
+        if items.len() < bulk_build::BULK_BUILD_THRESHOLD {
+            self.insert_batch(items);
+            return;
+        }
+        bulk_build::bulk_build(self, items);
     }
 
     /// Read-only planning phase of an insert. Picks the new node's layer,
