@@ -406,10 +406,42 @@ fn create_vector_index_returns_nodes_indexed_count() {
         .expect("create vector index");
 
     assert_eq!(rows.len(), 1);
-    assert_eq!(
-        rows[0].get("nodes_indexed"),
-        Some(&Value::Int(3)),
-        "should backfill exactly 3 nodes that have the embedding property"
+    // CREATE VECTOR INDEX now returns immediately with state="building" and
+    // nodes_indexed=0; the backfill thread fills the graph in the background
+    // and transitions the persisted state to "ready" with the final count.
+    let state = rows[0]
+        .get("state")
+        .and_then(|v| match v {
+            Value::String(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .expect("state field present on CREATE VECTOR INDEX response");
+    assert!(
+        matches!(state, "building" | "ready"),
+        "state should be building (background) or ready (legacy sync), got {state}",
+    );
+
+    // Wait for the background backfill to settle, then verify the graph
+    // has the three vectorised nodes by issuing a vector-search query.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut search_hits = 0usize;
+    while std::time::Instant::now() < deadline {
+        let results = db
+            .execute_cypher(
+                "MATCH (n:Item) WHERE vector_distance(n.embedding, [1.0, 0.0, 0.0]) < 2.0 \
+                 RETURN n.embedding AS e LIMIT 10",
+            )
+            .expect("vector search");
+        if results.len() >= 3 {
+            search_hits = results.len();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        search_hits >= 3,
+        "background backfill should populate the HNSW graph with all 3 vectorised \
+         nodes within 5s, got {search_hits} hits",
     );
 }
 

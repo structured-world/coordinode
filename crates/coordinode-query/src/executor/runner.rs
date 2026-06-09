@@ -39,6 +39,7 @@ use crate::cypher::ast::{
     BinaryOperator, Direction, Expr, LengthBound, NodePattern, Pattern, PatternElement,
     RelationshipPattern, ViolationMode,
 };
+use crate::index::IndexState;
 use crate::planner::logical::*;
 
 /// Default maximum hops for unbounded variable-length paths.
@@ -13201,23 +13202,125 @@ fn execute_create_vector_index(
     let label_id = ctx.interner.intern(label);
     let property_id = ctx.interner.intern(property);
     let tier = registry.tier_handle(label_id, property_id);
-    registry.register_with_tier(def, tier);
-
-    // Backfill existing nodes that have the indexed vector property.
-    let node_prefix = {
-        let mut p = Vec::with_capacity(8);
-        p.extend_from_slice(b"node:");
-        p.extend_from_slice(&ctx.shard_id.to_be_bytes());
-        p.push(b':');
-        p
-    };
+    registry.register_with_tier(def.clone(), tier);
 
     let field_id = ctx.interner.lookup(property);
-    let mut backfilled = 0u64;
+    let shard_id = ctx.shard_id;
 
-    if let Ok(iter) = ctx.engine.prefix_scan(Partition::Node, &node_prefix) {
+    // Snapshot the live HNSW handle BEFORE deciding sync vs background.
+    // The handle is `Arc<RwLock<HnswIndex>>`, cheap to clone, and stays
+    // valid for the lifetime of the registry entry.
+    let hnsw_handle = registry.get(label, property);
+
+    // Pick the execution mode based on whether the caller plumbed an
+    // owned engine handle. With `engine_arc = Some(...)` we move the
+    // backfill into a background thread and return immediately; with
+    // None (test paths that build ExecutionContext with only a borrowed
+    // engine) we keep the legacy synchronous loop.
+    let (final_state, nodes_indexed): (IndexState, i64) =
+        match (&ctx.engine_arc, hnsw_handle, field_id) {
+            (Some(engine_arc), Some(hnsw), Some(fid)) => {
+                // Publish the Building state so concurrent readers and the
+                // crash-recovery path see "backfill in progress" before the
+                // thread starts touching SSTs.
+                let initial_state = IndexState::Building {
+                    written: 0,
+                    estimated_total: 0,
+                };
+                let _ =
+                    crate::index::ops::save_index_state(ctx.engine, name, initial_state.clone());
+
+                let engine = Arc::clone(engine_arc);
+                let label_owned = label.to_string();
+                let property_owned = property.to_string();
+                let name_owned = name.to_string();
+
+                std::thread::Builder::new()
+                    .name(format!("vec-backfill-{name}"))
+                    .spawn(move || {
+                        let outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                backfill_vector_index(
+                                    engine.as_ref(),
+                                    hnsw.as_ref(),
+                                    &label_owned,
+                                    &property_owned,
+                                    fid,
+                                    shard_id,
+                                    &name_owned,
+                                )
+                            }));
+                        let terminal = match outcome {
+                            Ok(Ok(_written)) => IndexState::Ready,
+                            Ok(Err(e)) => IndexState::Failed { reason: e },
+                            Err(panic) => {
+                                let reason = panic
+                                    .downcast_ref::<&'static str>()
+                                    .map(|s| (*s).to_string())
+                                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "panic in backfill thread".to_string());
+                                IndexState::Failed { reason }
+                            }
+                        };
+                        let _ = crate::index::ops::save_index_state(
+                            engine.as_ref(),
+                            &name_owned,
+                            terminal,
+                        );
+                    })
+                    .map_err(|e| {
+                        ExecutionError::Unsupported(format!("spawn backfill thread: {e}"))
+                    })?;
+
+                (initial_state, 0)
+            }
+            _ => {
+                // Synchronous fallback (legacy path / tests).
+                let written = match field_id {
+                    Some(fid) => {
+                        run_backfill_sync(ctx.engine, registry, label, property, fid, shard_id)
+                    }
+                    None => 0,
+                };
+                (IndexState::Ready, written as i64)
+            }
+        };
+
+    let state_label = match &final_state {
+        IndexState::Building { .. } => "building",
+        IndexState::Ready => "ready",
+        IndexState::Failed { .. } => "failed",
+    };
+
+    let mut row = Row::new();
+    row.insert("index".to_string(), Value::String(name.to_string()));
+    row.insert("label".to_string(), Value::String(label.to_string()));
+    row.insert("property".to_string(), Value::String(property.to_string()));
+    row.insert("nodes_indexed".to_string(), Value::Int(nodes_indexed));
+    row.insert("state".to_string(), Value::String(state_label.to_string()));
+    Ok(vec![row])
+}
+
+/// Synchronous backfill: scans every node in shard, extracts the indexed
+/// vector property, inserts into the registry's HNSW handle. Returns the
+/// number of nodes inserted. Used by the legacy non-Arc test path.
+fn run_backfill_sync(
+    engine: &StorageEngine,
+    registry: &crate::index::VectorIndexRegistry,
+    label: &str,
+    property: &str,
+    field_id: u32,
+    shard_id: u16,
+) -> u64 {
+    let mut prefix = Vec::with_capacity(8);
+    prefix.extend_from_slice(b"node:");
+    prefix.extend_from_slice(&shard_id.to_be_bytes());
+    prefix.push(b':');
+
+    let mut backfilled = 0u64;
+    if let Ok(iter) = engine.prefix_scan(Partition::Node, &prefix) {
         for guard in iter {
-            let Ok((_key, value)) = guard.into_inner() else {
+            let Ok((key, value)) = guard.into_inner() else {
                 continue;
             };
             let Ok(record) = NodeRecord::from_msgpack(&value) else {
@@ -13226,15 +13329,11 @@ fn execute_create_vector_index(
             if record.primary_label() != label {
                 continue;
             }
-            let Some((_shard, node_id)) = coordinode_core::graph::node::decode_node_key(&_key)
+            let Some((_shard, node_id)) = coordinode_core::graph::node::decode_node_key(&key)
             else {
                 continue;
             };
-
-            let Some(fid) = field_id else {
-                continue;
-            };
-            let Some(val) = record.props.get(&fid) else {
+            let Some(val) = record.props.get(&field_id) else {
                 continue;
             };
             if let Some(vec_data) = try_extract_vector(val) {
@@ -13243,13 +13342,73 @@ fn execute_create_vector_index(
             }
         }
     }
+    backfilled
+}
 
-    let mut row = Row::new();
-    row.insert("index".to_string(), Value::String(name.to_string()));
-    row.insert("label".to_string(), Value::String(label.to_string()));
-    row.insert("property".to_string(), Value::String(property.to_string()));
-    row.insert("nodes_indexed".to_string(), Value::Int(backfilled as i64));
-    Ok(vec![row])
+/// Background backfill: same scan + extract + insert as the sync path,
+/// but writes directly into the cloned HNSW handle without going through
+/// the registry (registry isn't Arc-shared, but the handle is). Persists
+/// progress every PROGRESS_INTERVAL nodes so a crash mid-build resumes
+/// from the last checkpoint instead of starting over.
+fn backfill_vector_index(
+    engine: &StorageEngine,
+    hnsw: &std::sync::RwLock<coordinode_vector::hnsw::HnswIndex>,
+    label: &str,
+    property: &str,
+    field_id: u32,
+    shard_id: u16,
+    index_name: &str,
+) -> std::result::Result<u64, String> {
+    const PROGRESS_INTERVAL: u64 = 1000;
+    let _ = property;
+
+    let mut prefix = Vec::with_capacity(8);
+    prefix.extend_from_slice(b"node:");
+    prefix.extend_from_slice(&shard_id.to_be_bytes());
+    prefix.push(b':');
+
+    let iter = engine
+        .prefix_scan(Partition::Node, &prefix)
+        .map_err(|e| format!("prefix_scan: {e}"))?;
+
+    let mut written = 0u64;
+    let mut since_checkpoint = 0u64;
+    for guard in iter {
+        let Ok((key, value)) = guard.into_inner() else {
+            continue;
+        };
+        let Ok(record) = NodeRecord::from_msgpack(&value) else {
+            continue;
+        };
+        if record.primary_label() != label {
+            continue;
+        }
+        let Some((_shard, node_id)) = coordinode_core::graph::node::decode_node_key(&key) else {
+            continue;
+        };
+        let Some(val) = record.props.get(&field_id) else {
+            continue;
+        };
+        if let Some(vec_data) = try_extract_vector(val) {
+            if let Ok(mut graph) = hnsw.write() {
+                graph.insert(node_id.as_raw(), vec_data);
+            }
+            written += 1;
+            since_checkpoint += 1;
+            if since_checkpoint >= PROGRESS_INTERVAL {
+                since_checkpoint = 0;
+                let _ = crate::index::ops::save_index_state(
+                    engine,
+                    index_name,
+                    IndexState::Building {
+                        written,
+                        estimated_total: 0,
+                    },
+                );
+            }
+        }
+    }
+    Ok(written)
 }
 
 /// Execute `DROP VECTOR INDEX idx`: removes an HNSW vector index by name.
