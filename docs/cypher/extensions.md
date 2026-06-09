@@ -78,6 +78,46 @@ The CREATE response row includes a `state` field (`"building" | "ready" |
 "failed"`) so clients can poll for completion or surface the status in a
 control plane.
 
+#### Graph predicate pushdown
+
+When a query combines a vector top-K sort with a sibling label or simple
+property filter, the planner pushes the predicate down into the HNSW
+traversal so the search prunes non-matching candidates while it walks the
+graph instead of returning a wider top-K that the executor then filters
+post-hoc. Two examples:
+
+```cypher
+-- Label-only pushdown: only Item nodes are considered by HNSW.
+MATCH (n:Item)
+WHERE vector_similarity(n.embedding, $q) > 0.7
+RETURN n ORDER BY vector_distance(n.embedding, $q) LIMIT 10;
+
+-- Label + property pushdown: HNSW skips any candidate whose
+-- `category` is not "electronics".
+MATCH (n:Item)
+WHERE n.category = 'electronics'
+RETURN n ORDER BY vector_distance(n.embedding, $q) LIMIT 10;
+```
+
+What pushes down today:
+
+- `:Label` from the MATCH pattern → `LabelEq(label)`.
+- `var.prop = literal` (or `literal = var.prop`) leaves connected by
+  top-level `AND` → `PropertyEq { property, value }`.
+
+What does NOT push down (stays as a post-filter):
+
+- Numeric range / inequality (`>`, `<=`, `BETWEEN`).
+- `IS NULL` / `IS NOT NULL`.
+- `OR`-branches (only top-level `AND` is decomposed).
+- Cross-variable predicates (`n.x = m.y`).
+- Parameter literals on the literal side (`$param`); deferred to a
+  later optimisation that resolves params at plan time.
+
+Pushdown is transparent: it never changes the result set, only the
+search-time cost. The post-filter still runs and would catch any
+mis-pushdown as a correctness backstop.
+
 ### Vector Query Functions ✅
 
 ```cypher
