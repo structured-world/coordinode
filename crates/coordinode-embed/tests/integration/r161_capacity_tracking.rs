@@ -172,7 +172,7 @@ fn capacity_recovery_re_enables_writes() {
         Durability::Durable,
         Tier::Warm,
     )
-    .with_hard_limit_bytes(40_000)]);
+    .with_hard_limit_bytes(200_000)]);
     let engine = StorageEngine::open(&config).expect("open");
 
     // Push past 200 KB with bulk writes (the scan now sees the full
@@ -941,7 +941,7 @@ fn down_crossing_severity_does_not_increment_alert_counter() {
         Durability::Durable,
         Tier::Warm,
     )
-    .with_hard_limit_bytes(40_000)]);
+    .with_hard_limit_bytes(200_000)]);
     let engine = StorageEngine::open(&config).expect("open");
 
     // Phase 1: write to Full (UP-crossing increments counter).
@@ -1326,7 +1326,7 @@ fn writes_resume_after_compaction_frees_space() {
         Durability::Durable,
         Tier::Warm,
     )
-    .with_hard_limit_bytes(40_000)]);
+    .with_hard_limit_bytes(200_000)]);
     let engine = StorageEngine::open(&config).expect("open");
 
     // Phase 1: bulk-write the SAME 100 keys 50 times. Each rewrite
@@ -1334,10 +1334,14 @@ fn writes_resume_after_compaction_frees_space() {
     // all 50 versions in SSTs until compaction folds them. This is
     // the easy way to manufacture compaction-reclaimable space
     // without depending on tombstones.
-    for round in 0..50u32 {
+    // Wider per-round padding + more rounds so the rewrite barrage
+    // pushes the endpoint past the 200K hard limit even under the
+    // tighter SST encoding the engine ships in v5.
+    let padding = "x".repeat(64);
+    for round in 0..150u32 {
         for i in 0..100u32 {
             let key = format!("node:0:{i:010}");
-            let value = format!("round-{round}-payload-bytes-padding-padding");
+            let value = format!("round-{round}-{padding}");
             let _ = engine.put(Partition::Node, key.as_bytes(), value.as_bytes());
         }
     }
@@ -1401,7 +1405,7 @@ fn writes_resume_after_cascade_eviction_frees_hot_endpoint() {
             Durability::Durable,
             Tier::Hot,
         )
-        .with_hard_limit_bytes(40_000)
+        .with_hard_limit_bytes(200_000)
         .with_hard_limit_strategy(HardLimitStrategy::CascadeEvict),
         EndpointConfig::new(
             "ep-cold",
@@ -1415,10 +1419,13 @@ fn writes_resume_after_cascade_eviction_frees_hot_endpoint() {
 
     // Bulk write — same key set, many rewrites, plus diverse keys
     // to give compaction enough material to push to bottom level.
-    for round in 0..30u32 {
+    // Padding keeps each value chunky so the cumulative footprint
+    // crosses the 200K hard limit under v5's tighter SST encoding.
+    let padding = "x".repeat(64);
+    for round in 0..60u32 {
         for i in 0..200u32 {
             let key = format!("node:0:{i:010}");
-            let value = format!("round-{round}-payload-bytes-padding");
+            let value = format!("round-{round}-{padding}");
             let _ = engine.put(Partition::Node, key.as_bytes(), value.as_bytes());
         }
     }

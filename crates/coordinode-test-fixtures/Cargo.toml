@@ -13,5 +13,5 @@ coordinode-storage = { workspace = true }
 # resolve to the same lsm-tree instance — different versions would
 # create two `Arc<dyn Fs>` types and the `MemFs` we hand to the
 # engine builder would be unusable.
-lsm-tree = { package = "coordinode-lsm-tree", version = "4", default-features = false }
+lsm-tree = { package = "coordinode-lsm-tree", version = "5", default-features = false }
 tempfile = { workspace = true }

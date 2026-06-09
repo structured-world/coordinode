@@ -18,7 +18,7 @@ coordinode-modality = { workspace = true }
 # Needed for `Database::open_in_memory()` which constructs a MemFs-backed
 # engine. Also a useful production capability for ephemeral test
 # harnesses + in-process benchmarks against EmbeddedDb directly.
-lsm-tree = { package = "coordinode-lsm-tree", version = "4", default-features = false }
+lsm-tree = { package = "coordinode-lsm-tree", version = "5", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }
@@ -28,7 +28,7 @@ tracing = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
-lsm-tree = { package = "coordinode-lsm-tree", version = "4", default-features = false }
+lsm-tree = { package = "coordinode-lsm-tree", version = "5", default-features = false }
 tempfile = { workspace = true }
 coordinode-test-fixtures = { workspace = true }
 metrics = { workspace = true }
