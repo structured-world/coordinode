@@ -357,6 +357,9 @@ pub enum LogicalOp {
         /// logical layer so the executor can pass it straight through
         /// to `VectorIndexConfig` without re-parsing the string.
         quantization: coordinode_vector::hnsw::QuantizationCodec,
+        /// Reader behaviour while the index is in the Building state,
+        /// resolved from the Cypher `online_during_build` OPTIONS field.
+        online_during_build: crate::index::OnlineDuringBuild,
     },
 
     /// DROP VECTOR INDEX: remove an HNSW vector index by name.
@@ -2016,9 +2019,10 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             metric,
             dimensions,
             quantization,
+            online_during_build,
         } => {
             output.push_str(&format!(
-                "{prefix}CreateVectorIndex({name} ON :{label}({property}), m={m}, ef={ef_construction}, metric={metric:?}, dim={dimensions}, quant={quantization:?})\n"
+                "{prefix}CreateVectorIndex({name} ON :{label}({property}), m={m}, ef={ef_construction}, metric={metric:?}, dim={dimensions}, quant={quantization:?}, online={online_during_build:?})\n"
             ));
         }
         LogicalOp::DropVectorIndex { name } => {

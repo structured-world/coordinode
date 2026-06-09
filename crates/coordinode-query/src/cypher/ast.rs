@@ -300,6 +300,11 @@ pub struct CreateVectorIndexClause {
     ///
     /// Case-insensitive. Unrecognized values fall back to `"none"`.
     pub quantization: Option<String>,
+    /// Reader behaviour while the index is in the Building state.
+    /// Accepted values (case-insensitive): `"block"`, `"partial-recall"`
+    /// / `"partial_recall"`, `"offline"`. Unrecognized values fall back
+    /// to `"block"`.
+    pub online_during_build: Option<String>,
 }
 
 /// CREATE EDGE TYPE clause.

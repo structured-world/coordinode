@@ -942,3 +942,56 @@ fn create_vector_index_with_rabitq_2bit_quantization() {
         );
     }
 }
+
+// ── R858b-pre3 Step 3: online_during_build policy tests ──────────────────
+
+/// Default policy ("block") must let CREATE-then-SEARCH succeed: the gate
+/// polls until the background backfill completes before letting the query
+/// hit the HNSW graph, matching the legacy synchronous semantic.
+#[test]
+fn online_during_build_default_block_waits_for_backfill() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (n:Item {embedding: [1.0, 0.0, 0.0]})")
+        .expect("node");
+
+    db.execute_cypher(
+        "CREATE VECTOR INDEX item_emb ON :Item(embedding) OPTIONS {metric: \"cosine\"}",
+    )
+    .expect("create vector index");
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (n:Item) \
+             WHERE vector_similarity(n.embedding, [1.0, 0.0, 0.0]) > 0.9 \
+             RETURN n.embedding AS vec",
+        )
+        .expect("search waits for backfill, then returns the row");
+    assert_eq!(rows.len(), 1);
+}
+
+/// `online_during_build: "partial-recall"` lets the search hit the graph
+/// immediately, even before backfill finishes. With one node + cosine the
+/// graph fills almost instantly so this is mostly a parser-and-plumbing
+/// smoke test, but the gate must NOT consult the schema for this policy.
+#[test]
+fn online_during_build_partial_recall_does_not_block() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (n:Item {embedding: [1.0, 0.0, 0.0]})")
+        .expect("node");
+
+    db.execute_cypher(
+        "CREATE VECTOR INDEX item_emb ON :Item(embedding) \
+         OPTIONS {metric: \"cosine\", online_during_build: \"partial-recall\"}",
+    )
+    .expect("create vector index with partial-recall");
+
+    // Even if the search races the backfill thread, partial-recall lets
+    // the call go through without an error from the gate.
+    let _ = db
+        .execute_cypher(
+            "MATCH (n:Item) \
+             WHERE vector_similarity(n.embedding, [1.0, 0.0, 0.0]) > 0.9 \
+             RETURN n.embedding AS vec",
+        )
+        .expect("partial-recall search must not error");
+}

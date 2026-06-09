@@ -39,7 +39,7 @@ use crate::cypher::ast::{
     BinaryOperator, Direction, Expr, LengthBound, NodePattern, Pattern, PatternElement,
     RelationshipPattern, ViolationMode,
 };
-use crate::index::IndexState;
+use crate::index::{IndexState, OnlineDuringBuild};
 use crate::planner::logical::*;
 
 /// Default maximum hops for unbounded variable-length paths.
@@ -2730,6 +2730,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             metric,
             dimensions,
             quantization,
+            online_during_build,
         } => execute_create_vector_index(
             name,
             label,
@@ -2739,6 +2740,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             *metric,
             *dimensions,
             *quantization,
+            *online_during_build,
             ctx,
         ),
 
@@ -3997,6 +3999,7 @@ fn try_hnsw_vector_filter(
         base_k
     };
 
+    gate_vector_index_read(ctx.engine, registry, label, property)?;
     let results =
         match registry.search_with_loader(label, property, &query_vec, k, ctx.vector_loader) {
             Some(r) => r,
@@ -4181,6 +4184,7 @@ fn try_hnsw_vector_top_k(
     // Capped at 10_000 to prevent excessive memory for massive result sets.
     let overfetch = (k * 4).max(rows.len() * 2).clamp(100, 10_000);
 
+    gate_vector_index_read(ctx.engine, registry, &label_str, &property_str)?;
     let search_results = match registry.search_with_loader(
         &label_str,
         &property_str,
@@ -7054,6 +7058,79 @@ fn execute_create_from_pattern(
 ///
 /// Handles both `Value::Vector` (native) and `Value::Array` containing
 /// only Float/Int elements (Cypher array literals like `[1.0, 0.0]`).
+/// Gate a vector search against the index's persisted build state and
+/// online-during-build policy. Returns `Ok(())` when the caller can use
+/// the in-memory HNSW handle, `Err(...)` when the caller must abort.
+///
+/// Cost: when the in-memory registry policy is `PartialRecall` this is a
+/// single map lookup with no schema read — the dominant common case.
+/// `Block` and `Offline` policies plus the rarely-hit `Failed` recovery
+/// path consult the persisted schema for a fresh state.
+fn gate_vector_index_read(
+    engine: &StorageEngine,
+    registry: &crate::index::VectorIndexRegistry,
+    label: &str,
+    property: &str,
+) -> Result<(), ExecutionError> {
+    let Some(def) = registry.get_definition(label, property) else {
+        // No registered def — caller will fall back to brute-force or
+        // return an empty result. Not our gate to enforce.
+        return Ok(());
+    };
+
+    // PartialRecall: short-circuit before any schema read. Matches the
+    // pre-policy behaviour (search whatever's in the graph right now).
+    if def.online_during_build == OnlineDuringBuild::PartialRecall {
+        return Ok(());
+    }
+
+    // For Block / Offline, fetch the live state from schema so we react
+    // to backfill completion that happened after registry registration.
+    // Block polls until the backfill completes (matching the legacy
+    // synchronous-build semantic), Offline returns an error immediately.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let poll_step = std::time::Duration::from_millis(25);
+    loop {
+        let live_state = crate::index::ops::load_index_definition(engine, &def.name)
+            .ok()
+            .flatten()
+            .map(|d| d.state)
+            .unwrap_or(IndexState::Ready);
+
+        match live_state {
+            IndexState::Ready => return Ok(()),
+            IndexState::Failed { reason } => {
+                return Err(ExecutionError::Unsupported(format!(
+                    "vector index '{}' failed to build: {reason}",
+                    def.name
+                )));
+            }
+            IndexState::Building { .. } => match def.online_during_build {
+                OnlineDuringBuild::Offline => {
+                    return Err(ExecutionError::Unsupported(format!(
+                        "vector index '{}' is offline during build",
+                        def.name
+                    )));
+                }
+                OnlineDuringBuild::Block => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(ExecutionError::Unsupported(format!(
+                            "vector index '{}' still building after 30s",
+                            def.name
+                        )));
+                    }
+                    std::thread::sleep(poll_step);
+                    continue;
+                }
+                OnlineDuringBuild::PartialRecall => {
+                    // Early-return above handles this; unreachable here.
+                    return Ok(());
+                }
+            },
+        }
+    }
+}
+
 fn try_extract_vector(val: &Value) -> Option<Vec<f32>> {
     match val {
         Value::Vector(v) => Some(v.clone()),
@@ -13161,6 +13238,7 @@ fn execute_create_vector_index(
     metric: coordinode_core::graph::types::VectorMetric,
     dimensions: u32,
     quantization: coordinode_vector::hnsw::QuantizationCodec,
+    online_during_build: crate::index::OnlineDuringBuild,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let Some(registry) = ctx.vector_index_registry else {
@@ -13187,7 +13265,8 @@ fn execute_create_vector_index(
         quantization,
         offload_vectors: false,
     };
-    let def = crate::index::IndexDefinition::hnsw(name, label, property, config);
+    let mut def = crate::index::IndexDefinition::hnsw(name, label, property, config);
+    def.online_during_build = online_during_build;
 
     // Persist definition to the schema partition.
     crate::index::ops::save_index_definition(ctx.engine, &def)

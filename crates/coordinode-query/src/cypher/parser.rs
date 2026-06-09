@@ -1366,6 +1366,7 @@ fn build_create_vector_index_clause(
     let mut metric: Option<String> = None;
     let mut dimensions: Option<u32> = None;
     let mut quantization: Option<String> = None;
+    let mut online_during_build: Option<String> = None;
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
@@ -1394,6 +1395,7 @@ fn build_create_vector_index_clause(
                             "metric" => metric = Some(val_str),
                             "dimensions" => dimensions = val_str.parse().ok(),
                             "quantization" => quantization = Some(val_str),
+                            "online_during_build" => online_during_build = Some(val_str),
                             _ => {} // unknown options silently ignored
                         }
                     }
@@ -1418,6 +1420,7 @@ fn build_create_vector_index_clause(
         metric,
         dimensions,
         quantization,
+        online_during_build,
     })
 }
 

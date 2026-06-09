@@ -568,6 +568,21 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
         Clause::CreateVectorIndex(c) => {
             let metric = parse_vector_metric(c.metric.as_deref());
             let quantization = parse_quantization_codec(c.quantization.as_deref());
+            let online_during_build = match c
+                .online_during_build
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Some("partial-recall") | Some("partial_recall") => {
+                    crate::index::OnlineDuringBuild::PartialRecall
+                }
+                Some("offline") => crate::index::OnlineDuringBuild::Offline,
+                // Default + every other value (including the explicit "block")
+                // resolves to Block. Unknown values are silently accepted to match
+                // the existing OPTIONS parser tolerance for typos.
+                _ => crate::index::OnlineDuringBuild::Block,
+            };
             Ok(LogicalOp::CreateVectorIndex {
                 name: c.name.clone(),
                 label: c.label.clone(),
@@ -577,6 +592,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 metric,
                 dimensions: c.dimensions.unwrap_or(0),
                 quantization,
+                online_during_build,
             })
         }
         Clause::DropVectorIndex(c) => Ok(LogicalOp::DropVectorIndex {

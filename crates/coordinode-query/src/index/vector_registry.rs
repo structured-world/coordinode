@@ -188,6 +188,43 @@ impl VectorIndexRegistry {
             .cloned()
     }
 
+    /// Update the in-memory state of a registered index without touching
+    /// the persisted schema record. Called by the background backfill
+    /// thread after `save_index_state` so reader-side state checks can
+    /// answer without going to disk. Returns `true` when an index was
+    /// updated, `false` if no entry exists for the given (label, property).
+    pub fn set_state(&self, label: &str, property: &str, state: crate::index::IndexState) -> bool {
+        let mut defs = self.definitions.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(def) = defs.get_mut(&(label.to_string(), property.to_string())) {
+            def.state = state;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Quick read-side lookup: returns the live state and policy together
+    /// with the HNSW handle so a caller can decide whether to proceed,
+    /// wait, or error out without a separate `get_definition` call.
+    pub fn policy_state(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Option<(
+        crate::index::IndexState,
+        crate::index::OnlineDuringBuild,
+        HnswHandle,
+    )> {
+        let defs = self.definitions.read().unwrap_or_else(|e| e.into_inner());
+        let key = (label.to_string(), property.to_string());
+        let def = defs.get(&key)?;
+        let state = def.state.clone();
+        let policy = def.online_during_build;
+        drop(defs);
+        let handle = self.get(label, property)?;
+        Some((state, policy, handle))
+    }
+
     /// Get the index definition for a (label, property) pair.
     pub fn get_definition(&self, label: &str, property: &str) -> Option<IndexDefinition> {
         self.definitions

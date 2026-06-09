@@ -9,6 +9,26 @@ use serde::{Deserialize, Serialize};
 /// `Building` is set while a backfill task is running. `Failed` captures the
 /// error reason when a backfill aborts. Persisting this lets a reopen path
 /// detect interrupted backfills and resume them.
+/// Reader behaviour while an index is in [`IndexState::Building`].
+///
+/// Default [`Self::Block`] preserves the pre-state semantics: queries see
+/// a fully-built index because they wait for the backfill to finish.
+/// `PartialRecall` lets queries hit the partial graph immediately at the
+/// cost of recall < 1.0; `Offline` rejects queries with a clear error so
+/// the caller can route to a fallback path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OnlineDuringBuild {
+    /// Reader waits (up to a deadline) for the index to reach `Ready`
+    /// before proceeding. Matches the legacy synchronous semantic.
+    #[default]
+    Block,
+    /// Reader uses the partial index immediately. Recall improves as the
+    /// backfill writes more vectors.
+    PartialRecall,
+    /// Reader gets `IndexBuilding` so it can pick a fallback path.
+    Offline,
+}
+
 // Default Ready so pre-existing persisted IndexDefinition records (which
 // had no state field) deserialize as fully-built indexes. New indexes set
 // Building explicitly before spawning backfill.
@@ -109,6 +129,10 @@ pub struct IndexDefinition {
     /// Build state. Defaults to `Ready` when deserializing pre-state schema records.
     #[serde(default)]
     pub state: IndexState,
+    /// Reader behaviour during `IndexState::Building`. Defaults to
+    /// [`OnlineDuringBuild::Block`] for backward compatibility.
+    #[serde(default)]
+    pub online_during_build: OnlineDuringBuild,
 }
 
 /// Per-field analyzer configuration for text indexes.
@@ -194,6 +218,7 @@ impl IndexDefinition {
             vector_config: None,
             text_config: None,
             state: IndexState::Ready,
+            online_during_build: OnlineDuringBuild::Block,
         }
     }
 
@@ -216,6 +241,7 @@ impl IndexDefinition {
             vector_config: None,
             text_config: None,
             state: IndexState::Ready,
+            online_during_build: OnlineDuringBuild::Block,
         }
     }
 
@@ -239,6 +265,7 @@ impl IndexDefinition {
             vector_config: Some(config),
             text_config: None,
             state: IndexState::Ready,
+            online_during_build: OnlineDuringBuild::Block,
         }
     }
 
@@ -262,6 +289,7 @@ impl IndexDefinition {
             vector_config: None,
             text_config: Some(config),
             state: IndexState::Ready,
+            online_during_build: OnlineDuringBuild::Block,
         }
     }
 
