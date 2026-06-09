@@ -2918,7 +2918,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             query_vector,
             query_text,
             shard_overfetch_cap,
-            fusion: _,
+            fusion,
         } => {
             let rows = execute_op(input, ctx)?;
             execute_rank_fuse(
@@ -2927,6 +2927,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 query_vector.as_ref(),
                 query_text.as_ref(),
                 *shard_overfetch_cap,
+                fusion,
                 ctx,
             )
         }
@@ -4492,7 +4493,10 @@ fn execute_vector_filter(
 }
 
 /// RRF constant `k`: the industry standard from Cormack et al. 2009.
-/// Deliberately NOT a tunable — freezing k is a core contract of `rrf_score`.
+/// Default for `FusionStrategy::Rrf` — callers that pass a different `k`
+/// via the strategy use that value; this constant stays as the
+/// documented baseline.
+#[allow(dead_code)]
 const RRF_K: f64 = 60.0;
 
 /// Resolved scoring mode for a single `rrf_score` method expression.
@@ -4650,6 +4654,7 @@ fn execute_rank_fuse(
     query_vector: Option<&Expr>,
     query_text: Option<&Expr>,
     shard_overfetch_cap: Option<usize>,
+    fusion: &crate::planner::logical::FusionStrategy,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     if methods.is_empty() {
@@ -4776,17 +4781,39 @@ fn execute_rank_fuse(
         .map(|mr| mr.iter().filter(|r| r.is_some()).count() + 1)
         .collect();
 
-    // Compute RRF score per row.
+    // Compute fused score per row. RRF uses ranks; CC and DBSF need raw
+    // scores per method, so the score-based branches recompute method
+    // scores instead of falling back to the rank vector.
     let mut out_rows: Vec<Row> = Vec::with_capacity(n);
-    for (i, row) in rows.into_iter().enumerate() {
-        let mut score = 0.0_f64;
-        for (m, method_ranks) in ranks.iter().enumerate() {
-            let rank = method_ranks[i].unwrap_or(penalties[m]);
-            score += 1.0 / (RRF_K + rank as f64);
+    use crate::planner::logical::FusionStrategy;
+    match fusion {
+        FusionStrategy::Rrf { k } => {
+            let rrf_k = *k as f64;
+            for (i, row) in rows.into_iter().enumerate() {
+                let mut score = 0.0_f64;
+                for (m, method_ranks) in ranks.iter().enumerate() {
+                    let rank = method_ranks[i].unwrap_or(penalties[m]);
+                    score += 1.0 / (rrf_k + rank as f64);
+                }
+                let mut out = row;
+                // Keep historical `__rrf_score__` column for RRF callers; also
+                // emit `__hybrid_score__` so the universal sort column works
+                // regardless of fusion strategy.
+                out.insert("__rrf_score__".to_string(), Value::Float(score));
+                out.insert("__hybrid_score__".to_string(), Value::Float(score));
+                out_rows.push(out);
+            }
         }
-        let mut out = row;
-        out.insert("__rrf_score__".to_string(), Value::Float(score));
-        out_rows.push(out);
+        FusionStrategy::ConvexCombination { weights } | FusionStrategy::Dbsf { weights } => {
+            let use_zscore = matches!(fusion, FusionStrategy::Dbsf { .. });
+            let raw = compute_raw_method_scores(&rows, methods, &kinds, qv_slice, qt_slice, ctx)?;
+            let fused = fuse_raw_scores(&raw, &kinds, weights, use_zscore);
+            for (i, row) in rows.into_iter().enumerate() {
+                let mut out = row;
+                out.insert("__hybrid_score__".to_string(), Value::Float(fused[i]));
+                out_rows.push(out);
+            }
+        }
     }
 
     // Apply shard overfetch cap (R-HYB5 future path; None in CE).
@@ -4926,6 +4953,216 @@ fn score_text_method(
 ///
 /// Returns `row_ranks[i]` for `i in 0..n_rows`: `Some(rank)` when row i was
 /// in `scored`, `None` otherwise (penalty applied by the caller).
+/// Build the per-(method, row) matrix of raw scores for the CC / DBSF
+/// fusion kernels. Each cell is `Some(score)` when the row has a usable
+/// value for that method, `None` otherwise. The score sign convention
+/// follows the rank assignment: higher = better. Distance metrics are
+/// negated so a smaller raw distance lands as a larger score.
+fn compute_raw_method_scores(
+    rows: &[Row],
+    methods: &[Expr],
+    kinds: &[RankFuseMethodKind],
+    qv_slice: &[f32],
+    qt_slice: &str,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Vec<Vec<Option<f64>>>, ExecutionError> {
+    let mut out: Vec<Vec<Option<f64>>> = Vec::with_capacity(methods.len());
+    for (method_expr, kind) in methods.iter().zip(kinds.iter()) {
+        let variable = variable_for_method(method_expr);
+        let scores = match kind {
+            RankFuseMethodKind::VectorHnsw { metric, .. } => {
+                raw_scores_vector_method(rows, method_expr, qv_slice, Some(*metric), kind.desc())
+            }
+            RankFuseMethodKind::VectorBruteForce => {
+                raw_scores_vector_method(rows, method_expr, qv_slice, None, kind.desc())
+            }
+            RankFuseMethodKind::TextBm25 { label, property } => raw_scores_text_method(
+                rows,
+                method_expr,
+                qt_slice,
+                label,
+                property,
+                &variable,
+                ctx,
+            )?,
+        };
+        out.push(scores);
+    }
+    Ok(out)
+}
+
+/// Sibling of `score_vector_method` returning raw normalised-direction
+/// scores instead of competition ranks. "Normalised direction" means the
+/// sign convention is `higher = better` regardless of the metric: cosine
+/// / dot stay as-is, L1 / L2 are negated. Callers that need ascending
+/// distance can re-negate.
+fn raw_scores_vector_method(
+    rows: &[Row],
+    method_expr: &Expr,
+    query_vec: &[f32],
+    metric: Option<coordinode_core::graph::types::VectorMetric>,
+    desc: bool,
+) -> Vec<Option<f64>> {
+    let mut out: Vec<Option<f64>> = vec![None; rows.len()];
+    for (i, row) in rows.iter().enumerate() {
+        let val = eval_expr(method_expr, row);
+        let Some(v) = coerce_value_to_vec(&val) else {
+            continue;
+        };
+        if v.len() != query_vec.len() {
+            continue;
+        }
+        let raw = match metric {
+            Some(coordinode_core::graph::types::VectorMetric::Cosine) | None => {
+                coordinode_vector::metrics::cosine_similarity(&v, query_vec) as f64
+            }
+            Some(coordinode_core::graph::types::VectorMetric::L2) => {
+                coordinode_vector::metrics::euclidean_distance(&v, query_vec) as f64
+            }
+            Some(coordinode_core::graph::types::VectorMetric::DotProduct) => {
+                coordinode_vector::metrics::dot_product(&v, query_vec) as f64
+            }
+            Some(coordinode_core::graph::types::VectorMetric::L1) => {
+                coordinode_vector::metrics::manhattan_distance(&v, query_vec) as f64
+            }
+        };
+        // Normalise so higher = better. When the metric is ascending-by-
+        // default (`desc == false`, distance metrics), flip the sign.
+        let normalised = if desc { raw } else { -raw };
+        out[i] = Some(normalised);
+    }
+    out
+}
+
+/// Sibling of `score_text_method` returning raw BM25 scores per row.
+#[allow(clippy::too_many_arguments)]
+fn raw_scores_text_method(
+    rows: &[Row],
+    method_expr: &Expr,
+    query_text: &str,
+    label: &str,
+    property: &str,
+    variable: &str,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Vec<Option<f64>>, ExecutionError> {
+    let _ = method_expr;
+    let registry = ctx.text_index_registry.ok_or_else(|| {
+        ExecutionError::Unsupported(
+            "hybrid fusion: text method requires a TextIndexRegistry".to_string(),
+        )
+    })?;
+    let handle = registry.get(label, property).ok_or_else(|| {
+        ExecutionError::Unsupported(format!(
+            "hybrid fusion: no text index on :{label}({property})"
+        ))
+    })?;
+    let idx = handle.read().map_err(|_| {
+        ExecutionError::Unsupported("hybrid fusion: text index lock poisoned".into())
+    })?;
+    let limit = (rows.len() * 3).max(1000);
+    let results = idx
+        .search(query_text, limit)
+        .map_err(|e| ExecutionError::Unsupported(format!("hybrid fusion: text search: {e}")))?;
+    drop(idx);
+
+    let scores: std::collections::HashMap<u64, f32> =
+        results.into_iter().map(|r| (r.node_id, r.score)).collect();
+
+    let mut out: Vec<Option<f64>> = vec![None; rows.len()];
+    for (i, row) in rows.iter().enumerate() {
+        let Some(nid) = row_node_id(row, variable) else {
+            continue;
+        };
+        if let Some(&s) = scores.get(&nid) {
+            out[i] = Some(s as f64);
+        }
+    }
+    Ok(out)
+}
+
+/// Combine per-(method, row) raw scores into a single fused score per row
+/// using either min-max normalisation (Convex Combination) or z-score
+/// normalisation (DBSF). `weights` maps the method's category ("vector"
+/// or "text") to its blending coefficient. Missing weights default to 0
+/// (method contributes nothing). Methods whose range / stddev is
+/// degenerate (min == max or σ == 0) contribute zero to every row, since
+/// the normalisation is undefined.
+fn fuse_raw_scores(
+    raw: &[Vec<Option<f64>>],
+    kinds: &[RankFuseMethodKind],
+    weights: &std::collections::BTreeMap<String, f64>,
+    use_zscore: bool,
+) -> Vec<f64> {
+    let n_rows = raw.first().map(|c| c.len()).unwrap_or(0);
+    let mut fused = vec![0.0_f64; n_rows];
+    for (method_idx, column) in raw.iter().enumerate() {
+        let category = match &kinds[method_idx] {
+            RankFuseMethodKind::VectorHnsw { .. } | RankFuseMethodKind::VectorBruteForce => {
+                "vector"
+            }
+            RankFuseMethodKind::TextBm25 { .. } => "text",
+        };
+        let weight = weights.get(category).copied().unwrap_or(0.0);
+        if weight == 0.0 {
+            continue;
+        }
+        let normalised = if use_zscore {
+            zscore_normalise(column)
+        } else {
+            min_max_normalise(column)
+        };
+        for (i, n) in normalised.iter().enumerate() {
+            if let Some(v) = n {
+                fused[i] += weight * v;
+            }
+        }
+    }
+    fused
+}
+
+/// Min-max normalise: `(x - min) / (max - min)`. Returns None for any row
+/// when the column's min and max coincide (degenerate range — the
+/// normalised value is undefined; treat as "no contribution").
+fn min_max_normalise(column: &[Option<f64>]) -> Vec<Option<f64>> {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for v in column.iter().flatten() {
+        if *v < min {
+            min = *v;
+        }
+        if *v > max {
+            max = *v;
+        }
+    }
+    if !min.is_finite() || !max.is_finite() || (max - min).abs() < f64::EPSILON {
+        return vec![None; column.len()];
+    }
+    let range = max - min;
+    column
+        .iter()
+        .map(|cell| cell.map(|v| (v - min) / range))
+        .collect()
+}
+
+/// Z-score normalise: `(x - μ) / σ`. Returns None per row when σ == 0 or
+/// the column has fewer than 2 matched samples.
+fn zscore_normalise(column: &[Option<f64>]) -> Vec<Option<f64>> {
+    let values: Vec<f64> = column.iter().filter_map(|c| *c).collect();
+    if values.len() < 2 {
+        return vec![None; column.len()];
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+    let sigma = var.sqrt();
+    if sigma < f64::EPSILON {
+        return vec![None; column.len()];
+    }
+    column
+        .iter()
+        .map(|cell| cell.map(|v| (v - mean) / sigma))
+        .collect()
+}
+
 fn assign_competition_ranks(
     n_rows: usize,
     scored: &mut [(usize, f64, u64)],
@@ -19318,5 +19555,118 @@ mod tests {
         ctx.cascade_enter("t", None, None)
             .expect("fanout counter cleared");
         ctx.cascade_exit();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod fusion_kernel_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn approx_eq(a: f64, b: f64, eps: f64) -> bool {
+        (a - b).abs() < eps
+    }
+
+    #[test]
+    fn min_max_normalises_column_to_unit_range() {
+        let col = vec![Some(1.0), Some(2.0), Some(4.0), None];
+        let n = min_max_normalise(&col);
+        assert_eq!(n.len(), 4);
+        assert!(approx_eq(n[0].unwrap(), 0.0, 1e-9));
+        // (2-1)/(4-1) = 1/3
+        assert!(approx_eq(n[1].unwrap(), 1.0 / 3.0, 1e-9));
+        assert!(approx_eq(n[2].unwrap(), 1.0, 1e-9));
+        assert!(n[3].is_none());
+    }
+
+    #[test]
+    fn min_max_degenerate_range_returns_all_none() {
+        let col = vec![Some(5.0), Some(5.0), None];
+        let n = min_max_normalise(&col);
+        assert!(n.iter().all(|c| c.is_none()));
+    }
+
+    #[test]
+    fn zscore_normalises_to_zero_mean_unit_stddev() {
+        // For {1, 2, 3, 4}: mean = 2.5, σ = sqrt((1.25 + 0.25 + 0.25 + 1.25)/4) = sqrt(0.75 + 0.5) wait
+        // Wait, do it: deviations [-1.5, -0.5, 0.5, 1.5], squared [2.25, 0.25, 0.25, 2.25], sum 5, /4 = 1.25, sqrt ≈ 1.1180339887
+        let col = vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0)];
+        let n = zscore_normalise(&col);
+        let sigma = (5.0_f64 / 4.0).sqrt();
+        assert!(approx_eq(n[0].unwrap(), -1.5 / sigma, 1e-9));
+        assert!(approx_eq(n[1].unwrap(), -0.5 / sigma, 1e-9));
+        assert!(approx_eq(n[2].unwrap(), 0.5 / sigma, 1e-9));
+        assert!(approx_eq(n[3].unwrap(), 1.5 / sigma, 1e-9));
+    }
+
+    #[test]
+    fn zscore_zero_sigma_returns_all_none() {
+        let col = vec![Some(7.0), Some(7.0), Some(7.0)];
+        let n = zscore_normalise(&col);
+        assert!(n.iter().all(|c| c.is_none()));
+    }
+
+    #[test]
+    fn zscore_single_sample_returns_all_none() {
+        let col = vec![Some(1.0), None, None];
+        let n = zscore_normalise(&col);
+        assert!(n.iter().all(|c| c.is_none()));
+    }
+
+    #[test]
+    fn fuse_raw_scores_convex_combination_weighted_sum() {
+        // 3 rows, 2 methods (1 vector + 1 text).
+        // Vector column: [0.0, 0.5, 1.0] (cosine similarities after the sign convention)
+        // Text column  : [10.0, 5.0, 0.0] (BM25)
+        // weights: vector 0.6, text 0.4.
+        // Min-max:
+        //   vector → [0, 0.5, 1.0]      (already unit-range)
+        //   text   → [1.0, 0.5, 0.0]    ((10-0)/10, (5-0)/10, 0)
+        // Fused = 0.6 * v + 0.4 * t.
+        let raw = vec![
+            vec![Some(0.0), Some(0.5), Some(1.0)],
+            vec![Some(10.0), Some(5.0), Some(0.0)],
+        ];
+        let kinds = vec![
+            RankFuseMethodKind::VectorBruteForce,
+            RankFuseMethodKind::TextBm25 {
+                label: "Doc".into(),
+                property: "body".into(),
+            },
+        ];
+        let mut weights: BTreeMap<String, f64> = BTreeMap::new();
+        weights.insert("vector".into(), 0.6);
+        weights.insert("text".into(), 0.4);
+
+        let fused = fuse_raw_scores(&raw, &kinds, &weights, false);
+        assert!(approx_eq(fused[0], 0.6 * 0.0 + 0.4 * 1.0, 1e-9));
+        assert!(approx_eq(fused[1], 0.6 * 0.5 + 0.4 * 0.5, 1e-9));
+        assert!(approx_eq(fused[2], 0.6 * 1.0 + 0.4 * 0.0, 1e-9));
+    }
+
+    #[test]
+    fn fuse_raw_scores_dbsf_weighted_zscore_sum() {
+        // Single column with known z-scores; verify the weight scales correctly.
+        let raw = vec![vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0)]];
+        let kinds = vec![RankFuseMethodKind::VectorBruteForce];
+        let mut weights: BTreeMap<String, f64> = BTreeMap::new();
+        weights.insert("vector".into(), 1.0);
+
+        let fused = fuse_raw_scores(&raw, &kinds, &weights, true);
+        let sigma = (5.0_f64 / 4.0).sqrt();
+        assert!(approx_eq(fused[0], -1.5 / sigma, 1e-9));
+        assert!(approx_eq(fused[3], 1.5 / sigma, 1e-9));
+    }
+
+    #[test]
+    fn fuse_raw_scores_missing_weight_drops_method() {
+        let raw = vec![vec![Some(10.0), Some(0.0)]];
+        let kinds = vec![RankFuseMethodKind::VectorBruteForce];
+        // weights map is empty for "vector" — method drops out, fused stays 0.
+        let weights: BTreeMap<String, f64> = BTreeMap::new();
+
+        let fused = fuse_raw_scores(&raw, &kinds, &weights, false);
+        assert_eq!(fused, vec![0.0, 0.0]);
     }
 }
