@@ -9,6 +9,9 @@
 use coordinode_core::graph::types::VectorMetric;
 use tracing::info;
 
+pub mod maxsim;
+pub use maxsim::{maxsim, maxsim_per_query_token};
+
 /// Detect and log available SIMD capabilities.
 ///
 /// Call once at startup to log which instruction sets will be used
