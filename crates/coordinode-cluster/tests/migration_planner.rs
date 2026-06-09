@@ -15,7 +15,8 @@
 use coordinode_cluster::FailureDomain;
 use coordinode_cluster::{
     estimate_cost, ClusterTopology, CostInputs, LocalMigrationPlanner, MigrationPlanner, Modality,
-    PayloadEstimate, PlannerContext, ShardId, SingleNodeTopology, TopologyTree, TransferMode,
+    OnlineDuringRebuild, PayloadEstimate, PlannerContext, ShardId, SingleNodeTopology,
+    TopologyTree, TransferMode,
 };
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
@@ -158,4 +159,83 @@ fn planner_picks_remote_endpoint_when_source_fills_up() {
     // Network component formula: bytes / bandwidth.
     let expected_network = (payload.bytes as f64) / costs.bandwidth_bytes_per_sec;
     assert!((plan.cost_breakdown.network_secs - expected_network).abs() < 1e-9);
+}
+
+#[test]
+fn online_during_rebuild_policy_flows_through_planner() {
+    // Same 3-endpoint harness as the previous test, but the focus
+    // here is the read-side rebuild policy field on the resulting
+    // plan. Three sub-cases mirror the three points on the
+    // precedence ladder: enum default, planner default override,
+    // per-context override. The cost numbers are not relevant to
+    // policy resolution, so we keep them simple.
+    let limit = 200_000_u64;
+    let _ep_a = open_endpoint("ep-a", limit);
+    let _ep_b = open_endpoint("ep-b", limit);
+    let _ep_c = open_endpoint("ep-c", limit);
+
+    let payload = PayloadEstimate {
+        bytes: 1_000,
+        node_count: 500,
+        ef_construction: 200,
+    };
+    let costs = CostInputs {
+        bandwidth_bytes_per_sec: 100_000_000.0,
+        hnsw_build_rate_nodes_per_sec: 5_000.0,
+        neighbour_byte_cost: 64.0,
+    };
+
+    // Sub-case 1: bare planner emits the enum default
+    // (PartialRecall) when the context does not override.
+    let topology = three_endpoint_topology();
+    let planner_default = LocalMigrationPlanner::new(topology, Tier::Warm, Modality::Vector);
+    let ctx_default = PlannerContext {
+        source: "ep-a".to_string(),
+        shard: ShardId::ZERO,
+        payload,
+        costs,
+        online_policy_override: None,
+    };
+    let plan_default = planner_default
+        .plan(&ctx_default)
+        .expect("default policy plan");
+    assert_eq!(
+        plan_default.online_during_rebuild,
+        OnlineDuringRebuild::PartialRecall
+    );
+
+    // Sub-case 2: planner configured with Block via the builder
+    // writes Block into every plan when the context does not
+    // override.
+    let topology = three_endpoint_topology();
+    let planner_block = LocalMigrationPlanner::new(topology, Tier::Warm, Modality::Vector)
+        .with_online_policy(OnlineDuringRebuild::Block);
+    let plan_block = planner_block
+        .plan(&ctx_default)
+        .expect("planner-default block");
+    assert_eq!(plan_block.online_during_rebuild, OnlineDuringRebuild::Block);
+
+    // Sub-case 3: per-context override beats the planner default.
+    // Builder set to Block, context overrides with Offline; the
+    // resulting plan carries Offline.
+    let ctx_offline = PlannerContext {
+        source: "ep-a".to_string(),
+        shard: ShardId::ZERO,
+        payload,
+        costs,
+        online_policy_override: Some(OnlineDuringRebuild::Offline),
+    };
+    let plan_offline = planner_block
+        .plan(&ctx_offline)
+        .expect("context override Offline");
+    assert_eq!(
+        plan_offline.online_during_rebuild,
+        OnlineDuringRebuild::Offline
+    );
+
+    // The policy never touches the cost arithmetic: cost breakdowns
+    // for the three plans are identical given the same payload and
+    // cost inputs.
+    assert_eq!(plan_default.cost_breakdown, plan_block.cost_breakdown);
+    assert_eq!(plan_block.cost_breakdown, plan_offline.cost_breakdown);
 }
