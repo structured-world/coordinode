@@ -268,6 +268,23 @@ fn json_to_value(v: &serde_json::Value) -> Value {
             if let Some(doc_val) = obj.get("_document") {
                 return Value::Document(json_to_rmpv(doc_val));
             }
+            if let Some(mv_val) = obj.get("_multi_vector") {
+                if let Some(arr) = mv_val.as_array() {
+                    let rows: Vec<Vec<f32>> = arr
+                        .iter()
+                        .filter_map(|row| row.as_array())
+                        .map(|row| {
+                            row.iter()
+                                .filter_map(|x| x.as_f64().map(|f| f as f32))
+                                .collect()
+                        })
+                        .collect();
+                    if let Some(v) = Value::try_multi_vector(rows) {
+                        return v;
+                    }
+                    return Value::Null;
+                }
+            }
             let map: std::collections::BTreeMap<String, Value> = obj
                 .iter()
                 .map(|(k, v)| (k.clone(), json_to_value(v)))

@@ -138,6 +138,15 @@ pub enum Value {
     /// Used for semi-structured data that doesn't fit a flat property model.
     /// 4MB size limit (configurable). See document-operations arch doc.
     Document(rmpv::Value),
+
+    /// Multi-vector value: ordered list of per-token f32 vectors with
+    /// identical dimensionality. Backs late-interaction retrieval models
+    /// (ColBERT v2, MaxSim) where a document is represented by several
+    /// token-level embeddings instead of a single pooled vector.
+    ///
+    /// Construction-time invariant: every row must have the same length.
+    /// Use [`Value::try_multi_vector`] to enforce this.
+    MultiVector(Vec<Vec<f32>>),
 }
 
 impl Value {
@@ -157,6 +166,7 @@ impl Value {
             Self::Geo(_) => "GEO",
             Self::Binary(_) => "BINARY",
             Self::Document(_) => "DOCUMENT",
+            Self::MultiVector(_) => "MULTIVECTOR",
         }
     }
 
@@ -193,6 +203,15 @@ impl Value {
                 ]),
             },
             Self::Document(v) => v.clone(),
+            Self::MultiVector(rows) => rmpv::Value::Array(
+                rows.iter()
+                    .map(|row| {
+                        rmpv::Value::Array(
+                            row.iter().map(|f| rmpv::Value::F64(*f as f64)).collect(),
+                        )
+                    })
+                    .collect(),
+            ),
         }
     }
 
@@ -273,6 +292,29 @@ impl Value {
         }
     }
 
+    /// Try to get as multi-vector slice (per-token f32 rows).
+    pub fn as_multi_vector(&self) -> Option<&[Vec<f32>]> {
+        match self {
+            Self::MultiVector(rows) => Some(rows),
+            _ => None,
+        }
+    }
+
+    /// Build a `Value::MultiVector` enforcing equal row width. Returns
+    /// `None` if `rows` is empty or if any row's length differs from the
+    /// first row's. A zero-row or zero-dim multi-vector has no recoverable
+    /// dimensionality and scoring against it is undefined.
+    pub fn try_multi_vector(rows: Vec<Vec<f32>>) -> Option<Self> {
+        let dim = rows.first()?.len();
+        if dim == 0 {
+            return None;
+        }
+        if rows.iter().any(|row| row.len() != dim) {
+            return None;
+        }
+        Some(Self::MultiVector(rows))
+    }
+
     /// Default maximum DOCUMENT property size in bytes (4MB).
     pub const DOCUMENT_MAX_SIZE: usize = 4 * 1024 * 1024;
 
@@ -313,6 +355,42 @@ mod tests {
             "GEO"
         );
         assert_eq!(Value::Binary(vec![]).type_name(), "BINARY");
+        assert_eq!(
+            Value::MultiVector(vec![vec![0.0], vec![1.0]]).type_name(),
+            "MULTIVECTOR"
+        );
+    }
+
+    #[test]
+    fn multi_vector_rejects_mixed_dim() {
+        assert!(Value::try_multi_vector(vec![vec![0.0, 1.0], vec![2.0]]).is_none());
+        assert!(Value::try_multi_vector(vec![]).is_none());
+        assert!(Value::try_multi_vector(vec![vec![]]).is_none());
+        let ok = Value::try_multi_vector(vec![vec![0.0, 1.0], vec![2.0, 3.0]]);
+        assert!(matches!(ok, Some(Value::MultiVector(_))));
+    }
+
+    #[test]
+    fn multi_vector_to_rmpv_shape() {
+        let mv = Value::MultiVector(vec![vec![0.5, 1.5], vec![2.5, 3.5]]);
+        let rmp = mv.to_rmpv();
+        let rmpv::Value::Array(outer) = rmp else {
+            unreachable!("MultiVector::to_rmpv must produce outer Array");
+        };
+        assert_eq!(outer.len(), 2);
+        for row in &outer {
+            let rmpv::Value::Array(inner) = row else {
+                unreachable!("MultiVector::to_rmpv must produce inner Array");
+            };
+            assert_eq!(inner.len(), 2);
+        }
+    }
+
+    #[test]
+    fn multi_vector_accessor() {
+        let mv = Value::MultiVector(vec![vec![1.0, 2.0]]);
+        assert_eq!(mv.as_multi_vector().map(|r| r.len()), Some(1));
+        assert_eq!(Value::Int(1).as_multi_vector(), None);
     }
 
     #[test]
@@ -370,6 +448,11 @@ mod tests {
                     rmpv::Value::Integer(42.into()),
                 )]),
             )])),
+            Value::MultiVector(vec![
+                vec![0.1, 0.2, 0.3],
+                vec![0.4, 0.5, 0.6],
+                vec![0.7, 0.8, 0.9],
+            ]),
         ];
 
         for val in &values {

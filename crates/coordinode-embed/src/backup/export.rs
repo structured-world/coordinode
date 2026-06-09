@@ -424,6 +424,7 @@ pub(crate) fn value_to_json(value: &Value) -> serde_json::Value {
         Value::Geo(g) => serde_json::json!({"_geo": g}),
         Value::Binary(b) => serde_json::json!({"_binary": hex::encode(b)}),
         Value::Document(v) => serde_json::json!({"_document": rmpv_to_json(v)}),
+        Value::MultiVector(rows) => serde_json::json!({"_multi_vector": rows}),
     }
 }
 

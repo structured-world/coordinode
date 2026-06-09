@@ -85,6 +85,21 @@ fn value_to_proto(value: &Value) -> common::PropertyValue {
             let _ = rmpv::encode::write_value(&mut bytes, v);
             Some(common::property_value::Value::BytesValue(bytes))
         }
+        Value::MultiVector(rows) => {
+            // Wire as list-of-vectors. Lossy on the type tag but preserves
+            // all numeric data so the client can reconstruct the matrix.
+            let items = rows
+                .iter()
+                .map(|row| common::PropertyValue {
+                    value: Some(common::property_value::Value::VectorValue(common::Vector {
+                        values: row.clone(),
+                    })),
+                })
+                .collect();
+            Some(common::property_value::Value::ListValue(
+                common::PropertyList { values: items },
+            ))
+        }
     };
     common::PropertyValue { value: v }
 }
