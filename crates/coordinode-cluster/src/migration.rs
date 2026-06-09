@@ -32,6 +32,8 @@
 //! on the target (graph-bytes mode still ships the f32 source of
 //! truth; serialised neighbours alone are not a complete index).
 
+use std::fmt;
+
 use coordinode_storage::engine::config::Tier;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -109,6 +111,40 @@ impl OnlineDuringRebuild {
             Self::PartialRecall => "partial_recall",
             Self::Offline => "offline",
         }
+    }
+}
+
+impl fmt::Display for OnlineDuringRebuild {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl fmt::Display for TransferMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl MigrationPlan {
+    /// Single-line operator-facing summary of the plan: source,
+    /// target, shard id, recommended transfer mode, online-during-
+    /// rebuild policy, and the estimated total cost in seconds.
+    /// Pinned format so log-scraping tools can parse it.
+    ///
+    /// ```text
+    /// migration plan: ep-a -> ep-b shard=0 mode=rebuild_from_data policy=partial_recall total=2.345s
+    /// ```
+    pub fn explain(&self) -> String {
+        format!(
+            "migration plan: {} -> {} shard={} mode={} policy={} total={:.3}s",
+            self.source,
+            self.target,
+            self.shard.0,
+            self.recommended_mode,
+            self.online_during_rebuild,
+            self.estimated_total_secs,
+        )
     }
 }
 
@@ -753,6 +789,48 @@ mod tests {
         };
         let plan = planner.plan(&ctx).expect("hot peer must be picked");
         assert_eq!(plan.target, "ep-hot-2");
+    }
+
+    #[test]
+    fn online_during_rebuild_display_matches_as_str() {
+        for variant in [
+            OnlineDuringRebuild::Block,
+            OnlineDuringRebuild::PartialRecall,
+            OnlineDuringRebuild::Offline,
+        ] {
+            assert_eq!(format!("{variant}"), variant.as_str());
+        }
+    }
+
+    #[test]
+    fn transfer_mode_display_matches_as_str() {
+        for mode in [TransferMode::RebuildFromData, TransferMode::ShipGraphBytes] {
+            assert_eq!(format!("{mode}"), mode.as_str());
+        }
+    }
+
+    #[test]
+    fn migration_plan_explain_format_is_stable() {
+        let plan = MigrationPlan {
+            source: "ep-a".to_string(),
+            target: "ep-b".to_string(),
+            shard: ShardId::ZERO,
+            payload: sample_payload(),
+            recommended_mode: TransferMode::RebuildFromData,
+            cost_breakdown: MigrationCost {
+                network_secs: 1.0,
+                rebuild_secs: 1.345,
+                graph_serialise_secs: 0.0,
+            },
+            estimated_total_secs: 2.345,
+            online_during_rebuild: OnlineDuringRebuild::PartialRecall,
+        };
+        let line = plan.explain();
+        assert_eq!(
+            line,
+            "migration plan: ep-a -> ep-b shard=0 mode=rebuild_from_data \
+             policy=partial_recall total=2.345s"
+        );
     }
 
     #[test]
