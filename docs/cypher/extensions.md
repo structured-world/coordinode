@@ -102,17 +102,21 @@ RETURN n ORDER BY vector_distance(n.embedding, $q) LIMIT 10;
 What pushes down today:
 
 - `:Label` from the MATCH pattern → `LabelEq(label)`.
-- `var.prop = literal` (or `literal = var.prop`) leaves connected by
-  top-level `AND` → `PropertyEq { property, value }`.
+- `var.prop = literal` (or `literal = var.prop`) → `PropertyEq`.
+- `var.prop CMP literal` (or `literal CMP var.prop`) where CMP is one of
+  `>`, `>=`, `<`, `<=` and the literal is numeric → `PropertyCmp`. The
+  reversed form `100 <= n.id` flips automatically to `n.id >= 100`.
+- All leaves above combined via top-level `AND`.
 
 What does NOT push down (stays as a post-filter):
 
-- Numeric range / inequality (`>`, `<=`, `BETWEEN`).
+- `BETWEEN` (use the two-sided `>=` AND `<=` form instead).
 - `IS NULL` / `IS NOT NULL`.
 - `OR`-branches (only top-level `AND` is decomposed).
 - Cross-variable predicates (`n.x = m.y`).
 - Parameter literals on the literal side (`$param`); deferred to a
   later optimisation that resolves params at plan time.
+- Non-numeric inequalities (`n.name > "M"`).
 
 Pushdown is transparent: it never changes the result set, only the
 search-time cost. The post-filter still runs and would catch any

@@ -14,6 +14,7 @@ pub mod vector_registry;
 
 pub mod text_registry;
 
+pub use crate::planner::logical::{NumericCmp, VectorPredicate};
 pub use definition::{
     IndexDefinition, IndexState, IndexType, OnlineDuringBuild, TextFieldConfig, TextIndexConfig,
     VectorIndexConfig,

@@ -109,8 +109,29 @@ pub enum VectorPredicate {
         property: String,
         value: coordinode_core::graph::types::Value,
     },
+    /// Node has a numeric property satisfying a comparison with a literal.
+    /// Used for VDBBench-style range filters (`n.id >= 100`,
+    /// `n.score < 0.5`). Non-numeric stored values reject the node.
+    PropertyCmp {
+        property: String,
+        op: NumericCmp,
+        /// Always a numeric literal at plan time. Stored as a `Value` so
+        /// the predicate matches the shape of `PropertyEq` and the
+        /// evaluator handles both with one msgpack lookup.
+        value: coordinode_core::graph::types::Value,
+    },
     /// Conjunction of two predicates; both must hold.
     And(Box<VectorPredicate>, Box<VectorPredicate>),
+}
+
+/// Six-way numeric comparison set used by [`VectorPredicate::PropertyCmp`].
+/// Stable wire identity: variants are part of the EXPLAIN contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericCmp {
+    Gt,
+    Ge,
+    Lt,
+    Le,
 }
 
 /// A logical operator in the query plan tree.

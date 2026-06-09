@@ -17,7 +17,7 @@ use coordinode_core::graph::types::Value;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 
-use crate::planner::logical::VectorPredicate;
+use crate::planner::logical::{NumericCmp, VectorPredicate};
 
 /// Evaluate `predicate` against the node identified by `node_id`.
 ///
@@ -63,10 +63,45 @@ pub fn evaluate_against(
             };
             values_equal(stored, value)
         }
+        VectorPredicate::PropertyCmp {
+            property,
+            op,
+            value,
+        } => {
+            let Some(fid) = field_lookup(property) else {
+                return false;
+            };
+            let Some(stored) = record.props.get(&fid) else {
+                return false;
+            };
+            let Some(stored_n) = numeric(stored) else {
+                return false;
+            };
+            let Some(target_n) = numeric(value) else {
+                return false;
+            };
+            match op {
+                NumericCmp::Gt => stored_n > target_n,
+                NumericCmp::Ge => stored_n >= target_n,
+                NumericCmp::Lt => stored_n < target_n,
+                NumericCmp::Le => stored_n <= target_n,
+            }
+        }
         VectorPredicate::And(left, right) => {
             evaluate_against(record, left, field_lookup)
                 && evaluate_against(record, right, field_lookup)
         }
+    }
+}
+
+/// Widen Int / Float to a single comparable f64 representation. Returns
+/// None for non-numeric types — keeps the comparison total over all
+/// `Value` variants without silent coercion of strings / bools / etc.
+fn numeric(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(i) => Some(*i as f64),
+        Value::Float(f) => Some(*f),
+        _ => None,
     }
 }
 
@@ -174,6 +209,58 @@ mod tests {
         };
         // `lookup_category` returns None for unknown names → false.
         assert!(!evaluate_against(&r, &pred, &lookup_category));
+    }
+
+    #[test]
+    fn property_cmp_numeric_branches() {
+        // category as numeric proxy: stored int 42, compared against 10/50.
+        let mut record = NodeRecord::new("Item");
+        record.props.insert(2, Value::Int(42));
+
+        let pred_ge_10 = VectorPredicate::PropertyCmp {
+            property: "category".into(),
+            op: NumericCmp::Ge,
+            value: Value::Int(10),
+        };
+        let pred_ge_50 = VectorPredicate::PropertyCmp {
+            property: "category".into(),
+            op: NumericCmp::Ge,
+            value: Value::Int(50),
+        };
+        let pred_lt_50 = VectorPredicate::PropertyCmp {
+            property: "category".into(),
+            op: NumericCmp::Lt,
+            value: Value::Int(50),
+        };
+        assert!(evaluate_against(&record, &pred_ge_10, &lookup_category));
+        assert!(!evaluate_against(&record, &pred_ge_50, &lookup_category));
+        assert!(evaluate_against(&record, &pred_lt_50, &lookup_category));
+    }
+
+    #[test]
+    fn property_cmp_int_float_widening() {
+        // Stored Int(42), threshold Float(41.5) — Int widens to f64.
+        let mut record = NodeRecord::new("Item");
+        record.props.insert(2, Value::Int(42));
+        let pred = VectorPredicate::PropertyCmp {
+            property: "category".into(),
+            op: NumericCmp::Gt,
+            value: Value::Float(41.5),
+        };
+        assert!(evaluate_against(&record, &pred, &lookup_category));
+    }
+
+    #[test]
+    fn property_cmp_non_numeric_value_rejects() {
+        // Stored Bool — cannot be cast to f64 → predicate fails closed.
+        let mut record = NodeRecord::new("Item");
+        record.props.insert(2, Value::Bool(true));
+        let pred = VectorPredicate::PropertyCmp {
+            property: "category".into(),
+            op: NumericCmp::Ge,
+            value: Value::Int(0),
+        };
+        assert!(!evaluate_against(&record, &pred, &lookup_category));
     }
 
     #[test]

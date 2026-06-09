@@ -4117,7 +4117,7 @@ fn collect_predicate_property_ids(
     use crate::planner::logical::VectorPredicate as VP;
     match predicate {
         VP::LabelEq(_) => {}
-        VP::PropertyEq { property, .. } => {
+        VP::PropertyEq { property, .. } | VP::PropertyCmp { property, .. } => {
             if let Some(fid) = interner.lookup(property) {
                 out.insert(property.clone(), fid);
             }

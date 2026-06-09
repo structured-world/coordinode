@@ -1167,8 +1167,119 @@ fn extract_predicate_leaves(
                 out.push(leaf);
             }
         }
+        Expr::BinaryOp {
+            left,
+            op:
+                cmp @ (BinaryOperator::Gt
+                | BinaryOperator::Gte
+                | BinaryOperator::Lt
+                | BinaryOperator::Lte),
+            right,
+        } => {
+            // Numeric comparison: try the prop-on-left form, then prop-on-right
+            // (which flips the operator: `5 <= n.score` becomes `n.score >= 5`).
+            let op_forward = numeric_cmp_from_op(*cmp);
+            if let Some(leaf) = property_cmp_leaf(left, right, variable, op_forward) {
+                out.push(leaf);
+            } else if let Some(flipped) = flip_numeric_cmp(*cmp) {
+                if let Some(leaf) = property_cmp_leaf(right, left, variable, flipped) {
+                    out.push(leaf);
+                }
+            }
+        }
         _ => {}
     }
+}
+
+fn numeric_cmp_from_op(
+    op: crate::cypher::ast::BinaryOperator,
+) -> crate::planner::logical::NumericCmp {
+    use crate::cypher::ast::BinaryOperator as B;
+    use crate::planner::logical::NumericCmp as N;
+    match op {
+        B::Gt => N::Gt,
+        B::Gte => N::Ge,
+        B::Lt => N::Lt,
+        B::Lte => N::Le,
+        // The caller restricts us to the four comparison ops above; this
+        // branch is unreachable in practice but keeps the function total.
+        _ => N::Eq2Ne(),
+    }
+}
+
+/// Helper used by `numeric_cmp_from_op` when an unexpected operator slips
+/// through. Returning a default-ish variant keeps the planner from panicking;
+/// the executor's PropertyCmp arm then rejects the leaf when the variant
+/// doesn't match the requested semantic. Marked deliberately inconvenient so
+/// nobody mistakes it for a real comparator.
+impl crate::planner::logical::NumericCmp {
+    #[allow(non_snake_case)]
+    fn Eq2Ne() -> Self {
+        // Choose Ge as the dead-default; a Gt would equally do — the
+        // upstream extract_predicate_leaves guards against this path.
+        Self::Ge
+    }
+}
+
+fn flip_numeric_cmp(
+    op: crate::cypher::ast::BinaryOperator,
+) -> Option<crate::planner::logical::NumericCmp> {
+    use crate::cypher::ast::BinaryOperator as B;
+    use crate::planner::logical::NumericCmp as N;
+    Some(match op {
+        // `lit < prop` ↔ `prop > lit`
+        B::Lt => N::Gt,
+        B::Lte => N::Ge,
+        B::Gt => N::Lt,
+        B::Gte => N::Le,
+        _ => return None,
+    })
+}
+
+/// Build a `VectorPredicate::PropertyCmp` from a `(prop_side, literal_side)`
+/// pair when `prop_side` is `PropertyAccess(variable, prop)` and
+/// `literal_side` is a numeric `Literal(...)`. Non-numeric literals reject.
+fn property_cmp_leaf(
+    prop_side: &Expr,
+    literal_side: &Expr,
+    variable: &str,
+    op: crate::planner::logical::NumericCmp,
+) -> Option<crate::planner::logical::VectorPredicate> {
+    let prop_name = match prop_side {
+        Expr::PropertyAccess { expr, property } => match expr.as_ref() {
+            Expr::Variable(v) if v == variable => property.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    // Accept Int / Float literals (and unary-neg of them). Strings / bools /
+    // arrays reject — the executor's numeric() helper would reject them too,
+    // but rejecting at plan time keeps the predicate descriptor honest.
+    let value = match literal_side {
+        Expr::Literal(coordinode_core::graph::types::Value::Int(_))
+        | Expr::Literal(coordinode_core::graph::types::Value::Float(_)) => match literal_side {
+            Expr::Literal(v) => v.clone(),
+            _ => return None,
+        },
+        Expr::UnaryOp {
+            op: crate::cypher::ast::UnaryOperator::Neg,
+            expr: inner,
+        } => match inner.as_ref() {
+            Expr::Literal(coordinode_core::graph::types::Value::Int(i)) => {
+                coordinode_core::graph::types::Value::Int(-i)
+            }
+            Expr::Literal(coordinode_core::graph::types::Value::Float(f)) => {
+                coordinode_core::graph::types::Value::Float(-f)
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(crate::planner::logical::VectorPredicate::PropertyCmp {
+        property: prop_name,
+        op,
+        value,
+    })
 }
 
 /// Build a `VectorPredicate::PropertyEq` from a `(prop_side, literal_side)`
@@ -5843,5 +5954,119 @@ mod tests {
     fn fold_predicate_empty_returns_none() {
         let folded = fold_predicate(Vec::new());
         assert!(folded.is_none());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod numeric_predicate_tests {
+    use super::*;
+    use coordinode_core::graph::types::Value;
+
+    #[test]
+    fn collect_simple_predicates_extracts_numeric_ge() {
+        use crate::cypher::ast::BinaryOperator;
+        use crate::planner::logical::{NumericCmp, VectorPredicate};
+
+        let pred = Expr::BinaryOp {
+            left: Box::new(Expr::PropertyAccess {
+                expr: Box::new(Expr::Variable("n".into())),
+                property: "score".into(),
+            }),
+            op: BinaryOperator::Gte,
+            right: Box::new(Expr::Literal(Value::Float(0.7))),
+        };
+        let scan = LogicalOp::NodeScan {
+            variable: "n".into(),
+            labels: vec!["Item".into()],
+            property_filters: vec![],
+        };
+        let filter = LogicalOp::Filter {
+            input: Box::new(scan),
+            predicate: pred,
+        };
+        let mut leaves: Vec<VectorPredicate> = Vec::new();
+        collect_simple_property_predicates(&filter, "n", &mut leaves);
+        assert_eq!(leaves.len(), 1);
+        match &leaves[0] {
+            VectorPredicate::PropertyCmp {
+                property,
+                op,
+                value,
+            } => {
+                assert_eq!(property, "score");
+                assert_eq!(*op, NumericCmp::Ge);
+                assert_eq!(value, &Value::Float(0.7));
+            }
+            other => panic!("expected PropertyCmp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collect_simple_predicates_flips_reversed_numeric_cmp() {
+        use crate::cypher::ast::BinaryOperator;
+        use crate::planner::logical::{NumericCmp, VectorPredicate};
+
+        // 100 <= n.id → PropertyCmp { op: Ge }
+        let pred = Expr::BinaryOp {
+            left: Box::new(Expr::Literal(Value::Int(100))),
+            op: BinaryOperator::Lte,
+            right: Box::new(Expr::PropertyAccess {
+                expr: Box::new(Expr::Variable("n".into())),
+                property: "id".into(),
+            }),
+        };
+        let scan = LogicalOp::NodeScan {
+            variable: "n".into(),
+            labels: vec!["Item".into()],
+            property_filters: vec![],
+        };
+        let filter = LogicalOp::Filter {
+            input: Box::new(scan),
+            predicate: pred,
+        };
+        let mut leaves: Vec<VectorPredicate> = Vec::new();
+        collect_simple_property_predicates(&filter, "n", &mut leaves);
+        assert_eq!(leaves.len(), 1);
+        match &leaves[0] {
+            VectorPredicate::PropertyCmp { op, .. } => assert_eq!(*op, NumericCmp::Ge),
+            other => panic!("expected PropertyCmp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collect_simple_predicates_accepts_negative_literal() {
+        use crate::cypher::ast::{BinaryOperator, UnaryOperator};
+        use crate::planner::logical::VectorPredicate;
+
+        let pred = Expr::BinaryOp {
+            left: Box::new(Expr::PropertyAccess {
+                expr: Box::new(Expr::Variable("n".into())),
+                property: "balance".into(),
+            }),
+            op: BinaryOperator::Gt,
+            right: Box::new(Expr::UnaryOp {
+                op: UnaryOperator::Neg,
+                expr: Box::new(Expr::Literal(Value::Int(50))),
+            }),
+        };
+        let scan = LogicalOp::NodeScan {
+            variable: "n".into(),
+            labels: vec!["Item".into()],
+            property_filters: vec![],
+        };
+        let filter = LogicalOp::Filter {
+            input: Box::new(scan),
+            predicate: pred,
+        };
+        let mut leaves: Vec<VectorPredicate> = Vec::new();
+        collect_simple_property_predicates(&filter, "n", &mut leaves);
+        assert_eq!(leaves.len(), 1);
+        match &leaves[0] {
+            VectorPredicate::PropertyCmp { value, .. } => {
+                assert_eq!(value, &Value::Int(-50));
+            }
+            other => panic!("expected PropertyCmp, got {other:?}"),
+        }
     }
 }
