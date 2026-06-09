@@ -2918,6 +2918,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             query_vector,
             query_text,
             shard_overfetch_cap,
+            fusion: _,
         } => {
             let rows = execute_op(input, ctx)?;
             execute_rank_fuse(

@@ -62,6 +62,37 @@ pub struct TemporalFilter {
     pub lower_ms: Option<i64>,
 }
 
+/// Score-fusion kernel for hybrid sparse+dense retrieval via the
+/// `RankFuse` operator. Selects how per-method scores combine into a
+/// single `__hybrid_score__` column.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FusionStrategy {
+    /// Reciprocal Rank Fusion: `Σ 1 / (k + rank_i)`. Rank-based, ignores
+    /// raw score scale, robust to outliers. Default `k = 60` matches the
+    /// Cormack et al. 2009 baseline.
+    Rrf { k: u32 },
+    /// Convex Combination: `Σ w_i × min_max_normalised(method_i)`. Score-
+    /// aware; weights must be positive but are not normalised by the
+    /// operator (caller decides). Methods with min == max contribute
+    /// zero (degenerate range, can't normalise).
+    ConvexCombination {
+        weights: std::collections::BTreeMap<String, f64>,
+    },
+    /// Distribution-Based Score Fusion: `Σ w_i × z_score(method_i)`.
+    /// Score-aware, robust to skewed distributions, but requires a
+    /// reasonable sample size (≥ ~20 rows) to estimate μ and σ.
+    /// Methods with σ == 0 contribute zero.
+    Dbsf {
+        weights: std::collections::BTreeMap<String, f64>,
+    },
+}
+
+impl Default for FusionStrategy {
+    fn default() -> Self {
+        Self::Rrf { k: 60 }
+    }
+}
+
 /// Cheap-to-evaluate predicate over a single node, pushed into the HNSW
 /// search path so the traversal can skip non-matching branches.
 ///
@@ -637,6 +668,10 @@ pub enum LogicalOp {
         /// single-node — always processes the full input. Shape ready for
         /// R-HYB5 without call-site changes.
         shard_overfetch_cap: Option<usize>,
+        /// Fusion kernel — RRF (default, rank-based) or score-aware variants.
+        /// Defaults to `Rrf { k: 60 }` so existing callers see no behavioural
+        /// change. New callers wire up `cc_score(...)` or `dbsf_score(...)`.
+        fusion: FusionStrategy,
     },
 
     /// Document-level aggregate score (R-HYB2c).
@@ -1947,6 +1982,7 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             query_vector,
             query_text,
             shard_overfetch_cap,
+            fusion,
         } => {
             let method_strs: Vec<String> = methods.iter().map(|m| format!("{m:?}")).collect();
             let mut query_parts = Vec::new();
@@ -1960,8 +1996,15 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
                 Some(cap) => format!(", cap={cap}"),
                 None => String::new(),
             };
+            let fusion_str = match fusion {
+                FusionStrategy::Rrf { k } => format!("rrf k={k}"),
+                FusionStrategy::ConvexCombination { weights } => {
+                    format!("cc weights={weights:?}")
+                }
+                FusionStrategy::Dbsf { weights } => format!("dbsf weights={weights:?}"),
+            };
             output.push_str(&format!(
-                "{prefix}RankFuse(methods=[{}], query={{{}}}, k=60{cap_str})\n",
+                "{prefix}RankFuse(methods=[{}], query={{{}}}, {fusion_str}{cap_str})\n",
                 method_strs.join(", "),
                 query_parts.join(", "),
             ));

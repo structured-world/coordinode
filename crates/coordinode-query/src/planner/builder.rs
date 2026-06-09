@@ -3448,6 +3448,7 @@ fn wrap_rank_fuse(op: LogicalOp, sig: &RrfCallSig, sort_touches_rrf: &mut bool) 
                 query_vector: sig.query_vector.clone(),
                 query_text: sig.query_text.clone(),
                 shard_overfetch_cap: None,
+                fusion: crate::planner::logical::FusionStrategy::default(),
             };
             LogicalOp::Project {
                 input: Box::new(fused_input),
