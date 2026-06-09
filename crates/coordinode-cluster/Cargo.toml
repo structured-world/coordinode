@@ -17,6 +17,7 @@ tracing = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
 rmp-serde = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "topology_throughput"
