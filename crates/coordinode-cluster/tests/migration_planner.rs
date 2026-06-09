@@ -120,6 +120,7 @@ fn planner_picks_remote_endpoint_when_source_fills_up() {
         shard: ShardId::ZERO,
         payload,
         costs,
+        online_policy_override: None,
     };
     let plan = planner.plan(&ctx).expect("planner must produce a plan");
 

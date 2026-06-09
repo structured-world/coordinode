@@ -230,6 +230,14 @@ pub struct PlannerContext {
     /// applies these to each candidate target. A future enhancement
     /// will allow per-target overrides.
     pub costs: CostInputs,
+    /// Per-context override of the read-side rebuild policy. When
+    /// `Some(_)`, the planner writes that variant into the emitted
+    /// plan regardless of the planner's configured default. When
+    /// `None`, the planner falls back to its own configured default
+    /// (set via [`LocalMigrationPlanner::with_online_policy`]) and
+    /// then to [`OnlineDuringRebuild::default`].
+    #[serde(default)]
+    pub online_policy_override: Option<OnlineDuringRebuild>,
 }
 
 /// Errors returned by the migration planner.
@@ -332,22 +340,41 @@ pub struct LocalMigrationPlanner<T: ClusterTopology> {
     topology: T,
     tier: Tier,
     modality: Modality,
+    default_online_policy: OnlineDuringRebuild,
 }
 
 impl<T: ClusterTopology> LocalMigrationPlanner<T> {
     /// Build a planner over the given topology, scoped to the tier
-    /// and modality of the source endpoint.
+    /// and modality of the source endpoint. The default online
+    /// policy is [`OnlineDuringRebuild::default`]; override with
+    /// [`Self::with_online_policy`].
     pub fn new(topology: T, tier: Tier, modality: Modality) -> Self {
         Self {
             topology,
             tier,
             modality,
+            default_online_policy: OnlineDuringRebuild::default(),
         }
+    }
+
+    /// Builder method: configure the default online-during-rebuild
+    /// policy for plans emitted by this planner. A per-context
+    /// override on [`PlannerContext::online_policy_override`] still
+    /// takes precedence over this default.
+    pub fn with_online_policy(mut self, policy: OnlineDuringRebuild) -> Self {
+        self.default_online_policy = policy;
+        self
     }
 
     /// Borrow the underlying topology (handy for tests / EXPLAIN).
     pub fn topology(&self) -> &T {
         &self.topology
+    }
+
+    /// The default online-during-rebuild policy the planner will
+    /// write into plans when the context does not override it.
+    pub fn default_online_policy(&self) -> OnlineDuringRebuild {
+        self.default_online_policy
     }
 }
 
@@ -379,6 +406,9 @@ impl<T: ClusterTopology> MigrationPlanner for LocalMigrationPlanner<T> {
         }
 
         let (target, mode, cost, total) = best.ok_or(MigrationPlannerError::NoCandidates)?;
+        let online_policy = ctx
+            .online_policy_override
+            .unwrap_or(self.default_online_policy);
         Ok(MigrationPlan {
             source: ctx.source.clone(),
             target,
@@ -387,7 +417,7 @@ impl<T: ClusterTopology> MigrationPlanner for LocalMigrationPlanner<T> {
             recommended_mode: mode,
             cost_breakdown: cost,
             estimated_total_secs: total,
-            online_during_rebuild: OnlineDuringRebuild::default(),
+            online_during_rebuild: online_policy,
         })
     }
 }
@@ -494,6 +524,7 @@ mod tests {
             shard: ShardId::ZERO,
             payload: sample_payload(),
             costs: sample_costs(),
+            online_policy_override: None,
         };
         let bytes = rmp_serde::to_vec(&ctx).expect("serialise");
         let back: PlannerContext = rmp_serde::from_slice(&bytes).expect("deserialise");
@@ -630,6 +661,7 @@ mod tests {
             shard: ShardId::ZERO,
             payload: sample_payload(),
             costs: sample_costs(),
+            online_policy_override: None,
         };
         let err = planner.plan(&ctx).expect_err("must reject single-node");
         assert!(matches!(err, MigrationPlannerError::NoCandidates));
@@ -653,6 +685,7 @@ mod tests {
             shard: ShardId::ZERO,
             payload: sample_payload(),
             costs: sample_costs(),
+            online_policy_override: None,
         };
         let plan = planner.plan(&ctx).expect("must produce a plan");
         // Source filtered out; target is one of the other two.
@@ -684,6 +717,7 @@ mod tests {
             shard: ShardId::ZERO,
             payload: sample_payload(),
             costs: sample_costs(),
+            online_policy_override: None,
         };
         let err = planner.plan(&ctx).expect_err("source absent must reject");
         assert!(matches!(err, MigrationPlannerError::SourceNotInTopology(_)));
@@ -715,9 +749,82 @@ mod tests {
             shard: ShardId::ZERO,
             payload: sample_payload(),
             costs: sample_costs(),
+            online_policy_override: None,
         };
         let plan = planner.plan(&ctx).expect("hot peer must be picked");
         assert_eq!(plan.target, "ep-hot-2");
+    }
+
+    #[test]
+    fn default_planner_emits_enum_default_policy() {
+        use crate::topology::SingleNodeTopology;
+        use crate::types::{FailureDomain, Modality, TopologyTree};
+        let tree = TopologyTree {
+            endpoints: vec![
+                FailureDomain::local("ep-a", Tier::Warm),
+                FailureDomain::local("ep-b", Tier::Warm),
+            ],
+        };
+        let topology = SingleNodeTopology::from_tree(tree);
+        let planner = LocalMigrationPlanner::new(topology, Tier::Warm, Modality::Vector);
+        let ctx = PlannerContext {
+            source: "ep-a".to_string(),
+            shard: ShardId::ZERO,
+            payload: sample_payload(),
+            costs: sample_costs(),
+            online_policy_override: None,
+        };
+        let plan = planner.plan(&ctx).expect("plan");
+        assert_eq!(plan.online_during_rebuild, OnlineDuringRebuild::default());
+    }
+
+    #[test]
+    fn planner_default_override_writes_into_plan() {
+        use crate::topology::SingleNodeTopology;
+        use crate::types::{FailureDomain, Modality, TopologyTree};
+        let tree = TopologyTree {
+            endpoints: vec![
+                FailureDomain::local("ep-a", Tier::Warm),
+                FailureDomain::local("ep-b", Tier::Warm),
+            ],
+        };
+        let topology = SingleNodeTopology::from_tree(tree);
+        let planner = LocalMigrationPlanner::new(topology, Tier::Warm, Modality::Vector)
+            .with_online_policy(OnlineDuringRebuild::Block);
+        assert_eq!(planner.default_online_policy(), OnlineDuringRebuild::Block);
+        let ctx = PlannerContext {
+            source: "ep-a".to_string(),
+            shard: ShardId::ZERO,
+            payload: sample_payload(),
+            costs: sample_costs(),
+            online_policy_override: None,
+        };
+        let plan = planner.plan(&ctx).expect("plan");
+        assert_eq!(plan.online_during_rebuild, OnlineDuringRebuild::Block);
+    }
+
+    #[test]
+    fn context_override_beats_planner_default() {
+        use crate::topology::SingleNodeTopology;
+        use crate::types::{FailureDomain, Modality, TopologyTree};
+        let tree = TopologyTree {
+            endpoints: vec![
+                FailureDomain::local("ep-a", Tier::Warm),
+                FailureDomain::local("ep-b", Tier::Warm),
+            ],
+        };
+        let topology = SingleNodeTopology::from_tree(tree);
+        let planner = LocalMigrationPlanner::new(topology, Tier::Warm, Modality::Vector)
+            .with_online_policy(OnlineDuringRebuild::Block);
+        let ctx = PlannerContext {
+            source: "ep-a".to_string(),
+            shard: ShardId::ZERO,
+            payload: sample_payload(),
+            costs: sample_costs(),
+            online_policy_override: Some(OnlineDuringRebuild::Offline),
+        };
+        let plan = planner.plan(&ctx).expect("plan");
+        assert_eq!(plan.online_during_rebuild, OnlineDuringRebuild::Offline);
     }
 
     #[test]
