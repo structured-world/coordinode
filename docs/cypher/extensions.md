@@ -54,6 +54,29 @@ DROP VECTOR INDEX product_embedding
 | `ef_construction` | 200 | Dynamic list size during build |
 | `metric` | `"cosine"` | Distance metric: `cosine`, `euclidean`, `dot` |
 | `dimensions` | — | Vector dimensionality (required) |
+| `quantization` | `"none"` | In-RAM codec: `none`, `sq8`, `rabitq`, `rabitq-2bit`, `rabitq-3bit`, `rabitq-4bit` |
+| `online_during_build` | `"block"` | Reader behaviour while the index backfills (see below) |
+
+#### Online-during-build policy
+
+`CREATE VECTOR INDEX` returns immediately after persisting the definition;
+the HNSW graph is populated by a background backfill thread. Queries that
+arrive before the backfill finishes are governed by `online_during_build`:
+
+| Value | Behaviour |
+|-------|-----------|
+| `"block"` (default) | Reader polls the persisted state up to 30 seconds, then proceeds when the index reaches `Ready`. Matches the legacy synchronous semantic for callers that just want "do the right thing". |
+| `"partial-recall"` | Reader hits the partial HNSW graph immediately. Recall improves as the backfill writes more vectors; useful when search latency matters more than completeness. |
+| `"offline"` | Reader gets an error so it can pick a fallback path (e.g. brute force, alternative index, or queueing). |
+
+A backfill that aborts (panic, write error) lands the index in the `Failed`
+state and every reader sees an error regardless of policy. A subsequent
+engine reopen rebuilds the HNSW from on-disk vectors and resets the state
+to `Ready` automatically.
+
+The CREATE response row includes a `state` field (`"building" | "ready" |
+"failed"`) so clients can poll for completion or surface the status in a
+control plane.
 
 ### Vector Query Functions ✅
 

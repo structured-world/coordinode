@@ -995,3 +995,67 @@ fn online_during_build_partial_recall_does_not_block() {
         )
         .expect("partial-recall search must not error");
 }
+
+/// Crash-recovery: an index whose persisted state is `Building` (because
+/// the engine crashed mid-backfill) is rebuilt on reopen and the state is
+/// reset to `Ready`. Verified by writing a Building marker into the schema
+/// without going through the executor, closing the DB, and reopening.
+#[test]
+fn building_state_resets_to_ready_on_reopen() {
+    use coordinode_query::index::{ops as index_ops, IndexState};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().to_path_buf();
+
+    // Phase 1: open, create index synchronously, close.
+    {
+        let mut db = coordinode_embed::Database::open(&path).expect("first open");
+        db.execute_cypher("CREATE (n:Item {embedding: [1.0, 0.0, 0.0]})")
+            .expect("node");
+        db.execute_cypher(
+            "CREATE VECTOR INDEX item_emb ON :Item(embedding) OPTIONS {metric: \"cosine\"}",
+        )
+        .expect("create");
+
+        // Inject a stale Building marker directly via the storage engine,
+        // simulating a crash that left the backfill half-done.
+        let storage = db.engine();
+        index_ops::save_index_state(
+            storage,
+            "item_emb",
+            IndexState::Building {
+                written: 0,
+                estimated_total: 1,
+            },
+        )
+        .expect("inject Building state");
+
+        // db drops here, releasing the engine.
+    }
+
+    // Phase 2: reopen. The HNSW rebuild path should flip the state back
+    // to Ready after re-populating the graph from node records.
+    {
+        let mut db = coordinode_embed::Database::open(&path).expect("reopen");
+        let storage = db.engine();
+        let def = index_ops::load_index_definition(storage, "item_emb")
+            .expect("load")
+            .expect("def present after reopen");
+        assert_eq!(
+            def.state,
+            IndexState::Ready,
+            "reopen should reset stale Building to Ready"
+        );
+
+        // And the rebuilt index serves searches without the block gate
+        // hanging on a stale state.
+        let rows = db
+            .execute_cypher(
+                "MATCH (n:Item) \
+                 WHERE vector_similarity(n.embedding, [1.0, 0.0, 0.0]) > 0.9 \
+                 RETURN n.embedding AS vec",
+            )
+            .expect("post-reopen search");
+        assert_eq!(rows.len(), 1);
+    }
+}

@@ -824,6 +824,42 @@ impl Database {
                 vectors = count,
                 "rebuilt HNSW index on reopen"
             );
+
+            // Crash-recovery cleanup: a backfill that was interrupted (state
+            // == Building) or that aborted (state == Failed) leaves stale
+            // markers in schema. The full-scan rebuild above already
+            // repopulated the in-memory HNSW from every node record, so the
+            // index is consistent with on-disk data; flip the persisted
+            // state back to Ready to match.
+            let needs_state_reset =
+                !matches!(def.state, coordinode_query::index::IndexState::Ready);
+            if needs_state_reset {
+                match coordinode_query::index::ops::save_index_state(
+                    engine,
+                    &def.name,
+                    coordinode_query::index::IndexState::Ready,
+                ) {
+                    Ok(true) => tracing::info!(
+                        index = %def.name,
+                        prior = ?def.state,
+                        "reset stale index state to Ready after rebuild"
+                    ),
+                    Ok(false) => tracing::warn!(
+                        index = %def.name,
+                        "save_index_state returned false during state reset"
+                    ),
+                    Err(e) => tracing::warn!(
+                        index = %def.name,
+                        error = %e,
+                        "failed to reset index state after rebuild"
+                    ),
+                }
+                registry.set_state(
+                    &def.label,
+                    def.property(),
+                    coordinode_query::index::IndexState::Ready,
+                );
+            }
         }
 
         registry
