@@ -149,6 +149,37 @@ RETURN doc_score(d, $query_vec, {alpha: 0.7, beta: 0.2, gamma: 0.1}) AS score
 | Function | Signature | Returns | Notes |
 |----------|-----------|---------|-------|
 | `rrf_score` | `rrf_score([method_exprs...], {vector: ..., text: ...})` | Float | Reciprocal Rank Fusion over N scoring methods |
+| `cc_score` | `cc_score([method_exprs...], {vector: ..., text: ...}, {vector: w_v, text: w_t})` | Float | Convex Combination: weighted sum of min-max normalised scores |
+| `dbsf_score` | `dbsf_score([method_exprs...], {vector: ..., text: ...}, {vector: w_v, text: w_t})` | Float | Distribution-Based Score Fusion: weighted sum of z-score normalised scores |
+
+#### Picking a fusion strategy
+
+- **RRF** — rank-only, ignores raw score scale. Best default; robust when score distributions across methods are wildly different (BM25 vs cosine).
+- **Convex Combination** — score-aware, min-max normalised then weighted sum. Best when you have a known weighting between methods and the score range is well-behaved over the materialised batch.
+- **DBSF** — score-aware, z-score normalised then weighted sum. Best when scores within a method are roughly normally distributed and the batch is large enough (N ≥ ~20) for σ to be meaningful.
+
+Score-aware variants take a weights map as the third argument. Weights are positive numeric literals keyed by method category (`vector` / `text`); they are NOT auto-normalised, so the caller controls the sum.
+
+```cypher
+// CC: 60% vector + 40% text, score-aware blending.
+MATCH (c:Chunk)
+RETURN c.text,
+       cc_score([c.embedding, c.body],
+                {vector: $query_vec, text: $query_text},
+                {vector: 0.6, text: 0.4}) AS score
+ORDER BY score DESC LIMIT 20
+```
+
+```cypher
+// DBSF: equal-weight z-score blending — useful when both methods have
+// roughly normal score distributions over the materialised batch.
+MATCH (c:Chunk)
+RETURN c.text,
+       dbsf_score([c.embedding, c.body],
+                  {vector: $query_vec, text: $query_text},
+                  {vector: 0.5, text: 0.5}) AS score
+ORDER BY score DESC LIMIT 20
+```
 
 `rrf_score` fuses multiple scoring methods (vector similarity, BM25 text match, edge vector) into one ranking by summing `1 / (60 + rank_i)` across methods. Rank is positional over the full result set, so this is a materialising operator — the planner inserts a `RankFuse` stage that scores every row, sorts per method, assigns 1-based competition ranks (ties share a rank), and writes the fused score to the row. The constant `k = 60` is the IR standard from Cormack et al. 2009 and is deliberately non-tunable — freezing `k` is part of the stable API contract.
 
