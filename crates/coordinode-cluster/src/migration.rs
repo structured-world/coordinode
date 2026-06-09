@@ -64,6 +64,52 @@ pub struct MigrationPlan {
     /// Total wall-clock estimate (seconds). Cached for convenience;
     /// always equals `cost_breakdown.total_secs()`.
     pub estimated_total_secs: f64,
+    /// Read-side contract on the target while the rebuild is in
+    /// flight. See [`OnlineDuringRebuild`]. Defaults to the
+    /// enum default when older on-wire formats lack the field.
+    #[serde(default)]
+    pub online_during_rebuild: OnlineDuringRebuild,
+}
+
+/// Read-side contract on the migration target while the HNSW graph
+/// is being rebuilt. The cluster ships the policy as part of the
+/// plan so the executor on the target side knows up front whether
+/// to fail, partially-serve, or block search requests for the
+/// shard during the rebuild window.
+///
+/// The vocabulary mirrors the index-DDL `OnlineDuringBuild` enum
+/// for fresh `CREATE VECTOR INDEX` builds so operator tooling can
+/// reason about both lifecycles with one mental model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnlineDuringRebuild {
+    /// Target rejects searches for the shard until the rebuild
+    /// finishes. Strongest correctness; worst latency tail. Pick
+    /// this for shards where partial answers are unacceptable.
+    Block,
+    /// Target serves searches against the partially-rebuilt graph.
+    /// Recall drops below the steady-state target during the
+    /// rebuild window; the caller learns via a partial-result flag
+    /// on the response. Pick this for best-effort workloads.
+    /// Default for new plans.
+    #[default]
+    PartialRecall,
+    /// Target answers no search for the shard until the rebuild
+    /// completes. Reads on the shard fall back to the source (which
+    /// has not yet been decommissioned) via the routing layer.
+    Offline,
+}
+
+impl OnlineDuringRebuild {
+    /// String tag used in logs and EXPLAIN output. Lower-case
+    /// snake-case, matching the serde representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::PartialRecall => "partial_recall",
+            Self::Offline => "offline",
+        }
+    }
 }
 
 /// How to physically move a shard from source to target.
@@ -341,6 +387,7 @@ impl<T: ClusterTopology> MigrationPlanner for LocalMigrationPlanner<T> {
             recommended_mode: mode,
             cost_breakdown: cost,
             estimated_total_secs: total,
+            online_during_rebuild: OnlineDuringRebuild::default(),
         })
     }
 }
@@ -371,6 +418,30 @@ mod tests {
             network_secs: 0.01,
             rebuild_secs: 2.0,
             graph_serialise_secs: 0.0,
+        }
+    }
+
+    #[test]
+    fn online_during_rebuild_default_is_partial_recall() {
+        assert_eq!(
+            OnlineDuringRebuild::default(),
+            OnlineDuringRebuild::PartialRecall
+        );
+    }
+
+    #[test]
+    fn online_during_rebuild_as_str_matches_serde_tag() {
+        for variant in [
+            OnlineDuringRebuild::Block,
+            OnlineDuringRebuild::PartialRecall,
+            OnlineDuringRebuild::Offline,
+        ] {
+            let bytes = rmp_serde::to_vec(&variant).expect("serialise");
+            let back: OnlineDuringRebuild = rmp_serde::from_slice(&bytes).expect("deserialise");
+            assert_eq!(back, variant);
+            let tag = variant.as_str();
+            assert!(!tag.is_empty());
+            assert!(tag.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
         }
     }
 
@@ -409,6 +480,7 @@ mod tests {
             recommended_mode: TransferMode::RebuildFromData,
             cost_breakdown: sample_cost_breakdown(),
             estimated_total_secs: sample_cost_breakdown().total_secs(),
+            online_during_rebuild: OnlineDuringRebuild::Block,
         };
         let bytes = rmp_serde::to_vec(&plan).expect("serialise");
         let back: MigrationPlan = rmp_serde::from_slice(&bytes).expect("deserialise");

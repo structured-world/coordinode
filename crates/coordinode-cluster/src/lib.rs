@@ -136,8 +136,8 @@ pub mod types;
 pub use error::{TopologyError, TopologyResult};
 pub use migration::{
     estimate_cost, pick_recommended_mode, CostInputs, LocalMigrationPlanner, MigrationCost,
-    MigrationPlan, MigrationPlanner, MigrationPlannerError, PayloadEstimate, PlannerContext,
-    TransferMode,
+    MigrationPlan, MigrationPlanner, MigrationPlannerError, OnlineDuringRebuild, PayloadEstimate,
+    PlannerContext, TransferMode,
 };
 pub use routing::{ShardRouting, SingleShardRouting};
 pub use topology::{ClusterTopology, SingleNodeTopology};
