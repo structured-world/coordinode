@@ -1025,6 +1025,23 @@ pub fn annotate_vector_top_k(
                 _ => None,
             };
 
+            // Synthesise a pushdown predicate from sibling label + simple
+            // WHERE leaves matching the same variable. Conservative: only
+            // produce a predicate when we have a concrete label OR at least
+            // one `var.prop = literal` leaf — anything else stays None and
+            // the executor falls back to unfiltered HNSW.
+            let predicate = predicate.or_else(|| {
+                let var_str = variable.as_deref()?;
+                let mut leaves: Vec<crate::planner::logical::VectorPredicate> = Vec::new();
+                if let Some(lbl) = label {
+                    leaves.push(crate::planner::logical::VectorPredicate::LabelEq(
+                        lbl.to_string(),
+                    ));
+                }
+                collect_simple_property_predicates(&input, var_str, &mut leaves);
+                fold_predicate(leaves)
+            });
+
             // Recurse into input.
             let input = Box::new(annotate_vector_top_k(*input, registry));
 
@@ -1091,6 +1108,106 @@ pub fn annotate_vector_top_k(
 }
 
 /// Extract a single label from a NodeScan (or Filter over NodeScan) in the plan subtree.
+/// Walk an op tree below a VectorTopK and harvest every simple
+/// `variable.property = literal` predicate that references the same
+/// variable. Pushed as `VectorPredicate::PropertyEq` leaves onto `out`.
+///
+/// Conservative: only matches `Filter { predicate: BinaryOp Eq }` nodes
+/// where both sides reduce to (`PropertyAccess(var, prop)` and
+/// `Literal(...)`). Anything more complex (numeric range, IS NULL, OR
+/// branches, parameters) is ignored; the executor falls back to the
+/// post-filter for those.
+fn collect_simple_property_predicates(
+    op: &LogicalOp,
+    variable: &str,
+    out: &mut Vec<crate::planner::logical::VectorPredicate>,
+) {
+    match op {
+        LogicalOp::Filter { input, predicate } => {
+            extract_predicate_leaves(predicate, variable, out);
+            collect_simple_property_predicates(input, variable, out);
+        }
+        LogicalOp::Project { input, .. }
+        | LogicalOp::Sort { input, .. }
+        | LogicalOp::Limit { input, .. }
+        | LogicalOp::Skip { input, .. } => {
+            collect_simple_property_predicates(input, variable, out);
+        }
+        _ => {}
+    }
+}
+
+/// Pull `VectorPredicate::PropertyEq` leaves out of a single Cypher
+/// expression. Recurses into top-level `AND` conjunctions so a filter
+/// like `n.category = 'X' AND n.active = true` yields two leaves.
+fn extract_predicate_leaves(
+    expr: &Expr,
+    variable: &str,
+    out: &mut Vec<crate::planner::logical::VectorPredicate>,
+) {
+    use crate::cypher::ast::BinaryOperator;
+
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            extract_predicate_leaves(left, variable, out);
+            extract_predicate_leaves(right, variable, out);
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            if let Some(leaf) = property_eq_leaf(left, right, variable)
+                .or_else(|| property_eq_leaf(right, left, variable))
+            {
+                out.push(leaf);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Build a `VectorPredicate::PropertyEq` from a `(prop_side, literal_side)`
+/// pair when `prop_side` is `PropertyAccess(variable, prop)` and
+/// `literal_side` is a `Literal(...)` of a directly-comparable type.
+fn property_eq_leaf(
+    prop_side: &Expr,
+    literal_side: &Expr,
+    variable: &str,
+) -> Option<crate::planner::logical::VectorPredicate> {
+    let prop_name = match prop_side {
+        Expr::PropertyAccess { expr, property } => match expr.as_ref() {
+            Expr::Variable(v) if v == variable => property.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let value = match literal_side {
+        Expr::Literal(v) => v.clone(),
+        _ => return None,
+    };
+    Some(crate::planner::logical::VectorPredicate::PropertyEq {
+        property: prop_name,
+        value,
+    })
+}
+
+/// Combine a vector of leaves into a single `VectorPredicate` via nested
+/// `And`. Returns `None` for empty input so the caller falls back to the
+/// "no predicate" path.
+fn fold_predicate(
+    mut leaves: Vec<crate::planner::logical::VectorPredicate>,
+) -> Option<crate::planner::logical::VectorPredicate> {
+    let first = leaves.pop()?;
+    Some(leaves.into_iter().rev().fold(first, |acc, leaf| {
+        crate::planner::logical::VectorPredicate::And(Box::new(leaf), Box::new(acc))
+    }))
+}
+
 fn extract_scan_label(op: &LogicalOp) -> Option<&str> {
     match op {
         LogicalOp::NodeScan { labels, .. } if labels.len() == 1 => Some(&labels[0]),
@@ -5396,5 +5513,183 @@ mod tests {
         assert!(explain.contains("TRANSFER b→a"), "explain: {explain}");
         assert!(explain.contains("DUP_MERGE"), "explain: {explain}");
         assert!(explain.contains("+EDGE_PROPS"), "explain: {explain}");
+    }
+
+    // ── VectorPredicate harvesting from MATCH+WHERE ──────────────────────
+
+    #[test]
+    fn collect_simple_predicates_extracts_property_eq() {
+        use crate::cypher::ast::BinaryOperator;
+        use crate::planner::logical::VectorPredicate;
+
+        // Filter { input: NodeScan(:Item) , predicate: n.category = "X" }
+        let scan = LogicalOp::NodeScan {
+            variable: "n".into(),
+            labels: vec!["Item".into()],
+            property_filters: vec![],
+        };
+        let pred = Expr::BinaryOp {
+            left: Box::new(Expr::PropertyAccess {
+                expr: Box::new(Expr::Variable("n".into())),
+                property: "category".into(),
+            }),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Literal(Value::String("X".into()))),
+        };
+        let filter = LogicalOp::Filter {
+            input: Box::new(scan),
+            predicate: pred,
+        };
+
+        let mut leaves: Vec<VectorPredicate> = Vec::new();
+        collect_simple_property_predicates(&filter, "n", &mut leaves);
+        assert_eq!(leaves.len(), 1);
+        match &leaves[0] {
+            VectorPredicate::PropertyEq { property, value } => {
+                assert_eq!(property, "category");
+                assert_eq!(value, &Value::String("X".into()));
+            }
+            other => panic!("expected PropertyEq, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collect_simple_predicates_handles_reversed_eq() {
+        use crate::cypher::ast::BinaryOperator;
+        use crate::planner::logical::VectorPredicate;
+
+        // Predicate written as `"X" = n.category` (literal on the left).
+        let scan = LogicalOp::NodeScan {
+            variable: "n".into(),
+            labels: vec!["Item".into()],
+            property_filters: vec![],
+        };
+        let pred = Expr::BinaryOp {
+            left: Box::new(Expr::Literal(Value::String("X".into()))),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::PropertyAccess {
+                expr: Box::new(Expr::Variable("n".into())),
+                property: "category".into(),
+            }),
+        };
+        let filter = LogicalOp::Filter {
+            input: Box::new(scan),
+            predicate: pred,
+        };
+
+        let mut leaves: Vec<VectorPredicate> = Vec::new();
+        collect_simple_property_predicates(&filter, "n", &mut leaves);
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(leaves[0], VectorPredicate::PropertyEq { .. }));
+    }
+
+    #[test]
+    fn collect_simple_predicates_unwraps_conjunctions() {
+        use crate::cypher::ast::BinaryOperator;
+        use crate::planner::logical::VectorPredicate;
+
+        // n.category = "X" AND n.active = true
+        let left = Expr::BinaryOp {
+            left: Box::new(Expr::PropertyAccess {
+                expr: Box::new(Expr::Variable("n".into())),
+                property: "category".into(),
+            }),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Literal(Value::String("X".into()))),
+        };
+        let right = Expr::BinaryOp {
+            left: Box::new(Expr::PropertyAccess {
+                expr: Box::new(Expr::Variable("n".into())),
+                property: "active".into(),
+            }),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Literal(Value::Bool(true))),
+        };
+        let pred = Expr::BinaryOp {
+            left: Box::new(left),
+            op: BinaryOperator::And,
+            right: Box::new(right),
+        };
+
+        let scan = LogicalOp::NodeScan {
+            variable: "n".into(),
+            labels: vec!["Item".into()],
+            property_filters: vec![],
+        };
+        let filter = LogicalOp::Filter {
+            input: Box::new(scan),
+            predicate: pred,
+        };
+
+        let mut leaves: Vec<VectorPredicate> = Vec::new();
+        collect_simple_property_predicates(&filter, "n", &mut leaves);
+        assert_eq!(leaves.len(), 2);
+        for leaf in &leaves {
+            assert!(matches!(leaf, VectorPredicate::PropertyEq { .. }));
+        }
+    }
+
+    #[test]
+    fn collect_simple_predicates_ignores_other_variable() {
+        use crate::cypher::ast::BinaryOperator;
+        use crate::planner::logical::VectorPredicate;
+
+        // m.category = "X" — wrong variable name relative to vector top-k.
+        let pred = Expr::BinaryOp {
+            left: Box::new(Expr::PropertyAccess {
+                expr: Box::new(Expr::Variable("m".into())),
+                property: "category".into(),
+            }),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Literal(Value::String("X".into()))),
+        };
+        let scan = LogicalOp::NodeScan {
+            variable: "n".into(),
+            labels: vec!["Item".into()],
+            property_filters: vec![],
+        };
+        let filter = LogicalOp::Filter {
+            input: Box::new(scan),
+            predicate: pred,
+        };
+
+        let mut leaves: Vec<VectorPredicate> = Vec::new();
+        collect_simple_property_predicates(&filter, "n", &mut leaves);
+        assert!(leaves.is_empty());
+    }
+
+    #[test]
+    fn fold_predicate_chains_into_and() {
+        use crate::planner::logical::VectorPredicate;
+
+        let leaves = vec![
+            VectorPredicate::LabelEq("Item".into()),
+            VectorPredicate::PropertyEq {
+                property: "category".into(),
+                value: Value::String("X".into()),
+            },
+        ];
+        let folded = fold_predicate(leaves).expect("non-empty");
+        match folded {
+            VectorPredicate::And(l, r) => {
+                assert!(matches!(*l, VectorPredicate::LabelEq(_)));
+                assert!(matches!(*r, VectorPredicate::PropertyEq { .. }));
+            }
+            other => panic!("expected And, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fold_predicate_single_leaf_is_unwrapped() {
+        use crate::planner::logical::VectorPredicate;
+        let folded =
+            fold_predicate(vec![VectorPredicate::LabelEq("Item".into())]).expect("single leaf");
+        assert!(matches!(folded, VectorPredicate::LabelEq(_)));
+    }
+
+    #[test]
+    fn fold_predicate_empty_returns_none() {
+        let folded = fold_predicate(Vec::new());
+        assert!(folded.is_none());
     }
 }
