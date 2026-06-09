@@ -1999,6 +1999,40 @@ fn rewrite_top_k_at_root(op: LogicalOp) -> LogicalOp {
         };
     }
 
+    // Pattern A2: the sort expression is a direct maxsim_score call.
+    // ColBERT-style late-interaction: DESC order always (higher score wins).
+    if let Some((doc_expr, query_expr)) = match_maxsim_score_call(&sort_item.expr) {
+        if sort_item.ascending {
+            // ASC would mean "lowest similarity first" which is never the
+            // intent for late-interaction retrieval. Fall back to the
+            // generic Sort + Limit so the user's literal request stands.
+            return reconstruct_limit_sort(k, sort_item, *sort_input);
+        }
+        // Correctness check: when Sort.input is a Project that does NOT
+        // carry through the variable bound to the doc property, MaxSimTopK
+        // would see rows missing the multi-vector and score zero. The
+        // generic Sort + Limit path computes against the original row
+        // which still binds the variable. Fall back in that case.
+        if let LogicalOp::Project { items, .. } = sort_input.as_ref() {
+            if !project_preserves_vector_expr(&doc_expr, items) {
+                return LogicalOp::Limit {
+                    input: Box::new(LogicalOp::Sort {
+                        input: sort_input,
+                        items: vec![sort_item],
+                    }),
+                    count,
+                };
+            }
+        }
+        return LogicalOp::MaxSimTopK {
+            input: sort_input,
+            doc_expr,
+            query_expr,
+            k,
+            score_alias: None,
+        };
+    }
+
     // Pattern B: sort expr is a variable reference to an alias defined in
     // the inner Project.
     let alias_name = match &sort_item.expr {
@@ -2156,6 +2190,18 @@ fn match_vector_distance_call(expr: &Expr) -> Option<(Expr, Expr, String)> {
         ) && args.len() == 2
         {
             return Some((args[0].clone(), args[1].clone(), name.clone()));
+        }
+    }
+    None
+}
+
+/// Match a `maxsim_score(doc_expr, query_expr)` call shape used by the
+/// MaxSimTopK rewrite. Returns `(doc_expr, query_expr)` when the call
+/// matches; otherwise `None`.
+fn match_maxsim_score_call(expr: &Expr) -> Option<(Expr, Expr)> {
+    if let Expr::FunctionCall { name, args, .. } = expr {
+        if name == "maxsim_score" && args.len() == 2 {
+            return Some((args[0].clone(), args[1].clone()));
         }
     }
     None

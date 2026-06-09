@@ -2765,6 +2765,14 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         LogicalOp::ShowTriggers => execute_show_triggers(ctx),
         LogicalOp::AlterTrigger { clause } => execute_alter_trigger(clause, ctx),
 
+        LogicalOp::MaxSimTopK {
+            input,
+            doc_expr,
+            query_expr,
+            k,
+            score_alias,
+        } => execute_maxsim_top_k(input, doc_expr, query_expr, *k, score_alias.as_deref(), ctx),
+
         LogicalOp::Empty => Ok(vec![Row::new()]),
 
         LogicalOp::CreateNode {
@@ -5340,6 +5348,121 @@ fn execute_doc_score(
     }
 
     Ok(out_rows)
+}
+
+/// Execute MaxSimTopK: late-interaction (ColBERT-style) top-K via the
+/// MaxSim scalar with a bounded min-heap. Brute-force over the input
+/// rows in v1; replaces the generic Sort + Limit pipeline with an
+/// O(N log K) pass that never materialises the full sort buffer.
+fn execute_maxsim_top_k(
+    input: &LogicalOp,
+    doc_expr: &Expr,
+    query_expr: &Expr,
+    k: usize,
+    score_alias: Option<&str>,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    let rows = execute_op(input, ctx)?;
+    if k == 0 || rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let query_val = eval_expr(query_expr, &Row::new());
+    let query = coerce_value_to_multi_vector(&query_val);
+    let Some(query) = query else {
+        // Mirror the scalar's degenerate behaviour: missing / malformed
+        // query yields no rows rather than a hard error so a plan that
+        // pre-binds a stale parameter still completes.
+        return Ok(Vec::new());
+    };
+
+    use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
+
+    // Wrap (score, row_index) so we can use the std BinaryHeap as a
+    // bounded min-heap on score. The row index is the tie-breaker and
+    // keeps the heap order deterministic when scores collide.
+    #[derive(Debug)]
+    struct Scored {
+        score: f32,
+        idx: usize,
+    }
+    impl Eq for Scored {}
+    impl PartialEq for Scored {
+        fn eq(&self, other: &Self) -> bool {
+            self.score == other.score && self.idx == other.idx
+        }
+    }
+    impl Ord for Scored {
+        fn cmp(&self, other: &Self) -> Ordering {
+            // Reverse score for min-at-top, then natural idx order.
+            other
+                .score
+                .partial_cmp(&self.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| self.idx.cmp(&other.idx))
+        }
+    }
+    impl PartialOrd for Scored {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let mut heap: BinaryHeap<Scored> = BinaryHeap::with_capacity(k.saturating_add(1));
+    let mut scores: Vec<f32> = Vec::with_capacity(rows.len());
+
+    for (idx, row) in rows.iter().enumerate() {
+        let doc_val = eval_expr(doc_expr, row);
+        let Some(doc) = coerce_value_to_multi_vector(&doc_val) else {
+            scores.push(f32::NEG_INFINITY);
+            continue;
+        };
+        let score = coordinode_vector::metrics::maxsim(&doc, &query);
+        scores.push(score);
+        heap.push(Scored { score, idx });
+        if heap.len() > k {
+            heap.pop();
+        }
+    }
+
+    // Drain into descending-score order. `into_sorted_vec` sorts
+    // ascending by our reversed Ord (min-score at the top of the
+    // heap), which means the natural produced order is already
+    // descending by actual score.
+    let picks: Vec<Scored> = heap.into_sorted_vec();
+
+    let mut out = Vec::with_capacity(picks.len());
+    for pick in picks {
+        let mut row = rows[pick.idx].clone();
+        if let Some(alias) = score_alias {
+            row.insert(alias.to_string(), Value::Float(pick.score as f64));
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
+/// Coerce a Value to a multi-vector matrix for the MaxSim executor.
+/// Mirrors the eval-layer helper but lives next to its single caller
+/// so the executor doesn't have to depend on the private eval helper.
+fn coerce_value_to_multi_vector(val: &Value) -> Option<Vec<Vec<f32>>> {
+    match val {
+        Value::MultiVector(rows) => Some(rows.clone()),
+        Value::Array(arr) => {
+            let mut rows: Vec<Vec<f32>> = Vec::with_capacity(arr.len());
+            for item in arr {
+                let row = coerce_value_to_vec(item)?;
+                rows.push(row);
+            }
+            let width = rows.first().map(Vec::len)?;
+            if width == 0 || rows.iter().any(|r| r.len() != width) {
+                return None;
+            }
+            Some(rows)
+        }
+        _ => None,
+    }
 }
 
 /// Coerce a Value to Vec<f32> for vector operations in VectorFilter.

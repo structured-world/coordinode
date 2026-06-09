@@ -723,6 +723,30 @@ pub enum LogicalOp {
         gamma: Expr,
     },
 
+    /// Late-interaction (ColBERT-style) top-K via the MaxSim scalar.
+    ///
+    /// Extracted from the pattern `Sort(maxsim_score(d.tokens, q) DESC) +
+    /// Limit(K)` over a Project input. Replaces the generic
+    /// Sort + Limit pipeline with a single bounded min-heap pass:
+    /// O(N log K) instead of O(N log N) plus avoids materialising the
+    /// full sort buffer.
+    ///
+    /// Brute-force over the input rows in v1; a PLAID-style centroid
+    /// pruning pre-step will plug in here when added.
+    MaxSimTopK {
+        input: Box<LogicalOp>,
+        /// Expression for the document's multi-vector property
+        /// (e.g. `n.token_embeddings`).
+        doc_expr: Expr,
+        /// Query matrix expression (literal or parameter).
+        query_expr: Expr,
+        /// Top-K count (from LIMIT clause).
+        k: usize,
+        /// Optional score alias (`AS s` in `RETURN ... AS s`). When set,
+        /// the resulting rows include a column with the computed score.
+        score_alias: Option<String>,
+    },
+
     /// Empty input (no rows, used as leaf for standalone CREATE).
     Empty,
 }
@@ -893,6 +917,16 @@ impl LogicalOp {
                 input.substitute_params(params);
                 vector_expr.substitute_params(params);
                 query_vector.substitute_params(params);
+            }
+            LogicalOp::MaxSimTopK {
+                input,
+                doc_expr,
+                query_expr,
+                ..
+            } => {
+                input.substitute_params(params);
+                doc_expr.substitute_params(params);
+                query_expr.substitute_params(params);
             }
             LogicalOp::EdgeVectorSearch {
                 input,
@@ -1385,6 +1419,18 @@ fn estimate_op_cost(
             (input_cost + hnsw_cost, rows)
         }
 
+        LogicalOp::MaxSimTopK { input, k, .. } => {
+            let (input_cost, input_rows) = estimate_op_cost(input, defaults, stats, hints);
+            // Brute-force pass: every input row scored, bounded heap of K.
+            // Per-row cost: dim_q * dim_d dot products, but the planner only
+            // sees row counts. Use a constant factor representative of the
+            // MaxSim kernel (~100x a single dot vs vector_distance).
+            let k_f = (*k as f64).max(1.0);
+            let per_row_cost = 100.0;
+            let rows = k_f.min(input_rows);
+            (input_cost + input_rows * per_row_cost, rows)
+        }
+
         LogicalOp::TextFilter { input, .. } => {
             let (input_cost, input_rows) = estimate_op_cost(input, defaults, stats, hints);
             // Text search: tantivy index lookup is fast (inverted index), but
@@ -1619,7 +1665,8 @@ fn op_contains_vector_filter(op: &LogicalOp) -> bool {
         | LogicalOp::EncryptedFilter { input, .. }
         | LogicalOp::ShortestPath { input, .. }
         | LogicalOp::RankFuse { input, .. }
-        | LogicalOp::DocScore { input, .. } => op_contains_vector_filter(input),
+        | LogicalOp::DocScore { input, .. }
+        | LogicalOp::MaxSimTopK { input, .. } => op_contains_vector_filter(input),
         LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
             op_contains_vector_filter(left) || op_contains_vector_filter(right)
         }
@@ -1933,6 +1980,21 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             };
             output.push_str(&format!(
                 "{prefix}VectorTopK({function} k={k}{alias_info}, strategy: {strategy})\n"
+            ));
+            explain_op(input, indent + 1, output);
+        }
+        LogicalOp::MaxSimTopK {
+            input,
+            k,
+            score_alias,
+            ..
+        } => {
+            let alias_info = match score_alias {
+                Some(a) => format!(" AS {a}"),
+                None => String::new(),
+            };
+            output.push_str(&format!(
+                "{prefix}MaxSimTopK(maxsim_score k={k}{alias_info}, strategy: BruteForce)\n"
             ));
             explain_op(input, indent + 1, output);
         }

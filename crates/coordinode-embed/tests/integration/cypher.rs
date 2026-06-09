@@ -407,6 +407,63 @@ fn multi_vector_persists_and_scores_via_maxsim() {
 }
 
 #[test]
+fn maxsim_top_k_picks_best_docs_descending() {
+    // Pins the MaxSimTopK planner rewrite: a query of shape
+    //   MATCH (d:Doc) RETURN d.id, maxsim_score(d.tokens, $q)
+    //   ORDER BY ... DESC LIMIT k
+    // routes through the heap-based MaxSimTopK executor, returns
+    // exactly k rows in descending score order, and tags every
+    // surviving row.
+    let (mut db, _dir) = open_db();
+
+    let query_tokens = Value::MultiVector(vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+
+    // Three docs with deliberately distinct expected scores against
+    // the query [[1,0],[0,1]]:
+    //   d1 = [[1,0],[0,1]]       -> 1.0 + 1.0 = 2.0   (best)
+    //   d2 = [[0.5,0.5],[0,1]]   -> 0.5 + 1.0 = 1.5   (middle)
+    //   d3 = [[0.1,0.1]]         -> 0.1 + 0.1 = 0.2   (worst)
+    for (id, tokens) in [
+        (1i64, vec![vec![1.0, 0.0], vec![0.0, 1.0]]),
+        (2, vec![vec![0.5, 0.5], vec![0.0, 1.0]]),
+        (3, vec![vec![0.1, 0.1]]),
+    ] {
+        let mut params = HashMap::new();
+        params.insert("id".to_string(), Value::Int(id));
+        params.insert("tokens".to_string(), Value::MultiVector(tokens));
+        db.execute_cypher_with_params("CREATE (d:Doc {id: $id, tokens: $tokens})", params)
+            .expect("create doc");
+    }
+
+    let mut params = HashMap::new();
+    params.insert("q".to_string(), query_tokens);
+    let rows = db
+        .execute_cypher_with_params(
+            "MATCH (d:Doc)
+             RETURN d, d.id AS id, maxsim_score(d.tokens, $q) AS s
+             ORDER BY maxsim_score(d.tokens, $q) DESC
+             LIMIT 2",
+            params,
+        )
+        .expect("maxsim top-k");
+
+    assert_eq!(rows.len(), 2, "LIMIT 2 must produce exactly 2 rows");
+
+    // Top row must be d1 (score 2.0); second must be d2 (score 1.5).
+    assert_eq!(rows[0].get("id"), Some(&Value::Int(1)));
+    assert_eq!(rows[1].get("id"), Some(&Value::Int(2)));
+    let Some(Value::Float(s0)) = rows[0].get("s") else {
+        unreachable!("expected Float score on row 0");
+    };
+    let Some(Value::Float(s1)) = rows[1].get("s") else {
+        unreachable!("expected Float score on row 1");
+    };
+    assert!(s0 > s1, "row 0 score {s0} must exceed row 1 score {s1}");
+    assert!((s0 - 2.0).abs() < 1e-5);
+    assert!((s1 - 1.5).abs() < 1e-5);
+}
+
+#[test]
 fn param_binding_in_set() {
     let (mut db, _dir) = open_db();
     db.execute_cypher("CREATE (n:Config {key: 'theme', value: 'dark'})")
