@@ -362,6 +362,51 @@ fn param_binding_vector_param() {
 }
 
 #[test]
+fn multi_vector_persists_and_scores_via_maxsim() {
+    // Pins the end-to-end ColBERT-style late-interaction path:
+    //   1. CREATE a node whose property is a Value::MultiVector parameter
+    //   2. MATCH reads it back as Value::MultiVector
+    //   3. RETURN maxsim_score(n.tokens, $q) computes the score
+    // The Node store path is plain rmp-serde MessagePack on the Value
+    // enum, so the new MultiVector variant rides through transparently
+    // with no dedicated partition. This test will fail loudly if
+    // anything in the encode / decode / scalar dispatch ever stops
+    // round-tripping the matrix.
+    let (mut db, _dir) = open_db();
+
+    let doc_tokens = Value::MultiVector(vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.5, 0.5]]);
+    let query_tokens = Value::MultiVector(vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+
+    let mut create_params = HashMap::new();
+    create_params.insert("tokens".to_string(), doc_tokens.clone());
+    db.execute_cypher_with_params("CREATE (d:Doc {id: 1, tokens: $tokens})", create_params)
+        .expect("create with multi-vector param");
+
+    // Round-trip read confirms persistence.
+    let rows = db
+        .execute_cypher("MATCH (d:Doc {id: 1}) RETURN d.tokens")
+        .expect("read back");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("d.tokens"), Some(&doc_tokens));
+
+    // Score via the scalar through the full Cypher evaluator.
+    let mut score_params = HashMap::new();
+    score_params.insert("q".to_string(), query_tokens);
+    let rows = db
+        .execute_cypher_with_params(
+            "MATCH (d:Doc {id: 1}) RETURN maxsim_score(d.tokens, $q) AS s",
+            score_params,
+        )
+        .expect("score");
+    assert_eq!(rows.len(), 1);
+    // Hand-computed: q0 . d* max = 1.0, q1 . d* max = 1.0, sum = 2.0
+    let Some(Value::Float(s)) = rows[0].get("s") else {
+        unreachable!("expected Float score, got {:?}", rows[0].get("s"));
+    };
+    assert!((s - 2.0).abs() < 1e-5, "got s={s}");
+}
+
+#[test]
 fn param_binding_in_set() {
     let (mut db, _dir) = open_db();
     db.execute_cypher("CREATE (n:Config {key: 'theme', value: 'dark'})")
