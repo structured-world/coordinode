@@ -3,6 +3,26 @@
 use coordinode_core::graph::types::VectorMetric;
 use serde::{Deserialize, Serialize};
 
+/// Build state of an index.
+///
+/// `Ready` is the steady state for any index whose data is fully populated.
+/// `Building` is set while a backfill task is running. `Failed` captures the
+/// error reason when a backfill aborts. Persisting this lets a reopen path
+/// detect interrupted backfills and resume them.
+// Default Ready so pre-existing persisted IndexDefinition records (which
+// had no state field) deserialize as fully-built indexes. New indexes set
+// Building explicitly before spawning backfill.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexState {
+    /// Backfill in progress. `written` is approximate, updated in batches.
+    Building { written: u64, estimated_total: u64 },
+    /// Backfill complete, index reflects all matching data.
+    #[default]
+    Ready,
+    /// Backfill aborted; readers consult policy to decide error / partial.
+    Failed { reason: String },
+}
+
 /// Type of index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IndexType {
@@ -79,8 +99,16 @@ pub struct IndexDefinition {
     /// Vector index configuration. Only set when `index_type` is `Hnsw` or `Flat`.
     pub vector_config: Option<VectorIndexConfig>,
     /// Text index configuration. Only set when `index_type` is `Text`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Note: do NOT mark `skip_serializing_if` here — the struct uses
+    /// rmp-serde's default positional encoding, so a skipped field would
+    /// shift every following field's position on decode and corrupt the
+    /// roundtrip.
+    #[serde(default)]
     pub text_config: Option<TextIndexConfig>,
+    /// Build state. Defaults to `Ready` when deserializing pre-state schema records.
+    #[serde(default)]
+    pub state: IndexState,
 }
 
 /// Per-field analyzer configuration for text indexes.
@@ -165,6 +193,7 @@ impl IndexDefinition {
             ttl_seconds: None,
             vector_config: None,
             text_config: None,
+            state: IndexState::Ready,
         }
     }
 
@@ -186,6 +215,7 @@ impl IndexDefinition {
             ttl_seconds: None,
             vector_config: None,
             text_config: None,
+            state: IndexState::Ready,
         }
     }
 
@@ -208,6 +238,7 @@ impl IndexDefinition {
             ttl_seconds: None,
             vector_config: Some(config),
             text_config: None,
+            state: IndexState::Ready,
         }
     }
 
@@ -230,6 +261,7 @@ impl IndexDefinition {
             ttl_seconds: None,
             vector_config: None,
             text_config: Some(config),
+            state: IndexState::Ready,
         }
     }
 
@@ -298,6 +330,7 @@ impl IndexDefinition {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -342,5 +375,88 @@ mod tests {
     fn schema_key() {
         let idx = IndexDefinition::btree("user_email", "User", "email");
         assert_eq!(idx.schema_key(), b"schema:idx:user_email");
+    }
+
+    #[test]
+    fn new_indexes_default_to_ready_state() {
+        let btree = IndexDefinition::btree("u_email", "User", "email");
+        let hnsw = IndexDefinition::hnsw("u_vec", "User", "vec", VectorIndexConfig::default());
+        let compound = IndexDefinition::compound(
+            "u_lbl_status",
+            "User",
+            vec!["label".into(), "status".into()],
+        );
+        let text = IndexDefinition::text(
+            "u_text",
+            "User",
+            vec!["bio".into()],
+            TextIndexConfig::default(),
+        );
+        assert_eq!(btree.state, IndexState::Ready);
+        assert_eq!(hnsw.state, IndexState::Ready);
+        assert_eq!(compound.state, IndexState::Ready);
+        assert_eq!(text.state, IndexState::Ready);
+    }
+
+    #[test]
+    fn state_roundtrip_serde() {
+        let mut idx = IndexDefinition::hnsw("v", "L", "p", VectorIndexConfig::default());
+        idx.state = IndexState::Building {
+            written: 1234,
+            estimated_total: 9999,
+        };
+        let bytes = rmp_serde::to_vec(&idx).expect("encode");
+        let back: IndexDefinition = rmp_serde::from_slice(&bytes).expect("decode");
+        assert_eq!(back.state, idx.state);
+
+        idx.state = IndexState::Failed {
+            reason: "build aborted".to_string(),
+        };
+        let bytes = rmp_serde::to_vec(&idx).expect("encode failed");
+        let back: IndexDefinition = rmp_serde::from_slice(&bytes).expect("decode failed");
+        assert_eq!(
+            back.state,
+            IndexState::Failed {
+                reason: "build aborted".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_def_without_state_deserializes_as_ready() {
+        // Simulate a pre-state IndexDefinition record by encoding a struct
+        // that has the same field layout MINUS the `state` field. rmp-serde
+        // accepts the shorter struct because we marked `state` with
+        // `#[serde(default)]`.
+        #[derive(serde::Serialize)]
+        struct LegacyDef {
+            name: String,
+            label: String,
+            properties: Vec<String>,
+            index_type: IndexType,
+            unique: bool,
+            sparse: bool,
+            multikey: bool,
+            filter: Option<PartialFilter>,
+            ttl_seconds: Option<u64>,
+            vector_config: Option<VectorIndexConfig>,
+        }
+        let legacy = LegacyDef {
+            name: "u".into(),
+            label: "U".into(),
+            properties: vec!["v".into()],
+            index_type: IndexType::Hnsw,
+            unique: false,
+            sparse: true,
+            multikey: false,
+            filter: None,
+            ttl_seconds: None,
+            vector_config: Some(VectorIndexConfig::default()),
+        };
+        let bytes = rmp_serde::to_vec(&legacy).expect("encode legacy");
+        let back: IndexDefinition =
+            rmp_serde::from_slice(&bytes).expect("decode legacy as current");
+        assert_eq!(back.state, IndexState::Ready);
+        assert_eq!(back.name, "u");
     }
 }

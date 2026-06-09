@@ -15,7 +15,7 @@ pub mod vector_registry;
 pub mod text_registry;
 
 pub use definition::{
-    IndexDefinition, IndexType, TextFieldConfig, TextIndexConfig, VectorIndexConfig,
+    IndexDefinition, IndexState, IndexType, TextFieldConfig, TextIndexConfig, VectorIndexConfig,
 };
 pub use ops::{
     create_index_entries, create_index_entry, delete_index_entries, delete_index_entry, index_scan,

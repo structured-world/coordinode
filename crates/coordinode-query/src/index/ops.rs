@@ -14,7 +14,7 @@ use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::StorageError;
 use coordinode_storage::Guard;
 
-use super::definition::IndexDefinition;
+use super::definition::{IndexDefinition, IndexState};
 use coordinode_core::index::encoding::decode_node_id_from_index_key;
 
 /// Convert [`coordinode_modality::StoreError`] back into the
@@ -224,6 +224,25 @@ pub fn save_index_definition(
         name: format!("index serialize: {e}"),
     })?;
     engine.put(Partition::Schema, &key, &value)
+}
+
+/// Update only the `state` field of a persisted index definition.
+///
+/// Loads the current definition, swaps `state`, writes the result back. Used
+/// by the backfill task to publish progress and terminal states without
+/// rewriting any other field. Returns `Ok(false)` if the index has no
+/// persisted definition (caller's responsibility to handle the race).
+pub fn save_index_state(
+    engine: &StorageEngine,
+    name: &str,
+    state: IndexState,
+) -> Result<bool, StorageError> {
+    let Some(mut def) = load_index_definition(engine, name)? else {
+        return Ok(false);
+    };
+    def.state = state;
+    save_index_definition(engine, &def)?;
+    Ok(true)
 }
 
 /// Load index definition from schema partition.
@@ -846,5 +865,65 @@ mod tests {
         .expect("delete");
 
         assert_eq!(index_scan(&engine, &idx).expect("scan").len(), 0);
+    }
+
+    #[test]
+    fn save_index_state_updates_persisted_state_only() {
+        use crate::index::definition::VectorIndexConfig;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = test_engine(dir.path());
+
+        let mut def = IndexDefinition::hnsw("v_idx", "Doc", "embed", VectorIndexConfig::default());
+        def.unique = false;
+        save_index_definition(&engine, &def).expect("save");
+
+        // Update state only.
+        let updated = save_index_state(
+            &engine,
+            "v_idx",
+            IndexState::Building {
+                written: 100,
+                estimated_total: 1000,
+            },
+        )
+        .expect("save state");
+        assert!(updated, "save_index_state should report success");
+
+        let reloaded = load_index_definition(&engine, "v_idx")
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            reloaded.state,
+            IndexState::Building {
+                written: 100,
+                estimated_total: 1000
+            }
+        );
+        // Other fields preserved.
+        assert_eq!(reloaded.name, "v_idx");
+        assert_eq!(reloaded.label, "Doc");
+        assert_eq!(reloaded.properties, vec!["embed".to_string()]);
+
+        // Subsequent state update overwrites.
+        let updated = save_index_state(&engine, "v_idx", IndexState::Ready).expect("save ready");
+        assert!(updated);
+        let reloaded = load_index_definition(&engine, "v_idx")
+            .expect("load")
+            .expect("present");
+        assert_eq!(reloaded.state, IndexState::Ready);
+    }
+
+    #[test]
+    fn save_index_state_missing_index_returns_false() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = test_engine(dir.path());
+
+        let updated = save_index_state(&engine, "does_not_exist", IndexState::Ready)
+            .expect("save state should not error on missing");
+        assert!(
+            !updated,
+            "missing index should report not-found via Ok(false)"
+        );
     }
 }
