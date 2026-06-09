@@ -174,6 +174,34 @@ RETURN DISTINCT similar.name,
 ORDER BY score LIMIT 10
 ```
 
+### Multi-Vector Property (ColBERT / Late Interaction) ✅
+
+A multi-vector property stores an ordered list of per-token f32 vectors with identical dimensionality on a single node. This is the data model that ColBERT-style late-interaction retrieval expects: instead of pooling each document down to one dense vector, the encoder emits one vector per token and scoring is the MaxSim aggregate across that matrix.
+
+Properties of multi-vector type:
+
+- Stored in-line in the node's MessagePack record. No dedicated DDL is required; the type is inferred from the value shape (a list of equal-width f32 vectors).
+- A construction-time invariant enforces equal row width. Mixed-width inputs (e.g. `[[1.0, 0.0], [1.0]]`) are rejected at the value-building boundary; the field stays unset rather than partially written.
+- Scored via [`maxsim_score`](functions.md#late-interaction-scoring-maxsim--colbert) in `RETURN` or `ORDER BY`.
+
+```cypher
+-- Store a document with its per-token matrix (here a tiny 2-token, 3-dim example)
+CREATE (d:Doc {
+  id: 1,
+  token_embeddings: [
+    [0.1, 0.2, 0.3],
+    [0.4, 0.5, 0.6]
+  ]
+})
+
+-- Brute-force late-interaction top-K
+MATCH (d:Doc)
+RETURN d.id, maxsim_score(d.token_embeddings, $query_tokens) AS s
+ORDER BY s DESC LIMIT 10
+```
+
+Current implementation runs brute-force across all rows that reach the operator. A PLAID-style centroid index that prunes the document set before scoring is a planned optimisation. Storage stays in-line for now; a dedicated keyspace will land when typical per-document footprints (e.g. `220 tokens * 128 dim * 4 bytes = ~112 KB`) make the SST block-size pressure on the node partition worth a separate tier.
+
 ---
 
 ## Full-Text Search

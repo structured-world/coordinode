@@ -47,6 +47,34 @@ ORDER BY score DESC
 LIMIT 10
 ```
 
+### Late-Interaction Scoring (MaxSim / ColBERT) ✅ 🔷
+
+| Function | Signature | Returns | Notes |
+|----------|-----------|---------|-------|
+| `maxsim_score` | `maxsim_score(doc_tokens, query_tokens)` | Float | ColBERT-style late-interaction score over two multi-vector matrices |
+
+`maxsim_score` is the per-pair MaxSim primitive used by late-interaction retrieval models (ColBERT v2, ColBERTv2-PLAID, fastColBERT). Each argument is a multi-vector matrix: an ordered list of per-token f32 vectors with identical dimensionality. The score is
+
+```text
+maxsim_score(doc, query) = Sum over q in query_tokens of max over d in doc_tokens of dot(q, d)
+```
+
+Both arguments accept the native `MultiVector` value type or a plain `Array<Array<Float|Int>>` of the same shape (so that parameter literals from gRPC / JSON paths work without an explicit cast). All rows on both sides must have equal length; any mismatch returns `0.0`, and a missing argument returns `null`. Pre-normalise rows to unit L2 norm if you want cosine semantics; the kernel itself is metric-agnostic and computes raw dot products.
+
+Typical ColBERT workloads run with `dim = 128`, `|query_tokens| ~ 32-64`, `|doc_tokens| ~ 100-220`. The kernel is `O(|q| * |d| * dim)` per call and dispatches the inner per-pair distance through the AVX-512 / AVX2+FMA / NEON / scalar paths shared with `vector_dot`. A future centroid index (PLAID-style) will prune the `|d|` factor for large corpora; the current path is brute-force over the input rows.
+
+```cypher
+// Single document score
+MATCH (d:Doc {id: 1})
+RETURN maxsim_score(d.token_embeddings, $query_tokens) AS s
+
+// Top-K late-interaction retrieval
+MATCH (d:Doc)
+RETURN d.id, maxsim_score(d.token_embeddings, $query_tokens) AS s
+ORDER BY s DESC
+LIMIT 10
+```
+
 ### Full-Text Functions ✅ 🔷
 
 | Function | Signature | Returns | Notes |
