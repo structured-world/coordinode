@@ -388,6 +388,42 @@ impl VectorIndexRegistry {
         }
     }
 
+    /// HNSW top-K with a per-node visibility predicate (ACORN-style filtered
+    /// search). The closure is called for every candidate the traversal
+    /// considers; returning `false` prunes that branch. `overfetch_factor`
+    /// scales the in-search candidate window, `max_expansion_rounds` caps
+    /// how many times the inner loop expands when too many candidates fail
+    /// the predicate. Returns `None` when no index exists for `(label,
+    /// property)`.
+    ///
+    /// The HNSW engine never panics inside the closure: if the predicate
+    /// throws (caller-side bug) the search returns whatever it had so far.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_with_visibility<F>(
+        &self,
+        label: &str,
+        property: &str,
+        query: &[f32],
+        k: usize,
+        overfetch_factor: f64,
+        max_expansion_rounds: usize,
+        is_visible: F,
+    ) -> Option<Vec<SearchResult>>
+    where
+        F: Fn(u64) -> bool,
+    {
+        let handle = self.get(label, property)?;
+        let hnsw = handle.read().ok()?;
+        let (results, _stats) = hnsw.search_with_visibility(
+            query,
+            k,
+            overfetch_factor,
+            max_expansion_rounds,
+            is_visible,
+        );
+        Some(results)
+    }
+
     /// Bulk-insert multiple vectors into a specific HNSW index.
     ///
     /// Used during index rebuild (on Database::open or CREATE VECTOR INDEX).

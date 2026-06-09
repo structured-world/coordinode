@@ -2558,7 +2558,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             k,
             distance_alias,
             hnsw_index,
-            predicate: _,
+            predicate,
         } => {
             let rows = execute_op(input, ctx)?;
 
@@ -2580,6 +2580,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 *k,
                 distance_alias.as_deref(),
                 hnsw_index_name,
+                predicate.as_ref(),
                 ctx,
             )? {
                 hnsw_result
@@ -4099,6 +4100,34 @@ const VECTOR_TOP_K_BRUTE_FORCE_THRESHOLD: usize = 1000;
 /// `registry.get_definition_by_name` — skipping the `__label__` row heuristic.
 /// When None, falls back to detecting label from `rows[0].__label__`.
 #[allow(clippy::too_many_arguments)]
+/// Walk a [`VectorPredicate`] tree and collect every property name into the
+/// supplied map, with its resolved field id (or skipped when the interner
+/// doesn't know the name — predicate evaluation will then reject the leaf).
+///
+/// Called once per query, outside the HNSW hot loop, so the closure built
+/// from the resulting map can answer field lookups without ever touching
+/// the shared interner lock again.
+fn collect_predicate_property_ids(
+    predicate: &crate::planner::logical::VectorPredicate,
+    interner: &FieldInterner,
+    out: &mut std::collections::HashMap<String, u32>,
+) {
+    use crate::planner::logical::VectorPredicate as VP;
+    match predicate {
+        VP::LabelEq(_) => {}
+        VP::PropertyEq { property, .. } => {
+            if let Some(fid) = interner.lookup(property) {
+                out.insert(property.clone(), fid);
+            }
+        }
+        VP::And(left, right) => {
+            collect_predicate_property_ids(left, interner, out);
+            collect_predicate_property_ids(right, interner, out);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn try_hnsw_vector_top_k(
     rows: &[Row],
     vector_expr: &Expr,
@@ -4107,6 +4136,7 @@ fn try_hnsw_vector_top_k(
     k: usize,
     distance_alias: Option<&str>,
     hnsw_index_name: Option<&str>,
+    predicate: Option<&crate::planner::logical::VectorPredicate>,
     ctx: &ExecutionContext<'_>,
 ) -> Result<Option<Vec<Row>>, ExecutionError> {
     if rows.is_empty() || k == 0 {
@@ -4186,15 +4216,58 @@ fn try_hnsw_vector_top_k(
     let overfetch = (k * 4).max(rows.len() * 2).clamp(100, 10_000);
 
     gate_vector_index_read(ctx.engine, registry, &label_str, &property_str)?;
-    let search_results = match registry.search_with_loader(
-        &label_str,
-        &property_str,
-        &query_vec,
-        overfetch,
-        ctx.vector_loader,
-    ) {
-        Some(r) => r,
-        None => return Ok(None),
+
+    // ACORN-style filtered search: when the planner pushed a predicate down,
+    // pass it as a visibility closure so the HNSW traversal prunes branches
+    // that can't pass the filter. Otherwise fall back to the unfiltered path.
+    let search_results = if let Some(pred) = predicate {
+        // Resolve property names referenced by the predicate once, outside
+        // the closure, so the search hot path never re-enters the interner
+        // lock. We snapshot every PropertyEq leaf into a stable map.
+        let mut field_ids: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        collect_predicate_property_ids(pred, ctx.interner, &mut field_ids);
+
+        let engine = ctx.engine;
+        let shard_id = ctx.shard_id;
+        let pred_clone = pred.clone();
+        let lookup = move |name: &str| field_ids.get(name).copied();
+        let is_visible = move |node_id: u64| {
+            crate::executor::vector_predicate::evaluate_predicate(
+                engine,
+                shard_id,
+                coordinode_core::graph::node::NodeId::from_raw(node_id),
+                &pred_clone,
+                &lookup,
+            )
+        };
+        // Overfetch factor 2.0 + 3 expansion rounds matches the existing
+        // visibility-aware MVCC search defaults; ACORN literature suggests
+        // higher overfetch for very selective filters but those tunables
+        // remain a follow-up.
+        match registry.search_with_visibility(
+            &label_str,
+            &property_str,
+            &query_vec,
+            overfetch,
+            2.0,
+            3,
+            is_visible,
+        ) {
+            Some(r) => r,
+            None => return Ok(None),
+        }
+    } else {
+        match registry.search_with_loader(
+            &label_str,
+            &property_str,
+            &query_vec,
+            overfetch,
+            ctx.vector_loader,
+        ) {
+            Some(r) => r,
+            None => return Ok(None),
+        }
     };
 
     // Build node_id → row map from input rows for intersection.
