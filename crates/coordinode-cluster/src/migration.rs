@@ -200,6 +200,65 @@ pub enum MigrationPlannerError {
     SourceNotInTopology(EndpointId),
 }
 
+/// Compute the per-component cost of one transfer mode for a given
+/// payload and cost inputs. Pure function; the formulas are
+/// documented at the module level under "Cost decomposition".
+///
+/// All three components are non-negative and finite for any non-zero
+/// bandwidth and non-zero build rate. The caller is responsible for
+/// supplying positive inputs; a zero in any denominator would yield
+/// infinity and a downstream comparator would crash. The function
+/// guards by clamping the denominator to a tiny positive value, so
+/// pathological inputs surface as enormous (but finite) costs that
+/// any sane candidate beats.
+pub fn estimate_cost(
+    mode: TransferMode,
+    payload: PayloadEstimate,
+    inputs: CostInputs,
+) -> MigrationCost {
+    // Floor each denominator at 1.0 (one byte/sec, one node/sec). Real
+    // links and real builders are well above this; the floor only
+    // matters for pathological zero / near-zero inputs, where we want
+    // a huge-but-finite cost rather than infinity so the comparator
+    // in pick_recommended_mode stays well-defined.
+    let bandwidth = inputs.bandwidth_bytes_per_sec.max(1.0);
+    let build_rate = inputs.hnsw_build_rate_nodes_per_sec.max(1.0);
+
+    let network_secs = (payload.bytes as f64) / bandwidth;
+    let nodes = payload.node_count as f64;
+    let rebuild_full = nodes / build_rate;
+    let graph_full = nodes * inputs.neighbour_byte_cost.max(0.0) / bandwidth;
+
+    match mode {
+        TransferMode::RebuildFromData => MigrationCost {
+            network_secs,
+            rebuild_secs: rebuild_full,
+            graph_serialise_secs: 0.0,
+        },
+        TransferMode::ShipGraphBytes => MigrationCost {
+            network_secs,
+            rebuild_secs: 0.0,
+            graph_serialise_secs: graph_full,
+        },
+    }
+}
+
+/// Pick the transfer mode that minimises total cost for the given
+/// payload and cost inputs. Ties resolve in favour of
+/// [`TransferMode::RebuildFromData`] because the rebuild path makes
+/// no assumption about the serialised HNSW format being compatible
+/// across binary versions, which is the safer default during
+/// rolling upgrades.
+pub fn pick_recommended_mode(payload: PayloadEstimate, inputs: CostInputs) -> TransferMode {
+    let rebuild = estimate_cost(TransferMode::RebuildFromData, payload, inputs).total_secs();
+    let ship = estimate_cost(TransferMode::ShipGraphBytes, payload, inputs).total_secs();
+    if ship < rebuild {
+        TransferMode::ShipGraphBytes
+    } else {
+        TransferMode::RebuildFromData
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -288,5 +347,131 @@ mod tests {
         let err = MigrationPlannerError::SourceNotInTopology("ep-x".to_string());
         let s = format!("{err}");
         assert!(s.contains("ep-x"));
+    }
+
+    #[test]
+    fn rebuild_cost_has_zero_graph_serialise_term() {
+        let cost = estimate_cost(
+            TransferMode::RebuildFromData,
+            sample_payload(),
+            sample_costs(),
+        );
+        assert_eq!(cost.graph_serialise_secs, 0.0);
+        assert!(cost.rebuild_secs > 0.0);
+        assert!(cost.network_secs > 0.0);
+        assert!((cost.total_secs() - (cost.network_secs + cost.rebuild_secs)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ship_graph_bytes_cost_has_zero_rebuild_term() {
+        let cost = estimate_cost(
+            TransferMode::ShipGraphBytes,
+            sample_payload(),
+            sample_costs(),
+        );
+        assert_eq!(cost.rebuild_secs, 0.0);
+        assert!(cost.graph_serialise_secs > 0.0);
+        assert!(cost.network_secs > 0.0);
+    }
+
+    #[test]
+    fn network_component_is_payload_over_bandwidth() {
+        let payload = sample_payload();
+        let inputs = sample_costs();
+        let cost = estimate_cost(TransferMode::RebuildFromData, payload, inputs);
+        let expected = (payload.bytes as f64) / inputs.bandwidth_bytes_per_sec;
+        assert!((cost.network_secs - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rebuild_component_is_nodes_over_build_rate() {
+        let payload = sample_payload();
+        let inputs = sample_costs();
+        let cost = estimate_cost(TransferMode::RebuildFromData, payload, inputs);
+        let expected = (payload.node_count as f64) / inputs.hnsw_build_rate_nodes_per_sec;
+        assert!((cost.rebuild_secs - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pick_recommended_mode_prefers_rebuild_when_build_rate_high() {
+        // Very high build rate makes the rebuild path essentially free
+        // on the CPU side; the planner must pick RebuildFromData over
+        // ShipGraphBytes because shipping serialised graph adds bytes
+        // on the wire that rebuild avoids.
+        let payload = PayloadEstimate {
+            bytes: 10_000_000,
+            node_count: 1_000_000,
+            ef_construction: 200,
+        };
+        let inputs = CostInputs {
+            bandwidth_bytes_per_sec: 100_000_000.0,
+            hnsw_build_rate_nodes_per_sec: 1_000_000_000.0,
+            neighbour_byte_cost: 64.0,
+        };
+        assert_eq!(
+            pick_recommended_mode(payload, inputs),
+            TransferMode::RebuildFromData
+        );
+    }
+
+    #[test]
+    fn pick_recommended_mode_prefers_ship_when_build_rate_low() {
+        // Very slow build rate makes rebuild dominate; even a fat
+        // serialised graph payload is cheaper to ship than to recompute.
+        let payload = PayloadEstimate {
+            bytes: 1_000_000,
+            node_count: 1_000_000,
+            ef_construction: 400,
+        };
+        let inputs = CostInputs {
+            bandwidth_bytes_per_sec: 1_000_000_000.0,
+            hnsw_build_rate_nodes_per_sec: 100.0,
+            neighbour_byte_cost: 64.0,
+        };
+        assert_eq!(
+            pick_recommended_mode(payload, inputs),
+            TransferMode::ShipGraphBytes
+        );
+    }
+
+    #[test]
+    fn pick_recommended_mode_breaks_ties_in_favour_of_rebuild() {
+        // Cook the inputs so both totals are exactly equal: equal
+        // network component on both sides, and rebuild_full ==
+        // graph_full. That holds when nodes / build_rate ==
+        // nodes * neighbour_byte_cost / bandwidth, i.e.
+        // bandwidth / build_rate == neighbour_byte_cost.
+        let payload = PayloadEstimate {
+            bytes: 100_000,
+            node_count: 10_000,
+            ef_construction: 200,
+        };
+        let inputs = CostInputs {
+            bandwidth_bytes_per_sec: 64_000.0,
+            hnsw_build_rate_nodes_per_sec: 1_000.0,
+            neighbour_byte_cost: 64.0, // bandwidth/build_rate == 64 == neighbour_byte_cost
+        };
+        let rebuild = estimate_cost(TransferMode::RebuildFromData, payload, inputs).total_secs();
+        let ship = estimate_cost(TransferMode::ShipGraphBytes, payload, inputs).total_secs();
+        assert!((rebuild - ship).abs() < 1e-9, "costs must tie exactly");
+        assert_eq!(
+            pick_recommended_mode(payload, inputs),
+            TransferMode::RebuildFromData
+        );
+    }
+
+    #[test]
+    fn estimate_cost_tolerates_zero_bandwidth_without_panicking() {
+        // Pathological input: zero bandwidth would divide by zero.
+        // The implementation clamps to MIN_POSITIVE so the result is
+        // a huge but finite cost rather than NaN / infinity.
+        let inputs = CostInputs {
+            bandwidth_bytes_per_sec: 0.0,
+            hnsw_build_rate_nodes_per_sec: 1_000.0,
+            neighbour_byte_cost: 64.0,
+        };
+        let cost = estimate_cost(TransferMode::RebuildFromData, sample_payload(), inputs);
+        assert!(cost.network_secs.is_finite());
+        assert!(cost.total_secs() > 0.0);
     }
 }
