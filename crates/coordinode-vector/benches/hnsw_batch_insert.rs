@@ -83,6 +83,21 @@ fn bench_serial_vs_batch(c: &mut Criterion) {
                 criterion::BatchSize::LargeInput,
             );
         });
+
+        // bulk_build: leader-seed + cluster-ordered insert. Below the
+        // internal threshold it routes through insert_batch verbatim;
+        // above it the leader-seed pre-build of the upper graph plus
+        // the cluster-grouped follower order engage.
+        group.bench_with_input(BenchmarkId::new("bulk_build", n), &n, |b, _| {
+            b.iter_batched(
+                || (items.clone(), HnswIndex::new(make_config(n as u32))),
+                |(items, mut index)| {
+                    index.bulk_build(items);
+                    std::hint::black_box(index);
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        });
     }
 
     group.finish();
