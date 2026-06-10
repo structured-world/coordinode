@@ -19,7 +19,11 @@
 //! Subsequent commits replace the body of [`bulk_build`] with the
 //! actual algorithm without churning the entry-point shape.
 
+use coordinode_core::graph::types::VectorMetric;
+use rayon::prelude::*;
+
 use super::HnswIndex;
+use crate::metrics;
 
 /// Minimum item count at which the cluster-and-stitch path is
 /// expected to beat the incremental `insert_batch` path. Below this
@@ -69,6 +73,10 @@ pub(crate) fn bulk_build(index: &mut HnswIndex, items: Vec<(u64, Vec<f32>)>) {
         }
     }
 
+    // Capture the leader vectors before they move into the index;
+    // the cluster-assignment pass needs them by reference.
+    let leaders_for_assignment: Vec<Vec<f32>> = leaders.iter().map(|(_, v)| v.clone()).collect();
+
     // Seed the graph one leader at a time so each leader's plan
     // sees every prior leader; this builds a clean upper-graph
     // skeleton across the leader sample.
@@ -77,12 +85,78 @@ pub(crate) fn bulk_build(index: &mut HnswIndex, items: Vec<(u64, Vec<f32>)>) {
     }
 
     // Followers ride the parallel insert_batch path against the
-    // seeded graph. The leader-seeded upper graph reduces the
-    // depth of every follower's entry search and so amortises the
-    // per-follower planning cost.
+    // seeded graph. Before handing the batch off, reorder the
+    // followers so items of the same cluster are contiguous in the
+    // input vector. The apply phase then visits adjacent
+    // `nodes[]` indices for an entire cluster before moving to the
+    // next, giving the L1 / L2 cache a fighting chance against the
+    // pointer-chasing nature of graph inserts.
     if !followers.is_empty() {
-        index.insert_batch(followers);
+        let leader_vecs: Vec<Vec<f32>> = leaders_for_assignment;
+        let reordered = cluster_order_followers(followers, &leader_vecs, index.config().metric);
+        index.insert_batch(reordered);
     }
+}
+
+/// Brute-force assign every follower to the index of its nearest
+/// leader (by the configured metric), parallel via rayon. Returns
+/// the assignment vector in input order: position `i` holds the
+/// leader index for `followers[i]`.
+///
+/// Pure function, exposed at module scope so the property test can
+/// hit it directly without going through `bulk_build`.
+fn assign_followers_to_leaders(
+    followers: &[(u64, Vec<f32>)],
+    leaders: &[Vec<f32>],
+    metric: VectorMetric,
+) -> Vec<usize> {
+    if leaders.is_empty() {
+        return vec![0; followers.len()];
+    }
+    followers
+        .par_iter()
+        .map(|(_, v)| nearest_leader_index(v, leaders, metric))
+        .collect()
+}
+
+/// Pick the nearest leader for a single follower vector. Falls
+/// through to `cosine_distance` / `euclidean_distance` /
+/// `manhattan_distance` / `1 - dot` based on the metric. Equal
+/// distances break toward the lower index.
+fn nearest_leader_index(v: &[f32], leaders: &[Vec<f32>], metric: VectorMetric) -> usize {
+    let mut best_idx = 0;
+    let mut best_dist = f32::INFINITY;
+    for (i, l) in leaders.iter().enumerate() {
+        let d = match metric {
+            VectorMetric::Cosine => metrics::cosine_distance(v, l),
+            VectorMetric::L2 => metrics::euclidean_distance(v, l),
+            VectorMetric::L1 => metrics::manhattan_distance(v, l),
+            // Higher dot means closer; convert to a lower-is-better
+            // distance to share the comparator with the other metrics.
+            VectorMetric::DotProduct => -metrics::dot_product(v, l),
+        };
+        if d < best_dist {
+            best_dist = d;
+            best_idx = i;
+        }
+    }
+    best_idx
+}
+
+/// Reorder followers so items with the same leader assignment are
+/// contiguous in the output. Within a cluster, original input order
+/// is preserved (the leader-grouping pass is a stable sort by
+/// cluster id).
+fn cluster_order_followers(
+    followers: Vec<(u64, Vec<f32>)>,
+    leaders: &[Vec<f32>],
+    metric: VectorMetric,
+) -> Vec<(u64, Vec<f32>)> {
+    let assignment = assign_followers_to_leaders(&followers, leaders, metric);
+    let mut indexed: Vec<(usize, (u64, Vec<f32>))> = followers.into_iter().enumerate().collect();
+    // Stable sort keeps the input order inside each cluster.
+    indexed.sort_by_key(|(i, _)| assignment[*i]);
+    indexed.into_iter().map(|(_, item)| item).collect()
 }
 
 /// `floor(sqrt(n))` clamped to `[1, n]`. Returns 0 only when `n == 0`.
@@ -195,6 +269,69 @@ mod tests {
         for i in 0..8 {
             assert!(s.contains(&i));
         }
+    }
+
+    #[test]
+    fn cluster_assignment_picks_nearest_leader_under_l2() {
+        // Two leaders at the corners; followers in between are
+        // assigned to whichever leader they are closer to.
+        let leaders = vec![vec![0.0, 0.0], vec![10.0, 0.0]];
+        let followers = vec![
+            (0u64, vec![1.0, 0.0]), // closer to leader 0
+            (1u64, vec![9.0, 0.0]), // closer to leader 1
+            (2u64, vec![5.5, 0.0]), // closer to leader 1
+            (3u64, vec![4.5, 0.0]), // closer to leader 0
+        ];
+        let a = assign_followers_to_leaders(&followers, &leaders, VectorMetric::L2);
+        assert_eq!(a, vec![0, 1, 1, 0]);
+    }
+
+    #[test]
+    fn cluster_order_is_stable_and_groups_clusters_together() {
+        let leaders = vec![vec![0.0, 0.0], vec![10.0, 0.0]];
+        let followers = vec![
+            (10u64, vec![1.0, 0.0]), // cluster 0
+            (20u64, vec![9.0, 0.0]), // cluster 1
+            (30u64, vec![2.0, 0.0]), // cluster 0
+            (40u64, vec![8.0, 0.0]), // cluster 1
+        ];
+        let original_ids: Vec<u64> = followers.iter().map(|(id, _)| *id).collect();
+        let reordered = cluster_order_followers(followers, &leaders, VectorMetric::L2);
+        // Every original follower must appear exactly once in the output.
+        let reordered_ids: Vec<u64> = reordered.iter().map(|(id, _)| *id).collect();
+        let mut sorted_orig = original_ids.clone();
+        sorted_orig.sort_unstable();
+        let mut sorted_reord = reordered_ids.clone();
+        sorted_reord.sort_unstable();
+        assert_eq!(sorted_orig, sorted_reord);
+
+        // Cluster ids of consecutive followers in the output must be
+        // non-decreasing.
+        let mut last_cluster: i32 = -1;
+        for (_, v) in &reordered {
+            let c = nearest_leader_index(v, &leaders, VectorMetric::L2) as i32;
+            assert!(
+                c >= last_cluster,
+                "cluster ids must be non-decreasing in cluster-ordered output, got {c} after {last_cluster}",
+            );
+            last_cluster = c;
+        }
+
+        // Within each cluster the original input order is preserved
+        // (stable sort). Cluster 0 originals were [10, 30] in that
+        // order; cluster 1 were [20, 40].
+        let cluster0: Vec<u64> = reordered_ids
+            .iter()
+            .copied()
+            .filter(|id| matches!(id, 10 | 30))
+            .collect();
+        assert_eq!(cluster0, vec![10, 30]);
+        let cluster1: Vec<u64> = reordered_ids
+            .iter()
+            .copied()
+            .filter(|id| matches!(id, 20 | 40))
+            .collect();
+        assert_eq!(cluster1, vec![20, 40]);
     }
 
     #[test]
