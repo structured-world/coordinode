@@ -233,15 +233,43 @@ struct Args {
 
     /// Number of independent HNSW shards to build over the dataset.
     /// `1` (default) builds a single index (today's shape). `N>1`
-    /// partitions the train vectors by `id % N` so each shard owns
-    /// roughly `n_train/N` rows; at search time the bench scatters every
-    /// query to every shard and K-way merges the top-K. The reported
-    /// QPS is the aggregate across shards, which drives the per-node
-    /// parallel-efficiency metric
+    /// partitions the train vectors across shards (see
+    /// `--shard-routing`); at search time the bench scatters every
+    /// query to the routed shard subset and K-way merges the top-K.
+    /// The reported QPS is the aggregate across shards, which drives
+    /// the per-node parallel-efficiency metric
     ///   `E_node(K) = QPS(n_shards=K) / (K * QPS(n_shards=1))`.
     /// Recorded as `n_shards` in the output JSON.
     #[arg(long, default_value_t = 1)]
     n_shards: usize,
+
+    /// Shard partitioning + query routing strategy when `--n-shards > 1`.
+    ///
+    /// `modulo` (default): vectors land on shard `id % N`; partitions
+    /// are random w.r.t. geometry so every query MUST scatter to all
+    /// shards. Measures the worst-case fan-out floor.
+    ///
+    /// `centroid`: shards are k-means clusters (deterministic seeded
+    /// Lloyd iterations on a sample); each vector lands on its nearest
+    /// centroid's shard, and a query routes only to the `--route-top-m`
+    /// shards whose centroids are closest. Models the IVF-style routed
+    /// fan-out where per-query work does not grow with shard count.
+    #[arg(long, value_enum, default_value_t = ShardRoutingArg::Modulo)]
+    shard_routing: ShardRoutingArg,
+
+    /// Number of closest-centroid shards a query is routed to when
+    /// `--shard-routing centroid`. Clamped to `n_shards`. `1` probes
+    /// the maximum-savings / lowest-recall point; `n_shards` collapses
+    /// to scatter-all (same coverage as `modulo`, different partition
+    /// geometry). Ignored for `modulo` routing.
+    #[arg(long, default_value_t = 1)]
+    route_top_m: usize,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum ShardRoutingArg {
+    Modulo,
+    Centroid,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -463,7 +491,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut shards: Vec<HnswIndex> = (0..n_shards)
         .map(|_| HnswIndex::new(config.clone()))
         .collect();
-    info!(n_shards, "building shard fleet");
+    // Per-vector shard assignment. `modulo` spreads ids round-robin —
+    // geometry-blind, every query must scatter to all shards (worst-case
+    // fan-out floor). `centroid` clusters the space with deterministic
+    // k-means so a query can route to the top-m closest shards only —
+    // the IVF-style fan-out the distributed design uses.
+    let router: Option<CentroidRouter> =
+        if n_shards > 1 && args.shard_routing == ShardRoutingArg::Centroid {
+            let centroids = train_centroids(&train_flat, d, n_train, n_shards, metric);
+            Some(CentroidRouter {
+                centroids,
+                top_m: args.route_top_m.clamp(1, n_shards),
+                metric,
+            })
+        } else {
+            None
+        };
+    let assignment: Vec<usize> = match &router {
+        Some(r) => (0..n_train)
+            .map(|i| nearest_centroid(&train_flat[i * d..(i + 1) * d], &r.centroids, metric))
+            .collect(),
+        None => (0..n_train).map(|i| i % n_shards).collect(),
+    };
+    info!(n_shards, routing = ?args.shard_routing, "building shard fleet");
     // Chunked `insert_batch` (R858b). The apply-phase backfill bug that
     // collapsed recall at chunked scale was fixed by folding backfilled
     // candidates into the prune selection; 1k chunks match the API's
@@ -472,7 +522,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (shard_id, shard) in shards.iter_mut().enumerate() {
         let mut buf: Vec<(u64, Vec<f32>)> = Vec::with_capacity(BUILD_CHUNK);
         let mut shard_inserted = 0usize;
-        for row_idx in (0..n_train).filter(|i| i % n_shards == shard_id) {
+        for row_idx in (0..n_train).filter(|i| assignment[*i] == shard_id) {
             let start = row_idx * d;
             buf.push((row_idx as u64, train_flat[start..start + d].to_vec()));
             if buf.len() == BUILD_CHUNK {
@@ -512,6 +562,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let point = sweep_one(
             &shards,
+            router.as_ref(),
             &query_flat,
             &gt_flat,
             d,
@@ -572,6 +623,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // every query and K-way merges top-K so QPS is aggregate across the
     // fleet. `1` collapses to the single-index control case.
     report.record("n_shards", n_shards)?;
+    // Partitioning + routing strategy: `modulo` (geometry-blind,
+    // scatter-all) or `centroid` (k-means partitions, top-m routed
+    // fan-out). route_top_m only meaningful for centroid.
+    report.record(
+        "shard_routing",
+        match args.shard_routing {
+            ShardRoutingArg::Modulo => "modulo",
+            ShardRoutingArg::Centroid => "centroid",
+        },
+    )?;
+    if args.shard_routing == ShardRoutingArg::Centroid {
+        report.record("route_top_m", args.route_top_m.clamp(1, n_shards))?;
+    }
     // Bit-width only meaningful for `rabitq`; record unconditionally so
     // the dashboard can group/filter by it without per-row None handling.
     if args.quantization == "rabitq" {
@@ -618,6 +682,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         SearchModeArg::Exact => format!("{tag}-X"),
         SearchModeArg::Hnsw => tag,
     };
+    // Centroid-routed shard runs get a `-Cm` suffix (m = fan-out width)
+    // so they never overwrite scatter-all cells with the same M/codec.
+    let tag = if n_shards > 1 && args.shard_routing == ShardRoutingArg::Centroid {
+        format!("{tag}-C{}", args.route_top_m.clamp(1, n_shards))
+    } else {
+        tag
+    };
     let path = report.write_json(&args.output, Some(&tag))?;
     info!(path=?path, "report written");
     Ok(())
@@ -634,6 +705,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[allow(clippy::too_many_arguments)]
 fn sweep_one(
     shards: &[HnswIndex],
+    router: Option<&CentroidRouter>,
     query_flat: &[f32],
     gt_flat: &[i32],
     dim: usize,
@@ -657,7 +729,7 @@ fn sweep_one(
                 let q_start = q_idx * dim;
                 let query = &query_flat[q_start..q_start + dim];
                 let t = Instant::now();
-                let results = multi_search(shards, query, k, search_mode);
+                let results = multi_search(shards, router, query, k, search_mode);
                 let elapsed_us = t.elapsed().as_micros() as f64;
                 latencies_us.push(elapsed_us);
                 let gt_start = q_idx * gt_k;
@@ -707,7 +779,7 @@ fn sweep_one(
                             let q_start = q_idx * dim;
                             let query = &query_flat[q_start..q_start + dim];
                             let t = Instant::now();
-                            let results = multi_search(shards, query, k, search_mode);
+                            let results = multi_search(shards, router, query, k, search_mode);
                             lat.push(t.elapsed().as_micros() as f64);
                             let gt_start = q_idx * gt_k;
                             let gt: std::collections::HashSet<i64> = gt_flat
@@ -782,6 +854,7 @@ fn sweep_one(
 /// ascending and takes the first `k`.
 fn multi_search(
     shards: &[HnswIndex],
+    router: Option<&CentroidRouter>,
     query: &[f32],
     k: usize,
     mode: SearchMode,
@@ -790,13 +863,117 @@ fn multi_search(
     if shards.len() == 1 {
         return shards[0].search_with_mode(query, k, mode);
     }
-    let mut merged: Vec<coordinode_vector::hnsw::SearchResult> = shards
+    // Centroid routing prunes the fan-out to the top-m closest shards.
+    // Modulo partitions are geometry-blind, so no router = scatter-all.
+    let routed: Vec<usize> = match router {
+        Some(r) => r.route(query),
+        None => (0..shards.len()).collect(),
+    };
+    if routed.len() == 1 {
+        return shards[routed[0]].search_with_mode(query, k, mode);
+    }
+    let mut merged: Vec<coordinode_vector::hnsw::SearchResult> = routed
         .par_iter()
-        .flat_map_iter(|shard| shard.search_with_mode(query, k, mode))
+        .flat_map_iter(|&s| shards[s].search_with_mode(query, k, mode))
         .collect();
     merged.sort_by(|a, b| a.score.total_cmp(&b.score));
     merged.truncate(k);
     merged
+}
+
+/// Centroid-based shard router: k-means cluster centres plus the
+/// per-query fan-out width. Mirrors the IVF centroid index from the
+/// distributed design — routing cost is `n_shards` distance computations
+/// on the coordinator, after which only `top_m` shards do real work.
+struct CentroidRouter {
+    centroids: Vec<Vec<f32>>,
+    top_m: usize,
+    metric: VectorMetric,
+}
+
+impl CentroidRouter {
+    /// Shard indices of the `top_m` centroids closest to `query`,
+    /// best-first.
+    fn route(&self, query: &[f32]) -> Vec<usize> {
+        let mut scored: Vec<(usize, f32)> = self
+            .centroids
+            .iter()
+            .enumerate()
+            .map(|(j, c)| (j, centroid_distance(query, c, self.metric)))
+            .collect();
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+        scored.truncate(self.top_m);
+        scored.into_iter().map(|(j, _)| j).collect()
+    }
+}
+
+/// Distance used for centroid training / assignment / routing. Cosine
+/// datasets compare by cosine distance, everything else by squared L2
+/// (monotonic in L2, cheaper).
+fn centroid_distance(v: &[f32], c: &[f32], metric: VectorMetric) -> f32 {
+    match metric {
+        VectorMetric::Cosine => 1.0 - cosine_sim(v, c),
+        _ => l2_sq(v, c),
+    }
+}
+
+/// Index of the centroid closest to `v`.
+fn nearest_centroid(v: &[f32], centroids: &[Vec<f32>], metric: VectorMetric) -> usize {
+    let mut best = 0usize;
+    let mut best_d = f32::INFINITY;
+    for (j, c) in centroids.iter().enumerate() {
+        let dist = centroid_distance(v, c, metric);
+        if dist < best_d {
+            best_d = dist;
+            best = j;
+        }
+    }
+    best
+}
+
+/// Deterministic k-means (Lloyd) over an evenly-strided subsample.
+/// Init = evenly spaced sample points (deterministic, no RNG), 10
+/// iterations — plenty for k in the single digits. Empty clusters keep
+/// their previous centre, which can only happen with duplicate-heavy
+/// data and is harmless for routing purposes.
+fn train_centroids(
+    train_flat: &[f32],
+    d: usize,
+    n_train: usize,
+    k: usize,
+    metric: VectorMetric,
+) -> Vec<Vec<f32>> {
+    const SAMPLE_CAP: usize = 20_000;
+    const LLOYD_ITERS: usize = 10;
+    let sample_n = n_train.min(SAMPLE_CAP);
+    let stride = (n_train / sample_n).max(1);
+    let sample: Vec<&[f32]> = (0..n_train)
+        .step_by(stride)
+        .take(sample_n)
+        .map(|i| &train_flat[i * d..(i + 1) * d])
+        .collect();
+    let mut centroids: Vec<Vec<f32>> = (0..k)
+        .map(|j| sample[j * sample.len() / k].to_vec())
+        .collect();
+    for _ in 0..LLOYD_ITERS {
+        let mut sums = vec![vec![0f32; d]; k];
+        let mut counts = vec![0usize; k];
+        for v in &sample {
+            let cl = nearest_centroid(v, &centroids, metric);
+            counts[cl] += 1;
+            for (s, x) in sums[cl].iter_mut().zip(v.iter()) {
+                *s += x;
+            }
+        }
+        for j in 0..k {
+            if counts[j] > 0 {
+                for (cv, s) in centroids[j].iter_mut().zip(sums[j].iter()) {
+                    *cv = s / counts[j] as f32;
+                }
+            }
+        }
+    }
+    centroids
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
