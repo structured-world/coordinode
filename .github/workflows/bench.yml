@@ -57,6 +57,11 @@ on:
         description: 'Fan-out width for shard_routing=centroid: each query searches only the m closest-centroid shards. "1" = max savings / lowest recall; equal to n_shards = scatter-all coverage on k-means partitions. Ignored for modulo routing.'
         required: false
         default: '1'
+      server_mode:
+        description: 'Run the server-mode vector bench: start a real coordinode process, load 50k sift through the gRPC client, recompute subset groundtruth, measure search QPS at concurrency 1 and 4 through the full product path (gRPC -> Cypher -> planner -> HnswScan). The in-process vs server-mode delta prices the server overlay. Adds ~10-15 min (server build + load + search).'
+        type: boolean
+        required: false
+        default: false
       subset_size:
         description: 'First N base vectors to use from each dataset (groundtruth recomputed brute-force). 50000 (default) keeps per-commit wall-clock under 20 min. Set to 100000+ for the full marketing matrix when full_sweep=true.'
         required: false
@@ -529,6 +534,14 @@ jobs:
               done
             done
           done
+
+      - name: Vector — server-mode bench (full product path)
+        if: ${{ inputs.server_mode }}
+        env:
+          DATASET_ROOT: ${{ vars.BENCH_DATASET_ROOT }}
+        run: |
+          set -euo pipefail
+          ./benches/vector-ann/scripts/server_bench.sh
 
       # ── Future modality steps land here, one per modality ─────
       # - name: Graph — LDBC SNB SF1 Interactive
