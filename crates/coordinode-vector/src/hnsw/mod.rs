@@ -1129,20 +1129,36 @@ impl HnswIndex {
     }
 
     /// Bulk-build path for static corpora where every vector is known
-    /// at call time.
+    /// at call time. Prefer this over a manual `insert_batch` loop
+    /// when the caller has the full dataset in hand.
     ///
-    /// Below `BULK_BUILD_THRESHOLD` items, the rayon orchestration
-    /// overhead of the cluster-and-stitch algorithm exceeds the
-    /// per-cluster parallel win, so the call falls through to
-    /// [`Self::insert_batch`] verbatim. Above that threshold the call
-    /// delegates to the dedicated `bulk_build` module which implements
-    /// the ParlayANN-style sample-cluster-stitch topology.
+    /// Below the module's threshold the call falls through to
+    /// [`Self::insert_batch`] verbatim because the leader-seed and
+    /// cluster-ordering overhead does not pay back at small N. Above
+    /// the threshold the call routes through three stages:
     ///
-    /// For now both branches resolve to `insert_batch` so behaviour is
-    /// observationally identical; only the dispatch surface and the
-    /// fallback threshold land here. Later commits replace the
-    /// upper branch with the real algorithm without touching this
-    /// entry point.
+    /// 1. Sample `floor(sqrt(N))` leaders deterministically (xorshift
+    ///    Fisher-Yates over the input index set; reproducible for a
+    ///    given N).
+    /// 2. Seed the upper graph with sequential `insert` calls over
+    ///    just the leaders; each leader's plan sees every prior
+    ///    leader, producing a sparse, well-formed entry topology
+    ///    before any follower lands.
+    /// 3. Brute-force-assign followers to their nearest leader via
+    ///    rayon, stable-sort followers by cluster id so a cluster's
+    ///    items are contiguous, and hand the reordered batch to
+    ///    [`Self::insert_batch`]. The apply phase then visits adjacent
+    ///    `nodes[]` indices for a whole cluster before moving on,
+    ///    giving the cache a working set that fits between graph
+    ///    pointer chases.
+    ///
+    /// Each stage above leaves the graph in the same observable state
+    /// a plain `insert_batch` would; the change is order and locality,
+    /// not topology. A future task may extend this with cluster-
+    /// restricted plans + parallel per-cluster builds (the full
+    /// ParlayANN topology); that work requires threading an
+    /// allowed-node bitmap through the search-internals and is
+    /// deliberately not part of this entry point.
     pub fn bulk_build(&mut self, items: Vec<(u64, Vec<f32>)>) {
         if items.len() < bulk_build::BULK_BUILD_THRESHOLD {
             self.insert_batch(items);
