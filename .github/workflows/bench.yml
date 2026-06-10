@@ -78,6 +78,12 @@ permissions:
 jobs:
   bench:
     name: All modalities (sequential)
+    # Skip guard: commits whose message carries `[skip bench]` do not
+    # queue a bench run. Use for yml-only / docs-only / non-perf edits
+    # so the single self-hosted runner's queue is not serialised behind
+    # benches that would measure identical engine code. The guard only
+    # applies to push triggers; workflow_dispatch always runs.
+    if: ${{ github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip bench]') }}
     runs-on:
       - self-hosted
       - gpu-private-systems
@@ -229,7 +235,17 @@ jobs:
 
           for T in $THREAD_LIST; do
            for S in $SHARD_LIST; do
-            echo "::group::SIFT-128-L2 M=16 codec=none threads=$T shards=$S"
+            # Rayon pool budget = T x S. `--threads` pins the GLOBAL rayon
+            # pool, which the shard scatter's par_iter also runs on; with
+            # the pool capped at T the (T=2, S=2) cell would execute its
+            # 4 concurrent shard searches on only 2 workers and report a
+            # meaningless fixed-budget efficiency (measured 0.20-0.25 at
+            # 12d214b before this fix). Semantics after the fix:
+            #   T = per-shard search-thread budget
+            #   T x S = total core budget for the cell
+            # S=1 collapses to POOL=T, bit-identical to the legacy shape.
+            POOL=$((T * S))
+            echo "::group::SIFT-128-L2 M=16 codec=none threads=$T shards=$S pool=$POOL"
             ./target/release/bench-vector-ann \
               --train       "$DS_DIR/sift_base.fvecs" \
               --query       "$DS_DIR/sift_query.fvecs" \
@@ -237,7 +253,7 @@ jobs:
               --dataset-name sift-128-euclidean \
               --m 16 --ef-construction 200 \
               --codec none --ef-sweep "$EF_SWEEP" \
-              --threads "$T" \
+              --threads "$POOL" \
               --search-threads "$T" \
               --n-shards "$S" \
               --subset-size "$SUBSET_SIZE" \
@@ -258,7 +274,7 @@ jobs:
               --dataset-name sift-128-euclidean \
               --m 24 --ef-construction 200 \
               --codec none --ef-sweep "$EF_SWEEP" \
-              --threads "$T" \
+              --threads "$POOL" \
               --search-threads "$T" \
               --n-shards "$S" \
               --subset-size "$SUBSET_SIZE" \
@@ -277,7 +293,7 @@ jobs:
                 --m 16 --ef-construction 200 \
                 --codec none --quantization rabitq \
                 --ef-sweep "$EF_SWEEP" \
-                --threads "$T" \
+                --threads "$POOL" \
                 --search-threads "$T" \
                 --n-shards "$S" \
                 --subset-size "$SUBSET_SIZE" \
@@ -302,7 +318,7 @@ jobs:
                 --m 16 --ef-construction 200 \
                 --codec none --quantization "$QUANT" \
                 --ef-sweep "$EF_SWEEP" \
-                --threads "$T" \
+                --threads "$POOL" \
                 --search-threads "$T" \
                 --n-shards "$S" \
                 --subset-size "$SUBSET_SIZE" \
@@ -327,7 +343,7 @@ jobs:
                   --dataset-name "$DSNAME" \
                   --m 16 --ef-construction 200 \
                   --codec none --search-mode exact \
-                  --threads "$T" \
+                  --threads "$POOL" \
                   --search-threads "$T" \
                   --n-shards "$S" \
                   --subset-size "$SUBSET_SIZE" \
@@ -372,7 +388,7 @@ jobs:
                 --codec none --quantization rabitq \
                 --rerank-mode end-of-search --rerank-oversample "$OS" \
                 --ef-sweep "$EF_SWEEP" \
-                --threads "$T" \
+                --threads "$POOL" \
                 --search-threads "$T" \
                 --n-shards "$S" \
                 --subset-size "$SUBSET_SIZE" \
