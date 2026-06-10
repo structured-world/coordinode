@@ -33,6 +33,9 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 
 mod fvecs;
+mod gt;
+
+use crate::gt::{brute_force_gt, cosine_sim, l2_sq};
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -982,88 +985,4 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     }
     let idx = ((sorted.len() as f64) * p).floor() as usize;
     sorted[idx.min(sorted.len() - 1)]
-}
-
-/// Brute-force kNN for ground-truth recomputation on a subsampled
-/// training set. Runs `n_query` queries in parallel via rayon; each
-/// query computes the distance to every training vector and keeps
-/// the top-`k` by smaller-is-closer ordering. Result layout matches
-/// `read_ivecs`: row-major `Vec<i32>` of length `n_query * k`.
-fn brute_force_gt(
-    train: &[f32],
-    queries: &[f32],
-    d: usize,
-    k: usize,
-    metric: VectorMetric,
-) -> Vec<i32> {
-    use rayon::prelude::*;
-
-    let n_train = train.len() / d;
-    let n_query = queries.len() / d;
-    let mut result = vec![0i32; n_query * k];
-
-    result
-        .par_chunks_mut(k)
-        .enumerate()
-        .for_each(|(q_idx, out)| {
-            let q = &queries[q_idx * d..(q_idx + 1) * d];
-            let mut scored: Vec<(f32, i32)> = (0..n_train)
-                .map(|i| {
-                    let v = &train[i * d..(i + 1) * d];
-                    let score = match metric {
-                        VectorMetric::L2 => l2_sq(q, v),
-                        VectorMetric::L1 => l1(q, v),
-                        // Cosine similarity / dot product both ordered
-                        // descending; negate so smaller-is-closer
-                        // matches the L2 / L1 path.
-                        VectorMetric::Cosine => -cosine_sim(q, v),
-                        VectorMetric::DotProduct => -dot(q, v),
-                    };
-                    (score, i as i32)
-                })
-                .collect();
-            let take = k.min(scored.len());
-            if take < scored.len() {
-                scored.select_nth_unstable_by(take, |a, b| a.0.total_cmp(&b.0));
-            }
-            scored[..take].sort_by(|a, b| a.0.total_cmp(&b.0));
-            for (i, (_, idx)) in scored[..take].iter().enumerate() {
-                out[i] = *idx;
-            }
-        });
-
-    result
-}
-
-fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| {
-            let d = *x - *y;
-            d * d
-        })
-        .sum()
-}
-
-fn l1(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (*x - *y).abs()).sum()
-}
-
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| *x * *y).sum()
-}
-
-fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
-    let mut dot = 0.0f32;
-    let mut na = 0.0f32;
-    let mut nb = 0.0f32;
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += *x * *y;
-        na += *x * *x;
-        nb += *y * *y;
-    }
-    if na == 0.0 || nb == 0.0 {
-        return 0.0;
-    }
-    dot / (na.sqrt() * nb.sqrt())
 }

@@ -153,6 +153,26 @@ pub fn read_ivecs(path: impl AsRef<Path>) -> Result<(usize, Vec<i32>), FvecsErro
     Ok((first_dim.unwrap_or(0) as usize, vectors))
 }
 
+/// Write a row-major i32 matrix as an `.ivecs` file (the inverse of
+/// [`read_ivecs`]). Used by the loader bin to persist recomputed
+/// subset groundtruth so the server-mode search bench can measure
+/// recall against exactly the data that was loaded. (The module is
+/// compiled per-bin; bins that never write groundtruth see this as
+/// dead code.)
+#[allow(dead_code)]
+pub fn write_ivecs(path: impl AsRef<Path>, k: usize, rows: &[i32]) -> Result<(), FvecsError> {
+    use std::io::Write as _;
+    let mut writer = std::io::BufWriter::new(File::create(path)?);
+    for row in rows.chunks_exact(k) {
+        writer.write_all(&(k as u32).to_le_bytes())?;
+        for v in row {
+            writer.write_all(&v.to_le_bytes())?;
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

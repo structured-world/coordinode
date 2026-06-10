@@ -18,9 +18,11 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 
 // The shared fvecs module also exports `read_ivecs`, which only the
-// search bins use; the loader needs the train side alone.
+// search bins use.
 #[allow(dead_code)]
 mod fvecs;
+#[allow(dead_code)]
+mod gt;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -77,6 +79,23 @@ struct Args {
     /// Skip the CREATE VECTOR INDEX DDL (loads data only).
     #[arg(long, default_value_t = false)]
     no_index: bool,
+
+    /// Optional query `.fvecs` path. Together with
+    /// `--write-groundtruth`, recomputes exact k-NN against the
+    /// (possibly subset) train set and writes it as `.ivecs`. The
+    /// published full-dataset groundtruth is INVALID for a subset (it
+    /// references neighbours outside the loaded rows); the search
+    /// bench needs this recomputed file to measure recall correctly.
+    #[arg(long)]
+    query: Option<PathBuf>,
+
+    /// Output path for the recomputed subset groundtruth `.ivecs`.
+    #[arg(long)]
+    write_groundtruth: Option<PathBuf>,
+
+    /// k for the recomputed groundtruth rows.
+    #[arg(long, default_value_t = 10)]
+    gt_k: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -96,6 +115,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         n_train = args.subset_size;
     }
     info!(n_train, dim, "training set ready");
+
+    // Recompute groundtruth against the (possibly subset) train set.
+    // Runs BEFORE the load so a gt-only invocation works without a
+    // server, and a load failure doesn't waste the brute-force pass.
+    if let (Some(query_path), Some(gt_path)) = (&args.query, &args.write_groundtruth) {
+        let (q_dim, query_flat) = read_fvecs(query_path)?;
+        if q_dim != dim {
+            return Err(format!("query dim ({q_dim}) != train dim ({dim})").into());
+        }
+        let metric = match args.metric.as_str() {
+            "cosine" => coordinode_core::graph::types::VectorMetric::Cosine,
+            _ => coordinode_core::graph::types::VectorMetric::L2,
+        };
+        let t = Instant::now();
+        let gt = crate::gt::brute_force_gt(&train_flat, &query_flat, dim, args.gt_k, metric);
+        crate::fvecs::write_ivecs(gt_path, args.gt_k, &gt)?;
+        info!(
+            path = ?gt_path,
+            gt_k = args.gt_k,
+            secs = t.elapsed().as_secs_f64(),
+            "subset groundtruth written"
+        );
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
