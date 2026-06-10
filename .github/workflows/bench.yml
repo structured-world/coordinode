@@ -49,6 +49,14 @@ on:
         description: 'Comma-separated n_shards values to sweep for the vector bench (each value re-runs the full per-commit smoke set as an independent shard fleet). Empty / "default" = single-shard ("1"); the bench harness collapses to today''s single-index control path when n_shards=1. Example: "1,2" produces a T1 ST + T2 MT4 baseline AND a T3 SHARD pair for E_node calculation. Push trigger keeps "1" so the lean per-commit budget is unaffected; manual runs opt into ">=2".'
         required: false
         default: ''
+      shard_routing:
+        description: 'Shard partitioning + routing strategy for n_shards > 1: "modulo" (default, geometry-blind id % N partitions, every query scatters to ALL shards = worst-case fan-out floor) or "centroid" (deterministic k-means partitions; each query routes only to the route_top_m closest shards = IVF-style routed fan-out).'
+        required: false
+        default: 'modulo'
+      route_top_m:
+        description: 'Fan-out width for shard_routing=centroid: each query searches only the m closest-centroid shards. "1" = max savings / lowest recall; equal to n_shards = scatter-all coverage on k-means partitions. Ignored for modulo routing.'
+        required: false
+        default: '1'
       subset_size:
         description: 'First N base vectors to use from each dataset (groundtruth recomputed brute-force). 50000 (default) keeps per-commit wall-clock under 20 min. Set to 100000+ for the full marketing matrix when full_sweep=true.'
         required: false
@@ -177,6 +185,11 @@ jobs:
           # n_shards field on every JSON so the analysis can compute
           # E_node(K) = QPS(n_shards=K) / (K * QPS(n_shards=1)).
           SHARD_SWEEP: ${{ inputs.shard_sweep }}
+          # Partitioning + routing for multi-shard cells. modulo =
+          # scatter-all floor; centroid = k-means partitions + top-m
+          # routed fan-out (the distributed design's IVF model).
+          SHARD_ROUTING: ${{ inputs.shard_routing || 'modulo' }}
+          ROUTE_TOP_M: ${{ inputs.route_top_m || '1' }}
           # First N base vectors per dataset (groundtruth recomputed
           # brute-force inside bench-vector-ann). 50k by default to
           # match the hnswlib competitor donor cells already published
@@ -256,6 +269,7 @@ jobs:
               --threads "$POOL" \
               --search-threads "$T" \
               --n-shards "$S" \
+              --shard-routing "$SHARD_ROUTING" --route-top-m "$ROUTE_TOP_M" \
               --subset-size "$SUBSET_SIZE" \
               --output bench-results
             echo "::endgroup::"
@@ -277,6 +291,7 @@ jobs:
               --threads "$POOL" \
               --search-threads "$T" \
               --n-shards "$S" \
+              --shard-routing "$SHARD_ROUTING" --route-top-m "$ROUTE_TOP_M" \
               --subset-size "$SUBSET_SIZE" \
               --output bench-results
             echo "::endgroup::"
@@ -296,6 +311,7 @@ jobs:
                 --threads "$POOL" \
                 --search-threads "$T" \
                 --n-shards "$S" \
+                --shard-routing "$SHARD_ROUTING" --route-top-m "$ROUTE_TOP_M" \
                 --subset-size "$SUBSET_SIZE" \
                 --output bench-results
               echo "::endgroup::"
@@ -321,6 +337,7 @@ jobs:
                 --threads "$POOL" \
                 --search-threads "$T" \
                 --n-shards "$S" \
+                --shard-routing "$SHARD_ROUTING" --route-top-m "$ROUTE_TOP_M" \
                 --subset-size "$SUBSET_SIZE" \
                 --output bench-results
               echo "::endgroup::"
@@ -346,6 +363,7 @@ jobs:
                   --threads "$POOL" \
                   --search-threads "$T" \
                   --n-shards "$S" \
+                  --shard-routing "$SHARD_ROUTING" --route-top-m "$ROUTE_TOP_M" \
                   --subset-size "$SUBSET_SIZE" \
                   --output bench-results
                 echo "::endgroup::"
@@ -391,6 +409,7 @@ jobs:
                 --threads "$POOL" \
                 --search-threads "$T" \
                 --n-shards "$S" \
+                --shard-routing "$SHARD_ROUTING" --route-top-m "$ROUTE_TOP_M" \
                 --subset-size "$SUBSET_SIZE" \
                 --output bench-results
               echo "::endgroup::"
