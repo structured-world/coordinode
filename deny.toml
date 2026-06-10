@@ -17,6 +17,7 @@ allow = [
     "AGPL-3.0-only",
     "CC0-1.0",
     "CDLA-Permissive-2.0",
+    "0BSD",
 ]
 confidence-threshold = 0.8
 
@@ -24,6 +25,12 @@ confidence-threshold = 0.8
 ignore = true
 
 [advisories]
+ignore = [
+    # proc-macro-error2 marked unmaintained upstream; pulled transitively
+    # via include-flate-codegen. Tracking upstream migration; safe to
+    # ignore in CI until include-flate drops the dep.
+    "RUSTSEC-2026-0173",
+]
 
 [bans]
 multiple-versions = "allow"
