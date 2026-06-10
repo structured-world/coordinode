@@ -230,6 +230,18 @@ struct Args {
     /// point because `ef_search` has no effect on brute force.
     #[arg(long, value_enum, default_value_t = SearchModeArg::Hnsw)]
     search_mode: SearchModeArg,
+
+    /// Number of independent HNSW shards to build over the dataset.
+    /// `1` (default) builds a single index (today's shape). `N>1`
+    /// partitions the train vectors by `id % N` so each shard owns
+    /// roughly `n_train/N` rows; at search time the bench scatters every
+    /// query to every shard and K-way merges the top-K. The reported
+    /// QPS is the aggregate across shards, which drives the per-node
+    /// parallel-efficiency metric
+    ///   `E_node(K) = QPS(n_shards=K) / (K * QPS(n_shards=1))`.
+    /// Recorded as `n_shards` in the output JSON.
+    #[arg(long, default_value_t = 1)]
+    n_shards: usize,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -440,29 +452,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         ..Default::default()
     };
-    let mut index = HnswIndex::new(config);
-    info!("building index — this may take many minutes for SIFT1M");
+    // Build the shard fleet. `n_shards=1` collapses to a single index
+    // (today's shape, bit-identical control path). `n_shards>1`
+    // partitions the train set by `id % N` so each shard owns roughly
+    // `n_train/N` rows. Node ids stay in `[0, n_train)` across the
+    // fleet, which means the groundtruth ivecs (id-addressed) still
+    // map onto exactly one shard per id and recall is preserved when
+    // the bench scatters queries across shards and merges top-K.
+    let n_shards = args.n_shards.max(1);
+    let mut shards: Vec<HnswIndex> = (0..n_shards)
+        .map(|_| HnswIndex::new(config.clone()))
+        .collect();
+    info!(n_shards, "building shard fleet");
     // Chunked `insert_batch` (R858b). The apply-phase backfill bug that
     // collapsed recall at chunked scale was fixed by folding backfilled
     // candidates into the prune selection; 1k chunks match the API's
     // documented safe-batch upper bound.
     const BUILD_CHUNK: usize = 1_000;
-    let mut inserted = 0usize;
-    while inserted < n_train {
-        let end = (inserted + BUILD_CHUNK).min(n_train);
-        let chunk: Vec<(u64, Vec<f32>)> = (inserted..end)
-            .map(|row_idx| {
-                let start = row_idx * d;
-                (row_idx as u64, train_flat[start..start + d].to_vec())
-            })
-            .collect();
-        index.insert_batch(chunk);
-        inserted = end;
+    for (shard_id, shard) in shards.iter_mut().enumerate() {
+        let mut buf: Vec<(u64, Vec<f32>)> = Vec::with_capacity(BUILD_CHUNK);
+        let mut shard_inserted = 0usize;
+        for row_idx in (0..n_train).filter(|i| i % n_shards == shard_id) {
+            let start = row_idx * d;
+            buf.push((row_idx as u64, train_flat[start..start + d].to_vec()));
+            if buf.len() == BUILD_CHUNK {
+                shard_inserted += buf.len();
+                shard.insert_batch(std::mem::take(&mut buf));
+                info!(
+                    shard_id,
+                    inserted = shard_inserted,
+                    elapsed_s = build_start.elapsed().as_secs(),
+                    "shard build progress"
+                );
+            }
+        }
+        if !buf.is_empty() {
+            shard_inserted += buf.len();
+            shard.insert_batch(buf);
+        }
         info!(
-            inserted,
-            of = n_train,
+            shard_id,
+            inserted = shard_inserted,
             elapsed_s = build_start.elapsed().as_secs(),
-            "build progress"
+            "shard build complete"
         );
     }
     let build_secs = build_start.elapsed().as_secs_f64();
@@ -474,10 +506,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut points = Vec::new();
     for ef in &sweep {
         if !matches!(search_mode, SearchMode::Exact) {
-            index.set_ef_search(*ef);
+            for shard in &mut shards {
+                shard.set_ef_search(*ef);
+            }
         }
         let point = sweep_one(
-            &index,
+            &shards,
             &query_flat,
             &gt_flat,
             d,
@@ -534,6 +568,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `N>1` = aggregate throughput across N concurrent workers; pair
     // with the same N in competitor runs to derive E_core(N).
     report.record("search_threads", args.search_threads)?;
+    // Independent shards built over partitioned data; the bench scatters
+    // every query and K-way merges top-K so QPS is aggregate across the
+    // fleet. `1` collapses to the single-index control case.
+    report.record("n_shards", n_shards)?;
     // Bit-width only meaningful for `rabitq`; record unconditionally so
     // the dashboard can group/filter by it without per-row None handling.
     if args.quantization == "rabitq" {
@@ -595,7 +633,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// ground-truth row.
 #[allow(clippy::too_many_arguments)]
 fn sweep_one(
-    index: &HnswIndex,
+    shards: &[HnswIndex],
     query_flat: &[f32],
     gt_flat: &[i32],
     dim: usize,
@@ -619,7 +657,7 @@ fn sweep_one(
                 let q_start = q_idx * dim;
                 let query = &query_flat[q_start..q_start + dim];
                 let t = Instant::now();
-                let results = index.search_with_mode(query, k, search_mode);
+                let results = multi_search(shards, query, k, search_mode);
                 let elapsed_us = t.elapsed().as_micros() as f64;
                 latencies_us.push(elapsed_us);
                 let gt_start = q_idx * gt_k;
@@ -669,7 +707,7 @@ fn sweep_one(
                             let q_start = q_idx * dim;
                             let query = &query_flat[q_start..q_start + dim];
                             let t = Instant::now();
-                            let results = index.search_with_mode(query, k, search_mode);
+                            let results = multi_search(shards, query, k, search_mode);
                             lat.push(t.elapsed().as_micros() as f64);
                             let gt_start = q_idx * gt_k;
                             let gt: std::collections::HashSet<i64> = gt_flat
@@ -710,7 +748,7 @@ fn sweep_one(
     let qps = (n_test as f64 * REPLAY_ROUNDS as f64) / wall;
     let recall = hits as f64 / total as f64;
     let mean = latencies_us.iter().sum::<f64>() / latencies_us.len() as f64;
-    let ef_search = index.config().ef_search;
+    let ef_search = shards[0].config().ef_search;
     Ok(SweepPoint {
         ef_search,
         recall_at_k: recall,
@@ -720,6 +758,39 @@ fn sweep_one(
         latency_us_p95: percentile(&latencies_us, 0.95),
         latency_us_p99: percentile(&latencies_us, 0.99),
     })
+}
+
+/// Scatter the query to every shard, collect each shard's top-K results,
+/// merge into a single global top-K by ascending distance/score.
+///
+/// `n_shards=1` collapses to a direct call into the single index (no
+/// extra allocation, no merge), so the existing single-index push cells
+/// stay bit-identical with the legacy harness shape. For `n_shards>1`
+/// the bench cheats by holding the indices directly (no IPC, no routing)
+/// so the measurement isolates the fan-out + merge cost from network or
+/// proposal overhead.
+///
+/// Lower `score` is "better" across every supported metric (cosine
+/// distance, L2-squared, negated dot product), so the merge sorts
+/// ascending and takes the first `k`.
+fn multi_search(
+    shards: &[HnswIndex],
+    query: &[f32],
+    k: usize,
+    mode: SearchMode,
+) -> Vec<coordinode_vector::hnsw::SearchResult> {
+    if shards.len() == 1 {
+        return shards[0].search_with_mode(query, k, mode);
+    }
+    let mut merged: Vec<coordinode_vector::hnsw::SearchResult> =
+        Vec::with_capacity(shards.len() * k);
+    for shard in shards {
+        let mut hits = shard.search_with_mode(query, k, mode);
+        merged.append(&mut hits);
+    }
+    merged.sort_by(|a, b| a.score.total_cmp(&b.score));
+    merged.truncate(k);
+    merged
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
