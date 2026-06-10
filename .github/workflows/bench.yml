@@ -161,10 +161,13 @@ jobs:
           # E_core(4) = QPS_MT4 / (4 * QPS_ST) against competitors.
           THREAD_SWEEP: ${{ inputs.thread_sweep }}
           # First N base vectors per dataset (groundtruth recomputed
-          # brute-force inside bench-vector-ann). 50k by default for
-          # the lean push gate (must complete inside 20 min); manual
-          # runs override to 100k+ for marketing-grade numbers.
-          SUBSET_SIZE: ${{ inputs.subset_size || '20000' }}
+          # brute-force inside bench-vector-ann). 50k by default to
+          # match the hnswlib competitor donor cells already published
+          # on bench-data (glove-100-50k-angular t1/t4), so every push
+          # produces apples-to-apples E_core and absolute QPS deltas
+          # vs hnswlib without a separate manual cell. Manual runs can
+          # bump to 100k+ for marketing-grade numbers.
+          SUBSET_SIZE: ${{ inputs.subset_size || '50000' }}
           # Lean (push) vs full marketing matrix (manual). Push trigger
           # gives an empty string for boolean inputs, which we treat as
           # lean. Lean = sift+glove f32 only, no RaBitQ sweep.
