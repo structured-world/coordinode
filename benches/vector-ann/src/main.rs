@@ -760,15 +760,22 @@ fn sweep_one(
     })
 }
 
-/// Scatter the query to every shard, collect each shard's top-K results,
-/// merge into a single global top-K by ascending distance/score.
+/// Scatter the query to every shard IN PARALLEL, collect each shard's
+/// top-K results, merge into a single global top-K by ascending score.
 ///
 /// `n_shards=1` collapses to a direct call into the single index (no
-/// extra allocation, no merge), so the existing single-index push cells
-/// stay bit-identical with the legacy harness shape. For `n_shards>1`
-/// the bench cheats by holding the indices directly (no IPC, no routing)
-/// so the measurement isolates the fan-out + merge cost from network or
-/// proposal overhead.
+/// extra allocation, no merge, no rayon overhead), so the existing
+/// single-index push cells stay bit-identical with the legacy harness
+/// shape. For `n_shards>1` the bench cheats by holding the indices
+/// directly (no IPC, no routing) so the measurement isolates the
+/// fan-out + merge cost from network or proposal overhead.
+///
+/// Scatter uses `rayon::par_iter` so each shard's search runs on a
+/// separate worker; this is the apples-to-apples model for multi-host
+/// sharding where each shard's search hits its own host concurrently.
+/// Sequential scatter would just double per-query work and report a
+/// meaningless E_node(K) approx 1/K (measured at dfcee7d: E_node ~= 0.27
+/// with the legacy sequential loop).
 ///
 /// Lower `score` is "better" across every supported metric (cosine
 /// distance, L2-squared, negated dot product), so the merge sorts
@@ -779,15 +786,14 @@ fn multi_search(
     k: usize,
     mode: SearchMode,
 ) -> Vec<coordinode_vector::hnsw::SearchResult> {
+    use rayon::prelude::*;
     if shards.len() == 1 {
         return shards[0].search_with_mode(query, k, mode);
     }
-    let mut merged: Vec<coordinode_vector::hnsw::SearchResult> =
-        Vec::with_capacity(shards.len() * k);
-    for shard in shards {
-        let mut hits = shard.search_with_mode(query, k, mode);
-        merged.append(&mut hits);
-    }
+    let mut merged: Vec<coordinode_vector::hnsw::SearchResult> = shards
+        .par_iter()
+        .flat_map_iter(|shard| shard.search_with_mode(query, k, mode))
+        .collect();
     merged.sort_by(|a, b| a.score.total_cmp(&b.score));
     merged.truncate(k);
     merged
