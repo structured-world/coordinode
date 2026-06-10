@@ -33,18 +33,95 @@ use super::HnswIndex;
 /// re-measure and may lower the floor.
 pub(crate) const BULK_BUILD_THRESHOLD: usize = 256;
 
-/// Bulk-build the index from the given `items`. The caller is
-/// responsible for the dispatch decision; `HnswIndex::bulk_build`
-/// routes small batches through `insert_batch` and only this
-/// function is invoked when the corpus is large enough to benefit.
+/// Bulk-build the index from the given `items`.
 ///
-/// This entry shim currently forwards to `insert_batch` unchanged.
-/// The cluster-and-stitch body lands in a follow-up commit; the
-/// shim exists so callers can already pick the right path and the
-/// criterion bench can record the baseline before the algorithm
-/// landing changes the curve.
+/// Stage one of the cluster-and-stitch path: sample `floor(sqrt(N))`
+/// leaders deterministically, seed the upper layers of the graph
+/// with leader-only inserts, then run the rest of the corpus through
+/// the existing parallel `insert_batch`. The leader seed ensures the
+/// upper graph is sparse and well-formed before any follower
+/// arrives, which gives every follower's plan a small, fast entry
+/// search.
+///
+/// Subsequent commits replace the follower bulk-load with the
+/// per-cluster parallel build (Step 3) and add the cross-cluster
+/// stitch (Step 4). The seeded path here is a strict superset of
+/// `insert_batch` and must produce a graph with the same membership;
+/// recall comes from later steps.
 pub(crate) fn bulk_build(index: &mut HnswIndex, items: Vec<(u64, Vec<f32>)>) {
-    index.insert_batch(items);
+    let n = items.len();
+    if n == 0 {
+        return;
+    }
+
+    let leader_count = leader_count_for(n);
+    let leader_idx = sample_leader_indices(n, leader_count);
+
+    // Partition items into leaders + followers preserving the
+    // original ids. The leader set is a deterministic function of n.
+    let mut leaders: Vec<(u64, Vec<f32>)> = Vec::with_capacity(leader_count);
+    let mut followers: Vec<(u64, Vec<f32>)> = Vec::with_capacity(n - leader_count);
+    for (i, item) in items.into_iter().enumerate() {
+        if leader_idx.contains(&i) {
+            leaders.push(item);
+        } else {
+            followers.push(item);
+        }
+    }
+
+    // Seed the graph one leader at a time so each leader's plan
+    // sees every prior leader; this builds a clean upper-graph
+    // skeleton across the leader sample.
+    for (id, vec) in leaders {
+        index.insert(id, vec);
+    }
+
+    // Followers ride the parallel insert_batch path against the
+    // seeded graph. The leader-seeded upper graph reduces the
+    // depth of every follower's entry search and so amortises the
+    // per-follower planning cost.
+    if !followers.is_empty() {
+        index.insert_batch(followers);
+    }
+}
+
+/// `floor(sqrt(n))` clamped to `[1, n]`. Returns 0 only when `n == 0`.
+fn leader_count_for(n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let approx = (n as f64).sqrt().floor() as usize;
+    approx.max(1).min(n)
+}
+
+/// Sample `k` distinct leader indices from `0..n` using a
+/// deterministic xorshift-driven permutation. The same `n, k` pair
+/// always produces the same set so tests and bench runs are
+/// reproducible without depending on the `rand` crate.
+fn sample_leader_indices(n: usize, k: usize) -> std::collections::HashSet<usize> {
+    if k == 0 {
+        return std::collections::HashSet::new();
+    }
+    if k >= n {
+        return (0..n).collect();
+    }
+
+    // Seed derived from n itself; for a given corpus size the
+    // leader pick is stable.
+    let mut state: u64 = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).max(1);
+    let mut indices: Vec<usize> = (0..n).collect();
+
+    // Fisher-Yates over the first `k` slots is enough; the rest of
+    // the permutation is irrelevant.
+    for i in 0..k {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let span = (n - i) as u64;
+        let pick = (state % span) as usize + i;
+        indices.swap(i, pick);
+    }
+    indices.into_iter().take(k).collect()
 }
 
 #[cfg(test)]
@@ -88,6 +165,36 @@ mod tests {
         let expected = items.len();
         idx.bulk_build(items);
         assert_eq!(idx.len(), expected);
+    }
+
+    #[test]
+    fn leader_count_is_floor_sqrt() {
+        assert_eq!(leader_count_for(0), 0);
+        assert_eq!(leader_count_for(1), 1);
+        assert_eq!(leader_count_for(2), 1);
+        assert_eq!(leader_count_for(4), 2);
+        assert_eq!(leader_count_for(9), 3);
+        assert_eq!(leader_count_for(10), 3);
+        assert_eq!(leader_count_for(256), 16);
+        assert_eq!(leader_count_for(10_000), 100);
+    }
+
+    #[test]
+    fn leader_sample_is_deterministic_and_unique() {
+        let a = sample_leader_indices(1_000, 32);
+        let b = sample_leader_indices(1_000, 32);
+        assert_eq!(a, b, "same (n, k) must yield the same set");
+        assert_eq!(a.len(), 32);
+        assert!(a.iter().all(|&i| i < 1_000));
+    }
+
+    #[test]
+    fn leader_sample_covers_full_range_when_k_eq_n() {
+        let s = sample_leader_indices(8, 8);
+        assert_eq!(s.len(), 8);
+        for i in 0..8 {
+            assert!(s.contains(&i));
+        }
     }
 
     #[test]
