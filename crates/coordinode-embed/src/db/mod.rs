@@ -1311,6 +1311,12 @@ impl Database {
         // the resolved index name at execution time, not just at EXPLAIN time.
         plan.root = planner::annotate_vector_top_k(plan.root, &self.vector_index_registry);
 
+        // Promote pure vector top-K to the HnswScan index access path:
+        // the index becomes the row source and only the k result nodes
+        // are fetched, instead of materialising the whole label before
+        // ranking. Filtered queries keep the VectorTopK path.
+        plan.root = planner::apply_hnsw_scan_access_path(plan.root, &self.vector_index_registry);
+
         // Apply graph-predicate push-down (R-PUSH1): for every VectorFilter
         // preceded by a Traverse, annotate with strategy decision
         // (graph_first / acorn_filtered / vector_first) per the cost model
@@ -1524,6 +1530,9 @@ impl Database {
         // a matching B-tree index is registered).
         plan.root = planner::optimize_index_selection(plan.root, &self.index_registry);
         plan.root = planner::annotate_vector_top_k(plan.root, &self.vector_index_registry);
+        // Same access-path promotion as the execute path so EXPLAIN
+        // shows the plan that actually runs.
+        plan.root = planner::apply_hnsw_scan_access_path(plan.root, &self.vector_index_registry);
         let stats = self.compute_stats();
         let combined_for_push_down = stats.as_ref().map(|g| CombinedStats {
             graph: g,

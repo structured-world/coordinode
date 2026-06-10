@@ -1124,9 +1124,171 @@ pub fn apply_hnsw_scan_access_path(
     op: LogicalOp,
     registry: &crate::index::VectorIndexRegistry,
 ) -> LogicalOp {
-    // Step-1 scaffolding: the rewrite lands with the executor wiring.
-    let _ = registry;
-    op
+    match op {
+        LogicalOp::VectorTopK {
+            input,
+            vector_expr,
+            query_vector,
+            function,
+            k,
+            distance_alias,
+            hnsw_index,
+            predicate,
+        } => {
+            let rewrite = hnsw_scan_target(&input, &vector_expr, &function, &predicate, registry);
+            match rewrite {
+                Some((binding, label, property, index_name)) => LogicalOp::HnswScan {
+                    label,
+                    property,
+                    binding,
+                    query_vector,
+                    k,
+                    function,
+                    distance_alias,
+                    index_name,
+                },
+                None => LogicalOp::VectorTopK {
+                    input: Box::new(apply_hnsw_scan_access_path(*input, registry)),
+                    vector_expr,
+                    query_vector,
+                    function,
+                    k,
+                    distance_alias,
+                    hnsw_index,
+                    predicate,
+                },
+            }
+        }
+        LogicalOp::Project {
+            input,
+            items,
+            distinct,
+        } => LogicalOp::Project {
+            input: Box::new(apply_hnsw_scan_access_path(*input, registry)),
+            items,
+            distinct,
+        },
+        LogicalOp::Filter { input, predicate } => LogicalOp::Filter {
+            input: Box::new(apply_hnsw_scan_access_path(*input, registry)),
+            predicate,
+        },
+        LogicalOp::Sort { input, items } => LogicalOp::Sort {
+            input: Box::new(apply_hnsw_scan_access_path(*input, registry)),
+            items,
+        },
+        LogicalOp::Limit { input, count } => LogicalOp::Limit {
+            input: Box::new(apply_hnsw_scan_access_path(*input, registry)),
+            count,
+        },
+        LogicalOp::Skip { input, count } => LogicalOp::Skip {
+            input: Box::new(apply_hnsw_scan_access_path(*input, registry)),
+            count,
+        },
+        LogicalOp::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => LogicalOp::Aggregate {
+            input: Box::new(apply_hnsw_scan_access_path(*input, registry)),
+            group_by,
+            aggregates,
+        },
+        LogicalOp::Unwind {
+            input,
+            expr,
+            variable,
+        } => LogicalOp::Unwind {
+            input: Box::new(apply_hnsw_scan_access_path(*input, registry)),
+            expr,
+            variable,
+        },
+        LogicalOp::CartesianProduct { left, right } => LogicalOp::CartesianProduct {
+            left: Box::new(apply_hnsw_scan_access_path(*left, registry)),
+            right: Box::new(apply_hnsw_scan_access_path(*right, registry)),
+        },
+        LogicalOp::LeftOuterJoin { left, right } => LogicalOp::LeftOuterJoin {
+            left: Box::new(apply_hnsw_scan_access_path(*left, registry)),
+            right: Box::new(apply_hnsw_scan_access_path(*right, registry)),
+        },
+        // VectorTopK never hides below other operator kinds in a valid
+        // plan; leaves / DDL / writes are returned unchanged.
+        other => other,
+    }
+}
+
+/// Decide whether a `VectorTopK` qualifies for the HnswScan access path.
+/// Returns `(binding, label, property, index_name)` when ALL of:
+///
+/// - the input is a BARE single-label `NodeScan` with no inline
+///   property filters (any Filter / Traverse in between disqualifies —
+///   those compose with filtered HNSW search instead),
+/// - the vector expression is `scan_variable.property`,
+/// - the pushdown predicate is absent or just the scan label
+///   (annotate_vector_top_k synthesises `LabelEq` even for pure scans),
+/// - the registry has an index for `(label, property)` whose metric
+///   matches the ORDER BY function, so the index order IS the result
+///   order.
+fn hnsw_scan_target(
+    input: &LogicalOp,
+    vector_expr: &Expr,
+    function: &str,
+    predicate: &Option<crate::planner::logical::VectorPredicate>,
+    registry: &crate::index::VectorIndexRegistry,
+) -> Option<(String, String, String, String)> {
+    let LogicalOp::NodeScan {
+        variable,
+        labels,
+        property_filters,
+    } = input
+    else {
+        return None;
+    };
+    if labels.len() != 1 || !property_filters.is_empty() {
+        return None;
+    }
+    let label = &labels[0];
+
+    let Expr::PropertyAccess { expr, property } = vector_expr else {
+        return None;
+    };
+    let Expr::Variable(v) = expr.as_ref() else {
+        return None;
+    };
+    if v != variable {
+        return None;
+    }
+
+    use crate::planner::logical::VectorPredicate;
+    match predicate {
+        None => {}
+        Some(VectorPredicate::LabelEq(l)) if l == label => {}
+        Some(_) => return None,
+    }
+
+    let def = registry.get_definition(label, property)?;
+    let metric = def
+        .vector_config
+        .as_ref()
+        .map(|c| c.metric)
+        .unwrap_or(coordinode_core::graph::types::VectorMetric::Cosine);
+    use coordinode_core::graph::types::VectorMetric;
+    let compatible = matches!(
+        (function, metric),
+        ("vector_distance", VectorMetric::L2)
+            | ("vector_similarity", VectorMetric::Cosine)
+            | ("vector_dot", VectorMetric::DotProduct)
+            | ("vector_manhattan", VectorMetric::L1)
+    );
+    if !compatible {
+        return None;
+    }
+
+    Some((
+        variable.clone(),
+        label.clone(),
+        property.clone(),
+        def.name.clone(),
+    ))
 }
 
 /// Extract a single label from a NodeScan (or Filter over NodeScan) in the plan subtree.

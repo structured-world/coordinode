@@ -175,9 +175,12 @@ fn explain_shows_hnsw_scan_after_create() {
             "MATCH (n:Item) WITH n, vector_similarity(n.embedding, [1.0, 0.0, 0.0]) AS s ORDER BY s DESC LIMIT 5 RETURN n, s",
         )
         .expect("explain after");
+    // The access path replaces NodeScan+VectorTopK with the HnswScan
+    // source operator; the EXPLAIN line carries index, property, and
+    // the ORDER BY function (which implies the metric).
     assert!(
-        after.contains("HnswScan(item_emb, cosine)"),
-        "expected HnswScan(item_emb, cosine) after index, got:\n{after}"
+        after.contains("HnswScan(n:Item ON item_emb(embedding), vector_similarity"),
+        "expected HnswScan access path after index, got:\n{after}"
     );
 }
 
@@ -216,8 +219,8 @@ fn drop_vector_index_removes_index() {
         )
         .expect("explain after create");
     assert!(
-        after_create.contains("HnswScan(item_emb, cosine)"),
-        "expected HnswScan after create, got:\n{after_create}"
+        after_create.contains("HnswScan(n:Item ON item_emb(embedding), vector_similarity"),
+        "expected HnswScan access path after create, got:\n{after_create}"
     );
 
     // Drop the index.
@@ -288,8 +291,8 @@ fn vector_index_persists_across_reopen() {
             )
             .expect("explain after reopen");
         assert!(
-            plan.contains("HnswScan(persist_idx, cosine)"),
-            "expected HnswScan after reopen, got:\n{plan}"
+            plan.contains("ON persist_idx("),
+            "expected HnswScan access path after reopen, got:\n{plan}"
         );
     }
 }
@@ -554,8 +557,8 @@ fn drop_then_recreate_vector_index_succeeds() {
         )
         .expect("explain after re-create");
     assert!(
-        plan.contains("HnswScan(item_emb2, cosine)"),
-        "expected HnswScan(item_emb2, cosine) after re-create, got:\n{plan}"
+        plan.contains("ON item_emb2("),
+        "expected HnswScan access path after re-create, got:\n{plan}"
     );
 }
 
@@ -690,9 +693,11 @@ fn explain_shows_non_default_metric_in_hnsw_scan() {
         )
         .expect("explain");
 
+    // vector_distance + l2 index = compatible pair, so the access path
+    // engages; the function name in the EXPLAIN line implies the metric.
     assert!(
-        plan.contains("HnswScan(l2_idx, l2)"),
-        "expected HnswScan(l2_idx, l2) for l2 metric, got:\n{plan}"
+        plan.contains("HnswScan(n:Embed ON l2_idx(vec), vector_distance"),
+        "expected HnswScan access path for l2 metric, got:\n{plan}"
     );
 }
 
