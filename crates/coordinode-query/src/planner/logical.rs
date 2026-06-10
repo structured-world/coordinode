@@ -747,6 +747,39 @@ pub enum LogicalOp {
         score_alias: Option<String>,
     },
 
+    /// HNSW index access path: a SOURCE operator (peer of NodeScan).
+    ///
+    /// Replaces the `NodeScan -> [star Project] -> Sort(vector fn) ->
+    /// Limit(k)` chain when the query is a pure vector top-K over one
+    /// label with a registered HNSW index and no intermediate filters.
+    /// The executor asks the index for the top-k candidates and
+    /// point-fetches ONLY those k nodes from storage, making the query
+    /// O(k) storage reads instead of the O(N) full-label
+    /// materialisation that scan-then-rank pays.
+    ///
+    /// Queries with additional predicates keep the NodeScan +
+    /// VectorTopK path (which composes with filtered HNSW search).
+    HnswScan {
+        /// Label whose index serves the scan.
+        label: String,
+        /// Vector property the index covers.
+        property: String,
+        /// Row binding name for the fetched node (the MATCH variable).
+        binding: String,
+        /// Query vector expression (parameter or literal).
+        query_vector: Expr,
+        /// Top-K count (from the LIMIT clause).
+        k: usize,
+        /// Distance function from the original ORDER BY
+        /// (`vector_distance` / `vector_similarity` / ...). Determines
+        /// result ordering semantics and the score column value.
+        function: String,
+        /// Optional alias binding the computed distance into result rows.
+        distance_alias: Option<String>,
+        /// Registered index name (for EXPLAIN and executor lookup).
+        index_name: String,
+    },
+
     /// Empty input (no rows, used as leaf for standalone CREATE).
     Empty,
 }
@@ -906,6 +939,9 @@ impl LogicalOp {
             } => {
                 input.substitute_params(params);
                 vector_expr.substitute_params(params);
+                query_vector.substitute_params(params);
+            }
+            LogicalOp::HnswScan { query_vector, .. } => {
                 query_vector.substitute_params(params);
             }
             LogicalOp::VectorTopK {
@@ -1271,6 +1307,11 @@ fn estimate_op_cost(
 
         // IndexScan is a point-lookup: O(log N) cost, ~1 result row on average.
         LogicalOp::IndexScan { .. } => (1.0, 1.0),
+
+        // HnswScan: O(ef * log N) graph walk + k point reads. Cheapest
+        // source op when applicable — costed as k so the planner always
+        // prefers it over a full NodeScan of the same label.
+        LogicalOp::HnswScan { k, .. } => (*k as f64, *k as f64),
 
         LogicalOp::Traverse {
             input,
@@ -1699,6 +1740,24 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
         } => {
             output.push_str(&format!(
                 "{prefix}IndexScan({variable}:{label} ON {index_name}({property}))\n"
+            ));
+        }
+        LogicalOp::HnswScan {
+            label,
+            property,
+            binding,
+            k,
+            function,
+            index_name,
+            distance_alias,
+            ..
+        } => {
+            let alias_info = distance_alias
+                .as_deref()
+                .map(|a| format!(" AS {a}"))
+                .unwrap_or_default();
+            output.push_str(&format!(
+                "{prefix}HnswScan({binding}:{label} ON {index_name}({property}), {function} k={k}{alias_info})\n"
             ));
         }
         LogicalOp::Traverse {

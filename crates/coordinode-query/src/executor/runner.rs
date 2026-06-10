@@ -2116,6 +2116,14 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             value_expr,
         } => execute_btree_index_scan(variable, label, index_name, property, value_expr, ctx),
 
+        // Index access path for pure vector top-K. The planner only
+        // emits this op when a matching HNSW index is registered; the
+        // executor lands together with the planner rewrite, so until
+        // then reaching this arm means a hand-constructed plan.
+        LogicalOp::HnswScan { index_name, .. } => Err(ExecutionError::Unsupported(format!(
+            "HnswScan({index_name}) executor not yet wired"
+        ))),
+
         LogicalOp::Traverse {
             input,
             source,

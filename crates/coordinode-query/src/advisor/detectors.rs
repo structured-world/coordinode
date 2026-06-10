@@ -349,6 +349,7 @@ fn detect_vector_without_prefilter(op: &LogicalOp, suggestions: &mut Vec<Suggest
 fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
     match op {
         LogicalOp::NodeScan { .. }
+        | LogicalOp::HnswScan { .. }
         | LogicalOp::Empty
         | LogicalOp::ProcedureCall { .. }
         | LogicalOp::AlterLabel { .. }

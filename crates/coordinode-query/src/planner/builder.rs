@@ -1107,6 +1107,28 @@ pub fn annotate_vector_top_k(
     }
 }
 
+/// Access-path pass: replace `VectorTopK { input: bare NodeScan }` with
+/// the [`LogicalOp::HnswScan`] SOURCE operator when the query is a pure
+/// vector top-K over one label with a registered HNSW index.
+///
+/// "Bare" means the chain between VectorTopK and NodeScan contains no
+/// Filter / Traverse / anything that narrows or widens the row set —
+/// only a star-preserving Project is allowed. Those queries keep the
+/// scan-then-rank path, which composes with filtered HNSW search.
+///
+/// Runs AFTER [`annotate_vector_top_k`] so the registry lookup and the
+/// label/property extraction logic stay in one place conceptually; this
+/// pass re-derives them because the annotation only carries a display
+/// string.
+pub fn apply_hnsw_scan_access_path(
+    op: LogicalOp,
+    registry: &crate::index::VectorIndexRegistry,
+) -> LogicalOp {
+    // Step-1 scaffolding: the rewrite lands with the executor wiring.
+    let _ = registry;
+    op
+}
+
 /// Extract a single label from a NodeScan (or Filter over NodeScan) in the plan subtree.
 /// Walk an op tree below a VectorTopK and harvest every simple
 /// `variable.property = literal` predicate that references the same
@@ -5173,6 +5195,135 @@ mod tests {
         assert!(
             find_vector_top_k(&root).is_none(),
             "Pattern A must skip optimization when Project drops the vector variable: {root:?}"
+        );
+    }
+
+    // --- HnswScan access-path tests ---
+
+    /// Find HnswScan anywhere in a plan tree (depth-first).
+    fn find_hnsw_scan(op: &LogicalOp) -> Option<&LogicalOp> {
+        if matches!(op, LogicalOp::HnswScan { .. }) {
+            return Some(op);
+        }
+        match op {
+            LogicalOp::Project { input, .. }
+            | LogicalOp::Filter { input, .. }
+            | LogicalOp::Sort { input, .. }
+            | LogicalOp::Limit { input, .. }
+            | LogicalOp::Skip { input, .. }
+            | LogicalOp::Aggregate { input, .. }
+            | LogicalOp::VectorTopK { input, .. }
+            | LogicalOp::Unwind { input, .. } => find_hnsw_scan(input),
+            LogicalOp::CartesianProduct { left, right }
+            | LogicalOp::LeftOuterJoin { left, right } => {
+                find_hnsw_scan(left).or_else(|| find_hnsw_scan(right))
+            }
+            _ => None,
+        }
+    }
+
+    fn test_registry_with_doc_index() -> crate::index::VectorIndexRegistry {
+        let registry = crate::index::VectorIndexRegistry::new();
+        registry.register(crate::index::IndexDefinition::hnsw(
+            "doc_emb_idx",
+            "Doc",
+            "embedding",
+            crate::index::VectorIndexConfig {
+                dimensions: 2,
+                metric: coordinode_core::graph::types::VectorMetric::L2,
+                m: 16,
+                ef_construction: 200,
+                quantization: coordinode_vector::hnsw::QuantizationCodec::None,
+                offload_vectors: false,
+            },
+        ));
+        registry
+    }
+
+    /// Pure vector top-K over a bare NodeScan with a registered index
+    /// MUST plan as the HnswScan access path: no NodeScan, no
+    /// VectorTopK — the index IS the row source. This is the
+    /// scan-then-rank fix: without HnswScan every server-side vector
+    /// search materialises the whole label before ranking.
+    #[test]
+    fn hnsw_scan_replaces_scan_then_rank_for_pure_top_k() {
+        let registry = test_registry_with_doc_index();
+        let root = plan_root(
+            "MATCH (n:Doc) \
+             WITH *, vector_distance(n.embedding, [1.0, 0.0]) AS _dist \
+             ORDER BY _dist \
+             LIMIT 10 \
+             RETURN *",
+        );
+        let root = apply_hnsw_scan_access_path(root, &registry);
+        let scan = find_hnsw_scan(&root).expect(
+            "pure vector top-K with a registered index must plan HnswScan, \
+             not scan-then-rank",
+        );
+        if let LogicalOp::HnswScan {
+            label,
+            property,
+            binding,
+            k,
+            function,
+            index_name,
+            ..
+        } = scan
+        {
+            assert_eq!(label, "Doc");
+            assert_eq!(property, "embedding");
+            assert_eq!(binding, "n");
+            assert_eq!(*k, 10);
+            assert_eq!(function, "vector_distance");
+            assert_eq!(index_name, "doc_emb_idx");
+        } else {
+            unreachable!("find_hnsw_scan returned a non-HnswScan op");
+        }
+        assert!(
+            find_vector_top_k(&root).is_none(),
+            "HnswScan must REPLACE VectorTopK, not coexist: {root:?}"
+        );
+    }
+
+    /// A WHERE filter between the scan and the top-K keeps the
+    /// scan-then-rank path (filtered HNSW is the VectorTopK line of work).
+    #[test]
+    fn hnsw_scan_not_planned_with_filter() {
+        let registry = test_registry_with_doc_index();
+        let root = plan_root(
+            "MATCH (n:Doc) \
+             WHERE n.lang = 'en' \
+             WITH *, vector_distance(n.embedding, [1.0, 0.0]) AS _dist \
+             ORDER BY _dist \
+             LIMIT 10 \
+             RETURN *",
+        );
+        let root = apply_hnsw_scan_access_path(root, &registry);
+        assert!(
+            find_hnsw_scan(&root).is_none(),
+            "filtered query must keep the VectorTopK path: {root:?}"
+        );
+        assert!(
+            find_vector_top_k(&root).is_some(),
+            "filtered query must still have VectorTopK: {root:?}"
+        );
+    }
+
+    /// No registered index for the (label, property) → no HnswScan.
+    #[test]
+    fn hnsw_scan_not_planned_without_index() {
+        let registry = crate::index::VectorIndexRegistry::new();
+        let root = plan_root(
+            "MATCH (n:Doc) \
+             WITH *, vector_distance(n.embedding, [1.0, 0.0]) AS _dist \
+             ORDER BY _dist \
+             LIMIT 10 \
+             RETURN *",
+        );
+        let root = apply_hnsw_scan_access_path(root, &registry);
+        assert!(
+            find_hnsw_scan(&root).is_none(),
+            "no index registered -> no HnswScan: {root:?}"
         );
     }
 
