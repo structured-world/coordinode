@@ -10689,3 +10689,113 @@ fn read_consistency_snapshot_targets_as_of_timestamp_when_set() {
          elapsed={elapsed:?}"
     );
 }
+
+// ── HnswScan index access path ───────────────────────────────────────────
+
+/// HnswScan must return exactly the index's top-k as rows fetched by
+/// point reads, with full node materialisation (properties + label) and
+/// the distance alias carrying the same scalar the brute-force ORDER BY
+/// would compute. This is the executor half of the scan-then-rank fix:
+/// without it every vector top-K materialises the entire label.
+#[test]
+fn hnsw_scan_executor_returns_index_top_k() {
+    use coordinode_query::cypher::ast::Expr;
+    use coordinode_query::planner::logical::{LogicalOp, LogicalPlan};
+    use coordinode_vector::hnsw::{HnswConfig, HnswIndex};
+
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+
+    // Four 2-d points at increasing distance from the query [0, 0].
+    let coords: [(f64, f64); 4] = [(0.1, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.0)];
+    let mut node_ids: Vec<u64> = Vec::new();
+    for (x, y) in coords {
+        let rows = run_cypher_with_alloc(
+            &format!("CREATE (n:Item {{embedding: [{x}, {y}]}}) RETURN n"),
+            engine,
+            &mut interner,
+            &allocator,
+        );
+        let Some(Value::Int(id)) = rows[0].get("n") else {
+            panic!("CREATE must return the node id");
+        };
+        node_ids.push(*id as u64);
+    }
+
+    // Build the HNSW by hand with the SAME node ids the storage rows
+    // got, register it, and scan for top-2.
+    let mut hnsw = HnswIndex::new(HnswConfig {
+        m: 8,
+        m_max0: 16,
+        ef_construction: 64,
+        ef_search: 32,
+        metric: coordinode_core::graph::types::VectorMetric::L2,
+        max_dimensions: 2,
+        ..Default::default()
+    });
+    for (i, (x, y)) in coords.iter().enumerate() {
+        hnsw.insert(node_ids[i], vec![*x as f32, *y as f32]);
+    }
+    let registry = VectorIndexRegistry::new();
+    registry.register_with_index(
+        IndexDefinition::hnsw(
+            "item_emb_idx",
+            "Item",
+            "embedding",
+            coordinode_query::index::VectorIndexConfig {
+                dimensions: 2,
+                metric: coordinode_core::graph::types::VectorMetric::L2,
+                m: 8,
+                ef_construction: 64,
+                quantization: coordinode_vector::hnsw::QuantizationCodec::None,
+                offload_vectors: false,
+            },
+        ),
+        hnsw,
+    );
+
+    let plan = LogicalPlan {
+        root: LogicalOp::HnswScan {
+            label: "Item".to_string(),
+            property: "embedding".to_string(),
+            binding: "n".to_string(),
+            query_vector: Expr::Literal(Value::Array(vec![Value::Float(0.0), Value::Float(0.0)])),
+            k: 2,
+            function: "vector_distance".to_string(),
+            distance_alias: Some("_dist".to_string()),
+            index_name: "item_emb_idx".to_string(),
+        },
+        snapshot_ts: None,
+        vector_consistency: coordinode_core::graph::types::VectorConsistencyMode::default(),
+        read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
+    };
+    let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
+    ctx.vector_index_registry = Some(&registry);
+    let rows = execute(&plan, &mut ctx).expect("HnswScan must execute");
+
+    assert_eq!(rows.len(), 2, "top-2 of 4 points: {rows:?}");
+    // Nearest two to [0,0] are coords[0] and coords[1], in that order.
+    assert_eq!(rows[0].get("n"), Some(&Value::Int(node_ids[0] as i64)));
+    assert_eq!(rows[1].get("n"), Some(&Value::Int(node_ids[1] as i64)));
+    // Full node materialisation: property column present.
+    assert!(
+        rows[0].contains_key("n.embedding"),
+        "fetched row must carry node properties: {:?}",
+        rows[0]
+    );
+    assert_eq!(
+        rows[0].get("n.__label__"),
+        Some(&Value::String("Item".to_string()))
+    );
+    // Distance alias carries the brute-force scalar (sqrt L2): 0.1 and 1.0.
+    let Some(Value::Float(d0)) = rows[0].get("_dist") else {
+        panic!("_dist column missing: {:?}", rows[0]);
+    };
+    let Some(Value::Float(d1)) = rows[1].get("_dist") else {
+        panic!("_dist column missing: {:?}", rows[1]);
+    };
+    assert!((d0 - 0.1).abs() < 1e-5, "d0={d0}");
+    assert!((d1 - 1.0).abs() < 1e-5, "d1={d1}");
+}

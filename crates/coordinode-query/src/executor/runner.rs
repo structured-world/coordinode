@@ -2116,13 +2116,28 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             value_expr,
         } => execute_btree_index_scan(variable, label, index_name, property, value_expr, ctx),
 
-        // Index access path for pure vector top-K. The planner only
-        // emits this op when a matching HNSW index is registered; the
-        // executor lands together with the planner rewrite, so until
-        // then reaching this arm means a hand-constructed plan.
-        LogicalOp::HnswScan { index_name, .. } => Err(ExecutionError::Unsupported(format!(
-            "HnswScan({index_name}) executor not yet wired"
-        ))),
+        // Index access path for pure vector top-K: the index IS the row
+        // source; only the k result nodes are fetched from storage.
+        LogicalOp::HnswScan {
+            label,
+            property,
+            binding,
+            query_vector,
+            k,
+            function,
+            distance_alias,
+            index_name,
+        } => execute_hnsw_scan(
+            label,
+            property,
+            binding,
+            query_vector,
+            *k,
+            function,
+            distance_alias.as_deref(),
+            index_name,
+            ctx,
+        ),
 
         LogicalOp::Traverse {
             input,
@@ -3123,6 +3138,115 @@ fn execute_btree_index_scan(
         results.push(row);
     }
 
+    Ok(results)
+}
+
+/// Execute the `HnswScan` index access path: ask the HNSW index for the
+/// top-k candidates, then point-fetch ONLY those k node records into
+/// rows. O(k) storage reads — the whole point of the access path versus
+/// the scan-then-rank pipeline that materialises every node of the
+/// label before ranking.
+///
+/// Row shape matches `execute_node_scan` / `execute_btree_index_scan`
+/// (binding -> node_id, binding.prop -> value, binding.__label__,
+/// computed properties injected) so every downstream operator works
+/// unchanged. When `distance_alias` is set, the column carries the
+/// SAME scalar the brute-force path would have computed for the
+/// original ORDER BY function — recomputed exactly per candidate (k is
+/// tiny) instead of trusting the index's internal score, whose units
+/// differ per metric (e.g. squared L2 inside the engine vs sqrt L2
+/// from the Cypher scalar).
+#[allow(clippy::too_many_arguments)]
+fn execute_hnsw_scan(
+    label: &str,
+    property: &str,
+    binding: &str,
+    query_vector: &Expr,
+    k: usize,
+    function: &str,
+    distance_alias: Option<&str>,
+    index_name: &str,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    let Some(registry) = ctx.vector_index_registry else {
+        return Err(ExecutionError::Unsupported(format!(
+            "HnswScan({index_name}) requires vector_index_registry in ExecutionContext"
+        )));
+    };
+    // Honour the online-during-build policy exactly like the
+    // scan-then-rank path does.
+    gate_vector_index_read(ctx.engine, registry, label, property)?;
+
+    let qv_val = eval_expr(query_vector, &Row::new());
+    let Some(qv) = coerce_value_to_vec(&qv_val) else {
+        return Err(ExecutionError::Unsupported(format!(
+            "HnswScan({index_name}): query vector did not evaluate to a vector"
+        )));
+    };
+
+    let Some(hits) = registry.search(label, property, &qv, k) else {
+        // Index disappeared between planning and execution (concurrent
+        // DROP). Empty result keeps the read path total; the planner
+        // will not pick HnswScan on the next statement.
+        return Ok(Vec::new());
+    };
+
+    use coordinode_modality::NodeStore as _;
+    let nodes = coordinode_modality::LocalNodeStore::new(ctx.engine);
+    let mut results = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let node_id = NodeId::from_raw(hit.id);
+        let Some(record) = nodes.get(ctx.shard_id, node_id)? else {
+            // Node deleted after the index entry was written — skip.
+            continue;
+        };
+        if !record.has_label(label) {
+            continue;
+        }
+
+        let mut row = Row::new();
+        row.insert(binding.to_string(), Value::Int(hit.id as i64));
+        for (field_id, value) in &record.props {
+            if let Some(field_name) = ctx.interner.resolve(*field_id) {
+                row.insert(format!("{binding}.{field_name}"), value.clone());
+            }
+        }
+        if let Some(extra) = &record.extra {
+            for (name, value) in extra {
+                row.insert(format!("{binding}.{name}"), value.clone());
+            }
+        }
+        let primary_label = record.primary_label().to_string();
+        row.insert(
+            format!("{binding}.__label__"),
+            Value::String(primary_label.clone()),
+        );
+        inject_computed_properties(&mut row, binding, &primary_label, ctx);
+
+        if let Some(alias) = distance_alias {
+            let node_vec = row
+                .get(&format!("{binding}.{property}"))
+                .and_then(coerce_value_to_vec);
+            let score = match node_vec {
+                Some(nv) => match function {
+                    "vector_distance" => {
+                        coordinode_vector::metrics::euclidean_distance(&qv, &nv) as f64
+                    }
+                    "vector_similarity" => {
+                        coordinode_vector::metrics::cosine_similarity(&qv, &nv) as f64
+                    }
+                    "vector_dot" => coordinode_vector::metrics::dot_product(&qv, &nv) as f64,
+                    "vector_manhattan" => {
+                        coordinode_vector::metrics::manhattan_distance(&qv, &nv) as f64
+                    }
+                    _ => hit.score as f64,
+                },
+                None => hit.score as f64,
+            };
+            row.insert(alias.to_string(), Value::Float(score));
+        }
+        results.push(row);
+    }
     Ok(results)
 }
 
