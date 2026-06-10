@@ -126,6 +126,44 @@ use proto::{
     replication::{ReadConcern, ReadConcernLevel, WriteConcern, WriteConcernLevel},
 };
 
+/// Routing preference for read queries in a replicated cluster.
+///
+/// Mirrors the wire-level `ReadPreference`: [`Primary`] reads always
+/// execute on the Raft leader (strongest freshness), the other
+/// variants allow follower nodes to serve the read for scale-out.
+/// Follower reads observe the follower's applied state; combine with
+/// [`CoordinodeClient::execute_causal_read`] when read-your-writes is
+/// required.
+///
+/// [`Primary`]: ReadPreference::Primary
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadPreference {
+    /// Read from the Raft leader only (default). Fails on followers.
+    #[default]
+    Primary,
+    /// Prefer the leader, fall back to this node when it is a follower.
+    PrimaryPreferred,
+    /// Read from a follower only. Fails on the leader.
+    Secondary,
+    /// Prefer a follower, also accept the leader.
+    SecondaryPreferred,
+    /// Read from whichever node serves the connection.
+    Nearest,
+}
+
+impl ReadPreference {
+    fn to_proto(self) -> i32 {
+        use proto::replication::ReadPreference as Wire;
+        match self {
+            ReadPreference::Primary => Wire::Primary as i32,
+            ReadPreference::PrimaryPreferred => Wire::PrimaryPreferred as i32,
+            ReadPreference::Secondary => Wire::Secondary as i32,
+            ReadPreference::SecondaryPreferred => Wire::SecondaryPreferred as i32,
+            ReadPreference::Nearest => Wire::Nearest as i32,
+        }
+    }
+}
+
 /// A single result row: column name → property value.
 pub type Row = HashMap<String, Value>;
 
@@ -222,6 +260,49 @@ impl CoordinodeClient {
             None
         };
         self.execute_cypher_inner(query.into(), params, location)
+    }
+
+    /// Execute a read query with an explicit [`ReadPreference`].
+    ///
+    /// [`execute_cypher`] and [`execute_cypher_with_params`] always
+    /// route to the Raft leader; this method lets a connection to a
+    /// follower serve reads ([`ReadPreference::Secondary`] /
+    /// [`SecondaryPreferred`] / [`Nearest`]) for read scale-out.
+    /// Follower reads observe that follower's applied state — use
+    /// [`execute_causal_read`] when the read must observe a specific
+    /// prior write.
+    ///
+    /// [`execute_cypher`]: CoordinodeClient::execute_cypher
+    /// [`execute_cypher_with_params`]: CoordinodeClient::execute_cypher_with_params
+    /// [`execute_causal_read`]: CoordinodeClient::execute_causal_read
+    /// [`SecondaryPreferred`]: ReadPreference::SecondaryPreferred
+    /// [`Nearest`]: ReadPreference::Nearest
+    #[track_caller]
+    pub fn execute_cypher_with_read_preference(
+        &mut self,
+        query: impl Into<String>,
+        params: HashMap<String, Value>,
+        read_preference: ReadPreference,
+    ) -> impl Future<Output = Result<Vec<Row>, ClientError>> + '_ {
+        let location = if self.config.debug_source_tracking {
+            Some(Location::caller())
+        } else {
+            None
+        };
+        let query = query.into();
+        async move {
+            let (rows, _applied_index) = self
+                .execute_request(
+                    query,
+                    params,
+                    read_preference.to_proto(),
+                    None,
+                    None,
+                    location,
+                )
+                .await?;
+            Ok(rows)
+        }
     }
 
     // ── Causal consistency ────────────────────────────────────────────────────
