@@ -47,3 +47,7 @@ path = "src/main.rs"
 [[bin]]
 name = "bench-vector-grpc"
 path = "src/grpc_main.rs"
+
+[[bin]]
+name = "bench-vector-load"
+path = "src/load_main.rs"

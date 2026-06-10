@@ -135,12 +135,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         return Err("dataset name must end in -euclidean or -angular".into());
     };
+    // `WITH *` (not a narrowed projection) is REQUIRED: the planner's
+    // VectorTopK rewrite pattern-matches the Sort+Limit over a
+    // star-preserving WITH, exactly the shape the VectorSearch RPC
+    // emits. A narrowed `WITH n.ext_id AS ...` breaks the match and
+    // the query silently degrades to the brute-force O(N) scan
+    // (measured: 25 QPS vs HNSW-backed three-digit QPS on the same
+    // data). The final RETURN projects only ext_id so the response
+    // stays light.
     let cypher = format!(
         "MATCH (n:{label}) \
-         WITH n.ext_id AS ext_id, {score_fn}(n.{prop}, $qv) AS _s \
+         WITH *, {score_fn}(n.{prop}, $qv) AS _s \
          ORDER BY _s {order_dir} \
          LIMIT {k} \
-         RETURN ext_id",
+         RETURN n.ext_id AS ext_id",
         label = args.label,
         prop = args.property,
         k = args.k,
