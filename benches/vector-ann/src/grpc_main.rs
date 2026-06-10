@@ -33,7 +33,7 @@ use std::time::Instant;
 
 use clap::Parser;
 use coordinode_bench::BenchReport;
-use coordinode_client::{CoordinodeClient, Value};
+use coordinode_client::{CoordinodeClient, ReadPreference, Value};
 use serde::Serialize;
 use tracing::info;
 
@@ -45,10 +45,28 @@ const REPLAY_ROUNDS: usize = 10;
 #[derive(Parser, Debug)]
 #[command(name = "bench-vector-grpc", version)]
 struct Args {
-    /// gRPC endpoint of a running coordinode server,
-    /// e.g. `http://127.0.0.1:7080`.
+    /// gRPC endpoint(s) of running coordinode server(s), comma
+    /// separated, e.g. `http://127.0.0.1:7080` or
+    /// `http://n1:7080,http://n2:7080,http://n3:7080`. With multiple
+    /// endpoints, workers are assigned round-robin so a cluster run
+    /// spreads load across replicas (pick a concurrency that is a
+    /// multiple of the endpoint count for an even spread).
     #[arg(long)]
     endpoint: String,
+
+    /// Free-form topology tag recorded in the report and appended to
+    /// the output filename (e.g. `L2-leader`, `L3-replicas`), so
+    /// cluster cells stay distinguishable from single-node cells on
+    /// the same dataset.
+    #[arg(long)]
+    topology: Option<String>,
+
+    /// Read routing: `primary` (default, leader-only) or `nearest`
+    /// (each worker's node serves the read locally — required when
+    /// `--endpoint` spreads workers across cluster replicas, since
+    /// followers reject leader-only reads).
+    #[arg(long, default_value = "primary")]
+    read_preference: String,
 
     /// Path to the query `.fvecs` file.
     #[arg(long)]
@@ -185,6 +203,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     report.record("transport", "grpc")?;
     report.record("concurrency", args.concurrency)?;
+    report.record(
+        "endpoints",
+        args.endpoint.split(',').filter(|s| !s.is_empty()).count(),
+    )?;
+    if let Some(ref topo) = args.topology {
+        report.record("topology", topo.as_str())?;
+    }
+    report.record("read_preference", args.read_preference.as_str())?;
     report.record("dataset_n_test", n_test)?;
     report.record("dataset_dim", dim)?;
     report.record("k", args.k)?;
@@ -194,7 +220,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if point.recall_at_k >= 0.95 {
         report.record("qps_at_recall_0_95", point.qps)?;
     }
-    let path = report.write_json(&args.output, Some("GRPC"))?;
+    // Filename tag keeps cluster cells (L2/L3) from overwriting the
+    // single-node GRPC cell for the same dataset.
+    let tag = match args.topology {
+        Some(ref t) => format!("GRPC-{t}"),
+        None => "GRPC".to_string(),
+    };
+    let path = report.write_json(&args.output, Some(&tag))?;
     info!(path = ?path, "report written");
     Ok(())
 }
@@ -225,8 +257,24 @@ async fn run_rounds(
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut workers: Vec<tokio::task::JoinHandle<WorkerOut>> =
         Vec::with_capacity(args.concurrency.max(1));
-    for _ in 0..args.concurrency.max(1) {
-        let endpoint = args.endpoint.clone();
+    // Round-robin worker -> endpoint assignment; single endpoint is
+    // the degenerate one-element case.
+    let endpoints: Vec<String> = args
+        .endpoint
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if endpoints.is_empty() {
+        return Err("--endpoint resolved to an empty list".into());
+    }
+    let read_pref = match args.read_preference.as_str() {
+        "primary" => ReadPreference::Primary,
+        "nearest" => ReadPreference::Nearest,
+        other => return Err(format!("unknown --read-preference '{other}'").into()),
+    };
+    for w in 0..args.concurrency.max(1) {
+        let endpoint = endpoints[w % endpoints.len()].clone();
         let cypher = cypher.to_string();
         let queries = Arc::clone(&queries);
         let gt = Arc::clone(&gt);
@@ -250,7 +298,7 @@ async fn run_rounds(
                 params.insert("qv".to_string(), Value::Vector(qv));
                 let t = Instant::now();
                 let rows = client
-                    .execute_cypher_with_params(&cypher, params)
+                    .execute_cypher_with_read_preference(&cypher, params, read_pref)
                     .await
                     .map_err(|e| e.to_string())?;
                 lats.push(t.elapsed().as_micros() as f64);

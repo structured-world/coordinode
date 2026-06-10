@@ -62,6 +62,11 @@ on:
         type: boolean
         required: false
         default: false
+      cluster_mode:
+        description: 'Run the cluster-mode vector bench: form a real 3-node localhost RF=3 cluster, load 50k sift through the leader, measure search QPS against the leader only (L2, raft read-path overlay vs the single-process L1 cells) and round-robin across all replicas (L3, replica read scaling). Adds ~15-20 min.'
+        type: boolean
+        required: false
+        default: false
       subset_size:
         description: 'First N base vectors to use from each dataset (groundtruth recomputed brute-force). 50000 (default) keeps per-commit wall-clock under 20 min. Set to 100000+ for the full marketing matrix when full_sweep=true.'
         required: false
@@ -542,6 +547,17 @@ jobs:
         run: |
           set -euo pipefail
           ./benches/vector-ann/scripts/server_bench.sh
+
+      - name: Vector — cluster-mode bench (3-node RF=3)
+        if: ${{ inputs.cluster_mode }}
+        env:
+          DATASET_ROOT: ${{ vars.BENCH_DATASET_ROOT }}
+          # 50k x 128d backfill needs longer than the 30s default to
+          # settle on all three replicas before the search sweep.
+          INDEX_WAIT: '90'
+        run: |
+          set -euo pipefail
+          ./benches/vector-ann/scripts/cluster_bench.sh
 
       # ── Future modality steps land here, one per modality ─────
       # - name: Graph — LDBC SNB SF1 Interactive
