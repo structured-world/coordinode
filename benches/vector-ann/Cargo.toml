@@ -19,9 +19,14 @@ publish = false
 coordinode-vector = { path = "../../crates/coordinode-vector" }
 coordinode-bench = { path = "../../crates/coordinode-bench" }
 coordinode-core = { path = "../../crates/coordinode-core" }
+# gRPC driver for the server-mode bench bins (bench-vector-grpc /
+# bench-vector-load): measures the product path (client -> gRPC ->
+# engine) instead of the in-process HnswIndex.
+coordinode-client = { path = "../../crates/coordinode-client" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
@@ -38,3 +43,7 @@ tempfile = "3"
 [[bin]]
 name = "bench-vector-ann"
 path = "src/main.rs"
+
+[[bin]]
+name = "bench-vector-grpc"
+path = "src/grpc_main.rs"
