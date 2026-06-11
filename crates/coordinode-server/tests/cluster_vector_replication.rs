@@ -236,6 +236,7 @@ async fn follower_vector_search_matches_leader() {
         // entry (subscribe_applied task in main); this poll loop stands
         // in for that wiring at the Database level.
         n2.db.refresh_field_interner().unwrap();
+        n2.db.refresh_vector_indexes().unwrap();
         let mut total_overlap = 0.0;
         let mut min_overlap = f64::MAX;
         let mut worst = String::new();
@@ -257,7 +258,15 @@ async fn follower_vector_search_matches_leader() {
         let avg_overlap = total_overlap / probes.len() as f64;
         last_state = format!("avg_overlap={avg_overlap:.3} min_overlap={min_overlap:.3} {worst}");
         if avg_overlap >= 0.9 && min_overlap >= 0.7 {
-            return; // follower recall converged to the leader's
+            // Converged. The follower must also be serving through its
+            // OWN HNSW access path by now (replicated DDL + local
+            // rebuild), not the brute-force scan fallback.
+            let follower_plan = n2.db.explain_cypher(&probe_q).unwrap();
+            assert!(
+                follower_plan.contains("HnswScan"),
+                "follower converged but still plans without the index:\n{follower_plan}"
+            );
+            return;
         }
     }
     panic!("follower vector search never converged to leader recall: {last_state}");

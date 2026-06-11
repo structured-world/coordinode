@@ -251,8 +251,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let db = Arc::clone(&database);
                 tokio::spawn(async move {
                     while applied_rx.changed().await.is_ok() {
-                        if let Err(e) = db.read().refresh_field_interner() {
+                        let guard = db.read();
+                        if let Err(e) = guard.refresh_field_interner() {
                             tracing::warn!(%e, "field interner refresh failed");
+                        }
+                        // Replicated CREATE VECTOR INDEX definitions are
+                        // brought live here: register + local HNSW rebuild
+                        // (the graph itself is never replicated).
+                        match guard.refresh_vector_indexes() {
+                            Ok(0) => {}
+                            Ok(n) => tracing::info!(n, "vector indexes brought live from apply"),
+                            Err(e) => tracing::warn!(%e, "vector index refresh failed"),
                         }
                     }
                 });

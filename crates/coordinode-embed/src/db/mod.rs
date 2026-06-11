@@ -690,7 +690,6 @@ impl Database {
         interner_arc: &Arc<RwLock<FieldInterner>>,
         shard_id: u16,
     ) -> coordinode_query::index::VectorIndexRegistry {
-        use coordinode_core::graph::node::NodeRecord;
         use coordinode_query::index::IndexType;
 
         // Tier-backed registry: every registered HNSW index gets a
@@ -728,13 +727,57 @@ impl Database {
             return registry;
         }
 
+        Self::register_and_populate_hnsw(&registry, interner_arc, engine, shard_id, &hnsw_defs);
+        registry
+    }
+
+    /// Discover vector index definitions that were replicated into the
+    /// Schema partition after this Database opened (a follower applying
+    /// a leader's CREATE VECTOR INDEX) and bring them live: register in
+    /// the in-memory registry and rebuild the local HNSW from stored
+    /// nodes. Returns the number of indexes brought up. Cluster
+    /// deployments call this alongside [`Self::refresh_field_interner`]
+    /// whenever the applied index advances.
+    pub fn refresh_vector_indexes(&self) -> Result<usize, DatabaseError> {
+        use coordinode_query::index::IndexType;
+        let defs = coordinode_query::index::ops::list_index_definitions(&self.engine)?;
+        let new_defs: Vec<_> = defs
+            .into_iter()
+            .filter(|d| d.index_type == IndexType::Hnsw && d.vector_config.is_some())
+            .filter(|d| !self.vector_index_registry.has_index(&d.label, d.property()))
+            .collect();
+        if new_defs.is_empty() {
+            return Ok(0);
+        }
+        Self::register_and_populate_hnsw(
+            &self.vector_index_registry,
+            &self.interner,
+            &self.engine,
+            self.shard_id,
+            &new_defs,
+        );
+        Ok(new_defs.len())
+    }
+
+    /// Register the given HNSW definitions in `registry` and populate
+    /// them by scanning stored node records (shared by the open-time
+    /// loader and the cluster refresh path).
+    fn register_and_populate_hnsw(
+        registry: &coordinode_query::index::VectorIndexRegistry,
+        interner_arc: &Arc<RwLock<FieldInterner>>,
+        engine: &StorageEngine,
+        shard_id: u16,
+        hnsw_defs: &[coordinode_query::index::IndexDefinition],
+    ) {
+        use coordinode_core::graph::node::NodeRecord;
+
         // Step 2: Resolve (label, property) → interned ids in one short
         // write-locked pass, build per-index tier handles, then register
         // each HNSW with its tier bound. Lock scope is the for-loop body
         // only; released before step 3's read pass.
         {
             let mut g = interner_arc.write();
-            for def in &hnsw_defs {
+            for def in hnsw_defs {
                 let label_id = g.intern(&def.label);
                 let property_id = g.intern(def.property());
                 let tier = registry.tier_handle(label_id, property_id);
@@ -746,7 +789,7 @@ impl Database {
         // Build a lookup: label → [(property, label)] for efficient matching.
         let mut label_props: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
-        for def in &hnsw_defs {
+        for def in hnsw_defs {
             label_props
                 .entry(def.label.clone())
                 .or_default()
@@ -765,7 +808,7 @@ impl Database {
             Ok(it) => it,
             Err(e) => {
                 tracing::warn!("failed to scan nodes for HNSW rebuild: {e}");
-                return registry;
+                return;
             }
         };
 
@@ -819,7 +862,7 @@ impl Database {
         }
 
         // Log per-index rebuild counts for observability.
-        for def in &hnsw_defs {
+        for def in hnsw_defs {
             let count = per_index_counts
                 .get(&(def.label.clone(), def.property().to_string()))
                 .copied()
@@ -868,8 +911,6 @@ impl Database {
                 );
             }
         }
-
-        registry
     }
 
     /// Load persisted text index definitions from `schema:idx:*` and

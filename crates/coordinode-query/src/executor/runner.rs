@@ -13835,9 +13835,38 @@ fn execute_create_vector_index(
     let mut def = crate::index::IndexDefinition::hnsw(name, label, property, config);
     def.online_during_build = online_during_build;
 
-    // Persist definition to the schema partition.
-    crate::index::ops::save_index_definition(ctx.engine, &def)
-        .map_err(|e| ExecutionError::Unsupported(format!("persist vector index '{name}': {e}")))?;
+    // Persist the definition to the schema partition THROUGH the
+    // proposal pipeline: replicas discover the index by observing this
+    // key in their applied stream and run their own local backfill
+    // (the HNSW graph itself is never replicated, only the data is).
+    // Falls back to a direct engine write in legacy/test contexts that
+    // carry no pipeline.
+    if let (Some(pipeline), Some(id_gen)) = (ctx.proposal_pipeline, ctx.proposal_id_gen) {
+        let value = rmp_serde::to_vec(&def).map_err(|e| {
+            ExecutionError::Unsupported(format!("serialize vector index '{name}': {e}"))
+        })?;
+        let proposal = coordinode_core::txn::proposal::RaftProposal {
+            id: id_gen.next(),
+            mutations: vec![coordinode_core::txn::proposal::Mutation::Put {
+                partition: coordinode_core::txn::proposal::PartitionId::Schema,
+                key: def.schema_key(),
+                value,
+            }],
+            commit_ts: ctx
+                .mvcc_oracle
+                .map(|o| o.next())
+                .unwrap_or(ctx.mvcc_read_ts),
+            start_ts: ctx.mvcc_read_ts,
+            bypass_rate_limiter: false,
+        };
+        pipeline.propose_and_wait(&proposal).map_err(|e| {
+            ExecutionError::Unsupported(format!("persist vector index '{name}': {e}"))
+        })?;
+    } else {
+        crate::index::ops::save_index_definition(ctx.engine, &def).map_err(|e| {
+            ExecutionError::Unsupported(format!("persist vector index '{name}': {e}"))
+        })?;
+    }
 
     // Register the empty HNSW graph in memory with its tier handle
     // resolved from the executor's interner. Building the tier here
