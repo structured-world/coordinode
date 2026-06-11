@@ -1487,10 +1487,25 @@ impl Database {
             self.ensure_id_batch()?;
         }
 
-        // Persist field interner if new fields were interned during this query.
+        // Persist field interner if new fields were interned during this
+        // query. Goes through the proposal pipeline (not a direct engine
+        // put): property values are encoded against interner ids, so the
+        // mapping must replicate to every node that applies the data.
         if let Some(bytes) = interner_bytes {
-            self.engine
-                .put(Partition::Schema, SCHEMA_KEY_FIELD_INTERNER, &bytes)?;
+            let proposal = coordinode_core::txn::proposal::RaftProposal {
+                id: self.proposal_id_gen.next(),
+                mutations: vec![coordinode_core::txn::proposal::Mutation::Put {
+                    partition: coordinode_core::txn::proposal::PartitionId::Schema,
+                    key: SCHEMA_KEY_FIELD_INTERNER.to_vec(),
+                    value: bytes,
+                }],
+                commit_ts: self.oracle.next(),
+                start_ts: Timestamp::from_raw(0),
+                bypass_rate_limiter: false,
+            };
+            self.pipeline
+                .propose_and_wait(&proposal)
+                .map_err(|e| DatabaseError::Other(format!("persist field interner: {e}")))?;
         }
 
         // Invalidate cached storage statistics after any mutation so that
