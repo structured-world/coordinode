@@ -2780,8 +2780,21 @@ impl HnswIndex {
         // implementation gets (0.85+) on the same data — its
         // `searchBaseLayerST_AdaptiveRerankOpt` does the same f32-on-
         // results trick under another name.
+        // With no quantizer active there IS no cheap metric: the
+        // frontier score already falls through to the exact f32 path,
+        // and the verify pass below would recompute the identical
+        // value, doubling the distance work per visit. Measured on
+        // glove-100-50k ST at ef=200: 4929 distance calls per query
+        // (~2x hnswlib's volume), accounting for the whole 1.9x QPS
+        // gap on unquantized cells.
+        let cheap_is_exact = self.rabitq_params.is_none() && self.sq8_params.is_none();
+
         let cheap_ep = self.compute_distance(ctx, ep);
-        let exact_ep = self.compute_exact_distance(ctx, ep);
+        let exact_ep = if cheap_is_exact {
+            cheap_ep
+        } else {
+            self.compute_exact_distance(ctx, ep)
+        };
 
         let heap_cap = ef + 16;
         let mut candidates: BinaryHeap<Candidate> = BinaryHeap::with_capacity(heap_cap);
@@ -2873,7 +2886,13 @@ impl HnswIndex {
                     if cheap_dist < farthest_dist || results.len() < ef {
                         // Promising under the cheap metric — verify with
                         // exact f32 before letting it into the kept top-ef.
-                        let exact_dist = self.compute_exact_distance(ctx, neighbor_idx);
+                        // Unless no quantizer is active: then the frontier
+                        // score IS the exact f32 distance already.
+                        let exact_dist = if cheap_is_exact {
+                            cheap_dist
+                        } else {
+                            self.compute_exact_distance(ctx, neighbor_idx)
+                        };
 
                         candidates.push(Candidate {
                             distance: cheap_dist,
