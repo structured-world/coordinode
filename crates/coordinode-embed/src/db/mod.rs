@@ -26,7 +26,7 @@ use coordinode_query::executor::runner::{
     execute, AdaptiveConfig, ExecutionContext, ExecutionError, FeedbackCache, WriteStats,
 };
 use coordinode_query::planner;
-use coordinode_raft::proposal::{LocalProposalPipeline, OwnedLocalProposalPipeline};
+use coordinode_raft::proposal::OwnedLocalProposalPipeline;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
@@ -259,6 +259,12 @@ pub struct Database {
     /// Proposal ID generator for the Raft proposal pipeline.
     /// Arc-shared with the drain thread's pipeline.
     proposal_id_gen: Arc<ProposalIdGenerator>,
+    /// The write pipeline every mutation must flow through. In embedded
+    /// mode this is a local pipeline applying straight to the engine; in
+    /// cluster mode it is the Raft proposal pipeline, and bypassing it
+    /// (writing to the local engine directly) silently breaks
+    /// replication: followers never see the data.
+    pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline>,
     /// Session-level vector MVCC consistency mode.
     vector_consistency: VectorConsistencyMode,
     /// Session-level read concern. Default: Local.
@@ -651,6 +657,7 @@ impl Database {
             id_batch_ceiling: AtomicU64::new(ceiling),
             oracle,
             proposal_id_gen,
+            pipeline,
             vector_consistency: VectorConsistencyMode::default(),
             read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::default(),
             snapshot_read_ts: None,
@@ -1361,7 +1368,6 @@ impl Database {
         } else {
             self.oracle.next()
         };
-        let pipeline = LocalProposalPipeline::new(&self.engine);
         // Snapshot of the current interner is handed to the vector
         // loader (HNSW property lookups). The write-lock is then
         // acquired for the duration of execute, so the executor can
@@ -1403,7 +1409,9 @@ impl Database {
             vector_consistency: session.vector_consistency,
             vector_overfetch_factor: 1.2,
             vector_mvcc_stats: None,
-            proposal_pipeline: Some(&pipeline),
+            // The injected pipeline (Raft in cluster mode) — NOT a local
+            // engine-applying one. Writing past it breaks replication.
+            proposal_pipeline: Some(self.pipeline.as_ref()),
             proposal_id_gen: Some(&self.proposal_id_gen),
             read_concern: session.read_concern,
             write_concern: session.write_concern.clone(),
