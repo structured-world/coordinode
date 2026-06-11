@@ -3344,6 +3344,20 @@ impl HnswIndex {
         // Try exact f32 for both nodes
         if let (Some(ref va), Some(ref vb)) = (&self.node_vectors[a_idx], &self.node_vectors[b_idx])
         {
+            // Cosine fast path: both norms are precomputed per node, so
+            // skip QueryCtx entirely. The generic path recomputes ||a||
+            // on every call (QueryCtx::new), and this function runs
+            // O(max_conn x candidates) times per insert; on glove-100
+            // angular the redundant norm passes dominated build cycles.
+            if matches!(self.config.metric, VectorMetric::Cosine) {
+                if let (Some(&na), Some(&nb)) =
+                    (self.node_norms.get(a_idx), self.node_norms.get(b_idx))
+                {
+                    if na.is_finite() && na > 0.0 && nb.is_finite() && nb > 0.0 {
+                        return 1.0 - metrics::cosine_similarity_with_both_norms(va, vb, na, nb);
+                    }
+                }
+            }
             let ctx = QueryCtx::new(
                 va,
                 self.config.metric,
