@@ -299,9 +299,13 @@ async fn run_rounds(
                 // follower (or after a mid-run election) fails with a
                 // leader-required error. Rotate to the next endpoint
                 // and retry the SAME query; the failed attempt's
-                // latency is not recorded. Bounded so a leaderless
-                // cluster still terminates with the real error.
+                // latency is not recorded. During an election EVERY
+                // node answers "not leader" for up to a few hundred
+                // ms, so retries back off once a full rotation found
+                // no leader. The bound keeps a genuinely leaderless
+                // cluster terminating with the real error.
                 let mut attempts = 0usize;
+                const MAX_LEADER_RETRIES: usize = 30;
                 let rows = loop {
                     let mut params = std::collections::HashMap::new();
                     params.insert("qv".to_string(), Value::Vector(qv.clone()));
@@ -316,11 +320,14 @@ async fn run_rounds(
                         }
                         Err(e)
                             if endpoints.len() > 1
-                                && attempts < endpoints.len() * 2
+                                && attempts < MAX_LEADER_RETRIES
                                 && e.to_string().contains("requires the Raft leader") =>
                         {
                             attempts += 1;
                             ep_idx = (ep_idx + 1) % endpoints.len();
+                            if attempts.is_multiple_of(endpoints.len()) {
+                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            }
                             client = CoordinodeClient::connect(endpoints[ep_idx].clone())
                                 .await
                                 .map_err(|e| e.to_string())?;
