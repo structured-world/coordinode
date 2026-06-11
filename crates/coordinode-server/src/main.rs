@@ -241,6 +241,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let raft_node_shared: Option<Arc<coordinode_raft::cluster::RaftNode>> =
                 Some(Arc::clone(&raft_node));
 
+            // Refresh node-local derived state when replicated entries
+            // apply: property values are encoded against interner ids,
+            // and a follower that never refreshes its in-memory interner
+            // resolves every replicated property to null. The refresh is
+            // a cheap length pre-check unless the mapping actually grew.
+            if peers.is_some() {
+                let mut applied_rx = raft_node.subscribe_applied();
+                let db = Arc::clone(&database);
+                tokio::spawn(async move {
+                    while applied_rx.changed().await.is_ok() {
+                        if let Err(e) = db.read().refresh_field_interner() {
+                            tracing::warn!(%e, "field interner refresh failed");
+                        }
+                    }
+                });
+            }
+
             let query_registry = Arc::new(coordinode_query::advisor::QueryRegistry::new());
             let nplus1_detector =
                 Arc::new(coordinode_query::advisor::nplus1::NPlus1Detector::new());

@@ -7,7 +7,7 @@
 //! ~0.2 recall while the leader answered with full recall. The
 //! follower's HNSW index does not reflect the replicated data.
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::panic)]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,12 +77,18 @@ async fn open_node(node_id: u64, port: u16, leader: bool) -> ClusterNode {
     }
 }
 
-/// Deterministic pseudo-random unit-ish vector for row `i`.
+/// Deterministic pseudo-random vector for row `i`. The modulus is a
+/// prime far above the row count so no two rows share a vector;
+/// duplicate vectors would create distance ties whose ordering
+/// legitimately differs between the leader's HNSW path and the
+/// follower's scan path.
 fn vec_for(i: usize, dim: usize) -> Vec<f64> {
     (0..dim)
         .map(|d| {
-            let x = ((i * 31 + d * 7 + 13) % 1000) as f64;
-            x / 1000.0
+            // Multiplicative hash mix so values are spread rather than
+            // collinear (a linear ramp degenerates HNSW navigation).
+            let h = (i.wrapping_mul(2654435761) ^ d.wrapping_mul(40503)) % 99991;
+            h as f64 / 99991.0
         })
         .collect()
 }
@@ -217,24 +223,42 @@ async fn follower_vector_search_matches_leader() {
     eprintln!("leader bare props: {:?}", n1.db.execute_cypher(bare_q));
     eprintln!("follower bare props: {:?}", n2.db.execute_cypher(bare_q));
 
-    let mut last_mismatch = String::new();
+    // Leader answers through HNSW (approximate), follower through its
+    // own local plan; even with a follower-side index the graphs are
+    // built independently and legitimately differ in topology. The
+    // correctness contract is therefore recall overlap, not identical
+    // orderings: every probe's top-k sets must overlap >= 70% and the
+    // average across probes >= 90%.
+    let mut last_state = String::new();
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let mut all_match = true;
-        last_mismatch.clear();
+        // The server binary refreshes derived state on every applied
+        // entry (subscribe_applied task in main); this poll loop stands
+        // in for that wiring at the Database level.
+        n2.db.refresh_field_interner().unwrap();
+        let mut total_overlap = 0.0;
+        let mut min_overlap = f64::MAX;
+        let mut worst = String::new();
         for (qi, qv) in probes.iter().enumerate() {
             let leader_ids = top_ids(&mut n1.db, qv);
             let follower_ids = top_ids(&mut n2.db, qv);
-            if leader_ids != follower_ids {
-                all_match = false;
-                last_mismatch =
-                    format!("probe {qi}: leader={leader_ids:?} follower={follower_ids:?}");
-                break;
+            let leader_set: std::collections::HashSet<i64> = leader_ids.iter().copied().collect();
+            let inter = follower_ids
+                .iter()
+                .filter(|id| leader_set.contains(id))
+                .count();
+            let overlap = inter as f64 / leader_ids.len().max(1) as f64;
+            total_overlap += overlap;
+            if overlap < min_overlap {
+                min_overlap = overlap;
+                worst = format!("probe {qi}: leader={leader_ids:?} follower={follower_ids:?}");
             }
         }
-        if all_match {
-            return; // follower converged to leader results
+        let avg_overlap = total_overlap / probes.len() as f64;
+        last_state = format!("avg_overlap={avg_overlap:.3} min_overlap={min_overlap:.3} {worst}");
+        if avg_overlap >= 0.9 && min_overlap >= 0.7 {
+            return; // follower recall converged to the leader's
         }
     }
-    panic!("follower vector search never matched leader: {last_mismatch}");
+    panic!("follower vector search never converged to leader recall: {last_state}");
 }

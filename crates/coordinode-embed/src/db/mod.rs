@@ -1540,6 +1540,41 @@ impl Database {
         Ok(())
     }
 
+    /// Reload the in-memory field interner from the Schema partition if
+    /// the persisted mapping has grown. Returns `true` when a refresh
+    /// was applied.
+    ///
+    /// Property values are encoded against interner ids. On a Raft
+    /// follower the persisted mapping advances through entry apply
+    /// (replicated by the leader), but this Database instance's
+    /// in-memory copy does not — without a refresh, follower reads
+    /// resolve every property to null. Cluster deployments call this
+    /// whenever the applied index advances; embedded single-node
+    /// deployments never need it (the only writer is this instance).
+    pub fn refresh_field_interner(&self) -> Result<bool, DatabaseError> {
+        let Some(bytes) = self
+            .engine
+            .get(Partition::Schema, SCHEMA_KEY_FIELD_INTERNER)?
+        else {
+            return Ok(false);
+        };
+        let Some(persisted) = FieldInterner::from_bytes(&bytes) else {
+            tracing::warn!("corrupt persisted field interner, refresh skipped");
+            return Ok(false);
+        };
+        // Cheap pre-check under the read lock: the interner only grows,
+        // so a same-size persisted mapping cannot differ.
+        if persisted.len() <= self.interner.read().len() {
+            return Ok(false);
+        }
+        let mut guard = self.interner.write();
+        if persisted.len() <= guard.len() {
+            return Ok(false); // raced with another refresher
+        }
+        *guard = persisted;
+        Ok(true)
+    }
+
     /// Return EXPLAIN plan text for a Cypher query.
     ///
     /// Uses real storage statistics (node counts, fan-out) for
