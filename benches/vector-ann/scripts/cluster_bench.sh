@@ -67,6 +67,10 @@ cleanup() {
       wait "$pid" 2>/dev/null || true
     fi
   done
+  # The work dir holds 3 node data dirs plus raft snapshots (hundreds
+  # of MB per run); leaking it fills the runner's disk within a few
+  # runs.
+  rm -rf -- "$WORK_DIR"
 }
 trap cleanup EXIT
 
