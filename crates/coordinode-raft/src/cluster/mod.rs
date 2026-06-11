@@ -1492,36 +1492,58 @@ fn spawn_snapshot_trigger(
     config: SnapshotTriggerConfig,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        use openraft::rt::watch::WatchReceiver;
+
         let mut interval = tokio::time::interval(config.check_interval);
         // Don't fire immediately on startup
         interval.tick().await;
+        let metrics_rx = raft.metrics();
 
         loop {
             interval.tick().await;
 
-            // Check disk space threshold
-            let should_snapshot = match engine.disk_space() {
-                Ok(space) if space >= config.disk_space_threshold => {
+            // A manual trigger().snapshot() builds UNCONDITIONALLY (it
+            // is not filtered by the snapshot policy), and every build
+            // serializes ALL partitions. Rebuilding when nothing was
+            // applied since the last snapshot is pure waste and was
+            // observed to starve raft ticks under load (185MB builds
+            // every check interval -> heartbeat lag -> leader churn).
+            // Gate the trigger on actual log progress.
+            let (applied, snapped) = {
+                let m = metrics_rx.borrow_watched();
+                (
+                    m.last_applied.map(|id| id.index).unwrap_or(0),
+                    m.snapshot.map(|id| id.index).unwrap_or(0),
+                )
+            };
+            if applied <= snapped {
+                continue;
+            }
+
+            // Disk pressure makes the trigger eager; otherwise the
+            // periodic timer compacts whatever new entries exist.
+            if let Ok(space) = engine.disk_space() {
+                if space >= config.disk_space_threshold {
                     tracing::info!(
                         disk_space_bytes = space,
                         threshold = config.disk_space_threshold,
                         "snapshot trigger: disk space threshold exceeded"
                     );
-                    true
                 }
-                _ => true,
-            };
+            }
 
-            if should_snapshot {
-                match raft.trigger().snapshot().await {
-                    Ok(()) => {
-                        tracing::debug!("snapshot trigger: requested snapshot build");
-                    }
-                    Err(_fatal) => {
-                        // Raft instance shut down — exit the trigger loop
-                        tracing::debug!("snapshot trigger: raft shut down, stopping");
-                        break;
-                    }
+            match raft.trigger().snapshot().await {
+                Ok(()) => {
+                    tracing::debug!(
+                        applied,
+                        snapshot = snapped,
+                        "snapshot trigger: requested snapshot build"
+                    );
+                }
+                Err(_fatal) => {
+                    // Raft instance shut down — exit the trigger loop
+                    tracing::debug!("snapshot trigger: raft shut down, stopping");
+                    break;
                 }
             }
         }
