@@ -126,6 +126,16 @@ jobs:
       RAYON_NUM_THREADS: "4"
 
     steps:
+      - name: Reclaim leaked bench work dirs
+        # Earlier server/cluster bench scripts left their mktemp work
+        # dirs (node data + raft snapshots, hundreds of MB each) in
+        # /tmp on the self-hosted runner until the disk filled up. The
+        # scripts now clean up after themselves; this sweep reclaims
+        # anything older runs (or crashes) left behind, and runs FIRST
+        # so even the build has disk to work with.
+        run: |
+          rm -rf /tmp/cn-server-bench-* /tmp/cn-cluster-bench-* || true
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -539,16 +549,6 @@ jobs:
               done
             done
           done
-
-      - name: Reclaim leaked bench work dirs
-        # Earlier server/cluster bench scripts left their mktemp work
-        # dirs (node data + raft snapshots, hundreds of MB each) in
-        # /tmp on the self-hosted runner until the disk filled up. The
-        # scripts now clean up after themselves; this sweep reclaims
-        # anything older runs (or crashes) left behind.
-        if: ${{ inputs.server_mode || inputs.cluster_mode }}
-        run: |
-          rm -rf /tmp/cn-server-bench-* /tmp/cn-cluster-bench-* || true
 
       - name: Vector — server-mode bench (full product path)
         if: ${{ inputs.server_mode }}
