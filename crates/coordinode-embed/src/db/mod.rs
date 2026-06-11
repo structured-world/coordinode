@@ -146,7 +146,7 @@ const SCHEMA_KEY_FIELD_INTERNER: &[u8] = b"meta:field_interner";
 ///
 /// Handles both `Value::Vector` (native) and `Value::Array` containing
 /// only Float/Int elements (Cypher array literals like `[1.0, 0.0]`).
-fn try_extract_vector(val: &coordinode_core::graph::types::Value) -> Option<Vec<f32>> {
+pub(crate) fn try_extract_vector(val: &coordinode_core::graph::types::Value) -> Option<Vec<f32>> {
     use coordinode_core::graph::types::Value;
     match val {
         Value::Vector(v) => Some(v.clone()),

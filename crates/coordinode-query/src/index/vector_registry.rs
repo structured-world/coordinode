@@ -299,6 +299,19 @@ impl VectorIndexRegistry {
             .collect()
     }
 
+    /// Property names of every vector index registered for `label`.
+    /// Empty when the label has no vector indexes — callers use this
+    /// as a cheap pre-filter before decoding replicated node records.
+    pub fn indexed_properties(&self, label: &str) -> Vec<String> {
+        self.definitions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .filter(|(l, _)| l == label)
+            .map(|(_, p)| p.clone())
+            .collect()
+    }
+
     /// Insert a vector into all applicable HNSW indexes for a node.
     ///
     /// Called on node creation or vector property update. For bulk
