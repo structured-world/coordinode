@@ -288,7 +288,12 @@ pub struct Database {
     /// Index registry — tracks active indexes for EXPLAIN SUGGEST false-positive prevention.
     index_registry: coordinode_query::index::IndexRegistry,
     /// Vector index registry — holds live HNSW indexes for accelerated vector search.
-    vector_index_registry: coordinode_query::index::VectorIndexRegistry,
+    vector_index_registry: Arc<coordinode_query::index::VectorIndexRegistry>,
+    /// Background oplog tailer keeping HNSW indexes current with
+    /// replicated writes (see [`crate::vector_worker`]). `None` when
+    /// the process has no oplog (pure embedded mode without Raft).
+    /// Held for its Drop (stops the thread when the Database closes).
+    _vector_worker: Option<crate::vector_worker::VectorIndexWorker>,
     /// Text index registry — holds live tantivy indexes for full-text search.
     text_index_registry: coordinode_query::index::TextIndexRegistry,
     /// Adaptive query plan configuration — controls parallel traversal thresholds.
@@ -571,8 +576,36 @@ impl Database {
         // ADR-033. Interning happens inside `load_vector_indexes` under a
         // brief write guard; the registry itself holds no interner ref
         // (would cause reentrant write deadlocks against execute_cypher).
-        let vector_index_registry =
-            Self::load_vector_indexes(engine.clone(), &shared_interner, 1 /* shard_id */);
+        let vector_index_registry = Arc::new(Self::load_vector_indexes(
+            engine.clone(),
+            &shared_interner,
+            1, /* shard_id */
+        ));
+
+        // Tail the oplog for replicated vector writes. The bootstrap
+        // rebuild above covered history; the worker covers the live
+        // tail from here on (HNSW insert is an upsert, so any overlap
+        // between the two is harmless). Pure embedded deployments have
+        // no oplog directory and run without the worker: the executor
+        // updates indexes inline on the write path.
+        let oplog_dir = engine.data_dir().join("oplog").join("0");
+        let vector_worker = if oplog_dir.is_dir() {
+            let mut tailer = coordinode_storage::oplog::tailer::OplogTailer::new(
+                &oplog_dir,
+                coordinode_storage::oplog::tailer::ResumeToken::from_start(0),
+            );
+            let start = tailer
+                .seek_to_end()
+                .unwrap_or_else(|_| coordinode_storage::oplog::tailer::ResumeToken::from_start(0));
+            Some(crate::vector_worker::VectorIndexWorker::spawn(
+                oplog_dir,
+                start,
+                Arc::clone(&vector_index_registry),
+                Arc::clone(&shared_interner),
+            ))
+        } else {
+            None
+        };
 
         // Load text index definitions and rebuild tantivy indexes from stored nodes.
         let text_index_base = path.join("text_indexes");
@@ -666,6 +699,7 @@ impl Database {
             write_concern: coordinode_core::txn::write_concern::WriteConcern::default(),
             index_registry,
             vector_index_registry,
+            _vector_worker: vector_worker,
             text_index_registry,
             adaptive_config: AdaptiveConfig::default(),
             feedback_cache: FeedbackCache::default(),
@@ -1920,13 +1954,6 @@ impl Database {
     /// Get a reference to the vector index registry.
     pub fn vector_index_registry(&self) -> &coordinode_query::index::VectorIndexRegistry {
         &self.vector_index_registry
-    }
-
-    /// Get a mutable reference to the vector index registry.
-    pub fn vector_index_registry_mut(
-        &mut self,
-    ) -> &mut coordinode_query::index::VectorIndexRegistry {
-        &mut self.vector_index_registry
     }
 
     /// Create a full-text search index on a label's text property.

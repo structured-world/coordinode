@@ -266,7 +266,29 @@ async fn follower_vector_search_matches_leader() {
                 follower_plan.contains("HnswScan"),
                 "follower converged but still plans without the index:\n{follower_plan}"
             );
-            return;
+            // Vectors written AFTER the follower's index went live must
+            // reach its HNSW through the oplog worker (no rebuild, no
+            // re-registration). Search for an exact new vector: only an
+            // index that ingested the post-convergence write returns it.
+            let emb = vec_for(N + 7, DIM)
+                .iter()
+                .map(|x| format!("{x:.6}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            n1.db
+                .execute_cypher(&format!(
+                    "CREATE (n:Item {{ext_id: {}, embedding: [{emb}]}})",
+                    N + 7
+                ))
+                .unwrap();
+            for _ in 0..30 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let ids = top_ids(&mut n2.db, &vec_for(N + 7, DIM));
+                if ids.first() == Some(&((N + 7) as i64)) {
+                    return; // live tail reached the follower index
+                }
+            }
+            panic!("post-convergence write never reached the follower HNSW");
         }
     }
     panic!("follower vector search never converged to leader recall: {last_state}");

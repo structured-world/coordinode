@@ -124,6 +124,25 @@ impl OplogTailer {
         &self.position
     }
 
+    /// Move the cursor past every entry currently in the oplog and
+    /// return the resulting position. Consumers whose history is
+    /// covered by another mechanism (e.g. a bootstrap index rebuild)
+    /// start tailing from here instead of replaying the whole log.
+    pub fn seek_to_end(&mut self) -> StorageResult<ResumeToken> {
+        if let Some((seg_first_index, seg_path)) = self.list_segments()?.into_iter().next_back() {
+            let reader =
+                SegmentReader::open(&seg_path).or_else(|_| SegmentReader::open_active(&seg_path));
+            if let Ok(reader) = reader {
+                self.position = ResumeToken {
+                    shard_id: self.shard_id,
+                    segment_id: seg_first_index,
+                    entry_offset: reader.entries().len() as u64,
+                };
+            }
+        }
+        Ok(self.position.clone())
+    }
+
     /// Read up to `max_entries` entries from the current position, applying
     /// `filters`.
     ///
