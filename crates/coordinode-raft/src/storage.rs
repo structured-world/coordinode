@@ -744,6 +744,11 @@ pub struct CoordinodeStateMachine {
     /// Optional so legacy paths that don't need cross-modality snapshot
     /// semantics can leave it `None` (e.g. embedded-mode fast tests).
     max_assigned: Option<Arc<coordinode_core::txn::watermark::MaxAssignedWatermark>>,
+    /// Count of full snapshot builds performed by this state machine.
+    /// Observability for the snapshot trigger: every build serializes
+    /// ALL partitions (hundreds of MB), so redundant rebuilds are a
+    /// direct latency and leader-stability hazard worth monitoring.
+    snapshot_builds: Arc<core::sync::atomic::AtomicU64>,
 }
 
 impl CoordinodeStateMachine {
@@ -792,7 +797,15 @@ impl CoordinodeStateMachine {
             applied_tx,
             applied_rx,
             max_assigned,
+            snapshot_builds: Arc::new(core::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Handle to the snapshot-build counter (increments on every full
+    /// snapshot serialization). Cluster orchestration exposes it for
+    /// metrics and tests.
+    pub fn snapshot_builds_handle(&self) -> Arc<core::sync::atomic::AtomicU64> {
+        Arc::clone(&self.snapshot_builds)
     }
 
     /// Handle to the per-shard `maxAssigned` watermark, if one was wired
@@ -1136,6 +1149,7 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
             engine: Arc::clone(&self.engine),
             last_applied,
             last_membership,
+            snapshot_builds: Arc::clone(&self.snapshot_builds),
         }
     }
 
@@ -1237,6 +1251,8 @@ pub struct CoordinodeSnapshotBuilder {
     engine: Arc<StorageEngine>,
     last_applied: Option<openraft::type_config::alias::LogIdOf<TypeConfig>>,
     last_membership: openraft::StoredMembership<CommittedLeaderId, u64, openraft::impls::BasicNode>,
+    /// Shared build counter from the owning state machine.
+    snapshot_builds: Arc<core::sync::atomic::AtomicU64>,
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for CoordinodeSnapshotBuilder {
@@ -1252,6 +1268,9 @@ impl RaftSnapshotBuilder<TypeConfig> for CoordinodeSnapshotBuilder {
             last_log_index = last_log_id.map(|id| id.index),
             "building full storage snapshot"
         );
+
+        self.snapshot_builds
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
         // Serialize all KV data from all partitions
         let data = crate::snapshot::build_full_snapshot(&self.engine)?;

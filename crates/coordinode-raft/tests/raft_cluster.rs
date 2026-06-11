@@ -1024,6 +1024,103 @@ async fn cluster_background_snapshot_trigger() {
     );
 }
 
+/// The background trigger must NOT rebuild a snapshot when no entries
+/// were applied since the last build. Every build serializes ALL
+/// partitions (hundreds of MB on real data) and was observed to starve
+/// raft ticks and cause leader churn when rebuilt every check interval.
+#[tokio::test(flavor = "multi_thread")]
+async fn cluster_snapshot_trigger_skips_when_no_new_entries() {
+    use coordinode_raft::cluster::SnapshotTriggerConfig;
+
+    let result = tokio::time::timeout(Duration::from_secs(25), async {
+        let p1 = alloc_port();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
+        let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+        let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{p1}").parse().expect("addr");
+
+        let snap_config = SnapshotTriggerConfig {
+            check_interval: Duration::from_secs(1),
+            disk_space_threshold: 0, // disk criterion always satisfied
+        };
+        let n1 = RaftNode::open_cluster_with_snapshot_config(
+            1,
+            Arc::clone(&engine),
+            listen_addr,
+            format!("http://127.0.0.1:{p1}"),
+            snap_config,
+        )
+        .await
+        .expect("open leader");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let pipeline = n1.pipeline();
+        let id_gen = ProposalIdGenerator::with_base(2u64 << 48);
+        let proposal = RaftProposal {
+            id: id_gen.next(),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:1:snap-skip".to_vec(),
+                value: b"v".to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(100),
+            start_ts: Timestamp::from_raw(99),
+            bypass_rate_limiter: false,
+        };
+        pipeline.propose_and_wait(&proposal).expect("propose");
+
+        // Let the trigger fire and build the first snapshot.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let builds_after_first = n1.snapshot_builds();
+        assert!(
+            builds_after_first >= 1,
+            "trigger should have built an initial snapshot"
+        );
+
+        // NO new entries: several more check intervals must not rebuild.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let builds_after_idle = n1.snapshot_builds();
+        assert_eq!(
+            builds_after_idle,
+            builds_after_first,
+            "snapshot was rebuilt {} time(s) with no new applied entries",
+            builds_after_idle - builds_after_first
+        );
+
+        // A new entry re-arms the trigger.
+        let proposal = RaftProposal {
+            id: id_gen.next(),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:1:snap-skip-2".to_vec(),
+                value: b"v2".to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(200),
+            start_ts: Timestamp::from_raw(199),
+            bypass_rate_limiter: false,
+        };
+        pipeline.propose_and_wait(&proposal).expect("propose 2");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            n1.snapshot_builds() > builds_after_idle,
+            "trigger should rebuild once new entries were applied"
+        );
+
+        n1.shutdown().await.expect("shutdown");
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — cluster_snapshot_trigger_skips_when_no_new_entries"
+    );
+}
+
 /// gRPC snapshot transfer e2e: leader takes snapshot, purges logs, then
 /// a new node joins. The leader can't send AppendEntries (logs purged),
 /// so openraft sends snapshot via gRPC. Verify new node has the data.

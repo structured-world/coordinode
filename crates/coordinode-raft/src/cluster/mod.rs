@@ -76,6 +76,9 @@ pub struct RaftNode {
     raft: Arc<RaftInstance>,
     /// Applied watermark subscriber (from state machine).
     applied_rx: tokio::sync::watch::Receiver<u64>,
+    /// Snapshot-build counter (from state machine); see
+    /// [`RaftNode::snapshot_builds`].
+    snapshot_builds: Arc<core::sync::atomic::AtomicU64>,
     /// This node's ID.
     node_id: u64,
     /// Storage engine — held so `shutdown()` can flush before returning.
@@ -120,6 +123,7 @@ impl RaftNode {
         let state_machine = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), oracle);
 
         let applied_rx = state_machine.subscribe_applied();
+        let snapshot_builds = state_machine.snapshot_builds_handle();
 
         let network = StubNetworkFactory;
 
@@ -170,6 +174,7 @@ impl RaftNode {
         Ok(Self {
             raft,
             applied_rx,
+            snapshot_builds,
             node_id,
             engine,
             _grpc_shutdown: None,
@@ -235,6 +240,7 @@ impl RaftNode {
         let state_machine =
             CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle());
         let applied_rx = state_machine.subscribe_applied();
+        let snapshot_builds = state_machine.snapshot_builds_handle();
 
         let network = GrpcNetworkFactory;
 
@@ -296,6 +302,7 @@ impl RaftNode {
         Ok(Self {
             raft,
             applied_rx,
+            snapshot_builds,
             node_id,
             engine,
             _grpc_shutdown: Some(shutdown_tx),
@@ -359,6 +366,7 @@ impl RaftNode {
         let state_machine =
             CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle());
         let applied_rx = state_machine.subscribe_applied();
+        let snapshot_builds = state_machine.snapshot_builds_handle();
 
         let network = GrpcNetworkFactory;
 
@@ -407,6 +415,7 @@ impl RaftNode {
         let node = Self {
             raft,
             applied_rx,
+            snapshot_builds,
             node_id,
             engine,
             _grpc_shutdown: None, // no internal server — caller manages the router
@@ -453,6 +462,7 @@ impl RaftNode {
         let state_machine =
             CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle());
         let applied_rx = state_machine.subscribe_applied();
+        let snapshot_builds = state_machine.snapshot_builds_handle();
 
         let network = GrpcNetworkFactory;
 
@@ -479,6 +489,7 @@ impl RaftNode {
         let node = Self {
             raft,
             applied_rx,
+            snapshot_builds,
             node_id,
             engine,
             _grpc_shutdown: None, // no internal server — caller manages the router
@@ -527,6 +538,7 @@ impl RaftNode {
         let state_machine =
             CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle());
         let applied_rx = state_machine.subscribe_applied();
+        let snapshot_builds = state_machine.snapshot_builds_handle();
 
         let network = GrpcNetworkFactory;
 
@@ -562,6 +574,7 @@ impl RaftNode {
         Ok(Self {
             raft,
             applied_rx,
+            snapshot_builds,
             node_id,
             engine,
             _grpc_shutdown: Some(shutdown_tx),
@@ -685,6 +698,15 @@ impl RaftNode {
     /// Get the current applied log index (non-blocking).
     pub fn applied_index(&self) -> u64 {
         *self.applied_rx.borrow()
+    }
+
+    /// Number of full snapshot builds this node has performed. Every
+    /// build serializes ALL partitions, so an unexpectedly growing
+    /// count (without new applied entries) indicates a misfiring
+    /// trigger and a leader-stability hazard.
+    pub fn snapshot_builds(&self) -> u64 {
+        self.snapshot_builds
+            .load(core::sync::atomic::Ordering::Relaxed)
     }
 
     /// Wait until the applied log index reaches at least `target`, with timeout.
@@ -1487,15 +1509,7 @@ fn spawn_snapshot_trigger(
                     );
                     true
                 }
-                _ => {
-                    // Even if disk space check fails or is below threshold,
-                    // the periodic timer itself is a trigger reason:
-                    // "60 seconds check interval" from arch doc means we check
-                    // AND trigger if no recent snapshot exists.
-                    // openraft's LogsSinceLast handles the "no new entries" case
-                    // (won't build empty snapshot), so triggering is safe.
-                    true
-                }
+                _ => true,
             };
 
             if should_snapshot {
