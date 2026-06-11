@@ -125,6 +125,14 @@ pub struct StorageEngine {
     /// `Some` only when opened via `open_with_wal`. In cluster mode this is
     /// always `None` — Raft log is the crash-recovery mechanism (ADR-017).
     wal: Option<Arc<Mutex<StandaloneWal>>>,
+    /// The timestamp oracle this engine stamps writes with. `Some` only
+    /// when opened via [`StorageEngine::open_with_oracle`]. Exposed via
+    /// [`StorageEngine::oracle`] so subsystems applying externally
+    /// stamped writes (the Raft state machine on followers) can advance
+    /// the SAME oracle that local MVCC readers draw snapshots from;
+    /// without that, follower reads pin a stale snapshot and observe
+    /// none of the replicated data.
+    oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
 }
 
 impl StorageEngine {
@@ -135,7 +143,7 @@ impl StorageEngine {
         let gc_watermark = Arc::new(AtomicU64::new(0));
         let seqno: lsm_tree::SharedSequenceNumberGenerator =
             Arc::new(lsm_tree::SequenceNumberCounter::default());
-        Self::finish_open(config, seqno, gc_watermark, None)
+        Self::finish_open(config, seqno, gc_watermark, None, None)
     }
 
     /// Open with a standalone WAL for crash durability (embedded / no-Raft mode).
@@ -163,7 +171,7 @@ impl StorageEngine {
         let seqno: lsm_tree::SharedSequenceNumberGenerator =
             Arc::new(lsm_tree::SequenceNumberCounter::default());
         let wal_config = wal_config.unwrap_or_default();
-        Self::finish_open(config, seqno, gc_watermark, Some(wal_config))
+        Self::finish_open(config, seqno, gc_watermark, Some(wal_config), None)
     }
 
     /// Open with a custom `TimestampOracle` as the seqno generator.
@@ -176,8 +184,9 @@ impl StorageEngine {
         oracle: std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>,
     ) -> StorageResult<Self> {
         let gc_watermark = Arc::new(AtomicU64::new(0));
-        let seqno: lsm_tree::SharedSequenceNumberGenerator = Arc::new(OracleSeqnoGenerator(oracle));
-        Self::finish_open(config, seqno, gc_watermark, None)
+        let seqno: lsm_tree::SharedSequenceNumberGenerator =
+            Arc::new(OracleSeqnoGenerator(Arc::clone(&oracle)));
+        Self::finish_open(config, seqno, gc_watermark, None, Some(oracle))
     }
 
     fn finish_open(
@@ -185,6 +194,7 @@ impl StorageEngine {
         seqno: lsm_tree::SharedSequenceNumberGenerator,
         gc_watermark: Arc<AtomicU64>,
         wal_config: Option<WalConfig>,
+        oracle: Option<std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
     ) -> StorageResult<Self> {
         // Shared block cache across all partition trees.
         let cache = Arc::new(lsm_tree::Cache::with_capacity_bytes(
@@ -486,7 +496,16 @@ impl StorageEngine {
             capacity_scanner,
             partition_l0_endpoint,
             wal,
+            oracle,
         })
+    }
+
+    /// The timestamp oracle this engine stamps writes with, when opened
+    /// via [`StorageEngine::open_with_oracle`]. Subsystems that apply
+    /// externally stamped writes (the Raft state machine on followers)
+    /// must advance this oracle so local MVCC readers observe them.
+    pub fn oracle(&self) -> Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>> {
+        self.oracle.clone()
     }
 
     /// Get a tree handle by logical partition.

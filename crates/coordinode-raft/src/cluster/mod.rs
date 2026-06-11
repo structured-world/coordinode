@@ -113,6 +113,10 @@ impl RaftNode {
         let config = Arc::new(default_raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
+        // Explicit oracle wins; otherwise fall back to the oracle the
+        // engine itself stamps writes with (see the cluster constructors
+        // for why the state machine must advance it).
+        let oracle = oracle.or_else(|| engine.oracle());
         let state_machine = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), oracle);
 
         let applied_rx = state_machine.subscribe_applied();
@@ -223,7 +227,13 @@ impl RaftNode {
         let config = Arc::new(default_raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
-        let state_machine = CoordinodeStateMachine::new(Arc::clone(&engine));
+        // Wire the engine's own timestamp oracle into the state machine:
+        // applied entries carry the leader's commit timestamps, and the
+        // local oracle must advance past them or MVCC readers on this
+        // node keep drawing stale snapshots that observe none of the
+        // replicated data.
+        let state_machine =
+            CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle());
         let applied_rx = state_machine.subscribe_applied();
 
         let network = GrpcNetworkFactory;
@@ -341,7 +351,13 @@ impl RaftNode {
         let config = Arc::new(default_raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
-        let state_machine = CoordinodeStateMachine::new(Arc::clone(&engine));
+        // Wire the engine's own timestamp oracle into the state machine:
+        // applied entries carry the leader's commit timestamps, and the
+        // local oracle must advance past them or MVCC readers on this
+        // node keep drawing stale snapshots that observe none of the
+        // replicated data.
+        let state_machine =
+            CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle());
         let applied_rx = state_machine.subscribe_applied();
 
         let network = GrpcNetworkFactory;
@@ -429,7 +445,13 @@ impl RaftNode {
         let config = Arc::new(default_raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
-        let state_machine = CoordinodeStateMachine::new(Arc::clone(&engine));
+        // Wire the engine's own timestamp oracle into the state machine:
+        // applied entries carry the leader's commit timestamps, and the
+        // local oracle must advance past them or MVCC readers on this
+        // node keep drawing stale snapshots that observe none of the
+        // replicated data.
+        let state_machine =
+            CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle());
         let applied_rx = state_machine.subscribe_applied();
 
         let network = GrpcNetworkFactory;
@@ -497,7 +519,13 @@ impl RaftNode {
         let config = Arc::new(default_raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
-        let state_machine = CoordinodeStateMachine::new(Arc::clone(&engine));
+        // Wire the engine's own timestamp oracle into the state machine:
+        // applied entries carry the leader's commit timestamps, and the
+        // local oracle must advance past them or MVCC readers on this
+        // node keep drawing stale snapshots that observe none of the
+        // replicated data.
+        let state_machine =
+            CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle());
         let applied_rx = state_machine.subscribe_applied();
 
         let network = GrpcNetworkFactory;
