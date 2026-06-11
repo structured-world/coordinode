@@ -274,14 +274,15 @@ async fn run_rounds(
         other => return Err(format!("unknown --read-preference '{other}'").into()),
     };
     for w in 0..args.concurrency.max(1) {
-        let endpoint = endpoints[w % endpoints.len()].clone();
+        let endpoints = endpoints.clone();
         let cypher = cypher.to_string();
         let queries = Arc::clone(&queries);
         let gt = Arc::clone(&gt);
         let next = Arc::clone(&next);
         let k = args.k;
         workers.push(tokio::spawn(async move {
-            let mut client = CoordinodeClient::connect(endpoint)
+            let mut ep_idx = w % endpoints.len();
+            let mut client = CoordinodeClient::connect(endpoints[ep_idx].clone())
                 .await
                 .map_err(|e| e.to_string())?;
             let mut lats: Vec<f64> = Vec::new();
@@ -294,14 +295,39 @@ async fn run_rounds(
                 }
                 let q_idx = i % n_test;
                 let qv = queries[q_idx * dim..(q_idx + 1) * dim].to_vec();
-                let mut params = std::collections::HashMap::new();
-                params.insert("qv".to_string(), Value::Vector(qv));
-                let t = Instant::now();
-                let rows = client
-                    .execute_cypher_with_read_preference(&cypher, params, read_pref)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                lats.push(t.elapsed().as_micros() as f64);
+                // Leader-locating retry: a `primary` read against a
+                // follower (or after a mid-run election) fails with a
+                // leader-required error. Rotate to the next endpoint
+                // and retry the SAME query; the failed attempt's
+                // latency is not recorded. Bounded so a leaderless
+                // cluster still terminates with the real error.
+                let mut attempts = 0usize;
+                let rows = loop {
+                    let mut params = std::collections::HashMap::new();
+                    params.insert("qv".to_string(), Value::Vector(qv.clone()));
+                    let t = Instant::now();
+                    match client
+                        .execute_cypher_with_read_preference(&cypher, params, read_pref)
+                        .await
+                    {
+                        Ok(rows) => {
+                            lats.push(t.elapsed().as_micros() as f64);
+                            break rows;
+                        }
+                        Err(e)
+                            if endpoints.len() > 1
+                                && attempts < endpoints.len() * 2
+                                && e.to_string().contains("requires the Raft leader") =>
+                        {
+                            attempts += 1;
+                            ep_idx = (ep_idx + 1) % endpoints.len();
+                            client = CoordinodeClient::connect(endpoints[ep_idx].clone())
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        }
+                        Err(e) => return Err(e.to_string()),
+                    }
+                };
                 let gt_row: std::collections::HashSet<i64> = gt[q_idx * gt_k..q_idx * gt_k + k]
                     .iter()
                     .map(|x| i64::from(*x))

@@ -50,6 +50,17 @@ PORTS=("$BASE_PORT" "$((BASE_PORT + 10))" "$((BASE_PORT + 20))")
 PIDS=()
 
 cleanup() {
+  status=$?
+  # On failure, surface the node logs before the temp dir is lost —
+  # without them a CI failure is undiagnosable (leader elections,
+  # backfill errors, replication stalls all live here).
+  if [ "$status" -ne 0 ]; then
+    for i in 1 2 3; do
+      echo "::group::node$i.log tail (exit $status)"
+      tail -40 "$WORK_DIR/node$i.log" 2>/dev/null || true
+      echo "::endgroup::"
+    done
+  fi
   for pid in "${PIDS[@]:-}"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
@@ -147,10 +158,13 @@ run_search() {
 }
 
 # L2: leader-only reads. Same concurrency points as server_bench.sh
-# so L2/L1 divides cleanly.
+# so L2/L1 divides cleanly. All endpoints are passed so the bench's
+# leader-locating retry survives elections (leadership has been
+# observed to move off node1 mid-run under load); `primary` still
+# guarantees every recorded query was served by the leader.
 for C in 1 4; do
   echo "::group::L2 leader-only search concurrency=$C"
-  run_search "$LEADER" "$C" "L2" "primary"
+  run_search "$ALL_ENDPOINTS" "$C" "L2" "primary"
   echo "::endgroup::"
 done
 
