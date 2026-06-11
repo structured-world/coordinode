@@ -15,6 +15,12 @@ rust-version = "1.90"
 license = "AGPL-3.0-only"
 publish = false
 
+[features]
+# Pass-through diagnostic: per-query distance-kernel call counts in
+# the sweep log. Build with `--features dist-counters` for gap
+# attribution runs; off for measured cells.
+dist-counters = ["coordinode-vector/dist-counters"]
+
 [dependencies]
 coordinode-vector = { path = "../../crates/coordinode-vector" }
 coordinode-bench = { path = "../../crates/coordinode-bench" }

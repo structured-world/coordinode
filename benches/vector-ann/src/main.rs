@@ -582,6 +582,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             p99_us = point.latency_us_p99,
             "sweep point"
         );
+        // Diagnostic: distance-kernel calls per query for this ef point
+        // (single-thread sweeps only: the counter is thread-local and
+        // the ST path runs every query on this thread). The counter
+        // still includes build-phase calls on the FIRST ef point; read
+        // the second and later points for clean per-query numbers.
+        #[cfg(feature = "dist-counters")]
+        if args.search_threads <= 1 {
+            let calls = coordinode_vector::metrics::take_dist_calls();
+            let total_q = (n_test * REPLAY_ROUNDS) as u64;
+            info!(
+                ef_search = ef,
+                dist_calls_per_query = calls / total_q.max(1),
+                "distance-kernel call volume"
+            );
+        }
         points.push(point);
         // Search scratch buffers grow with ef_search — track the peak
         // so the report carries both build-time and search-time RSS.

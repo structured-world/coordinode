@@ -228,10 +228,32 @@ pub fn norm_l2(a: &[f32]) -> f32 {
     dot_product_inner(a, a).sqrt()
 }
 
+// --- Diagnostic distance-call counter (bench-only feature) ---
+
+#[cfg(feature = "dist-counters")]
+std::thread_local! {
+    static DIST_CALLS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Read and reset this thread's distance-kernel invocation counter.
+/// Only meaningful with the `dist-counters` feature; counts every
+/// `dot_product_inner` entry (dot, cosine, norm all funnel through it).
+#[cfg(feature = "dist-counters")]
+pub fn take_dist_calls() -> u64 {
+    DIST_CALLS.with(|c| c.replace(0))
+}
+
+#[inline]
+fn count_dist_call() {
+    #[cfg(feature = "dist-counters")]
+    DIST_CALLS.with(|c| c.set(c.get() + 1));
+}
+
 // --- Scalar implementations ---
 
 #[inline]
 fn dot_product_inner(a: &[f32], b: &[f32]) -> f32 {
+    count_dist_call();
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") {

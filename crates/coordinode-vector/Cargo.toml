@@ -17,6 +17,13 @@ smallvec = { version = "1.13", features = ["serde", "union"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+# Diagnostic counter for distance-kernel invocations (thread-local,
+# no atomics). Bench-only: lets the harness compare distance-call
+# volume against competitors at equal recall. Never enable in
+# production builds.
+dist-counters = []
+
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
