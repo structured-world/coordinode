@@ -429,6 +429,91 @@ impl SegmentReader {
         })
     }
 
+    /// Open a segment that has NOT been sealed yet (no footer) and load
+    /// every complete entry from it.
+    ///
+    /// The per-entry framing (`varint(len) || payload || crc32`) makes a
+    /// prefix read safe: parsing stops at the first incomplete or
+    /// corrupt frame, which on an actively written segment is simply the
+    /// entry the writer has not finished flushing. Live oplog consumers
+    /// (index maintenance, CDC) use this to tail the ACTIVE segment
+    /// instead of waiting up to a full rotation for it to seal.
+    ///
+    /// The returned reader carries a synthesized footer describing the
+    /// complete prefix; callers must treat the segment as still growing
+    /// and re-read it for new entries.
+    pub fn open_active(path: &Path) -> StorageResult<Self> {
+        let data = std::fs::read(path)
+            .map_err(|e| StorageError::Io(format!("read segment {:?}: {e}", path)))?;
+
+        let total_len = data.len() as u64;
+        if total_len < HEADER_SIZE {
+            return Err(StorageError::Io(format!(
+                "segment {:?} too short for a header: {} bytes",
+                path, total_len
+            )));
+        }
+
+        let mut cursor = Cursor::new(&data);
+        let header = read_header(&mut cursor)?;
+        if header.version != FORMAT_VERSION {
+            return Err(StorageError::Io(format!(
+                "unsupported oplog version {} in {:?}",
+                header.version, path
+            )));
+        }
+
+        cursor.set_position(HEADER_SIZE);
+        let mut entries = Vec::new();
+        let mut first_ts = 0u64;
+        let mut last_ts = 0u64;
+        loop {
+            let frame_start = cursor.position();
+            let Ok(payload_len) = decode_varint(&mut cursor) else {
+                break; // truncated varint: writer mid-flush
+            };
+            let payload_len = payload_len as usize;
+            let remaining = (total_len - cursor.position()) as usize;
+            if remaining < payload_len + 4 {
+                break; // incomplete frame tail
+            }
+            let mut payload = vec![0u8; payload_len];
+            if cursor.read_exact(&mut payload).is_err() {
+                break;
+            }
+            let mut crc_buf = [0u8; 4];
+            if cursor.read_exact(&mut crc_buf).is_err() {
+                break;
+            }
+            if crc32fast::hash(&payload) != u32::from_le_bytes(crc_buf) {
+                // Torn write at the tail; everything before it is good.
+                cursor.set_position(frame_start);
+                break;
+            }
+            let Ok(entry) = OplogEntry::decode(&payload) else {
+                cursor.set_position(frame_start);
+                break;
+            };
+            if entries.is_empty() {
+                first_ts = entry.ts;
+            }
+            last_ts = entry.ts;
+            entries.push(entry);
+        }
+
+        let footer = SegmentFooter {
+            entry_count: entries.len() as u32,
+            first_ts,
+            last_ts,
+            total_bytes: cursor.position(),
+        };
+        Ok(Self {
+            header,
+            footer,
+            entries,
+        })
+    }
+
     /// All entries in this segment in order.
     pub fn entries(&self) -> &[OplogEntry] {
         &self.entries

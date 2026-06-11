@@ -152,15 +152,35 @@ impl OplogTailer {
                 continue;
             }
 
+            let is_last = segments
+                .last()
+                .map(|(idx, _)| idx == seg_first_index)
+                .unwrap_or(false);
             let reader = match SegmentReader::open(seg_path) {
                 Ok(r) => r,
+                // The newest segment is usually still being written (no
+                // footer yet). Read its complete-entry prefix so live
+                // consumers see entries without waiting up to a full
+                // rotation for the seal; the per-entry crc framing makes
+                // the prefix read safe.
+                Err(_) if is_last => match SegmentReader::open_active(seg_path) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::debug!(
+                            segment = %seg_path.display(),
+                            error = %e,
+                            "active segment not yet readable"
+                        );
+                        continue;
+                    }
+                },
                 Err(e) => {
-                    // Segment may still be actively written (no footer yet).
-                    // Skip it — it'll appear as a proper sealed segment later.
+                    // A non-final unreadable segment is real corruption or
+                    // a mid-write straggler; skip and let later calls retry.
                     tracing::debug!(
                         segment = %seg_path.display(),
                         error = %e,
-                        "skipping unreadable segment (may be active)"
+                        "skipping unreadable segment"
                     );
                     continue;
                 }
@@ -342,6 +362,78 @@ mod tests {
         let mut tailer = OplogTailer::new(dir.path(), token);
         let batch = tailer.read_next(100, &CdcFilters::default()).expect("read");
         assert!(batch.is_empty(), "empty dir = empty batch");
+    }
+
+    /// Live consumers must see entries in the ACTIVE (unsealed) segment;
+    /// waiting for the seal means up to a full rotation of lag.
+    #[test]
+    fn tailer_reads_active_segment_incrementally() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut mgr = open_manager(dir.path());
+
+        for i in 0..3u64 {
+            mgr.append(&make_entry(i, 1000 + i, false)).expect("append");
+        }
+        mgr.flush().expect("flush");
+        // NO seal: the segment is still active.
+
+        let token = ResumeToken::from_start(0);
+        let mut tailer = OplogTailer::new(dir.path(), token);
+        let batch = tailer.read_next(100, &CdcFilters::default()).expect("read");
+        assert_eq!(batch.len(), 3, "active segment entries must be visible");
+        assert_eq!(batch[2].0.index, 2);
+
+        // Entries appended AFTER the first read are picked up on the next
+        // read from the same tailer position.
+        for i in 3..5u64 {
+            mgr.append(&make_entry(i, 1000 + i, false)).expect("append");
+        }
+        mgr.flush().expect("flush");
+        let batch = tailer.read_next(100, &CdcFilters::default()).expect("read");
+        assert_eq!(batch.len(), 2, "newly appended entries must be visible");
+        assert_eq!(batch[0].0.index, 3);
+        assert_eq!(batch[1].0.index, 4);
+    }
+
+    /// A torn write at the tail of the active segment must not break the
+    /// prefix read: complete entries before it are returned.
+    #[test]
+    fn tailer_active_segment_ignores_torn_tail() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut mgr = open_manager(dir.path());
+        for i in 0..3u64 {
+            mgr.append(&make_entry(i, 1000 + i, false)).expect("append");
+        }
+        mgr.flush().expect("flush");
+        drop(mgr); // release the file handle; segment stays unsealed
+
+        // Simulate a torn write: garbage bytes at the end of the file.
+        let seg_path = std::fs::read_dir(dir.path())
+            .expect("dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|e| e == "oplog"))
+            .or_else(|| {
+                std::fs::read_dir(dir.path())
+                    .ok()?
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .find(|p| p.is_file())
+            })
+            .expect("segment file");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&seg_path)
+            .expect("open for append");
+        f.write_all(&[0x07, 0xde, 0xad, 0xbe]).expect("torn bytes");
+        drop(f);
+
+        let token = ResumeToken::from_start(0);
+        let mut tailer = OplogTailer::new(dir.path(), token);
+        let batch = tailer.read_next(100, &CdcFilters::default()).expect("read");
+        assert_eq!(batch.len(), 3, "complete prefix must survive a torn tail");
     }
 
     #[test]
