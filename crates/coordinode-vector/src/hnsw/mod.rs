@@ -3462,7 +3462,14 @@ impl HnswIndex {
         // to do RaBitQ. Cuts the helper's SoA-read cost in half
         // (one cache line + one Option discriminant + one enum match
         // instead of two cache lines + two Option discriminants).
-        if matches!(self.config.metric, VectorMetric::Cosine) {
+        // Gate on the INDEX-level codec state before touching the
+        // per-node array: `node_rabitq_codes[idx]` is a random read
+        // with a 72B stride, and on unquantized indexes (codes all
+        // None) it was a guaranteed cache miss per neighbour visit
+        // spent only to DECIDE what to prefetch — perf measured it at
+        // ~32% of search_layer self-time on glove-50k ST. RaBitQ codes
+        // exist only after calibration, which requires `rabitq_params`.
+        if self.rabitq_params.is_some() && matches!(self.config.metric, VectorMetric::Cosine) {
             if let Some(ref enc) = self.node_rabitq_codes[idx] {
                 let code_words = match enc {
                     RabitqEncoded::OneBit(c) => c.code.as_ptr() as *const u8,
