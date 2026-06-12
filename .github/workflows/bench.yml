@@ -227,7 +227,10 @@ jobs:
           # ef sweep and subset are HARD-locked to keep each cell under
           # the 20-min job ceiling. full_sweep widens the cell SURFACE
           # (extra codec / mode rows) but never the per-cell workload.
-          EF_SWEEP="40,80,200,400"
+          # 135 sits on the alpha-pruned graph's recall-0.95 crossing
+          # (glove angular); without it qps_at_recall_0_95 falls back
+          # to the ef=200 point and underreports the tuned build by ~45%.
+          EF_SWEEP="40,80,135,200,400"
           echo "::notice::vector mode = $( [ "$FULL_SWEEP" = "true" ] && echo full-sweep || echo lean ), ef sweep = $EF_SWEEP, subset = $SUBSET_SIZE"
 
           # Build the list of `--threads` values to sweep. Empty input
