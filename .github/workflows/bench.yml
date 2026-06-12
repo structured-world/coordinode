@@ -346,12 +346,15 @@ jobs:
             fi
             for QUANT in $QUANT_LIST; do
               echo "::group::glove-100-angular M=16 codec=$QUANT threads=$T shards=$S"
+              # Angular f32 cells run the tuned build point (the engine
+              # defaults alpha-pruning to 1.15 for cosine; ef_construction
+              # 320 is the measured pareto winner at recall>=0.95).
               ./target/release/bench-vector-ann \
                 --train       "$GLOVE_DIR/glove_base.fvecs" \
                 --query       "$GLOVE_DIR/glove_query.fvecs" \
                 --groundtruth "$GLOVE_DIR/glove_groundtruth.ivecs" \
                 --dataset-name glove-100-angular \
-                --m 16 --ef-construction 200 \
+                --m 16 --ef-construction 320 \
                 --codec none --quantization "$QUANT" \
                 --ef-sweep "$EF_SWEEP" \
                 --threads "$POOL" \

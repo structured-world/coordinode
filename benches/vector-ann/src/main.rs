@@ -167,12 +167,13 @@ struct Args {
     threads: usize,
 
     /// RobustPrune α parameter for neighbour selection during HNSW
-    /// construction. `1.0` (default) keeps the original "take M closest"
-    /// strategy. `> 1.0` (Vamana paper recommends `1.2`) enables the
-    /// RobustPrune heuristic — sparser, more diverse graph at the cost
-    /// of higher build time, for lower fanout per query and higher QPS
-    /// at fixed recall on the search side.
-    #[arg(long, default_value_t = 1.0)]
+    /// construction. `0` (default) = AUTO: the engine's metric-tuned
+    /// default (Cosine = 1.15, others = off). `1.0` forces the
+    /// original "take M closest" strategy off. `> 1.0` (Vamana paper
+    /// recommends `1.2`) sets RobustPrune explicitly — sparser, more
+    /// diverse graph at the cost of higher build time, for lower
+    /// fanout per query and higher QPS at fixed recall.
+    #[arg(long, default_value_t = 0.0)]
     alpha_pruning: f32,
 
     /// Rerank strategy on the RaBitQ search path. `inline` (default)
@@ -623,8 +624,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     report.record("hnsw_ef_construction", args.ef_construction)?;
     // RobustPrune α; recorded so the dashboard can filter / group runs
     // built with α=1.0 (legacy "take M closest") vs α>1.0 (Vamana-style
-    // diverse graph).
-    report.record("hnsw_alpha_pruning", args.alpha_pruning as f64)?;
+    // diverse graph). Records the RESOLVED value (auto -> metric
+    // default), not the raw CLI arg, so cells stay comparable.
+    report.record("hnsw_alpha_pruning", config.effective_alpha() as f64)?;
     report.record("hnsw_rerank_mode", args.rerank_mode.clone())?;
     report.record("hnsw_rerank_oversample", args.rerank_oversample as f64)?;
     report.record("quantization", args.quantization.clone())?;
