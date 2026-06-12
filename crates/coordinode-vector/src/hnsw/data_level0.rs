@@ -264,24 +264,37 @@ impl DataLevel0Block {
         unsafe { self.node_base(idx).add(self.vector_offset) as *const f32 }
     }
 
-    /// Issue an `_mm_prefetch` (or arch equivalent) for the **f32 vector**
-    /// portion of node `idx`'s per-node block. Targets `vector_offset`
-    /// (offset 260 at sift d=128) so the warmed cache line is the one
-    /// the rerank f32 read will actually touch — not the leading
-    /// neighbour-count / neighbour-ids cache line that the f32 path
-    /// never reads. No-op on unsupported architectures. Safe wrapper:
-    /// `idx >= capacity` skips the hint instead of panicking.
+    /// Issue `_mm_prefetch` hints (or arch equivalent) covering the
+    /// **entire f32 vector** portion of node `idx`'s per-node block.
+    /// Targets `vector_offset` (offset 260 at sift d=128) so the warmed
+    /// lines are the ones the distance kernel will actually touch — not
+    /// the leading neighbour-count / neighbour-ids cache line that the
+    /// f32 path never reads.
+    ///
+    /// One hint per 64B line over the full `dim * 4` span: a d=100
+    /// vector is 400 B = 7 lines, and a single-line hint left the
+    /// kernel missing on lines 2-7 of every visit (the search loop
+    /// prefetches one neighbour ahead, so the ~40ns of the current
+    /// neighbour's dot is exactly the latency window these hints need).
+    /// No-op on unsupported architectures. Safe wrapper: `idx >=
+    /// capacity` skips the hint instead of panicking.
     #[inline(always)]
     pub(super) fn prefetch(&self, idx: usize) {
         if idx >= self.capacity {
             return;
         }
-        // SAFETY: `idx < capacity` gate above; `vector_offset` lies
-        // inside the per-node block by construction. Prefetch is a
-        // hint, not a load — the pointer is never dereferenced by
-        // this function.
+        // SAFETY: `idx < capacity` gate above; `vector_offset` and the
+        // `dim * 4` span lie inside the per-node block by construction.
+        // Prefetch is a hint, not a load — the pointer is never
+        // dereferenced by this function.
         unsafe {
-            super::prefetch_read_data(self.vector_ptr(idx) as *const u8);
+            let base = self.vector_ptr(idx) as *const u8;
+            let span = self.dim * core::mem::size_of::<f32>();
+            let mut off = 0;
+            while off < span {
+                super::prefetch_read_data(base.add(off));
+                off += 64;
+            }
         }
     }
 }
