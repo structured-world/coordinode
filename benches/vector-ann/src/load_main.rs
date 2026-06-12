@@ -96,6 +96,19 @@ struct Args {
     /// k for the recomputed groundtruth rows.
     #[arg(long, default_value_t = 10)]
     gt_k: usize,
+
+    /// Shard fan-out: with `--n-shards N --shard-idx I`, load only the
+    /// rows where `row % N == I`, keeping the GLOBAL row index as
+    /// `ext_id` so a scatter-gather search merged across all shards
+    /// scores against the full-dataset groundtruth. The groundtruth
+    /// recompute (`--write-groundtruth`) always covers the FULL
+    /// (subset) train set regardless of the shard filter.
+    #[arg(long, default_value_t = 1)]
+    n_shards: usize,
+
+    /// This loader's shard index in `0..n_shards`.
+    #[arg(long, default_value_t = 0)]
+    shard_idx: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -160,11 +173,22 @@ async fn load(
         prop = args.property,
     );
 
+    if args.shard_idx >= args.n_shards.max(1) {
+        return Err(format!(
+            "--shard-idx {} out of range for --n-shards {}",
+            args.shard_idx, args.n_shards
+        )
+        .into());
+    }
     let wall = Instant::now();
     let mut sent = 0usize;
+    let mut loaded = 0usize;
     while sent < n_train {
         let end = (sent + args.batch_size).min(n_train);
         let batch: Vec<Value> = (sent..end)
+            // Modulo shard filter; ext_id stays the GLOBAL row index
+            // so merged scatter-gather results match the groundtruth.
+            .filter(|i| args.n_shards <= 1 || i % args.n_shards == args.shard_idx)
             .map(|i| {
                 let mut row = HashMap::new();
                 row.insert("ext_id".to_string(), Value::Int(i as i64));
@@ -175,11 +199,14 @@ async fn load(
                 Value::Map(row)
             })
             .collect();
-        let mut params = HashMap::new();
-        params.insert("batch".to_string(), Value::List(batch));
-        client
-            .execute_cypher_with_params(&insert_cypher, params)
-            .await?;
+        if !batch.is_empty() {
+            loaded += batch.len();
+            let mut params = HashMap::new();
+            params.insert("batch".to_string(), Value::List(batch));
+            client
+                .execute_cypher_with_params(&insert_cypher, params)
+                .await?;
+        }
         sent = end;
         if sent % 10_000 < args.batch_size {
             info!(
@@ -193,7 +220,10 @@ async fn load(
     let load_secs = wall.elapsed().as_secs_f64();
     info!(
         load_secs,
-        vectors_per_sec = n_train as f64 / load_secs,
+        loaded,
+        shard_idx = args.shard_idx,
+        n_shards = args.n_shards,
+        vectors_per_sec = loaded as f64 / load_secs.max(f64::EPSILON),
         "data load complete"
     );
 

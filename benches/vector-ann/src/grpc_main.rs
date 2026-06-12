@@ -108,6 +108,16 @@ struct Args {
     /// Output base directory for the report JSON.
     #[arg(long, default_value = "bench-results")]
     output: PathBuf,
+
+    /// Scatter-gather shard mode: every endpoint holds a DISJOINT
+    /// partition (loaded with `bench-vector-load --n-shards/--shard-idx`);
+    /// each query is sent to ALL endpoints concurrently and the
+    /// per-shard top-k are merged client-side before scoring against
+    /// the full groundtruth. Per-query latency is the slowest shard's
+    /// wall time (the merge is the real distributed read path). Without
+    /// this flag multiple endpoints mean replica round-robin instead.
+    #[arg(long, default_value_t = false)]
+    shard_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -162,12 +172,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (measured: 25 QPS vs HNSW-backed three-digit QPS on the same
     // data). The final RETURN projects only ext_id so the response
     // stays light.
+    // Shard mode additionally projects the score so the client can
+    // K-way merge per-shard top-k lists by actual distance.
+    let score_proj = if args.shard_mode { ", _s AS score" } else { "" };
     let cypher = format!(
         "MATCH (n:{label}) \
          WITH *, {score_fn}(n.{prop}, $qv) AS _s \
          ORDER BY _s {order_dir} \
          LIMIT {k} \
-         RETURN n.ext_id AS ext_id",
+         RETURN n.ext_id AS ext_id{score_proj}",
         label = args.label,
         prop = args.property,
         k = args.k,
@@ -273,6 +286,117 @@ async fn run_rounds(
         "nearest" => ReadPreference::Nearest,
         other => return Err(format!("unknown --read-preference '{other}'").into()),
     };
+
+    if args.shard_mode {
+        // Scatter-gather: each worker owns one client PER shard
+        // endpoint; a query fans out to all shards concurrently and
+        // the per-shard top-k merge by score is the result. Higher
+        // score = better for -angular (similarity), lower = better
+        // for -euclidean (distance).
+        let descending = args.dataset_name.ends_with("-angular");
+        let k = args.k;
+        for _w in 0..args.concurrency.max(1) {
+            let endpoints = endpoints.clone();
+            let cypher = cypher.to_string();
+            let queries = Arc::clone(&queries);
+            let gt = Arc::clone(&gt);
+            let next = Arc::clone(&next);
+            workers.push(tokio::spawn(async move {
+                let mut clients = Vec::with_capacity(endpoints.len());
+                for ep in &endpoints {
+                    clients.push(
+                        CoordinodeClient::connect(ep.clone())
+                            .await
+                            .map_err(|e| e.to_string())?,
+                    );
+                }
+                let mut lats: Vec<f64> = Vec::new();
+                let mut hits = 0u64;
+                let mut denom = 0u64;
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= total {
+                        break;
+                    }
+                    let q_idx = i % n_test;
+                    let qv = queries[q_idx * dim..(q_idx + 1) * dim].to_vec();
+                    let t = Instant::now();
+                    // Fan out concurrently; per-query latency is the
+                    // slowest shard (the join wall time) — that IS the
+                    // distributed read path's cost.
+                    let calls = clients.iter_mut().map(|c| {
+                        let mut params = std::collections::HashMap::new();
+                        params.insert("qv".to_string(), Value::Vector(qv.clone()));
+                        c.execute_cypher_with_params(&cypher, params)
+                    });
+                    let per_shard = futures::future::try_join_all(calls)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    lats.push(t.elapsed().as_micros() as f64);
+
+                    let mut merged: Vec<(i64, f64)> = Vec::with_capacity(endpoints.len() * k);
+                    for rows in &per_shard {
+                        for row in rows {
+                            if let (Some(Value::Int(id)), Some(score)) =
+                                (row.get("ext_id"), row.get("score"))
+                            {
+                                let s = match score {
+                                    Value::Float(f) => *f,
+                                    Value::Int(v) => *v as f64,
+                                    _ => continue,
+                                };
+                                merged.push((*id, s));
+                            }
+                        }
+                    }
+                    if descending {
+                        merged.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    } else {
+                        merged.sort_by(|a, b| a.1.total_cmp(&b.1));
+                    }
+                    merged.truncate(k);
+
+                    let gt_row: std::collections::HashSet<i64> = gt[q_idx * gt_k..q_idx * gt_k + k]
+                        .iter()
+                        .map(|x| i64::from(*x))
+                        .collect();
+                    hits += merged.iter().filter(|(id, _)| gt_row.contains(id)).count() as u64;
+                    denom += k as u64;
+                }
+                Ok((lats, hits, denom))
+            }));
+        }
+        let mut latencies: Vec<f64> = Vec::with_capacity(total);
+        let mut hits = 0u64;
+        let mut denom = 0u64;
+        for handle in workers {
+            let (mut lats, h, d) = handle
+                .await?
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            latencies.append(&mut lats);
+            hits += h;
+            denom += d;
+        }
+        let wall_s = wall.elapsed().as_secs_f64();
+        latencies.sort_by(|a, b| a.total_cmp(b));
+        let mean = latencies.iter().sum::<f64>() / latencies.len().max(1) as f64;
+        let pct = |p: f64| -> f64 {
+            if latencies.is_empty() {
+                return 0.0;
+            }
+            let idx = ((latencies.len() as f64) * p).floor() as usize;
+            latencies[idx.min(latencies.len() - 1)]
+        };
+        return Ok(GrpcSweepPoint {
+            recall_at_k: hits as f64 / denom.max(1) as f64,
+            qps: total as f64 / wall_s,
+            latency_us_mean: mean,
+            latency_us_p50: pct(0.50),
+            latency_us_p95: pct(0.95),
+            latency_us_p99: pct(0.99),
+        });
+    }
+
     for w in 0..args.concurrency.max(1) {
         let endpoints = endpoints.clone();
         let cypher = cypher.to_string();
