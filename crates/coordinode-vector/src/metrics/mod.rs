@@ -167,21 +167,16 @@ pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
 /// | aarch64 NEON               | `l2_squared_neon_mt` | 16 |
 /// | scalar fallback            | `l2_squared_scalar`  | 1  |
 ///
-/// `#[inline]` is mandatory — the HNSW search hot loop calls this
-/// thousands of times per query, and the CPUID branch must hoist OUT
-/// of the loop (LLVM constant-folds `is_x86_feature_detected!` per
-/// monomorphization site when inlined). Without inline the call
-/// boundary plus per-call CPUID-cache load costs ~10 cycles each visit.
+/// On x86_64 dispatch is a one-time bound function pointer (see
+/// `KernelSlot`): one relaxed load + predicted indirect call, no
+/// per-call feature detection. On aarch64 the NEON detect macro
+/// constant-folds away and the kernel inlines directly.
 #[inline]
 pub fn euclidean_distance_squared(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512f") {
-            return unsafe { l2_squared_avx512(a, b) };
-        }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return unsafe { l2_squared_avx2_mt(a, b) };
-        }
+        // SAFETY: kernel resolved against this CPU's detected features.
+        return unsafe { (L2_KERNEL.get(resolve_l2_kernel))(a, b) };
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -206,9 +201,8 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 pub fn manhattan_distance(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
-            return unsafe { l1_avx2_mt(a, b) };
-        }
+        // SAFETY: kernel resolved against this CPU's detected features.
+        return unsafe { (L1_KERNEL.get(resolve_l1_kernel))(a, b) };
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -249,6 +243,88 @@ fn count_dist_call() {
     DIST_CALLS.with(|c| c.set(c.get() + 1));
 }
 
+// --- One-time kernel binding (x86_64 only) ---
+//
+// On x86_64 `is_x86_feature_detected!` compiles to a cached atomic
+// load plus a branch, and the dispatchers below paid it up to three
+// times per distance call (avx512f, avx2, fma) — measurable on a
+// ~30ns kernel called thousands of times per HNSW query, while the
+// `#[target_feature]` kernel cannot inline into the caller anyway.
+// hnswlib avoids this by resolving the kernel function pointer once;
+// same idea here, process-wide: first call resolves, every later call
+// is one relaxed load + a perfectly-predicted indirect call. CPU
+// features cannot change at runtime, so a benign Relaxed race is fine
+// (worst case two threads resolve to the identical pointer).
+//
+// aarch64 deliberately keeps direct dispatch: NEON is in the target
+// baseline, the detect macro constant-folds away and the kernel
+// inlines into the caller — a bound pointer BLOCKS that inlining
+// (measured +3-5% hnsw_search regression when tried).
+
+#[cfg(target_arch = "x86_64")]
+type SimKernel = unsafe fn(&[f32], &[f32]) -> f32;
+
+#[cfg(target_arch = "x86_64")]
+struct KernelSlot(core::sync::atomic::AtomicPtr<()>);
+
+#[cfg(target_arch = "x86_64")]
+impl KernelSlot {
+    const fn new() -> Self {
+        Self(core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()))
+    }
+
+    #[inline]
+    fn get(&self, resolve: fn() -> SimKernel) -> SimKernel {
+        use core::sync::atomic::Ordering;
+        let p = self.0.load(Ordering::Relaxed);
+        if !p.is_null() {
+            // SAFETY: the slot only ever stores pointers produced from a
+            // `SimKernel` below; the transmute reverses that exact cast.
+            return unsafe { core::mem::transmute::<*mut (), SimKernel>(p) };
+        }
+        let k = resolve();
+        self.0.store(k as *mut (), Ordering::Relaxed);
+        k
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+static DOT_KERNEL: KernelSlot = KernelSlot::new();
+#[cfg(target_arch = "x86_64")]
+static L2_KERNEL: KernelSlot = KernelSlot::new();
+#[cfg(target_arch = "x86_64")]
+static L1_KERNEL: KernelSlot = KernelSlot::new();
+
+#[cfg(target_arch = "x86_64")]
+fn resolve_dot_kernel() -> SimKernel {
+    if is_x86_feature_detected!("avx512f") {
+        return dot_avx512;
+    }
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return dot_avx2_mt;
+    }
+    dot_scalar
+}
+
+#[cfg(target_arch = "x86_64")]
+fn resolve_l2_kernel() -> SimKernel {
+    if is_x86_feature_detected!("avx512f") {
+        return l2_squared_avx512;
+    }
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return l2_squared_avx2_mt;
+    }
+    l2_squared_scalar
+}
+
+#[cfg(target_arch = "x86_64")]
+fn resolve_l1_kernel() -> SimKernel {
+    if is_x86_feature_detected!("avx2") {
+        return l1_avx2_mt;
+    }
+    l1_scalar
+}
+
 // --- Scalar implementations ---
 
 #[inline]
@@ -256,12 +332,9 @@ fn dot_product_inner(a: &[f32], b: &[f32]) -> f32 {
     count_dist_call();
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512f") {
-            return unsafe { dot_avx512(a, b) };
-        }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return unsafe { dot_avx2_mt(a, b) };
-        }
+        // SAFETY: the kernel was resolved against this CPU's detected
+        // features; features do not change for the process lifetime.
+        return unsafe { (DOT_KERNEL.get(resolve_dot_kernel))(a, b) };
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -871,5 +944,36 @@ mod tests {
             approx_eq(l1_result, l1_s),
             "l1: {l1_result} vs scalar: {l1_s}"
         );
+    }
+
+    #[test]
+    fn bound_kernels_match_scalar_across_dims() {
+        // The bound function pointer must agree with the scalar reference
+        // for SIMD-width multiples AND remainder tails. Relative tolerance:
+        // SIMD multi-accumulator summation order legitimately differs from
+        // sequential scalar order by a few ULPs at larger dims.
+        fn rel_eq(x: f32, y: f32) -> bool {
+            (x - y).abs() <= 1e-5 * x.abs().max(y.abs()).max(1.0)
+        }
+        for dim in [1usize, 7, 8, 16, 31, 100, 128, 1024] {
+            let a: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.31 - 3.0).collect();
+            let b: Vec<f32> = (0..dim).map(|i| (i as f32) * -0.17 + 1.5).collect();
+
+            assert!(
+                rel_eq(dot_product(&a, &b), dot_scalar(&a, &b)),
+                "dot mismatch at dim {dim}"
+            );
+            assert!(
+                rel_eq(
+                    euclidean_distance_squared(&a, &b),
+                    l2_squared_scalar(&a, &b)
+                ),
+                "l2 mismatch at dim {dim}"
+            );
+            assert!(
+                rel_eq(manhattan_distance(&a, &b), l1_scalar(&a, &b)),
+                "l1 mismatch at dim {dim}"
+            );
+        }
     }
 }
