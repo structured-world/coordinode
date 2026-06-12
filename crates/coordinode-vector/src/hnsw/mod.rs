@@ -374,6 +374,12 @@ pub struct HnswIndex {
     /// time; we store the norm separately so the f32 vector stays in
     /// its original scale for the rerank + SQ8 paths.
     node_norms: Vec<f32>,
+    /// 1 / ‖vector‖₂ per node (0.0 for zero vectors), parallel to
+    /// `node_norms`. The per-visit cosine reads this instead of the
+    /// norm so the score is one multiply (`dot * inv_a * inv_b`)
+    /// rather than a divide — `divss` has ~3x the latency of `mulss`
+    /// and sits on the accept/reject critical path of every visit.
+    node_inv_norms: Vec<f32>,
     /// SQ8-quantized vector, parallel to `nodes`. `None` until SQ8
     /// calibration completes (or always None when SQ8 is disabled).
     node_quantized: Vec<Option<Vec<u8>>>,
@@ -581,6 +587,10 @@ struct QueryCtx<'a> {
     /// ‖query‖₂ — pre-computed once per search. Used by Cosine metric only;
     /// other metrics ignore this field.
     norm_l2: f32,
+    /// 1 / ‖query‖₂ (0.0 for zero vectors) — lets the per-visit cosine
+    /// turn its division into a multiply when the node's inverse norm
+    /// is also cached. Cosine only; other metrics ignore it.
+    inv_norm_l2: f32,
     /// Pre-encoded RaBitQ representation for the active codec, populated
     /// once per search and reused across thousands of `compute_distance`
     /// calls. Encoding is `O(D²)` (matrix-vector); paying it per call
@@ -642,6 +652,7 @@ impl<'a> QueryCtx<'a> {
         Self {
             vec,
             norm_l2,
+            inv_norm_l2: inv_or_zero(norm_l2),
             rabitq_query,
         }
     }
@@ -668,8 +679,22 @@ impl<'a> QueryCtx<'a> {
         Self {
             vec,
             norm_l2,
+            inv_norm_l2: inv_or_zero(norm_l2),
             rabitq_query: None,
         }
+    }
+}
+
+/// `1 / n`, or 0.0 when `n` is too small to invert safely. The zero
+/// sentinel makes `dot * inv_a * inv_b` evaluate to 0.0 for zero
+/// vectors — the same "no direction" answer the division-based cosine
+/// helpers return through their epsilon guard.
+#[inline]
+fn inv_or_zero(n: f32) -> f32 {
+    if n < f32::EPSILON {
+        0.0
+    } else {
+        1.0 / n
     }
 }
 
@@ -729,6 +754,7 @@ impl HnswIndex {
             nodes: Vec::with_capacity(capacity),
             node_vectors: Vec::with_capacity(capacity),
             node_norms: Vec::with_capacity(capacity),
+            node_inv_norms: Vec::with_capacity(capacity),
             node_quantized: Vec::with_capacity(capacity),
             node_rabitq_codes: Vec::with_capacity(capacity),
             neighbours_l0: Vec::with_capacity(capacity),
@@ -1584,7 +1610,9 @@ impl HnswIndex {
         self.mirror_inline_layer0(idx, id, &vector);
         self.mirror_data_level0_vector(idx, &vector);
         // SoA payload pushes in lockstep — same idx, no extra clone.
-        self.node_norms.push(metrics::norm_l2(&vector));
+        let norm = metrics::norm_l2(&vector);
+        self.node_norms.push(norm);
+        self.node_inv_norms.push(inv_or_zero(norm));
         self.node_vectors.push(Some(vector));
         self.node_quantized.push(quantized);
         let rabitq_for_mirror = rabitq_code.clone();
@@ -1698,7 +1726,9 @@ impl HnswIndex {
             // Mirror into the contiguous layer-0 stores before moving `vec`.
             self.mirror_inline_layer0(idx, plan.id, &vec);
             self.mirror_data_level0_vector(idx, &vec);
-            self.node_norms.push(metrics::norm_l2(&vec));
+            let norm = metrics::norm_l2(&vec);
+            self.node_norms.push(norm);
+            self.node_inv_norms.push(inv_or_zero(norm));
             self.node_vectors.push(Some(vec));
             self.node_quantized.push(quantized);
             let rabitq_for_mirror = rabitq_code.clone();
@@ -3075,19 +3105,18 @@ impl HnswIndex {
                             b_norm,
                         );
                 }
-                // Cached f32 norm available even without RaBitQ — skip the
-                // per-visit `norm_l2(b)` pass. Falls through to the legacy
-                // single-norm helper when the cache slot is missing
-                // (e.g. node inserted before the field landed).
-                if let Some(&b_norm) = self.node_norms.get(node_idx) {
-                    if b_norm.is_finite() && b_norm > 0.0 {
-                        return 1.0
-                            - metrics::cosine_similarity_with_both_norms(
-                                ctx.vec,
-                                node_vec,
-                                ctx.norm_l2,
-                                b_norm,
-                            );
+                // Cached inverse norm available even without RaBitQ — skip
+                // the per-visit `norm_l2(b)` pass AND the divide: the score
+                // is `1 - dot * inv_a * inv_b`. Zero-vector inverses are
+                // stored as 0.0, which collapses the product to 0.0 — the
+                // same answer the division helpers' epsilon guard gives.
+                // Falls through to the legacy single-norm helper when the
+                // cache slot is missing (node inserted before the field
+                // landed).
+                if let Some(&b_inv) = self.node_inv_norms.get(node_idx) {
+                    if b_inv.is_finite() {
+                        let dot = metrics::dot_product(ctx.vec, node_vec);
+                        return 1.0 - dot * ctx.inv_norm_l2 * b_inv;
                     }
                 }
             }
