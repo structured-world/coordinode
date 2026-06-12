@@ -2876,40 +2876,71 @@ impl HnswIndex {
             }
 
             if level < self.node_levels(closest.idx as usize) {
-                if level == 0 {
-                    self.read_layer0_neighbours_into(closest.idx as usize, &mut connections);
-                } else {
-                    connections.clear();
-                    self.neighbours_at(closest.idx as usize, level)
-                        .snapshot_into(&mut connections);
-                }
-
                 unvisited_neighbors.clear();
-                // hnswlib trick: prefetch the NEXT neighbour's visited
-                // counter byte one iteration ahead of the read. The
-                // counters array is `Vec<u8>` sized to N (1.18M bytes
-                // on glove) — random-access reads on a 1MB array spill
-                // out of L1 every iteration. Prefetching one ahead lets
-                // the cache line arrive in time for the
-                // `check_and_mark` random read on the next iteration.
-                //
-                // Donor: hnswlib `hnswalg.h:371-374`
-                //   _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
-                //   _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
-                for (i, &neighbor_idx_u64) in connections.iter().enumerate() {
-                    if i + 1 < connections.len() {
-                        let next_idx = connections[i + 1] as usize;
-                        if let Some(p) = visited.counter_ptr(next_idx) {
-                            prefetch_read_data(p);
+                // Layer-0 fast path: walk the inline block's neighbour row
+                // in place instead of materialising it into `connections`
+                // first — the copy paid a second pass plus a buffer write
+                // per edge on the hottest loop in the search. The visited
+                // one-ahead prefetch (hnswlib `hnswalg.h:371-374` trick:
+                // the counters array is ~N bytes, random reads spill out
+                // of L1 every iteration, hinting one ahead hides that
+                // latency) is preserved by peeking the next slot's id.
+                let mut walked_inline = false;
+                if level == 0 {
+                    if let Some(inline) = self.inline_layer0.as_ref() {
+                        let cidx = closest.idx as usize;
+                        if cidx < inline.capacity() {
+                            walked_inline = true;
+                            // SAFETY: cidx < capacity gate above; slot is
+                            // bounded by m_max0 (len clamped below), which
+                            // is the in-bounds slot count by construction.
+                            unsafe {
+                                use core::sync::atomic::Ordering::Relaxed;
+                                let len = (inline.neighbour_len(cidx).load(Relaxed) as usize)
+                                    .min(inline.m_max0());
+                                for slot in 0..len {
+                                    let neighbor_idx =
+                                        inline.neighbour(cidx, slot).load(Relaxed) as usize;
+                                    if slot + 1 < len {
+                                        let next_idx =
+                                            inline.neighbour(cidx, slot + 1).load(Relaxed) as usize;
+                                        if let Some(p) = visited.counter_ptr(next_idx) {
+                                            prefetch_read_data(p);
+                                        }
+                                    }
+                                    if neighbor_idx < n_nodes
+                                        && !visited.check_and_mark_unchecked(neighbor_idx)
+                                    {
+                                        unvisited_neighbors.push(neighbor_idx);
+                                    }
+                                }
+                            }
                         }
                     }
-                    let neighbor_idx = neighbor_idx_u64 as usize;
-                    if neighbor_idx < n_nodes {
-                        // SAFETY: visited_pool.get(self.nodes.len())
-                        // resized counters >= n_nodes; neighbor_idx <
-                        // n_nodes per the gate above.
-                        if !unsafe { visited.check_and_mark_unchecked(neighbor_idx) } {
-                            unvisited_neighbors.push(neighbor_idx);
+                }
+                if !walked_inline {
+                    if level == 0 {
+                        self.read_layer0_neighbours_into(closest.idx as usize, &mut connections);
+                    } else {
+                        connections.clear();
+                        self.neighbours_at(closest.idx as usize, level)
+                            .snapshot_into(&mut connections);
+                    }
+                    for (i, &neighbor_idx_u64) in connections.iter().enumerate() {
+                        if i + 1 < connections.len() {
+                            let next_idx = connections[i + 1] as usize;
+                            if let Some(p) = visited.counter_ptr(next_idx) {
+                                prefetch_read_data(p);
+                            }
+                        }
+                        let neighbor_idx = neighbor_idx_u64 as usize;
+                        if neighbor_idx < n_nodes {
+                            // SAFETY: visited_pool.get(self.nodes.len())
+                            // resized counters >= n_nodes; neighbor_idx <
+                            // n_nodes per the gate above.
+                            if !unsafe { visited.check_and_mark_unchecked(neighbor_idx) } {
+                                unvisited_neighbors.push(neighbor_idx);
+                            }
                         }
                     }
                 }
