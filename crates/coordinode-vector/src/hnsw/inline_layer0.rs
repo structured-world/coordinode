@@ -259,6 +259,32 @@ impl InlineLayer0 {
         self.rabitq_bits
     }
 
+    /// Issue prefetch hints covering node `idx`'s neighbour-id region
+    /// (`[AtomicU64; m_max0]` + the `neighbour_len` byte). The search
+    /// loop reads this region immediately after popping a candidate;
+    /// hinting the NEXT candidate's region while the current one is
+    /// being expanded hides the random-access miss. Safe wrapper:
+    /// `idx >= capacity` skips the hint. No-op on unsupported
+    /// architectures; prefetch is a hint, never a dereference.
+    #[inline(always)]
+    pub fn prefetch_neighbours(&self, idx: usize) {
+        if idx >= self.capacity {
+            return;
+        }
+        // SAFETY: idx gate above; the span `m_max0 * 8 + 1` lies inside
+        // the per-node block by construction (ids at offset 0, len byte
+        // directly after).
+        unsafe {
+            let base = self.node_base_ptr(idx);
+            let span = self.m_max0 * 8 + 1;
+            let mut off = 0;
+            while off < span {
+                super::prefetch_read_data(base.add(off));
+                off += 64;
+            }
+        }
+    }
+
     /// Byte length of the packed RaBitQ code slot per node.
     ///
     /// Equal to `(dim * rabitq_bits).div_ceil(8)`. The contiguous search

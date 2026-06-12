@@ -2832,6 +2832,19 @@ impl HnswIndex {
                 break;
             }
 
+            // Hint the NEXT frontier candidate's neighbour-id region
+            // while the current one is being expanded: the pop on the
+            // following iteration reads that region immediately, and
+            // it is a random access the hardware prefetcher cannot
+            // predict (hnswlib issues the same hint on its candidate
+            // top inside `searchBaseLayerST`).
+            if level == 0 {
+                if let (Some(next), Some(inline)) = (candidates.peek(), self.inline_layer0.as_ref())
+                {
+                    inline.prefetch_neighbours(next.idx as usize);
+                }
+            }
+
             if level < self.node_levels(closest.idx as usize) {
                 if level == 0 {
                     self.read_layer0_neighbours_into(closest.idx as usize, &mut connections);
