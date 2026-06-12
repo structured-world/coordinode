@@ -3052,24 +3052,28 @@ impl HnswIndex {
                     }
                 }
             }
-            if let (Some(params), Some(qenc), Some(xcode)) = (
-                self.rabitq_params.as_ref(),
-                ctx.rabitq_query.as_ref(),
-                self.node_rabitq_codes[node_idx].as_ref(),
-            ) {
-                match (qenc, xcode) {
-                    // 1-bit data × 4-bit-plane query — paper §3.3.2 kernel.
-                    // Lifts the cosine estimator from `O(1/√(D/4))` (legacy
-                    // XOR popcount) to `O(1/√D)`, which is what closes the
-                    // glove-100 recall=0.17 plateau (chroma single_bit.rs
-                    // does the same).
-                    (RabitqQuery::OneBit(q), RabitqEncoded::OneBit(x)) => {
-                        return params.estimate_cosine_distance_q(x, q);
+            // Nested, not a tuple pattern: a tuple would index
+            // `node_rabitq_codes[node_idx]` (random 72B-stride read,
+            // a guaranteed cache miss per visit) even when the params
+            // or query are None, i.e. on every unquantized search.
+            if let (Some(params), Some(qenc)) =
+                (self.rabitq_params.as_ref(), ctx.rabitq_query.as_ref())
+            {
+                if let Some(xcode) = self.node_rabitq_codes[node_idx].as_ref() {
+                    match (qenc, xcode) {
+                        // 1-bit data × 4-bit-plane query — paper §3.3.2 kernel.
+                        // Lifts the cosine estimator from `O(1/√(D/4))` (legacy
+                        // XOR popcount) to `O(1/√D)`, which is what closes the
+                        // glove-100 recall=0.17 plateau (chroma single_bit.rs
+                        // does the same).
+                        (RabitqQuery::OneBit(q), RabitqEncoded::OneBit(x)) => {
+                            return params.estimate_cosine_distance_q(x, q);
+                        }
+                        (RabitqQuery::Multi(q), RabitqEncoded::Multi(x)) if q.bits == x.bits => {
+                            return params.estimate_cosine_distance_ext(q, x);
+                        }
+                        _ => {}
                     }
-                    (RabitqQuery::Multi(q), RabitqEncoded::Multi(x)) if q.bits == x.bits => {
-                        return params.estimate_cosine_distance_ext(q, x);
-                    }
-                    _ => {}
                 }
             }
         }
@@ -3092,18 +3096,21 @@ impl HnswIndex {
             // RaBitQ code is available, then feed the both-norms helper to
             // skip the `norm_l2(b)` pass per neighbour visit.
             if matches!(self.config.metric, VectorMetric::Cosine) {
-                if let (Some(enc), Some(params)) = (
-                    self.node_rabitq_codes[node_idx].as_ref(),
-                    self.rabitq_params.as_ref(),
-                ) {
-                    let b_norm = rabitq_code_norm(enc, params);
-                    return 1.0
-                        - metrics::cosine_similarity_with_both_norms(
-                            ctx.vec,
-                            node_vec,
-                            ctx.norm_l2,
-                            b_norm,
-                        );
+                // Nested, not a tuple pattern: a tuple would index
+                // `node_rabitq_codes[node_idx]` (random 72B-stride read,
+                // a cache miss per visit) even on unquantized indexes
+                // where the params are None.
+                if let Some(params) = self.rabitq_params.as_ref() {
+                    if let Some(enc) = self.node_rabitq_codes[node_idx].as_ref() {
+                        let b_norm = rabitq_code_norm(enc, params);
+                        return 1.0
+                            - metrics::cosine_similarity_with_both_norms(
+                                ctx.vec,
+                                node_vec,
+                                ctx.norm_l2,
+                                b_norm,
+                            );
+                    }
                 }
                 // Cached inverse norm available even without RaBitQ — skip
                 // the per-visit `norm_l2(b)` pass AND the divide: the score
