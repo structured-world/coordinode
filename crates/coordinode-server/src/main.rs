@@ -533,6 +533,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 use them with restore, not backup"
                         .into());
                 }
+                coordinode_embed::backup::BackupFormat::RaftSnapshot => {
+                    // Self-contained whole-database blob, not the entity-counted
+                    // logical export. The Raft snapshot deliberately excludes the
+                    // `meta:` Schema keys (per-node config) including the field
+                    // interner, so a standalone backup frames the interner ahead
+                    // of the snapshot: [u32 interner_len][interner][snapshot].
+                    use std::io::Write;
+                    let interner_bytes = db.interner().to_bytes();
+                    let snapshot = coordinode_raft::snapshot::build_full_snapshot(db.engine())
+                        .map_err(|e| format!("backup failed: {e}"))?;
+                    let interner_len = u32::try_from(interner_bytes.len())
+                        .map_err(|_| "field interner too large to frame".to_string())?;
+                    writer
+                        .write_all(&interner_len.to_be_bytes())
+                        .and_then(|()| writer.write_all(&interner_bytes))
+                        .and_then(|()| writer.write_all(&snapshot))
+                        .and_then(|()| writer.flush())
+                        .map_err(|e| format!("backup write failed: {e}"))?;
+                    info!(
+                        interner_bytes = interner_bytes.len(),
+                        snapshot_bytes = snapshot.len(),
+                        "backup complete (raft-snapshot)"
+                    );
+                    return Ok(());
+                }
             };
 
             info!(
@@ -649,6 +674,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         edges = stats.edges,
                         schema = stats.schema_entries,
                         "restore complete (apoc-cypher)"
+                    );
+                }
+                coordinode_embed::backup::BackupFormat::RaftSnapshot => {
+                    use std::io::Read;
+                    let mut reader = std::io::BufReader::new(file);
+                    let mut data = Vec::new();
+                    reader
+                        .read_to_end(&mut data)
+                        .map_err(|e| format!("restore read failed: {e}"))?;
+                    // Frame: [u32 interner_len][interner][snapshot]. Restore the
+                    // framed interner first (the snapshot omits it), then install
+                    // the snapshot blob.
+                    if data.len() < 4 {
+                        return Err("raft-snapshot file truncated (no interner header)".into());
+                    }
+                    let interner_len =
+                        u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                    let body = &data[4..];
+                    if body.len() < interner_len {
+                        return Err("raft-snapshot file truncated (interner body)".into());
+                    }
+                    let (interner_bytes, snapshot) = body.split_at(interner_len);
+                    db.persist_field_interner_bytes(interner_bytes)
+                        .map_err(|e| format!("restore interner failed: {e}"))?;
+                    coordinode_raft::snapshot::install_full_snapshot(db.engine(), snapshot)
+                        .map_err(|e| format!("restore failed: {e}"))?;
+                    info!(
+                        interner_bytes = interner_len,
+                        snapshot_bytes = snapshot.len(),
+                        "restore complete (raft-snapshot)"
                     );
                 }
             }

@@ -1650,6 +1650,21 @@ impl Database {
         Ok(true)
     }
 
+    /// Persist field-interner bytes (e.g. recovered from a snapshot-based
+    /// restore) to the Schema partition so a later open reloads them, and
+    /// update this instance's in-memory copy. A full Raft snapshot excludes
+    /// `meta:` Schema keys, so the interner must be carried and restored
+    /// alongside it for a self-contained backup.
+    pub fn persist_field_interner_bytes(&self, bytes: &[u8]) -> Result<(), DatabaseError> {
+        let Some(interner) = FieldInterner::from_bytes(bytes) else {
+            return Err(DatabaseError::Other("corrupt field interner bytes".into()));
+        };
+        self.engine
+            .put(Partition::Schema, SCHEMA_KEY_FIELD_INTERNER, bytes)?;
+        *self.interner.write() = interner;
+        Ok(())
+    }
+
     /// Return EXPLAIN plan text for a Cypher query.
     ///
     /// Uses real storage statistics (node counts, fan-out) for

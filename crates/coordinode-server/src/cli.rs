@@ -252,8 +252,8 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  Usage:\n  \
                  coordinode serve [--mode full] [--node-id N] [--addr ADDR] [--advertise-addr ADDR]\n          \
                  [--rest-addr ADDR] [--ops-addr ADDR] [--data DIR] [--peers PEERS]\n  \
-                 coordinode backup --output FILE [--data DIR] [--format json|cypher|binary] [--namespace NS]\n  \
-                 coordinode restore --input FILE [--data DIR] [--format json|cypher|binary|apoc-json|apoc-cypher] [--namespace NS]\n  \
+                 coordinode backup --output FILE [--data DIR] [--format json|cypher|binary|snapshot] [--namespace NS]\n  \
+                 coordinode restore --input FILE [--data DIR] [--format json|cypher|binary|snapshot|apoc-json|apoc-cypher] [--namespace NS]\n  \
                  coordinode checkpoint --output DIR [--data DIR]\n  \
                  coordinode verify [--data DIR] [--deep]\n  \
                  coordinode version\n  \
@@ -391,9 +391,13 @@ fn parse_format(args: &[String]) -> BackupFormat {
         // Import-only Neo4j formats (restore only; backup rejects them).
         Some("apoc-json") | Some("apoc_json") => BackupFormat::ApocJson,
         Some("apoc-cypher") | Some("apoc_cypher") => BackupFormat::ApocCypher,
+        // Full Raft data snapshot (backup and restore).
+        Some("snapshot") | Some("raft-snapshot") | Some("raft_snapshot") => {
+            BackupFormat::RaftSnapshot
+        }
         Some(other) => {
             eprintln!(
-                "error: unknown format '{other}'. Use: json, cypher, binary \
+                "error: unknown format '{other}'. Use: json, cypher, binary, snapshot \
                  (backup/restore) or apoc-json, apoc-cypher (restore only)"
             );
             std::process::exit(1);
@@ -457,6 +461,28 @@ mod tests {
         match cmd {
             Command::Backup { format, .. } => assert_eq!(format, BackupFormat::Cypher),
             _ => panic!("expected Backup command"),
+        }
+    }
+
+    #[test]
+    fn backup_snapshot_format() {
+        let cmd = parse_args_from(&args(
+            "coordinode backup --output db.snap --format snapshot",
+        ));
+        match cmd {
+            Command::Backup { format, .. } => assert_eq!(format, BackupFormat::RaftSnapshot),
+            _ => panic!("expected Backup command"),
+        }
+    }
+
+    #[test]
+    fn restore_snapshot_format() {
+        let cmd = parse_args_from(&args(
+            "coordinode restore --input db.snap --format raft-snapshot",
+        ));
+        match cmd {
+            Command::Restore { format, .. } => assert_eq!(format, BackupFormat::RaftSnapshot),
+            _ => panic!("expected Restore command"),
         }
     }
 

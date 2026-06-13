@@ -33,6 +33,10 @@ pub enum BackupFormat {
     /// Neo4j APOC cypher-export (`apoc.export.cypher.all`). Import-only:
     /// a structural parser reads the foreign CREATE statements directly.
     ApocCypher,
+    /// Full Raft data snapshot: a single self-contained binary blob of every
+    /// user-data partition, the same artifact the Raft layer ships between
+    /// nodes. Fast whole-database backup/restore; not human-readable.
+    RaftSnapshot,
 }
 
 #[cfg(test)]
