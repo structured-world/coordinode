@@ -293,8 +293,8 @@ fn build_match_clause(pair: Pair<'_, Rule>) -> Result<MatchClause, ParseError> {
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
-            Rule::pattern_list => {
-                patterns = build_pattern_list(inner)?;
+            Rule::match_pattern_list => {
+                patterns = build_match_pattern_list(inner)?;
             }
             Rule::where_inline => {
                 let expr = find_expression(inner)?;
@@ -308,6 +308,55 @@ fn build_match_clause(pair: Pair<'_, Rule>) -> Result<MatchClause, ParseError> {
         patterns,
         where_clause,
     })
+}
+
+/// MATCH-only pattern list: each entry may carry a named-path assignment
+/// (`p = ...`) and/or be wrapped in `shortestPath(...)`.
+fn build_match_pattern_list(pair: Pair<'_, Rule>) -> Result<Vec<Pattern>, ParseError> {
+    let mut patterns = Vec::new();
+    for inner in pair.into_inner() {
+        if inner.as_rule() == Rule::match_pattern {
+            patterns.push(build_match_pattern(inner)?);
+        }
+    }
+    Ok(patterns)
+}
+
+fn build_match_pattern(pair: Pair<'_, Rule>) -> Result<Pattern, ParseError> {
+    let mut path_variable: Option<String> = None;
+    let mut shortest_path = false;
+    let mut pattern: Option<Pattern> = None;
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::path_assign => {
+                // `p =` : the variable is the only token inside.
+                for v in inner.into_inner() {
+                    if v.as_rule() == Rule::variable {
+                        path_variable = Some(v.as_str().to_string());
+                    }
+                }
+            }
+            Rule::shortest_path_pattern => {
+                shortest_path = true;
+                for p in inner.into_inner() {
+                    if p.as_rule() == Rule::pattern {
+                        pattern = Some(build_pattern(p)?);
+                    }
+                }
+            }
+            Rule::pattern => {
+                pattern = Some(build_pattern(inner)?);
+            }
+            _ => {}
+        }
+    }
+
+    let mut pattern =
+        pattern.ok_or_else(|| ParseError::Invalid("empty MATCH pattern".to_string()))?;
+    pattern.path_variable = path_variable;
+    pattern.shortest_path = shortest_path;
+    Ok(pattern)
 }
 
 fn build_pattern_list(pair: Pair<'_, Rule>) -> Result<Vec<Pattern>, ParseError> {
@@ -327,7 +376,11 @@ fn build_pattern(pair: Pair<'_, Rule>) -> Result<Pattern, ParseError> {
             build_pattern_element(inner, &mut elements)?;
         }
     }
-    Ok(Pattern { elements })
+    Ok(Pattern {
+        elements,
+        path_variable: None,
+        shortest_path: false,
+    })
 }
 
 fn build_pattern_element(
@@ -2314,7 +2367,11 @@ fn build_pattern_predicate_expr(pair: Pair<'_, Rule>) -> Result<Expr, ParseError
             _ => {}
         }
     }
-    Ok(Expr::PatternPredicate(Pattern { elements }))
+    Ok(Expr::PatternPredicate(Pattern {
+        elements,
+        path_variable: None,
+        shortest_path: false,
+    }))
 }
 
 fn build_binary_chain(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
@@ -3353,6 +3410,35 @@ mod tests {
         let q = parse_ok("MATCH (a:User), (b:Movie) WHERE a.id = 1 RETURN a, b");
         if let Clause::Match(ref m) = q.clauses[0] {
             assert_eq!(m.patterns.len(), 2);
+        }
+    }
+
+    #[test]
+    fn shortest_path_named_pattern_parses() {
+        let q =
+            parse_ok("MATCH p = shortestPath((a:Person)-[:KNOWS*]->(b:Person)) RETURN length(p)");
+        if let Clause::Match(ref m) = q.clauses[0] {
+            assert_eq!(m.patterns.len(), 1);
+            let p = &m.patterns[0];
+            assert!(p.shortest_path, "pattern must be flagged shortest_path");
+            assert_eq!(p.path_variable.as_deref(), Some("p"));
+            // (a)-[:KNOWS*]->(b): node, relationship, node.
+            assert_eq!(p.elements.len(), 3);
+        } else {
+            panic!("expected MATCH clause");
+        }
+    }
+
+    #[test]
+    fn named_path_without_shortest_path_parses() {
+        // `p = (a)-[:KNOWS]->(b)` binds a path variable on a plain pattern.
+        let q = parse_ok("MATCH p = (a)-[:KNOWS]->(b) RETURN p");
+        if let Clause::Match(ref m) = q.clauses[0] {
+            let p = &m.patterns[0];
+            assert!(!p.shortest_path);
+            assert_eq!(p.path_variable.as_deref(), Some("p"));
+        } else {
+            panic!("expected MATCH clause");
         }
     }
 

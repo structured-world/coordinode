@@ -507,6 +507,14 @@ pub struct MatchClause {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pattern {
     pub elements: Vec<PatternElement>,
+    /// Named-path variable from `p = <pattern>` in a MATCH clause, if any.
+    /// Bound to a path value when the pattern is planned as a path-producing
+    /// op (currently `shortestPath`). `None` for CREATE / MERGE /
+    /// WHERE-predicate patterns, which never bind a path.
+    pub path_variable: Option<String>,
+    /// True when this pattern came from `shortestPath(<pattern>)`. Planned as
+    /// a single-pair BFS that binds `path_variable` to the resulting path.
+    pub shortest_path: bool,
 }
 
 /// An element in a graph pattern.

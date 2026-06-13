@@ -8513,6 +8513,108 @@ fn g071_where_pattern_predicate_positive() {
 }
 
 #[test]
+fn shortest_path_end_to_end_binds_path_and_length() {
+    // Alice -> Bob -> Carol : shortestPath from Alice to Carol is 2 hops,
+    // 3 nodes. Exercises the full parse -> plan -> execute path now that
+    // shortestPath() is wired through the grammar and planner.
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+
+    insert_node(
+        engine,
+        1,
+        1,
+        "Person",
+        &[("name", Value::String("Alice".into()))],
+        &mut interner,
+    );
+    insert_node(
+        engine,
+        1,
+        2,
+        "Person",
+        &[("name", Value::String("Bob".into()))],
+        &mut interner,
+    );
+    insert_node(
+        engine,
+        1,
+        3,
+        "Person",
+        &[("name", Value::String("Carol".into()))],
+        &mut interner,
+    );
+    insert_edge(engine, "KNOWS", 1, 2);
+    insert_edge(engine, "KNOWS", 2, 3);
+    register_schema_edge_type(engine, "KNOWS");
+
+    let rows = run_cypher_with_alloc(
+        "MATCH p = shortestPath((a:Person {name: 'Alice'})-[:KNOWS*]->(c:Person {name: 'Carol'})) \
+         RETURN length(p) AS len, size(nodes(p)) AS hops",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+
+    assert_eq!(rows.len(), 1, "one shortest path Alice -> Carol");
+    assert_eq!(
+        rows[0].get("len"),
+        Some(&Value::Int(2)),
+        "Alice -> Bob -> Carol is 2 relationships"
+    );
+    assert_eq!(
+        rows[0].get("hops"),
+        Some(&Value::Int(3)),
+        "path visits 3 nodes"
+    );
+}
+
+#[test]
+fn shortest_path_end_to_end_unreachable_binds_null() {
+    // No edge between the two: BFS finds nothing. v1 keeps the row and binds
+    // the path to NULL (so length(p) is NULL), rather than dropping the row
+    // as Neo4j does. Documented v1 divergence.
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+
+    insert_node(
+        engine,
+        1,
+        1,
+        "Person",
+        &[("name", Value::String("Alice".into()))],
+        &mut interner,
+    );
+    insert_node(
+        engine,
+        1,
+        2,
+        "Person",
+        &[("name", Value::String("Zoe".into()))],
+        &mut interner,
+    );
+    register_schema_edge_type(engine, "KNOWS");
+
+    let rows = run_cypher_with_alloc(
+        "MATCH p = shortestPath((a:Person {name: 'Alice'})-[:KNOWS*]->(z:Person {name: 'Zoe'})) \
+         RETURN length(p) AS len",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 1, "row retained with NULL path");
+    assert_eq!(
+        rows[0].get("len"),
+        Some(&Value::Null),
+        "length(NULL path) is NULL"
+    );
+}
+
+#[test]
 fn g071_where_not_pattern_predicate() {
     // WHERE NOT (a)-[:KNOWS]->(b) should return rows where the edge does NOT exist
     let fx = test_engine();

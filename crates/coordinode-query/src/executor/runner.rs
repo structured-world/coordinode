@@ -15793,6 +15793,8 @@ mod tests {
                             ("name".into(), Expr::Literal(Value::String("Bob".into()))),
                         ],
                     })],
+                    path_variable: None,
+                    shortest_path: false,
                 }],
             },
         };

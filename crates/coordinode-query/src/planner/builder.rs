@@ -23,6 +23,9 @@ pub enum PlanError {
     #[error("unsupported pattern structure")]
     UnsupportedPattern,
 
+    #[error("shortestPath() {0}")]
+    ShortestPathShape(String),
+
     #[error(
         "rrf_score() takes exactly 2 arguments: rrf_score([method_exprs...], {{vector: ..., text: ...}}); \
          k=60 is the IR standard (Cormack et al. 2009) and is not tunable"
@@ -644,6 +647,8 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                     PatternElement::Relationship(rel),
                     PatternElement::Node(target_node),
                 ],
+                path_variable: None,
+                shortest_path: false,
             };
             let match_clause = MatchClause {
                 patterns: vec![pattern],
@@ -2570,10 +2575,83 @@ fn build_match_op(mc: &MatchClause) -> Result<LogicalOp, PlanError> {
     Ok(result)
 }
 
+/// Build a single-pair shortest-path plan from `p = shortestPath((a)-[*]->(b))`.
+///
+/// Both endpoints are scanned (carrying their inline label / property filters)
+/// and joined, so the BFS runs between each matching `(a, b)` pair. The path is
+/// bound to the named-path variable. v1 supports the self-contained form where
+/// the endpoint filters live inside the `shortestPath(...)` pattern; endpoints
+/// pre-bound by an earlier clause are not yet reused.
+fn build_shortest_path(pattern: &Pattern) -> Result<LogicalOp, PlanError> {
+    // Capped at the engine's hop ceiling; the executor clamps again to be safe.
+    const SHORTEST_PATH_DEFAULT_MAX_HOPS: u64 = 10;
+
+    let (src_np, rel, tgt_np) = match pattern.elements.as_slice() {
+        [PatternElement::Node(a), PatternElement::Relationship(r), PatternElement::Node(b)] => {
+            (a, r, b)
+        }
+        _ => {
+            return Err(PlanError::ShortestPathShape(
+                "expects a single relationship between two nodes, e.g. \
+                 shortestPath((a)-[:KNOWS*]->(b))"
+                    .to_string(),
+            ));
+        }
+    };
+
+    let source = src_np
+        .variable
+        .clone()
+        .ok_or_else(|| PlanError::ShortestPathShape("source node must be named".to_string()))?;
+    let target = tgt_np
+        .variable
+        .clone()
+        .ok_or_else(|| PlanError::ShortestPathShape("target node must be named".to_string()))?;
+    let path_variable = pattern.path_variable.clone().ok_or_else(|| {
+        PlanError::ShortestPathShape(
+            "must be assigned to a path variable, e.g. p = shortestPath(...)".to_string(),
+        )
+    })?;
+
+    let scan_source = LogicalOp::NodeScan {
+        variable: source.clone(),
+        labels: src_np.labels.clone(),
+        property_filters: src_np.properties.clone(),
+    };
+    let scan_target = LogicalOp::NodeScan {
+        variable: target.clone(),
+        labels: tgt_np.labels.clone(),
+        property_filters: tgt_np.properties.clone(),
+    };
+    let input = LogicalOp::CartesianProduct {
+        left: Box::new(scan_source),
+        right: Box::new(scan_target),
+    };
+
+    let max_depth = rel
+        .length
+        .and_then(|l| l.max)
+        .unwrap_or(SHORTEST_PATH_DEFAULT_MAX_HOPS);
+
+    Ok(LogicalOp::ShortestPath {
+        input: Box::new(input),
+        source,
+        target,
+        edge_types: rel.rel_types.clone(),
+        direction: rel.direction,
+        max_depth,
+        path_variable,
+    })
+}
+
 /// Build a scan + traversal chain from a single pattern.
 fn build_pattern_scan(pattern: &Pattern) -> Result<LogicalOp, PlanError> {
     if pattern.elements.is_empty() {
         return Err(PlanError::EmptyPattern);
+    }
+
+    if pattern.shortest_path {
+        return build_shortest_path(pattern);
     }
 
     let mut current: Option<LogicalOp> = None;
@@ -4774,6 +4852,39 @@ mod tests {
     }
 
     #[test]
+    fn shortest_path_plans_shortest_path_op() {
+        fn find_shortest_path(op: &LogicalOp) -> Option<(&str, &str, &str, u64)> {
+            match op {
+                LogicalOp::ShortestPath {
+                    source,
+                    target,
+                    path_variable,
+                    max_depth,
+                    ..
+                } => Some((source, target, path_variable, *max_depth)),
+                LogicalOp::Project { input, .. }
+                | LogicalOp::Filter { input, .. }
+                | LogicalOp::Aggregate { input, .. } => find_shortest_path(input),
+                LogicalOp::CartesianProduct { left, right } => {
+                    find_shortest_path(left).or_else(|| find_shortest_path(right))
+                }
+                _ => None,
+            }
+        }
+
+        let root = plan_root(
+            "MATCH p = shortestPath((a:Person {pid: 1})-[:KNOWS*..6]->(b:Person {pid: 2})) \
+             RETURN length(p)",
+        );
+        let (source, target, path_var, max_depth) =
+            find_shortest_path(&root).expect("plan must contain a ShortestPath op");
+        assert_eq!(source, "a");
+        assert_eq!(target, "b");
+        assert_eq!(path_var, "p");
+        assert_eq!(max_depth, 6, "max_depth comes from the *..6 bound");
+    }
+
+    #[test]
     fn match_node_with_properties() {
         let root = plan_root("MATCH (n:User {name: 'Alice'}) RETURN n");
         if let LogicalOp::Project { input, .. } = &root {
@@ -5239,6 +5350,8 @@ mod tests {
                     properties: vec![],
                 }),
             ],
+            path_variable: None,
+            shortest_path: false,
         }];
         let vars = collect_pattern_variables(&patterns);
         assert_eq!(vars, vec!["a", "r", "b"]);

@@ -375,6 +375,11 @@ impl<'a> Analyzer<'a> {
 
     /// Bind variables from a graph pattern into the current scope.
     fn bind_pattern(&mut self, pattern: &Pattern) {
+        // A named path (`p = ...`, including shortestPath) binds the path
+        // variable so RETURN p / length(p) / nodes(p) resolve.
+        if let Some(ref pv) = pattern.path_variable {
+            self.scope.insert(pv.clone(), Vec::new());
+        }
         for element in &pattern.elements {
             match element {
                 PatternElement::Node(np) => {

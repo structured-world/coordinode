@@ -50,8 +50,16 @@ clause = {
 
 // --- MATCH ---
 
-match_clause = { kw_match ~ pattern_list ~ where_inline? }
-optional_match_clause = { kw_optional ~ kw_match ~ pattern_list ~ where_inline? }
+match_clause = { kw_match ~ match_pattern_list ~ where_inline? }
+optional_match_clause = { kw_optional ~ kw_match ~ match_pattern_list ~ where_inline? }
+
+// MATCH-only pattern forms: an optional named-path assignment (`p = ...`)
+// and the `shortestPath(...)` wrapper. Kept separate from `pattern` so the
+// CREATE / MERGE / WHERE-predicate paths that consume `pattern` are unchanged.
+match_pattern_list = { match_pattern ~ ("," ~ match_pattern)* }
+match_pattern = { path_assign? ~ (shortest_path_pattern | pattern) }
+path_assign = { variable ~ "=" }
+shortest_path_pattern = { kw_shortestpath ~ "(" ~ pattern ~ ")" }
 
 where_inline = { kw_where ~ expression }
 where_clause = { kw_where ~ expression }
@@ -642,6 +650,7 @@ double_string_content = @{ (!"\"" ~ ("\\\\" | "\\\"" | ANY))* }
 // Separated rules to avoid PEG matching issues with multi-word constructs.
 
 kw_match      = @{ ^"match" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_shortestpath = @{ ^"shortestpath" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_optional   = @{ ^"optional" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_where      = @{ ^"where" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_return     = @{ ^"return" ~ !(ASCII_ALPHANUMERIC | "_") }
