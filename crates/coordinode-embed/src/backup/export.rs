@@ -510,8 +510,15 @@ fn load_edge_properties(
         .map_err(|e| ExportError::Storage(e.to_string()))?
     {
         Some(bytes) => {
-            let record: HashMap<u32, Value> = rmp_serde::from_slice(&bytes)
-                .map_err(|e| ExportError::Serialization(e.to_string()))?;
+            // The query executor stores edge properties as the native
+            // `Vec<(field_id, Value)>` wire shape (runner.rs); older
+            // restore paths wrote a `HashMap`. Accept both.
+            let record: HashMap<u32, Value> =
+                match rmp_serde::from_slice::<Vec<(u32, Value)>>(&bytes) {
+                    Ok(v) => v.into_iter().collect(),
+                    Err(_) => rmp_serde::from_slice(&bytes)
+                        .map_err(|e| ExportError::Serialization(e.to_string()))?,
+                };
             Ok(resolve_properties(&record, interner))
         }
         None => Ok(serde_json::Map::new()),

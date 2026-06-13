@@ -1,7 +1,7 @@
 //! Restore graph data from backup files into CoordiNode storage.
 //!
 //! Supports JSON Lines and binary formats for import.
-//! Cypher import executes statements through the query engine.
+//! Cypher restore parses CoordiNode's own cypher dump format directly.
 
 use std::io::{BufRead, Read};
 
@@ -210,17 +210,21 @@ pub fn restore_json<R: BufRead>(
                 // Write edge properties if present
                 if let Some(props) = obj.get("properties").and_then(|v| v.as_object()) {
                     if !props.is_empty() {
-                        let mut prop_map = std::collections::HashMap::new();
-                        for (name, json_val) in props {
-                            let field_id = interner.intern(name);
-                            prop_map.insert(field_id, json_to_value(json_val));
-                        }
+                        // Executor-native wire shape: Vec<(field_id, Value)>
+                        // (runner.rs decodes exactly this) — a HashMap would
+                        // make the restored props unreadable by queries.
+                        let prop_vec: Vec<(u32, Value)> = props
+                            .iter()
+                            .map(|(name, json_val)| {
+                                (interner.intern(name), json_to_value(json_val))
+                            })
+                            .collect();
                         let ep_key = coordinode_core::graph::edge::encode_edgeprop_key(
                             edge_type,
                             NodeId::from_raw(source),
                             NodeId::from_raw(target),
                         );
-                        let ep_value = rmp_serde::to_vec(&prop_map)
+                        let ep_value = rmp_serde::to_vec(&prop_vec)
                             .map_err(|e| RestoreError::Deserialization(e.to_string()))?;
                         engine
                             .put(Partition::EdgeProp, &ep_key, &ep_value)
@@ -239,6 +243,290 @@ pub fn restore_json<R: BufRead>(
     }
 
     Ok(stats)
+}
+
+/// Restore from a Cypher (OpenCypher `CREATE` statements) backup dump.
+///
+/// Parses the statement form emitted by [`super::export::export_cypher`]:
+///
+/// ```text
+/// CREATE (n<id>:<L1>:<L2> {<props>});
+/// CREATE (n<src>)-[:<TYPE> {<props>}]->(n<tgt>);
+/// ```
+///
+/// and writes directly to storage, preserving the original node ids so
+/// edges link to their endpoints. Property values are JSON literals (see
+/// `format_cypher_props`), parsed via the shared [`json_to_value`].
+///
+/// This is the round-trip path for CoordiNode's own cypher dumps. It is
+/// deliberately NOT a general OpenCypher importer: arbitrary external
+/// cypher (foreign schemas, computed expressions, multi-statement scope)
+/// must go through the query engine.
+pub fn restore_cypher<R: BufRead>(
+    engine: &StorageEngine,
+    interner: &mut FieldInterner,
+    shard_id: u16,
+    reader: &mut R,
+) -> Result<RestoreStats, RestoreError> {
+    use coordinode_core::graph::edge::{
+        encode_adj_key_forward, encode_adj_key_reverse, encode_edgeprop_key,
+    };
+    use coordinode_core::graph::node::NodeRecord;
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let node_store = LocalNodeStore::new(engine);
+    let mut stats = RestoreStats::default();
+
+    // One statement per line, each terminated by `;`. Export emits JSON
+    // values, which escape newlines, so line-based splitting is safe.
+    for line_result in reader.lines() {
+        let line = line_result?;
+        let stmt = line.trim().trim_end_matches(';').trim();
+        if stmt.is_empty() || stmt.starts_with("//") {
+            continue;
+        }
+        let body = stmt
+            .strip_prefix("CREATE ")
+            .ok_or_else(|| {
+                RestoreError::InvalidFormat(format!("expected CREATE statement: {stmt}"))
+            })?
+            .trim();
+
+        if body.contains(")-[") {
+            let (source, edge_type, target, props) = parse_cypher_edge(body)?;
+            let fwd = encode_adj_key_forward(&edge_type, NodeId::from_raw(source));
+            engine
+                .merge(
+                    Partition::Adj,
+                    &fwd,
+                    &coordinode_storage::engine::merge::encode_add(target),
+                )
+                .map_err(|e| RestoreError::Storage(e.to_string()))?;
+            let rev = encode_adj_key_reverse(&edge_type, NodeId::from_raw(target));
+            engine
+                .merge(
+                    Partition::Adj,
+                    &rev,
+                    &coordinode_storage::engine::merge::encode_add(source),
+                )
+                .map_err(|e| RestoreError::Storage(e.to_string()))?;
+            if !props.is_empty() {
+                // Executor-native wire shape: Vec<(field_id, Value)>
+                // (runner.rs decodes exactly this) — a HashMap would make
+                // the restored props unreadable by queries.
+                let prop_vec: Vec<(u32, Value)> = props
+                    .into_iter()
+                    .map(|(name, val)| (interner.intern(&name), val))
+                    .collect();
+                let ep_key = encode_edgeprop_key(
+                    &edge_type,
+                    NodeId::from_raw(source),
+                    NodeId::from_raw(target),
+                );
+                let ep_value = rmp_serde::to_vec(&prop_vec)
+                    .map_err(|e| RestoreError::Deserialization(e.to_string()))?;
+                engine
+                    .put(Partition::EdgeProp, &ep_key, &ep_value)
+                    .map_err(|e| RestoreError::Storage(e.to_string()))?;
+            }
+            stats.edges += 1;
+        } else {
+            let (id, labels, props) = parse_cypher_node(body)?;
+            let mut record = NodeRecord::with_labels(labels);
+            for (name, val) in props {
+                record.set(interner.intern(&name), val);
+            }
+            node_store
+                .put(shard_id, NodeId::from_raw(id), &record)
+                .map_err(|e| RestoreError::Storage(e.to_string()))?;
+            stats.nodes += 1;
+        }
+    }
+    Ok(stats)
+}
+
+/// Decoded `(node_id, labels, properties)` from a cypher node statement.
+type CypherNode = (u64, Vec<String>, Vec<(String, Value)>);
+/// Decoded `(source_id, edge_type, target_id, properties)` from a cypher edge.
+type CypherEdge = (u64, String, u64, Vec<(String, Value)>);
+
+/// Parse `(n<id>:<labels> {<props>})` or `(n<id>:<labels>)`.
+fn parse_cypher_node(body: &str) -> Result<CypherNode, RestoreError> {
+    let inner = body
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or_else(|| RestoreError::InvalidFormat(format!("malformed node: {body}")))?;
+    // Split the variable+labels head from the optional ` {props}` tail.
+    let (head, props) = match inner.find(" {") {
+        Some(brace) => {
+            let head = inner[..brace].trim();
+            let props_block = inner[brace + 2..]
+                .trim_end()
+                .strip_suffix('}')
+                .ok_or_else(|| {
+                    RestoreError::InvalidFormat(format!("unterminated props: {inner}"))
+                })?;
+            (head, parse_cypher_props(props_block)?)
+        }
+        None => (inner.trim(), Vec::new()),
+    };
+    // head = `n<id>:<L1>:<L2>` (labels may be empty).
+    let head = head.strip_prefix('n').ok_or_else(|| {
+        RestoreError::InvalidFormat(format!("node var must start with n: {head}"))
+    })?;
+    let (id_str, label_str) = match head.find(':') {
+        Some(c) => (&head[..c], &head[c + 1..]),
+        None => (head, ""),
+    };
+    let id: u64 = id_str
+        .trim()
+        .parse()
+        .map_err(|_| RestoreError::InvalidFormat(format!("bad node id: {id_str}")))?;
+    let labels: Vec<String> = label_str
+        .split(':')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    Ok((id, labels, props))
+}
+
+/// Parse `(n<src>)-[:<TYPE> {<props>}]->(n<tgt>)`.
+fn parse_cypher_edge(body: &str) -> Result<CypherEdge, RestoreError> {
+    let rel_open = body
+        .find(")-[")
+        .ok_or_else(|| RestoreError::InvalidFormat(format!("malformed edge: {body}")))?;
+    let rel_close = body
+        .find("]->(")
+        .ok_or_else(|| RestoreError::InvalidFormat(format!("malformed edge: {body}")))?;
+    let src = parse_node_ref(&body[..rel_open + 1])?;
+    let tgt_str = body[rel_close + 4..]
+        .trim_end()
+        .strip_suffix(')')
+        .ok_or_else(|| RestoreError::InvalidFormat(format!("malformed edge target: {body}")))?;
+    let tgt = parse_pid(tgt_str)?;
+    // rel = `:<TYPE>` or `:<TYPE> {props}`.
+    let rel = body[rel_open + 3..rel_close]
+        .trim()
+        .strip_prefix(':')
+        .ok_or_else(|| RestoreError::InvalidFormat(format!("edge missing type: {body}")))?
+        .trim();
+    let (edge_type, props) = match rel.find(" {") {
+        Some(brace) => {
+            let props_block = rel[brace + 2..]
+                .trim_end()
+                .strip_suffix('}')
+                .ok_or_else(|| RestoreError::InvalidFormat(format!("unterminated props: {rel}")))?;
+            (
+                rel[..brace].trim().to_string(),
+                parse_cypher_props(props_block)?,
+            )
+        }
+        None => (rel.to_string(), Vec::new()),
+    };
+    Ok((src, edge_type, tgt, props))
+}
+
+/// Parse `(n<id>)` -> id.
+fn parse_node_ref(s: &str) -> Result<u64, RestoreError> {
+    let inner = s
+        .trim()
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or_else(|| RestoreError::InvalidFormat(format!("malformed node ref: {s}")))?;
+    parse_pid(inner.trim())
+}
+
+/// Parse `n<id>` -> id.
+fn parse_pid(s: &str) -> Result<u64, RestoreError> {
+    s.strip_prefix('n')
+        .and_then(|d| d.trim().parse().ok())
+        .ok_or_else(|| RestoreError::InvalidFormat(format!("bad node ref: {s}")))
+}
+
+/// Parse a cypher property block `key: <json>, key2: <json>` (no braces)
+/// as emitted by `format_cypher_props`: bare identifier keys, JSON values.
+fn parse_cypher_props(s: &str) -> Result<Vec<(String, Value)>, RestoreError> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for seg in split_top_level(s, ',') {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        let colon = find_top_level(seg, ':')
+            .ok_or_else(|| RestoreError::InvalidFormat(format!("bad property: {seg}")))?;
+        let key = seg[..colon].trim().to_string();
+        let val_str = seg[colon + 1..].trim();
+        let json: serde_json::Value = serde_json::from_str(val_str).map_err(|e| {
+            RestoreError::Deserialization(format!("property value '{val_str}': {e}"))
+        })?;
+        out.push((key, json_to_value(&json)));
+    }
+    Ok(out)
+}
+
+/// Split `s` on `delim` at the top nesting level only (ignores delimiters
+/// inside `"..."` strings and `[]` / `{}` brackets).
+fn split_top_level(s: &str, delim: char) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '[' | '{' => depth += 1,
+            ']' | '}' => depth -= 1,
+            _ if c == delim && depth == 0 => {
+                parts.push(s[start..i].to_string());
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(s[start..].to_string());
+    parts
+}
+
+/// Byte index of the first top-level `delim` in `s`, or None.
+fn find_top_level(s: &str, delim: char) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '[' | '{' => depth += 1,
+            ']' | '}' => depth -= 1,
+            _ if c == delim && depth == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Convert JSON value to CoordiNode Value.

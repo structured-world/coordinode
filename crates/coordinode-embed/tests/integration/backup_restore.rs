@@ -53,6 +53,87 @@ fn dump_restore_binary(db1: &Database) -> (Database, tempfile::TempDir) {
     (db2, dir2)
 }
 
+/// Round-trip through the cypher dump format: export to a cypher string,
+/// restore via `restore_cypher` into a fresh db. Mirrors the binary path
+/// but exercises the text format's parser.
+fn dump_restore_cypher(db1: &Database) -> (Database, tempfile::TempDir) {
+    let mut buf = Vec::new();
+    let snapshot = db1.engine().snapshot();
+    export::export_cypher(db1.engine(), &db1.interner(), 1, &snapshot, &mut buf)
+        .expect("export_cypher");
+
+    let dir2 = tempfile::tempdir().expect("tempdir for db2");
+    let db2 = Database::open(dir2.path()).expect("open db2");
+    let mut interner = db2.interner().clone();
+    let mut cursor = std::io::Cursor::new(&buf);
+    restore::restore_cypher(db2.engine(), &mut interner, 1, &mut cursor).expect("restore_cypher");
+    *db2.interner_arc().write() = interner;
+    (db2, dir2)
+}
+
+#[test]
+fn node_and_edge_props_survive_cypher_roundtrip() {
+    let dir1 = tempfile::tempdir().unwrap();
+    let mut db1 = Database::open(dir1.path()).unwrap();
+    db1.execute_cypher("CREATE (a:User:Admin {name: 'Alice', age: 30, vip: true, score: 1.5})")
+        .unwrap();
+    db1.execute_cypher("CREATE (b:User {name: 'Bob'})").unwrap();
+    db1.execute_cypher(
+        "MATCH (a:User {name: 'Alice'}), (b:User {name: 'Bob'}) \
+         CREATE (a)-[:FOLLOWS {since: 2020, weight: 0.5}]->(b)",
+    )
+    .unwrap();
+
+    let (mut db2, _keep) = dump_restore_cypher(&db1);
+
+    // Multi-label node + scalar props.
+    let node = db2
+        .execute_cypher(
+            "MATCH (n:Admin {name: 'Alice'}) \
+             RETURN n.age AS age, n.vip AS vip, n.score AS score",
+        )
+        .expect("MATCH restored node");
+    assert_eq!(node.len(), 1, "Alice (multi-label) must restore");
+    assert_eq!(node[0].get("age"), Some(&Value::Int(30)));
+    assert_eq!(node[0].get("vip"), Some(&Value::Bool(true)));
+    assert_eq!(node[0].get("score"), Some(&Value::Float(1.5)));
+
+    // Edge endpoints + edge props.
+    let edge = db2
+        .execute_cypher(
+            "MATCH (a:User)-[r:FOLLOWS]->(b:User) \
+             RETURN a.name AS src, b.name AS dst, r.since AS since, r.weight AS weight",
+        )
+        .expect("MATCH restored edge");
+    assert_eq!(edge.len(), 1, "FOLLOWS edge must restore");
+    assert_eq!(edge[0].get("src"), Some(&Value::String("Alice".into())));
+    assert_eq!(edge[0].get("dst"), Some(&Value::String("Bob".into())));
+    assert_eq!(edge[0].get("since"), Some(&Value::Int(2020)));
+    assert_eq!(edge[0].get("weight"), Some(&Value::Float(0.5)));
+}
+
+#[test]
+fn string_with_special_chars_survives_cypher_roundtrip() {
+    let dir1 = tempfile::tempdir().unwrap();
+    let mut db1 = Database::open(dir1.path()).unwrap();
+    // Commas, colons, braces and quotes inside a string value must not
+    // confuse the property parser's top-level splitter.
+    db1.execute_cypher("CREATE (n:Note {body: 'a, b: c {x} \"q\"', tag: 'plain'})")
+        .unwrap();
+
+    let (mut db2, _keep) = dump_restore_cypher(&db1);
+
+    let rows = db2
+        .execute_cypher("MATCH (n:Note {tag: 'plain'}) RETURN n.body AS body")
+        .expect("MATCH note");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("body"),
+        Some(&Value::String("a, b: c {x} \"q\"".into())),
+        "string with delimiters must survive the property parser"
+    );
+}
+
 #[test]
 fn node_properties_survive_binary_roundtrip() {
     let dir1 = tempfile::tempdir().unwrap();

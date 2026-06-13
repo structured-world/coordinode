@@ -562,11 +562,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 coordinode_embed::backup::BackupFormat::Cypher => {
-                    eprintln!(
-                        "error: Cypher restore not yet implemented. \
-                         Use json or binary format for restore."
+                    let mut reader = std::io::BufReader::new(file);
+                    let mut interner = db.interner().clone();
+                    let shard_id = 1u16;
+                    let stats = coordinode_embed::backup::restore::restore_cypher(
+                        db.engine(),
+                        &mut interner,
+                        shard_id,
+                        &mut reader,
+                    )
+                    .map_err(|e| format!("restore failed: {e}"))?;
+                    *db.interner_arc().write() = interner;
+                    info!(
+                        nodes = stats.nodes,
+                        edges = stats.edges,
+                        schema = stats.schema_entries,
+                        "restore complete (cypher)"
                     );
-                    std::process::exit(1);
                 }
             }
         }
