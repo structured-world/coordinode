@@ -66,6 +66,9 @@ pub enum Command {
         format: BackupFormat,
         /// Optional namespace filter (export only this namespace).
         namespace: Option<String>,
+        /// Incremental snapshot boundary: with `--format snapshot`, export
+        /// only changes after this seqno (from a prior backup's report).
+        since: Option<u64>,
     },
     /// Restore database from a backup file.
     Restore {
@@ -209,11 +212,18 @@ pub fn parse_args_from(args: &[String]) -> Command {
             };
             let format = parse_format(args);
             let namespace = find_flag(args, "--namespace");
+            let since = find_flag(args, "--since").map(|s| {
+                s.parse::<u64>().unwrap_or_else(|_| {
+                    eprintln!("error: --since must be a non-negative integer seqno");
+                    std::process::exit(1);
+                })
+            });
             Command::Backup {
                 data_dir,
                 output,
                 format,
                 namespace,
+                since,
             }
         }
         "restore" => {
@@ -252,7 +262,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  Usage:\n  \
                  coordinode serve [--mode full] [--node-id N] [--addr ADDR] [--advertise-addr ADDR]\n          \
                  [--rest-addr ADDR] [--ops-addr ADDR] [--data DIR] [--peers PEERS]\n  \
-                 coordinode backup --output FILE [--data DIR] [--format json|cypher|binary|snapshot] [--namespace NS]\n  \
+                 coordinode backup --output FILE [--data DIR] [--format json|cypher|binary|snapshot] [--namespace NS] [--since SEQNO]\n  \
                  coordinode restore --input FILE [--data DIR] [--format json|cypher|binary|snapshot|apoc-json|apoc-cypher] [--namespace NS]\n  \
                  coordinode checkpoint --output DIR [--data DIR]\n  \
                  coordinode verify [--data DIR] [--deep]\n  \
@@ -443,6 +453,7 @@ mod tests {
                 output,
                 format,
                 namespace,
+                ..
             } => {
                 assert_eq!(data_dir, "/db");
                 assert_eq!(output, "/tmp/b.bin");

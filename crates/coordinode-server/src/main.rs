@@ -477,6 +477,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             output,
             format,
             namespace: _namespace,
+            since,
         } => {
             logging::init_logging();
             info!(
@@ -535,26 +536,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 coordinode_embed::backup::BackupFormat::RaftSnapshot => {
                     // Self-contained whole-database blob, not the entity-counted
-                    // logical export. The Raft snapshot deliberately excludes the
-                    // `meta:` Schema keys (per-node config) including the field
-                    // interner, so a standalone backup frames the interner ahead
-                    // of the snapshot: [u32 interner_len][interner][snapshot].
+                    // logical export. The Raft snapshot omits the `meta:` Schema
+                    // keys (per-node config) including the field interner, so a
+                    // standalone backup frames the interner and a mode byte ahead
+                    // of it: [mode u8][u32 interner_len][interner][snapshot],
+                    // where mode 0 = full, 1 = incremental (changes after a seqno).
                     use std::io::Write;
                     let interner_bytes = db.interner().to_bytes();
-                    let snapshot = coordinode_raft::snapshot::build_full_snapshot(db.engine())
-                        .map_err(|e| format!("backup failed: {e}"))?;
+                    let current_seqno: u64 = db.engine().snapshot();
+                    let (mode, snapshot): (u8, Vec<u8>) = match since {
+                        Some(since_seqno) => {
+                            let ts =
+                                coordinode_core::txn::timestamp::Timestamp::from_raw(since_seqno);
+                            match coordinode_raft::snapshot::build_incremental_snapshot(
+                                db.engine(),
+                                ts,
+                            )
+                            .map_err(|e| format!("backup failed: {e}"))?
+                            {
+                                Some(delta) => (1u8, delta),
+                                None => {
+                                    info!(
+                                        since = since_seqno,
+                                        "no changes since seqno; empty incremental backup"
+                                    );
+                                    (1u8, Vec::new())
+                                }
+                            }
+                        }
+                        None => {
+                            let full = coordinode_raft::snapshot::build_full_snapshot(db.engine())
+                                .map_err(|e| format!("backup failed: {e}"))?;
+                            (0u8, full)
+                        }
+                    };
                     let interner_len = u32::try_from(interner_bytes.len())
                         .map_err(|_| "field interner too large to frame".to_string())?;
                     writer
-                        .write_all(&interner_len.to_be_bytes())
+                        .write_all(&[mode])
+                        .and_then(|()| writer.write_all(&interner_len.to_be_bytes()))
                         .and_then(|()| writer.write_all(&interner_bytes))
                         .and_then(|()| writer.write_all(&snapshot))
                         .and_then(|()| writer.flush())
                         .map_err(|e| format!("backup write failed: {e}"))?;
                     info!(
+                        mode = if mode == 1 { "incremental" } else { "full" },
+                        seqno = current_seqno,
                         interner_bytes = interner_bytes.len(),
                         snapshot_bytes = snapshot.len(),
-                        "backup complete (raft-snapshot)"
+                        "backup complete (raft-snapshot); pass --since {current_seqno} \
+                         for the next incremental"
                     );
                     return Ok(());
                 }
@@ -683,24 +714,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     reader
                         .read_to_end(&mut data)
                         .map_err(|e| format!("restore read failed: {e}"))?;
-                    // Frame: [u32 interner_len][interner][snapshot]. Restore the
-                    // framed interner first (the snapshot omits it), then install
-                    // the snapshot blob.
-                    if data.len() < 4 {
-                        return Err("raft-snapshot file truncated (no interner header)".into());
+                    // Frame: [mode u8][u32 interner_len][interner][snapshot].
+                    // Restore the framed interner first (the snapshot omits it),
+                    // then install per mode (0 full, 1 incremental).
+                    if data.len() < 5 {
+                        return Err("raft-snapshot file truncated (no frame header)".into());
                     }
+                    let mode = data[0];
                     let interner_len =
-                        u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-                    let body = &data[4..];
+                        u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
+                    let body = &data[5..];
                     if body.len() < interner_len {
                         return Err("raft-snapshot file truncated (interner body)".into());
                     }
                     let (interner_bytes, snapshot) = body.split_at(interner_len);
                     db.persist_field_interner_bytes(interner_bytes)
                         .map_err(|e| format!("restore interner failed: {e}"))?;
-                    coordinode_raft::snapshot::install_full_snapshot(db.engine(), snapshot)
-                        .map_err(|e| format!("restore failed: {e}"))?;
+                    match mode {
+                        0 => {
+                            coordinode_raft::snapshot::install_full_snapshot(db.engine(), snapshot)
+                                .map_err(|e| format!("restore failed: {e}"))?
+                        }
+                        1 if snapshot.is_empty() => {
+                            info!("incremental backup had no changes; nothing to apply");
+                        }
+                        1 => coordinode_raft::snapshot::install_incremental_snapshot(
+                            db.engine(),
+                            snapshot,
+                        )
+                        .map_err(|e| format!("restore failed: {e}"))?,
+                        other => {
+                            return Err(format!("unknown snapshot mode byte: {other}").into());
+                        }
+                    }
                     info!(
+                        mode = if mode == 1 { "incremental" } else { "full" },
                         interner_bytes = interner_len,
                         snapshot_bytes = snapshot.len(),
                         "restore complete (raft-snapshot)"
