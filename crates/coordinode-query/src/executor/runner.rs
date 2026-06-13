@@ -1836,31 +1836,32 @@ impl<'a> ExecutionContext<'a> {
         let buf_key = (Partition::Adj, adj_key.to_vec());
         let buffered = self.mvcc_write_buffer.get(&buf_key);
 
-        let raw = match buffered {
+        // Parse the base posting list directly from the borrowed bytes in every
+        // branch: no intermediate `Vec` copy. The storage reads hand back a
+        // refcounted `Bytes` and the buffered overlay holds a `Vec`; both deref
+        // to `&[u8]`, which is all `from_bytes` needs.
+        let mut plist = match buffered {
             // Buffered tombstone wins over on-disk state. Merge operands
             // accumulated AFTER the tombstone still apply (start from empty).
-            Some(None) => None,
-            Some(Some(bytes)) => Some(bytes.clone()),
+            Some(None) => PostingList::new(),
+            Some(Some(bytes)) => PostingList::from_bytes(bytes)
+                .map_err(|e| ExecutionError::Serialization(format!("posting list: {e}")))?,
             None => {
                 // No buffered overlay — read base posting list from storage.
                 // When adj_snapshot is set (AS OF TIMESTAMP), read through the
                 // snapshot so merge operands written after the snapshot are
                 // invisible.
-                if let Some(snap) = &self.adj_snapshot {
-                    self.engine
-                        .snapshot_get(snap, Partition::Adj, adj_key)?
-                        .map(|b| b.to_vec())
+                let fetched = if let Some(snap) = &self.adj_snapshot {
+                    self.engine.snapshot_get(snap, Partition::Adj, adj_key)?
                 } else {
-                    self.engine
-                        .get(Partition::Adj, adj_key)?
-                        .map(|b| b.to_vec())
+                    self.engine.get(Partition::Adj, adj_key)?
+                };
+                match fetched {
+                    Some(b) => PostingList::from_bytes(&b)
+                        .map_err(|e| ExecutionError::Serialization(format!("posting list: {e}")))?,
+                    None => PostingList::new(),
                 }
             }
-        };
-        let mut plist = match raw {
-            Some(bytes) => PostingList::from_bytes(&bytes)
-                .map_err(|e| ExecutionError::Serialization(format!("posting list: {e}")))?,
-            None => PostingList::new(),
         };
 
         // Apply pending adds from this transaction (read-your-own-writes).
@@ -3357,6 +3358,9 @@ fn expand_one_hop(
 
         if let Some(posting_list) = ctx.adj_get(&adj_key)? {
             let fan_out = posting_list.len();
+            // Reserve the whole fan-out up front so a high-degree node does not
+            // repeatedly reallocate `neighbors` mid-expansion (super-node path).
+            neighbors.reserve(fan_out);
             if ctx.adaptive.enabled && fan_out > ctx.adaptive.parallel_threshold {
                 tracing::info!(
                     node_id = src_id.as_raw(),
@@ -3378,6 +3382,7 @@ fn expand_one_hop(
         if direction == Direction::Both {
             write_adj_key_reverse(edge_type, src_id, &mut adj_key);
             if let Some(posting_list) = ctx.adj_get(&adj_key)? {
+                neighbors.reserve(posting_list.len());
                 for tgt_uid in posting_list.iter() {
                     neighbors.push((tgt_uid, et_idx));
                 }
