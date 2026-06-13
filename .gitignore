@@ -98,3 +98,6 @@ docs/public/bench-results/
 # Standalone bench workspace artifacts
 benches/vector-ann/target/
 benches/vector-ann/Cargo.lock
+
+# External test fixtures (Neo4j example dumps etc.) - downloaded, not versioned
+/test-data/
