@@ -78,6 +78,19 @@ pub enum Command {
         /// Optional target namespace (restore into this namespace).
         namespace: Option<String>,
     },
+    /// Create a hard-linked physical checkpoint of the whole database.
+    ///
+    /// Zero-copy on a single filesystem: SST files are hard-linked, so the
+    /// checkpoint consumes no extra disk until the originals compact away.
+    /// The result is an independently-openable database — restore by
+    /// pointing `serve --data` at the checkpoint (or a copy of it). Orders
+    /// of magnitude faster than a logical `backup` dump for large data.
+    Checkpoint {
+        /// Data directory (source database).
+        data_dir: String,
+        /// Output directory for the checkpoint (must not exist).
+        output: String,
+    },
     /// Admin commands for a running cluster.
     AdminNodeJoin {
         /// gRPC address of any cluster member (usually the leader).
@@ -221,6 +234,17 @@ pub fn parse_args_from(args: &[String]) -> Command {
                 namespace,
             }
         }
+        "checkpoint" => {
+            let data_dir = find_flag(args, "--data").unwrap_or_else(|| "./data".to_string());
+            let output = match find_flag(args, "--output") {
+                Some(o) => o,
+                None => {
+                    eprintln!("error: --output is required for checkpoint");
+                    std::process::exit(1);
+                }
+            };
+            Command::Checkpoint { data_dir, output }
+        }
         "admin" => parse_admin_args(args),
         _ => {
             eprintln!(
@@ -230,6 +254,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  [--rest-addr ADDR] [--ops-addr ADDR] [--data DIR] [--peers PEERS]\n  \
                  coordinode backup --output FILE [--data DIR] [--format json|cypher|binary] [--namespace NS]\n  \
                  coordinode restore --input FILE [--data DIR] [--format json|cypher|binary] [--namespace NS]\n  \
+                 coordinode checkpoint --output DIR [--data DIR]\n  \
                  coordinode verify [--data DIR] [--deep]\n  \
                  coordinode version\n  \
                  coordinode admin node join --node CLUSTER_ADDR --id NODE_ID --addr NODE_ADDR [--pre-seeded] [--follow]\n  \

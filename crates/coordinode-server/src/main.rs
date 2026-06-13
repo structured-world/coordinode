@@ -105,6 +105,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("verification complete");
         }
 
+        cli::Command::Checkpoint { data_dir, output } => {
+            logging::init_logging();
+            info!(data_dir = %data_dir, output = %output, "creating checkpoint");
+
+            let config = coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    &data_dir,
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]);
+            let engine = coordinode_storage::engine::core::StorageEngine::open(&config)?;
+            let summary = engine
+                .create_checkpoint(std::path::Path::new(&output))
+                .map_err(|e| format!("checkpoint failed: {e}"))?;
+            info!(
+                partitions = summary.partitions,
+                copied_bytes = summary.total_bytes,
+                oplog_bytes = summary.oplog_bytes,
+                max_seqno = summary.max_seqno,
+                output = %output,
+                "checkpoint complete"
+            );
+        }
+
         cli::Command::Serve {
             mode,
             node_id,

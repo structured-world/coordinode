@@ -543,6 +543,72 @@ impl StorageEngine {
         &self.endpoints
     }
 
+    /// Create a consistent on-disk checkpoint of the whole database in
+    /// `target` (which must not yet exist). Each partition tree is
+    /// hard-link checkpointed into `target/<partition>/` (zero-copy on a
+    /// single filesystem, falling back to byte-copy across volumes), and
+    /// the oplog directory is copied alongside. The result is a complete,
+    /// independently-openable database: restore is simply
+    /// `StorageEngine::open` against `target` (or a copy of it).
+    ///
+    /// The field interner and schema metadata live in the Schema partition
+    /// tree, so they are captured by that tree's checkpoint — no separate
+    /// handling needed.
+    ///
+    /// Scope: single-endpoint (single-node CE) layout, where every
+    /// partition and the oplog live under one `data_dir`. Multi-endpoint
+    /// (tiered placement across volumes) is rejected rather than silently
+    /// producing a checkpoint whose restored routing points at absent
+    /// source paths.
+    ///
+    /// # Errors
+    ///
+    /// - `target` already exists, or its parent cannot be created
+    /// - any partition tree's checkpoint fails (see lsm `create_checkpoint`)
+    /// - the engine uses more than one endpoint (multi-endpoint deferred)
+    /// - the oplog directory cannot be copied
+    pub fn create_checkpoint(&self, target: &Path) -> StorageResult<CheckpointSummary> {
+        use lsm_tree::AbstractTree;
+
+        if self.endpoints.len() > 1 {
+            return Err(StorageError::Io(format!(
+                "checkpoint of a multi-endpoint engine is not supported yet \
+                 ({} endpoints configured); single-node CE backup expects one data_dir",
+                self.endpoints.len()
+            )));
+        }
+        if target.exists() {
+            return Err(StorageError::Io(format!(
+                "checkpoint target {target:?} already exists; refusing to overwrite"
+            )));
+        }
+        std::fs::create_dir_all(target)
+            .map_err(|e| StorageError::Io(format!("create checkpoint dir {target:?}: {e}")))?;
+
+        let mut summary = CheckpointSummary::default();
+        for &part in Partition::all() {
+            let tree = self.tree(part)?;
+            let info = tree
+                .create_checkpoint(&target.join(part.name()))
+                .map_err(|e| {
+                    StorageError::Io(format!("checkpoint partition {}: {e}", part.name()))
+                })?;
+            summary.partitions += 1;
+            summary.total_bytes += info.total_bytes;
+            summary.max_seqno = summary.max_seqno.max(info.seqno);
+        }
+
+        // Copy the oplog directory verbatim — sealed segments are
+        // append-only, so a plain recursive byte copy is a consistent
+        // snapshot for replay during restore.
+        let src_oplog = self.data_dir.join("oplog");
+        if src_oplog.exists() {
+            summary.oplog_bytes = copy_dir_recursive(&src_oplog, &target.join("oplog"))?;
+        }
+
+        Ok(summary)
+    }
+
     /// Resolve the oplog target endpoint for a given shard
     /// ([storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2,
     /// INV-D1). Convenience accessor that re-runs the per-shard
@@ -1393,6 +1459,144 @@ impl Drop for StorageEngine {
         // Step 3: best-effort final flush of any remaining active memtable data.
         for tree in self.coordinator.trees().values() {
             let _ = tree.flush_active_memtable(0);
+        }
+    }
+}
+
+/// Outcome of [`StorageEngine::create_checkpoint`].
+#[derive(Debug, Default, Clone)]
+pub struct CheckpointSummary {
+    /// Number of partition trees checkpointed.
+    pub partitions: usize,
+    /// Sum of `CheckpointInfo.total_bytes` across partition trees: near
+    /// zero for an all-hard-link checkpoint, large when cross-fs copy
+    /// fall-back fired.
+    pub total_bytes: u64,
+    /// Bytes copied for the oplog directory.
+    pub oplog_bytes: u64,
+    /// Highest captured lsm seqno across partitions — the checkpoint's
+    /// logical position, used by PITR to bound oplog replay.
+    pub max_seqno: lsm_tree::SeqNo,
+}
+
+/// Recursively copy `src` into `dst`, returning total bytes copied.
+/// Plain file copy (no symlink following needed for oplog segments).
+fn copy_dir_recursive(src: &Path, dst: &Path) -> StorageResult<u64> {
+    std::fs::create_dir_all(dst)
+        .map_err(|e| StorageError::Io(format!("create dir {dst:?}: {e}")))?;
+    let mut bytes = 0u64;
+    let entries =
+        std::fs::read_dir(src).map_err(|e| StorageError::Io(format!("read dir {src:?}: {e}")))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| StorageError::Io(format!("dir entry in {src:?}: {e}")))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| StorageError::Io(format!("file type {:?}: {e}", entry.path())))?;
+        let to = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            bytes += copy_dir_recursive(&entry.path(), &to)?;
+        } else {
+            bytes += std::fs::copy(entry.path(), &to)
+                .map_err(|e| StorageError::Io(format!("copy {:?}: {e}", entry.path())))?;
+        }
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod checkpoint_tests {
+    use super::*;
+    use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
+    use tempfile::TempDir;
+
+    fn disk_engine(dir: &std::path::Path) -> StorageEngine {
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
+        StorageEngine::open(&config).expect("open engine")
+    }
+
+    #[test]
+    fn checkpoint_round_trips_all_partitions() {
+        let src_dir = TempDir::new().expect("src tempdir");
+        let engine = disk_engine(src_dir.path());
+
+        // Seed a couple of partitions, including Schema (which carries the
+        // interner) and Node (the main data partition).
+        engine
+            .put(Partition::Node, b"k-node", b"v-node")
+            .expect("put node");
+        engine
+            .put(Partition::Schema, b"k-schema", b"v-schema")
+            .expect("put schema");
+        engine
+            .put(Partition::Adj, b"adj:T:out:x", b"posting")
+            .expect("put adj");
+
+        // Checkpoint into a fresh sibling dir.
+        let ckpt_parent = TempDir::new().expect("ckpt parent");
+        let target = ckpt_parent.path().join("snap1");
+        let summary = engine.create_checkpoint(&target).expect("checkpoint");
+        assert_eq!(
+            summary.partitions,
+            Partition::all().len(),
+            "every partition tree must be checkpointed"
+        );
+        assert!(
+            target.join("Node").exists(),
+            "Node partition dir in checkpoint"
+        );
+        assert!(
+            target.join("Schema").exists(),
+            "Schema partition dir in checkpoint"
+        );
+
+        // Drop the source engine, then open a brand-new engine against the
+        // checkpoint and confirm every written key is present and correct.
+        drop(engine);
+        let restored = disk_engine(&target);
+        assert_eq!(
+            restored
+                .get(Partition::Node, b"k-node")
+                .expect("get node")
+                .as_deref(),
+            Some(b"v-node".as_ref()),
+            "node value must survive the checkpoint"
+        );
+        assert_eq!(
+            restored
+                .get(Partition::Schema, b"k-schema")
+                .expect("get schema")
+                .as_deref(),
+            Some(b"v-schema".as_ref()),
+            "schema value must survive the checkpoint"
+        );
+        assert_eq!(
+            restored
+                .get(Partition::Adj, b"adj:T:out:x")
+                .expect("get adj")
+                .as_deref(),
+            Some(b"posting".as_ref()),
+            "adjacency value must survive the checkpoint"
+        );
+    }
+
+    #[test]
+    fn checkpoint_refuses_existing_target() {
+        let src_dir = TempDir::new().expect("src tempdir");
+        let engine = disk_engine(src_dir.path());
+        let existing = TempDir::new().expect("existing target");
+        match engine.create_checkpoint(existing.path()) {
+            Err(e) => assert!(
+                format!("{e}").contains("already exists"),
+                "must refuse to overwrite an existing target, got: {e}"
+            ),
+            Ok(_) => panic!("checkpoint must refuse an existing target"),
         }
     }
 }
