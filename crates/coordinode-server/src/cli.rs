@@ -80,6 +80,10 @@ pub enum Command {
         format: BackupFormat,
         /// Optional target namespace (restore into this namespace).
         namespace: Option<String>,
+        /// Selective restore: keep only nodes carrying one of these labels
+        /// (and edges between kept nodes). Applies to json / apoc-json /
+        /// hetio-json. Empty = restore everything.
+        only_labels: Vec<String>,
     },
     /// Create a hard-linked physical checkpoint of the whole database.
     ///
@@ -237,11 +241,20 @@ pub fn parse_args_from(args: &[String]) -> Command {
             };
             let format = parse_format(args);
             let namespace = find_flag(args, "--namespace");
+            let only_labels = find_flag(args, "--only-labels")
+                .map(|s| {
+                    s.split(',')
+                        .map(|l| l.trim().to_string())
+                        .filter(|l| !l.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
             Command::Restore {
                 data_dir,
                 input,
                 format,
                 namespace,
+                only_labels,
             }
         }
         "checkpoint" => {
@@ -263,7 +276,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  coordinode serve [--mode full] [--node-id N] [--addr ADDR] [--advertise-addr ADDR]\n          \
                  [--rest-addr ADDR] [--ops-addr ADDR] [--data DIR] [--peers PEERS]\n  \
                  coordinode backup --output FILE [--data DIR] [--format json|cypher|binary|snapshot] [--namespace NS] [--since SEQNO]\n  \
-                 coordinode restore --input FILE [--data DIR] [--format json|cypher|binary|snapshot|apoc-json|apoc-cypher|hetio-json] [--namespace NS]\n  \
+                 coordinode restore --input FILE [--data DIR] [--format json|cypher|binary|snapshot|apoc-json|apoc-cypher|hetio-json] [--namespace NS] [--only-labels L1,L2]\n  \
                  coordinode checkpoint --output DIR [--data DIR]\n  \
                  coordinode verify [--data DIR] [--deep]\n  \
                  coordinode version\n  \
@@ -510,11 +523,25 @@ mod tests {
                 input,
                 format,
                 namespace,
+                ..
             } => {
                 assert_eq!(data_dir, "/db2");
                 assert_eq!(input, "/tmp/backup.json");
                 assert_eq!(format, BackupFormat::Json);
                 assert!(namespace.is_none());
+            }
+            _ => panic!("expected Restore command"),
+        }
+    }
+
+    #[test]
+    fn restore_only_labels_parsed() {
+        let cmd = parse_args_from(&args(
+            "coordinode restore --input x.json --only-labels User,Post",
+        ));
+        match cmd {
+            Command::Restore { only_labels, .. } => {
+                assert_eq!(only_labels, vec!["User".to_string(), "Post".to_string()]);
             }
             _ => panic!("expected Restore command"),
         }

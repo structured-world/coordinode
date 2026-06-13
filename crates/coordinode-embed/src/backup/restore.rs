@@ -115,9 +115,14 @@ pub fn restore_json<R: BufRead>(
     interner: &mut FieldInterner,
     shard_id: u16,
     reader: &mut R,
+    only_labels: Option<&std::collections::HashSet<String>>,
 ) -> Result<RestoreStats, RestoreError> {
     let node_store = coordinode_modality::LocalNodeStore::new(engine);
     let mut stats = RestoreStats::default();
+    // Selective restore: with `only_labels`, keep only nodes carrying a matching
+    // label and drop edges whose endpoints were filtered out. Exports list nodes
+    // before edges, so `kept` is complete by the time edges are read.
+    let mut kept: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     for line_result in reader.lines() {
         let line = line_result?;
@@ -141,6 +146,12 @@ pub fn restore_json<R: BufRead>(
                     .and_then(|v| v.as_u64())
                     .ok_or_else(|| RestoreError::InvalidFormat("node missing 'id'".into()))?;
                 let labels = json_labels(obj.get("labels"));
+                if let Some(filter) = only_labels {
+                    if !labels.iter().any(|l| filter.contains(l)) {
+                        continue;
+                    }
+                    kept.insert(id);
+                }
                 write_node_record(
                     &node_store,
                     interner,
@@ -166,6 +177,9 @@ pub fn restore_json<R: BufRead>(
                     .ok_or_else(|| {
                         RestoreError::InvalidFormat("edge missing 'edge_type'".into())
                     })?;
+                if only_labels.is_some() && (!kept.contains(&source) || !kept.contains(&target)) {
+                    continue;
+                }
                 write_edge_record(
                     engine,
                     interner,
@@ -202,9 +216,13 @@ pub fn restore_apoc_json<R: BufRead>(
     interner: &mut FieldInterner,
     shard_id: u16,
     reader: &mut R,
+    only_labels: Option<&std::collections::HashSet<String>>,
 ) -> Result<RestoreStats, RestoreError> {
     let node_store = coordinode_modality::LocalNodeStore::new(engine);
     let mut stats = RestoreStats::default();
+    // Selective restore: keep only label-matching nodes; drop edges to dropped
+    // nodes (APOC lists nodes before relationships).
+    let mut kept: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     for line_result in reader.lines() {
         let line = line_result?;
@@ -219,6 +237,12 @@ pub fn restore_apoc_json<R: BufRead>(
             Some("node") => {
                 let id = apoc_id(obj.get("id"), "node")?;
                 let labels = json_labels(obj.get("labels"));
+                if let Some(filter) = only_labels {
+                    if !labels.iter().any(|l| filter.contains(l)) {
+                        continue;
+                    }
+                    kept.insert(id);
+                }
                 write_node_record(
                     &node_store,
                     interner,
@@ -238,6 +262,9 @@ pub fn restore_apoc_json<R: BufRead>(
                 let edge_type = obj.get("label").and_then(|v| v.as_str()).ok_or_else(|| {
                     RestoreError::InvalidFormat("relationship missing 'label'".into())
                 })?;
+                if only_labels.is_some() && (!kept.contains(&source) || !kept.contains(&target)) {
+                    continue;
+                }
                 write_edge_record(
                     engine,
                     interner,
@@ -1398,6 +1425,7 @@ pub fn restore_hetio_json<R: BufRead>(
     interner: &mut FieldInterner,
     shard_id: u16,
     reader: &mut R,
+    only_labels: Option<&std::collections::HashSet<String>>,
 ) -> Result<RestoreStats, RestoreError> {
     use serde::Deserialize;
 
@@ -1434,6 +1462,13 @@ pub fn restore_hetio_json<R: BufRead>(
 
     for (idx, n) in doc.nodes.iter().enumerate() {
         let id = idx as u64;
+        // Selective restore: a node whose kind is filtered out is never added to
+        // the id map, so edges referencing it resolve to None and drop below.
+        if let Some(filter) = only_labels {
+            if !filter.contains(&n.kind) {
+                continue;
+            }
+        }
         id_map.insert((n.kind.clone(), ident_key(&n.identifier)), id);
         let mut props = n.data.clone();
         if let Some(name) = &n.name {

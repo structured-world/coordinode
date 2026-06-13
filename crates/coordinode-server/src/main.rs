@@ -605,6 +605,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             input,
             format,
             namespace: _namespace,
+            only_labels,
         } => {
             logging::init_logging();
             info!(
@@ -613,6 +614,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format = ?format,
                 "starting restore"
             );
+
+            // Selective restore label filter (json / apoc-json / hetio-json).
+            let label_filter: Option<std::collections::HashSet<String>> = if only_labels.is_empty()
+            {
+                None
+            } else {
+                Some(only_labels.into_iter().collect())
+            };
 
             let db = coordinode_embed::Database::open(&data_dir)
                 .map_err(|e| format!("failed to open database: {e}"))?;
@@ -633,6 +642,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut interner,
                         shard_id,
                         &mut reader,
+                        label_filter.as_ref(),
                     )
                     .map_err(|e| format!("restore failed: {e}"))?;
                     info!(
@@ -679,6 +689,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut interner,
                         shard_id,
                         &mut reader,
+                        label_filter.as_ref(),
                     )
                     .map_err(|e| format!("restore failed: {e}"))?;
                     *db.interner_arc().write() = interner;
@@ -715,6 +726,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut interner,
                         shard_id,
                         &mut reader,
+                        label_filter.as_ref(),
                     )
                     .map_err(|e| format!("restore failed: {e}"))?;
                     *db.interner_arc().write() = interner;

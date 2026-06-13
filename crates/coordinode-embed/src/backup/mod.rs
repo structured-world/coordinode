@@ -155,7 +155,8 @@ mod tests {
 
         let mut interner2 = coordinode_core::graph::intern::FieldInterner::new();
         let mut cursor = std::io::BufReader::new(std::io::Cursor::new(&buf));
-        let stats = restore::restore_json(db2.engine(), &mut interner2, 1, &mut cursor).unwrap();
+        let stats =
+            restore::restore_json(db2.engine(), &mut interner2, 1, &mut cursor, None).unwrap();
 
         assert_eq!(stats.nodes, 1, "should restore 1 node");
     }
@@ -176,7 +177,8 @@ mod tests {
 
         let mut interner = db.interner().clone();
         let mut cursor = std::io::BufReader::new(std::io::Cursor::new(dump.as_bytes()));
-        let stats = restore::restore_apoc_json(db.engine(), &mut interner, 1, &mut cursor).unwrap();
+        let stats =
+            restore::restore_apoc_json(db.engine(), &mut interner, 1, &mut cursor, None).unwrap();
         *db.interner_arc().write() = interner;
 
         assert_eq!(stats.nodes, 2, "two nodes");
@@ -272,7 +274,7 @@ mod tests {
         let mut interner = db.interner().clone();
         let mut cursor = std::io::BufReader::new(std::io::Cursor::new(doc.as_bytes()));
         let stats =
-            restore::restore_hetio_json(db.engine(), &mut interner, 1, &mut cursor).unwrap();
+            restore::restore_hetio_json(db.engine(), &mut interner, 1, &mut cursor, None).unwrap();
         *db.interner_arc().write() = interner;
 
         assert_eq!(stats.nodes, 2, "two hetnet nodes");
@@ -289,6 +291,46 @@ mod tests {
             .execute_cypher("MATCH (g:Gene {identifier: 9489}) RETURN g.name")
             .unwrap();
         assert_eq!(g.len(), 1, "node found by its original hetnet identifier");
+    }
+
+    #[test]
+    fn json_restore_only_labels_filters_nodes_and_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Database::open(dir.path()).unwrap();
+        // Two User nodes + one Post node; a User->User FOLLOWS edge (kept) and a
+        // User->Post WROTE edge (must be dropped because Post is filtered out).
+        let dump = concat!(
+            r#"{"type":"node","id":1,"labels":["User"],"properties":{"name":"Alice"}}"#,
+            "\n",
+            r#"{"type":"node","id":2,"labels":["User"],"properties":{"name":"Bob"}}"#,
+            "\n",
+            r#"{"type":"node","id":3,"labels":["Post"],"properties":{"title":"Hi"}}"#,
+            "\n",
+            r#"{"type":"edge","source":1,"target":2,"edge_type":"FOLLOWS","properties":{}}"#,
+            "\n",
+            r#"{"type":"edge","source":1,"target":3,"edge_type":"WROTE","properties":{}}"#,
+        );
+        let only: std::collections::HashSet<String> = ["User".to_string()].into_iter().collect();
+        let mut interner = db.interner().clone();
+        let mut cursor = std::io::BufReader::new(std::io::Cursor::new(dump.as_bytes()));
+        let stats =
+            restore::restore_json(db.engine(), &mut interner, 1, &mut cursor, Some(&only)).unwrap();
+        *db.interner_arc().write() = interner;
+
+        assert_eq!(stats.nodes, 2, "only the two User nodes are kept");
+        assert_eq!(
+            stats.edges, 1,
+            "only the User->User edge kept; User->Post dropped"
+        );
+        let f = db
+            .execute_cypher("MATCH (a:User)-[:FOLLOWS]->(b:User) RETURN b.name")
+            .unwrap();
+        assert_eq!(f.len(), 1, "kept FOLLOWS edge traverses");
+        // The filtered-out WROTE edge to the dropped Post must be gone.
+        let w = db
+            .execute_cypher("MATCH (a)-[:WROTE]->(b) RETURN b")
+            .unwrap();
+        assert_eq!(w.len(), 0, "edge to filtered node dropped");
     }
 
     #[test]
