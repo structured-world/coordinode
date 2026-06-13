@@ -1833,8 +1833,16 @@ impl<'a> ExecutionContext<'a> {
         // (`mvcc_delete`) the same adj key, the buffered effect must win over
         // the on-disk base — otherwise reads return stale data and a
         // transaction abort would leave partial mutations applied.
-        let buf_key = (Partition::Adj, adj_key.to_vec());
-        let buffered = self.mvcc_write_buffer.get(&buf_key);
+        //
+        // Read-only traversals carry an empty write buffer, so probe it only
+        // when it holds something: that skips a per-read key `Vec` allocation
+        // on the adjacency hot path (the lookup key owns its bytes).
+        let buffered = if self.mvcc_write_buffer.is_empty() {
+            None
+        } else {
+            self.mvcc_write_buffer
+                .get(&(Partition::Adj, adj_key.to_vec()))
+        };
 
         // Parse the base posting list directly from the borrowed bytes in every
         // branch: no intermediate `Vec` copy. The storage reads hand back a
