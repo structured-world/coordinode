@@ -939,6 +939,7 @@ pub fn optimize_index_selection(
             target_filters,
             edge_filters,
             temporal_filter,
+            path_variable,
         } => LogicalOp::Traverse {
             input: Box::new(optimize_index_selection(*input, registry)),
             source,
@@ -951,6 +952,7 @@ pub fn optimize_index_selection(
             target_filters,
             edge_filters,
             temporal_filter,
+            path_variable,
         },
         LogicalOp::Aggregate {
             input,
@@ -2082,6 +2084,7 @@ fn optimize_edge_vector_search(op: LogicalOp) -> LogicalOp {
             target_filters,
             edge_filters,
             temporal_filter,
+            path_variable,
         } => LogicalOp::Traverse {
             input: Box::new(optimize_edge_vector_search(*input)),
             source,
@@ -2094,6 +2097,7 @@ fn optimize_edge_vector_search(op: LogicalOp) -> LogicalOp {
             target_filters,
             edge_filters,
             temporal_filter,
+            path_variable,
         },
         LogicalOp::TextFilter {
             input,
@@ -2695,6 +2699,7 @@ fn build_pattern_scan(pattern: &Pattern) -> Result<LogicalOp, PlanError> {
                     target_filters: Vec::new(),
                     edge_filters: rp.properties.clone(),
                     temporal_filter: None,
+                    path_variable: None,
                 });
             }
         }
@@ -2703,7 +2708,19 @@ fn build_pattern_scan(pattern: &Pattern) -> Result<LogicalOp, PlanError> {
     // Post-process: fill in target info from the pattern structure.
     // Walk the elements in pairs: (Node, Rel, Node, Rel, Node, ...)
     // The first Node is the scan, each (Rel, Node) pair is a Traverse.
-    let result = build_pattern_chain(&pattern.elements)?;
+    let mut result = build_pattern_chain(&pattern.elements)?;
+
+    // Named path on a single-relationship pattern (`p = (a)-[:R*]->(b)` or a
+    // one-hop `p = (a)-[:R]->(b)`): bind the route on the lone Traverse so the
+    // executor reconstructs it. Multi-relationship linear named paths are not
+    // yet projected (the path would have to span multiple Traverse ops).
+    if let Some(pv) = &pattern.path_variable {
+        if pattern.elements.len() == 3 {
+            if let LogicalOp::Traverse { path_variable, .. } = &mut result {
+                *path_variable = Some(pv.clone());
+            }
+        }
+    }
 
     Ok(result)
 }
@@ -2765,6 +2782,7 @@ fn build_pattern_chain(elements: &[PatternElement]) -> Result<LogicalOp, PlanErr
             target_filters: target_node.properties.clone(),
             edge_filters: rel.properties.clone(),
             temporal_filter: None,
+            path_variable: None,
         };
 
         last_var = target_var;
@@ -4700,6 +4718,7 @@ pub(crate) fn lift_temporal_filter(op: LogicalOp) -> LogicalOp {
                         target_filters,
                         edge_filters,
                         temporal_filter,
+                        path_variable,
                     },
                 ) if edge_variable.as_deref() == Some(edge_var.as_str())
                     && temporal_filter.is_none() =>
@@ -4720,6 +4739,7 @@ pub(crate) fn lift_temporal_filter(op: LogicalOp) -> LogicalOp {
                             upper_ms: Some(upper_ms),
                             lower_ms: Some(lower_ms),
                         }),
+                        path_variable,
                     }
                 }
                 (_, other) => lift_temporal_filter(other),
@@ -6061,6 +6081,7 @@ mod tests {
             target_filters: vec![],
             edge_filters: vec![],
             temporal_filter: None,
+            path_variable: None,
         };
         let violating = LogicalOp::VectorFilter {
             input: Box::new(traverse),
@@ -6113,6 +6134,7 @@ mod tests {
             target_filters: vec![],
             edge_filters: vec![],
             temporal_filter: None,
+            path_variable: None,
         };
         let decision =
             select_push_down_strategy(50, VectorIndexParams::default_node(10_000, 128), 0.5, 10);
@@ -6242,6 +6264,7 @@ mod tests {
                 target_filters: vec![],
                 edge_filters: vec![],
                 temporal_filter: None,
+                path_variable: None,
             };
             LogicalOp::VectorFilter {
                 input: Box::new(tr),

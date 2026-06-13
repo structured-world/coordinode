@@ -2151,6 +2151,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             target_filters,
             edge_filters,
             temporal_filter,
+            path_variable,
         } => {
             let input_rows = execute_op(input, ctx)?;
 
@@ -2184,6 +2185,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 edge_filters,
                 edge_temporal: &edge_temporal,
                 temporal_filter: temporal_filter.as_ref(),
+                path_variable: path_variable.as_deref(),
             };
             execute_traverse(&input_rows, &params, ctx)
         }
@@ -3294,6 +3296,9 @@ struct TraverseParams<'a> {
     edge_temporal: &'a [bool],
     /// Optional pushed-down time-slice filter for temporal edges.
     temporal_filter: Option<&'a crate::planner::logical::TemporalFilter>,
+    /// Named-path variable to bind the source-to-target route. When set, the
+    /// traversal runs sequentially and records the predecessor chain.
+    path_variable: Option<&'a str>,
 }
 
 /// Traverse edges from source nodes to target nodes.
@@ -3868,10 +3873,12 @@ fn execute_single_hop_traverse(
                 .is_some_and(|s| s.temporal)
         });
 
-        // Switch to parallel when fan-out exceeds threshold
+        // Switch to parallel when fan-out exceeds threshold. A requested path
+        // projection forces the sequential path so the route is bound exactly.
         if use_parallel
             && !has_temporal
             && !target_has_temporal
+            && params.path_variable.is_none()
             && neighbors.len() >= ctx.adaptive.parallel_threshold
         {
             ctx.warnings.push(format!(
@@ -3917,12 +3924,69 @@ fn execute_single_hop_traverse(
                     edge_type,
                     edge_is_temporal,
                 };
-                results.extend(build_target_rows(&trp, params, ctx)?);
+                let mut target_rows = build_target_rows(&trp, params, ctx)?;
+                if let Some(pv) = params.path_variable {
+                    // One-hop named path: source -> target via this edge.
+                    let path = Value::Path(coordinode_core::graph::types::PathValue {
+                        nodes: vec![source_id.as_raw(), target_uid],
+                        rels: vec![coordinode_core::graph::types::PathRel {
+                            edge_type: edge_type.unwrap_or_default().to_string(),
+                            source: source_id.as_raw(),
+                            target: target_uid,
+                        }],
+                    });
+                    for r in &mut target_rows {
+                        r.insert(pv.to_string(), path.clone());
+                    }
+                }
+                results.extend(target_rows);
             }
         }
     }
 
     Ok(results)
+}
+
+/// Reconstruct the route from `source` to `target` as a path value, using the
+/// BFS predecessor map (`pred[n] = Some((prev, edge_type_idx))`; the source's
+/// entry is `None`). The route is the shortest one the level-synchronous BFS
+/// discovered to `target`. Returns a zero-length path when `source == target`.
+fn reconstruct_bfs_path(
+    source: u64,
+    target: u64,
+    pred: &rustc_hash::FxHashMap<u64, Option<(u64, usize)>>,
+    edge_types: &[String],
+) -> Value {
+    let mut back: Vec<(u64, usize)> = Vec::new();
+    let mut cur = target;
+    while cur != source {
+        match pred.get(&cur).copied().flatten() {
+            Some((prev, et_idx)) => {
+                back.push((cur, et_idx));
+                cur = prev;
+            }
+            // Target unreachable from source in `pred` (should not happen for a
+            // node the BFS emitted); fall back to a lone-node path.
+            None => break,
+        }
+    }
+    back.reverse();
+
+    let mut nodes = Vec::with_capacity(back.len() + 1);
+    let mut rels = Vec::with_capacity(back.len());
+    nodes.push(source);
+    let mut prev = source;
+    for (node, et_idx) in back {
+        let edge_type = edge_types.get(et_idx).cloned().unwrap_or_default();
+        rels.push(coordinode_core::graph::types::PathRel {
+            edge_type,
+            source: prev,
+            target: node,
+        });
+        nodes.push(node);
+        prev = node;
+    }
+    Value::Path(coordinode_core::graph::types::PathValue { nodes, rels })
 }
 
 /// Variable-length path traversal: level-synchronous BFS with edge-based
@@ -3971,6 +4035,16 @@ fn execute_varlen_traverse(
         // is pure waste. Guarding here removes that waste across every depth.
         let mut expanded: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
 
+        // Predecessor map for named-path reconstruction: only built when a path
+        // variable is requested. `pred[n] = Some((prev, edge_type_idx))`, the
+        // source's entry is `None`. Records the first (shortest) route to each
+        // reached node.
+        let mut pred: rustc_hash::FxHashMap<u64, Option<(u64, usize)>> =
+            rustc_hash::FxHashMap::default();
+        if params.path_variable.is_some() {
+            pred.insert(source_id.as_raw(), None);
+        }
+
         // Adaptive: track total edges processed for divergence detection.
         let mut edges_processed: usize = 0;
         let mut divergence_detected = false;
@@ -4006,6 +4080,9 @@ fn execute_varlen_traverse(
                     }
                     edges_processed += 1;
                     next_frontier.push(tgt_uid);
+                    if params.path_variable.is_some() {
+                        pred.entry(tgt_uid).or_insert(Some((src_uid, et_idx)));
+                    }
                     if depth >= min_hops {
                         depth_neighbors.push((src_uid, tgt_uid, et_idx));
                     }
@@ -4059,6 +4136,7 @@ fn execute_varlen_traverse(
             let use_parallel = ctx.adaptive.enabled
                 && !has_temporal
                 && !target_has_temporal
+                && params.path_variable.is_none()
                 && depth_neighbors.len() >= ctx.adaptive.parallel_threshold;
 
             if use_parallel {
@@ -4100,7 +4178,19 @@ fn execute_varlen_traverse(
                         edge_type,
                         edge_is_temporal,
                     };
-                    results.extend(build_target_rows(&trp, params, ctx)?);
+                    let mut target_rows = build_target_rows(&trp, params, ctx)?;
+                    if let Some(pv) = params.path_variable {
+                        let path = reconstruct_bfs_path(
+                            source_id.as_raw(),
+                            tgt_uid,
+                            &pred,
+                            params.edge_types,
+                        );
+                        for r in &mut target_rows {
+                            r.insert(pv.to_string(), path.clone());
+                        }
+                    }
+                    results.extend(target_rows);
                 }
             }
 
@@ -14841,6 +14931,7 @@ mod tests {
                     target_filters: vec![],
                     edge_filters: vec![],
                     temporal_filter: None,
+                    path_variable: None,
                 }),
                 items: vec![crate::planner::logical::ProjectItem {
                     expr: Expr::PropertyAccess {
@@ -16017,6 +16108,7 @@ mod tests {
                     target_filters: vec![],
                     edge_filters: vec![],
                     temporal_filter: None,
+                    path_variable: None,
                 }),
                 items: vec![crate::planner::logical::ProjectItem {
                     expr: Expr::Star,
@@ -16091,6 +16183,7 @@ mod tests {
                 target_filters: vec![],
                 edge_filters: vec![],
                 temporal_filter: None,
+                path_variable: None,
             },
         };
 
@@ -16131,6 +16224,7 @@ mod tests {
                 target_filters: vec![],
                 edge_filters: vec![],
                 temporal_filter: None,
+                path_variable: None,
             },
         };
 
@@ -16229,6 +16323,7 @@ mod tests {
                 target_filters: vec![],
                 edge_filters: vec![],
                 temporal_filter: None,
+                path_variable: None,
             },
         };
 
@@ -16479,6 +16574,7 @@ mod tests {
                 target_filters: vec![],
                 edge_filters: vec![],
                 temporal_filter: None,
+                path_variable: None,
             },
         };
 
@@ -16529,6 +16625,7 @@ mod tests {
                 target_filters: vec![],
                 edge_filters: vec![],
                 temporal_filter: None,
+                path_variable: None,
             },
         };
 
@@ -16614,6 +16711,7 @@ mod tests {
                 target_filters: vec![],
                 edge_filters: vec![],
                 temporal_filter: None,
+                path_variable: None,
             },
         };
 
@@ -16659,6 +16757,7 @@ mod tests {
                 target_filters: vec![],
                 edge_filters: vec![],
                 temporal_filter: None,
+                path_variable: None,
             },
         };
 
@@ -17662,6 +17761,7 @@ mod tests {
                 target_filters: vec![],
                 edge_filters: vec![],
                 temporal_filter: None,
+                path_variable: None,
             }),
             predicate: Expr::BinaryOp {
                 left: Box::new(Expr::PropertyAccess {
@@ -17727,6 +17827,7 @@ mod tests {
             target_filters: vec![],
             edge_filters: vec![],
             temporal_filter: None,
+            path_variable: None,
         };
         assert!(
             !super::needs_correlated_execution(&right),
@@ -17849,6 +17950,7 @@ mod tests {
                 target_filters: vec![],
                 edge_filters: vec![],
                 temporal_filter: None,
+                path_variable: None,
             },
         };
 
@@ -19467,6 +19569,7 @@ mod tests {
                 target_filters: vec![],
                 edge_filters: vec![],
                 temporal_filter: None,
+                path_variable: None,
             },
         };
 

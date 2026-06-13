@@ -175,6 +175,11 @@ pub enum LogicalOp {
         /// `valid_from <= $T AND (valid_to IS NULL OR valid_to > $T)`
         /// predicate elsewhere in the query.
         temporal_filter: Option<TemporalFilter>,
+        /// Named-path variable from `p = (a)-[:R*]->(b)`. When set, the
+        /// traversal reconstructs and binds the route from source to each
+        /// reached target as a path value (the executor forces the
+        /// sequential path so the predecessor chain stays exact).
+        path_variable: Option<String>,
     },
 
     /// B-tree index point-lookup: replaces `Filter { input: NodeScan }` when a matching index exists.

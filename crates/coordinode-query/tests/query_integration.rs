@@ -8572,6 +8572,64 @@ fn shortest_path_end_to_end_binds_path_and_length() {
 }
 
 #[test]
+fn varlen_named_path_binds_route_and_length() {
+    // Alice -> Bob -> Carol. `p = (a)-[:KNOWS*1..3]->(x)` binds a path per
+    // reached target; for Carol the route is 2 hops over 3 nodes.
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+
+    insert_node(
+        engine,
+        1,
+        1,
+        "Person",
+        &[("name", Value::String("Alice".into()))],
+        &mut interner,
+    );
+    insert_node(
+        engine,
+        1,
+        2,
+        "Person",
+        &[("name", Value::String("Bob".into()))],
+        &mut interner,
+    );
+    insert_node(
+        engine,
+        1,
+        3,
+        "Person",
+        &[("name", Value::String("Carol".into()))],
+        &mut interner,
+    );
+    insert_edge(engine, "KNOWS", 1, 2);
+    insert_edge(engine, "KNOWS", 2, 3);
+    register_schema_edge_type(engine, "KNOWS");
+
+    let rows = run_cypher_with_alloc(
+        "MATCH p = (a:Person {name: 'Alice'})-[:KNOWS*1..3]->(x:Person {name: 'Carol'}) \
+         RETURN length(p) AS len, size(nodes(p)) AS n",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+
+    assert_eq!(rows.len(), 1, "one route to Carol");
+    assert_eq!(
+        rows[0].get("len"),
+        Some(&Value::Int(2)),
+        "Alice -> Bob -> Carol is 2 hops"
+    );
+    assert_eq!(
+        rows[0].get("n"),
+        Some(&Value::Int(3)),
+        "3 nodes on the route"
+    );
+}
+
+#[test]
 fn shortest_path_end_to_end_unreachable_binds_null() {
     // No edge between the two: BFS finds nothing. v1 keeps the row and binds
     // the path to NULL (so length(p) is NULL), rather than dropping the row

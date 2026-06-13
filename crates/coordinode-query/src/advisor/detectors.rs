@@ -578,6 +578,7 @@ mod tests {
             target_filters: vec![],
             edge_filters: vec![],
             temporal_filter: None,
+            path_variable: None,
         }
     }
 
@@ -597,6 +598,7 @@ mod tests {
             target_filters: vec![],
             edge_filters: vec![],
             temporal_filter: None,
+            path_variable: None,
         }
     }
 
@@ -751,6 +753,7 @@ mod tests {
             target_filters: vec![],
             edge_filters: vec![],
             temporal_filter: None,
+            path_variable: None,
         };
         let suggestions = detect_suggestions(&plan(op), None);
         assert!(suggestions.is_empty());
@@ -865,6 +868,7 @@ mod tests {
             target_filters: vec![],
             edge_filters: vec![],
             temporal_filter: None,
+            path_variable: None,
         };
         let p = plan(LogicalOp::VectorFilter {
             input: Box::new(traverse),
