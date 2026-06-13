@@ -3959,7 +3959,10 @@ fn execute_varlen_traverse(
 
         // Edge-level cycle detection: (source_uid, target_uid, edge_type_idx).
         // Prevents traversing the same relationship twice per BFS invocation.
-        let mut visited_edges: HashSet<(u64, u64, usize)> = HashSet::new();
+        // Keys are internal ids (not attacker-controlled), so a fast non-DoS
+        // hasher is the right choice on this hot loop.
+        let mut visited_edges: rustc_hash::FxHashSet<(u64, u64, usize)> =
+            rustc_hash::FxHashSet::default();
 
         // Adaptive: track total edges processed for divergence detection.
         let mut edges_processed: usize = 0;
@@ -4089,6 +4092,14 @@ fn execute_varlen_traverse(
                     results.extend(build_target_rows(&trp, params, ctx)?);
                 }
             }
+
+            // A node reached via several edges at this depth need only be
+            // expanded once: its out-edges are identical regardless of how it
+            // was reached, and edge-level dedup keeps the emitted rows
+            // unchanged. Collapsing duplicates here avoids redundant adjacency
+            // reads on dense / power-law graphs (the common social-graph case).
+            let mut seen_frontier: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
+            next_frontier.retain(|uid| seen_frontier.insert(*uid));
 
             frontier = next_frontier;
         }
@@ -6264,9 +6275,10 @@ fn execute_shortest_path(
             _ => continue,
         };
 
-        // BFS from src_uid to tgt_uid
+        // BFS from src_uid to tgt_uid. Visited set is keyed by internal id, so
+        // a fast non-DoS hasher fits this hot loop.
         let mut queue: VecDeque<(u64, usize)> = VecDeque::new();
-        let mut visited: HashSet<u64> = HashSet::new();
+        let mut visited: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
 
         queue.push_back((src_uid, 0));
         visited.insert(src_uid);
