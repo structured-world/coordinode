@@ -4177,16 +4177,26 @@ fn execute_varlen_traverse(
                 results.extend(parallel_rows);
             } else {
                 for &(src_uid, tgt_uid, et_idx) in &depth_neighbors {
-                    // For depth > 1, update source in the row so edge property lookups
-                    // use the correct intermediate node (G066 fix).
-                    let mut hop_row = row.clone();
-                    hop_row.insert(params.source.to_string(), Value::Int(src_uid as i64));
+                    // For depth > 1 the source becomes an intermediate node, so
+                    // edge property lookups must rebind it to that node. At depth
+                    // 1 (and any hop whose source is still the original) the row
+                    // already binds `source_id`, so skip the per-edge row clone
+                    // and the source-key allocation entirely on that hot path.
+                    let hop_row;
+                    let input_row: &Row = if src_uid == source_id.as_raw() {
+                        row
+                    } else {
+                        let mut r = row.clone();
+                        r.insert(params.source.to_string(), Value::Int(src_uid as i64));
+                        hop_row = r;
+                        &hop_row
+                    };
 
                     let edge_type = params.edge_types.get(et_idx).map(|s| s.as_str());
                     let edge_is_temporal =
                         params.edge_temporal.get(et_idx).copied().unwrap_or(false);
                     let trp = TargetRowParams {
-                        input_row: &hop_row,
+                        input_row,
                         target_uid: tgt_uid,
                         edge_type,
                         edge_is_temporal,
