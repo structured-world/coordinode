@@ -23,6 +23,61 @@ fn node_shard_prefix(shard_id: u16) -> Vec<u8> {
     prefix
 }
 
+/// Wire-format version of the binary backup dump. Bump on any
+/// incompatible change to [`BackupEntry`] layout or to the value
+/// encodings stored inside it. Restore refuses dumps newer than the
+/// version it understands (see `restore_binary`).
+pub const BINARY_FORMAT_VERSION: u32 = 1;
+
+/// Human-readable producer string embedded in the binary dump manifest:
+/// `coordinode-embed/<crate-version>`. Used only for diagnostics in
+/// restore errors; never gates compatibility on its own.
+pub fn producer_tag() -> String {
+    concat!("coordinode-embed/", env!("CARGO_PKG_VERSION")).to_string()
+}
+
+/// Deterministic FNV-1a 64-bit fingerprint of the schema partition.
+///
+/// Hashes the schema `(key, value)` pairs in key-sorted order so the
+/// result is stable across runs and independent of scan order. A dump's
+/// fingerprint identifies the label / property-type contract it was
+/// produced under; restoring into a non-empty database whose schema
+/// fingerprint differs risks merging incompatible type definitions, so
+/// `restore_binary` rejects that mismatch unless forced.
+pub fn schema_fingerprint(engine: &StorageEngine) -> Result<u64, ExportError> {
+    let iter = engine
+        .prefix_scan(Partition::Schema, b"schema:")
+        .map_err(|e| ExportError::Storage(e.to_string()))?;
+
+    let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for guard in iter {
+        let (k, v) = guard
+            .into_inner()
+            .map_err(|e| ExportError::Storage(e.to_string()))?;
+        pairs.push((k.to_vec(), v.to_vec()));
+    }
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // FNV-1a 64-bit: deterministic, no random seed, dependency-free.
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        // Length-delimit each field so (k=ab, v=c) and (k=a, v=bc) differ.
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    };
+    for (k, v) in &pairs {
+        mix(k);
+        mix(v);
+    }
+    Ok(hash)
+}
+
 /// Errors during backup export.
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
@@ -252,7 +307,18 @@ pub fn export_binary<W: Write>(
 ) -> Result<ExportStats, ExportError> {
     let mut stats = ExportStats::default();
 
-    // Write interner first (needed for restore)
+    // Manifest first so restore can validate compatibility before any write.
+    let manifest = BackupEntry::Manifest {
+        format_version: BINARY_FORMAT_VERSION,
+        producer: producer_tag(),
+        schema_fingerprint: schema_fingerprint(engine)?,
+    };
+    let encoded =
+        rmp_serde::to_vec(&manifest).map_err(|e| ExportError::Serialization(e.to_string()))?;
+    writer.write_all(&(encoded.len() as u32).to_le_bytes())?;
+    writer.write_all(&encoded)?;
+
+    // Interner second (needed for restore)
     let interner_bytes = interner.to_bytes();
     let header = BackupEntry::Interner(interner_bytes);
     let encoded =
@@ -362,7 +428,18 @@ pub fn export_binary<W: Write>(
 /// A single entry in a binary backup dump.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum BackupEntry {
-    /// Field interner state (must be first entry).
+    /// Dump manifest. Written as the very first entry so restore can
+    /// validate compatibility before touching storage.
+    Manifest {
+        /// Wire-format version; see [`BINARY_FORMAT_VERSION`].
+        format_version: u32,
+        /// Producing build, e.g. `coordinode-embed/0.4.3` (diagnostics only).
+        producer: String,
+        /// FNV-1a fingerprint of the source schema partition; see
+        /// [`schema_fingerprint`].
+        schema_fingerprint: u64,
+    },
+    /// Field interner state (follows the manifest).
     Interner(Vec<u8>),
     /// Node: raw key + MessagePack value.
     Node { key: Vec<u8>, value: Vec<u8> },

@@ -84,6 +84,10 @@ pub enum Command {
         /// (and edges between kept nodes). Applies to json / apoc-json /
         /// hetio-json. Empty = restore everything.
         only_labels: Vec<String>,
+        /// Bypass binary-dump compatibility checks (format version and
+        /// schema fingerprint). Use to restore a newer dump or into a
+        /// database with a differing schema at your own risk.
+        force: bool,
     },
     /// Create a hard-linked physical checkpoint of the whole database.
     ///
@@ -249,12 +253,14 @@ pub fn parse_args_from(args: &[String]) -> Command {
                         .collect()
                 })
                 .unwrap_or_default();
+            let force = args.iter().any(|a| a == "--force");
             Command::Restore {
                 data_dir,
                 input,
                 format,
                 namespace,
                 only_labels,
+                force,
             }
         }
         "checkpoint" => {
@@ -276,7 +282,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  coordinode serve [--mode full] [--node-id N] [--addr ADDR] [--advertise-addr ADDR]\n          \
                  [--rest-addr ADDR] [--ops-addr ADDR] [--data DIR] [--peers PEERS]\n  \
                  coordinode backup --output FILE [--data DIR] [--format json|cypher|binary|snapshot] [--namespace NS] [--since SEQNO]\n  \
-                 coordinode restore --input FILE [--data DIR] [--format json|cypher|binary|snapshot|apoc-json|apoc-cypher|hetio-json] [--namespace NS] [--only-labels L1,L2]\n  \
+                 coordinode restore --input FILE [--data DIR] [--format json|cypher|binary|snapshot|apoc-json|apoc-cypher|hetio-json] [--namespace NS] [--only-labels L1,L2] [--force]\n  \
                  coordinode checkpoint --output DIR [--data DIR]\n  \
                  coordinode verify [--data DIR] [--deep]\n  \
                  coordinode version\n  \
@@ -543,6 +549,26 @@ mod tests {
             Command::Restore { only_labels, .. } => {
                 assert_eq!(only_labels, vec!["User".to_string(), "Post".to_string()]);
             }
+            _ => panic!("expected Restore command"),
+        }
+    }
+
+    #[test]
+    fn restore_force_flag_parsed() {
+        let cmd = parse_args_from(&args(
+            "coordinode restore --input db.bin --format binary --force",
+        ));
+        match cmd {
+            Command::Restore { force, .. } => assert!(force, "--force should set force=true"),
+            _ => panic!("expected Restore command"),
+        }
+    }
+
+    #[test]
+    fn restore_force_defaults_false() {
+        let cmd = parse_args_from(&args("coordinode restore --input db.bin --format binary"));
+        match cmd {
+            Command::Restore { force, .. } => assert!(!force, "force defaults to false"),
             _ => panic!("expected Restore command"),
         }
     }

@@ -606,12 +606,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             format,
             namespace: _namespace,
             only_labels,
+            force,
         } => {
             logging::init_logging();
             info!(
                 data_dir = %data_dir,
                 input = %input,
                 format = ?format,
+                force,
                 "starting restore"
             );
 
@@ -653,9 +655,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 coordinode_embed::backup::BackupFormat::Binary => {
-                    let (stats, _interner) =
-                        coordinode_embed::backup::restore::restore_binary(db.engine(), &mut reader)
-                            .map_err(|e| format!("restore failed: {e}"))?;
+                    let (stats, _interner) = coordinode_embed::backup::restore::restore_binary(
+                        db.engine(),
+                        &mut reader,
+                        force,
+                    )
+                    .map_err(|e| format!("restore failed: {e}"))?;
                     info!(
                         nodes = stats.nodes,
                         edges = stats.edges,

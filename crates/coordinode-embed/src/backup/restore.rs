@@ -27,6 +27,12 @@ pub enum RestoreError {
 
     #[error("invalid backup format: {0}")]
     InvalidFormat(String),
+
+    #[error("incompatible dump: {0}")]
+    IncompatibleVersion(String),
+
+    #[error("schema fingerprint mismatch: {0}")]
+    SchemaMismatch(String),
 }
 
 /// Statistics from a restore operation.
@@ -45,10 +51,12 @@ pub struct RestoreStats {
 pub fn restore_binary<R: Read>(
     engine: &StorageEngine,
     reader: &mut R,
+    force: bool,
 ) -> Result<(RestoreStats, Option<FieldInterner>), RestoreError> {
     let mut stats = RestoreStats::default();
     let mut interner = None;
     let mut len_buf = [0u8; 4];
+    let mut manifest_seen = false;
 
     loop {
         match reader.read_exact(&mut len_buf) {
@@ -64,7 +72,30 @@ pub fn restore_binary<R: Read>(
         let entry: BackupEntry = rmp_serde::from_slice(&entry_buf)
             .map_err(|e| RestoreError::Deserialization(e.to_string()))?;
 
+        // The manifest must lead the dump. Any other first entry means a
+        // pre-versioned or corrupt file; reject unless forced.
+        let first_entry = stats.nodes == 0
+            && stats.edges == 0
+            && stats.schema_entries == 0
+            && interner.is_none()
+            && !manifest_seen;
+        if first_entry && !matches!(entry, BackupEntry::Manifest { .. }) && !force {
+            return Err(RestoreError::IncompatibleVersion(
+                "binary dump has no leading manifest (pre-versioned or corrupt); \
+                 re-export, or force to restore anyway"
+                    .to_string(),
+            ));
+        }
+
         match entry {
+            BackupEntry::Manifest {
+                format_version,
+                producer,
+                schema_fingerprint,
+            } => {
+                validate_manifest(engine, format_version, &producer, schema_fingerprint, force)?;
+                manifest_seen = true;
+            }
             BackupEntry::Interner(data) => {
                 interner = FieldInterner::from_bytes(&data);
             }
@@ -100,6 +131,55 @@ pub fn restore_binary<R: Read>(
     }
 
     Ok((stats, interner))
+}
+
+/// Validate a binary dump manifest against the target engine.
+///
+/// Two gates, both overridable with `force`:
+/// 1. **Format version**: refuse a dump whose `format_version` is newer
+///    than this build understands (a newer producer may use encodings we
+///    cannot decode). Older dumps are accepted (we stay backward-readable).
+/// 2. **Schema fingerprint**: if the target database already holds schema
+///    (non-empty fingerprint that differs from the dump's), merging risks
+///    conflicting label / property-type definitions, so reject. Restoring
+///    into a fresh database (fingerprint of an empty schema) always passes.
+fn validate_manifest(
+    engine: &StorageEngine,
+    format_version: u32,
+    producer: &str,
+    dump_fingerprint: u64,
+    force: bool,
+) -> Result<(), RestoreError> {
+    use super::export::{schema_fingerprint, BINARY_FORMAT_VERSION};
+
+    if format_version > BINARY_FORMAT_VERSION && !force {
+        return Err(RestoreError::IncompatibleVersion(format!(
+            "dump format v{format_version} from {producer} is newer than supported v{BINARY_FORMAT_VERSION}; \
+             upgrade coordinode or force to attempt a best-effort restore"
+        )));
+    }
+
+    let target_fingerprint =
+        schema_fingerprint(engine).map_err(|e| RestoreError::Storage(e.to_string()))?;
+    // Fingerprint of an empty schema partition is the FNV offset basis; a
+    // fresh restore target matches it, so only a populated, differing target
+    // trips the guard.
+    let empty_fingerprint = schema_fingerprint_of_empty();
+    let target_is_empty = target_fingerprint == empty_fingerprint;
+    if !target_is_empty && target_fingerprint != dump_fingerprint && !force {
+        return Err(RestoreError::SchemaMismatch(format!(
+            "target schema fingerprint {target_fingerprint:#x} differs from dump {dump_fingerprint:#x}; \
+             restoring would merge incompatible schemas, force to override"
+        )));
+    }
+
+    Ok(())
+}
+
+/// FNV-1a fingerprint of an empty schema partition (no `(k,v)` pairs).
+/// Equals the algorithm's offset basis since the mix loop never runs.
+fn schema_fingerprint_of_empty() -> u64 {
+    0xcbf2_9ce4_8422_2325
 }
 
 /// Restore from JSON Lines backup.

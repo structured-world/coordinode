@@ -41,7 +41,7 @@ fn dump_restore_binary(db1: &Database) -> (Database, tempfile::TempDir) {
     let db2 = Database::open(dir2.path()).expect("open db2");
     let mut cursor = std::io::Cursor::new(&buf);
     let (_stats, restored_interner) =
-        restore::restore_binary(db2.engine(), &mut cursor).expect("restore_binary");
+        restore::restore_binary(db2.engine(), &mut cursor, false).expect("restore_binary");
 
     // Install the restored interner so Cypher queries against db2 can
     // resolve the property / label ids in the restored payload.

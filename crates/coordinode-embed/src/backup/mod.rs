@@ -131,7 +131,7 @@ mod tests {
 
         let mut cursor = std::io::Cursor::new(&buf);
         let (restore_stats, _interner) =
-            restore::restore_binary(db2.engine(), &mut cursor).unwrap();
+            restore::restore_binary(db2.engine(), &mut cursor, false).unwrap();
 
         assert_eq!(restore_stats.nodes, export_stats.nodes);
     }
@@ -346,5 +346,122 @@ mod tests {
         assert_eq!(stats.nodes, 0);
         assert_eq!(stats.edges, 0);
         assert!(buf.is_empty(), "empty DB should produce no output");
+    }
+
+    /// Encode a list of backup entries into the length-prefixed binary
+    /// stream that `restore_binary` consumes.
+    fn encode_dump(entries: &[export::BackupEntry]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for e in entries {
+            let encoded = rmp_serde::to_vec(e).unwrap();
+            buf.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&encoded);
+        }
+        buf
+    }
+
+    #[test]
+    fn binary_restore_accepts_manifest_at_current_version() {
+        // A normally-produced dump carries a manifest at the current format
+        // version and restores into a fresh database without forcing.
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Database::open(dir.path()).unwrap();
+        db.execute_cypher("CREATE (a:User {name: 'Alice'})")
+            .unwrap();
+
+        let mut buf = Vec::new();
+        let snapshot = db.engine().snapshot();
+        export::export_binary(db.engine(), &db.interner(), 1, &snapshot, &mut buf).unwrap();
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let db2 = Database::open(dir2.path()).unwrap();
+        let mut cursor = std::io::Cursor::new(&buf);
+        let (stats, _interner) = restore::restore_binary(db2.engine(), &mut cursor, false).unwrap();
+        assert_eq!(stats.nodes, 1, "restore should accept current-version dump");
+    }
+
+    #[test]
+    fn binary_restore_rejects_newer_format_version() {
+        // A dump whose format version is newer than this build understands
+        // must be refused (the encodings inside may be undecodable here).
+        let newer = export::BINARY_FORMAT_VERSION + 1;
+        let dump = encode_dump(&[
+            export::BackupEntry::Manifest {
+                format_version: newer,
+                producer: "coordinode-embed/99.0.0".to_string(),
+                schema_fingerprint: 0,
+            },
+            export::BackupEntry::Interner(Vec::new()),
+        ]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+
+        let mut cursor = std::io::Cursor::new(&dump);
+        let err = restore::restore_binary(db.engine(), &mut cursor, false).unwrap_err();
+        assert!(
+            matches!(err, restore::RestoreError::IncompatibleVersion(_)),
+            "newer format version must be rejected, got {err:?}"
+        );
+
+        // Force overrides the version gate for a best-effort restore.
+        let mut cursor = std::io::Cursor::new(&dump);
+        restore::restore_binary(db.engine(), &mut cursor, true)
+            .expect("force should bypass the version gate");
+    }
+
+    #[test]
+    fn binary_restore_rejects_missing_manifest() {
+        // A pre-versioned or truncated dump that does not lead with a
+        // manifest is refused unless forced.
+        let dump = encode_dump(&[export::BackupEntry::Interner(Vec::new())]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+
+        let mut cursor = std::io::Cursor::new(&dump);
+        let err = restore::restore_binary(db.engine(), &mut cursor, false).unwrap_err();
+        assert!(
+            matches!(err, restore::RestoreError::IncompatibleVersion(_)),
+            "missing manifest must be rejected, got {err:?}"
+        );
+
+        let mut cursor = std::io::Cursor::new(&dump);
+        restore::restore_binary(db.engine(), &mut cursor, true)
+            .expect("force should bypass the manifest requirement");
+    }
+
+    #[test]
+    fn binary_restore_rejects_schema_fingerprint_mismatch() {
+        use coordinode_storage::engine::partition::Partition;
+
+        // Target database already holds schema whose fingerprint differs
+        // from the dump's: merging would risk conflicting type definitions.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        db.engine()
+            .put(Partition::Schema, b"schema:label:Widget", b"v1")
+            .unwrap();
+
+        let dump = encode_dump(&[
+            export::BackupEntry::Manifest {
+                format_version: export::BINARY_FORMAT_VERSION,
+                producer: export::producer_tag(),
+                schema_fingerprint: 0xdead_beef,
+            },
+            export::BackupEntry::Interner(Vec::new()),
+        ]);
+
+        let mut cursor = std::io::Cursor::new(&dump);
+        let err = restore::restore_binary(db.engine(), &mut cursor, false).unwrap_err();
+        assert!(
+            matches!(err, restore::RestoreError::SchemaMismatch(_)),
+            "differing schema fingerprint must be rejected, got {err:?}"
+        );
+
+        // Force overrides the schema guard.
+        let mut cursor = std::io::Cursor::new(&dump);
+        restore::restore_binary(db.engine(), &mut cursor, true)
+            .expect("force should bypass the schema fingerprint guard");
     }
 }
