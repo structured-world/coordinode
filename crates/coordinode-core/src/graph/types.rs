@@ -147,6 +147,38 @@ pub enum Value {
     /// Construction-time invariant: every row must have the same length.
     /// Use [`Value::try_multi_vector`] to enforce this.
     MultiVector(Vec<Vec<f32>>),
+
+    /// A graph path: the alternating node/relationship sequence produced by
+    /// `shortestPath(...)` and variable-length `MATCH p = (a)-[*]->(b)`.
+    /// `length(p)` is the relationship count; `nodes(p)` / `relationships(p)`
+    /// project the two sequences. Maps to the Bolt Path structure on the wire.
+    Path(PathValue),
+}
+
+/// One relationship hop inside a [`PathValue`]: its type and endpoint node ids
+/// (raw [`NodeId`] values). Properties are not carried in v1 of the path model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PathRel {
+    /// Relationship type (edge label).
+    pub edge_type: String,
+    /// Source node id (raw).
+    pub source: u64,
+    /// Target node id (raw).
+    pub target: u64,
+}
+
+/// A graph path as an alternating node/relationship sequence.
+///
+/// Invariant: `nodes.len() == rels.len() + 1` for a non-empty path; a
+/// zero-length path is a single node with no relationships. The `i`-th
+/// relationship connects `nodes[i]` to `nodes[i + 1]` (following the traversal
+/// direction). `length(p)` is `rels.len()`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PathValue {
+    /// Ordered node ids along the path (raw [`NodeId`] values), start to end.
+    pub nodes: Vec<u64>,
+    /// Ordered relationship hops, one fewer than `nodes` on a non-empty path.
+    pub rels: Vec<PathRel>,
 }
 
 impl Value {
@@ -167,6 +199,7 @@ impl Value {
             Self::Binary(_) => "BINARY",
             Self::Document(_) => "DOCUMENT",
             Self::MultiVector(_) => "MULTIVECTOR",
+            Self::Path(_) => "PATH",
         }
     }
 
@@ -212,6 +245,39 @@ impl Value {
                     })
                     .collect(),
             ),
+            Self::Path(p) => {
+                let nodes = rmpv::Value::Array(
+                    p.nodes
+                        .iter()
+                        .map(|n| rmpv::Value::Integer((*n).into()))
+                        .collect(),
+                );
+                let rels = rmpv::Value::Array(
+                    p.rels
+                        .iter()
+                        .map(|r| {
+                            rmpv::Value::Map(vec![
+                                (
+                                    rmpv::Value::String("type".into()),
+                                    rmpv::Value::String(r.edge_type.clone().into()),
+                                ),
+                                (
+                                    rmpv::Value::String("source".into()),
+                                    rmpv::Value::Integer(r.source.into()),
+                                ),
+                                (
+                                    rmpv::Value::String("target".into()),
+                                    rmpv::Value::Integer(r.target.into()),
+                                ),
+                            ])
+                        })
+                        .collect(),
+                );
+                rmpv::Value::Map(vec![
+                    (rmpv::Value::String("nodes".into()), nodes),
+                    (rmpv::Value::String("rels".into()), rels),
+                ])
+            }
         }
     }
 

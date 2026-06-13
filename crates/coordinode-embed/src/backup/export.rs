@@ -425,6 +425,14 @@ pub(crate) fn value_to_json(value: &Value) -> serde_json::Value {
         Value::Binary(b) => serde_json::json!({"_binary": hex::encode(b)}),
         Value::Document(v) => serde_json::json!({"_document": rmpv_to_json(v)}),
         Value::MultiVector(rows) => serde_json::json!({"_multi_vector": rows}),
+        Value::Path(p) => serde_json::json!({"_path": {
+            "nodes": p.nodes,
+            "rels": p.rels.iter().map(|r| serde_json::json!({
+                "type": r.edge_type,
+                "source": r.source,
+                "target": r.target,
+            })).collect::<Vec<_>>(),
+        }}),
     }
 }
 

@@ -100,6 +100,35 @@ fn value_to_proto(value: &Value) -> common::PropertyValue {
                 common::PropertyList { values: items },
             ))
         }
+        Value::Path(p) => {
+            // No dedicated proto Path type yet, so wire the path as a
+            // structured map { nodes: [...], rels: [{type, source, target}] }
+            // by reusing the Map encoding. A first-class proto Path (and Bolt
+            // Path PackStream struct) is the follow-up wire-encoding step.
+            let mut m: std::collections::BTreeMap<String, Value> =
+                std::collections::BTreeMap::new();
+            m.insert(
+                "nodes".to_string(),
+                Value::Array(p.nodes.iter().map(|n| Value::Int(*n as i64)).collect()),
+            );
+            m.insert(
+                "rels".to_string(),
+                Value::Array(
+                    p.rels
+                        .iter()
+                        .map(|r| {
+                            let mut rm: std::collections::BTreeMap<String, Value> =
+                                std::collections::BTreeMap::new();
+                            rm.insert("type".to_string(), Value::String(r.edge_type.clone()));
+                            rm.insert("source".to_string(), Value::Int(r.source as i64));
+                            rm.insert("target".to_string(), Value::Int(r.target as i64));
+                            Value::Map(rm)
+                        })
+                        .collect(),
+                ),
+            );
+            value_to_proto(&Value::Map(m)).value
+        }
     };
     common::PropertyValue { value: v }
 }

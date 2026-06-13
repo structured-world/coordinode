@@ -585,6 +585,37 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
             Some(Value::Array(a)) => Value::Int(a.len() as i64),
             _ => Value::Null,
         },
+        // length(p) → number of relationships in a path.
+        "length" => match evaluated.first() {
+            Some(Value::Path(p)) => Value::Int(p.rels.len() as i64),
+            _ => Value::Null,
+        },
+        // nodes(p) → ordered list of node ids along the path.
+        "nodes" => match evaluated.first() {
+            Some(Value::Path(p)) => {
+                Value::Array(p.nodes.iter().map(|n| Value::Int(*n as i64)).collect())
+            }
+            _ => Value::Null,
+        },
+        // relationships(p) → ordered list of relationships, each a map of
+        // {type, source, target}. A first-class relationship value can replace
+        // the map once the path model carries relationship ids and properties.
+        "relationships" => match evaluated.first() {
+            Some(Value::Path(p)) => Value::Array(
+                p.rels
+                    .iter()
+                    .map(|r| {
+                        let mut m: std::collections::BTreeMap<String, Value> =
+                            std::collections::BTreeMap::new();
+                        m.insert("type".to_string(), Value::String(r.edge_type.clone()));
+                        m.insert("source".to_string(), Value::Int(r.source as i64));
+                        m.insert("target".to_string(), Value::Int(r.target as i64));
+                        Value::Map(m)
+                    })
+                    .collect(),
+            ),
+            _ => Value::Null,
+        },
         "type" => {
             // type(r) → relationship type string.
             // The executor stores edge type as `r.__type__` in the row.
@@ -1241,6 +1272,56 @@ mod tests {
         };
         let v = eval_expr(&expr, &empty_row());
         assert_eq!(v, Value::Int(5));
+    }
+
+    #[test]
+    fn eval_path_functions() {
+        use coordinode_core::graph::types::{PathRel, PathValue};
+        // Path n10 -[:KNOWS]-> n20 -[:KNOWS]-> n30: length 2, 3 nodes.
+        let path = Value::Path(PathValue {
+            nodes: vec![10, 20, 30],
+            rels: vec![
+                PathRel {
+                    edge_type: "KNOWS".into(),
+                    source: 10,
+                    target: 20,
+                },
+                PathRel {
+                    edge_type: "KNOWS".into(),
+                    source: 20,
+                    target: 30,
+                },
+            ],
+        });
+        let call = |name: &str| {
+            eval_expr(
+                &Expr::FunctionCall {
+                    name: name.into(),
+                    args: vec![Expr::Literal(path.clone())],
+                    distinct: false,
+                },
+                &empty_row(),
+            )
+        };
+
+        assert_eq!(call("length"), Value::Int(2), "length = relationship count");
+        assert_eq!(
+            call("nodes"),
+            Value::Array(vec![Value::Int(10), Value::Int(20), Value::Int(30)])
+        );
+
+        let mut rel0 = std::collections::BTreeMap::new();
+        rel0.insert("type".to_string(), Value::String("KNOWS".into()));
+        rel0.insert("source".to_string(), Value::Int(10));
+        rel0.insert("target".to_string(), Value::Int(20));
+        let mut rel1 = std::collections::BTreeMap::new();
+        rel1.insert("type".to_string(), Value::String("KNOWS".into()));
+        rel1.insert("source".to_string(), Value::Int(20));
+        rel1.insert("target".to_string(), Value::Int(30));
+        assert_eq!(
+            call("relationships"),
+            Value::Array(vec![Value::Map(rel0), Value::Map(rel1)])
+        );
     }
 
     #[test]
