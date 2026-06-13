@@ -527,6 +527,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .map_err(|e| format!("backup failed: {e}"))?
                 }
+                coordinode_embed::backup::BackupFormat::ApocJson
+                | coordinode_embed::backup::BackupFormat::ApocCypher => {
+                    return Err("apoc-json and apoc-cypher are import-only formats; \
+                                use them with restore, not backup"
+                        .into());
+                }
             };
 
             info!(
@@ -605,6 +611,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         edges = stats.edges,
                         schema = stats.schema_entries,
                         "restore complete (cypher)"
+                    );
+                }
+                coordinode_embed::backup::BackupFormat::ApocJson => {
+                    let mut reader = std::io::BufReader::new(file);
+                    let mut interner = db.interner().clone();
+                    let shard_id = 1u16;
+                    let stats = coordinode_embed::backup::restore::restore_apoc_json(
+                        db.engine(),
+                        &mut interner,
+                        shard_id,
+                        &mut reader,
+                    )
+                    .map_err(|e| format!("restore failed: {e}"))?;
+                    *db.interner_arc().write() = interner;
+                    info!(
+                        nodes = stats.nodes,
+                        edges = stats.edges,
+                        schema = stats.schema_entries,
+                        "restore complete (apoc-json)"
+                    );
+                }
+                coordinode_embed::backup::BackupFormat::ApocCypher => {
+                    let mut reader = std::io::BufReader::new(file);
+                    let mut interner = db.interner().clone();
+                    let shard_id = 1u16;
+                    let stats = coordinode_embed::backup::restore::restore_apoc_cypher(
+                        db.engine(),
+                        &mut interner,
+                        shard_id,
+                        &mut reader,
+                    )
+                    .map_err(|e| format!("restore failed: {e}"))?;
+                    *db.interner_arc().write() = interner;
+                    info!(
+                        nodes = stats.nodes,
+                        edges = stats.edges,
+                        schema = stats.schema_entries,
+                        "restore complete (apoc-cypher)"
                     );
                 }
             }

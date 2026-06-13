@@ -253,7 +253,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  coordinode serve [--mode full] [--node-id N] [--addr ADDR] [--advertise-addr ADDR]\n          \
                  [--rest-addr ADDR] [--ops-addr ADDR] [--data DIR] [--peers PEERS]\n  \
                  coordinode backup --output FILE [--data DIR] [--format json|cypher|binary] [--namespace NS]\n  \
-                 coordinode restore --input FILE [--data DIR] [--format json|cypher|binary] [--namespace NS]\n  \
+                 coordinode restore --input FILE [--data DIR] [--format json|cypher|binary|apoc-json|apoc-cypher] [--namespace NS]\n  \
                  coordinode checkpoint --output DIR [--data DIR]\n  \
                  coordinode verify [--data DIR] [--deep]\n  \
                  coordinode version\n  \
@@ -388,8 +388,14 @@ fn parse_format(args: &[String]) -> BackupFormat {
         Some("json") | None => BackupFormat::Json,
         Some("cypher") => BackupFormat::Cypher,
         Some("binary") => BackupFormat::Binary,
+        // Import-only Neo4j formats (restore only; backup rejects them).
+        Some("apoc-json") | Some("apoc_json") => BackupFormat::ApocJson,
+        Some("apoc-cypher") | Some("apoc_cypher") => BackupFormat::ApocCypher,
         Some(other) => {
-            eprintln!("error: unknown format '{other}'. Use: json, cypher, or binary");
+            eprintln!(
+                "error: unknown format '{other}'. Use: json, cypher, binary \
+                 (backup/restore) or apoc-json, apoc-cypher (restore only)"
+            );
             std::process::exit(1);
         }
     }

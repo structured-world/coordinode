@@ -116,11 +116,7 @@ pub fn restore_json<R: BufRead>(
     shard_id: u16,
     reader: &mut R,
 ) -> Result<RestoreStats, RestoreError> {
-    use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse};
-    use coordinode_core::graph::node::NodeRecord;
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    let node_store = LocalNodeStore::new(engine);
-
+    let node_store = coordinode_modality::LocalNodeStore::new(engine);
     let mut stats = RestoreStats::default();
 
     for line_result in reader.lines() {
@@ -144,31 +140,15 @@ pub fn restore_json<R: BufRead>(
                     .get("id")
                     .and_then(|v| v.as_u64())
                     .ok_or_else(|| RestoreError::InvalidFormat("node missing 'id'".into()))?;
-
-                let labels: Vec<String> = obj
-                    .get("labels")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let mut record = NodeRecord::with_labels(labels);
-
-                if let Some(props) = obj.get("properties").and_then(|v| v.as_object()) {
-                    for (name, json_val) in props {
-                        let field_id = interner.intern(name);
-                        let value = json_to_value(json_val);
-                        record.set(field_id, value);
-                    }
-                }
-
-                node_store
-                    .put(shard_id, NodeId::from_raw(id), &record)
-                    .map_err(|e| RestoreError::Storage(e.to_string()))?;
-
+                let labels = json_labels(obj.get("labels"));
+                write_node_record(
+                    &node_store,
+                    interner,
+                    shard_id,
+                    id,
+                    labels,
+                    obj.get("properties").and_then(|v| v.as_object()),
+                )?;
                 stats.nodes += 1;
             }
             "edge" => {
@@ -186,52 +166,14 @@ pub fn restore_json<R: BufRead>(
                     .ok_or_else(|| {
                         RestoreError::InvalidFormat("edge missing 'edge_type'".into())
                     })?;
-
-                // Write forward adjacency via merge operator (raw key, no MVCC).
-                let fwd_key = encode_adj_key_forward(edge_type, NodeId::from_raw(source));
-                engine
-                    .merge(
-                        Partition::Adj,
-                        &fwd_key,
-                        &coordinode_storage::engine::merge::encode_add(target),
-                    )
-                    .map_err(|e| RestoreError::Storage(e.to_string()))?;
-
-                // Write reverse adjacency via merge operator.
-                let rev_key = encode_adj_key_reverse(edge_type, NodeId::from_raw(target));
-                engine
-                    .merge(
-                        Partition::Adj,
-                        &rev_key,
-                        &coordinode_storage::engine::merge::encode_add(source),
-                    )
-                    .map_err(|e| RestoreError::Storage(e.to_string()))?;
-
-                // Write edge properties if present
-                if let Some(props) = obj.get("properties").and_then(|v| v.as_object()) {
-                    if !props.is_empty() {
-                        // Executor-native wire shape: Vec<(field_id, Value)>
-                        // (runner.rs decodes exactly this) — a HashMap would
-                        // make the restored props unreadable by queries.
-                        let prop_vec: Vec<(u32, Value)> = props
-                            .iter()
-                            .map(|(name, json_val)| {
-                                (interner.intern(name), json_to_value(json_val))
-                            })
-                            .collect();
-                        let ep_key = coordinode_core::graph::edge::encode_edgeprop_key(
-                            edge_type,
-                            NodeId::from_raw(source),
-                            NodeId::from_raw(target),
-                        );
-                        let ep_value = rmp_serde::to_vec(&prop_vec)
-                            .map_err(|e| RestoreError::Deserialization(e.to_string()))?;
-                        engine
-                            .put(Partition::EdgeProp, &ep_key, &ep_value)
-                            .map_err(|e| RestoreError::Storage(e.to_string()))?;
-                    }
-                }
-
+                write_edge_record(
+                    engine,
+                    interner,
+                    source,
+                    target,
+                    edge_type,
+                    obj.get("properties").and_then(|v| v.as_object()),
+                )?;
                 stats.edges += 1;
             }
             other => {
@@ -243,6 +185,175 @@ pub fn restore_json<R: BufRead>(
     }
 
     Ok(stats)
+}
+
+/// Restore from a Neo4j APOC json-export dump (`apoc.export.json.all`).
+///
+/// APOC emits JSON Lines of `{"type":"node"|"relationship", ...}` where ids
+/// are stringified Neo4j internal ids. This is the same on-disk path our own
+/// json restore uses, modulo three mechanical differences handled here:
+/// string ids, a `relationship` record (vs our `edge`) carrying nested
+/// `start`/`end` objects, and `label` (vs `edge_type`). We never execute
+/// APOC; this reads its portable output and writes straight to storage, the
+/// same way [`restore_json`] does. Records of other types (graph metadata)
+/// are skipped.
+pub fn restore_apoc_json<R: BufRead>(
+    engine: &StorageEngine,
+    interner: &mut FieldInterner,
+    shard_id: u16,
+    reader: &mut R,
+) -> Result<RestoreStats, RestoreError> {
+    let node_store = coordinode_modality::LocalNodeStore::new(engine);
+    let mut stats = RestoreStats::default();
+
+    for line_result in reader.lines() {
+        let line = line_result?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let obj: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| RestoreError::Deserialization(format!("invalid JSON: {e}")))?;
+
+        match obj.get("type").and_then(|v| v.as_str()) {
+            Some("node") => {
+                let id = apoc_id(obj.get("id"), "node")?;
+                let labels = json_labels(obj.get("labels"));
+                write_node_record(
+                    &node_store,
+                    interner,
+                    shard_id,
+                    id,
+                    labels,
+                    obj.get("properties").and_then(|v| v.as_object()),
+                )?;
+                stats.nodes += 1;
+            }
+            Some("relationship") => {
+                let source = apoc_id(
+                    obj.get("start").and_then(|s| s.get("id")),
+                    "relationship start",
+                )?;
+                let target = apoc_id(obj.get("end").and_then(|e| e.get("id")), "relationship end")?;
+                let edge_type = obj.get("label").and_then(|v| v.as_str()).ok_or_else(|| {
+                    RestoreError::InvalidFormat("relationship missing 'label'".into())
+                })?;
+                write_edge_record(
+                    engine,
+                    interner,
+                    source,
+                    target,
+                    edge_type,
+                    obj.get("properties").and_then(|v| v.as_object()),
+                )?;
+                stats.edges += 1;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Collect a JSON labels array into owned strings.
+fn json_labels(v: Option<&serde_json::Value>) -> Vec<String> {
+    v.and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse an APOC stringified internal id into a `u64`. Tolerates a raw
+/// numeric id too, so non-standard exporters that skip the quoting still load.
+fn apoc_id(v: Option<&serde_json::Value>, what: &str) -> Result<u64, RestoreError> {
+    let v = v.ok_or_else(|| RestoreError::InvalidFormat(format!("{what} missing id")))?;
+    if let Some(n) = v.as_u64() {
+        return Ok(n);
+    }
+    v.as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| RestoreError::InvalidFormat(format!("{what} id is not a numeric string")))
+}
+
+/// Write one node (labels + properties) to storage, interning property names.
+fn write_node_record(
+    node_store: &coordinode_modality::LocalNodeStore,
+    interner: &mut FieldInterner,
+    shard_id: u16,
+    id: u64,
+    labels: Vec<String>,
+    props: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<(), RestoreError> {
+    use coordinode_core::graph::node::NodeRecord;
+    use coordinode_modality::NodeStore as _;
+
+    let mut record = NodeRecord::with_labels(labels);
+    if let Some(props) = props {
+        for (name, json_val) in props {
+            let field_id = interner.intern(name);
+            record.set(field_id, json_to_value(json_val));
+        }
+    }
+    node_store
+        .put(shard_id, NodeId::from_raw(id), &record)
+        .map_err(|e| RestoreError::Storage(e.to_string()))
+}
+
+/// Write one edge: both adjacency directions (merge operator, raw keys) plus
+/// optional edge properties in executor-native shape.
+fn write_edge_record(
+    engine: &StorageEngine,
+    interner: &mut FieldInterner,
+    source: u64,
+    target: u64,
+    edge_type: &str,
+    props: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<(), RestoreError> {
+    use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse};
+
+    let fwd_key = encode_adj_key_forward(edge_type, NodeId::from_raw(source));
+    engine
+        .merge(
+            Partition::Adj,
+            &fwd_key,
+            &coordinode_storage::engine::merge::encode_add(target),
+        )
+        .map_err(|e| RestoreError::Storage(e.to_string()))?;
+
+    let rev_key = encode_adj_key_reverse(edge_type, NodeId::from_raw(target));
+    engine
+        .merge(
+            Partition::Adj,
+            &rev_key,
+            &coordinode_storage::engine::merge::encode_add(source),
+        )
+        .map_err(|e| RestoreError::Storage(e.to_string()))?;
+
+    if let Some(props) = props {
+        if !props.is_empty() {
+            // Executor-native wire shape: Vec<(field_id, Value)> (runner.rs
+            // decodes exactly this). A HashMap would make the restored props
+            // unreadable by queries.
+            let prop_vec: Vec<(u32, Value)> = props
+                .iter()
+                .map(|(name, json_val)| (interner.intern(name), json_to_value(json_val)))
+                .collect();
+            let ep_key = coordinode_core::graph::edge::encode_edgeprop_key(
+                edge_type,
+                NodeId::from_raw(source),
+                NodeId::from_raw(target),
+            );
+            let ep_value = rmp_serde::to_vec(&prop_vec)
+                .map_err(|e| RestoreError::Deserialization(e.to_string()))?;
+            engine
+                .put(Partition::EdgeProp, &ep_key, &ep_value)
+                .map_err(|e| RestoreError::Storage(e.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Restore from a Cypher (OpenCypher `CREATE` statements) backup dump.
@@ -529,6 +640,661 @@ fn find_top_level(s: &str, delim: char) -> Option<usize> {
     None
 }
 
+/// Restore from a Neo4j APOC cypher-export dump (`apoc.export.cypher.all`).
+///
+/// This is a structural parser, NOT a Cypher engine: it recognises the
+/// statement shapes APOC emits and writes node/edge records straight to
+/// storage, the same way [`restore_cypher`] does for our own dumps. APOC is
+/// never executed (it is a Neo4j plugin that does not run correctly on a
+/// sharded cluster).
+///
+/// Both APOC export modes are handled:
+/// - **plain** (`useOptimizations: {type: "NONE"}`): one `CREATE (...)`
+///   statement per node and a `MATCH (...), (...) CREATE (a)-[:T]->(b)`
+///   per relationship. Node ids come from the `UNIQUE IMPORT ID` property.
+/// - **unwind-batch** (APOC's default): `UNWIND [ {...}, ... ] AS row CREATE
+///   (n{...: row._id}) SET n += row.properties` and the relationship variant.
+///
+/// Schema statements (`CREATE CONSTRAINT` / `CREATE INDEX` / `DROP ...`),
+/// transaction markers (`:begin` / `:commit` / `BEGIN` / `COMMIT`), and the
+/// `UNIQUE IMPORT LABEL` cleanup pass are skipped: CoordiNode rebuilds those
+/// natively. Cypher functions / temporal literals in values are a hard error
+/// (we import data, not evaluate Cypher).
+pub fn restore_apoc_cypher<R: BufRead>(
+    engine: &StorageEngine,
+    interner: &mut FieldInterner,
+    shard_id: u16,
+    reader: &mut R,
+) -> Result<RestoreStats, RestoreError> {
+    let node_store = coordinode_modality::LocalNodeStore::new(engine);
+    let mut stats = RestoreStats::default();
+
+    let mut text = String::new();
+    reader.read_to_string(&mut text)?;
+
+    // Transaction markers sit on their own line with no `;`, so they would
+    // otherwise glue onto the following statement and hide it. Drop them
+    // before splitting; they carry no graph data.
+    let filtered = text
+        .lines()
+        .filter(|l| {
+            let u = l.trim().to_uppercase();
+            !(matches!(u.as_str(), "BEGIN" | "COMMIT" | ":BEGIN" | ":COMMIT")
+                || u.starts_with("SCHEMA AWAIT"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for stmt in split_statements(&filtered) {
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        apply_apoc_cypher_stmt(stmt, engine, &node_store, interner, shard_id, &mut stats)?;
+    }
+    Ok(stats)
+}
+
+/// Classify and apply one APOC cypher statement.
+fn apply_apoc_cypher_stmt(
+    stmt: &str,
+    engine: &StorageEngine,
+    node_store: &coordinode_modality::LocalNodeStore,
+    interner: &mut FieldInterner,
+    shard_id: u16,
+    stats: &mut RestoreStats,
+) -> Result<(), RestoreError> {
+    let upper = stmt.to_uppercase();
+
+    // Transaction markers, schema DDL, and the import-label cleanup pass:
+    // CoordiNode rebuilds schema natively, so these carry no graph data.
+    let is_skippable = stmt.starts_with("//")
+        || matches!(upper.as_str(), "BEGIN" | "COMMIT" | ":BEGIN" | ":COMMIT")
+        || upper.starts_with("SCHEMA AWAIT")
+        || upper.starts_with("CREATE CONSTRAINT")
+        || upper.starts_with("DROP CONSTRAINT")
+        || upper.starts_with("CREATE INDEX")
+        || upper.starts_with("DROP INDEX")
+        || upper.starts_with("CREATE RANGE INDEX")
+        || upper.starts_with("CREATE TEXT INDEX")
+        || upper.starts_with("CREATE POINT INDEX")
+        || upper.starts_with("CREATE LOOKUP INDEX")
+        || upper.starts_with("CREATE FULLTEXT INDEX")
+        || upper.starts_with("CREATE VECTOR INDEX")
+        || (upper.starts_with("MATCH (N:") && upper.contains("REMOVE"));
+    if is_skippable {
+        return Ok(());
+    }
+
+    if upper.starts_with("UNWIND") {
+        apply_apoc_unwind(stmt, engine, node_store, interner, shard_id, stats)
+    } else if upper.starts_with("CREATE (") || upper.starts_with("CREATE(") {
+        apply_apoc_plain_node(stmt, node_store, interner, shard_id, stats)
+    } else if upper.starts_with("MATCH") && stmt.contains("]->") {
+        apply_apoc_plain_rel(stmt, engine, interner, stats)
+    } else {
+        // Unknown maintenance statement (e.g. a vendor-specific clause):
+        // skip rather than fail; only CREATE/UNWIND carry graph data.
+        Ok(())
+    }
+}
+
+/// Apply an `UNWIND [...] AS row CREATE/MATCH ...` batch (node or relationship).
+fn apply_apoc_unwind(
+    stmt: &str,
+    engine: &StorageEngine,
+    node_store: &coordinode_modality::LocalNodeStore,
+    interner: &mut FieldInterner,
+    shard_id: u16,
+    stats: &mut RestoreStats,
+) -> Result<(), RestoreError> {
+    let lb = stmt
+        .find('[')
+        .ok_or_else(|| RestoreError::InvalidFormat("UNWIND without a list".into()))?;
+    let mut lit = CypherLit::new(&stmt[lb..]);
+    let rows = lit.list()?;
+    let rest = lit.rest();
+    let rows = rows
+        .as_array()
+        .ok_or_else(|| RestoreError::InvalidFormat("UNWIND list is not an array".into()))?;
+
+    if rest.contains("]->") {
+        let edge_type = extract_reltype(&rest)?;
+        for row in rows {
+            let source = nested_id(row, "start")?;
+            let target = nested_id(row, "end")?;
+            let props = row.get("properties").and_then(|v| v.as_object());
+            write_edge_record(engine, interner, source, target, &edge_type, props)?;
+            stats.edges += 1;
+        }
+    } else {
+        let labels = extract_create_labels(&rest)?;
+        for row in rows {
+            let id = row
+                .get("_id")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| RestoreError::InvalidFormat("UNWIND node row missing _id".into()))?;
+            let props = row.get("properties").and_then(|v| v.as_object());
+            write_node_record(node_store, interner, shard_id, id, labels.clone(), props)?;
+            stats.nodes += 1;
+        }
+    }
+    Ok(())
+}
+
+/// `row["<side>"]["_id"]` as a `u64` (relationship endpoint).
+fn nested_id(row: &serde_json::Value, side: &str) -> Result<u64, RestoreError> {
+    row.get(side)
+        .and_then(|s| s.get("_id"))
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| RestoreError::InvalidFormat(format!("UNWIND rel row missing {side}._id")))
+}
+
+/// Apply a plain `CREATE (:Labels {props, `UNIQUE IMPORT ID`: N});` node.
+fn apply_apoc_plain_node(
+    stmt: &str,
+    node_store: &coordinode_modality::LocalNodeStore,
+    interner: &mut FieldInterner,
+    shard_id: u16,
+    stats: &mut RestoreStats,
+) -> Result<(), RestoreError> {
+    let body = stmt["CREATE".len()..].trim();
+    let inner = body
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or_else(|| RestoreError::InvalidFormat(format!("malformed node: {stmt}")))?;
+    let brace = first_brace(inner).ok_or_else(|| {
+        RestoreError::InvalidFormat(format!("node without UNIQUE IMPORT ID props: {stmt}"))
+    })?;
+    let labels = parse_label_list(&inner[..brace]);
+    let map = CypherLit::new(&inner[brace..]).map()?;
+    let mut obj = map
+        .as_object()
+        .cloned()
+        .ok_or_else(|| RestoreError::InvalidFormat("node props not a map".into()))?;
+    let id = obj
+        .remove("UNIQUE IMPORT ID")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            RestoreError::InvalidFormat(
+                "plain node missing `UNIQUE IMPORT ID` (constraint-keyed nodes are not supported)"
+                    .into(),
+            )
+        })?;
+    write_node_record(node_store, interner, shard_id, id, labels, Some(&obj))?;
+    stats.nodes += 1;
+    Ok(())
+}
+
+/// Apply a plain `MATCH (a{id:X}), (b{id:Y}) CREATE (a)-[:T {props}]->(b);`.
+fn apply_apoc_plain_rel(
+    stmt: &str,
+    engine: &StorageEngine,
+    interner: &mut FieldInterner,
+    stats: &mut RestoreStats,
+) -> Result<(), RestoreError> {
+    let cpos = find_top_keyword(stmt, "CREATE")
+        .ok_or_else(|| RestoreError::InvalidFormat(format!("rel without CREATE: {stmt}")))?;
+    let (match_part, create_part) = stmt.split_at(cpos);
+    let ids = extract_import_ids(match_part);
+    if ids.len() != 2 {
+        return Err(RestoreError::InvalidFormat(format!(
+            "expected 2 UNIQUE IMPORT IDs in MATCH, got {}: {stmt}",
+            ids.len()
+        )));
+    }
+    let edge_type = extract_reltype(create_part)?;
+    let props = extract_rel_props(create_part)?;
+    write_edge_record(engine, interner, ids[0], ids[1], &edge_type, props.as_ref())?;
+    stats.edges += 1;
+    Ok(())
+}
+
+/// Pull the relationship type out of a `-[var:`TYPE` {props}]->` pattern.
+fn extract_reltype(s: &str) -> Result<String, RestoreError> {
+    let open = s
+        .find("-[")
+        .ok_or_else(|| RestoreError::InvalidFormat("missing relationship pattern".into()))?;
+    let close = s[open..]
+        .find("]->")
+        .map(|i| open + i)
+        .ok_or_else(|| RestoreError::InvalidFormat("missing `]->`".into()))?;
+    let inner = &s[open + 2..close];
+    let colon = inner
+        .find(':')
+        .ok_or_else(|| RestoreError::InvalidFormat("relationship missing type".into()))?;
+    Ok(strip_label_token(&inner[colon + 1..]))
+}
+
+/// Properties of a `-[var:`TYPE` {props}]->` pattern, if any.
+fn extract_rel_props(
+    s: &str,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, RestoreError> {
+    let open = s
+        .find("-[")
+        .ok_or_else(|| RestoreError::InvalidFormat("missing relationship pattern".into()))?;
+    let close = s[open..]
+        .find("]->")
+        .map(|i| open + i)
+        .ok_or_else(|| RestoreError::InvalidFormat("missing `]->`".into()))?;
+    let inner = &s[open + 2..close];
+    match first_brace(inner) {
+        Some(b) => Ok(CypherLit::new(&inner[b..]).map()?.as_object().cloned()),
+        None => Ok(None),
+    }
+}
+
+/// Labels of a `CREATE (var:`L1`:`L2` ...)` clause inside a larger statement.
+fn extract_create_labels(s: &str) -> Result<Vec<String>, RestoreError> {
+    let open = s
+        .find("CREATE (")
+        .map(|i| i + "CREATE (".len())
+        .or_else(|| s.find("CREATE(").map(|i| i + "CREATE(".len()))
+        .ok_or_else(|| RestoreError::InvalidFormat("UNWIND batch without CREATE".into()))?;
+    let head_end = s[open..]
+        .find(['{', ')'])
+        .map(|i| open + i)
+        .unwrap_or(s.len());
+    Ok(parse_label_list(&s[open..head_end]))
+}
+
+/// Every integer following a `UNIQUE IMPORT ID` occurrence, in order. Used to
+/// read both relationship endpoints out of a plain `MATCH ..., ...` head.
+fn extract_import_ids(s: &str) -> Vec<u64> {
+    const NEEDLE: &str = "UNIQUE IMPORT ID";
+    let mut ids = Vec::new();
+    let mut from = 0;
+    while let Some(p) = s[from..].find(NEEDLE) {
+        let after = from + p + NEEDLE.len();
+        if let Some(colon) = s[after..].find(':') {
+            let num: String = s[after + colon + 1..]
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = num.parse::<u64>() {
+                ids.push(n);
+            }
+        }
+        from = after;
+    }
+    ids
+}
+
+/// Split `head` (`var:`L1`:`L2``) into labels, dropping the leading variable
+/// and the synthetic `UNIQUE IMPORT LABEL`.
+fn parse_label_list(head: &str) -> Vec<String> {
+    let mut segs = Vec::new();
+    let mut buf = String::new();
+    let mut in_bt = false;
+    for c in head.chars() {
+        match c {
+            '`' => {
+                in_bt = !in_bt;
+                buf.push(c);
+            }
+            ':' if !in_bt => segs.push(std::mem::take(&mut buf)),
+            _ => buf.push(c),
+        }
+    }
+    segs.push(buf);
+    segs.into_iter()
+        .skip(1) // first segment is the node variable, not a label
+        .map(|s| s.trim().trim_matches('`').to_string())
+        .filter(|s| !s.is_empty() && s != "UNIQUE IMPORT LABEL")
+        .collect()
+}
+
+/// A single label/type token: backtick-quoted `` `Name` `` or bare, stopping
+/// at whitespace or `{`.
+fn strip_label_token(s: &str) -> String {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix('`') {
+        if let Some(end) = rest.find('`') {
+            return rest[..end].to_string();
+        }
+    }
+    s.split(|c: char| c.is_whitespace() || c == '{')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Byte index of the first `{` not inside a quoted run, or None.
+fn first_brace(s: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' | '`' => quote = Some(c),
+            '{' => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Byte index of `kw` at bracket-depth 0 outside any quoted run, or None.
+fn find_top_keyword(s: &str, kw: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' | '`' => quote = Some(c),
+            '[' | '{' | '(' => depth += 1,
+            ']' | '}' | ')' => depth -= 1,
+            _ if depth == 0 && s[i..].starts_with(kw) => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split a cypher script into statements on top-level `;`, honoring quoted
+/// runs (`"`, `'`, `` ` ``) and `()` / `[]` / `{}` nesting.
+fn split_statements(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in text.chars() {
+        if let Some(q) = quote {
+            buf.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' | '`' => {
+                quote = Some(c);
+                buf.push(c);
+            }
+            '[' | '{' | '(' => {
+                depth += 1;
+                buf.push(c);
+            }
+            ']' | '}' | ')' => {
+                depth -= 1;
+                buf.push(c);
+            }
+            ';' if depth == 0 => out.push(std::mem::take(&mut buf)),
+            _ => buf.push(c),
+        }
+    }
+    if !buf.trim().is_empty() {
+        out.push(buf);
+    }
+    out
+}
+
+/// A minimal recursive parser for the Cypher literal subset APOC emits: maps
+/// with backtick / bare / quoted keys, lists, double/single-quoted strings,
+/// numbers, `true`/`false`/`null`, and arbitrary nesting. It does NOT evaluate
+/// Cypher functions (`datetime(...)` etc.) — such a value is a hard error,
+/// because this path imports data, it does not execute Cypher.
+struct CypherLit {
+    chars: Vec<char>,
+    pos: usize,
+}
+
+impl CypherLit {
+    fn new(s: &str) -> Self {
+        Self {
+            chars: s.chars().collect(),
+            pos: 0,
+        }
+    }
+
+    /// Remaining unconsumed input (after a `list`/`map` parse).
+    fn rest(&self) -> String {
+        self.chars[self.pos..].iter().collect()
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    fn advance(&mut self) -> Option<char> {
+        let c = self.chars.get(self.pos).copied();
+        if c.is_some() {
+            self.pos += 1;
+        }
+        c
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(c) if c.is_whitespace()) {
+            self.pos += 1;
+        }
+    }
+
+    fn err(msg: impl Into<String>) -> RestoreError {
+        RestoreError::InvalidFormat(format!("cypher literal: {}", msg.into()))
+    }
+
+    fn expect(&mut self, c: char) -> Result<(), RestoreError> {
+        self.skip_ws();
+        if self.peek() == Some(c) {
+            self.pos += 1;
+            Ok(())
+        } else {
+            Err(Self::err(format!("expected '{c}'")))
+        }
+    }
+
+    fn value(&mut self) -> Result<serde_json::Value, RestoreError> {
+        self.skip_ws();
+        match self.peek() {
+            Some('{') => self.map(),
+            Some('[') => self.list(),
+            Some('"') | Some('\'') => Ok(serde_json::Value::String(self.string()?)),
+            Some(c) if c == '-' || c == '+' || c.is_ascii_digit() => self.number(),
+            Some(_) => self.bareword(),
+            None => Err(Self::err("unexpected end")),
+        }
+    }
+
+    fn map(&mut self) -> Result<serde_json::Value, RestoreError> {
+        self.expect('{')?;
+        let mut obj = serde_json::Map::new();
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some('}') => {
+                    self.pos += 1;
+                    break;
+                }
+                None => return Err(Self::err("unterminated map")),
+                _ => {}
+            }
+            let key = self.key()?;
+            self.expect(':')?;
+            let val = self.value()?;
+            obj.insert(key, val);
+            self.skip_ws();
+            match self.advance() {
+                Some(',') => {}
+                Some('}') => break,
+                _ => return Err(Self::err("expected ',' or '}'")),
+            }
+        }
+        Ok(serde_json::Value::Object(obj))
+    }
+
+    fn list(&mut self) -> Result<serde_json::Value, RestoreError> {
+        self.expect('[')?;
+        let mut arr = Vec::new();
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some(']') => {
+                    self.pos += 1;
+                    break;
+                }
+                None => return Err(Self::err("unterminated list")),
+                _ => {}
+            }
+            arr.push(self.value()?);
+            self.skip_ws();
+            match self.advance() {
+                Some(',') => {}
+                Some(']') => break,
+                _ => return Err(Self::err("expected ',' or ']'")),
+            }
+        }
+        Ok(serde_json::Value::Array(arr))
+    }
+
+    /// A map key: backtick-quoted, string-quoted, or a bare identifier.
+    fn key(&mut self) -> Result<String, RestoreError> {
+        self.skip_ws();
+        match self.peek() {
+            Some('`') => self.backtick(),
+            Some('"') | Some('\'') => self.string(),
+            Some(_) => {
+                let start = self.pos;
+                while let Some(c) = self.peek() {
+                    if c.is_whitespace() || c == ':' {
+                        break;
+                    }
+                    self.pos += 1;
+                }
+                if self.pos == start {
+                    return Err(Self::err("empty key"));
+                }
+                Ok(self.chars[start..self.pos].iter().collect())
+            }
+            None => Err(Self::err("expected key")),
+        }
+    }
+
+    fn backtick(&mut self) -> Result<String, RestoreError> {
+        self.expect('`')?;
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if c == '`' {
+                let s: String = self.chars[start..self.pos].iter().collect();
+                self.pos += 1;
+                return Ok(s);
+            }
+            self.pos += 1;
+        }
+        Err(Self::err("unterminated backtick"))
+    }
+
+    fn string(&mut self) -> Result<String, RestoreError> {
+        let quote = self.advance().ok_or_else(|| Self::err("expected string"))?;
+        let mut out = String::new();
+        while let Some(c) = self.advance() {
+            if c == '\\' {
+                match self.advance() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('r') => out.push('\r'),
+                    Some('b') => out.push('\u{8}'),
+                    Some('f') => out.push('\u{c}'),
+                    Some('u') => {
+                        let mut code = 0u32;
+                        for _ in 0..4 {
+                            let h = self.advance().ok_or_else(|| Self::err("bad \\u escape"))?;
+                            code = code * 16
+                                + h.to_digit(16).ok_or_else(|| Self::err("bad \\u hex"))?;
+                        }
+                        out.push(char::from_u32(code).ok_or_else(|| Self::err("bad codepoint"))?);
+                    }
+                    Some(other) => out.push(other),
+                    None => return Err(Self::err("dangling escape")),
+                }
+            } else if c == quote {
+                return Ok(out);
+            } else {
+                out.push(c);
+            }
+        }
+        Err(Self::err("unterminated string"))
+    }
+
+    fn number(&mut self) -> Result<serde_json::Value, RestoreError> {
+        let start = self.pos;
+        if matches!(self.peek(), Some('+') | Some('-')) {
+            self.pos += 1;
+        }
+        let mut is_float = false;
+        while let Some(c) = self.peek() {
+            match c {
+                '0'..='9' => self.pos += 1,
+                '.' | 'e' | 'E' => {
+                    is_float = true;
+                    self.pos += 1;
+                }
+                '+' | '-' => self.pos += 1, // exponent sign
+                _ => break,
+            }
+        }
+        let s: String = self.chars[start..self.pos].iter().collect();
+        if is_float {
+            let f: f64 = s
+                .parse()
+                .map_err(|_| Self::err(format!("bad number '{s}'")))?;
+            serde_json::Number::from_f64(f)
+                .map(serde_json::Value::Number)
+                .ok_or_else(|| Self::err("non-finite number"))
+        } else {
+            let i: i64 = s
+                .parse()
+                .map_err(|_| Self::err(format!("bad integer '{s}'")))?;
+            Ok(serde_json::Value::Number(i.into()))
+        }
+    }
+
+    fn bareword(&mut self) -> Result<serde_json::Value, RestoreError> {
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if c.is_alphanumeric() || c == '_' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        let word: String = self.chars[start..self.pos].iter().collect();
+        match word.to_lowercase().as_str() {
+            "true" => Ok(serde_json::Value::Bool(true)),
+            "false" => Ok(serde_json::Value::Bool(false)),
+            "null" => Ok(serde_json::Value::Null),
+            _ => Err(Self::err(format!(
+                "unsupported value '{word}' (cypher functions and temporals are not imported)"
+            ))),
+        }
+    }
+}
+
 /// Convert JSON value to CoordiNode Value.
 fn json_to_value(v: &serde_json::Value) -> Value {
     match v {
@@ -621,6 +1387,87 @@ fn json_to_rmpv(v: &serde_json::Value) -> rmpv::Value {
 mod tests {
     use super::*;
     use crate::backup::export::value_to_json;
+
+    #[test]
+    fn cypher_lit_parses_map_with_backtick_keys_and_mixed_values() {
+        let src = r#"{`name`:"admins", `count`:3, `active`:true, `score`:1.5, `tags`:["a","b"], `UNIQUE IMPORT ID`:7}"#;
+        let v = CypherLit::new(src).map().unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj["name"], serde_json::json!("admins"));
+        assert_eq!(obj["count"], serde_json::json!(3));
+        assert_eq!(obj["active"], serde_json::json!(true));
+        assert_eq!(obj["score"], serde_json::json!(1.5));
+        assert_eq!(obj["tags"], serde_json::json!(["a", "b"]));
+        assert_eq!(obj["UNIQUE IMPORT ID"], serde_json::json!(7));
+    }
+
+    #[test]
+    fn cypher_lit_parses_float_embedding_array() {
+        // The vector-embedding case: a list of floats must round-trip.
+        let src = "[0.1, -0.25, 3.0, 1.0e-3]";
+        let v = CypherLit::new(src).list().unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 4);
+        assert_eq!(arr[0].as_f64().unwrap(), 0.1);
+        assert_eq!(arr[1].as_f64().unwrap(), -0.25);
+        assert_eq!(arr[3].as_f64().unwrap(), 0.001);
+    }
+
+    #[test]
+    fn cypher_lit_rest_exposes_trailing_input() {
+        let mut lit = CypherLit::new("[1,2] AS row CREATE (n)");
+        let _ = lit.list().unwrap();
+        assert_eq!(lit.rest().trim(), "AS row CREATE (n)");
+    }
+
+    #[test]
+    fn cypher_lit_rejects_function_value() {
+        // datetime(...) is a function, not data — must fail loudly.
+        let err = CypherLit::new(r#"{`when`: datetime("2020")}"#).map();
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn split_statements_handles_multiline_and_semicolon_in_string() {
+        let text = "CREATE (n {`s`:\"a;b\"});\nUNWIND [1,2] AS row\nCREATE (m);\n";
+        let stmts: Vec<String> = split_statements(text)
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(stmts.len(), 2, "semicolon inside string must not split");
+        assert!(stmts[1].starts_with("UNWIND"));
+    }
+
+    #[test]
+    fn parse_label_list_drops_var_and_import_label() {
+        assert_eq!(
+            parse_label_list("n:`User`:`HighValue`"),
+            vec!["User", "HighValue"]
+        );
+        // Anonymous node (no var) plus the synthetic import label.
+        assert_eq!(
+            parse_label_list(":`Group`:`UNIQUE IMPORT LABEL`"),
+            vec!["Group"]
+        );
+    }
+
+    #[test]
+    fn extract_helpers_read_reltype_and_import_ids() {
+        assert_eq!(
+            extract_reltype("CREATE (a)-[r:`MEMBER_OF` {`since`:2020}]->(b)").unwrap(),
+            "MEMBER_OF"
+        );
+        let ids = extract_import_ids(
+            "MATCH (n1:`UNIQUE IMPORT LABEL`{`UNIQUE IMPORT ID`:5}), (n2:`L`{`UNIQUE IMPORT ID`:8})",
+        );
+        assert_eq!(ids, vec![5, 8]);
+        assert_eq!(
+            extract_create_labels("CREATE (n:`Person`{`UNIQUE IMPORT ID`: row._id}) SET n += x")
+                .unwrap(),
+            vec!["Person"]
+        );
+    }
 
     #[test]
     fn document_json_roundtrip_via_marker() {
