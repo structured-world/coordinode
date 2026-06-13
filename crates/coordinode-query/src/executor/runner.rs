@@ -6278,19 +6278,21 @@ fn execute_shortest_path(
             _ => continue,
         };
 
-        // BFS from src_uid to tgt_uid. Visited set is keyed by internal id, so
-        // a fast non-DoS hasher fits this hot loop.
+        // BFS from src_uid to tgt_uid, recording each node's predecessor so the
+        // actual path can be reconstructed. Keys are internal ids, so a fast
+        // non-DoS hasher fits this hot loop. `pred[n]` is None for the source
+        // and Some((predecessor, edge_type_idx)) otherwise.
         let mut queue: VecDeque<(u64, usize)> = VecDeque::new();
-        let mut visited: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
+        let mut pred: rustc_hash::FxHashMap<u64, Option<(u64, usize)>> =
+            rustc_hash::FxHashMap::default();
 
         queue.push_back((src_uid, 0));
-        visited.insert(src_uid);
+        pred.insert(src_uid, None);
 
-        let mut found_depth: Option<usize> = None;
-
+        let mut found = false;
         while let Some((uid, depth)) = queue.pop_front() {
             if uid == tgt_uid {
-                found_depth = Some(depth);
+                found = true;
                 break;
             }
             if depth >= max_d {
@@ -6300,21 +6302,47 @@ fn execute_shortest_path(
             let nid = NodeId::from_raw(uid);
             let neighbors = expand_one_hop(nid, sp.edge_types, sp.direction, ctx)?;
 
-            for (neighbor_uid, _et_idx) in neighbors {
-                if visited.insert(neighbor_uid) {
+            for (neighbor_uid, et_idx) in neighbors {
+                if let std::collections::hash_map::Entry::Vacant(e) = pred.entry(neighbor_uid) {
+                    e.insert(Some((uid, et_idx)));
                     queue.push_back((neighbor_uid, depth + 1));
                 }
             }
         }
 
         let mut out = row.clone();
-        match found_depth {
-            Some(d) => {
-                out.insert(sp.path_variable.to_string(), Value::Int(d as i64));
+        if found {
+            // Walk predecessors back from tgt to src, then reverse into a
+            // forward node/relationship sequence. A zero-length path (src ==
+            // tgt) yields a single node and no relationships.
+            let mut back: Vec<(u64, usize)> = Vec::new();
+            let mut cur = tgt_uid;
+            while let Some(Some((p, et))) = pred.get(&cur).copied() {
+                back.push((cur, et));
+                cur = p;
             }
-            None => {
-                out.insert(sp.path_variable.to_string(), Value::Null);
+            back.reverse();
+
+            let mut nodes = Vec::with_capacity(back.len() + 1);
+            let mut rels = Vec::with_capacity(back.len());
+            nodes.push(src_uid);
+            let mut prev = src_uid;
+            for (node, et_idx) in back {
+                let edge_type = sp.edge_types.get(et_idx).cloned().unwrap_or_default();
+                rels.push(coordinode_core::graph::types::PathRel {
+                    edge_type,
+                    source: prev,
+                    target: node,
+                });
+                nodes.push(node);
+                prev = node;
             }
+            out.insert(
+                sp.path_variable.to_string(),
+                Value::Path(coordinode_core::graph::types::PathValue { nodes, rels }),
+            );
+        } else {
+            out.insert(sp.path_variable.to_string(), Value::Null);
         }
         results.push(out);
     }
@@ -16814,7 +16842,18 @@ mod tests {
 
         let results = execute_shortest_path(&[input_row], &sp, &mut ctx).expect("sp");
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].get("p"), Some(&Value::Int(1)));
+        // p is now a Path: Alice -[:KNOWS]-> Bob (length 1, nodes [1, 2]).
+        assert_eq!(
+            results[0].get("p"),
+            Some(&Value::Path(coordinode_core::graph::types::PathValue {
+                nodes: vec![1, 2],
+                rels: vec![coordinode_core::graph::types::PathRel {
+                    edge_type: "KNOWS".into(),
+                    source: 1,
+                    target: 2,
+                }],
+            }))
+        );
     }
 
     #[test]
@@ -16839,8 +16878,18 @@ mod tests {
 
         let results = execute_shortest_path(&[input_row], &sp, &mut ctx).expect("sp");
         assert_eq!(results.len(), 1);
-        // Alice→Charlie is direct (1 hop), should find shortest
-        assert_eq!(results[0].get("p"), Some(&Value::Int(1)));
+        // Alice→Charlie is direct (1 hop): path nodes [1, 3], one KNOWS rel.
+        assert_eq!(
+            results[0].get("p"),
+            Some(&Value::Path(coordinode_core::graph::types::PathValue {
+                nodes: vec![1, 3],
+                rels: vec![coordinode_core::graph::types::PathRel {
+                    edge_type: "KNOWS".into(),
+                    source: 1,
+                    target: 3,
+                }],
+            }))
+        );
     }
 
     #[test]
@@ -16893,7 +16942,14 @@ mod tests {
         };
 
         let results = execute_shortest_path(&[input_row], &sp, &mut ctx).expect("sp");
-        assert_eq!(results[0].get("p"), Some(&Value::Int(0)));
+        // Alice→Alice is a zero-length path: a single node, no relationships.
+        assert_eq!(
+            results[0].get("p"),
+            Some(&Value::Path(coordinode_core::graph::types::PathValue {
+                nodes: vec![1],
+                rels: vec![],
+            }))
+        );
     }
 
     // -- Aggregation: DISTINCT --
