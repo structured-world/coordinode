@@ -3964,6 +3964,13 @@ fn execute_varlen_traverse(
         let mut visited_edges: rustc_hash::FxHashSet<(u64, u64, usize)> =
             rustc_hash::FxHashSet::default();
 
+        // Nodes already expanded in this traversal. A node is expanded at most
+        // once: re-expanding it (reached again via a different edge at the same
+        // or a later depth) would only re-encounter its already-visited
+        // out-edges, so the emitted rows are identical and the adjacency read
+        // is pure waste. Guarding here removes that waste across every depth.
+        let mut expanded: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
+
         // Adaptive: track total edges processed for divergence detection.
         let mut edges_processed: usize = 0;
         let mut divergence_detected = false;
@@ -3986,6 +3993,10 @@ fn execute_varlen_traverse(
             let mut depth_neighbors: Vec<(u64, u64, usize)> = Vec::new(); // (src, tgt, et_idx)
 
             for &src_uid in &frontier {
+                // Expand each node at most once across the whole traversal.
+                if !expanded.insert(src_uid) {
+                    continue;
+                }
                 let src_nid = NodeId::from_raw(src_uid);
                 let neighbors = expand_one_hop(src_nid, params.edge_types, params.direction, ctx)?;
 
@@ -4092,14 +4103,6 @@ fn execute_varlen_traverse(
                     results.extend(build_target_rows(&trp, params, ctx)?);
                 }
             }
-
-            // A node reached via several edges at this depth need only be
-            // expanded once: its out-edges are identical regardless of how it
-            // was reached, and edge-level dedup keeps the emitted rows
-            // unchanged. Collapsing duplicates here avoids redundant adjacency
-            // reads on dense / power-law graphs (the common social-graph case).
-            let mut seen_frontier: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
-            next_frontier.retain(|uid| seen_frontier.insert(*uid));
 
             frontier = next_frontier;
         }

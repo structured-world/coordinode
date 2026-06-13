@@ -375,6 +375,51 @@ fn varlen_cycle_terminates() {
     );
 }
 
+#[test]
+fn varlen_diamond_node_reached_twice_still_expands_onward() {
+    // Diamond with a tail: A→B, A→C, B→D, C→D, D→E. D is reachable by two
+    // distinct 2-hop paths. The traversal must still expand D (so E is
+    // reached) and must report D exactly once among distinct endpoints — the
+    // expand-once invariant must not drop the onward edge D→E.
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+
+    for (id, name) in [(1u64, "A"), (2, "B"), (3, "C"), (4, "D"), (5, "E")] {
+        insert_node(
+            engine,
+            1,
+            id,
+            "X",
+            &[("name", Value::String(name.into()))],
+            &mut interner,
+        );
+    }
+    insert_edge(engine, "NEXT", 1, 2);
+    insert_edge(engine, "NEXT", 1, 3);
+    insert_edge(engine, "NEXT", 2, 4);
+    insert_edge(engine, "NEXT", 3, 4);
+    insert_edge(engine, "NEXT", 4, 5);
+
+    let results = run_cypher(
+        "MATCH (a:X {name: \"A\"})-[:NEXT*1..3]->(b) RETURN DISTINCT b.name AS name",
+        engine,
+        &mut interner,
+    );
+
+    let mut names: Vec<String> = results
+        .iter()
+        .filter_map(|r| match r.get("name") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    names.sort();
+    // B, C at 1 hop; D at 2 hops; E at 3 hops (proves D expanded despite the
+    // double arrival). D appears once under DISTINCT.
+    assert_eq!(names, vec!["B", "C", "D", "E"], "got {names:?}");
+}
+
 // ── Aggregation: full Cypher pipeline ───────────────────────────────────
 
 #[test]
