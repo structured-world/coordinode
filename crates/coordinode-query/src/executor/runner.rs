@@ -3106,8 +3106,13 @@ fn execute_btree_index_scan(
         }
     }
 
-    // Evaluate the lookup value from the expression.
-    let lookup_val = eval_expr(value_expr, &Row::new());
+    // Evaluate the lookup value. A correlated key (e.g. `WHERE a.pid = e.s`
+    // driven per outer row) resolves against `correlated_row`; a literal /
+    // parameter key ignores the row, so the empty-row fallback is equivalent.
+    let lookup_val = match &ctx.correlated_row {
+        Some(corr) => eval_expr(value_expr, corr),
+        None => eval_expr(value_expr, &Row::new()),
+    };
 
     // Use index_scan_exact to find node IDs matching the lookup value.
     let node_ids = crate::index::ops::index_scan_exact(ctx.engine, index_name, &lookup_val)
@@ -6830,6 +6835,9 @@ fn scan_filter_references_outside(
         } => property_filters
             .iter()
             .any(|(_, expr)| expr_references_outside(expr, bound)),
+        // A correlated index point-lookup carries its key in `value_expr`;
+        // it must drive per-outer-row execution just like a correlated scan.
+        LogicalOp::IndexScan { value_expr, .. } => expr_references_outside(value_expr, bound),
         LogicalOp::Traverse { input, .. }
         | LogicalOp::Filter { input, .. }
         | LogicalOp::VectorFilter { input, .. }
@@ -19771,6 +19779,157 @@ mod tests {
             name_val,
             Some(&coordinode_core::graph::types::Value::String("Bob".into())),
             "row should have n.name = Bob, got {name_val:?}"
+        );
+    }
+
+    /// Planner: a correlated equality (`a.pid = e.s` lowered to a property
+    /// filter) on an indexed property is rewritten to IndexScan, even when it
+    /// sits on the right of a CartesianProduct (optimizer must recurse there).
+    #[test]
+    fn correlated_property_filter_rewrites_to_index_scan() {
+        let registry = crate::index::IndexRegistry::new();
+        registry.register_in_memory(crate::index::IndexDefinition::btree(
+            "person_pid",
+            "Person",
+            "pid",
+        ));
+
+        // right = NodeScan(a:Person {pid: e.s}) — correlated key e.s.
+        let right = LogicalOp::NodeScan {
+            variable: "a".to_string(),
+            labels: vec!["Person".to_string()],
+            property_filters: vec![(
+                "pid".to_string(),
+                Expr::PropertyAccess {
+                    expr: Box::new(Expr::Variable("e".to_string())),
+                    property: "s".to_string(),
+                },
+            )],
+        };
+        let left = LogicalOp::NodeScan {
+            variable: "e".to_string(),
+            labels: vec!["Edge".to_string()],
+            property_filters: vec![],
+        };
+        let plan = LogicalOp::CartesianProduct {
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+
+        let optimized = crate::planner::optimize_index_selection(plan, &registry);
+        let explain = crate::planner::logical::LogicalPlan {
+            root: optimized,
+            snapshot_ts: None,
+            vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
+        }
+        .explain();
+
+        assert!(
+            explain.contains("IndexScan(a:Person ON person_pid(pid))"),
+            "correlated filter must become IndexScan, got:\n{explain}"
+        );
+    }
+
+    /// Planner: a self-referential equality (`a.pid = a.other`) must NOT be
+    /// rewritten to IndexScan — the key depends on the scanned row.
+    #[test]
+    fn self_referential_filter_stays_node_scan() {
+        let registry = crate::index::IndexRegistry::new();
+        registry.register_in_memory(crate::index::IndexDefinition::btree(
+            "person_pid",
+            "Person",
+            "pid",
+        ));
+
+        let plan = LogicalOp::NodeScan {
+            variable: "a".to_string(),
+            labels: vec!["Person".to_string()],
+            property_filters: vec![(
+                "pid".to_string(),
+                Expr::PropertyAccess {
+                    expr: Box::new(Expr::Variable("a".to_string())),
+                    property: "other".to_string(),
+                },
+            )],
+        };
+
+        let optimized = crate::planner::optimize_index_selection(plan, &registry);
+        let explain = crate::planner::logical::LogicalPlan {
+            root: optimized,
+            snapshot_ts: None,
+            vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
+        }
+        .explain();
+
+        assert!(
+            !explain.contains("IndexScan"),
+            "self-referential key must not use an index point lookup, got:\n{explain}"
+        );
+        assert!(
+            explain.contains("NodeScan"),
+            "expected NodeScan, got:\n{explain}"
+        );
+    }
+
+    /// Executor: a correlated IndexScan resolves `value_expr` against
+    /// `correlated_row`, so a per-outer-row key (`e.s`) reaches the index.
+    #[test]
+    fn index_scan_resolves_correlated_key() {
+        let (_dir, engine, mut interner) = setup_test_graph();
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+        let registry = crate::index::IndexRegistry::new();
+
+        let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
+        execute_op(
+            &LogicalOp::CreateIndex {
+                name: "user_name_idx".to_string(),
+                label: "User".to_string(),
+                property: "name".to_string(),
+                unique: false,
+                sparse: false,
+                filter: None,
+            },
+            &mut ctx,
+        )
+        .expect("CREATE INDEX failed");
+
+        // Outer row binds e.s = "Bob"; the index key is the correlated e.s.
+        let mut corr = Row::new();
+        corr.insert(
+            "e.s".to_string(),
+            coordinode_core::graph::types::Value::String("Bob".into()),
+        );
+        ctx.correlated_row = Some(corr);
+
+        let rows = execute_op(
+            &LogicalOp::IndexScan {
+                variable: "n".to_string(),
+                label: "User".to_string(),
+                index_name: "user_name_idx".to_string(),
+                property: "name".to_string(),
+                value_expr: Expr::PropertyAccess {
+                    expr: Box::new(Expr::Variable("e".to_string())),
+                    property: "s".to_string(),
+                },
+            },
+            &mut ctx,
+        )
+        .expect("correlated IndexScan failed");
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "correlated IndexScan for e.s='Bob' should return one row, got {}",
+            rows.len()
+        );
+        assert_eq!(
+            rows[0].get("n.name"),
+            Some(&coordinode_core::graph::types::Value::String("Bob".into())),
+            "correlated IndexScan should resolve to Bob"
         );
     }
 

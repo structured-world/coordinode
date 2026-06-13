@@ -842,49 +842,65 @@ pub fn optimize_index_selection(
     op: LogicalOp,
     registry: &crate::index::IndexRegistry,
 ) -> LogicalOp {
-    // For Filter(NodeScan), check if we can rewrite to IndexScan before recursing.
-    if let LogicalOp::Filter { input, predicate } = op {
-        // Check if the pattern matches: Filter(NodeScan{single-label}, var.prop = val).
-        if let LogicalOp::NodeScan {
-            ref variable,
-            ref labels,
-            ref property_filters,
-        } = *input
-        {
-            if labels.len() == 1 && property_filters.is_empty() {
-                if let Expr::BinaryOp {
-                    ref left,
-                    op: BinaryOperator::Eq,
-                    ref right,
-                } = predicate
-                {
-                    let label = &labels[0];
-                    if let Some(prop) = extract_index_property(left, variable) {
-                        if matches!(right.as_ref(), Expr::Literal(_) | Expr::Parameter(_)) {
-                            let indexes = registry.indexes_for_property(label, &prop);
-                            if let Some(idx) = indexes.into_iter().next() {
-                                return LogicalOp::IndexScan {
-                                    variable: variable.clone(),
-                                    label: label.clone(),
-                                    index_name: idx.name.clone(),
-                                    property: prop,
-                                    value_expr: *right.clone(),
-                                };
+    match op {
+        // Filter(NodeScan{single-label, no inline filters}, var.prop = key)
+        // -> IndexScan when an index exists and `key` does not reference the
+        // scan variable. `key` may be a literal, a parameter, or a correlated
+        // outer value (e.g. `WHERE a.pid = e.s` driven per UNWIND row); the
+        // executor resolves a correlated key against the outer row.
+        LogicalOp::Filter { input, predicate } => {
+            if let LogicalOp::NodeScan {
+                ref variable,
+                ref labels,
+                ref property_filters,
+            } = *input
+            {
+                if labels.len() == 1 && property_filters.is_empty() {
+                    if let Expr::BinaryOp {
+                        ref left,
+                        op: BinaryOperator::Eq,
+                        ref right,
+                    } = predicate
+                    {
+                        if let Some(prop) = extract_index_property(left, variable) {
+                            if !expr_references_var(right, variable) {
+                                if let Some(scan) =
+                                    try_index_rewrite(variable, &labels[0], &prop, right, registry)
+                                {
+                                    return scan;
+                                }
                             }
                         }
                     }
                 }
             }
+            LogicalOp::Filter {
+                input: Box::new(optimize_index_selection(*input, registry)),
+                predicate,
+            }
         }
-        // Pattern not matched — recurse into input, keep Filter.
-        return LogicalOp::Filter {
-            input: Box::new(optimize_index_selection(*input, registry)),
-            predicate,
-        };
-    }
-
-    // For all other operators, recurse into direct children only.
-    match op {
+        // Bare NodeScan with exactly one inline equality filter on an indexed
+        // property -> IndexScan. This is the lowered form of `MATCH (a:L {p: k})`
+        // / `WHERE a.p = k`. `k` must not reference the scan variable. Only a
+        // single filter is rewritten (a point lookup carries one key); a
+        // multi-filter scan stays a NodeScan so residual predicates still apply.
+        LogicalOp::NodeScan {
+            variable,
+            labels,
+            property_filters,
+        } if labels.len() == 1 && property_filters.len() == 1 => {
+            let (prop, key) = &property_filters[0];
+            if !expr_references_var(key, &variable) {
+                if let Some(scan) = try_index_rewrite(&variable, &labels[0], prop, key, registry) {
+                    return scan;
+                }
+            }
+            LogicalOp::NodeScan {
+                variable,
+                labels,
+                property_filters,
+            }
+        }
         LogicalOp::Project {
             input,
             items,
@@ -899,6 +915,10 @@ pub fn optimize_index_selection(
             items,
         },
         LogicalOp::Limit { input, count } => LogicalOp::Limit {
+            input: Box::new(optimize_index_selection(*input, registry)),
+            count,
+        },
+        LogicalOp::Skip { input, count } => LogicalOp::Skip {
             input: Box::new(optimize_index_selection(*input, registry)),
             count,
         },
@@ -936,8 +956,98 @@ pub fn optimize_index_selection(
             group_by,
             aggregates,
         },
-        // Leaf ops, DDL ops, and any ops without an input field — return as-is.
+        LogicalOp::CartesianProduct { left, right } => LogicalOp::CartesianProduct {
+            left: Box::new(optimize_index_selection(*left, registry)),
+            right: Box::new(optimize_index_selection(*right, registry)),
+        },
+        LogicalOp::LeftOuterJoin { left, right } => LogicalOp::LeftOuterJoin {
+            left: Box::new(optimize_index_selection(*left, registry)),
+            right: Box::new(optimize_index_selection(*right, registry)),
+        },
+        LogicalOp::Unwind {
+            input,
+            expr,
+            variable,
+        } => LogicalOp::Unwind {
+            input: Box::new(optimize_index_selection(*input, registry)),
+            expr,
+            variable,
+        },
+        LogicalOp::CreateNode {
+            input,
+            variable,
+            labels,
+            properties,
+        } => LogicalOp::CreateNode {
+            input: input.map(|i| Box::new(optimize_index_selection(*i, registry))),
+            variable,
+            labels,
+            properties,
+        },
+        LogicalOp::CreateEdge {
+            input,
+            source,
+            target,
+            edge_type,
+            direction,
+            variable,
+            properties,
+        } => LogicalOp::CreateEdge {
+            input: Box::new(optimize_index_selection(*input, registry)),
+            source,
+            target,
+            edge_type,
+            direction,
+            variable,
+            properties,
+        },
+        // Leaf ops, DDL ops, mutation ops over non-MATCH inputs, and any op
+        // without a child relevant to index selection — return as-is.
         other => other,
+    }
+}
+
+/// Build an `IndexScan` for `(label, property) = value_expr` if a B-tree index
+/// is registered for that pair. Returns None when no index matches.
+fn try_index_rewrite(
+    variable: &str,
+    label: &str,
+    property: &str,
+    value_expr: &Expr,
+    registry: &crate::index::IndexRegistry,
+) -> Option<LogicalOp> {
+    let idx = registry
+        .indexes_for_property(label, property)
+        .into_iter()
+        .next()?;
+    Some(LogicalOp::IndexScan {
+        variable: variable.to_string(),
+        label: label.to_string(),
+        index_name: idx.name.clone(),
+        property: property.to_string(),
+        value_expr: value_expr.clone(),
+    })
+}
+
+/// True if `expr` references `var` (as `Variable(var)`, `Variable("var.prop")`,
+/// or a property access on `var`). Rejects self-referential equality
+/// (`a.x = a.y`) from index point-lookup rewriting while allowing literals,
+/// parameters, and correlated outer references.
+fn expr_references_var(expr: &Expr, var: &str) -> bool {
+    match expr {
+        Expr::Variable(name) => {
+            name == var || name.strip_prefix(var).is_some_and(|s| s.starts_with('.'))
+        }
+        Expr::PropertyAccess { expr, .. } | Expr::UnaryOp { expr, .. } => {
+            expr_references_var(expr, var)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_references_var(left, var) || expr_references_var(right, var)
+        }
+        Expr::FunctionCall { args, .. } | Expr::List(args) => {
+            args.iter().any(|e| expr_references_var(e, var))
+        }
+        _ => false,
     }
 }
 
