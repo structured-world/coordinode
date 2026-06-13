@@ -89,6 +89,11 @@ crossbeam-epoch = "0.9"
 
 # Fast non-DoS hasher for internal-id keyed maps/sets on hot paths.
 rustc-hash = "2.1"
+
+# Pure-Rust decompressors for transparently reading compressed restore inputs
+# (no C FFI: bzip2-rs is decompress-only pure Rust; flate2 uses miniz_oxide).
+bzip2-rs = "0.1"
+flate2 = "1"
 # parking_lot: fast userspace-fast-path RwLock/Mutex, ~8-byte vs std's ~40-byte,
 # no futex syscall on the uncontended path. Std-only, std-tier consumers only.
 parking_lot = "0.12"

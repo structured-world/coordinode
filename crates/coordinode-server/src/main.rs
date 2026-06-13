@@ -529,9 +529,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| format!("backup failed: {e}"))?
                 }
                 coordinode_embed::backup::BackupFormat::ApocJson
-                | coordinode_embed::backup::BackupFormat::ApocCypher => {
-                    return Err("apoc-json and apoc-cypher are import-only formats; \
-                                use them with restore, not backup"
+                | coordinode_embed::backup::BackupFormat::ApocCypher
+                | coordinode_embed::backup::BackupFormat::HetioJson => {
+                    return Err("apoc-json, apoc-cypher and hetio-json are import-only \
+                                formats; use them with restore, not backup"
                         .into());
                 }
                 coordinode_embed::backup::BackupFormat::RaftSnapshot => {
@@ -618,10 +619,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let file = std::fs::File::open(&input)
                 .map_err(|e| format!("failed to open input file '{input}': {e}"))?;
+            // Transparently decompress a bzip2/gzip-compressed input (tool-side,
+            // pure-Rust). Uncompressed input passes through unchanged.
+            let mut reader = decompressing_reader(file)
+                .map_err(|e| format!("failed to read input file '{input}': {e}"))?;
 
             match format {
                 coordinode_embed::backup::BackupFormat::Json => {
-                    let mut reader = std::io::BufReader::new(file);
                     let mut interner = db.interner().clone();
                     let shard_id = 1u16;
                     let stats = coordinode_embed::backup::restore::restore_json(
@@ -639,7 +643,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 coordinode_embed::backup::BackupFormat::Binary => {
-                    let mut reader = std::io::BufReader::new(file);
                     let (stats, _interner) =
                         coordinode_embed::backup::restore::restore_binary(db.engine(), &mut reader)
                             .map_err(|e| format!("restore failed: {e}"))?;
@@ -651,7 +654,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 coordinode_embed::backup::BackupFormat::Cypher => {
-                    let mut reader = std::io::BufReader::new(file);
                     let mut interner = db.interner().clone();
                     let shard_id = 1u16;
                     let stats = coordinode_embed::backup::restore::restore_cypher(
@@ -670,7 +672,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 coordinode_embed::backup::BackupFormat::ApocJson => {
-                    let mut reader = std::io::BufReader::new(file);
                     let mut interner = db.interner().clone();
                     let shard_id = 1u16;
                     let stats = coordinode_embed::backup::restore::restore_apoc_json(
@@ -689,7 +690,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 coordinode_embed::backup::BackupFormat::ApocCypher => {
-                    let mut reader = std::io::BufReader::new(file);
                     let mut interner = db.interner().clone();
                     let shard_id = 1u16;
                     let stats = coordinode_embed::backup::restore::restore_apoc_cypher(
@@ -707,9 +707,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "restore complete (apoc-cypher)"
                     );
                 }
+                coordinode_embed::backup::BackupFormat::HetioJson => {
+                    let mut interner = db.interner().clone();
+                    let shard_id = 1u16;
+                    let stats = coordinode_embed::backup::restore::restore_hetio_json(
+                        db.engine(),
+                        &mut interner,
+                        shard_id,
+                        &mut reader,
+                    )
+                    .map_err(|e| format!("restore failed: {e}"))?;
+                    *db.interner_arc().write() = interner;
+                    info!(
+                        nodes = stats.nodes,
+                        edges = stats.edges,
+                        schema = stats.schema_entries,
+                        "restore complete (hetio-json)"
+                    );
+                }
                 coordinode_embed::backup::BackupFormat::RaftSnapshot => {
                     use std::io::Read;
-                    let mut reader = std::io::BufReader::new(file);
                     let mut data = Vec::new();
                     reader
                         .read_to_end(&mut data)
@@ -780,6 +797,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Wrap a restore input file so a bzip2- or gzip-compressed dump is
+/// transparently decompressed before parsing. The leading magic bytes are
+/// sniffed; an uncompressed file passes through unchanged. Decompression lives
+/// tool-side (this binary) with pure-Rust decoders only (bzip2-rs decompress,
+/// flate2/miniz_oxide) so the database runtime never links a compression
+/// codec. A zstd-compressed input is rejected with guidance rather than
+/// silently mishandled.
+fn decompressing_reader<R: std::io::Read + 'static>(
+    mut reader: R,
+) -> std::io::Result<Box<dyn std::io::BufRead>> {
+    use std::io::Read;
+    let mut magic = [0u8; 4];
+    let mut filled = 0;
+    while filled < magic.len() {
+        match reader.read(&mut magic[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let head = magic[..filled].to_vec();
+    let chained = std::io::Cursor::new(head.clone()).chain(reader);
+    if head.starts_with(b"BZh") {
+        Ok(Box::new(std::io::BufReader::new(
+            bzip2_rs::DecoderReader::new(chained),
+        )))
+    } else if head.starts_with(&[0x1f, 0x8b]) {
+        Ok(Box::new(std::io::BufReader::new(
+            flate2::read::GzDecoder::new(chained),
+        )))
+    } else if head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        Err(std::io::Error::other(
+            "zstd-compressed restore input is not yet supported; decompress it first",
+        ))
+    } else {
+        Ok(Box::new(std::io::BufReader::new(chained)))
+    }
 }
 
 /// Execute `coordinode admin node decommission` — connect to a running cluster and
@@ -953,4 +1010,41 @@ async fn admin_node_join(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod decompress_tests {
+    use super::decompressing_reader;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn gzip_input_is_transparently_decompressed() {
+        let plain = b"hello\nworld\n";
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(plain).unwrap();
+        let gz = enc.finish().unwrap();
+        let mut r = decompressing_reader(std::io::Cursor::new(gz)).unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn uncompressed_input_passes_through() {
+        let plain = b"{\"type\":\"node\"}\n";
+        let mut r = decompressing_reader(std::io::Cursor::new(plain.to_vec())).unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn zstd_magic_is_rejected_with_guidance() {
+        let zstd = vec![0x28u8, 0xb5, 0x2f, 0xfd, 0, 0, 0, 0];
+        match decompressing_reader(std::io::Cursor::new(zstd)) {
+            Err(e) => assert!(e.to_string().contains("zstd"), "got: {e}"),
+            Ok(_) => panic!("expected zstd rejection"),
+        }
+    }
 }

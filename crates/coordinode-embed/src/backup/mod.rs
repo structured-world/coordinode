@@ -37,6 +37,10 @@ pub enum BackupFormat {
     /// user-data partition, the same artifact the Raft layer ships between
     /// nodes. Fast whole-database backup/restore; not human-readable.
     RaftSnapshot,
+    /// Hetionet "hetnet" JSON (dhimmel/hetio source format). Import-only:
+    /// `{nodes, edges}` with `(kind, identifier)` node keys, mapped to node
+    /// labels / relationship types the way hetnetpy loads it into Neo4j.
+    HetioJson,
 }
 
 #[cfg(test)]
@@ -247,6 +251,44 @@ mod tests {
             .execute_cypher("MATCH (a)-[:KNOWS]->(b) RETURN b.name")
             .unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn hetio_json_restore_maps_kinds_and_resolves_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Database::open(dir.path()).unwrap();
+
+        // Hetnet shape: nodes keyed by (kind, identifier) where identifier is a
+        // string OR an integer; edges reference endpoints by [kind, identifier].
+        let doc = concat!(
+            r#"{"nodes":["#,
+            r#"{"kind":"Gene","identifier":9489,"name":"GeneA","data":{"chromosome":"1"}},"#,
+            r#"{"kind":"Disease","identifier":"DOID:1","name":"DiseaseB","data":{}}"#,
+            r#"],"edges":["#,
+            r#"{"source_id":["Gene",9489],"target_id":["Disease","DOID:1"],"kind":"associates","direction":"both","data":{"score":0.9}}"#,
+            r#"]}"#,
+        );
+
+        let mut interner = db.interner().clone();
+        let mut cursor = std::io::BufReader::new(std::io::Cursor::new(doc.as_bytes()));
+        let stats =
+            restore::restore_hetio_json(db.engine(), &mut interner, 1, &mut cursor).unwrap();
+        *db.interner_arc().write() = interner;
+
+        assert_eq!(stats.nodes, 2, "two hetnet nodes");
+        assert_eq!(stats.edges, 1, "one hetnet edge");
+
+        // kind became the label; the integer-id Gene resolves the edge to the
+        // string-id Disease (mixed identifier types map consistently).
+        let rows = db
+            .execute_cypher("MATCH (g:Gene)-[:associates]->(d:Disease) RETURN d.name")
+            .unwrap();
+        assert_eq!(rows.len(), 1, "edge resolves across mixed-type identifiers");
+        // identifier is preserved as a property.
+        let g = db
+            .execute_cypher("MATCH (g:Gene {identifier: 9489}) RETURN g.name")
+            .unwrap();
+        assert_eq!(g.len(), 1, "node found by its original hetnet identifier");
     }
 
     #[test]

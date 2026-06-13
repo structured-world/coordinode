@@ -30,6 +30,9 @@ coordinode-search = { workspace = true, optional = true }
 coordinode-storage = { workspace = true }
 coordinode-raft = { workspace = true }
 coordinode-auth = { workspace = true }
+# Decompression for the restore CLI only (tool-side, never the DB runtime).
+bzip2-rs = { workspace = true }
+flate2 = { workspace = true }
 structured-proxy = { version = "1", optional = true }
 tokio = { workspace = true }
 tonic = { workspace = true }

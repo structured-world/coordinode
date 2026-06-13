@@ -1382,6 +1382,102 @@ fn json_to_rmpv(v: &serde_json::Value) -> rmpv::Value {
     }
 }
 
+/// Restore from a Hetionet "hetnet" JSON document (the dhimmel/hetio source
+/// format that the `hetnetpy` library turns into a Neo4j graph). The document
+/// is a single object: `{nodes: [{kind, identifier, name, data}], edges:
+/// [{source_id: [kind, id], target_id: [kind, id], kind, data}]}`.
+///
+/// Node identity is a `(kind, identifier)` pair (identifier may be a string or
+/// an integer), so this mints a sequential node id per node and resolves edge
+/// endpoints through that map. `kind` becomes the node label / relationship
+/// type; `name` and `data` become properties. This mirrors what hetnetpy does
+/// when it writes the hetnet into Neo4j, so the dataset loads straight from the
+/// JSON with no Neo4j round trip.
+pub fn restore_hetio_json<R: BufRead>(
+    engine: &StorageEngine,
+    interner: &mut FieldInterner,
+    shard_id: u16,
+    reader: &mut R,
+) -> Result<RestoreStats, RestoreError> {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct HetNode {
+        kind: String,
+        identifier: serde_json::Value,
+        #[serde(default)]
+        name: Option<serde_json::Value>,
+        #[serde(default)]
+        data: serde_json::Map<String, serde_json::Value>,
+    }
+    #[derive(Deserialize)]
+    struct HetEdge {
+        source_id: (String, serde_json::Value),
+        target_id: (String, serde_json::Value),
+        kind: String,
+        #[serde(default)]
+        data: serde_json::Map<String, serde_json::Value>,
+    }
+    #[derive(Deserialize)]
+    struct HetnetDoc {
+        nodes: Vec<HetNode>,
+        edges: Vec<HetEdge>,
+    }
+
+    let doc: HetnetDoc = serde_json::from_reader(reader)
+        .map_err(|e| RestoreError::Deserialization(format!("hetnet json: {e}")))?;
+
+    let node_store = coordinode_modality::LocalNodeStore::new(engine);
+    let mut stats = RestoreStats::default();
+    let mut id_map: std::collections::HashMap<(String, String), u64> =
+        std::collections::HashMap::with_capacity(doc.nodes.len());
+
+    for (idx, n) in doc.nodes.iter().enumerate() {
+        let id = idx as u64;
+        id_map.insert((n.kind.clone(), ident_key(&n.identifier)), id);
+        let mut props = n.data.clone();
+        if let Some(name) = &n.name {
+            props.insert("name".to_string(), name.clone());
+        }
+        props.insert("identifier".to_string(), n.identifier.clone());
+        write_node_record(
+            &node_store,
+            interner,
+            shard_id,
+            id,
+            vec![n.kind.clone()],
+            Some(&props),
+        )?;
+        stats.nodes += 1;
+    }
+
+    for e in &doc.edges {
+        let src = id_map.get(&(e.source_id.0.clone(), ident_key(&e.source_id.1)));
+        let tgt = id_map.get(&(e.target_id.0.clone(), ident_key(&e.target_id.1)));
+        let (Some(&src), Some(&tgt)) = (src, tgt) else {
+            // Endpoint not present in the node set: skip the dangling edge.
+            continue;
+        };
+        let props = if e.data.is_empty() {
+            None
+        } else {
+            Some(&e.data)
+        };
+        write_edge_record(engine, interner, src, tgt, &e.kind, props)?;
+        stats.edges += 1;
+    }
+    Ok(stats)
+}
+
+/// Canonical string key for a hetnet identifier (string or integer) so a node
+/// and the edge endpoints that reference it resolve to the same map entry.
+fn ident_key(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
