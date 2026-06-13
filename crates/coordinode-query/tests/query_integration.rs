@@ -439,6 +439,41 @@ fn unwind_list_end_to_end() {
     assert_eq!(results[2].get("x"), Some(&Value::Int(30)));
 }
 
+// ── Correlated inline property filter (regression) ──────────────────────
+
+#[test]
+fn inline_property_filter_resolves_outer_bound_variable() {
+    // Regression: an inline node-pattern property map whose value is a
+    // member-access on an outer (UNWIND-bound) variable must resolve at
+    // runtime, matching nodes by the per-row value — NOT silently
+    // return zero rows. `(p:Person {age: e.a})` is semantically
+    // identical to `(p:Person) WHERE p.age = e.a`. Alice and Charlie are
+    // both age 30, so the query must return both names.
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    let results = run_cypher(
+        "UNWIND [{a: 30}] AS e MATCH (p:Person {age: e.a}) RETURN p.name AS name",
+        engine,
+        &mut interner,
+    );
+
+    let mut names: Vec<String> = results
+        .iter()
+        .filter_map(|r| match r.get("name") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["Alice".to_string(), "Charlie".to_string()],
+        "inline property filter referencing an outer bound variable must \
+         resolve per-row, matching both age-30 persons"
+    );
+}
+
 // ── OPTIONAL MATCH: full Cypher pipeline ────────────────────────────────
 
 #[test]

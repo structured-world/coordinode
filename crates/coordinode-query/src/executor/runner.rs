@@ -2448,7 +2448,15 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             // correlated execution so the Merge can access the bound src/tgt variables.
             // Without this, execute_merge gets no source/target IDs and fails when it
             // tries to create the edge from a non-NodeScan pattern.
-            if is_relationship_merge(right) {
+            //
+            // The same correlated path is needed when the right side is a
+            // NodeScan whose inline property filter references a variable
+            // bound by the LEFT (e.g. `UNWIND ... AS e MATCH (a {p: e.x})`).
+            // Evaluating that scan once globally cannot resolve `e.x`; it
+            // must run per-left-row with `e` in scope. The detector keys on
+            // a filter variable not bound within the right subtree, so a
+            // genuinely uncorrelated cross product keeps the fast global path.
+            if is_relationship_merge(right) || right_has_correlated_filter(right) {
                 let prev_corr = ctx.correlated_row.take();
                 let mut result = Vec::new();
                 for lr in &left_rows {
@@ -3035,14 +3043,27 @@ fn execute_node_scan(
         // Inject COMPUTED property values from schema (R082).
         inject_computed_properties(&mut row, variable, &primary_label, ctx);
 
-        // Apply inline property filters from pattern
+        // Apply inline property filters from pattern. When this scan runs
+        // inside a correlated join (e.g. `UNWIND ... AS e MATCH (a {p: e.x})`)
+        // the filter value can reference outer-bound variables; evaluate it
+        // against the correlated row extended with this node's bindings so
+        // `e.x` resolves. An inline `{p: e.x}` is semantically identical to
+        // `WHERE a.p = e.x`, which already works through the post-join Filter
+        // path — this closes the asymmetry.
         let mut matches = true;
         for (prop_name, filter_expr) in property_filters {
             let actual = row
                 .get(&format!("{variable}.{prop_name}"))
                 .cloned()
                 .unwrap_or(Value::Null);
-            let expected = eval_expr(filter_expr, &row);
+            let expected = match &ctx.correlated_row {
+                Some(corr) => {
+                    let mut eval_row = corr.clone();
+                    eval_row.extend(row.clone());
+                    eval_expr(filter_expr, &eval_row)
+                }
+                None => eval_expr(filter_expr, &row),
+            };
             if actual != expected {
                 matches = false;
                 break;
@@ -6745,6 +6766,101 @@ fn execute_mergemany_standalone(
 fn is_relationship_merge(op: &LogicalOp) -> bool {
     match op {
         LogicalOp::Merge { pattern, .. } => as_traverse_op(pattern).is_some(),
+        _ => false,
+    }
+}
+
+/// True if `op`'s subtree contains a `NodeScan` whose inline property
+/// filter references a variable NOT bound within `op` itself — i.e. the
+/// filter is correlated with an outer (left) input and the scan must run
+/// per-left-row to resolve it. A genuinely self-contained pattern returns
+/// false and keeps the fast global cross-product path.
+fn right_has_correlated_filter(op: &LogicalOp) -> bool {
+    let mut bound = std::collections::HashSet::new();
+    collect_bound_vars(op, &mut bound);
+    scan_filter_references_outside(op, &bound)
+}
+
+fn collect_bound_vars(op: &LogicalOp, out: &mut std::collections::HashSet<String>) {
+    match op {
+        LogicalOp::NodeScan { variable, .. } | LogicalOp::IndexScan { variable, .. } => {
+            out.insert(variable.clone());
+        }
+        LogicalOp::Traverse {
+            input,
+            target_variable,
+            edge_variable,
+            ..
+        } => {
+            collect_bound_vars(input, out);
+            out.insert(target_variable.clone());
+            if let Some(ev) = edge_variable {
+                out.insert(ev.clone());
+            }
+        }
+        LogicalOp::Unwind {
+            input, variable, ..
+        } => {
+            collect_bound_vars(input, out);
+            out.insert(variable.clone());
+        }
+        LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
+            collect_bound_vars(left, out);
+            collect_bound_vars(right, out);
+        }
+        LogicalOp::Filter { input, .. }
+        | LogicalOp::VectorFilter { input, .. }
+        | LogicalOp::TextFilter { input, .. }
+        | LogicalOp::Aggregate { input, .. }
+        | LogicalOp::Project { input, .. }
+        | LogicalOp::Sort { input, .. }
+        | LogicalOp::Limit { input, .. }
+        | LogicalOp::Skip { input, .. } => collect_bound_vars(input, out),
+        _ => {}
+    }
+}
+
+fn scan_filter_references_outside(
+    op: &LogicalOp,
+    bound: &std::collections::HashSet<String>,
+) -> bool {
+    match op {
+        LogicalOp::NodeScan {
+            property_filters, ..
+        } => property_filters
+            .iter()
+            .any(|(_, expr)| expr_references_outside(expr, bound)),
+        LogicalOp::Traverse { input, .. }
+        | LogicalOp::Filter { input, .. }
+        | LogicalOp::VectorFilter { input, .. }
+        | LogicalOp::TextFilter { input, .. }
+        | LogicalOp::Aggregate { input, .. }
+        | LogicalOp::Project { input, .. }
+        | LogicalOp::Sort { input, .. }
+        | LogicalOp::Limit { input, .. }
+        | LogicalOp::Skip { input, .. }
+        | LogicalOp::Unwind { input, .. } => scan_filter_references_outside(input, bound),
+        LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
+            scan_filter_references_outside(left, bound)
+                || scan_filter_references_outside(right, bound)
+        }
+        _ => false,
+    }
+}
+
+/// True if `expr` references any `Variable` not present in `bound`.
+fn expr_references_outside(expr: &Expr, bound: &std::collections::HashSet<String>) -> bool {
+    match expr {
+        Expr::Variable(name) => !bound.contains(name),
+        Expr::PropertyAccess { expr, .. } | Expr::UnaryOp { expr, .. } => {
+            expr_references_outside(expr, bound)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_references_outside(left, bound) || expr_references_outside(right, bound)
+        }
+        Expr::FunctionCall { args, .. } | Expr::List(args) => {
+            args.iter().any(|e| expr_references_outside(e, bound))
+        }
         _ => false,
     }
 }
