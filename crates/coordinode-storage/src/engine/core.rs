@@ -1556,12 +1556,16 @@ mod checkpoint_tests {
             Partition::all().len(),
             "every partition tree must be checkpointed"
         );
+        // Partition directories are named by `Partition::name()`, which is
+        // lower-case ("node", "schema"). Assert the exact names: a capitalised
+        // path silently passes on case-insensitive filesystems (macOS) and
+        // fails on case-sensitive ones (Linux CI).
         assert!(
-            target.join("Node").exists(),
+            target.join(Partition::Node.name()).exists(),
             "Node partition dir in checkpoint"
         );
         assert!(
-            target.join("Schema").exists(),
+            target.join(Partition::Schema.name()).exists(),
             "Schema partition dir in checkpoint"
         );
 
