@@ -11039,3 +11039,114 @@ fn hnsw_scan_executor_returns_index_top_k() {
     assert!((d0 - 0.1).abs() < 1e-5, "d0={d0}");
     assert!((d1 - 1.0).abs() < 1e-5, "d1={d1}");
 }
+
+// Distributed traversal correctness: a coordinator that routes each frontier
+// node to the engine owning its out-edges (sharded by source) and gathers the
+// results must reach exactly the same node set as a single engine holding the
+// whole graph. This validates the level-synchronous frontier-exchange BFS
+// (route -> local expand -> gather + dedup) that backs cross-shard traversal,
+// independent of the network transport.
+fn out_neighbors(engine: &StorageEngine, edge_type: &str, src: u64) -> Vec<u64> {
+    let key = encode_adj_key_forward(edge_type, NodeId::from_raw(src));
+    match engine.get(Partition::Adj, &key).expect("get adj") {
+        Some(bytes) => PostingList::from_bytes(&bytes)
+            .expect("decode posting")
+            .iter()
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Level-synchronous BFS reachable set within `[1..=max_hops]`, expanding each
+/// frontier node through `expand` (which routes to the owning engine).
+fn bfs_reachable<F>(start: u64, max_hops: usize, mut expand: F) -> std::collections::BTreeSet<u64>
+where
+    F: FnMut(u64) -> Vec<u64>,
+{
+    let mut reached = std::collections::BTreeSet::new();
+    let mut expanded = std::collections::HashSet::new();
+    let mut frontier = vec![start];
+    for _ in 0..max_hops {
+        let mut next = Vec::new();
+        for &n in &frontier {
+            if !expanded.insert(n) {
+                continue;
+            }
+            for t in expand(n) {
+                if reached.insert(t) {
+                    next.push(t);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    reached
+}
+
+#[test]
+fn distributed_frontier_exchange_matches_single_engine() {
+    // Deterministic random graph: NODES nodes, each with a few outgoing KNOWS
+    // edges. The single engine holds all out-edges; the two shard engines each
+    // hold only the out-edges of the sources they own (src % 2).
+    const NODES: u64 = 300;
+    const OUT_DEG: u64 = 4;
+
+    let fx_single = test_engine();
+    let fx_a = test_engine();
+    let fx_b = test_engine();
+    let single = &fx_single.engine;
+    let shards = [&fx_a.engine, &fx_b.engine];
+
+    // splitmix64-ish deterministic edge generation.
+    let mut state: u64 = 0x1234_5678_9abc_def0;
+    let mut rand = || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+
+    for src in 0..NODES {
+        for _ in 0..OUT_DEG {
+            let tgt = rand() % NODES;
+            if tgt == src {
+                continue;
+            }
+            insert_edge(single, "KNOWS", src, tgt);
+            // Shard by source: the engine owning `src` holds its out-edges.
+            insert_edge(shards[(src % 2) as usize], "KNOWS", src, tgt);
+        }
+    }
+
+    // Compare reachable sets from several sources at several hop depths.
+    for &start in &[0u64, 1, 7, 42, 150, 299] {
+        for &hops in &[1usize, 2, 3, 4] {
+            let single_set = bfs_reachable(start, hops, |n| out_neighbors(single, "KNOWS", n));
+            let sharded_set = bfs_reachable(start, hops, |n| {
+                // Coordinator routes the node to the shard owning its out-edges.
+                out_neighbors(shards[(n % 2) as usize], "KNOWS", n)
+            });
+            assert_eq!(
+                single_set,
+                sharded_set,
+                "reachable set diverged at start={start} hops={hops}: \
+                 single={} sharded={}",
+                single_set.len(),
+                sharded_set.len()
+            );
+        }
+    }
+
+    // Sanity: the graph is non-trivial (multi-hop reaches a meaningful set),
+    // otherwise the equality above would be vacuous.
+    let wide = bfs_reachable(0, 4, |n| out_neighbors(single, "KNOWS", n));
+    assert!(
+        wide.len() > 20,
+        "graph too sparse to be a meaningful test: 4-hop reach = {}",
+        wide.len()
+    );
+}
