@@ -67,11 +67,6 @@ on:
         type: boolean
         required: false
         default: false
-      graph_cluster_mode:
-        description: 'Run the cluster-mode graph-traversal bench: form a real localhost raft cluster, load a synthetic social graph through the leader, and measure k-hop traversal QPS leader-only (G1 baseline) vs round-robin across nodes (G2). Reports whether spreading reads across nodes helps or hurts (E_node = G2/G1; >1 helps, <1 degrades). Uses a warm-up pass and a concurrency ladder. Adds ~10-15 min.'
-        type: boolean
-        required: false
-        default: false
       subset_size:
         description: 'First N base vectors to use from each dataset (groundtruth recomputed brute-force). 50000 (default) keeps per-commit wall-clock under 20 min. Set to 100000+ for the full marketing matrix when full_sweep=true.'
         required: false
@@ -579,23 +574,6 @@ jobs:
         run: |
           set -euo pipefail
           ./benches/vector-ann/scripts/cluster_bench.sh
-
-      - name: Graph — cluster-mode traversal bench (leader vs round-robin)
-        if: ${{ inputs.graph_cluster_mode }}
-        env:
-          # 2-node cluster matches the configuration under question; a
-          # 50k-node graph keeps per-query work above fixed overheads while
-          # the run stays well under the runner's time budget.
-          NODES: '2'
-          GRAPH_NODES: '50000'
-          HOPS: '1,2'
-          CONCURRENCY: '1,2,4,8,16'
-          WARMUP: '200'
-          SETTLE: '20'
-          OUTPUT: bench-results
-        run: |
-          set -euo pipefail
-          ./benches/vector-ann/scripts/cluster_graph_bench.sh
 
       # ── Future modality steps land here, one per modality ─────
       # - name: Graph — LDBC SNB SF1 Interactive
