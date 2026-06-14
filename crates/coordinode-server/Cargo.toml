@@ -56,7 +56,7 @@ futures-util = { workspace = true }
 
 # Safe setrlimit(RLIMIT_NOFILE) wrapper for the configurable fd limit.
 [target.'cfg(unix)'.dependencies]
-rlimit = "0.10"
+rlimit = "0.11"
 
 [build-dependencies]
 tonic-prost-build = "0.14"
