@@ -25,6 +25,11 @@ dist-counters = ["coordinode-vector/dist-counters"]
 coordinode-vector = { path = "../../crates/coordinode-vector" }
 coordinode-bench = { path = "../../crates/coordinode-bench" }
 coordinode-core = { path = "../../crates/coordinode-core" }
+# Storage-backed shard engines for the sharded-traversal perf prototype
+# (shard_traverse bin): each shard is a real on-disk StorageEngine so the
+# single-node baseline reflects real posting-list read cost.
+coordinode-storage = { path = "../../crates/coordinode-storage" }
+tempfile = "3"
 # gRPC driver for the server-mode bench bins (bench-vector-grpc /
 # bench-vector-load): measures the product path (client -> gRPC ->
 # engine) instead of the in-process HnswIndex.
@@ -63,3 +68,7 @@ path = "src/load_main.rs"
 [[bin]]
 name = "bench-graph"
 path = "src/graph_main.rs"
+
+[[bin]]
+name = "shard-traverse"
+path = "src/shard_traverse.rs"
