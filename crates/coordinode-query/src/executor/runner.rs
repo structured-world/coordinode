@@ -19954,6 +19954,65 @@ mod tests {
         );
     }
 
+    /// A correlated equality lifted above a join (a later MATCH building on a
+    /// prior binding, `... MATCH (b:Person) WHERE b.pid = e.d`) must become a
+    /// correlated IndexScan on the join's right side, not a full label scan.
+    /// Without this the endpoint lookup is O(label) per outer row, which is why
+    /// bulk edge loading was slow.
+    #[test]
+    fn lifted_correlated_equality_uses_index_scan() {
+        use crate::planner::optimize_index_selection;
+
+        let registry = crate::index::IndexRegistry::new();
+        registry.register_in_memory(crate::index::IndexDefinition::btree(
+            "person_pid",
+            "Person",
+            "pid",
+        ));
+
+        // Filter(CartesianProduct(NodeScan(e), NodeScan(b:Person)), b.pid = e.d):
+        // the shape the planner emits for the lifted correlated endpoint.
+        let left = LogicalOp::NodeScan {
+            variable: "e".to_string(),
+            labels: vec![],
+            property_filters: vec![],
+        };
+        let right = LogicalOp::NodeScan {
+            variable: "b".to_string(),
+            labels: vec!["Person".to_string()],
+            property_filters: vec![],
+        };
+        let predicate = Expr::BinaryOp {
+            left: Box::new(Expr::PropertyAccess {
+                expr: Box::new(Expr::Variable("b".to_string())),
+                property: "pid".to_string(),
+            }),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::PropertyAccess {
+                expr: Box::new(Expr::Variable("e".to_string())),
+                property: "d".to_string(),
+            }),
+        };
+        let plan = LogicalOp::Filter {
+            input: Box::new(LogicalOp::CartesianProduct {
+                left: Box::new(left),
+                right: Box::new(right),
+            }),
+            predicate,
+        };
+
+        let optimized = optimize_index_selection(plan, &registry);
+        // The right side is now an IndexScan; the Person NodeScan is gone.
+        assert!(
+            matches!(
+                &optimized,
+                LogicalOp::CartesianProduct { right, .. }
+                    if matches!(right.as_ref(), LogicalOp::IndexScan { .. })
+            ),
+            "expected CartesianProduct(.., IndexScan), got: {optimized:?}"
+        );
+    }
+
     /// Integration test: IndexScan execution returns nodes matching the index lookup.
     ///
     /// Creates an index, inserts nodes, then queries via `LogicalOp::IndexScan`

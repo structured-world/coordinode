@@ -882,6 +882,56 @@ fn extract_property_name(expr: &Expr) -> Option<String> {
 ///
 /// This pass is separate from `build_logical_plan` so callers without an index registry can
 /// skip it without changing the planner's public signature.
+/// Pull a lifted correlated equality into a correlated `IndexScan` on the join's
+/// right side.
+///
+/// A MATCH building on a prior clause (`UNWIND ... AS e  MATCH (b:L) WHERE
+/// b.prop = e.x`) plans as `Filter(CartesianProduct(left, NodeScan(b)),
+/// b.prop = e.x)`: the equality references the outer `e`, so it is lifted above
+/// the join and cannot be rewritten by the `Filter(NodeScan, ...)` rule. That
+/// leaves `b` as a full label scan per outer row. When an index covers
+/// `L(prop)` and the key does not reference `b`, rewrite to
+/// `CartesianProduct(left, IndexScan(b, prop = e.x))`: the executor runs the
+/// right side per outer row (the key resolves against the correlated row), so
+/// the endpoint lookup becomes a point read instead of a full scan.
+fn try_correlated_index_join(
+    input: &LogicalOp,
+    predicate: &Expr,
+    registry: &crate::index::IndexRegistry,
+) -> Option<LogicalOp> {
+    let LogicalOp::CartesianProduct { left, right } = input else {
+        return None;
+    };
+    let LogicalOp::NodeScan {
+        variable,
+        labels,
+        property_filters,
+    } = right.as_ref()
+    else {
+        return None;
+    };
+    if labels.len() != 1 || !property_filters.is_empty() {
+        return None;
+    }
+    let Expr::BinaryOp {
+        left: pl,
+        op: BinaryOperator::Eq,
+        right: pr,
+    } = predicate
+    else {
+        return None;
+    };
+    let prop = extract_index_property(pl, variable)?;
+    if expr_references_var(pr, variable) {
+        return None;
+    }
+    let scan = try_index_rewrite(variable, &labels[0], &prop, pr, registry)?;
+    Some(LogicalOp::CartesianProduct {
+        left: Box::new(optimize_index_selection((**left).clone(), registry)),
+        right: Box::new(scan),
+    })
+}
+
 pub fn optimize_index_selection(
     op: LogicalOp,
     registry: &crate::index::IndexRegistry,
@@ -917,6 +967,11 @@ pub fn optimize_index_selection(
                         }
                     }
                 }
+            }
+            // Correlated equality lifted above a join (later MATCH on a prior
+            // binding): pull it into a correlated IndexScan on the right side.
+            if let Some(rewritten) = try_correlated_index_join(&input, &predicate, registry) {
+                return rewritten;
             }
             LogicalOp::Filter {
                 input: Box::new(optimize_index_selection(*input, registry)),

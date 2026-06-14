@@ -11193,3 +11193,70 @@ fn two_match_continues_from_bound_source() {
         "1-hop from pid 0 must reach exactly its 2 neighbours, not all nodes"
     );
 }
+
+#[test]
+fn unwind_double_correlated_endpoint_create_links_correct_pair() {
+    // The bulk edge-load shape: each unwound row resolves two endpoints by a
+    // correlated property lookup and creates the edge between exactly them.
+    // The IndexScan rewrite must keep per-row endpoint resolution correct.
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    for pid in 0..4u64 {
+        insert_node(
+            engine,
+            1,
+            pid + 1,
+            "Person",
+            &[("pid", Value::Int(pid as i64))],
+            &mut interner,
+        );
+    }
+    register_schema_edge_type(engine, "KNOWS");
+
+    run_cypher(
+        "UNWIND [{s: 0, d: 2}, {s: 1, d: 3}] AS e \
+         MATCH (a:Person) WHERE a.pid = e.s \
+         MATCH (b:Person) WHERE b.pid = e.d \
+         CREATE (a)-[:KNOWS]->(b)",
+        engine,
+        &mut interner,
+    );
+
+    // pid 0 must KNOW exactly pid 2; pid 1 exactly pid 3; nothing else.
+    fn out_pids(src_pid: i64, engine: &StorageEngine, interner: &mut FieldInterner) -> Vec<i64> {
+        let rows = run_cypher(
+            &format!(
+                "MATCH (a:Person) WHERE a.pid = {src_pid} \
+                 MATCH (a)-[:KNOWS]->(b) RETURN b.pid AS p"
+            ),
+            engine,
+            interner,
+        );
+        let mut got: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match r.get("p") {
+                Some(Value::Int(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        got.sort_unstable();
+        got
+    }
+
+    assert_eq!(
+        out_pids(0, engine, &mut interner),
+        vec![2],
+        "pid 0 KNOWS only pid 2"
+    );
+    assert_eq!(
+        out_pids(1, engine, &mut interner),
+        vec![3],
+        "pid 1 KNOWS only pid 3"
+    );
+    assert_eq!(
+        out_pids(2, engine, &mut interner),
+        Vec::<i64>::new(),
+        "pid 2 has no out-edges"
+    );
+}
