@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Cluster-mode graph-traversal bench: an N-node localhost raft cluster
-# measuring k-hop traversal read scaling on top of the single-process
-# gRPC numbers from bench-graph. Two phases:
+# measuring whether spreading k-hop traversal reads across nodes helps or
+# hurts versus the leader alone. Two phases:
 #
 #   G1  load the synthetic social graph through the leader and measure
 #       k-hop traversal against the LEADER only  -> single-node baseline
 #   G2  re-measure the same queries round-robin across ALL nodes
-#       -> replica read scaling (E_node = QPS(N nodes) / QPS(1 node))
+#       -> 2-node delta. E_node = QPS(G2) / QPS(G1) at matched concurrency;
+#          > 1 means spreading reads helps, < 1 means it degrades.
 #
 # bench-graph generates and loads its own Barabasi-Albert graph, so no
 # external dataset is required (unlike the vector cluster bench).
@@ -19,8 +20,10 @@
 #                 failure tolerance)
 #   GRAPH_NODES   Person nodes in the synthetic graph (default 20000)
 #   HOPS          comma-separated hop sweep (default 1,2,3)
-#   CONCURRENCY   comma-separated concurrency for the multi-node phase
-#                 (default 3,6; keep multiples of NODES for an even spread)
+#   CONCURRENCY   comma-separated concurrency ladder (default 1,2,4,8,16;
+#                 conc 1 anchors the per-hop baseline, higher points find the
+#                 saturation level where a 2-node delta actually shows)
+#   WARMUP        warm-up queries per endpoint before timing (default 200)
 #   BASE_PORT     first node's gRPC port (default 7300; nodes step by 10;
 #                 ops port is gRPC+4)
 #   SETTLE        seconds to wait for raft replication before G2 (default 15)
@@ -33,7 +36,8 @@ set -euo pipefail
 NODES="${NODES:-3}"
 GRAPH_NODES="${GRAPH_NODES:-20000}"
 HOPS="${HOPS:-1,2,3}"
-CONCURRENCY="${CONCURRENCY:-3,6}"
+CONCURRENCY="${CONCURRENCY:-1,2,4,8,16}"
+WARMUP="${WARMUP:-200}"
 BASE_PORT="${BASE_PORT:-7300}"
 SETTLE="${SETTLE:-15}"
 OUTPUT="${OUTPUT:-bench-results}"
@@ -134,6 +138,7 @@ echo "::group::G1 load graph + leader-only traversal baseline"
   --nodes "$GRAPH_NODES" \
   --hops "$HOPS" \
   --concurrency "$CONCURRENCY" \
+  --warmup-queries "$WARMUP" \
   --dataset-name "social-ba-${GRAPH_NODES}" \
   --output "$OUTPUT"
 echo "::endgroup::"
@@ -151,6 +156,7 @@ echo "::group::G2 round-robin traversal across all $NODES nodes"
   --concurrency "$CONCURRENCY" \
   --no-load \
   --read-preference nearest \
+  --warmup-queries "$WARMUP" \
   --dataset-name "social-ba-${GRAPH_NODES}" \
   --output "$OUTPUT"
 echo "::endgroup::"

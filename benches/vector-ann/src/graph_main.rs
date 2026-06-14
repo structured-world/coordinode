@@ -91,6 +91,12 @@ struct Args {
     #[arg(long, default_value = "social-ba")]
     dataset_name: String,
 
+    /// Warm-up traversal queries fired at EACH endpoint before timing starts.
+    /// A cold follower connection or unwarmed cache otherwise lands entirely in
+    /// the first timed cell and inflates its tail latency. 0 disables.
+    #[arg(long, default_value_t = 0)]
+    warmup_queries: usize,
+
     /// Read preference for the traversal queries: primary, primary-preferred,
     /// secondary, secondary-preferred, or nearest. The default `primary` routes
     /// every read to the Raft leader; use `nearest` (or a secondary variant)
@@ -288,6 +294,34 @@ async fn run(
     }
 
     let queries = Arc::new(sample_sources(args.nodes, args.queries));
+
+    // Warm every endpoint (connections, server caches) outside the timed region
+    // so a cold follower read does not pollute the first cell's tail latency.
+    if args.warmup_queries > 0 {
+        let max_hop = hops.iter().copied().max().unwrap_or(1);
+        let warm_cypher = format!(
+            "MATCH (p:Person) WHERE p.pid = $pid \
+             MATCH (p)-[:KNOWS*1..{max_hop}]->(f) RETURN count(DISTINCT f) AS reach"
+        );
+        let read_pref = args.read_pref();
+        for ep in &endpoints {
+            let mut wc = CoordinodeClient::connect(ep.clone()).await?;
+            for k in 0..args.warmup_queries {
+                let pid = queries[k % queries.len()];
+                let mut params = HashMap::new();
+                params.insert("pid".to_string(), Value::Int(pid as i64));
+                let _ = wc
+                    .execute_cypher_with_read_preference(&warm_cypher, params, read_pref)
+                    .await;
+            }
+        }
+        info!(
+            warmup_queries = args.warmup_queries,
+            endpoints = endpoints.len(),
+            "warm-up complete"
+        );
+    }
+
     let mut cells: Vec<GraphCell> = Vec::new();
 
     for &h in hops {
