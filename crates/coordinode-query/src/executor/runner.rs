@@ -4002,6 +4002,32 @@ fn reconstruct_bfs_path(
     Value::Path(coordinode_core::graph::types::PathValue { nodes, rels })
 }
 
+/// Expand a whole BFS frontier by one hop, returning the `(src, tgt,
+/// edge_type_idx)` triples in frontier-then-adjacency order.
+///
+/// This is the level-synchronous scatter-gather seam. The single-shard engine
+/// expands every source locally here. A distributed engine keeps the BFS
+/// coordinator identical and replaces this one call with a per-shard scatter:
+/// route each source to the shard owning its out-edges, run this same local
+/// expansion there, and return the slice. Keeping all expansion behind a
+/// single frontier-level step is what makes that swap localised.
+fn expand_frontier(
+    to_expand: &[u64],
+    params: &TraverseParams<'_>,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<(u64, u64, usize)>, ExecutionError> {
+    let mut out = Vec::new();
+    for &src_uid in to_expand {
+        let src_nid = NodeId::from_raw(src_uid);
+        let neighbors = expand_one_hop(src_nid, params.edge_types, params.direction, ctx)?;
+        out.reserve(neighbors.len());
+        for (tgt_uid, et_idx) in neighbors {
+            out.push((src_uid, tgt_uid, et_idx));
+        }
+    }
+    Ok(out)
+}
+
 /// Variable-length path traversal: level-synchronous BFS with edge-based
 /// cycle detection.
 ///
@@ -4079,26 +4105,30 @@ fn execute_varlen_traverse(
             // Collect all unique neighbors across the frontier for this depth
             let mut depth_neighbors: Vec<(u64, u64, usize)> = Vec::new(); // (src, tgt, et_idx)
 
-            for &src_uid in &frontier {
-                // Expand each node at most once across the whole traversal.
-                if !expanded.insert(src_uid) {
+            // Expand the whole depth frontier in one step. Each node expands at
+            // most once across the traversal, so filter to the not-yet-expanded
+            // members (in frontier order) and hand them to the frontier-level
+            // expansion seam. The single-shard engine expands locally; the
+            // distributed engine routes each source to its owning shard, which
+            // runs this same expansion and returns its slice (scatter-gather).
+            let to_expand: Vec<u64> = frontier
+                .iter()
+                .copied()
+                .filter(|&src_uid| expanded.insert(src_uid))
+                .collect();
+            let expansions = expand_frontier(&to_expand, params, ctx)?;
+
+            for (src_uid, tgt_uid, et_idx) in expansions {
+                if !visited_edges.insert((src_uid, tgt_uid, et_idx)) {
                     continue;
                 }
-                let src_nid = NodeId::from_raw(src_uid);
-                let neighbors = expand_one_hop(src_nid, params.edge_types, params.direction, ctx)?;
-
-                for (tgt_uid, et_idx) in neighbors {
-                    if !visited_edges.insert((src_uid, tgt_uid, et_idx)) {
-                        continue;
-                    }
-                    edges_processed += 1;
-                    next_frontier.push(tgt_uid);
-                    if params.path_variable.is_some() {
-                        pred.entry(tgt_uid).or_insert(Some((src_uid, et_idx)));
-                    }
-                    if depth >= min_hops {
-                        depth_neighbors.push((src_uid, tgt_uid, et_idx));
-                    }
+                edges_processed += 1;
+                next_frontier.push(tgt_uid);
+                if params.path_variable.is_some() {
+                    pred.entry(tgt_uid).or_insert(Some((src_uid, et_idx)));
+                }
+                if depth >= min_hops {
+                    depth_neighbors.push((src_uid, tgt_uid, et_idx));
                 }
             }
 
