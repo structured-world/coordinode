@@ -29,9 +29,9 @@ use std::time::Instant;
 
 use clap::Parser;
 use coordinode_bench::BenchReport;
-use coordinode_client::{CoordinodeClient, Value};
+use coordinode_client::{CoordinodeClient, ReadPreference, Value};
 use serde::Serialize;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Query-replay rounds per concurrency cell.
 const REPLAY_ROUNDS: usize = 5;
@@ -90,6 +90,14 @@ struct Args {
     /// Dataset tag recorded in the report / filename.
     #[arg(long, default_value = "social-ba")]
     dataset_name: String,
+
+    /// Read preference for the traversal queries: primary, primary-preferred,
+    /// secondary, secondary-preferred, or nearest. The default `primary` routes
+    /// every read to the Raft leader; use `nearest` (or a secondary variant)
+    /// when round-robining across a replicated cluster so followers serve their
+    /// workers' reads locally instead of rejecting them.
+    #[arg(long, default_value = "primary")]
+    read_preference: String,
 }
 
 impl Args {
@@ -106,6 +114,22 @@ impl Args {
             vec!["http://127.0.0.1:7080".to_string()]
         } else {
             list
+        }
+    }
+
+    /// Parse `--read-preference` into the client enum. Unknown values fall back
+    /// to `Primary` with a warning so a typo never silently changes routing.
+    fn read_pref(&self) -> ReadPreference {
+        match self.read_preference.to_ascii_lowercase().as_str() {
+            "primary" => ReadPreference::Primary,
+            "primary-preferred" | "primary_preferred" => ReadPreference::PrimaryPreferred,
+            "secondary" => ReadPreference::Secondary,
+            "secondary-preferred" | "secondary_preferred" => ReadPreference::SecondaryPreferred,
+            "nearest" => ReadPreference::Nearest,
+            other => {
+                warn!(value = other, "unknown read-preference, using primary");
+                ReadPreference::Primary
+            }
         }
     }
 }
@@ -305,6 +329,7 @@ async fn run(
     report.record("ba_m", args.m)?;
     report.record("edges", edges.len())?;
     report.record("endpoints", endpoints.len())?;
+    report.record("read_preference", args.read_preference.clone())?;
     report.record("cells", serde_json::to_value(&cells)?)?;
     let path = report.write_json(&args.output, Some("GRAPH"))?;
     info!(path = ?path, "report written");
@@ -406,6 +431,7 @@ async fn run_cell(
 
     let mut workers = Vec::with_capacity(concurrency.max(1));
     let wall = Instant::now();
+    let read_pref = args.read_pref();
     for w in 0..concurrency.max(1) {
         let cypher = cypher.clone();
         // Round-robin workers across endpoints so concurrency spreads evenly
@@ -429,7 +455,7 @@ async fn run_cell(
                 params.insert("pid".to_string(), Value::Int(pid as i64));
                 let t = Instant::now();
                 let rows = client
-                    .execute_cypher_with_params(&cypher, params)
+                    .execute_cypher_with_read_preference(&cypher, params, read_pref)
                     .await
                     .map_err(|e| e.to_string())?;
                 lats.push(t.elapsed().as_micros() as f64);

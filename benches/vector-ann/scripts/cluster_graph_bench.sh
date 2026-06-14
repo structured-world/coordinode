@@ -142,12 +142,15 @@ echo "waiting ${SETTLE}s for raft replication to settle on all replicas"
 sleep "$SETTLE"
 
 echo "::group::G2 round-robin traversal across all $NODES nodes"
+# `nearest` lets a follower serve its own workers' reads locally; the default
+# `primary` would reject every read that lands on a follower.
 "$BENCH" \
   --endpoint "$ALL_ENDPOINTS" \
   --nodes "$GRAPH_NODES" \
   --hops "$HOPS" \
   --concurrency "$CONCURRENCY" \
   --no-load \
+  --read-preference nearest \
   --dataset-name "social-ba-${GRAPH_NODES}" \
   --output "$OUTPUT"
 echo "::endgroup::"
