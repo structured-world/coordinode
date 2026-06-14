@@ -39,7 +39,11 @@ const REPLAY_ROUNDS: usize = 5;
 #[derive(Parser, Debug)]
 #[command(name = "bench-graph", version)]
 struct Args {
-    /// gRPC endpoint of a running coordinode server.
+    /// gRPC endpoint(s) of running coordinode server(s). Accepts a
+    /// comma-separated list; query load is round-robined across them so a
+    /// replicated multi-node cluster reports read-scaling throughput
+    /// (E_node = QPS(N nodes) / QPS(1 node) at fixed concurrency). The load
+    /// and sanity phases always use the first endpoint.
     #[arg(long, default_value = "http://127.0.0.1:7080")]
     endpoint: String,
 
@@ -86,6 +90,24 @@ struct Args {
     /// Dataset tag recorded in the report / filename.
     #[arg(long, default_value = "social-ba")]
     dataset_name: String,
+}
+
+impl Args {
+    /// Parse `--endpoint` into the list of server endpoints (comma-separated).
+    /// Always returns at least one entry.
+    fn endpoints(&self) -> Vec<String> {
+        let list: Vec<String> = self
+            .endpoint
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if list.is_empty() {
+            vec!["http://127.0.0.1:7080".to_string()]
+        } else {
+            list
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -212,7 +234,10 @@ async fn run(
     hops: &[u32],
     concurrencies: &[usize],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = CoordinodeClient::connect(args.endpoint.clone()).await?;
+    let endpoints = args.endpoints();
+    // Load and sanity always target the first endpoint; replication makes the
+    // data visible on the others.
+    let mut client = CoordinodeClient::connect(endpoints[0].clone()).await?;
 
     if !args.no_load {
         load_graph(&mut client, args, edges).await?;
@@ -279,6 +304,7 @@ async fn run(
     report.record("nodes", args.nodes)?;
     report.record("ba_m", args.m)?;
     report.record("edges", edges.len())?;
+    report.record("endpoints", endpoints.len())?;
     report.record("cells", serde_json::to_value(&cells)?)?;
     let path = report.write_json(&args.output, Some("GRAPH"))?;
     info!(path = ?path, "report written");
@@ -375,14 +401,16 @@ async fn run_cell(
     );
     let total = sources.len() * REPLAY_ROUNDS;
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let endpoint = args.endpoint.clone();
+    let endpoints = args.endpoints();
     let n_sources = sources.len();
 
     let mut workers = Vec::with_capacity(concurrency.max(1));
     let wall = Instant::now();
-    for _ in 0..concurrency.max(1) {
+    for w in 0..concurrency.max(1) {
         let cypher = cypher.clone();
-        let endpoint = endpoint.clone();
+        // Round-robin workers across endpoints so concurrency spreads evenly
+        // over a replicated cluster's nodes.
+        let endpoint = endpoints[w % endpoints.len()].clone();
         let sources = Arc::clone(sources);
         let next = Arc::clone(&next);
         workers.push(tokio::spawn(async move {
