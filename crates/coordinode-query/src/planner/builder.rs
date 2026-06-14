@@ -306,11 +306,50 @@ fn op_children(op: &LogicalOp) -> Vec<&LogicalOp> {
     }
 }
 
+/// True when a MATCH clause is a linear traversal whose first node reuses a
+/// bare variable already bound by a prior clause: `MATCH (v) ... MATCH
+/// (v)-[:R]->(x)`. Such a MATCH continues the traversal out of the bound `v`
+/// rather than opening a fresh scan, so the prior clause's filter on `v` is
+/// preserved. Restricted to a single relationship-bearing pattern with no
+/// re-stated labels / properties on the anchor and no named/shortest path, so
+/// every other shape keeps the prior scan-and-join behaviour.
+fn pattern_is_bound_continuation(pattern: &Pattern, prior_vars: &[String]) -> bool {
+    if pattern.shortest_path || pattern.path_variable.is_some() || pattern.elements.len() < 3 {
+        return false;
+    }
+    match pattern.elements.first() {
+        Some(PatternElement::Node(np)) => {
+            np.labels.is_empty()
+                && np.properties.is_empty()
+                && np.variable.as_ref().is_some_and(|v| prior_vars.contains(v))
+        }
+        _ => false,
+    }
+}
+
+/// A single-pattern MATCH continues a prior binding when its lone pattern does.
+fn match_is_bound_continuation(mc: &MatchClause, prior_vars: &[String]) -> bool {
+    matches!(mc.patterns.as_slice(), [p] if pattern_is_bound_continuation(p, prior_vars))
+}
+
 /// Apply a single clause to the current plan, producing a new operator.
 fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp, PlanError> {
     match clause {
         Clause::Match(mc) => {
             match current {
+                // Continuation: this MATCH traverses out of a node already bound
+                // by a prior clause. Build the traversal on top of `existing`
+                // (preserving its filters) instead of re-scanning, then apply
+                // this MATCH's own WHERE on top.
+                Some(existing)
+                    if match_is_bound_continuation(mc, &collect_op_variables(&existing)) =>
+                {
+                    let chain = build_pattern_chain(&mc.patterns[0].elements, Some(existing))?;
+                    Ok(match &mc.where_clause {
+                        Some(pred) => apply_compound_where(pred, chain),
+                        None => chain,
+                    })
+                }
                 Some(existing) if mc.where_clause.is_some() => {
                     // G024: When building on top of a prior clause, the WHERE
                     // may reference variables from both the prior plan (existing)
@@ -2708,7 +2747,7 @@ fn build_pattern_scan(pattern: &Pattern) -> Result<LogicalOp, PlanError> {
     // Post-process: fill in target info from the pattern structure.
     // Walk the elements in pairs: (Node, Rel, Node, Rel, Node, ...)
     // The first Node is the scan, each (Rel, Node) pair is a Traverse.
-    let mut result = build_pattern_chain(&pattern.elements)?;
+    let mut result = build_pattern_chain(&pattern.elements, None)?;
 
     // Named path on a single-relationship pattern (`p = (a)-[:R*]->(b)` or a
     // one-hop `p = (a)-[:R]->(b)`): bind the route on the lone Traverse so the
@@ -2726,7 +2765,15 @@ fn build_pattern_scan(pattern: &Pattern) -> Result<LogicalOp, PlanError> {
 }
 
 /// Build a chain of NodeScan → Traverse → Traverse from pattern elements.
-fn build_pattern_chain(elements: &[PatternElement]) -> Result<LogicalOp, PlanError> {
+///
+/// When `base` is `Some`, the pattern's first node is already bound by a prior
+/// clause: the chain traverses out of that binding instead of opening a fresh
+/// `NodeScan`, so `MATCH (p) ... MATCH (p)-[:R]->(f)` continues from the bound
+/// `p` rather than re-scanning every node (which would drop the prior filter).
+fn build_pattern_chain(
+    elements: &[PatternElement],
+    base: Option<LogicalOp>,
+) -> Result<LogicalOp, PlanError> {
     if elements.is_empty() {
         return Err(PlanError::EmptyPattern);
     }
@@ -2737,10 +2784,13 @@ fn build_pattern_chain(elements: &[PatternElement]) -> Result<LogicalOp, PlanErr
         _ => return Err(PlanError::UnsupportedPattern),
     };
 
-    let mut current = LogicalOp::NodeScan {
-        variable: first_node.variable.clone().unwrap_or_default(),
-        labels: first_node.labels.clone(),
-        property_filters: first_node.properties.clone(),
+    let mut current = match base {
+        Some(input) => input,
+        None => LogicalOp::NodeScan {
+            variable: first_node.variable.clone().unwrap_or_default(),
+            labels: first_node.labels.clone(),
+            property_filters: first_node.properties.clone(),
+        },
     };
 
     let source_var = first_node.variable.clone().unwrap_or_default();

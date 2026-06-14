@@ -11150,3 +11150,46 @@ fn distributed_frontier_exchange_matches_single_engine() {
         wide.len()
     );
 }
+
+#[test]
+fn two_match_continues_from_bound_source() {
+    // A second MATCH that traverses out of a variable bound by a prior MATCH
+    // must continue from that binding, not re-scan every node of the label.
+    // Before the fix, MATCH (p:Person) WHERE p.pid = X MATCH (p)-[:KNOWS]->(f)
+    // returned every edge target, as if the second MATCH dropped the
+    // WHERE-filtered source and traversed from all Person nodes.
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    for pid in 0..4u64 {
+        insert_node(
+            engine,
+            1,
+            pid + 1,
+            "Person",
+            &[("pid", Value::Int(pid as i64))],
+            &mut interner,
+        );
+    }
+    // 1 -> 2, 1 -> 3, 2 -> 4  (node ids; pid = id-1)
+    insert_edge(engine, "KNOWS", 1, 2);
+    insert_edge(engine, "KNOWS", 1, 3);
+    insert_edge(engine, "KNOWS", 2, 4);
+    register_schema_edge_type(engine, "KNOWS");
+
+    // pid 0 (node 1) has exactly two 1-hop KNOWS neighbours.
+    let rows = run_cypher(
+        "MATCH (p:Person) WHERE p.pid = 0 \
+         MATCH (p)-[:KNOWS*1..1]->(f) RETURN count(DISTINCT f) AS reach",
+        engine,
+        &mut interner,
+    );
+    let reach = match rows.first().and_then(|r| r.get("reach")) {
+        Some(Value::Int(n)) => *n,
+        other => panic!("no reach count: {other:?}"),
+    };
+    assert_eq!(
+        reach, 2,
+        "1-hop from pid 0 must reach exactly its 2 neighbours, not all nodes"
+    );
+}
