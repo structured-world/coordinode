@@ -588,6 +588,15 @@ impl StorageEngine {
         let mut summary = CheckpointSummary::default();
         for &part in Partition::all() {
             let tree = self.tree(part)?;
+            // Flush the active memtable to an on-disk segment first: a
+            // checkpoint snapshots persisted segments, so recent writes still
+            // resident in memory would otherwise be missing from the backup.
+            // This also makes the per-partition checkpoint directory appear
+            // deterministically (previously it depended on whether a
+            // background flush happened to have run before the checkpoint).
+            tree.flush_active_memtable(0).map_err(|e| {
+                StorageError::Io(format!("flush before checkpoint {}: {e}", part.name()))
+            })?;
             let info = tree
                 .create_checkpoint(&target.join(part.name()))
                 .map_err(|e| {
