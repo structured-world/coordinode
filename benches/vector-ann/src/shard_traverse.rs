@@ -18,6 +18,7 @@ use coordinode_core::graph::edge::{encode_adj_key_forward, PostingList};
 use coordinode_core::graph::node::NodeId;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::merge::encode_add_batch;
 use coordinode_storage::engine::partition::Partition;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -58,6 +59,13 @@ struct Args {
     /// an `nid` int (its node id, indexed) and `knows` uid edges.
     #[arg(long)]
     export_rdf: Option<std::path::PathBuf>,
+
+    /// Diagnostic: build one hub adjacency key via many merge operands (the
+    /// loader's write path) and time snapshot reads before and after a forced
+    /// compaction. Confirms whether merge-on-read of uncompacted operands is the
+    /// traversal-read bottleneck. Runs and exits; ignores graph args.
+    #[arg(long)]
+    confirm_merge: bool,
 }
 
 /// Deterministic splitmix64.
@@ -193,8 +201,89 @@ fn reachable_sharded(
     reached
 }
 
+/// Diagnostic: prove whether merge-on-read of uncompacted adjacency operands is
+/// the traversal-read cost. Builds one hub key via `degree` single-neighbour
+/// merge operands (an incrementally-loaded hub) and a second hub via one put of
+/// the full posting list (the compacted shape), then times snapshot reads of
+/// each before and after a forced compaction.
+fn confirm_merge_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = disk_engine(dir.path());
+    let hub_merge = encode_adj_key_forward("KNOWS", NodeId::from_raw(1));
+    let hub_put = encode_adj_key_forward("KNOWS", NodeId::from_raw(2));
+    let degree: u64 = 1000;
+    let iters: usize = 2000;
+
+    // Key A: built from `degree` separate merge operands (worst case of a hub
+    // touched once per loaded batch with no compaction since).
+    for t in 0..degree {
+        engine
+            .merge(Partition::Adj, &hub_merge, &encode_add_batch(&[100 + t]))
+            .expect("merge");
+    }
+    // Key B: built from a single put of the full posting list.
+    let mut pl = PostingList::new();
+    for t in 0..degree {
+        pl.insert(100 + t);
+    }
+    engine
+        .put(Partition::Adj, &hub_put, &pl.to_bytes().expect("pl bytes"))
+        .expect("put");
+
+    let read_us = |snap: &_, key: &[u8]| -> f64 {
+        let _ = engine
+            .snapshot_get(snap, Partition::Adj, key)
+            .expect("warm");
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(engine.snapshot_get(snap, Partition::Adj, key).expect("get"));
+        }
+        t0.elapsed().as_secs_f64() * 1e6 / iters as f64
+    };
+
+    let snap = engine.snapshot();
+    let before_merge = read_us(&snap, &hub_merge);
+    let before_put = read_us(&snap, &hub_put);
+    eprintln!("--- merge-on-read confirm (degree={degree}, {iters} reads) ---");
+    eprintln!("BEFORE compaction:");
+    eprintln!("  merge-operand hub: {before_merge:.2} us/read");
+    eprintln!("  single-put hub:    {before_put:.2} us/read");
+    eprintln!("  ratio: {:.1}x", before_merge / before_put.max(1e-9));
+
+    engine
+        .force_compaction(Partition::Adj)
+        .expect("force_compaction");
+
+    let snap2 = engine.snapshot();
+    let after_merge = read_us(&snap2, &hub_merge);
+    let after_put = read_us(&snap2, &hub_put);
+    eprintln!("AFTER force_compaction(Adj):");
+    eprintln!("  merge-operand hub: {after_merge:.2} us/read");
+    eprintln!("  single-put hub:    {after_put:.2} us/read");
+    eprintln!("  ratio: {:.1}x", after_merge / after_put.max(1e-9));
+
+    // Apply the shipped fix: collapse merge operands into single stored values.
+    let rewritten = engine
+        .collapse_merge_operands(Partition::Adj)
+        .expect("collapse");
+    let snap3 = engine.snapshot();
+    let after_repair = read_us(&snap3, &hub_merge);
+    eprintln!("AFTER collapse_merge_operands(Adj) (rewrote {rewritten} keys):");
+    eprintln!("  merge-operand hub: {after_repair:.2} us/read");
+    eprintln!(
+        "verdict: collapse sped the merged hub by {:.1}x (vs before)",
+        before_merge / after_repair.max(1e-9)
+    );
+}
+
 fn main() {
     let args = Args::parse();
+
+    if args.confirm_merge {
+        confirm_merge_read();
+        return;
+    }
+
     let n = args.shards.max(1);
 
     // Generate a Barabasi-Albert graph: adjacency in memory first, then write

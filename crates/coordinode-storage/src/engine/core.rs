@@ -1022,7 +1022,44 @@ impl StorageEngine {
         tree.flush_active_memtable(0)?;
         // Major compaction: compact all SST data.
         tree.major_compact(u64::MAX, 0)?;
+        // Major compaction does not fold merge operands that never met a base
+        // value into one entry, so a key written purely through `merge()`
+        // (commutative partitions: adjacency, counters) still re-merges every
+        // operand on each read. Collapse them into single stored values.
+        if part.is_commutative() {
+            self.collapse_merge_operands(part)?;
+        }
         Ok(())
+    }
+
+    /// Collapse accumulated merge operands in a commutative partition into one
+    /// stored value per key, returning the number of keys rewritten.
+    ///
+    /// Each `merge()` write appends an operand; a key touched `N` times carries
+    /// `N` operands that the registered merge operator re-applies on *every*
+    /// read (`O(N)` per read). A super-node adjacency list touched once per load
+    /// batch accumulates hundreds of operands, so a single traversal step pays
+    /// `O(operands)` to read one neighbour set. This pass reads each key once
+    /// (folding the operands through the merge operator) and writes the folded
+    /// value back with `put`, which replaces the operand chain with a single
+    /// base value. Subsequent reads are `O(1)` in operand count until new
+    /// `merge()` writes accumulate again.
+    ///
+    /// Run it as a maintenance pass after a bulk load, or rely on the same call
+    /// from [`Self::force_compaction`] for a commutative partition.
+    pub fn collapse_merge_operands(&self, part: Partition) -> StorageResult<usize> {
+        // Snapshot the merged state first; writing while the scan iterator is
+        // live would read keys this pass has already rewritten.
+        let mut folded: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for guard in self.prefix_scan(part, b"")? {
+            let (key, value) = guard.into_inner()?;
+            folded.push((key.to_vec(), value.to_vec()));
+        }
+        let rewritten = folded.len();
+        for (key, value) in folded {
+            self.put(part, &key, &value)?;
+        }
+        Ok(rewritten)
     }
 
     /// Scan all key-value pairs in a partition whose keys start with the given prefix.
@@ -1756,6 +1793,66 @@ mod tests {
             .expect("decode posting list");
         let uids: Vec<u64> = plist.iter().collect();
         assert_eq!(uids, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn collapse_merge_operands_preserves_value_and_folds_operands() {
+        use crate::engine::merge::encode_add_batch;
+        use coordinode_core::graph::edge::PostingList;
+
+        let engine = test_engine_memfs();
+        let key = b"adj:KNOWS:out:00000007";
+
+        // Build a hub via many single-neighbour merge operands, the shape a
+        // super-node takes after an incremental bulk load.
+        let degree: u64 = 64;
+        for t in 0..degree {
+            engine
+                .merge(Partition::Adj, key, &encode_add_batch(&[1000 + t]))
+                .expect("merge");
+        }
+        let before = engine
+            .get(Partition::Adj, key)
+            .expect("get")
+            .expect("hub exists");
+        let before_uids: Vec<u64> = PostingList::from_bytes(&before)
+            .expect("decode")
+            .iter()
+            .collect();
+        assert_eq!(before_uids.len(), degree as usize);
+
+        // Collapse: the operand chain folds into a single stored value.
+        let rewritten = engine
+            .collapse_merge_operands(Partition::Adj)
+            .expect("collapse");
+        assert!(rewritten >= 1, "at least the hub key is rewritten");
+
+        // The merged value is byte-for-byte identical after collapsing.
+        let after = engine
+            .get(Partition::Adj, key)
+            .expect("get")
+            .expect("hub still exists");
+        let after_uids: Vec<u64> = PostingList::from_bytes(&after)
+            .expect("decode")
+            .iter()
+            .collect();
+        assert_eq!(after_uids, before_uids, "collapse must preserve neighbours");
+
+        // A later merge still composes correctly on top of the folded base.
+        engine
+            .merge(Partition::Adj, key, &encode_add_batch(&[9999]))
+            .expect("merge after collapse");
+        let extended: Vec<u64> = PostingList::from_bytes(
+            &engine
+                .get(Partition::Adj, key)
+                .expect("get")
+                .expect("exists"),
+        )
+        .expect("decode")
+        .iter()
+        .collect();
+        assert!(extended.contains(&9999), "new edge visible after collapse");
+        assert_eq!(extended.len(), degree as usize + 1);
     }
 
     #[test]
