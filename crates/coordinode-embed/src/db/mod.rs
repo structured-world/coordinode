@@ -1463,6 +1463,7 @@ impl Database {
             id_allocator: &self.allocator,
             shard_id: self.shard_id,
             adaptive: self.adaptive_config.clone(),
+            dedup_varlen_targets: false,
             snapshot_ts: None,
             retention_window_us: 7 * 24 * 3600 * 1_000_000,
             warnings: Vec::new(),

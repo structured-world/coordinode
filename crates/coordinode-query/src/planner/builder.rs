@@ -5220,6 +5220,63 @@ mod tests {
         assert!(explain.contains("Project"));
     }
 
+    /// The product graph-traversal query: a var-length BFS whose reached set is
+    /// consumed only by `count(DISTINCT f)`. The planner wraps the aggregate in a
+    /// Project (RETURN ... AS reach) and lifts the pid predicate, so the dedup
+    /// detector must see through those wrappers and still enable per-node
+    /// emission. Regression for the near-global traversal that otherwise emits
+    /// O(edges) rows and runs for minutes.
+    #[test]
+    fn varlen_count_distinct_plan_enables_target_dedup() {
+        let p = plan(
+            "MATCH (p:Person) WHERE p.pid = 0 \
+             MATCH (p)-[:KNOWS*1..6]->(f) RETURN count(DISTINCT f) AS reach",
+        );
+        assert!(
+            crate::executor::runner::plan_allows_varlen_target_dedup(&p.root),
+            "count(DISTINCT f) over a lone var-length traverse must enable target \
+             dedup; planned tree was:\n{}",
+            p.explain()
+        );
+    }
+
+    /// Same shape with a parameterised source predicate, as the traversal bench
+    /// and real clients send it. The parameter must not change the plan shape the
+    /// dedup detector matches.
+    #[test]
+    fn varlen_count_distinct_param_plan_enables_target_dedup() {
+        let p = plan(
+            "MATCH (p:Person) WHERE p.pid = $pid \
+             MATCH (p)-[:KNOWS*1..6]->(f) RETURN count(DISTINCT f) AS reach",
+        );
+        assert!(
+            crate::executor::runner::plan_allows_varlen_target_dedup(&p.root),
+            "parameterised count(DISTINCT f) must enable target dedup; tree was:\n{}",
+            p.explain()
+        );
+    }
+
+    /// Dedup must NOT fire when target multiplicity is observable: a bare
+    /// `RETURN f` projects every path, and `count(f)` without DISTINCT counts
+    /// paths. The Project passthrough above the aggregate must not relax these.
+    #[test]
+    fn varlen_observable_multiplicity_disables_target_dedup() {
+        let bare = plan("MATCH (p:Person)-[:KNOWS*1..6]->(f) RETURN f");
+        assert!(
+            !crate::executor::runner::plan_allows_varlen_target_dedup(&bare.root),
+            "bare RETURN f exposes path multiplicity; dedup must stay off:\n{}",
+            bare.explain()
+        );
+
+        let count_no_distinct =
+            plan("MATCH (p:Person)-[:KNOWS*1..6]->(f) RETURN count(f) AS reach");
+        assert!(
+            !crate::executor::runner::plan_allows_varlen_target_dedup(&count_no_distinct.root),
+            "count(f) without DISTINCT counts paths; dedup must stay off:\n{}",
+            count_no_distinct.explain()
+        );
+    }
+
     // -- UNWIND --
 
     #[test]

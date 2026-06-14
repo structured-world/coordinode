@@ -255,6 +255,13 @@ pub struct ExecutionContext<'a> {
     pub shard_id: u16,
     /// Adaptive query plan configuration.
     pub adaptive: AdaptiveConfig,
+    /// When true, variable-length traversal emits each reached target node at
+    /// most once instead of one row per reaching edge. Set by the planner only
+    /// when the whole query provably cannot observe target multiplicity (a lone
+    /// var-length traverse feeding `count(DISTINCT target)` with no path or edge
+    /// variable), so it never changes a result. Collapses the emitted row count
+    /// from O(edges) to O(reached nodes) on dense / near-global traversals.
+    pub dedup_varlen_targets: bool,
     /// Feedback cache for known super-node fan-out degrees.
     /// Shared across queries within the same session/connection.
     pub feedback_cache: Option<FeedbackCache>,
@@ -1960,6 +1967,100 @@ impl<'a> ExecutionContext<'a> {
     }
 }
 
+/// Decide whether variable-length traversal may dedup target-node emission for
+/// this plan without changing any result (sets `dedup_varlen_targets`).
+///
+/// Safe ONLY when the whole plan is a read-only linear spine of the exact shape
+/// `Aggregate[count(DISTINCT v), no GROUP BY] -> (Filter|Project|Sort|Limit|Skip
+/// |single-hop Traverse)* -> Traverse(var-length, target = v, no path/edge var)
+/// -> (Filter|Project|...)* -> Scan`. The aggregate collapses multiplicity, so
+/// emitting each reached `v` once instead of once-per-edge yields the identical
+/// `count(DISTINCT v)`. Any branch (CartesianProduct), mutation, second
+/// aggregate, second var-length traverse, or unrecognised op makes the function
+/// return `false` (the conservative default leaves emission unchanged), so it
+/// can never enable dedup for a plan whose multiplicity is observable.
+pub(crate) fn plan_allows_varlen_target_dedup(root: &LogicalOp) -> bool {
+    // Skip read-only passthrough wrappers above the aggregate: a `RETURN ... AS
+    // alias` becomes a Project, and ORDER BY / LIMIT / SKIP act on the single
+    // already-aggregated row. None can re-expose the traverse's per-edge
+    // multiplicity, so the count(DISTINCT v) below is the only consumer.
+    let mut top = root;
+    let aggregate = loop {
+        match top {
+            LogicalOp::Project { input, .. }
+            | LogicalOp::Sort { input, .. }
+            | LogicalOp::Limit { input, .. }
+            | LogicalOp::Skip { input, .. } => top = input.as_ref(),
+            LogicalOp::Aggregate { .. } => break top,
+            _ => return false,
+        }
+    };
+    let LogicalOp::Aggregate {
+        input,
+        group_by,
+        aggregates,
+    } = aggregate
+    else {
+        return false;
+    };
+    if !group_by.is_empty() || aggregates.len() != 1 {
+        return false;
+    }
+    let item = &aggregates[0];
+    if !item.distinct || !item.function.eq_ignore_ascii_case("count") {
+        return false;
+    }
+    let Expr::Variable(target_var) = &item.arg else {
+        return false;
+    };
+
+    // Walk the single-input spine below the aggregate. Exactly one var-length
+    // traverse must appear, binding `target_var`, with no path or edge variable.
+    let mut cur = input.as_ref();
+    let mut found_qualifying = false;
+    loop {
+        match cur {
+            LogicalOp::Traverse {
+                input,
+                target_variable,
+                length,
+                path_variable,
+                edge_variable,
+                ..
+            } => {
+                if length.is_some() {
+                    // A second var-length traverse would also be deduped by the
+                    // global flag — bail rather than reason about it.
+                    if found_qualifying {
+                        return false;
+                    }
+                    if path_variable.is_some()
+                        || edge_variable.is_some()
+                        || target_variable != target_var
+                    {
+                        return false;
+                    }
+                    found_qualifying = true;
+                }
+                cur = input.as_ref();
+            }
+            LogicalOp::Filter { input, .. }
+            | LogicalOp::Project { input, .. }
+            | LogicalOp::Sort { input, .. }
+            | LogicalOp::Limit { input, .. }
+            | LogicalOp::Skip { input, .. } => {
+                cur = input.as_ref();
+            }
+            LogicalOp::NodeScan { .. }
+            | LogicalOp::IndexScan { .. }
+            | LogicalOp::HnswScan { .. }
+            | LogicalOp::Empty => return found_qualifying,
+            // Any branch / mutation / unrecognised op: stay safe, do not dedup.
+            _ => return false,
+        }
+    }
+}
+
 /// Execute a logical plan against storage, returning result rows.
 pub fn execute(
     plan: &LogicalPlan,
@@ -2098,6 +2199,11 @@ pub fn execute(
             }
         }
     }
+
+    // Enable per-node dedup of variable-length traversal emission when the plan
+    // provably cannot observe target multiplicity (count(DISTINCT v) over a lone
+    // var-length traverse). Collapses O(edges) emitted rows to O(reached nodes).
+    ctx.dedup_varlen_targets = plan_allows_varlen_target_dedup(&plan.root);
 
     let result = execute_op(&plan.root, ctx)?;
 
@@ -4052,6 +4158,24 @@ fn execute_varlen_traverse(
         return Ok(Vec::new());
     }
 
+    // Per-node emission: when the planner proved the result cannot observe target
+    // multiplicity (count(DISTINCT target), no path/edge variable), emit each
+    // reached target once instead of once per reaching edge. Traversal itself is
+    // unchanged; only row emission is deduped. Cuts O(edges) rows to O(nodes).
+    let dedup_targets = ctx.dedup_varlen_targets
+        && params.path_variable.is_none()
+        && params.edge_variable.is_none();
+
+    // Minimal emission: when dedup is active AND the target carries no label or
+    // inline property filter to check, the sole consumer (count(DISTINCT target))
+    // reads only the target id. Emit a bare target binding and skip the whole
+    // per-row materialisation (target node read + decode + property formatting +
+    // computed-property injection) that dominates a dense traversal. When labels
+    // or filters are present we keep deduping but still materialise so the filter
+    // can be applied.
+    let minimal_emit =
+        dedup_targets && params.target_labels.is_empty() && params.target_filters.is_empty();
+
     let mut results = Vec::new();
 
     for row in input_rows {
@@ -4073,6 +4197,11 @@ fn execute_varlen_traverse(
         // out-edges, so the emitted rows are identical and the adjacency read
         // is pure waste. Guarding here removes that waste across every depth.
         let mut expanded: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
+
+        // Target nodes already emitted as a result row for this source. Only
+        // consulted when `dedup_targets` is set; keeps each reached node to one
+        // emitted row within the [min..max] window.
+        let mut emitted_targets: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
 
         // Predecessor map for named-path reconstruction: only built when a path
         // variable is requested. `pred[n] = Some((prev, edge_type_idx))`, the
@@ -4127,7 +4256,7 @@ fn execute_varlen_traverse(
                 if params.path_variable.is_some() {
                     pred.entry(tgt_uid).or_insert(Some((src_uid, et_idx)));
                 }
-                if depth >= min_hops {
+                if depth >= min_hops && (!dedup_targets || emitted_targets.insert(tgt_uid)) {
                     depth_neighbors.push((src_uid, tgt_uid, et_idx));
                 }
             }
@@ -4182,7 +4311,18 @@ fn execute_varlen_traverse(
                 && params.path_variable.is_none()
                 && depth_neighbors.len() >= ctx.adaptive.parallel_threshold;
 
-            if use_parallel {
+            if minimal_emit {
+                // Bare target binding only: count(DISTINCT target) reads nothing
+                // else. depth_neighbors is already deduped to distinct targets.
+                for &(_src_uid, tgt_uid, _et_idx) in &depth_neighbors {
+                    let mut out = row.clone();
+                    out.insert(
+                        params.target_variable.to_string(),
+                        Value::Int(tgt_uid as i64),
+                    );
+                    results.push(out);
+                }
+            } else if use_parallel {
                 // depth_neighbors already has (src, tgt, et_idx) — pass directly
                 let pctx = ParallelCtx {
                     engine: ctx.engine,
@@ -14806,6 +14946,7 @@ mod tests {
             id_allocator: allocator,
             shard_id: 1,
             adaptive: AdaptiveConfig::default(),
+            dedup_varlen_targets: false,
             snapshot_ts: None,
             retention_window_us: 7 * 24 * 3600 * 1_000_000, // 7 days in micros
             warnings: Vec::new(),
@@ -16642,6 +16783,139 @@ mod tests {
         // At 2 hops from Alice: Charlie (via Bob) and Dave (via Charlie)
         assert!(target_ids.contains(&3), "should reach Charlie at 2 hops");
         assert!(target_ids.contains(&5), "should reach Dave at 2 hops");
+    }
+
+    /// `count(DISTINCT b)` over a var-length traverse whose targets are reachable
+    /// via multiple paths must equal the number of DISTINCT reached nodes. This
+    /// is the shape the planner enables target dedup for, so the test guards that
+    /// the per-node emission optimisation does not drop or double-count nodes.
+    #[test]
+    fn varlen_count_distinct_dedups_multipath_targets() {
+        // A(1)→B(2)→C(3)→D(5)→E(6), plus A→C, B→C. From Alice within 1..3 the
+        // distinct reachable set is {B, C, D, E} = 4, but C and D are each
+        // reachable by two paths, so a per-edge emission would over-count.
+        let (_dir, engine, mut interner) = setup_varlen_graph();
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+
+        let traverse = LogicalOp::Traverse {
+            input: Box::new(LogicalOp::NodeScan {
+                variable: "a".into(),
+                labels: vec!["User".into()],
+                property_filters: vec![(
+                    "name".into(),
+                    Expr::Literal(Value::String("Alice".into())),
+                )],
+            }),
+            source: "a".into(),
+            edge_types: vec!["KNOWS".into()],
+            direction: Direction::Outgoing,
+            target_variable: "b".into(),
+            target_labels: vec![],
+            length: Some(LengthBound {
+                min: Some(1),
+                max: Some(3),
+            }),
+            edge_variable: None,
+            target_filters: vec![],
+            edge_filters: vec![],
+            temporal_filter: None,
+            path_variable: None,
+        };
+
+        let plan = LogicalPlan {
+            snapshot_ts: None,
+            vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
+            root: LogicalOp::Aggregate {
+                input: Box::new(traverse),
+                group_by: vec![],
+                aggregates: vec![crate::planner::logical::AggregateItem {
+                    function: "count".into(),
+                    arg: Expr::Variable("b".into()),
+                    distinct: true,
+                    alias: Some("cnt".into()),
+                    percentile_expr: None,
+                }],
+            },
+        };
+
+        // The planner detector must enable dedup for exactly this shape.
+        assert!(
+            plan_allows_varlen_target_dedup(&plan.root),
+            "count(DISTINCT b) over a lone var-length traverse must allow dedup"
+        );
+
+        let results = execute(&plan, &mut ctx).expect("execute");
+        assert_eq!(results.len(), 1, "count aggregate yields one row");
+        let cnt = match results[0].get("cnt") {
+            Some(Value::Int(n)) => *n,
+            other => panic!("expected Int count, got {other:?}"),
+        };
+        assert_eq!(
+            cnt, 4,
+            "distinct reachable nodes within 1..3 are B, C, D, E"
+        );
+    }
+
+    /// A plain `RETURN b` (no DISTINCT, no aggregate) must NOT trigger target
+    /// dedup: per-path multiplicity is observable, so a multi-path node appears
+    /// once per reaching path. Guards the detector against a false positive.
+    #[test]
+    fn varlen_plain_return_keeps_path_multiplicity() {
+        let (_dir, engine, mut interner) = setup_varlen_graph();
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+
+        let plan = LogicalPlan {
+            snapshot_ts: None,
+            vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
+            root: LogicalOp::Traverse {
+                input: Box::new(LogicalOp::NodeScan {
+                    variable: "a".into(),
+                    labels: vec!["User".into()],
+                    property_filters: vec![(
+                        "name".into(),
+                        Expr::Literal(Value::String("Alice".into())),
+                    )],
+                }),
+                source: "a".into(),
+                edge_types: vec!["KNOWS".into()],
+                direction: Direction::Outgoing,
+                target_variable: "b".into(),
+                target_labels: vec![],
+                length: Some(LengthBound {
+                    min: Some(1),
+                    max: Some(3),
+                }),
+                edge_variable: None,
+                target_filters: vec![],
+                edge_filters: vec![],
+                temporal_filter: None,
+                path_variable: None,
+            },
+        };
+
+        // A bare traverse (no count(DISTINCT) parent) must not allow dedup.
+        assert!(
+            !plan_allows_varlen_target_dedup(&plan.root),
+            "a bare traverse must not enable target dedup"
+        );
+
+        let results = execute(&plan, &mut ctx).expect("execute");
+        let charlie_rows = results
+            .iter()
+            .filter(|r| matches!(r.get("b"), Some(Value::Int(3))))
+            .count();
+        // Charlie (3) is reachable as A→C (1 hop) and A→B→C (2 hops): two paths,
+        // so without dedup it must appear at least twice.
+        assert!(
+            charlie_rows >= 2,
+            "multi-path node must keep per-path multiplicity without DISTINCT, got {charlie_rows}"
+        );
     }
 
     #[test]

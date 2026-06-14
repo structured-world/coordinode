@@ -36,6 +36,7 @@ fn make_test_ctx<'a>(
         id_allocator: allocator,
         shard_id: 1,
         adaptive: AdaptiveConfig::default(),
+        dedup_varlen_targets: false,
         snapshot_ts: None,
         retention_window_us: 7 * 24 * 3600 * 1_000_000,
         warnings: Vec::new(),
