@@ -51,6 +51,8 @@ Key flags:
 | `--data` | `./data` | Data directory |
 | `--peers` | (none) | Peer addresses for cluster mode |
 
+See [Configuration](/guide/configuration) for the full flag and environment reference, the packaged config file, and the open-file-descriptor limit.
+
 The binary exposes **gRPC only** on port 7080. For REST/JSON, run [structured-proxy](https://github.com/structured-world/structured-proxy) in front of it (see `docker-compose.yml` for a reference setup).
 
 ## Verify

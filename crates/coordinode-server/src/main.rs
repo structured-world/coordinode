@@ -59,6 +59,36 @@ mod metrics_catalog;
 mod ops;
 mod services;
 
+/// Raise the process open-file-descriptor soft limit before opening storage.
+///
+/// `target = Some(n)` requests `n` descriptors (clamped to the hard limit);
+/// `None` raises the soft limit to the current hard limit. Returns the
+/// effective `(soft, hard)` pair, or `None` when the syscall fails. The storage
+/// engine keeps many files open at once, so a low limit surfaces as
+/// "too many open files" under load.
+#[cfg(unix)]
+fn set_nofile_limit(target: Option<u64>) -> Option<(u64, u64)> {
+    // `None` means "raise to the hard limit": request u64::MAX, which the helper
+    // clamps to the current hard limit.
+    let want = target.unwrap_or(u64::MAX);
+    match rlimit::increase_nofile_limit(want) {
+        Ok(soft) => {
+            let hard = rlimit::Resource::NOFILE
+                .get()
+                .map(|(_, hard)| hard)
+                .unwrap_or(soft);
+            Some((soft, hard))
+        }
+        Err(_) => None,
+    }
+}
+
+/// No descriptor limit to manage on non-unix platforms.
+#[cfg(not(unix))]
+fn set_nofile_limit(_target: Option<u64>) -> Option<(u64, u64)> {
+    None
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let command = cli::parse_args();
@@ -142,8 +172,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ops_addr,
             data_dir,
             peers,
+            nofile,
+            max_connections,
+            max_request_size_mb,
+            request_timeout_secs,
+            http2_keepalive_secs,
+            cache_size_mb,
+            write_buffer_mb,
         } => {
             logging::init_logging();
+
+            // Raise the open-file-descriptor limit before opening storage: the
+            // engine keeps many files open at once. Honour an explicit target or
+            // raise the soft limit to the hard limit.
+            if let Some((soft, hard)) = set_nofile_limit(nofile) {
+                info!(soft, hard, "file-descriptor limit");
+            }
 
             let addr: SocketAddr = grpc_addr.parse()?;
             // Advertise address is what peers use to connect to this node.
@@ -173,7 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // administration, and ensures consistent apply ordering via oracle.
 
             // Common setup: open storage engine + timestamp oracle.
-            let storage_config =
+            let mut storage_config =
                 coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
                     EndpointConfig::new(
                         "default",
@@ -183,6 +227,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Tier::Warm,
                     ),
                 ]);
+            if let Some(mb) = cache_size_mb {
+                storage_config.block_cache_bytes = mb.saturating_mul(1024 * 1024);
+            }
+            if let Some(mb) = write_buffer_mb {
+                storage_config.max_write_buffer_bytes = mb.saturating_mul(1024 * 1024);
+            }
             let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
             let engine = coordinode_storage::engine::core::StorageEngine::open_with_oracle(
                 &storage_config,
@@ -422,41 +472,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
+            // Network limits: per-request timeout, per-connection in-flight cap,
+            // and HTTP/2 keepalive pings. Each applies only when configured.
+            let mut server = Server::builder();
+            if let Some(secs) = request_timeout_secs {
+                server = server.timeout(std::time::Duration::from_secs(secs));
+            }
+            if let Some(n) = max_connections {
+                server = server.concurrency_limit_per_connection(n);
+            }
+            if let Some(secs) = http2_keepalive_secs {
+                server =
+                    server.http2_keepalive_interval(Some(std::time::Duration::from_secs(secs)));
+            }
+
+            // Cap the decoded size of any single request to guard against
+            // unbounded-allocation messages. Applied to every service.
+            let max_req_bytes = max_request_size_mb.saturating_mul(1024 * 1024);
+
             // NodeInfoLayer: inject x-coordinode-node / x-coordinode-hops /
             // x-coordinode-load response headers on every gRPC response.
-            let mut builder = Server::builder().layer(grpc::NodeInfoLayer::new(node_id));
+            let mut builder = server.layer(grpc::NodeInfoLayer::new(node_id));
             let mut router = builder
-                .add_service(proto::graph::graph_service_server::GraphServiceServer::new(
-                    graph_service,
-                ))
                 .add_service(
-                    proto::graph::schema_service_server::SchemaServiceServer::new(schema_service),
+                    proto::graph::graph_service_server::GraphServiceServer::new(graph_service)
+                        .max_decoding_message_size(max_req_bytes),
                 )
                 .add_service(
-                    proto::query::cypher_service_server::CypherServiceServer::new(cypher_service),
+                    proto::graph::schema_service_server::SchemaServiceServer::new(schema_service)
+                        .max_decoding_message_size(max_req_bytes),
                 )
                 .add_service(
-                    proto::query::vector_service_server::VectorServiceServer::new(vector_service),
+                    proto::query::cypher_service_server::CypherServiceServer::new(cypher_service)
+                        .max_decoding_message_size(max_req_bytes),
                 )
                 .add_service(
-                    proto::query::text_service_server::TextServiceServer::new(text_service),
+                    proto::query::vector_service_server::VectorServiceServer::new(vector_service)
+                        .max_decoding_message_size(max_req_bytes),
                 )
                 .add_service(
-                    proto::health::health_service_server::HealthServiceServer::new(health_service),
+                    proto::query::text_service_server::TextServiceServer::new(text_service)
+                        .max_decoding_message_size(max_req_bytes),
                 )
-                .add_service(proto::graph::blob_service_server::BlobServiceServer::new(
-                    blob_service,
-                ))
+                .add_service(
+                    proto::health::health_service_server::HealthServiceServer::new(health_service)
+                        .max_decoding_message_size(max_req_bytes),
+                )
+                .add_service(
+                    proto::graph::blob_service_server::BlobServiceServer::new(blob_service)
+                        .max_decoding_message_size(max_req_bytes),
+                )
                 .add_service(
                     proto::replication::cdc::change_stream_service_server::ChangeStreamServiceServer::new(
                         cdc_service,
-                    ),
+                    )
+                    .max_decoding_message_size(max_req_bytes),
                 );
 
             // Register ClusterService only in cluster mode (requires Raft node).
             if let Some(cs) = cluster_service {
                 router = router.add_service(
-                    proto::admin::cluster::cluster_service_server::ClusterServiceServer::new(cs),
+                    proto::admin::cluster::cluster_service_server::ClusterServiceServer::new(cs)
+                        .max_decoding_message_size(max_req_bytes),
                 );
                 info!("ClusterService registered — cluster join/leave management available");
             }

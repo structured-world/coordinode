@@ -22,6 +22,7 @@ const guideSidebar = [
       { text: "Docker", link: "/guide/docker" },
       { text: "Binary", link: "/guide/binary" },
       { text: "Embedded (Rust)", link: "/guide/embedded" },
+      { text: "Configuration", link: "/guide/configuration" },
     ],
   },
   {

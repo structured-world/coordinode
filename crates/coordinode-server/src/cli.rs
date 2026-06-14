@@ -43,6 +43,31 @@ pub enum Command {
         /// When provided, enables Raft consensus with the given peers.
         /// Example: --peers "node2:7080,node3:7080"
         peers: Option<Vec<String>>,
+        /// Open-file-descriptor soft limit to request at startup
+        /// (`setrlimit(RLIMIT_NOFILE)`). `None` raises the soft limit to the
+        /// hard limit. The storage engine keeps many files open, so a high
+        /// limit matters in production. Unix only; ignored elsewhere.
+        nofile: Option<u64>,
+        /// Maximum in-flight requests per client connection (gRPC concurrency
+        /// limit). `None` leaves it unbounded. Mirrors a connection cap on a
+        /// stream-multiplexed transport.
+        max_connections: Option<usize>,
+        /// Maximum decoded request message size, in MiB (default: 16, matching
+        /// the common document-size limit). Guards against unbounded-allocation
+        /// requests.
+        max_request_size_mb: usize,
+        /// Per-request timeout in seconds. `None` disables the server-side
+        /// timeout.
+        request_timeout_secs: Option<u64>,
+        /// HTTP/2 keepalive ping interval in seconds. `None` disables keepalive
+        /// pings. Useful to detect half-open connections across a load balancer.
+        http2_keepalive_secs: Option<u64>,
+        /// Block cache size in MiB. `None` keeps the engine default. The read
+        /// path serves hot blocks from this cache before touching disk.
+        cache_size_mb: Option<u64>,
+        /// Write buffer (memtable) size in MiB. `None` keeps the engine
+        /// default. Larger buffers reduce flush frequency at the cost of memory.
+        write_buffer_mb: Option<u64>,
     },
     /// Print version and exit.
     Version,
@@ -191,6 +216,13 @@ pub fn parse_args_from(args: &[String]) -> Command {
                 );
                 std::process::exit(1);
             }
+            let nofile = find_flag_num(args, "--nofile");
+            let max_connections = find_flag_num(args, "--max-connections");
+            let max_request_size_mb = find_flag_num(args, "--max-request-size-mb").unwrap_or(16);
+            let request_timeout_secs = find_flag_num(args, "--request-timeout-secs");
+            let http2_keepalive_secs = find_flag_num(args, "--http2-keepalive-secs");
+            let cache_size_mb = find_flag_num(args, "--cache-size-mb");
+            let write_buffer_mb = find_flag_num(args, "--write-buffer-mb");
             Command::Serve {
                 mode,
                 node_id,
@@ -201,6 +233,13 @@ pub fn parse_args_from(args: &[String]) -> Command {
                 ops_addr,
                 data_dir,
                 peers,
+                nofile,
+                max_connections,
+                max_request_size_mb,
+                request_timeout_secs,
+                http2_keepalive_secs,
+                cache_size_mb,
+                write_buffer_mb,
             }
         }
         "version" | "--version" | "-v" => Command::Version,
@@ -280,7 +319,9 @@ pub fn parse_args_from(args: &[String]) -> Command {
                 "coordinode v{}\n\n\
                  Usage:\n  \
                  coordinode serve [--mode full] [--node-id N] [--addr ADDR] [--advertise-addr ADDR]\n          \
-                 [--rest-addr ADDR] [--ops-addr ADDR] [--data DIR] [--peers PEERS]\n  \
+                 [--rest-addr ADDR] [--ops-addr ADDR] [--data DIR] [--peers PEERS]\n          \
+                 [--nofile N] [--max-connections N] [--max-request-size-mb N] [--request-timeout-secs N]\n          \
+                 [--http2-keepalive-secs N] [--cache-size-mb N] [--write-buffer-mb N]\n  \
                  coordinode backup --output FILE [--data DIR] [--format json|cypher|binary|snapshot] [--namespace NS] [--since SEQNO]\n  \
                  coordinode restore --input FILE [--data DIR] [--format json|cypher|binary|snapshot|apoc-json|apoc-cypher|hetio-json] [--namespace NS] [--only-labels L1,L2] [--force]\n  \
                  coordinode checkpoint --output DIR [--data DIR]\n  \
@@ -401,6 +442,13 @@ fn default_serve() -> Command {
         ops_addr: "[::]:7084".to_string(),
         data_dir: "./data".to_string(),
         peers: None,
+        nofile: None,
+        max_connections: None,
+        max_request_size_mb: 16,
+        request_timeout_secs: None,
+        http2_keepalive_secs: None,
+        cache_size_mb: None,
+        write_buffer_mb: None,
     }
 }
 
@@ -409,6 +457,20 @@ fn find_flag(args: &[String], flag: &str) -> Option<String> {
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+/// Parse a numeric flag value, exiting with a clear message on a bad value.
+/// Absent flag returns `None`.
+fn find_flag_num<T>(args: &[String], flag: &str) -> Option<T>
+where
+    T: std::str::FromStr,
+{
+    find_flag(args, flag).map(|s| {
+        s.parse().unwrap_or_else(|_| {
+            eprintln!("error: {flag} requires a valid number, got '{s}'");
+            std::process::exit(1);
+        })
+    })
 }
 
 /// Parse --format flag (default: json).
@@ -632,6 +694,60 @@ mod tests {
                 assert_eq!(node_id, 3);
                 let p = peers.unwrap_or_default();
                 assert_eq!(p.len(), 2);
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn serve_resource_flags_parsed() {
+        let cmd = parse_args_from(&args(
+            "coordinode serve --nofile 262144 --max-connections 1024 \
+             --max-request-size-mb 32 --request-timeout-secs 30 \
+             --http2-keepalive-secs 60 --cache-size-mb 4096 --write-buffer-mb 256",
+        ));
+        match cmd {
+            Command::Serve {
+                nofile,
+                max_connections,
+                max_request_size_mb,
+                request_timeout_secs,
+                http2_keepalive_secs,
+                cache_size_mb,
+                write_buffer_mb,
+                ..
+            } => {
+                assert_eq!(nofile, Some(262144));
+                assert_eq!(max_connections, Some(1024));
+                assert_eq!(max_request_size_mb, 32);
+                assert_eq!(request_timeout_secs, Some(30));
+                assert_eq!(http2_keepalive_secs, Some(60));
+                assert_eq!(cache_size_mb, Some(4096));
+                assert_eq!(write_buffer_mb, Some(256));
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn serve_resource_flags_default() {
+        let cmd = parse_args_from(&args("coordinode serve"));
+        match cmd {
+            Command::Serve {
+                nofile,
+                max_connections,
+                max_request_size_mb,
+                request_timeout_secs,
+                cache_size_mb,
+                ..
+            } => {
+                // Unset network/storage knobs stay None; the request-size cap has
+                // a safe default.
+                assert!(nofile.is_none());
+                assert!(max_connections.is_none());
+                assert_eq!(max_request_size_mb, 16);
+                assert!(request_timeout_secs.is_none());
+                assert!(cache_size_mb.is_none());
             }
             _ => panic!("expected Serve command"),
         }
