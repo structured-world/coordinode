@@ -3476,7 +3476,10 @@ fn expand_one_hop(
             // repeatedly reallocate `neighbors` mid-expansion (super-node path).
             neighbors.reserve(fan_out);
             if ctx.adaptive.enabled && fan_out > ctx.adaptive.parallel_threshold {
-                tracing::info!(
+                // Diagnostic only: a per-super-node log on the traversal hot path
+                // must stay at debug so a near-global query does not pay
+                // formatting + writer-lock cost (and flood the log) per hub.
+                tracing::debug!(
                     node_id = src_id.as_raw(),
                     fan_out,
                     edge_type = edge_type.as_str(),
