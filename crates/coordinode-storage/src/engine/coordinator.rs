@@ -45,7 +45,7 @@
 //! [`MultiModalCoordinator::set_gc_watermark`]. Neither hook requires
 //! API changes; the seam is the existing accessor surface.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -363,6 +363,119 @@ pub trait MultiModalCoordinator: Send + Sync {
 
 /// CE single-Raft, single-shard [`MultiModalCoordinator`] implementation.
 /// Owns the per-partition LSM tree handles + shared seqno generator
+/// Drives the MVCC GC watermark from the set of currently-pinned read
+/// snapshots.
+///
+/// The watermark is the seqno below which version history and merge operands
+/// may be folded or collected at compaction. **Invariant:** the watermark must
+/// never exceed the oldest live snapshot, or a reader pinned at that snapshot
+/// would observe folded state newer than its pin. With no live snapshots the
+/// watermark tracks the current seqno, so compaction folds everything.
+///
+/// Per-query reads at the current seqno are always `>=` the watermark and need
+/// no protection; the registry exists to hold the watermark back for in-flight
+/// statements and long-lived consumers (backup, CDC, checkpoint) that pin an
+/// older seqno across compactions.
+pub struct GcWatermarkController {
+    /// Pinned seqno -> reference count. The smallest key is the oldest live
+    /// snapshot; an empty map means no reader is pinned.
+    pins: Mutex<BTreeMap<u64, usize>>,
+    /// The shared atomic the compaction filter reads as its fold/GC threshold.
+    gc_watermark: Arc<AtomicU64>,
+    /// Current-seqno source; the watermark target when nothing is pinned.
+    seqno: lsm_tree::SharedSequenceNumberGenerator,
+}
+
+impl GcWatermarkController {
+    fn new(gc_watermark: Arc<AtomicU64>, seqno: lsm_tree::SharedSequenceNumberGenerator) -> Self {
+        let controller = Self {
+            pins: Mutex::new(BTreeMap::new()),
+            gc_watermark,
+            seqno,
+        };
+        if let Ok(pins) = controller.pins.lock() {
+            controller.recompute(&pins);
+        }
+        controller
+    }
+
+    /// Recompute and publish the watermark: the oldest pinned seqno, or the
+    /// current seqno when nothing is pinned. Caller holds the `pins` lock.
+    fn recompute(&self, pins: &BTreeMap<u64, usize>) {
+        let watermark = pins
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or_else(|| self.seqno.get());
+        self.gc_watermark.store(watermark, Ordering::Release);
+    }
+
+    /// Pin the current snapshot seqno so the watermark cannot advance past it
+    /// until the returned guard drops. Returns the pinned seqno.
+    pub fn pin(self: &Arc<Self>) -> (u64, SnapshotPin) {
+        let seqno = self.seqno.get();
+        (seqno, self.pin_at(seqno))
+    }
+
+    /// Pin an explicit seqno — for a reader that already holds a snapshot at a
+    /// possibly-older point in time (a statement reading at its allocated
+    /// `read_ts`, or a long-lived backup / CDC consumer). The watermark will
+    /// not advance past `seqno` until the returned guard drops.
+    pub fn pin_at(self: &Arc<Self>, seqno: u64) -> SnapshotPin {
+        if let Ok(mut pins) = self.pins.lock() {
+            *pins.entry(seqno).or_insert(0) += 1;
+            self.recompute(&pins);
+        }
+        SnapshotPin {
+            controller: Arc::clone(self),
+            seqno,
+        }
+    }
+
+    /// Advance the watermark toward the current seqno. A no-op while any
+    /// snapshot is pinned; call periodically so folding and version GC keep up
+    /// during quiescent periods with no read traffic.
+    pub fn tick(&self) {
+        if let Ok(pins) = self.pins.lock() {
+            self.recompute(&pins);
+        }
+    }
+
+    fn release(&self, seqno: u64) {
+        if let Ok(mut pins) = self.pins.lock() {
+            if let Some(count) = pins.get_mut(&seqno) {
+                *count -= 1;
+                if *count == 0 {
+                    pins.remove(&seqno);
+                }
+            }
+            self.recompute(&pins);
+        }
+    }
+}
+
+/// RAII guard holding a read-snapshot pin. While alive it keeps the GC
+/// watermark at or below its seqno; dropping it releases the pin and lets the
+/// watermark advance.
+#[must_use = "dropping the pin immediately releases the snapshot"]
+pub struct SnapshotPin {
+    controller: Arc<GcWatermarkController>,
+    seqno: u64,
+}
+
+impl SnapshotPin {
+    /// The seqno this guard pins reads to.
+    pub fn seqno(&self) -> u64 {
+        self.seqno
+    }
+}
+
+impl Drop for SnapshotPin {
+    fn drop(&mut self) {
+        self.controller.release(self.seqno);
+    }
+}
+
 /// + GC watermark + block cache.
 ///
 /// One instance is created per [`crate::engine::core::StorageEngine`]
@@ -393,6 +506,10 @@ pub struct LocalMultiModalCoordinator {
     /// retention can be dropped at compaction time. Observed by the
     /// seqno-retention compaction filter on every compaction.
     gc_watermark: Arc<AtomicU64>,
+    /// Drives `gc_watermark` from live read-snapshot pins so the compaction
+    /// filter folds operands / collects versions instead of seeing a frozen
+    /// `0` threshold.
+    gc_controller: Arc<GcWatermarkController>,
 }
 
 impl LocalMultiModalCoordinator {
@@ -405,12 +522,45 @@ impl LocalMultiModalCoordinator {
         cache: Arc<lsm_tree::Cache>,
         gc_watermark: Arc<AtomicU64>,
     ) -> Self {
+        let gc_controller = Arc::new(GcWatermarkController::new(
+            Arc::clone(&gc_watermark),
+            seqno.clone(),
+        ));
         Self {
             trees,
             seqno,
             cache,
             gc_watermark,
+            gc_controller,
         }
+    }
+
+    /// Pin a read snapshot at the current seqno. While the returned guard is
+    /// alive the GC watermark cannot advance past it, so compaction will not
+    /// fold or collect state the reader must still observe. Returns the pinned
+    /// seqno.
+    pub fn pin_snapshot(&self) -> (lsm_tree::SeqNo, SnapshotPin) {
+        self.gc_controller.pin()
+    }
+
+    /// Pin a read snapshot at an explicit (possibly older) seqno — for a reader
+    /// that already allocated its `read_ts`, or a long-lived backup / CDC
+    /// consumer.
+    pub fn pin_snapshot_at(&self, seqno: lsm_tree::SeqNo) -> SnapshotPin {
+        self.gc_controller.pin_at(seqno)
+    }
+
+    /// Advance the GC watermark toward the current seqno when no snapshot is
+    /// pinned. Call periodically so folding / version GC keep up during quiet
+    /// periods.
+    pub fn advance_gc_watermark(&self) {
+        self.gc_controller.tick();
+    }
+
+    /// The current GC watermark value (the seqno below which compaction may
+    /// fold operands / collect versions). Observability + test hook.
+    pub fn gc_watermark_value(&self) -> u64 {
+        self.gc_watermark.load(Ordering::Acquire)
     }
 
     /// Borrow the partition handle for a given logical partition.

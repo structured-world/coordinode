@@ -21,7 +21,7 @@ use crate::engine::batch::WriteBatch;
 use crate::engine::compaction::CompactionScheduler;
 use crate::engine::config::EndpointConfig;
 use crate::engine::config::{FlushPolicy, StorageConfig};
-use crate::engine::coordinator::{LocalMultiModalCoordinator, MultiModalCoordinator};
+use crate::engine::coordinator::{LocalMultiModalCoordinator, MultiModalCoordinator, SnapshotPin};
 use crate::engine::flush::FlushManager;
 use crate::engine::partition::Partition;
 use crate::engine::routing::PartitionRouting;
@@ -670,6 +670,34 @@ impl StorageEngine {
     /// during LSM compaction.
     pub fn set_gc_watermark(&self, watermark: u64) {
         self.coordinator.set_gc_watermark(watermark);
+    }
+
+    /// Pin a read snapshot at the current seqno, holding the GC watermark at or
+    /// below it until the returned guard drops. A reader that holds the guard
+    /// for the lifetime of its snapshot reads is guaranteed that compaction
+    /// will not fold or collect any state it must still observe. Returns the
+    /// pinned seqno to read at.
+    pub fn pin_snapshot(&self) -> (lsm_tree::SeqNo, SnapshotPin) {
+        self.coordinator.pin_snapshot()
+    }
+
+    /// Pin a read snapshot at an explicit seqno (a statement reading at its
+    /// allocated `read_ts`, or a long-lived backup / CDC consumer). Holds the
+    /// GC watermark at or below `seqno` until the guard drops.
+    pub fn pin_snapshot_at(&self, seqno: lsm_tree::SeqNo) -> SnapshotPin {
+        self.coordinator.pin_snapshot_at(seqno)
+    }
+
+    /// Advance the GC watermark toward the current seqno when no read snapshot
+    /// is pinned. Lets compaction fold merge operands and collect old versions
+    /// during quiescent periods; a no-op while any snapshot is pinned.
+    pub fn advance_gc_watermark(&self) {
+        self.coordinator.advance_gc_watermark();
+    }
+
+    /// The current GC watermark value. Observability + test hook.
+    pub fn gc_watermark(&self) -> u64 {
+        self.coordinator.gc_watermark_value()
     }
 
     /// Read a value by key from the given partition.
@@ -1853,6 +1881,86 @@ mod tests {
         .collect();
         assert!(extended.contains(&9999), "new edge visible after collapse");
         assert_eq!(extended.len(), degree as usize + 1);
+    }
+
+    #[test]
+    fn gc_watermark_tracks_oldest_pin() {
+        let engine = test_engine_memfs();
+
+        // Writes advance the shared seqno.
+        for i in 0..5u64 {
+            engine
+                .put(Partition::Node, format!("node:00:{i:08}").as_bytes(), b"v")
+                .expect("put");
+        }
+        // No pins: the watermark advances to the current seqno so compaction
+        // may fold / collect everything.
+        engine.advance_gc_watermark();
+        assert!(
+            engine.gc_watermark() > 0,
+            "watermark advances to current seqno when nothing is pinned"
+        );
+
+        // Pin a snapshot: the watermark must not exceed it.
+        let (pinned, pin) = engine.pin_snapshot();
+        assert!(
+            engine.gc_watermark() <= pinned,
+            "watermark capped at the pinned seqno"
+        );
+
+        // Newer writes move the current seqno well past the pin.
+        for i in 5..15u64 {
+            engine
+                .put(Partition::Node, format!("node:00:{i:08}").as_bytes(), b"v")
+                .expect("put");
+        }
+        engine.advance_gc_watermark();
+        assert!(
+            engine.gc_watermark() <= pinned,
+            "an active pin holds the watermark back despite newer writes"
+        );
+
+        // Releasing the pin lets the watermark advance past the old snapshot.
+        drop(pin);
+        let after = engine.gc_watermark();
+        assert!(
+            after > pinned,
+            "watermark advances after the pin is released (got {after}, pin {pinned})"
+        );
+    }
+
+    #[test]
+    fn gc_watermark_holds_at_minimum_of_two_pins() {
+        let engine = test_engine_memfs();
+        for i in 0..3u64 {
+            engine
+                .put(Partition::Node, format!("node:00:{i:08}").as_bytes(), b"v")
+                .expect("put");
+        }
+        let (first, pin_first) = engine.pin_snapshot();
+        for i in 3..8u64 {
+            engine
+                .put(Partition::Node, format!("node:00:{i:08}").as_bytes(), b"v")
+                .expect("put");
+        }
+        let (second, pin_second) = engine.pin_snapshot();
+        assert!(second >= first, "later pin captures a newer seqno");
+        // Watermark must sit at the OLDER pin while both are live.
+        assert!(
+            engine.gc_watermark() <= first,
+            "watermark held at the oldest live pin"
+        );
+        // Dropping the newer pin alone must not advance past the older one.
+        drop(pin_second);
+        assert!(
+            engine.gc_watermark() <= first,
+            "older pin still holds the watermark after the newer one drops"
+        );
+        drop(pin_first);
+        assert!(
+            engine.gc_watermark() > first,
+            "watermark advances only once the oldest pin drops"
+        );
     }
 
     #[test]
