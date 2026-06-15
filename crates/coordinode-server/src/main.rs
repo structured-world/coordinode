@@ -57,6 +57,7 @@ mod grpc;
 mod logging;
 mod metrics_catalog;
 mod ops;
+mod registry;
 mod services;
 
 /// Raise the process open-file-descriptor soft limit before opening storage.
@@ -185,24 +186,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!(data_dir = %data_dir, "compaction complete");
         }
 
-        cli::Command::Serve {
-            mode,
-            node_id,
-            grpc_addr,
-            advertise_addr,
-            #[cfg(feature = "rest-proxy")]
-            rest_addr,
-            ops_addr,
-            data_dir,
-            peers,
-            nofile,
-            max_connections,
-            max_request_size_mb,
-            request_timeout_secs,
-            http2_keepalive_secs,
-            cache_size_mb,
-            write_buffer_mb,
-        } => {
+        cli::Command::Serve(serve_args) => {
+            let cli::ServeArgs {
+                mode,
+                node_id,
+                grpc_addr,
+                advertise_addr,
+                #[cfg(feature = "rest-proxy")]
+                rest_addr,
+                ops_addr,
+                data_dir,
+                peers,
+                nofile,
+                max_connections,
+                max_request_size_mb,
+                request_timeout_secs,
+                http2_keepalive_secs,
+                cache_size_mb,
+                write_buffer_mb,
+                retention_window_secs,
+                registry_heartbeat_ms,
+                registry_eviction_ms,
+            } = *serve_args;
             logging::init_logging();
 
             // Raise the open-file-descriptor limit before opening storage: the
@@ -347,16 +352,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // eviction and advances the window with the wall clock. Both
             // standalone and cluster modes drive it through the same Raft
             // pipeline. Held for the process lifetime.
-            let consumer_registry = coordinode_replicate::ShardConsumerRegistry::new(
+            // Operator overrides for the retention window + background
+            // cadences arrive as `coordinode serve` flags; `None` keeps the
+            // built-in defaults (7-day window, 100 ms heartbeat, 1 s eviction).
+            let _registry_bg = registry::build_consumer_registry(
                 Arc::clone(&engine),
                 Arc::clone(&pipeline),
-                Arc::new(
-                    coordinode_core::txn::proposal::ProposalIdGenerator::with_base(node_id << 48),
-                ),
-                Arc::new(coordinode_replicate::SystemClock),
+                node_id,
+                registry::RegistryTuning {
+                    retention_window_secs,
+                    heartbeat_window_ms: registry_heartbeat_ms,
+                    eviction_interval_ms: registry_eviction_ms,
+                },
             );
-            let _registry_bg = consumer_registry
-                .start_background(coordinode_replicate::BackgroundConfig::default());
 
             let raft_node_shared: Option<Arc<coordinode_raft::cluster::RaftNode>> =
                 Some(Arc::clone(&raft_node));

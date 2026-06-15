@@ -50,6 +50,9 @@ arguments is the same as `coordinode serve`).
 | `--http2-keepalive-secs` | (none) | HTTP/2 keepalive ping interval, in seconds. Detects half-open connections behind a load balancer. |
 | `--cache-size-mb` | engine default | Block cache size, in MiB. The read path serves hot blocks from this cache before touching disk. |
 | `--write-buffer-mb` | engine default | Write buffer (memtable) size, in MiB. Larger buffers flush less often at the cost of memory. |
+| `--retention-window-secs` | `604800` (7 days) | MVCC time-travel / `AS OF TIMESTAMP` horizon, in seconds. The GC watermark is held back to at least `now - this`, so history within the window stays queryable and CDC / backup consumers keep their checkpoint readable. |
+| `--registry-heartbeat-ms` | `100` | Consumer-registry heartbeat coalescing window, in ms. Buffered consumer heartbeats flush as one Raft proposal per window; a larger window trades freshness for fewer proposals on busy shards. |
+| `--registry-eviction-ms` | `1000` | Consumer-registry TTL-eviction sweep interval, in ms. How often expired registrations are swept and the retention floor is refreshed against the wall clock. |
 
 Single-node start:
 
@@ -206,6 +209,25 @@ reason.
   the working set, not the whole dataset.
 - `--write-buffer-mb N` sets the in-memory write buffer (memtable). Larger
   buffers flush to disk less often, trading memory for fewer, larger flushes.
+
+## Retention and time-travel
+
+MVCC keeps superseded versions so `AS OF TIMESTAMP` queries can read the past
+and CDC / backup consumers can resume from a checkpoint. The garbage collector
+reclaims versions older than the retention window; the window is therefore the
+horizon for both time-travel reads and lagging-consumer recovery.
+
+- `--retention-window-secs N` sets that horizon, in seconds (default seven
+  days). Shorter windows reclaim space sooner but shrink the time-travel range
+  and the grace period a slow consumer has before its checkpoint is collected.
+  A registered consumer lagging beyond the window holds the floor back for
+  itself rather than losing data silently.
+- `--registry-heartbeat-ms N` and `--registry-eviction-ms N` tune the
+  consumer-retention registry's background service: how often buffered consumer
+  heartbeats are flushed as a coalesced proposal, and how often expired
+  registrations are swept. The defaults (100 ms / 1000 ms) suit most
+  deployments; raise the heartbeat window on shards with many consumers to cut
+  proposal volume.
 
 ## Other subcommands
 

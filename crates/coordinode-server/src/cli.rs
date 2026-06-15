@@ -13,62 +13,10 @@ use crate::config::ServeMode;
 
 /// Parsed CLI command.
 pub enum Command {
-    /// Start the database server (default).
-    Serve {
-        /// Operational mode (CE supports only "full").
-        /// --mode=compute and --mode=storage require coordinode-ee.
-        mode: ServeMode,
-        /// Numeric node ID for this instance (default: 1).
-        /// Must be unique within the cluster. In single-node deployments
-        /// the default of 1 is always correct.
-        node_id: u64,
-        /// gRPC listen address (default: [::]:7080).
-        grpc_addr: String,
-        /// Advertise address for intra-cluster gRPC (default: same as --addr).
-        /// Other nodes use this address to send Raft RPCs to this node.
-        /// Set this when the listen address is 0.0.0.0 or [::] so peers
-        /// know the actual hostname/IP.
-        advertise_addr: Option<String>,
-        /// REST/JSON proxy listen address (default: [::]:7081).
-        /// Transcodes HTTP/JSON requests to gRPC via embedded structured-proxy.
-        /// Only present when compiled with the `rest-proxy` feature.
-        #[cfg(feature = "rest-proxy")]
-        rest_addr: String,
-        /// Operational HTTP server address for /metrics and /health (default: [::]:7084).
-        /// Pass port 0 to let the OS assign an ephemeral port (useful in tests).
-        ops_addr: String,
-        /// Data directory (default: ./data).
-        data_dir: String,
-        /// Peer addresses for cluster mode (comma-separated).
-        /// When provided, enables Raft consensus with the given peers.
-        /// Example: --peers "node2:7080,node3:7080"
-        peers: Option<Vec<String>>,
-        /// Open-file-descriptor soft limit to request at startup
-        /// (`setrlimit(RLIMIT_NOFILE)`). `None` raises the soft limit to the
-        /// hard limit. The storage engine keeps many files open, so a high
-        /// limit matters in production. Unix only; ignored elsewhere.
-        nofile: Option<u64>,
-        /// Maximum in-flight requests per client connection (gRPC concurrency
-        /// limit). `None` leaves it unbounded. Mirrors a connection cap on a
-        /// stream-multiplexed transport.
-        max_connections: Option<usize>,
-        /// Maximum decoded request message size, in MiB (default: 16, matching
-        /// the common document-size limit). Guards against unbounded-allocation
-        /// requests.
-        max_request_size_mb: usize,
-        /// Per-request timeout in seconds. `None` disables the server-side
-        /// timeout.
-        request_timeout_secs: Option<u64>,
-        /// HTTP/2 keepalive ping interval in seconds. `None` disables keepalive
-        /// pings. Useful to detect half-open connections across a load balancer.
-        http2_keepalive_secs: Option<u64>,
-        /// Block cache size in MiB. `None` keeps the engine default. The read
-        /// path serves hot blocks from this cache before touching disk.
-        cache_size_mb: Option<u64>,
-        /// Write buffer (memtable) size in MiB. `None` keeps the engine
-        /// default. Larger buffers reduce flush frequency at the cost of memory.
-        write_buffer_mb: Option<u64>,
-    },
+    /// Start the database server (default). Boxed via [`ServeArgs`]: `serve`
+    /// carries far more fields than any other subcommand, so inlining it would
+    /// make every `Command` value as large as `Serve`.
+    Serve(Box<ServeArgs>),
     /// Print version and exit.
     Version,
     /// Verify storage integrity.
@@ -172,6 +120,81 @@ pub enum Command {
     },
 }
 
+/// Arguments for the `serve` subcommand. Boxed inside [`Command::Serve`] to keep
+/// the command enum compact — this struct has many more fields than any other
+/// subcommand and would otherwise dominate every `Command` value's size.
+pub struct ServeArgs {
+    /// Operational mode (CE supports only "full").
+    /// --mode=compute and --mode=storage require coordinode-ee.
+    pub mode: ServeMode,
+    /// Numeric node ID for this instance (default: 1).
+    /// Must be unique within the cluster. In single-node deployments
+    /// the default of 1 is always correct.
+    pub node_id: u64,
+    /// gRPC listen address (default: [::]:7080).
+    pub grpc_addr: String,
+    /// Advertise address for intra-cluster gRPC (default: same as --addr).
+    /// Other nodes use this address to send Raft RPCs to this node.
+    /// Set this when the listen address is 0.0.0.0 or [::] so peers
+    /// know the actual hostname/IP.
+    pub advertise_addr: Option<String>,
+    /// REST/JSON proxy listen address (default: [::]:7081).
+    /// Transcodes HTTP/JSON requests to gRPC via embedded structured-proxy.
+    /// Only present when compiled with the `rest-proxy` feature.
+    #[cfg(feature = "rest-proxy")]
+    pub rest_addr: String,
+    /// Operational HTTP server address for /metrics and /health (default: [::]:7084).
+    /// Pass port 0 to let the OS assign an ephemeral port (useful in tests).
+    pub ops_addr: String,
+    /// Data directory (default: ./data).
+    pub data_dir: String,
+    /// Peer addresses for cluster mode (comma-separated).
+    /// When provided, enables Raft consensus with the given peers.
+    /// Example: --peers "node2:7080,node3:7080"
+    pub peers: Option<Vec<String>>,
+    /// Open-file-descriptor soft limit to request at startup
+    /// (`setrlimit(RLIMIT_NOFILE)`). `None` raises the soft limit to the
+    /// hard limit. The storage engine keeps many files open, so a high
+    /// limit matters in production. Unix only; ignored elsewhere.
+    pub nofile: Option<u64>,
+    /// Maximum in-flight requests per client connection (gRPC concurrency
+    /// limit). `None` leaves it unbounded. Mirrors a connection cap on a
+    /// stream-multiplexed transport.
+    pub max_connections: Option<usize>,
+    /// Maximum decoded request message size, in MiB (default: 16, matching
+    /// the common document-size limit). Guards against unbounded-allocation
+    /// requests.
+    pub max_request_size_mb: usize,
+    /// Per-request timeout in seconds. `None` disables the server-side
+    /// timeout.
+    pub request_timeout_secs: Option<u64>,
+    /// HTTP/2 keepalive ping interval in seconds. `None` disables keepalive
+    /// pings. Useful to detect half-open connections across a load balancer.
+    pub http2_keepalive_secs: Option<u64>,
+    /// Block cache size in MiB. `None` keeps the engine default. The read
+    /// path serves hot blocks from this cache before touching disk.
+    pub cache_size_mb: Option<u64>,
+    /// Write buffer (memtable) size in MiB. `None` keeps the engine
+    /// default. Larger buffers reduce flush frequency at the cost of memory.
+    pub write_buffer_mb: Option<u64>,
+    /// MVCC time-travel / consumer-retention window in seconds. `None`
+    /// keeps the default (7 days). This is the `AS OF TIMESTAMP` horizon:
+    /// the GC watermark is held back to at least `now - this`, so history
+    /// within the window stays queryable and CDC / backup consumers that
+    /// register against it keep their checkpoint readable.
+    pub retention_window_secs: Option<u64>,
+    /// Consumer-registry heartbeat coalescing window in milliseconds.
+    /// `None` keeps the default (100 ms). Buffered consumer heartbeats
+    /// flush as one coalesced Raft proposal per window — a larger window
+    /// trades heartbeat freshness for fewer proposals on busy shards.
+    pub registry_heartbeat_ms: Option<u64>,
+    /// Consumer-registry TTL-eviction sweep interval in milliseconds.
+    /// `None` keeps the default (1000 ms). How often expired consumer
+    /// registrations are swept and the retention floor is refreshed
+    /// against the wall clock.
+    pub registry_eviction_ms: Option<u64>,
+}
+
 /// Parse command line arguments.
 pub fn parse_args() -> Command {
     let args: Vec<String> = std::env::args().collect();
@@ -234,7 +257,10 @@ pub fn parse_args_from(args: &[String]) -> Command {
             let http2_keepalive_secs = find_flag_num(args, "--http2-keepalive-secs");
             let cache_size_mb = find_flag_num(args, "--cache-size-mb");
             let write_buffer_mb = find_flag_num(args, "--write-buffer-mb");
-            Command::Serve {
+            let retention_window_secs = find_flag_num(args, "--retention-window-secs");
+            let registry_heartbeat_ms = find_flag_num(args, "--registry-heartbeat-ms");
+            let registry_eviction_ms = find_flag_num(args, "--registry-eviction-ms");
+            Command::Serve(Box::new(ServeArgs {
                 mode,
                 node_id,
                 grpc_addr,
@@ -251,7 +277,10 @@ pub fn parse_args_from(args: &[String]) -> Command {
                 http2_keepalive_secs,
                 cache_size_mb,
                 write_buffer_mb,
-            }
+                retention_window_secs,
+                registry_heartbeat_ms,
+                registry_eviction_ms,
+            }))
         }
         "version" | "--version" | "-v" => Command::Version,
         "verify" => {
@@ -336,7 +365,8 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  coordinode serve [--mode full] [--node-id N] [--addr ADDR] [--advertise-addr ADDR]\n          \
                  [--rest-addr ADDR] [--ops-addr ADDR] [--data DIR] [--peers PEERS]\n          \
                  [--nofile N] [--max-connections N] [--max-request-size-mb N] [--request-timeout-secs N]\n          \
-                 [--http2-keepalive-secs N] [--cache-size-mb N] [--write-buffer-mb N]\n  \
+                 [--http2-keepalive-secs N] [--cache-size-mb N] [--write-buffer-mb N]\n          \
+                 [--retention-window-secs N] [--registry-heartbeat-ms N] [--registry-eviction-ms N]\n  \
                  coordinode backup --output FILE [--data DIR] [--format json|cypher|binary|snapshot] [--namespace NS] [--since SEQNO]\n  \
                  coordinode restore --input FILE [--data DIR] [--format json|cypher|binary|snapshot|apoc-json|apoc-cypher|hetio-json] [--namespace NS] [--only-labels L1,L2] [--force]\n  \
                  coordinode checkpoint --output DIR [--data DIR]\n  \
@@ -448,7 +478,7 @@ fn parse_admin_args(args: &[String]) -> Command {
 }
 
 fn default_serve() -> Command {
-    Command::Serve {
+    Command::Serve(Box::new(ServeArgs {
         mode: ServeMode::Full,
         node_id: 1,
         grpc_addr: "[::]:7080".to_string(),
@@ -465,7 +495,10 @@ fn default_serve() -> Command {
         http2_keepalive_secs: None,
         cache_size_mb: None,
         write_buffer_mb: None,
-    }
+        retention_window_secs: None,
+        registry_heartbeat_ms: None,
+        registry_eviction_ms: None,
+    }))
 }
 
 fn find_flag(args: &[String], flag: &str) -> Option<String> {
@@ -670,22 +703,17 @@ mod tests {
     #[test]
     fn default_is_serve() {
         let cmd = parse_args_from(&args("coordinode"));
-        assert!(matches!(cmd, Command::Serve { .. }));
+        assert!(matches!(cmd, Command::Serve(_)));
     }
 
     #[test]
     fn serve_default_mode_is_full() {
         let cmd = parse_args_from(&args("coordinode serve"));
         match cmd {
-            Command::Serve {
-                mode,
-                node_id,
-                advertise_addr,
-                ..
-            } => {
-                assert_eq!(mode, ServeMode::Full);
-                assert_eq!(node_id, 1);
-                assert!(advertise_addr.is_none());
+            Command::Serve(args) => {
+                assert_eq!(args.mode, ServeMode::Full);
+                assert_eq!(args.node_id, 1);
+                assert!(args.advertise_addr.is_none());
             }
             _ => panic!("expected Serve command"),
         }
@@ -695,7 +723,7 @@ mod tests {
     fn serve_explicit_mode_full() {
         let cmd = parse_args_from(&args("coordinode serve --mode full"));
         match cmd {
-            Command::Serve { mode, .. } => assert_eq!(mode, ServeMode::Full),
+            Command::Serve(args) => assert_eq!(args.mode, ServeMode::Full),
             _ => panic!("expected Serve command"),
         }
     }
@@ -706,10 +734,9 @@ mod tests {
             "coordinode serve --node-id 3 --peers node1:7080,node2:7080",
         ));
         match cmd {
-            Command::Serve { node_id, peers, .. } => {
-                assert_eq!(node_id, 3);
-                let p = peers.unwrap_or_default();
-                assert_eq!(p.len(), 2);
+            Command::Serve(args) => {
+                assert_eq!(args.node_id, 3);
+                assert_eq!(args.peers.as_ref().map(|p| p.len()), Some(2));
             }
             _ => panic!("expected Serve command"),
         }
@@ -723,23 +750,14 @@ mod tests {
              --http2-keepalive-secs 60 --cache-size-mb 4096 --write-buffer-mb 256",
         ));
         match cmd {
-            Command::Serve {
-                nofile,
-                max_connections,
-                max_request_size_mb,
-                request_timeout_secs,
-                http2_keepalive_secs,
-                cache_size_mb,
-                write_buffer_mb,
-                ..
-            } => {
-                assert_eq!(nofile, Some(262144));
-                assert_eq!(max_connections, Some(1024));
-                assert_eq!(max_request_size_mb, 32);
-                assert_eq!(request_timeout_secs, Some(30));
-                assert_eq!(http2_keepalive_secs, Some(60));
-                assert_eq!(cache_size_mb, Some(4096));
-                assert_eq!(write_buffer_mb, Some(256));
+            Command::Serve(args) => {
+                assert_eq!(args.nofile, Some(262144));
+                assert_eq!(args.max_connections, Some(1024));
+                assert_eq!(args.max_request_size_mb, 32);
+                assert_eq!(args.request_timeout_secs, Some(30));
+                assert_eq!(args.http2_keepalive_secs, Some(60));
+                assert_eq!(args.cache_size_mb, Some(4096));
+                assert_eq!(args.write_buffer_mb, Some(256));
             }
             _ => panic!("expected Serve command"),
         }
@@ -749,21 +767,45 @@ mod tests {
     fn serve_resource_flags_default() {
         let cmd = parse_args_from(&args("coordinode serve"));
         match cmd {
-            Command::Serve {
-                nofile,
-                max_connections,
-                max_request_size_mb,
-                request_timeout_secs,
-                cache_size_mb,
-                ..
-            } => {
+            Command::Serve(args) => {
                 // Unset network/storage knobs stay None; the request-size cap has
                 // a safe default.
-                assert!(nofile.is_none());
-                assert!(max_connections.is_none());
-                assert_eq!(max_request_size_mb, 16);
-                assert!(request_timeout_secs.is_none());
-                assert!(cache_size_mb.is_none());
+                assert!(args.nofile.is_none());
+                assert!(args.max_connections.is_none());
+                assert_eq!(args.max_request_size_mb, 16);
+                assert!(args.request_timeout_secs.is_none());
+                assert!(args.cache_size_mb.is_none());
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn serve_registry_flags_parsed() {
+        let cmd = parse_args_from(&args(
+            "coordinode serve --retention-window-secs 3600 \
+             --registry-heartbeat-ms 50 --registry-eviction-ms 500",
+        ));
+        match cmd {
+            Command::Serve(args) => {
+                assert_eq!(args.retention_window_secs, Some(3600));
+                assert_eq!(args.registry_heartbeat_ms, Some(50));
+                assert_eq!(args.registry_eviction_ms, Some(500));
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn serve_registry_flags_default_to_none() {
+        // Unset → None so the server keeps the registry's built-in defaults
+        // (7-day retention window, 100 ms heartbeat, 1000 ms eviction sweep).
+        let cmd = parse_args_from(&args("coordinode serve"));
+        match cmd {
+            Command::Serve(args) => {
+                assert!(args.retention_window_secs.is_none());
+                assert!(args.registry_heartbeat_ms.is_none());
+                assert!(args.registry_eviction_ms.is_none());
             }
             _ => panic!("expected Serve command"),
         }
@@ -773,8 +815,8 @@ mod tests {
     fn serve_advertise_addr() {
         let cmd = parse_args_from(&args("coordinode serve --advertise-addr node1:7080"));
         match cmd {
-            Command::Serve { advertise_addr, .. } => {
-                assert_eq!(advertise_addr.as_deref(), Some("node1:7080"));
+            Command::Serve(args) => {
+                assert_eq!(args.advertise_addr.as_deref(), Some("node1:7080"));
             }
             _ => panic!("expected Serve command"),
         }
@@ -785,7 +827,7 @@ mod tests {
     fn serve_custom_rest_addr() {
         let cmd = parse_args_from(&args("coordinode serve --rest-addr 0.0.0.0:8081"));
         match cmd {
-            Command::Serve { rest_addr, .. } => assert_eq!(rest_addr, "0.0.0.0:8081"),
+            Command::Serve(args) => assert_eq!(args.rest_addr, "0.0.0.0:8081"),
             _ => panic!("expected Serve command"),
         }
     }
@@ -795,7 +837,7 @@ mod tests {
     fn serve_default_rest_addr() {
         let cmd = parse_args_from(&args("coordinode serve"));
         match cmd {
-            Command::Serve { rest_addr, .. } => assert_eq!(rest_addr, "[::]:7081"),
+            Command::Serve(args) => assert_eq!(args.rest_addr, "[::]:7081"),
             _ => panic!("expected Serve command"),
         }
     }
