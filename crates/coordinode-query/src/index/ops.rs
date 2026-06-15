@@ -293,18 +293,15 @@ pub fn list_index_definitions(
 
 /// Delete index definition and all entries.
 pub fn drop_index(engine: &StorageEngine, index: &IndexDefinition) -> Result<(), StorageError> {
-    // Delete definition
+    // The index DEFINITION lives in the Schema partition and is keyed by a
+    // query-layer type (`IndexDefinition`), so it stays a direct delete here.
     let schema_key = index.schema_key();
     engine.delete(Partition::Schema, &schema_key)?;
 
-    // Delete all index entries by scanning the prefix
-    let prefix = index.key_prefix();
-    let iter = engine.prefix_scan(Partition::Idx, &prefix)?;
-
-    for guard in iter {
-        let (key, _) = guard.into_inner().map_err(StorageError::Engine)?;
-        engine.delete(Partition::Idx, &key)?;
-    }
+    // Index ENTRIES live in Partition::Idx behind the Layer-4 store.
+    LocalIndexStore::new(engine)
+        .clear(&index.name)
+        .map_err(map_store_err)?;
 
     Ok(())
 }

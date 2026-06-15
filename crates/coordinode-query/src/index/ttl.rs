@@ -8,10 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
-use coordinode_modality::{LocalNodeStore, NodeStore};
+use coordinode_modality::{IndexStore as _, LocalIndexStore, LocalNodeStore, NodeStore};
 use coordinode_storage::engine::core::StorageEngine;
-use coordinode_storage::engine::partition::Partition;
-use coordinode_storage::Guard;
 
 use super::definition::IndexDefinition;
 
@@ -52,10 +50,11 @@ pub fn reap_ttl_index(
     let cutoff_us = now_us - ttl_us;
     let nodes = LocalNodeStore::new(engine);
 
-    // Scan the index prefix
-    let prefix = index.key_prefix();
-    let iter = match engine.prefix_scan(Partition::Idx, &prefix) {
-        Ok(iter) => iter,
+    // Full-index walk through the Layer-4 store — returns (raw key, node id)
+    // pairs with the node id already decoded from the entry suffix.
+    let index_store = LocalIndexStore::new(engine);
+    let entries = match index_store.scan_all(&index.name) {
+        Ok(entries) => entries,
         Err(e) => {
             result.errors.push(format!("scan error: {e}"));
             return result;
@@ -65,35 +64,22 @@ pub fn reap_ttl_index(
     // Collect expired node IDs
     let mut expired_nodes: Vec<(u64, Vec<u8>)> = Vec::new(); // (node_id, index_key)
 
-    for guard in iter {
-        let (key, _) = match guard.into_inner() {
-            Ok(kv) => kv,
-            Err(e) => {
-                result.errors.push(format!("read error: {e}"));
-                continue;
-            }
-        };
-
+    for (key, node) in entries {
         result.checked += 1;
-
-        // Extract node ID from index key
-        if let Some(node_id) = coordinode_core::index::encoding::decode_node_id_from_index_key(&key)
-        {
-            // Read the node to check its timestamp value
-            match nodes.get(shard_id, NodeId::from_raw(node_id)) {
-                Ok(Some(record)) => {
-                    // Check if the timestamp property has expired
-                    if is_node_expired(&record, index.property(), cutoff_us) {
-                        expired_nodes.push((node_id, key.to_vec()));
-                    }
+        // Read the node to check its timestamp value
+        match nodes.get(shard_id, node) {
+            Ok(Some(record)) => {
+                // Check if the timestamp property has expired
+                if is_node_expired(&record, index.property(), cutoff_us) {
+                    expired_nodes.push((node.as_raw(), key));
                 }
-                Ok(None) => {
-                    // Node already deleted — clean up orphaned index entry
-                    expired_nodes.push((node_id, key.to_vec()));
-                }
-                Err(e) => {
-                    result.errors.push(format!("node read error: {e}"));
-                }
+            }
+            Ok(None) => {
+                // Node already deleted — clean up orphaned index entry
+                expired_nodes.push((node.as_raw(), key));
+            }
+            Err(e) => {
+                result.errors.push(format!("node read error: {e}"));
             }
         }
     }
@@ -101,7 +87,7 @@ pub fn reap_ttl_index(
     // Delete expired nodes and their index entries
     for (node_id, index_key) in &expired_nodes {
         // Delete the index entry
-        if let Err(e) = engine.delete(Partition::Idx, index_key) {
+        if let Err(e) = index_store.delete_raw(index_key) {
             result
                 .errors
                 .push(format!("index delete error for node {node_id}: {e}"));
@@ -161,6 +147,7 @@ mod tests {
     use coordinode_storage::engine::config::{
         Durability, EndpointConfig, Media, StorageConfig, Tier,
     };
+    use coordinode_storage::engine::partition::Partition;
 
     fn test_engine(dir: &std::path::Path) -> StorageEngine {
         let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(

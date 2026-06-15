@@ -113,6 +113,19 @@ pub trait IndexStore {
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
     fn scan_all(&self, name: &str) -> StoreResult<Vec<(Vec<u8>, NodeId)>>;
+
+    /// Delete every entry under the named index prefix. Returns the
+    /// number of entries removed. Used for DROP INDEX and the abort
+    /// path of an index build (roll back partially-written entries
+    /// after a unique-constraint violation).
+    fn clear(&self, name: &str) -> StoreResult<usize>;
+
+    /// Delete a single index entry by its raw key — the opaque bytes
+    /// handed back from [`IndexStore::scan_all`]. Lets a full-index walk
+    /// (e.g. the TTL reaper) selectively drop the entries it decided are
+    /// expired without reconstructing the `(values, node_id)` tuple. The
+    /// caller never builds the key; it only passes back one it scanned.
+    fn delete_raw(&self, raw_key: &[u8]) -> StoreResult<()>;
 }
 
 /// CE single-shard implementation of [`IndexStore`].
@@ -205,6 +218,29 @@ impl IndexStore for LocalIndexStore<'_> {
         }
         Ok(out)
     }
+
+    fn clear(&self, name: &str) -> StoreResult<usize> {
+        let prefix = index_prefix(name);
+        let iter = self.engine.prefix_scan(Partition::Idx, &prefix)?;
+        // Collect first, then delete: deleting while holding the scan
+        // iterator over the same partition is not guaranteed safe across
+        // engine implementations.
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for guard in iter {
+            let (key, _) = guard.into_inner()?;
+            keys.push(key.to_vec());
+        }
+        let removed = keys.len();
+        for key in &keys {
+            self.engine.delete(Partition::Idx, key)?;
+        }
+        Ok(removed)
+    }
+
+    fn delete_raw(&self, raw_key: &[u8]) -> StoreResult<()> {
+        self.engine.delete(Partition::Idx, raw_key)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -228,6 +264,77 @@ mod tests {
             .expect("put");
         let hits = store.scan_exact("user_name", &v).expect("scan");
         assert_eq!(hits, vec![NodeId::from_raw(1)]);
+    }
+
+    #[test]
+    fn clear_removes_every_entry_and_reports_count() {
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalIndexStore::new(engine);
+        for id in [1u64, 2, 3] {
+            store
+                .put_entry(
+                    "user_name",
+                    &[Value::String(format!("u{id}"))],
+                    NodeId::from_raw(id),
+                )
+                .expect("put");
+        }
+        // A second index must survive the clear (prefix isolation).
+        store
+            .put_entry("user_age", &[Value::Int(30)], NodeId::from_raw(9))
+            .expect("put other");
+
+        let removed = store.clear("user_name").expect("clear");
+        assert_eq!(removed, 3, "clear reports the number of entries removed");
+        assert!(
+            store.scan_all("user_name").expect("scan").is_empty(),
+            "cleared index has no entries left",
+        );
+        assert_eq!(
+            store.scan_all("user_age").expect("scan other").len(),
+            1,
+            "clear is prefix-isolated to the named index",
+        );
+    }
+
+    #[test]
+    fn clear_empty_index_is_zero() {
+        let fx = open_engine();
+        let store = LocalIndexStore::new(&fx.engine);
+        assert_eq!(store.clear("never_written").expect("clear"), 0);
+    }
+
+    #[test]
+    fn delete_raw_removes_a_scanned_entry() {
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalIndexStore::new(engine);
+        for id in [1u64, 2] {
+            store
+                .put_entry(
+                    "by_name",
+                    &[Value::String("dup".into())],
+                    NodeId::from_raw(id),
+                )
+                .expect("put");
+        }
+        // Scan, then selectively delete node 1's entry by its raw key.
+        let entries = store.scan_all("by_name").expect("scan");
+        let (raw_key, _) = entries
+            .iter()
+            .find(|(_, nid)| *nid == NodeId::from_raw(1))
+            .cloned()
+            .expect("entry for node 1");
+        store.delete_raw(&raw_key).expect("delete_raw");
+
+        let remaining = store.scan_all("by_name").expect("rescan");
+        assert_eq!(remaining.len(), 1, "exactly one entry removed");
+        assert_eq!(
+            remaining[0].1,
+            NodeId::from_raw(2),
+            "node 2's entry survives"
+        );
     }
 
     #[test]

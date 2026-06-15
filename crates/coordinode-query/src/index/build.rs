@@ -13,10 +13,8 @@
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
-use coordinode_modality::{LocalNodeStore, NodeStore};
+use coordinode_modality::{IndexStore as _, LocalIndexStore, LocalNodeStore, NodeStore};
 use coordinode_storage::engine::core::StorageEngine;
-use coordinode_storage::engine::partition::Partition;
-use coordinode_storage::Guard;
 
 use super::definition::IndexDefinition;
 use super::ops::{create_index_entry, save_index_definition};
@@ -173,13 +171,12 @@ pub fn build_index(
                 continue;
             }
 
-            // Use compound index entry
-            let encoded = coordinode_core::index::encoding::encode_compound_index_key(
+            // Use compound index entry (Layer-4 store hides the key encoding).
+            match LocalIndexStore::new(engine).put_entry(
                 &index.name,
                 &values,
-                node_id,
-            );
-            match engine.put(Partition::Idx, &encoded, &[]) {
+                NodeId::from_raw(node_id),
+            ) {
                 Ok(()) => result.indexed += 1,
                 Err(e) => {
                     result.errors.push(format!("compound index write: {e}"));
@@ -192,14 +189,7 @@ pub fn build_index(
     if !result.violations.is_empty() {
         // Unique constraint violations — abort
         // Clean up: drop all created index entries
-        let idx_prefix = index.key_prefix();
-        if let Ok(iter) = engine.prefix_scan(Partition::Idx, &idx_prefix) {
-            for guard in iter {
-                if let Ok((k, _)) = guard.into_inner() {
-                    let _ = engine.delete(Partition::Idx, &k);
-                }
-            }
-        }
+        let _ = LocalIndexStore::new(engine).clear(&index.name);
         result.state = Some(IndexBuildState::Aborted);
     } else if !result.errors.is_empty() && result.indexed == 0 {
         result.state = Some(IndexBuildState::Aborted);
