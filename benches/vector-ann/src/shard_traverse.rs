@@ -66,6 +66,13 @@ struct Args {
     /// traversal-read bottleneck. Runs and exits; ignores graph args.
     #[arg(long)]
     confirm_merge: bool,
+
+    /// Diagnostic: load the BA graph via per-edge merge operands (the server's
+    /// write path), time a full k-hop BFS, collapse operands, then re-time. Shows
+    /// the end-to-end traversal speedup from operand collapse. Uses --nodes/--m/
+    /// --hops/--queries. Runs and exits.
+    #[arg(long)]
+    confirm_traverse: bool,
 }
 
 /// Deterministic splitmix64.
@@ -276,11 +283,103 @@ fn confirm_merge_read() {
     );
 }
 
+/// Diagnostic: load a BA graph through per-edge merge operands (the server's
+/// incremental write path), time a full k-hop BFS, collapse the operands, then
+/// re-time. Shows the end-to-end traversal speedup the operand collapse delivers.
+fn confirm_traverse(args: &Args) {
+    let nodes = args.nodes;
+    let m = args.m.min(nodes.saturating_sub(1)).max(1);
+    let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut targets: Vec<u64> = Vec::new();
+    let mut rng = Rng(0x5EED_1234_ABCD);
+    for i in 0..=m {
+        for j in 0..=m {
+            if i != j {
+                adj.entry(i).or_default().push(j);
+                targets.push(i);
+            }
+        }
+    }
+    for v in (m + 1)..nodes {
+        let mut picked = HashSet::new();
+        while picked.len() < m as usize {
+            let t = if targets.is_empty() {
+                rng.below(v)
+            } else {
+                targets[rng.below(targets.len() as u64) as usize]
+            };
+            if t != v {
+                picked.insert(t);
+            }
+        }
+        for &t in &picked {
+            adj.entry(v).or_default().push(t);
+            adj.entry(t).or_default().push(v);
+            targets.push(v);
+            targets.push(t);
+        }
+    }
+    let edges: usize = adj.values().map(|v| v.len()).sum();
+    eprintln!(
+        "--- confirm-traverse: nodes={nodes} m={m} directed_edges={edges} hops={} queries={} ---",
+        args.hops, args.queries
+    );
+
+    // Load via per-edge merge operands, the shape the server accumulates.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = disk_engine(dir.path());
+    for (&src, tgts) in &adj {
+        let key = encode_adj_key_forward("KNOWS", NodeId::from_raw(src));
+        for &t in tgts {
+            engine
+                .merge(Partition::Adj, &key, &encode_add_batch(&[t]))
+                .expect("merge");
+        }
+    }
+
+    let mut qrng = Rng(0xC0FF_EE00_2222);
+    let sources: Vec<u64> = (0..args.queries).map(|_| qrng.below(nodes)).collect();
+
+    let bfs_ms = |engine: &StorageEngine| -> (f64, f64) {
+        let _ = reachable_single(engine, sources[0], args.hops);
+        let t0 = Instant::now();
+        let mut reach = 0usize;
+        for &s in &sources {
+            reach += reachable_single(engine, s, args.hops).len();
+        }
+        let per = t0.elapsed().as_secs_f64() * 1000.0 / sources.len() as f64;
+        (per, reach as f64 / sources.len() as f64)
+    };
+
+    let (before, mean_reach) = bfs_ms(&engine);
+    eprintln!("BEFORE collapse: {before:.1} ms/query (mean_reachable={mean_reach:.0})");
+
+    let rewritten = engine
+        .collapse_merge_operands(Partition::Adj)
+        .expect("collapse");
+    let (after, _) = bfs_ms(&engine);
+    eprintln!("AFTER collapse_merge_operands ({rewritten} keys): {after:.1} ms/query");
+    eprintln!(
+        "verdict: collapse sped the traversal by {:.1}x",
+        before / after.max(1e-9)
+    );
+}
+
 fn main() {
     let args = Args::parse();
 
     if args.confirm_merge {
         confirm_merge_read();
+        return;
+    }
+
+    if args.confirm_traverse {
+        confirm_traverse(&args);
+        return;
+    }
+
+    if args.confirm_traverse {
+        confirm_traverse(&args);
         return;
     }
 
