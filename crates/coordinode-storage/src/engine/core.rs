@@ -1112,6 +1112,63 @@ impl StorageEngine {
         Ok(Box::new(tree.prefix(prefix, seqno, None)))
     }
 
+    /// Keys touched (written, merged, or deleted) strictly after
+    /// `since_seqno`, deduplicated and sorted. The O(delta) basis for
+    /// incremental snapshots: the lsm-tree surfaces only the keys whose
+    /// version history advanced past `since_seqno`, instead of scanning the
+    /// whole partition twice and diffing.
+    ///
+    /// Values are intentionally NOT returned — the caller re-reads the merged
+    /// current value per key, so a key that accumulated merge operands (adj
+    /// posting list, counter delta) is captured as its resolved state, not raw
+    /// operands. Dispatches over `AnyTree`: KV-separated (blob) partitions use
+    /// the blob scan path that resolves indirected values.
+    pub fn changed_keys_since(
+        &self,
+        part: Partition,
+        since_seqno: u64,
+    ) -> StorageResult<Vec<Vec<u8>>> {
+        use lsm_tree::{AnyTree, ScanSinceEvent};
+
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut collect = |ev: ScanSinceEvent| -> StorageResult<()> {
+            match ev {
+                ScanSinceEvent::Insert { key, .. }
+                | ScanSinceEvent::MergeOperand { key, .. }
+                | ScanSinceEvent::PointTombstone { key, .. } => {
+                    keys.push(key.to_vec());
+                    Ok(())
+                }
+                // CoordiNode's Mutation set is Put / Delete / Merge only — it
+                // never issues range deletes, so this is unreachable for our
+                // data. Surface it loudly rather than silently miss keys.
+                ScanSinceEvent::RangeTombstone { .. } => Err(StorageError::Io(
+                    "range tombstone in scan_since_seqno: CoordiNode issues no range deletes"
+                        .to_string(),
+                )),
+            }
+        };
+        match self.tree(part)? {
+            AnyTree::Standard(t) => {
+                for ev in t.scan_since_seqno(since_seqno).map_err(|e| {
+                    StorageError::Io(format!("scan_since_seqno {}: {e}", part.name()))
+                })? {
+                    collect(ev)?;
+                }
+            }
+            AnyTree::Blob(bt) => {
+                for ev in bt.scan_since_seqno(since_seqno).map_err(|e| {
+                    StorageError::Io(format!("scan_since_seqno {}: {e}", part.name()))
+                })? {
+                    collect(ev)?;
+                }
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        Ok(keys)
+    }
+
     /// Scan key-value pairs visible at a specific sequence number.
     ///
     /// Like [`Self::prefix_scan`], but reads at an arbitrary point-in-time.
@@ -1740,6 +1797,78 @@ mod tests {
         )])
         .with_fs(Arc::new(lsm_tree::fs::MemFs::new()));
         StorageEngine::open(&config).expect("failed to open memfs engine")
+    }
+
+    /// `changed_keys_since` returns exactly the keys whose version
+    /// history advanced past the boundary seqno — new writes, deletes, and
+    /// merge-partition operands — and excludes untouched pre-boundary keys.
+    /// Exercises both the standard-tree path (Node/Counter) and the
+    /// KV-separated path (Blob).
+    #[test]
+    fn changed_keys_since_captures_post_boundary_only() {
+        let (engine, _d) = test_engine();
+
+        engine
+            .put(Partition::Node, b"node:1:untouched", b"v0")
+            .expect("put untouched");
+        engine
+            .put(Partition::Node, b"node:1:doomed", b"v0")
+            .expect("put doomed");
+        let boundary = engine.snapshot();
+
+        // After the boundary: a fresh key, a delete of a pre-boundary key, a
+        // merge operand (Counter), and a blob-tree write.
+        engine
+            .put(Partition::Node, b"node:1:fresh", b"v1")
+            .expect("put fresh");
+        engine
+            .delete(Partition::Node, b"node:1:doomed")
+            .expect("delete doomed");
+        engine
+            .merge(Partition::Counter, b"counter:deg:1", &5i64.to_le_bytes())
+            .expect("merge counter");
+        engine
+            .put(Partition::Blob, b"blob:abc", &[7u8; 64])
+            .expect("put blob");
+
+        let node = engine
+            .changed_keys_since(Partition::Node, boundary)
+            .expect("changed node");
+        assert!(node.contains(&b"node:1:fresh".to_vec()), "new key captured");
+        assert!(
+            node.contains(&b"node:1:doomed".to_vec()),
+            "deleted key captured (tombstone)"
+        );
+        assert!(
+            !node.contains(&b"node:1:untouched".to_vec()),
+            "untouched pre-boundary key excluded"
+        );
+
+        let counter = engine
+            .changed_keys_since(Partition::Counter, boundary)
+            .expect("changed counter");
+        assert!(
+            counter.contains(&b"counter:deg:1".to_vec()),
+            "merge-partition key captured via MergeOperand event"
+        );
+
+        let blob = engine
+            .changed_keys_since(Partition::Blob, boundary)
+            .expect("changed blob");
+        assert!(
+            blob.contains(&b"blob:abc".to_vec()),
+            "KV-separated (blob) scan path captures the key"
+        );
+
+        // A scan from "now" sees nothing new.
+        let now = engine.snapshot();
+        assert!(
+            engine
+                .changed_keys_since(Partition::Node, now)
+                .expect("changed at now")
+                .is_empty(),
+            "no keys changed at/after the current seqno"
+        );
     }
 
     #[test]

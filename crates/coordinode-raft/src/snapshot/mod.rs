@@ -195,46 +195,15 @@ pub fn build_full_snapshot(engine: &StorageEngine) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn collect_kv(
-    engine: &StorageEngine,
-    part: Partition,
-    seqno: u64,
-) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let iter = engine
-        .prefix_scan_at(part, &[], seqno)
-        .map_err(|e| io::Error::other(format!("incr scan {}: {e}", part.name())))?;
-    let mut result = Vec::new();
-    for guard in iter {
-        let (k, v) = guard
-            .into_inner()
-            .map_err(|e| io::Error::other(format!("incr iter {}: {e}", part.name())))?;
-        result.push((k.to_vec(), v.to_vec()));
-    }
-    Ok(result)
-}
-
-fn collect_kv_current(
-    engine: &StorageEngine,
-    part: Partition,
-) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let iter = engine
-        .prefix_scan(part, &[])
-        .map_err(|e| io::Error::other(format!("incr scan {}: {e}", part.name())))?;
-    let mut result = Vec::new();
-    for guard in iter {
-        let (k, v) = guard
-            .into_inner()
-            .map_err(|e| io::Error::other(format!("incr iter {}: {e}", part.name())))?;
-        result.push((k.to_vec(), v.to_vec()));
-    }
-    Ok(result)
-}
-
 /// Build an incremental snapshot containing only KV pairs modified after `since_ts`.
 ///
-/// Uses native seqno MVCC (ADR-016): compares the current state against a
-/// point-in-time snapshot at `since_ts` via sorted merge-diff. Entries that
-/// are new, changed, or deleted since `since_ts` are included.
+/// Uses native seqno MVCC (ADR-016): the lsm-tree `scan_since_seqno` surfaces
+/// only the keys whose version history advanced past `since_ts` (O(delta), not
+/// a 2× full-partition scan), and each changed key's merged current value is
+/// re-read. Entries that are new, changed, or deleted since `since_ts` are
+/// included (a key now absent → tombstone). The GC watermark is pinned at
+/// `since_ts` for the build so concurrent compaction cannot drop needed
+/// history.
 ///
 /// Schema-partition keys are always included for consistency (Dgraph pattern).
 ///
@@ -262,6 +231,11 @@ pub fn build_incremental_snapshot(
     // sees exactly the writes up to and including the snapshot boundary.
     let old_seqno = since_ts.as_raw();
 
+    // Pin the GC watermark at `old_seqno` for the duration of the build so a
+    // concurrent compaction cannot collect version history the `scan_since`
+    // pass still needs. Released when `_pin` drops at function end.
+    let _pin = engine.pin_snapshot_at(old_seqno);
+
     for part in partitions {
         let tag = partition_tag(part);
         let mut changed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -285,47 +259,24 @@ pub fn build_incremental_snapshot(
                 changed.push((raw_key.to_vec(), raw_value.to_vec()));
             }
         } else {
-            // Native seqno MVCC diff: compare old snapshot vs current to find changes.
-            // Both iterators yield entries in sorted key order, enabling merge-join.
-            let old_entries = collect_kv(engine, part, old_seqno)?;
-            let cur_entries = collect_kv_current(engine, part)?;
-
-            // Sorted merge-diff to find new, changed, and deleted entries.
-            let mut oi = 0;
-            let mut ci = 0;
-            while oi < old_entries.len() || ci < cur_entries.len() {
-                match (old_entries.get(oi), cur_entries.get(ci)) {
-                    (Some((ok, _)), Some((ck, cv))) => match ok.as_slice().cmp(ck.as_slice()) {
-                        std::cmp::Ordering::Less => {
-                            // Key in old but not in current → deleted (tombstone)
-                            changed.push((ok.clone(), Vec::new()));
-                            oi += 1;
-                        }
-                        std::cmp::Ordering::Greater => {
-                            // Key in current but not in old → new entry
-                            changed.push((ck.clone(), cv.clone()));
-                            ci += 1;
-                        }
-                        std::cmp::Ordering::Equal => {
-                            // Key in both → include only if value changed
-                            if old_entries[oi].1 != *cv {
-                                changed.push((ck.clone(), cv.clone()));
-                            }
-                            oi += 1;
-                            ci += 1;
-                        }
-                    },
-                    (Some((ok, _)), None) => {
-                        // Remaining old keys were deleted
-                        changed.push((ok.clone(), Vec::new()));
-                        oi += 1;
-                    }
-                    (None, Some((ck, cv))) => {
-                        // Remaining current keys are new
-                        changed.push((ck.clone(), cv.clone()));
-                        ci += 1;
-                    }
-                    (None, None) => break,
+            // O(delta): the lsm-tree surfaces only the keys whose version
+            // history advanced past `old_seqno` (vs. the former 2× full-scan +
+            // merge-diff). Re-read each changed key's merged current value —
+            // this resolves accumulated merge operands for the adj / counter
+            // partitions, so the wire format stays state-based (Put resolved
+            // value / tombstone), and the receiver's merge-write apply is
+            // unchanged. A key now absent is a tombstone (empty value),
+            // matching the deletion case of the old diff.
+            let changed_keys = engine
+                .changed_keys_since(part, old_seqno)
+                .map_err(|e| io::Error::other(format!("incr scan_since {}: {e}", part.name())))?;
+            for key in changed_keys {
+                match engine
+                    .get(part, &key)
+                    .map_err(|e| io::Error::other(format!("incr get {}: {e}", part.name())))?
+                {
+                    Some(value) => changed.push((key, value.to_vec())),
+                    None => changed.push((key, Vec::new())),
                 }
             }
         }
