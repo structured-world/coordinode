@@ -27,7 +27,6 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse, PostingList};
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::{NodeId, NodeIdAllocator, NodeRecord};
 use coordinode_core::graph::types::Value;
@@ -37,7 +36,6 @@ use coordinode_query::planner::build_logical_plan;
 use coordinode_search::tantivy::multi_lang::{MultiLangConfig, MultiLanguageTextIndex};
 use coordinode_search::tantivy::TextIndex;
 use coordinode_storage::engine::core::StorageEngine;
-use coordinode_storage::engine::partition::Partition;
 
 /// Logic-test fixture (memory by default, disk via env). Most hybrid
 /// scoring contracts are pure query-plan + scorer behaviour with no
@@ -123,24 +121,15 @@ fn insert_node(
 }
 
 fn insert_edge(engine: &StorageEngine, edge_type: &str, source_id: u64, target_id: u64) {
-    let fwd_key = encode_adj_key_forward(edge_type, NodeId::from_raw(source_id));
-    let mut fwd_list = match engine.get(Partition::Adj, &fwd_key).expect("get") {
-        Some(b) => PostingList::from_bytes(&b).expect("decode"),
-        None => PostingList::new(),
-    };
-    fwd_list.insert(target_id);
-    engine
-        .put(Partition::Adj, &fwd_key, &fwd_list.to_bytes().expect("ser"))
-        .expect("put fwd");
-    let rev_key = encode_adj_key_reverse(edge_type, NodeId::from_raw(target_id));
-    let mut rev_list = match engine.get(Partition::Adj, &rev_key).expect("get") {
-        Some(b) => PostingList::from_bytes(&b).expect("decode"),
-        None => PostingList::new(),
-    };
-    rev_list.insert(source_id);
-    engine
-        .put(Partition::Adj, &rev_key, &rev_list.to_bytes().expect("ser"))
-        .expect("put rev");
+    use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+    LocalEdgeStore::new(engine)
+        .put_edge(
+            edge_type,
+            NodeId::from_raw(source_id),
+            NodeId::from_raw(target_id),
+            None,
+        )
+        .expect("put edge");
 }
 
 // ─────────────────────────────────────────────────────────────────────────

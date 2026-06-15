@@ -295,9 +295,12 @@ mod tests {
         let node_id = NodeId::from_raw(42);
 
         let record = make_record("Item", Some("electronics"));
-        let bytes = record.to_msgpack().expect("encode");
-        let key = encode_node_key(shard_id, node_id);
-        engine.put(Partition::Node, &key, &bytes).expect("put node");
+        {
+            use coordinode_modality::{LocalNodeStore, NodeStore as _};
+            LocalNodeStore::new(&engine)
+                .put(shard_id, node_id, &record)
+                .expect("put node");
+        }
 
         let pred = VectorPredicate::And(
             Box::new(VectorPredicate::LabelEq("Item".into())),

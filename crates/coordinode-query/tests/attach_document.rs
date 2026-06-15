@@ -13,7 +13,6 @@
 
 use std::collections::HashMap;
 
-use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse, PostingList};
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::{NodeId, NodeIdAllocator, NodeRecord};
 use coordinode_core::graph::types::Value;
@@ -140,38 +139,25 @@ fn register_schema_edge_type(engine: &StorageEngine, edge_type: &str) {
 }
 
 fn insert_edge(engine: &StorageEngine, edge_type: &str, source_id: u64, target_id: u64) {
-    let fwd_key = encode_adj_key_forward(edge_type, NodeId::from_raw(source_id));
-    let mut fwd_list = match engine.get(Partition::Adj, &fwd_key).expect("get") {
-        Some(bytes) => PostingList::from_bytes(&bytes).expect("decode"),
-        None => PostingList::new(),
-    };
-    fwd_list.insert(target_id);
-    engine
-        .put(Partition::Adj, &fwd_key, &fwd_list.to_bytes().expect("ser"))
-        .unwrap();
-
-    let rev_key = encode_adj_key_reverse(edge_type, NodeId::from_raw(target_id));
-    let mut rev_list = match engine.get(Partition::Adj, &rev_key).expect("get") {
-        Some(bytes) => PostingList::from_bytes(&bytes).expect("decode"),
-        None => PostingList::new(),
-    };
-    rev_list.insert(source_id);
-    engine
-        .put(Partition::Adj, &rev_key, &rev_list.to_bytes().expect("ser"))
-        .unwrap();
-
+    use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+    LocalEdgeStore::new(engine)
+        .put_edge(
+            edge_type,
+            NodeId::from_raw(source_id),
+            NodeId::from_raw(target_id),
+            None,
+        )
+        .expect("put edge");
     register_schema_edge_type(engine, edge_type);
 }
 
 fn adj_contains(engine: &StorageEngine, edge_type: &str, src: u64, tgt: u64) -> bool {
-    let fwd = encode_adj_key_forward(edge_type, NodeId::from_raw(src));
-    match engine.get(Partition::Adj, &fwd).expect("get fwd") {
-        Some(bytes) => PostingList::from_bytes(&bytes)
-            .expect("decode")
-            .iter()
-            .any(|u| u == tgt),
-        None => false,
-    }
+    use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+    LocalEdgeStore::new(engine)
+        .scan_neighbors_out(edge_type, NodeId::from_raw(src))
+        .expect("scan out-neighbors")
+        .iter()
+        .any(|n| n.as_raw() == tgt)
 }
 
 fn node_exists(engine: &StorageEngine, id: u64) -> bool {

@@ -6,7 +6,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse, PostingList};
+use coordinode_core::graph::edge::PostingList;
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::{NodeId, NodeIdAllocator, NodeRecord};
 use coordinode_core::graph::types::Value;
@@ -124,25 +124,17 @@ fn register_schema_edge_type(engine: &StorageEngine, edge_type: &str) {
 }
 
 fn insert_edge(engine: &StorageEngine, edge_type: &str, source_id: u64, target_id: u64) {
-    let fwd_key = encode_adj_key_forward(edge_type, NodeId::from_raw(source_id));
-    let mut fwd_list = match engine.get(Partition::Adj, &fwd_key).expect("get") {
-        Some(bytes) => PostingList::from_bytes(&bytes).expect("decode"),
-        None => PostingList::new(),
-    };
-    fwd_list.insert(target_id);
-    engine
-        .put(Partition::Adj, &fwd_key, &fwd_list.to_bytes().expect("ser"))
-        .expect("put fwd");
-
-    let rev_key = encode_adj_key_reverse(edge_type, NodeId::from_raw(target_id));
-    let mut rev_list = match engine.get(Partition::Adj, &rev_key).expect("get") {
-        Some(bytes) => PostingList::from_bytes(&bytes).expect("decode"),
-        None => PostingList::new(),
-    };
-    rev_list.insert(source_id);
-    engine
-        .put(Partition::Adj, &rev_key, &rev_list.to_bytes().expect("ser"))
-        .expect("put rev");
+    // Seed an edge through the Layer-4 store (hides adj-key encoding; writes
+    // the same commutative merge operands the executor reads — ADR-040/R166).
+    use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+    LocalEdgeStore::new(engine)
+        .put_edge(
+            edge_type,
+            NodeId::from_raw(source_id),
+            NodeId::from_raw(target_id),
+            None,
+        )
+        .expect("put edge");
 }
 
 /// Execute a Cypher query end-to-end: parse → plan → execute.
@@ -11048,14 +11040,13 @@ fn hnsw_scan_executor_returns_index_top_k() {
 // (route -> local expand -> gather + dedup) that backs cross-shard traversal,
 // independent of the network transport.
 fn out_neighbors(engine: &StorageEngine, edge_type: &str, src: u64) -> Vec<u64> {
-    let key = encode_adj_key_forward(edge_type, NodeId::from_raw(src));
-    match engine.get(Partition::Adj, &key).expect("get adj") {
-        Some(bytes) => PostingList::from_bytes(&bytes)
-            .expect("decode posting")
-            .iter()
-            .collect(),
-        None => Vec::new(),
-    }
+    use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+    LocalEdgeStore::new(engine)
+        .scan_neighbors_out(edge_type, NodeId::from_raw(src))
+        .expect("scan out-neighbors")
+        .into_iter()
+        .map(|n| n.as_raw())
+        .collect()
 }
 
 /// Level-synchronous BFS reachable set within `[1..=max_hops]`, expanding each

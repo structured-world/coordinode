@@ -31,6 +31,24 @@ const RAW_ENCODER_NEEDLES: &[&str] = &[
     "encode_temporal_edgeprop_key(",
 ];
 
+/// Full raw key-encoder surface forbidden in the integration test
+/// suites (`tests/*.rs`). Broader than `RAW_ENCODER_NEEDLES` (which gates
+/// the `src/` baseline for node / edgeprop only): test fixtures must seed
+/// and assert through the Layer-4 stores, so NO raw key builder of any
+/// partition may appear in `tests/`.
+const TEST_ENCODER_NEEDLES: &[&str] = &[
+    "encode_node_key(",
+    "encode_temporal_node_key(",
+    "encode_edgeprop_key(",
+    "encode_temporal_edgeprop_key(",
+    "encode_adj_key_forward(",
+    "encode_adj_key_reverse(",
+    "write_adj_key_forward(",
+    "write_adj_key_reverse(",
+    "encode_index_key(",
+    "encode_compound_index_key(",
+];
+
 /// Files where the test runs. The scan is whitelist-based so the
 /// gate cannot accidentally start covering crates outside our scope.
 const SCAN_FILES: &[&str] = &[
@@ -47,21 +65,25 @@ const SCAN_FILES: &[&str] = &[
 /// CURRENT post-migration count; the gate fails if a future PR
 /// raises it. Update with the migration audit comment when lowering.
 const ALLOWED: &[(&str, usize)] = &[
-    // runner.rs baseline (R166 audit-suite slice): the OCC-scope
-    // audit suite now uses typed `OccScope::contains_node[_temporal]`
-    // / `contains_edge_props[_temporal]` overloads (added to
-    // coordinode-storage in the same slice) so the assertions are
-    // raw-encoder-free. Remaining ~26 in cfg(test) seed-fixture
-    // setups (need raw keys to construct probe payloads with the
-    // EdgeProp `Vec<(field_id, Value)>` shape that LocalEdgeStore
-    // doesn't accept yet) + ~15 typed-helper internals. Total = 41.
-    ("src/executor/runner.rs", 41),
-    // vector_predicate.rs: one raw encode_node_key call on the
-    // ACORN-filtered hot path (predicate evaluator point-get); two
-    // additional uses live inside the cfg(test) module that builds
-    // direct engine.put fixtures for the round-trip and corrupt-record
-    // tests. Total = 3.
-    ("src/executor/vector_predicate.rs", 3),
+    // runner.rs baseline. After R166 the cfg(test) seed fixtures route
+    // through the real Layer-4 stores (`LocalNodeStore::put[_temporal]`,
+    // `LocalEdgeStore::put_edge[_temporal]`) — unblocked by ADR-040, which
+    // made `EdgeProperties` and the executor's `Vec<(field_id, Value)>`
+    // shape wire-identical — and the OCC-scope asserts use typed
+    // `OccScope::contains_node` / `contains_edge_props`. Remaining 34 =
+    // ~30 production typed-helper internals + R165 intentional production
+    // residuals (raw-byte edgeprop transfer, prefix-scan harvest) + 4
+    // legit-raw cfg(test) sites that MUST build raw keys: three
+    // decode-error tests planting non-MessagePack garbage at node /
+    // temporal-node / edgeprop keys, and one white-box flush test poking
+    // a dummy key into `mvcc_write_buffer`.
+    ("src/executor/runner.rs", 34),
+    // vector_predicate.rs: one raw encode_node_key on the ACORN-filtered
+    // hot path (predicate evaluator point-get, production) + one
+    // cfg(test) corrupt-record test that plants invalid bytes at a raw
+    // node key. The valid-fixture seed migrated to LocalNodeStore (R166).
+    // Total = 2.
+    ("src/executor/vector_predicate.rs", 2),
     // ops.rs — fully routed through LocalIndexStore after slice 12.
     ("src/index/ops.rs", 0),
     // build.rs (R166): cfg(test) `insert_node` helper now routes
@@ -164,6 +186,64 @@ fn encoder_lockdown_no_new_files_with_raw_encoders() {
     assert!(
         bad.is_empty(),
         "Encoder lockdown coverage gaps:\n{}",
+        bad.join("\n"),
+    );
+}
+
+/// Enforce that the integration test suites contain ZERO raw key-encoder
+/// calls: fixtures are seeded and storage state asserted through the
+/// Layer-4 stores (`LocalNodeStore` / `LocalEdgeStore` / `LocalIndexStore`)
+/// and typed `OccScope` probes, never by reaching into the partition key
+/// layout. This file itself is skipped — it holds the needle strings as
+/// search literals, not as encoder calls.
+#[test]
+fn encoder_lockdown_tests_dir_is_clean() {
+    let tests_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut bad: Vec<String> = Vec::new();
+
+    fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    walk(&tests_root, &mut files);
+
+    for path in &files {
+        if path.file_name().is_some_and(|n| n == "encoder_lockdown.rs") {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+        let content = fs::read_to_string(path).unwrap_or_default();
+        for needle in TEST_ENCODER_NEEDLES {
+            if content.contains(needle) {
+                bad.push(format!(
+                    "{rel} uses `{needle}` — seed fixtures and assert storage \
+                     state through the Layer-4 stores (LocalNodeStore / \
+                     LocalEdgeStore / LocalIndexStore) and typed OccScope \
+                     probes, not raw key encoders.",
+                ));
+            }
+        }
+    }
+
+    assert!(
+        bad.is_empty(),
+        "tests/ raw key-encoder regressions:\n{}",
         bad.join("\n"),
     );
 }

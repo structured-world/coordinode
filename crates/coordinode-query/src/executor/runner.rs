@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 use rayon::prelude::*;
 
 use coordinode_core::graph::edge::{
-    encode_adj_key_forward, encode_adj_key_reverse, encode_edgeprop_key,
-    encode_temporal_edgeprop_key, temporal_edgeprop_pair_prefix, write_adj_key_forward,
-    write_adj_key_reverse, AdjDirection, AdjKeyParts, PostingList,
+    decode_edge_props, encode_adj_key_forward, encode_adj_key_reverse, encode_edge_props,
+    encode_edgeprop_key, encode_temporal_edgeprop_key, temporal_edgeprop_pair_prefix,
+    write_adj_key_forward, write_adj_key_reverse, AdjDirection, AdjKeyParts, PostingList,
 };
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::NodeIdAllocator;
@@ -1109,7 +1109,7 @@ impl<'a> ExecutionContext<'a> {
         let Some(bytes) = self.mvcc_get(Partition::EdgeProp, &key)? else {
             return Ok(None);
         };
-        let decoded = rmp_serde::from_slice::<Vec<(u32, Value)>>(&bytes).map_err(|e| {
+        let decoded = decode_edge_props(&bytes).map_err(|e| {
             ExecutionError::Serialization(format!(
                 "edge prop {edge_type}/{}/{} decode: {e}",
                 src.as_raw(),
@@ -1131,7 +1131,7 @@ impl<'a> ExecutionContext<'a> {
         prop_map: &[(u32, Value)],
     ) -> Result<(), ExecutionError> {
         let key = encode_edgeprop_key(edge_type, src, tgt);
-        let bytes = rmp_serde::to_vec(prop_map).map_err(|e| {
+        let bytes = encode_edge_props(prop_map).map_err(|e| {
             ExecutionError::Serialization(format!(
                 "edge prop {edge_type}/{}/{} encode: {e}",
                 src.as_raw(),
@@ -1156,7 +1156,7 @@ impl<'a> ExecutionContext<'a> {
         let Some(bytes) = self.mvcc_get(Partition::EdgeProp, &key)? else {
             return Ok(None);
         };
-        let decoded = rmp_serde::from_slice::<Vec<(u32, Value)>>(&bytes).map_err(|e| {
+        let decoded = decode_edge_props(&bytes).map_err(|e| {
             ExecutionError::Serialization(format!(
                 "edge prop {edge_type}/{}/{} temporal@{valid_from_ms} decode: {e}",
                 src.as_raw(),
@@ -1194,7 +1194,7 @@ impl<'a> ExecutionContext<'a> {
         prop_map: &[(u32, Value)],
     ) -> Result<(), ExecutionError> {
         let key = encode_temporal_edgeprop_key(edge_type, src, tgt, valid_from_ms);
-        let bytes = rmp_serde::to_vec(prop_map).map_err(|e| {
+        let bytes = encode_edge_props(prop_map).map_err(|e| {
             ExecutionError::Serialization(format!(
                 "edge prop {edge_type}/{}/{} temporal@{valid_from_ms} encode: {e}",
                 src.as_raw(),
@@ -3805,9 +3805,7 @@ fn build_target_rows(
                             {
                                 version_row.insert(format!("{ev}.valid_from"), Value::Int(vf));
                             }
-                            if let Ok(prop_map) =
-                                rmp_serde::from_slice::<Vec<(u32, Value)>>(ep_bytes)
-                            {
+                            if let Ok(prop_map) = decode_edge_props(ep_bytes) {
                                 for (field_id, value) in prop_map {
                                     if let Some(field_name) = ctx.interner.resolve(field_id) {
                                         version_row.insert(format!("{ev}.{field_name}"), value);
@@ -4037,9 +4035,7 @@ fn process_targets_parallel(
                                 }
                             }
                             if let Some(ep_bytes) = ep_bytes {
-                                if let Ok(prop_map) =
-                                    rmp_serde::from_slice::<Vec<(u32, Value)>>(&ep_bytes)
-                                {
+                                if let Ok(prop_map) = decode_edge_props(&ep_bytes) {
                                     for (field_id, value) in prop_map {
                                         if let Some(field_name) = pctx.interner.resolve(field_id) {
                                             out_row.insert(format!("{ev}.{field_name}"), value);
@@ -14098,7 +14094,7 @@ fn decode_edgeprop_into_map(
     ctx: &ExecutionContext<'_>,
 ) -> std::collections::BTreeMap<String, Value> {
     let mut out: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
-    if let Ok(prop_map) = rmp_serde::from_slice::<Vec<(u32, Value)>>(bytes) {
+    if let Ok(prop_map) = decode_edge_props(bytes) {
         for (field_id, value) in prop_map {
             if let Some(name) = ctx.interner.resolve(field_id) {
                 out.insert(name.to_string(), value);
@@ -18405,30 +18401,28 @@ mod tests {
             .as_ref()
             .expect("MVCC mode must have an OCC scope");
 
-        // Drain into a Vec so we can both count Node-partition entries
-        // and probe specific target keys without re-locking per assert.
+        // Verify specific target keys are tracked via the typed OCC probe
+        // (builds the key internally — no raw encoder). Done before draining.
+        for target_id in 2..=11u64 {
+            assert!(
+                scope.contains_node(1, NodeId::from_raw(target_id)),
+                "target node {target_id} should be in OCC read-set",
+            );
+        }
+
+        // Drain to count Node-partition entries.
         let tracked: Vec<_> = scope.drain();
         let node_read_keys: Vec<_> = tracked
             .iter()
             .filter(|(part, _)| *part == Partition::Node)
             .collect();
-
         // At least 10 target Node keys must be in read-set (from parallel path)
-        // plus 1 for the Hub node (from sequential NodeScan)
+        // plus 1 for the Hub node (from sequential NodeScan).
         assert!(
             node_read_keys.len() >= 10,
             "expected ≥10 Node keys in OCC read-set (parallel targets), got {}",
             node_read_keys.len(),
         );
-
-        // Verify specific target keys are tracked.
-        for target_id in 2..=11u64 {
-            let target_key = encode_node_key(1, NodeId::from_raw(target_id));
-            assert!(
-                tracked.contains(&(Partition::Node, target_key.to_vec())),
-                "target node {target_id} should be in OCC read-set",
-            );
-        }
     }
 
     #[test]
@@ -18663,20 +18657,19 @@ mod tests {
         .expect("open");
         let src = NodeId::from_raw(1);
         let tgt = NodeId::from_raw(2);
-        let payload: Vec<(u32, Value)> = vec![(0, Value::Int(7))];
-        // Seed via direct engine.put on the raw key — the EdgeProp
-        // wire format here is the `Vec<(field_id, Value)>` shape the
-        // executor encodes (LocalEdgeStore::put_edge expects a
-        // different `EdgeProperties` shape, so we can't reuse it
-        // for fixture seeding without changing the on-disk format).
-        let ep_key = encode_edgeprop_key("REL", src, tgt);
-        engine
-            .put(
-                Partition::EdgeProp,
-                &ep_key,
-                &rmp_serde::to_vec(&payload).unwrap(),
-            )
-            .expect("seed");
+        // Seed via the Layer-4 store. Post-ADR-040 `EdgeProperties` and the
+        // executor's `Vec<(field_id, Value)>` shape serialise to identical
+        // bytes through the one canonical codec, so the executor reads this
+        // fixture back verbatim.
+        {
+            use coordinode_core::graph::edge::EdgeProperties;
+            use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+            let mut props = EdgeProperties::new();
+            props.set(0, Value::Int(7));
+            LocalEdgeStore::new(&engine)
+                .put_edge("REL", src, tgt, Some(&props))
+                .expect("seed");
+        }
 
         let mut interner = FieldInterner::new();
         let allocator = NodeIdAllocator::new(0);
@@ -18722,15 +18715,17 @@ mod tests {
         .expect("open");
         let src = NodeId::from_raw(11);
         let tgt = NodeId::from_raw(22);
-        let payload: Vec<(u32, Value)> = vec![(1, Value::String("v".into()))];
-        let temporal_key = encode_temporal_edgeprop_key("REL", src, tgt, 5000);
-        engine
-            .put(
-                Partition::EdgeProp,
-                &temporal_key,
-                &rmp_serde::to_vec(&payload).unwrap(),
-            )
-            .expect("seed");
+        // Seed a temporal edge version through the Layer-4 store (canonical
+        // edgeprop codec — wire-identical to the executor, ADR-040).
+        {
+            use coordinode_core::graph::edge::EdgeProperties;
+            use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+            let mut props = EdgeProperties::new();
+            props.set(1, Value::String("v".into()));
+            LocalEdgeStore::new(&engine)
+                .put_edge_temporal("REL", src, tgt, 5000, &props)
+                .expect("seed");
+        }
 
         let mut interner = FieldInterner::new();
         let allocator = NodeIdAllocator::new(0);
@@ -19012,10 +19007,12 @@ mod tests {
         // Seed a node so the simulated MATCH read returns Some.
         let id = NodeId::from_raw(700);
         let seed = NodeRecord::new("U");
-        let key = encode_node_key(0, id);
-        engine
-            .put(Partition::Node, &key, &seed.to_msgpack().unwrap())
-            .expect("seed");
+        {
+            use coordinode_modality::{LocalNodeStore, NodeStore as _};
+            LocalNodeStore::new(&engine)
+                .put(0, id, &seed)
+                .expect("seed");
+        }
 
         let mut interner = FieldInterner::new();
         let allocator = NodeIdAllocator::new(0);
@@ -19031,9 +19028,12 @@ mod tests {
         // Stamps a fresh seqno that is necessarily > mvcc_read_ts.
         let mut altered = NodeRecord::new("U");
         altered.set(ctx.interner.intern("name"), Value::String("Bob".into()));
-        engine
-            .put(Partition::Node, &key, &altered.to_msgpack().unwrap())
-            .expect("concurrent put");
+        {
+            use coordinode_modality::{LocalNodeStore, NodeStore as _};
+            LocalNodeStore::new(&engine)
+                .put(0, id, &altered)
+                .expect("concurrent put");
+        }
 
         // ON MATCH SET: buffer a write on an UNRELATED key so the txn
         // is not read-only and flush actually runs OCC validation.
@@ -19132,11 +19132,13 @@ mod tests {
         .expect("open");
         // Seed v@1000 outside of the transaction-under-test.
         let id = NodeId::from_raw(44);
-        let seeded_key = coordinode_core::graph::node::encode_temporal_node_key(0, id, 1000);
         let rec = NodeRecord::new("Tx");
-        engine
-            .put(Partition::Node, &seeded_key, &rec.to_msgpack().unwrap())
-            .expect("seed");
+        {
+            use coordinode_modality::{LocalNodeStore, NodeStore as _};
+            LocalNodeStore::new(&engine)
+                .put_temporal(0, id, 1000, &rec)
+                .expect("seed");
+        }
 
         let mut interner = FieldInterner::new();
         let allocator = NodeIdAllocator::new(0);
@@ -19580,9 +19582,10 @@ mod tests {
         // Seed.
         let id = NodeId::from_raw(11);
         let rec = NodeRecord::new("Item");
-        let bytes = rec.to_msgpack().expect("encode");
-        let key = encode_node_key(0, id);
-        engine.put(Partition::Node, &key, &bytes).expect("seed");
+        {
+            use coordinode_modality::{LocalNodeStore, NodeStore as _};
+            LocalNodeStore::new(&engine).put(0, id, &rec).expect("seed");
+        }
 
         let mut interner = FieldInterner::new();
         let allocator = NodeIdAllocator::new(0);
@@ -20015,14 +20018,12 @@ mod tests {
         // Use field_id 0 directly — "name" was interned first by insert_node,
         // so it has id 0. Avoids borrowing interner while ctx is alive.
         modified_record.set(0, Value::String("T5-modified".into()));
-        let target5_key = encode_node_key(1, NodeId::from_raw(5));
-        engine
-            .put(
-                Partition::Node,
-                &target5_key,
-                &modified_record.to_msgpack().expect("serialize"),
-            )
-            .expect("concurrent write");
+        {
+            use coordinode_modality::{LocalNodeStore, NodeStore as _};
+            LocalNodeStore::new(&engine)
+                .put(1, NodeId::from_raw(5), &modified_record)
+                .expect("concurrent write");
+        }
 
         // T1: Add a dummy write so mvcc_flush doesn't skip conflict check
         // (read-only transactions return early without OCC check)
