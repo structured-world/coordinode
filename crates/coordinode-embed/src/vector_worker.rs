@@ -100,6 +100,12 @@ fn run(
             std::thread::sleep(IDLE_POLL);
             continue;
         }
+        // Track the highest commit HLC consumed in this batch. After the
+        // worker has applied every entry up to `max_ts`, every index it
+        // maintains for this shard has seen all writes up to `max_ts` — the
+        // ones with no vector-write at `max_ts` are still current as of it.
+        // This is the per-shard read-your-writes freshness watermark.
+        let mut max_ts = 0u64;
         for (entry, _token) in batch {
             for op in &entry.ops {
                 let OplogOp::Insert {
@@ -115,6 +121,10 @@ fn run(
                 }
                 apply_node_write(key, value, &registry, &interner);
             }
+            max_ts = max_ts.max(entry.ts);
+        }
+        if max_ts > 0 {
+            registry.advance_indexed_hlc_all(max_ts);
         }
     }
     tracing::info!("vector oplog worker stopped");
@@ -241,6 +251,17 @@ mod tests {
         }
         worker.shutdown();
         assert_eq!(indexed, 20, "all live oplog inserts must reach the index");
+
+        // Freshness watermark must advance to the last applied entry's HLC
+        // (entries carry ts = index, 0..=19). This is the read-your-writes
+        // fence: a reader that wrote at HLC <= 19 sees a current index.
+        assert_eq!(
+            registry
+                .health_snapshot("Item", "embedding")
+                .and_then(|h| h.indexed_hlc()),
+            Some(19),
+            "worker must advance the index freshness watermark to the last applied entry ts"
+        );
 
         // And the index must actually answer with them.
         let results = handle.read().unwrap().search(&[5.0, 0.0, 0.0, 0.0], 1);

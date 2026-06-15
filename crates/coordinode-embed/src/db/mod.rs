@@ -169,6 +169,24 @@ pub(crate) fn try_extract_vector(val: &coordinode_core::graph::types::Value) -> 
     }
 }
 
+/// One-line human description of a vector index's serving health, for EXPLAIN
+/// output.
+fn describe_index_health(state: &coordinode_vector::health::IndexHealthState) -> String {
+    use coordinode_vector::health::IndexHealthState as H;
+    match state {
+        H::Ready { indexed_hlc } => format!("ready (indexed_hlc={indexed_hlc})"),
+        H::Rebuilding {
+            progress,
+            eta_ms,
+            indexed_hlc,
+        } => format!(
+            "rebuilding {:.0}% (indexed_hlc={indexed_hlc}, eta={eta_ms}ms)",
+            progress * 100.0
+        ),
+        H::Offline { reason } => format!("offline: {reason}"),
+    }
+}
+
 /// Loads f32 vectors from the node: partition for HNSW reranking.
 ///
 /// When HNSW indexes have `offload_vectors` enabled, this loader provides
@@ -945,6 +963,12 @@ impl Database {
                 );
             }
         }
+
+        // The eager rebuild folded every node record committed before open
+        // into the in-memory graphs, so each index is current as of the
+        // engine's snapshot seqno. Seed the freshness watermark there; the
+        // oplog-tailing worker advances it further as live writes arrive.
+        registry.advance_indexed_hlc_all(engine.snapshot());
     }
 
     /// Load persisted text index definitions from `schema:idx:*` and
@@ -1704,7 +1728,30 @@ impl Database {
         let stats_ref = stats
             .as_ref()
             .map(|s| s as &dyn coordinode_core::graph::stats::StorageStats);
-        Ok(plan.explain_with_stats(stats_ref))
+        let mut explain = plan.explain_with_stats(stats_ref);
+
+        // Annotate the live serving health of any vector index the
+        // plan actually uses. `apply_hnsw_scan_access_path` above promotes a
+        // matching query to `HnswScan(<index_name>, …)`, so the index name is
+        // present in the text exactly when the plan reads through that index —
+        // a brute-force fallback names no index and gets no annotation.
+        let mut health_lines = Vec::new();
+        for def in self.vector_index_registry.all_definitions() {
+            if !explain.contains(&def.name) {
+                continue;
+            }
+            if let Some(state) = self
+                .vector_index_registry
+                .health_snapshot(&def.label, def.property())
+            {
+                health_lines.push(format!("  {}: {}", def.name, describe_index_health(&state)));
+            }
+        }
+        if !health_lines.is_empty() {
+            explain.push_str("\n\nVector index health:\n");
+            explain.push_str(&health_lines.join("\n"));
+        }
+        Ok(explain)
     }
 
     /// Return EXPLAIN SUGGEST: plan + optimization suggestions.
@@ -3209,6 +3256,57 @@ mod tests {
             .unwrap();
         // M=12, base=384, quant → base/2 = 192. Clamped to [64,1024] → 192.
         assert_eq!(cross, 192);
+    }
+
+    /// EXPLAIN annotates the serving health of a vector index the plan reads
+    /// through: a top-k vector query is promoted to HnswScan, so
+    /// the index name appears and its current state is surfaced.
+    #[test]
+    fn explain_annotates_vector_index_health() {
+        use coordinode_core::graph::types::VectorMetric;
+        use coordinode_query::index::VectorIndexConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Database::open(dir.path()).unwrap();
+        db.create_vector_index(
+            "movie_emb",
+            "Movie",
+            "embedding",
+            VectorIndexConfig {
+                dimensions: 3,
+                metric: VectorMetric::L2,
+                m: 16,
+                ef_construction: 200,
+                quantization: coordinode_vector::hnsw::QuantizationCodec::None,
+                offload_vectors: false,
+            },
+        );
+        // Drive the index into a non-ready state so EXPLAIN shows more than the
+        // default "ready".
+        db.vector_index_registry()
+            .report_health_rebuild("Movie", "embedding", 0.5, 250);
+
+        let explain = db
+            .explain_cypher(
+                "MATCH (m:Movie) \
+                 WITH *, vector_distance(m.embedding, [0.1, 0.2, 0.3]) AS d \
+                 ORDER BY d ASC LIMIT 5 \
+                 RETURN m",
+            )
+            .expect("explain");
+
+        assert!(
+            explain.contains("movie_emb"),
+            "top-k vector query must be promoted to HnswScan(movie_emb): {explain}"
+        );
+        assert!(
+            explain.contains("Vector index health:"),
+            "EXPLAIN must carry the index health section: {explain}"
+        );
+        assert!(
+            explain.to_lowercase().contains("rebuilding"),
+            "health annotation must reflect the rebuilding state: {explain}"
+        );
     }
 
     /// End-to-end: an EXPLAIN of TRAVERSE→VECTOR_FILTER must hit

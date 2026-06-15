@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 
 use coordinode_core::graph::node::NodeId;
 use coordinode_storage::engine::core::StorageEngine;
+use coordinode_vector::health::{HealthSignal, IndexHealthState};
 use coordinode_vector::hnsw::{HnswConfig, HnswIndex, SearchResult};
 use coordinode_vector::storage::lsm_backed::LsmVectorTier;
 use coordinode_vector::storage::{VectorTierHandle, VectorTierStorage};
@@ -39,6 +40,12 @@ pub struct VectorIndexRegistry {
     indexes: RwLock<HashMap<VectorIndexKey, HnswHandle>>,
     /// Index definitions keyed by (label, property) for metadata lookup.
     definitions: RwLock<HashMap<VectorIndexKey, IndexDefinition>>,
+    /// Per-index lifecycle + freshness signal. Held as an
+    /// `Arc<HealthSignal>` so the read + serving path reads the current
+    /// state and `indexed_hlc` watermark without taking the `indexes`
+    /// write lock. Advanced by the oplog-tailing maintenance worker as it
+    /// applies writes, and transitioned around rebuilds.
+    health: RwLock<HashMap<VectorIndexKey, Arc<HealthSignal>>>,
     /// Optional persistent f32 truth tier backend (ADR-033). When set,
     /// callers obtain a `VectorTierHandle` via [`Self::tier_handle`]
     /// using pre-resolved `(label_id, property_id)` and pass it to
@@ -55,6 +62,7 @@ impl VectorIndexRegistry {
         Self {
             indexes: RwLock::new(HashMap::new()),
             definitions: RwLock::new(HashMap::new()),
+            health: RwLock::new(HashMap::new()),
             tier_backend: None,
         }
     }
@@ -73,6 +81,7 @@ impl VectorIndexRegistry {
         Self {
             indexes: RwLock::new(HashMap::new()),
             definitions: RwLock::new(HashMap::new()),
+            health: RwLock::new(HashMap::new()),
             tier_backend: Some(backend),
         }
     }
@@ -143,6 +152,10 @@ impl VectorIndexRegistry {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(key.clone(), Arc::new(RwLock::new(hnsw)));
+        self.health
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), HealthSignal::new_ready());
         self.definitions
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -158,6 +171,10 @@ impl VectorIndexRegistry {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(key.clone(), Arc::new(RwLock::new(hnsw)));
+        self.health
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), HealthSignal::new_ready());
         self.definitions
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -170,6 +187,10 @@ impl VectorIndexRegistry {
     pub fn unregister(&self, label: &str, property: &str) {
         let key = (label.to_string(), property.to_string());
         self.indexes
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        self.health
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&key);
@@ -186,6 +207,77 @@ impl VectorIndexRegistry {
             .unwrap_or_else(|e| e.into_inner())
             .get(&(label.to_string(), property.to_string()))
             .cloned()
+    }
+
+    /// Lock-free handle to a (label, property) index's lifecycle + freshness
+    /// signal. `None` when no such index exists. Cloning the
+    /// `Arc` lets the serving path read state without the `indexes` lock.
+    pub fn health_handle(&self, label: &str, property: &str) -> Option<Arc<HealthSignal>> {
+        self.health
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(label.to_string(), property.to_string()))
+            .cloned()
+    }
+
+    /// Current lifecycle state + freshness watermark of a (label, property)
+    /// index. `None` when no such index exists. This is what the gRPC
+    /// response metadata, EXPLAIN output, and Prometheus exporter read.
+    pub fn health_snapshot(&self, label: &str, property: &str) -> Option<IndexHealthState> {
+        self.health_handle(label, property).map(|h| h.snapshot())
+    }
+
+    /// Advance the freshness watermark of every maintained index to `hlc`
+    /// (monotonic). Called by the oplog-tailing maintenance worker after it
+    /// applies an entry (or batch) at commit HLC `hlc`: once the worker has
+    /// consumed that entry, every index it maintains for the shard has seen
+    /// all writes up to `hlc` — the ones with no vector-write at `hlc` are
+    /// still current as of `hlc`. This is the per-shard read-your-writes
+    /// fence surfaced per index.
+    pub fn advance_indexed_hlc_all(&self, hlc: u64) {
+        for h in self
+            .health
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+        {
+            h.advance_indexed_hlc(hlc);
+        }
+    }
+
+    /// Transition a single index to `Ready` (e.g. after a rebuild completes).
+    /// No-op when the index is unknown.
+    pub fn mark_health_ready(&self, label: &str, property: &str) {
+        if let Some(h) = self.health_handle(label, property) {
+            h.mark_ready();
+        }
+    }
+
+    /// Report rebuild progress for a single index, transitioning it to
+    /// `Rebuilding`. No-op when the index is unknown.
+    pub fn report_health_rebuild(&self, label: &str, property: &str, progress: f32, eta_ms: u64) {
+        if let Some(h) = self.health_handle(label, property) {
+            h.report_rebuild_progress(progress, eta_ms);
+        }
+    }
+
+    /// Mark a single index `Offline` with a reason. No-op when unknown.
+    pub fn mark_health_offline(&self, label: &str, property: &str, reason: impl Into<String>) {
+        if let Some(h) = self.health_handle(label, property) {
+            h.mark_offline(reason);
+        }
+    }
+
+    /// Snapshot the health of every registered index as `(label, property,
+    /// state)`. Used by the metrics exporter to publish per-index serving
+    /// state and freshness-lag gauges each scrape interval.
+    pub fn all_health(&self) -> Vec<(String, String, IndexHealthState)> {
+        self.health
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|((label, property), h)| (label.clone(), property.clone(), h.snapshot()))
+            .collect()
     }
 
     /// Update the in-memory state of a registered index without touching
@@ -499,6 +591,60 @@ mod tests {
         assert!(!reg.has_index("Movie", "title"));
         assert!(!reg.has_index("User", "embedding"));
         assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn health_tracks_state_and_freshness_watermark() {
+        let reg = VectorIndexRegistry::new();
+        reg.register(IndexDefinition::hnsw(
+            "movie_embedding",
+            "Movie",
+            "embedding",
+            test_config(),
+        ));
+
+        // Freshly registered → Ready with a zero watermark.
+        assert_eq!(
+            reg.health_snapshot("Movie", "embedding"),
+            Some(IndexHealthState::Ready { indexed_hlc: 0 })
+        );
+        // Unknown index → no health.
+        assert!(reg.health_snapshot("Movie", "missing").is_none());
+
+        // Worker cursor advance lifts the watermark for every maintained index.
+        reg.advance_indexed_hlc_all(4_200);
+        assert_eq!(
+            reg.health_snapshot("Movie", "embedding"),
+            Some(IndexHealthState::Ready { indexed_hlc: 4_200 })
+        );
+
+        // Rebuild keeps the already-folded watermark.
+        reg.report_health_rebuild("Movie", "embedding", 0.42, 1_000);
+        let snap = reg.health_snapshot("Movie", "embedding");
+        assert!(
+            matches!(snap, Some(IndexHealthState::Rebuilding { .. })),
+            "expected Rebuilding, got {snap:?}"
+        );
+        if let Some(IndexHealthState::Rebuilding {
+            progress,
+            indexed_hlc,
+            ..
+        }) = snap
+        {
+            assert!((progress - 0.42).abs() < 1e-3);
+            assert_eq!(indexed_hlc, 4_200);
+        }
+
+        // Completion returns to Ready, watermark intact.
+        reg.mark_health_ready("Movie", "embedding");
+        assert_eq!(
+            reg.health_snapshot("Movie", "embedding"),
+            Some(IndexHealthState::Ready { indexed_hlc: 4_200 })
+        );
+
+        // Unregister drops the health entry.
+        reg.unregister("Movie", "embedding");
+        assert!(reg.health_snapshot("Movie", "embedding").is_none());
     }
 
     #[test]

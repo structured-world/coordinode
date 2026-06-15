@@ -366,6 +366,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             );
 
+            // Vector index observability: publish per-index
+            // serving state + freshness lag as Prometheus gauges. Scrape-style
+            // periodic collector — the lag needs the engine's current
+            // committed HLC, which is only meaningful at sample time.
+            {
+                let db_metrics = Arc::clone(&database);
+                let engine_metrics = Arc::clone(&engine);
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+                    loop {
+                        tick.tick().await;
+                        let committed = engine_metrics.snapshot();
+                        let health = db_metrics.read().vector_index_registry().all_health();
+                        for (label, property, state) in health {
+                            let code = match &state {
+                                coordinode_vector::health::IndexHealthState::Ready { .. } => 0.0,
+                                coordinode_vector::health::IndexHealthState::Rebuilding {
+                                    ..
+                                } => 1.0,
+                                coordinode_vector::health::IndexHealthState::Offline { .. } => 2.0,
+                            };
+                            metrics::gauge!(
+                                "coordinode_vector_index_state",
+                                "label" => label.clone(),
+                                "property" => property.clone(),
+                            )
+                            .set(code);
+                            let lag = state
+                                .indexed_hlc()
+                                .map(|h| committed.saturating_sub(h))
+                                .unwrap_or(0);
+                            metrics::gauge!(
+                                "coordinode_vector_index_lag_hlc",
+                                "label" => label,
+                                "property" => property,
+                            )
+                            .set(lag as f64);
+                        }
+                    }
+                });
+            }
+
             let raft_node_shared: Option<Arc<coordinode_raft::cluster::RaftNode>> =
                 Some(Arc::clone(&raft_node));
 

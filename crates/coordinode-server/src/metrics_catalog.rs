@@ -77,6 +77,14 @@ fn register_query_metrics() {
         "HNSW candidates scanned per search"
     );
     metrics::describe_gauge!("coordinode_vector_index_size", "Vectors in HNSW index");
+    metrics::describe_gauge!(
+        "coordinode_vector_index_state",
+        "Vector index serving state per {label, property}: 0=ready, 1=rebuilding, 2=offline"
+    );
+    metrics::describe_gauge!(
+        "coordinode_vector_index_lag_hlc",
+        "Vector index freshness lag per {label, property}: committed HLC minus indexed HLC (microseconds)"
+    );
 
     // Full-text search
     metrics::describe_gauge!(

@@ -85,6 +85,55 @@ fn row_to_vector_result(
     })
 }
 
+/// Map the engine-side vector index health snapshot to its wire form. The
+/// serving lifecycle, rebuild progress, and the `indexed_hlc` freshness
+/// watermark are carried back so a client can fence read-your-writes against
+/// the index that answered the query.
+fn index_health_to_proto(
+    h: coordinode_vector::health::IndexHealthState,
+) -> query::VectorIndexHealth {
+    use coordinode_vector::health::IndexHealthState as H;
+    use query::vector_index_health::ServingState;
+    match h {
+        H::Ready { indexed_hlc } => query::VectorIndexHealth {
+            serving_state: ServingState::Ready as i32,
+            rebuild_progress: 0.0,
+            eta_ms: 0,
+            indexed_hlc,
+            offline_reason: String::new(),
+        },
+        H::Rebuilding {
+            progress,
+            eta_ms,
+            indexed_hlc,
+        } => query::VectorIndexHealth {
+            serving_state: ServingState::Rebuilding as i32,
+            rebuild_progress: progress,
+            eta_ms,
+            indexed_hlc,
+            offline_reason: String::new(),
+        },
+        H::Offline { reason } => query::VectorIndexHealth {
+            serving_state: ServingState::Offline as i32,
+            rebuild_progress: 0.0,
+            eta_ms: 0,
+            indexed_hlc: 0,
+            offline_reason: reason,
+        },
+    }
+}
+
+/// Echo the freshness watermark of the serving index as a response-trailer
+/// header so a client library can read it without decoding the body. No-op
+/// when the query did not run against a managed HNSW index.
+fn set_indexed_hlc_header<T>(resp: &mut Response<T>, health: Option<&query::VectorIndexHealth>) {
+    if let Some(h) = health {
+        if let Ok(val) = h.indexed_hlc.to_string().parse() {
+            resp.metadata_mut().insert("coordinode-indexed-hlc", val);
+        }
+    }
+}
+
 pub struct VectorServiceImpl {
     database: Arc<RwLock<Database>>,
 }
@@ -136,18 +185,32 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         params.insert("qv".to_string(), Value::Vector(query_vector.values.clone()));
 
         // Shared read access: vector search is read-only and benefits
-        // from running in parallel with other queries.
-        let rows = {
+        // from running in parallel with other queries. Read the serving
+        // index's health under the same lock so the watermark reported is
+        // consistent with the snapshot the query ran against. The registry
+        // keys on the raw (unescaped) label/property.
+        let (rows, index_health) = {
             let db = self.database.read();
-            db.execute_cypher_shared(&cypher, Some(params), None, None, None)
+            let rows = db
+                .execute_cypher_shared(&cypher, Some(params), None, None, None)
                 .map_err(|e| db_err_to_status("vector search", e))?
-                .rows
+                .rows;
+            let health = db
+                .vector_index_registry()
+                .health_snapshot(&req.label, &req.property)
+                .map(index_health_to_proto);
+            (rows, health)
         };
 
         let results: Vec<query::VectorResult> =
             rows.into_iter().filter_map(row_to_vector_result).collect();
 
-        Ok(Response::new(query::VectorSearchResponse { results }))
+        let mut response = Response::new(query::VectorSearchResponse {
+            results,
+            index_health: index_health.clone(),
+        });
+        set_indexed_hlc_header(&mut response, index_health.as_ref());
+        Ok(response)
     }
 
     async fn hybrid_search(
@@ -206,7 +269,13 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         let results: Vec<query::VectorResult> =
             rows.into_iter().filter_map(row_to_vector_result).collect();
 
-        Ok(Response::new(query::HybridSearchResponse { results }))
+        // The hybrid request carries no label, so the vector phase can span
+        // several labels' indexes — there is no single index whose health to
+        // report. Leave it unset (documented contract on the proto field).
+        Ok(Response::new(query::HybridSearchResponse {
+            results,
+            index_health: None,
+        }))
     }
 }
 
@@ -412,6 +481,112 @@ mod tests {
 
         let database = Arc::new(RwLock::new(database));
         (VectorServiceImpl::new(database), dir)
+    }
+
+    /// A `Ready` index reports its freshness watermark both in the response
+    /// body (`index_health.indexed_hlc`) and as the `coordinode-indexed-hlc`
+    /// trailer header, so a client can fence read-your-writes: it has been
+    /// served an index current as of that HLC.
+    #[tokio::test]
+    async fn vector_search_reports_ready_health_and_hlc_header() {
+        use query::vector_index_health::ServingState;
+        let (svc, _dir) = test_service_with_index("Vec", "embedding", 3);
+
+        // Advance the index's freshness watermark as the oplog-tailing
+        // maintenance worker would after applying writes up to HLC 4242.
+        svc.database
+            .write()
+            .vector_index_registry()
+            .advance_indexed_hlc_all(4242);
+
+        let resp = svc
+            .vector_search(Request::new(query::VectorSearchRequest {
+                label: "Vec".to_string(),
+                property: "embedding".to_string(),
+                query_vector: Some(crate::proto::common::Vector {
+                    values: vec![1.0, 0.0, 0.0],
+                }),
+                top_k: 1,
+                metric: 0,
+            }))
+            .await
+            .expect("vector search should succeed");
+
+        // Header echoes the watermark for client-side ordering.
+        assert_eq!(
+            resp.metadata()
+                .get("coordinode-indexed-hlc")
+                .expect("indexed-hlc header present")
+                .to_str()
+                .unwrap(),
+            "4242"
+        );
+
+        let health = resp
+            .into_inner()
+            .index_health
+            .expect("managed HNSW index → health present");
+        assert_eq!(health.serving_state, ServingState::Ready as i32);
+        assert_eq!(health.indexed_hlc, 4242);
+    }
+
+    /// A rebuilding index surfaces `Rebuilding{progress, indexed_hlc}` in the
+    /// response metadata so a caller can apply its VECTOR_REBUILD_POLICY.
+    #[tokio::test]
+    async fn vector_search_reports_rebuilding_health() {
+        use query::vector_index_health::ServingState;
+        let (svc, _dir) = test_service_with_index("Vec", "embedding", 3);
+
+        {
+            let db = svc.database.write();
+            let reg = db.vector_index_registry();
+            reg.advance_indexed_hlc_all(900);
+            reg.report_health_rebuild("Vec", "embedding", 0.42, 1_500);
+        }
+
+        let resp = svc
+            .vector_search(Request::new(query::VectorSearchRequest {
+                label: "Vec".to_string(),
+                property: "embedding".to_string(),
+                query_vector: Some(crate::proto::common::Vector {
+                    values: vec![1.0, 0.0, 0.0],
+                }),
+                top_k: 1,
+                metric: 0,
+            }))
+            .await
+            .expect("vector search should succeed");
+
+        let health = resp.into_inner().index_health.expect("health present");
+        assert_eq!(health.serving_state, ServingState::Rebuilding as i32);
+        assert!((health.rebuild_progress - 0.42).abs() < 1e-3);
+        assert_eq!(health.eta_ms, 1_500);
+        // The watermark folded so far survives the rebuild transition.
+        assert_eq!(health.indexed_hlc, 900);
+    }
+
+    /// A query that runs without a managed HNSW index (brute-force fallback)
+    /// omits index health and the watermark header — there is nothing to fence
+    /// against.
+    #[tokio::test]
+    async fn vector_search_without_index_omits_health() {
+        let (svc, _dir) = test_service();
+
+        let resp = svc
+            .vector_search(Request::new(query::VectorSearchRequest {
+                label: "Unindexed".to_string(),
+                property: "embedding".to_string(),
+                query_vector: Some(crate::proto::common::Vector {
+                    values: vec![1.0, 0.0, 0.0],
+                }),
+                top_k: 1,
+                metric: 0,
+            }))
+            .await
+            .expect("vector search should succeed");
+
+        assert!(resp.metadata().get("coordinode-indexed-hlc").is_none());
+        assert!(resp.into_inner().index_health.is_none());
     }
 
     /// With an HNSW index registered, vector_search routes through the HNSW path
