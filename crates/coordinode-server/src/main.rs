@@ -333,10 +333,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &data_dir,
                     Arc::clone(&engine),
                     oracle.clone(),
-                    pipeline,
+                    Arc::clone(&pipeline),
                 )
                 .map_err(|e| format!("failed to open database: {e}"))?,
             ));
+
+            // Per-shard consumer-retention registry (ADR-028). Constructing it
+            // makes the registry the source of the MVCC GC watermark: it
+            // activates the documented retention window (`now - 7d`, so
+            // `AS OF TIMESTAMP` history is retained) and, once CDC / backup
+            // consumers register, holds older versions / oplog segments back
+            // for them. The background service runs batched heartbeats + TTL
+            // eviction and advances the window with the wall clock. Both
+            // standalone and cluster modes drive it through the same Raft
+            // pipeline. Held for the process lifetime.
+            let consumer_registry = coordinode_replicate::ShardConsumerRegistry::new(
+                Arc::clone(&engine),
+                Arc::clone(&pipeline),
+                Arc::new(
+                    coordinode_core::txn::proposal::ProposalIdGenerator::with_base(node_id << 48),
+                ),
+                Arc::new(coordinode_replicate::SystemClock),
+            );
+            let _registry_bg = consumer_registry
+                .start_background(coordinode_replicate::BackgroundConfig::default());
 
             let raft_node_shared: Option<Arc<coordinode_raft::cluster::RaftNode>> =
                 Some(Arc::clone(&raft_node));

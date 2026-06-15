@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use coordinode_core::txn::proposal::{
-    Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline, RaftProposal,
+    Mutation, PartitionId, ProposalError, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_raft::cluster::RaftNode;
@@ -258,10 +258,94 @@ async fn cluster_propose_on_follower_returns_error() {
         };
 
         let err = pipeline.propose_and_wait(&proposal);
-        assert!(err.is_err(), "propose on follower should fail");
+        // A non-leader write must yield an error — never an Ok carrying a
+        // fabricated committed index. The operationTime token can only be
+        // minted by the leader that actually committed the entry.
+        assert!(
+            matches!(
+                err,
+                Err(ProposalError::NotLeader { .. }) | Err(ProposalError::Raft(_))
+            ),
+            "follower propose must fail with NotLeader/Raft and mint no committed \
+             index, got {err:?}"
+        );
 
         n1.node.shutdown().await.expect("shutdown 1");
         n2.node.shutdown().await.expect("shutdown 2");
+    })
+    .await;
+
+    assert!(result.is_ok(), "TIMED OUT after {TEST_TIMEOUT:?}");
+}
+
+/// operationTime (cross-replica): the committed index returned by a leader write is
+/// a faithful `afterClusterTime` token across the cluster. Successive writes
+/// return strictly increasing indices, and every follower applies the same
+/// write-set (deterministic replay) so a causal read fencing on the returned
+/// index is satisfiable on any replica.
+#[tokio::test(flavor = "multi_thread")]
+async fn cluster_committed_index_advances_and_replicates() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let (n1, n2, n3, _, _, _) = bootstrap_3_node().await;
+
+        let pipeline = n1.node.pipeline();
+        let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+
+        let mut indices = Vec::new();
+        for i in 1..=3u64 {
+            let proposal = RaftProposal {
+                id: id_gen.next(),
+                mutations: vec![Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: format!("node:1:xrepl-{i}").into_bytes(),
+                    value: format!("v{i}").into_bytes(),
+                }],
+                commit_ts: Timestamp::from_raw(100 + i),
+                start_ts: Timestamp::from_raw(99 + i),
+                bypass_rate_limiter: false,
+            };
+            let outcome = pipeline
+                .propose_and_wait(&proposal)
+                .expect("propose on leader");
+            let idx = outcome
+                .applied_index
+                .expect("leader write must carry a committed index");
+            indices.push(idx);
+        }
+
+        // Strictly increasing committed indices — each write's operationTime
+        // is its own, advancing monotonically (no overshoot, no reuse).
+        assert!(
+            indices.windows(2).all(|w| w[1] > w[0]),
+            "committed indices must strictly increase: {indices:?}"
+        );
+
+        // Deterministic replay: every follower applies the identical write-set.
+        // Reaching the leader's committed index on a follower is exactly what
+        // makes a causal read with that afterClusterTime token satisfiable.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        for (label, engine) in [("n1", &n1.engine), ("n2", &n2.engine), ("n3", &n3.engine)] {
+            for i in 1..=3u64 {
+                let val = engine
+                    .get(Partition::Node, format!("node:1:xrepl-{i}").as_bytes())
+                    .expect("read");
+                assert_eq!(
+                    val.as_deref(),
+                    Some(format!("v{i}").as_bytes()),
+                    "{label}: missing replicated write i={i} (committed index {})",
+                    indices[(i - 1) as usize],
+                );
+            }
+        }
+
+        n1.node.shutdown().await.expect("shutdown 1");
+        n2.node.shutdown().await.expect("shutdown 2");
+        n3.node.shutdown().await.expect("shutdown 3");
     })
     .await;
 
@@ -389,6 +473,17 @@ async fn cluster_remove_node() {
 }
 
 /// Leader failover: shutdown leader → new leader elected → propose works.
+///
+/// Also the non-flaky form of task (2) "majority writeConcern + leader crash":
+/// a Raft-committed write (majority-acked through the pipeline) and the
+/// committed index it minted as `operationTime` are NOT rolled back when the
+/// leader crashes — the data survives on the surviving quorum, and the log
+/// index space stays continuous across the leader change (the new leader's
+/// next committed index strictly exceeds the pre-crash one). The precise
+/// crash-in-the-commit-before-apply *window* is a race that needs fault
+/// injection and is intentionally not timing-tested; what is deterministic —
+/// and asserted here — is that a committed operationTime is durable across
+/// failover.
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_leader_failover() {
     let _ = tracing_subscriber::fmt()
@@ -413,9 +508,11 @@ async fn cluster_leader_failover() {
             start_ts: Timestamp::from_raw(99),
             bypass_rate_limiter: false,
         };
-        pipeline1
+        let pre_idx = pipeline1
             .propose_and_wait(&proposal)
-            .expect("propose before failover");
+            .expect("propose before failover")
+            .applied_index
+            .expect("majority-committed write must carry an operationTime index");
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Kill leader
@@ -449,9 +546,19 @@ async fn cluster_leader_failover() {
             start_ts: Timestamp::from_raw(199),
             bypass_rate_limiter: false,
         };
-        pipeline_new
+        let post_idx = pipeline_new
             .propose_and_wait(&proposal2)
-            .expect("propose on new leader after failover");
+            .expect("propose on new leader after failover")
+            .applied_index
+            .expect("post-failover committed write must carry an operationTime index");
+
+        // The log index space is continuous across the leader change: the new
+        // leader's committed index strictly exceeds the pre-crash one — the
+        // pre-crash operationTime was not rolled back and reused.
+        assert!(
+            post_idx > pre_idx,
+            "committed index must advance across failover: pre={pre_idx}, post={post_idx}"
+        );
 
         // Verify both old and new data on a follower
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -464,7 +571,7 @@ async fn cluster_leader_failover() {
         assert_eq!(
             old.as_deref(),
             Some(b"pre-failover".as_slice()),
-            "old data should survive failover"
+            "pre-crash committed write (operationTime {pre_idx}) must survive failover, not roll back"
         );
 
         let new = follower

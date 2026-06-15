@@ -446,7 +446,7 @@ fn submit_proposal(
     };
 
     match pipeline.propose_and_wait(&proposal) {
-        Ok(()) => {
+        Ok(_) => {
             tracing::debug!(
                 count,
                 commit_ts = commit_ts.as_raw(),
@@ -473,7 +473,7 @@ fn submit_proposal(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::txn::proposal::{Mutation, PartitionId, ProposalError};
+    use crate::txn::proposal::{Mutation, PartitionId, ProposalError, ProposalOutcome};
 
     /// Mock pipeline that records proposals.
     struct RecordingPipeline {
@@ -502,9 +502,12 @@ mod tests {
     }
 
     impl ProposalPipeline for RecordingPipeline {
-        fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<(), ProposalError> {
+        fn propose_and_wait(
+            &self,
+            proposal: &RaftProposal,
+        ) -> Result<ProposalOutcome, ProposalError> {
             self.proposals.lock().unwrap().push(proposal.clone());
-            Ok(())
+            Ok(ProposalOutcome::local())
         }
     }
 
@@ -670,7 +673,7 @@ mod tests {
     fn drain_tolerates_pipeline_errors() {
         struct FailingPipeline;
         impl ProposalPipeline for FailingPipeline {
-            fn propose_and_wait(&self, _: &RaftProposal) -> Result<(), ProposalError> {
+            fn propose_and_wait(&self, _: &RaftProposal) -> Result<ProposalOutcome, ProposalError> {
                 Err(ProposalError::Storage("test error".into()))
             }
         }

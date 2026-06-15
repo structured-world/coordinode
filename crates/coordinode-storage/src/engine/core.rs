@@ -695,6 +695,17 @@ impl StorageEngine {
         self.coordinator.advance_gc_watermark();
     }
 
+    /// Publish the consumer-registry retention floor (ADR-028 feed a):
+    /// `min(consumer_checkpoints, MVCC time-travel window)`, supplied by the
+    /// `SeqnoConsumerRegistry` in `coordinode-replicate`. The effective GC
+    /// watermark becomes `min(live snapshot pin / current seqno, floor)` — a
+    /// lagging CDC / backup consumer or the retention window holds old MVCC
+    /// versions back (CockroachDB protected-timestamp / TiDB service-safe-point
+    /// shape) without ever overriding a live reader's pin. `u64::MAX` clears it.
+    pub fn set_consumer_retention_floor(&self, floor: u64) {
+        self.coordinator.set_consumer_retention_floor(floor);
+    }
+
     /// The current GC watermark value. Observability + test hook.
     pub fn gc_watermark(&self) -> u64 {
         self.coordinator.gc_watermark_value()

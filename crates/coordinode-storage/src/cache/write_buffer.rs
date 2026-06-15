@@ -332,6 +332,7 @@ fn partition_to_u8(p: PartitionId) -> u8 {
         PartitionId::Idx => 6,
         PartitionId::Counter => 7,
         PartitionId::VectorF32 => 8,
+        PartitionId::Registry => 9,
     }
 }
 
@@ -346,6 +347,7 @@ fn u8_to_partition(b: u8) -> Option<PartitionId> {
         6 => Some(PartitionId::Idx),
         7 => Some(PartitionId::Counter),
         8 => Some(PartitionId::VectorF32),
+        9 => Some(PartitionId::Registry),
         _ => None,
     }
 }

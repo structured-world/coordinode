@@ -24,6 +24,7 @@ rest-proxy = ["dep:structured-proxy"]
 [dependencies]
 coordinode-core = { workspace = true }
 coordinode-embed = { workspace = true }
+coordinode-replicate = { workspace = true }
 coordinode-query = { workspace = true }
 coordinode-vector = { workspace = true, optional = true }
 coordinode-search = { workspace = true, optional = true }

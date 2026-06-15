@@ -325,6 +325,7 @@ impl LogStore {
             PartitionId::Idx => 6,
             PartitionId::Counter => 7,
             PartitionId::VectorF32 => 8,
+            PartitionId::Registry => 9,
         }
     }
 

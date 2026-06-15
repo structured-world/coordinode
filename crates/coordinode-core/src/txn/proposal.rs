@@ -212,6 +212,13 @@ pub enum PartitionId {
     /// f32 directly from here (matches Qdrant / Weaviate / ES BBQ
     /// pattern — no intermediate quantized disk tier).
     VectorF32,
+
+    /// `registry:` — per-shard consumer-retention registry (ADR-028).
+    /// Holds `ConsumerRegistration` records replicated through this shard's
+    /// Raft group; `min(checkpoint_seqno)` over the keyspace is the shard's
+    /// retention floor consumed by LSM compaction, oplog retention, and the
+    /// tiering validator.
+    Registry,
 }
 
 /// A batch of mutations to be proposed through Raft.
@@ -331,6 +338,42 @@ pub enum ProposalError {
     WriteConcernTimeout { timeout_ms: u32 },
 }
 
+/// Outcome of a successfully applied proposal.
+///
+/// Carries the Raft committed log index of this specific proposal so the
+/// write path can return a faithful causal `operationTime` token to the
+/// client. Without it, callers fall back to sampling the node's current
+/// applied index, which is not the index of *this* write (it is captured
+/// around execution and may precede or overshoot the write's own commit) —
+/// the root of the `operationTime` inaccuracy.
+///
+/// `applied_index` is `None` for the local / embedded pipeline, which has
+/// no Raft log and therefore no cluster-wide commit index. Causal sessions
+/// are a cluster concept; in embedded mode the absence is correct, not a
+/// missing value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProposalOutcome {
+    /// Raft committed log index of this proposal, or `None` when applied
+    /// through a non-replicated (local / embedded) pipeline.
+    pub applied_index: Option<u64>,
+}
+
+impl ProposalOutcome {
+    /// Outcome for a replicated proposal committed at `index`.
+    pub fn replicated(index: u64) -> Self {
+        Self {
+            applied_index: Some(index),
+        }
+    }
+
+    /// Outcome for a locally-applied proposal (no Raft index).
+    pub fn local() -> Self {
+        Self {
+            applied_index: None,
+        }
+    }
+}
+
 /// Abstraction for replicating and applying mutation proposals.
 ///
 /// ## Implementations
@@ -343,7 +386,8 @@ pub enum ProposalError {
 /// ## Contract
 ///
 /// - Caller has already performed OCC validation and assigned commit_ts.
-/// - On `Ok(())`, the mutations are durably applied at commit_ts.
+/// - On `Ok(outcome)`, the mutations are durably applied at commit_ts;
+///   `outcome.applied_index` is the Raft commit index when replicated.
 /// - On `Err(ProposalError::Duplicate)`, the mutations were already applied
 ///   (safe to ignore).
 /// - On `Err(ProposalError::Storage)`, the transaction should be retried.
@@ -352,8 +396,9 @@ pub trait ProposalPipeline: Send + Sync {
     ///
     /// In local mode: applies directly (synchronous).
     /// In cluster mode: replicates via Raft, waits for majority
-    /// ACK, then applies. Returns after the mutations are durable.
-    fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<(), ProposalError>;
+    /// ACK, then applies. Returns after the mutations are durable, with the
+    /// committed [`ProposalOutcome`].
+    fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<ProposalOutcome, ProposalError>;
 
     /// Propose mutations with a client-specified write concern timeout.
     ///
@@ -371,7 +416,7 @@ pub trait ProposalPipeline: Send + Sync {
         &self,
         proposal: &RaftProposal,
         timeout: std::time::Duration,
-    ) -> Result<(), ProposalError> {
+    ) -> Result<ProposalOutcome, ProposalError> {
         let _ = timeout; // default: ignore timeout (local proposals are instant)
         self.propose_and_wait(proposal)
     }

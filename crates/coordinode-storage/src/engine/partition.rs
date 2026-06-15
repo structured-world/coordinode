@@ -53,6 +53,12 @@ pub enum Partition {
     /// (matches Qdrant / Weaviate / ES BBQ pattern — no intermediate
     /// quantized disk tier).
     VectorF32,
+
+    /// `registry:` — per-shard consumer-retention registry (ADR-028).
+    /// Key format: `registry:<consumer_id>`. Holds `ConsumerRegistration`
+    /// records replicated through this shard's Raft group; the minimum
+    /// checkpoint over the keyspace is the shard's retention floor.
+    Registry,
 }
 
 impl From<coordinode_core::txn::proposal::PartitionId> for Partition {
@@ -68,6 +74,7 @@ impl From<coordinode_core::txn::proposal::PartitionId> for Partition {
             PartitionId::Idx => Self::Idx,
             PartitionId::Counter => Self::Counter,
             PartitionId::VectorF32 => Self::VectorF32,
+            PartitionId::Registry => Self::Registry,
         }
     }
 }
@@ -86,6 +93,7 @@ impl Partition {
             Self::Raft => "raft",
             Self::Counter => "counter",
             Self::VectorF32 => "vec",
+            Self::Registry => "registry",
         }
     }
 
@@ -117,6 +125,7 @@ impl Partition {
             Self::Raft,
             Self::Counter,
             Self::VectorF32,
+            Self::Registry,
         ]
     }
 }

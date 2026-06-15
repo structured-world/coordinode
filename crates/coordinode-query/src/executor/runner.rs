@@ -212,6 +212,13 @@ pub struct WriteStats {
     pub properties_removed: u64,
     pub labels_added: u64,
     pub labels_removed: u64,
+    /// Raft committed log index of this statement's write, when it was
+    /// replicated through a `RaftProposalPipeline`. `None` for read-only
+    /// statements and for non-replicated (local / embedded) writes. The
+    /// gRPC layer surfaces it as the causal `operationTime` token so a
+    /// client's follow-up causal read fences on *its own* write index
+    /// rather than the node's current applied index.
+    pub applied_index: Option<u64>,
 }
 
 impl WriteStats {
@@ -509,6 +516,7 @@ fn partition_to_id(p: Partition) -> PartitionId {
         Partition::Raft => unreachable!("Raft partition is not exposed to the query layer"),
         Partition::Counter => PartitionId::Counter,
         Partition::VectorF32 => PartitionId::VectorF32,
+        Partition::Registry => PartitionId::Registry,
     }
 }
 
@@ -1612,16 +1620,25 @@ impl<'a> ExecutionContext<'a> {
             // Per MongoDB spec: "On timeout, data is NOT rolled back."
             // The proposal may still commit after timeout fires.
             let timeout_ms = self.write_concern.timeout_ms;
-            if timeout_ms > 0 {
+            let outcome = if timeout_ms > 0 {
                 let timeout = std::time::Duration::from_millis(u64::from(timeout_ms));
                 pipeline
                     .propose_with_timeout(&proposal, timeout)
-                    .map_err(proposal_err_to_execution)?;
+                    .map_err(proposal_err_to_execution)?
             } else {
                 pipeline
                     .propose_and_wait(&proposal)
-                    .map_err(proposal_err_to_execution)?;
-            }
+                    .map_err(proposal_err_to_execution)?
+            };
+            // Record the committed Raft index of this write so the gRPC
+            // layer can return it as the causal operationTime token. `None`
+            // in local/embedded mode (no Raft log). `max` (not assign): a
+            // statement may have issued an earlier in-execute proposal (e.g.
+            // CREATE VECTOR INDEX schema persist) whose index must remain
+            // covered — operationTime spans every Raft entry the statement
+            // produced. (`Option` orders `None < Some`.)
+            self.write_stats.applied_index =
+                self.write_stats.applied_index.max(outcome.applied_index);
         } else {
             // Legacy direct-write path (no pipeline configured).
             // ADR-016: plain engine.put()/delete() — oracle auto-stamps seqno.
@@ -14411,9 +14428,15 @@ fn execute_create_vector_index(
             start_ts: ctx.mvcc_read_ts,
             bypass_rate_limiter: false,
         };
-        pipeline.propose_and_wait(&proposal).map_err(|e| {
+        let outcome = pipeline.propose_and_wait(&proposal).map_err(|e| {
             ExecutionError::Unsupported(format!("persist vector index '{name}': {e}"))
         })?;
+        // DDL persists the index definition as its own Raft entry — fold its
+        // committed index into operationTime so a causal read after a
+        // CREATE VECTOR INDEX fences past the definition's replication, not
+        // just the (often empty) data-write flush. `max` keeps any larger
+        // index a later data flush in the same statement might mint.
+        ctx.write_stats.applied_index = ctx.write_stats.applied_index.max(outcome.applied_index);
     } else {
         crate::index::ops::save_index_definition(ctx.engine, &def).map_err(|e| {
             ExecutionError::Unsupported(format!("persist vector index '{name}': {e}"))

@@ -18,6 +18,7 @@ use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::read_fence::{
     ReadConcern, ReadFenceError, ReadPreference, READ_FENCE_TIMEOUT,
 };
+use coordinode_replicate::ReplicatedWriter;
 
 use crate::proto::{common, query, replication};
 
@@ -269,6 +270,11 @@ fn fence_error_to_status(err: ReadFenceError) -> Status {
 
 pub struct CypherServiceImpl {
     database: Arc<RwLock<Database>>,
+    /// Write coordination point: Cypher execution routes through this so the
+    /// committed Raft index of a write reaches the response as the causal
+    /// `operationTime`. Shares the same `Database` handle as `database`
+    /// (used directly only for read-only EXPLAIN / stats paths).
+    writer: ReplicatedWriter,
     query_registry: Arc<QueryRegistry>,
     nplus1_detector: Arc<NPlus1Detector>,
     /// Raft node for read fence (follower reads). `None` in standalone mode.
@@ -282,6 +288,7 @@ impl CypherServiceImpl {
         nplus1_detector: Arc<NPlus1Detector>,
     ) -> Self {
         Self {
+            writer: ReplicatedWriter::new(Arc::clone(&database)),
             database,
             query_registry,
             nplus1_detector,
@@ -456,37 +463,26 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             } else {
                 Some(convert_params(&req.parameters))
             };
-            let shared_attempt = {
-                let db = self.database.read();
-                db.execute_cypher_shared(
+            self.writer
+                .execute(
                     &req.query,
-                    params.clone(),
+                    params,
                     source_ctx.as_ref(),
                     Some(&executor_read_concern),
                     executor_write_concern.as_ref(),
                 )
-            };
-            match shared_attempt {
-                Ok(r) => r,
-                Err(coordinode_embed::DatabaseError::Semantic(msg))
-                    if msg.contains("SET commands require exclusive Database access") =>
-                {
-                    let mut db = self.database.write();
-                    db.execute_cypher_full(
-                        &req.query,
-                        params,
-                        source_ctx.as_ref(),
-                        Some(executor_read_concern),
-                        executor_write_concern,
-                    )
-                    .map_err(db_error_to_status)?
-                }
-                Err(e) => return Err(db_error_to_status(e)),
-            }
+                .map_err(db_error_to_status)?
         };
         // Read / write guard released here, held only during query execution.
         let result_rows = exec_result.rows;
         let write_stats = exec_result.write_stats;
+
+        // Causal operationTime: a replicated write reports its OWN committed
+        // Raft index, not the node's current applied index sampled around
+        // execution by the read fence (which is not this write's index — the
+        // operationTime inaccuracy). Reads keep the fence value. `None` (embedded /
+        // non-replicated) falls back to the fence value.
+        let applied_index = write_stats.applied_index.unwrap_or(applied_index);
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -1212,6 +1208,106 @@ mod tests {
             1,
             "causal read must return the written node"
         );
+    }
+
+    /// Build a CypherService backed by a real (single-node) Raft pipeline,
+    /// mirroring the standalone server wiring in `main.rs`: one shared
+    /// engine + oracle, `RaftNode::open_with_oracle`, `RaftProposalPipeline`,
+    /// `Database::from_engine`, and the read fence attached.
+    async fn test_service_raft() -> (CypherServiceImpl, Arc<RaftNode>, tempfile::TempDir) {
+        use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, Tier};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+        let config = coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+            EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            ),
+        ]);
+        let engine = Arc::new(
+            coordinode_storage::engine::core::StorageEngine::open_with_oracle(
+                &config,
+                Arc::clone(&oracle),
+            )
+            .expect("open engine"),
+        );
+        let node = Arc::new(
+            RaftNode::open_with_oracle(1, Arc::clone(&engine), Some(Arc::clone(&oracle)))
+                .await
+                .expect("raft node"),
+        );
+        // Single-node Raft needs a moment to elect itself leader.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> = Arc::new(
+            coordinode_raft::proposal::RaftProposalPipeline::new(Arc::clone(node.raft())),
+        );
+        let db = Database::from_engine(dir.path(), engine, oracle, pipeline).expect("from_engine");
+        let svc = CypherServiceImpl::new(
+            Arc::new(RwLock::new(db)),
+            Arc::new(QueryRegistry::new()),
+            Arc::new(NPlus1Detector::new()),
+        )
+        .with_raft_node(Arc::clone(&node));
+        (svc, node, dir)
+    }
+
+    /// operationTime regression (end-to-end): a write through a Raft-backed service
+    /// returns ITS OWN committed Raft index as `operationTime`, not the
+    /// node's current applied index sampled by the read fence. Successive
+    /// writes report strictly increasing indices, and a causal read fencing
+    /// on a write's reported index observes that write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn raft_write_returns_own_committed_index() {
+        let (svc, node, _dir) = test_service_raft().await;
+
+        let w1 = svc
+            .execute_cypher(cypher_request("CREATE (n:RaftCausal {v: 1}) RETURN n"))
+            .await
+            .expect("first write")
+            .into_inner();
+        let idx1 = w1.stats.expect("stats present").applied_index;
+        assert!(
+            idx1 > 0,
+            "Raft-backed write must return its committed index, got {idx1}"
+        );
+
+        let w2 = svc
+            .execute_cypher(cypher_request("CREATE (n:RaftCausal {v: 2}) RETURN n"))
+            .await
+            .expect("second write")
+            .into_inner();
+        let idx2 = w2.stats.expect("stats present").applied_index;
+        assert!(
+            idx2 > idx1,
+            "second write's operationTime must advance: {idx1} -> {idx2}"
+        );
+
+        // A causal read fencing on the second write's own index sees both nodes.
+        let read = svc
+            .execute_cypher(Request::new(query::ExecuteCypherRequest {
+                query: "MATCH (n:RaftCausal) RETURN n.v".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: Some(crate::proto::replication::ReadConcern {
+                    level: 2, // MAJORITY
+                    after_index: idx2,
+                    at_timestamp: 0,
+                }),
+                write_concern: None,
+            }))
+            .await
+            .expect("causal read after write");
+        assert_eq!(
+            read.into_inner().rows.len(),
+            2,
+            "causal read fencing on the write index must observe both writes"
+        );
+
+        node.shutdown().await.expect("shutdown");
     }
 
     /// after_index = 0 with any readConcern level is always valid (no fence).

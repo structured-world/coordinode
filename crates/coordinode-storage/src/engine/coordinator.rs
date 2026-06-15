@@ -384,6 +384,15 @@ pub struct GcWatermarkController {
     gc_watermark: Arc<AtomicU64>,
     /// Current-seqno source; the watermark target when nothing is pinned.
     seqno: lsm_tree::SharedSequenceNumberGenerator,
+    /// External retention floor, published by the `SeqnoConsumerRegistry`
+    /// (`coordinode-replicate`): `min(consumer_checkpoints, retention_window)`.
+    /// Combined into the watermark by `min`, so the effective GC threshold is
+    /// `min(oldest_pin_or_current, external_floor)` — a CDC / backup consumer
+    /// or the time-travel window holds retention back exactly like a
+    /// CockroachDB protected timestamp / TiDB service safe point. `u64::MAX`
+    /// (the default) imposes no extra constraint, so embedded engines with no
+    /// registry behave as before (watermark tracks live pins / current seqno).
+    external_floor: AtomicU64,
 }
 
 impl GcWatermarkController {
@@ -392,6 +401,7 @@ impl GcWatermarkController {
             pins: Mutex::new(BTreeMap::new()),
             gc_watermark,
             seqno,
+            external_floor: AtomicU64::new(u64::MAX),
         };
         if let Ok(pins) = controller.pins.lock() {
             controller.recompute(&pins);
@@ -399,15 +409,28 @@ impl GcWatermarkController {
         controller
     }
 
-    /// Recompute and publish the watermark: the oldest pinned seqno, or the
-    /// current seqno when nothing is pinned. Caller holds the `pins` lock.
+    /// Recompute and publish the watermark: the lesser of (the oldest pinned
+    /// seqno, or the current seqno when nothing is pinned) and the external
+    /// retention floor. Caller holds the `pins` lock.
     fn recompute(&self, pins: &BTreeMap<u64, usize>) {
-        let watermark = pins
+        let pin_floor = pins
             .keys()
             .next()
             .copied()
             .unwrap_or_else(|| self.seqno.get());
+        let watermark = pin_floor.min(self.external_floor.load(Ordering::Acquire));
         self.gc_watermark.store(watermark, Ordering::Release);
+    }
+
+    /// Publish the external retention floor (consumer registry) and recompute.
+    /// The watermark can only be held *back* by this, never pushed past the
+    /// oldest live snapshot pin — a registered consumer never causes a live
+    /// reader's versions to be collected.
+    pub fn set_external_floor(&self, floor: u64) {
+        self.external_floor.store(floor, Ordering::Release);
+        if let Ok(pins) = self.pins.lock() {
+            self.recompute(&pins);
+        }
     }
 
     /// Pin the current snapshot seqno so the watermark cannot advance past it
@@ -555,6 +578,16 @@ impl LocalMultiModalCoordinator {
     /// periods.
     pub fn advance_gc_watermark(&self) {
         self.gc_controller.tick();
+    }
+
+    /// Publish the consumer-registry retention floor (ADR-028 feed a):
+    /// `min(consumer_checkpoints, time-travel window)`. The effective GC
+    /// watermark becomes `min(live-pin / current seqno, this floor)`, so a
+    /// lagging CDC / backup consumer or the MVCC retention window holds old
+    /// versions back without ever overriding a live snapshot pin. `u64::MAX`
+    /// clears the constraint (no registry).
+    pub fn set_consumer_retention_floor(&self, floor: u64) {
+        self.gc_controller.set_external_floor(floor);
     }
 
     /// The current GC watermark value (the seqno below which compaction may

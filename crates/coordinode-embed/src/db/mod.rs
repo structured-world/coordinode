@@ -1543,7 +1543,7 @@ impl Database {
 
         // Capture write_stats before dropping ctx (which borrows the
         // interner_guard via &mut *).
-        let write_stats = ctx.write_stats.clone();
+        let mut write_stats = ctx.write_stats.clone();
         let nodes_created = write_stats.nodes_created;
         let had_mutations = write_stats.has_mutations();
         // Drop ctx, then snapshot the interner state under the same
@@ -1579,9 +1579,19 @@ impl Database {
                 start_ts: Timestamp::from_raw(0),
                 bypass_rate_limiter: false,
             };
-            self.pipeline
+            let outcome = self
+                .pipeline
                 .propose_and_wait(&proposal)
                 .map_err(|e| DatabaseError::Other(format!("persist field interner: {e}")))?;
+            // The interner mapping for a newly-seen field commits at a HIGHER
+            // Raft index than the user write it accompanies. operationTime must
+            // cover it: a causal read fencing on the returned index has to
+            // observe both the written data AND the interner entry needed to
+            // decode the write's new property names on a follower. Take the
+            // max so the token spans every Raft entry this statement produced.
+            // (`Option` orders `None < Some`, so this is a no-op in embedded /
+            // non-replicated mode where both are `None`.)
+            write_stats.applied_index = write_stats.applied_index.max(outcome.applied_index);
         }
 
         // Invalidate cached storage statistics after any mutation so that

@@ -1054,6 +1054,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "coordinode-replicate"
+version = "0.4.3"
+dependencies = [
+ "coordinode-core",
+ "coordinode-embed",
+ "coordinode-query",
+ "coordinode-raft",
+ "coordinode-storage",
+ "metrics",
+ "parking_lot",
+ "rmp-serde",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "coordinode-s3"
 version = "0.4.3"
 dependencies = [
@@ -1105,6 +1124,7 @@ dependencies = [
  "coordinode-embed",
  "coordinode-query",
  "coordinode-raft",
+ "coordinode-replicate",
  "coordinode-search",
  "coordinode-storage",
  "coordinode-vector",

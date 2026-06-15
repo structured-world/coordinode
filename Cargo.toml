@@ -14,6 +14,7 @@ members = [
     "crates/coordinode-server",
     "crates/coordinode-s3",
     "crates/coordinode-embed",
+    "crates/coordinode-replicate",
     "crates/coordinode-client",
     "crates/coordinode-test-fixtures",
     "crates/coordinode-bench",
@@ -127,6 +128,7 @@ coordinode-auth = { path = "crates/coordinode-auth" }
 coordinode-server = { path = "crates/coordinode-server" }
 coordinode-s3 = { path = "crates/coordinode-s3" }
 coordinode-embed = { path = "crates/coordinode-embed" }
+coordinode-replicate = { path = "crates/coordinode-replicate" }
 coordinode-client = { path = "crates/coordinode-client" }
 coordinode-test-fixtures = { path = "crates/coordinode-test-fixtures" }
 coordinode-bench = { path = "crates/coordinode-bench" }

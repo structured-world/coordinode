@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use coordinode_core::txn::proposal::{
-    Mutation, PartitionId, ProposalError, ProposalPipeline, RaftProposal,
+    Mutation, PartitionId, ProposalError, ProposalOutcome, ProposalPipeline, RaftProposal,
 };
 use coordinode_storage::engine::config::FlushPolicy;
 use coordinode_storage::engine::core::StorageEngine;
@@ -67,6 +67,7 @@ pub fn to_partition(id: PartitionId) -> Partition {
         PartitionId::Idx => Partition::Idx,
         PartitionId::Counter => Partition::Counter,
         PartitionId::VectorF32 => Partition::VectorF32,
+        PartitionId::Registry => Partition::Registry,
     }
 }
 
@@ -86,6 +87,7 @@ pub fn to_partition_id(p: Partition) -> PartitionId {
         Partition::Raft => unreachable!("Raft partition is internal-only"),
         Partition::Counter => PartitionId::Counter,
         Partition::VectorF32 => PartitionId::VectorF32,
+        Partition::Registry => PartitionId::Registry,
     }
 }
 
@@ -156,7 +158,7 @@ impl<'a> LocalProposalPipeline<'a> {
 }
 
 impl ProposalPipeline for LocalProposalPipeline<'_> {
-    fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<(), ProposalError> {
+    fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<ProposalOutcome, ProposalError> {
         for mutation in &proposal.mutations {
             self.apply_mutation(mutation)?;
         }
@@ -168,7 +170,8 @@ impl ProposalPipeline for LocalProposalPipeline<'_> {
             "local proposal applied"
         );
 
-        Ok(())
+        // Local pipeline has no Raft log — no cluster-wide commit index.
+        Ok(ProposalOutcome::local())
     }
 }
 
@@ -208,7 +211,7 @@ impl OwnedLocalProposalPipeline {
 }
 
 impl ProposalPipeline for OwnedLocalProposalPipeline {
-    fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<(), ProposalError> {
+    fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<ProposalOutcome, ProposalError> {
         // ── WAL-first write path ─────────────────────────────────────────────
         // When a standalone WAL is active: append mutations to the journal and
         // fsync BEFORE applying to the memtable.  This ensures any record that
@@ -269,7 +272,8 @@ impl ProposalPipeline for OwnedLocalProposalPipeline {
             "owned local proposal applied"
         );
 
-        Ok(())
+        // Embedded/standalone WAL pipeline — no Raft commit index.
+        Ok(ProposalOutcome::local())
     }
 }
 
@@ -366,7 +370,10 @@ impl RaftProposalPipeline {
 
     /// Async propose-and-wait: submit proposal through openraft and wait
     /// for it to be committed and applied by the state machine.
-    async fn propose_async(&self, proposal: &RaftProposal) -> Result<(), ProposalError> {
+    async fn propose_async(
+        &self,
+        proposal: &RaftProposal,
+    ) -> Result<ProposalOutcome, ProposalError> {
         let request = Request::single(proposal.clone());
         let start = std::time::Instant::now();
 
@@ -395,13 +402,18 @@ impl RaftProposalPipeline {
                         .increment(1);
                     metrics::histogram!("coordinode_raft_proposal_duration_seconds")
                         .record(elapsed);
+                    let committed_index = response.log_id.index;
                     tracing::debug!(
                         proposal_id = %proposal.id,
                         mutations = response.data.mutations_applied,
                         log_id = ?response.log_id,
+                        committed_index,
                         "raft proposal committed"
                     );
-                    return Ok(());
+                    // The committed log index is this write's faithful causal
+                    // `operationTime` — surfaced so the gRPC layer returns it
+                    // instead of sampling the node's current applied index.
+                    return Ok(ProposalOutcome::replicated(committed_index));
                 }
                 Ok(Err(raft_err)) => {
                     let elapsed = start.elapsed().as_secs_f64();
@@ -461,7 +473,7 @@ fn extract_forward_leader(
 }
 
 impl ProposalPipeline for RaftProposalPipeline {
-    fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<(), ProposalError> {
+    fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<ProposalOutcome, ProposalError> {
         // Bridge sync ProposalPipeline trait to async openraft.
         // block_in_place tells tokio "this thread will block" so it moves
         // other async tasks to other worker threads. Requires rt-multi-thread.
@@ -474,7 +486,7 @@ impl ProposalPipeline for RaftProposalPipeline {
         &self,
         proposal: &RaftProposal,
         timeout: Duration,
-    ) -> Result<(), ProposalError> {
+    ) -> Result<ProposalOutcome, ProposalError> {
         // True async timeout: if wtimeout fires before Raft commits,
         // the client gets an error immediately. The proposal is NOT
         // cancelled — openraft may still commit the entry after timeout.
@@ -918,6 +930,89 @@ mod tests {
         assert_eq!(val.as_deref(), Some(b"raft-val".as_slice()));
 
         node.shutdown().await.expect("shutdown");
+    }
+
+    /// operationTime regression: a Raft-replicated proposal RETURNS its committed
+    /// log index (the pipeline used to discard it, forcing the gRPC layer
+    /// to sample the node's current applied index instead — not this
+    /// write's index). The index must be present and strictly increase
+    /// across successive writes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn raft_pipeline_returns_committed_index() {
+        let (_dir, engine) = test_engine();
+        let node = RaftNode::single_node(engine.clone())
+            .await
+            .expect("bootstrap");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let pipeline = RaftProposalPipeline::new(Arc::clone(node.raft()));
+        let id_gen = ProposalIdGenerator::new();
+
+        let mk = |key: &[u8], ts: u64| RaftProposal {
+            id: id_gen.next(),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: key.to_vec(),
+                value: b"v".to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(ts),
+            start_ts: Timestamp::from_raw(ts - 1),
+            bypass_rate_limiter: false,
+        };
+
+        let first = pipeline
+            .propose_and_wait(&mk(b"node:1:idx-a", 100))
+            .expect("first propose");
+        let second = pipeline
+            .propose_and_wait(&mk(b"node:1:idx-b", 200))
+            .expect("second propose");
+
+        let i1 = first
+            .applied_index
+            .expect("replicated write must carry a committed index");
+        let i2 = second
+            .applied_index
+            .expect("replicated write must carry a committed index");
+        assert!(i1 > 0, "committed index must be non-zero, got {i1}");
+        assert!(
+            i2 > i1,
+            "committed index must strictly increase: {i1} then {i2}"
+        );
+
+        // propose_with_timeout surfaces the same committed index.
+        let third = pipeline
+            .propose_with_timeout(&mk(b"node:1:idx-c", 300), Duration::from_secs(10))
+            .expect("third propose");
+        assert!(
+            third.applied_index.expect("committed index") > i2,
+            "propose_with_timeout must also return an advancing index"
+        );
+
+        node.shutdown().await.expect("shutdown");
+    }
+
+    /// The local (embedded) pipeline has no Raft log, so it reports no
+    /// committed index — `None`, never a fabricated zero.
+    #[test]
+    fn local_pipeline_has_no_committed_index() {
+        let (engine, _dir) = setup();
+        let pipeline = LocalProposalPipeline::new(&engine);
+        let id_gen = ProposalIdGenerator::new();
+
+        let outcome = pipeline
+            .propose_and_wait(&RaftProposal {
+                id: id_gen.next(),
+                mutations: vec![Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: b"node:1:local-idx".to_vec(),
+                    value: b"v".to_vec(),
+                }],
+                commit_ts: Timestamp::from_raw(100),
+                start_ts: Timestamp::from_raw(99),
+                bypass_rate_limiter: false,
+            })
+            .expect("propose");
+        assert_eq!(outcome.applied_index, None);
     }
 
     /// WriteConcernTimeout error has correct format.

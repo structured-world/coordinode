@@ -259,14 +259,37 @@ impl OplogManager {
 
     /// Delete segments whose `last_ts` falls outside the retention window.
     ///
-    /// `now_secs` — current Unix time in seconds.
+    /// Time-only retention: equivalent to [`purge_with_floor`] with an
+    /// unconstrained consumer floor (`u64::MAX`).
     ///
-    /// HLC timestamps use the upper 46 bits for wall-clock milliseconds, so
-    /// the comparison is: `segment.last_ts < cutoff_hlc` where
-    /// `cutoff_hlc = (now_secs - retention_secs) * 1000 << 18`.
-    ///
-    /// Returns the number of segments removed.
+    /// [`purge_with_floor`]: Self::purge_with_floor
     pub fn purge_expired(&mut self, now_secs: u64) -> StorageResult<usize> {
+        self.purge_with_floor(now_secs, u64::MAX)
+    }
+
+    /// Delete segments that are BOTH outside the time window AND fully below
+    /// the consumer oplog-retention floor (ADR-028 feed b, logical OR keep):
+    ///
+    /// ```text
+    /// keep segment  iff  last_ts within retention_secs   (time safety net)
+    ///                OR  last_index >= oplog_index_floor  (a CDC consumer needs it)
+    /// purge         iff  NOT kept
+    /// ```
+    ///
+    /// `oplog_index_floor` is `min(checkpoint)` over `OplogEvents` consumers
+    /// from the `SeqnoConsumerRegistry` (Raft-index space), or `u64::MAX` when
+    /// no CDC consumer is registered — in which case only the time policy
+    /// applies. A segment covering indices `[first_idx, first_idx +
+    /// entry_count)` has `last_index = first_idx + entry_count - 1`.
+    ///
+    /// `now_secs` — current Unix time in seconds. HLC `last_ts` packs wall ms
+    /// in the upper bits, so the cutoff is `(now_secs - retention_secs) * 1000
+    /// << 18`.
+    pub fn purge_with_floor(
+        &mut self,
+        now_secs: u64,
+        oplog_index_floor: u64,
+    ) -> StorageResult<usize> {
         let cutoff_ms = now_secs
             .saturating_sub(self.retention_secs)
             .saturating_mul(1_000);
@@ -278,13 +301,19 @@ impl OplogManager {
 
         for (first_idx, path) in self.sealed.drain(..) {
             let reader = SegmentReader::open(&path)?;
-            if reader.footer.last_ts < cutoff_hlc {
+            let within_window = reader.footer.last_ts >= cutoff_hlc;
+            // last_index = first_idx + entry_count - 1; a segment with at least
+            // one entry whose last index reaches the floor is still needed.
+            let last_index =
+                first_idx.saturating_add(u64::from(reader.footer.entry_count).saturating_sub(1));
+            let needed_by_consumer = last_index >= oplog_index_floor;
+            if within_window || needed_by_consumer {
+                remaining.push((first_idx, path));
+            } else {
                 std::fs::remove_file(&path).map_err(|e| {
                     StorageError::Io(format!("remove expired segment {:?}: {e}", path))
                 })?;
                 purged += 1;
-            } else {
-                remaining.push((first_idx, path));
             }
         }
 
@@ -608,6 +637,50 @@ mod tests {
         let purged = mgr.purge_expired(10_000).expect("purge");
         assert_eq!(purged, 0, "recent segment must not be purged");
         assert_eq!(mgr.sealed.len(), 1);
+    }
+
+    /// Feed (b): a time-expired segment is KEPT when its last index is at or
+    /// above the consumer oplog floor, and PURGED once below it — the logical
+    /// OR of time-window and CDC-consumer need.
+    #[test]
+    fn purge_with_floor_keeps_consumer_needed_segments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut mgr =
+            OplogManager::open(dir.path(), 0, 64 * 1024 * 1024, 50_000, 3600).expect("open");
+
+        // Two time-expired segments: seg0 = indices [0,2], seg1 = [3,5].
+        let old_ts = 100u64 << 18;
+        for i in 0..3u64 {
+            let mut e = make_entry(i, old_ts);
+            e.ts = old_ts;
+            mgr.append(&e).expect("append seg0");
+        }
+        mgr.rotate().expect("rotate seg0");
+        for i in 3..6u64 {
+            let mut e = make_entry(i, old_ts);
+            e.ts = old_ts;
+            mgr.append(&e).expect("append seg1");
+        }
+        mgr.rotate().expect("rotate seg1");
+        assert_eq!(mgr.sealed.len(), 2);
+
+        // Consumer floor = 4: seg0 (last_index 2 < 4) is expired AND below the
+        // floor → purged; seg1 (last_index 5 >= 4) is needed → kept despite
+        // being time-expired.
+        let purged = mgr.purge_with_floor(10_000, 4).expect("purge with floor");
+        assert_eq!(
+            purged, 1,
+            "only the segment fully below the floor is purged"
+        );
+        assert_eq!(mgr.sealed.len(), 1, "consumer-needed segment retained");
+
+        // Once the consumer advances past it (or none registered → u64::MAX),
+        // the time-expired segment is collected.
+        let purged = mgr
+            .purge_with_floor(10_000, u64::MAX)
+            .expect("purge time-only");
+        assert_eq!(purged, 1, "no consumer need → pure time retention");
+        assert_eq!(mgr.sealed.len(), 0);
     }
 
     #[test]
