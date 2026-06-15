@@ -25,9 +25,13 @@
 //! query, accumulate recall@10 (overlap with ground-truth top-10),
 //! measure wall time of the search loop, derive QPS = Q / wall_s.
 //!
-//! Per ann-benchmarks methodology: 10 query-replay rounds, warm cache,
-//! single-thread search (multi-thread is a separate sweep dimension
-//! tracked under `qps_per_thread`).
+//! Per ann-benchmarks methodology: 10 query-replay rounds, warm cache.
+//! Search concurrency is the `--search-threads N` axis (default `1` =
+//! sequential per-query latency on one core, the ann-benchmarks
+//! convention). `N>1` dispatches the query stream across `N` worker
+//! threads and reports aggregate throughput, recorded under
+//! `search_threads`; `E_core(N) = QPS(N) / (N * QPS(1))` is derived
+//! downstream from the ST and MT runs.
 
 #![forbid(unsafe_code)]
 #![warn(clippy::unwrap_used, clippy::expect_used)]
