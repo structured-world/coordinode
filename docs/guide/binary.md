@@ -62,6 +62,16 @@ curl http://localhost:7084/health
 # → {"status":"serving"}
 ```
 
+## Compact After a Bulk Import
+
+After loading a large dataset, run an offline compaction to collapse the
+accumulated merge operands (adjacency lists, counters) into single values.
+This keeps traversal reads fast. The server must be stopped first.
+
+```bash
+coordinode compact --data /var/lib/coordinode
+```
+
 ## systemd Service (Linux)
 
 ```ini

@@ -162,6 +162,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
+        cli::Command::Compact { data_dir } => {
+            logging::init_logging();
+            info!(data_dir = %data_dir, "compacting database");
+
+            let config = coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    &data_dir,
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]);
+            let engine = coordinode_storage::engine::core::StorageEngine::open(&config)?;
+            for &part in coordinode_storage::engine::partition::Partition::all() {
+                engine
+                    .force_compaction(part)
+                    .map_err(|e| format!("compaction failed for {part:?}: {e}"))?;
+                info!(partition = ?part, "partition compacted");
+            }
+            info!(data_dir = %data_dir, "compaction complete");
+        }
+
         cli::Command::Serve {
             mode,
             node_id,

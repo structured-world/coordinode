@@ -127,6 +127,17 @@ pub enum Command {
         /// Output directory for the checkpoint (must not exist).
         output: String,
     },
+    /// Compact the database offline: major-compact every partition and fold
+    /// accumulated merge operands (adjacency, counters) into single values.
+    ///
+    /// Run after a bulk import to collapse the per-edge merge operands a
+    /// super-node accumulates, so traversal reads cost O(1) in operand count
+    /// instead of O(operands). The server must not be running against the same
+    /// data directory.
+    Compact {
+        /// Data directory (database to compact).
+        data_dir: String,
+    },
     /// Admin commands for a running cluster.
     AdminNodeJoin {
         /// gRPC address of any cluster member (usually the leader).
@@ -313,6 +324,10 @@ pub fn parse_args_from(args: &[String]) -> Command {
             };
             Command::Checkpoint { data_dir, output }
         }
+        "compact" => {
+            let data_dir = find_flag(args, "--data").unwrap_or_else(|| "./data".to_string());
+            Command::Compact { data_dir }
+        }
         "admin" => parse_admin_args(args),
         _ => {
             eprintln!(
@@ -325,6 +340,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  coordinode backup --output FILE [--data DIR] [--format json|cypher|binary|snapshot] [--namespace NS] [--since SEQNO]\n  \
                  coordinode restore --input FILE [--data DIR] [--format json|cypher|binary|snapshot|apoc-json|apoc-cypher|hetio-json] [--namespace NS] [--only-labels L1,L2] [--force]\n  \
                  coordinode checkpoint --output DIR [--data DIR]\n  \
+                 coordinode compact [--data DIR]\n  \
                  coordinode verify [--data DIR] [--deep]\n  \
                  coordinode version\n  \
                  coordinode admin node join --node CLUSTER_ADDR --id NODE_ID --addr NODE_ADDR [--pre-seeded] [--follow]\n  \
@@ -788,6 +804,24 @@ mod tests {
     fn version_command() {
         let cmd = parse_args_from(&args("coordinode version"));
         assert!(matches!(cmd, Command::Version));
+    }
+
+    #[test]
+    fn compact_uses_explicit_data_dir() {
+        let cmd = parse_args_from(&args("coordinode compact --data /var/lib/coordinode"));
+        match cmd {
+            Command::Compact { data_dir } => assert_eq!(data_dir, "/var/lib/coordinode"),
+            _ => panic!("expected Compact command"),
+        }
+    }
+
+    #[test]
+    fn compact_defaults_data_dir() {
+        let cmd = parse_args_from(&args("coordinode compact"));
+        match cmd {
+            Command::Compact { data_dir } => assert_eq!(data_dir, "./data"),
+            _ => panic!("expected Compact command"),
+        }
     }
 
     #[test]
