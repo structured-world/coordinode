@@ -268,18 +268,9 @@ fn confirm_merge_read() {
     eprintln!("  merge-operand hub: {after_merge:.2} us/read");
     eprintln!("  single-put hub:    {after_put:.2} us/read");
     eprintln!("  ratio: {:.1}x", after_merge / after_put.max(1e-9));
-
-    // Apply the shipped fix: collapse merge operands into single stored values.
-    let rewritten = engine
-        .collapse_merge_operands(Partition::Adj)
-        .expect("collapse");
-    let snap3 = engine.snapshot();
-    let after_repair = read_us(&snap3, &hub_merge);
-    eprintln!("AFTER collapse_merge_operands(Adj) (rewrote {rewritten} keys):");
-    eprintln!("  merge-operand hub: {after_repair:.2} us/read");
     eprintln!(
-        "verdict: collapse sped the merged hub by {:.1}x (vs before)",
-        before_merge / after_repair.max(1e-9)
+        "verdict: watermark-driven fold (force_compaction) sped the merged hub by {:.1}x",
+        before_merge / after_merge.max(1e-9)
     );
 }
 
@@ -352,15 +343,17 @@ fn confirm_traverse(args: &Args) {
     };
 
     let (before, mean_reach) = bfs_ms(&engine);
-    eprintln!("BEFORE collapse: {before:.1} ms/query (mean_reachable={mean_reach:.0})");
+    eprintln!("BEFORE fold: {before:.1} ms/query (mean_reachable={mean_reach:.0})");
 
-    let rewritten = engine
-        .collapse_merge_operands(Partition::Adj)
-        .expect("collapse");
+    // force_compaction advances the watermark (nothing pinned) and folds the
+    // adjacency operand chains through the major compaction.
+    engine
+        .force_compaction(Partition::Adj)
+        .expect("force_compaction");
     let (after, _) = bfs_ms(&engine);
-    eprintln!("AFTER collapse_merge_operands ({rewritten} keys): {after:.1} ms/query");
+    eprintln!("AFTER fold (force_compaction): {after:.1} ms/query");
     eprintln!(
-        "verdict: collapse sped the traversal by {:.1}x",
+        "verdict: watermark-driven fold sped the traversal by {:.1}x",
         before / after.max(1e-9)
     );
 }
