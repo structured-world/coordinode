@@ -453,7 +453,7 @@ fn write_edge_record(
                 NodeId::from_raw(source),
                 NodeId::from_raw(target),
             );
-            let ep_value = rmp_serde::to_vec(&prop_vec)
+            let ep_value = coordinode_core::graph::edge::encode_edge_props(&prop_vec)
                 .map_err(|e| RestoreError::Deserialization(e.to_string()))?;
             engine
                 .put(Partition::EdgeProp, &ep_key, &ep_value)
@@ -540,7 +540,7 @@ pub fn restore_cypher<R: BufRead>(
                     NodeId::from_raw(source),
                     NodeId::from_raw(target),
                 );
-                let ep_value = rmp_serde::to_vec(&prop_vec)
+                let ep_value = coordinode_core::graph::edge::encode_edge_props(&prop_vec)
                     .map_err(|e| RestoreError::Deserialization(e.to_string()))?;
                 engine
                     .put(Partition::EdgeProp, &ep_key, &ep_value)

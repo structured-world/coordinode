@@ -317,14 +317,16 @@ impl EdgeProperties {
         self.props.is_empty()
     }
 
-    /// Serialize to MessagePack bytes.
+    /// Serialize to the canonical edge-property wire format (ADR-040).
     pub fn to_msgpack(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
-        rmp_serde::to_vec(&self.props)
+        let pairs: Vec<(u32, PropertyValue)> =
+            self.props.iter().map(|(k, v)| (*k, v.clone())).collect();
+        encode_edge_props(&pairs)
     }
 
-    /// Deserialize from MessagePack bytes.
+    /// Deserialize from the canonical edge-property wire format (ADR-040).
     pub fn from_msgpack(data: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
-        let props: HashMap<u32, PropertyValue> = rmp_serde::from_slice(data)?;
+        let props = decode_edge_props(data)?.into_iter().collect();
         Ok(Self { props })
     }
 }
@@ -333,6 +335,37 @@ impl Default for EdgeProperties {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Encode an edge-property facet set to the single canonical on-disk wire
+/// format (ADR-040): a MessagePack array of `(field_id, value)` pairs
+/// sorted ascending by `field_id`, duplicate field ids collapsed last-wins.
+///
+/// This is the ONLY edge-property value encoder in the tree. Every writer
+/// — the query executor, [`EdgeProperties::to_msgpack`], backup restore —
+/// routes through it so the `edgeprop:` partition holds exactly one byte
+/// layout (no dual-format readers, per ADR-021). Sorting makes the bytes
+/// deterministic: the same logical facet set always yields the same bytes
+/// regardless of insertion order or `HashMap` iteration order, which is a
+/// hard requirement for page-ECC, block dedup, and snapshot diffing.
+pub fn encode_edge_props(
+    props: &[(u32, PropertyValue)],
+) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    // BTreeMap gives ascending-by-field_id order and last-wins dedup in one
+    // pass; the typical edge carries 1–5 facets, so the cost is negligible.
+    let ordered: std::collections::BTreeMap<u32, &PropertyValue> =
+        props.iter().map(|(k, v)| (*k, v)).collect();
+    let pairs: Vec<(u32, &PropertyValue)> = ordered.into_iter().collect();
+    rmp_serde::to_vec(&pairs)
+}
+
+/// Decode an edge-property facet set from the canonical wire format
+/// (ADR-040). Counterpart to [`encode_edge_props`]. Returns the pairs in
+/// stored (sorted-by-`field_id`) order.
+pub fn decode_edge_props(
+    bytes: &[u8],
+) -> Result<Vec<(u32, PropertyValue)>, rmp_serde::decode::Error> {
+    rmp_serde::from_slice(bytes)
 }
 
 /// Direction of an adjacency key.
@@ -494,6 +527,79 @@ impl PostingList {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::graph::types::Value;
+
+    // -- Edge-property codec tests (ADR-040) --
+
+    #[test]
+    fn edge_props_codec_round_trips() {
+        let props = vec![
+            (3u32, Value::Int(7)),
+            (1u32, Value::String("a".into())),
+            (2u32, Value::Float(1.5)),
+        ];
+        let bytes = encode_edge_props(&props).expect("encode");
+        let back = decode_edge_props(&bytes).expect("decode");
+        // Stored in ascending field_id order.
+        assert_eq!(
+            back,
+            vec![
+                (1u32, Value::String("a".into())),
+                (2u32, Value::Float(1.5)),
+                (3u32, Value::Int(7)),
+            ]
+        );
+    }
+
+    #[test]
+    fn edge_props_codec_is_deterministic_regardless_of_input_order() {
+        // The whole point of ADR-040: identical logical facet set →
+        // identical bytes, so page-ECC / dedup / snapshot-diff are stable.
+        let a = vec![
+            (2u32, Value::Int(2)),
+            (1u32, Value::Int(1)),
+            (3u32, Value::Int(3)),
+        ];
+        let b = vec![
+            (3u32, Value::Int(3)),
+            (1u32, Value::Int(1)),
+            (2u32, Value::Int(2)),
+        ];
+        assert_eq!(
+            encode_edge_props(&a).expect("a"),
+            encode_edge_props(&b).expect("b"),
+            "different insertion order must produce identical bytes",
+        );
+    }
+
+    #[test]
+    fn edge_props_codec_dedups_last_wins() {
+        let props = vec![(1u32, Value::Int(1)), (1u32, Value::Int(99))];
+        let back = decode_edge_props(&encode_edge_props(&props).expect("encode")).expect("decode");
+        assert_eq!(
+            back,
+            vec![(1u32, Value::Int(99))],
+            "duplicate field id keeps the last value"
+        );
+    }
+
+    #[test]
+    fn edge_properties_wire_matches_executor_vec_shape() {
+        // EdgeProperties (the typed Layer-4 value) and the executor's raw
+        // Vec<(field_id, value)> MUST serialise to the same bytes — that is
+        // what lets LocalEdgeStore writes round-trip through the executor's
+        // reader and vice versa (the unification that ADR-040 mandates).
+        let pairs = vec![(5u32, Value::Int(10)), (2u32, Value::String("x".into()))];
+        let mut ep = EdgeProperties::new();
+        for (fid, v) in &pairs {
+            ep.set(*fid, v.clone());
+        }
+        assert_eq!(
+            ep.to_msgpack().expect("ep encode"),
+            encode_edge_props(&pairs).expect("vec encode"),
+            "EdgeProperties and the executor Vec shape must be wire-identical",
+        );
+    }
 
     // -- Key encoding tests --
 

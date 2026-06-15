@@ -595,15 +595,13 @@ fn load_edge_properties(
         .map_err(|e| ExportError::Storage(e.to_string()))?
     {
         Some(bytes) => {
-            // The query executor stores edge properties as the native
-            // `Vec<(field_id, Value)>` wire shape (runner.rs); older
-            // restore paths wrote a `HashMap`. Accept both.
-            let record: HashMap<u32, Value> =
-                match rmp_serde::from_slice::<Vec<(u32, Value)>>(&bytes) {
-                    Ok(v) => v.into_iter().collect(),
-                    Err(_) => rmp_serde::from_slice(&bytes)
-                        .map_err(|e| ExportError::Serialization(e.to_string()))?,
-                };
+            // Edge properties use the single canonical wire format
+            // (ADR-040): a sorted MessagePack array of (field_id, value)
+            // pairs, shared by every writer.
+            let record: HashMap<u32, Value> = edge::decode_edge_props(&bytes)
+                .map_err(|e| ExportError::Serialization(e.to_string()))?
+                .into_iter()
+                .collect();
             Ok(resolve_properties(&record, interner))
         }
         None => Ok(serde_json::Map::new()),
