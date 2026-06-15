@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 use rayon::prelude::*;
 
 use coordinode_core::graph::edge::{
-    decode_adj_key, encode_adj_key_forward, encode_adj_key_reverse, encode_edgeprop_key,
+    encode_adj_key_forward, encode_adj_key_reverse, encode_edgeprop_key,
     encode_temporal_edgeprop_key, temporal_edgeprop_pair_prefix, write_adj_key_forward,
-    write_adj_key_reverse, AdjDirection, PostingList,
+    write_adj_key_reverse, AdjDirection, AdjKeyParts, PostingList,
 };
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::NodeIdAllocator;
@@ -1897,6 +1897,127 @@ impl<'a> ExecutionContext<'a> {
         } else {
             Ok(Some(plist))
         }
+    }
+
+    // ── Typed adjacency wrappers ──────────────────────────────────
+    // Hide adj-key encoding from Layer-5 call sites: callers pass
+    // `(edge_type, node)` instead of a pre-encoded key. All delegate to
+    // the raw merge-path methods above, so the commutative merge +
+    // read-your-own-writes + AS-OF snapshot semantics are unchanged.
+    // Adjacency stays off the OCC path by construction (edge add/remove
+    // is commutative — see storage-engine.md merge-operator contract).
+
+    /// Forward-adjacency read (`src`'s out-neighbours for `edge_type`).
+    pub fn adj_get_fwd(
+        &self,
+        edge_type: &str,
+        src: NodeId,
+    ) -> Result<Option<PostingList>, ExecutionError> {
+        self.adj_get(&encode_adj_key_forward(edge_type, src))
+    }
+
+    /// Reverse-adjacency read (`tgt`'s in-neighbours for `edge_type`).
+    pub fn adj_get_rev(
+        &self,
+        edge_type: &str,
+        tgt: NodeId,
+    ) -> Result<Option<PostingList>, ExecutionError> {
+        self.adj_get(&encode_adj_key_reverse(edge_type, tgt))
+    }
+
+    /// Buffer a forward-adjacency add (`src` gains out-neighbour `uid`).
+    pub fn adj_merge_add_fwd(&mut self, edge_type: &str, src: NodeId, uid: u64) {
+        self.adj_merge_add(&encode_adj_key_forward(edge_type, src), uid);
+    }
+
+    /// Buffer a reverse-adjacency add (`tgt` gains in-neighbour `uid`).
+    pub fn adj_merge_add_rev(&mut self, edge_type: &str, tgt: NodeId, uid: u64) {
+        self.adj_merge_add(&encode_adj_key_reverse(edge_type, tgt), uid);
+    }
+
+    /// Buffer a forward-adjacency remove (`src` loses out-neighbour `uid`).
+    pub fn adj_merge_remove_fwd(&mut self, edge_type: &str, src: NodeId, uid: u64) {
+        self.adj_merge_remove(&encode_adj_key_forward(edge_type, src), uid);
+    }
+
+    /// Buffer a reverse-adjacency remove (`tgt` loses in-neighbour `uid`).
+    pub fn adj_merge_remove_rev(&mut self, edge_type: &str, tgt: NodeId, uid: u64) {
+        self.adj_merge_remove(&encode_adj_key_reverse(edge_type, tgt), uid);
+    }
+
+    /// Buffered wholesale delete of a node's forward posting list. Goes
+    /// through the MVCC write buffer so it rolls back with the
+    /// transaction (used by MERGE NODES source-side teardown).
+    pub fn mvcc_delete_adj_fwd(
+        &mut self,
+        edge_type: &str,
+        src: NodeId,
+    ) -> Result<(), ExecutionError> {
+        self.mvcc_delete(Partition::Adj, &encode_adj_key_forward(edge_type, src))
+    }
+
+    /// Buffered wholesale delete of a node's reverse posting list.
+    pub fn mvcc_delete_adj_rev(
+        &mut self,
+        edge_type: &str,
+        tgt: NodeId,
+    ) -> Result<(), ExecutionError> {
+        self.mvcc_delete(Partition::Adj, &encode_adj_key_reverse(edge_type, tgt))
+    }
+
+    /// Buffered wholesale purge of a node's posting list on `dir`, plus
+    /// drop of any pending merge operands still buffered for that key.
+    /// The MVCC tombstone rolls back with the transaction; clearing the
+    /// pending adds/removes stops a buffered edge from resurrecting the
+    /// posting list the node-delete cascade just tombstoned.
+    pub fn mvcc_purge_adj(
+        &mut self,
+        edge_type: &str,
+        node: NodeId,
+        dir: AdjDirection,
+    ) -> Result<(), ExecutionError> {
+        let key = match dir {
+            AdjDirection::Out => encode_adj_key_forward(edge_type, node),
+            AdjDirection::In => encode_adj_key_reverse(edge_type, node),
+        };
+        self.mvcc_delete(Partition::Adj, &key)?;
+        self.merge_adj_adds.remove(&key);
+        self.merge_adj_removes.remove(&key);
+        Ok(())
+    }
+
+    /// MVCC-aware idempotent edge-type registration. Writes the empty
+    /// existence marker at `schema:edge_type:<name>:1` only if it is not
+    /// already present — checking the transaction's write buffer (RYOW)
+    /// before the OCC-tracked snapshot read so a concurrent
+    /// `CREATE EDGE TYPE` body is never clobbered. Hides the
+    /// `Partition::Schema` key from Layer-5 call sites while keeping the
+    /// read on the Layer-3 OCC path (schema reads are not commutative, so
+    /// they must participate in conflict detection).
+    pub fn mvcc_register_edge_type(&mut self, edge_type: &str) -> Result<(), ExecutionError> {
+        let et_key = edge_type_schema_key(edge_type);
+        let already_registered = self
+            .mvcc_write_buffer
+            .contains_key(&(Partition::Schema, et_key.clone()))
+            || self.mvcc_get(Partition::Schema, &et_key)?.is_some();
+        if !already_registered {
+            self.mvcc_put(Partition::Schema, &et_key, b"")?;
+        }
+        Ok(())
+    }
+
+    /// MVCC-aware existence probe for an edge type. `true` if either the
+    /// explicit `CREATE EDGE TYPE` revision pointer or the implicit
+    /// edge-create existence marker (revision 1) is present. Both reads go
+    /// through the OCC-tracked snapshot path. Hides `Partition::Schema`
+    /// from DDL call sites.
+    pub fn mvcc_edge_type_exists(&mut self, name: &str) -> Result<bool, ExecutionError> {
+        let pointer_key = encode_edge_type_current_revision_key(name);
+        if self.mvcc_get(Partition::Schema, &pointer_key)?.is_some() {
+            return Ok(true);
+        }
+        let marker_key = encode_edge_type_schema_key(name, 1);
+        Ok(self.mvcc_get(Partition::Schema, &marker_key)?.is_some())
     }
 
     /// Raw prefix scan on adj: partition (no MVCC timestamp filtering).
@@ -7594,22 +7715,13 @@ fn execute_merge_relationship_create(
         Direction::Outgoing | Direction::Both => (source_id, target_id),
         Direction::Incoming => (target_id, source_id),
     };
-    let fwd_key = encode_adj_key_forward(et, from_id);
-    ctx.adj_merge_add(&fwd_key, to_id.as_raw());
-    let rev_key = encode_adj_key_reverse(et, to_id);
-    ctx.adj_merge_add(&rev_key, from_id.as_raw());
+    ctx.adj_merge_add_fwd(et, from_id, to_id.as_raw());
+    ctx.adj_merge_add_rev(et, to_id, from_id.as_raw());
     ctx.write_stats.edges_created += 1;
 
     // Register edge type in schema (idempotent — never clobber an existing
     // EdgeTypeSchema written by `CREATE EDGE TYPE`).
-    let et_key = edge_type_schema_key(et);
-    let already_registered = ctx
-        .mvcc_write_buffer
-        .contains_key(&(Partition::Schema, et_key.clone()))
-        || ctx.mvcc_get(Partition::Schema, &et_key)?.is_some();
-    if !already_registered {
-        ctx.mvcc_put(Partition::Schema, &et_key, b"")?;
-    }
+    ctx.mvcc_register_edge_type(et)?;
 
     let mut row = correlated.clone();
     if let Some(ev) = edge_variable {
@@ -8577,14 +8689,7 @@ fn execute_create_edge(
         // an empty marker — breaking subsequent temporal lookups for this type.
         // This enables O(edge_types) targeted lookup in DETACH DELETE instead
         // of O(all_edges) full scan.
-        let et_key = edge_type_schema_key(edge_type);
-        let already_registered = ctx
-            .mvcc_write_buffer
-            .contains_key(&(Partition::Schema, et_key.clone()))
-            || ctx.mvcc_get(Partition::Schema, &et_key)?.is_some();
-        if !already_registered {
-            ctx.mvcc_put(Partition::Schema, &et_key, b"")?;
-        }
+        ctx.mvcc_register_edge_type(edge_type)?;
 
         // Store edge properties (facets) in EdgeProp partition.
         // Non-temporal: key = edgeprop:<TYPE>:<src BE>:<tgt BE>
@@ -10534,17 +10639,23 @@ fn execute_delete(
             // adj_get applies pending merge_adj_adds/removes (RYOW) automatically.
             let edge_types = ctx.list_edge_types()?;
             let mut edge_count: u64 = 0;
-            let mut edges_to_delete = Vec::new();
+            let mut edges_to_delete: Vec<AdjKeyParts> = Vec::new();
 
             for edge_type in &edge_types {
-                for adj_key in [
-                    encode_adj_key_forward(edge_type, node_id),
-                    encode_adj_key_reverse(edge_type, node_id),
-                ] {
-                    if ctx.adj_get(&adj_key)?.is_some() {
+                for direction in [AdjDirection::Out, AdjDirection::In] {
+                    let present = match direction {
+                        AdjDirection::Out => ctx.adj_get_fwd(edge_type, node_id)?,
+                        AdjDirection::In => ctx.adj_get_rev(edge_type, node_id)?,
+                    }
+                    .is_some();
+                    if present {
                         edge_count += 1;
                         if detach {
-                            edges_to_delete.push(adj_key);
+                            edges_to_delete.push(AdjKeyParts {
+                                edge_type: edge_type.clone(),
+                                direction,
+                                node_id,
+                            });
                         }
                     }
                 }
@@ -10571,8 +10682,8 @@ fn execute_delete(
             // per `(edge_type)` and is reused across every (src, tgt) pair on
             // that key; we snapshot per-pair *before* deletion so the body
             // reading the same key returns empty (RYOW).
-            for edge_key in &edges_to_delete {
-                if let Some(parts) = decode_adj_key(edge_key) {
+            for parts in &edges_to_delete {
+                {
                     // Look up BEFORE COMMIT DELETE triggers for this edge type
                     // once per adj key. Re-used across every (node, peer) pair
                     // walked from the posting list.
@@ -10586,20 +10697,27 @@ fn execute_delete(
                     let is_temporal = lookup_edge_type_temporal(&parts.edge_type, ctx)?;
 
                     // Read posting list to find connected nodes
-                    if let Some(plist) = ctx.adj_get(edge_key)? {
+                    let plist = match parts.direction {
+                        AdjDirection::Out => ctx.adj_get_fwd(&parts.edge_type, parts.node_id)?,
+                        AdjDirection::In => ctx.adj_get_rev(&parts.edge_type, parts.node_id)?,
+                    };
+                    if let Some(plist) = plist {
                         for peer_uid in plist.iter() {
                             let peer_id = NodeId::from_raw(peer_uid);
-                            let counterpart_key = match parts.direction {
-                                // This key is adj:TYPE:out:NODE → counterpart is adj:TYPE:in:PEER
-                                AdjDirection::Out => {
-                                    encode_adj_key_reverse(&parts.edge_type, peer_id)
-                                }
-                                // This key is adj:TYPE:in:NODE → counterpart is adj:TYPE:out:PEER
-                                AdjDirection::In => {
-                                    encode_adj_key_forward(&parts.edge_type, peer_id)
-                                }
+                            // adj:TYPE:out:NODE → counterpart adj:TYPE:in:PEER,
+                            // and adj:TYPE:in:NODE → counterpart adj:TYPE:out:PEER.
+                            match parts.direction {
+                                AdjDirection::Out => ctx.adj_merge_remove_rev(
+                                    &parts.edge_type,
+                                    peer_id,
+                                    node_id.as_raw(),
+                                ),
+                                AdjDirection::In => ctx.adj_merge_remove_fwd(
+                                    &parts.edge_type,
+                                    peer_id,
+                                    node_id.as_raw(),
+                                ),
                             };
-                            ctx.adj_merge_remove(&counterpart_key, node_id.as_raw());
 
                             // Clean up edge properties for this edge. Temporal
                             // edge types keep one edgeprop entry per version
@@ -10679,15 +10797,8 @@ fn execute_delete(
                     }
                 }
 
-                ctx.engine
-                    .delete(Partition::Adj, edge_key)
-                    .map_err(ExecutionError::Storage)?;
+                ctx.mvcc_purge_adj(&parts.edge_type, parts.node_id, parts.direction)?;
                 ctx.write_stats.edges_deleted += 1;
-            }
-            // Also clear any pending merge adds for deleted keys.
-            for edge_key in &edges_to_delete {
-                ctx.merge_adj_adds.remove(edge_key);
-                ctx.merge_adj_removes.remove(edge_key);
             }
 
             // Delete the node record.
@@ -11306,11 +11417,11 @@ fn transfer_node_edges(
     for edge_type in &edge_types {
         let temporal = lookup_edge_type_temporal(edge_type, ctx)?;
         for direction in [AdjDirection::Out, AdjDirection::In] {
-            let source_adj = match direction {
-                AdjDirection::Out => encode_adj_key_forward(edge_type, source_id),
-                AdjDirection::In => encode_adj_key_reverse(edge_type, source_id),
-            };
-            let Some(plist) = ctx.adj_get(&source_adj)? else {
+            let Some(plist) = (match direction {
+                AdjDirection::Out => ctx.adj_get_fwd(edge_type, source_id),
+                AdjDirection::In => ctx.adj_get_rev(edge_type, source_id),
+            })?
+            else {
                 continue;
             };
 
@@ -11318,11 +11429,10 @@ fn transfer_node_edges(
             // merge_remove on it during the loop would be safe (deferred) but
             // collecting up-front keeps the loop body simpler.
             let peers: Vec<u64> = plist.iter().collect();
-            let target_adj = match direction {
-                AdjDirection::Out => encode_adj_key_forward(edge_type, target_id),
-                AdjDirection::In => encode_adj_key_reverse(edge_type, target_id),
-            };
-            let target_plist = ctx.adj_get(&target_adj)?;
+            let target_plist = match direction {
+                AdjDirection::Out => ctx.adj_get_fwd(edge_type, target_id),
+                AdjDirection::In => ctx.adj_get_rev(edge_type, target_id),
+            }?;
 
             for peer_uid in peers {
                 let mut peer_id = NodeId::from_raw(peer_uid);
@@ -11352,15 +11462,18 @@ fn transfer_node_edges(
                     // Drop the source-side edge entirely (no transfer).
                     // Remove from source's posting list + counterpart, and
                     // delete edgeprop for the old endpoints.
-                    let counterpart_key = match direction {
-                        AdjDirection::Out => {
-                            encode_adj_key_reverse(edge_type, NodeId::from_raw(peer_uid))
-                        }
-                        AdjDirection::In => {
-                            encode_adj_key_forward(edge_type, NodeId::from_raw(peer_uid))
-                        }
+                    match direction {
+                        AdjDirection::Out => ctx.adj_merge_remove_rev(
+                            edge_type,
+                            NodeId::from_raw(peer_uid),
+                            source_id.as_raw(),
+                        ),
+                        AdjDirection::In => ctx.adj_merge_remove_fwd(
+                            edge_type,
+                            NodeId::from_raw(peer_uid),
+                            source_id.as_raw(),
+                        ),
                     };
-                    ctx.adj_merge_remove(&counterpart_key, source_id.as_raw());
                     delete_edgeprop_for_pair(edge_type, old_src, old_tgt, temporal, ctx)?;
                     ctx.write_stats.edges_deleted += 1;
                     continue;
@@ -11368,34 +11481,43 @@ fn transfer_node_edges(
 
                 // Re-point this edge.
                 // 1. Adjacency rewrite: remove source from posting lists; add target.
-                let source_counterpart = match direction {
-                    AdjDirection::Out => {
-                        encode_adj_key_reverse(edge_type, NodeId::from_raw(peer_uid))
-                    }
-                    AdjDirection::In => {
-                        encode_adj_key_forward(edge_type, NodeId::from_raw(peer_uid))
-                    }
+                match direction {
+                    AdjDirection::Out => ctx.adj_merge_remove_rev(
+                        edge_type,
+                        NodeId::from_raw(peer_uid),
+                        source_id.as_raw(),
+                    ),
+                    AdjDirection::In => ctx.adj_merge_remove_fwd(
+                        edge_type,
+                        NodeId::from_raw(peer_uid),
+                        source_id.as_raw(),
+                    ),
                 };
-                ctx.adj_merge_remove(&source_counterpart, source_id.as_raw());
 
-                let target_counterpart = match direction {
-                    AdjDirection::Out => encode_adj_key_reverse(edge_type, peer_id),
-                    AdjDirection::In => encode_adj_key_forward(edge_type, peer_id),
-                };
                 // For KeepBoth duplicate strategy: add even if duplicate (parallel edge).
                 // For MergeProperties/KeepTarget where edge persists, also add — uniqueness
                 // is enforced by posting list de-dup on the key value.
-                ctx.adj_merge_add(&target_counterpart, target_id.as_raw());
+                match direction {
+                    AdjDirection::Out => {
+                        ctx.adj_merge_add_rev(edge_type, peer_id, target_id.as_raw())
+                    }
+                    AdjDirection::In => {
+                        ctx.adj_merge_add_fwd(edge_type, peer_id, target_id.as_raw())
+                    }
+                };
 
                 // Target's own posting list also has to learn about the new
                 // peer (otherwise traversals starting from target won't see it
                 // — only inverse traversals would). The source's own posting
                 // list is deleted wholesale after the peer loop completes.
-                let target_own_side = match direction {
-                    AdjDirection::Out => encode_adj_key_forward(edge_type, target_id),
-                    AdjDirection::In => encode_adj_key_reverse(edge_type, target_id),
+                match direction {
+                    AdjDirection::Out => {
+                        ctx.adj_merge_add_fwd(edge_type, target_id, peer_id.as_raw())
+                    }
+                    AdjDirection::In => {
+                        ctx.adj_merge_add_rev(edge_type, target_id, peer_id.as_raw())
+                    }
                 };
-                ctx.adj_merge_add(&target_own_side, peer_id.as_raw());
 
                 // 2. Edge-property transfer. Per spec, edge properties always
                 // move with the edge; `transfer_edge_properties` is a redundant
@@ -11426,7 +11548,10 @@ fn transfer_node_edges(
             // the MVCC buffer so that an error later in the merge (STRICT
             // schema violation on the next input row, OCC conflict on flush,
             // etc.) rolls back this drop together with all other writes.
-            ctx.mvcc_delete(Partition::Adj, &source_adj)?;
+            match direction {
+                AdjDirection::Out => ctx.mvcc_delete_adj_fwd(edge_type, source_id)?,
+                AdjDirection::In => ctx.mvcc_delete_adj_rev(edge_type, source_id)?,
+            };
         }
     }
     Ok(())
@@ -11585,92 +11710,83 @@ fn detach_delete_node(
     }
 
     let edge_types = ctx.list_edge_types()?;
-    let mut adj_keys = Vec::new();
+    let mut adj_targets: Vec<(String, AdjDirection)> = Vec::new();
     for edge_type in &edge_types {
-        for adj_key in [
-            encode_adj_key_forward(edge_type, node_id),
-            encode_adj_key_reverse(edge_type, node_id),
-        ] {
-            if ctx.adj_get(&adj_key)?.is_some() {
-                adj_keys.push(adj_key);
-            }
+        if ctx.adj_get_fwd(edge_type, node_id)?.is_some() {
+            adj_targets.push((edge_type.clone(), AdjDirection::Out));
+        }
+        if ctx.adj_get_rev(edge_type, node_id)?.is_some() {
+            adj_targets.push((edge_type.clone(), AdjDirection::In));
         }
     }
-    for edge_key in &adj_keys {
-        if let Some(parts) = decode_adj_key(edge_key) {
-            // Probe edge DELETE triggers once per adj key. Re-used across all
-            // peer pairs walked from the posting list. Mirrors the wiring in
-            // `execute_delete` DETACH branch and `cascade_delete_source_node`.
-            let edge_target_segment =
-                coordinode_core::schema::triggers::TriggerTargetSchema::edge_type(&parts.edge_type)
-                    .index_key_segment();
-            let matched_edge_delete = ctx.lookup_matching_triggers(&edge_target_segment, "d")?;
-            if let Some(plist) = ctx.adj_get(edge_key)? {
-                let temporal = lookup_edge_type_temporal(&parts.edge_type, ctx)?;
-                for peer_uid in plist.iter() {
-                    let peer_id = NodeId::from_raw(peer_uid);
-                    let counterpart_key = match parts.direction {
-                        AdjDirection::Out => encode_adj_key_reverse(&parts.edge_type, peer_id),
-                        AdjDirection::In => encode_adj_key_forward(&parts.edge_type, peer_id),
-                    };
-                    ctx.adj_merge_remove(&counterpart_key, node_id.as_raw());
-
-                    let (ep_src, ep_tgt) = match parts.direction {
-                        AdjDirection::Out => (node_id, peer_id),
-                        AdjDirection::In => (peer_id, node_id),
-                    };
-
-                    // Pre-snapshot edge prop maps for trigger firing — one per
-                    // version for temporal edges, single entry for non-temporal.
-                    // Captured before edgeprop deletion so the body's RYOW
-                    // reads see the edge as gone.
-                    let mut edge_delete_snapshots: Vec<std::collections::BTreeMap<String, Value>> =
-                        Vec::new();
-                    if !matched_edge_delete.is_empty() {
-                        if temporal {
-                            let prefix =
-                                temporal_edgeprop_pair_prefix(&parts.edge_type, ep_src, ep_tgt);
-                            for (_k, bytes) in ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)? {
-                                edge_delete_snapshots.push(decode_edgeprop_into_map(&bytes, ctx));
-                            }
-                        } else if let Some(prop_map) =
-                            ctx.mvcc_get_edge_props(&parts.edge_type, ep_src, ep_tgt)?
-                        {
-                            edge_delete_snapshots
-                                .push(decode_edgeprop_map_into_named(&prop_map, ctx));
-                        } else {
-                            edge_delete_snapshots.push(std::collections::BTreeMap::new());
-                        }
+    for (edge_type, direction) in &adj_targets {
+        let edge_type = edge_type.as_str();
+        let direction = *direction;
+        // Probe edge DELETE triggers once per adj key. Re-used across all
+        // peer pairs walked from the posting list. Mirrors the wiring in
+        // `execute_delete` DETACH branch and `cascade_delete_source_node`.
+        let edge_target_segment =
+            coordinode_core::schema::triggers::TriggerTargetSchema::edge_type(edge_type)
+                .index_key_segment();
+        let matched_edge_delete = ctx.lookup_matching_triggers(&edge_target_segment, "d")?;
+        let plist = match direction {
+            AdjDirection::Out => ctx.adj_get_fwd(edge_type, node_id)?,
+            AdjDirection::In => ctx.adj_get_rev(edge_type, node_id)?,
+        };
+        if let Some(plist) = plist {
+            let temporal = lookup_edge_type_temporal(edge_type, ctx)?;
+            for peer_uid in plist.iter() {
+                let peer_id = NodeId::from_raw(peer_uid);
+                match direction {
+                    AdjDirection::Out => {
+                        ctx.adj_merge_remove_rev(edge_type, peer_id, node_id.as_raw())
                     }
+                    AdjDirection::In => {
+                        ctx.adj_merge_remove_fwd(edge_type, peer_id, node_id.as_raw())
+                    }
+                };
 
-                    delete_edgeprop_for_pair(&parts.edge_type, ep_src, ep_tgt, temporal, ctx)?;
+                let (ep_src, ep_tgt) = match direction {
+                    AdjDirection::Out => (node_id, peer_id),
+                    AdjDirection::In => (peer_id, node_id),
+                };
 
-                    if !matched_edge_delete.is_empty() {
-                        for before in &edge_delete_snapshots {
-                            let trigger_params = trigger_params_for_edge_delete(
-                                &parts.edge_type,
-                                ep_src,
-                                ep_tgt,
-                                before,
-                            );
-                            fire_before_commit_triggers(
-                                &matched_edge_delete,
-                                &trigger_params,
-                                ctx,
-                            )?;
+                // Pre-snapshot edge prop maps for trigger firing — one per
+                // version for temporal edges, single entry for non-temporal.
+                // Captured before edgeprop deletion so the body's RYOW
+                // reads see the edge as gone.
+                let mut edge_delete_snapshots: Vec<std::collections::BTreeMap<String, Value>> =
+                    Vec::new();
+                if !matched_edge_delete.is_empty() {
+                    if temporal {
+                        let prefix = temporal_edgeprop_pair_prefix(edge_type, ep_src, ep_tgt);
+                        for (_k, bytes) in ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)? {
+                            edge_delete_snapshots.push(decode_edgeprop_into_map(&bytes, ctx));
                         }
+                    } else if let Some(prop_map) =
+                        ctx.mvcc_get_edge_props(edge_type, ep_src, ep_tgt)?
+                    {
+                        edge_delete_snapshots.push(decode_edgeprop_map_into_named(&prop_map, ctx));
+                    } else {
+                        edge_delete_snapshots.push(std::collections::BTreeMap::new());
+                    }
+                }
+
+                delete_edgeprop_for_pair(edge_type, ep_src, ep_tgt, temporal, ctx)?;
+
+                if !matched_edge_delete.is_empty() {
+                    for before in &edge_delete_snapshots {
+                        let trigger_params =
+                            trigger_params_for_edge_delete(edge_type, ep_src, ep_tgt, before);
+                        fire_before_commit_triggers(&matched_edge_delete, &trigger_params, ctx)?;
                     }
                 }
             }
         }
-        // MVCC-buffered delete: rolled back atomically with the surrounding
-        // transaction on any later error.
-        ctx.mvcc_delete(Partition::Adj, edge_key)?;
+        // MVCC-buffered purge (tombstone + pending-merge clear): rolled
+        // back atomically with the surrounding transaction on any later error.
+        ctx.mvcc_purge_adj(edge_type, node_id, direction)?;
         ctx.write_stats.edges_deleted += 1;
-    }
-    for edge_key in &adj_keys {
-        ctx.merge_adj_adds.remove(edge_key);
-        ctx.merge_adj_removes.remove(edge_key);
     }
     // Drop the primary node record.
     ctx.mvcc_delete_node(ctx.shard_id, node_id)?;
@@ -12128,14 +12244,7 @@ fn create_single_edge(
     ctx.write_stats.edges_created += 1;
 
     // Register edge type in schema (idempotent — never clobber existing schema).
-    let et_key = edge_type_schema_key(edge_type);
-    let already_registered = ctx
-        .mvcc_write_buffer
-        .contains_key(&(Partition::Schema, et_key.clone()))
-        || ctx.mvcc_get(Partition::Schema, &et_key)?.is_some();
-    if !already_registered {
-        ctx.mvcc_put(Partition::Schema, &et_key, b"")?;
-    }
+    ctx.mvcc_register_edge_type(edge_type)?;
 
     // Fire BEFORE COMMIT CREATE triggers registered on this edge type.
     // `create_single_edge` is the bare-bones edge insertion path used by
@@ -12281,19 +12390,16 @@ fn transfer_edges_on_node(
 ) -> Result<(), ExecutionError> {
     for edge_type in edge_types {
         // Forward: source is the edge source.
-        let fwd = encode_adj_key_forward(edge_type, source_id);
-        if let Some(plist) = ctx.adj_get(&fwd)? {
+        if let Some(plist) = ctx.adj_get_fwd(edge_type, source_id)? {
             let peers: Vec<u64> = plist.iter().collect();
             for peer_uid in peers {
                 let peer_id = NodeId::from_raw(peer_uid);
                 // Remove source → peer
-                ctx.adj_merge_remove(&fwd, peer_uid);
-                let peer_in = encode_adj_key_reverse(edge_type, peer_id);
-                ctx.adj_merge_remove(&peer_in, source_id.as_raw());
+                ctx.adj_merge_remove_fwd(edge_type, source_id, peer_uid);
+                ctx.adj_merge_remove_rev(edge_type, peer_id, source_id.as_raw());
                 // Add target → peer
-                let tgt_out = encode_adj_key_forward(edge_type, target_id);
-                ctx.adj_merge_add(&tgt_out, peer_uid);
-                ctx.adj_merge_add(&peer_in, target_id.as_raw());
+                ctx.adj_merge_add_fwd(edge_type, target_id, peer_uid);
+                ctx.adj_merge_add_rev(edge_type, peer_id, target_id.as_raw());
 
                 // Move edge properties.
                 let old_ep = encode_edgeprop_key(edge_type, source_id, peer_id);
@@ -12306,17 +12412,14 @@ fn transfer_edges_on_node(
         }
 
         // Reverse: source is the edge target.
-        let rev = encode_adj_key_reverse(edge_type, source_id);
-        if let Some(plist) = ctx.adj_get(&rev)? {
+        if let Some(plist) = ctx.adj_get_rev(edge_type, source_id)? {
             let peers: Vec<u64> = plist.iter().collect();
             for peer_uid in peers {
                 let peer_id = NodeId::from_raw(peer_uid);
-                ctx.adj_merge_remove(&rev, peer_uid);
-                let peer_out = encode_adj_key_forward(edge_type, peer_id);
-                ctx.adj_merge_remove(&peer_out, source_id.as_raw());
-                let tgt_in = encode_adj_key_reverse(edge_type, target_id);
-                ctx.adj_merge_add(&tgt_in, peer_uid);
-                ctx.adj_merge_add(&peer_out, target_id.as_raw());
+                ctx.adj_merge_remove_rev(edge_type, source_id, peer_uid);
+                ctx.adj_merge_remove_fwd(edge_type, peer_id, source_id.as_raw());
+                ctx.adj_merge_add_rev(edge_type, target_id, peer_uid);
+                ctx.adj_merge_add_fwd(edge_type, peer_id, target_id.as_raw());
 
                 let old_ep = encode_edgeprop_key(edge_type, peer_id, source_id);
                 if let Some(ep_bytes) = ctx.mvcc_get(Partition::EdgeProp, &old_ep)? {
@@ -12728,10 +12831,8 @@ fn delete_single_edge(
         0
     };
     if remaining == 0 {
-        let fwd = encode_adj_key_forward(edge_type, src);
-        ctx.adj_merge_remove(&fwd, tgt.as_raw());
-        let rev = encode_adj_key_reverse(edge_type, tgt);
-        ctx.adj_merge_remove(&rev, src.as_raw());
+        ctx.adj_merge_remove_fwd(edge_type, src, tgt.as_raw());
+        ctx.adj_merge_remove_rev(edge_type, tgt, src.as_raw());
     }
 
     ctx.write_stats.edges_deleted += 1;
@@ -12758,17 +12859,23 @@ fn cascade_delete_source_node(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<(), ExecutionError> {
     let edge_types = ctx.list_edge_types()?;
-    let mut remaining_edges: Vec<Vec<u8>> = Vec::new();
+    let mut remaining_edges: Vec<AdjKeyParts> = Vec::new();
     let mut remaining_count: u64 = 0;
 
     for et in &edge_types {
-        for adj_key in [
-            encode_adj_key_forward(et, source_id),
-            encode_adj_key_reverse(et, source_id),
-        ] {
-            if ctx.adj_get(&adj_key)?.is_some() {
+        for direction in [AdjDirection::Out, AdjDirection::In] {
+            let present = match direction {
+                AdjDirection::Out => ctx.adj_get_fwd(et, source_id)?,
+                AdjDirection::In => ctx.adj_get_rev(et, source_id)?,
+            }
+            .is_some();
+            if present {
                 remaining_count += 1;
-                remaining_edges.push(adj_key);
+                remaining_edges.push(AdjKeyParts {
+                    edge_type: et.clone(),
+                    direction,
+                    node_id: source_id,
+                });
             }
         }
     }
@@ -12786,22 +12893,29 @@ fn cascade_delete_source_node(
     // any DELETE trigger registered on the source's label or on its connected
     // edges' types — asymmetric with DETACH DELETE and a real correctness
     // gap for audit/compliance workloads.
-    for edge_key in &remaining_edges {
-        if let Some(parts) = decode_adj_key(edge_key) {
+    for parts in &remaining_edges {
+        {
             let edge_target_segment =
                 coordinode_core::schema::triggers::TriggerTargetSchema::edge_type(&parts.edge_type)
                     .index_key_segment();
             let matched_edge_delete = ctx.lookup_matching_triggers(&edge_target_segment, "d")?;
             let is_temporal = lookup_edge_type_temporal(&parts.edge_type, ctx)?;
 
-            if let Some(plist) = ctx.adj_get(edge_key)? {
+            let plist = match parts.direction {
+                AdjDirection::Out => ctx.adj_get_fwd(&parts.edge_type, parts.node_id)?,
+                AdjDirection::In => ctx.adj_get_rev(&parts.edge_type, parts.node_id)?,
+            };
+            if let Some(plist) = plist {
                 for peer_uid in plist.iter() {
                     let peer_id = NodeId::from_raw(peer_uid);
-                    let counterpart_key = match parts.direction {
-                        AdjDirection::Out => encode_adj_key_reverse(&parts.edge_type, peer_id),
-                        AdjDirection::In => encode_adj_key_forward(&parts.edge_type, peer_id),
+                    match parts.direction {
+                        AdjDirection::Out => {
+                            ctx.adj_merge_remove_rev(&parts.edge_type, peer_id, source_id.as_raw())
+                        }
+                        AdjDirection::In => {
+                            ctx.adj_merge_remove_fwd(&parts.edge_type, peer_id, source_id.as_raw())
+                        }
                     };
-                    ctx.adj_merge_remove(&counterpart_key, source_id.as_raw());
 
                     let (ep_src, ep_tgt) = match parts.direction {
                         AdjDirection::Out => (source_id, peer_id),
@@ -12860,15 +12974,8 @@ fn cascade_delete_source_node(
                 }
             }
         }
-        ctx.engine
-            .delete(Partition::Adj, edge_key)
-            .map_err(ExecutionError::Storage)?;
+        ctx.mvcc_purge_adj(&parts.edge_type, parts.node_id, parts.direction)?;
         ctx.write_stats.edges_deleted += 1;
-    }
-    // Clear any pending merges targeting deleted adj keys.
-    for edge_key in &remaining_edges {
-        ctx.merge_adj_adds.remove(edge_key);
-        ctx.merge_adj_removes.remove(edge_key);
     }
 
     // Delete the node record itself (B-tree / vector / text indexes left to
@@ -13425,11 +13532,7 @@ fn execute_create_edge_type(
     //  1. current_revision pointer → set by explicit CREATE EDGE TYPE
     //  2. legacy unparametrised existence marker at revision 1 → set by
     //     implicit edge registration in `create_edges_for_correlated_row`.
-    let pointer_key = encode_edge_type_current_revision_key(name);
-    let marker_key = encode_edge_type_schema_key(name, 1);
-    let already_exists = ctx.mvcc_get(Partition::Schema, &pointer_key)?.is_some()
-        || ctx.mvcc_get(Partition::Schema, &marker_key)?.is_some();
-    if already_exists {
+    if ctx.mvcc_edge_type_exists(name)? {
         return Err(ExecutionError::Unsupported(format!(
             "edge type '{name}' already exists"
         )));
@@ -19937,6 +20040,135 @@ mod tests {
         assert!(
             err_msg.contains("OCC conflict"),
             "expected OCC conflict error, got: {err_msg}",
+        );
+    }
+
+    /// Regression: DETACH DELETE must purge the deleted node's own adjacency
+    /// posting lists through the MVCC write buffer (so they roll back with the
+    /// transaction), NOT via an immediate `engine.delete`. Before the fix the
+    /// DETACH path deleted the posting list directly on disk, so an OCC
+    /// conflict (or any error) raised at `mvcc_flush` rolled back the buffered
+    /// node-delete while the adjacency list stayed gone — orphaning the
+    /// surviving peer's edges.
+    ///
+    /// The discriminating observation: between `execute` and `mvcc_flush` the
+    /// on-disk posting list is still present (buffered tombstone), while a
+    /// read-your-own-writes probe inside the transaction sees it as gone. The
+    /// immediate-delete bug fails the "still on disk before flush" assertion.
+    #[test]
+    fn detach_delete_adj_purge_is_buffered_not_immediate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+        let engine = StorageEngine::open_with_oracle(
+            &coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+                EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                ),
+            ]),
+            oracle.clone(),
+        )
+        .expect("open with oracle");
+        let mut interner = FieldInterner::new();
+        let allocator = NodeIdAllocator::new(0);
+
+        // Alice (1) --KNOWS--> Bob (2)
+        insert_node(
+            &engine,
+            1,
+            1,
+            "Person",
+            &[("name", Value::String("Alice".into()))],
+            &mut interner,
+        );
+        insert_node(
+            &engine,
+            1,
+            2,
+            "Person",
+            &[("name", Value::String("Bob".into()))],
+            &mut interner,
+        );
+        insert_edge(&engine, "KNOWS", 1, 2);
+
+        let alice_fwd = encode_adj_key_forward("KNOWS", NodeId::from_raw(1));
+        assert!(
+            engine
+                .get(Partition::Adj, &alice_fwd)
+                .expect("get")
+                .is_some(),
+            "precondition: Alice's forward posting list exists on disk",
+        );
+
+        // Transaction: DETACH DELETE Alice. Do NOT flush — observe buffer state.
+        let read_ts = oracle.next();
+        let snap = engine.snapshot_at(read_ts.as_raw());
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+        ctx.mvcc_oracle = Some(&oracle);
+        ctx.mvcc_read_ts = read_ts;
+        ctx.mvcc_snapshot = snap;
+
+        let plan = LogicalPlan {
+            snapshot_ts: None,
+            vector_consistency: VectorConsistencyMode::default(),
+            read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
+            ),
+            root: LogicalOp::Delete {
+                input: Box::new(LogicalOp::NodeScan {
+                    variable: "n".into(),
+                    labels: vec!["Person".into()],
+                    property_filters: vec![(
+                        "name".into(),
+                        Expr::Literal(Value::String("Alice".into())),
+                    )],
+                }),
+                variables: vec!["n".into()],
+                detach: true,
+            },
+        };
+        // Use `execute_op` (not `execute`, which auto-commits) so the
+        // transaction's buffered writes are observable before flush.
+        let deleted = execute_op(&plan.root, &mut ctx).expect("detach delete execute");
+        assert_eq!(deleted.len(), 1, "DETACH DELETE matched Alice");
+
+        // The regression assertion: before flush the on-disk posting list is
+        // STILL present because the purge is MVCC-buffered. The immediate-delete
+        // bug (`engine.delete`) removes it here, so an OCC conflict or any error
+        // at flush would roll back the buffered node-delete while the adjacency
+        // stayed gone — orphaning Bob.
+        assert!(
+            engine
+                .get(Partition::Adj, &alice_fwd)
+                .expect("get")
+                .is_some(),
+            "DETACH purge must be MVCC-buffered, not an immediate engine.delete \
+             — otherwise an aborted transaction orphans the surviving peer",
+        );
+        assert!(
+            ctx.mvcc_write_buffer
+                .contains_key(&(Partition::Adj, alice_fwd.clone())),
+            "DETACH purge must buffer an Adj tombstone in the MVCC write buffer",
+        );
+
+        // After commit the deletion lands on disk, proving the purge was real
+        // (buffered, not skipped).
+        ctx.mvcc_flush().expect("flush");
+        assert!(
+            engine
+                .get(Partition::Adj, &alice_fwd)
+                .expect("get")
+                .is_none(),
+            "post-commit: Alice's forward posting list is removed",
+        );
+        assert!(
+            LocalNodeStore::new(&engine)
+                .get(1, NodeId::from_raw(1))
+                .expect("get")
+                .is_none(),
+            "post-commit: Alice's node record is removed",
         );
     }
 
