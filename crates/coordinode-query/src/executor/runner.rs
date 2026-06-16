@@ -23,7 +23,6 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
 use coordinode_storage::engine::StorageSnapshot;
-use coordinode_storage::Guard;
 
 use super::eval::{eval_binary_op, eval_expr, eval_unary_op, is_truthy};
 use super::row::Row;
@@ -13659,49 +13658,37 @@ fn execute_create_text_index(
         .register(def)
         .map_err(|e| ExecutionError::Unsupported(format!("register text index: {e}")))?;
 
-    // Backfill: scan existing nodes with this label and any indexed property.
+    // Backfill: scan existing nodes with this label and any indexed property
+    // through the node store (it owns the partition + key encoding).
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     let shard_id = ctx.shard_id;
-    let node_prefix = {
-        let mut p = Vec::with_capacity(5 + 2 + 1);
-        p.extend_from_slice(b"node:");
-        p.extend_from_slice(&shard_id.to_be_bytes());
-        p.push(b':');
-        p
-    };
-
+    let interner = &*ctx.interner;
     let mut count = 0u64;
-    if let Ok(iter) = ctx.engine.prefix_scan(Partition::Node, &node_prefix) {
-        for guard in iter {
-            let Ok((_key, value)) = guard.into_inner() else {
-                continue;
-            };
-            let Ok(record) = NodeRecord::from_msgpack(&value) else {
-                continue;
-            };
-            if record.primary_label() != label {
-                continue;
-            }
-            let node_id = match coordinode_core::graph::node::decode_node_key(&_key) {
-                Some((_shard, nid)) => nid,
-                None => continue,
-            };
-            // Index all matching properties for this node.
-            let mut indexed = false;
-            for prop in &properties {
-                if let Some(field_id) = ctx.interner.lookup(prop) {
-                    if let Some(val) = record.props.get(&field_id) {
-                        if let Some(text) = val.as_str() {
-                            registry.on_text_written(label, node_id, prop, text);
-                            indexed = true;
+    let _ = LocalNodeStore.for_each_in_shard_at_snapshot(
+        ctx.engine,
+        None,
+        shard_id,
+        &mut |node_id, _key, record| {
+            if record.primary_label() == label {
+                // Index all matching properties for this node.
+                let mut indexed = false;
+                for prop in &properties {
+                    if let Some(field_id) = interner.lookup(prop) {
+                        if let Some(val) = record.props.get(&field_id) {
+                            if let Some(text) = val.as_str() {
+                                registry.on_text_written(label, node_id, prop, text);
+                                indexed = true;
+                            }
                         }
                     }
                 }
+                if indexed {
+                    count += 1;
+                }
             }
-            if indexed {
-                count += 1;
-            }
-        }
-    }
+            Ok(std::ops::ControlFlow::Continue(()))
+        },
+    );
 
     let props_str = properties.join(", ");
     let mut row = Row::new();
@@ -13996,36 +13983,24 @@ fn run_backfill_sync(
     field_id: u32,
     shard_id: u16,
 ) -> u64 {
-    let mut prefix = Vec::with_capacity(8);
-    prefix.extend_from_slice(b"node:");
-    prefix.extend_from_slice(&shard_id.to_be_bytes());
-    prefix.push(b':');
-
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     let mut backfilled = 0u64;
-    if let Ok(iter) = engine.prefix_scan(Partition::Node, &prefix) {
-        for guard in iter {
-            let Ok((key, value)) = guard.into_inner() else {
-                continue;
-            };
-            let Ok(record) = NodeRecord::from_msgpack(&value) else {
-                continue;
-            };
-            if record.primary_label() != label {
-                continue;
+    let _ = LocalNodeStore.for_each_in_shard_at_snapshot(
+        engine,
+        None,
+        shard_id,
+        &mut |node_id, _key, record| {
+            if record.primary_label() == label {
+                if let Some(val) = record.props.get(&field_id) {
+                    if let Some(vec_data) = try_extract_vector(val) {
+                        registry.on_vector_written(label, node_id, property, &vec_data);
+                        backfilled += 1;
+                    }
+                }
             }
-            let Some((_shard, node_id)) = coordinode_core::graph::node::decode_node_key(&key)
-            else {
-                continue;
-            };
-            let Some(val) = record.props.get(&field_id) else {
-                continue;
-            };
-            if let Some(vec_data) = try_extract_vector(val) {
-                registry.on_vector_written(label, node_id, property, &vec_data);
-                backfilled += 1;
-            }
-        }
-    }
+            Ok(std::ops::ControlFlow::Continue(()))
+        },
+    );
     backfilled
 }
 
@@ -14046,52 +14021,36 @@ fn backfill_vector_index(
     const PROGRESS_INTERVAL: u64 = 1000;
     let _ = property;
 
-    let mut prefix = Vec::with_capacity(8);
-    prefix.extend_from_slice(b"node:");
-    prefix.extend_from_slice(&shard_id.to_be_bytes());
-    prefix.push(b':');
-
-    let iter = engine
-        .prefix_scan(Partition::Node, &prefix)
-        .map_err(|e| format!("prefix_scan: {e}"))?;
-
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     let mut written = 0u64;
     let mut since_checkpoint = 0u64;
-    for guard in iter {
-        let Ok((key, value)) = guard.into_inner() else {
-            continue;
-        };
-        let Ok(record) = NodeRecord::from_msgpack(&value) else {
-            continue;
-        };
-        if record.primary_label() != label {
-            continue;
-        }
-        let Some((_shard, node_id)) = coordinode_core::graph::node::decode_node_key(&key) else {
-            continue;
-        };
-        let Some(val) = record.props.get(&field_id) else {
-            continue;
-        };
-        if let Some(vec_data) = try_extract_vector(val) {
-            if let Ok(mut graph) = hnsw.write() {
-                graph.insert(node_id.as_raw(), vec_data);
+    LocalNodeStore
+        .for_each_in_shard_at_snapshot(engine, None, shard_id, &mut |node_id, _key, record| {
+            if record.primary_label() == label {
+                if let Some(val) = record.props.get(&field_id) {
+                    if let Some(vec_data) = try_extract_vector(val) {
+                        if let Ok(mut graph) = hnsw.write() {
+                            graph.insert(node_id.as_raw(), vec_data);
+                        }
+                        written += 1;
+                        since_checkpoint += 1;
+                        if since_checkpoint >= PROGRESS_INTERVAL {
+                            since_checkpoint = 0;
+                            let _ = crate::index::ops::save_index_state(
+                                engine,
+                                index_name,
+                                IndexState::Building {
+                                    written,
+                                    estimated_total: 0,
+                                },
+                            );
+                        }
+                    }
+                }
             }
-            written += 1;
-            since_checkpoint += 1;
-            if since_checkpoint >= PROGRESS_INTERVAL {
-                since_checkpoint = 0;
-                let _ = crate::index::ops::save_index_state(
-                    engine,
-                    index_name,
-                    IndexState::Building {
-                        written,
-                        estimated_total: 0,
-                    },
-                );
-            }
-        }
-    }
+            Ok(std::ops::ControlFlow::Continue(()))
+        })
+        .map_err(|e| format!("shard scan: {e}"))?;
     Ok(written)
 }
 
@@ -14185,62 +14144,47 @@ fn execute_create_btree_index(
         .register(ctx.engine, def)
         .map_err(|e| ExecutionError::Unsupported(format!("register index '{name}': {e}")))?;
 
-    // Backfill existing nodes that match the label.
-    let node_prefix = {
-        let mut p = Vec::with_capacity(8);
-        p.extend_from_slice(b"node:");
-        p.extend_from_slice(&ctx.shard_id.to_be_bytes());
-        p.push(b':');
-        p
-    };
-
+    // Backfill existing nodes that match the label, scanned through the
+    // node store (it owns the partition + key encoding).
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     let field_id = ctx.interner.lookup(property);
+    let engine = ctx.engine;
     let mut backfilled = 0u64;
-
-    if let Ok(iter) = ctx.engine.prefix_scan(Partition::Node, &node_prefix) {
-        for guard in iter {
-            let Ok((_key, value)) = guard.into_inner() else {
-                continue;
-            };
-            let Ok(record) = NodeRecord::from_msgpack(&value) else {
-                continue;
-            };
+    let _ = LocalNodeStore.for_each_in_shard_at_snapshot(
+        engine,
+        None,
+        ctx.shard_id,
+        &mut |node_id, _key, record| {
             if record.primary_label() != label {
-                continue;
+                return Ok(std::ops::ControlFlow::Continue(()));
             }
-            let Some((_, node_id)) = coordinode_core::graph::node::decode_node_key(&_key) else {
-                continue;
-            };
-
             let prop_val = if let Some(fid) = field_id {
                 record.props.get(&fid).cloned().unwrap_or(Value::Null)
             } else {
                 Value::Null
             };
-
             // Sparse indexes skip null values.
             if sparse && prop_val.is_null() {
-                continue;
+                return Ok(std::ops::ControlFlow::Continue(()));
             }
-
             // Apply partial filter if any.
             if let Some(f) = filter {
                 let props = [(property.to_string(), prop_val.clone())];
                 if !f.matches(&props) {
-                    continue;
+                    return Ok(std::ops::ControlFlow::Continue(()));
                 }
             }
-
             let props = [(property.to_string(), prop_val)];
-            if let Err(e) = registry.on_node_created(ctx.engine, node_id, label, &props) {
+            if let Err(e) = registry.on_node_created(engine, node_id, label, &props) {
                 tracing::warn!(
                     "CREATE INDEX backfill: unique violation on node {node_id:?} ({label}.{property}): {e}"
                 );
             } else {
                 backfilled += 1;
             }
-        }
-    }
+            Ok(std::ops::ControlFlow::Continue(()))
+        },
+    );
 
     let mut row = Row::new();
     row.insert("index".to_string(), Value::String(name.to_string()));
