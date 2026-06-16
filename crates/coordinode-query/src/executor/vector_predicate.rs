@@ -12,10 +12,10 @@
 //! interner lock from inside a search-side hot loop. The closure can cache
 //! the lookup or even return `None` to make the predicate fail closed.
 
-use coordinode_core::graph::node::{encode_node_key, NodeId, NodeRecord};
+use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
+use coordinode_modality::{LocalNodeStore, NodeStore as _};
 use coordinode_storage::engine::core::StorageEngine;
-use coordinode_storage::engine::partition::Partition;
 
 use crate::planner::logical::{NumericCmp, VectorPredicate};
 
@@ -34,8 +34,8 @@ pub fn evaluate_predicate(
     predicate: &VectorPredicate,
     field_lookup: &dyn Fn(&str) -> Option<u32>,
 ) -> bool {
-    let key = encode_node_key(shard_id, node_id);
-    let Ok(Some(bytes)) = engine.get(Partition::Node, &key) else {
+    let Ok((_key, Some(bytes))) = LocalNodeStore.read_at_snapshot(engine, None, shard_id, node_id)
+    else {
         return false;
     };
     let Ok(record) = NodeRecord::from_msgpack(&bytes) else {
@@ -366,6 +366,12 @@ mod tests {
 
     #[test]
     fn evaluate_predicate_corrupt_record_returns_false() {
+        // Raw partition write is the one legitimate raw-access case: plant a
+        // corrupt msgpack body the typed store could never produce, to verify
+        // decode failure resolves to "not visible".
+        use coordinode_core::graph::node::encode_node_key;
+        use coordinode_storage::engine::partition::Partition;
+
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = test_engine(dir.path());
 
