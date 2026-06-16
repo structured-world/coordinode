@@ -31,6 +31,7 @@ use coordinode_core::index::encoding::{
 };
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::engine::transaction::Transaction;
 use coordinode_storage::Guard;
 
 use crate::error::{StoreError, StoreResult};
@@ -163,6 +164,19 @@ pub trait IndexStore {
     /// is stored under `name` (the caller handles the race). Used by the
     /// backfill task to publish progress / terminal states.
     fn set_definition_state(&self, name: &str, state: IndexState) -> StoreResult<bool>;
+
+    /// Persist an index definition through a statement [`Transaction`]
+    /// (OCC-tracked, read-your-own-writes) — the CREATE INDEX DDL path. Same
+    /// `schema:idx:<name>` keyspace and encoding as [`Self::put_definition`],
+    /// but the write buffers on the transaction and applies atomically at
+    /// commit, so a CREATE INDEX racing a conflicting schema change is
+    /// detected like any other write. Mirrors the `SchemaStore::*_txn` family.
+    fn put_definition_txn(&self, txn: &mut Transaction, def: &IndexDefinition) -> StoreResult<()>;
+
+    /// Delete a persisted index definition by name through a statement
+    /// [`Transaction`] — the DROP INDEX DDL path. Tombstone semantics (no error
+    /// when absent).
+    fn delete_definition_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()>;
 }
 
 /// CE single-shard implementation of [`IndexStore`].
@@ -350,6 +364,18 @@ impl IndexStore for LocalIndexStore<'_> {
         def.state = state;
         self.put_definition(&def)?;
         Ok(true)
+    }
+
+    fn put_definition_txn(&self, txn: &mut Transaction, def: &IndexDefinition) -> StoreResult<()> {
+        let value = rmp_serde::to_vec(def)
+            .map_err(|e| StoreError::Invariant(format!("index definition serialize: {e}")))?;
+        txn.put(Partition::Schema, &def.schema_key(), &value)?;
+        Ok(())
+    }
+
+    fn delete_definition_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()> {
+        txn.delete(Partition::Schema, &definition_key(name))?;
+        Ok(())
     }
 }
 
@@ -661,5 +687,52 @@ mod tests {
         assert_eq!(b.len(), 1);
         assert_eq!(a[0].1, NodeId::from_raw(1));
         assert_eq!(b[0].1, NodeId::from_raw(2));
+    }
+
+    #[test]
+    fn definition_txn_round_trip() {
+        use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+        use coordinode_core::txn::write_concern::WriteConcern;
+        use coordinode_storage::engine::transaction::CommitContext;
+
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let store = LocalIndexStore::new(engine);
+
+        let commit = |t: &mut Transaction| {
+            let wc = WriteConcern::majority();
+            let ctx = CommitContext {
+                write_concern: &wc,
+                pipeline: None,
+                id_gen: None,
+                drain_buffer: None,
+                nvme_write_buffer: None,
+            };
+            t.commit(&ctx).expect("commit");
+        };
+
+        let def = IndexDefinition::btree("user_email", "User", "email").unique();
+
+        // CREATE INDEX: persist the definition through a statement transaction.
+        let read_ts = oracle.next();
+        let mut t = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        store.put_definition_txn(&mut t, &def).expect("put txn");
+        commit(&mut t);
+        let loaded = store
+            .load_definition("user_email")
+            .expect("load")
+            .expect("present after commit");
+        assert_eq!(loaded.name, "user_email");
+        assert!(loaded.unique);
+
+        // DROP INDEX: delete the definition through a statement transaction.
+        let read_ts = oracle.next();
+        let mut t = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        store
+            .delete_definition_txn(&mut t, "user_email")
+            .expect("delete txn");
+        commit(&mut t);
+        assert!(store.load_definition("user_email").expect("load").is_none());
     }
 }

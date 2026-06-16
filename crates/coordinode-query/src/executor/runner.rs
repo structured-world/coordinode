@@ -828,6 +828,25 @@ impl<'a> ExecutionContext<'a> {
         Ok(self.txn.delete(part, key)?)
     }
 
+    /// Persist an index definition transactionally (CREATE INDEX DDL). Buffers
+    /// on the statement transaction through the Layer-4 index store, which
+    /// owns the `schema:idx:` keyspace and encoding — Layer 5 names neither.
+    pub fn mvcc_put_index_def(
+        &mut self,
+        def: &crate::index::IndexDefinition,
+    ) -> Result<(), ExecutionError> {
+        use coordinode_modality::{IndexStore as _, LocalIndexStore};
+        self.sync_txn_state();
+        Ok(LocalIndexStore::new(self.engine).put_definition_txn(&mut self.txn, def)?)
+    }
+
+    /// Delete an index definition by name transactionally (DROP INDEX DDL).
+    pub fn mvcc_delete_index_def(&mut self, name: &str) -> Result<(), ExecutionError> {
+        use coordinode_modality::{IndexStore as _, LocalIndexStore};
+        self.sync_txn_state();
+        Ok(LocalIndexStore::new(self.engine).delete_definition_txn(&mut self.txn, name)?)
+    }
+
     /// MVCC-aware typed node read.
     ///
     /// Combines key encoding, raw read through [`Self::mvcc_get`]
@@ -13632,11 +13651,8 @@ fn execute_create_text_index(
     };
     let def = crate::index::IndexDefinition::text(name, label, properties.clone(), config);
 
-    // Persist index definition to schema: partition.
-    let schema_key = def.schema_key();
-    let bytes = rmp_serde::to_vec(&def)
-        .map_err(|e| ExecutionError::Unsupported(format!("serialize index def: {e}")))?;
-    ctx.mvcc_put(Partition::Schema, &schema_key, &bytes)?;
+    // Persist index definition transactionally through the index store.
+    ctx.mvcc_put_index_def(&def)?;
 
     // Register in text index registry (creates tantivy directory + empty index).
     registry
@@ -13720,9 +13736,8 @@ fn execute_drop_text_index(
     // Remove from registry.
     registry.unregister(&def.label, def.property());
 
-    // Remove from schema: partition.
-    let schema_key = def.schema_key();
-    ctx.mvcc_delete(Partition::Schema, &schema_key)?;
+    // Remove the definition transactionally through the index store.
+    ctx.mvcc_delete_index_def(&def.name)?;
 
     let mut row = Row::new();
     row.insert("index".to_string(), Value::String(name.to_string()));
@@ -14110,9 +14125,8 @@ fn execute_drop_vector_index(
     let label = def.label.clone();
     let property = def.property().to_string();
 
-    // Tombstone the schema definition key.
-    let schema_key = def.schema_key();
-    ctx.mvcc_delete(Partition::Schema, &schema_key)?;
+    // Tombstone the definition transactionally through the index store.
+    ctx.mvcc_delete_index_def(&def.name)?;
 
     // Remove from in-memory registry.
     registry.unregister(&label, &property);
