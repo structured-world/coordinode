@@ -11,12 +11,56 @@
 use coordinode_core::graph::edge::EdgeProperties;
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
+use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_modality::{
     BlobStore, Bucket, Crs, DocumentStore, EdgeStore, IndexStore, LocalBlobStore,
     LocalDocumentStore, LocalEdgeStore, LocalIndexStore, LocalNodeStore, LocalSpatialStore,
     LocalTimeSeriesStore, Measurement, NodeStore, Point, SpatialStore, TimeSeriesStore,
 };
+use coordinode_storage::engine::transaction::{CommitContext, Transaction};
 use std::collections::BTreeMap;
+
+/// Commit a transaction's buffered writes (edge merges + edgeprops).
+fn commit(txn: &mut Transaction) {
+    let wc = WriteConcern::majority();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    txn.commit(&ctx).expect("commit");
+}
+
+/// Seed a node via an MVCC transaction + commit.
+fn put_node(
+    engine: &coordinode_storage::engine::core::StorageEngine,
+    shard: u16,
+    id: NodeId,
+    record: &NodeRecord,
+) {
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let read_ts = oracle.next();
+    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    LocalNodeStore
+        .put(&mut txn, shard, id, record)
+        .expect("put node");
+    commit(&mut txn);
+}
+
+/// Read a node at the latest committed snapshot through an MVCC transaction.
+fn get_node(
+    engine: &coordinode_storage::engine::core::StorageEngine,
+    shard: u16,
+    id: NodeId,
+) -> Option<NodeRecord> {
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let read_ts = oracle.next();
+    let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    LocalNodeStore.get(&txn, shard, id).expect("get node")
+}
 
 /// Logic-test fixture (memory backing, env-flippable). Cross-store
 /// integration tests verify per-modality slicing of a shared
@@ -33,10 +77,10 @@ fn open_shared_engine() -> coordinode_test_fixtures::EngineFixture {
 fn node_edge_index_document_flow() {
     let fx = open_shared_engine();
     let engine = &fx.engine;
-    let nodes = LocalNodeStore::new(engine);
-    let edges = LocalEdgeStore::new(engine);
+    let edges = LocalEdgeStore;
     let indexes = LocalIndexStore::new(engine);
     let docs = LocalDocumentStore::new(engine);
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
 
     let alice = NodeId::from_raw(1);
     let bob = NodeId::from_raw(2);
@@ -44,10 +88,10 @@ fn node_edge_index_document_flow() {
     // 1. Create two nodes with a property.
     let mut alice_rec = NodeRecord::new("User");
     alice_rec.set_extra("name", Value::String("alice".into()));
-    nodes.put(0, alice, &alice_rec).expect("put alice");
+    put_node(engine, 0, alice, &alice_rec);
     let mut bob_rec = NodeRecord::new("User");
     bob_rec.set_extra("name", Value::String("bob".into()));
-    nodes.put(0, bob, &bob_rec).expect("put bob");
+    put_node(engine, 0, bob, &bob_rec);
 
     // 2. Index both by name.
     indexes
@@ -57,12 +101,17 @@ fn node_edge_index_document_flow() {
         .put_entry("by_name", &[Value::String("bob".into())], bob)
         .expect("idx bob");
 
-    // 3. Edge alice --KNOWS--> bob with a property.
+    // 3. Edge alice --KNOWS--> bob with a property (buffered, committed).
     let mut props = EdgeProperties::new();
     props.set(1, Value::String("since-2020".into()));
-    edges
-        .put_edge("KNOWS", alice, bob, Some(&props))
-        .expect("edge");
+    {
+        let read_ts = oracle.next();
+        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        edges
+            .put_edge(&mut txn, "KNOWS", alice, bob, Some(&props))
+            .expect("edge");
+        commit(&mut txn);
+    }
 
     // 4. Document update on alice's profile sub-tree.
     docs.set_path(
@@ -77,7 +126,7 @@ fn node_edge_index_document_flow() {
     // --- Cross-store read-back ---
 
     // NodeStore sees both nodes plus the merged profile.city value.
-    let alice_after = nodes.get(0, alice).expect("ok").expect("Some");
+    let alice_after = get_node(engine, 0, alice).expect("Some");
     let profile = alice_after.get_extra("profile").expect("profile present");
     let rmpv_map = match profile {
         Value::Document(m) => m,
@@ -109,11 +158,15 @@ fn node_edge_index_document_flow() {
     assert_eq!(bob_via_idx, vec![bob]);
 
     // EdgeStore: alice's forward neighbours include bob.
-    let out = edges.scan_neighbors_out("KNOWS", alice).expect("scan");
+    let read_ts = oracle.next();
+    let rtxn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let out = edges
+        .scan_neighbors_out(&rtxn, "KNOWS", alice)
+        .expect("scan");
     assert_eq!(out, vec![bob]);
     // And the edgeprop survives.
     let edge_props = edges
-        .get_props("KNOWS", alice, bob)
+        .get_props(&rtxn, "KNOWS", alice, bob)
         .expect("ok")
         .expect("Some");
     assert_eq!(edge_props.get(1), Some(&Value::String("since-2020".into())));
@@ -133,14 +186,11 @@ fn node_edge_index_document_flow() {
 fn vector_spatial_timeseries_on_same_logical_entity() {
     let fx = open_shared_engine();
     let engine = &fx.engine;
-    let nodes = LocalNodeStore::new(engine);
     let spatial = LocalSpatialStore::new(engine);
     let ts = LocalTimeSeriesStore::new(engine);
 
     let sensor = NodeId::from_raw(42);
-    nodes
-        .put(0, sensor, &NodeRecord::new("Sensor"))
-        .expect("put sensor");
+    put_node(engine, 0, sensor, &NodeRecord::new("Sensor"));
 
     // Spatial: sensor's GPS location.
     let loc = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
@@ -192,7 +242,7 @@ fn vector_spatial_timeseries_on_same_logical_entity() {
 
     // Original sensor node still readable through NodeStore — its
     // body wasn't touched by spatial / ts writes.
-    let sensor_after = nodes.get(0, sensor).expect("ok").expect("Some");
+    let sensor_after = get_node(engine, 0, sensor).expect("Some");
     assert_eq!(sensor_after.primary_label(), "Sensor");
 }
 
@@ -204,13 +254,10 @@ fn schema_blob_node_consistency() {
 
     let fx = open_shared_engine();
     let engine = &fx.engine;
-    let nodes = LocalNodeStore::new(engine);
     let blobs = LocalBlobStore::new(engine);
 
     let node = NodeId::from_raw(7);
-    nodes
-        .put(0, node, &NodeRecord::new("Document"))
-        .expect("put node");
+    put_node(engine, 0, node, &NodeRecord::new("Document"));
 
     // Two chunks + a blob ref pointing at them.
     let chunks = vec![
@@ -243,6 +290,6 @@ fn schema_blob_node_consistency() {
 
     // The node itself is still readable and untouched by the blob
     // writes.
-    let node_after = nodes.get(0, node).expect("ok").expect("Some");
+    let node_after = get_node(engine, 0, node).expect("Some");
     assert_eq!(node_after.primary_label(), "Document");
 }

@@ -3,33 +3,25 @@
 //! Each operator produces a `Vec<Row>` from its input.
 //! Future optimization: streaming iterator model.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
 
-use coordinode_core::graph::edge::{
-    decode_edge_props, encode_adj_key_forward, encode_adj_key_reverse, encode_edge_props,
-    encode_edgeprop_key, encode_temporal_edgeprop_key, temporal_edgeprop_pair_prefix,
-    write_adj_key_forward, write_adj_key_reverse, AdjDirection, AdjKeyParts, PostingList,
-};
+use coordinode_core::graph::edge::{decode_edge_props, AdjDirection, AdjKeyParts, PostingList};
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::NodeIdAllocator;
-use coordinode_core::graph::node::{encode_node_key, NodeId, NodeRecord};
+use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::{Value, VectorConsistencyMode, VectorMvccStats};
 use coordinode_core::schema::definition::{
-    encode_edge_type_current_revision_key, encode_edge_type_schema_key,
-    encode_label_current_revision_key, encode_label_schema_key, EdgeTypeSchema, LabelSchema,
-    PropertyDef, PropertyType, SchemaMode,
+    EdgeTypeSchema, LabelSchema, PropertyDef, PropertyType, SchemaMode,
 };
 use coordinode_core::schema::validation::validate_one;
-use coordinode_core::txn::proposal::{
-    Mutation, PartitionId, ProposalError, ProposalIdGenerator, ProposalPipeline, RaftProposal,
-};
+use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_storage::engine::core::StorageEngine;
-use coordinode_storage::engine::merge::{encode_add_batch, encode_remove};
 use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::engine::transaction::Transaction;
 use coordinode_storage::engine::StorageSnapshot;
 use coordinode_storage::Guard;
 
@@ -328,26 +320,18 @@ pub struct ExecutionContext<'a> {
     /// MVCC read timestamp (start_ts). Allocated from oracle at statement start.
     /// All reads see a consistent snapshot at this timestamp.
     pub mvcc_read_ts: Timestamp,
-    /// In-memory write buffer for MVCC: (partition, user_key) → value.
-    /// Writes are buffered here during execution and flushed atomically
-    /// at commit time with a commit_ts from the oracle.
-    /// Reads check this buffer first (read-your-own-writes).
-    #[allow(clippy::type_complexity)]
-    pub mvcc_write_buffer: HashMap<(Partition, Vec<u8>), Option<Vec<u8>>>,
+    /// Layer-3 transaction context (ADR-041): owns the MVCC read snapshot,
+    /// the read-your-own-writes write buffer, and the OCC read-set. The
+    /// executor routes primitive `(partition, key)` reads/writes through it
+    /// (`mvcc_get` / `mvcc_put` / `mvcc_delete` / `mvcc_prefix_scan` delegate
+    /// here); modality-specific RYOW (node merge deltas) and the commit path
+    /// still live on the executor and drive the transaction via its
+    /// `pub(crate)` surface until they migrate too.
+    pub txn: Transaction<'a>,
     /// Procedure context for CALL statements. When set, enables
     /// `db.advisor.*` procedures in the executor.
     pub procedure_ctx: Option<crate::advisor::procedures::ProcedureContext>,
 
-    /// Layer-3 OCC scope: read-set tracker pinned at `mvcc_read_ts`.
-    ///
-    /// Lazily created on the first read when `mvcc_oracle.is_some()`
-    /// via [`Self::ensure_occ_scope`]; the scope's `read_ts` is sourced
-    /// from `mvcc_read_ts.as_raw()`. Layer-5 hands it the keys it
-    /// touches (`s.track(part, key)`), Layer-3 validates at commit
-    /// time via `coordinator.validate_occ(&scope)` — see
-    /// [`coordinode_storage::engine::coordinator::OccScope`] for the
-    /// full contract and commutative-partition policy.
-    pub occ_scope: Option<coordinode_storage::engine::coordinator::OccScope>,
     /// Vector MVCC consistency mode. Controls how vector search interacts
     /// with snapshot isolation. Default: `Current` (no visibility filter).
     /// Set via `SET vector_consistency = 'snapshot'` or per-query hint.
@@ -398,15 +382,6 @@ pub struct ExecutionContext<'a> {
     pub nvme_write_buffer: Option<&'a coordinode_storage::cache::write_buffer::NvmeWriteBuffer>,
     /// Pending merge-add UIDs per adj key (raw key, no MVCC timestamp).
     ///
-    /// Edge creates accumulate UIDs here instead of read-modify-write.
-    /// At flush, each entry becomes a `Mutation::Merge` with `encode_add_batch`.
-    /// Also checked for read-your-own-writes during edge traversal.
-    pub merge_adj_adds: HashMap<Vec<u8>, Vec<u64>>,
-    /// Pending merge-remove UIDs per adj key.
-    ///
-    /// Edge deletes (specific edge, not DETACH) accumulate here.
-    /// At flush, each UID becomes a `Mutation::Merge` with `encode_remove`.
-    pub merge_adj_removes: HashMap<Vec<u8>, Vec<u64>>,
     /// MVCC snapshot for point-in-time reads (ADR-016: native seqno MVCC).
     ///
     /// When MVCC is enabled, this snapshot is created at `mvcc_read_ts` via
@@ -416,21 +391,6 @@ pub struct ExecutionContext<'a> {
     ///
     /// When None (legacy mode), reads go directly through engine.get().
     pub mvcc_snapshot: Option<StorageSnapshot>,
-    /// storage snapshot for adj: partition time-travel reads.
-    ///
-    /// When set (typically from AS OF TIMESTAMP or statement-level snapshot),
-    /// `adj_get()` reads through this snapshot instead of raw engine.get().
-    /// This ensures merge operands written after the snapshot are invisible,
-    /// providing consistent edge visibility for time-travel queries.
-    ///
-    /// Taken at statement start from `engine.snapshot()`.
-    pub adj_snapshot: Option<StorageSnapshot>,
-    /// Pending DocDelta merge operands for node: partition.
-    ///
-    /// Path-targeted SET/REMOVE on DOCUMENT properties via merge operands.
-    /// Each entry: (node_key, encoded DocDelta with PathTarget::PropField).
-    /// At flush, each becomes `Mutation::Merge` on `Partition::Node`.
-    pub merge_node_deltas: Vec<(Vec<u8>, Vec<u8>)>,
     /// L1 cascade depth counter (the trigger architecture). Shared across all triggers in
     /// one originating user mutation. Incremented before each trigger body
     /// is executed, decremented (RAII-style) when the body returns. When
@@ -501,23 +461,6 @@ pub struct ExecutionContext<'a> {
     /// CreateNode operator hot path (line ≈ 7290) which dominates
     /// bulk loads.
     pub pending_vector_writes: Vec<(String, String, NodeId, Vec<f32>)>,
-}
-
-/// Convert storage `Partition` to serializable `PartitionId`.
-fn partition_to_id(p: Partition) -> PartitionId {
-    match p {
-        Partition::Node => PartitionId::Node,
-        Partition::Adj => PartitionId::Adj,
-        Partition::EdgeProp => PartitionId::EdgeProp,
-        Partition::Blob => PartitionId::Blob,
-        Partition::BlobRef => PartitionId::BlobRef,
-        Partition::Schema => PartitionId::Schema,
-        Partition::Idx => PartitionId::Idx,
-        Partition::Raft => unreachable!("Raft partition is not exposed to the query layer"),
-        Partition::Counter => PartitionId::Counter,
-        Partition::VectorF32 => PartitionId::VectorF32,
-        Partition::Registry => PartitionId::Registry,
-    }
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -656,22 +599,21 @@ impl<'a> ExecutionContext<'a> {
         target_segment: &str,
         event_segment: &str,
     ) -> Result<Vec<coordinode_core::schema::triggers::TriggerSchema>, ExecutionError> {
-        use coordinode_core::schema::triggers::{
-            encode_trigger_index_key, encode_trigger_key, TriggerSchema,
-        };
-        let idx_key = encode_trigger_index_key(target_segment, event_segment);
-        let names: Vec<String> = match self.mvcc_get(Partition::Schema, &idx_key)? {
-            Some(bytes) => rmp_serde::from_slice(&bytes).map_err(|e| {
-                ExecutionError::Serialization(format!(
-                    "trigger_index decode for {target_segment}/{event_segment}: {e}"
-                ))
-            })?,
-            None => return Ok(Vec::new()),
-        };
+        use coordinode_core::schema::triggers::TriggerSchema;
+        use coordinode_modality::{LocalTriggerStore, TriggerStore as _};
+        self.sync_txn_state();
+        let names: Vec<String> =
+            match LocalTriggerStore.get_index(&mut self.txn, target_segment, event_segment)? {
+                Some(bytes) => rmp_serde::from_slice(&bytes).map_err(|e| {
+                    ExecutionError::Serialization(format!(
+                        "trigger_index decode for {target_segment}/{event_segment}: {e}"
+                    ))
+                })?,
+                None => return Ok(Vec::new()),
+            };
         let mut out = Vec::with_capacity(names.len());
         for name in names {
-            let def_key = encode_trigger_key(&name);
-            let Some(bytes) = self.mvcc_get(Partition::Schema, &def_key)? else {
+            let Some(bytes) = LocalTriggerStore.get_definition(&mut self.txn, &name)? else {
                 // Inconsistent state — index references a missing definition.
                 // Skip rather than fail the mutation; the next DDL will
                 // rebuild the index.
@@ -696,20 +638,21 @@ impl<'a> ExecutionContext<'a> {
     /// `SET n.doc.a = 1, n.doc.b = 2` (the second item would not see delta from first).
     ///
     /// Read order: write buffer first, then committed engine state.
-    /// Does not consult `merge_node_deltas`.
-    /// Typed analogue of [`Self::schema_peek_node`] for callers that
-    /// want a decoded [`NodeRecord`]. Same non-materialising read
-    /// semantics — RYOW from write_buffer, snapshot fallback, no
-    /// touch on `merge_node_deltas`, no OCC scope tracking (this is
-    /// a schema-introspection read, not a transactional read).
-    /// Encapsulates `encode_node_key + schema_peek_node + from_msgpack`.
+    /// Does not consult `merge_node_deltas`. Non-materialising read with
+    /// RYOW from the write buffer + snapshot fallback, no OCC scope tracking
+    /// (a schema-introspection read, not a transactional read). Delegates to
+    /// [`coordinode_modality::NodeStore::peek_raw`].
     pub fn schema_peek_node_typed(
         &self,
         shard_id: u16,
         node_id: NodeId,
     ) -> Result<Option<NodeRecord>, ExecutionError> {
-        let key = encode_node_key(shard_id, node_id);
-        let Some(bytes) = self.schema_peek_node(&key)? else {
+        // Layer-4 LocalNodeStore owns key encoding; this is an untracked peek
+        // (no OCC, no delta materialisation). The transaction is pinned to the
+        // statement snapshot in the prelude, so this `&self` read sees the same
+        // point-in-time as `mvcc_snapshot`.
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        let Some(bytes) = LocalNodeStore.peek_raw(&self.txn, shard_id, node_id)? else {
             return Ok(None);
         };
         NodeRecord::from_msgpack(&bytes).map(Some).map_err(|e| {
@@ -718,23 +661,6 @@ impl<'a> ExecutionContext<'a> {
                 node_id.as_raw(),
             ))
         })
-    }
-
-    pub fn schema_peek_node(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ExecutionError> {
-        // Check write buffer (nodes already written or materialized in this txn).
-        let buf_key = (Partition::Node, key.to_vec());
-        if let Some(buffered) = self.mvcc_write_buffer.get(&buf_key) {
-            return Ok(buffered.clone());
-        }
-        // Fall back to committed state in the engine.
-        if let Some(ref snap) = self.mvcc_snapshot {
-            Ok(self
-                .engine
-                .snapshot_get(snap, Partition::Node, key)?
-                .map(|b| b.to_vec()))
-        } else {
-            Ok(self.engine.get(Partition::Node, key)?.map(|b| b.to_vec()))
-        }
     }
 
     /// Return the primary label for a node, using the per-statement cache.
@@ -771,15 +697,21 @@ impl<'a> ExecutionContext<'a> {
     /// recorded via [`OccScope::track`] becomes part of the read-set
     /// validated at commit time.
     fn ensure_occ_scope(&mut self) -> Option<&coordinode_storage::engine::coordinator::OccScope> {
-        if self.mvcc_oracle.is_some() && self.occ_scope.is_none() {
-            use coordinode_storage::engine::coordinator::MultiModalCoordinator;
-            self.occ_scope = Some(
-                self.engine
-                    .coordinator()
-                    .occ_scope_at(self.mvcc_read_ts.as_raw()),
-            );
-        }
-        self.occ_scope.as_ref()
+        self.sync_txn_state();
+        self.txn.ensure_occ_scope()
+    }
+
+    /// Sync the Layer-3 transaction's read snapshot + read timestamp from the
+    /// executor's current values. Transitional (ADR-041): the executor still
+    /// owns `mvcc_snapshot` / `mvcc_read_ts` (assigned post-construction and
+    /// read pervasively), so we refresh the transaction's copies at the point
+    /// of each read. Called at the entry of every read primitive; the
+    /// transaction's OCC scope is created lazily at the first tracked read,
+    /// pinned at the then-current `read_ts` (matching prior behaviour).
+    fn sync_txn_state(&mut self) {
+        self.txn.set_oracle(self.mvcc_oracle);
+        self.txn.set_snapshot(self.mvcc_snapshot);
+        self.txn.set_read_ts(self.mvcc_read_ts);
     }
 
     /// MVCC-aware read: write buffer → snapshot O(1) → legacy fallback.
@@ -787,56 +719,42 @@ impl<'a> ExecutionContext<'a> {
     /// 1. Check write buffer (read-your-own-writes within this statement)
     /// 2. If MVCC snapshot set: snapshot.get() — O(1) native seqno MVCC (ADR-016)
     /// 3. If no snapshot: direct engine.get() — legacy mode
+    ///
+    /// Generic test-access primitive used by this crate's and downstream
+    /// crates' tests. Production execution reads through the typed Layer-4
+    /// stores (no `Partition` in production query paths, ADR-041).
     pub fn mvcc_get(
         &mut self,
         part: Partition,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, ExecutionError> {
-        // RYOW for pending node merge deltas: materialize into write buffer
-        // so subsequent reads see the correct state.
-        if part == Partition::Node && self.merge_node_deltas.iter().any(|(k, _)| k == key) {
+        self.sync_txn_state();
+        // RYOW for pending node merge deltas: materialize into the write
+        // buffer so the transaction read below sees the correct state. This
+        // node-modality concern stays above the modality-agnostic Layer-3
+        // transaction (ADR-041).
+        if part == Partition::Node && self.txn.node_deltas().iter().any(|(k, _)| k == key) {
             self.materialize_node_deltas(key)?;
         }
-
-        // Check write buffer first (read-your-own-writes — not tracked in read-set)
-        let buf_key = (part, key.to_vec());
-        if let Some(buffered) = self.mvcc_write_buffer.get(&buf_key) {
-            return Ok(buffered.clone());
-        }
-
-        // Track this key in the Layer-3 OCC scope (conflict detection
-        // at commit). Legacy mode (no oracle) has no scope.
-        if let Some(scope) = self.ensure_occ_scope() {
-            scope.track(part, key);
-        }
-
-        // Native seqno MVCC read via snapshot_at (ADR-016) or legacy read
-        if let Some(ref snap) = self.mvcc_snapshot {
-            Ok(self
-                .engine
-                .snapshot_get(snap, part, key)?
-                .map(|b| b.to_vec()))
-        } else {
-            Ok(self.engine.get(part, key)?.map(|b| b.to_vec()))
-        }
+        // Buffer (RYOW) → snapshot read + OCC tracking, all owned by the
+        // Layer-3 transaction.
+        Ok(self.txn.get(part, key)?)
     }
 
     /// MVCC-aware write: buffers in write_buffer for atomic flush at commit.
     ///
     /// When MVCC is disabled (legacy mode), writes directly to engine.
+    ///
+    /// Generic primitive retained for the index-DDL path (index definitions
+    /// in `Partition::Schema`), pending the index-subsystem typing.
     pub fn mvcc_put(
         &mut self,
         part: Partition,
         key: &[u8],
         value: &[u8],
     ) -> Result<(), ExecutionError> {
-        if self.mvcc_oracle.is_some() {
-            self.mvcc_write_buffer
-                .insert((part, key.to_vec()), Some(value.to_vec()));
-            Ok(())
-        } else {
-            Ok(self.engine.put(part, key, value)?)
-        }
+        self.sync_txn_state();
+        Ok(self.txn.put(part, key, value)?)
     }
 
     /// Read the current label schema by name. Returns `None` if the label
@@ -852,31 +770,9 @@ impl<'a> ExecutionContext<'a> {
         &mut self,
         name: &str,
     ) -> Result<Option<LabelSchema>, ExecutionError> {
-        let pointer_key = encode_label_current_revision_key(name);
-        let Some(pointer_bytes) = self.mvcc_get(Partition::Schema, &pointer_key)? else {
-            return Ok(None);
-        };
-        let revision_array: [u8; 8] = match pointer_bytes.as_slice().try_into() {
-            Ok(arr) => arr,
-            Err(_) => {
-                return Err(ExecutionError::Unsupported(format!(
-                    "corrupt current_revision pointer for label '{name}': expected 8 bytes, got {}",
-                    pointer_bytes.len()
-                )));
-            }
-        };
-        let revision = u64::from_be_bytes(revision_array);
-        let schema_key = encode_label_schema_key(name, revision);
-        let Some(schema_bytes) = self.mvcc_get(Partition::Schema, &schema_key)? else {
-            return Err(ExecutionError::Unsupported(format!(
-                "label '{name}' pointer references missing revision {revision}"
-            )));
-        };
-        LabelSchema::from_msgpack(&schema_bytes)
-            .map(Some)
-            .map_err(|e| {
-                ExecutionError::Unsupported(format!("corrupt schema for label '{name}': {e}"))
-            })
+        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        self.sync_txn_state();
+        Ok(LocalSchemaStore::new(self.engine).load_label_txn(&mut self.txn, name)?)
     }
 
     /// Read the current edge type schema by name. Returns `None` if no schema
@@ -891,34 +787,9 @@ impl<'a> ExecutionContext<'a> {
         &mut self,
         name: &str,
     ) -> Result<Option<EdgeTypeSchema>, ExecutionError> {
-        let pointer_key = encode_edge_type_current_revision_key(name);
-        let Some(pointer_bytes) = self.mvcc_get(Partition::Schema, &pointer_key)? else {
-            return Ok(None);
-        };
-        let revision_array: [u8; 8] = match pointer_bytes.as_slice().try_into() {
-            Ok(arr) => arr,
-            Err(_) => {
-                return Err(ExecutionError::Unsupported(format!(
-                    "corrupt current_revision pointer for edge type '{name}': expected 8 bytes, got {}",
-                    pointer_bytes.len()
-                )));
-            }
-        };
-        let revision = u64::from_be_bytes(revision_array);
-        let schema_key = encode_edge_type_schema_key(name, revision);
-        let Some(schema_bytes) = self.mvcc_get(Partition::Schema, &schema_key)? else {
-            return Err(ExecutionError::Unsupported(format!(
-                "edge type '{name}' pointer references missing revision {revision}"
-            )));
-        };
-        if schema_bytes.is_empty() {
-            return Ok(None);
-        }
-        EdgeTypeSchema::from_msgpack(&schema_bytes)
-            .map(Some)
-            .map_err(|e| {
-                ExecutionError::Unsupported(format!("corrupt schema for edge type '{name}': {e}"))
-            })
+        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        self.sync_txn_state();
+        Ok(LocalSchemaStore::new(self.engine).load_edge_type_txn(&mut self.txn, name)?)
     }
 
     /// Write an edge type schema as the current revision: writes the schema body
@@ -928,21 +799,9 @@ impl<'a> ExecutionContext<'a> {
         &mut self,
         schema: &EdgeTypeSchema,
     ) -> Result<(), ExecutionError> {
-        let schema_bytes = schema.to_msgpack().map_err(|e| {
-            ExecutionError::Unsupported(format!(
-                "edge type schema encode for '{}': {e}",
-                schema.name
-            ))
-        })?;
-        let schema_key = encode_edge_type_schema_key(&schema.name, schema.schema_revision);
-        self.mvcc_put(Partition::Schema, &schema_key, &schema_bytes)?;
-        let pointer_key = encode_edge_type_current_revision_key(&schema.name);
-        self.mvcc_put(
-            Partition::Schema,
-            &pointer_key,
-            &schema.schema_revision.to_be_bytes(),
-        )?;
-        Ok(())
+        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        self.sync_txn_state();
+        Ok(LocalSchemaStore::new(self.engine).save_edge_type_txn(&mut self.txn, schema)?)
     }
 
     /// Write a label schema as the current revision: writes the schema body
@@ -953,30 +812,20 @@ impl<'a> ExecutionContext<'a> {
         &mut self,
         schema: &LabelSchema,
     ) -> Result<(), ExecutionError> {
-        let schema_bytes = schema.to_msgpack().map_err(|e| {
-            ExecutionError::Unsupported(format!("schema encode for '{}': {e}", schema.name))
-        })?;
-        let schema_key = encode_label_schema_key(&schema.name, schema.schema_revision);
-        self.mvcc_put(Partition::Schema, &schema_key, &schema_bytes)?;
-        let pointer_key = encode_label_current_revision_key(&schema.name);
-        self.mvcc_put(
-            Partition::Schema,
-            &pointer_key,
-            &schema.schema_revision.to_be_bytes(),
-        )?;
-        Ok(())
+        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        self.sync_txn_state();
+        Ok(LocalSchemaStore::new(self.engine).save_label_txn(&mut self.txn, schema)?)
     }
 
     /// MVCC-aware delete: buffers tombstone in write_buffer for atomic flush.
     ///
     /// When MVCC is disabled (legacy mode), deletes directly from engine.
+    ///
+    /// Generic primitive retained for the index-DDL path (index definitions
+    /// in `Partition::Schema`), pending the index-subsystem typing.
     pub fn mvcc_delete(&mut self, part: Partition, key: &[u8]) -> Result<(), ExecutionError> {
-        if self.mvcc_oracle.is_some() {
-            self.mvcc_write_buffer.insert((part, key.to_vec()), None);
-            Ok(())
-        } else {
-            Ok(self.engine.delete(part, key)?)
-        }
+        self.sync_txn_state();
+        Ok(self.txn.delete(part, key)?)
     }
 
     /// MVCC-aware typed node read.
@@ -992,14 +841,16 @@ impl<'a> ExecutionContext<'a> {
         shard_id: u16,
         node_id: NodeId,
     ) -> Result<Option<NodeRecord>, ExecutionError> {
-        let key = encode_node_key(shard_id, node_id);
-        let Some(bytes) = self.mvcc_get(Partition::Node, &key)? else {
+        // Layer-4 LocalNodeStore owns key encoding + node-delta RYOW and does
+        // the OCC-tracked read (ADR-041); the query layer keeps the decode +
+        // its diagnostic error contract (node id in the message).
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        self.sync_txn_state();
+        let Some(bytes) = LocalNodeStore.get_raw_tracked(&mut self.txn, shard_id, node_id)? else {
             return Ok(None);
         };
         let record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
-            ExecutionError::Serialization(
-                format!("node {} deserialization: {e}", node_id.as_raw(),),
-            )
+            ExecutionError::Serialization(format!("node {} deserialization: {e}", node_id.as_raw()))
         })?;
         Ok(Some(record))
     }
@@ -1014,11 +865,11 @@ impl<'a> ExecutionContext<'a> {
         node_id: NodeId,
         record: &NodeRecord,
     ) -> Result<(), ExecutionError> {
-        let key = encode_node_key(shard_id, node_id);
-        let bytes = record.to_msgpack().map_err(|e| {
-            ExecutionError::Serialization(format!("node {} serialization: {e}", node_id.as_raw(),))
-        })?;
-        self.mvcc_put(Partition::Node, &key, &bytes)
+        // Delegate to Layer-4 LocalNodeStore (owns key encoding + msgpack);
+        // the put buffers on the transaction for atomic flush (ADR-041).
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        self.sync_txn_state();
+        Ok(LocalNodeStore.put(&mut self.txn, shard_id, node_id, record)?)
     }
 
     /// MVCC-aware typed read of a temporal node version.
@@ -1034,12 +885,15 @@ impl<'a> ExecutionContext<'a> {
         node_id: NodeId,
         valid_from_ms: i64,
     ) -> Result<Option<NodeRecord>, ExecutionError> {
-        let key = coordinode_core::graph::node::encode_temporal_node_key(
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        self.sync_txn_state();
+        let Some(bytes) = LocalNodeStore.get_temporal_raw_tracked(
+            &mut self.txn,
             shard_id,
             node_id,
             valid_from_ms,
-        );
-        let Some(bytes) = self.mvcc_get(Partition::Node, &key)? else {
+        )?
+        else {
             return Ok(None);
         };
         let record = NodeRecord::from_msgpack(&bytes).map_err(|e| {
@@ -1064,18 +918,9 @@ impl<'a> ExecutionContext<'a> {
         valid_from_ms: i64,
         record: &NodeRecord,
     ) -> Result<(), ExecutionError> {
-        let key = coordinode_core::graph::node::encode_temporal_node_key(
-            shard_id,
-            node_id,
-            valid_from_ms,
-        );
-        let bytes = record.to_msgpack().map_err(|e| {
-            ExecutionError::Serialization(format!(
-                "node {} temporal@{valid_from_ms} serialization: {e}",
-                node_id.as_raw(),
-            ))
-        })?;
-        self.mvcc_put(Partition::Node, &key, &bytes)
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        self.sync_txn_state();
+        Ok(LocalNodeStore.put_temporal(&mut self.txn, shard_id, node_id, valid_from_ms, record)?)
     }
 
     /// MVCC-aware typed delete of a temporal node version (tombstone
@@ -1092,12 +937,9 @@ impl<'a> ExecutionContext<'a> {
         node_id: NodeId,
         valid_from_ms: i64,
     ) -> Result<(), ExecutionError> {
-        let key = coordinode_core::graph::node::encode_temporal_node_key(
-            shard_id,
-            node_id,
-            valid_from_ms,
-        );
-        self.mvcc_delete(Partition::Node, &key)
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        self.sync_txn_state();
+        Ok(LocalNodeStore.delete_temporal(&mut self.txn, shard_id, node_id, valid_from_ms)?)
     }
 
     /// MVCC-aware typed edge-property read. Hides the
@@ -1113,8 +955,11 @@ impl<'a> ExecutionContext<'a> {
         src: NodeId,
         tgt: NodeId,
     ) -> Result<Option<Vec<(u32, Value)>>, ExecutionError> {
-        let key = encode_edgeprop_key(edge_type, src, tgt);
-        let Some(bytes) = self.mvcc_get(Partition::EdgeProp, &key)? else {
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        self.sync_txn_state();
+        let Some(bytes) =
+            LocalEdgeStore.get_props_raw_tracked(&mut self.txn, edge_type, src, tgt, None)?
+        else {
             return Ok(None);
         };
         let decoded = decode_edge_props(&bytes).map_err(|e| {
@@ -1138,15 +983,9 @@ impl<'a> ExecutionContext<'a> {
         tgt: NodeId,
         prop_map: &[(u32, Value)],
     ) -> Result<(), ExecutionError> {
-        let key = encode_edgeprop_key(edge_type, src, tgt);
-        let bytes = encode_edge_props(prop_map).map_err(|e| {
-            ExecutionError::Serialization(format!(
-                "edge prop {edge_type}/{}/{} encode: {e}",
-                src.as_raw(),
-                tgt.as_raw(),
-            ))
-        })?;
-        self.mvcc_put(Partition::EdgeProp, &key, &bytes)
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        self.sync_txn_state();
+        Ok(LocalEdgeStore.put_props(&mut self.txn, edge_type, src, tgt, None, prop_map)?)
     }
 
     /// MVCC-aware typed edge-property read at a specific temporal
@@ -1160,8 +999,16 @@ impl<'a> ExecutionContext<'a> {
         tgt: NodeId,
         valid_from_ms: i64,
     ) -> Result<Option<Vec<(u32, Value)>>, ExecutionError> {
-        let key = encode_temporal_edgeprop_key(edge_type, src, tgt, valid_from_ms);
-        let Some(bytes) = self.mvcc_get(Partition::EdgeProp, &key)? else {
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        self.sync_txn_state();
+        let Some(bytes) = LocalEdgeStore.get_props_raw_tracked(
+            &mut self.txn,
+            edge_type,
+            src,
+            tgt,
+            Some(valid_from_ms),
+        )?
+        else {
             return Ok(None);
         };
         let decoded = decode_edge_props(&bytes).map_err(|e| {
@@ -1201,15 +1048,16 @@ impl<'a> ExecutionContext<'a> {
         valid_from_ms: i64,
         prop_map: &[(u32, Value)],
     ) -> Result<(), ExecutionError> {
-        let key = encode_temporal_edgeprop_key(edge_type, src, tgt, valid_from_ms);
-        let bytes = encode_edge_props(prop_map).map_err(|e| {
-            ExecutionError::Serialization(format!(
-                "edge prop {edge_type}/{}/{} temporal@{valid_from_ms} encode: {e}",
-                src.as_raw(),
-                tgt.as_raw(),
-            ))
-        })?;
-        self.mvcc_put(Partition::EdgeProp, &key, &bytes)
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        self.sync_txn_state();
+        Ok(LocalEdgeStore.put_props(
+            &mut self.txn,
+            edge_type,
+            src,
+            tgt,
+            Some(valid_from_ms),
+            prop_map,
+        )?)
     }
 
     /// MVCC-aware typed edge-property write that branches on a
@@ -1239,8 +1087,105 @@ impl<'a> ExecutionContext<'a> {
         src: NodeId,
         tgt: NodeId,
     ) -> Result<(), ExecutionError> {
-        let key = encode_edgeprop_key(edge_type, src, tgt);
-        self.mvcc_delete(Partition::EdgeProp, &key)
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        self.sync_txn_state();
+        Ok(LocalEdgeStore.delete_props(&mut self.txn, edge_type, src, tgt, None)?)
+    }
+
+    /// Raw bytes of every temporal edge-property version for
+    /// `(edge_type, src, tgt)`, optionally bounded to `valid_from <= upper_ms`.
+    /// Delegates the key shape + scan to the Layer-4 store; the caller decodes.
+    pub fn mvcc_scan_edge_prop_version_bytes(
+        &mut self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        upper_ms: Option<i64>,
+    ) -> Result<Vec<(i64, Vec<u8>)>, ExecutionError> {
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        self.sync_txn_state();
+        Ok(LocalEdgeStore.scan_versions_raw_tracked(
+            &mut self.txn,
+            edge_type,
+            src,
+            tgt,
+            upper_ms,
+        )?)
+    }
+
+    /// Raw bytes of a single edge-property body (non-temporal or per-version).
+    /// Delegates the key shape to the Layer-4 store; the caller decodes.
+    pub fn mvcc_get_edge_prop_bytes(
+        &mut self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        valid_from_ms: Option<i64>,
+    ) -> Result<Option<Vec<u8>>, ExecutionError> {
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        self.sync_txn_state();
+        Ok(LocalEdgeStore.get_props_raw_tracked(
+            &mut self.txn,
+            edge_type,
+            src,
+            tgt,
+            valid_from_ms,
+        )?)
+    }
+
+    /// Move a non-temporal edge-property body from `(old_src, old_tgt)` to
+    /// `(new_src, new_tgt)` (edge-rewiring). Delegates to the Layer-4 store.
+    pub fn mvcc_move_edge_props(
+        &mut self,
+        edge_type: &str,
+        old_src: NodeId,
+        old_tgt: NodeId,
+        new_src: NodeId,
+        new_tgt: NodeId,
+    ) -> Result<(), ExecutionError> {
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        self.sync_txn_state();
+        Ok(LocalEdgeStore.move_props(
+            &mut self.txn,
+            edge_type,
+            old_src,
+            old_tgt,
+            new_src,
+            new_tgt,
+        )?)
+    }
+
+    /// Tombstone every temporal edge-property version of `(edge_type, src, tgt)`.
+    pub fn mvcc_delete_all_edge_prop_versions(
+        &mut self,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+    ) -> Result<(), ExecutionError> {
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        self.sync_txn_state();
+        Ok(LocalEdgeStore.delete_all_versions(&mut self.txn, edge_type, src, tgt)?)
+    }
+
+    /// Move every temporal edge-property version preserving each `valid_from`.
+    pub fn mvcc_transfer_all_edge_prop_versions(
+        &mut self,
+        edge_type: &str,
+        old_src: NodeId,
+        old_tgt: NodeId,
+        new_src: NodeId,
+        new_tgt: NodeId,
+    ) -> Result<(), ExecutionError> {
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        self.sync_txn_state();
+        Ok(LocalEdgeStore.transfer_all_versions(
+            &mut self.txn,
+            edge_type,
+            old_src,
+            old_tgt,
+            new_src,
+            new_tgt,
+        )?)
     }
 
     /// MVCC-aware typed edge-property delete at a specific temporal
@@ -1252,8 +1197,9 @@ impl<'a> ExecutionContext<'a> {
         tgt: NodeId,
         valid_from_ms: i64,
     ) -> Result<(), ExecutionError> {
-        let key = encode_temporal_edgeprop_key(edge_type, src, tgt, valid_from_ms);
-        self.mvcc_delete(Partition::EdgeProp, &key)
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        self.sync_txn_state();
+        Ok(LocalEdgeStore.delete_props(&mut self.txn, edge_type, src, tgt, Some(valid_from_ms))?)
     }
 
     /// MVCC-aware typed edge-property delete that branches on a
@@ -1315,8 +1261,8 @@ impl<'a> ExecutionContext<'a> {
     /// nested-path executors (e.g. `SET n.config.host = "x"`,
     /// `REMOVE n.tags[0]`).
     pub fn mvcc_merge_node_delta(&mut self, shard_id: u16, node_id: NodeId, operand: Vec<u8>) {
-        let key = encode_node_key(shard_id, node_id);
-        self.merge_node_deltas.push((key, operand));
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        LocalNodeStore.buffer_node_delta(&mut self.txn, shard_id, node_id, operand);
     }
 
     /// MVCC-aware typed node delete. Buffers a tombstone for the
@@ -1330,8 +1276,9 @@ impl<'a> ExecutionContext<'a> {
         shard_id: u16,
         node_id: NodeId,
     ) -> Result<(), ExecutionError> {
-        let key = encode_node_key(shard_id, node_id);
-        self.mvcc_delete(Partition::Node, &key)
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        self.sync_txn_state();
+        Ok(LocalNodeStore.delete(&mut self.txn, shard_id, node_id)?)
     }
 
     /// Flush MVCC write buffer to storage with a commit timestamp.
@@ -1353,417 +1300,62 @@ impl<'a> ExecutionContext<'a> {
     ///
     /// Returns the commit_ts used, or `ErrConflict` if a conflict is detected.
     pub fn mvcc_flush(&mut self) -> Result<Option<Timestamp>, ExecutionError> {
-        // Flush adj merge buffers even in legacy (no MVCC) mode.
-        // Legacy puts write directly to engine, but merge adds are buffered.
-        if self.mvcc_oracle.is_none() {
-            for (key, uids) in self.merge_adj_adds.drain() {
-                self.engine
-                    .merge(Partition::Adj, &key, &encode_add_batch(&uids))
-                    .map_err(ExecutionError::Storage)?;
-            }
-            for (key, uids) in self.merge_adj_removes.drain() {
-                for uid in uids {
-                    self.engine
-                        .merge(Partition::Adj, &key, &encode_remove(uid))
-                        .map_err(ExecutionError::Storage)?;
-                }
-            }
-            for (key, operand) in self.merge_node_deltas.drain(..) {
-                self.engine
-                    .merge(Partition::Node, &key, &operand)
-                    .map_err(ExecutionError::Storage)?;
-            }
-            return Ok(None); // Legacy mode — writes already applied
-        }
-        // SAFETY: checked is_none() above and returned early.
-        let oracle = match self.mvcc_oracle {
-            Some(o) => o,
-            None => return Ok(None),
+        // Push the executor's per-statement context (oracle, snapshot, read_ts)
+        // into the Layer-3 transaction, then delegate to the single commit
+        // locus (ADR-041): OCC validation, commit_ts assignment, write-concern
+        // fan-out, and the Raft proposal pipeline all live in `Transaction`.
+        self.sync_txn_state();
+        let write_concern = self.write_concern.clone();
+        let ctx = coordinode_storage::engine::transaction::CommitContext {
+            write_concern: &write_concern,
+            pipeline: self.proposal_pipeline,
+            id_gen: self.proposal_id_gen,
+            drain_buffer: self.drain_buffer,
+            nvme_write_buffer: self.nvme_write_buffer,
         };
-
-        let has_merge_ops = !self.merge_adj_adds.is_empty()
-            || !self.merge_adj_removes.is_empty()
-            || !self.merge_node_deltas.is_empty();
-        if self.mvcc_write_buffer.is_empty() && !has_merge_ops {
-            return Ok(Some(self.mvcc_read_ts)); // Read-only — no commit needed
-        }
-
-        let commit_ts = oracle.next();
-
-        // OCC conflict detection (ADR-016: native seqno-based).
-        // Delegated to Layer-3 — `coordinator.validate_occ` walks the
-        // scope's tracked keys, skips commutative partitions, and
-        // returns the first conflicting key. Detects all writes
-        // including ABA (write + revert to same value) via lsm-tree's
-        // `get_internal_entry` seqno inspection.
-        if let Some(scope) = self.occ_scope.as_ref() {
-            use coordinode_storage::engine::coordinator::MultiModalCoordinator;
-            if let Some(conflict) = self.engine.coordinator().validate_occ(scope)? {
-                return Err(ExecutionError::Conflict(format!(
-                    "OCC conflict: key in {:?} partition was modified by another \
-                     transaction after start_ts={}. Retry the transaction.",
-                    conflict.partition, conflict.read_ts,
-                )));
-            }
-        }
-
-        // Resolve effective write concern (j:true upgrades W0 → W1).
-        use coordinode_core::txn::write_concern::WriteConcernLevel;
-        let effective_level = self.write_concern.effective_level();
-
-        // Write concern W0 (fire-and-forget): apply directly to local storage
-        // without going through the proposal pipeline. No durability guarantee.
-        // Data visible locally but NOT replicated. Lost on crash.
-        //
-        // ADR-016: writes use plain engine.put()/delete() — no versioned key
-        // encoding. LSM seqno from OracleSeqnoGenerator provides native MVCC.
-        if effective_level == WriteConcernLevel::W0 {
-            for ((part, key), value) in self.mvcc_write_buffer.drain() {
-                match value {
-                    Some(v) => self.engine.put(part, &key, &v)?,
-                    None => self.engine.delete(part, &key)?,
-                }
-            }
-            // Apply adj merge operands directly to StorageEngine (raw keys).
-            for (key, uids) in self.merge_adj_adds.drain() {
-                self.engine
-                    .merge(Partition::Adj, &key, &encode_add_batch(&uids))
-                    .map_err(ExecutionError::Storage)?;
-            }
-            for (key, uids) in self.merge_adj_removes.drain() {
-                for uid in uids {
-                    self.engine
-                        .merge(Partition::Adj, &key, &encode_remove(uid))
-                        .map_err(ExecutionError::Storage)?;
-                }
-            }
-            for (key, operand) in self.merge_node_deltas.drain(..) {
-                self.engine
-                    .merge(Partition::Node, &key, &operand)
-                    .map_err(ExecutionError::Storage)?;
-            }
-            return Ok(Some(commit_ts));
-        }
-
-        // Write concern Memory/Cache (volatile with drain):
-        // 1. Apply locally for immediate read visibility (same as W0)
-        // 2. Buffer mutations in DrainBuffer for background Raft replication
-        // 3. Return immediately — drain thread handles durability
-        //
-        // Crash before drain = data lost (explicit contract).
-        // Drained entries preserve original commit_ts for CDC fidelity.
-        if effective_level.is_volatile() {
-            // Step 1: Apply locally for read visibility.
-            for ((part, key), value) in &self.mvcc_write_buffer {
-                match value {
-                    Some(v) => self.engine.put(*part, key, v)?,
-                    None => self.engine.delete(*part, key)?,
-                }
-            }
-            for (key, uids) in &self.merge_adj_adds {
-                self.engine
-                    .merge(Partition::Adj, key, &encode_add_batch(uids))
-                    .map_err(ExecutionError::Storage)?;
-            }
-            for (key, uids) in &self.merge_adj_removes {
-                for uid in uids {
-                    self.engine
-                        .merge(Partition::Adj, key, &encode_remove(*uid))
-                        .map_err(ExecutionError::Storage)?;
-                }
-            }
-            for (key, operand) in &self.merge_node_deltas {
-                self.engine
-                    .merge(Partition::Node, key, operand)
-                    .map_err(ExecutionError::Storage)?;
-            }
-
-            // Step 2: Buffer for drain (if drain buffer is available).
-            if let Some(drain_buf) = self.drain_buffer {
-                let mut mutations: Vec<Mutation> = self
-                    .mvcc_write_buffer
-                    .drain()
-                    .map(|((part, key), value)| match value {
-                        Some(v) => Mutation::Put {
-                            partition: partition_to_id(part),
-                            key,
-                            value: v,
-                        },
-                        None => Mutation::Delete {
-                            partition: partition_to_id(part),
-                            key,
-                        },
-                    })
-                    .collect();
-
-                for (key, uids) in self.merge_adj_adds.drain() {
-                    mutations.push(Mutation::Merge {
-                        partition: PartitionId::Adj,
-                        key,
-                        operand: encode_add_batch(&uids),
-                    });
-                }
-                for (key, uids) in self.merge_adj_removes.drain() {
-                    for uid in uids {
-                        mutations.push(Mutation::Merge {
-                            partition: PartitionId::Adj,
-                            key: key.clone(),
-                            operand: encode_remove(uid),
-                        });
-                    }
-                }
-                for (key, operand) in self.merge_node_deltas.drain(..) {
-                    mutations.push(Mutation::Merge {
-                        partition: PartitionId::Node,
-                        key,
-                        operand,
-                    });
-                }
-
-                let entry = coordinode_core::txn::drain::DrainEntry::new(
-                    mutations,
-                    commit_ts,
-                    self.mvcc_read_ts,
-                );
-
-                // w:cache: persist to NVMe before ACK for process-crash recovery.
-                // w:memory skips this — data loss on crash is the explicit contract.
-                if effective_level == WriteConcernLevel::Cache {
-                    if let Some(wb) = self.nvme_write_buffer {
-                        wb.append(&entry).map_err(|e| {
-                            ExecutionError::Serialization(format!("w:cache NVMe write failed: {e}"))
-                        })?;
-                    }
-                }
-
-                drain_buf.append(entry).map_err(|e| {
-                    ExecutionError::Serialization(format!("volatile write backpressure: {e}"))
-                })?;
-            } else {
-                // No drain buffer — clear write buffers (local writes already applied).
-                self.mvcc_write_buffer.clear();
-                self.merge_adj_adds.clear();
-                self.merge_adj_removes.clear();
-                self.merge_node_deltas.clear();
-            }
-
-            return Ok(Some(commit_ts));
-        }
-
-        // W1 / Majority: apply through proposal pipeline (or direct write).
-        //
-        // When a pipeline is configured, mutations are packaged into a
-        // RaftProposal and sent through the pipeline for durable application.
-        // In single-node mode (W1 and Majority are equivalent), the pipeline
-        // applies directly to CoordiNode storage. In cluster mode, Majority replicates
-        // via Raft first while W1 returns after leader WAL fsync.
-        //
-        // When no pipeline is configured (legacy/test mode), mutations are
-        // written directly to MvccEngine.
-        if let (Some(pipeline), Some(id_gen)) = (self.proposal_pipeline, self.proposal_id_gen) {
-            let mut mutations: Vec<Mutation> = self
-                .mvcc_write_buffer
-                .drain()
-                .map(|((part, key), value)| match value {
-                    Some(v) => Mutation::Put {
-                        partition: partition_to_id(part),
-                        key,
-                        value: v,
-                    },
-                    None => Mutation::Delete {
-                        partition: partition_to_id(part),
-                        key,
-                    },
-                })
-                .collect();
-
-            // Adj merge operands: bypass MVCC, raw keys.
-            for (key, uids) in self.merge_adj_adds.drain() {
-                mutations.push(Mutation::Merge {
-                    partition: PartitionId::Adj,
-                    key,
-                    operand: encode_add_batch(&uids),
-                });
-            }
-            for (key, uids) in self.merge_adj_removes.drain() {
-                for uid in uids {
-                    mutations.push(Mutation::Merge {
-                        partition: PartitionId::Adj,
-                        key: key.clone(),
-                        operand: encode_remove(uid),
-                    });
-                }
-            }
-            for (key, operand) in self.merge_node_deltas.drain(..) {
-                mutations.push(Mutation::Merge {
-                    partition: PartitionId::Node,
-                    key,
-                    operand,
-                });
-            }
-
-            let proposal = RaftProposal {
-                id: id_gen.next(),
-                mutations,
-                commit_ts,
-                start_ts: self.mvcc_read_ts,
-                bypass_rate_limiter: false,
-            };
-
-            // Apply write concern timeout if configured (wtimeout > 0).
-            //
-            // propose_with_timeout uses true async timeout in cluster mode
-            // (RaftProposalPipeline wraps propose_async with tokio::time::timeout).
-            // In embedded/single-node mode, the default impl delegates to
-            // propose_and_wait (proposals complete in µs, timeout irrelevant).
-            //
-            // Per MongoDB spec: "On timeout, data is NOT rolled back."
-            // The proposal may still commit after timeout fires.
-            let timeout_ms = self.write_concern.timeout_ms;
-            let outcome = if timeout_ms > 0 {
-                let timeout = std::time::Duration::from_millis(u64::from(timeout_ms));
-                pipeline
-                    .propose_with_timeout(&proposal, timeout)
-                    .map_err(proposal_err_to_execution)?
-            } else {
-                pipeline
-                    .propose_and_wait(&proposal)
-                    .map_err(proposal_err_to_execution)?
-            };
-            // Record the committed Raft index of this write so the gRPC
-            // layer can return it as the causal operationTime token. `None`
-            // in local/embedded mode (no Raft log). `max` (not assign): a
-            // statement may have issued an earlier in-execute proposal (e.g.
-            // CREATE VECTOR INDEX schema persist) whose index must remain
-            // covered — operationTime spans every Raft entry the statement
-            // produced. (`Option` orders `None < Some`.)
-            self.write_stats.applied_index =
-                self.write_stats.applied_index.max(outcome.applied_index);
-        } else {
-            // Legacy direct-write path (no pipeline configured).
-            // ADR-016: plain engine.put()/delete() — oracle auto-stamps seqno.
-            for ((part, key), value) in self.mvcc_write_buffer.drain() {
-                match value {
-                    Some(v) => self.engine.put(part, &key, &v)?,
-                    None => self.engine.delete(part, &key)?,
-                }
-            }
-            // Apply adj merge operands directly to StorageEngine (raw keys).
-            for (key, uids) in self.merge_adj_adds.drain() {
-                self.engine
-                    .merge(Partition::Adj, &key, &encode_add_batch(&uids))
-                    .map_err(ExecutionError::Storage)?;
-            }
-            for (key, uids) in self.merge_adj_removes.drain() {
-                for uid in uids {
-                    self.engine
-                        .merge(Partition::Adj, &key, &encode_remove(uid))
-                        .map_err(ExecutionError::Storage)?;
-                }
-            }
-            for (key, operand) in self.merge_node_deltas.drain(..) {
-                self.engine
-                    .merge(Partition::Node, &key, &operand)
-                    .map_err(ExecutionError::Storage)?;
-            }
-        }
-
-        // Journal gate (j:true): force WAL fsync after commit.
-        // With FlushPolicy::SyncPerBatch this is already done by WriteBatch,
-        // but with Periodic/Manual policies, j:true forces an explicit persist.
-        if self.write_concern.journal {
-            self.engine
-                .persist()
-                .map_err(|e| ExecutionError::Serialization(format!("journal fsync failed: {e}")))?;
-        }
-
-        Ok(Some(commit_ts))
+        let outcome = self.txn.commit(&ctx).map_err(commit_err_to_execution)?;
+        // operationTime spans every Raft entry the statement produced — `max`,
+        // not assign: a statement may have issued an earlier in-execute
+        // proposal (e.g. CREATE VECTOR INDEX schema persist) whose index must
+        // remain covered. (`Option` orders `None < Some`.)
+        self.write_stats.applied_index = self.write_stats.applied_index.max(outcome.applied_index);
+        Ok(outcome.commit_ts)
     }
 
     /// Materialize pending node merge deltas for a key into the write buffer.
     ///
-    /// Called lazily from `mvcc_get()` to ensure RYOW correctness: if a
-    /// transaction wrote merge operands (SET n.config.x = y) and later reads
-    /// the same node, the pending deltas must be visible.
+    /// Called lazily from the generic `mvcc_get()` primitive. Production node
+    /// reads materialise deltas inside `LocalNodeStore` (ADR-041).
     fn materialize_node_deltas(&mut self, node_key: &[u8]) -> Result<(), ExecutionError> {
-        // Collect matching deltas.
-        let matching: Vec<Vec<u8>> = self
-            .merge_node_deltas
-            .iter()
-            .filter(|(k, _)| k == node_key)
-            .map(|(_, op)| op.clone())
-            .collect();
-
-        if matching.is_empty() {
-            return Ok(());
-        }
-
-        // Remove materialized deltas from the buffer.
-        self.merge_node_deltas.retain(|(k, _)| k != node_key);
-
-        // Read current node value (from write buffer or storage).
-        let buf_key = (Partition::Node, node_key.to_vec());
-        let current = if let Some(buffered) = self.mvcc_write_buffer.get(&buf_key) {
-            buffered.clone()
-        } else if let Some(ref snap) = self.mvcc_snapshot {
-            self.engine
-                .snapshot_get(snap, Partition::Node, node_key)?
-                .map(|b| b.to_vec())
-        } else {
-            self.engine
-                .get(Partition::Node, node_key)?
-                .map(|b| b.to_vec())
-        };
-
-        let mut record = match current {
-            Some(ref bytes) => NodeRecord::from_msgpack(bytes)
-                .map_err(|e| ExecutionError::Serialization(format!("RYOW node decode: {e}")))?,
-            None => NodeRecord::new(""),
-        };
-
-        // Apply each pending delta.
-        for operand in &matching {
-            if let Ok(delta) = coordinode_core::graph::doc_delta::DocDelta::decode(&operand[1..]) {
-                match delta.target() {
-                    coordinode_core::graph::doc_delta::PathTarget::PropField(field_id) => {
-                        let mut doc = match record.props.get(field_id) {
-                            Some(v) => v.to_rmpv(),
-                            None => rmpv::Value::Map(Vec::new()),
-                        };
-                        delta.apply(&mut doc);
-                        record.set(
-                            *field_id,
-                            coordinode_core::graph::types::Value::Document(doc),
-                        );
-                    }
-                    coordinode_core::graph::doc_delta::PathTarget::Extra => {
-                        // Extra-targeted deltas handled by merge function, not here.
-                    }
-                }
-            }
-        }
-
-        let new_bytes = record
-            .to_msgpack()
-            .map_err(|e| ExecutionError::Serialization(format!("RYOW node encode: {e}")))?;
-        self.mvcc_write_buffer.insert(buf_key, Some(new_bytes));
-        Ok(())
+        // Node-delta read-your-own-writes lives in Layer-4 LocalNodeStore
+        // (node-modality concern); the modality-agnostic transaction does not
+        // own it (ADR-041).
+        Ok(
+            coordinode_modality::LocalNodeStore::materialize_pending_deltas(
+                &mut self.txn,
+                node_key,
+            )?,
+        )
     }
 
     /// MVCC-aware prefix scan: returns deduplicated (user_key, value) pairs
     /// visible at the current snapshot timestamp.
     ///
     /// In legacy mode, returns raw prefix scan results as (key, value) pairs.
+    ///
+    /// Generic test-access primitive (see [`Self::mvcc_get`]).
     pub fn mvcc_prefix_scan(
         &mut self,
         part: Partition,
         prefix: &[u8],
     ) -> Result<Vec<KvPair>, ExecutionError> {
+        self.sync_txn_state();
         // RYOW for pending node merge deltas: materialize all matching keys
         // into write buffer so the scan sees up-to-date values.
-        if part == Partition::Node && !self.merge_node_deltas.is_empty() {
+        if part == Partition::Node && !self.txn.node_deltas().is_empty() {
             let matching_keys: Vec<Vec<u8>> = self
-                .merge_node_deltas
+                .txn
+                .node_deltas()
                 .iter()
                 .filter(|(k, _)| k.starts_with(prefix))
                 .map(|(k, _)| k.clone())
@@ -1774,83 +1366,21 @@ impl<'a> ExecutionContext<'a> {
                 self.materialize_node_deltas(&key)?;
             }
         }
-
-        // Check write buffer for matching entries (read-your-own-writes)
-        let mut buffer_matches: Vec<KvPair> = Vec::new();
-        for ((p, key), value) in &self.mvcc_write_buffer {
-            if *p == part && key.starts_with(prefix) {
-                if let Some(v) = value {
-                    buffer_matches.push((key.clone(), v.clone()));
-                }
-            }
-        }
-
-        if let Some(ref snap) = self.mvcc_snapshot {
-            // Native seqno MVCC scan via snapshot (ADR-016)
-            let scan_results = self.engine.snapshot_prefix_scan(snap, part, prefix)?;
-            let mut results: Vec<KvPair> = scan_results
-                .into_iter()
-                .map(|(k, v)| (k, v.to_vec()))
-                .collect();
-
-            // Track all scanned keys in the Layer-3 OCC scope.
-            // Keys from the write buffer are our own writes — NOT tracked.
-            let buffer_keys: HashSet<Vec<u8>> =
-                buffer_matches.iter().map(|(k, _)| k.clone()).collect();
-            if let Some(scope) = self.ensure_occ_scope() {
-                for (k, _) in &results {
-                    if !buffer_keys.contains(k) {
-                        scope.track(part, k);
-                    }
-                }
-            }
-
-            // Merge buffer matches (buffer takes priority)
-            results.retain(|(k, _)| !buffer_keys.contains(k));
-            results.extend(buffer_matches);
-            Ok(results)
-        } else {
-            let iter = self.engine.prefix_scan(part, prefix)?;
-            let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            for guard in iter {
-                let (k, v) = guard
-                    .into_inner()
-                    .map_err(|e| ExecutionError::Storage(e.into()))?;
-                results.push((k.to_vec(), v.to_vec()));
-            }
-            // Add buffer matches
-            results.extend(buffer_matches);
-            Ok(results)
-        }
+        // Buffer overlay + snapshot scan + OCC tracking, owned by the Layer-3
+        // transaction.
+        Ok(self.txn.prefix_scan(part, prefix)?)
     }
 
-    // ── Adj partition: raw merge operators (no MVCC key versioning) ──
-
-    /// Record an edge add via merge operator (no read required).
-    ///
-    /// Buffers the UID for batch encoding at flush time. Also handles
-    /// read-your-own-writes: subsequent traversals in this transaction
-    /// will see the added edge.
-    pub fn adj_merge_add(&mut self, adj_key: &[u8], uid: u64) {
-        self.merge_adj_adds
-            .entry(adj_key.to_vec())
-            .or_default()
-            .push(uid);
-    }
-
-    /// Record an edge remove via merge operator (no read required).
-    pub fn adj_merge_remove(&mut self, adj_key: &[u8], uid: u64) {
-        self.merge_adj_removes
-            .entry(adj_key.to_vec())
-            .or_default()
-            .push(uid);
-    }
+    // ── Adj partition: raw posting read (test-only) ──
+    // Production adjacency access goes through the typed EdgeStore methods
+    // (posting_fwd/rev, posting_for_key, merge_add_fwd/rev, …) — no raw adj
+    // key or `Partition::Adj` in the query layer (ADR-041).
 
     /// Read an adjacency posting list (raw key, no MVCC timestamp).
     ///
     /// Reads the latest merged value from StorageEngine, then applies
     /// pending adds/removes from this transaction's merge buffer
-    /// (read-your-own-writes).
+    /// (read-your-own-writes). Generic test-access primitive.
     pub fn adj_get(&self, adj_key: &[u8]) -> Result<Option<PostingList>, ExecutionError> {
         // RYOW for buffered tombstones / puts on the adj key. When a prior
         // operation in this transaction wrote (`mvcc_put`) or deleted
@@ -1861,11 +1391,10 @@ impl<'a> ExecutionContext<'a> {
         // Read-only traversals carry an empty write buffer, so probe it only
         // when it holds something: that skips a per-read key `Vec` allocation
         // on the adjacency hot path (the lookup key owns its bytes).
-        let buffered = if self.mvcc_write_buffer.is_empty() {
+        let buffered = if self.txn.write_buffer_is_empty() {
             None
         } else {
-            self.mvcc_write_buffer
-                .get(&(Partition::Adj, adj_key.to_vec()))
+            self.txn.buffered(Partition::Adj, adj_key)
         };
 
         // Parse the base posting list directly from the borrowed bytes in every
@@ -1879,16 +1408,10 @@ impl<'a> ExecutionContext<'a> {
             Some(Some(bytes)) => PostingList::from_bytes(bytes)
                 .map_err(|e| ExecutionError::Serialization(format!("posting list: {e}")))?,
             None => {
-                // No buffered overlay — read base posting list from storage.
-                // When adj_snapshot is set (AS OF TIMESTAMP), read through the
-                // snapshot so merge operands written after the snapshot are
-                // invisible.
-                let fetched = if let Some(snap) = &self.adj_snapshot {
-                    self.engine.snapshot_get(snap, Partition::Adj, adj_key)?
-                } else {
-                    self.engine.get(Partition::Adj, adj_key)?
-                };
-                match fetched {
+                // No buffered overlay — read base posting list from storage
+                // through the Layer-3 adjacency base read (snapshot-aware when
+                // adj_snapshot is set, e.g. AS OF TIMESTAMP).
+                match self.txn.adj_base_get(adj_key)? {
                     Some(b) => PostingList::from_bytes(&b)
                         .map_err(|e| ExecutionError::Serialization(format!("posting list: {e}")))?,
                     None => PostingList::new(),
@@ -1897,13 +1420,13 @@ impl<'a> ExecutionContext<'a> {
         };
 
         // Apply pending adds from this transaction (read-your-own-writes).
-        if let Some(adds) = self.merge_adj_adds.get(adj_key) {
+        if let Some(adds) = self.txn.merge_adj_adds().get(adj_key) {
             for &uid in adds {
                 plist.insert(uid);
             }
         }
         // Apply pending removes from this transaction.
-        if let Some(removes) = self.merge_adj_removes.get(adj_key) {
+        if let Some(removes) = self.txn.merge_adj_removes().get(adj_key) {
             for &uid in removes {
                 plist.remove(uid);
             }
@@ -1930,7 +1453,8 @@ impl<'a> ExecutionContext<'a> {
         edge_type: &str,
         src: NodeId,
     ) -> Result<Option<PostingList>, ExecutionError> {
-        self.adj_get(&encode_adj_key_forward(edge_type, src))
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        Ok(LocalEdgeStore.posting_fwd(&self.txn, edge_type, src)?)
     }
 
     /// Reverse-adjacency read (`tgt`'s in-neighbours for `edge_type`).
@@ -1939,27 +1463,32 @@ impl<'a> ExecutionContext<'a> {
         edge_type: &str,
         tgt: NodeId,
     ) -> Result<Option<PostingList>, ExecutionError> {
-        self.adj_get(&encode_adj_key_reverse(edge_type, tgt))
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        Ok(LocalEdgeStore.posting_rev(&self.txn, edge_type, tgt)?)
     }
 
     /// Buffer a forward-adjacency add (`src` gains out-neighbour `uid`).
     pub fn adj_merge_add_fwd(&mut self, edge_type: &str, src: NodeId, uid: u64) {
-        self.adj_merge_add(&encode_adj_key_forward(edge_type, src), uid);
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        LocalEdgeStore.merge_add_fwd(&mut self.txn, edge_type, src, uid);
     }
 
     /// Buffer a reverse-adjacency add (`tgt` gains in-neighbour `uid`).
     pub fn adj_merge_add_rev(&mut self, edge_type: &str, tgt: NodeId, uid: u64) {
-        self.adj_merge_add(&encode_adj_key_reverse(edge_type, tgt), uid);
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        LocalEdgeStore.merge_add_rev(&mut self.txn, edge_type, tgt, uid);
     }
 
     /// Buffer a forward-adjacency remove (`src` loses out-neighbour `uid`).
     pub fn adj_merge_remove_fwd(&mut self, edge_type: &str, src: NodeId, uid: u64) {
-        self.adj_merge_remove(&encode_adj_key_forward(edge_type, src), uid);
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        LocalEdgeStore.merge_remove_fwd(&mut self.txn, edge_type, src, uid);
     }
 
     /// Buffer a reverse-adjacency remove (`tgt` loses in-neighbour `uid`).
     pub fn adj_merge_remove_rev(&mut self, edge_type: &str, tgt: NodeId, uid: u64) {
-        self.adj_merge_remove(&encode_adj_key_reverse(edge_type, tgt), uid);
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        LocalEdgeStore.merge_remove_rev(&mut self.txn, edge_type, tgt, uid);
     }
 
     /// Buffered wholesale delete of a node's forward posting list. Goes
@@ -1970,7 +1499,9 @@ impl<'a> ExecutionContext<'a> {
         edge_type: &str,
         src: NodeId,
     ) -> Result<(), ExecutionError> {
-        self.mvcc_delete(Partition::Adj, &encode_adj_key_forward(edge_type, src))
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        self.sync_txn_state();
+        Ok(LocalEdgeStore.delete_adj_fwd(&mut self.txn, edge_type, src)?)
     }
 
     /// Buffered wholesale delete of a node's reverse posting list.
@@ -1979,7 +1510,9 @@ impl<'a> ExecutionContext<'a> {
         edge_type: &str,
         tgt: NodeId,
     ) -> Result<(), ExecutionError> {
-        self.mvcc_delete(Partition::Adj, &encode_adj_key_reverse(edge_type, tgt))
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        self.sync_txn_state();
+        Ok(LocalEdgeStore.delete_adj_rev(&mut self.txn, edge_type, tgt)?)
     }
 
     /// Buffered wholesale purge of a node's posting list on `dir`, plus
@@ -1993,14 +1526,9 @@ impl<'a> ExecutionContext<'a> {
         node: NodeId,
         dir: AdjDirection,
     ) -> Result<(), ExecutionError> {
-        let key = match dir {
-            AdjDirection::Out => encode_adj_key_forward(edge_type, node),
-            AdjDirection::In => encode_adj_key_reverse(edge_type, node),
-        };
-        self.mvcc_delete(Partition::Adj, &key)?;
-        self.merge_adj_adds.remove(&key);
-        self.merge_adj_removes.remove(&key);
-        Ok(())
+        use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+        self.sync_txn_state();
+        Ok(LocalEdgeStore.purge_adj(&mut self.txn, edge_type, node, dir == AdjDirection::Out)?)
     }
 
     /// MVCC-aware idempotent edge-type registration. Writes the empty
@@ -2012,15 +1540,10 @@ impl<'a> ExecutionContext<'a> {
     /// read on the Layer-3 OCC path (schema reads are not commutative, so
     /// they must participate in conflict detection).
     pub fn mvcc_register_edge_type(&mut self, edge_type: &str) -> Result<(), ExecutionError> {
-        let et_key = edge_type_schema_key(edge_type);
-        let already_registered = self
-            .mvcc_write_buffer
-            .contains_key(&(Partition::Schema, et_key.clone()))
-            || self.mvcc_get(Partition::Schema, &et_key)?.is_some();
-        if !already_registered {
-            self.mvcc_put(Partition::Schema, &et_key, b"")?;
-        }
-        Ok(())
+        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        self.sync_txn_state();
+        Ok(LocalSchemaStore::new(self.engine)
+            .register_edge_type_marker(&mut self.txn, edge_type)?)
     }
 
     /// MVCC-aware existence probe for an edge type. `true` if either the
@@ -2029,79 +1552,32 @@ impl<'a> ExecutionContext<'a> {
     /// through the OCC-tracked snapshot path. Hides `Partition::Schema`
     /// from DDL call sites.
     pub fn mvcc_edge_type_exists(&mut self, name: &str) -> Result<bool, ExecutionError> {
-        let pointer_key = encode_edge_type_current_revision_key(name);
-        if self.mvcc_get(Partition::Schema, &pointer_key)?.is_some() {
-            return Ok(true);
-        }
-        let marker_key = encode_edge_type_schema_key(name, 1);
-        Ok(self.mvcc_get(Partition::Schema, &marker_key)?.is_some())
+        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        self.sync_txn_state();
+        Ok(LocalSchemaStore::new(self.engine).edge_type_exists(&mut self.txn, name)?)
     }
 
     /// Raw prefix scan on adj: partition (no MVCC timestamp filtering).
     ///
     /// Returns (raw_key, raw_value) pairs.
     pub fn adj_prefix_scan(&self, prefix: &[u8]) -> Result<Vec<KvPair>, ExecutionError> {
-        // When adj_snapshot is set (AS OF TIMESTAMP or statement-level snapshot),
-        // read through the snapshot so merge operands written after it are invisible.
-        if let Some(snap) = &self.adj_snapshot {
-            let entries = self
-                .engine
-                .snapshot_prefix_scan(snap, Partition::Adj, prefix)?;
-            Ok(entries.into_iter().map(|(k, v)| (k, v.to_vec())).collect())
-        } else {
-            let iter = self.engine.prefix_scan(Partition::Adj, prefix)?;
-            let mut results = Vec::new();
-            for guard in iter {
-                let (k, v) = guard
-                    .into_inner()
-                    .map_err(|e| ExecutionError::Storage(e.into()))?;
-                results.push((k.to_vec(), v.to_vec()));
-            }
-            Ok(results)
-        }
+        // Snapshot-aware base adjacency scan lives at Layer 3 (reads through the
+        // adjacency snapshot when set, so post-snapshot merge operands stay
+        // invisible).
+        Ok(self.txn.adj_base_prefix_scan(prefix)?)
     }
 
     /// Return all edge type names registered in the Schema partition.
     ///
     /// Used by DETACH DELETE to build targeted adj key lookups instead of
     /// scanning every adj: key in the database.
-    pub(crate) fn list_edge_types(&self) -> Result<Vec<String>, ExecutionError> {
-        // The schema partition now holds version-prefixed keys
-        // `schema:edge_type:<name>:<version>`. To enumerate distinct edge
-        // types we strip the trailing `:<version>` suffix and dedup.
-        // Names cannot contain `:` (DDL grammar restricts identifiers), so
-        // the rightmost ':' delimiter is unambiguous.
-        const PREFIX: &[u8] = b"schema:edge_type:";
-        let iter = self.engine.prefix_scan(Partition::Schema, PREFIX)?;
-        let mut types: Vec<String> = Vec::new();
-        let extract_name = |key: &[u8]| -> Option<String> {
-            let suffix = key.get(PREFIX.len()..)?;
-            let suffix_str = std::str::from_utf8(suffix).ok()?;
-            let (name, _version) = suffix_str.rsplit_once(':')?;
-            Some(name.to_string())
-        };
-        for guard in iter {
-            let (k, _) = guard
-                .into_inner()
-                .map_err(|e| ExecutionError::Storage(e.into()))?;
-            if let Some(name) = extract_name(&k) {
-                if !types.contains(&name) {
-                    types.push(name);
-                }
-            }
-        }
-        // Include edge types registered in this transaction's write buffer
-        // (not yet flushed to the engine — covers same-tx CREATE + DETACH DELETE).
-        for (part, key) in self.mvcc_write_buffer.keys() {
-            if *part == Partition::Schema && key.starts_with(PREFIX) {
-                if let Some(name) = extract_name(key) {
-                    if !types.contains(&name) {
-                        types.push(name);
-                    }
-                }
-            }
-        }
-        Ok(types)
+    pub(crate) fn list_edge_types(&mut self) -> Result<Vec<String>, ExecutionError> {
+        // Layer-4 SchemaStore owns the edge-type key shape; the tracked scan
+        // overlays this transaction's write buffer, so same-tx
+        // CREATE + DETACH DELETE sees freshly-registered types.
+        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        self.sync_txn_state();
+        Ok(LocalSchemaStore::new(self.engine).list_edge_type_names(&mut self.txn)?)
     }
 }
 
@@ -2217,13 +1693,19 @@ pub fn execute(
 
     // Take a storage snapshot for statement-level adj: partition consistency.
     // When mvcc_snapshot is set, reuse it for adj reads too (same point-in-time).
-    if ctx.adj_snapshot.is_none() {
-        if let Some(ref snap) = ctx.mvcc_snapshot {
-            ctx.adj_snapshot = Some(*snap);
+    if ctx.txn.adj_snapshot().is_none() {
+        if let Some(snap) = ctx.mvcc_snapshot {
+            ctx.txn.set_adj_snapshot(Some(snap));
         } else {
-            ctx.adj_snapshot = Some(ctx.engine.snapshot());
+            let snap = ctx.engine.snapshot();
+            ctx.txn.set_adj_snapshot(Some(snap));
         }
     }
+
+    // Pin the Layer-3 transaction to the statement snapshot/oracle/read_ts now,
+    // so even `&self` reads (e.g. schema peeks) that go through the store see
+    // the same point-in-time as the executor's `mvcc_snapshot` field.
+    ctx.sync_txn_state();
 
     // Handle AS OF TIMESTAMP: evaluate the timestamp expression, override snapshots.
     // Since commit_ts = seqno (ADR-016, OracleSeqnoGenerator), the timestamp value
@@ -2271,7 +1753,8 @@ pub fn execute(
             let seqno = ts as u64;
             if let Some(snap) = ctx.engine.snapshot_at(seqno) {
                 ctx.mvcc_snapshot = Some(snap);
-                ctx.adj_snapshot = Some(snap);
+                ctx.txn.set_adj_snapshot(Some(snap));
+                ctx.txn.set_snapshot(Some(snap));
             }
         }
     }
@@ -2791,8 +2274,9 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                     if let Some(id_val) = row.get("_node_id") {
                         if let Some(id) = id_val.as_int() {
                             use coordinode_modality::NodeStore as _;
-                            let nodes = coordinode_modality::LocalNodeStore::new(ctx.engine);
+                            let nodes = coordinode_modality::LocalNodeStore;
                             match nodes.get_at_seqno(
+                                &ctx.txn,
                                 ctx.shard_id,
                                 coordinode_core::graph::node::NodeId::from_raw(id as u64),
                                 *snap,
@@ -3249,12 +2733,12 @@ fn execute_node_scan(
 ) -> Result<Vec<Row>, ExecutionError> {
     let mut results = Vec::new();
 
-    // Scan all nodes in the shard using prefix scan.
-    let prefix = encode_node_key(ctx.shard_id, NodeId::from_raw(0));
-    // Use just the shard prefix (everything before the node ID)
-    let prefix_bytes = &prefix[..8];
-
-    let scan_results = ctx.mvcc_prefix_scan(Partition::Node, prefix_bytes)?;
+    // Scan all nodes in the shard using prefix scan. The Layer-4 store owns
+    // the node-key shape; the query layer just runs the tracked prefix scan.
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let prefix_bytes = LocalNodeStore.shard_scan_prefix(ctx.shard_id);
+    ctx.sync_txn_state();
+    let scan_results = LocalNodeStore.prefix_scan_tracked(&mut ctx.txn, &prefix_bytes)?;
 
     for (key_bytes, value_bytes) in &scan_results {
         let record = NodeRecord::from_msgpack(value_bytes).map_err(|e| {
@@ -3376,12 +2860,12 @@ fn execute_btree_index_scan(
     let mut results = Vec::with_capacity(node_ids.len());
 
     use coordinode_modality::NodeStore as _;
-    let nodes = coordinode_modality::LocalNodeStore::new(ctx.engine);
+    let nodes = coordinode_modality::LocalNodeStore;
     for raw_id in node_ids {
         let node_id = NodeId::from_raw(raw_id);
 
         // Fetch the node record.
-        let record_opt = nodes.get(ctx.shard_id, node_id)?;
+        let record_opt = nodes.get(&ctx.txn, ctx.shard_id, node_id)?;
 
         let Some(record) = record_opt else {
             // Node was deleted since the index entry was created — skip stale entry.
@@ -3473,11 +2957,11 @@ fn execute_hnsw_scan(
     };
 
     use coordinode_modality::NodeStore as _;
-    let nodes = coordinode_modality::LocalNodeStore::new(ctx.engine);
+    let nodes = coordinode_modality::LocalNodeStore;
     let mut results = Vec::with_capacity(hits.len());
     for hit in hits {
         let node_id = NodeId::from_raw(hit.id);
-        let Some(record) = nodes.get(ctx.shard_id, node_id)? else {
+        let Some(record) = nodes.get(&ctx.txn, ctx.shard_id, node_id)? else {
             // Node deleted after the index entry was written — skip.
             continue;
         };
@@ -3598,17 +3082,18 @@ fn expand_one_hop(
     // Avoids N_edge_types × N_directions heap allocations per traversal step.
     let mut adj_key = Vec::with_capacity(64);
 
+    use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
     for (et_idx, edge_type) in edge_types.iter().enumerate() {
         match direction {
             Direction::Outgoing | Direction::Both => {
-                write_adj_key_forward(edge_type, src_id, &mut adj_key);
+                LocalEdgeStore.write_fwd_key(&mut adj_key, edge_type, src_id);
             }
             Direction::Incoming => {
-                write_adj_key_reverse(edge_type, src_id, &mut adj_key);
+                LocalEdgeStore.write_rev_key(&mut adj_key, edge_type, src_id);
             }
         }
 
-        if let Some(posting_list) = ctx.adj_get(&adj_key)? {
+        if let Some(posting_list) = LocalEdgeStore.posting_for_key(&ctx.txn, &adj_key)? {
             let fan_out = posting_list.len();
             // Reserve the whole fan-out up front so a high-degree node does not
             // repeatedly reallocate `neighbors` mid-expansion (super-node path).
@@ -3635,8 +3120,8 @@ fn expand_one_hop(
         }
 
         if direction == Direction::Both {
-            write_adj_key_reverse(edge_type, src_id, &mut adj_key);
-            if let Some(posting_list) = ctx.adj_get(&adj_key)? {
+            LocalEdgeStore.write_rev_key(&mut adj_key, edge_type, src_id);
+            if let Some(posting_list) = LocalEdgeStore.posting_for_key(&ctx.txn, &adj_key)? {
                 neighbors.reserve(posting_list.len());
                 for tgt_uid in posting_list.iter() {
                     neighbors.push((tgt_uid, et_idx));
@@ -3691,8 +3176,10 @@ fn build_target_rows(
     // Collect (record, optional valid_from) pairs to emit. Non-temporal
     // path produces one pair; temporal path produces one per version.
     let target_records: Vec<(NodeRecord, Option<i64>)> = if target_is_temporal {
-        let prefix = coordinode_core::graph::node::temporal_node_id_prefix(ctx.shard_id, target_id);
-        let scanned = ctx.mvcc_prefix_scan(Partition::Node, &prefix)?;
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        let prefix = LocalNodeStore.version_prefix(ctx.shard_id, target_id);
+        ctx.sync_txn_state();
+        let scanned = LocalNodeStore.prefix_scan_tracked(&mut ctx.txn, &prefix)?;
         if scanned.is_empty() {
             return Ok(Vec::new());
         }
@@ -3789,22 +3276,24 @@ fn build_target_rows(
             };
 
             if trp.edge_is_temporal {
-                let prefix = temporal_edgeprop_pair_prefix(et, ep_src, ep_tgt);
-                let scanned = ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)?;
-                let versions: Vec<_> =
-                    if let Some(upper_ms) = params.temporal_filter.and_then(|tf| tf.upper_ms) {
-                        let bound = coordinode_core::graph::edge::valid_from_upper_bound_key(
-                            et, ep_src, ep_tgt, upper_ms,
-                        );
-                        scanned.into_iter().filter(|(k, _)| k < &bound).collect()
-                    } else {
-                        scanned
-                    };
+                // Layer-4 store owns the temporal edgeprop key shape + scan;
+                // returns (valid_from, raw props bytes) so the query layer
+                // projects fields (and keeps the props-decode contract).
+                use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+                ctx.sync_txn_state();
+                let upper_ms = params.temporal_filter.and_then(|tf| tf.upper_ms);
+                let versions = LocalEdgeStore.scan_versions_raw_tracked(
+                    &mut ctx.txn,
+                    et,
+                    ep_src,
+                    ep_tgt,
+                    upper_ms,
+                )?;
                 let mut acc: Vec<Row> =
                     Vec::with_capacity(materialised_rows.len() * versions.len());
                 if !versions.is_empty() {
                     for base in &materialised_rows {
-                        for (key, ep_bytes) in &versions {
+                        for (vf, ep_bytes) in &versions {
                             let mut version_row = base.clone();
                             version_row
                                 .insert(format!("{ev}.__type__"), Value::String(et.to_string()));
@@ -3817,11 +3306,7 @@ fn build_target_rows(
                                 format!("{ev}.__tgt__"),
                                 Value::Int(ep_tgt.as_raw() as i64),
                             );
-                            if let Some((_, _, _, vf)) =
-                                coordinode_core::graph::edge::decode_temporal_edgeprop_key(key)
-                            {
-                                version_row.insert(format!("{ev}.valid_from"), Value::Int(vf));
-                            }
+                            version_row.insert(format!("{ev}.valid_from"), Value::Int(*vf));
                             if let Ok(prop_map) = decode_edge_props(ep_bytes) {
                                 for (field_id, value) in prop_map {
                                     if let Some(field_name) = ctx.interner.resolve(field_id) {
@@ -3951,22 +3436,23 @@ fn process_targets_parallel(
         .flat_map_iter(|chunk| {
             chunk.iter().filter_map(|(src_uid, tgt_uid, et_idx)| {
                 let target_id = NodeId::from_raw(*tgt_uid);
-                let target_key = encode_node_key(pctx.shard_id, target_id);
 
-                // Read node record (direct engine access, thread-safe)
-                let bytes = if let Some(snap) = pctx.mvcc_snapshot {
-                    pctx.engine
-                        .snapshot_get(&snap, Partition::Node, &target_key)
-                        .ok()?
-                } else {
-                    pctx.engine.get(Partition::Node, &target_key).ok()?
-                };
+                // Stateless snapshot read through the Layer-4 store: the
+                // snapshot seqno (a Copy value) is the shared unit across
+                // rayon workers, so no &mut Transaction crosses threads. The
+                // store owns key encoding and hands the key back for OCC.
+                use coordinode_modality::{LocalNodeStore, NodeStore as _};
+                let (target_key, bytes) = LocalNodeStore
+                    .read_at_snapshot(pctx.engine, pctx.mvcc_snapshot, pctx.shard_id, target_id)
+                    .ok()?;
                 let bytes = bytes?;
 
-                // Track Node key in OCC read-set (G067)
+                // Track the node key in the OCC read-set: each worker records
+                // into the shared accumulator; merged into the statement's
+                // read-set after the parallel section.
                 if let Some(ref keys) = pctx.occ_read_keys {
                     if let Ok(mut guard) = keys.lock() {
-                        guard.push((Partition::Node, target_key.to_vec()));
+                        guard.push((Partition::Node, target_key));
                     }
                 }
 
@@ -4036,16 +3522,21 @@ fn process_targets_parallel(
                                 format!("{ev}.__tgt__"),
                                 Value::Int(ep_tgt.as_raw() as i64),
                             );
-                            let ep_key = encode_edgeprop_key(et, ep_src, ep_tgt);
-                            let ep_bytes = if let Some(snap) = pctx.mvcc_snapshot {
-                                pctx.engine
-                                    .snapshot_get(&snap, Partition::EdgeProp, &ep_key)
-                                    .ok()
-                                    .flatten()
-                            } else {
-                                pctx.engine.get(Partition::EdgeProp, &ep_key).ok().flatten()
-                            };
-                            // Track EdgeProp key in OCC read-set (G067)
+                            // Stateless snapshot read via the Layer-4 store
+                            // (Variant A): shared snapshot seqno, no &mut txn
+                            // across rayon threads; the store returns the key
+                            // for the worker's OCC accumulator.
+                            use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+                            let (ep_key, ep_bytes) = LocalEdgeStore
+                                .edgeprop_at_snapshot(
+                                    pctx.engine,
+                                    pctx.mvcc_snapshot,
+                                    et,
+                                    ep_src,
+                                    ep_tgt,
+                                )
+                                .unwrap_or((Vec::new(), None));
+                            // Track the EdgeProp key in the OCC read-set.
                             if let Some(ref keys) = pctx.occ_read_keys {
                                 if let Ok(mut guard) = keys.lock() {
                                     guard.push((Partition::EdgeProp, ep_key));
@@ -7641,11 +7132,11 @@ fn check_single_hop_exists(
                 for (tgt_uid, _) in &neighbors {
                     let tgt_id = NodeId::from_raw(*tgt_uid);
                     if dst_is_temporal {
-                        let prefix = coordinode_core::graph::node::temporal_node_id_prefix(
-                            ctx.shard_id,
-                            tgt_id,
-                        );
-                        for (_k, data) in ctx.mvcc_prefix_scan(Partition::Node, &prefix)? {
+                        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+                        let prefix = LocalNodeStore.version_prefix(ctx.shard_id, tgt_id);
+                        ctx.sync_txn_state();
+                        let versions = LocalNodeStore.prefix_scan_tracked(&mut ctx.txn, &prefix)?;
+                        for (_k, data) in versions {
                             if let Ok(record) = NodeRecord::from_msgpack(&data) {
                                 if dst_node.labels.iter().all(|l| record.labels.contains(l)) {
                                     return Ok(true);
@@ -7998,8 +7489,6 @@ fn execute_upsert(
 
             // Pass 2: create edges (all node IDs now in row)
             let mut edge_results = Vec::new();
-            // Single buffer reused across all relationship patterns in this pass.
-            let mut edge_key_buf = Vec::with_capacity(64);
             for row in &new_results {
                 let mut current_row = row.clone();
                 for (i, element) in elements.iter().enumerate() {
@@ -8039,13 +7528,10 @@ fn execute_upsert(
 
                         let edge_type = rp.rel_types.first().cloned().unwrap_or_default();
 
-                        // Forward posting list (merge operator, no read needed).
-                        write_adj_key_forward(&edge_type, source_id, &mut edge_key_buf);
-                        ctx.adj_merge_add(&edge_key_buf, target_id.as_raw());
-
-                        // Reverse posting list (merge operator, no read needed).
-                        write_adj_key_reverse(&edge_type, target_id, &mut edge_key_buf);
-                        ctx.adj_merge_add(&edge_key_buf, source_id.as_raw());
+                        // Forward + reverse posting lists (commutative merge,
+                        // no read needed) via the typed Layer-4 store.
+                        ctx.adj_merge_add_fwd(&edge_type, source_id, target_id.as_raw());
+                        ctx.adj_merge_add_rev(&edge_type, target_id, source_id.as_raw());
                         ctx.write_stats.edges_created += 1;
 
                         // Fire BEFORE COMMIT CREATE triggers on the new
@@ -8658,8 +8144,6 @@ fn execute_create_edge(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let mut results = Vec::new();
-    // Single buffer reused for forward and reverse key writes across all rows.
-    let mut edge_key = Vec::with_capacity(64);
 
     // Check if the edge type is registered as temporal. Temporal edges require
     // a `valid_from` property at write time so every version can be keyed by
@@ -8687,13 +8171,9 @@ fn execute_create_edge(
             _ => continue,
         };
 
-        // Forward posting list: source -> targets (merge operator, no read needed).
-        write_adj_key_forward(edge_type, source_id, &mut edge_key);
-        ctx.adj_merge_add(&edge_key, target_id.as_raw());
-
-        // Reverse posting list: target <- sources (merge operator, no read needed).
-        write_adj_key_reverse(edge_type, target_id, &mut edge_key);
-        ctx.adj_merge_add(&edge_key, source_id.as_raw());
+        // Forward + reverse posting lists (commutative merge) via the store.
+        ctx.adj_merge_add_fwd(edge_type, source_id, target_id.as_raw());
+        ctx.adj_merge_add_rev(edge_type, target_id, source_id.as_raw());
         ctx.write_stats.edges_created += 1;
 
         // Register edge type in schema (idempotent marker) ONLY if no entry
@@ -10751,23 +10231,22 @@ fn execute_delete(
                             > = Vec::new();
                             if !matched_edge_delete.is_empty() {
                                 if is_temporal {
-                                    let prefix = temporal_edgeprop_pair_prefix(
+                                    for (_vf, bytes) in ctx.mvcc_scan_edge_prop_version_bytes(
                                         &parts.edge_type,
                                         ep_src,
                                         ep_tgt,
-                                    );
-                                    for (_k, bytes) in
-                                        ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)?
-                                    {
+                                        None,
+                                    )? {
                                         edge_delete_snapshots
                                             .push(decode_edgeprop_into_map(&bytes, ctx));
                                     }
                                 } else {
-                                    let ep_key =
-                                        encode_edgeprop_key(&parts.edge_type, ep_src, ep_tgt);
-                                    if let Some(bytes) =
-                                        ctx.mvcc_get(Partition::EdgeProp, &ep_key)?
-                                    {
+                                    if let Some(bytes) = ctx.mvcc_get_edge_prop_bytes(
+                                        &parts.edge_type,
+                                        ep_src,
+                                        ep_tgt,
+                                        None,
+                                    )? {
                                         edge_delete_snapshots
                                             .push(decode_edgeprop_into_map(&bytes, ctx));
                                     } else {
@@ -10778,16 +10257,13 @@ fn execute_delete(
                             }
 
                             if is_temporal {
-                                let prefix =
-                                    temporal_edgeprop_pair_prefix(&parts.edge_type, ep_src, ep_tgt);
-                                let versions =
-                                    ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)?;
-                                for (vkey, _) in versions {
-                                    ctx.mvcc_delete(Partition::EdgeProp, &vkey)?;
-                                }
+                                ctx.mvcc_delete_all_edge_prop_versions(
+                                    &parts.edge_type,
+                                    ep_src,
+                                    ep_tgt,
+                                )?;
                             } else {
-                                let ep_key = encode_edgeprop_key(&parts.edge_type, ep_src, ep_tgt);
-                                ctx.mvcc_delete(Partition::EdgeProp, &ep_key)?;
+                                ctx.mvcc_delete_edge_props(&parts.edge_type, ep_src, ep_tgt)?;
                             }
 
                             // Fire edge-DELETE triggers per snapshotted version.
@@ -10993,26 +10469,15 @@ fn execute_merge_nodes(
             continue;
         }
 
-        let target_key = encode_node_key(ctx.shard_id, target_id);
-        let source_key = encode_node_key(ctx.shard_id, source_id);
-
         // Source missing → no-op (idempotent: already merged in a prior attempt).
-        let source_bytes = match ctx.mvcc_get(Partition::Node, &source_key)? {
-            Some(b) => b,
-            None => {
-                out.push(row.clone());
-                continue;
-            }
+        let Some(source_rec) = ctx.mvcc_get_node(ctx.shard_id, source_id)? else {
+            out.push(row.clone());
+            continue;
         };
         // Target missing → hard error (the surviving node must exist).
-        let target_bytes = ctx.mvcc_get(Partition::Node, &target_key)?.ok_or_else(|| {
+        let mut target_rec = ctx.mvcc_get_node(ctx.shard_id, target_id)?.ok_or_else(|| {
             ExecutionError::Unsupported(format!("MERGE NODES target node {target_id} not found"))
         })?;
-
-        let mut target_rec = NodeRecord::from_msgpack(&target_bytes)
-            .map_err(|e| ExecutionError::Serialization(format!("target decode: {e}")))?;
-        let source_rec = NodeRecord::from_msgpack(&source_bytes)
-            .map_err(|e| ExecutionError::Serialization(format!("source decode: {e}")))?;
 
         // Capture target's properties BEFORE merge so we can issue per-property
         // index notifications afterwards (delete-old / insert-new).
@@ -11119,10 +10584,7 @@ fn execute_merge_nodes(
         )?;
 
         // Persist merged target record.
-        let new_bytes = target_rec
-            .to_msgpack()
-            .map_err(|e| ExecutionError::Serialization(format!("target encode: {e}")))?;
-        ctx.mvcc_put(Partition::Node, &target_key, &new_bytes)?;
+        ctx.mvcc_put_node(ctx.shard_id, target_id, &target_rec)?;
         ctx.write_stats.properties_set += 1;
 
         // Fire BEFORE COMMIT UPDATE triggers on the merged target node's
@@ -11587,21 +11049,9 @@ fn transfer_edgeprop_record(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<(), ExecutionError> {
     if temporal {
-        // Temporal edge type: prefix-scan every version, copy, then delete.
-        let old_prefix = temporal_edgeprop_pair_prefix(edge_type, old_src, old_tgt);
-        let versions = ctx.mvcc_prefix_scan(Partition::EdgeProp, &old_prefix)?;
-        for (old_key, bytes) in versions {
-            // Suffix after pair prefix encodes the version timestamp; preserve it.
-            let suffix = &old_key[old_prefix.len()..];
-            let mut new_key = temporal_edgeprop_pair_prefix(edge_type, new_src, new_tgt);
-            new_key.extend_from_slice(suffix);
-            // Skip if a record with the new key already exists — temporal
-            // duplicates at the same version-ts collapse to the existing one.
-            if ctx.mvcc_get(Partition::EdgeProp, &new_key)?.is_none() {
-                ctx.mvcc_put(Partition::EdgeProp, &new_key, &bytes)?;
-            }
-            ctx.mvcc_delete(Partition::EdgeProp, &old_key)?;
-        }
+        // Temporal edge type: move every version (preserving valid_from) via
+        // the Layer-4 store, then return.
+        ctx.mvcc_transfer_all_edge_prop_versions(edge_type, old_src, old_tgt, new_src, new_tgt)?;
         return Ok(());
     }
 
@@ -11654,14 +11104,9 @@ fn delete_edgeprop_for_pair(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<(), ExecutionError> {
     if temporal {
-        let prefix = temporal_edgeprop_pair_prefix(edge_type, src, tgt);
-        let versions = ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)?;
-        for (k, _) in versions {
-            ctx.mvcc_delete(Partition::EdgeProp, &k)?;
-        }
+        ctx.mvcc_delete_all_edge_prop_versions(edge_type, src, tgt)?;
     } else {
-        let key = encode_edgeprop_key(edge_type, src, tgt);
-        ctx.mvcc_delete(Partition::EdgeProp, &key)?;
+        ctx.mvcc_delete_edge_props(edge_type, src, tgt)?;
     }
     Ok(())
 }
@@ -11772,8 +11217,9 @@ fn detach_delete_node(
                     Vec::new();
                 if !matched_edge_delete.is_empty() {
                     if temporal {
-                        let prefix = temporal_edgeprop_pair_prefix(edge_type, ep_src, ep_tgt);
-                        for (_k, bytes) in ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)? {
+                        for (_vf, bytes) in
+                            ctx.mvcc_scan_edge_prop_version_bytes(edge_type, ep_src, ep_tgt, None)?
+                        {
                             edge_delete_snapshots.push(decode_edgeprop_into_map(&bytes, ctx));
                         }
                     } else if let Some(prop_map) =
@@ -12246,13 +11692,8 @@ fn create_single_edge(
     edge_type: &str,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<(), ExecutionError> {
-    let mut edge_key = Vec::with_capacity(64);
-
-    write_adj_key_forward(edge_type, src, &mut edge_key);
-    ctx.adj_merge_add(&edge_key, tgt.as_raw());
-
-    write_adj_key_reverse(edge_type, tgt, &mut edge_key);
-    ctx.adj_merge_add(&edge_key, src.as_raw());
+    ctx.adj_merge_add_fwd(edge_type, src, tgt.as_raw());
+    ctx.adj_merge_add_rev(edge_type, tgt, src.as_raw());
 
     ctx.write_stats.edges_created += 1;
 
@@ -12414,13 +11855,8 @@ fn transfer_edges_on_node(
                 ctx.adj_merge_add_fwd(edge_type, target_id, peer_uid);
                 ctx.adj_merge_add_rev(edge_type, peer_id, target_id.as_raw());
 
-                // Move edge properties.
-                let old_ep = encode_edgeprop_key(edge_type, source_id, peer_id);
-                if let Some(ep_bytes) = ctx.mvcc_get(Partition::EdgeProp, &old_ep)? {
-                    let new_ep = encode_edgeprop_key(edge_type, target_id, peer_id);
-                    ctx.mvcc_put(Partition::EdgeProp, &new_ep, &ep_bytes)?;
-                    ctx.mvcc_delete(Partition::EdgeProp, &old_ep)?;
-                }
+                // Move edge properties (Layer-4 store owns key shape + body move).
+                ctx.mvcc_move_edge_props(edge_type, source_id, peer_id, target_id, peer_id)?;
             }
         }
 
@@ -12434,12 +11870,7 @@ fn transfer_edges_on_node(
                 ctx.adj_merge_add_rev(edge_type, target_id, peer_uid);
                 ctx.adj_merge_add_fwd(edge_type, peer_id, target_id.as_raw());
 
-                let old_ep = encode_edgeprop_key(edge_type, peer_id, source_id);
-                if let Some(ep_bytes) = ctx.mvcc_get(Partition::EdgeProp, &old_ep)? {
-                    let new_ep = encode_edgeprop_key(edge_type, peer_id, target_id);
-                    ctx.mvcc_put(Partition::EdgeProp, &new_ep, &ep_bytes)?;
-                    ctx.mvcc_delete(Partition::EdgeProp, &old_ep)?;
-                }
+                ctx.mvcc_move_edge_props(edge_type, peer_id, source_id, peer_id, target_id)?;
             }
         }
     }
@@ -12583,14 +12014,11 @@ fn execute_attach_document(
         }
 
         // --- 2. Read source node (always non-temporal here) ---
-        let source_key = encode_node_key(ctx.shard_id, source_id);
-        let source_bytes = ctx.mvcc_get(Partition::Node, &source_key)?.ok_or_else(|| {
+        let source_record = ctx.mvcc_get_node(ctx.shard_id, source_id)?.ok_or_else(|| {
             ExecutionError::Unsupported(format!(
                 "ATTACH DOCUMENT: source node {source_id} not found"
             ))
         })?;
-        let source_record = NodeRecord::from_msgpack(&source_bytes)
-            .map_err(|e| ExecutionError::Serialization(format!("node decode: {e}")))?;
 
         // --- 3. Package source properties as a DOCUMENT ---
         let doc = source_record_to_document(&source_record, ctx.interner);
@@ -12806,8 +12234,7 @@ fn delete_single_edge(
     let mut delete_snapshots: Vec<std::collections::BTreeMap<String, Value>> = Vec::new();
     if !matched_delete.is_empty() {
         if is_temporal {
-            let prefix = temporal_edgeprop_pair_prefix(edge_type, src, tgt);
-            for (_k, bytes) in ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)? {
+            for (_vf, bytes) in ctx.mvcc_scan_edge_prop_version_bytes(edge_type, src, tgt, None)? {
                 delete_snapshots.push(decode_edgeprop_into_map(&bytes, ctx));
             }
         } else if let Some(prop_map) = ctx.mvcc_get_edge_props(edge_type, src, tgt)? {
@@ -12821,16 +12248,7 @@ fn delete_single_edge(
     }
 
     if is_temporal {
-        // Snapshot every version key under the pair prefix, then delete each.
-        // Version-key delete still goes through the raw mvcc_delete because the
-        // suffix is harvested from the prefix scan rather than reconstructed
-        // from a (vf) value — keeping the bytes-form delete here is the
-        // direct expression of "drop whatever versions exist for this pair".
-        let prefix = temporal_edgeprop_pair_prefix(edge_type, src, tgt);
-        let versions = ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)?;
-        for (key, _) in versions {
-            ctx.mvcc_delete(Partition::EdgeProp, &key)?;
-        }
+        ctx.mvcc_delete_all_edge_prop_versions(edge_type, src, tgt)?;
     } else {
         ctx.mvcc_delete_edge_props(edge_type, src, tgt)?;
     }
@@ -12942,9 +12360,12 @@ fn cascade_delete_source_node(
                         Vec::new();
                     if !matched_edge_delete.is_empty() {
                         if is_temporal {
-                            let prefix =
-                                temporal_edgeprop_pair_prefix(&parts.edge_type, ep_src, ep_tgt);
-                            for (_k, bytes) in ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)? {
+                            for (_vf, bytes) in ctx.mvcc_scan_edge_prop_version_bytes(
+                                &parts.edge_type,
+                                ep_src,
+                                ep_tgt,
+                                None,
+                            )? {
                                 edge_delete_snapshots.push(decode_edgeprop_into_map(&bytes, ctx));
                             }
                         } else if let Some(prop_map) =
@@ -12958,15 +12379,9 @@ fn cascade_delete_source_node(
                     }
 
                     if is_temporal {
-                        let prefix =
-                            temporal_edgeprop_pair_prefix(&parts.edge_type, ep_src, ep_tgt);
-                        let versions = ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)?;
-                        for (vkey, _) in versions {
-                            ctx.mvcc_delete(Partition::EdgeProp, &vkey)?;
-                        }
+                        ctx.mvcc_delete_all_edge_prop_versions(&parts.edge_type, ep_src, ep_tgt)?;
                     } else {
-                        let ep_key = encode_edgeprop_key(&parts.edge_type, ep_src, ep_tgt);
-                        ctx.mvcc_delete(Partition::EdgeProp, &ep_key)?;
+                        ctx.mvcc_delete_edge_props(&parts.edge_type, ep_src, ep_tgt)?;
                     }
 
                     if !matched_edge_delete.is_empty() {
@@ -13076,24 +12491,22 @@ fn load_current_label_schema_from_engine(
     engine: &StorageEngine,
     name: &str,
 ) -> Option<LabelSchema> {
-    let pointer_key = encode_label_current_revision_key(name);
-    let pointer = engine.get(Partition::Schema, &pointer_key).ok().flatten()?;
-    let revision_array: [u8; 8] = pointer.as_ref().try_into().ok()?;
-    let revision = u64::from_be_bytes(revision_array);
-    let schema_key = encode_label_schema_key(name, revision);
-    let bytes = engine.get(Partition::Schema, &schema_key).ok().flatten()?;
-    LabelSchema::from_msgpack(&bytes).ok()
+    use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+    // Best-effort engine-direct (untracked) read: any error → None.
+    LocalSchemaStore::new(engine)
+        .load_label(name)
+        .ok()
+        .flatten()
 }
 
-/// Build the Schema-partition key for a given edge type name.
+/// Build the Schema-partition key for a given edge type name (test fixtures
+/// that plant/inspect raw edge-type markers). Production code goes through
+/// [`coordinode_modality::SchemaStore`].
 ///
-/// Format: `schema:edge_type:<name>`
+/// Format: `schema:edge_type:<name>:1`
+#[cfg(test)]
 fn edge_type_schema_key(edge_type: &str) -> Vec<u8> {
-    // Aligns with the canonical version-prefixed key (`schema:edge_type:<name>:<version>`)
-    // — see `encode_edge_type_schema_key`. CE deployments only ever have
-    // version 1; the existence marker pattern used by `list_edge_types`
-    // expects this format so prefix scans match real schemas.
-    encode_edge_type_schema_key(edge_type, 1)
+    coordinode_core::schema::definition::encode_edge_type_schema_key(edge_type, 1)
 }
 
 /// Look up whether an edge type was declared with the TEMPORAL modifier.
@@ -13212,20 +12625,9 @@ pub(crate) fn temporal_pair_remaining_versions(
     target_id: NodeId,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<usize, ExecutionError> {
-    let prefix = temporal_edgeprop_pair_prefix(edge_type, source_id, target_id);
-    let scan = ctx.mvcc_prefix_scan(Partition::EdgeProp, &prefix)?;
-    let mut remaining = 0_usize;
-    for (key, _) in scan {
-        let tombstoned = matches!(
-            ctx.mvcc_write_buffer
-                .get(&(Partition::EdgeProp, key.clone())),
-            Some(None)
-        );
-        if !tombstoned {
-            remaining += 1;
-        }
-    }
-    Ok(remaining)
+    use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+    ctx.sync_txn_state();
+    Ok(LocalEdgeStore.count_live_versions(&mut ctx.txn, edge_type, source_id, target_id)?)
 }
 
 /// Test-only helper preserved for legacy tests that build edgeprop
@@ -13240,8 +12642,10 @@ pub(crate) fn edgeprop_write_key(
     valid_from_ms: Option<i64>,
 ) -> Vec<u8> {
     match valid_from_ms {
-        Some(vf) => encode_temporal_edgeprop_key(edge_type, source_id, target_id, vf),
-        None => encode_edgeprop_key(edge_type, source_id, target_id),
+        Some(vf) => coordinode_core::graph::edge::encode_temporal_edgeprop_key(
+            edge_type, source_id, target_id, vf,
+        ),
+        None => coordinode_core::graph::edge::encode_edgeprop_key(edge_type, source_id, target_id),
     }
 }
 
@@ -13665,21 +13069,22 @@ fn append_to_trigger_index(
     event_segment: &str,
     name: &str,
 ) -> Result<(), ExecutionError> {
-    use coordinode_core::schema::triggers::encode_trigger_index_key;
-    let key = encode_trigger_index_key(target_segment, event_segment);
-    let mut names: Vec<String> = match ctx.mvcc_get(Partition::Schema, &key)? {
-        Some(bytes) => rmp_serde::from_slice(&bytes).map_err(|e| {
-            ExecutionError::Serialization(format!(
-                "trigger_index decode for {target_segment}/{event_segment}: {e}"
-            ))
-        })?,
-        None => Vec::new(),
-    };
+    use coordinode_modality::{LocalTriggerStore, TriggerStore as _};
+    ctx.sync_txn_state();
+    let mut names: Vec<String> =
+        match LocalTriggerStore.get_index(&mut ctx.txn, target_segment, event_segment)? {
+            Some(bytes) => rmp_serde::from_slice(&bytes).map_err(|e| {
+                ExecutionError::Serialization(format!(
+                    "trigger_index decode for {target_segment}/{event_segment}: {e}"
+                ))
+            })?,
+            None => Vec::new(),
+        };
     if !names.iter().any(|n| n == name) {
         names.push(name.to_string());
         let bytes = rmp_serde::to_vec(&names)
             .map_err(|e| ExecutionError::Serialization(format!("trigger_index encode: {e}")))?;
-        ctx.mvcc_put(Partition::Schema, &key, &bytes)?;
+        LocalTriggerStore.put_index(&mut ctx.txn, target_segment, event_segment, &bytes)?;
     }
     Ok(())
 }
@@ -13691,24 +13096,25 @@ fn remove_from_trigger_index(
     event_segment: &str,
     name: &str,
 ) -> Result<(), ExecutionError> {
-    use coordinode_core::schema::triggers::encode_trigger_index_key;
-    let key = encode_trigger_index_key(target_segment, event_segment);
-    let mut names: Vec<String> = match ctx.mvcc_get(Partition::Schema, &key)? {
-        Some(bytes) => rmp_serde::from_slice(&bytes)
-            .map_err(|e| ExecutionError::Serialization(format!("trigger_index decode: {e}")))?,
-        None => return Ok(()),
-    };
+    use coordinode_modality::{LocalTriggerStore, TriggerStore as _};
+    ctx.sync_txn_state();
+    let mut names: Vec<String> =
+        match LocalTriggerStore.get_index(&mut ctx.txn, target_segment, event_segment)? {
+            Some(bytes) => rmp_serde::from_slice(&bytes)
+                .map_err(|e| ExecutionError::Serialization(format!("trigger_index decode: {e}")))?,
+            None => return Ok(()),
+        };
     let before = names.len();
     names.retain(|n| n != name);
     if names.len() == before {
         return Ok(());
     }
     if names.is_empty() {
-        ctx.mvcc_delete(Partition::Schema, &key)?;
+        LocalTriggerStore.delete_index(&mut ctx.txn, target_segment, event_segment)?;
     } else {
         let bytes = rmp_serde::to_vec(&names)
             .map_err(|e| ExecutionError::Serialization(format!("trigger_index encode: {e}")))?;
-        ctx.mvcc_put(Partition::Schema, &key, &bytes)?;
+        LocalTriggerStore.put_index(&mut ctx.txn, target_segment, event_segment, &bytes)?;
     }
     Ok(())
 }
@@ -13732,10 +13138,14 @@ fn execute_create_trigger(
     c: &crate::cypher::ast::CreateTriggerClause,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    use coordinode_core::schema::triggers::{encode_trigger_key, TriggerSchema};
+    use coordinode_core::schema::triggers::TriggerSchema;
+    use coordinode_modality::{LocalTriggerStore, TriggerStore as _};
 
-    let key = encode_trigger_key(&c.name);
-    if ctx.mvcc_get(Partition::Schema, &key)?.is_some() {
+    ctx.sync_txn_state();
+    if LocalTriggerStore
+        .get_definition(&mut ctx.txn, &c.name)?
+        .is_some()
+    {
         return Err(ExecutionError::Conflict(format!(
             "trigger `{}` already exists; use DROP TRIGGER first or ALTER it",
             c.name
@@ -13762,7 +13172,7 @@ fn execute_create_trigger(
     };
     let bytes = rmp_serde::to_vec(&schema)
         .map_err(|e| ExecutionError::Serialization(format!("trigger `{}` encode: {e}", c.name)))?;
-    ctx.mvcc_put(Partition::Schema, &key, &bytes)?;
+    LocalTriggerStore.put_definition(&mut ctx.txn, &c.name, &bytes)?;
 
     for event_seg in events_schema.enabled_segments() {
         append_to_trigger_index(ctx, &target_segment, event_seg, &c.name)?;
@@ -13778,10 +13188,11 @@ fn execute_drop_trigger(
     name: &str,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    use coordinode_core::schema::triggers::{encode_trigger_key, TriggerSchema};
+    use coordinode_core::schema::triggers::TriggerSchema;
+    use coordinode_modality::{LocalTriggerStore, TriggerStore as _};
 
-    let key = encode_trigger_key(name);
-    let bytes = match ctx.mvcc_get(Partition::Schema, &key)? {
+    ctx.sync_txn_state();
+    let bytes = match LocalTriggerStore.get_definition(&mut ctx.txn, name)? {
         Some(b) => b,
         None => {
             return Err(ExecutionError::Unsupported(format!(
@@ -13795,7 +13206,7 @@ fn execute_drop_trigger(
     for event_seg in schema.events.enabled_segments() {
         remove_from_trigger_index(ctx, &target_segment, event_seg, name)?;
     }
-    ctx.mvcc_delete(Partition::Schema, &key)?;
+    LocalTriggerStore.delete_definition(&mut ctx.txn, name)?;
 
     let mut row = Row::new();
     row.insert("name".into(), Value::String(name.into()));
@@ -13804,22 +13215,14 @@ fn execute_drop_trigger(
 }
 
 fn execute_show_triggers(ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>, ExecutionError> {
-    use coordinode_core::schema::triggers::{trigger_scan_prefix, TriggerSchema};
+    use coordinode_core::schema::triggers::TriggerSchema;
+    use coordinode_modality::{LocalTriggerStore, TriggerStore as _};
 
-    let prefix = trigger_scan_prefix();
-    let scanned = ctx.mvcc_prefix_scan(Partition::Schema, prefix)?;
+    ctx.sync_txn_state();
+    let scanned = LocalTriggerStore.scan_definitions(&mut ctx.txn)?;
 
     let mut rows: Vec<Row> = Vec::new();
-    for (k, v) in scanned {
-        // Defensive: `mvcc_prefix_scan` with `schema:trigger:` (15 bytes with
-        // trailing colon) already excludes the index family
-        // `schema:trigger_index:…` because the byte after `schema:trigger` is
-        // `_` there vs `:` for definitions. Skip anything that does not start
-        // with our exact prefix anyway in case the underlying scan ever
-        // changes its semantics.
-        if !k.starts_with(prefix) || k.len() == prefix.len() {
-            continue;
-        }
+    for (_k, v) in scanned {
         let schema: TriggerSchema = match rmp_serde::from_slice(&v) {
             Ok(s) => s,
             Err(_) => continue,
@@ -13874,10 +13277,11 @@ fn execute_alter_trigger(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     use crate::cypher::ast::AlterTriggerAction;
-    use coordinode_core::schema::triggers::{encode_trigger_key, TriggerSchema};
+    use coordinode_core::schema::triggers::TriggerSchema;
+    use coordinode_modality::{LocalTriggerStore, TriggerStore as _};
 
-    let key = encode_trigger_key(&c.name);
-    let bytes = match ctx.mvcc_get(Partition::Schema, &key)? {
+    ctx.sync_txn_state();
+    let bytes = match LocalTriggerStore.get_definition(&mut ctx.txn, &c.name)? {
         Some(b) => b,
         None => {
             return Err(ExecutionError::Unsupported(format!(
@@ -13914,7 +13318,7 @@ fn execute_alter_trigger(
 
     let bytes = rmp_serde::to_vec(&schema)
         .map_err(|e| ExecutionError::Serialization(format!("trigger `{}` encode: {e}", c.name)))?;
-    ctx.mvcc_put(Partition::Schema, &key, &bytes)?;
+    LocalTriggerStore.put_definition(&mut ctx.txn, &c.name, &bytes)?;
 
     let mut row = Row::new();
     row.insert("name".into(), Value::String(c.name.clone()));
@@ -14215,8 +13619,7 @@ fn execute_create_text_index(
     let schema_key = def.schema_key();
     let bytes = rmp_serde::to_vec(&def)
         .map_err(|e| ExecutionError::Unsupported(format!("serialize index def: {e}")))?;
-    ctx.mvcc_write_buffer
-        .insert((Partition::Schema, schema_key), Some(bytes));
+    ctx.mvcc_put(Partition::Schema, &schema_key, &bytes)?;
 
     // Register in text index registry (creates tantivy directory + empty index).
     registry
@@ -14302,8 +13705,7 @@ fn execute_drop_text_index(
 
     // Remove from schema: partition.
     let schema_key = def.schema_key();
-    ctx.mvcc_write_buffer
-        .insert((Partition::Schema, schema_key), None);
+    ctx.mvcc_delete(Partition::Schema, &schema_key)?;
 
     let mut row = Row::new();
     row.insert("index".to_string(), Value::String(name.to_string()));
@@ -14324,10 +13726,11 @@ fn execute_create_encrypted_index(
     // Store the index definition keyed by name for easy DROP lookup.
     let schema_key = format!("encrypted_index:{name}");
     let meta = format!("{{\"name\":\"{name}\",\"label\":\"{label}\",\"property\":\"{property}\"}}");
-    ctx.mvcc_write_buffer.insert(
-        (Partition::Schema, schema_key.into_bytes()),
-        Some(meta.into_bytes()),
-    );
+    ctx.mvcc_put(
+        Partition::Schema,
+        &schema_key.into_bytes(),
+        &meta.into_bytes(),
+    )?;
 
     let mut row = Row::new();
     row.insert("index".to_string(), Value::String(name.to_string()));
@@ -14348,8 +13751,7 @@ fn execute_drop_encrypted_index(
     // For now, write a tombstone for the known key pattern.
     // A full implementation would scan the schema partition.
     let tombstone_key = format!("encrypted_index:{name}");
-    ctx.mvcc_write_buffer
-        .insert((Partition::Schema, tombstone_key.into_bytes()), None);
+    ctx.mvcc_delete(Partition::Schema, &tombstone_key.into_bytes())?;
 
     let mut row = Row::new();
     row.insert("index".to_string(), Value::String(name.to_string()));
@@ -14693,8 +14095,7 @@ fn execute_drop_vector_index(
 
     // Tombstone the schema definition key.
     let schema_key = def.schema_key();
-    ctx.mvcc_write_buffer
-        .insert((Partition::Schema, schema_key), None);
+    ctx.mvcc_delete(Partition::Schema, &schema_key)?;
 
     // Remove from in-memory registry.
     registry.unregister(&label, &property);
@@ -14895,38 +14296,27 @@ fn execute_procedure_call(
     Ok(rows)
 }
 
-/// Map a [`ProposalError`] from the proposal pipeline into an
-/// [`ExecutionError`] preserving the typed `CapacityExhausted`
-/// variant. Without this, the gRPC handler would see a generic
-/// `Internal` Status for a capacity-exhausted write rather than the
-/// gRPC-canonical `RESOURCE_EXHAUSTED` (and the operator-actionable
-/// `endpoint-id` / `used-bytes` / `hard-limit-bytes` metadata
-/// headers would never be set).
-///
-/// Maps:
-/// - `ProposalError::CapacityExhausted { .. }` →
-///   `ExecutionError::Storage(StorageError::CapacityExhausted { .. })`
-///   so the type survives the next `DatabaseError::Execution(...)`
-///   wrap. The server's `db_err_to_status` already drills into both
-///   `Storage` and `Execution` variants when resolving capacity.
-/// - Everything else → `ExecutionError::Serialization(...)` with the
-///   stringified pipeline error (legacy behaviour).
-fn proposal_err_to_execution(err: ProposalError) -> ExecutionError {
-    if let ProposalError::CapacityExhausted {
-        endpoint_id,
-        used_bytes,
-        hard_limit_bytes,
-    } = err
-    {
-        return ExecutionError::Storage(
-            coordinode_storage::error::StorageError::CapacityExhausted {
-                endpoint_id,
-                used_bytes,
-                hard_limit_bytes,
-            },
-        );
+/// Map a Layer-3 [`CommitError`](coordinode_storage::engine::transaction::CommitError)
+/// from [`Transaction::commit`](coordinode_storage::engine::transaction::Transaction::commit)
+/// into an [`ExecutionError`], preserving the typed `CapacityExhausted`
+/// variant. Without this, the gRPC handler would see a generic `Internal`
+/// Status for a capacity-exhausted write rather than the gRPC-canonical
+/// `RESOURCE_EXHAUSTED` (and the operator-actionable `endpoint-id` /
+/// `used-bytes` / `hard-limit-bytes` metadata headers would never be set).
+/// The structured `CapacityExhausted` survives because `Transaction::commit`
+/// already folds the pipeline's `ProposalError::CapacityExhausted` into a
+/// `CommitError::Storage(StorageError::CapacityExhausted { .. })`, which this
+/// mapping forwards verbatim; the server's `db_err_to_status` drills into both
+/// `Storage` and `Execution` variants when resolving capacity.
+fn commit_err_to_execution(
+    err: coordinode_storage::engine::transaction::CommitError,
+) -> ExecutionError {
+    use coordinode_storage::engine::transaction::CommitError;
+    match err {
+        CommitError::Conflict(msg) => ExecutionError::Conflict(msg),
+        CommitError::Storage(e) => ExecutionError::Storage(e),
+        CommitError::Serialization(msg) => ExecutionError::Serialization(msg),
     }
-    ExecutionError::Serialization(format!("proposal pipeline error: {err}"))
 }
 
 #[cfg(test)]
@@ -14934,8 +14324,13 @@ fn proposal_err_to_execution(err: ProposalError) -> ExecutionError {
 mod tests {
     use super::*;
     use crate::cypher::ast::BinaryOperator;
+    // Adjacency key encoders are no longer used by production code in this
+    // module (the typed EdgeStore wrappers own them) — only test fixtures
+    // that plant/inspect raw adj posting lists need them.
+    use coordinode_core::graph::edge::{
+        encode_adj_key_forward, encode_adj_key_reverse, encode_edgeprop_key,
+    };
     use coordinode_core::graph::node::NodeRecord;
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     use coordinode_storage::engine::config::{
         Durability, EndpointConfig, Media, StorageConfig, Tier,
     };
@@ -14965,15 +14360,82 @@ mod tests {
         props: &[(&str, Value)],
         interner: &mut FieldInterner,
     ) {
-        use coordinode_modality::{LocalNodeStore, NodeStore as _};
         let mut record = NodeRecord::new(label);
         for (name, value) in props {
             let field_id = interner.intern(name);
             record.set(field_id, value.clone());
         }
-        LocalNodeStore::new(engine)
-            .put(shard_id, NodeId::from_raw(node_id), &record)
+        seed_node_record(engine, shard_id, NodeId::from_raw(node_id), &record);
+    }
+
+    /// Commit a built node record in its own MVCC transaction.
+    fn seed_node_record(
+        engine: &StorageEngine,
+        shard_id: u16,
+        node_id: NodeId,
+        record: &NodeRecord,
+    ) {
+        use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+        use coordinode_core::txn::write_concern::WriteConcern;
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        use coordinode_storage::engine::transaction::{CommitContext, Transaction};
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        LocalNodeStore
+            .put(&mut txn, shard_id, node_id, record)
             .expect("put node");
+        let wc = WriteConcern::majority();
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: None,
+            id_gen: None,
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        txn.commit(&ctx).expect("commit node");
+    }
+
+    /// Commit a temporal node version in its own MVCC transaction.
+    fn seed_node_temporal(
+        engine: &StorageEngine,
+        shard_id: u16,
+        node_id: NodeId,
+        valid_from_ms: i64,
+        record: &NodeRecord,
+    ) {
+        use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+        use coordinode_core::txn::write_concern::WriteConcern;
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        use coordinode_storage::engine::transaction::{CommitContext, Transaction};
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        LocalNodeStore
+            .put_temporal(&mut txn, shard_id, node_id, valid_from_ms, record)
+            .expect("put temporal node");
+        let wc = WriteConcern::majority();
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: None,
+            id_gen: None,
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        txn.commit(&ctx).expect("commit node");
+    }
+
+    /// Read a node at the latest committed snapshot via an MVCC transaction.
+    fn read_node(engine: &StorageEngine, shard_id: u16, node_id: NodeId) -> Option<NodeRecord> {
+        use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        use coordinode_storage::engine::transaction::Transaction;
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        LocalNodeStore
+            .get(&txn, shard_id, node_id)
+            .expect("get node")
     }
 
     /// Insert an edge via merge operator (both forward and reverse posting list).
@@ -15084,8 +14546,12 @@ mod tests {
             mvcc_oracle: None,
             mvcc_read_ts: coordinode_core::txn::timestamp::Timestamp::ZERO,
             procedure_ctx: None,
-            mvcc_write_buffer: std::collections::HashMap::new(),
-            occ_scope: None,
+            txn: Transaction::new(
+                engine,
+                None,
+                coordinode_core::txn::timestamp::Timestamp::ZERO,
+                None,
+            ),
             vector_consistency: VectorConsistencyMode::default(),
             vector_overfetch_factor: 1.2,
             vector_mvcc_stats: None,
@@ -15095,11 +14561,7 @@ mod tests {
             write_concern: coordinode_core::txn::write_concern::WriteConcern::majority(),
             drain_buffer: None,
             nvme_write_buffer: None,
-            merge_adj_adds: std::collections::HashMap::new(),
-            merge_adj_removes: std::collections::HashMap::new(),
             mvcc_snapshot: None,
-            adj_snapshot: None,
-            merge_node_deltas: Vec::new(),
             // L1/L2 cascade tracking (the trigger architecture) — counters start at zero per
             // originating user mutation; defaults match cluster setting
             // defaults documented in the trigger architecture.
@@ -15838,10 +15300,7 @@ mod tests {
             .get("n")
             .and_then(|v| v.as_int())
             .expect("node id");
-        let record = LocalNodeStore::new(&engine)
-            .get(1, NodeId::from_raw(node_id as u64))
-            .expect("get")
-            .expect("node exists");
+        let record = read_node(&engine, 1, NodeId::from_raw(node_id as u64)).expect("node exists");
         assert_eq!(record.primary_label(), "User");
     }
 
@@ -15916,10 +15375,7 @@ mod tests {
 
         // Verify the update persisted in storage
         let node_id = result[0].get("n").and_then(|v| v.as_int()).expect("id");
-        let record = LocalNodeStore::new(&engine)
-            .get(1, NodeId::from_raw(node_id as u64))
-            .expect("get")
-            .expect("exists");
+        let record = read_node(&engine, 1, NodeId::from_raw(node_id as u64)).expect("exists");
         let name_id = interner.lookup("name").expect("field id");
         assert_eq!(record.get(name_id), Some(&Value::String("Alicia".into())));
     }
@@ -15931,10 +15387,7 @@ mod tests {
         let mut ctx = make_ctx(&engine, &mut interner, &allocator);
 
         // First, verify Alice exists
-        assert!(LocalNodeStore::new(&engine)
-            .get(1, NodeId::from_raw(1))
-            .expect("get")
-            .is_some());
+        assert!(read_node(&engine, 1, NodeId::from_raw(1)).is_some());
 
         // DETACH DELETE node 1 (Alice) — she has edges, so DETACH is required.
         let plan = LogicalPlan {
@@ -15959,10 +15412,7 @@ mod tests {
         execute(&plan, &mut ctx).expect("execute");
 
         // Verify Alice was deleted
-        assert!(LocalNodeStore::new(&engine)
-            .get(1, NodeId::from_raw(1))
-            .expect("get")
-            .is_none());
+        assert!(read_node(&engine, 1, NodeId::from_raw(1)).is_none());
     }
 
     #[test]
@@ -15998,10 +15448,7 @@ mod tests {
 
         // Verify age was removed
         let node_id = result[0].get("n").and_then(|v| v.as_int()).expect("id");
-        let record = LocalNodeStore::new(&engine)
-            .get(1, NodeId::from_raw(node_id as u64))
-            .expect("get")
-            .expect("exists");
+        let record = read_node(&engine, 1, NodeId::from_raw(node_id as u64)).expect("exists");
         let age_id = interner.lookup("age").expect("field id");
         assert!(record.get(age_id).is_none());
     }
@@ -16125,10 +15572,7 @@ mod tests {
 
         // Verify age was updated
         let node_id = result[0].get("n").and_then(|v| v.as_int()).expect("id");
-        let record = LocalNodeStore::new(&engine)
-            .get(1, NodeId::from_raw(node_id as u64))
-            .expect("get")
-            .expect("exists");
+        let record = read_node(&engine, 1, NodeId::from_raw(node_id as u64)).expect("exists");
         let age_id = interner.lookup("age").expect("field id");
         assert_eq!(record.get(age_id), Some(&Value::Int(31)));
     }
@@ -16253,10 +15697,7 @@ mod tests {
 
         // Verify age was updated
         let node_id = result[0].get("n").and_then(|v| v.as_int()).expect("id");
-        let record = LocalNodeStore::new(&engine)
-            .get(1, NodeId::from_raw(node_id as u64))
-            .expect("get")
-            .expect("exists");
+        let record = read_node(&engine, 1, NodeId::from_raw(node_id as u64)).expect("exists");
         let age_id = interner.lookup("age").expect("field id");
         assert_eq!(record.get(age_id), Some(&Value::Int(31)));
     }
@@ -16309,11 +15750,10 @@ mod tests {
         // concurrent modification from another connection)
         let alice_id = NodeId::from_raw(1);
         {
-            let nodes = LocalNodeStore::new(&engine);
-            let mut record = nodes.get(1, alice_id).unwrap().unwrap();
+            let mut record = read_node(&engine, 1, alice_id).unwrap();
             let age_id = interner.lookup("age").unwrap();
             record.set(age_id, Value::Int(999)); // external modification
-            nodes.put(1, alice_id, &record).unwrap();
+            seed_node_record(&engine, 1, alice_id, &record);
         }
 
         // Second UPSERT: this reads fresh bytes in CAS snapshot,
@@ -16349,10 +15789,7 @@ mod tests {
         }
 
         // Verify final value is 60 (second UPSERT applied)
-        let record = LocalNodeStore::new(&engine)
-            .get(1, alice_id)
-            .unwrap()
-            .unwrap();
+        let record = read_node(&engine, 1, alice_id).unwrap();
         let age_id = interner.lookup("age").unwrap();
         assert_eq!(record.get(age_id), Some(&Value::Int(60)));
     }
@@ -17901,10 +17338,7 @@ mod tests {
         // merge removes already flushed by execute() → mvcc_flush()
 
         // Verify Alice's node is gone
-        assert!(LocalNodeStore::new(&engine)
-            .get(1, NodeId::from_raw(1))
-            .expect("get")
-            .is_none());
+        assert!(read_node(&engine, 1, NodeId::from_raw(1)).is_none());
 
         // Verify Alice's own adj: keys are gone
         let alice_out_knows = encode_adj_key_forward("KNOWS", NodeId::from_raw(1));
@@ -18046,7 +17480,7 @@ mod tests {
         let engine = test_engine(dir.path());
         let mut interner = FieldInterner::new();
         let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-        let ctx = make_ctx(&engine, &mut interner, &allocator);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
 
         let types = ctx.list_edge_types().expect("list_edge_types");
         assert!(types.is_empty(), "no edge types in empty schema");
@@ -18065,7 +17499,7 @@ mod tests {
 
         let mut interner = FieldInterner::new();
         let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
-        let ctx = make_ctx(&engine, &mut interner, &allocator);
+        let mut ctx = make_ctx(&engine, &mut interner, &allocator);
 
         let mut types = ctx.list_edge_types().expect("list_edge_types");
         types.sort();
@@ -18083,7 +17517,8 @@ mod tests {
 
         // Write edge type directly into write buffer (simulates execute_create_edge).
         let et_key = edge_type_schema_key("WORKS_AT");
-        ctx.mvcc_write_buffer
+        ctx.txn
+            .write_buffer_mut()
             .insert((Partition::Schema, et_key), Some(b"".to_vec()));
 
         let types = ctx.list_edge_types().expect("list_edge_types");
@@ -18420,8 +17855,8 @@ mod tests {
         // The source node (Hub, id=1) is read via sequential mvcc_get in NodeScan,
         // and 10 target nodes are read via parallel path — all should be tracked.
         let scope = ctx
-            .occ_scope
-            .as_ref()
+            .txn
+            .occ_scope()
             .expect("MVCC mode must have an OCC scope");
 
         // Verify specific target keys are tracked via the typed OCC probe
@@ -18512,10 +17947,7 @@ mod tests {
         // Seed a temporal version so the read returns Some, via the
         // typed Layer-4 `put_temporal` (raw-encoder-free fixture).
         let rec = NodeRecord::new("E");
-        use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        LocalNodeStore::new(&engine)
-            .put_temporal(0, id, 1234567890, &rec)
-            .expect("seed");
+        seed_node_temporal(&engine, 0, id, 1234567890, &rec);
 
         let mut interner = FieldInterner::new();
         let allocator = NodeIdAllocator::new(0);
@@ -18528,7 +17960,7 @@ mod tests {
             .expect("get")
             .expect("Some");
 
-        let scope = ctx.occ_scope.as_ref().expect("scope");
+        let scope = ctx.txn.occ_scope().expect("scope");
         assert!(
             scope.contains_node_temporal(0, id, 1234567890),
             "OCC scope must contain the 25-byte temporal key, not the non-temporal one",
@@ -18570,7 +18002,7 @@ mod tests {
         let id = NodeId::from_raw(88);
         ctx.mvcc_put_node_temporal(0, id, 1000, &NodeRecord::new("E"))
             .expect("put");
-        match ctx.occ_scope.as_ref() {
+        match ctx.txn.occ_scope() {
             None => { /* fine — no scope materialised on pure write */ }
             Some(scope) => assert!(
                 !scope.contains_node_temporal(0, id, 1000),
@@ -18686,12 +18118,26 @@ mod tests {
         // fixture back verbatim.
         {
             use coordinode_core::graph::edge::EdgeProperties;
+            use coordinode_core::txn::write_concern::WriteConcern;
             use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+            use coordinode_storage::engine::transaction::{CommitContext, Transaction};
             let mut props = EdgeProperties::new();
             props.set(0, Value::Int(7));
-            LocalEdgeStore::new(&engine)
-                .put_edge("REL", src, tgt, Some(&props))
+            let read_ts = oracle.next();
+            let mut txn =
+                Transaction::new(&engine, Some(&*oracle), read_ts, Some(engine.snapshot()));
+            LocalEdgeStore
+                .put_edge(&mut txn, "REL", src, tgt, Some(&props))
                 .expect("seed");
+            let wc = WriteConcern::majority();
+            let ctx = CommitContext {
+                write_concern: &wc,
+                pipeline: None,
+                id_gen: None,
+                drain_buffer: None,
+                nvme_write_buffer: None,
+            };
+            txn.commit(&ctx).expect("commit seed");
         }
 
         let mut interner = FieldInterner::new();
@@ -18708,7 +18154,7 @@ mod tests {
         // Typed OCC-scope assertion — `contains_edge_props` builds
         // the key internally so the assertion is raw-encoder-free
         // even though the fixture seeding above is not.
-        let scope = ctx.occ_scope.as_ref().expect("scope");
+        let scope = ctx.txn.occ_scope().expect("scope");
         assert!(
             scope.contains_edge_props("REL", src, tgt),
             "OCC scope must contain the encoded EdgeProp key after a typed read",
@@ -18742,12 +18188,26 @@ mod tests {
         // edgeprop codec — wire-identical to the executor, ADR-040).
         {
             use coordinode_core::graph::edge::EdgeProperties;
+            use coordinode_core::txn::write_concern::WriteConcern;
             use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+            use coordinode_storage::engine::transaction::{CommitContext, Transaction};
             let mut props = EdgeProperties::new();
             props.set(1, Value::String("v".into()));
-            LocalEdgeStore::new(&engine)
-                .put_edge_temporal("REL", src, tgt, 5000, &props)
+            let read_ts = oracle.next();
+            let mut txn =
+                Transaction::new(&engine, Some(&*oracle), read_ts, Some(engine.snapshot()));
+            LocalEdgeStore
+                .put_edge_temporal(&mut txn, "REL", src, tgt, 5000, &props)
                 .expect("seed");
+            let wc = WriteConcern::majority();
+            let ctx = CommitContext {
+                write_concern: &wc,
+                pipeline: None,
+                id_gen: None,
+                drain_buffer: None,
+                nvme_write_buffer: None,
+            };
+            txn.commit(&ctx).expect("commit seed");
         }
 
         let mut interner = FieldInterner::new();
@@ -18764,7 +18224,7 @@ mod tests {
         // Typed OCC-scope assertions — verify the temporal key is
         // tracked but the non-temporal (short) one for the same
         // pair is NOT.
-        let scope = ctx.occ_scope.as_ref().expect("scope");
+        let scope = ctx.txn.occ_scope().expect("scope");
         assert!(
             scope.contains_edge_props_temporal("REL", src, tgt, 5000),
             "OCC scope must record the temporal (per-version) key",
@@ -18807,7 +18267,7 @@ mod tests {
         ctx.mvcc_put_edge_props("REL", src, tgt, &payload)
             .expect("put");
 
-        match ctx.occ_scope.as_ref() {
+        match ctx.txn.occ_scope() {
             None => { /* no scope materialised on pure write — fine */ }
             Some(scope) => assert!(
                 !scope.contains_edge_props("REL", src, tgt),
@@ -19030,12 +18490,7 @@ mod tests {
         // Seed a node so the simulated MATCH read returns Some.
         let id = NodeId::from_raw(700);
         let seed = NodeRecord::new("U");
-        {
-            use coordinode_modality::{LocalNodeStore, NodeStore as _};
-            LocalNodeStore::new(&engine)
-                .put(0, id, &seed)
-                .expect("seed");
-        }
+        seed_node_record(&engine, 0, id, &seed);
 
         let mut interner = FieldInterner::new();
         let allocator = NodeIdAllocator::new(0);
@@ -19051,12 +18506,7 @@ mod tests {
         // Stamps a fresh seqno that is necessarily > mvcc_read_ts.
         let mut altered = NodeRecord::new("U");
         altered.set(ctx.interner.intern("name"), Value::String("Bob".into()));
-        {
-            use coordinode_modality::{LocalNodeStore, NodeStore as _};
-            LocalNodeStore::new(&engine)
-                .put(0, id, &altered)
-                .expect("concurrent put");
-        }
+        seed_node_record(&engine, 0, id, &altered);
 
         // ON MATCH SET: buffer a write on an UNRELATED key so the txn
         // is not read-only and flush actually runs OCC validation.
@@ -19156,12 +18606,7 @@ mod tests {
         // Seed v@1000 outside of the transaction-under-test.
         let id = NodeId::from_raw(44);
         let rec = NodeRecord::new("Tx");
-        {
-            use coordinode_modality::{LocalNodeStore, NodeStore as _};
-            LocalNodeStore::new(&engine)
-                .put_temporal(0, id, 1000, &rec)
-                .expect("seed");
-        }
+        seed_node_temporal(&engine, 0, id, 1000, &rec);
 
         let mut interner = FieldInterner::new();
         let allocator = NodeIdAllocator::new(0);
@@ -19489,7 +18934,7 @@ mod tests {
         let rec = NodeRecord::new("Probe");
         ctx.mvcc_put_node(0, id, &rec).expect("put");
 
-        match ctx.occ_scope.as_ref() {
+        match ctx.txn.occ_scope() {
             None => { /* fine — pure write created no scope */ }
             Some(scope) => assert!(
                 !scope.contains_node(0, id),
@@ -19522,9 +18967,7 @@ mod tests {
         // Seed a node via the typed Layer-4 store.
         let id = NodeId::from_raw(99);
         let seed = NodeRecord::new("Probe");
-        LocalNodeStore::new(&engine)
-            .put(0, id, &seed)
-            .expect("seed");
+        seed_node_record(&engine, 0, id, &seed);
 
         let mut interner = FieldInterner::new();
         let allocator = NodeIdAllocator::new(0);
@@ -19534,7 +18977,7 @@ mod tests {
 
         let _ = ctx.mvcc_get_node(0, id).expect("get").expect("Some");
         // OCC scope must contain the encoded node key.
-        let scope = ctx.occ_scope.as_ref().expect("MVCC mode → scope present");
+        let scope = ctx.txn.occ_scope().expect("MVCC mode → scope present");
         assert!(
             scope.contains_node(0, id),
             "typed read must populate OCC scope under Node partition",
@@ -19560,7 +19003,7 @@ mod tests {
         )
         .expect("open");
         let id = NodeId::from_raw(55);
-        let key = encode_node_key(0, id);
+        let key = coordinode_core::graph::node::encode_node_key(0, id);
         // Plant garbage — not a valid MessagePack NodeRecord.
         engine
             .put(Partition::Node, &key, b"this-is-not-msgpack")
@@ -19605,10 +19048,7 @@ mod tests {
         // Seed.
         let id = NodeId::from_raw(11);
         let rec = NodeRecord::new("Item");
-        {
-            use coordinode_modality::{LocalNodeStore, NodeStore as _};
-            LocalNodeStore::new(&engine).put(0, id, &rec).expect("seed");
-        }
+        seed_node_record(&engine, 0, id, &rec);
 
         let mut interner = FieldInterner::new();
         let allocator = NodeIdAllocator::new(0);
@@ -19882,7 +19322,7 @@ mod tests {
         //     trip ensure_occ_scope from the read side, since the
         //     read returned before the track call), OR
         //   - scope exists but does not contain own_key.
-        match ctx.occ_scope.as_ref() {
+        match ctx.txn.occ_scope() {
             None => { /* fine — no scope means no tracking happened */ }
             Some(scope) => assert!(
                 !scope.contains(Partition::Node, b"own_key"),
@@ -19920,7 +19360,7 @@ mod tests {
         let results = ctx.mvcc_prefix_scan(Partition::Node, b"k").expect("scan");
         assert_eq!(results.len(), 2);
         assert!(
-            ctx.occ_scope.is_none(),
+            ctx.txn.occ_scope().is_none(),
             "legacy mode must NOT materialise an OCC scope",
         );
     }
@@ -19948,7 +19388,7 @@ mod tests {
         let mut ctx = make_ctx(&engine, &mut interner, &allocator);
         // ctx.mvcc_oracle stays None.
         assert!(ctx.ensure_occ_scope().is_none());
-        assert!(ctx.occ_scope.is_none(), "no scope materialised");
+        assert!(ctx.txn.occ_scope().is_none(), "no scope materialised");
     }
 
     #[test]
@@ -20041,17 +19481,13 @@ mod tests {
         // Use field_id 0 directly — "name" was interned first by insert_node,
         // so it has id 0. Avoids borrowing interner while ctx is alive.
         modified_record.set(0, Value::String("T5-modified".into()));
-        {
-            use coordinode_modality::{LocalNodeStore, NodeStore as _};
-            LocalNodeStore::new(&engine)
-                .put(1, NodeId::from_raw(5), &modified_record)
-                .expect("concurrent write");
-        }
+        seed_node_record(&engine, 1, NodeId::from_raw(5), &modified_record);
 
         // T1: Add a dummy write so mvcc_flush doesn't skip conflict check
         // (read-only transactions return early without OCC check)
-        let dummy_key = encode_node_key(1, NodeId::from_raw(999));
-        ctx.mvcc_write_buffer
+        let dummy_key = coordinode_core::graph::node::encode_node_key(1, NodeId::from_raw(999));
+        ctx.txn
+            .write_buffer_mut()
             .insert((Partition::Node, dummy_key), Some(b"dummy".to_vec()));
 
         // T1: OCC conflict check via mvcc_flush should detect the write to target 5
@@ -20172,8 +19608,7 @@ mod tests {
              — otherwise an aborted transaction orphans the surviving peer",
         );
         assert!(
-            ctx.mvcc_write_buffer
-                .contains_key(&(Partition::Adj, alice_fwd.clone())),
+            ctx.txn.buffered(Partition::Adj, &alice_fwd).is_some(),
             "DETACH purge must buffer an Adj tombstone in the MVCC write buffer",
         );
 
@@ -20188,10 +19623,7 @@ mod tests {
             "post-commit: Alice's forward posting list is removed",
         );
         assert!(
-            LocalNodeStore::new(&engine)
-                .get(1, NodeId::from_raw(1))
-                .expect("get")
-                .is_none(),
+            read_node(&engine, 1, NodeId::from_raw(1)).is_none(),
             "post-commit: Alice's node record is removed",
         );
     }

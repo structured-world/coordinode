@@ -8,8 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
+use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_modality::{IndexStore as _, LocalIndexStore, LocalNodeStore, NodeStore};
 use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::transaction::Transaction;
 
 use super::definition::IndexDefinition;
 
@@ -48,7 +50,11 @@ pub fn reap_ttl_index(
         .unwrap_or(0);
 
     let cutoff_us = now_us - ttl_us;
-    let nodes = LocalNodeStore::new(engine);
+    let nodes = LocalNodeStore;
+    // TTL reaping is a bulk background sweep — cheap direct-mode transaction
+    // (no snapshot/OCC): reads latest, node deletes apply immediately to the
+    // engine, like the direct deletes this replaces.
+    let mut reaper_txn = Transaction::new(engine, None, Timestamp::ZERO, None);
 
     // Full-index walk through the Layer-4 store — returns (raw key, node id)
     // pairs with the node id already decoded from the entry suffix.
@@ -67,7 +73,7 @@ pub fn reap_ttl_index(
     for (key, node) in entries {
         result.checked += 1;
         // Read the node to check its timestamp value
-        match nodes.get(shard_id, node) {
+        match nodes.get(&reaper_txn, shard_id, node) {
             Ok(Some(record)) => {
                 // Check if the timestamp property has expired
                 if is_node_expired(&record, index.property(), cutoff_us) {
@@ -94,8 +100,8 @@ pub fn reap_ttl_index(
             continue;
         }
 
-        // Delete the node record
-        if let Err(e) = nodes.delete(shard_id, NodeId::from_raw(*node_id)) {
+        // Delete the node record (buffered on the reaper transaction).
+        if let Err(e) = nodes.delete(&mut reaper_txn, shard_id, NodeId::from_raw(*node_id)) {
             result
                 .errors
                 .push(format!("node delete error for node {node_id}: {e}"));
@@ -168,13 +174,51 @@ mod tests {
         timestamp_us: i64,
         interner: &mut FieldInterner,
     ) {
-        use coordinode_modality::{LocalNodeStore, NodeStore as _};
         let mut record = NodeRecord::new(label);
         let ts_field = interner.intern("created_at");
         record.set(ts_field, Value::Timestamp(timestamp_us));
-        LocalNodeStore::new(engine)
-            .put(shard_id, NodeId::from_raw(node_id), &record)
-            .expect("put");
+        seed_node_record(engine, shard_id, NodeId::from_raw(node_id), &record);
+    }
+
+    /// Commit a built node record in its own MVCC transaction.
+    fn seed_node_record(
+        engine: &StorageEngine,
+        shard_id: u16,
+        node_id: NodeId,
+        record: &NodeRecord,
+    ) {
+        use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+        use coordinode_core::txn::write_concern::WriteConcern;
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        use coordinode_storage::engine::transaction::{CommitContext, Transaction};
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        LocalNodeStore
+            .put(&mut txn, shard_id, node_id, record)
+            .expect("put node");
+        let wc = WriteConcern::majority();
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: None,
+            id_gen: None,
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        txn.commit(&ctx).expect("commit node");
+    }
+
+    /// Read a node at the latest committed snapshot via an MVCC transaction.
+    fn read_node(engine: &StorageEngine, shard_id: u16, node_id: NodeId) -> Option<NodeRecord> {
+        use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        use coordinode_storage::engine::transaction::Transaction;
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        LocalNodeStore
+            .get(&txn, shard_id, node_id)
+            .expect("get node")
     }
 
     fn create_ttl_index_entry(
@@ -217,12 +261,10 @@ mod tests {
         assert_eq!(result.deleted, 1); // Only node 1 expired
 
         // Verify node 1 was deleted
-        use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        let nodes = LocalNodeStore::new(&engine);
-        assert!(nodes.get(1, NodeId::from_raw(1)).expect("get").is_none());
+        assert!(read_node(&engine, 1, NodeId::from_raw(1)).is_none());
 
         // Verify node 2 still exists
-        assert!(nodes.get(1, NodeId::from_raw(2)).expect("get").is_some());
+        assert!(read_node(&engine, 1, NodeId::from_raw(2)).is_some());
     }
 
     #[test]

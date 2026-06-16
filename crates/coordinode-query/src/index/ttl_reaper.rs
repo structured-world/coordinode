@@ -943,21 +943,55 @@ mod tests {
         timestamp_us: i64,
         interner: &mut FieldInterner,
     ) {
-        use coordinode_modality::{LocalNodeStore, NodeStore as _};
         let mut record = NodeRecord::new(label);
         let ts_field = interner.intern("created_at");
         record.set(ts_field, Value::Timestamp(timestamp_us));
-        LocalNodeStore::new(engine)
-            .put(shard_id, NodeId::from_raw(node_id), &record)
+        seed_node_record(engine, shard_id, NodeId::from_raw(node_id), &record);
+    }
+
+    /// Commit a built node record in its own MVCC transaction.
+    fn seed_node_record(
+        engine: &StorageEngine,
+        shard_id: u16,
+        node_id: NodeId,
+        record: &NodeRecord,
+    ) {
+        use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+        use coordinode_core::txn::write_concern::WriteConcern;
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        use coordinode_storage::engine::transaction::{CommitContext, Transaction};
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        LocalNodeStore
+            .put(&mut txn, shard_id, node_id, record)
             .expect("put node");
+        let wc = WriteConcern::majority();
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: None,
+            id_gen: None,
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        txn.commit(&ctx).expect("commit node");
+    }
+
+    /// Read a node at the latest committed snapshot via an MVCC transaction.
+    fn read_node(engine: &StorageEngine, shard_id: u16, node_id: NodeId) -> Option<NodeRecord> {
+        use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        use coordinode_storage::engine::transaction::Transaction;
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        LocalNodeStore
+            .get(&txn, shard_id, node_id)
+            .expect("get node")
     }
 
     fn node_exists(engine: &StorageEngine, shard_id: u16, node_id: u64) -> bool {
-        use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        LocalNodeStore::new(engine)
-            .get(shard_id, NodeId::from_raw(node_id))
-            .expect("get")
-            .is_some()
+        read_node(engine, shard_id, NodeId::from_raw(node_id)).is_some()
     }
 
     fn make_ttl_schema(label: &str, duration_secs: u64, scope: TtlScope) -> LabelSchema {
@@ -1109,11 +1143,7 @@ mod tests {
             "node should survive field removal"
         );
 
-        use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        let record = LocalNodeStore::new(&engine)
-            .get(1, NodeId::from_raw(10))
-            .unwrap()
-            .unwrap();
+        let record = read_node(&engine, 1, NodeId::from_raw(10)).unwrap();
         // The timestamp field should be removed.
         let has_timestamp = record
             .props
@@ -1160,10 +1190,7 @@ mod tests {
         let pd_field = interner.intern("profile_data");
         record.set(ts_field, Value::Timestamp(old_ts));
         record.set(pd_field, Value::String("sensitive content".into()));
-        use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        LocalNodeStore::new(&engine)
-            .put(1, NodeId::from_raw(30), &record)
-            .expect("put");
+        seed_node_record(&engine, 1, NodeId::from_raw(30), &record);
 
         // Use the same interner so the reaper can resolve target_field_id = pd_field.
         // Without an interner, the reaper has no way to map "profile_data" → u32 field_id
@@ -1179,10 +1206,7 @@ mod tests {
         );
 
         // Reload node and verify: profile_data deleted, created_at preserved.
-        let updated = LocalNodeStore::new(&engine)
-            .get(1, NodeId::from_raw(30))
-            .expect("get")
-            .expect("node exists");
+        let updated = read_node(&engine, 1, NodeId::from_raw(30)).expect("node exists");
         assert!(
             !updated.props.contains_key(&pd_field),
             "profile_data must be removed by subtree TTL"
@@ -1228,10 +1252,7 @@ mod tests {
         let mut record = NodeRecord::new("Cache");
         record.set(ts_field, Value::Timestamp(old_ts));
         record.set(payload_field, Value::String("stale data".into()));
-        use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        LocalNodeStore::new(&engine)
-            .put(1, NodeId::from_raw(99), &record)
-            .expect("put");
+        seed_node_record(&engine, 1, NodeId::from_raw(99), &record);
 
         // Reap with the EMPTY interner — target_field_id will be None.
         let result = reap_computed_ttl_with_interner(&engine, 1, 1000, &interner);
@@ -1252,10 +1273,7 @@ mod tests {
         );
 
         // The node must be untouched.
-        let updated = LocalNodeStore::new(&engine)
-            .get(1, NodeId::from_raw(99))
-            .expect("get")
-            .expect("node exists");
+        let updated = read_node(&engine, 1, NodeId::from_raw(99)).expect("node exists");
         assert!(
             updated.props.contains_key(&payload_field),
             "payload must NOT be removed when target_field_id is unresolved"
@@ -1296,10 +1314,7 @@ mod tests {
         let mut record = NodeRecord::new("Profile");
         record.set(ts_field, Value::Timestamp(old_ts));
         record.set(bio_field, Value::String("hello".into()));
-        use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        LocalNodeStore::new(&engine)
-            .put(1, NodeId::from_raw(77), &record)
-            .expect("put");
+        seed_node_record(&engine, 1, NodeId::from_raw(77), &record);
 
         // First reap: bio must be removed, node survives, subtrees_removed = 1.
         let r1 = reap_computed_ttl_with_interner(&engine, 1, 1000, &interner);
@@ -1307,10 +1322,7 @@ mod tests {
         assert!(node_exists(&engine, 1, 77), "node must survive subtree TTL");
 
         // Verify bio is gone.
-        let after_r1 = LocalNodeStore::new(&engine)
-            .get(1, NodeId::from_raw(77))
-            .expect("get")
-            .expect("node exists");
+        let after_r1 = read_node(&engine, 1, NodeId::from_raw(77)).expect("node exists");
         assert!(
             !after_r1.props.contains_key(&bio_field),
             "bio removed after first pass"
@@ -1371,10 +1383,7 @@ mod tests {
         let mut peer_record = NodeRecord::new("User");
         let name_field = interner.intern("name");
         peer_record.set(name_field, Value::String("alice".into()));
-        use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        LocalNodeStore::new(&engine)
-            .put(1, NodeId::from_raw(100), &peer_record)
-            .unwrap();
+        seed_node_record(&engine, 1, NodeId::from_raw(100), &peer_record);
 
         // Create edge: node 1 -[OWNS]-> node 100
         let fwd_key = encode_adj_key_forward("OWNS", NodeId::from_raw(1));
@@ -1471,10 +1480,7 @@ mod tests {
         record.set(created_field, Value::Timestamp(two_hours_ago));
         record.set(updated_field, Value::Timestamp(now));
 
-        use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        LocalNodeStore::new(&engine)
-            .put(1, NodeId::from_raw(42), &record)
-            .expect("put");
+        seed_node_record(&engine, 1, NodeId::from_raw(42), &record);
 
         // Use interner-aware reaper function directly.
         let result = reap_computed_ttl_with_interner(&engine, 1, 1000, &interner);

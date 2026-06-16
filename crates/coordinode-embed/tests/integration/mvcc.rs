@@ -382,8 +382,8 @@ fn occ_conflict_via_prefix_scan() {
 
     // Verify the scanned key IS in the OCC scope (Layer 3)
     assert!(
-        ctx.occ_scope
-            .as_ref()
+        ctx.txn
+            .occ_scope()
             .expect("MVCC mode must have OCC scope")
             .contains(Partition::Node, b"node:0:1"),
         "prefix_scan results must be tracked in OCC scope"

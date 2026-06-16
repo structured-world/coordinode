@@ -47,9 +47,13 @@ fn make_test_ctx<'a>(
         vector_loader: None,
         mvcc_oracle: None,
         mvcc_read_ts: coordinode_core::txn::timestamp::Timestamp::ZERO,
-        mvcc_write_buffer: HashMap::new(),
+        txn: coordinode_storage::engine::transaction::Transaction::new(
+            engine,
+            None,
+            coordinode_core::txn::timestamp::Timestamp::ZERO,
+            None,
+        ),
         procedure_ctx: None,
-        occ_scope: None,
         vector_consistency: coordinode_core::graph::types::VectorConsistencyMode::default(),
         vector_overfetch_factor: 1.2,
         vector_mvcc_stats: None,
@@ -59,11 +63,7 @@ fn make_test_ctx<'a>(
         write_concern: coordinode_core::txn::write_concern::WriteConcern::majority(),
         drain_buffer: None,
         nvme_write_buffer: None,
-        merge_adj_adds: HashMap::new(),
-        merge_adj_removes: HashMap::new(),
         mvcc_snapshot: None,
-        adj_snapshot: None,
-        merge_node_deltas: Vec::new(),
         cascade_depth: 0,
         cascade_depth_limit: 10,
         cascade_fire_counts: std::collections::HashMap::new(),
@@ -120,15 +120,12 @@ fn insert_user_with_address(
     name: &str,
     address: rmpv::Value,
 ) {
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     let mut record = NodeRecord::new("User");
     let name_fid = interner.intern("name");
     let addr_fid = interner.intern("address");
     record.set(name_fid, Value::String(name.into()));
     record.set(addr_fid, Value::Document(address));
-    LocalNodeStore::new(engine)
-        .put(1, NodeId::from_raw(id), &record)
-        .expect("put node");
+    put_node_committed(engine, 1, id, &record);
 }
 
 fn register_schema_edge_type(engine: &StorageEngine, edge_type: &str) {
@@ -141,25 +138,82 @@ fn register_schema_edge_type(engine: &StorageEngine, edge_type: &str) {
 }
 
 fn insert_edge_direct(engine: &StorageEngine, edge_type: &str, source_id: u64, target_id: u64) {
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use coordinode_core::txn::write_concern::WriteConcern;
     use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
-    LocalEdgeStore::new(engine)
+    use coordinode_storage::engine::transaction::{CommitContext, Transaction};
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let read_ts = oracle.next();
+    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    LocalEdgeStore
         .put_edge(
+            &mut txn,
             edge_type,
             NodeId::from_raw(source_id),
             NodeId::from_raw(target_id),
             None,
         )
         .expect("put edge");
+    let wc = WriteConcern::majority();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    txn.commit(&ctx).expect("commit edge");
     register_schema_edge_type(engine, edge_type);
 }
 
 fn adj_contains(engine: &StorageEngine, edge_type: &str, src: u64, tgt: u64) -> bool {
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
     use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
-    LocalEdgeStore::new(engine)
-        .scan_neighbors_out(edge_type, NodeId::from_raw(src))
+    use coordinode_storage::engine::transaction::Transaction;
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let read_ts = oracle.next();
+    let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    LocalEdgeStore
+        .scan_neighbors_out(&txn, edge_type, NodeId::from_raw(src))
         .expect("scan out-neighbors")
         .iter()
         .any(|n| n.as_raw() == tgt)
+}
+
+/// Seed a node (committed MVCC transaction).
+fn put_node_committed(engine: &StorageEngine, shard: u16, id: u64, record: &NodeRecord) {
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use coordinode_core::txn::write_concern::WriteConcern;
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    use coordinode_storage::engine::transaction::{CommitContext, Transaction};
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let read_ts = oracle.next();
+    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    LocalNodeStore
+        .put(&mut txn, shard, NodeId::from_raw(id), record)
+        .expect("put node");
+    let wc = WriteConcern::majority();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    txn.commit(&ctx).expect("commit node");
+}
+
+/// Read a node at the latest committed snapshot.
+fn read_node_record(engine: &StorageEngine, shard: u16, id: u64) -> Option<NodeRecord> {
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    use coordinode_storage::engine::transaction::Transaction;
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let read_ts = oracle.next();
+    let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    LocalNodeStore
+        .get(&txn, shard, NodeId::from_raw(id))
+        .expect("get node")
 }
 
 fn read_address_prop(
@@ -167,10 +221,7 @@ fn read_address_prop(
     interner: &FieldInterner,
     node_id: u64,
 ) -> Option<Value> {
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    let record = LocalNodeStore::new(engine)
-        .get(1, NodeId::from_raw(node_id))
-        .expect("get node")?;
+    let record = read_node_record(engine, 1, node_id)?;
     let fid = interner.lookup("address")?;
     record.props.get(&fid).cloned()
 }
@@ -257,13 +308,10 @@ fn detach_document_nested_path() {
         (rmpv::Value::String("billing".into()), billing.clone()),
     ]);
 
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     let mut record = NodeRecord::new("User");
     let fid = interner.intern("meta");
     record.set(fid, Value::Document(meta.clone()));
-    LocalNodeStore::new(engine)
-        .put(1, NodeId::from_raw(1), &record)
-        .unwrap();
+    put_node_committed(engine, 1, 1, &record);
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
     let results = run(
@@ -282,10 +330,7 @@ fn detach_document_nested_path() {
 
     // meta.billing must survive; meta.shipping must be removed.
     let meta_fid = interner.lookup("meta").unwrap();
-    let after = LocalNodeStore::new(engine)
-        .get(1, NodeId::from_raw(1))
-        .unwrap()
-        .expect("node still present");
+    let after = read_node_record(engine, 1, 1).expect("node still present");
     let Value::Document(meta_after) = after.props.get(&meta_fid).cloned().unwrap() else {
         panic!("meta must still be a Document");
     };
@@ -388,14 +433,11 @@ fn detach_document_missing_property_errors() {
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     // User with no `address` field at all.
     let mut record = NodeRecord::new("User");
     let fid = interner.intern("name");
     record.set(fid, Value::String("Alice".into()));
-    LocalNodeStore::new(engine)
-        .put(1, NodeId::from_raw(1), &record)
-        .unwrap();
+    put_node_committed(engine, 1, 1, &record);
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
     let err = run_err(
@@ -419,14 +461,11 @@ fn detach_document_non_document_value_errors() {
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
 
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     // `address` is a plain string — not a document.
     let mut record = NodeRecord::new("User");
     let fid = interner.intern("address");
     record.set(fid, Value::String("just a string".into()));
-    LocalNodeStore::new(engine)
-        .put(1, NodeId::from_raw(1), &record)
-        .unwrap();
+    put_node_committed(engine, 1, 1, &record);
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
     let err = run_err(
@@ -463,13 +502,10 @@ fn detach_document_default_edge_type_from_camel_case() {
         rmpv::Value::String("firmware".into()),
         rmpv::Value::String("2.1".into()),
     )]);
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     let mut record = NodeRecord::new("Device");
     let fid = interner.intern("sensorConfig");
     record.set(fid, Value::Document(cfg));
-    LocalNodeStore::new(engine)
-        .put(1, NodeId::from_raw(1), &record)
-        .unwrap();
+    put_node_committed(engine, 1, 1, &record);
 
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
     let results = run(

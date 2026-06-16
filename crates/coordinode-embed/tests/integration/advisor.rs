@@ -1271,19 +1271,34 @@ fn stats_cache_ttl_zero_always_recomputes() {
     // execute_cypher, so no auto-invalidation fires).
     {
         use coordinode_core::graph::node::{NodeId, NodeRecord};
+        use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+        use coordinode_core::txn::write_concern::WriteConcern;
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        use coordinode_storage::engine::transaction::{CommitContext, Transaction};
 
-        let node_store = LocalNodeStore::new(db.engine());
+        let engine = db.engine();
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
         for raw_id in 9000..9005u64 {
             let rec = NodeRecord {
                 labels: vec!["ZeroTTL".to_string()],
                 props: std::collections::HashMap::new(),
                 extra: None,
             };
-            node_store
-                .put(1, NodeId::from_raw(raw_id), &rec)
+            LocalNodeStore
+                .put(&mut txn, 1, NodeId::from_raw(raw_id), &rec)
                 .expect("direct write");
         }
+        let wc = WriteConcern::majority();
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: None,
+            id_gen: None,
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        txn.commit(&ctx).expect("commit direct writes");
     }
 
     // With TTL=0, compute_stats recomputes immediately — sees 15 nodes.
@@ -1318,19 +1333,34 @@ fn stats_cache_ttl_max_stays_stale_until_invalidation() {
     // Write 5 more via direct storage engine (bypasses auto-invalidation).
     {
         use coordinode_core::graph::node::{NodeId, NodeRecord};
+        use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+        use coordinode_core::txn::write_concern::WriteConcern;
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        use coordinode_storage::engine::transaction::{CommitContext, Transaction};
 
-        let node_store = LocalNodeStore::new(db.engine());
+        let engine = db.engine();
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
         for raw_id in 8000..8005u64 {
             let rec = NodeRecord {
                 labels: vec!["MaxTTL".to_string()],
                 props: std::collections::HashMap::new(),
                 extra: None,
             };
-            node_store
-                .put(1, NodeId::from_raw(raw_id), &rec)
+            LocalNodeStore
+                .put(&mut txn, 1, NodeId::from_raw(raw_id), &rec)
                 .expect("direct write");
         }
+        let wc = WriteConcern::majority();
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: None,
+            id_gen: None,
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        txn.commit(&ctx).expect("commit direct writes");
     }
 
     // TTL=MAX → cache still returns stale 10.

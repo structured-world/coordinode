@@ -18,6 +18,40 @@ fn open_engine() -> coordinode_test_fixtures::EngineFixture {
     coordinode_test_fixtures::engine_for_logic()
 }
 
+/// Commit a built node record in its own MVCC transaction.
+fn seed_node_record(engine: &StorageEngine, shard: u16, id: NodeId, record: &NodeRecord) {
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use coordinode_core::txn::write_concern::WriteConcern;
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    use coordinode_storage::engine::transaction::{CommitContext, Transaction};
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let read_ts = oracle.next();
+    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    LocalNodeStore
+        .put(&mut txn, shard, id, record)
+        .expect("put node");
+    let wc = WriteConcern::majority();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    txn.commit(&ctx).expect("commit node");
+}
+
+/// Read a node at the latest committed snapshot via an MVCC transaction.
+fn read_node(engine: &StorageEngine, shard: u16, id: NodeId) -> Option<NodeRecord> {
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    use coordinode_storage::engine::transaction::Transaction;
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let read_ts = oracle.next();
+    let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    LocalNodeStore.get(&txn, shard, id).expect("get node")
+}
+
 /// Store a NodeRecord with Document property in storage, read back, verify exact match.
 #[test]
 fn document_property_storage_roundtrip() {
@@ -53,16 +87,10 @@ fn document_property_storage_roundtrip() {
     rec.set(1, PropertyValue::String("sensor-001".into()));
     rec.set(2, PropertyValue::Document(doc.clone()));
 
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    LocalNodeStore::new(engine)
-        .put(0, NodeId::from_raw(1), &rec)
-        .expect("put to storage");
+    seed_node_record(engine, 0, NodeId::from_raw(1), &rec);
 
     // Read back
-    let restored = LocalNodeStore::new(engine)
-        .get(0, NodeId::from_raw(1))
-        .expect("get from storage")
-        .expect("key should exist");
+    let restored = read_node(engine, 0, NodeId::from_raw(1)).expect("key should exist");
 
     assert_eq!(restored.primary_label(), "Device");
     assert_eq!(
@@ -90,15 +118,9 @@ fn document_deep_nesting_storage_roundtrip() {
     let mut rec = NodeRecord::new("Config");
     rec.set(1, PropertyValue::Document(level1.clone()));
 
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    LocalNodeStore::new(engine)
-        .put(0, NodeId::from_raw(2), &rec)
-        .expect("put to storage");
+    seed_node_record(engine, 0, NodeId::from_raw(2), &rec);
 
-    let restored = LocalNodeStore::new(engine)
-        .get(0, NodeId::from_raw(2))
-        .expect("get from storage")
-        .expect("key should exist");
+    let restored = read_node(engine, 0, NodeId::from_raw(2)).expect("key should exist");
 
     assert_eq!(restored.get(1), Some(&PropertyValue::Document(level1)));
 }
@@ -123,15 +145,9 @@ fn document_heterogeneous_array_storage() {
     let mut rec = NodeRecord::new("Test");
     rec.set(1, PropertyValue::Document(doc.clone()));
 
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    LocalNodeStore::new(engine)
-        .put(0, NodeId::from_raw(3), &rec)
-        .expect("put to storage");
+    seed_node_record(engine, 0, NodeId::from_raw(3), &rec);
 
-    let restored = LocalNodeStore::new(engine)
-        .get(0, NodeId::from_raw(3))
-        .expect("get from storage")
-        .expect("key should exist");
+    let restored = read_node(engine, 0, NodeId::from_raw(3)).expect("key should exist");
 
     assert_eq!(restored.get(1), Some(&PropertyValue::Document(doc)));
 }
@@ -155,15 +171,9 @@ fn document_mixed_with_regular_properties() {
     rec.set(5, PropertyValue::Vector(vec![0.1, 0.2, 0.3]));
     rec.set(6, PropertyValue::Document(doc.clone()));
 
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    LocalNodeStore::new(engine)
-        .put(0, NodeId::from_raw(4), &rec)
-        .expect("put to storage");
+    seed_node_record(engine, 0, NodeId::from_raw(4), &rec);
 
-    let restored = LocalNodeStore::new(engine)
-        .get(0, NodeId::from_raw(4))
-        .expect("get from storage")
-        .expect("key should exist");
+    let restored = read_node(engine, 0, NodeId::from_raw(4)).expect("key should exist");
 
     assert_eq!(
         restored.get(1),
@@ -189,7 +199,6 @@ fn document_persists_across_reopen() {
         rmpv::Value::String("data".into()),
     )]);
 
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
     let id = NodeId::from_raw(5);
 
     // Write + close
@@ -204,9 +213,7 @@ fn document_persists_across_reopen() {
         let engine = StorageEngine::open(&config).expect("open");
         let mut rec = NodeRecord::new("Persistent");
         rec.set(1, PropertyValue::Document(doc.clone()));
-        LocalNodeStore::new(&engine)
-            .put(0, id, &rec)
-            .expect("put to storage");
+        seed_node_record(&engine, 0, id, &rec);
         // engine drops here (storage flush on drop)
     }
 
@@ -220,10 +227,7 @@ fn document_persists_across_reopen() {
             Tier::Warm,
         )]);
         let engine = StorageEngine::open(&config).expect("reopen");
-        let restored = LocalNodeStore::new(&engine)
-            .get(0, id)
-            .expect("get from storage")
-            .expect("key should exist after reopen");
+        let restored = read_node(&engine, 0, id).expect("key should exist after reopen");
         assert_eq!(restored.primary_label(), "Persistent");
         assert_eq!(restored.get(1), Some(&PropertyValue::Document(doc)));
     }

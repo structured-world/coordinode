@@ -10,10 +10,13 @@
 
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
+use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_modality::{
     Bbox, Crs, IndexStore, LocalIndexStore, LocalNodeStore, LocalSpatialStore, NodeStore, Point,
     SpatialStore,
 };
+use coordinode_storage::engine::transaction::{CommitContext, Transaction};
 use proptest::prelude::*;
 
 /// Logic-test fixture — invariant proptests verify per-modality
@@ -75,14 +78,30 @@ proptest! {
     ) {
         let fx = open_engine();
         let engine = &fx.engine;
-        let store = LocalNodeStore::new(engine);
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let store = LocalNodeStore;
         let id = NodeId::from_raw(1);
-        for &vf in &valid_froms {
-            store
-                .put_temporal(0, id, vf, &NodeRecord::new("L"))
-                .unwrap();
+        {
+            let read_ts = oracle.next();
+            let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+            for &vf in &valid_froms {
+                store
+                    .put_temporal(&mut txn, 0, id, vf, &NodeRecord::new("L"))
+                    .unwrap();
+            }
+            let wc = WriteConcern::majority();
+            let ctx = CommitContext {
+                write_concern: &wc,
+                pipeline: None,
+                id_gen: None,
+                drain_buffer: None,
+                nvme_write_buffer: None,
+            };
+            txn.commit(&ctx).unwrap();
         }
-        let versions = store.scan_versions(0, id).unwrap();
+        let read_ts = oracle.next();
+        let rtxn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let versions = store.scan_versions(&rtxn, 0, id).unwrap();
         // Deduplicate (same valid_from collapses).
         let mut expected: Vec<i64> = valid_froms;
         expected.sort_unstable();

@@ -296,10 +296,26 @@ mod tests {
 
         let record = make_record("Item", Some("electronics"));
         {
+            use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+            use coordinode_core::txn::write_concern::WriteConcern;
             use coordinode_modality::{LocalNodeStore, NodeStore as _};
-            LocalNodeStore::new(&engine)
-                .put(shard_id, node_id, &record)
+            use coordinode_storage::engine::transaction::{CommitContext, Transaction};
+            let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+            let read_ts = oracle.next();
+            let mut txn =
+                Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+            LocalNodeStore
+                .put(&mut txn, shard_id, node_id, &record)
                 .expect("put node");
+            let wc = WriteConcern::majority();
+            let ctx = CommitContext {
+                write_concern: &wc,
+                pipeline: None,
+                id_gen: None,
+                drain_buffer: None,
+                nvme_write_buffer: None,
+            };
+            txn.commit(&ctx).expect("commit node");
         }
 
         let pred = VectorPredicate::And(

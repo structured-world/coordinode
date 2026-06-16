@@ -61,6 +61,7 @@ pub mod node;
 pub mod schema;
 pub mod spatial;
 pub mod timeseries;
+pub mod trigger;
 pub mod vector;
 
 pub use blob::{BlobStore, LocalBlobStore};
@@ -75,4 +76,5 @@ pub use timeseries::{
     Bucket, BucketControl, FieldStats, LocalTimeSeriesStore, Measurement, OverflowEntry,
     TimeSeriesStore,
 };
+pub use trigger::{LocalTriggerStore, TriggerStore};
 pub use vector::{LocalVectorStore, VectorStore};

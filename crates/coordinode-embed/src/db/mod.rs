@@ -230,10 +230,15 @@ impl coordinode_vector::VectorLoader for StorageVectorLoader {
             None => return result,
         };
 
+        use coordinode_core::txn::timestamp::Timestamp;
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        let node_store = LocalNodeStore::new(&self.engine);
+        use coordinode_storage::engine::transaction::Transaction;
+        // Vector loading is a bulk read — cheap direct-mode transaction (no
+        // snapshot/OCC); reads the latest committed node records.
+        let txn = Transaction::new(&self.engine, None, Timestamp::ZERO, None);
+        let node_store = LocalNodeStore;
         for &node_id in ids {
-            let record = match node_store.get(self.shard_id, NodeId::from_raw(node_id)) {
+            let record = match node_store.get(&txn, self.shard_id, NodeId::from_raw(node_id)) {
                 Ok(Some(r)) => r,
                 _ => continue,
             };
@@ -1504,8 +1509,12 @@ impl Database {
                 nplus1: Arc::clone(&self.nplus1_detector),
                 dismissed: Arc::clone(&self.dismissed),
             }),
-            mvcc_write_buffer: std::collections::HashMap::new(),
-            occ_scope: None,
+            txn: coordinode_storage::engine::transaction::Transaction::new(
+                &self.engine,
+                Some(&self.oracle),
+                read_ts,
+                None,
+            ),
             vector_consistency: session.vector_consistency,
             vector_overfetch_factor: 1.2,
             vector_mvcc_stats: None,
@@ -1517,11 +1526,7 @@ impl Database {
             write_concern: session.write_concern.clone(),
             drain_buffer: Some(&self.drain_buffer),
             nvme_write_buffer: self.nvme_write_buffer.as_deref(),
-            merge_adj_adds: std::collections::HashMap::new(),
-            merge_adj_removes: std::collections::HashMap::new(),
             mvcc_snapshot: None,
-            adj_snapshot: None,
-            merge_node_deltas: Vec::new(),
             // Cascade tracking — cluster defaults for trigger cycle protection.
             cascade_depth: 0,
             cascade_depth_limit: 10,

@@ -13,8 +13,10 @@
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
+use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_modality::{IndexStore as _, LocalIndexStore, LocalNodeStore, NodeStore};
 use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::transaction::Transaction;
 
 use super::definition::IndexDefinition;
 use super::ops::{create_index_entry, save_index_definition};
@@ -86,8 +88,12 @@ pub fn build_index(
     // Phase 2: InProgress — scan nodes
     result.state = Some(IndexBuildState::InProgress);
 
-    let nodes = LocalNodeStore::new(engine);
-    let scanned = match nodes.scan_shard(shard_id) {
+    let nodes = LocalNodeStore;
+    // Index build is a bulk background scan — cheap direct-mode transaction
+    // (no snapshot/OCC); reads the latest committed state, like the engine
+    // prefix scan it replaces.
+    let scan_txn = Transaction::new(engine, None, Timestamp::ZERO, None);
+    let scanned = match nodes.scan_shard(&scan_txn, shard_id) {
         Ok(v) => v,
         Err(e) => {
             result.errors.push(format!("scan error: {e}"));
@@ -235,15 +241,30 @@ mod tests {
         props: &[(&str, Value)],
         interner: &mut FieldInterner,
     ) {
+        use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+        use coordinode_core::txn::write_concern::WriteConcern;
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        use coordinode_storage::engine::transaction::{CommitContext, Transaction};
         let mut record = NodeRecord::new(label);
         for (name, value) in props {
             let field_id = interner.intern(name);
             record.set(field_id, value.clone());
         }
-        LocalNodeStore::new(engine)
-            .put(shard_id, NodeId::from_raw(node_id), &record)
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        LocalNodeStore
+            .put(&mut txn, shard_id, NodeId::from_raw(node_id), &record)
             .expect("put");
+        let wc = WriteConcern::majority();
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: None,
+            id_gen: None,
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        txn.commit(&ctx).expect("commit");
     }
 
     #[test]

@@ -12,6 +12,8 @@ use coordinode_core::graph::blob::ChunkId;
 use coordinode_core::graph::doc_delta::PathTarget;
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
+use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_modality::{
     Bbox, BlobStore, Bucket, Crs, DocumentStore, EdgeStore, IndexStore, LocalBlobStore,
     LocalDocumentStore, LocalEdgeStore, LocalIndexStore, LocalNodeStore, LocalSpatialStore,
@@ -20,6 +22,7 @@ use coordinode_modality::{
 };
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::transaction::{CommitContext, Transaction};
 use coordinode_vector::hnsw::HnswConfig;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::collections::BTreeMap;
@@ -44,14 +47,29 @@ fn bench_node_put(c: &mut Criterion) {
     let mut group = c.benchmark_group("node_put");
     group.sample_size(20);
     let (_dir, engine) = mk_engine();
-    let store = LocalNodeStore::new(&engine);
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalNodeStore;
     let record = NodeRecord::new("User");
 
     group.throughput(Throughput::Elements(1));
     group.bench_function("single_put", |b| {
         let mut id = 0u64;
         b.iter(|| {
-            store.put(0, NodeId::from_raw(id), &record).unwrap();
+            let read_ts = oracle.next();
+            let mut txn =
+                Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+            store
+                .put(&mut txn, 0, NodeId::from_raw(id), &record)
+                .unwrap();
+            let wc = WriteConcern::majority();
+            let ctx = CommitContext {
+                write_concern: &wc,
+                pipeline: None,
+                id_gen: None,
+                drain_buffer: None,
+                nvme_write_buffer: None,
+            };
+            txn.commit(&ctx).unwrap();
             id = id.wrapping_add(1);
         });
     });
@@ -67,15 +85,34 @@ fn bench_edge_scan(c: &mut Criterion) {
     for &n in &[100usize, 1000, 10_000] {
         // Build a fresh engine per size so prior runs don't pollute.
         let (_dir, engine) = mk_engine();
-        let store = LocalEdgeStore::new(&engine);
-        for i in 0..n as u64 {
-            store
-                .put_edge("F", src, NodeId::from_raw(i + 1000), None)
-                .unwrap();
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let store = LocalEdgeStore;
+        {
+            let read_ts = oracle.next();
+            let mut txn =
+                Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+            for i in 0..n as u64 {
+                store
+                    .put_edge(&mut txn, "F", src, NodeId::from_raw(i + 1000), None)
+                    .unwrap();
+            }
+            let wc = WriteConcern::majority();
+            let ctx = CommitContext {
+                write_concern: &wc,
+                pipeline: None,
+                id_gen: None,
+                drain_buffer: None,
+                nvme_write_buffer: None,
+            };
+            txn.commit(&ctx).unwrap();
         }
+        // Read-only transaction reused across iterations: measures the
+        // posting-list scan, not transaction setup.
+        let read_ts = oracle.next();
+        let rtxn = Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| store.scan_neighbors_out("F", src).unwrap())
+            b.iter(|| store.scan_neighbors_out(&rtxn, "F", src).unwrap())
         });
     }
     group.finish();
@@ -256,10 +293,23 @@ fn bench_document_set_path(c: &mut Criterion) {
     group.sample_size(20);
     let (_dir, engine) = mk_engine();
     let docs = LocalDocumentStore::new(&engine);
-    let nodes = LocalNodeStore::new(&engine);
-    nodes
-        .put(0, NodeId::from_raw(1), &NodeRecord::new("L"))
-        .unwrap();
+    {
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let mut txn = Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        LocalNodeStore
+            .put(&mut txn, 0, NodeId::from_raw(1), &NodeRecord::new("L"))
+            .unwrap();
+        let wc = WriteConcern::majority();
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: None,
+            id_gen: None,
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        txn.commit(&ctx).unwrap();
+    }
     group.bench_function("single_set_path", |b| {
         let mut i = 0u64;
         b.iter(|| {

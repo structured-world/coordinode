@@ -8,8 +8,10 @@ use std::io::{BufRead, Read};
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
+use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::engine::transaction::Transaction;
 
 use super::export::BackupEntry;
 
@@ -197,7 +199,6 @@ pub fn restore_json<R: BufRead>(
     reader: &mut R,
     only_labels: Option<&std::collections::HashSet<String>>,
 ) -> Result<RestoreStats, RestoreError> {
-    let node_store = coordinode_modality::LocalNodeStore::new(engine);
     let mut stats = RestoreStats::default();
     // Selective restore: with `only_labels`, keep only nodes carrying a matching
     // label and drop edges whose endpoints were filtered out. Exports list nodes
@@ -233,7 +234,7 @@ pub fn restore_json<R: BufRead>(
                     kept.insert(id);
                 }
                 write_node_record(
-                    &node_store,
+                    engine,
                     interner,
                     shard_id,
                     id,
@@ -298,7 +299,6 @@ pub fn restore_apoc_json<R: BufRead>(
     reader: &mut R,
     only_labels: Option<&std::collections::HashSet<String>>,
 ) -> Result<RestoreStats, RestoreError> {
-    let node_store = coordinode_modality::LocalNodeStore::new(engine);
     let mut stats = RestoreStats::default();
     // Selective restore: keep only label-matching nodes; drop edges to dropped
     // nodes (APOC lists nodes before relationships).
@@ -324,7 +324,7 @@ pub fn restore_apoc_json<R: BufRead>(
                     kept.insert(id);
                 }
                 write_node_record(
-                    &node_store,
+                    engine,
                     interner,
                     shard_id,
                     id,
@@ -386,8 +386,10 @@ fn apoc_id(v: Option<&serde_json::Value>, what: &str) -> Result<u64, RestoreErro
 }
 
 /// Write one node (labels + properties) to storage, interning property names.
+/// Each record commits in its own MVCC transaction (bulk restore is a stream
+/// of independent writes; per-record commit bounds buffer growth).
 fn write_node_record(
-    node_store: &coordinode_modality::LocalNodeStore,
+    engine: &StorageEngine,
     interner: &mut FieldInterner,
     shard_id: u16,
     id: u64,
@@ -395,7 +397,6 @@ fn write_node_record(
     props: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<(), RestoreError> {
     use coordinode_core::graph::node::NodeRecord;
-    use coordinode_modality::NodeStore as _;
 
     let mut record = NodeRecord::with_labels(labels);
     if let Some(props) = props {
@@ -404,8 +405,23 @@ fn write_node_record(
             record.set(field_id, json_to_value(json_val));
         }
     }
-    node_store
-        .put(shard_id, NodeId::from_raw(id), &record)
+    put_node_committed(engine, shard_id, NodeId::from_raw(id), &record)
+}
+
+/// Write a single fully-built node record straight to the engine (cheap
+/// direct-mode transaction: bulk restore is non-transactional, so it skips
+/// the MVCC buffer / OCC / snapshot / commit overhead — `put` lands
+/// immediately). Shared by the JSON/APOC/Cypher restore paths.
+fn put_node_committed(
+    engine: &StorageEngine,
+    shard_id: u16,
+    node_id: NodeId,
+    record: &coordinode_core::graph::node::NodeRecord,
+) -> Result<(), RestoreError> {
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let mut txn = Transaction::new(engine, None, Timestamp::ZERO, None);
+    LocalNodeStore
+        .put(&mut txn, shard_id, node_id, record)
         .map_err(|e| RestoreError::Storage(e.to_string()))
 }
 
@@ -490,8 +506,6 @@ pub fn restore_cypher<R: BufRead>(
         encode_adj_key_forward, encode_adj_key_reverse, encode_edgeprop_key,
     };
     use coordinode_core::graph::node::NodeRecord;
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    let node_store = LocalNodeStore::new(engine);
     let mut stats = RestoreStats::default();
 
     // One statement per line, each terminated by `;`. Export emits JSON
@@ -553,9 +567,7 @@ pub fn restore_cypher<R: BufRead>(
             for (name, val) in props {
                 record.set(interner.intern(&name), val);
             }
-            node_store
-                .put(shard_id, NodeId::from_raw(id), &record)
-                .map_err(|e| RestoreError::Storage(e.to_string()))?;
+            put_node_committed(engine, shard_id, NodeId::from_raw(id), &record)?;
             stats.nodes += 1;
         }
     }
@@ -773,7 +785,6 @@ pub fn restore_apoc_cypher<R: BufRead>(
     shard_id: u16,
     reader: &mut R,
 ) -> Result<RestoreStats, RestoreError> {
-    let node_store = coordinode_modality::LocalNodeStore::new(engine);
     let mut stats = RestoreStats::default();
 
     let mut text = String::new();
@@ -797,7 +808,7 @@ pub fn restore_apoc_cypher<R: BufRead>(
         if stmt.is_empty() {
             continue;
         }
-        apply_apoc_cypher_stmt(stmt, engine, &node_store, interner, shard_id, &mut stats)?;
+        apply_apoc_cypher_stmt(stmt, engine, interner, shard_id, &mut stats)?;
     }
     Ok(stats)
 }
@@ -806,7 +817,6 @@ pub fn restore_apoc_cypher<R: BufRead>(
 fn apply_apoc_cypher_stmt(
     stmt: &str,
     engine: &StorageEngine,
-    node_store: &coordinode_modality::LocalNodeStore,
     interner: &mut FieldInterner,
     shard_id: u16,
     stats: &mut RestoreStats,
@@ -834,9 +844,9 @@ fn apply_apoc_cypher_stmt(
     }
 
     if upper.starts_with("UNWIND") {
-        apply_apoc_unwind(stmt, engine, node_store, interner, shard_id, stats)
+        apply_apoc_unwind(stmt, engine, interner, shard_id, stats)
     } else if upper.starts_with("CREATE (") || upper.starts_with("CREATE(") {
-        apply_apoc_plain_node(stmt, node_store, interner, shard_id, stats)
+        apply_apoc_plain_node(stmt, engine, interner, shard_id, stats)
     } else if upper.starts_with("MATCH") && stmt.contains("]->") {
         apply_apoc_plain_rel(stmt, engine, interner, stats)
     } else {
@@ -850,7 +860,6 @@ fn apply_apoc_cypher_stmt(
 fn apply_apoc_unwind(
     stmt: &str,
     engine: &StorageEngine,
-    node_store: &coordinode_modality::LocalNodeStore,
     interner: &mut FieldInterner,
     shard_id: u16,
     stats: &mut RestoreStats,
@@ -882,7 +891,7 @@ fn apply_apoc_unwind(
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| RestoreError::InvalidFormat("UNWIND node row missing _id".into()))?;
             let props = row.get("properties").and_then(|v| v.as_object());
-            write_node_record(node_store, interner, shard_id, id, labels.clone(), props)?;
+            write_node_record(engine, interner, shard_id, id, labels.clone(), props)?;
             stats.nodes += 1;
         }
     }
@@ -900,7 +909,7 @@ fn nested_id(row: &serde_json::Value, side: &str) -> Result<u64, RestoreError> {
 /// Apply a plain `CREATE (:Labels {props, `UNIQUE IMPORT ID`: N});` node.
 fn apply_apoc_plain_node(
     stmt: &str,
-    node_store: &coordinode_modality::LocalNodeStore,
+    engine: &StorageEngine,
     interner: &mut FieldInterner,
     shard_id: u16,
     stats: &mut RestoreStats,
@@ -928,7 +937,7 @@ fn apply_apoc_plain_node(
                     .into(),
             )
         })?;
-    write_node_record(node_store, interner, shard_id, id, labels, Some(&obj))?;
+    write_node_record(engine, interner, shard_id, id, labels, Some(&obj))?;
     stats.nodes += 1;
     Ok(())
 }
@@ -1535,7 +1544,6 @@ pub fn restore_hetio_json<R: BufRead>(
     let doc: HetnetDoc = serde_json::from_reader(reader)
         .map_err(|e| RestoreError::Deserialization(format!("hetnet json: {e}")))?;
 
-    let node_store = coordinode_modality::LocalNodeStore::new(engine);
     let mut stats = RestoreStats::default();
     let mut id_map: std::collections::HashMap<(String, String), u64> =
         std::collections::HashMap::with_capacity(doc.nodes.len());
@@ -1556,7 +1564,7 @@ pub fn restore_hetio_json<R: BufRead>(
         }
         props.insert("identifier".to_string(), n.identifier.clone());
         write_node_record(
-            &node_store,
+            engine,
             interner,
             shard_id,
             id,

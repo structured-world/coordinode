@@ -22,6 +22,7 @@ use coordinode_core::schema::definition::{
 use coordinode_storage::engine::batch::WriteBatch;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::engine::transaction::Transaction;
 use coordinode_storage::Guard;
 
 use crate::error::{StoreError, StoreResult};
@@ -146,6 +147,46 @@ pub trait SchemaStore {
     /// Symmetric to [`Self::list_labels`]. Returns one
     /// [`EdgeTypeSchema`] per active edge type, in arbitrary order.
     fn list_edge_types(&self) -> StoreResult<Vec<EdgeTypeSchema>>;
+
+    // ── Transaction-threaded variants (query-execution path) ───────────────
+    // The query layer reads/writes schema inside a statement transaction:
+    // pointer + body resolve through the transaction (RYOW + OCC tracking in
+    // MVCC mode). Same revision-indirection contract as the engine variants.
+
+    /// Load the current label schema through a transaction (tracked read).
+    fn load_label_txn(&self, txn: &mut Transaction, name: &str)
+        -> StoreResult<Option<LabelSchema>>;
+
+    /// Load the current edge type schema through a transaction (tracked read).
+    fn load_edge_type_txn(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+    ) -> StoreResult<Option<EdgeTypeSchema>>;
+
+    /// Persist a label schema (body + current-revision pointer) on the
+    /// transaction's write buffer; applied atomically at commit.
+    fn save_label_txn(&self, txn: &mut Transaction, schema: &LabelSchema) -> StoreResult<()>;
+
+    /// Persist an edge type schema (body + pointer) on the transaction.
+    fn save_edge_type_txn(&self, txn: &mut Transaction, schema: &EdgeTypeSchema)
+        -> StoreResult<()>;
+
+    /// Idempotently write the implicit edge-type existence marker (empty body
+    /// at revision 1) — checks the write buffer (RYOW) then the OCC-tracked
+    /// snapshot before writing, so a concurrent `CREATE EDGE TYPE` body is
+    /// never clobbered. Edge-create paths call this for first-seen types.
+    fn register_edge_type_marker(&self, txn: &mut Transaction, name: &str) -> StoreResult<()>;
+
+    /// Whether an edge type exists: explicit current-revision pointer OR the
+    /// implicit existence marker (revision 1). Both reads are OCC-tracked.
+    fn edge_type_exists(&self, txn: &mut Transaction, name: &str) -> StoreResult<bool>;
+
+    /// Distinct names of every edge type registered in the schema partition,
+    /// including types created in this transaction's (not yet flushed) write
+    /// buffer. Enumerates the `schema:edge_type:<name>:<version>` family and
+    /// strips the version suffix.
+    fn list_edge_type_names(&self, txn: &mut Transaction) -> StoreResult<Vec<String>>;
 }
 
 /// CE single-shard implementation of [`SchemaStore`]. Operates
@@ -186,6 +227,25 @@ impl<'a> LocalSchemaStore<'a> {
             kind,
             message: format!("revision pointer expected 8 bytes, got {}", bytes.len()),
         })?;
+        Ok(Some(u64::from_be_bytes(array)))
+    }
+
+    /// Transaction-threaded revision pointer read (tracked).
+    fn load_revision_pointer_txn(
+        txn: &mut Transaction,
+        key: &[u8],
+        kind: &'static str,
+    ) -> StoreResult<Option<u64>> {
+        let Some(bytes) = txn.get(Partition::Schema, key)? else {
+            return Ok(None);
+        };
+        let array: [u8; 8] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Decode {
+                kind,
+                message: format!("revision pointer expected 8 bytes, got {}", bytes.len()),
+            })?;
         Ok(Some(u64::from_be_bytes(array)))
     }
 }
@@ -335,6 +395,135 @@ impl SchemaStore for LocalSchemaStore<'_> {
             }
         }
         Ok(out)
+    }
+
+    fn load_label_txn(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+    ) -> StoreResult<Option<LabelSchema>> {
+        let pointer_key = encode_label_current_revision_key(name);
+        let Some(revision) = Self::load_revision_pointer_txn(txn, &pointer_key, "label")? else {
+            return Ok(None);
+        };
+        let schema_key = encode_label_schema_key(name, revision);
+        let Some(schema_bytes) = txn.get(Partition::Schema, &schema_key)? else {
+            return Err(StoreError::Decode {
+                kind: "label schema",
+                message: format!("pointer for '{name}' references missing revision {revision}"),
+            });
+        };
+        LabelSchema::from_msgpack(&schema_bytes)
+            .map(Some)
+            .map_err(|e| StoreError::Decode {
+                kind: "label schema",
+                message: format!("decode failed for '{name}' rev {revision}: {e}"),
+            })
+    }
+
+    fn load_edge_type_txn(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+    ) -> StoreResult<Option<EdgeTypeSchema>> {
+        let pointer_key = encode_edge_type_current_revision_key(name);
+        let Some(revision) = Self::load_revision_pointer_txn(txn, &pointer_key, "edge type")?
+        else {
+            return Ok(None);
+        };
+        let schema_key = encode_edge_type_schema_key(name, revision);
+        let Some(schema_bytes) = txn.get(Partition::Schema, &schema_key)? else {
+            return Err(StoreError::Decode {
+                kind: "edge type schema",
+                message: format!("pointer for '{name}' references missing revision {revision}"),
+            });
+        };
+        // Legacy zero-length idempotent existence marker → "no schema".
+        if schema_bytes.is_empty() {
+            return Ok(None);
+        }
+        EdgeTypeSchema::from_msgpack(&schema_bytes)
+            .map(Some)
+            .map_err(|e| StoreError::Decode {
+                kind: "edge type schema",
+                message: format!("decode failed for '{name}' rev {revision}: {e}"),
+            })
+    }
+
+    fn save_label_txn(&self, txn: &mut Transaction, schema: &LabelSchema) -> StoreResult<()> {
+        let body = schema.to_msgpack().map_err(|e| StoreError::Decode {
+            kind: "label schema",
+            message: format!("encode '{}': {e}", schema.name),
+        })?;
+        let schema_key = encode_label_schema_key(&schema.name, schema.schema_revision);
+        txn.put(Partition::Schema, &schema_key, &body)?;
+        let pointer_key = encode_label_current_revision_key(&schema.name);
+        txn.put(
+            Partition::Schema,
+            &pointer_key,
+            &schema.schema_revision.to_be_bytes(),
+        )?;
+        Ok(())
+    }
+
+    fn save_edge_type_txn(
+        &self,
+        txn: &mut Transaction,
+        schema: &EdgeTypeSchema,
+    ) -> StoreResult<()> {
+        let body = schema.to_msgpack().map_err(|e| StoreError::Decode {
+            kind: "edge type schema",
+            message: format!("encode '{}': {e}", schema.name),
+        })?;
+        let schema_key = encode_edge_type_schema_key(&schema.name, schema.schema_revision);
+        txn.put(Partition::Schema, &schema_key, &body)?;
+        let pointer_key = encode_edge_type_current_revision_key(&schema.name);
+        txn.put(
+            Partition::Schema,
+            &pointer_key,
+            &schema.schema_revision.to_be_bytes(),
+        )?;
+        Ok(())
+    }
+
+    fn register_edge_type_marker(&self, txn: &mut Transaction, name: &str) -> StoreResult<()> {
+        let key = encode_edge_type_schema_key(name, 1);
+        let already = txn.buffered(Partition::Schema, &key).is_some()
+            || txn.get(Partition::Schema, &key)?.is_some();
+        if !already {
+            txn.put(Partition::Schema, &key, b"")?;
+        }
+        Ok(())
+    }
+
+    fn edge_type_exists(&self, txn: &mut Transaction, name: &str) -> StoreResult<bool> {
+        let pointer_key = encode_edge_type_current_revision_key(name);
+        if txn.get(Partition::Schema, &pointer_key)?.is_some() {
+            return Ok(true);
+        }
+        let marker_key = encode_edge_type_schema_key(name, 1);
+        Ok(txn.get(Partition::Schema, &marker_key)?.is_some())
+    }
+
+    fn list_edge_type_names(&self, txn: &mut Transaction) -> StoreResult<Vec<String>> {
+        // `schema:edge_type:<name>:<version>` — names cannot contain ':'
+        // (DDL grammar), so the rightmost ':' splits name from version.
+        const PREFIX: &[u8] = b"schema:edge_type:";
+        let extract_name = |key: &[u8]| -> Option<String> {
+            let suffix = key.get(PREFIX.len()..)?;
+            let suffix_str = std::str::from_utf8(suffix).ok()?;
+            let (name, _version) = suffix_str.rsplit_once(':')?;
+            Some(name.to_string())
+        };
+        let mut types: Vec<String> = Vec::new();
+        for (k, _) in txn.prefix_scan(Partition::Schema, PREFIX)? {
+            if let Some(name) = extract_name(&k) {
+                if !types.contains(&name) {
+                    types.push(name);
+                }
+            }
+        }
+        Ok(types)
     }
 }
 

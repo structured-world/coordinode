@@ -68,9 +68,13 @@ fn make_test_ctx<'a>(
         vector_loader: None,
         mvcc_oracle: None,
         mvcc_read_ts: coordinode_core::txn::timestamp::Timestamp::ZERO,
-        mvcc_write_buffer: std::collections::HashMap::new(),
+        txn: coordinode_storage::engine::transaction::Transaction::new(
+            engine,
+            None,
+            coordinode_core::txn::timestamp::Timestamp::ZERO,
+            None,
+        ),
         procedure_ctx: None,
-        occ_scope: None,
         vector_consistency: coordinode_core::graph::types::VectorConsistencyMode::default(),
         vector_overfetch_factor: 1.2,
         vector_mvcc_stats: None,
@@ -80,11 +84,7 @@ fn make_test_ctx<'a>(
         write_concern: coordinode_core::txn::write_concern::WriteConcern::majority(),
         drain_buffer: None,
         nvme_write_buffer: None,
-        merge_adj_adds: std::collections::HashMap::new(),
-        merge_adj_removes: std::collections::HashMap::new(),
         mvcc_snapshot: None,
-        adj_snapshot: None,
-        merge_node_deltas: Vec::new(),
         cascade_depth: 0,
         cascade_depth_limit: 10,
         cascade_fire_counts: std::collections::HashMap::new(),
@@ -108,28 +108,57 @@ fn insert_node(
     props: &[(&str, Value)],
     interner: &mut FieldInterner,
 ) {
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use coordinode_core::txn::write_concern::WriteConcern;
     use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    use coordinode_storage::engine::transaction::{CommitContext, Transaction};
     let nid = NodeId::from_raw(node_id);
     let mut record = NodeRecord::new(label);
     for (k, v) in props {
         let fid = interner.intern(k);
         record.set(fid, v.clone());
     }
-    LocalNodeStore::new(engine)
-        .put(1, nid, &record)
-        .expect("put");
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let read_ts = oracle.next();
+    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    LocalNodeStore.put(&mut txn, 1, nid, &record).expect("put");
+    let wc = WriteConcern::majority();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    txn.commit(&ctx).expect("commit");
 }
 
 fn insert_edge(engine: &StorageEngine, edge_type: &str, source_id: u64, target_id: u64) {
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use coordinode_core::txn::write_concern::WriteConcern;
     use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
-    LocalEdgeStore::new(engine)
+    use coordinode_storage::engine::transaction::{CommitContext, Transaction};
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let read_ts = oracle.next();
+    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    LocalEdgeStore
         .put_edge(
+            &mut txn,
             edge_type,
             NodeId::from_raw(source_id),
             NodeId::from_raw(target_id),
             None,
         )
         .expect("put edge");
+    let wc = WriteConcern::majority();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    txn.commit(&ctx).expect("commit edge");
 }
 
 // ─────────────────────────────────────────────────────────────────────────

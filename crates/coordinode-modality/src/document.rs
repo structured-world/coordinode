@@ -411,11 +411,44 @@ mod tests {
     use crate::node::{LocalNodeStore, NodeStore};
     use coordinode_core::graph::node::NodeRecord;
     use coordinode_core::graph::types::Value;
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use coordinode_core::txn::write_concern::WriteConcern;
+    use coordinode_storage::engine::core::StorageEngine;
+    use coordinode_storage::engine::transaction::{CommitContext, Transaction};
 
     /// Logic-test fixture (memory backing, env-flippable). Document
     /// property tests verify dot-notation + merge-op contracts.
     fn open_engine() -> coordinode_test_fixtures::EngineFixture {
         coordinode_test_fixtures::engine_for_logic()
+    }
+
+    /// Seed a base node via an MVCC transaction (shard 0) + commit, so a
+    /// subsequent document merge has a record to merge into.
+    fn put_node(engine: &StorageEngine, id: NodeId, record: &NodeRecord) {
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        LocalNodeStore
+            .put(&mut txn, 0, id, record)
+            .expect("put node");
+        let wc = WriteConcern::majority();
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: None,
+            id_gen: None,
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        txn.commit(&ctx).expect("commit node");
+    }
+
+    /// Read a node (shard 0) at the latest committed snapshot through an
+    /// MVCC transaction.
+    fn get_node(engine: &StorageEngine, id: NodeId) -> Option<NodeRecord> {
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        LocalNodeStore.get(&txn, 0, id).expect("get node")
     }
 
     /// Round-trip a SetPath against the Extra map and verify the
@@ -426,9 +459,8 @@ mod tests {
         let engine = &fx.engine;
         // First seed a base node so the merge has something to merge
         // into.
-        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(1);
-        nodes.put(0, id, &NodeRecord::new("User")).expect("put");
+        put_node(engine, id, &NodeRecord::new("User"));
 
         let docs = LocalDocumentStore::new(engine);
         docs.set_path(
@@ -445,7 +477,7 @@ mod tests {
         // extra.profile is an rmpv::Value::Map; we walk it to find
         // the city key without depending on a specific Value variant
         // ordering inside the rmpv map.
-        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        let rec = get_node(engine, id).expect("Some");
         let extra = rec
             .get_extra("profile")
             .expect("profile key present in extra after merge");
@@ -473,9 +505,8 @@ mod tests {
     fn increment_accumulates_over_multiple_deltas() {
         let fx = open_engine();
         let engine = &fx.engine;
-        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(7);
-        nodes.put(0, id, &NodeRecord::new("Counter")).expect("put");
+        put_node(engine, id, &NodeRecord::new("Counter"));
 
         let docs = LocalDocumentStore::new(engine);
         for _ in 0..3 {
@@ -483,7 +514,7 @@ mod tests {
                 .expect("inc");
         }
 
-        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        let rec = get_node(engine, id).expect("Some");
         let hits = rec.get_extra("hits").expect("hits present");
         // Extra entries flow through rmpv at the merge boundary, so
         // numeric increments land as Value::Document(F64) rather
@@ -513,9 +544,8 @@ mod tests {
     fn delete_path_missing_is_idempotent() {
         let fx = open_engine();
         let engine = &fx.engine;
-        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(99);
-        nodes.put(0, id, &NodeRecord::new("X")).expect("put");
+        put_node(engine, id, &NodeRecord::new("X"));
 
         let docs = LocalDocumentStore::new(engine);
         // Path doesn't exist — delete must succeed silently.
@@ -528,7 +558,7 @@ mod tests {
         .expect("delete missing");
 
         // Node still readable, no change.
-        nodes.get(0, id).expect("ok").expect("Some");
+        get_node(engine, id).expect("Some");
     }
 
     fn read_array_len(rec: &coordinode_core::graph::node::NodeRecord, key: &str) -> usize {
@@ -557,9 +587,8 @@ mod tests {
     fn array_push_creates_array_if_missing() {
         let fx = open_engine();
         let engine = &fx.engine;
-        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(20);
-        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+        put_node(engine, id, &NodeRecord::new("L"));
 
         let docs = LocalDocumentStore::new(engine);
         docs.array_push(
@@ -571,7 +600,7 @@ mod tests {
         )
         .expect("push");
 
-        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        let rec = get_node(engine, id).expect("Some");
         assert_eq!(read_array_len(&rec, "scores"), 1);
     }
 
@@ -579,9 +608,8 @@ mod tests {
     fn array_push_appends_in_order() {
         let fx = open_engine();
         let engine = &fx.engine;
-        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(21);
-        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+        put_node(engine, id, &NodeRecord::new("L"));
 
         let docs = LocalDocumentStore::new(engine);
         for v in [1.0, 2.0, 3.0] {
@@ -594,7 +622,7 @@ mod tests {
             )
             .expect("push");
         }
-        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        let rec = get_node(engine, id).expect("Some");
         assert_eq!(read_array_len(&rec, "xs"), 3);
     }
 
@@ -603,9 +631,8 @@ mod tests {
         // Seed an array, pull a value not in it — array unchanged.
         let fx = open_engine();
         let engine = &fx.engine;
-        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(22);
-        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+        put_node(engine, id, &NodeRecord::new("L"));
 
         let docs = LocalDocumentStore::new(engine);
         docs.array_push(
@@ -624,7 +651,7 @@ mod tests {
             rmpv::Value::String("not-there".into()),
         )
         .expect("pull");
-        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        let rec = get_node(engine, id).expect("Some");
         assert_eq!(read_array_len(&rec, "tags"), 1);
     }
 
@@ -632,9 +659,8 @@ mod tests {
     fn array_pull_missing_path_is_noop() {
         let fx = open_engine();
         let engine = &fx.engine;
-        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(23);
-        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+        put_node(engine, id, &NodeRecord::new("L"));
 
         let docs = LocalDocumentStore::new(engine);
         docs.array_pull(
@@ -646,23 +672,22 @@ mod tests {
         )
         .expect("pull missing");
         // Node still readable.
-        nodes.get(0, id).expect("ok").expect("Some");
+        get_node(engine, id).expect("Some");
     }
 
     #[test]
     fn increment_accepts_negative_delta() {
         let fx = open_engine();
         let engine = &fx.engine;
-        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(24);
-        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+        put_node(engine, id, &NodeRecord::new("L"));
 
         let docs = LocalDocumentStore::new(engine);
         docs.increment(0, id, PathTarget::Extra, vec!["v".to_string()], 10.0)
             .expect("inc up");
         docs.increment(0, id, PathTarget::Extra, vec!["v".to_string()], -3.5)
             .expect("inc down");
-        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        let rec = get_node(engine, id).expect("Some");
         assert!((read_numeric(&rec, "v") - 6.5).abs() < 1e-9);
     }
 
@@ -670,15 +695,14 @@ mod tests {
     fn increment_creates_value_if_missing() {
         let fx = open_engine();
         let engine = &fx.engine;
-        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(25);
-        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+        put_node(engine, id, &NodeRecord::new("L"));
 
         let docs = LocalDocumentStore::new(engine);
         // No prior value — increment from scratch lands at delta.
         docs.increment(0, id, PathTarget::Extra, vec!["fresh".to_string()], 7.0)
             .expect("inc");
-        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        let rec = get_node(engine, id).expect("Some");
         assert!((read_numeric(&rec, "fresh") - 7.0).abs() < 1e-9);
     }
 
@@ -686,14 +710,13 @@ mod tests {
     fn remove_property_missing_is_idempotent() {
         let fx = open_engine();
         let engine = &fx.engine;
-        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(26);
-        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+        put_node(engine, id, &NodeRecord::new("L"));
 
         let docs = LocalDocumentStore::new(engine);
         docs.remove_property(0, id, PathTarget::Extra, Some("never".to_string()))
             .expect("remove missing");
-        nodes.get(0, id).expect("ok").expect("Some");
+        get_node(engine, id).expect("Some");
     }
 
     #[test]
@@ -702,9 +725,8 @@ mod tests {
         // intermediate map must be created so the leaf set lands.
         let fx = open_engine();
         let engine = &fx.engine;
-        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(27);
-        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+        put_node(engine, id, &NodeRecord::new("L"));
 
         let docs = LocalDocumentStore::new(engine);
         docs.set_path(
@@ -734,7 +756,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("key {key} missing"))
         }
 
-        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        let rec = get_node(engine, id).expect("Some");
         let a = rec.get_extra("a").expect("a present");
         let a_inner = match a {
             Value::Document(m) => m,
@@ -753,9 +775,8 @@ mod tests {
     fn delete_path_existing_path_removes_value() {
         let fx = open_engine();
         let engine = &fx.engine;
-        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(28);
-        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+        put_node(engine, id, &NodeRecord::new("L"));
 
         let docs = LocalDocumentStore::new(engine);
         docs.set_path(
@@ -769,7 +790,7 @@ mod tests {
         docs.delete_path(0, id, PathTarget::Extra, vec!["a".into(), "b".into()])
             .expect("delete");
 
-        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        let rec = get_node(engine, id).expect("Some");
         // After delete, "a" map exists but lacks "b" — or the whole
         // "a" entry may be gone if it became empty. Either way, "b"
         // must not be reachable.
@@ -786,9 +807,8 @@ mod tests {
         // Push 3 entries, pull one — array has 2 left.
         let fx = open_engine();
         let engine = &fx.engine;
-        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(29);
-        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+        put_node(engine, id, &NodeRecord::new("L"));
 
         let docs = LocalDocumentStore::new(engine);
         for s in ["a", "b", "c"] {
@@ -810,7 +830,7 @@ mod tests {
         )
         .expect("pull");
 
-        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        let rec = get_node(engine, id).expect("Some");
         assert_eq!(read_array_len(&rec, "tags"), 2);
     }
 
@@ -818,9 +838,8 @@ mod tests {
     fn remove_property_existing_property_clears_it() {
         let fx = open_engine();
         let engine = &fx.engine;
-        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(30);
-        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+        put_node(engine, id, &NodeRecord::new("L"));
 
         let docs = LocalDocumentStore::new(engine);
         docs.set_path(
@@ -834,7 +853,7 @@ mod tests {
         docs.remove_property(0, id, PathTarget::Extra, Some("temp".into()))
             .expect("remove");
 
-        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        let rec = get_node(engine, id).expect("Some");
         assert!(
             rec.get_extra("temp").is_none(),
             "temp must be gone after remove_property",
@@ -848,9 +867,8 @@ mod tests {
         // merges).
         let fx = open_engine();
         let engine = &fx.engine;
-        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(31);
-        nodes.put(0, id, &NodeRecord::new("L")).expect("put");
+        put_node(engine, id, &NodeRecord::new("L"));
 
         let docs = LocalDocumentStore::new(engine);
         docs.set_path(
@@ -870,7 +888,7 @@ mod tests {
         )
         .expect("set int");
 
-        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        let rec = get_node(engine, id).expect("Some");
         let v = rec.get_extra("x").expect("x present");
         match v {
             Value::Document(rmpv::Value::Integer(i)) => {
@@ -888,11 +906,10 @@ mod tests {
         // typed accessor on NodeRecord.
         let fx = open_engine();
         let engine = &fx.engine;
-        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(32);
         let mut base = NodeRecord::new("L");
         base.set_extra("placeholder", Value::Int(0));
-        nodes.put(0, id, &base).expect("put");
+        put_node(engine, id, &base);
 
         let docs = LocalDocumentStore::new(engine);
         docs.set_path(
@@ -904,7 +921,7 @@ mod tests {
         )
         .expect("set propfield");
 
-        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        let rec = get_node(engine, id).expect("Some");
         let v = rec
             .props
             .get(&7)
@@ -930,8 +947,7 @@ mod tests {
         let fx = open_engine();
         let engine = Arc::clone(&fx.engine);
         let id = NodeId::from_raw(100);
-        let nodes = LocalNodeStore::new(&engine);
-        nodes.put(0, id, &NodeRecord::new("Multi")).expect("seed");
+        put_node(&engine, id, &NodeRecord::new("Multi"));
 
         let handles: Vec<_> = (0..4u64)
             .map(|t| {
@@ -953,7 +969,7 @@ mod tests {
             h.join().expect("join");
         }
 
-        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        let rec = get_node(&engine, id).expect("Some");
         for t in 0u64..4 {
             assert!(
                 rec.get_extra(&format!("k{t}")).is_some(),
@@ -968,9 +984,8 @@ mod tests {
     fn array_add_to_set_deduplicates() {
         let fx = open_engine();
         let engine = &fx.engine;
-        let nodes = LocalNodeStore::new(engine);
         let id = NodeId::from_raw(5);
-        nodes.put(0, id, &NodeRecord::new("Y")).expect("put");
+        put_node(engine, id, &NodeRecord::new("Y"));
 
         let docs = LocalDocumentStore::new(engine);
         for _ in 0..3 {
@@ -984,7 +999,7 @@ mod tests {
             .expect("add");
         }
 
-        let rec = nodes.get(0, id).expect("ok").expect("Some");
+        let rec = get_node(engine, id).expect("Some");
         let tags = rec.get_extra("tags").expect("tags present");
         // Same rmpv shape: arrays in `extra` come back wrapped in
         // Value::Document(rmpv::Value::Array(...)).
