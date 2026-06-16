@@ -1725,8 +1725,34 @@ pub(crate) fn plan_allows_varlen_target_dedup(root: &LogicalOp) -> bool {
     }
 }
 
-/// Execute a logical plan against storage, returning result rows.
+/// Execute a logical plan against storage, returning result rows, and
+/// auto-commit the statement's writes.
+///
+/// This is the single-statement (auto-commit) entry point: it runs the plan
+/// via [`execute_no_commit`] and then flushes the transaction
+/// ([`ExecutionContext::mvcc_flush`] — assign `commit_ts`, OCC validate,
+/// persist via the Raft proposal pipeline). Interactive multi-statement
+/// transactions (ADR-042) call [`execute_no_commit`] directly and commit the
+/// shared transaction once, after the final statement.
 pub fn execute(
+    plan: &LogicalPlan,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    let result = execute_no_commit(plan, ctx)?;
+    // Flush MVCC write buffer: assign commit_ts and persist all buffered
+    // writes. In legacy mode (mvcc_oracle: None) this is a no-op.
+    ctx.mvcc_flush()?;
+    Ok(result)
+}
+
+/// Execute a logical plan against storage WITHOUT committing.
+///
+/// Runs the full plan (snapshot setup, watermark wait, operator tree) and
+/// leaves every mutation buffered on `ctx.txn` — the caller is responsible
+/// for committing (or rolling back). [`execute`] wraps this with an
+/// auto-commit; interactive transactions (ADR-042) run N statements through
+/// this entry against one shared `ctx.txn` and commit once at the end.
+pub fn execute_no_commit(
     plan: &LogicalPlan,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
@@ -1877,11 +1903,6 @@ pub fn execute(
     ctx.dedup_varlen_targets = plan_allows_varlen_target_dedup(&plan.root);
 
     let result = execute_op(&plan.root, ctx)?;
-
-    // Flush MVCC write buffer: assign commit_ts and persist all buffered writes.
-    // In legacy mode (mvcc_oracle: None), this is a no-op.
-    ctx.mvcc_flush()?;
-
     Ok(result)
 }
 
