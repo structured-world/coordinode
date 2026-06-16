@@ -161,6 +161,24 @@ pub struct Transaction<'a> {
     merge_node_deltas: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+/// The borrow-free owned state of a [`Transaction`] — everything except the
+/// `engine` / `oracle` borrows. An interactive multi-statement transaction
+/// (ADR-042) parks this in a leader-local registry between statements and
+/// rebuilds a [`Transaction`] around it (via [`Transaction::resume`]) for each
+/// statement, so the pinned snapshot, write buffer, OCC read-set, and merge
+/// buffers persist across statements while the transaction itself stays a
+/// short-lived borrow. Produced by [`Transaction::into_state`].
+pub struct TransactionState {
+    read_ts: Timestamp,
+    snapshot: Option<StorageSnapshot>,
+    adj_snapshot: Option<StorageSnapshot>,
+    write_buffer: HashMap<(Partition, Vec<u8>), Option<Vec<u8>>>,
+    occ_scope: Option<OccScope>,
+    merge_adj_adds: HashMap<Vec<u8>, Vec<u64>>,
+    merge_adj_removes: HashMap<Vec<u8>, Vec<u64>>,
+    merge_node_deltas: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
 impl<'a> Transaction<'a> {
     /// Open a transaction. `oracle: Some` + `snapshot: Some` is the MVCC path;
     /// `oracle: None` is legacy direct-to-engine mode (no snapshot, no buffer).
@@ -181,6 +199,53 @@ impl<'a> Transaction<'a> {
             merge_adj_adds: HashMap::new(),
             merge_adj_removes: HashMap::new(),
             merge_node_deltas: Vec::new(),
+        }
+    }
+
+    /// Consume the transaction, returning its borrow-free owned state.
+    ///
+    /// The `engine` / `oracle` borrows are dropped; everything that defines
+    /// the transaction's progress — the pinned `read_ts` + snapshots, the
+    /// read-your-own-writes write buffer, the OCC read-set, and the adjacency
+    /// / node merge buffers — is moved out. Pair with [`Self::resume`] to park
+    /// an interactive multi-statement transaction (ADR-042) in a leader-local
+    /// registry between statements and rebuild it for the next statement, so
+    /// the snapshot and accumulated buffers persist while the `Transaction`
+    /// itself stays a short-lived borrow.
+    pub fn into_state(self) -> TransactionState {
+        TransactionState {
+            read_ts: self.read_ts,
+            snapshot: self.snapshot,
+            adj_snapshot: self.adj_snapshot,
+            write_buffer: self.write_buffer,
+            occ_scope: self.occ_scope,
+            merge_adj_adds: self.merge_adj_adds,
+            merge_adj_removes: self.merge_adj_removes,
+            merge_node_deltas: self.merge_node_deltas,
+        }
+    }
+
+    /// Rebuild a transaction around parked [`TransactionState`] with freshly
+    /// supplied `engine` / `oracle` borrows — the resume side of
+    /// [`Self::into_state`]. The pinned `read_ts` + snapshots carry over, so
+    /// every statement of an interactive transaction reads the same MVCC
+    /// snapshot (repeatable read across the transaction).
+    pub fn resume(
+        engine: &'a StorageEngine,
+        oracle: Option<&'a TimestampOracle>,
+        state: TransactionState,
+    ) -> Self {
+        Self {
+            engine,
+            oracle,
+            read_ts: state.read_ts,
+            snapshot: state.snapshot,
+            adj_snapshot: state.adj_snapshot,
+            write_buffer: state.write_buffer,
+            occ_scope: state.occ_scope,
+            merge_adj_adds: state.merge_adj_adds,
+            merge_adj_removes: state.merge_adj_removes,
+            merge_node_deltas: state.merge_node_deltas,
         }
     }
 
@@ -980,6 +1045,39 @@ mod tests {
         txn.put(Partition::Node, b"w1", b"v").unwrap();
         txn.get(Partition::Node, b"w1").unwrap();
         assert_eq!(txn.occ_scope.as_ref().map(|s| s.tracked_count()), Some(2));
+    }
+
+    #[test]
+    fn into_state_resume_preserves_buffer_occ_and_read_ts() {
+        // The interactive-transaction park/resume cycle (ADR-042): a
+        // transaction's progress survives being parked as TransactionState
+        // and rebuilt with fresh engine/oracle borrows.
+        let (engine, oracle, _d) = test_engine();
+        let mut txn = mvcc_txn(&engine, &oracle);
+        let read_ts = txn.read_ts();
+        txn.put(Partition::Node, b"k1", b"v1").unwrap();
+        txn.delete(Partition::Node, b"k2").unwrap();
+        txn.get(Partition::Node, b"r1").unwrap(); // tracks OCC
+        let occ_before = txn.occ_scope.as_ref().map(|s| s.tracked_count());
+
+        // Park and rebuild.
+        let state = txn.into_state();
+        let mut resumed = Transaction::resume(&engine, Some(&oracle), state);
+
+        // read_ts pinned (repeatable read across statements).
+        assert_eq!(resumed.read_ts(), read_ts);
+        // Buffered write + tombstone survive (read-your-own-writes still works).
+        assert_eq!(
+            resumed.get(Partition::Node, b"k1").unwrap().as_deref(),
+            Some(&b"v1"[..])
+        );
+        assert_eq!(resumed.get(Partition::Node, b"k2").unwrap(), None);
+        // OCC read-set survives; the rebuilt `r1` read does not double-count.
+        resumed.get(Partition::Node, b"r1").unwrap();
+        assert_eq!(
+            resumed.occ_scope.as_ref().map(|s| s.tracked_count()),
+            occ_before,
+        );
     }
 
     #[test]
