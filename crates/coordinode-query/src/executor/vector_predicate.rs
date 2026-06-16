@@ -115,6 +115,8 @@ fn values_equal(a: &Value, b: &Value) -> bool {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// Tests plant raw fixtures (corrupt node bytes) via the storage partition.
+#[allow(clippy::disallowed_types)]
 mod tests {
     use super::*;
     use coordinode_core::graph::node::NodeRecord;

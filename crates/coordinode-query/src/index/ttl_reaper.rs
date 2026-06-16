@@ -802,6 +802,9 @@ fn reaper_loop(
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
+// Tests plant raw fixtures (nodes, adjacency, edge-type markers) via the
+// storage partition.
+#[allow(clippy::disallowed_types)]
 mod tests {
     use super::*;
     // Tests plant fixtures directly (adjacency posting lists, edge-type

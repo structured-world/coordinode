@@ -147,6 +147,8 @@ pub fn reap_all_ttl_indexes(
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
+// Tests plant raw index fixtures via the storage partition.
+#[allow(clippy::disallowed_types)]
 mod tests {
     use super::*;
     use coordinode_core::graph::intern::FieldInterner;

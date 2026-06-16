@@ -140,6 +140,12 @@ unsafe_code = "forbid"
 unwrap_used = "deny"
 expect_used = "warn"
 panic = "warn"
+# Off by default workspace-wide; coordinode-query opts in via a crate-level
+# `#![deny(clippy::disallowed_types)]` to forbid naming the storage partition
+# enum in the query layer (ADR-041). The clippy.toml that lists the type is
+# global, so this keeps the lint inert in the storage / modality / embed
+# crates that legitimately name partitions.
+disallowed_types = "allow"
 
 [profile.release]
 lto = "fat"

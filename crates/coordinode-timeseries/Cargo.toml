@@ -26,3 +26,8 @@ default = []
 # coordinode-query) can pin the bitemporal-axis clock to a known
 # sequence. Production binaries never enable this.
 test-clock = []
+
+[lints.clippy]
+# The ADR-041 partition guard (clippy.toml `disallowed-types`) is global and
+# warn-by-default; only coordinode-query opts into it. Keep it inert here.
+disallowed_types = "allow"

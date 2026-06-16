@@ -71,3 +71,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 unwrap_used = "deny"
 expect_used = "warn"
 panic = "warn"
+# The ADR-041 partition guard (clippy.toml `disallowed-types`) is global and
+# warn-by-default; only coordinode-query opts into it. Keep it inert here —
+# this storage-adjacent crate legitimately names partitions.
+disallowed_types = "allow"

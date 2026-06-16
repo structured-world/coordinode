@@ -20,6 +20,11 @@ use coordinode_core::schema::validation::validate_one;
 use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_storage::engine::core::StorageEngine;
+// ADR-041 storage-partition guard: the only legitimate Partition users in this
+// crate are the partition-parameterised transaction primitives below (which
+// take it by argument) and test fixtures. Production execution goes through the
+// typed Layer-4 stores. See the crate-level `#![deny(clippy::disallowed_types)]`.
+#[allow(clippy::disallowed_types)]
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
 use coordinode_storage::engine::StorageSnapshot;
@@ -722,6 +727,7 @@ impl<'a> ExecutionContext<'a> {
     /// Generic test-access primitive used by this crate's and downstream
     /// crates' tests. Production execution reads through the typed Layer-4
     /// stores (no `Partition` in production query paths, ADR-041).
+    #[allow(clippy::disallowed_types)] // partition-parameterised primitive
     pub fn mvcc_get(
         &mut self,
         part: Partition,
@@ -744,8 +750,9 @@ impl<'a> ExecutionContext<'a> {
     ///
     /// When MVCC is disabled (legacy mode), writes directly to engine.
     ///
-    /// Generic primitive retained for the index-DDL path (index definitions
-    /// in `Partition::Schema`), pending the index-subsystem typing.
+    /// Generic test-access primitive (see [`Self::mvcc_get`]). Production DDL
+    /// and data writes go through the typed Layer-4 stores.
+    #[allow(clippy::disallowed_types)] // partition-parameterised primitive
     pub fn mvcc_put(
         &mut self,
         part: Partition,
@@ -820,8 +827,9 @@ impl<'a> ExecutionContext<'a> {
     ///
     /// When MVCC is disabled (legacy mode), deletes directly from engine.
     ///
-    /// Generic primitive retained for the index-DDL path (index definitions
-    /// in `Partition::Schema`), pending the index-subsystem typing.
+    /// Generic test-access primitive (see [`Self::mvcc_get`]). Production DDL
+    /// and data writes go through the typed Layer-4 stores.
+    #[allow(clippy::disallowed_types)] // partition-parameterised primitive
     pub fn mvcc_delete(&mut self, part: Partition, key: &[u8]) -> Result<(), ExecutionError> {
         self.sync_txn_state();
         Ok(self.txn.delete(part, key)?)
@@ -1385,6 +1393,7 @@ impl<'a> ExecutionContext<'a> {
     /// In legacy mode, returns raw prefix scan results as (key, value) pairs.
     ///
     /// Generic test-access primitive (see [`Self::mvcc_get`]).
+    #[allow(clippy::disallowed_types)] // partition-parameterised primitive
     pub fn mvcc_prefix_scan(
         &mut self,
         part: Partition,

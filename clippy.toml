@@ -1,0 +1,12 @@
+# Layer-5 storage-partition guard (ADR-041).
+#
+# The query layer (coordinode-query) must reach storage only through the
+# Layer-4 modality stores (NodeStore, EdgeStore, IndexStore, SchemaStore, ...).
+# Naming the physical storage partition enum in the query layer leaks a
+# Layer-3 concern upward. This list is inert in crates that do not enable
+# `clippy::disallowed_types` (only coordinode-query does, via a crate-level
+# `#![deny]`), so the storage / modality crates that legitimately name
+# partitions are unaffected.
+disallowed-types = [
+    { path = "coordinode_storage::engine::partition::Partition", reason = "Layer 5 (coordinode-query) reaches storage only through Layer-4 modality stores (ADR-041); name partitions inside the stores, not the query layer" },
+]
