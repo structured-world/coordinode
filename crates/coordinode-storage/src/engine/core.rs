@@ -853,6 +853,32 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Apply a single proposal [`Mutation`] to its target partition.
+    ///
+    /// Maps the partition-agnostic [`PartitionId`] the mutation carries to the
+    /// physical [`Partition`] and dispatches to [`Self::put`] / [`Self::delete`]
+    /// / [`Self::merge`]. Put/Delete write plain keys (the seqno oracle
+    /// auto-stamps under ADR-016); Merge writes the raw operand. This lets
+    /// callers above the storage layer (background maintenance, proposal
+    /// pipelines) apply mutations without naming a partition or key encoder.
+    ///
+    /// [`PartitionId`]: coordinode_core::txn::proposal::PartitionId
+    pub fn apply_mutation(&self, mutation: &Mutation) -> StorageResult<()> {
+        match mutation {
+            Mutation::Put {
+                partition,
+                key,
+                value,
+            } => self.put(Partition::from(*partition), key, value),
+            Mutation::Delete { partition, key } => self.delete(Partition::from(*partition), key),
+            Mutation::Merge {
+                partition,
+                key,
+                operand,
+            } => self.merge(Partition::from(*partition), key, operand),
+        }
+    }
+
     /// Bulk-delete all keys in a range by dropping entire LSM tables.
     ///
     /// This is a table-level operation — far more efficient than individual

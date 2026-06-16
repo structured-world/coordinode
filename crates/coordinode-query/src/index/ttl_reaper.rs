@@ -492,49 +492,14 @@ fn submit_mutations(
         pipe.propose_and_wait(&proposal)
             .map_err(|e| e.to_string())?;
     } else {
+        // No pipeline (single-node / tests): apply each mutation straight to
+        // the engine. The storage layer owns the PartitionId -> Partition
+        // bridge, so this background path never names a partition.
         for mutation in &batch {
-            apply_mutation_directly(engine, mutation)?;
+            engine.apply_mutation(mutation).map_err(|e| e.to_string())?;
         }
     }
     Ok(())
-}
-
-/// Apply a single mutation directly to the storage engine (no pipeline).
-fn apply_mutation_directly(engine: &StorageEngine, mutation: &Mutation) -> Result<(), String> {
-    match mutation {
-        Mutation::Put {
-            partition,
-            key,
-            value,
-        } => engine
-            .put(to_partition(*partition), key, value)
-            .map_err(|e| e.to_string()),
-        Mutation::Delete { partition, key } => engine
-            .delete(to_partition(*partition), key)
-            .map_err(|e| e.to_string()),
-        Mutation::Merge {
-            partition,
-            key,
-            operand,
-        } => engine
-            .merge(to_partition(*partition), key, operand)
-            .map_err(|e| e.to_string()),
-    }
-}
-
-fn to_partition(id: PartitionId) -> Partition {
-    match id {
-        PartitionId::Node => Partition::Node,
-        PartitionId::Adj => Partition::Adj,
-        PartitionId::EdgeProp => Partition::EdgeProp,
-        PartitionId::Blob => Partition::Blob,
-        PartitionId::BlobRef => Partition::BlobRef,
-        PartitionId::Schema => Partition::Schema,
-        PartitionId::Idx => Partition::Idx,
-        PartitionId::Counter => Partition::Counter,
-        PartitionId::VectorF32 => Partition::VectorF32,
-        PartitionId::Registry => Partition::Registry,
-    }
 }
 
 /// Resolve anchor timestamp: uses interner when available, falls back
