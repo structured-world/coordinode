@@ -314,6 +314,21 @@ pub trait EdgeStore {
         tgt: NodeId,
     ) -> StoreResult<Option<PostingList>>;
 
+    /// Stateless posting read for a pre-built adjacency key, straight from the
+    /// engine at `snapshot` (latest when `None`), with no [`Transaction`].
+    /// `None` only when the adjacency key is absent; an existing key with an
+    /// empty list returns `Some(empty)` (unlike the RYOW [`Self::posting_fwd`]
+    /// which collapses empty to `None`) so a background scanner can tell
+    /// "no key" from "key present but drained" and clean up the latter. For
+    /// background walks (TTL reaper) with no MVCC transaction; mirrors the
+    /// [`crate::NodeStore::read_at_snapshot`] Variant A read model.
+    fn posting_at_snapshot(
+        &self,
+        engine: &StorageEngine,
+        snapshot: Option<lsm_tree::SeqNo>,
+        adj_key: &[u8],
+    ) -> StoreResult<Option<PostingList>>;
+
     /// Buffer a forward-adjacency add (`src` gains out-neighbour `uid`).
     fn merge_add_fwd(&self, txn: &mut Transaction, edge_type: &str, src: NodeId, uid: u64);
     /// Buffer a reverse-adjacency add (`tgt` gains in-neighbour `uid`).
@@ -782,6 +797,22 @@ impl EdgeStore for LocalEdgeStore {
     ) -> StoreResult<Option<PostingList>> {
         let plist = Self::read_posting_list(txn, &encode_adj_key_reverse(edge_type, tgt))?;
         Ok((!plist.is_empty()).then_some(plist))
+    }
+
+    fn posting_at_snapshot(
+        &self,
+        engine: &StorageEngine,
+        snapshot: Option<lsm_tree::SeqNo>,
+        adj_key: &[u8],
+    ) -> StoreResult<Option<PostingList>> {
+        let bytes = match snapshot {
+            Some(snap) => engine.snapshot_get(&snap, Partition::Adj, adj_key)?,
+            None => engine.get(Partition::Adj, adj_key)?,
+        };
+        match bytes {
+            Some(b) => Ok(Some(PostingList::from_bytes(&b).map_err(Self::decode_err)?)),
+            None => Ok(None),
+        }
     }
 
     fn merge_add_fwd(&self, txn: &mut Transaction, edge_type: &str, src: NodeId, uid: u64) {
@@ -1373,5 +1404,53 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn posting_at_snapshot_reads_committed_adjacency() {
+        let db = open();
+        let alice = NodeId::from_raw(1);
+        let bob = NodeId::from_raw(2);
+        let carol = NodeId::from_raw(3);
+        db.write(|s, t| {
+            s.put_edge(t, "KNOWS", alice, bob, None).expect("put");
+            s.put_edge(t, "KNOWS", alice, carol, None).expect("put");
+        });
+
+        let store = LocalEdgeStore;
+        // Absent key → None.
+        assert!(store
+            .posting_at_snapshot(&db.engine, None, &encode_adj_key_forward("KNOWS", bob))
+            .expect("ok")
+            .is_none());
+        // Present key → the full peer set (latest committed).
+        let fwd = store
+            .posting_at_snapshot(&db.engine, None, &encode_adj_key_forward("KNOWS", alice))
+            .expect("ok")
+            .expect("present");
+        let mut peers: Vec<u64> = fwd.iter().collect();
+        peers.sort_unstable();
+        assert_eq!(peers, vec![2, 3]);
+    }
+
+    #[test]
+    fn posting_at_snapshot_returns_empty_present_list_not_none() {
+        // A present adjacency key whose list is empty must read back as
+        // Some(empty), not None — a background scanner relies on this to
+        // distinguish "no key" from "key drained" and clean up the latter.
+        let db = open();
+        let a = NodeId::from_raw(7);
+        db.engine
+            .put(
+                Partition::Adj,
+                &encode_adj_key_forward("F", a),
+                &PostingList::new().to_bytes().expect("encode empty"),
+            )
+            .expect("inject empty");
+        let got = LocalEdgeStore
+            .posting_at_snapshot(&db.engine, None, &encode_adj_key_forward("F", a))
+            .expect("ok");
+        assert!(got.is_some(), "present empty key reads as Some");
+        assert!(got.expect("some").is_empty());
     }
 }

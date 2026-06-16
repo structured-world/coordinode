@@ -39,6 +39,12 @@ use coordinode_storage::Guard;
 
 use crate::error::{StoreError, StoreResult};
 
+/// Visitor for [`NodeStore::for_each_in_shard_at_snapshot`]: receives each
+/// node's id, raw storage key, and decoded record, returning
+/// [`ControlFlow::Break`](core::ops::ControlFlow::Break) to stop the walk early.
+pub type ShardVisitor<'a> =
+    dyn FnMut(NodeId, &[u8], &NodeRecord) -> StoreResult<core::ops::ControlFlow<()>> + 'a;
+
 /// Layer 4 node store. Reads/writes [`NodeRecord`] via shard-aware
 /// keys over a [`Transaction`]; supports temporal and non-temporal
 /// flavours.
@@ -210,6 +216,37 @@ pub trait NodeStore {
         shard_id: u16,
         node_id: NodeId,
     ) -> StoreResult<(Vec<u8>, Option<Vec<u8>>)>;
+
+    /// Stateless raw read of a node record by its already-encoded key, at
+    /// `snapshot` (latest when `None`), with no [`Transaction`]. Returns the
+    /// raw MessagePack bytes (caller decodes). For background scanners that
+    /// hold a node key from a prior scan and want to re-read it without a
+    /// transaction.
+    fn read_raw_at_snapshot(
+        &self,
+        engine: &StorageEngine,
+        snapshot: Option<lsm_tree::SeqNo>,
+        node_key: &[u8],
+    ) -> StoreResult<Option<Vec<u8>>>;
+
+    /// Stateless shard walk at `snapshot` (latest when `None`), with no
+    /// [`Transaction`]. Invokes `visit(node_id, node_key, record)` for every
+    /// non-temporal node record in the shard, in key order; the visitor
+    /// returns [`ControlFlow::Break`] to stop early (e.g. a reaper hitting its
+    /// per-pass deletion budget). The raw node key is passed through so the
+    /// caller can build keyed mutations without re-encoding. Mirrors
+    /// [`Self::for_each_in_shard`] but engine-bound (background path) rather
+    /// than transaction-bound. Rows whose body fails to decode are skipped
+    /// (not surfaced as an error) so one corrupt record never aborts the walk.
+    ///
+    /// [`ControlFlow::Break`]: core::ops::ControlFlow::Break
+    fn for_each_in_shard_at_snapshot(
+        &self,
+        engine: &StorageEngine,
+        snapshot: Option<lsm_tree::SeqNo>,
+        shard_id: u16,
+        visit: &mut ShardVisitor<'_>,
+    ) -> StoreResult<()>;
 
     /// Iterate every non-temporal node record in a shard, latest
     /// visible seqno. Yields `(NodeId, NodeRecord)` pairs in key
@@ -528,6 +565,74 @@ impl NodeStore for LocalNodeStore {
             None => engine.get(Partition::Node, &key)?.map(|b| b.to_vec()),
         };
         Ok((key, bytes))
+    }
+
+    fn read_raw_at_snapshot(
+        &self,
+        engine: &StorageEngine,
+        snapshot: Option<lsm_tree::SeqNo>,
+        node_key: &[u8],
+    ) -> StoreResult<Option<Vec<u8>>> {
+        let bytes = match snapshot {
+            Some(snap) => engine
+                .snapshot_get(&snap, Partition::Node, node_key)?
+                .map(|b| b.to_vec()),
+            None => engine.get(Partition::Node, node_key)?.map(|b| b.to_vec()),
+        };
+        Ok(bytes)
+    }
+
+    fn for_each_in_shard_at_snapshot(
+        &self,
+        engine: &StorageEngine,
+        snapshot: Option<lsm_tree::SeqNo>,
+        shard_id: u16,
+        visit: &mut ShardVisitor<'_>,
+    ) -> StoreResult<()> {
+        let mut prefix = Vec::with_capacity(8);
+        prefix.extend_from_slice(b"node:");
+        prefix.extend_from_slice(&shard_id.to_be_bytes());
+        prefix.push(b':');
+
+        // Decode + dispatch one scanned (key, value) pair; returns whether to
+        // continue. Non-temporal node keys are exactly 16 bytes
+        // (node:<shard:2><id:8>); temporal versions add a suffix — skip those.
+        let mut handle = |key: &[u8], value: &[u8]| -> StoreResult<core::ops::ControlFlow<()>> {
+            if key.len() != 16 {
+                return Ok(core::ops::ControlFlow::Continue(()));
+            }
+            let id_bytes: [u8; 8] = match key[8..16].try_into() {
+                Ok(b) => b,
+                Err(_) => return Ok(core::ops::ControlFlow::Continue(())),
+            };
+            let node_id = NodeId::from_raw(u64::from_be_bytes(id_bytes));
+            // Skip rows whose body fails to decode rather than aborting the
+            // whole walk — a single corrupt record must not take down a
+            // background shard scan (TTL reaper, maintenance).
+            let Ok(record) = Self::decode_record(value) else {
+                return Ok(core::ops::ControlFlow::Continue(()));
+            };
+            visit(node_id, key, &record)
+        };
+
+        match snapshot {
+            Some(snap) => {
+                for (key, value) in engine.snapshot_prefix_scan(&snap, Partition::Node, &prefix)? {
+                    if handle(&key, &value)?.is_break() {
+                        break;
+                    }
+                }
+            }
+            None => {
+                for guard in engine.prefix_scan(Partition::Node, &prefix)? {
+                    let (key, value) = guard.into_inner()?;
+                    if handle(&key, &value)?.is_break() {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn for_each_in_shard(
@@ -1001,5 +1106,86 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn read_raw_at_snapshot_latest_round_trip() {
+        let db = open();
+        let id = NodeId::from_raw(42);
+        let key = encode_node_key(3, id);
+        // Absent → None.
+        assert!(LocalNodeStore
+            .read_raw_at_snapshot(&db.engine, None, &key)
+            .expect("ok")
+            .is_none());
+        // After a committed write, the raw bytes decode back to the record.
+        db.write(|s, t| s.put(t, 3, id, &rec("User")).expect("put"));
+        let bytes = LocalNodeStore
+            .read_raw_at_snapshot(&db.engine, None, &key)
+            .expect("ok")
+            .expect("present");
+        assert_eq!(
+            NodeRecord::from_msgpack(&bytes)
+                .expect("decode")
+                .primary_label(),
+            "User"
+        );
+    }
+
+    #[test]
+    fn for_each_in_shard_at_snapshot_visits_in_key_order_and_breaks_early() {
+        let db = open();
+        // Two shards; only shard 1's nodes should be visited.
+        db.write(|s, t| {
+            s.put(t, 1, NodeId::from_raw(3), &rec("User")).expect("put");
+            s.put(t, 1, NodeId::from_raw(1), &rec("User")).expect("put");
+            s.put(t, 1, NodeId::from_raw(2), &rec("User")).expect("put");
+            s.put(t, 2, NodeId::from_raw(9), &rec("Other"))
+                .expect("put");
+        });
+
+        // Full walk: key order (1, 2, 3), shard-isolated, key matches id.
+        let mut seen = Vec::new();
+        LocalNodeStore
+            .for_each_in_shard_at_snapshot(&db.engine, None, 1, &mut |id, key, record| {
+                assert_eq!(key, encode_node_key(1, id));
+                assert_eq!(record.primary_label(), "User");
+                seen.push(id.as_raw());
+                Ok(core::ops::ControlFlow::Continue(()))
+            })
+            .expect("walk");
+        assert_eq!(seen, vec![1, 2, 3]);
+
+        // Early break stops after the first node.
+        let mut count = 0usize;
+        LocalNodeStore
+            .for_each_in_shard_at_snapshot(&db.engine, None, 1, &mut |_, _, _| {
+                count += 1;
+                Ok(core::ops::ControlFlow::Break(()))
+            })
+            .expect("walk");
+        assert_eq!(count, 1, "break stops after the first visit");
+    }
+
+    #[test]
+    fn for_each_in_shard_at_snapshot_skips_corrupt_rows() {
+        let db = open();
+        db.write(|s, t| s.put(t, 0, NodeId::from_raw(1), &rec("User")).expect("put"));
+        // Plant a corrupt body in the same shard — must be skipped, not abort.
+        db.engine
+            .put(
+                Partition::Node,
+                &encode_node_key(0, NodeId::from_raw(2)),
+                &[0xff, 0x00],
+            )
+            .expect("inject");
+        let mut seen = Vec::new();
+        LocalNodeStore
+            .for_each_in_shard_at_snapshot(&db.engine, None, 0, &mut |id, _, _| {
+                seen.push(id.as_raw());
+                Ok(core::ops::ControlFlow::Continue(()))
+            })
+            .expect("walk tolerates corrupt row");
+        assert_eq!(seen, vec![1], "corrupt row skipped, valid row visited");
     }
 }

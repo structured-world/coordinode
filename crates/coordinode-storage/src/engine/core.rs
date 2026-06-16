@@ -4336,4 +4336,38 @@ mod merge_tests {
             panic!("expected Document at props[20]");
         }
     }
+
+    #[test]
+    fn apply_mutation_dispatches_to_partition() {
+        use coordinode_core::txn::proposal::{Mutation, PartitionId};
+        let (engine, _dir) = test_engine();
+
+        // Put through apply_mutation lands in the mapped physical partition.
+        engine
+            .apply_mutation(&Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:0:1".to_vec(),
+                value: b"alice".to_vec(),
+            })
+            .expect("put");
+        assert_eq!(
+            engine
+                .get(Partition::Node, b"node:0:1")
+                .expect("get")
+                .as_deref(),
+            Some(b"alice".as_ref()),
+        );
+
+        // Delete through apply_mutation tombstones the same key.
+        engine
+            .apply_mutation(&Mutation::Delete {
+                partition: PartitionId::Node,
+                key: b"node:0:1".to_vec(),
+            })
+            .expect("delete");
+        assert!(engine
+            .get(Partition::Node, b"node:0:1")
+            .expect("get")
+            .is_none());
+    }
 }

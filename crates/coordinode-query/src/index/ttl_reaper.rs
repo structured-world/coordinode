@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse, PostingList};
+use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse};
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
 use coordinode_core::schema::computed::{ComputedSpec, TtlScope};
@@ -26,10 +26,12 @@ use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
 use coordinode_core::txn::timestamp::Timestamp;
+use coordinode_modality::{
+    EdgeStore as _, LocalEdgeStore, LocalNodeStore, LocalSchemaStore, NodeStore as _,
+    SchemaStore as _,
+};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::merge::encode_remove;
-use coordinode_storage::engine::partition::Partition;
-use coordinode_storage::Guard;
 
 /// Configuration for the COMPUTED TTL background reaper.
 #[derive(Debug, Clone)]
@@ -209,7 +211,6 @@ fn discover_ttl_targets(
     engine: &StorageEngine,
     interner: Option<&coordinode_core::graph::intern::FieldInterner>,
 ) -> Result<Vec<TtlTarget>, String> {
-    use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
     let schemas = LocalSchemaStore::new(engine)
         .list_labels()
         .map_err(|e| e.to_string())?;
@@ -245,32 +246,12 @@ fn discover_ttl_targets(
     Ok(targets)
 }
 
-/// List all registered edge types from schema partition. Versioned keys
+/// List all registered edge type names via the schema store. Versioned keys
 /// (`schema:edge_type:<name>:<version>`) dedup to one entry per name.
 fn list_edge_types(engine: &StorageEngine) -> Vec<String> {
-    let prefix = b"schema:edge_type:";
-    let iter = match engine.prefix_scan(Partition::Schema, prefix) {
-        Ok(it) => it,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut types: Vec<String> = Vec::new();
-    for guard in iter {
-        if let Ok((key, _)) = guard.into_inner() {
-            let suffix = match std::str::from_utf8(&key[prefix.len()..]) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let name = match suffix.rsplit_once(':') {
-                Some((name, _version)) => name.to_string(),
-                None => continue,
-            };
-            if !types.contains(&name) {
-                types.push(name);
-            }
-        }
-    }
-    types
+    LocalSchemaStore::new(engine)
+        .list_edge_type_names_engine()
+        .unwrap_or_default()
 }
 
 /// Run reaper for one label+TTL target. Collects mutations and submits
@@ -308,155 +289,129 @@ fn reap_label(
 
     let cutoff_us = now_us - (target.duration_secs as i64 * 1_000_000);
 
-    let node_prefix = {
-        let mut p = Vec::with_capacity(8);
-        p.extend_from_slice(b"node:");
-        p.extend_from_slice(&shard_id.to_be_bytes());
-        p.push(b':');
-        p
-    };
-
-    let iter = match engine.prefix_scan(Partition::Node, &node_prefix) {
-        Ok(it) => it,
-        Err(e) => {
-            result.errors.push(format!("node scan error: {e}"));
-            return result;
-        }
-    };
-
-    for guard in iter {
-        if result.total_deletions() >= max_deletions {
-            break;
-        }
-
-        let (key, value) = match guard.into_inner() {
-            Ok(kv) => kv,
-            Err(e) => {
-                result.errors.push(format!("node read error: {e}"));
-                continue;
+    // Walk the shard through the node store (it owns the key encoding and the
+    // partition); the reaper only turns each expired record into mutations.
+    let scan = LocalNodeStore.for_each_in_shard_at_snapshot(
+        engine,
+        None,
+        shard_id,
+        &mut |node_id, key, record| {
+            if result.total_deletions() >= max_deletions {
+                return Ok(std::ops::ControlFlow::Break(()));
             }
-        };
-
-        let record = match NodeRecord::from_msgpack(&value) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
-        if !record.labels.contains(&target.label) {
-            continue;
-        }
-
-        result.nodes_checked += 1;
-
-        let anchor_us = match resolve_anchor(&record, &target.anchor_field, target.anchor_field_id)
-        {
-            Some(ts) => ts,
-            None => continue,
-        };
-
-        if anchor_us >= cutoff_us {
-            continue;
-        }
-
-        let node_id = decode_node_id_from_key(&key);
-
-        match target.scope {
-            TtlScope::Node => {
-                match collect_node_deletion_mutations(engine, node_id, &key, edge_types) {
-                    Ok(mutations) => {
-                        pending.extend(mutations);
-                        result.nodes_deleted += 1;
-                    }
-                    Err(e) => {
-                        result.errors.push(format!(
-                            "collect node {node_id} (label {}): {e}",
-                            target.label
-                        ));
-                    }
-                }
+            if !record.labels.contains(&target.label) {
+                return Ok(std::ops::ControlFlow::Continue(()));
             }
-            TtlScope::Field => {
-                match collect_property_removal_mutations(
-                    engine,
-                    &key,
-                    target.anchor_field_id,
-                    &target.anchor_field,
-                ) {
-                    Ok(mutations) => {
-                        pending.extend(mutations);
-                        result.fields_removed += 1;
-                    }
-                    Err(e) => {
-                        result.errors.push(format!(
-                            "collect remove {} from node {node_id}: {e}",
-                            target.anchor_field
-                        ));
-                    }
-                }
+            result.nodes_checked += 1;
+
+            let anchor_us =
+                match resolve_anchor(record, &target.anchor_field, target.anchor_field_id) {
+                    Some(ts) => ts,
+                    None => return Ok(std::ops::ControlFlow::Continue(())),
+                };
+            if anchor_us >= cutoff_us {
+                return Ok(std::ops::ControlFlow::Continue(()));
             }
-            TtlScope::Subtree => {
-                // Subtree: delete `target_field` if specified and resolved,
-                // otherwise fall back to the anchor field (same as Field scope).
-                //
-                // When `target_field` is Some but `target_field_id` is None the
-                // field name was not present in the interner snapshot given to the
-                // reaper at startup — this can happen in production when a schema
-                // with a new `target_field` is added after the database is opened
-                // and no nodes carrying that field have been written yet.
-                // Skipping is safer than letting the timestamp heuristic in
-                // `collect_property_removal_mutations` remove the wrong field.
-                // The skip is recorded in `result.errors` so operators can detect
-                // the stale interner condition.
-                // Guard at reap_label entry already returns early when
-                // target_field is Some but target_field_id is None, so the
-                // (Some(_), None) arm is unreachable here.
-                let to_delete: Option<(Option<u32>, &str)> =
-                    match (&target.target_field, target.target_field_id) {
-                        (Some(tf), Some(field_id)) => {
-                            // Skip if the target field is already absent — anchor_field
-                            // is preserved by design, so the node stays visible to the
-                            // reaper on every pass.  Without this check, subtrees_removed
-                            // would be incremented and a (no-op) merge mutation submitted
-                            // on every reap cycle after the first deletion.
-                            if record.props.contains_key(&field_id) {
-                                Some((target.target_field_id, tf.as_str()))
-                            } else {
-                                None
-                            }
+
+            let nid_raw = node_id.as_raw();
+            match target.scope {
+                TtlScope::Node => {
+                    match collect_node_deletion_mutations(engine, nid_raw, key, edge_types) {
+                        Ok(mutations) => {
+                            pending.extend(mutations);
+                            result.nodes_deleted += 1;
                         }
-                        (Some(_), None) => unreachable!(
-                            "unresolved target_field should have been caught by early return"
-                        ),
-                        (None, _) => Some((target.anchor_field_id, target.anchor_field.as_str())),
-                    };
-
-                if let Some((del_field_id, del_field_name)) = to_delete {
+                        Err(e) => result.errors.push(format!(
+                            "collect node {nid_raw} (label {}): {e}",
+                            target.label
+                        )),
+                    }
+                }
+                TtlScope::Field => {
                     match collect_property_removal_mutations(
                         engine,
-                        &key,
-                        del_field_id,
-                        del_field_name,
+                        key,
+                        target.anchor_field_id,
+                        &target.anchor_field,
                     ) {
                         Ok(mutations) => {
                             pending.extend(mutations);
-                            result.subtrees_removed += 1;
+                            result.fields_removed += 1;
                         }
-                        Err(e) => {
-                            result.errors.push(format!(
-                                "collect remove {del_field_name} from node {node_id}: {e}",
-                            ));
+                        Err(e) => result.errors.push(format!(
+                            "collect remove {} from node {nid_raw}: {e}",
+                            target.anchor_field
+                        )),
+                    }
+                }
+                TtlScope::Subtree => {
+                    // Subtree: delete `target_field` if specified and resolved,
+                    // otherwise fall back to the anchor field (same as Field scope).
+                    //
+                    // When `target_field` is Some but `target_field_id` is None the
+                    // field name was not present in the interner snapshot given to the
+                    // reaper at startup — this can happen in production when a schema
+                    // with a new `target_field` is added after the database is opened
+                    // and no nodes carrying that field have been written yet.
+                    // Skipping is safer than letting the timestamp heuristic in
+                    // `collect_property_removal_mutations` remove the wrong field.
+                    // The skip is recorded in `result.errors` so operators can detect
+                    // the stale interner condition.
+                    // Guard at reap_label entry already returns early when
+                    // target_field is Some but target_field_id is None, so the
+                    // (Some(_), None) arm is unreachable here.
+                    let to_delete: Option<(Option<u32>, &str)> =
+                        match (&target.target_field, target.target_field_id) {
+                            (Some(tf), Some(field_id)) => {
+                                // Skip if the target field is already absent — anchor_field
+                                // is preserved by design, so the node stays visible to the
+                                // reaper on every pass.  Without this check, subtrees_removed
+                                // would be incremented and a (no-op) merge mutation submitted
+                                // on every reap cycle after the first deletion.
+                                if record.props.contains_key(&field_id) {
+                                    Some((target.target_field_id, tf.as_str()))
+                                } else {
+                                    None
+                                }
+                            }
+                            (Some(_), None) => unreachable!(
+                                "unresolved target_field should have been caught by early return"
+                            ),
+                            (None, _) => {
+                                Some((target.anchor_field_id, target.anchor_field.as_str()))
+                            }
+                        };
+
+                    if let Some((del_field_id, del_field_name)) = to_delete {
+                        match collect_property_removal_mutations(
+                            engine,
+                            key,
+                            del_field_id,
+                            del_field_name,
+                        ) {
+                            Ok(mutations) => {
+                                pending.extend(mutations);
+                                result.subtrees_removed += 1;
+                            }
+                            Err(e) => result.errors.push(format!(
+                                "collect remove {del_field_name} from node {nid_raw}: {e}",
+                            )),
                         }
                     }
                 }
             }
-        }
 
-        // Flush batch when full.
-        if pending.len() >= max_deletions {
-            if let Err(e) = submit_mutations(&mut pending, engine, pipeline, id_gen) {
-                result.errors.push(format!("submit batch: {e}"));
+            // Flush batch when full.
+            if pending.len() >= max_deletions {
+                if let Err(e) = submit_mutations(&mut pending, engine, pipeline, id_gen) {
+                    result.errors.push(format!("submit batch: {e}"));
+                }
             }
-        }
+            Ok(std::ops::ControlFlow::Continue(()))
+        },
+    );
+    if let Err(e) = scan {
+        result.errors.push(format!("node scan error: {e}"));
     }
 
     // Flush remaining.
@@ -625,31 +580,29 @@ fn collect_node_deletion_mutations(
             (encode_adj_key_forward(edge_type, nid), true),
             (encode_adj_key_reverse(edge_type, nid), false),
         ] {
-            if let Ok(Some(bytes)) = engine.get(Partition::Adj, &adj_key) {
-                if let Ok(plist) = PostingList::from_bytes(&bytes) {
-                    for peer_uid in plist.iter() {
-                        let peer_id = NodeId::from_raw(peer_uid);
-                        let counterpart = if is_outgoing {
-                            encode_adj_key_reverse(edge_type, peer_id)
-                        } else {
-                            encode_adj_key_forward(edge_type, peer_id)
-                        };
+            if let Ok(Some(plist)) = LocalEdgeStore.posting_at_snapshot(engine, None, &adj_key) {
+                for peer_uid in plist.iter() {
+                    let peer_id = NodeId::from_raw(peer_uid);
+                    let counterpart = if is_outgoing {
+                        encode_adj_key_reverse(edge_type, peer_id)
+                    } else {
+                        encode_adj_key_forward(edge_type, peer_id)
+                    };
 
-                        // Merge-remove this node from peer's posting list.
-                        mutations.push(Mutation::Merge {
-                            partition: PartitionId::Adj,
-                            key: counterpart,
-                            operand: encode_remove(node_id),
-                        });
+                    // Merge-remove this node from peer's posting list.
+                    mutations.push(Mutation::Merge {
+                        partition: PartitionId::Adj,
+                        key: counterpart,
+                        operand: encode_remove(node_id),
+                    });
 
-                        // Delete edge properties.
-                        let (src, tgt) = if is_outgoing {
-                            (nid, peer_id)
-                        } else {
-                            (peer_id, nid)
-                        };
-                        mutations.push(Mutation::delete_edge_props(edge_type, src, tgt));
-                    }
+                    // Delete edge properties.
+                    let (src, tgt) = if is_outgoing {
+                        (nid, peer_id)
+                    } else {
+                        (peer_id, nid)
+                    };
+                    mutations.push(Mutation::delete_edge_props(edge_type, src, tgt));
                 }
 
                 // Delete the adj key.
@@ -686,8 +639,8 @@ fn collect_property_removal_mutations(
         }
     } else {
         // No interner — read node to find field_id, then emit merge operand.
-        let bytes = engine
-            .get(Partition::Node, node_key)
+        let bytes = LocalNodeStore
+            .read_raw_at_snapshot(engine, None, node_key)
             .map_err(|e| e.to_string())?;
         match bytes {
             Some(data) => {
@@ -720,26 +673,6 @@ fn collect_property_removal_mutations(
         key: node_key.to_vec(),
         operand,
     }])
-}
-
-/// Extract node ID from a node: key.
-/// Key format: `node:` (5) + shard_id BE (2) + `:` (1) + node_id BE (8)
-fn decode_node_id_from_key(key: &[u8]) -> u64 {
-    if key.len() >= 16 {
-        let id_bytes = &key[8..16];
-        u64::from_be_bytes([
-            id_bytes[0],
-            id_bytes[1],
-            id_bytes[2],
-            id_bytes[3],
-            id_bytes[4],
-            id_bytes[5],
-            id_bytes[6],
-            id_bytes[7],
-        ])
-    } else {
-        0
-    }
 }
 
 /// Background reaper handle. Spawns a thread that periodically runs
@@ -871,12 +804,17 @@ fn reaper_loop(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    // Tests plant fixtures directly (adjacency posting lists, edge-type
+    // markers, node records) — raw partition + posting access is legitimate
+    // setup the typed stores can't express.
+    use coordinode_core::graph::edge::PostingList;
     use coordinode_core::graph::intern::FieldInterner;
     use coordinode_core::graph::node::NodeId;
     use coordinode_core::schema::definition::PropertyDef;
     use coordinode_storage::engine::config::{
         Durability, EndpointConfig, Media, StorageConfig, Tier,
     };
+    use coordinode_storage::engine::partition::Partition;
 
     fn test_engine(dir: &std::path::Path) -> StorageEngine {
         let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(

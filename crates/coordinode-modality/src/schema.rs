@@ -187,6 +187,25 @@ pub trait SchemaStore {
     /// buffer. Enumerates the `schema:edge_type:<name>:<version>` family and
     /// strips the version suffix.
     fn list_edge_type_names(&self, txn: &mut Transaction) -> StoreResult<Vec<String>>;
+
+    /// Like [`Self::list_edge_type_names`] but reads straight from the engine at
+    /// the latest committed state, with no [`Transaction`]. For background
+    /// scanners (TTL reaper) that enumerate edge types without an MVCC
+    /// transaction. Includes existence markers (zero-length bodies): a
+    /// registered type with only a marker still has adjacency a reaper must
+    /// clean, so unlike [`Self::list_edge_types`] this does not drop them.
+    fn list_edge_type_names_engine(&self) -> StoreResult<Vec<String>>;
+}
+
+/// Extract the edge-type name from a `schema:edge_type:<name>:<version>` key.
+/// Names cannot contain ':' (DDL grammar), so the rightmost ':' splits name
+/// from version.
+fn edge_type_name_from_key(key: &[u8]) -> Option<String> {
+    const PREFIX: &[u8] = b"schema:edge_type:";
+    let suffix = key.get(PREFIX.len()..)?;
+    let suffix_str = std::str::from_utf8(suffix).ok()?;
+    let (name, _version) = suffix_str.rsplit_once(':')?;
+    Some(name.to_string())
 }
 
 /// CE single-shard implementation of [`SchemaStore`]. Operates
@@ -506,18 +525,24 @@ impl SchemaStore for LocalSchemaStore<'_> {
     }
 
     fn list_edge_type_names(&self, txn: &mut Transaction) -> StoreResult<Vec<String>> {
-        // `schema:edge_type:<name>:<version>` — names cannot contain ':'
-        // (DDL grammar), so the rightmost ':' splits name from version.
         const PREFIX: &[u8] = b"schema:edge_type:";
-        let extract_name = |key: &[u8]| -> Option<String> {
-            let suffix = key.get(PREFIX.len()..)?;
-            let suffix_str = std::str::from_utf8(suffix).ok()?;
-            let (name, _version) = suffix_str.rsplit_once(':')?;
-            Some(name.to_string())
-        };
         let mut types: Vec<String> = Vec::new();
         for (k, _) in txn.prefix_scan(Partition::Schema, PREFIX)? {
-            if let Some(name) = extract_name(&k) {
+            if let Some(name) = edge_type_name_from_key(&k) {
+                if !types.contains(&name) {
+                    types.push(name);
+                }
+            }
+        }
+        Ok(types)
+    }
+
+    fn list_edge_type_names_engine(&self) -> StoreResult<Vec<String>> {
+        const PREFIX: &[u8] = b"schema:edge_type:";
+        let mut types: Vec<String> = Vec::new();
+        for guard in self.engine.prefix_scan(Partition::Schema, PREFIX)? {
+            let (k, _) = guard.into_inner()?;
+            if let Some(name) = edge_type_name_from_key(&k) {
                 if !types.contains(&name) {
                     types.push(name);
                 }
@@ -820,5 +845,42 @@ mod tests {
             "legacy marker must be skipped, only KNOWS surfaces",
         );
         assert_eq!(listed[0].name, "KNOWS");
+    }
+
+    #[test]
+    fn list_edge_type_names_engine_includes_markers_and_dedups_versions() {
+        // The engine name lister parses names straight from
+        // `schema:edge_type:<name>:<version>` keys, so unlike
+        // `list_edge_types` it INCLUDES zero-length existence markers (a
+        // reaper must clean adjacency for every registered type) and dedups
+        // multiple versions of the same name to one entry.
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalSchemaStore::new(engine);
+
+        let mut knows_v1 = sample_edge_type();
+        knows_v1.name = "KNOWS".into();
+        knows_v1.schema_revision = 1;
+        store.save_edge_type(&knows_v1).expect("save v1");
+        let mut knows_v2 = sample_edge_type();
+        knows_v2.name = "KNOWS".into();
+        knows_v2.schema_revision = 2;
+        store.save_edge_type(&knows_v2).expect("save v2");
+        // Legacy zero-length marker — present in keys, absent from decoded list.
+        engine
+            .put(
+                Partition::Schema,
+                &encode_edge_type_schema_key("LEGACY", 1),
+                b"",
+            )
+            .expect("legacy marker");
+
+        let mut names = store.list_edge_type_names_engine().expect("names");
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["KNOWS".to_string(), "LEGACY".to_string()],
+            "marker included, versions deduped to one KNOWS entry",
+        );
     }
 }
