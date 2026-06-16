@@ -846,6 +846,29 @@ impl<'a> ExecutionContext<'a> {
         Ok(LocalIndexStore::new(self.engine).delete_definition_txn(&mut self.txn, name)?)
     }
 
+    /// Persist an encrypted-index definition transactionally (CREATE ENCRYPTED
+    /// INDEX DDL) through the Layer-4 store, which owns the `encrypted_index:`
+    /// keyspace and encoding.
+    pub fn mvcc_put_encrypted_index_def(
+        &mut self,
+        def: &coordinode_modality::EncryptedIndexDefinition,
+    ) -> Result<(), ExecutionError> {
+        use coordinode_modality::{EncryptedIndexStore as _, LocalEncryptedIndexStore};
+        self.sync_txn_state();
+        Ok(LocalEncryptedIndexStore::new(self.engine).put_definition_txn(&mut self.txn, def)?)
+    }
+
+    /// Delete an encrypted-index definition by name transactionally (DROP
+    /// ENCRYPTED INDEX DDL).
+    pub fn mvcc_delete_encrypted_index_def(&mut self, name: &str) -> Result<(), ExecutionError> {
+        use coordinode_modality::{EncryptedIndexStore as _, LocalEncryptedIndexStore};
+        self.sync_txn_state();
+        Ok(
+            LocalEncryptedIndexStore::new(self.engine)
+                .delete_definition_txn(&mut self.txn, name)?,
+        )
+    }
+
     /// MVCC-aware typed node read.
     ///
     /// Combines key encoding, raw read through [`Self::mvcc_get`]
@@ -13742,14 +13765,9 @@ fn execute_create_encrypted_index(
     property: &str,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    // Store the index definition keyed by name for easy DROP lookup.
-    let schema_key = format!("encrypted_index:{name}");
-    let meta = format!("{{\"name\":\"{name}\",\"label\":\"{label}\",\"property\":\"{property}\"}}");
-    ctx.mvcc_put(
-        Partition::Schema,
-        &schema_key.into_bytes(),
-        &meta.into_bytes(),
-    )?;
+    // Persist the definition transactionally through the encrypted-index store.
+    let def = coordinode_modality::EncryptedIndexDefinition::new(name, label, property);
+    ctx.mvcc_put_encrypted_index_def(&def)?;
 
     let mut row = Row::new();
     row.insert("index".to_string(), Value::String(name.to_string()));
@@ -13764,13 +13782,10 @@ fn execute_drop_encrypted_index(
     name: &str,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    // Scan for the schema key matching this index name.
-    // Since we don't have a registry for encrypted indexes yet, we tombstone
-    // all schema keys that end with the index name.
-    // For now, write a tombstone for the known key pattern.
-    // A full implementation would scan the schema partition.
-    let tombstone_key = format!("encrypted_index:{name}");
-    ctx.mvcc_delete(Partition::Schema, &tombstone_key.into_bytes())?;
+    // Delete the definition transactionally through the encrypted-index store.
+    // A future registry would enumerate definitions; today the DDL drops the
+    // single name-keyed record.
+    ctx.mvcc_delete_encrypted_index_def(name)?;
 
     let mut row = Row::new();
     row.insert("index".to_string(), Value::String(name.to_string()));

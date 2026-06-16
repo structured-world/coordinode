@@ -55,6 +55,7 @@
 pub mod blob;
 pub mod document;
 pub mod edge;
+pub mod encrypted_index;
 pub mod error;
 pub mod index;
 pub mod index_def;
@@ -68,6 +69,9 @@ pub mod vector;
 pub use blob::{BlobStore, LocalBlobStore};
 pub use document::{DocumentStore, LocalDocumentStore};
 pub use edge::{EdgeStore, LocalEdgeStore};
+pub use encrypted_index::{
+    EncryptedIndexDefinition, EncryptedIndexStore, LocalEncryptedIndexStore,
+};
 pub use error::{StoreError, StoreResult};
 pub use index::{IndexStore, LocalIndexStore};
 pub use index_def::{
