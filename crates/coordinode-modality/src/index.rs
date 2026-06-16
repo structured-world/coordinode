@@ -1,16 +1,20 @@
-//! Index store — secondary B-tree-style entries in [`Partition::Idx`].
+//! Index store — secondary B-tree-style entries in [`Partition::Idx`]
+//! plus the index-definition catalog in [`Partition::Schema`].
 //!
-//! Stores entries of the form `idx:<name>:<sortable_value>:<node_id>`
+//! Entries take the form `idx:<name>:<sortable_value>:<node_id>`
 //! (value-bytes encoded by [`coordinode_core::index::encoding`] for
 //! correct lexicographic ordering). Supports point lookup
 //! ([`IndexStore::scan_exact`]) and full-index walk
 //! ([`IndexStore::scan_all`]).
 //!
-//! The store deliberately does NOT carry index metadata (kind,
-//! target label, target property) — that is a query-layer concept.
-//! The store operates one level below: caller passes the index name,
-//! value(s), and node id and gets back the bytes-level entry
-//! behaviour.
+//! The store also owns the index-DEFINITION catalog: the serializable
+//! [`IndexDefinition`] records keyed by `schema:idx:<name>`. This
+//! mirrors how mature engines place the schema/index catalog below the
+//! query engine (the query layer issues logical DDL and reads the
+//! catalog for planning, but does not own the definition keyspace or
+//! its encoding). Definition CRUD lives in
+//! [`IndexStore::put_definition`] / [`IndexStore::load_definition`] /
+//! [`IndexStore::list_definitions`] / [`IndexStore::delete_definition`].
 //!
 //! ## Single-column vs compound
 //!
@@ -29,7 +33,8 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::Guard;
 
-use crate::error::StoreResult;
+use crate::error::{StoreError, StoreResult};
+use crate::index_def::{IndexDefinition, IndexState};
 
 /// Layer 4 index store: entry-level B-tree index ops over
 /// [`Partition::Idx`].
@@ -126,6 +131,38 @@ pub trait IndexStore {
     /// expired without reconstructing the `(values, node_id)` tuple. The
     /// caller never builds the key; it only passes back one it scanned.
     fn delete_raw(&self, raw_key: &[u8]) -> StoreResult<()>;
+
+    /// Return every entry's node id under the named index in key order,
+    /// without value filtering. Backs full-index walks (range queries,
+    /// SHOW INDEX). Distinct from [`IndexStore::scan_all`] in that it
+    /// does not allocate a key buffer per entry.
+    fn scan_entry_ids(&self, name: &str) -> StoreResult<Vec<NodeId>>;
+
+    /// Persist an index definition into the schema catalog (keyed by
+    /// `schema:idx:<name>`). Overwrites any existing definition with the
+    /// same name. The store owns both the catalog keyspace and the
+    /// MessagePack encoding — callers pass the typed definition only.
+    fn put_definition(&self, def: &IndexDefinition) -> StoreResult<()>;
+
+    /// Load a persisted index definition by name. `Ok(None)` when no
+    /// definition is stored under that name.
+    fn load_definition(&self, name: &str) -> StoreResult<Option<IndexDefinition>>;
+
+    /// List every persisted index definition in `schema:idx:` key order.
+    /// A definition whose stored bytes fail to decode is skipped (with a
+    /// tracing warning) rather than aborting the whole listing — one
+    /// corrupt record must not take down registry rebuild on open.
+    fn list_definitions(&self) -> StoreResult<Vec<IndexDefinition>>;
+
+    /// Delete a persisted index definition by name. Returns `Ok(())`
+    /// even when no definition was stored (tombstone semantics).
+    fn delete_definition(&self, name: &str) -> StoreResult<()>;
+
+    /// Update only the build `state` of a persisted definition, leaving
+    /// every other field intact. Returns `Ok(false)` when no definition
+    /// is stored under `name` (the caller handles the race). Used by the
+    /// backfill task to publish progress / terminal states.
+    fn set_definition_state(&self, name: &str, state: IndexState) -> StoreResult<bool>;
 }
 
 /// CE single-shard implementation of [`IndexStore`].
@@ -166,6 +203,13 @@ fn index_prefix(name: &str) -> Vec<u8> {
     p.extend_from_slice(name.as_bytes());
     p.push(b':');
     p
+}
+
+fn definition_key(name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(11 + name.len());
+    key.extend_from_slice(b"schema:idx:");
+    key.extend_from_slice(name.as_bytes());
+    key
 }
 
 fn index_value_prefix(name: &str, values: &[Value]) -> Vec<u8> {
@@ -240,6 +284,72 @@ impl IndexStore for LocalIndexStore<'_> {
     fn delete_raw(&self, raw_key: &[u8]) -> StoreResult<()> {
         self.engine.delete(Partition::Idx, raw_key)?;
         Ok(())
+    }
+
+    fn scan_entry_ids(&self, name: &str) -> StoreResult<Vec<NodeId>> {
+        let prefix = index_prefix(name);
+        let iter = self.engine.prefix_scan(Partition::Idx, &prefix)?;
+        let mut out = Vec::new();
+        for guard in iter {
+            let (key, _) = guard.into_inner()?;
+            if let Some(id) = decode_node_id_from_index_key(&key) {
+                out.push(NodeId::from_raw(id));
+            }
+        }
+        Ok(out)
+    }
+
+    fn put_definition(&self, def: &IndexDefinition) -> StoreResult<()> {
+        let key = def.schema_key();
+        let value = rmp_serde::to_vec(def)
+            .map_err(|e| StoreError::Invariant(format!("index definition serialize: {e}")))?;
+        self.engine.put(Partition::Schema, &key, &value)?;
+        Ok(())
+    }
+
+    fn load_definition(&self, name: &str) -> StoreResult<Option<IndexDefinition>> {
+        let key = definition_key(name);
+        match self.engine.get(Partition::Schema, &key)? {
+            Some(bytes) => {
+                let def = rmp_serde::from_slice(&bytes).map_err(|e| StoreError::Decode {
+                    kind: "index definition",
+                    message: e.to_string(),
+                })?;
+                Ok(Some(def))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn list_definitions(&self) -> StoreResult<Vec<IndexDefinition>> {
+        let iter = self.engine.prefix_scan(Partition::Schema, b"schema:idx:")?;
+        let mut out = Vec::new();
+        for guard in iter {
+            let (_key, value) = guard.into_inner()?;
+            match rmp_serde::from_slice::<IndexDefinition>(&value) {
+                Ok(def) => out.push(def),
+                Err(e) => {
+                    tracing::warn!("list_definitions: skipping corrupt index def: {e}");
+                    continue;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn delete_definition(&self, name: &str) -> StoreResult<()> {
+        let key = definition_key(name);
+        self.engine.delete(Partition::Schema, &key)?;
+        Ok(())
+    }
+
+    fn set_definition_state(&self, name: &str, state: IndexState) -> StoreResult<bool> {
+        let Some(mut def) = self.load_definition(name)? else {
+            return Ok(false);
+        };
+        def.state = state;
+        self.put_definition(&def)?;
+        Ok(true)
     }
 }
 

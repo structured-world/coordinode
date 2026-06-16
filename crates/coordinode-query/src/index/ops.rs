@@ -10,12 +10,9 @@ use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
 use coordinode_modality::{IndexStore as _, LocalIndexStore, StoreError};
 use coordinode_storage::engine::core::StorageEngine;
-use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::StorageError;
-use coordinode_storage::Guard;
 
 use super::definition::{IndexDefinition, IndexState};
-use coordinode_core::index::encoding::decode_node_id_from_index_key;
 
 /// Convert [`coordinode_modality::StoreError`] back into the
 /// existing [`StorageError`] vocabulary used by callers of this
@@ -199,31 +196,20 @@ pub fn index_scan(
     engine: &StorageEngine,
     index: &IndexDefinition,
 ) -> Result<Vec<u64>, StorageError> {
-    let prefix = index.key_prefix();
-    let iter = engine.prefix_scan(Partition::Idx, &prefix)?;
-    let mut results = Vec::new();
-
-    for guard in iter {
-        let (key, _value) = guard.into_inner().map_err(StorageError::Engine)?;
-
-        if let Some(node_id) = decode_node_id_from_index_key(&key) {
-            results.push(node_id);
-        }
-    }
-
-    Ok(results)
+    let ids = LocalIndexStore::new(engine)
+        .scan_entry_ids(&index.name)
+        .map_err(map_store_err)?;
+    Ok(ids.into_iter().map(|id| id.as_raw()).collect())
 }
 
-/// Save index definition to schema partition.
+/// Save index definition to the index-store catalog.
 pub fn save_index_definition(
     engine: &StorageEngine,
     index: &IndexDefinition,
 ) -> Result<(), StorageError> {
-    let key = index.schema_key();
-    let value = rmp_serde::to_vec(index).map_err(|e| StorageError::PartitionNotFound {
-        name: format!("index serialize: {e}"),
-    })?;
-    engine.put(Partition::Schema, &key, &value)
+    LocalIndexStore::new(engine)
+        .put_definition(index)
+        .map_err(map_store_err)
 }
 
 /// Update only the `state` field of a persisted index definition.
@@ -237,72 +223,40 @@ pub fn save_index_state(
     name: &str,
     state: IndexState,
 ) -> Result<bool, StorageError> {
-    let Some(mut def) = load_index_definition(engine, name)? else {
-        return Ok(false);
-    };
-    def.state = state;
-    save_index_definition(engine, &def)?;
-    Ok(true)
+    LocalIndexStore::new(engine)
+        .set_definition_state(name, state)
+        .map_err(map_store_err)
 }
 
-/// Load index definition from schema partition.
+/// Load index definition from the index-store catalog.
 pub fn load_index_definition(
     engine: &StorageEngine,
     name: &str,
 ) -> Result<Option<IndexDefinition>, StorageError> {
-    let mut key = Vec::with_capacity(11 + name.len());
-    key.extend_from_slice(b"schema:idx:");
-    key.extend_from_slice(name.as_bytes());
-
-    match engine.get(Partition::Schema, &key)? {
-        Some(bytes) => {
-            let def: IndexDefinition =
-                rmp_serde::from_slice(&bytes).map_err(|e| StorageError::PartitionNotFound {
-                    name: format!("index deserialize: {e}"),
-                })?;
-            Ok(Some(def))
-        }
-        None => Ok(None),
-    }
+    LocalIndexStore::new(engine)
+        .load_definition(name)
+        .map_err(map_store_err)
 }
 
 /// List every persisted index definition in `schema:idx:` order.
 ///
-/// Equivalent to `coordinode_modality::SchemaStore::list_labels`
-/// but for [`IndexDefinition`] — which lives in `coordinode-query`
-/// (above modality), so the helper has to be here. Skips entries
-/// whose body fails to decode rather than aborting the whole list
-/// (a corrupt index def shouldn't take out the registry).
+/// Skips entries whose body fails to decode rather than aborting the
+/// whole list (a corrupt index def shouldn't take out the registry).
 pub fn list_index_definitions(
     engine: &StorageEngine,
 ) -> Result<Vec<IndexDefinition>, StorageError> {
-    let iter = engine.prefix_scan(Partition::Schema, b"schema:idx:")?;
-    let mut out = Vec::new();
-    for guard in iter {
-        let (_key, value) = guard.into_inner().map_err(StorageError::Engine)?;
-        match rmp_serde::from_slice::<IndexDefinition>(&value) {
-            Ok(def) => out.push(def),
-            Err(e) => {
-                tracing::warn!("list_index_definitions: skipping corrupt index def: {e}",);
-                continue;
-            }
-        }
-    }
-    Ok(out)
+    LocalIndexStore::new(engine)
+        .list_definitions()
+        .map_err(map_store_err)
 }
 
 /// Delete index definition and all entries.
 pub fn drop_index(engine: &StorageEngine, index: &IndexDefinition) -> Result<(), StorageError> {
-    // The index DEFINITION lives in the Schema partition and is keyed by a
-    // query-layer type (`IndexDefinition`), so it stays a direct delete here.
-    let schema_key = index.schema_key();
-    engine.delete(Partition::Schema, &schema_key)?;
-
-    // Index ENTRIES live in Partition::Idx behind the Layer-4 store.
-    LocalIndexStore::new(engine)
-        .clear(&index.name)
+    let store = LocalIndexStore::new(engine);
+    store
+        .delete_definition(&index.name)
         .map_err(map_store_err)?;
-
+    store.clear(&index.name).map_err(map_store_err)?;
     Ok(())
 }
 

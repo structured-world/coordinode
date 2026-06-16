@@ -57,6 +57,7 @@ pub mod document;
 pub mod edge;
 pub mod error;
 pub mod index;
+pub mod index_def;
 pub mod node;
 pub mod schema;
 pub mod spatial;
@@ -69,6 +70,10 @@ pub use document::{DocumentStore, LocalDocumentStore};
 pub use edge::{EdgeStore, LocalEdgeStore};
 pub use error::{StoreError, StoreResult};
 pub use index::{IndexStore, LocalIndexStore};
+pub use index_def::{
+    IndexDefinition, IndexState, IndexType, OnlineDuringBuild, PartialFilter, TextFieldConfig,
+    TextIndexConfig, VectorIndexConfig,
+};
 pub use node::{LocalNodeStore, NodeStore};
 pub use schema::{LocalSchemaStore, SchemaStore};
 pub use spatial::{distance, Bbox, Crs, LocalSpatialStore, Point, SpatialStore};
