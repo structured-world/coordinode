@@ -115,6 +115,23 @@ impl OccScope {
         }
     }
 
+    /// Merge a batch of `Partition::Node` keys into the read-set. Lets a
+    /// caller (e.g. a parallel traversal worker pool) accumulate raw node
+    /// keys without naming the partition, then merge them here.
+    pub fn extend_node_keys<I: IntoIterator<Item = Vec<u8>>>(&self, iter: I) {
+        if let Ok(mut guard) = self.read_set.lock() {
+            guard.extend(iter.into_iter().map(|k| (Partition::Node, k)));
+        }
+    }
+
+    /// Merge a batch of `Partition::EdgeProp` keys into the read-set
+    /// (see [`Self::extend_node_keys`]).
+    pub fn extend_edge_prop_keys<I: IntoIterator<Item = Vec<u8>>>(&self, iter: I) {
+        if let Ok(mut guard) = self.read_set.lock() {
+            guard.extend(iter.into_iter().map(|k| (Partition::EdgeProp, k)));
+        }
+    }
+
     /// Number of distinct tracked `(part, key)` pairs. Test/EXPLAIN
     /// hook — production code does not inspect this.
     pub fn tracked_count(&self) -> usize {

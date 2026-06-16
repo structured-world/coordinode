@@ -3387,8 +3387,15 @@ fn build_target_rows(
     Ok(kept)
 }
 
-/// Collected OCC read-set keys from parallel processing (G067).
-type OccReadKeys = Mutex<Vec<(Partition, Vec<u8>)>>;
+/// Collected OCC read-set keys from parallel processing, kept per partition
+/// so the query layer never names a `Partition` variant — node and edge-prop
+/// keys go in separate buffers and merge through the typed
+/// `OccScope::extend_node_keys` / `extend_edge_prop_keys`.
+#[derive(Default)]
+struct OccReadKeys {
+    node: Mutex<Vec<Vec<u8>>>,
+    edge_prop: Mutex<Vec<Vec<u8>>>,
+}
 
 /// Read-only context extracted from `ExecutionContext` for parallel processing.
 /// All fields are `Send + Sync`, enabling safe rayon parallelism.
@@ -3398,11 +3405,11 @@ struct ParallelCtx<'a> {
     shard_id: u16,
     mvcc_snapshot: Option<StorageSnapshot>,
     chunk_size: usize,
-    /// OCC read-set keys collected during parallel processing (G067).
-    /// When `Some`, parallel workers push `(Partition, key)` for each storage
-    /// read so that the caller can merge them into `ExecutionContext::occ_scope`
-    /// via `OccScope::extend` after the parallel block. `None` when MVCC
-    /// oracle is inactive (legacy mode).
+    /// OCC read-set keys collected during parallel processing. When `Some`,
+    /// parallel workers push each read's raw key into the matching per-partition
+    /// buffer; the caller merges them into `ExecutionContext::occ_scope` via the
+    /// typed `OccScope::extend_*_keys` after the parallel block. `None` when the
+    /// MVCC oracle is inactive (legacy mode).
     occ_read_keys: Option<OccReadKeys>,
 }
 
@@ -3451,8 +3458,8 @@ fn process_targets_parallel(
                 // into the shared accumulator; merged into the statement's
                 // read-set after the parallel section.
                 if let Some(ref keys) = pctx.occ_read_keys {
-                    if let Ok(mut guard) = keys.lock() {
-                        guard.push((Partition::Node, target_key));
+                    if let Ok(mut guard) = keys.node.lock() {
+                        guard.push(target_key);
                     }
                 }
 
@@ -3538,8 +3545,8 @@ fn process_targets_parallel(
                                 .unwrap_or((Vec::new(), None));
                             // Track the EdgeProp key in the OCC read-set.
                             if let Some(ref keys) = pctx.occ_read_keys {
-                                if let Ok(mut guard) = keys.lock() {
-                                    guard.push((Partition::EdgeProp, ep_key));
+                                if let Ok(mut guard) = keys.edge_prop.lock() {
+                                    guard.push(ep_key);
                                 }
                             }
                             if let Some(ep_bytes) = ep_bytes {
@@ -3641,7 +3648,7 @@ fn execute_single_hop_traverse(
                 mvcc_snapshot: ctx.mvcc_snapshot,
                 chunk_size: ctx.adaptive.parallel_chunk_size,
                 occ_read_keys: if ctx.mvcc_oracle.is_some() {
-                    Some(Mutex::new(Vec::new()))
+                    Some(OccReadKeys::default())
                 } else {
                     None
                 },
@@ -3652,11 +3659,16 @@ fn execute_single_hop_traverse(
                 .map(|&(tgt, et_idx)| (src_raw, tgt, et_idx))
                 .collect();
             let parallel_rows = process_targets_parallel(&with_src, row, params, &pctx);
-            // Merge OCC read keys from parallel workers into the
-            // Layer-3 scope.
-            if let Some(ref keys_mutex) = pctx.occ_read_keys {
-                if let (Ok(keys), Some(scope)) = (keys_mutex.lock(), ctx.ensure_occ_scope()) {
-                    scope.extend(keys.iter().cloned());
+            // Merge OCC read keys from parallel workers into the Layer-3 scope
+            // via the typed per-partition extends.
+            if let Some(ref keys) = pctx.occ_read_keys {
+                if let Some(scope) = ctx.ensure_occ_scope() {
+                    if let Ok(mut node) = keys.node.lock() {
+                        scope.extend_node_keys(node.drain(..));
+                    }
+                    if let Ok(mut ep) = keys.edge_prop.lock() {
+                        scope.extend_edge_prop_keys(ep.drain(..));
+                    }
                 }
             }
             results.extend(parallel_rows);
@@ -3959,17 +3971,22 @@ fn execute_varlen_traverse(
                     mvcc_snapshot: ctx.mvcc_snapshot,
                     chunk_size: ctx.adaptive.parallel_chunk_size,
                     occ_read_keys: if ctx.mvcc_oracle.is_some() {
-                        Some(Mutex::new(Vec::new()))
+                        Some(OccReadKeys::default())
                     } else {
                         None
                     },
                 };
                 let parallel_rows = process_targets_parallel(&depth_neighbors, row, params, &pctx);
-                // Merge OCC read keys from parallel workers into the
-                // Layer-3 scope.
-                if let Some(ref keys_mutex) = pctx.occ_read_keys {
-                    if let (Ok(keys), Some(scope)) = (keys_mutex.lock(), ctx.ensure_occ_scope()) {
-                        scope.extend(keys.iter().cloned());
+                // Merge OCC read keys from parallel workers into the Layer-3
+                // scope via the typed per-partition extends.
+                if let Some(ref keys) = pctx.occ_read_keys {
+                    if let Some(scope) = ctx.ensure_occ_scope() {
+                        if let Ok(mut node) = keys.node.lock() {
+                            scope.extend_node_keys(node.drain(..));
+                        }
+                        if let Ok(mut ep) = keys.edge_prop.lock() {
+                            scope.extend_edge_prop_keys(ep.drain(..));
+                        }
                     }
                 }
                 results.extend(parallel_rows);
