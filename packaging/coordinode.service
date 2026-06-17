@@ -8,11 +8,19 @@ Wants=network-online.target
 Type=simple
 User=coordinode
 Group=coordinode
-EnvironmentFile=/etc/coordinode/coordinode.conf
 StateDirectory=coordinode coordinode/data
 StateDirectoryMode=0750
 WorkingDirectory=/var/lib/coordinode
-ExecStart=/usr/bin/coordinode serve --addr ${COORDINODE_ADDR} --rest-addr ${COORDINODE_REST_ADDR} --ops-addr ${COORDINODE_OPS_ADDR} --data ${COORDINODE_DATA} $COORDINODE_EXTRA_ARGS
+# All server tunables live in the YAML config file (the single config gate).
+# Override individual values without editing the file by appending CLI flags
+# here via a drop-in (`systemctl edit coordinode`): the command line wins.
+ExecStart=/usr/bin/coordinode serve --config /etc/coordinode/coordinode.conf
+# Logging is controlled through the environment (standard Rust ecosystem knobs).
+# Override via `systemctl edit coordinode`:
+#   [Service]
+#   Environment=RUST_LOG=debug
+#   Environment=COORDINODE_LOG_FORMAT=json
+Environment=RUST_LOG=info
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536

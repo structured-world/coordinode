@@ -1,5 +1,9 @@
 //! Server configuration: CLI args, config file, env vars.
 
+pub mod server;
+
+pub use server::{CliOverrides, ServerConfig};
+
 /// Operational mode for the `coordinode` binary.
 ///
 /// CE supports only [`ServeMode::Full`]. `--mode=compute` and

@@ -44,6 +44,7 @@ tower = "0.5"
 http = "1"
 pin-project-lite = "0.2"
 serde = { workspace = true }
+serde_yaml_ng = "0.10"
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 tracing = { workspace = true }

@@ -186,17 +186,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!(data_dir = %data_dir, "compaction complete");
         }
 
-        cli::Command::Serve(serve_args) => {
-            let cli::ServeArgs {
-                mode,
+        cli::Command::Serve {
+            config_path,
+            overrides,
+        } => {
+            // Resolve the single config gate: built-in defaults, overlaid by the
+            // YAML config file (if `--config` given), overlaid last by the
+            // command-line flags. A malformed / unreadable config file is a
+            // startup error rather than a silent fallback.
+            let mut cfg = config::ServerConfig::load(config_path.as_deref())
+                .map_err(|e| format!("config error: {e}"))?;
+            cfg.apply_overrides(&overrides);
+
+            // Resolve the operational mode from the merged string value, so a
+            // mode set in the config file is validated exactly like a CLI flag.
+            let mode = match config::ServeMode::parse(&cfg.mode) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            // Bind the resolved settings into the local names the rest of the
+            // handler uses. `peers` becomes `None` when empty (= standalone),
+            // matching the cluster-detection contract below.
+            let config::ServerConfig {
                 node_id,
                 grpc_addr,
                 advertise_addr,
-                #[cfg(feature = "rest-proxy")]
                 rest_addr,
                 ops_addr,
                 data_dir,
-                peers,
                 nofile,
                 max_connections,
                 max_request_size_mb,
@@ -207,7 +228,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 retention_window_secs,
                 registry_heartbeat_ms,
                 registry_eviction_ms,
-            } = *serve_args;
+                interactive_txn_idle_timeout_secs,
+                interactive_txn_max_bytes,
+                peers: peers_vec,
+                mode: _,
+            } = cfg;
+            let peers = if peers_vec.is_empty() {
+                None
+            } else {
+                Some(peers_vec)
+            };
+            #[cfg(not(feature = "rest-proxy"))]
+            let _ = rest_addr;
+
+            // Cross-field validation, deferred from CLI parse because the peer
+            // list can arrive from the config file: a node id above 1 only makes
+            // sense as a member of a multi-node cluster.
+            if node_id > 1 && peers.is_none() {
+                eprintln!(
+                    "error: node_id={node_id} requires peers. \
+                     Single-node deployments always use node-id=1."
+                );
+                std::process::exit(1);
+            }
+
             logging::init_logging();
 
             // Raise the open-file-descriptor limit before opening storage: the
@@ -342,6 +386,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .map_err(|e| format!("failed to open database: {e}"))?,
             ));
+
+            // Interactive-transaction tunables (ADR-042). Always resolved (the
+            // config gate carries the built-in defaults: 30s idle timeout,
+            // 256 MiB buffered-write ceiling per open transaction).
+            {
+                let mut db = database.write();
+                db.set_interactive_idle_timeout(std::time::Duration::from_secs(
+                    interactive_txn_idle_timeout_secs,
+                ));
+                db.set_max_interactive_txn_bytes(interactive_txn_max_bytes as usize);
+            }
 
             // Per-shard consumer-retention registry (ADR-028). Constructing it
             // makes the registry the source of the MVCC GC watermark: it

@@ -9,14 +9,22 @@
 
 use coordinode_embed::backup::BackupFormat;
 
-use crate::config::ServeMode;
+use crate::config::CliOverrides;
 
 /// Parsed CLI command.
 pub enum Command {
-    /// Start the database server (default). Boxed via [`ServeArgs`]: `serve`
-    /// carries far more fields than any other subcommand, so inlining it would
-    /// make every `Command` value as large as `Serve`.
-    Serve(Box<ServeArgs>),
+    /// Start the database server (default). The resolved configuration is
+    /// `ServerConfig::default()` overlaid by the `--config` YAML file (if any)
+    /// then by these command-line `overrides` (CLI wins). Boxed because the
+    /// override set is far larger than any other subcommand's payload.
+    Serve {
+        /// `--config <path>`: optional YAML config file. Absent = built-in
+        /// defaults; present-but-unreadable / malformed = startup error.
+        config_path: Option<String>,
+        /// Command-line flag overrides, folded over the config file last so
+        /// the command line beats the file.
+        overrides: Box<CliOverrides>,
+    },
     /// Print version and exit.
     Version,
     /// Verify storage integrity.
@@ -120,81 +128,6 @@ pub enum Command {
     },
 }
 
-/// Arguments for the `serve` subcommand. Boxed inside [`Command::Serve`] to keep
-/// the command enum compact — this struct has many more fields than any other
-/// subcommand and would otherwise dominate every `Command` value's size.
-pub struct ServeArgs {
-    /// Operational mode (CE supports only "full").
-    /// --mode=compute and --mode=storage require coordinode-ee.
-    pub mode: ServeMode,
-    /// Numeric node ID for this instance (default: 1).
-    /// Must be unique within the cluster. In single-node deployments
-    /// the default of 1 is always correct.
-    pub node_id: u64,
-    /// gRPC listen address (default: [::]:7080).
-    pub grpc_addr: String,
-    /// Advertise address for intra-cluster gRPC (default: same as --addr).
-    /// Other nodes use this address to send Raft RPCs to this node.
-    /// Set this when the listen address is 0.0.0.0 or [::] so peers
-    /// know the actual hostname/IP.
-    pub advertise_addr: Option<String>,
-    /// REST/JSON proxy listen address (default: [::]:7081).
-    /// Transcodes HTTP/JSON requests to gRPC via embedded structured-proxy.
-    /// Only present when compiled with the `rest-proxy` feature.
-    #[cfg(feature = "rest-proxy")]
-    pub rest_addr: String,
-    /// Operational HTTP server address for /metrics and /health (default: [::]:7084).
-    /// Pass port 0 to let the OS assign an ephemeral port (useful in tests).
-    pub ops_addr: String,
-    /// Data directory (default: ./data).
-    pub data_dir: String,
-    /// Peer addresses for cluster mode (comma-separated).
-    /// When provided, enables Raft consensus with the given peers.
-    /// Example: --peers "node2:7080,node3:7080"
-    pub peers: Option<Vec<String>>,
-    /// Open-file-descriptor soft limit to request at startup
-    /// (`setrlimit(RLIMIT_NOFILE)`). `None` raises the soft limit to the
-    /// hard limit. The storage engine keeps many files open, so a high
-    /// limit matters in production. Unix only; ignored elsewhere.
-    pub nofile: Option<u64>,
-    /// Maximum in-flight requests per client connection (gRPC concurrency
-    /// limit). `None` leaves it unbounded. Mirrors a connection cap on a
-    /// stream-multiplexed transport.
-    pub max_connections: Option<usize>,
-    /// Maximum decoded request message size, in MiB (default: 16, matching
-    /// the common document-size limit). Guards against unbounded-allocation
-    /// requests.
-    pub max_request_size_mb: usize,
-    /// Per-request timeout in seconds. `None` disables the server-side
-    /// timeout.
-    pub request_timeout_secs: Option<u64>,
-    /// HTTP/2 keepalive ping interval in seconds. `None` disables keepalive
-    /// pings. Useful to detect half-open connections across a load balancer.
-    pub http2_keepalive_secs: Option<u64>,
-    /// Block cache size in MiB. `None` keeps the engine default. The read
-    /// path serves hot blocks from this cache before touching disk.
-    pub cache_size_mb: Option<u64>,
-    /// Write buffer (memtable) size in MiB. `None` keeps the engine
-    /// default. Larger buffers reduce flush frequency at the cost of memory.
-    pub write_buffer_mb: Option<u64>,
-    /// MVCC time-travel / consumer-retention window in seconds. `None`
-    /// keeps the default (7 days). This is the `AS OF TIMESTAMP` horizon:
-    /// the GC watermark is held back to at least `now - this`, so history
-    /// within the window stays queryable and CDC / backup consumers that
-    /// register against it keep their checkpoint readable.
-    pub retention_window_secs: Option<u64>,
-    /// Consumer-registry heartbeat coalescing window in milliseconds.
-    /// `None` keeps the default (100 ms). Buffered consumer heartbeats
-    /// flush as one coalesced Raft proposal per window — a larger window
-    /// trades heartbeat freshness for fewer proposals on busy shards.
-    pub registry_heartbeat_ms: Option<u64>,
-    /// Consumer-registry TTL-eviction sweep interval in milliseconds.
-    /// `None` keeps the default (1000 ms). How often expired consumer
-    /// registrations are swept and the retention floor is refreshed
-    /// against the wall clock.
-    pub registry_eviction_ms: Option<u64>,
-}
-
 /// Parse command line arguments.
 pub fn parse_args() -> Command {
     let args: Vec<String> = std::env::args().collect();
@@ -209,78 +142,60 @@ pub fn parse_args_from(args: &[String]) -> Command {
 
     match args[1].as_str() {
         "serve" => {
-            let mode = match find_flag(args, "--mode") {
-                None => ServeMode::Full,
-                Some(s) => match ServeMode::parse(&s) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        std::process::exit(1);
-                    }
-                },
-            };
-            let node_id: u64 = match find_flag(args, "--node-id") {
-                None => 1,
+            // Flags fill an all-`Option` override set: a flag left off the
+            // command line stays `None` so the config-file / default value
+            // stands. Defaults and cross-field validation (mode resolution,
+            // node-id-requires-peers) move to the resolution step in `main`,
+            // because the missing side may be supplied by the config file.
+            let config_path = find_flag(args, "--config");
+            // Validate the numeric format of --node-id at parse time (cheap,
+            // value-independent); the >1-requires-peers rule is checked after
+            // the config file is merged.
+            let node_id: Option<u64> = match find_flag(args, "--node-id") {
+                None => None,
                 Some(s) => match s.parse() {
-                    Ok(id) if id > 0 => id,
+                    Ok(id) if id > 0 => Some(id),
                     _ => {
                         eprintln!("error: --node-id must be a positive integer, got '{s}'");
                         std::process::exit(1);
                     }
                 },
             };
-            let grpc_addr = find_flag(args, "--addr").unwrap_or_else(|| "[::]:7080".to_string());
-            let advertise_addr = find_flag(args, "--advertise-addr");
-            #[cfg(feature = "rest-proxy")]
-            let rest_addr =
-                find_flag(args, "--rest-addr").unwrap_or_else(|| "[::]:7081".to_string());
-            let ops_addr = find_flag(args, "--ops-addr").unwrap_or_else(|| "[::]:7084".to_string());
-            let data_dir = find_flag(args, "--data").unwrap_or_else(|| "./data".to_string());
             let peers = find_flag(args, "--peers").map(|p| {
                 p.split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect()
             });
-            // Validate: --node-id > 1 without --peers makes no sense.
-            if node_id > 1 && peers.is_none() {
-                eprintln!(
-                    "error: --node-id={node_id} requires --peers. \
-                     Single-node deployments always use node-id=1."
-                );
-                std::process::exit(1);
-            }
-            let nofile = find_flag_num(args, "--nofile");
-            let max_connections = find_flag_num(args, "--max-connections");
-            let max_request_size_mb = find_flag_num(args, "--max-request-size-mb").unwrap_or(16);
-            let request_timeout_secs = find_flag_num(args, "--request-timeout-secs");
-            let http2_keepalive_secs = find_flag_num(args, "--http2-keepalive-secs");
-            let cache_size_mb = find_flag_num(args, "--cache-size-mb");
-            let write_buffer_mb = find_flag_num(args, "--write-buffer-mb");
-            let retention_window_secs = find_flag_num(args, "--retention-window-secs");
-            let registry_heartbeat_ms = find_flag_num(args, "--registry-heartbeat-ms");
-            let registry_eviction_ms = find_flag_num(args, "--registry-eviction-ms");
-            Command::Serve(Box::new(ServeArgs {
-                mode,
+            let overrides = CliOverrides {
+                mode: find_flag(args, "--mode"),
                 node_id,
-                grpc_addr,
-                advertise_addr,
-                #[cfg(feature = "rest-proxy")]
-                rest_addr,
-                ops_addr,
-                data_dir,
+                grpc_addr: find_flag(args, "--addr"),
+                advertise_addr: find_flag(args, "--advertise-addr"),
+                rest_addr: find_flag(args, "--rest-addr"),
+                ops_addr: find_flag(args, "--ops-addr"),
+                data_dir: find_flag(args, "--data"),
                 peers,
-                nofile,
-                max_connections,
-                max_request_size_mb,
-                request_timeout_secs,
-                http2_keepalive_secs,
-                cache_size_mb,
-                write_buffer_mb,
-                retention_window_secs,
-                registry_heartbeat_ms,
-                registry_eviction_ms,
-            }))
+                nofile: find_flag_num(args, "--nofile"),
+                max_connections: find_flag_num(args, "--max-connections"),
+                max_request_size_mb: find_flag_num(args, "--max-request-size-mb"),
+                request_timeout_secs: find_flag_num(args, "--request-timeout-secs"),
+                http2_keepalive_secs: find_flag_num(args, "--http2-keepalive-secs"),
+                cache_size_mb: find_flag_num(args, "--cache-size-mb"),
+                write_buffer_mb: find_flag_num(args, "--write-buffer-mb"),
+                retention_window_secs: find_flag_num(args, "--retention-window-secs"),
+                registry_heartbeat_ms: find_flag_num(args, "--registry-heartbeat-ms"),
+                registry_eviction_ms: find_flag_num(args, "--registry-eviction-ms"),
+                interactive_txn_idle_timeout_secs: find_flag_num(
+                    args,
+                    "--interactive-txn-idle-timeout-secs",
+                ),
+                interactive_txn_max_bytes: find_flag_num(args, "--interactive-txn-max-bytes"),
+            };
+            Command::Serve {
+                config_path,
+                overrides: Box::new(overrides),
+            }
         }
         "version" | "--version" | "-v" => Command::Version,
         "verify" => {
@@ -478,27 +393,10 @@ fn parse_admin_args(args: &[String]) -> Command {
 }
 
 fn default_serve() -> Command {
-    Command::Serve(Box::new(ServeArgs {
-        mode: ServeMode::Full,
-        node_id: 1,
-        grpc_addr: "[::]:7080".to_string(),
-        advertise_addr: None,
-        #[cfg(feature = "rest-proxy")]
-        rest_addr: "[::]:7081".to_string(),
-        ops_addr: "[::]:7084".to_string(),
-        data_dir: "./data".to_string(),
-        peers: None,
-        nofile: None,
-        max_connections: None,
-        max_request_size_mb: 16,
-        request_timeout_secs: None,
-        http2_keepalive_secs: None,
-        cache_size_mb: None,
-        write_buffer_mb: None,
-        retention_window_secs: None,
-        registry_heartbeat_ms: None,
-        registry_eviction_ms: None,
-    }))
+    Command::Serve {
+        config_path: None,
+        overrides: Box::new(CliOverrides::default()),
+    }
 }
 
 fn find_flag(args: &[String], flag: &str) -> Option<String> {
@@ -703,17 +601,39 @@ mod tests {
     #[test]
     fn default_is_serve() {
         let cmd = parse_args_from(&args("coordinode"));
-        assert!(matches!(cmd, Command::Serve(_)));
+        assert!(matches!(cmd, Command::Serve { .. }));
+    }
+
+    /// Bare `serve` leaves every override `None` and no config path, so the
+    /// resolution step in `main` falls back to the built-in defaults.
+    #[test]
+    fn serve_bare_has_no_overrides_and_no_config() {
+        let cmd = parse_args_from(&args("coordinode serve"));
+        match cmd {
+            Command::Serve {
+                config_path,
+                overrides,
+            } => {
+                assert!(config_path.is_none());
+                assert!(overrides.mode.is_none());
+                assert!(overrides.node_id.is_none());
+                assert!(overrides.advertise_addr.is_none());
+            }
+            _ => panic!("expected Serve command"),
+        }
     }
 
     #[test]
-    fn serve_default_mode_is_full() {
-        let cmd = parse_args_from(&args("coordinode serve"));
+    fn serve_config_path_parsed() {
+        let cmd = parse_args_from(&args(
+            "coordinode serve --config /etc/coordinode/coordinode.conf",
+        ));
         match cmd {
-            Command::Serve(args) => {
-                assert_eq!(args.mode, ServeMode::Full);
-                assert_eq!(args.node_id, 1);
-                assert!(args.advertise_addr.is_none());
+            Command::Serve { config_path, .. } => {
+                assert_eq!(
+                    config_path.as_deref(),
+                    Some("/etc/coordinode/coordinode.conf")
+                );
             }
             _ => panic!("expected Serve command"),
         }
@@ -723,7 +643,9 @@ mod tests {
     fn serve_explicit_mode_full() {
         let cmd = parse_args_from(&args("coordinode serve --mode full"));
         match cmd {
-            Command::Serve(args) => assert_eq!(args.mode, ServeMode::Full),
+            Command::Serve { overrides, .. } => {
+                assert_eq!(overrides.mode.as_deref(), Some("full"))
+            }
             _ => panic!("expected Serve command"),
         }
     }
@@ -734,9 +656,9 @@ mod tests {
             "coordinode serve --node-id 3 --peers node1:7080,node2:7080",
         ));
         match cmd {
-            Command::Serve(args) => {
-                assert_eq!(args.node_id, 3);
-                assert_eq!(args.peers.as_ref().map(|p| p.len()), Some(2));
+            Command::Serve { overrides, .. } => {
+                assert_eq!(overrides.node_id, Some(3));
+                assert_eq!(overrides.peers.as_ref().map(|p| p.len()), Some(2));
             }
             _ => panic!("expected Serve command"),
         }
@@ -750,31 +672,31 @@ mod tests {
              --http2-keepalive-secs 60 --cache-size-mb 4096 --write-buffer-mb 256",
         ));
         match cmd {
-            Command::Serve(args) => {
-                assert_eq!(args.nofile, Some(262144));
-                assert_eq!(args.max_connections, Some(1024));
-                assert_eq!(args.max_request_size_mb, 32);
-                assert_eq!(args.request_timeout_secs, Some(30));
-                assert_eq!(args.http2_keepalive_secs, Some(60));
-                assert_eq!(args.cache_size_mb, Some(4096));
-                assert_eq!(args.write_buffer_mb, Some(256));
+            Command::Serve { overrides, .. } => {
+                assert_eq!(overrides.nofile, Some(262144));
+                assert_eq!(overrides.max_connections, Some(1024));
+                assert_eq!(overrides.max_request_size_mb, Some(32));
+                assert_eq!(overrides.request_timeout_secs, Some(30));
+                assert_eq!(overrides.http2_keepalive_secs, Some(60));
+                assert_eq!(overrides.cache_size_mb, Some(4096));
+                assert_eq!(overrides.write_buffer_mb, Some(256));
             }
             _ => panic!("expected Serve command"),
         }
     }
 
     #[test]
-    fn serve_resource_flags_default() {
+    fn serve_resource_flags_default_to_none() {
+        // Unset → None so the resolution step keeps config-file / built-in
+        // defaults (incl. the 16 MiB request-size cap).
         let cmd = parse_args_from(&args("coordinode serve"));
         match cmd {
-            Command::Serve(args) => {
-                // Unset network/storage knobs stay None; the request-size cap has
-                // a safe default.
-                assert!(args.nofile.is_none());
-                assert!(args.max_connections.is_none());
-                assert_eq!(args.max_request_size_mb, 16);
-                assert!(args.request_timeout_secs.is_none());
-                assert!(args.cache_size_mb.is_none());
+            Command::Serve { overrides, .. } => {
+                assert!(overrides.nofile.is_none());
+                assert!(overrides.max_connections.is_none());
+                assert!(overrides.max_request_size_mb.is_none());
+                assert!(overrides.request_timeout_secs.is_none());
+                assert!(overrides.cache_size_mb.is_none());
             }
             _ => panic!("expected Serve command"),
         }
@@ -787,10 +709,10 @@ mod tests {
              --registry-heartbeat-ms 50 --registry-eviction-ms 500",
         ));
         match cmd {
-            Command::Serve(args) => {
-                assert_eq!(args.retention_window_secs, Some(3600));
-                assert_eq!(args.registry_heartbeat_ms, Some(50));
-                assert_eq!(args.registry_eviction_ms, Some(500));
+            Command::Serve { overrides, .. } => {
+                assert_eq!(overrides.retention_window_secs, Some(3600));
+                assert_eq!(overrides.registry_heartbeat_ms, Some(50));
+                assert_eq!(overrides.registry_eviction_ms, Some(500));
             }
             _ => panic!("expected Serve command"),
         }
@@ -802,10 +724,39 @@ mod tests {
         // (7-day retention window, 100 ms heartbeat, 1000 ms eviction sweep).
         let cmd = parse_args_from(&args("coordinode serve"));
         match cmd {
-            Command::Serve(args) => {
-                assert!(args.retention_window_secs.is_none());
-                assert!(args.registry_heartbeat_ms.is_none());
-                assert!(args.registry_eviction_ms.is_none());
+            Command::Serve { overrides, .. } => {
+                assert!(overrides.retention_window_secs.is_none());
+                assert!(overrides.registry_heartbeat_ms.is_none());
+                assert!(overrides.registry_eviction_ms.is_none());
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn serve_interactive_txn_flags_parsed() {
+        let cmd = parse_args_from(&args(
+            "coordinode serve --interactive-txn-idle-timeout-secs 60 \
+             --interactive-txn-max-bytes 1048576",
+        ));
+        match cmd {
+            Command::Serve { overrides, .. } => {
+                assert_eq!(overrides.interactive_txn_idle_timeout_secs, Some(60));
+                assert_eq!(overrides.interactive_txn_max_bytes, Some(1_048_576));
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn serve_interactive_txn_flags_default_to_none() {
+        // Unset → None so the server keeps the ADR-042 defaults (30s idle
+        // timeout, 256 MiB buffered-write ceiling per interactive transaction).
+        let cmd = parse_args_from(&args("coordinode serve"));
+        match cmd {
+            Command::Serve { overrides, .. } => {
+                assert!(overrides.interactive_txn_idle_timeout_secs.is_none());
+                assert!(overrides.interactive_txn_max_bytes.is_none());
             }
             _ => panic!("expected Serve command"),
         }
@@ -815,31 +766,93 @@ mod tests {
     fn serve_advertise_addr() {
         let cmd = parse_args_from(&args("coordinode serve --advertise-addr node1:7080"));
         match cmd {
-            Command::Serve(args) => {
-                assert_eq!(args.advertise_addr.as_deref(), Some("node1:7080"));
+            Command::Serve { overrides, .. } => {
+                assert_eq!(overrides.advertise_addr.as_deref(), Some("node1:7080"));
             }
             _ => panic!("expected Serve command"),
         }
     }
 
-    #[cfg(feature = "rest-proxy")]
     #[test]
     fn serve_custom_rest_addr() {
         let cmd = parse_args_from(&args("coordinode serve --rest-addr 0.0.0.0:8081"));
         match cmd {
-            Command::Serve(args) => assert_eq!(args.rest_addr, "0.0.0.0:8081"),
+            Command::Serve { overrides, .. } => {
+                assert_eq!(overrides.rest_addr.as_deref(), Some("0.0.0.0:8081"))
+            }
             _ => panic!("expected Serve command"),
         }
     }
 
-    #[cfg(feature = "rest-proxy")]
     #[test]
-    fn serve_default_rest_addr() {
+    fn serve_default_rest_addr_is_none() {
         let cmd = parse_args_from(&args("coordinode serve"));
         match cmd {
-            Command::Serve(args) => assert_eq!(args.rest_addr, "[::]:7081"),
+            Command::Serve { overrides, .. } => assert!(overrides.rest_addr.is_none()),
             _ => panic!("expected Serve command"),
         }
+    }
+
+    /// End-to-end resolution exactly as `main` performs it: a YAML config file
+    /// on disk supplies some knobs, the command line overrides a subset, and
+    /// the rest fall through to the built-in defaults. Proves the three-layer
+    /// precedence (CLI > config file > default) through the real CLI parser.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn serve_config_file_plus_cli_resolves_with_correct_precedence() {
+        use crate::config::ServerConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordinode.conf");
+        // File sets node_id, grpc_addr, and the idle timeout.
+        std::fs::write(
+            &path,
+            "node_id: 5\n\
+             grpc_addr: \"0.0.0.0:9999\"\n\
+             interactive_txn_idle_timeout_secs: 90\n\
+             peers:\n  - \"n1:7080\"\n  - \"n2:7080\"\n",
+        )
+        .unwrap();
+        let path_str = path.to_str().unwrap();
+
+        // CLI overrides node_id (beats the file) and sets the data dir; leaves
+        // grpc_addr and the idle timeout to the file, and ops_addr to default.
+        let argv = args(&format!(
+            "coordinode serve --config {path_str} --node-id 7 --data /var/lib/coordinode"
+        ));
+        let (config_path, overrides) = match parse_args_from(&argv) {
+            Command::Serve {
+                config_path,
+                overrides,
+            } => (config_path, overrides),
+            _ => panic!("expected Serve command"),
+        };
+        assert_eq!(config_path.as_deref(), Some(path_str));
+
+        let mut cfg = ServerConfig::load(config_path.as_deref()).unwrap();
+        cfg.apply_overrides(&overrides);
+
+        // CLI wins.
+        assert_eq!(cfg.node_id, 7, "CLI --node-id beats the config file");
+        assert_eq!(cfg.data_dir, "/var/lib/coordinode", "CLI --data applied");
+        // File wins over default.
+        assert_eq!(
+            cfg.grpc_addr, "0.0.0.0:9999",
+            "config file grpc_addr stands"
+        );
+        assert_eq!(
+            cfg.interactive_txn_idle_timeout_secs, 90,
+            "config file idle timeout stands"
+        );
+        assert_eq!(cfg.peers, vec!["n1:7080", "n2:7080"], "config file peers");
+        // Untouched by both → built-in default.
+        assert_eq!(cfg.ops_addr, "[::]:7084", "default ops_addr");
+        assert_eq!(cfg.max_request_size_mb, 16, "default request-size cap");
+        assert_eq!(
+            cfg.interactive_txn_max_bytes,
+            256 * 1024 * 1024,
+            "default interactive-txn byte ceiling"
+        );
     }
 
     #[test]

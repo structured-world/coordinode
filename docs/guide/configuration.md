@@ -1,40 +1,58 @@
 # Configuration
 
-CoordiNode is configured through command-line flags. The packaged Linux service
-maps a small environment file to those flags, so on a package install you edit
-one file and restart. This page is the full reference for every flag, the
-environment variables the binary reads directly, the packaged config file, and
-the operating-system limits that matter for a production deployment.
+CoordiNode resolves its configuration from a single in-code gate that layers
+three sources, lowest to highest precedence:
+
+1. **Built-in defaults** — every setting has a safe default.
+2. **The YAML config file** — `coordinode serve --config <path>`, if given.
+3. **Command-line flags** — every setting also has a `serve` flag.
+
+So the command line overrides the config file, which overrides the defaults.
+Each setting appears once in each layer, and every config-file key has a
+matching CLI flag of the same meaning. This page is the full reference for every
+setting, the environment variables the binary reads directly, the packaged
+config file, and the operating-system limits that matter in production.
 
 ## How configuration flows
 
-There is no separate config-file format parsed by the binary. Settings reach the
-server in two ways:
+Pass a config file and override individual values on the command line:
 
-1. **Command-line flags** to `coordinode serve` (the source of truth).
-2. **A handful of environment variables** read directly by the process
-   (logging only).
+```bash
+# File supplies the baseline; --node-id on the CLI wins over the file's value.
+coordinode serve --config /etc/coordinode/coordinode.conf --node-id 2
+```
 
-On a package install the systemd unit reads `/etc/coordinode/coordinode.conf`
-(an `EnvironmentFile`) and expands those variables into the `ExecStart` flags.
-So editing the conf file is equivalent to changing the flags:
+A missing `--config` runs on built-in defaults plus any flags. A `--config` path
+that cannot be read or contains an unknown key / malformed value is a startup
+error — the server fails loud rather than silently falling back.
+
+On a package install the systemd unit points `--config` at the shipped file:
 
 ```
-/etc/coordinode/coordinode.conf   (KEY=value)
-        |  EnvironmentFile=
+/etc/coordinode/coordinode.conf   (YAML)
+        |  --config
         v
 coordinode.service ExecStart:
-  coordinode serve --addr ${COORDINODE_ADDR} --rest-addr ${COORDINODE_REST_ADDR} \
-                   --ops-addr ${COORDINODE_OPS_ADDR} --data ${COORDINODE_DATA}
+  coordinode serve --config /etc/coordinode/coordinode.conf
 ```
+
+To override one value without editing the file, add a CLI flag through a systemd
+drop-in (`systemctl edit coordinode`); the command line beats the file.
 
 ## `serve` flags
 
 `coordinode serve` is the default subcommand (running `coordinode` with no
 arguments is the same as `coordinode serve`).
 
+Every flag below (except `--config` itself) has a YAML config-file key with the
+same name in `snake_case` (for example `--max-request-size-mb` is
+`max_request_size_mb`, `--addr` is `grpc_addr`, `--data` is `data_dir`). The
+defaults in the table are the built-in defaults that apply when neither the
+config file nor a flag sets the value.
+
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--config` | (none) | Path to a YAML config file. Absent = built-in defaults. A present-but-unreadable or malformed file is a startup error. Has no config-file key (it names the file). |
 | `--mode` | `full` | Operational mode. The CE binary supports only `full`. `compute` and `storage` require the Enterprise binary and are rejected with a clear message. |
 | `--node-id` | `1` | Numeric node ID, unique within a cluster. Single-node deployments always use `1`. Any value above `1` requires `--peers`. |
 | `--addr` | `[::]:7080` | gRPC listen address. Carries the native API and inter-node Raft RPCs. |
@@ -53,6 +71,8 @@ arguments is the same as `coordinode serve`).
 | `--retention-window-secs` | `604800` (7 days) | MVCC time-travel / `AS OF TIMESTAMP` horizon, in seconds. The GC watermark is held back to at least `now - this`, so history within the window stays queryable and CDC / backup consumers keep their checkpoint readable. |
 | `--registry-heartbeat-ms` | `100` | Consumer-registry heartbeat coalescing window, in ms. Buffered consumer heartbeats flush as one Raft proposal per window; a larger window trades freshness for fewer proposals on busy shards. |
 | `--registry-eviction-ms` | `1000` | Consumer-registry TTL-eviction sweep interval, in ms. How often expired registrations are swept and the retention floor is refreshed against the wall clock. |
+| `--interactive-txn-idle-timeout-secs` | `30` | Idle timeout for an interactive transaction (a `BeginTransaction` left open without `CommitTransaction`/`RollbackTransaction`), in seconds. An open transaction pins an MVCC snapshot and buffers writes in memory; one idle this long is auto-rolled-back to release them. |
+| `--interactive-txn-max-bytes` | `268435456` (256 MiB) | Max buffered (uncommitted) bytes per interactive transaction. A transaction whose accumulated writes exceed this is aborted, capping the leader memory a client can hold without committing. |
 
 Single-node start:
 
@@ -71,17 +91,23 @@ coordinode serve --node-id 1 --addr 0.0.0.0:7080 \
 
 ## Environment variables
 
-The binary reads these directly, regardless of how it was launched:
+Logging is controlled through the environment (the standard Rust ecosystem
+knobs), independent of the config file. The binary reads these directly,
+regardless of how it was launched:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RUST_LOG` | `info` | Log level filter. Standard env-filter syntax, for example `RUST_LOG=warn,coordinode_query=debug`. |
 | `COORDINODE_LOG_FORMAT` | `text` | Log output format. `text` for human-readable, `json` for structured logs to ship to a collector. |
 
-The `COORDINODE_ADDR`, `COORDINODE_REST_ADDR`, `COORDINODE_OPS_ADDR`, and
-`COORDINODE_DATA` variables in the packaged conf file are **not** read by the
-binary. The systemd unit expands them into `serve` flags. If you launch the
-binary yourself (Docker, a script), pass the flags directly.
+On a package install set these via a systemd drop-in (`systemctl edit
+coordinode`):
+
+```ini
+[Service]
+Environment=RUST_LOG=warn,coordinode_query=debug
+Environment=COORDINODE_LOG_FORMAT=json
+```
 
 ## Ports
 
@@ -96,37 +122,52 @@ proxy, or keep it internal to the host's monitoring network.
 
 ## Packaged config file (RPM / DEB)
 
-The `.rpm` and `.deb` packages install `/etc/coordinode/coordinode.conf` and
-mark it as a configuration file, so your edits survive package upgrades
-(`%config(noreplace)` on RPM, a dpkg conffile on DEB). Default contents:
+The `.rpm` and `.deb` packages install `/etc/coordinode/coordinode.conf` (the
+YAML config file the unit passes to `--config`) and mark it as a configuration
+file, so your edits survive package upgrades (`%config(noreplace)` on RPM, a
+dpkg conffile on DEB). It ships with every key documented; uncommented keys set
+the default value, commented keys show it. Excerpt:
 
-```bash
+```yaml
+# Operational mode (CE supports only "full").
+mode: full
+
+# Numeric node id. Single-node = 1; a value above 1 needs a non-empty peers list.
+node_id: 1
+
 # gRPC listen address (native API + inter-node Raft).
-COORDINODE_ADDR=0.0.0.0:7080
+grpc_addr: "0.0.0.0:7080"
 
 # REST/JSON listen address (transcoded from gRPC by the embedded proxy).
-COORDINODE_REST_ADDR=0.0.0.0:7081
+rest_addr: "0.0.0.0:7081"
 
 # Operational HTTP listen address: Prometheus /metrics, /health, /ready.
-COORDINODE_OPS_ADDR=127.0.0.1:7084
+ops_addr: "127.0.0.1:7084"
 
 # Data directory. Owned by the coordinode system user.
-COORDINODE_DATA=/var/lib/coordinode/data
+data_dir: /var/lib/coordinode/data
 
-# Optional: structured JSON logs (uncomment to enable).
-# COORDINODE_LOG_FORMAT=json
+# Cluster peers (empty = standalone). For HA list the other members:
+# peers:
+#   - "node2.internal:7080"
+#   - "node3.internal:7080"
+peers: []
 
-# Optional: log level filter (RUST_LOG syntax).
-# RUST_LOG=info
+# Resource / network / storage tuning (commented keys show the default):
+# nofile: 262144
+# max_connections: 1024
+max_request_size_mb: 16
+# cache_size_mb: 4096
+# write_buffer_mb: 256
 
-# Optional: extra serve flags (resource / network / storage tuning), appended
-# to the command line and word-split. See the flag table above.
-# COORDINODE_EXTRA_ARGS=--nofile 262144 --cache-size-mb 4096 --max-connections 1024
+# Interactive-transaction limits.
+interactive_txn_idle_timeout_secs: 30
+interactive_txn_max_bytes: 268435456
 ```
 
-The `COORDINODE_EXTRA_ARGS` line is how you set the resource, network, and
-storage flags on a package install: list any `serve` flags there and they are
-appended to the launch command. Apply changes:
+Set any tunable directly in this file. To override one value without editing the
+file, add the matching CLI flag through a drop-in (`systemctl edit coordinode`)
+since the command line beats the file. Apply changes:
 
 ```bash
 sudo systemctl restart coordinode
