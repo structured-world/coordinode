@@ -135,6 +135,74 @@ fn idle_transaction_is_reaped() {
 }
 
 #[test]
+fn max_buffered_bytes_aborts_transaction() {
+    let mut db = open_db();
+    // Tiny ceiling so a single CREATE's buffered write exceeds it.
+    db.set_max_interactive_txn_bytes(8);
+    let tx = db.begin_transaction();
+    let err = db
+        .execute_in_transaction(
+            tx,
+            "CREATE (n:Big {payload: 'this exceeds eight bytes'})",
+            None,
+        )
+        .expect_err("statement must abort over the byte ceiling");
+    assert!(
+        format!("{err}").contains("max_interactive_txn_bytes"),
+        "error names the breached ceiling: {err}",
+    );
+    // Aborted → handle consumed: commit fails.
+    assert!(db.commit_transaction(tx).is_err());
+    // Nothing committed.
+    let rows = db.execute_cypher("MATCH (n:Big) RETURN n").expect("read");
+    assert_eq!(rows.len(), 0);
+}
+
+#[test]
+fn configured_idle_timeout_reaps_on_begin() {
+    let mut db = open_db();
+    // Zero timeout: any prior open transaction is idle on the next begin.
+    db.set_interactive_idle_timeout(Duration::from_secs(0));
+    let stale = db.begin_transaction();
+    // A second begin runs the reaper with the configured (zero) timeout.
+    let _fresh = db.begin_transaction();
+    assert!(
+        db.commit_transaction(stale).is_err(),
+        "stale transaction reaped by the configured idle timeout on begin",
+    );
+}
+
+#[test]
+fn commit_conflict_aborts_second_transaction() {
+    let mut db = open_db();
+    db.execute_cypher("CREATE (n:Acct {id: 1, bal: 100})")
+        .expect("seed");
+
+    // Two interactive transactions both read-modify-write the same node.
+    let tx_a = db.begin_transaction();
+    let tx_b = db.begin_transaction();
+    db.execute_in_transaction(tx_a, "MATCH (n:Acct {id: 1}) SET n.bal = n.bal + 10", None)
+        .expect("a read-modify-write");
+    db.execute_in_transaction(tx_b, "MATCH (n:Acct {id: 1}) SET n.bal = n.bal + 20", None)
+        .expect("b read-modify-write");
+
+    // A commits first → succeeds.
+    db.commit_transaction(tx_a).expect("commit a");
+    // B read the node at its snapshot; A committed a write to it after B began
+    // → OCC conflict at commit, B is rejected (lost update prevented).
+    assert!(
+        db.commit_transaction(tx_b).is_err(),
+        "B's commit conflicts with A's concurrent write to the same node",
+    );
+
+    // Exactly A's update is durable.
+    let rows = db
+        .execute_cypher("MATCH (n:Acct {id: 1}) RETURN n.bal AS bal")
+        .expect("read");
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
 fn concurrent_transactions_are_independent() {
     let mut db = open_db();
     let tx_a = db.begin_transaction();

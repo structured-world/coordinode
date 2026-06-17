@@ -376,6 +376,17 @@ pub struct Database {
     >,
     /// Monotonic source of interactive transaction ids.
     next_txn_id: AtomicU64,
+    /// Idle timeout for interactive transactions (ADR-042): an open
+    /// transaction with no activity for this long is auto-rolled-back (it pins
+    /// an MVCC snapshot + buffers memory). Set by the server from the
+    /// `--interactive-txn-idle-timeout-secs` flag (passed via
+    /// `COORDINODE_EXTRA_ARGS` in `/etc/coordinode/coordinode.conf`).
+    interactive_idle_timeout: Duration,
+    /// Max buffered (uncommitted) bytes per interactive transaction before it
+    /// is aborted — caps leader memory a client can hold without committing.
+    /// Set by the server from the `--interactive-txn-max-bytes` flag (passed
+    /// via `COORDINODE_EXTRA_ARGS` in `/etc/coordinode/coordinode.conf`).
+    max_interactive_txn_bytes: usize,
 }
 
 /// A query whose parse + analyze + logical-plan-build succeeded, kept
@@ -769,6 +780,8 @@ impl Database {
             plan_cache: Arc::new(PlanCache::new(1024)),
             interactive_txns: Mutex::new(std::collections::HashMap::new()),
             next_txn_id: AtomicU64::new(0),
+            interactive_idle_timeout: Self::DEFAULT_INTERACTIVE_TXN_IDLE_TIMEOUT,
+            max_interactive_txn_bytes: Self::DEFAULT_MAX_INTERACTIVE_TXN_BYTES,
         })
     }
 
@@ -1280,9 +1293,10 @@ impl Database {
     /// transaction pins an MVCC snapshot at its `start_ts`, so every statement
     /// reads the same point-in-time (repeatable read). State is leader-local
     /// and ephemeral — durability happens only at commit. Idle transactions
-    /// are reaped after [`Self::INTERACTIVE_TXN_IDLE_TIMEOUT`].
+    /// are reaped after the configured idle timeout
+    /// ([`Self::set_interactive_idle_timeout`]).
     pub fn begin_transaction(&self) -> u64 {
-        self.reap_idle_transactions(Self::INTERACTIVE_TXN_IDLE_TIMEOUT);
+        self.reap_idle_transactions(self.interactive_idle_timeout);
         let id = self.next_txn_id.fetch_add(1, Ordering::Relaxed) + 1;
         let read_ts = self.oracle.next();
         let snapshot = self.engine.snapshot_at(read_ts.as_raw());
@@ -1344,6 +1358,17 @@ impl Database {
             TxnMode::Interactive(Box::new(state)),
         )?;
         if let Some(state) = out_state {
+            // Cap buffered (uncommitted) memory: a client that keeps writing
+            // without committing must not grow leader memory unbounded. On
+            // breach the transaction aborts (state dropped, handle consumed).
+            let buffered = state.buffered_bytes();
+            if buffered > self.max_interactive_txn_bytes {
+                return Err(DatabaseError::Other(format!(
+                    "interactive transaction {txn_id} exceeded max_interactive_txn_bytes \
+                     ({buffered} > {}); transaction aborted",
+                    self.max_interactive_txn_bytes
+                )));
+            }
             self.interactive_txns
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -1422,7 +1447,21 @@ impl Database {
     }
 
     /// Default idle timeout for an open interactive transaction (ADR-042).
-    pub const INTERACTIVE_TXN_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+    pub const DEFAULT_INTERACTIVE_TXN_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Default max buffered bytes per interactive transaction (256 MiB, ADR-042).
+    pub const DEFAULT_MAX_INTERACTIVE_TXN_BYTES: usize = 256 * 1024 * 1024;
+
+    /// Set the interactive-transaction idle timeout (server config wiring).
+    pub fn set_interactive_idle_timeout(&mut self, timeout: Duration) {
+        self.interactive_idle_timeout = timeout;
+    }
+
+    /// Set the per-interactive-transaction buffered-bytes ceiling (server
+    /// config wiring).
+    pub fn set_max_interactive_txn_bytes(&mut self, bytes: usize) {
+        self.max_interactive_txn_bytes = bytes;
+    }
 
     /// Set session-level vector consistency mode.
     ///

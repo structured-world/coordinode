@@ -186,6 +186,35 @@ impl TransactionState {
     pub fn read_ts(&self) -> Timestamp {
         self.read_ts
     }
+
+    /// Approximate size in bytes of the buffered, uncommitted mutations —
+    /// the point write buffer (keys + values) plus the adjacency and node
+    /// merge buffers. An interactive transaction caps this against a
+    /// configured ceiling so a client that buffers without committing cannot
+    /// grow leader memory unbounded.
+    pub fn buffered_bytes(&self) -> usize {
+        let writes: usize = self
+            .write_buffer
+            .iter()
+            .map(|((_, k), v)| k.len() + v.as_ref().map_or(0, Vec::len))
+            .sum();
+        let adj_adds: usize = self
+            .merge_adj_adds
+            .iter()
+            .map(|(k, uids)| k.len() + uids.len() * 8)
+            .sum();
+        let adj_removes: usize = self
+            .merge_adj_removes
+            .iter()
+            .map(|(k, uids)| k.len() + uids.len() * 8)
+            .sum();
+        let node_deltas: usize = self
+            .merge_node_deltas
+            .iter()
+            .map(|(k, op)| k.len() + op.len())
+            .sum();
+        writes + adj_adds + adj_removes + node_deltas
+    }
 }
 
 impl<'a> Transaction<'a> {

@@ -222,6 +222,7 @@ impl CoordinodeProcess {
                     read_preference: 0, // PRIMARY
                     read_concern: None,
                     write_concern: None,
+                    transaction_id: 0, // auto-commit (no interactive transaction)
                 })
                 .await;
             if result.is_ok() {

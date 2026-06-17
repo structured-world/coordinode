@@ -43,6 +43,7 @@ async fn cypher_q(proc: &CoordinodeProcess, query: &str) -> Vec<HashMap<String, 
             read_preference: 0,
             read_concern: None,
             write_concern: None,
+            transaction_id: 0,
         })
         .await
         .expect("execute_cypher must succeed")
@@ -102,6 +103,7 @@ async fn g088_causal_write_without_majority_rejected() {
                 at_timestamp: 0,
             }),
             write_concern: None, // omitted → treated as UNSPECIFIED (w:1)
+            transaction_id: 0,
         })
         .await;
 
@@ -144,6 +146,7 @@ async fn g088_causal_write_with_w1_rejected() {
                 timeout_ms: 0,
                 journal: false,
             }),
+            transaction_id: 0,
         })
         .await;
 
@@ -183,6 +186,7 @@ async fn g088_causal_write_with_majority_accepted() {
                 timeout_ms: 0,
                 journal: false,
             }),
+            transaction_id: 0,
         })
         .await;
 
@@ -215,6 +219,7 @@ async fn g088_causal_read_without_majority_accepted() {
                 at_timestamp: 0,
             }),
             write_concern: None, // read-only — write_concern irrelevant
+            transaction_id: 0,
         })
         .await;
 
@@ -313,6 +318,7 @@ async fn bug_latent_set_after_delete_must_not_show_unwritten_value() {
             read_preference: 0,
             read_concern: None,
             write_concern: None,
+            transaction_id: 0,
         })
         .await;
 
@@ -535,6 +541,7 @@ async fn r171_temporal_create_without_valid_from_rejected() {
             read_preference: 0,
             read_concern: None,
             write_concern: None,
+            transaction_id: 0,
         })
         .await;
 
@@ -914,6 +921,7 @@ async fn r171_temporal_set_valid_from_rejected() {
             read_preference: 0,
             read_concern: None,
             write_concern: None,
+            transaction_id: 0,
         })
         .await;
     let status = result.expect_err("SET r.valid_from must be rejected on temporal edges");
@@ -944,6 +952,7 @@ async fn r171_temporal_invalid_interval_rejected() {
             read_preference: 0,
             read_concern: None,
             write_concern: None,
+            transaction_id: 0,
         })
         .await;
     let status = result.expect_err("inverted interval must be rejected");
@@ -1019,6 +1028,7 @@ async fn r171_temporal_merge_rejected() {
             read_preference: 0,
             read_concern: None,
             write_concern: None,
+            transaction_id: 0,
         })
         .await;
     let status = result.expect_err("MERGE on temporal edge type must be rejected");
@@ -1074,6 +1084,7 @@ async fn r171_temporal_overlaps_with_parameters() {
             read_preference: 0,
             read_concern: None,
             write_concern: None,
+            transaction_id: 0,
         })
         .await
         .expect("query must succeed")
