@@ -1,10 +1,9 @@
 //! Modality store throughput benchmarks.
 //!
 //! Tight micro-benchmarks for the operations on the query hot path.
-//! Not exhaustive — focused on the surfaces R165 will dispatch to from
-//! the query layer (knn, bbox scan, posting-list put/scan). Per
-//! CLAUDE.md engineering principles these measure throughput AND
-//! tail-friendliness (criterion histograms).
+//! Not exhaustive — focused on the surfaces the query layer dispatches
+//! to (knn, bbox scan, posting-list put/scan). These measure throughput
+//! AND tail-friendliness (criterion histograms).
 
 #![allow(clippy::unwrap_used)]
 
@@ -39,6 +38,25 @@ fn mk_engine() -> (TempDir, StorageEngine) {
     )]);
     let engine = StorageEngine::open(&cfg).unwrap();
     (dir, engine)
+}
+
+/// Buffer store writes on one MVCC transaction and commit — bench
+/// setup helper for the engine-backed stores now threaded through a
+/// transaction (ADR-041).
+fn bench_write(engine: &StorageEngine, body: impl FnOnce(&mut Transaction)) {
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let read_ts = oracle.next();
+    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    body(&mut txn);
+    let wc = WriteConcern::majority();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    txn.commit(&ctx).unwrap();
 }
 
 /// Node put throughput at varying record sizes — small overhead dominated
@@ -159,26 +177,38 @@ fn bench_spatial_bbox(c: &mut Criterion) {
 
     for &n in &[100usize, 1000, 10_000] {
         let (_dir, engine) = mk_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let store = LocalSpatialStore;
         // Spread points across a 1000x1000 square.
-        for i in 0..n as u64 {
-            let x = ((i * 37) % 1000) as f64;
-            let y = ((i * 91) % 1000) as f64;
-            store
-                .insert(
-                    1,
-                    NodeId::from_raw(i + 1),
-                    &Point::new_2d(Crs::Cartesian2d, x, y),
-                )
-                .unwrap();
-        }
+        bench_write(&engine, |txn| {
+            for i in 0..n as u64 {
+                store
+                    .insert(
+                        txn,
+                        1,
+                        NodeId::from_raw(i + 1),
+                        &Point::new_2d(
+                            Crs::Cartesian2d,
+                            ((i * 37) % 1000) as f64,
+                            ((i * 91) % 1000) as f64,
+                        ),
+                    )
+                    .unwrap();
+            }
+        });
         let bbox = Bbox {
             // ~1% of the population area => early-break should kick in.
             lower: Point::new_2d(Crs::Cartesian2d, 0.0, 0.0),
             upper: Point::new_2d(Crs::Cartesian2d, 100.0, 100.0),
         };
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let rtxn = Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| store.scan_within_bbox(1, Crs::Cartesian2d, &bbox).unwrap())
+            b.iter(|| {
+                store
+                    .scan_within_bbox(&rtxn, 1, Crs::Cartesian2d, &bbox)
+                    .unwrap()
+            })
         });
     }
     group.finish();
@@ -196,32 +226,42 @@ fn bench_spatial_bbox_long_thin_band(c: &mut Criterion) {
 
     for &n in &[10_000usize, 100_000] {
         let (_dir, engine) = mk_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let store = LocalSpatialStore;
         // Spread `n` points uniformly across worldwide WGS84.
-        for i in 0..n as u64 {
-            let lon = -180.0 + ((i.wrapping_mul(73_856_093)) % 360_000) as f64 / 1000.0;
-            let lat = -90.0 + ((i.wrapping_mul(19_349_663)) % 180_000) as f64 / 1000.0;
-            store
-                .insert(
-                    1,
-                    NodeId::from_raw(i + 1),
-                    &Point::new_2d(Crs::Wgs84_2d, lon, lat),
-                )
-                .unwrap();
-        }
+        bench_write(&engine, |txn| {
+            for i in 0..n as u64 {
+                let lon = -180.0 + ((i.wrapping_mul(73_856_093)) % 360_000) as f64 / 1000.0;
+                let lat = -90.0 + ((i.wrapping_mul(19_349_663)) % 180_000) as f64 / 1000.0;
+                store
+                    .insert(
+                        txn,
+                        1,
+                        NodeId::from_raw(i + 1),
+                        &Point::new_2d(Crs::Wgs84_2d, lon, lat),
+                    )
+                    .unwrap();
+            }
+        });
         // Equatorial band: full lon, 1° lat (~0.55% of total area).
         let bbox = Bbox {
             lower: Point::new_2d(Crs::Wgs84_2d, -180.0, -0.5),
             upper: Point::new_2d(Crs::Wgs84_2d, 180.0, 0.5),
         };
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let rtxn = Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| store.scan_within_bbox(1, Crs::Wgs84_2d, &bbox).unwrap())
+            b.iter(|| {
+                store
+                    .scan_within_bbox(&rtxn, 1, Crs::Wgs84_2d, &bbox)
+                    .unwrap()
+            })
         });
     }
     group.finish();
 }
 
-/// Spatial bbox scan — G101 target workload: TIGHT bbox in a LARGE
+/// Spatial bbox scan — subrange-decomposition target workload: TIGHT bbox in a LARGE
 /// uniform index. Broad-window scan walks the full curve interval
 /// (≈ full index for uniform data), but only ~bbox_area / total_area
 /// points are valid. This is where Z-curve subrange decomposition
@@ -241,27 +281,37 @@ fn bench_spatial_bbox_tight_in_large(c: &mut Criterion) {
 
     for &n in &[10_000usize, 100_000] {
         let (_dir, engine) = mk_engine();
-        let store = LocalSpatialStore::new(&engine);
+        let store = LocalSpatialStore;
         // Spread `n` points uniformly across a 1_000_000 × 1_000_000
         // square. Pseudo-random via large coprime multipliers.
-        for i in 0..n as u64 {
-            let x = ((i.wrapping_mul(73_856_093)) % 1_000_000) as f64;
-            let y = ((i.wrapping_mul(19_349_663)) % 1_000_000) as f64;
-            store
-                .insert(
-                    1,
-                    NodeId::from_raw(i + 1),
-                    &Point::new_2d(Crs::Cartesian2d, x, y),
-                )
-                .unwrap();
-        }
+        bench_write(&engine, |txn| {
+            for i in 0..n as u64 {
+                let x = ((i.wrapping_mul(73_856_093)) % 1_000_000) as f64;
+                let y = ((i.wrapping_mul(19_349_663)) % 1_000_000) as f64;
+                store
+                    .insert(
+                        txn,
+                        1,
+                        NodeId::from_raw(i + 1),
+                        &Point::new_2d(Crs::Cartesian2d, x, y),
+                    )
+                    .unwrap();
+            }
+        });
         // Tight 100×100 bbox at the origin — 1e-8 of population area.
         let bbox = Bbox {
             lower: Point::new_2d(Crs::Cartesian2d, 0.0, 0.0),
             upper: Point::new_2d(Crs::Cartesian2d, 100.0, 100.0),
         };
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let rtxn = Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| store.scan_within_bbox(1, Crs::Cartesian2d, &bbox).unwrap())
+            b.iter(|| {
+                store
+                    .scan_within_bbox(&rtxn, 1, Crs::Cartesian2d, &bbox)
+                    .unwrap()
+            })
         });
     }
     group.finish();
@@ -292,7 +342,8 @@ fn bench_document_set_path(c: &mut Criterion) {
     let mut group = c.benchmark_group("document_set_path");
     group.sample_size(20);
     let (_dir, engine) = mk_engine();
-    let docs = LocalDocumentStore::new(&engine);
+    let docs = LocalDocumentStore;
+    let wc = WriteConcern::majority();
     {
         let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
         let read_ts = oracle.next();
@@ -300,7 +351,6 @@ fn bench_document_set_path(c: &mut Criterion) {
         LocalNodeStore
             .put(&mut txn, 0, NodeId::from_raw(1), &NodeRecord::new("L"))
             .unwrap();
-        let wc = WriteConcern::majority();
         let ctx = CommitContext {
             write_concern: &wc,
             pipeline: None,
@@ -313,7 +363,14 @@ fn bench_document_set_path(c: &mut Criterion) {
     group.bench_function("single_set_path", |b| {
         let mut i = 0u64;
         b.iter(|| {
+            // One buffered delta committed per iteration — the realistic
+            // SET n.path = x transaction shape.
+            let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+            let read_ts = oracle.next();
+            let mut txn =
+                Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
             docs.set_path(
+                &mut txn,
                 0,
                 NodeId::from_raw(1),
                 PathTarget::Extra,
@@ -321,6 +378,14 @@ fn bench_document_set_path(c: &mut Criterion) {
                 rmpv::Value::Integer((i as i64).into()),
             )
             .unwrap();
+            let ctx = CommitContext {
+                write_concern: &wc,
+                pipeline: None,
+                id_gen: None,
+                drain_buffer: None,
+                nvme_write_buffer: None,
+            };
+            txn.commit(&ctx).unwrap();
             i = i.wrapping_add(1);
         });
     });
@@ -333,7 +398,7 @@ fn bench_timeseries_bucket(c: &mut Criterion) {
     group.sample_size(10);
     for &n in &[10usize, 100, 1000] {
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let mut measurements = Vec::with_capacity(n);
         for i in 0..n {
             let mut fields = BTreeMap::new();
@@ -345,10 +410,17 @@ fn bench_timeseries_bucket(c: &mut Criterion) {
             });
         }
         let bucket = Bucket::from_measurements(rmpv::Value::Nil, measurements);
-        store.put_bucket(0, NodeId::from_raw(1), &bucket).unwrap();
+        bench_write(&engine, |txn| {
+            store
+                .put_bucket(txn, 0, NodeId::from_raw(1), &bucket)
+                .unwrap();
+        });
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let rtxn = Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| store.get_bucket(0, NodeId::from_raw(1)).unwrap())
+            b.iter(|| store.get_bucket(&rtxn, 0, NodeId::from_raw(1)).unwrap())
         });
     }
     group.finish();
@@ -360,13 +432,18 @@ fn bench_blob_chunk(c: &mut Criterion) {
     group.sample_size(20);
     for &n in &[1024usize, 8 * 1024, 64 * 1024] {
         let (_dir, engine) = mk_engine();
-        let store = LocalBlobStore::new(&engine);
+        let store = LocalBlobStore;
         let payload = vec![0xab_u8; n];
         let id = ChunkId::from_data(&payload);
-        store.put_chunk(&id, &payload).unwrap();
+        bench_write(&engine, |txn| {
+            store.put_chunk(txn, &id, &payload).unwrap();
+        });
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let rtxn = Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
         group.throughput(Throughput::Bytes(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| store.get_chunk(&id).unwrap())
+            b.iter(|| store.get_chunk(&rtxn, &id).unwrap())
         });
     }
     group.finish();

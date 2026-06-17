@@ -34,7 +34,7 @@ use coordinode_storage::engine::partition::Partition;
 /// Key under [`Partition::Schema`] where each shard's last-issued
 /// ingestion stamp is persisted: `schema:meta:ts_clock:<shard_id_u16_be>`.
 /// Read on clock construction, written every
-/// [`PERSIST_EVERY_N_STAMPS`] calls to `next()` so a crash can lose
+/// `PERSIST_EVERY_N_STAMPS` calls to `next()` so a crash can lose
 /// at most that many stamps from durability.
 const TS_CLOCK_KEY_PREFIX: &[u8] = b"schema:meta:ts_clock:";
 
@@ -222,10 +222,10 @@ pub fn persist_last_stamp(
 }
 
 /// Production clock with engine-backed restart monotonicity. Wraps
-/// the same CAS-monotonic logic as [`MonotonicHlcClock`] but seeds
+/// the same CAS-monotonic logic as `MonotonicHlcClock` but seeds
 /// from `max(persisted_last + 1, wall_clock_now)` on construction
 /// and writes the current stamp back to the engine every
-/// [`PERSIST_EVERY_N_STAMPS`] calls.
+/// `PERSIST_EVERY_N_STAMPS` calls.
 ///
 /// ## Restart-monotonicity guarantee
 ///
@@ -237,7 +237,7 @@ pub fn persist_last_stamp(
 /// that exceeds the lost-stamp window — practically impossible
 /// outside of malicious clock tampering.
 ///
-/// ## When to use this vs. [`MonotonicHlcClock`]
+/// ## When to use this vs. `MonotonicHlcClock`
 ///
 /// - **Production CE single-node** → `PersistentMonotonicHlcClock`.
 ///   The engine handle is already on hand at catalog construction.
@@ -251,7 +251,7 @@ pub struct PersistentMonotonicHlcClock {
     engine: std::sync::Arc<StorageEngine>,
     shard_id: u16,
     /// Counter of `next()` calls since the last persistence write.
-    /// On reaching [`PERSIST_EVERY_N_STAMPS`] we persist and reset.
+    /// On reaching `PERSIST_EVERY_N_STAMPS` we persist and reset.
     since_persist: AtomicU64,
 }
 

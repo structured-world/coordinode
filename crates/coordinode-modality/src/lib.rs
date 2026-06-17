@@ -10,10 +10,10 @@
 //! ## Why a separate crate
 //!
 //! - **Crate-level isolation of physical layout.** Once the query layer
-//!   migrates to these traits (R165), `coordinode-query` no longer
-//!   imports `Partition` or any `encode_*` key builder. The
-//!   partition-key surface drops to `pub(in store impl)` and the
-//!   physical layout becomes an internal detail.
+//!   migrates to these traits, `coordinode-query` no longer imports
+//!   `Partition` or any `encode_*` key builder. The partition-key
+//!   surface drops to `pub(in store impl)` and the physical layout
+//!   becomes an internal detail.
 //! - **Monomorphization for the planner.** Callers above are generic
 //!   over the trait (`fn execute<E: EdgeStore>(...)`) so the compiler
 //!   specializes per concrete impl — same zero-cost dispatch as direct
@@ -25,21 +25,29 @@
 //!
 //! ## Store inventory
 //!
-//! | Modality | Trait | CE impl |
-//! |----------|-------|---------|
-//! | Schema (label / edge-type / migration / chunk-assignment DDL state) | [`SchemaStore`] | [`LocalSchemaStore`] |
-//! | Blob (binary chunks + blob references) | [`BlobStore`] | [`LocalBlobStore`] |
-//! | Index (secondary indexes — btree, hash, fulltext term postings) | [`IndexStore`] | [`LocalIndexStore`] |
-//! | Node (incl. temporal versioning, ADR-027) | [`NodeStore`] | [`LocalNodeStore`] |
-//! | Edge (adjacency + properties, non-temporal) | [`EdgeStore`] | [`LocalEdgeStore`] |
-//! | Vector | VectorStore | — (next PR) |
-//! | Document | DocumentStore | — (next PR) |
-//! | TimeSeries | TimeSeriesStore | — (next PR) |
-//! | Spatial | SpatialStore | — (next PR) |
+//! The **Threading** column records how each store reaches Layer 3.
+//! `Transaction` stores thread the active transaction through every
+//! method (ADR-041): writes buffer on it and commit atomically with the
+//! surrounding graph mutation; reads go through its MVCC snapshot. The
+//! sole exceptions are [`IndexStore`], a hybrid whose secondary-index
+//! entry writes stay engine-direct while DDL definition writes thread a
+//! [`Transaction`], and [`VectorStore`], whose HNSW graph is in-memory
+//! only (rebuilt on open, no partition surface to thread).
 //!
-//! Remaining six stores land in follow-up commits grouped by modality
-//! family (graph, vectors, specialty). See the storage stack
-//! architecture document for the full Layer 4 contract.
+//! | Modality | Trait | CE impl | Threading |
+//! |----------|-------|---------|-----------|
+//! | Schema (label / edge-type / migration / chunk-assignment DDL state) | [`SchemaStore`] | [`LocalSchemaStore`] | `Transaction` |
+//! | Node (incl. temporal versioning, ADR-027) | [`NodeStore`] | [`LocalNodeStore`] | `Transaction` |
+//! | Edge (adjacency + properties, non-temporal) | [`EdgeStore`] | [`LocalEdgeStore`] | `Transaction` |
+//! | Document (path-targeted DOCUMENT merge deltas, ADR-015) | [`DocumentStore`] | [`LocalDocumentStore`] | `Transaction` |
+//! | Spatial (CRS point index) | [`SpatialStore`] | [`LocalSpatialStore`] | `Transaction` |
+//! | TimeSeries (bucket + overflow) | [`TimeSeriesStore`] | [`LocalTimeSeriesStore`] | `Transaction` |
+//! | Blob (binary chunks + blob references) | [`BlobStore`] | [`LocalBlobStore`] | `Transaction` |
+//! | Index (secondary indexes — btree, hash, fulltext term postings) | [`IndexStore`] | [`LocalIndexStore`] | hybrid (entries `engine`, DDL `Transaction`) |
+//! | Vector (HNSW KNN index) | [`VectorStore`] | [`LocalVectorStore`] | `engine` (in-memory graph) |
+//!
+//! See the storage stack architecture document for the full Layer 4
+//! contract.
 //!
 //! ## Error model
 //!
@@ -49,6 +57,8 @@
 //! variant so capacity-exhausted, checksum-mismatch, and other typed
 //! engine errors are preserved end-to-end (the gRPC layer drills into
 //! the chain to surface `RESOURCE_EXHAUSTED` correctly).
+//!
+//! [`Transaction`]: coordinode_storage::engine::transaction::Transaction
 
 #![deny(missing_docs)]
 

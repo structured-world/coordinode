@@ -5,15 +5,25 @@
 //! Document-typed properties (Mongo-like nested maps + arrays) are
 //! mutated through commutative [`DocDelta`] operands rather than
 //! read-modify-write. Each [`DocDelta`] is encoded with the
-//! `PREFIX_DOC_DELTA` byte and written via the engine's
-//! `merge(Partition::Node, …)` path; the merge function replays
-//! operands in seqno order against the base `NodeRecord` during
-//! reads and compaction.
+//! `PREFIX_DOC_DELTA` byte and buffered on the transaction; the
+//! merge function replays operands in seqno order against the base
+//! `NodeRecord` during reads and compaction.
+//!
+//! ## Transaction threading (ADR-041)
+//!
+//! Every method takes an explicit `&mut Transaction`. The encoded
+//! [`DocDelta`] operand is buffered via
+//! [`Transaction::push_node_delta`] and applied at
+//! [`Transaction::commit`] through the node-partition merge path, so a
+//! set of document mutations lands atomically (or not at all). Reads in
+//! the same transaction surface the pending operands via
+//! [`NodeStore::get_raw_tracked`](crate::NodeStore::get_raw_tracked),
+//! which materialises buffered deltas before the OCC-tracked read.
 //!
 //! ## What this store exposes
 //!
-//! Every method is a typed wrapper around `engine.merge(...)` that
-//! hides:
+//! Every method is a typed wrapper around
+//! [`Transaction::push_node_delta`] that hides:
 //!
 //! - Operand framing (the `PREFIX_DOC_DELTA` prefix byte).
 //! - MessagePack encoding of the [`DocDelta`] enum.
@@ -39,37 +49,20 @@
 
 use coordinode_core::graph::doc_delta::{DocDelta, PathTarget};
 use coordinode_core::graph::node::{encode_node_key, NodeId};
-use coordinode_storage::engine::core::StorageEngine;
-use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::engine::transaction::Transaction;
 
 use crate::error::{StoreError, StoreResult};
 
-/// Layer 4 document store: typed write of [`DocDelta`] operands
-/// against DOCUMENT-typed properties of a node.
+/// Layer 4 document store: typed buffering of [`DocDelta`] operands
+/// against DOCUMENT-typed properties of a node. Every method buffers a
+/// merge operand on the supplied [`Transaction`]; the operands apply
+/// atomically at [`Transaction::commit`].
 pub trait DocumentStore {
     /// Set a value at a dotted path on the node's document property.
     /// Intermediate maps are created as needed.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use coordinode_modality::{LocalDocumentStore, DocumentStore};
-    /// # use coordinode_core::graph::{doc_delta::PathTarget, node::NodeId};
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/x"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(&engine);
-    /// store.set_path(
-    ///     0, NodeId::from_raw(1), PathTarget::Extra,
-    ///     vec!["a".into(), "b".into()],
-    ///     rmpv::Value::String("hello".into()),
-    /// )?;
-    /// # Ok::<_, Box<dyn std::error::Error>>(())
-    /// ```
     fn set_path(
         &self,
+        txn: &mut Transaction,
         shard_id: u16,
         node_id: NodeId,
         target: PathTarget,
@@ -78,24 +71,9 @@ pub trait DocumentStore {
     ) -> StoreResult<()>;
 
     /// Delete a value at a dotted path. Idempotent on missing path.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use coordinode_modality::{LocalDocumentStore, DocumentStore};
-    /// # use coordinode_core::graph::{doc_delta::PathTarget, node::NodeId};
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/x"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(&engine);
-    /// store.delete_path(0, NodeId::from_raw(1), PathTarget::Extra,
-    ///                   vec!["a".into(), "b".into()])?;
-    /// # Ok::<_, Box<dyn std::error::Error>>(())
-    /// ```
     fn delete_path(
         &self,
+        txn: &mut Transaction,
         shard_id: u16,
         node_id: NodeId,
         target: PathTarget,
@@ -104,27 +82,9 @@ pub trait DocumentStore {
 
     /// Append a value to an array at path. Creates the array if
     /// missing.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use coordinode_modality::{LocalDocumentStore, DocumentStore};
-    /// # use coordinode_core::graph::{doc_delta::PathTarget, node::NodeId};
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/x"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(&engine);
-    /// store.array_push(
-    ///     0, NodeId::from_raw(1), PathTarget::Extra,
-    ///     vec!["tags".into()],
-    ///     rmpv::Value::String("rust".into()),
-    /// )?;
-    /// # Ok::<_, Box<dyn std::error::Error>>(())
-    /// ```
     fn array_push(
         &self,
+        txn: &mut Transaction,
         shard_id: u16,
         node_id: NodeId,
         target: PathTarget,
@@ -134,25 +94,9 @@ pub trait DocumentStore {
 
     /// Remove the first occurrence of a value from an array at path.
     /// Idempotent.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use coordinode_modality::{LocalDocumentStore, DocumentStore};
-    /// # use coordinode_core::graph::{doc_delta::PathTarget, node::NodeId};
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/x"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(&engine);
-    /// store.array_pull(0, NodeId::from_raw(1), PathTarget::Extra,
-    ///                  vec!["tags".into()],
-    ///                  rmpv::Value::String("rust".into()))?;
-    /// # Ok::<_, Box<dyn std::error::Error>>(())
-    /// ```
     fn array_pull(
         &self,
+        txn: &mut Transaction,
         shard_id: u16,
         node_id: NodeId,
         target: PathTarget,
@@ -161,25 +105,9 @@ pub trait DocumentStore {
     ) -> StoreResult<()>;
 
     /// Add value to array only if not already present.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use coordinode_modality::{LocalDocumentStore, DocumentStore};
-    /// # use coordinode_core::graph::{doc_delta::PathTarget, node::NodeId};
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/x"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(&engine);
-    /// store.array_add_to_set(0, NodeId::from_raw(1), PathTarget::Extra,
-    ///                        vec!["tags".into()],
-    ///                        rmpv::Value::String("rust".into()))?;
-    /// # Ok::<_, Box<dyn std::error::Error>>(())
-    /// ```
     fn array_add_to_set(
         &self,
+        txn: &mut Transaction,
         shard_id: u16,
         node_id: NodeId,
         target: PathTarget,
@@ -188,23 +116,9 @@ pub trait DocumentStore {
     ) -> StoreResult<()>;
 
     /// Numeric increment at path (commutative).
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use coordinode_modality::{LocalDocumentStore, DocumentStore};
-    /// # use coordinode_core::graph::{doc_delta::PathTarget, node::NodeId};
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/x"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(&engine);
-    /// store.increment(0, NodeId::from_raw(1), PathTarget::Extra, vec!["v".into()], 1.0)?;
-    /// # Ok::<_, Box<dyn std::error::Error>>(())
-    /// ```
     fn increment(
         &self,
+        txn: &mut Transaction,
         shard_id: u16,
         node_id: NodeId,
         target: PathTarget,
@@ -215,23 +129,9 @@ pub trait DocumentStore {
     /// Remove a top-level property from the node's record. For
     /// `PathTarget::Extra` the caller supplies the key; for
     /// `PathTarget::PropField(_)` the field id in the target is used.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use coordinode_modality::{LocalDocumentStore, DocumentStore};
-    /// # use coordinode_core::graph::{doc_delta::PathTarget, node::NodeId};
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/x"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalDocumentStore::new(&engine);
-    /// store.remove_property(0, NodeId::from_raw(1), PathTarget::Extra, Some("name".into()))?;
-    /// # Ok::<_, Box<dyn std::error::Error>>(())
-    /// ```
     fn remove_property(
         &self,
+        txn: &mut Transaction,
         shard_id: u16,
         node_id: NodeId,
         target: PathTarget,
@@ -239,64 +139,42 @@ pub trait DocumentStore {
     ) -> StoreResult<()>;
 }
 
-/// CE single-shard implementation of [`DocumentStore`].
-pub struct LocalDocumentStore<'a> {
-    engine: &'a StorageEngine,
-}
+/// CE single-shard implementation of [`DocumentStore`]. Stateless — all
+/// storage access flows through the [`Transaction`] passed to each
+/// method (ADR-041).
+pub struct LocalDocumentStore;
 
-impl<'a> LocalDocumentStore<'a> {
-    /// Wrap a storage engine for document-store operations.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use coordinode_modality::{LocalDocumentStore, DocumentStore};
-    /// use coordinode_core::graph::node::NodeId;
-    /// use coordinode_core::graph::doc_delta::PathTarget;
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/store"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm,
-    /// # )]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalDocumentStore::new(&engine);
-    /// store.set_path(
-    ///     0,
-    ///     NodeId::from_raw(1),
-    ///     PathTarget::Extra,
-    ///     vec!["profile".into(), "city".into()],
-    ///     rmpv::Value::String("Berlin".into()),
-    /// )?;
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn new(engine: &'a StorageEngine) -> Self {
-        Self { engine }
-    }
-
-    fn write_delta(&self, shard_id: u16, node_id: NodeId, delta: DocDelta) -> StoreResult<()> {
+impl LocalDocumentStore {
+    /// Encode `delta` and buffer it as a node merge operand on `txn`.
+    /// The operand carries the `PREFIX_DOC_DELTA` framing byte and is
+    /// applied at commit via the node-partition merge path.
+    fn write_delta(
+        txn: &mut Transaction,
+        shard_id: u16,
+        node_id: NodeId,
+        delta: DocDelta,
+    ) -> StoreResult<()> {
         let operand = delta.encode().map_err(|e| StoreError::Decode {
             kind: "doc delta",
             message: format!("encode: {e}"),
         })?;
-        self.engine.merge(
-            Partition::Node,
-            &encode_node_key(shard_id, node_id),
-            &operand,
-        )?;
+        txn.push_node_delta(encode_node_key(shard_id, node_id), operand);
         Ok(())
     }
 }
 
-impl DocumentStore for LocalDocumentStore<'_> {
+impl DocumentStore for LocalDocumentStore {
     fn set_path(
         &self,
+        txn: &mut Transaction,
         shard_id: u16,
         node_id: NodeId,
         target: PathTarget,
         path: Vec<String>,
         value: rmpv::Value,
     ) -> StoreResult<()> {
-        self.write_delta(
+        Self::write_delta(
+            txn,
             shard_id,
             node_id,
             DocDelta::SetPath {
@@ -309,23 +187,31 @@ impl DocumentStore for LocalDocumentStore<'_> {
 
     fn delete_path(
         &self,
+        txn: &mut Transaction,
         shard_id: u16,
         node_id: NodeId,
         target: PathTarget,
         path: Vec<String>,
     ) -> StoreResult<()> {
-        self.write_delta(shard_id, node_id, DocDelta::DeletePath { target, path })
+        Self::write_delta(
+            txn,
+            shard_id,
+            node_id,
+            DocDelta::DeletePath { target, path },
+        )
     }
 
     fn array_push(
         &self,
+        txn: &mut Transaction,
         shard_id: u16,
         node_id: NodeId,
         target: PathTarget,
         path: Vec<String>,
         value: rmpv::Value,
     ) -> StoreResult<()> {
-        self.write_delta(
+        Self::write_delta(
+            txn,
             shard_id,
             node_id,
             DocDelta::ArrayPush {
@@ -338,13 +224,15 @@ impl DocumentStore for LocalDocumentStore<'_> {
 
     fn array_pull(
         &self,
+        txn: &mut Transaction,
         shard_id: u16,
         node_id: NodeId,
         target: PathTarget,
         path: Vec<String>,
         value: rmpv::Value,
     ) -> StoreResult<()> {
-        self.write_delta(
+        Self::write_delta(
+            txn,
             shard_id,
             node_id,
             DocDelta::ArrayPull {
@@ -357,13 +245,15 @@ impl DocumentStore for LocalDocumentStore<'_> {
 
     fn array_add_to_set(
         &self,
+        txn: &mut Transaction,
         shard_id: u16,
         node_id: NodeId,
         target: PathTarget,
         path: Vec<String>,
         value: rmpv::Value,
     ) -> StoreResult<()> {
-        self.write_delta(
+        Self::write_delta(
+            txn,
             shard_id,
             node_id,
             DocDelta::ArrayAddToSet {
@@ -376,13 +266,15 @@ impl DocumentStore for LocalDocumentStore<'_> {
 
     fn increment(
         &self,
+        txn: &mut Transaction,
         shard_id: u16,
         node_id: NodeId,
         target: PathTarget,
         path: Vec<String>,
         amount: f64,
     ) -> StoreResult<()> {
-        self.write_delta(
+        Self::write_delta(
+            txn,
             shard_id,
             node_id,
             DocDelta::Increment {
@@ -395,12 +287,18 @@ impl DocumentStore for LocalDocumentStore<'_> {
 
     fn remove_property(
         &self,
+        txn: &mut Transaction,
         shard_id: u16,
         node_id: NodeId,
         target: PathTarget,
         key: Option<String>,
     ) -> StoreResult<()> {
-        self.write_delta(shard_id, node_id, DocDelta::RemoveProperty { target, key })
+        Self::write_delta(
+            txn,
+            shard_id,
+            node_id,
+            DocDelta::RemoveProperty { target, key },
+        )
     }
 }
 
@@ -422,15 +320,13 @@ mod tests {
         coordinode_test_fixtures::engine_for_logic()
     }
 
-    /// Seed a base node via an MVCC transaction (shard 0) + commit, so a
-    /// subsequent document merge has a record to merge into.
-    fn put_node(engine: &StorageEngine, id: NodeId, record: &NodeRecord) {
+    /// Open an MVCC transaction (shard 0), commit it, returning the
+    /// committed outcome. Shared spine for `put_node` and `commit_docs`.
+    fn run_committed(engine: &StorageEngine, body: impl FnOnce(&mut Transaction)) {
         let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
         let read_ts = oracle.next();
         let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
-        LocalNodeStore
-            .put(&mut txn, 0, id, record)
-            .expect("put node");
+        body(&mut txn);
         let wc = WriteConcern::majority();
         let ctx = CommitContext {
             write_concern: &wc,
@@ -439,7 +335,26 @@ mod tests {
             drain_buffer: None,
             nvme_write_buffer: None,
         };
-        txn.commit(&ctx).expect("commit node");
+        txn.commit(&ctx).expect("commit txn");
+    }
+
+    /// Seed a base node via an MVCC transaction (shard 0) + commit, so a
+    /// subsequent document merge has a record to merge into.
+    fn put_node(engine: &StorageEngine, id: NodeId, record: &NodeRecord) {
+        run_committed(engine, |txn| {
+            LocalNodeStore.put(txn, 0, id, record).expect("put node");
+        });
+    }
+
+    /// Run document-store ops inside one MVCC transaction (shard 0) and
+    /// commit, so the buffered merge operands land for a subsequent
+    /// read. The closure receives a stateless [`LocalDocumentStore`]
+    /// and the open transaction.
+    fn commit_docs(
+        engine: &StorageEngine,
+        body: impl FnOnce(&LocalDocumentStore, &mut Transaction),
+    ) {
+        run_committed(engine, |txn| body(&LocalDocumentStore, txn));
     }
 
     /// Read a node (shard 0) at the latest committed snapshot through an
@@ -462,15 +377,17 @@ mod tests {
         let id = NodeId::from_raw(1);
         put_node(engine, id, &NodeRecord::new("User"));
 
-        let docs = LocalDocumentStore::new(engine);
-        docs.set_path(
-            0,
-            id,
-            PathTarget::Extra,
-            vec!["profile".to_string(), "city".to_string()],
-            rmpv::Value::String("Berlin".into()),
-        )
-        .expect("set_path");
+        commit_docs(engine, |docs, txn| {
+            docs.set_path(
+                txn,
+                0,
+                id,
+                PathTarget::Extra,
+                vec!["profile".to_string(), "city".to_string()],
+                rmpv::Value::String("Berlin".into()),
+            )
+            .expect("set_path");
+        });
 
         // Read back via NodeStore — the merge operator collapses the
         // delta history transparently. The nested Document value at
@@ -508,11 +425,12 @@ mod tests {
         let id = NodeId::from_raw(7);
         put_node(engine, id, &NodeRecord::new("Counter"));
 
-        let docs = LocalDocumentStore::new(engine);
-        for _ in 0..3 {
-            docs.increment(0, id, PathTarget::Extra, vec!["hits".to_string()], 1.0)
-                .expect("inc");
-        }
+        commit_docs(engine, |docs, txn| {
+            for _ in 0..3 {
+                docs.increment(txn, 0, id, PathTarget::Extra, vec!["hits".to_string()], 1.0)
+                    .expect("inc");
+            }
+        });
 
         let rec = get_node(engine, id).expect("Some");
         let hits = rec.get_extra("hits").expect("hits present");
@@ -547,15 +465,17 @@ mod tests {
         let id = NodeId::from_raw(99);
         put_node(engine, id, &NodeRecord::new("X"));
 
-        let docs = LocalDocumentStore::new(engine);
         // Path doesn't exist — delete must succeed silently.
-        docs.delete_path(
-            0,
-            id,
-            PathTarget::Extra,
-            vec!["never".to_string(), "existed".to_string()],
-        )
-        .expect("delete missing");
+        commit_docs(engine, |docs, txn| {
+            docs.delete_path(
+                txn,
+                0,
+                id,
+                PathTarget::Extra,
+                vec!["never".to_string(), "existed".to_string()],
+            )
+            .expect("delete missing");
+        });
 
         // Node still readable, no change.
         get_node(engine, id).expect("Some");
@@ -590,15 +510,17 @@ mod tests {
         let id = NodeId::from_raw(20);
         put_node(engine, id, &NodeRecord::new("L"));
 
-        let docs = LocalDocumentStore::new(engine);
-        docs.array_push(
-            0,
-            id,
-            PathTarget::Extra,
-            vec!["scores".to_string()],
-            rmpv::Value::F64(42.0),
-        )
-        .expect("push");
+        commit_docs(engine, |docs, txn| {
+            docs.array_push(
+                txn,
+                0,
+                id,
+                PathTarget::Extra,
+                vec!["scores".to_string()],
+                rmpv::Value::F64(42.0),
+            )
+            .expect("push");
+        });
 
         let rec = get_node(engine, id).expect("Some");
         assert_eq!(read_array_len(&rec, "scores"), 1);
@@ -611,17 +533,19 @@ mod tests {
         let id = NodeId::from_raw(21);
         put_node(engine, id, &NodeRecord::new("L"));
 
-        let docs = LocalDocumentStore::new(engine);
-        for v in [1.0, 2.0, 3.0] {
-            docs.array_push(
-                0,
-                id,
-                PathTarget::Extra,
-                vec!["xs".to_string()],
-                rmpv::Value::F64(v),
-            )
-            .expect("push");
-        }
+        commit_docs(engine, |docs, txn| {
+            for v in [1.0, 2.0, 3.0] {
+                docs.array_push(
+                    txn,
+                    0,
+                    id,
+                    PathTarget::Extra,
+                    vec!["xs".to_string()],
+                    rmpv::Value::F64(v),
+                )
+                .expect("push");
+            }
+        });
         let rec = get_node(engine, id).expect("Some");
         assert_eq!(read_array_len(&rec, "xs"), 3);
     }
@@ -634,23 +558,26 @@ mod tests {
         let id = NodeId::from_raw(22);
         put_node(engine, id, &NodeRecord::new("L"));
 
-        let docs = LocalDocumentStore::new(engine);
-        docs.array_push(
-            0,
-            id,
-            PathTarget::Extra,
-            vec!["tags".to_string()],
-            rmpv::Value::String("a".into()),
-        )
-        .expect("seed");
-        docs.array_pull(
-            0,
-            id,
-            PathTarget::Extra,
-            vec!["tags".to_string()],
-            rmpv::Value::String("not-there".into()),
-        )
-        .expect("pull");
+        commit_docs(engine, |docs, txn| {
+            docs.array_push(
+                txn,
+                0,
+                id,
+                PathTarget::Extra,
+                vec!["tags".to_string()],
+                rmpv::Value::String("a".into()),
+            )
+            .expect("seed");
+            docs.array_pull(
+                txn,
+                0,
+                id,
+                PathTarget::Extra,
+                vec!["tags".to_string()],
+                rmpv::Value::String("not-there".into()),
+            )
+            .expect("pull");
+        });
         let rec = get_node(engine, id).expect("Some");
         assert_eq!(read_array_len(&rec, "tags"), 1);
     }
@@ -662,15 +589,17 @@ mod tests {
         let id = NodeId::from_raw(23);
         put_node(engine, id, &NodeRecord::new("L"));
 
-        let docs = LocalDocumentStore::new(engine);
-        docs.array_pull(
-            0,
-            id,
-            PathTarget::Extra,
-            vec!["never".to_string()],
-            rmpv::Value::String("x".into()),
-        )
-        .expect("pull missing");
+        commit_docs(engine, |docs, txn| {
+            docs.array_pull(
+                txn,
+                0,
+                id,
+                PathTarget::Extra,
+                vec!["never".to_string()],
+                rmpv::Value::String("x".into()),
+            )
+            .expect("pull missing");
+        });
         // Node still readable.
         get_node(engine, id).expect("Some");
     }
@@ -682,11 +611,12 @@ mod tests {
         let id = NodeId::from_raw(24);
         put_node(engine, id, &NodeRecord::new("L"));
 
-        let docs = LocalDocumentStore::new(engine);
-        docs.increment(0, id, PathTarget::Extra, vec!["v".to_string()], 10.0)
-            .expect("inc up");
-        docs.increment(0, id, PathTarget::Extra, vec!["v".to_string()], -3.5)
-            .expect("inc down");
+        commit_docs(engine, |docs, txn| {
+            docs.increment(txn, 0, id, PathTarget::Extra, vec!["v".to_string()], 10.0)
+                .expect("inc up");
+            docs.increment(txn, 0, id, PathTarget::Extra, vec!["v".to_string()], -3.5)
+                .expect("inc down");
+        });
         let rec = get_node(engine, id).expect("Some");
         assert!((read_numeric(&rec, "v") - 6.5).abs() < 1e-9);
     }
@@ -698,10 +628,18 @@ mod tests {
         let id = NodeId::from_raw(25);
         put_node(engine, id, &NodeRecord::new("L"));
 
-        let docs = LocalDocumentStore::new(engine);
         // No prior value — increment from scratch lands at delta.
-        docs.increment(0, id, PathTarget::Extra, vec!["fresh".to_string()], 7.0)
+        commit_docs(engine, |docs, txn| {
+            docs.increment(
+                txn,
+                0,
+                id,
+                PathTarget::Extra,
+                vec!["fresh".to_string()],
+                7.0,
+            )
             .expect("inc");
+        });
         let rec = get_node(engine, id).expect("Some");
         assert!((read_numeric(&rec, "fresh") - 7.0).abs() < 1e-9);
     }
@@ -713,9 +651,10 @@ mod tests {
         let id = NodeId::from_raw(26);
         put_node(engine, id, &NodeRecord::new("L"));
 
-        let docs = LocalDocumentStore::new(engine);
-        docs.remove_property(0, id, PathTarget::Extra, Some("never".to_string()))
-            .expect("remove missing");
+        commit_docs(engine, |docs, txn| {
+            docs.remove_property(txn, 0, id, PathTarget::Extra, Some("never".to_string()))
+                .expect("remove missing");
+        });
         get_node(engine, id).expect("Some");
     }
 
@@ -728,20 +667,22 @@ mod tests {
         let id = NodeId::from_raw(27);
         put_node(engine, id, &NodeRecord::new("L"));
 
-        let docs = LocalDocumentStore::new(engine);
-        docs.set_path(
-            0,
-            id,
-            PathTarget::Extra,
-            vec![
-                "a".to_string(),
-                "b".to_string(),
-                "c".to_string(),
-                "d".to_string(),
-            ],
-            rmpv::Value::String("deep".into()),
-        )
-        .expect("set deep");
+        commit_docs(engine, |docs, txn| {
+            docs.set_path(
+                txn,
+                0,
+                id,
+                PathTarget::Extra,
+                vec![
+                    "a".to_string(),
+                    "b".to_string(),
+                    "c".to_string(),
+                    "d".to_string(),
+                ],
+                rmpv::Value::String("deep".into()),
+            )
+            .expect("set deep");
+        });
 
         fn descend<'a>(map: &'a rmpv::Value, key: &str) -> &'a rmpv::Value {
             let rmpv::Value::Map(pairs) = map else {
@@ -778,17 +719,19 @@ mod tests {
         let id = NodeId::from_raw(28);
         put_node(engine, id, &NodeRecord::new("L"));
 
-        let docs = LocalDocumentStore::new(engine);
-        docs.set_path(
-            0,
-            id,
-            PathTarget::Extra,
-            vec!["a".into(), "b".into()],
-            rmpv::Value::String("hello".into()),
-        )
-        .expect("set");
-        docs.delete_path(0, id, PathTarget::Extra, vec!["a".into(), "b".into()])
-            .expect("delete");
+        commit_docs(engine, |docs, txn| {
+            docs.set_path(
+                txn,
+                0,
+                id,
+                PathTarget::Extra,
+                vec!["a".into(), "b".into()],
+                rmpv::Value::String("hello".into()),
+            )
+            .expect("set");
+            docs.delete_path(txn, 0, id, PathTarget::Extra, vec!["a".into(), "b".into()])
+                .expect("delete");
+        });
 
         let rec = get_node(engine, id).expect("Some");
         // After delete, "a" map exists but lacks "b" — or the whole
@@ -810,25 +753,28 @@ mod tests {
         let id = NodeId::from_raw(29);
         put_node(engine, id, &NodeRecord::new("L"));
 
-        let docs = LocalDocumentStore::new(engine);
-        for s in ["a", "b", "c"] {
-            docs.array_push(
+        commit_docs(engine, |docs, txn| {
+            for s in ["a", "b", "c"] {
+                docs.array_push(
+                    txn,
+                    0,
+                    id,
+                    PathTarget::Extra,
+                    vec!["tags".into()],
+                    rmpv::Value::String(s.into()),
+                )
+                .expect("push");
+            }
+            docs.array_pull(
+                txn,
                 0,
                 id,
                 PathTarget::Extra,
                 vec!["tags".into()],
-                rmpv::Value::String(s.into()),
+                rmpv::Value::String("b".into()),
             )
-            .expect("push");
-        }
-        docs.array_pull(
-            0,
-            id,
-            PathTarget::Extra,
-            vec!["tags".into()],
-            rmpv::Value::String("b".into()),
-        )
-        .expect("pull");
+            .expect("pull");
+        });
 
         let rec = get_node(engine, id).expect("Some");
         assert_eq!(read_array_len(&rec, "tags"), 2);
@@ -841,17 +787,19 @@ mod tests {
         let id = NodeId::from_raw(30);
         put_node(engine, id, &NodeRecord::new("L"));
 
-        let docs = LocalDocumentStore::new(engine);
-        docs.set_path(
-            0,
-            id,
-            PathTarget::Extra,
-            vec!["temp".into()],
-            rmpv::Value::String("v".into()),
-        )
-        .expect("seed");
-        docs.remove_property(0, id, PathTarget::Extra, Some("temp".into()))
-            .expect("remove");
+        commit_docs(engine, |docs, txn| {
+            docs.set_path(
+                txn,
+                0,
+                id,
+                PathTarget::Extra,
+                vec!["temp".into()],
+                rmpv::Value::String("v".into()),
+            )
+            .expect("seed");
+            docs.remove_property(txn, 0, id, PathTarget::Extra, Some("temp".into()))
+                .expect("remove");
+        });
 
         let rec = get_node(engine, id).expect("Some");
         assert!(
@@ -870,23 +818,26 @@ mod tests {
         let id = NodeId::from_raw(31);
         put_node(engine, id, &NodeRecord::new("L"));
 
-        let docs = LocalDocumentStore::new(engine);
-        docs.set_path(
-            0,
-            id,
-            PathTarget::Extra,
-            vec!["x".into()],
-            rmpv::Value::String("hello".into()),
-        )
-        .expect("set string");
-        docs.set_path(
-            0,
-            id,
-            PathTarget::Extra,
-            vec!["x".into()],
-            rmpv::Value::Integer(42.into()),
-        )
-        .expect("set int");
+        commit_docs(engine, |docs, txn| {
+            docs.set_path(
+                txn,
+                0,
+                id,
+                PathTarget::Extra,
+                vec!["x".into()],
+                rmpv::Value::String("hello".into()),
+            )
+            .expect("set string");
+            docs.set_path(
+                txn,
+                0,
+                id,
+                PathTarget::Extra,
+                vec!["x".into()],
+                rmpv::Value::Integer(42.into()),
+            )
+            .expect("set int");
+        });
 
         let rec = get_node(engine, id).expect("Some");
         let v = rec.get_extra("x").expect("x present");
@@ -911,15 +862,17 @@ mod tests {
         base.set_extra("placeholder", Value::Int(0));
         put_node(engine, id, &base);
 
-        let docs = LocalDocumentStore::new(engine);
-        docs.set_path(
-            0,
-            id,
-            PathTarget::PropField(7),
-            Vec::new(), // top-level write at field 7
-            rmpv::Value::String("via_field".into()),
-        )
-        .expect("set propfield");
+        commit_docs(engine, |docs, txn| {
+            docs.set_path(
+                txn,
+                0,
+                id,
+                PathTarget::PropField(7),
+                Vec::new(), // top-level write at field 7
+                rmpv::Value::String("via_field".into()),
+            )
+            .expect("set propfield");
+        });
 
         let rec = get_node(engine, id).expect("Some");
         let v = rec
@@ -938,9 +891,9 @@ mod tests {
 
     #[test]
     fn concurrent_set_path_distinct_keys_converges() {
-        // Four threads each set a distinct key under extra; merge
-        // operator collapses all four deltas into a single node body
-        // on read.
+        // Four threads each set a distinct key under extra in its own
+        // transaction; the merge operator collapses all four deltas
+        // into a single node body on read.
         use std::sync::Arc;
         use std::thread;
 
@@ -953,15 +906,17 @@ mod tests {
             .map(|t| {
                 let engine = Arc::clone(&engine);
                 thread::spawn(move || {
-                    let docs = LocalDocumentStore::new(&engine);
-                    docs.set_path(
-                        0,
-                        id,
-                        PathTarget::Extra,
-                        vec![format!("k{t}")],
-                        rmpv::Value::Integer((t as i64).into()),
-                    )
-                    .expect("set_path");
+                    commit_docs(&engine, |docs, txn| {
+                        docs.set_path(
+                            txn,
+                            0,
+                            id,
+                            PathTarget::Extra,
+                            vec![format!("k{t}")],
+                            rmpv::Value::Integer((t as i64).into()),
+                        )
+                        .expect("set_path");
+                    });
                 })
             })
             .collect();
@@ -987,17 +942,19 @@ mod tests {
         let id = NodeId::from_raw(5);
         put_node(engine, id, &NodeRecord::new("Y"));
 
-        let docs = LocalDocumentStore::new(engine);
-        for _ in 0..3 {
-            docs.array_add_to_set(
-                0,
-                id,
-                PathTarget::Extra,
-                vec!["tags".to_string()],
-                rmpv::Value::String("rust".into()),
-            )
-            .expect("add");
-        }
+        commit_docs(engine, |docs, txn| {
+            for _ in 0..3 {
+                docs.array_add_to_set(
+                    txn,
+                    0,
+                    id,
+                    PathTarget::Extra,
+                    vec!["tags".to_string()],
+                    rmpv::Value::String("rust".into()),
+                )
+                .expect("add");
+            }
+        });
 
         let rec = get_node(engine, id).expect("Some");
         let tags = rec.get_extra("tags").expect("tags present");

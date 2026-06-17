@@ -9,7 +9,11 @@ use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 
 use coordinode_core::graph::node::NodeId;
+use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_modality::{Bucket, BucketControl, FieldStats, Measurement, TimeSeriesStore};
+use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::transaction::{CommitContext, Transaction};
 
 use crate::clock::IngestionClock;
 use crate::config::{CatalogConfig, STRIPE_COUNT};
@@ -34,7 +38,7 @@ struct OpenBucket {
     /// Meta-field value shared by every measurement in this bucket.
     /// Carried so the flush can pass it to [`Bucket::from_measurements`].
     meta: rmpv::Value,
-    /// Running byte-size estimate (see [`measurement_router::route`]).
+    /// Running byte-size estimate (see [`crate::measurement_router::route`]).
     size_estimate: u32,
     /// Wall-clock time the bucket was opened. Drives future age-
     /// based flushes (Slice C).
@@ -63,7 +67,7 @@ struct Stripe {
 /// the bucket body from the underlying store.
 #[derive(Debug, Clone)]
 struct ClosedBucketHandle {
-    /// Node id the bucket lives at in [`Partition::Node`].
+    /// Node id the bucket lives at in `Partition::Node`.
     node_id: NodeId,
     /// Wall-clock time the bucket flushed. Drives TTL eviction.
     closed_at: SystemTime,
@@ -197,6 +201,10 @@ pub struct BucketCatalog<'store, S: TimeSeriesStore> {
     config: CatalogConfig,
     shard_id: u16,
     store: &'store S,
+    /// Engine the catalog opens its short-lived bucket transactions
+    /// against (ADR-041). The `store` is a stateless typed handle; the
+    /// engine is what its buffered writes commit through.
+    engine: &'store StorageEngine,
     stripes: [RwLock<Stripe>; STRIPE_COUNT],
     /// Monotonic source of bucket node ids. The catalog issues these
     /// directly today; a follow-up will route them through the
@@ -204,7 +212,7 @@ pub struct BucketCatalog<'store, S: TimeSeriesStore> {
     /// regular graph nodes.
     next_node_id: std::sync::atomic::AtomicU64,
     /// Monotonic source of overflow arrival seqnos. Catalog-local;
-    /// each [`OverflowEntry`] gets a unique seqno per catalog
+    /// each [`coordinode_modality::OverflowEntry`] gets a unique seqno per catalog
     /// lifetime. After [`Self::compact_if_needed`] runs the seqno
     /// space implicitly resets (the merged base bucket invalidates
     /// the prior overflow seqnos), but we keep the counter
@@ -215,7 +223,7 @@ pub struct BucketCatalog<'store, S: TimeSeriesStore> {
     /// per ADR-027). The catalog stamps every incoming measurement
     /// via `clock.next()` before buffering — production replicas
     /// share a Raft-leader-stamped clock; CE single-node uses
-    /// [`MonotonicHlcClock`]; tests use `ScriptedClock`.
+    /// [`crate::clock::MonotonicHlcClock`]; tests use `ScriptedClock`.
     clock: std::sync::Arc<dyn IngestionClock>,
 }
 
@@ -230,6 +238,7 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
         config: CatalogConfig,
         shard_id: u16,
         store: &'store S,
+        engine: &'store StorageEngine,
         next_node_id_seed: u64,
         clock: std::sync::Arc<dyn IngestionClock>,
     ) -> CatalogResult<Self> {
@@ -238,11 +247,48 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
             config,
             shard_id,
             store,
+            engine,
             stripes: std::array::from_fn(|_| RwLock::new(Stripe::default())),
             next_node_id: std::sync::atomic::AtomicU64::new(next_node_id_seed),
             next_overflow_seqno: std::sync::atomic::AtomicU64::new(1),
             clock,
         })
+    }
+
+    /// Open a short-lived MVCC transaction against the catalog's
+    /// engine, run `body` (the store reads/writes for one logical
+    /// bucket operation), then commit it. The catalog owns its bucket
+    /// transaction boundaries (ADR-041): bucket bodies are
+    /// point-overwrites, so a fresh per-operation transaction
+    /// reproduces the prior immediate-write semantics while keeping
+    /// multi-step operations atomic (e.g. compaction's base rewrite +
+    /// overflow tombstones land in one commit or none). `body` receives
+    /// `&Self` so it can reach `store` / `shard_id` / `clock` without
+    /// re-borrowing the outer `self`.
+    fn run_txn<R>(
+        &self,
+        body: impl FnOnce(&Self, &mut Transaction) -> CatalogResult<R>,
+    ) -> CatalogResult<R> {
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let mut txn = Transaction::new(
+            self.engine,
+            Some(&oracle),
+            read_ts,
+            Some(self.engine.snapshot()),
+        );
+        let out = body(self, &mut txn)?;
+        let wc = WriteConcern::majority();
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: None,
+            id_gen: None,
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        txn.commit(&ctx)
+            .map_err(|e| CatalogError::Commit(e.to_string()))?;
+        Ok(out)
     }
 
     /// Ingest one measurement. Tier-1 in-buffer late-arrival
@@ -412,7 +458,9 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
                     node_id = handle.node_id.as_raw(),
                     "Tier-2 reopen",
                 );
-                let reopened = self.store.reopen_bucket(self.shard_id, handle.node_id)?;
+                let reopened = self.run_txn(|c, txn| {
+                    Ok(c.store.reopen_bucket(txn, c.shard_id, handle.node_id)?)
+                })?;
                 if reopened {
                     // Take the handle out of LRU — the bucket is open again.
                     stripe.recently_closed.remove(&key);
@@ -473,14 +521,15 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
                     "Tier-3 overflow",
                 );
                 drop(stripe); // release lock before store I/O
-                self.store.put_overflow(
-                    u32::from(label_id),
-                    node_id,
-                    &coordinode_modality::OverflowEntry {
-                        arrival_seqno,
-                        measurement,
-                    },
-                )?;
+                let entry = coordinode_modality::OverflowEntry {
+                    arrival_seqno,
+                    measurement,
+                };
+                self.run_txn(|c, txn| {
+                    c.store
+                        .put_overflow(txn, u32::from(label_id), node_id, &entry)?;
+                    Ok(())
+                })?;
                 return Ok(());
             }
         }
@@ -575,8 +624,7 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
     /// the configured count threshold. Returns `Ok(true)` if a
     /// compaction ran, `Ok(false)` if not.
     ///
-    /// Threshold (arch default — see `arch/core/timeseries.md`
-    /// §Background merge): more than `OVERFLOW_COMPACT_THRESHOLD`
+    /// Threshold: more than `OVERFLOW_COMPACT_THRESHOLD`
     /// (50) overflow entries triggers compaction. The catalog does
     /// NOT enforce an age threshold here — call sites that care
     /// about "compact stale overflow" run their own age check and
@@ -587,60 +635,63 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
     /// per shard); tests invoke it directly. The catalog itself
     /// does not spawn any threads — driver wiring lives above.
     pub fn compact_if_needed(&self, label_id: u32, bucket_id: NodeId) -> CatalogResult<bool> {
-        let overflow = self.store.scan_overflow(label_id, bucket_id)?;
-        if overflow.len() <= OVERFLOW_COMPACT_THRESHOLD {
-            return Ok(false);
-        }
-        // Read the current base bucket; merge with overflow
-        // measurements; write back atomically (compact_overflow
-        // builds the merge under a WriteBatch covering both the
-        // base put and the overflow tombstones).
-        let Some(base) = self.store.get_bucket(self.shard_id, bucket_id)? else {
-            tracing::warn!(
+        // One transaction spans the read (scan overflow + base bucket)
+        // and the write (rewrite base + tombstone overflow), so the
+        // compaction is atomic — a crash cannot leave overflow visible
+        // against an already-rewritten base.
+        self.run_txn(|c, txn| {
+            let overflow = c.store.scan_overflow(txn, label_id, bucket_id)?;
+            if overflow.len() <= OVERFLOW_COMPACT_THRESHOLD {
+                return Ok(false);
+            }
+            let Some(base) = c.store.get_bucket(txn, c.shard_id, bucket_id)? else {
+                tracing::warn!(
+                    label_id,
+                    bucket_id = bucket_id.as_raw(),
+                    "compact_if_needed: base bucket missing — leaving overflow in place",
+                );
+                return Ok(false);
+            };
+            let mut merged: Vec<Measurement> = base.measurements().collect();
+            let mut overflow_seqnos: Vec<u64> = Vec::with_capacity(overflow.len());
+            for entry in overflow {
+                overflow_seqnos.push(entry.arrival_seqno);
+                merged.push(entry.measurement);
+            }
+            merged.sort_by_key(|m| m.timestamp_us);
+            // Bitemporal backfill: a base bucket written before the
+            // `__ingestion_ts__` axis landed has measurements with
+            // `ingestion_ts_us = None`. After compaction the bucket
+            // becomes the new authoritative copy; we backfill the missing
+            // stamps with `c.clock.next()` so the merged bucket carries
+            // a complete ingestion_timestamps column and stays queryable
+            // under `AS OF INGESTION_TIME`. Without backfill,
+            // `Bucket::from_measurements` would see a half-stamped vec
+            // and CLEAR the ingestion_timestamps column to prevent
+            // misalignment — losing the bitemporal axis on every legacy
+            // bucket touched by compaction.
+            for m in &mut merged {
+                if m.ingestion_ts_us.is_none() {
+                    m.ingestion_ts_us = Some(c.clock.next());
+                }
+            }
+            let merged_bucket = Bucket::from_measurements(base.meta.clone(), merged);
+            c.store.compact_overflow(
+                txn,
+                c.shard_id,
+                label_id,
+                bucket_id,
+                &merged_bucket,
+                &overflow_seqnos,
+            )?;
+            tracing::debug!(
                 label_id,
                 bucket_id = bucket_id.as_raw(),
-                "compact_if_needed: base bucket missing — leaving overflow in place",
+                compacted = overflow_seqnos.len(),
+                "overflow compacted",
             );
-            return Ok(false);
-        };
-        let mut merged: Vec<Measurement> = base.measurements().collect();
-        let mut overflow_seqnos: Vec<u64> = Vec::with_capacity(overflow.len());
-        for entry in overflow {
-            overflow_seqnos.push(entry.arrival_seqno);
-            merged.push(entry.measurement);
-        }
-        merged.sort_by_key(|m| m.timestamp_us);
-        // Bitemporal backfill: a base bucket written before the
-        // `__ingestion_ts__` axis landed has measurements with
-        // `ingestion_ts_us = None`. After compaction the bucket
-        // becomes the new authoritative copy; we backfill the missing
-        // stamps with `self.clock.next()` so the merged bucket carries
-        // a complete ingestion_timestamps column and stays queryable
-        // under `AS OF INGESTION_TIME`. Without backfill,
-        // `Bucket::from_measurements` would see a half-stamped vec
-        // and CLEAR the ingestion_timestamps column to prevent
-        // misalignment — losing the bitemporal axis on every legacy
-        // bucket touched by compaction.
-        for m in &mut merged {
-            if m.ingestion_ts_us.is_none() {
-                m.ingestion_ts_us = Some(self.clock.next());
-            }
-        }
-        let merged_bucket = Bucket::from_measurements(base.meta.clone(), merged);
-        self.store.compact_overflow(
-            self.shard_id,
-            label_id,
-            bucket_id,
-            &merged_bucket,
-            &overflow_seqnos,
-        )?;
-        tracing::debug!(
-            label_id,
-            bucket_id = bucket_id.as_raw(),
-            compacted = overflow_seqnos.len(),
-            "overflow compacted",
-        );
-        Ok(true)
+            Ok(true)
+        })
     }
 
     /// Background compactor driver primitive: discover every bucket
@@ -660,7 +711,7 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
     /// `(label_id, bucket_id)` pairs — cost scales with the number of
     /// stale buckets, not the overflow volume.
     pub fn compact_all_pending(&self) -> CatalogResult<usize> {
-        let candidates = self.store.list_overflow_buckets()?;
+        let candidates = self.run_txn(|c, txn| Ok(c.store.list_overflow_buckets(txn)?))?;
         let mut compacted = 0usize;
         for (label_id, bucket_id) in candidates {
             if self.compact_if_needed(label_id, bucket_id)? {
@@ -683,9 +734,12 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
         let mut sorted = bucket.buffer.clone();
         sorted.sort_by_key(|m| m.timestamp_us);
         let body = Bucket::from_measurements(meta.clone(), sorted);
-        self.store
-            .put_bucket(self.shard_id, bucket.node_id, &body)?;
-        self.store.mark_closed(self.shard_id, bucket.node_id)?;
+        // Persist the bucket body and close it in one transaction.
+        self.run_txn(|c, txn| {
+            c.store.put_bucket(txn, c.shard_id, bucket.node_id, &body)?;
+            c.store.mark_closed(txn, c.shard_id, bucket.node_id)?;
+            Ok(())
+        })?;
         Ok(ClosedBucketHandle {
             node_id: bucket.node_id,
             closed_at: SystemTime::now(),
@@ -781,10 +835,44 @@ mod tests {
         }
     }
 
+    /// Run direct `TimeSeriesStore` writes (test setup / assertions
+    /// that bypass the catalog) in one committed MVCC transaction.
+    fn ts_write<R>(
+        engine: &StorageEngine,
+        body: impl FnOnce(&LocalTimeSeriesStore, &mut Transaction) -> R,
+    ) -> R {
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let out = body(&LocalTimeSeriesStore, &mut txn);
+        let wc = WriteConcern::majority();
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: None,
+            id_gen: None,
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        txn.commit(&ctx).expect("commit ts test write");
+        out
+    }
+
+    /// Run a direct `TimeSeriesStore` read against the latest committed
+    /// snapshot.
+    fn ts_read<R>(
+        engine: &StorageEngine,
+        body: impl FnOnce(&LocalTimeSeriesStore, &Transaction) -> R,
+    ) -> R {
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        body(&LocalTimeSeriesStore, &txn)
+    }
+
     #[test]
     fn invalid_config_rejected_at_construction() {
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig {
             max_count: 0,
             ..CatalogConfig::default()
@@ -793,6 +881,7 @@ mod tests {
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new())
         )
@@ -802,12 +891,13 @@ mod tests {
     #[test]
     fn single_measurement_appends_without_flush() {
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig::arch_defaults();
         let catalog = BucketCatalog::new(
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )
@@ -825,16 +915,17 @@ mod tests {
         assert_eq!(catalog.open_bucket_count(), 1);
         // Store should NOT have a persisted bucket yet — open bucket
         // lives in catalog memory only.
-        let persisted = store
-            .get_bucket(0, NodeId::from_raw(1))
-            .expect("get_bucket");
+        let persisted = ts_read(&engine, |s, txn| {
+            s.get_bucket(txn, 0, NodeId::from_raw(1))
+                .expect("get_bucket")
+        });
         assert!(persisted.is_none(), "no put_bucket should have fired yet");
     }
 
     #[test]
     fn count_rollover_flushes_and_reopens() {
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig {
             max_count: 3,
             ..CatalogConfig::default()
@@ -843,6 +934,7 @@ mod tests {
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )
@@ -865,10 +957,11 @@ mod tests {
         assert_eq!(catalog.open_bucket_count(), 1, "post-rollover, one open");
 
         // Flushed bucket persisted at node_id 1 with 3 measurements.
-        let persisted = store
-            .get_bucket(0, NodeId::from_raw(1))
-            .expect("get_bucket")
-            .expect("bucket exists");
+        let persisted = ts_read(&engine, |s, txn| {
+            s.get_bucket(txn, 0, NodeId::from_raw(1))
+                .expect("get_bucket")
+        })
+        .expect("bucket exists");
         assert_eq!(persisted.control.count, 3);
         assert!(persisted.control.closed, "flushed bucket is closed");
     }
@@ -876,7 +969,7 @@ mod tests {
     #[test]
     fn out_of_order_measurements_sorted_on_flush() {
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig {
             max_count: 4,
             ..CatalogConfig::default()
@@ -885,6 +978,7 @@ mod tests {
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )
@@ -901,14 +995,17 @@ mod tests {
         // so any next write would roll over, but we want to inspect
         // BEFORE rollover. Use flush_all.
         catalog.flush_all().unwrap();
-        let persisted = store.get_bucket(0, NodeId::from_raw(1)).unwrap().unwrap();
+        let persisted = ts_read(&engine, |s, txn| {
+            s.get_bucket(txn, 0, NodeId::from_raw(1)).unwrap()
+        })
+        .unwrap();
         assert_eq!(persisted.timestamps, vec![25, 50, 100, 200]);
     }
 
     #[test]
     fn time_rollover_when_measurement_outside_granularity() {
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig {
             granularity_span: Duration::from_millis(10),
             ..CatalogConfig::default()
@@ -917,6 +1014,7 @@ mod tests {
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )
@@ -933,7 +1031,10 @@ mod tests {
 
         // Second write must have triggered Time rollover: bucket 1
         // flushed with 1 measurement, bucket 2 opened with 1.
-        let flushed = store.get_bucket(0, NodeId::from_raw(1)).unwrap().unwrap();
+        let flushed = ts_read(&engine, |s, txn| {
+            s.get_bucket(txn, 0, NodeId::from_raw(1)).unwrap()
+        })
+        .unwrap();
         assert_eq!(flushed.control.count, 1);
         assert_eq!(flushed.timestamps, vec![0]);
         assert_eq!(catalog.open_bucket_count(), 1);
@@ -942,12 +1043,13 @@ mod tests {
     #[test]
     fn schema_rollover_when_new_field_introduced() {
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig::arch_defaults();
         let catalog = BucketCatalog::new(
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )
@@ -966,7 +1068,10 @@ mod tests {
             )
             .unwrap();
 
-        let flushed = store.get_bucket(0, NodeId::from_raw(1)).unwrap().unwrap();
+        let flushed = ts_read(&engine, |s, txn| {
+            s.get_bucket(txn, 0, NodeId::from_raw(1)).unwrap()
+        })
+        .unwrap();
         assert_eq!(flushed.control.count, 1);
         assert!(flushed.control.fields_stats.contains_key("temp"));
         assert!(!flushed.control.fields_stats.contains_key("humidity"));
@@ -975,12 +1080,13 @@ mod tests {
     #[test]
     fn distinct_meta_values_open_distinct_buckets() {
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig::arch_defaults();
         let catalog = BucketCatalog::new(
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )
@@ -1010,12 +1116,13 @@ mod tests {
     #[test]
     fn flush_all_drains_every_stripe() {
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig::arch_defaults();
         let catalog = BucketCatalog::new(
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )
@@ -1045,7 +1152,7 @@ mod tests {
         // should re-open the same bucket (same node_id) rather
         // than allocate a new one.
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig {
             max_count: 100,
             granularity_span: Duration::from_secs(3600),
@@ -1055,6 +1162,7 @@ mod tests {
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )
@@ -1074,7 +1182,10 @@ mod tests {
         assert_eq!(catalog.recently_closed_count(), 1);
 
         // Pre-Tier-2 store state: bucket 1 closed in store.
-        let pre = store.get_bucket(0, NodeId::from_raw(1)).unwrap().unwrap();
+        let pre = ts_read(&engine, |s, txn| {
+            s.get_bucket(txn, 0, NodeId::from_raw(1)).unwrap()
+        })
+        .unwrap();
         assert!(pre.control.closed, "bucket 1 closed in store pre-reopen");
 
         // Write a late measurement at ts=500 (inside [0, 2000]
@@ -1097,7 +1208,7 @@ mod tests {
     #[test]
     fn tier2_skipped_when_measurement_outside_time_range() {
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig {
             max_count: 3,
             granularity_span: Duration::from_secs(3600),
@@ -1107,6 +1218,7 @@ mod tests {
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )
@@ -1145,7 +1257,7 @@ mod tests {
     #[test]
     fn tier2_skipped_when_schema_drifts() {
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig {
             max_count: 3,
             granularity_span: Duration::from_secs(3600),
@@ -1155,6 +1267,7 @@ mod tests {
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )
@@ -1192,7 +1305,7 @@ mod tests {
     #[test]
     fn tier2_ttl_expires_handle() {
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig {
             max_count: 2,
             granularity_span: Duration::from_millis(50),
@@ -1202,6 +1315,7 @@ mod tests {
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )
@@ -1236,7 +1350,7 @@ mod tests {
     #[test]
     fn lru_evicts_oldest_on_capacity_overflow() {
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig {
             max_count: 1,
             granularity_span: Duration::from_secs(3600),
@@ -1246,6 +1360,7 @@ mod tests {
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )
@@ -1287,7 +1402,7 @@ mod tests {
         // `write_measurement_at`. Tier 2 skips on TTL; Tier 3 picks
         // up the same handle (no TTL check) and routes to overflow.
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig {
             max_count: 2,
             granularity_span: Duration::from_millis(50),
@@ -1297,6 +1412,7 @@ mod tests {
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )
@@ -1311,10 +1427,10 @@ mod tests {
         }
         catalog.flush_all().unwrap();
         assert_eq!(catalog.recently_closed_count(), 1);
-        assert!(store
-            .scan_overflow(7, NodeId::from_raw(1))
-            .unwrap()
-            .is_empty());
+        assert!(ts_read(&engine, |s, txn| s
+            .scan_overflow(txn, 7, NodeId::from_raw(1))
+            .unwrap())
+        .is_empty());
 
         // Late measurement in-window (ts=500us inside [0, 1000])
         // but `now` is far past TTL → Tier 2 skips → Tier 3 should
@@ -1325,7 +1441,9 @@ mod tests {
             .unwrap();
 
         // Overflow has one entry under bucket 1.
-        let overflow = store.scan_overflow(7, NodeId::from_raw(1)).unwrap();
+        let overflow = ts_read(&engine, |s, txn| {
+            s.scan_overflow(txn, 7, NodeId::from_raw(1)).unwrap()
+        });
         assert_eq!(overflow.len(), 1);
         assert_eq!(overflow[0].measurement.timestamp_us, 500);
         // No new open bucket allocated for the key.
@@ -1339,7 +1457,7 @@ mod tests {
         // Tier 3 must NOT route to that bucket's overflow — instead
         // a fresh bucket opens for the new timestamp.
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig {
             max_count: 2,
             granularity_span: Duration::from_millis(50),
@@ -1349,6 +1467,7 @@ mod tests {
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )
@@ -1369,22 +1488,23 @@ mod tests {
             .write_measurement_at(7, meta, measurement(10_000_000, &[("temp", 22.0)]), future)
             .unwrap();
 
-        assert!(store
-            .scan_overflow(7, NodeId::from_raw(1))
-            .unwrap()
-            .is_empty());
+        assert!(ts_read(&engine, |s, txn| s
+            .scan_overflow(txn, 7, NodeId::from_raw(1))
+            .unwrap())
+        .is_empty());
         assert_eq!(catalog.open_bucket_count(), 1);
     }
 
     #[test]
     fn compact_if_needed_no_op_below_threshold() {
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig::arch_defaults();
         let catalog = BucketCatalog::new(
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )
@@ -1398,7 +1518,7 @@ mod tests {
     #[test]
     fn compact_if_needed_merges_overflow_into_base_when_above_threshold() {
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig {
             max_count: 2,
             granularity_span: Duration::from_millis(50),
@@ -1408,6 +1528,7 @@ mod tests {
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )
@@ -1435,7 +1556,10 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            store.scan_overflow(7, NodeId::from_raw(1)).unwrap().len(),
+            ts_read(&engine, |s, txn| s
+                .scan_overflow(txn, 7, NodeId::from_raw(1))
+                .unwrap())
+            .len(),
             51,
         );
 
@@ -1445,11 +1569,14 @@ mod tests {
 
         // Post-compact: overflow set empty, base bucket has 2 + 51 = 53
         // measurements (merged + sorted).
-        assert!(store
-            .scan_overflow(7, NodeId::from_raw(1))
-            .unwrap()
-            .is_empty());
-        let base = store.get_bucket(0, NodeId::from_raw(1)).unwrap().unwrap();
+        assert!(ts_read(&engine, |s, txn| s
+            .scan_overflow(txn, 7, NodeId::from_raw(1))
+            .unwrap())
+        .is_empty());
+        let base = ts_read(&engine, |s, txn| {
+            s.get_bucket(txn, 0, NodeId::from_raw(1)).unwrap()
+        })
+        .unwrap();
         assert_eq!(base.control.count, 53);
         // First two are the originals (0, 1000); next 51 are the
         // overflow entries (500..551). Sorted: 0, 500..551, 1000.
@@ -1464,7 +1591,7 @@ mod tests {
         // background driver primitive must discover both via
         // `list_overflow_buckets` and compact each one.
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig {
             max_count: 2,
             granularity_span: Duration::from_millis(50),
@@ -1474,6 +1601,7 @@ mod tests {
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )
@@ -1544,16 +1672,19 @@ mod tests {
         assert_eq!(compacted, 2, "A and B compacted, C below threshold");
 
         // Post-compact: A's and B's overflow sets empty; C's intact.
-        assert!(store
-            .scan_overflow(7, NodeId::from_raw(1))
-            .unwrap()
-            .is_empty());
-        assert!(store
-            .scan_overflow(7, NodeId::from_raw(2))
-            .unwrap()
-            .is_empty());
+        assert!(ts_read(&engine, |s, txn| s
+            .scan_overflow(txn, 7, NodeId::from_raw(1))
+            .unwrap())
+        .is_empty());
+        assert!(ts_read(&engine, |s, txn| s
+            .scan_overflow(txn, 7, NodeId::from_raw(2))
+            .unwrap())
+        .is_empty());
         assert_eq!(
-            store.scan_overflow(7, NodeId::from_raw(3)).unwrap().len(),
+            ts_read(&engine, |s, txn| s
+                .scan_overflow(txn, 7, NodeId::from_raw(3))
+                .unwrap())
+            .len(),
             10,
         );
     }
@@ -1567,7 +1698,7 @@ mod tests {
         // sequence via ScriptedClock so we know exactly which
         // stamps land on which measurement.
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig {
             max_count: 3,
             granularity_span: Duration::from_secs(3600),
@@ -1576,7 +1707,7 @@ mod tests {
         let clock = std::sync::Arc::new(crate::clock::ScriptedClock::new(vec![
             1_000_000, 2_000_000, 3_000_000,
         ]));
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1, clock).unwrap();
+        let catalog = BucketCatalog::new(cfg, 0, &store, &engine, 1, clock).unwrap();
         let meta = rmpv::Value::String("sensor-1".into());
 
         catalog
@@ -1592,10 +1723,10 @@ mod tests {
 
         // Read back via the store, verify ingestion-ts column has
         // exactly the three stamps in the order the catalog assigned.
-        let bucket = store
-            .get_bucket(0, NodeId::from_raw(1))
-            .unwrap()
-            .expect("bucket persisted");
+        let bucket = ts_read(&engine, |s, txn| {
+            s.get_bucket(txn, 0, NodeId::from_raw(1)).unwrap()
+        })
+        .expect("bucket persisted");
         assert_eq!(bucket.control.count, 3);
         assert_eq!(
             bucket.ingestion_timestamps,
@@ -1619,10 +1750,10 @@ mod tests {
         // with the clock value — otherwise a malicious client could
         // backdate writes and break `AS OF INGESTION_TIME` semantics.
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig::arch_defaults();
         let clock = std::sync::Arc::new(crate::clock::ScriptedClock::new(vec![999]));
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1, clock).unwrap();
+        let catalog = BucketCatalog::new(cfg, 0, &store, &engine, 1, clock).unwrap();
         let meta = rmpv::Value::String("sensor".into());
 
         // Caller tries to claim ingestion_ts = 1 (far past) on a
@@ -1635,10 +1766,10 @@ mod tests {
         catalog.flush_all().unwrap();
 
         // Read back: engine MUST have overwritten to the clock's 999.
-        let bucket = store
-            .get_bucket(0, NodeId::from_raw(1))
-            .unwrap()
-            .expect("bucket persisted");
+        let bucket = ts_read(&engine, |s, txn| {
+            s.get_bucket(txn, 0, NodeId::from_raw(1)).unwrap()
+        })
+        .expect("bucket persisted");
         assert_eq!(
             bucket.ingestion_timestamps,
             vec![999],
@@ -1654,10 +1785,10 @@ mod tests {
         // storage payoff — non-bitemporal labels (95% TS workloads)
         // pay zero per-measurement overhead for the bitemporal axis.
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig::arch_defaults();
         let clock = std::sync::Arc::new(crate::clock::ScriptedClock::new(vec![1, 2, 3]));
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1, clock).unwrap();
+        let catalog = BucketCatalog::new(cfg, 0, &store, &engine, 1, clock).unwrap();
         let meta = rmpv::Value::String("iot-sensor".into());
 
         // Caller even pre-stamps — engine still wipes (engine-assigned-only).
@@ -1671,10 +1802,10 @@ mod tests {
         catalog.write_measurement(7, meta.clone(), m3).unwrap();
         catalog.flush_all().unwrap();
 
-        let bucket = store
-            .get_bucket(0, NodeId::from_raw(1))
-            .unwrap()
-            .expect("bucket persisted");
+        let bucket = ts_read(&engine, |s, txn| {
+            s.get_bucket(txn, 0, NodeId::from_raw(1)).unwrap()
+        })
+        .expect("bucket persisted");
         assert_eq!(bucket.timestamps.len(), 3, "event-time column populated");
         assert!(
             bucket.ingestion_timestamps.is_empty(),
@@ -1696,14 +1827,14 @@ mod tests {
         // Tier-3 overflow path under event-time-only mode: caller
         // pre-stamp wiped, overflow row stored with None.
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig {
             max_count: 2,
             granularity_span: Duration::from_millis(50),
             ..CatalogConfig::default()
         };
         let clock = std::sync::Arc::new(crate::clock::ScriptedClock::new(vec![1, 2, 3]));
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1, clock).unwrap();
+        let catalog = BucketCatalog::new(cfg, 0, &store, &engine, 1, clock).unwrap();
         let meta = rmpv::Value::String("s".into());
 
         // Open + flush a bucket via the event-time-only path.
@@ -1724,7 +1855,9 @@ mod tests {
 
         // Tier-3 overflow row must have ingestion_ts_us = None
         // (engine wiped, even on the overflow path).
-        let entries = store.scan_overflow(7, NodeId::from_raw(1)).unwrap();
+        let entries = ts_read(&engine, |s, txn| {
+            s.scan_overflow(txn, 7, NodeId::from_raw(1)).unwrap()
+        });
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries[0].measurement.ingestion_ts_us, None,
@@ -1740,7 +1873,6 @@ mod tests {
         // measurements iterator must then yield `ingestion_ts_us = None`
         // for every row, not panic or yield zeros.
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
 
         // Hand-build a v1-shape bucket (no ingestion_timestamps column)
         // via Bucket::from_measurements with all Nones — verifies the
@@ -1753,12 +1885,16 @@ mod tests {
             legacy_bucket.ingestion_timestamps.is_empty(),
             "all-None input must produce empty ingestion column (legacy shape on wire)",
         );
-        store
-            .put_bucket(0, NodeId::from_raw(42), &legacy_bucket)
-            .unwrap();
+        ts_write(&engine, |s, txn| {
+            s.put_bucket(txn, 0, NodeId::from_raw(42), &legacy_bucket)
+                .unwrap();
+        });
 
         // Round-trip through the store.
-        let read_back = store.get_bucket(0, NodeId::from_raw(42)).unwrap().unwrap();
+        let read_back = ts_read(&engine, |s, txn| {
+            s.get_bucket(txn, 0, NodeId::from_raw(42)).unwrap()
+        })
+        .unwrap();
         assert!(
             read_back.ingestion_timestamps.is_empty(),
             "legacy bucket round-trip preserves empty ingestion column",
@@ -1779,7 +1915,7 @@ mod tests {
         // every original stamp (no backfill needed, all stamps from
         // the original writer's clock).
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig {
             max_count: 2,
             granularity_span: Duration::from_millis(50),
@@ -1789,7 +1925,7 @@ mod tests {
         // overflow writes + backfill safety margin.
         let stamps: Vec<i64> = (1_000_000..1_000_100).collect();
         let clock = std::sync::Arc::new(crate::clock::ScriptedClock::new(stamps.clone()));
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1, clock).unwrap();
+        let catalog = BucketCatalog::new(cfg, 0, &store, &engine, 1, clock).unwrap();
         let meta = rmpv::Value::String("s".into());
 
         // 2 base measurements + flush (closes bucket).
@@ -1820,7 +1956,10 @@ mod tests {
 
         // Post-compact: read back, every measurement still has Some
         // ingestion_ts. Column length matches event-time column.
-        let merged = store.get_bucket(0, NodeId::from_raw(1)).unwrap().unwrap();
+        let merged = ts_read(&engine, |s, txn| {
+            s.get_bucket(txn, 0, NodeId::from_raw(1)).unwrap()
+        })
+        .unwrap();
         assert_eq!(merged.timestamps.len(), 53);
         assert_eq!(
             merged.ingestion_timestamps.len(),
@@ -1850,7 +1989,7 @@ mod tests {
         // the column (half-stamped → drop) and lose the bitemporal
         // axis on every legacy bucket touched.
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
 
         // Plant a legacy bucket directly (no catalog write — bypasses
         // the stamping path). 5 measurements, no ingestion column.
@@ -1864,11 +2003,12 @@ mod tests {
             legacy_bucket.ingestion_timestamps.is_empty(),
             "plant precondition: legacy bucket has empty ingestion column",
         );
-        store
-            .put_bucket(0, NodeId::from_raw(1), &legacy_bucket)
-            .unwrap();
-        // Mark closed manually so compact_if_needed proceeds.
-        store.mark_closed(0, NodeId::from_raw(1)).unwrap();
+        ts_write(&engine, |s, txn| {
+            s.put_bucket(txn, 0, NodeId::from_raw(1), &legacy_bucket)
+                .unwrap();
+            // Mark closed manually so compact_if_needed proceeds.
+            s.mark_closed(txn, 0, NodeId::from_raw(1)).unwrap();
+        });
 
         // Set up catalog with a deterministic clock. Stamps:
         //   5 backfills (for legacy base) + 51 overflow writes
@@ -1880,14 +2020,15 @@ mod tests {
             granularity_span: Duration::from_millis(50),
             ..CatalogConfig::default()
         };
-        let catalog = BucketCatalog::new(cfg, 0, &store, 100, clock).unwrap();
+        let catalog = BucketCatalog::new(cfg, 0, &store, &engine, 100, clock).unwrap();
 
         // 51 overflow writes — manually since the catalog doesn't
         // know about the planted bucket. Route them directly via
-        // store.put_overflow so they target bucket 1.
-        for i in 0..51 {
-            store
-                .put_overflow(
+        // put_overflow so they target bucket 1.
+        ts_write(&engine, |s, txn| {
+            for i in 0..51 {
+                s.put_overflow(
+                    txn,
                     7,
                     NodeId::from_raw(1),
                     &coordinode_modality::OverflowEntry {
@@ -1906,14 +2047,18 @@ mod tests {
                     },
                 )
                 .unwrap();
-        }
+            }
+        });
 
         // Compact — must backfill the 5 legacy measurements with
         // clock stamps, keep the 51 overflow stamps verbatim.
         assert!(catalog.compact_if_needed(7, NodeId::from_raw(1)).unwrap());
 
         // Verify: merged bucket has 56 measurements, all stamped.
-        let merged = store.get_bucket(0, NodeId::from_raw(1)).unwrap().unwrap();
+        let merged = ts_read(&engine, |s, txn| {
+            s.get_bucket(txn, 0, NodeId::from_raw(1)).unwrap()
+        })
+        .unwrap();
         assert_eq!(merged.timestamps.len(), 56, "5 base + 51 overflow");
         assert_eq!(
             merged.ingestion_timestamps.len(),
@@ -1948,7 +2093,7 @@ mod tests {
         // catalog assigned. Verify by writing far-late, then
         // reading back via scan_overflow.
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig {
             max_count: 2,
             granularity_span: Duration::from_millis(50),
@@ -1957,7 +2102,7 @@ mod tests {
         let clock = std::sync::Arc::new(crate::clock::ScriptedClock::new(vec![
             777_000, 888_000, 999_000,
         ]));
-        let catalog = BucketCatalog::new(cfg, 0, &store, 1, clock).unwrap();
+        let catalog = BucketCatalog::new(cfg, 0, &store, &engine, 1, clock).unwrap();
         let meta = rmpv::Value::String("s".into());
 
         // Open + flush a bucket so the LRU has a handle. Bitemporal
@@ -1985,7 +2130,9 @@ mod tests {
             .unwrap();
 
         // Inspect the overflow row directly.
-        let entries = store.scan_overflow(7, NodeId::from_raw(1)).unwrap();
+        let entries = ts_read(&engine, |s, txn| {
+            s.scan_overflow(txn, 7, NodeId::from_raw(1)).unwrap()
+        });
         assert_eq!(entries.len(), 1, "Tier-3 routed the late write to overflow");
         assert_eq!(
             entries[0].measurement.ingestion_ts_us,
@@ -1997,12 +2144,13 @@ mod tests {
     #[test]
     fn compact_all_pending_no_op_when_overflow_set_empty() {
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig::arch_defaults();
         let catalog = BucketCatalog::new(
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )
@@ -2013,7 +2161,7 @@ mod tests {
     #[test]
     fn concurrent_writers_distinct_keys_scale_across_stripes() {
         let (_dir, engine) = mk_engine();
-        let store = LocalTimeSeriesStore::new(&engine);
+        let store = LocalTimeSeriesStore;
         let cfg = CatalogConfig {
             max_count: 1000,
             ..CatalogConfig::default()
@@ -2022,6 +2170,7 @@ mod tests {
             cfg,
             0,
             &store,
+            &engine,
             1,
             std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
         )

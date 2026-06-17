@@ -115,7 +115,7 @@ pub trait VectorStore: Send + Sync {
 
     /// KNN search with an explicit strategy. `SearchMode::Hnsw` follows
     /// the graph using the index's configured `ef_search` (matches
-    /// [`knn_search`]). `SearchMode::Exact` runs a brute-force linear
+    /// [`Self::knn_search`]). `SearchMode::Exact` runs a brute-force linear
     /// scan over every stored vector and returns recall=1.0 top-k. The
     /// store owns one set of vectors; both modes read the same data.
     ///

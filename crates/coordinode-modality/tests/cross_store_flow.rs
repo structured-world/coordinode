@@ -4,7 +4,7 @@
 //!
 //! Scope: realistic flows that touch ≥2 stores in one transaction-ish
 //! sequence. Not exhaustive — focused on the patterns the query
-//! layer's `runner.rs` will compose once R165 migration lands.
+//! layer's `runner.rs` will compose once the store-trait migration lands.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -32,6 +32,29 @@ fn commit(txn: &mut Transaction) {
         nvme_write_buffer: None,
     };
     txn.commit(&ctx).expect("commit");
+}
+
+/// Run store writes in one MVCC transaction (shard-agnostic) and commit.
+fn write_txn(
+    engine: &coordinode_storage::engine::core::StorageEngine,
+    body: impl FnOnce(&mut Transaction),
+) {
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let read_ts = oracle.next();
+    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    body(&mut txn);
+    commit(&mut txn);
+}
+
+/// Run a store read closure against the latest committed snapshot.
+fn read_txn<R>(
+    engine: &coordinode_storage::engine::core::StorageEngine,
+    body: impl FnOnce(&Transaction) -> R,
+) -> R {
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let read_ts = oracle.next();
+    let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    body(&txn)
 }
 
 /// Seed a node via an MVCC transaction + commit.
@@ -79,7 +102,7 @@ fn node_edge_index_document_flow() {
     let engine = &fx.engine;
     let edges = LocalEdgeStore;
     let indexes = LocalIndexStore::new(engine);
-    let docs = LocalDocumentStore::new(engine);
+    let docs = LocalDocumentStore;
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
 
     let alice = NodeId::from_raw(1);
@@ -113,15 +136,21 @@ fn node_edge_index_document_flow() {
         commit(&mut txn);
     }
 
-    // 4. Document update on alice's profile sub-tree.
-    docs.set_path(
-        0,
-        alice,
-        coordinode_core::graph::doc_delta::PathTarget::Extra,
-        vec!["profile".into(), "city".into()],
-        rmpv::Value::String("Berlin".into()),
-    )
-    .expect("doc update");
+    // 4. Document update on alice's profile sub-tree (buffered, committed).
+    {
+        let read_ts = oracle.next();
+        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        docs.set_path(
+            &mut txn,
+            0,
+            alice,
+            coordinode_core::graph::doc_delta::PathTarget::Extra,
+            vec!["profile".into(), "city".into()],
+            rmpv::Value::String("Berlin".into()),
+        )
+        .expect("doc update");
+        commit(&mut txn);
+    }
 
     // --- Cross-store read-back ---
 
@@ -186,15 +215,14 @@ fn node_edge_index_document_flow() {
 fn vector_spatial_timeseries_on_same_logical_entity() {
     let fx = open_shared_engine();
     let engine = &fx.engine;
-    let spatial = LocalSpatialStore::new(engine);
-    let ts = LocalTimeSeriesStore::new(engine);
+    let spatial = LocalSpatialStore;
+    let ts = LocalTimeSeriesStore;
 
     let sensor = NodeId::from_raw(42);
     put_node(engine, 0, sensor, &NodeRecord::new("Sensor"));
 
     // Spatial: sensor's GPS location.
     let loc = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
-    spatial.insert(1, sensor, &loc).expect("spatial insert");
 
     // TimeSeries: bucket of readings keyed by the same node id.
     let mut m1 = BTreeMap::new();
@@ -219,7 +247,14 @@ fn vector_spatial_timeseries_on_same_logical_entity() {
     // Bucket uses a DIFFERENT node id (buckets are nodes too —
     // bucket_id is distinct from sensor_id).
     let bucket_id = NodeId::from_raw(43);
-    ts.put_bucket(0, bucket_id, &bucket).expect("ts put");
+    // Spatial point + time-series bucket buffer on one transaction and
+    // commit together.
+    write_txn(engine, |txn| {
+        spatial
+            .insert(txn, 1, sensor, &loc)
+            .expect("spatial insert");
+        ts.put_bucket(txn, 0, bucket_id, &bucket).expect("ts put");
+    });
 
     // --- Read back ---
 
@@ -228,14 +263,17 @@ fn vector_spatial_timeseries_on_same_logical_entity() {
         lower: Point::new_2d(Crs::Wgs84_2d, 2.0, 48.0),
         upper: Point::new_2d(Crs::Wgs84_2d, 3.0, 49.0),
     };
-    let hits = spatial
-        .scan_within_bbox(1, Crs::Wgs84_2d, &bbox)
-        .expect("scan");
+    let hits = read_txn(engine, |txn| {
+        spatial
+            .scan_within_bbox(txn, 1, Crs::Wgs84_2d, &bbox)
+            .expect("scan")
+    });
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].0, sensor);
 
     // TimeSeries: bucket round-trips with stats.
-    let ts_back = ts.get_bucket(0, bucket_id).expect("ok").expect("Some");
+    let ts_back =
+        read_txn(engine, |txn| ts.get_bucket(txn, 0, bucket_id).expect("ok")).expect("Some");
     assert_eq!(ts_back.control.count, 2);
     assert_eq!(ts_back.control.time_min_us, 100);
     assert_eq!(ts_back.control.time_max_us, 200);
@@ -254,7 +292,7 @@ fn schema_blob_node_consistency() {
 
     let fx = open_shared_engine();
     let engine = &fx.engine;
-    let blobs = LocalBlobStore::new(engine);
+    let blobs = LocalBlobStore;
 
     let node = NodeId::from_raw(7);
     put_node(engine, 0, node, &NodeRecord::new("Document"));
@@ -264,26 +302,27 @@ fn schema_blob_node_consistency() {
         (ChunkId::from_data(b"chunk-a"), b"chunk-a".to_vec()),
         (ChunkId::from_data(b"chunk-b"), b"chunk-b".to_vec()),
     ];
-    blobs.put_chunks(&chunks).expect("chunks");
-
     let blob_ref = BlobRef {
         total_size: 14,
         chunks: chunks.iter().map(|(id, _)| *id).collect(),
     };
-    blobs.put_blob_ref(node, 0, &blob_ref).expect("ref");
+    // Chunks + ref buffer on one transaction and commit together.
+    write_txn(engine, |txn| {
+        blobs.put_chunks(txn, &chunks).expect("chunks");
+        blobs.put_blob_ref(txn, node, 0, &blob_ref).expect("ref");
+    });
 
     // Cross-store assertions.
-    let loaded_ref = blobs
-        .get_blob_ref(node, 0)
-        .expect("ok")
-        .expect("ref present");
+    let loaded_ref =
+        read_txn(engine, |txn| blobs.get_blob_ref(txn, node, 0).expect("ok")).expect("ref present");
     assert_eq!(loaded_ref.total_size, 14);
     assert_eq!(loaded_ref.chunks.len(), 2);
 
     // Chunks reassemble to the original payload.
     let mut reassembled = Vec::new();
     for id in &loaded_ref.chunks {
-        let chunk = blobs.get_chunk(id).expect("ok").expect("chunk present");
+        let chunk =
+            read_txn(engine, |txn| blobs.get_chunk(txn, id).expect("ok")).expect("chunk present");
         reassembled.extend_from_slice(&chunk);
     }
     assert_eq!(reassembled, b"chunk-achunk-b");

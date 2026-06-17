@@ -121,8 +121,8 @@ pub trait NodeStore {
 
     /// Buffer a document-delta operand for `(shard, id)` (encodes the node
     /// key; `operand` is a pre-built `DocDelta::encode()` blob). Applied via
-    /// [`Self::materialize_pending_deltas`] on the next read and drained at
-    /// commit — the `SET n.path = x` / `REMOVE n.path` write path.
+    /// [`LocalNodeStore::materialize_pending_deltas`] on the next read and
+    /// drained at commit — the `SET n.path = x` / `REMOVE n.path` write path.
     fn buffer_node_delta(
         &self,
         txn: &mut Transaction,

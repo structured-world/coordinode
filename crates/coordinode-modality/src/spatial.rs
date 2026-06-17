@@ -53,13 +53,30 @@
 //!   covering), spatial histograms / cardinality estimates (planner
 //!   concern). 3D Hilbert and proper S2 cells land as follow-up; the
 //!   trait surface is already shaped for them.
+//!
+//! ## Transaction threading (ADR-041)
+//!
+//! Spatial point entries are a secondary index in [`Partition::Idx`].
+//! Writes (`insert` / `delete`) take `&mut Transaction` and buffer the
+//! index-row mutation on it, so the spatial entry commits atomically
+//! with the node write that produced the point. Reads
+//! (`scan_within_bbox` / `knn_nearest`) take `&Transaction` and walk
+//! the committed MVCC snapshot via
+//! [`Transaction::base_prefix_scan`] — untracked, so a candidate scan
+//! never balloons the OCC read set over an entire label's points. The
+//! Layer-3 transaction read path exposes only prefix scans (no
+//! engine-level byte-range scan), so the bbox scan walks the
+//! `(label_id, crs)` prefix once and applies the Z-curve interval
+//! filter in memory.
+//!
+//! [`Transaction`]: coordinode_storage::engine::transaction::Transaction
+//! [`Transaction::base_prefix_scan`]: coordinode_storage::engine::transaction::Transaction::base_prefix_scan
 
 use std::cmp::Ordering;
 
 use coordinode_core::graph::node::NodeId;
-use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_storage::Guard;
+use coordinode_storage::engine::transaction::Transaction;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{StoreError, StoreResult};
@@ -144,79 +161,51 @@ pub struct Bbox {
 /// Layer-4 spatial store contract. Every method is keyed by
 /// `(label_id, crs)` — one logical index per `(label, property)` pair
 /// in the higher schema layer.
+///
+/// ## Transaction threading (ADR-041)
+///
+/// Writes ([`Self::insert`] / [`Self::delete`]) take `&mut Transaction`
+/// and buffer the point-index `Partition::Idx` mutation on it, so the
+/// spatial entry commits atomically with the node write that produced
+/// the point. Reads ([`Self::scan_within_bbox`] / [`Self::knn_nearest`])
+/// take `&Transaction` and walk the committed MVCC snapshot via
+/// [`Transaction::base_prefix_scan`] — untracked (a candidate scan must
+/// not balloon the OCC read set over an entire label's points).
 pub trait SpatialStore {
-    /// Index a point.
+    /// Index a point. Buffers the `(label_id, crs, curve, node_id)`
+    /// row on `txn`.
     ///
-    /// **Contract gotcha:** the index key is
-    /// `(label_id, crs, curve, node_id)` — so writing the *same*
-    /// `node_id` with *different* coordinates lands in a *different*
-    /// physical row. The old row is NOT garbage-collected by this
-    /// call. Callers updating a moving point MUST call
-    /// [`Self::delete`] with the OLD coordinates first (or use a
-    /// dedicated upsert helper at the layer above, which can hide
-    /// the old-coord bookkeeping). Inserting the same `(node_id,
-    /// coords)` pair twice IS idempotent (same key, same body).
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use coordinode_modality::{LocalSpatialStore, SpatialStore, Crs, Point};
-    /// # use coordinode_core::graph::node::NodeId;
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/x"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSpatialStore::new(&engine);
-    /// let paris = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
-    /// store.insert(1, NodeId::from_raw(1), &paris)?;
-    /// # Ok::<_, Box<dyn std::error::Error>>(())
-    /// ```
-    fn insert(&self, label_id: u32, node_id: NodeId, point: &Point) -> StoreResult<()>;
+    /// **Contract gotcha:** writing the *same* `node_id` with
+    /// *different* coordinates lands in a *different* physical row
+    /// (the curve is part of the key). The old row is NOT
+    /// garbage-collected by this call — callers updating a moving
+    /// point MUST [`Self::delete`] the OLD coordinates first.
+    /// Inserting the same `(node_id, coords)` pair twice IS idempotent.
+    fn insert(
+        &self,
+        txn: &mut Transaction,
+        label_id: u32,
+        node_id: NodeId,
+        point: &Point,
+    ) -> StoreResult<()>;
 
     /// Remove the entry for `node_id` previously written with `point`.
     /// Idempotent on a missing key.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use coordinode_modality::{LocalSpatialStore, SpatialStore, Crs, Point};
-    /// # use coordinode_core::graph::node::NodeId;
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/x"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSpatialStore::new(&engine);
-    /// let p = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
-    /// store.delete(1, NodeId::from_raw(1), &p)?;
-    /// # Ok::<_, Box<dyn std::error::Error>>(())
-    /// ```
-    fn delete(&self, label_id: u32, node_id: NodeId, point: &Point) -> StoreResult<()>;
+    fn delete(
+        &self,
+        txn: &mut Transaction,
+        label_id: u32,
+        node_id: NodeId,
+        point: &Point,
+    ) -> StoreResult<()>;
 
     /// Range-scan candidates whose curve key falls inside the
     /// quantised window of `bbox`, then post-filter by exact bbox
     /// containment on the original `f64` coordinates. Returns
     /// `(node_id, point)` pairs in curve-key order.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use coordinode_modality::{LocalSpatialStore, SpatialStore, Crs, Point, Bbox};
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/x"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSpatialStore::new(&engine);
-    /// let bbox = Bbox {
-    ///     lower: Point::new_2d(Crs::Wgs84_2d, 2.0, 48.0),
-    ///     upper: Point::new_2d(Crs::Wgs84_2d, 3.0, 49.0),
-    /// };
-    /// let hits = store.scan_within_bbox(1, Crs::Wgs84_2d, &bbox)?;
-    /// # Ok::<_, Box<dyn std::error::Error>>(())
-    /// ```
     fn scan_within_bbox(
         &self,
+        txn: &Transaction,
         label_id: u32,
         crs: Crs,
         bbox: &Bbox,
@@ -226,23 +215,9 @@ pub trait SpatialStore {
     /// whole `(label_id, crs)` partition and keeps the top-k by exact
     /// distance — fine for trait-level CE; an EE / indexed
     /// implementation can specialise this method.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use coordinode_modality::{LocalSpatialStore, SpatialStore, Crs, Point};
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/x"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalSpatialStore::new(&engine);
-    /// let center = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
-    /// let knn = store.knn_nearest(1, Crs::Wgs84_2d, &center, 5)?;
-    /// # Ok::<_, Box<dyn std::error::Error>>(())
-    /// ```
     fn knn_nearest(
         &self,
+        txn: &Transaction,
         label_id: u32,
         crs: Crs,
         center: &Point,
@@ -250,40 +225,10 @@ pub trait SpatialStore {
     ) -> StoreResult<Vec<(NodeId, Point, f64)>>;
 }
 
-/// CE single-shard `SpatialStore` implementation.
-pub struct LocalSpatialStore<'a> {
-    engine: &'a StorageEngine,
-}
-
-impl<'a> LocalSpatialStore<'a> {
-    /// Wrap a storage engine for spatial store operations.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use coordinode_modality::{LocalSpatialStore, SpatialStore, Crs, Point, Bbox};
-    /// use coordinode_core::graph::node::NodeId;
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/store"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm,
-    /// # )]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalSpatialStore::new(&engine);
-    /// let paris = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
-    /// store.insert(1, NodeId::from_raw(1), &paris)?;
-    /// let bbox = Bbox {
-    ///     lower: Point::new_2d(Crs::Wgs84_2d, 2.0, 48.0),
-    ///     upper: Point::new_2d(Crs::Wgs84_2d, 3.0, 49.0),
-    /// };
-    /// let hits = store.scan_within_bbox(1, Crs::Wgs84_2d, &bbox)?;
-    /// assert_eq!(hits.len(), 1);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn new(engine: &'a StorageEngine) -> Self {
-        Self { engine }
-    }
-}
+/// CE single-shard `SpatialStore` implementation. Stateless — all
+/// storage access flows through the [`Transaction`] passed to each
+/// method (ADR-041).
+pub struct LocalSpatialStore;
 
 fn encode_spatial_prefix(label_id: u32, crs: Crs) -> Vec<u8> {
     let mut out = Vec::with_capacity(SPATIAL_PREFIX.len() + 4 + 2);
@@ -332,7 +277,7 @@ fn decode_node_id_from_key(key: &[u8]) -> Option<NodeId> {
 ///     within the rim cell).
 ///
 /// Algorithm: recursive power-of-2 quadrant subdivision starting
-/// from the full `[0, 2^32)` space (G101, Tropf-Herzog 1981 family).
+/// from the full `[0, 2^32)` space (Tropf-Herzog 1981 family).
 ///
 /// **Hard caps** prevent runaway output on adversarial bbox shapes:
 /// - `DEPTH_CAP` bounds recursion depth. At max depth the cell is
@@ -484,8 +429,8 @@ fn morton_intervals(bbox: &Bbox) -> Vec<(u64, u64)> {
     // Threshold set effectively-disabling: decomposition only
     // triggers on ratios above 100_000, which no current bbox
     // shape produces. The function and helpers remain in tree as
-    // **G101 scaffold** for the proper upstream-supported re-attempt
-    // (lsm-tree iterator-level skip primitive — see GAPS.md G101).
+    // scaffold for the proper upstream-supported re-attempt once the
+    // lsm-tree iterator-level skip primitive lands.
     const GAIN_THRESHOLD: u64 = 100_000;
 
     let (x_min, x_max, y_min, y_max) = match bbox.lower.crs {
@@ -716,76 +661,82 @@ fn point_in_bbox(point: &Point, bbox: &Bbox) -> bool {
     true
 }
 
-impl SpatialStore for LocalSpatialStore<'_> {
-    fn insert(&self, label_id: u32, node_id: NodeId, point: &Point) -> StoreResult<()> {
+/// Decode the 8-byte curve value from a spatial key
+/// (`<prefix><curve:8 BE><node_id:8 BE>`). Returns `None` for a
+/// malformed (too-short) key.
+fn decode_curve_from_key(key: &[u8]) -> Option<u64> {
+    let curve_end = key.len().checked_sub(8)?;
+    let curve_start = curve_end.checked_sub(8)?;
+    let curve_bytes: [u8; 8] = key.get(curve_start..curve_end)?.try_into().ok()?;
+    Some(u64::from_be_bytes(curve_bytes))
+}
+
+impl SpatialStore for LocalSpatialStore {
+    fn insert(
+        &self,
+        txn: &mut Transaction,
+        label_id: u32,
+        node_id: NodeId,
+        point: &Point,
+    ) -> StoreResult<()> {
         let curve = encode_curve(point);
         let key = encode_spatial_key(label_id, point.crs, curve, node_id);
         let body = encode_body(point)?;
-        self.engine.put(Partition::Idx, &key, &body)?;
+        txn.put(Partition::Idx, &key, &body)?;
         Ok(())
     }
 
-    fn delete(&self, label_id: u32, node_id: NodeId, point: &Point) -> StoreResult<()> {
+    fn delete(
+        &self,
+        txn: &mut Transaction,
+        label_id: u32,
+        node_id: NodeId,
+        point: &Point,
+    ) -> StoreResult<()> {
         let curve = encode_curve(point);
         let key = encode_spatial_key(label_id, point.crs, curve, node_id);
-        self.engine.delete(Partition::Idx, &key)?;
+        txn.delete(Partition::Idx, &key)?;
         Ok(())
     }
 
     fn scan_within_bbox(
         &self,
+        txn: &Transaction,
         label_id: u32,
         crs: Crs,
         bbox: &Bbox,
     ) -> StoreResult<Vec<(NodeId, Point)>> {
-        // **G101 (2026-05-21 second attempt):** Z-curve subrange
-        // decomposition with hard caps + cell-merging + adaptive
-        // bailout. `morton_intervals` decides between:
-        //   - Single broad interval (current bbox spans the curve
-        //     window densely — broad scan is already optimal,
-        //     decomposition would add per-interval setup overhead).
-        //   - Multiple disjoint intervals (bbox is sparse on the
-        //     curve — long thin equatorial band etc. — dead Z-curve
-        //     subranges are skipped at LSM level).
+        // Z-curve subrange decomposition with
+        // hard caps + cell-merging + adaptive bailout.
+        // `morton_intervals` decides between a single broad interval
+        // (bbox spans the curve window densely) and multiple disjoint
+        // intervals (sparse on the curve — a long thin equatorial band
+        // etc.).
         //
-        // Key layout: `<prefix><curve:8 BE><node_id:8 BE>`. To cover
-        // all node_ids at the boundary curve, the start key uses the
-        // lowest possible node_id suffix (zeros) and the end key the
-        // highest (0xff). Both bounds are inclusive in lsm-tree's
-        // `range` API.
+        // Key layout: `<prefix><curve:8 BE><node_id:8 BE>`. The Layer-3
+        // [`Transaction`] read path exposes only prefix scans (no
+        // engine-level byte-range scan), so both paths walk the
+        // `(label_id, crs)` prefix once on the committed snapshot and
+        // apply the curve-interval filter in memory. The covering
+        // invariant (every bbox point's curve lies in some interval)
+        // makes the in-memory membership test exact; the dense-window
+        // path keeps the sorted early-break.
         let prefix = encode_spatial_prefix(label_id, crs);
         let intervals = morton_intervals(bbox);
+        let pairs = txn.base_prefix_scan(Partition::Idx, &prefix)?;
         let mut out = Vec::new();
 
-        // **Path choice**: for the single-interval case (adaptive
-        // bailout picked broad scan), `prefix_scan` + early-break
-        // on `curve > curve_max` is measurably faster than
-        // `range_scan` over the equivalent byte range — lsm-tree's
-        // `range` API has higher per-call setup than `prefix` and
-        // the dense-window walk-then-break wins. Multi-interval
-        // case amortises range_scan setup across multiple disjoint
-        // chunks so the cost is worth paying.
         if intervals.len() <= 1 {
             let (curve_min, curve_max) = intervals
                 .first()
                 .copied()
                 .unwrap_or_else(|| morton_window(bbox));
-            let iter = self.engine.prefix_scan(Partition::Idx, &prefix)?;
-            for guard in iter {
-                let (key, value) = guard.into_inner()?;
-                let curve_end = match key.len().checked_sub(8) {
-                    Some(end) => end,
-                    None => continue,
+            // base_prefix_scan yields keys in sorted (curve-ascending)
+            // order, so we can break once the curve passes curve_max.
+            for (key, value) in pairs {
+                let Some(curve) = decode_curve_from_key(&key) else {
+                    continue;
                 };
-                let curve_start = match curve_end.checked_sub(8) {
-                    Some(start) => start,
-                    None => continue,
-                };
-                let curve_bytes: [u8; 8] = match key[curve_start..curve_end].try_into() {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-                let curve = u64::from_be_bytes(curve_bytes);
                 if curve > curve_max {
                     break;
                 }
@@ -795,7 +746,7 @@ impl SpatialStore for LocalSpatialStore<'_> {
                 let Some(node_id) = decode_node_id_from_key(&key) else {
                     continue;
                 };
-                let point = decode_body(value.as_ref())?;
+                let point = decode_body(&value)?;
                 if point_in_bbox(&point, bbox) {
                     out.push((node_id, point));
                 }
@@ -803,29 +754,23 @@ impl SpatialStore for LocalSpatialStore<'_> {
             return Ok(out);
         }
 
-        // Multi-interval path: per-interval bounded range_scan.
-        for (curve_lo, curve_hi) in intervals {
-            let mut start_key = prefix.clone();
-            start_key.extend_from_slice(&curve_lo.to_be_bytes());
-            start_key.extend_from_slice(&[0u8; 8]);
-            let mut end_key = prefix.clone();
-            end_key.extend_from_slice(&curve_hi.to_be_bytes());
-            end_key.extend_from_slice(&[0xffu8; 8]);
-            let iter = self
-                .engine
-                .range_scan(Partition::Idx, &start_key, &end_key)?;
-            for guard in iter {
-                let (key, value) = guard.into_inner()?;
-                let Some(node_id) = decode_node_id_from_key(&key) else {
-                    continue;
-                };
-                let point = decode_body(value.as_ref())?;
-                // Intra-interval Z-shape false positives still
-                // possible at depth-cap fallback cells; exact
-                // post-filter is mandatory.
-                if point_in_bbox(&point, bbox) {
-                    out.push((node_id, point));
-                }
+        // Multi-interval path: a row qualifies if its curve falls in any
+        // decomposition interval. Intra-interval Z-shape false positives
+        // are still possible at depth-cap fallback cells, so the exact
+        // `point_in_bbox` post-filter is mandatory.
+        for (key, value) in pairs {
+            let Some(curve) = decode_curve_from_key(&key) else {
+                continue;
+            };
+            if !intervals.iter().any(|&(lo, hi)| curve >= lo && curve <= hi) {
+                continue;
+            }
+            let Some(node_id) = decode_node_id_from_key(&key) else {
+                continue;
+            };
+            let point = decode_body(&value)?;
+            if point_in_bbox(&point, bbox) {
+                out.push((node_id, point));
             }
         }
         Ok(out)
@@ -833,6 +778,7 @@ impl SpatialStore for LocalSpatialStore<'_> {
 
     fn knn_nearest(
         &self,
+        txn: &Transaction,
         label_id: u32,
         crs: Crs,
         center: &Point,
@@ -843,13 +789,11 @@ impl SpatialStore for LocalSpatialStore<'_> {
         }
         let prefix = encode_spatial_prefix(label_id, crs);
         let mut candidates: Vec<(NodeId, Point, f64)> = Vec::new();
-        let iter = self.engine.prefix_scan(Partition::Idx, &prefix)?;
-        for guard in iter {
-            let (key, value) = guard.into_inner()?;
+        for (key, value) in txn.base_prefix_scan(Partition::Idx, &prefix)? {
             let Some(node_id) = decode_node_id_from_key(&key) else {
                 continue;
             };
-            let point = decode_body(value.as_ref())?;
+            let point = decode_body(&value)?;
             let d = distance(center, &point);
             candidates.push((node_id, point, d));
         }
@@ -864,6 +808,11 @@ impl SpatialStore for LocalSpatialStore<'_> {
 mod tests {
     use super::*;
 
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use coordinode_core::txn::write_concern::WriteConcern;
+    use coordinode_storage::engine::core::StorageEngine;
+    use coordinode_storage::engine::transaction::CommitContext;
+
     /// Logic-test fixture (memory backing, env-flippable). Spatial
     /// Z-curve tests verify encoding/scan correctness, not
     /// persistence.
@@ -871,7 +820,41 @@ mod tests {
         coordinode_test_fixtures::engine_for_logic()
     }
 
-    // -- G101 Z-curve subrange decomposition --
+    /// Apply spatial writes in one MVCC transaction (shard-agnostic,
+    /// `Partition::Idx`) and commit, so the buffered index rows land
+    /// for a subsequent read.
+    fn write_spatial(
+        engine: &StorageEngine,
+        body: impl FnOnce(&LocalSpatialStore, &mut Transaction),
+    ) {
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        body(&LocalSpatialStore, &mut txn);
+        let wc = WriteConcern::majority();
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: None,
+            id_gen: None,
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        txn.commit(&ctx).expect("commit spatial");
+    }
+
+    /// Run a spatial read closure against the latest committed snapshot
+    /// through a fresh MVCC transaction.
+    fn read_spatial<R>(
+        engine: &StorageEngine,
+        body: impl FnOnce(&LocalSpatialStore, &Transaction) -> R,
+    ) -> R {
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        body(&LocalSpatialStore, &txn)
+    }
+
+    // -- Z-curve subrange decomposition --
 
     #[test]
     fn morton_decompose_full_space_yields_single_interval() {
@@ -991,8 +974,8 @@ mod tests {
         // produce ≥ 1 interval for any non-degenerate bbox. The
         // adaptive bailout is intentionally not asserted here:
         // morton_intervals is currently retained as dead-code
-        // scaffold for the proper G101 re-attempt (see GAPS.md
-        // G101 status note).
+        // scaffold for the proper subrange-decomposition re-attempt
+        // once the lsm-tree skip primitive lands.
         let wgs = morton_intervals(&Bbox {
             lower: Point::new_2d(Crs::Wgs84_2d, 0.0, 0.0),
             upper: Point::new_2d(Crs::Wgs84_2d, 1.0, 1.0),
@@ -1059,14 +1042,17 @@ mod tests {
     fn insert_then_scan_bbox_returns_point() {
         let fx = mk_engine();
         let engine = &fx.engine;
-        let store = LocalSpatialStore::new(engine);
         let paris = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
-        store.insert(1, NodeId::from_raw(1), &paris).unwrap();
+        write_spatial(engine, |s, txn| {
+            s.insert(txn, 1, NodeId::from_raw(1), &paris).unwrap();
+        });
         let bbox = Bbox {
             lower: Point::new_2d(Crs::Wgs84_2d, 2.0, 48.0),
             upper: Point::new_2d(Crs::Wgs84_2d, 3.0, 49.0),
         };
-        let hits = store.scan_within_bbox(1, Crs::Wgs84_2d, &bbox).unwrap();
+        let hits = read_spatial(engine, |s, txn| {
+            s.scan_within_bbox(txn, 1, Crs::Wgs84_2d, &bbox).unwrap()
+        });
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, NodeId::from_raw(1));
         assert!((hits[0].1.coords[0] - paris.coords[0]).abs() < 1e-6);
@@ -1076,18 +1062,20 @@ mod tests {
     fn scan_bbox_filters_outside_points() {
         let fx = mk_engine();
         let engine = &fx.engine;
-        let store = LocalSpatialStore::new(engine);
         let paris = Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566);
         let kyiv = Point::new_2d(Crs::Wgs84_2d, 30.5234, 50.4501);
-        store.insert(1, NodeId::from_raw(1), &paris).unwrap();
-        store.insert(1, NodeId::from_raw(2), &kyiv).unwrap();
+        write_spatial(engine, |s, txn| {
+            s.insert(txn, 1, NodeId::from_raw(1), &paris).unwrap();
+            s.insert(txn, 1, NodeId::from_raw(2), &kyiv).unwrap();
+        });
         let paris_bbox = Bbox {
             lower: Point::new_2d(Crs::Wgs84_2d, 1.5, 48.0),
             upper: Point::new_2d(Crs::Wgs84_2d, 3.0, 49.5),
         };
-        let hits = store
-            .scan_within_bbox(1, Crs::Wgs84_2d, &paris_bbox)
-            .unwrap();
+        let hits = read_spatial(engine, |s, txn| {
+            s.scan_within_bbox(txn, 1, Crs::Wgs84_2d, &paris_bbox)
+                .unwrap()
+        });
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, NodeId::from_raw(1));
     }
@@ -1096,15 +1084,18 @@ mod tests {
     fn delete_removes_point() {
         let fx = mk_engine();
         let engine = &fx.engine;
-        let store = LocalSpatialStore::new(engine);
         let p = Point::new_2d(Crs::Cartesian2d, 10.0, 20.0);
-        store.insert(7, NodeId::from_raw(42), &p).unwrap();
-        store.delete(7, NodeId::from_raw(42), &p).unwrap();
+        write_spatial(engine, |s, txn| {
+            s.insert(txn, 7, NodeId::from_raw(42), &p).unwrap();
+            s.delete(txn, 7, NodeId::from_raw(42), &p).unwrap();
+        });
         let bbox = Bbox {
             lower: Point::new_2d(Crs::Cartesian2d, 0.0, 0.0),
             upper: Point::new_2d(Crs::Cartesian2d, 100.0, 100.0),
         };
-        let hits = store.scan_within_bbox(7, Crs::Cartesian2d, &bbox).unwrap();
+        let hits = read_spatial(engine, |s, txn| {
+            s.scan_within_bbox(txn, 7, Crs::Cartesian2d, &bbox).unwrap()
+        });
         assert!(hits.is_empty());
     }
 
@@ -1112,24 +1103,27 @@ mod tests {
     fn knn_returns_closest_in_distance_order() {
         let fx = mk_engine();
         let engine = &fx.engine;
-        let store = LocalSpatialStore::new(engine);
         let pts = [
             (1u64, 0.0, 0.0),
             (2, 1.0, 0.0),
             (3, 5.0, 5.0),
             (4, 10.0, 10.0),
         ];
-        for (id, x, y) in pts {
-            store
-                .insert(
+        write_spatial(engine, |s, txn| {
+            for (id, x, y) in pts {
+                s.insert(
+                    txn,
                     3,
                     NodeId::from_raw(id),
                     &Point::new_2d(Crs::Cartesian2d, x, y),
                 )
                 .unwrap();
-        }
+            }
+        });
         let center = Point::new_2d(Crs::Cartesian2d, 0.0, 0.0);
-        let knn = store.knn_nearest(3, Crs::Cartesian2d, &center, 2).unwrap();
+        let knn = read_spatial(engine, |s, txn| {
+            s.knn_nearest(txn, 3, Crs::Cartesian2d, &center, 2).unwrap()
+        });
         assert_eq!(knn.len(), 2);
         assert_eq!(knn[0].0, NodeId::from_raw(1));
         assert_eq!(knn[1].0, NodeId::from_raw(2));
@@ -1140,16 +1134,19 @@ mod tests {
     fn knn_k_zero_returns_empty() {
         let fx = mk_engine();
         let engine = &fx.engine;
-        let store = LocalSpatialStore::new(engine);
-        store
-            .insert(
+        write_spatial(engine, |s, txn| {
+            s.insert(
+                txn,
                 1,
                 NodeId::from_raw(1),
                 &Point::new_2d(Crs::Cartesian2d, 0.0, 0.0),
             )
             .unwrap();
+        });
         let center = Point::new_2d(Crs::Cartesian2d, 0.0, 0.0);
-        let knn = store.knn_nearest(1, Crs::Cartesian2d, &center, 0).unwrap();
+        let knn = read_spatial(engine, |s, txn| {
+            s.knn_nearest(txn, 1, Crs::Cartesian2d, &center, 0).unwrap()
+        });
         assert!(knn.is_empty());
     }
 
@@ -1174,14 +1171,17 @@ mod tests {
     fn cartesian_3d_round_trip_and_knn() {
         let fx = mk_engine();
         let engine = &fx.engine;
-        let store = LocalSpatialStore::new(engine);
         let origin = Point::new_3d(Crs::Cartesian3d, 0.0, 0.0, 0.0);
         let near = Point::new_3d(Crs::Cartesian3d, 1.0, 1.0, 1.0);
         let far = Point::new_3d(Crs::Cartesian3d, 100.0, 100.0, 100.0);
-        store.insert(9, NodeId::from_raw(1), &origin).unwrap();
-        store.insert(9, NodeId::from_raw(2), &near).unwrap();
-        store.insert(9, NodeId::from_raw(3), &far).unwrap();
-        let knn = store.knn_nearest(9, Crs::Cartesian3d, &origin, 2).unwrap();
+        write_spatial(engine, |s, txn| {
+            s.insert(txn, 9, NodeId::from_raw(1), &origin).unwrap();
+            s.insert(txn, 9, NodeId::from_raw(2), &near).unwrap();
+            s.insert(txn, 9, NodeId::from_raw(3), &far).unwrap();
+        });
+        let knn = read_spatial(engine, |s, txn| {
+            s.knn_nearest(txn, 9, Crs::Cartesian3d, &origin, 2).unwrap()
+        });
         assert_eq!(knn.len(), 2);
         assert_eq!(knn[0].0, NodeId::from_raw(1));
         assert_eq!(knn[1].0, NodeId::from_raw(2));
@@ -1191,16 +1191,21 @@ mod tests {
     fn scoped_by_label_id() {
         let fx = mk_engine();
         let engine = &fx.engine;
-        let store = LocalSpatialStore::new(engine);
         let p = Point::new_2d(Crs::Cartesian2d, 1.0, 1.0);
-        store.insert(1, NodeId::from_raw(10), &p).unwrap();
-        store.insert(2, NodeId::from_raw(20), &p).unwrap();
+        write_spatial(engine, |s, txn| {
+            s.insert(txn, 1, NodeId::from_raw(10), &p).unwrap();
+            s.insert(txn, 2, NodeId::from_raw(20), &p).unwrap();
+        });
         let bbox = Bbox {
             lower: Point::new_2d(Crs::Cartesian2d, 0.0, 0.0),
             upper: Point::new_2d(Crs::Cartesian2d, 10.0, 10.0),
         };
-        let hits1 = store.scan_within_bbox(1, Crs::Cartesian2d, &bbox).unwrap();
-        let hits2 = store.scan_within_bbox(2, Crs::Cartesian2d, &bbox).unwrap();
+        let hits1 = read_spatial(engine, |s, txn| {
+            s.scan_within_bbox(txn, 1, Crs::Cartesian2d, &bbox).unwrap()
+        });
+        let hits2 = read_spatial(engine, |s, txn| {
+            s.scan_within_bbox(txn, 2, Crs::Cartesian2d, &bbox).unwrap()
+        });
         assert_eq!(hits1.len(), 1);
         assert_eq!(hits2.len(), 1);
         assert_eq!(hits1[0].0, NodeId::from_raw(10));
@@ -1215,18 +1220,21 @@ mod tests {
         // `insert`.
         let fx = mk_engine();
         let engine = &fx.engine;
-        let store = LocalSpatialStore::new(engine);
         let id = NodeId::from_raw(1);
         let p1 = Point::new_2d(Crs::Cartesian2d, 0.0, 0.0);
         let p2 = Point::new_2d(Crs::Cartesian2d, 100.0, 100.0);
-        store.insert(1, id, &p1).unwrap();
-        store.insert(1, id, &p2).unwrap();
+        write_spatial(engine, |s, txn| {
+            s.insert(txn, 1, id, &p1).unwrap();
+            s.insert(txn, 1, id, &p2).unwrap();
+        });
 
         let bbox = Bbox {
             lower: Point::new_2d(Crs::Cartesian2d, -200.0, -200.0),
             upper: Point::new_2d(Crs::Cartesian2d, 200.0, 200.0),
         };
-        let hits = store.scan_within_bbox(1, Crs::Cartesian2d, &bbox).unwrap();
+        let hits = read_spatial(engine, |s, txn| {
+            s.scan_within_bbox(txn, 1, Crs::Cartesian2d, &bbox).unwrap()
+        });
         // Both rows visible: stale-key behaviour the docstring warns
         // about.
         assert_eq!(hits.len(), 2);
@@ -1240,19 +1248,22 @@ mod tests {
         // insert(new). Exactly one row visible afterwards.
         let fx = mk_engine();
         let engine = &fx.engine;
-        let store = LocalSpatialStore::new(engine);
         let id = NodeId::from_raw(2);
         let p1 = Point::new_2d(Crs::Cartesian2d, 0.0, 0.0);
         let p2 = Point::new_2d(Crs::Cartesian2d, 50.0, 50.0);
-        store.insert(2, id, &p1).unwrap();
-        store.delete(2, id, &p1).unwrap();
-        store.insert(2, id, &p2).unwrap();
+        write_spatial(engine, |s, txn| {
+            s.insert(txn, 2, id, &p1).unwrap();
+            s.delete(txn, 2, id, &p1).unwrap();
+            s.insert(txn, 2, id, &p2).unwrap();
+        });
 
         let bbox = Bbox {
             lower: Point::new_2d(Crs::Cartesian2d, -100.0, -100.0),
             upper: Point::new_2d(Crs::Cartesian2d, 100.0, 100.0),
         };
-        let hits = store.scan_within_bbox(2, Crs::Cartesian2d, &bbox).unwrap();
+        let hits = read_spatial(engine, |s, txn| {
+            s.scan_within_bbox(txn, 2, Crs::Cartesian2d, &bbox).unwrap()
+        });
         assert_eq!(hits.len(), 1);
         assert!((hits[0].1.coords[0] - 50.0).abs() < 1e-6);
     }
@@ -1265,17 +1276,18 @@ mod tests {
         // composition layer above.
         let fx = mk_engine();
         let engine = &fx.engine;
-        let store = LocalSpatialStore::new(engine);
         let id = NodeId::from_raw(1);
-        store
-            .insert(1, id, &Point::new_2d(Crs::Cartesian2d, 0.0, 0.0))
-            .unwrap();
-        store
-            .insert(1, id, &Point::new_2d(Crs::Cartesian2d, 1.0, 1.0))
-            .unwrap();
+        write_spatial(engine, |s, txn| {
+            s.insert(txn, 1, id, &Point::new_2d(Crs::Cartesian2d, 0.0, 0.0))
+                .unwrap();
+            s.insert(txn, 1, id, &Point::new_2d(Crs::Cartesian2d, 1.0, 1.0))
+                .unwrap();
+        });
 
         let center = Point::new_2d(Crs::Cartesian2d, 0.0, 0.0);
-        let knn = store.knn_nearest(1, Crs::Cartesian2d, &center, 5).unwrap();
+        let knn = read_spatial(engine, |s, txn| {
+            s.knn_nearest(txn, 1, Crs::Cartesian2d, &center, 5).unwrap()
+        });
         let ids: Vec<u64> = knn.iter().map(|(id, _, _)| id.as_raw()).collect();
         assert_eq!(ids, vec![1, 1], "stale row produces duplicate id in knn");
     }
@@ -1286,17 +1298,20 @@ mod tests {
         // overwrites with identical bytes — net effect is one row.
         let fx = mk_engine();
         let engine = &fx.engine;
-        let store = LocalSpatialStore::new(engine);
         let id = NodeId::from_raw(3);
         let p = Point::new_2d(Crs::Cartesian2d, 5.0, 5.0);
-        store.insert(3, id, &p).unwrap();
-        store.insert(3, id, &p).unwrap();
+        write_spatial(engine, |s, txn| {
+            s.insert(txn, 3, id, &p).unwrap();
+            s.insert(txn, 3, id, &p).unwrap();
+        });
 
         let bbox = Bbox {
             lower: Point::new_2d(Crs::Cartesian2d, 0.0, 0.0),
             upper: Point::new_2d(Crs::Cartesian2d, 10.0, 10.0),
         };
-        let hits = store.scan_within_bbox(3, Crs::Cartesian2d, &bbox).unwrap();
+        let hits = read_spatial(engine, |s, txn| {
+            s.scan_within_bbox(txn, 3, Crs::Cartesian2d, &bbox).unwrap()
+        });
         assert_eq!(hits.len(), 1);
     }
 
@@ -1307,26 +1322,29 @@ mod tests {
         // both match.
         let fx = mk_engine();
         let engine = &fx.engine;
-        let store = LocalSpatialStore::new(engine);
         let bbox = Bbox {
             lower: Point::new_2d(Crs::Cartesian2d, 10.0, 20.0),
             upper: Point::new_2d(Crs::Cartesian2d, 30.0, 40.0),
         };
-        store
-            .insert(
+        write_spatial(engine, |s, txn| {
+            s.insert(
+                txn,
                 5,
                 NodeId::from_raw(1),
                 &Point::new_2d(Crs::Cartesian2d, 10.0, 20.0),
             )
             .unwrap();
-        store
-            .insert(
+            s.insert(
+                txn,
                 5,
                 NodeId::from_raw(2),
                 &Point::new_2d(Crs::Cartesian2d, 30.0, 40.0),
             )
             .unwrap();
-        let hits = store.scan_within_bbox(5, Crs::Cartesian2d, &bbox).unwrap();
+        });
+        let hits = read_spatial(engine, |s, txn| {
+            s.scan_within_bbox(txn, 5, Crs::Cartesian2d, &bbox).unwrap()
+        });
         assert_eq!(hits.len(), 2);
     }
 
@@ -1362,18 +1380,21 @@ mod tests {
         // but Y outside would leak.
         let fx = mk_engine();
         let engine = &fx.engine;
-        let store = LocalSpatialStore::new(engine);
         // Two points: one inside the bbox, one with Y far outside but
         // a curve key that may fall in the [cmin, cmax] range.
         let inside = Point::new_2d(Crs::Cartesian2d, 5.0, 1.0);
         let outside_y = Point::new_2d(Crs::Cartesian2d, 5.0, 50.0);
-        store.insert(1, NodeId::from_raw(1), &inside).unwrap();
-        store.insert(1, NodeId::from_raw(2), &outside_y).unwrap();
+        write_spatial(engine, |s, txn| {
+            s.insert(txn, 1, NodeId::from_raw(1), &inside).unwrap();
+            s.insert(txn, 1, NodeId::from_raw(2), &outside_y).unwrap();
+        });
         let bbox = Bbox {
             lower: Point::new_2d(Crs::Cartesian2d, 0.0, 0.0),
             upper: Point::new_2d(Crs::Cartesian2d, 10.0, 2.0),
         };
-        let hits = store.scan_within_bbox(1, Crs::Cartesian2d, &bbox).unwrap();
+        let hits = read_spatial(engine, |s, txn| {
+            s.scan_within_bbox(txn, 1, Crs::Cartesian2d, &bbox).unwrap()
+        });
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, NodeId::from_raw(1));
     }
@@ -1384,35 +1405,38 @@ mod tests {
         // we know the iteration must stop at the middle one.
         let fx = mk_engine();
         let engine = &fx.engine;
-        let store = LocalSpatialStore::new(engine);
         // Tight bbox containing only the first point. Inserted points
         // far apart so curves diverge sharply.
-        store
-            .insert(
+        write_spatial(engine, |s, txn| {
+            s.insert(
+                txn,
                 7,
                 NodeId::from_raw(1),
                 &Point::new_2d(Crs::Cartesian2d, 0.0, 0.0),
             )
             .unwrap();
-        store
-            .insert(
+            s.insert(
+                txn,
                 7,
                 NodeId::from_raw(2),
                 &Point::new_2d(Crs::Cartesian2d, 5e8, 5e8),
             )
             .unwrap();
-        store
-            .insert(
+            s.insert(
+                txn,
                 7,
                 NodeId::from_raw(3),
                 &Point::new_2d(Crs::Cartesian2d, 9e8, 9e8),
             )
             .unwrap();
+        });
         let bbox = Bbox {
             lower: Point::new_2d(Crs::Cartesian2d, -1.0, -1.0),
             upper: Point::new_2d(Crs::Cartesian2d, 1.0, 1.0),
         };
-        let hits = store.scan_within_bbox(7, Crs::Cartesian2d, &bbox).unwrap();
+        let hits = read_spatial(engine, |s, txn| {
+            s.scan_within_bbox(txn, 7, Crs::Cartesian2d, &bbox).unwrap()
+        });
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, NodeId::from_raw(1));
     }
@@ -1433,11 +1457,11 @@ mod tests {
             .map(|t| {
                 let engine = Arc::clone(&engine);
                 thread::spawn(move || {
-                    let store = LocalSpatialStore::new(&engine);
                     let point = Point::new_2d(Crs::Cartesian2d, t as f64, t as f64);
-                    store
-                        .insert(1, NodeId::from_raw(t + 1), &point)
-                        .expect("insert");
+                    write_spatial(&engine, |s, txn| {
+                        s.insert(txn, 1, NodeId::from_raw(t + 1), &point)
+                            .expect("insert");
+                    });
                 })
             })
             .collect();
@@ -1445,12 +1469,13 @@ mod tests {
             h.join().expect("join");
         }
 
-        let store = LocalSpatialStore::new(&engine);
         let bbox = Bbox {
             lower: Point::new_2d(Crs::Cartesian2d, -10.0, -10.0),
             upper: Point::new_2d(Crs::Cartesian2d, 10.0, 10.0),
         };
-        let hits = store.scan_within_bbox(1, Crs::Cartesian2d, &bbox).unwrap();
+        let hits = read_spatial(&engine, |s, txn| {
+            s.scan_within_bbox(txn, 1, Crs::Cartesian2d, &bbox).unwrap()
+        });
         assert_eq!(hits.len(), 4, "all four concurrent inserts must be visible");
     }
 

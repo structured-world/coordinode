@@ -120,16 +120,33 @@ proptest! {
     ) {
         let fx = open_engine();
         let engine = &fx.engine;
-        let store = LocalSpatialStore::new(engine);
+        let store = LocalSpatialStore;
         let id = NodeId::from_raw(1);
         let p = Point::new_2d(Crs::Cartesian2d, x, y);
-        store.insert(1, id, &p).unwrap();
+        {
+            let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+            let read_ts = oracle.next();
+            let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+            store.insert(&mut txn, 1, id, &p).unwrap();
+            let wc = WriteConcern::majority();
+            let ctx = CommitContext {
+                write_concern: &wc,
+                pipeline: None,
+                id_gen: None,
+                drain_buffer: None,
+                nvme_write_buffer: None,
+            };
+            txn.commit(&ctx).unwrap();
+        }
         // Bbox covers the whole quantised range we configured.
         let bbox = Bbox {
             lower: Point::new_2d(Crs::Cartesian2d, -1e9, -1e9),
             upper: Point::new_2d(Crs::Cartesian2d, 1e9, 1e9),
         };
-        let hits = store.scan_within_bbox(1, Crs::Cartesian2d, &bbox).unwrap();
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let rtxn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let hits = store.scan_within_bbox(&rtxn, 1, Crs::Cartesian2d, &bbox).unwrap();
         prop_assert_eq!(hits.len(), 1);
         prop_assert_eq!(hits[0].0, id);
     }
@@ -145,19 +162,37 @@ proptest! {
     ) {
         let fx = open_engine();
         let engine = &fx.engine;
-        let store = LocalSpatialStore::new(engine);
-        store
-            .insert(
-                1,
-                NodeId::from_raw(99),
-                &Point::new_2d(Crs::Cartesian2d, ox, oy),
-            )
-            .unwrap();
+        let store = LocalSpatialStore;
+        {
+            let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+            let read_ts = oracle.next();
+            let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+            store
+                .insert(
+                    &mut txn,
+                    1,
+                    NodeId::from_raw(99),
+                    &Point::new_2d(Crs::Cartesian2d, ox, oy),
+                )
+                .unwrap();
+            let wc = WriteConcern::majority();
+            let ctx = CommitContext {
+                write_concern: &wc,
+                pipeline: None,
+                id_gen: None,
+                drain_buffer: None,
+                nvme_write_buffer: None,
+            };
+            txn.commit(&ctx).unwrap();
+        }
         let bbox = Bbox {
             lower: Point::new_2d(Crs::Cartesian2d, 0.0, 0.0),
             upper: Point::new_2d(Crs::Cartesian2d, 10.0, 10.0),
         };
-        let hits = store.scan_within_bbox(1, Crs::Cartesian2d, &bbox).unwrap();
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let rtxn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let hits = store.scan_within_bbox(&rtxn, 1, Crs::Cartesian2d, &bbox).unwrap();
         prop_assert!(hits.is_empty());
     }
 }

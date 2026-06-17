@@ -47,4 +47,11 @@ pub enum CatalogError {
     /// zero count or size limit).
     #[error("invalid catalog configuration: {0}")]
     InvalidConfig(&'static str),
+
+    /// A short-lived bucket transaction failed to commit. The catalog
+    /// owns its own transaction boundaries (ADR-041) — each logical
+    /// bucket operation opens, writes, and commits one transaction;
+    /// this variant carries the underlying commit failure.
+    #[error("time-series transaction commit: {0}")]
+    Commit(String),
 }
