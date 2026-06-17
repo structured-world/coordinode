@@ -12,13 +12,13 @@
   "devDependencies": {
     "@structured-world/vue-privacy": "^1.10.0",
     "echarts": "^5.5.1",
-    "vitepress": "^1.6.4",
+    "vitepress": "2.0.0-alpha.17",
     "vue": "^3.5.14",
     "vue-echarts": "^7.0.3"
   },
   "resolutions": {
-    "esbuild": "0.25.12",
+    "esbuild": "0.28.1",
     "tar": "7.5.16",
-    "vite": "6.4.3"
+    "vite": "7.3.5"
   }
 }
