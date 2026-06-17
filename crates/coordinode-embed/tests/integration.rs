@@ -22,6 +22,7 @@ mod integration {
     mod g063_from_engine;
     mod helpers;
     mod hnsw;
+    mod interactive_txn;
     mod merge_stress;
     mod mvcc;
     mod r069_mvcc_integration;

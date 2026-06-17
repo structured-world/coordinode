@@ -179,6 +179,15 @@ pub struct TransactionState {
     merge_node_deltas: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+impl TransactionState {
+    /// The pinned read timestamp (`start_ts`) of the parked transaction. An
+    /// interactive transaction reuses this for every statement so all reads
+    /// resolve against the same snapshot (repeatable read).
+    pub fn read_ts(&self) -> Timestamp {
+        self.read_ts
+    }
+}
+
 impl<'a> Transaction<'a> {
     /// Open a transaction. `oracle: Some` + `snapshot: Some` is the MVCC path;
     /// `oracle: None` is legacy direct-to-engine mode (no snapshot, no buffer).
@@ -225,11 +234,31 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    /// Extract the transaction's owned state into a [`TransactionState`]
+    /// without consuming the transaction — the buffers are drained
+    /// (`mem::take`) and the snapshots/`read_ts` copied, leaving the
+    /// transaction valid but empty. Used to park an interactive transaction's
+    /// progress mid-flow (when the transaction lives inside a borrowed
+    /// `ExecutionContext` that cannot be moved out). Pair with
+    /// [`Self::resume`].
+    pub fn take_state(&mut self) -> TransactionState {
+        TransactionState {
+            read_ts: self.read_ts,
+            snapshot: self.snapshot,
+            adj_snapshot: self.adj_snapshot,
+            write_buffer: std::mem::take(&mut self.write_buffer),
+            occ_scope: self.occ_scope.take(),
+            merge_adj_adds: std::mem::take(&mut self.merge_adj_adds),
+            merge_adj_removes: std::mem::take(&mut self.merge_adj_removes),
+            merge_node_deltas: std::mem::take(&mut self.merge_node_deltas),
+        }
+    }
+
     /// Rebuild a transaction around parked [`TransactionState`] with freshly
     /// supplied `engine` / `oracle` borrows — the resume side of
-    /// [`Self::into_state`]. The pinned `read_ts` + snapshots carry over, so
-    /// every statement of an interactive transaction reads the same MVCC
-    /// snapshot (repeatable read across the transaction).
+    /// [`Self::into_state`] / [`Self::take_state`]. The pinned `read_ts` +
+    /// snapshots carry over, so every statement of an interactive transaction
+    /// reads the same MVCC snapshot (repeatable read across the transaction).
     pub fn resume(
         engine: &'a StorageEngine,
         oracle: Option<&'a TimestampOracle>,

@@ -23,7 +23,8 @@ use coordinode_query::advisor::{
 use coordinode_query::cypher;
 use coordinode_query::executor::row::Row;
 use coordinode_query::executor::runner::{
-    execute, AdaptiveConfig, ExecutionContext, ExecutionError, FeedbackCache, WriteStats,
+    execute, execute_no_commit, AdaptiveConfig, ExecutionContext, ExecutionError, FeedbackCache,
+    WriteStats,
 };
 use coordinode_query::planner;
 use coordinode_raft::proposal::OwnedLocalProposalPipeline;
@@ -254,6 +255,21 @@ impl coordinode_vector::VectorLoader for StorageVectorLoader {
 }
 
 /// Embedded database instance.
+/// How `execute_cypher_impl` should treat the statement's transaction
+/// boundary (ADR-042).
+enum TxnMode {
+    /// Single-statement auto-commit: allocate a fresh `read_ts`, build a new
+    /// transaction, and commit (flush) at the end. The default for every
+    /// bare statement.
+    AutoCommit,
+    /// One statement of an interactive multi-statement transaction: resume the
+    /// parked transaction state (reusing its pinned `read_ts` / snapshot for
+    /// repeatable reads), run WITHOUT committing, and hand the updated state
+    /// back to the caller to re-park. Boxed so the enum stays small (the
+    /// state is large; auto-commit is the common variant).
+    Interactive(Box<coordinode_storage::engine::transaction::TransactionState>),
+}
+
 pub struct Database {
     engine: Arc<StorageEngine>,
     // Wrapped in Arc<RwLock<…>> so concurrent gRPC handlers can hold a
@@ -344,6 +360,22 @@ pub struct Database {
     /// on a clone of the cached plan so they stay sensitive to live
     /// index registry state. See [`PlanCache`].
     plan_cache: Arc<PlanCache>,
+    /// Open interactive multi-statement transactions (ADR-042), keyed by a
+    /// server-allocated transaction id. Leader-local and ephemeral: parked
+    /// `TransactionState` (uncommitted writes + OCC read-set + pinned
+    /// snapshot) plus the last-touched instant for idle-timeout reaping.
+    /// Never replicated — durability happens only at `commit_transaction`.
+    interactive_txns: Mutex<
+        std::collections::HashMap<
+            u64,
+            (
+                coordinode_storage::engine::transaction::TransactionState,
+                Instant,
+            ),
+        >,
+    >,
+    /// Monotonic source of interactive transaction ids.
+    next_txn_id: AtomicU64,
 }
 
 /// A query whose parse + analyze + logical-plan-build succeeded, kept
@@ -735,6 +767,8 @@ impl Database {
             // bound prevents unbounded growth on adversarial inputs
             // that produce a fresh query string per call.
             plan_cache: Arc::new(PlanCache::new(1024)),
+            interactive_txns: Mutex::new(std::collections::HashMap::new()),
+            next_txn_id: AtomicU64::new(0),
         })
     }
 
@@ -1135,8 +1169,8 @@ impl Database {
             return Ok(Vec::new());
         }
         let session = self.capture_session();
-        self.execute_cypher_impl(query, Some(source), None, &session)
-            .map(|(rows, _)| rows)
+        self.execute_cypher_impl(query, Some(source), None, &session, TxnMode::AutoCommit)
+            .map(|(rows, _, _)| rows)
     }
 
     /// Execute a Cypher query with both source context and bound parameters.
@@ -1158,8 +1192,8 @@ impl Database {
             return Ok(Vec::new());
         }
         let session = self.capture_session();
-        self.execute_cypher_impl(query, Some(source), params, &session)
-            .map(|(rows, _)| rows)
+        self.execute_cypher_impl(query, Some(source), params, &session, TxnMode::AutoCommit)
+            .map(|(rows, _, _)| rows)
     }
 
     /// Execute a Cypher query and return result rows.
@@ -1171,8 +1205,8 @@ impl Database {
             return Ok(Vec::new());
         }
         let session = self.capture_session();
-        self.execute_cypher_impl(query, None, None, &session)
-            .map(|(rows, _)| rows)
+        self.execute_cypher_impl(query, None, None, &session, TxnMode::AutoCommit)
+            .map(|(rows, _, _)| rows)
     }
 
     /// Execute a Cypher query with bound parameters.
@@ -1193,8 +1227,8 @@ impl Database {
             return Ok(Vec::new());
         }
         let session = self.capture_session();
-        self.execute_cypher_impl(query, None, params, &session)
-            .map(|(rows, _)| rows)
+        self.execute_cypher_impl(query, None, params, &session, TxnMode::AutoCommit)
+            .map(|(rows, _, _)| rows)
     }
 
     /// Execute a Cypher query end-to-end with full session-level overrides and
@@ -1234,9 +1268,159 @@ impl Database {
         }
 
         let params = params.and_then(|p| if p.is_empty() { None } else { Some(p) });
-        self.execute_cypher_impl(query, source, params, &session)
-            .map(|(rows, write_stats)| CypherResult { rows, write_stats })
+        self.execute_cypher_impl(query, source, params, &session, TxnMode::AutoCommit)
+            .map(|(rows, write_stats, _)| CypherResult { rows, write_stats })
     }
+
+    /// Begin an interactive multi-statement transaction (ADR-042).
+    ///
+    /// Returns a server-allocated transaction id. Pass it to
+    /// [`Self::execute_in_transaction`] for each statement, then
+    /// [`Self::commit_transaction`] or [`Self::rollback_transaction`]. The
+    /// transaction pins an MVCC snapshot at its `start_ts`, so every statement
+    /// reads the same point-in-time (repeatable read). State is leader-local
+    /// and ephemeral — durability happens only at commit. Idle transactions
+    /// are reaped after [`Self::INTERACTIVE_TXN_IDLE_TIMEOUT`].
+    pub fn begin_transaction(&self) -> u64 {
+        self.reap_idle_transactions(Self::INTERACTIVE_TXN_IDLE_TIMEOUT);
+        let id = self.next_txn_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let read_ts = self.oracle.next();
+        let snapshot = self.engine.snapshot_at(read_ts.as_raw());
+        let mut txn = coordinode_storage::engine::transaction::Transaction::new(
+            &self.engine,
+            Some(&self.oracle),
+            read_ts,
+            snapshot,
+        );
+        let state = txn.take_state();
+        self.interactive_txns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id, (state, Instant::now()));
+        id
+    }
+
+    /// Run one statement of an interactive transaction (ADR-042).
+    ///
+    /// The statement reads at the transaction's pinned snapshot and its writes
+    /// buffer on the transaction without committing. A statement error aborts
+    /// the transaction (its parked state is dropped, matching SQL "current
+    /// transaction is aborted" semantics) — subsequent statements and commit
+    /// then fail with "unknown transaction id". A single client drives its
+    /// transaction serially, so the state is checked out for the statement.
+    pub fn execute_in_transaction(
+        &self,
+        txn_id: u64,
+        query: &str,
+        params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
+    ) -> Result<Vec<Row>, DatabaseError> {
+        let state = {
+            let mut reg = self
+                .interactive_txns
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match reg.remove(&txn_id) {
+                Some((state, _touched)) => state,
+                None => {
+                    return Err(DatabaseError::Other(format!(
+                        "unknown transaction id {txn_id}"
+                    )))
+                }
+            }
+        };
+        let session = QuerySession {
+            read_concern: self.read_concern,
+            snapshot_read_ts: None,
+            write_concern: self.write_concern.clone(),
+            vector_consistency: self.vector_consistency,
+        };
+        let params = params.and_then(|p| if p.is_empty() { None } else { Some(p) });
+        // On error the state is intentionally NOT re-parked → transaction aborts.
+        let (rows, _stats, out_state) = self.execute_cypher_impl(
+            query,
+            None,
+            params,
+            &session,
+            TxnMode::Interactive(Box::new(state)),
+        )?;
+        if let Some(state) = out_state {
+            self.interactive_txns
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(txn_id, (state, Instant::now()));
+        }
+        Ok(rows)
+    }
+
+    /// Commit an interactive transaction (ADR-042): validate the accumulated
+    /// OCC read-set, assign `commit_ts`, and persist every buffered mutation
+    /// in a single proposal. The handle is consumed (removed from the
+    /// registry) whether commit succeeds or fails; on `ErrConflict` the client
+    /// retries the whole transaction from `begin`.
+    pub fn commit_transaction(&self, txn_id: u64) -> Result<(), DatabaseError> {
+        let state = self
+            .interactive_txns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&txn_id)
+            .map(|(s, _)| s);
+        let Some(state) = state else {
+            return Err(DatabaseError::Other(format!(
+                "unknown transaction id {txn_id}"
+            )));
+        };
+        let mut txn = coordinode_storage::engine::transaction::Transaction::resume(
+            &self.engine,
+            Some(&self.oracle),
+            state,
+        );
+        let wc = self.write_concern.clone();
+        let commit_ctx = coordinode_storage::engine::transaction::CommitContext {
+            write_concern: &wc,
+            pipeline: Some(self.pipeline.as_ref()),
+            id_gen: Some(&self.proposal_id_gen),
+            drain_buffer: Some(&self.drain_buffer),
+            nvme_write_buffer: self.nvme_write_buffer.as_deref(),
+        };
+        txn.commit(&commit_ctx)
+            .map_err(|e| DatabaseError::Other(format!("commit failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Roll back an interactive transaction (ADR-042): discard all buffered
+    /// writes and the OCC read-set. No proposal is emitted (nothing was
+    /// durable). Errors only if the id is unknown.
+    pub fn rollback_transaction(&self, txn_id: u64) -> Result<(), DatabaseError> {
+        if self
+            .interactive_txns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&txn_id)
+            .is_some()
+        {
+            Ok(())
+        } else {
+            Err(DatabaseError::Other(format!(
+                "unknown transaction id {txn_id}"
+            )))
+        }
+    }
+
+    /// Drop interactive transactions idle longer than `timeout` (ADR-042
+    /// mandatory idle timeout). An open transaction pins an MVCC snapshot and
+    /// buffers writes in memory, so an abandoned one would leak retention and
+    /// leader memory. Called opportunistically on `begin`; a production
+    /// deployment also runs this periodically.
+    pub fn reap_idle_transactions(&self, timeout: Duration) {
+        let now = Instant::now();
+        self.interactive_txns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|_, (_, touched)| now.duration_since(*touched) < timeout);
+    }
+
+    /// Default idle timeout for an open interactive transaction (ADR-042).
+    pub const INTERACTIVE_TXN_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// Set session-level vector consistency mode.
     ///
@@ -1339,8 +1523,8 @@ impl Database {
         }
 
         let params = params.and_then(|p| if p.is_empty() { None } else { Some(p) });
-        self.execute_cypher_impl(query, source, params, &session)
-            .map(|(rows, write_stats)| CypherResult { rows, write_stats })
+        self.execute_cypher_impl(query, source, params, &session, TxnMode::AutoCommit)
+            .map(|(rows, write_stats, _)| CypherResult { rows, write_stats })
     }
 
     pub fn execute_cypher_with_read_concern(
@@ -1360,8 +1544,8 @@ impl Database {
         session.read_concern = read_concern.level;
         session.snapshot_read_ts = read_concern.at_timestamp;
 
-        self.execute_cypher_impl(query, None, None, &session)
-            .map(|(r, _)| r)
+        self.execute_cypher_impl(query, None, None, &session, TxnMode::AutoCommit)
+            .map(|(r, _, _)| r)
     }
 
     fn execute_cypher_impl(
@@ -1370,7 +1554,15 @@ impl Database {
         source: Option<&SourceContext>,
         params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
         session: &QuerySession,
-    ) -> Result<(Vec<Row>, WriteStats), DatabaseError> {
+        txn_mode: TxnMode,
+    ) -> Result<
+        (
+            Vec<Row>,
+            WriteStats,
+            Option<coordinode_storage::engine::transaction::TransactionState>,
+        ),
+        DatabaseError,
+    > {
         // SET-style session commands are handled by the public entry
         // points before reaching here (so this impl can stay on
         // &self). Regular Cypher only past this point.
@@ -1460,17 +1652,41 @@ impl Database {
         //   and Linearizable use Raft commit_index / lease check.
         // - Snapshot with at_timestamp: pin to explicit MVCC timestamp.
         use coordinode_core::txn::read_concern::ReadConcernLevel;
-        let read_ts = if session.read_concern == ReadConcernLevel::Snapshot {
-            // One-shot snapshot read; already captured into the
-            // session (Database.snapshot_read_ts was taken when
-            // the session was built).
-            if let Some(ts) = session.snapshot_read_ts {
-                Timestamp::from_raw(ts)
-            } else {
-                self.oracle.next()
+        let read_ts = match &txn_mode {
+            // Interactive transaction: every statement reuses the pinned
+            // start_ts so all reads resolve against the same snapshot
+            // (repeatable read across the transaction — ADR-042).
+            TxnMode::Interactive(state) => state.read_ts(),
+            TxnMode::AutoCommit if session.read_concern == ReadConcernLevel::Snapshot => {
+                // One-shot snapshot read; already captured into the
+                // session (Database.snapshot_read_ts was taken when
+                // the session was built).
+                if let Some(ts) = session.snapshot_read_ts {
+                    Timestamp::from_raw(ts)
+                } else {
+                    self.oracle.next()
+                }
             }
-        } else {
-            self.oracle.next()
+            TxnMode::AutoCommit => self.oracle.next(),
+        };
+        // Build the transaction up front: a fresh one for auto-commit, or
+        // the resumed parked state for an interactive statement. `interactive`
+        // drives the no-commit execution + state extraction below.
+        let interactive = matches!(txn_mode, TxnMode::Interactive(_));
+        let txn = match txn_mode {
+            TxnMode::Interactive(state) => {
+                coordinode_storage::engine::transaction::Transaction::resume(
+                    &self.engine,
+                    Some(&self.oracle),
+                    *state,
+                )
+            }
+            TxnMode::AutoCommit => coordinode_storage::engine::transaction::Transaction::new(
+                &self.engine,
+                Some(&self.oracle),
+                read_ts,
+                None,
+            ),
         };
         // Snapshot of the current interner is handed to the vector
         // loader (HNSW property lookups). The write-lock is then
@@ -1509,12 +1725,7 @@ impl Database {
                 nplus1: Arc::clone(&self.nplus1_detector),
                 dismissed: Arc::clone(&self.dismissed),
             }),
-            txn: coordinode_storage::engine::transaction::Transaction::new(
-                &self.engine,
-                Some(&self.oracle),
-                read_ts,
-                None,
-            ),
+            txn,
             vector_consistency: session.vector_consistency,
             vector_overfetch_factor: 1.2,
             vector_mvcc_stats: None,
@@ -1545,11 +1756,25 @@ impl Database {
         };
 
         let start = Instant::now();
-        let results = execute(&plan, &mut ctx)?;
+        // Auto-commit flushes the statement's writes; an interactive statement
+        // leaves them buffered on the transaction for COMMIT to flush later.
+        let results = if interactive {
+            execute_no_commit(&plan, &mut ctx)?
+        } else {
+            execute(&plan, &mut ctx)?
+        };
         // Flush HNSW writes accumulated during execute as a single
         // batched insert per (label, property) — amortises the HNSW
         // write-lock acquisition across the whole statement.
         ctx.flush_pending_vector_writes();
+        // Park the (uncommitted) transaction state so the caller can re-hold it
+        // for the next statement of an interactive transaction. `take_state`
+        // drains the buffers without consuming `ctx`, leaving it droppable.
+        let out_state = if interactive {
+            Some(ctx.txn.take_state())
+        } else {
+            None
+        };
         let duration_us = start.elapsed().as_micros() as u64;
 
         // Record execution in advisor registry with plan + optional source
@@ -1629,7 +1854,7 @@ impl Database {
             self.invalidate_stats_cache();
         }
 
-        Ok((results, write_stats))
+        Ok((results, write_stats, out_state))
     }
 
     /// Ensure the allocator has a persisted batch reservation.
