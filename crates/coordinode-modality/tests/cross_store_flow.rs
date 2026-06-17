@@ -306,9 +306,10 @@ fn schema_blob_node_consistency() {
         total_size: 14,
         chunks: chunks.iter().map(|(id, _)| *id).collect(),
     };
-    // Chunks + ref buffer on one transaction and commit together.
+    // Chunks land on the data plane (direct); the ref on the metadata
+    // plane (transactional).
+    blobs.put_chunks(engine, &chunks).expect("chunks");
     write_txn(engine, |txn| {
-        blobs.put_chunks(txn, &chunks).expect("chunks");
         blobs.put_blob_ref(txn, node, 0, &blob_ref).expect("ref");
     });
 
@@ -321,8 +322,10 @@ fn schema_blob_node_consistency() {
     // Chunks reassemble to the original payload.
     let mut reassembled = Vec::new();
     for id in &loaded_ref.chunks {
-        let chunk =
-            read_txn(engine, |txn| blobs.get_chunk(txn, id).expect("ok")).expect("chunk present");
+        let chunk = blobs
+            .get_chunk(engine, id)
+            .expect("ok")
+            .expect("chunk present");
         reassembled.extend_from_slice(&chunk);
     }
     assert_eq!(reassembled, b"chunk-achunk-b");

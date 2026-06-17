@@ -435,15 +435,11 @@ fn bench_blob_chunk(c: &mut Criterion) {
         let store = LocalBlobStore;
         let payload = vec![0xab_u8; n];
         let id = ChunkId::from_data(&payload);
-        bench_write(&engine, |txn| {
-            store.put_chunk(txn, &id, &payload).unwrap();
-        });
-        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
-        let read_ts = oracle.next();
-        let rtxn = Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        // Chunks are data-plane: written/read directly against the engine.
+        store.put_chunk(&engine, &id, &payload).unwrap();
         group.throughput(Throughput::Bytes(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| store.get_chunk(&rtxn, &id).unwrap())
+            b.iter(|| store.get_chunk(&engine, &id).unwrap())
         });
     }
     group.finish();

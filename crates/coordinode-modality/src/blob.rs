@@ -19,23 +19,40 @@
 //! `delete_chunk` directly — the only safe way to drop a chunk is
 //! through the GC.
 //!
-//! ## Transaction threading (ADR-041)
+//! ## Data plane vs metadata plane (ADR-011)
 //!
-//! Every method threads the active [`Transaction`]. Writes
-//! (`put_chunk` / `put_chunks` / `put_blob_ref` / `delete_blob_ref`)
-//! take `&mut Transaction` and buffer the `Partition::Blob` /
-//! `Partition::BlobRef` mutations on it, so the chunks plus the ref
-//! that points at them commit atomically with the node write that
-//! produced the blob (a multi-chunk `put_chunks` lands as one commit
-//! or none). Reads (`get_chunk` / `get_blob_ref`) take `&Transaction`
-//! and read through the committed MVCC snapshot via
-//! [`Transaction::read_untracked`] — content-addressed chunks are
-//! immutable, so they never join the OCC conflict set.
+//! Blobs follow the object-store separation that lets Ceph/MinIO scale:
+//! bulk object **data** is placed directly on storage, **never** routed
+//! through the consensus log, while small **metadata** is transactional.
+//!
+//! - **Chunks (data plane)** — `put_chunk` / `put_chunks` / `get_chunk`
+//!   take an engine handle and read/write `Partition::Blob` directly.
+//!   Chunks are content-addressed and immutable: a given [`ChunkId`]
+//!   always maps to the same bytes, so writes are idempotent and need
+//!   no MVCC version, OCC conflict tracking, or Raft proposal. Payloads
+//!   are large (multi-MB) and must never sit in a transaction's
+//!   in-memory write buffer or be shipped as a single consensus entry.
+//!   Cluster durability for chunks is the placement layer's job —
+//!   replication / Reed-Solomon erasure coding under CRUSH failure-
+//!   domain rules (see the erasure-coding and segments architecture),
+//!   not the transaction commit path.
+//! - **Blob refs (metadata plane)** — `put_blob_ref` / `get_blob_ref` /
+//!   `delete_blob_ref` thread the active [`Transaction`]: the per-(node,
+//!   prop) ref is small and commits atomically with the node write that
+//!   produced it, and reads see it through the same MVCC snapshot as the
+//!   node (time-travel consistent).
+//!
+//! Atomicity between a chunk and the ref pointing at it is **eventual**:
+//! chunks are placed first, the ref commits second, and orphan chunks
+//! (ref never committed, or ref later deleted) are reclaimed by the
+//! Layer 3 reference-counting GC sweep — exactly the RADOS / MinIO model.
 //!
 //! [`Transaction`]: coordinode_storage::engine::transaction::Transaction
 
 use coordinode_core::graph::blob::{encode_blob_key, encode_blobref_key, BlobRef, ChunkId};
 use coordinode_core::graph::node::NodeId;
+use coordinode_storage::engine::batch::WriteBatch;
+use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
 
@@ -43,26 +60,28 @@ use crate::error::{StoreError, StoreResult};
 
 pub use coordinode_core::graph::blob::INLINE_THRESHOLD;
 
-/// Layer 4 blob store: chunk-level CAS storage + per-property blob
-/// references over a [`Transaction`]. Hides partition layout and key
-/// encoders.
+/// Layer 4 blob store: content-addressed chunk CAS (data plane, direct
+/// to the engine) + per-property blob references (metadata plane,
+/// transactional). Hides partition layout and key encoders.
 pub trait BlobStore {
-    /// Persist a chunk by content hash. Idempotent: re-putting an
-    /// existing `chunk_id` buffers identical bytes. Buffered on `txn`.
-    fn put_chunk(&self, txn: &mut Transaction, chunk_id: &ChunkId, data: &[u8]) -> StoreResult<()>;
+    /// Persist a chunk by content hash directly to the engine
+    /// (data plane). Idempotent: re-putting an existing `chunk_id`
+    /// overwrites identical bytes.
+    fn put_chunk(&self, engine: &StorageEngine, chunk_id: &ChunkId, data: &[u8])
+        -> StoreResult<()>;
 
-    /// Persist many chunks. All buffer on the same `txn`, so they
-    /// commit together. Useful when a new blob ref pulls in multiple
-    /// new chunks.
-    fn put_chunks(&self, txn: &mut Transaction, chunks: &[(ChunkId, Vec<u8>)]) -> StoreResult<()>;
+    /// Persist many chunks in one engine [`WriteBatch`] (data plane).
+    /// Useful when a new blob ref pulls in multiple new chunks.
+    fn put_chunks(&self, engine: &StorageEngine, chunks: &[(ChunkId, Vec<u8>)]) -> StoreResult<()>;
 
-    /// Fetch a chunk by content hash. Returns `None` if not stored
-    /// (either never written, or already swept by GC because no ref
-    /// pointed at it).
-    fn get_chunk(&self, txn: &Transaction, chunk_id: &ChunkId) -> StoreResult<Option<Vec<u8>>>;
+    /// Fetch a chunk by content hash (data plane). Returns `None` if not
+    /// stored (either never written, or already swept by GC because no
+    /// ref pointed at it).
+    fn get_chunk(&self, engine: &StorageEngine, chunk_id: &ChunkId)
+        -> StoreResult<Option<Vec<u8>>>;
 
-    /// Persist the [`BlobRef`] for a (node, prop) pair. Overwrites any
-    /// previous ref at the same key. Buffered on `txn`.
+    /// Persist the [`BlobRef`] for a (node, prop) pair (metadata plane).
+    /// Overwrites any previous ref at the same key. Buffered on `txn`.
     fn put_blob_ref(
         &self,
         txn: &mut Transaction,
@@ -71,7 +90,8 @@ pub trait BlobStore {
         blob_ref: &BlobRef,
     ) -> StoreResult<()>;
 
-    /// Fetch the [`BlobRef`] for a (node, prop) pair.
+    /// Fetch the [`BlobRef`] for a (node, prop) pair (metadata plane),
+    /// through the transaction's MVCC snapshot.
     fn get_blob_ref(
         &self,
         txn: &Transaction,
@@ -79,9 +99,9 @@ pub trait BlobStore {
         prop_id: u32,
     ) -> StoreResult<Option<BlobRef>>;
 
-    /// Remove the [`BlobRef`] for a (node, prop) pair. Chunks remain
-    /// in [`Partition::Blob`] — orphan chunks are reclaimed by the
-    /// Layer 3 GC sweep. Buffered on `txn`.
+    /// Remove the [`BlobRef`] for a (node, prop) pair (metadata plane).
+    /// Chunks remain in [`Partition::Blob`] — orphan chunks are reclaimed
+    /// by the Layer 3 GC sweep. Buffered on `txn`.
     fn delete_blob_ref(
         &self,
         txn: &mut Transaction,
@@ -90,26 +110,42 @@ pub trait BlobStore {
     ) -> StoreResult<()>;
 }
 
-/// CE single-shard implementation of [`BlobStore`]. Stateless — all
-/// storage access flows through the [`Transaction`] passed to each
-/// method (ADR-041).
+/// CE single-shard implementation of [`BlobStore`]. Stateless: chunk
+/// (data-plane) ops take the engine handle directly, blob-ref
+/// (metadata-plane) ops thread the transaction.
 pub struct LocalBlobStore;
 
 impl BlobStore for LocalBlobStore {
-    fn put_chunk(&self, txn: &mut Transaction, chunk_id: &ChunkId, data: &[u8]) -> StoreResult<()> {
-        txn.put(Partition::Blob, &encode_blob_key(chunk_id), data)?;
+    fn put_chunk(
+        &self,
+        engine: &StorageEngine,
+        chunk_id: &ChunkId,
+        data: &[u8],
+    ) -> StoreResult<()> {
+        engine.put(Partition::Blob, &encode_blob_key(chunk_id), data)?;
         Ok(())
     }
 
-    fn put_chunks(&self, txn: &mut Transaction, chunks: &[(ChunkId, Vec<u8>)]) -> StoreResult<()> {
-        for (id, data) in chunks {
-            txn.put(Partition::Blob, &encode_blob_key(id), data)?;
+    fn put_chunks(&self, engine: &StorageEngine, chunks: &[(ChunkId, Vec<u8>)]) -> StoreResult<()> {
+        if chunks.is_empty() {
+            return Ok(());
         }
+        let mut batch = WriteBatch::new(engine);
+        for (id, data) in chunks {
+            batch.put(Partition::Blob, encode_blob_key(id), data.clone());
+        }
+        batch.commit()?;
         Ok(())
     }
 
-    fn get_chunk(&self, txn: &Transaction, chunk_id: &ChunkId) -> StoreResult<Option<Vec<u8>>> {
-        Ok(txn.read_untracked(Partition::Blob, &encode_blob_key(chunk_id))?)
+    fn get_chunk(
+        &self,
+        engine: &StorageEngine,
+        chunk_id: &ChunkId,
+    ) -> StoreResult<Option<Vec<u8>>> {
+        Ok(engine
+            .get(Partition::Blob, &encode_blob_key(chunk_id))?
+            .map(|b| b.to_vec()))
     }
 
     fn put_blob_ref(
@@ -210,32 +246,30 @@ mod tests {
     fn chunk_round_trip() {
         let fx = open_engine();
         let engine = &fx.engine;
+        let store = LocalBlobStore;
         let id = ChunkId::from_data(b"abc");
-        assert!(read_blob(engine, |s, txn| s.get_chunk(txn, &id).expect("none")).is_none());
-        write_blob(engine, |s, txn| {
-            s.put_chunk(txn, &id, b"abc").expect("put");
-        });
-        let got = read_blob(engine, |s, txn| s.get_chunk(txn, &id).expect("some")).expect("Some");
+        assert!(store.get_chunk(engine, &id).expect("none").is_none());
+        store.put_chunk(engine, &id, b"abc").expect("put");
+        let got = store.get_chunk(engine, &id).expect("some").expect("Some");
         assert_eq!(got, b"abc");
     }
 
     #[test]
     fn put_chunks_commits_together() {
-        // All chunks buffer on one transaction ⇒ visible together
-        // after commit. Smoke check: write three chunks via
-        // put_chunks, then verify each individually.
+        // All chunks land in one engine WriteBatch ⇒ visible together.
+        // Smoke check: write three chunks via put_chunks, then verify
+        // each individually.
         let fx = open_engine();
         let engine = &fx.engine;
+        let store = LocalBlobStore;
         let chunks = vec![
             (ChunkId::from_data(b"a"), b"a".to_vec()),
             (ChunkId::from_data(b"b"), b"b".to_vec()),
             (ChunkId::from_data(b"c"), b"c".to_vec()),
         ];
-        write_blob(engine, |s, txn| {
-            s.put_chunks(txn, &chunks).expect("batch");
-        });
+        store.put_chunks(engine, &chunks).expect("batch");
         for (id, expected) in &chunks {
-            let got = read_blob(engine, |s, txn| s.get_chunk(txn, id).expect("ok"));
+            let got = store.get_chunk(engine, id).expect("ok");
             assert_eq!(got.as_deref(), Some(expected.as_slice()));
         }
     }
@@ -244,23 +278,26 @@ mod tests {
     fn put_chunks_empty_is_noop() {
         let fx = open_engine();
         let engine = &fx.engine;
-        write_blob(engine, |s, txn| {
-            s.put_chunks(txn, &[]).expect("empty batch ok");
-        });
+        LocalBlobStore
+            .put_chunks(engine, &[])
+            .expect("empty batch ok");
     }
 
     #[test]
     fn blob_ref_round_trip() {
         let fx = open_engine();
         let engine = &fx.engine;
+        let store = LocalBlobStore;
         let node_id = NodeId::from_raw(42);
         let prop_id = 7;
 
         // Construct a real BlobRef from a >threshold-byte payload.
         let payload = vec![0xaa_u8; INLINE_THRESHOLD + 64];
         let (blob_ref, chunks) = create_blob(&payload);
+        // Chunks land on the data plane (direct), the ref on the
+        // metadata plane (transactional).
+        store.put_chunks(engine, &chunks).expect("chunks");
         write_blob(engine, |s, txn| {
-            s.put_chunks(txn, &chunks).expect("chunks");
             s.put_blob_ref(txn, node_id, prop_id, &blob_ref)
                 .expect("put ref");
         });
@@ -274,7 +311,9 @@ mod tests {
         // Reassemble payload via chunk gets.
         let mut reassembled = Vec::with_capacity(loaded.total_size as usize);
         for id in &loaded.chunks {
-            let chunk = read_blob(engine, |s, txn| s.get_chunk(txn, id).expect("ok"))
+            let chunk = store
+                .get_chunk(engine, id)
+                .expect("ok")
                 .expect("chunk present");
             reassembled.extend_from_slice(&chunk);
         }
@@ -288,11 +327,12 @@ mod tests {
         // dedup-friendly behaviour.
         let fx = open_engine();
         let engine = &fx.engine;
+        let store = LocalBlobStore;
         let node_id = NodeId::from_raw(11);
         let payload = vec![0x33_u8; INLINE_THRESHOLD + 8];
         let (blob_ref, chunks) = create_blob(&payload);
+        store.put_chunks(engine, &chunks).expect("chunks");
         write_blob(engine, |s, txn| {
-            s.put_chunks(txn, &chunks).expect("chunks");
             s.put_blob_ref(txn, node_id, 0, &blob_ref).expect("put ref");
         });
 
@@ -309,7 +349,7 @@ mod tests {
         );
         for (id, _) in &chunks {
             assert!(
-                read_blob(engine, |s, txn| s.get_chunk(txn, id).expect("ok")).is_some(),
+                store.get_chunk(engine, id).expect("ok").is_some(),
                 "chunks must remain (Layer 3 GC's job, not store's)",
             );
         }
@@ -322,12 +362,11 @@ mod tests {
         // silently).
         let fx = open_engine();
         let engine = &fx.engine;
+        let store = LocalBlobStore;
         let id = ChunkId::from_data(b"xyz");
-        write_blob(engine, |s, txn| {
-            s.put_chunk(txn, &id, b"xyz").expect("first put");
-            s.put_chunk(txn, &id, b"xyz").expect("second put");
-        });
-        let got = read_blob(engine, |s, txn| s.get_chunk(txn, &id).expect("ok"));
+        store.put_chunk(engine, &id, b"xyz").expect("first put");
+        store.put_chunk(engine, &id, b"xyz").expect("second put");
+        let got = store.get_chunk(engine, &id).expect("ok");
         assert_eq!(got.as_deref(), Some(b"xyz".as_slice()));
     }
 
@@ -337,14 +376,15 @@ mod tests {
         // IDs must keep two distinct refs.
         let fx = open_engine();
         let engine = &fx.engine;
+        let store = LocalBlobStore;
         let node = NodeId::from_raw(7);
         let payload_a = vec![0x01_u8; INLINE_THRESHOLD + 4];
         let payload_b = vec![0x02_u8; INLINE_THRESHOLD + 4];
         let (ref_a, chunks_a) = create_blob(&payload_a);
         let (ref_b, chunks_b) = create_blob(&payload_b);
+        store.put_chunks(engine, &chunks_a).expect("chunks a");
+        store.put_chunks(engine, &chunks_b).expect("chunks b");
         write_blob(engine, |s, txn| {
-            s.put_chunks(txn, &chunks_a).expect("chunks a");
-            s.put_chunks(txn, &chunks_b).expect("chunks b");
             s.put_blob_ref(txn, node, 1, &ref_a).expect("ref a");
             s.put_blob_ref(txn, node, 2, &ref_b).expect("ref b");
         });
@@ -363,7 +403,7 @@ mod tests {
         let fx = open_engine();
         let engine = &fx.engine;
         let id = ChunkId::from_data(b"never");
-        assert!(read_blob(engine, |s, txn| s.get_chunk(txn, &id).expect("ok")).is_none());
+        assert!(LocalBlobStore.get_chunk(engine, &id).expect("ok").is_none());
     }
 
     #[test]
