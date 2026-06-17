@@ -1356,8 +1356,9 @@ impl Database {
     /// OCC read-set, assign `commit_ts`, and persist every buffered mutation
     /// in a single proposal. The handle is consumed (removed from the
     /// registry) whether commit succeeds or fails; on `ErrConflict` the client
-    /// retries the whole transaction from `begin`.
-    pub fn commit_transaction(&self, txn_id: u64) -> Result<(), DatabaseError> {
+    /// retries the whole transaction from `begin`. Returns the committed Raft
+    /// index (the causal `operationTime` token; 0 in embedded mode).
+    pub fn commit_transaction(&self, txn_id: u64) -> Result<u64, DatabaseError> {
         let state = self
             .interactive_txns
             .lock()
@@ -1382,9 +1383,10 @@ impl Database {
             drain_buffer: Some(&self.drain_buffer),
             nvme_write_buffer: self.nvme_write_buffer.as_deref(),
         };
-        txn.commit(&commit_ctx)
+        let outcome = txn
+            .commit(&commit_ctx)
             .map_err(|e| DatabaseError::Other(format!("commit failed: {e}")))?;
-        Ok(())
+        Ok(outcome.applied_index.unwrap_or(0))
     }
 
     /// Roll back an interactive transaction (ADR-042): discard all buffered

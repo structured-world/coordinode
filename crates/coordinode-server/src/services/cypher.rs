@@ -314,6 +314,57 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
 
         let start = std::time::Instant::now();
 
+        // Interactive transaction statement (ADR-042): a non-zero transaction_id
+        // runs this statement against the held transaction — reads at its pinned
+        // snapshot, writes buffer until CommitTransaction. No per-statement
+        // commit and no causal fence (the snapshot was pinned at BEGIN). A zero
+        // transaction_id is the auto-commit path below.
+        if req.transaction_id != 0 {
+            let params = if req.parameters.is_empty() {
+                None
+            } else {
+                Some(convert_params(&req.parameters))
+            };
+            let rows = self
+                .database
+                .read()
+                .execute_in_transaction(req.transaction_id, &req.query, params)
+                .map_err(db_error_to_status)?;
+            let columns: Vec<String> = rows
+                .first()
+                .map(|r| r.keys().cloned().collect())
+                .unwrap_or_default();
+            let proto_rows: Vec<query::Row> = rows
+                .iter()
+                .map(|row| query::Row {
+                    values: columns
+                        .iter()
+                        .map(|col| {
+                            row.get(col)
+                                .map(value_to_proto)
+                                .unwrap_or(common::PropertyValue { value: None })
+                        })
+                        .collect(),
+                })
+                .collect();
+            return Ok(Response::new(query::ExecuteCypherResponse {
+                columns,
+                rows: proto_rows,
+                // Buffered statement: no commit yet, so no mutation stats and no
+                // applied_index — those land on the CommitTransaction response.
+                stats: Some(query::QueryStats {
+                    nodes_created: 0,
+                    nodes_deleted: 0,
+                    edges_created: 0,
+                    edges_deleted: 0,
+                    properties_set: 0,
+                    execution_time_ms: start.elapsed().as_millis() as i64,
+                    applied_index: 0,
+                    served_by_leader: false,
+                }),
+            }));
+        }
+
         // Extract causal fence parameters before entering the Raft block so that
         // validation can run in both cluster and standalone modes.
         let concern_level = req.read_concern.as_ref().map(|rc| rc.level).unwrap_or(0);
@@ -608,6 +659,41 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             }),
         }))
     }
+
+    async fn begin_transaction(
+        &self,
+        _request: Request<query::BeginTransactionRequest>,
+    ) -> Result<Response<query::BeginTransactionResponse>, Status> {
+        let transaction_id = self.database.read().begin_transaction();
+        Ok(Response::new(query::BeginTransactionResponse {
+            transaction_id,
+        }))
+    }
+
+    async fn commit_transaction(
+        &self,
+        request: Request<query::CommitTransactionRequest>,
+    ) -> Result<Response<query::CommitTransactionResponse>, Status> {
+        let applied_index = self
+            .database
+            .read()
+            .commit_transaction(request.into_inner().transaction_id)
+            .map_err(db_error_to_status)?;
+        Ok(Response::new(query::CommitTransactionResponse {
+            applied_index,
+        }))
+    }
+
+    async fn rollback_transaction(
+        &self,
+        request: Request<query::RollbackTransactionRequest>,
+    ) -> Result<Response<query::RollbackTransactionResponse>, Status> {
+        self.database
+            .read()
+            .rollback_transaction(request.into_inner().transaction_id)
+            .map_err(db_error_to_status)?;
+        Ok(Response::new(query::RollbackTransactionResponse {}))
+    }
 }
 
 #[cfg(test)]
@@ -723,7 +809,98 @@ mod tests {
             read_preference: 0,  // UNSPECIFIED → Primary
             read_concern: None,  // UNSPECIFIED → Local
             write_concern: None, // UNSPECIFIED → W1
+            transaction_id: 0,   // auto-commit
         })
+    }
+
+    fn cypher_request_in_txn(q: &str, transaction_id: u64) -> Request<query::ExecuteCypherRequest> {
+        Request::new(query::ExecuteCypherRequest {
+            query: q.to_string(),
+            parameters: std::collections::HashMap::new(),
+            read_preference: 0,
+            read_concern: None,
+            write_concern: None,
+            transaction_id,
+        })
+    }
+
+    /// gRPC interactive transaction: begin → statement-in-txn → commit, with
+    /// the buffered writes invisible until commit, then visible after.
+    #[tokio::test]
+    async fn grpc_interactive_transaction_commit() {
+        let (svc, _dir) = test_service();
+
+        let tx = svc
+            .begin_transaction(Request::new(query::BeginTransactionRequest {}))
+            .await
+            .expect("begin")
+            .into_inner()
+            .transaction_id;
+        assert_ne!(tx, 0, "begin returns a non-zero transaction id");
+
+        svc.execute_cypher(cypher_request_in_txn("CREATE (n:TxNode {id: 1})", tx))
+            .await
+            .expect("statement in txn");
+
+        // Auto-commit read does not see the uncommitted write.
+        let before = svc
+            .execute_cypher(cypher_request("MATCH (n:TxNode) RETURN n"))
+            .await
+            .expect("read before")
+            .into_inner();
+        assert_eq!(before.rows.len(), 0, "uncommitted write invisible");
+
+        svc.commit_transaction(Request::new(query::CommitTransactionRequest {
+            transaction_id: tx,
+        }))
+        .await
+        .expect("commit");
+
+        let after = svc
+            .execute_cypher(cypher_request("MATCH (n:TxNode) RETURN n"))
+            .await
+            .expect("read after")
+            .into_inner();
+        assert_eq!(after.rows.len(), 1, "committed write visible");
+    }
+
+    /// gRPC interactive transaction rollback discards the buffered write and
+    /// consumes the handle.
+    #[tokio::test]
+    async fn grpc_interactive_transaction_rollback() {
+        let (svc, _dir) = test_service();
+
+        let tx = svc
+            .begin_transaction(Request::new(query::BeginTransactionRequest {}))
+            .await
+            .expect("begin")
+            .into_inner()
+            .transaction_id;
+
+        svc.execute_cypher(cypher_request_in_txn("CREATE (n:TxNode {id: 2})", tx))
+            .await
+            .expect("statement in txn");
+
+        svc.rollback_transaction(Request::new(query::RollbackTransactionRequest {
+            transaction_id: tx,
+        }))
+        .await
+        .expect("rollback");
+
+        let rows = svc
+            .execute_cypher(cypher_request("MATCH (n:TxNode) RETURN n"))
+            .await
+            .expect("read")
+            .into_inner();
+        assert_eq!(rows.rows.len(), 0, "rolled-back write discarded");
+
+        // Handle consumed: commit on the rolled-back id is an error.
+        assert!(svc
+            .commit_transaction(Request::new(query::CommitTransactionRequest {
+                transaction_id: tx,
+            }))
+            .await
+            .is_err());
     }
 
     /// gRPC execute_cypher creates a node and returns it.
@@ -1084,6 +1261,7 @@ mod tests {
                     at_timestamp: 0,
                 }),
                 write_concern: None,
+                transaction_id: 0,
             }))
             .await;
 
@@ -1113,6 +1291,7 @@ mod tests {
                     at_timestamp: 0,
                 }),
                 write_concern: None,
+                transaction_id: 0,
             }))
             .await;
 
@@ -1148,6 +1327,7 @@ mod tests {
                     at_timestamp: 0,
                 }),
                 write_concern: None,
+                transaction_id: 0,
             }))
             .await;
 
@@ -1194,6 +1374,7 @@ mod tests {
                     at_timestamp: 0,
                 }),
                 write_concern: None,
+                transaction_id: 0,
             }))
             .await;
 
@@ -1298,6 +1479,7 @@ mod tests {
                     at_timestamp: 0,
                 }),
                 write_concern: None,
+                transaction_id: 0,
             }))
             .await
             .expect("causal read after write");
@@ -1328,6 +1510,7 @@ mod tests {
                         at_timestamp: 0,
                     }),
                     write_concern: None,
+                    transaction_id: 0,
                 }))
                 .await;
             assert!(
@@ -1360,6 +1543,7 @@ mod tests {
                     at_timestamp: 0,
                 }),
                 write_concern: None, // omitted → treated as UNSPECIFIED (w:1)
+                transaction_id: 0,
             }))
             .await;
 
@@ -1398,6 +1582,7 @@ mod tests {
                     timeout_ms: 0,
                     journal: false,
                 }),
+                transaction_id: 0,
             }))
             .await;
 
@@ -1432,6 +1617,7 @@ mod tests {
                     timeout_ms: 0,
                     journal: false,
                 }),
+                transaction_id: 0,
             }))
             .await;
 
@@ -1461,6 +1647,7 @@ mod tests {
                     at_timestamp: 0,
                 }),
                 write_concern: None, // read-only — write_concern irrelevant
+                transaction_id: 0,
             }))
             .await;
 
@@ -1543,6 +1730,7 @@ mod tests {
                     journal: false,
                     timeout_ms: 0,
                 }),
+                transaction_id: 0,
             }))
             .await
             .expect("write should succeed");
@@ -1639,6 +1827,7 @@ mod tests {
                     at_timestamp: 1_700_000_000_000_000,
                 }),
                 write_concern: None,
+                transaction_id: 0,
             }))
             .await;
         let err = result.expect_err("must reject");
@@ -1675,6 +1864,7 @@ mod tests {
                     at_timestamp: 1,
                 }),
                 write_concern: None,
+                transaction_id: 0,
             }))
             .await
             .expect("snapshot read should succeed");
@@ -1706,6 +1896,7 @@ mod tests {
                     at_timestamp: 0, // no pin → latest
                 }),
                 write_concern: None,
+                transaction_id: 0,
             }))
             .await
             .expect("snapshot read");
@@ -1736,6 +1927,7 @@ mod tests {
                     journal: false,
                     timeout_ms: 0,
                 }),
+                transaction_id: 0,
             }))
             .await
             .expect("memory write should succeed");
@@ -1762,6 +1954,7 @@ mod tests {
                     at_timestamp: 1_700_000_000_000_000,
                 }),
                 write_concern: None,
+                transaction_id: 0,
             }))
             .await;
         let err = result.expect_err("must reject combination");
@@ -1792,6 +1985,7 @@ mod tests {
                     journal: true,
                     timeout_ms: 5_000,
                 }),
+                transaction_id: 0,
             }))
             .await
             .expect("journaled write should succeed");
@@ -1814,6 +2008,7 @@ mod tests {
                     journal: false,
                     timeout_ms: 0,
                 }),
+                transaction_id: 0,
             }))
             .await
             .expect("cache write should succeed");
@@ -1920,6 +2115,7 @@ mod tests {
                 read_preference: 0,
                 read_concern: None,
                 write_concern: None,
+                transaction_id: 0,
             }))
             .await;
 

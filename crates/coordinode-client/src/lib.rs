@@ -490,6 +490,10 @@ impl CoordinodeClient {
             read_preference,
             read_concern,
             write_concern,
+            // Auto-commit: this convenience wrapper runs each statement on its
+            // own. Interactive transactions use the BeginTransaction RPC and
+            // set transaction_id on the request directly.
+            transaction_id: 0,
         });
 
         if let Some(loc) = location {

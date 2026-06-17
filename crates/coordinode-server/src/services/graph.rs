@@ -831,6 +831,7 @@ mod tests {
                 read_preference: 0, // UNSPECIFIED → Primary
                 read_concern: None, // UNSPECIFIED → Local
                 write_concern: None,
+                transaction_id: 0,
             }))
             .await
             .expect("execute_cypher should succeed")
