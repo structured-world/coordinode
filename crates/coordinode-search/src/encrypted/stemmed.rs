@@ -294,10 +294,13 @@ mod tests {
     #[test]
     fn end_to_end_stemmed_sse_storage() {
         use crate::encrypted::storage::EncryptedIndex;
+        use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+        use coordinode_core::txn::write_concern::WriteConcern;
         use coordinode_storage::engine::config::{
             Durability, EndpointConfig, Media, StorageConfig, Tier,
         };
         use coordinode_storage::engine::core::StorageEngine;
+        use coordinode_storage::engine::transaction::{CommitContext, Transaction};
 
         let dir = tempfile::tempdir().unwrap();
         let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -310,21 +313,43 @@ mod tests {
         let engine = StorageEngine::open(&config).unwrap();
         let key = test_key();
 
-        // WRITE: stem + tokenize + persist
-        let idx = EncryptedIndex::new(&engine, "Article", "body_stems");
+        // WRITE: stem + tokenize + persist, buffered on one transaction.
+        let idx = EncryptedIndex::new("Article", "body_stems");
         let stems = stem_and_tokenize("running through the forest", "english", &key);
-        for st in &stems {
-            idx.insert(&st.token, 1).unwrap();
-        }
-
         let stems2 = stem_and_tokenize("swimming in the ocean", "english", &key);
-        for st in &stems2 {
-            idx.insert(&st.token, 2).unwrap();
+        {
+            let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+            let read_ts = oracle.next();
+            let mut txn =
+                Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+            for st in &stems {
+                idx.insert(&mut txn, &st.token, 1).unwrap();
+            }
+            for st in &stems2 {
+                idx.insert(&mut txn, &st.token, 2).unwrap();
+            }
+            let wc = WriteConcern::majority();
+            let ctx = CommitContext {
+                write_concern: &wc,
+                pipeline: None,
+                id_gen: None,
+                drain_buffer: None,
+                nvme_write_buffer: None,
+            };
+            txn.commit(&ctx).unwrap();
         }
 
         // SEARCH: "run" → stem → HMAC → storage lookup
         let query_token = stem_query_token("run", "english", &key).unwrap();
-        let results = idx.search(&query_token).unwrap();
+        let rt_oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let rt_read_ts = rt_oracle.next();
+        let rtxn = Transaction::new(
+            &engine,
+            Some(&rt_oracle),
+            rt_read_ts,
+            Some(engine.snapshot()),
+        );
+        let results = idx.search(&rtxn, &query_token).unwrap();
         assert!(results.contains(&1), "'run' should find doc 1 in SSE index");
         assert!(
             !results.contains(&2),

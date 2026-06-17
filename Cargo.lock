@@ -1099,6 +1099,7 @@ name = "coordinode-search"
 version = "0.4.3"
 dependencies = [
  "aes-gcm 0.10.3",
+ "coordinode-core",
  "coordinode-storage",
  "hmac",
  "jieba-rs",

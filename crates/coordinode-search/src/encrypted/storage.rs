@@ -6,9 +6,8 @@
 //! This enables prefix scanning to find all nodes matching a token,
 //! and per-field/per-label index isolation.
 
-use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_storage::Guard;
+use coordinode_storage::engine::transaction::Transaction;
 
 use super::field::SseError;
 use super::token::{SearchToken, SEARCH_TOKEN_LEN};
@@ -18,73 +17,85 @@ use super::token::{SearchToken, SEARCH_TOKEN_LEN};
 /// Each (label, field) pair has its own namespace in the `Idx` partition.
 /// Tokens are stored as hex-encoded keys for safe binary-to-key conversion.
 ///
-/// In clustered mode, writes go through the Raft proposal pipeline
-/// and the Idx partition is replicated across nodes.
-pub struct EncryptedIndex<'a> {
-    engine: &'a StorageEngine,
+/// ## Transaction threading (ADR-041)
+///
+/// The index is a typed handle scoped to one `(label, field)` pair; it
+/// holds no engine reference. Every method threads the active
+/// [`Transaction`]: writes ([`Self::insert`] / [`Self::remove`] /
+/// [`Self::remove_node`]) take `&mut Transaction` and buffer their
+/// `Partition::Idx` mutations on it, so token postings commit
+/// atomically with the node write that produced them (and, in
+/// clustered mode, replicate through the Raft proposal pipeline that
+/// the commit drives). Reads ([`Self::search`] / [`Self::count`]) take
+/// `&Transaction` and walk the committed MVCC snapshot via
+/// [`Transaction::base_prefix_scan`].
+pub struct EncryptedIndex {
     /// Label name (e.g., "User") for key prefix scoping.
     label: String,
     /// Field name (e.g., "email") for key prefix scoping.
     field: String,
 }
 
-impl<'a> EncryptedIndex<'a> {
-    /// Create a persistent SSE index for a specific label + field.
-    pub fn new(engine: &'a StorageEngine, label: &str, field: &str) -> Self {
+impl EncryptedIndex {
+    /// Create a persistent SSE index handle for a specific label + field.
+    pub fn new(label: &str, field: &str) -> Self {
         Self {
-            engine,
             label: label.to_string(),
             field: field.to_string(),
         }
     }
 
-    /// Insert a token → node_id mapping.
+    /// Insert a token → node_id mapping. Buffered on `txn`.
     ///
     /// Idempotent: re-inserting the same (token, node_id) is a no-op
     /// (overwrites with same empty value).
-    pub fn insert(&self, token: &SearchToken, node_id: u64) -> Result<(), SseError> {
+    pub fn insert(
+        &self,
+        txn: &mut Transaction,
+        token: &SearchToken,
+        node_id: u64,
+    ) -> Result<(), SseError> {
         let key = self.entry_key(token, node_id);
-        self.engine
-            .put(Partition::Idx, &key, &[])
+        txn.put(Partition::Idx, &key, &[])
             .map_err(|e| SseError::Storage(e.to_string()))
     }
 
-    /// Remove a specific (token, node_id) mapping.
-    pub fn remove(&self, token: &SearchToken, node_id: u64) -> Result<(), SseError> {
+    /// Remove a specific (token, node_id) mapping. Buffered on `txn`.
+    pub fn remove(
+        &self,
+        txn: &mut Transaction,
+        token: &SearchToken,
+        node_id: u64,
+    ) -> Result<(), SseError> {
         let key = self.entry_key(token, node_id);
-        self.engine
-            .delete(Partition::Idx, &key)
+        txn.delete(Partition::Idx, &key)
             .map_err(|e| SseError::Storage(e.to_string()))
     }
 
     /// Remove all tokens for a given node_id in this (label, field).
     ///
-    /// Scans the entire (label, field) prefix and removes entries matching node_id.
-    /// Used when deleting or updating a node's encrypted field.
-    pub fn remove_node(&self, node_id: u64) -> Result<(), SseError> {
+    /// Scans the entire (label, field) prefix and buffers a tombstone
+    /// for every entry matching node_id on `txn`. Used when deleting or
+    /// updating a node's encrypted field.
+    pub fn remove_node(&self, txn: &mut Transaction, node_id: u64) -> Result<(), SseError> {
         let prefix = self.field_prefix();
         let node_suffix = format!(":{node_id:016x}");
 
-        let iter = self
-            .engine
-            .prefix_scan(Partition::Idx, &prefix)
+        let pairs = txn
+            .base_prefix_scan(Partition::Idx, &prefix)
             .map_err(|e| SseError::Storage(e.to_string()))?;
 
         let mut keys_to_delete = Vec::new();
-        for item in iter {
-            let (key, _value) = item
-                .into_inner()
-                .map_err(|e| SseError::Storage(e.to_string()))?;
+        for (key, _value) in pairs {
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if key_str.ends_with(&node_suffix) {
-                    keys_to_delete.push(key.to_vec());
+                    keys_to_delete.push(key);
                 }
             }
         }
 
         for key in keys_to_delete {
-            self.engine
-                .delete(Partition::Idx, &key)
+            txn.delete(Partition::Idx, &key)
                 .map_err(|e| SseError::Storage(e.to_string()))?;
         }
 
@@ -95,19 +106,19 @@ impl<'a> EncryptedIndex<'a> {
     ///
     /// Scans entries with prefix `idx:sse:<label>:<field>:<token_hex>:`
     /// and extracts node IDs from the key suffix.
-    pub fn search(&self, query_token: &SearchToken) -> Result<Vec<u64>, SseError> {
+    pub fn search(
+        &self,
+        txn: &Transaction,
+        query_token: &SearchToken,
+    ) -> Result<Vec<u64>, SseError> {
         let prefix = self.token_prefix(query_token);
 
-        let iter = self
-            .engine
-            .prefix_scan(Partition::Idx, &prefix)
+        let pairs = txn
+            .base_prefix_scan(Partition::Idx, &prefix)
             .map_err(|e| SseError::Storage(e.to_string()))?;
 
         let mut node_ids = Vec::new();
-        for item in iter {
-            let (key, _value) = item
-                .into_inner()
-                .map_err(|e| SseError::Storage(e.to_string()))?;
+        for (key, _value) in pairs {
             if let Some(node_id) = self.extract_node_id(&key) {
                 node_ids.push(node_id);
             }
@@ -117,8 +128,8 @@ impl<'a> EncryptedIndex<'a> {
     }
 
     /// Count of entries for a specific token.
-    pub fn count(&self, token: &SearchToken) -> Result<usize, SseError> {
-        Ok(self.search(token)?.len())
+    pub fn count(&self, txn: &Transaction, token: &SearchToken) -> Result<usize, SseError> {
+        Ok(self.search(txn, token)?.len())
     }
 
     /// Build the full entry key: `idx:sse:<label>:<field>:<token_hex>:<node_id_hex>`
@@ -166,6 +177,11 @@ mod tests {
         Durability, EndpointConfig, Media, StorageConfig, Tier,
     };
 
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use coordinode_core::txn::write_concern::WriteConcern;
+    use coordinode_storage::engine::core::StorageEngine;
+    use coordinode_storage::engine::transaction::{CommitContext, Transaction};
+
     fn test_engine(dir: &std::path::Path) -> StorageEngine {
         let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
             "default",
@@ -177,6 +193,31 @@ mod tests {
         StorageEngine::open(&config).unwrap()
     }
 
+    /// Run SSE index writes in one MVCC transaction and commit.
+    fn commit_txn(engine: &StorageEngine, body: impl FnOnce(&mut Transaction)) {
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        body(&mut txn);
+        let wc = WriteConcern::majority();
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: None,
+            id_gen: None,
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        txn.commit(&ctx).unwrap();
+    }
+
+    /// Run an SSE index read against the latest committed snapshot.
+    fn read_txn<R>(engine: &StorageEngine, body: impl FnOnce(&Transaction) -> R) -> R {
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        body(&txn)
+    }
+
     fn make_token(value: &[u8]) -> SearchToken {
         let key = SearchKey::from_bytes(&[1u8; 32]).unwrap();
         generate_search_token(value, &key)
@@ -186,12 +227,12 @@ mod tests {
     fn insert_and_search() {
         let dir = tempfile::tempdir().unwrap();
         let engine = test_engine(dir.path());
-        let idx = EncryptedIndex::new(&engine, "User", "email");
+        let idx = EncryptedIndex::new("User", "email");
 
         let token = make_token(b"alice@example.com");
-        idx.insert(&token, 1).unwrap();
+        commit_txn(&engine, |txn| idx.insert(txn, &token, 1).unwrap());
 
-        let results = idx.search(&token).unwrap();
+        let results = read_txn(&engine, |txn| idx.search(txn, &token).unwrap());
         assert_eq!(results, vec![1]);
     }
 
@@ -199,10 +240,10 @@ mod tests {
     fn search_not_found() {
         let dir = tempfile::tempdir().unwrap();
         let engine = test_engine(dir.path());
-        let idx = EncryptedIndex::new(&engine, "User", "email");
+        let idx = EncryptedIndex::new("User", "email");
 
         let token = make_token(b"nonexistent");
-        let results = idx.search(&token).unwrap();
+        let results = read_txn(&engine, |txn| idx.search(txn, &token).unwrap());
         assert!(results.is_empty());
     }
 
@@ -210,14 +251,16 @@ mod tests {
     fn multiple_nodes_same_token() {
         let dir = tempfile::tempdir().unwrap();
         let engine = test_engine(dir.path());
-        let idx = EncryptedIndex::new(&engine, "User", "role");
+        let idx = EncryptedIndex::new("User", "role");
 
         let token = make_token(b"admin");
-        idx.insert(&token, 1).unwrap();
-        idx.insert(&token, 2).unwrap();
-        idx.insert(&token, 3).unwrap();
+        commit_txn(&engine, |txn| {
+            idx.insert(txn, &token, 1).unwrap();
+            idx.insert(txn, &token, 2).unwrap();
+            idx.insert(txn, &token, 3).unwrap();
+        });
 
-        let results = idx.search(&token).unwrap();
+        let results = read_txn(&engine, |txn| idx.search(txn, &token).unwrap());
         assert_eq!(results.len(), 3);
     }
 
@@ -225,15 +268,17 @@ mod tests {
     fn remove_specific_entry() {
         let dir = tempfile::tempdir().unwrap();
         let engine = test_engine(dir.path());
-        let idx = EncryptedIndex::new(&engine, "User", "email");
+        let idx = EncryptedIndex::new("User", "email");
 
         let token = make_token(b"alice@example.com");
-        idx.insert(&token, 1).unwrap();
-        idx.insert(&token, 2).unwrap();
+        commit_txn(&engine, |txn| {
+            idx.insert(txn, &token, 1).unwrap();
+            idx.insert(txn, &token, 2).unwrap();
+        });
 
-        idx.remove(&token, 1).unwrap();
+        commit_txn(&engine, |txn| idx.remove(txn, &token, 1).unwrap());
 
-        let results = idx.search(&token).unwrap();
+        let results = read_txn(&engine, |txn| idx.search(txn, &token).unwrap());
         assert_eq!(results, vec![2]);
     }
 
@@ -241,20 +286,22 @@ mod tests {
     fn remove_node_across_tokens() {
         let dir = tempfile::tempdir().unwrap();
         let engine = test_engine(dir.path());
-        let idx = EncryptedIndex::new(&engine, "User", "email");
+        let idx = EncryptedIndex::new("User", "email");
 
         let t1 = make_token(b"alice@example.com");
         let t2 = make_token(b"alice_alt@example.com");
 
-        idx.insert(&t1, 1).unwrap();
-        idx.insert(&t2, 1).unwrap();
-        idx.insert(&t1, 2).unwrap();
+        commit_txn(&engine, |txn| {
+            idx.insert(txn, &t1, 1).unwrap();
+            idx.insert(txn, &t2, 1).unwrap();
+            idx.insert(txn, &t1, 2).unwrap();
+        });
 
-        idx.remove_node(1).unwrap();
+        commit_txn(&engine, |txn| idx.remove_node(txn, 1).unwrap());
 
-        assert!(idx.search(&t1).unwrap().contains(&2));
-        assert!(!idx.search(&t1).unwrap().contains(&1));
-        assert!(idx.search(&t2).unwrap().is_empty());
+        assert!(read_txn(&engine, |txn| idx.search(txn, &t1).unwrap()).contains(&2));
+        assert!(!read_txn(&engine, |txn| idx.search(txn, &t1).unwrap()).contains(&1));
+        assert!(read_txn(&engine, |txn| idx.search(txn, &t2).unwrap()).is_empty());
     }
 
     #[test]
@@ -262,15 +309,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = test_engine(dir.path());
 
-        let idx_user = EncryptedIndex::new(&engine, "User", "email");
-        let idx_admin = EncryptedIndex::new(&engine, "Admin", "email");
+        let idx_user = EncryptedIndex::new("User", "email");
+        let idx_admin = EncryptedIndex::new("Admin", "email");
 
         let token = make_token(b"shared@example.com");
-        idx_user.insert(&token, 1).unwrap();
-        idx_admin.insert(&token, 2).unwrap();
+        commit_txn(&engine, |txn| {
+            idx_user.insert(txn, &token, 1).unwrap();
+            idx_admin.insert(txn, &token, 2).unwrap();
+        });
 
-        assert_eq!(idx_user.search(&token).unwrap(), vec![1]);
-        assert_eq!(idx_admin.search(&token).unwrap(), vec![2]);
+        assert_eq!(
+            read_txn(&engine, |txn| idx_user.search(txn, &token).unwrap()),
+            vec![1]
+        );
+        assert_eq!(
+            read_txn(&engine, |txn| idx_admin.search(txn, &token).unwrap()),
+            vec![2]
+        );
     }
 
     #[test]
@@ -278,17 +333,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = test_engine(dir.path());
 
-        let idx_email = EncryptedIndex::new(&engine, "User", "email");
-        let idx_phone = EncryptedIndex::new(&engine, "User", "phone");
+        let idx_email = EncryptedIndex::new("User", "email");
+        let idx_phone = EncryptedIndex::new("User", "phone");
 
         let t_email = make_token(b"alice@example.com");
         let t_phone = make_token(b"+1234567890");
 
-        idx_email.insert(&t_email, 1).unwrap();
-        idx_phone.insert(&t_phone, 1).unwrap();
+        commit_txn(&engine, |txn| {
+            idx_email.insert(txn, &t_email, 1).unwrap();
+            idx_phone.insert(txn, &t_phone, 1).unwrap();
+        });
 
-        assert_eq!(idx_email.search(&t_email).unwrap(), vec![1]);
-        assert!(idx_email.search(&t_phone).unwrap().is_empty());
+        assert_eq!(
+            read_txn(&engine, |txn| idx_email.search(txn, &t_email).unwrap()),
+            vec![1]
+        );
+        assert!(read_txn(&engine, |txn| idx_email.search(txn, &t_phone).unwrap()).is_empty());
     }
 
     #[test]
@@ -299,15 +359,15 @@ mod tests {
         // Write and close
         {
             let engine = test_engine(dir.path());
-            let idx = EncryptedIndex::new(&engine, "User", "email");
-            idx.insert(&token, 42).unwrap();
+            let idx = EncryptedIndex::new("User", "email");
+            commit_txn(&engine, |txn| idx.insert(txn, &token, 42).unwrap());
         }
 
         // Reopen and verify
         {
             let engine = test_engine(dir.path());
-            let idx = EncryptedIndex::new(&engine, "User", "email");
-            let results = idx.search(&token).unwrap();
+            let idx = EncryptedIndex::new("User", "email");
+            let results = read_txn(&engine, |txn| idx.search(txn, &token).unwrap());
             assert_eq!(results, vec![42], "token should survive reopen");
         }
     }
@@ -331,12 +391,12 @@ mod tests {
             .unwrap();
 
         // Store token in SSE index
-        let idx = EncryptedIndex::new(&engine, "User", "email");
-        idx.insert(&token, 1).unwrap();
+        let idx = EncryptedIndex::new("User", "email");
+        commit_txn(&engine, |txn| idx.insert(txn, &token, 1).unwrap());
 
         // SEARCH: generate query token + lookup + decrypt
         let query_token = generate_search_token(b"alice@example.com", &pair.search_key);
-        let matching_ids = idx.search(&query_token).unwrap();
+        let matching_ids = read_txn(&engine, |txn| idx.search(txn, &query_token).unwrap());
         assert_eq!(matching_ids, vec![1]);
 
         // Retrieve and decrypt
@@ -353,27 +413,31 @@ mod tests {
     fn count_entries() {
         let dir = tempfile::tempdir().unwrap();
         let engine = test_engine(dir.path());
-        let idx = EncryptedIndex::new(&engine, "User", "email");
+        let idx = EncryptedIndex::new("User", "email");
 
         let token = make_token(b"test");
-        idx.insert(&token, 1).unwrap();
-        idx.insert(&token, 2).unwrap();
+        commit_txn(&engine, |txn| {
+            idx.insert(txn, &token, 1).unwrap();
+            idx.insert(txn, &token, 2).unwrap();
+        });
 
-        assert_eq!(idx.count(&token).unwrap(), 2);
+        assert_eq!(read_txn(&engine, |txn| idx.count(txn, &token).unwrap()), 2);
     }
 
     #[test]
     fn insert_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let engine = test_engine(dir.path());
-        let idx = EncryptedIndex::new(&engine, "User", "email");
+        let idx = EncryptedIndex::new("User", "email");
 
         let token = make_token(b"test");
-        idx.insert(&token, 1).unwrap();
-        idx.insert(&token, 1).unwrap(); // duplicate
+        commit_txn(&engine, |txn| {
+            idx.insert(txn, &token, 1).unwrap();
+            idx.insert(txn, &token, 1).unwrap(); // duplicate
+        });
 
         assert_eq!(
-            idx.count(&token).unwrap(),
+            read_txn(&engine, |txn| idx.count(txn, &token).unwrap()),
             1,
             "duplicate should be idempotent"
         );

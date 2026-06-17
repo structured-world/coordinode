@@ -1,4 +1,4 @@
-//! Integration tests: SSE encrypted search via Cypher (G017).
+//! Integration tests: SSE encrypted search via Cypher.
 //!
 //! Tests CREATE/DROP ENCRYPTED INDEX DDL and encrypted_match() function
 //! through the full Cypher pipeline: parse → plan → execute.
@@ -13,6 +13,32 @@ fn open_db() -> (Database, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Database::open(dir.path()).expect("open db");
     (db, dir)
+}
+
+/// Seed SSE token postings through one committed MVCC transaction —
+/// the `EncryptedIndex` store buffers its `Partition::Idx` writes on
+/// the transaction (ADR-041).
+fn commit_sse(
+    engine: &coordinode_storage::engine::core::StorageEngine,
+    body: impl FnOnce(&mut coordinode_storage::engine::transaction::Transaction),
+) {
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use coordinode_core::txn::write_concern::WriteConcern;
+    use coordinode_storage::engine::transaction::{CommitContext, Transaction};
+
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let read_ts = oracle.next();
+    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    body(&mut txn);
+    let wc = WriteConcern::majority();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    txn.commit(&ctx).expect("commit sse tokens");
 }
 
 /// CREATE ENCRYPTED INDEX parses and executes without error.
@@ -87,12 +113,15 @@ fn encrypted_match_e2e_search() {
 
     // Insert tokens into SSE index (server-side, via programmatic API)
     {
-        let index =
-            coordinode_search::encrypted::EncryptedIndex::new(db.engine(), "Patient", "ssn");
-        index
-            .insert(&token_alice, alice_id)
-            .expect("insert alice token");
-        index.insert(&token_bob, bob_id).expect("insert bob token");
+        let index = coordinode_search::encrypted::EncryptedIndex::new("Patient", "ssn");
+        commit_sse(db.engine(), |txn| {
+            index
+                .insert(txn, &token_alice, alice_id)
+                .expect("insert alice token");
+            index
+                .insert(txn, &token_bob, bob_id)
+                .expect("insert bob token");
+        });
     }
 
     // Search via encrypted_match() — pass token as hex-encoded string parameter
@@ -171,10 +200,13 @@ fn encrypted_match_compound_where() {
     };
 
     {
-        let index =
-            coordinode_search::encrypted::EncryptedIndex::new(db.engine(), "Patient", "ssn");
-        index.insert(&token, active_id).expect("insert active");
-        index.insert(&token, inactive_id).expect("insert inactive");
+        let index = coordinode_search::encrypted::EncryptedIndex::new("Patient", "ssn");
+        commit_sse(db.engine(), |txn| {
+            index.insert(txn, &token, active_id).expect("insert active");
+            index
+                .insert(txn, &token, inactive_id)
+                .expect("insert inactive");
+        });
     }
 
     // Compound WHERE: encrypted_match AND property filter

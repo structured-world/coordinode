@@ -5915,10 +5915,12 @@ fn execute_encrypted_filter(
         return Ok(rows.to_vec());
     }
 
-    // Create storage-backed SSE index on the fly (cheap — just stores engine ref + strings).
-    let index = EncryptedIndex::new(ctx.engine, &label, &property);
+    // Create storage-backed SSE index handle on the fly (cheap — just
+    // holds the (label, field) scoping strings). The search reads
+    // through the active transaction's committed snapshot.
+    let index = EncryptedIndex::new(&label, &property);
     let matching_ids = index
-        .search(&search_token)
+        .search(&ctx.txn, &search_token)
         .map_err(|e| ExecutionError::Unsupported(format!("encrypted search error: {e}")))?;
 
     // Build a set for O(1) lookup.

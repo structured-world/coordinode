@@ -35,6 +35,7 @@ lindera = { workspace = true, optional = true }
 jieba-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
+coordinode-core = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

@@ -657,7 +657,7 @@ impl TextIndex {
     }
 
     /// MVCC-aware variant of `add_document_with_language`. See
-    /// [`add_document_at`] for `commit_ts` semantics.
+    /// [`Self::add_document_at`] for `commit_ts` semantics.
     pub fn add_document_with_language_at(
         &mut self,
         node_id: u64,
