@@ -1690,6 +1690,47 @@ mod checkpoint_tests {
         StorageEngine::open(&config).expect("open engine")
     }
 
+    /// R159 Part C: a `page_ecc = ForceOn` endpoint makes
+    /// `to_tree_config_with_routing` request `Config::page_ecc(true)`.
+    /// Verify the engine opens (no `PageEccUnsupported`), and a value
+    /// survives a flush-to-SST + reopen — i.e. it round-trips through
+    /// the Reed-Solomon-trailered block codec. Only meaningful with the
+    /// `page_ecc` feature compiled, so the test is gated on it.
+    #[cfg(feature = "page_ecc")]
+    #[test]
+    fn page_ecc_force_on_round_trips_through_sst() {
+        use crate::engine::config::PageEccPolicy;
+
+        let dir = TempDir::new().expect("tempdir");
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "ecc",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable, // ForceOn overrides Durable's Auto-off
+            Tier::Warm,
+        )
+        .with_page_ecc(PageEccPolicy::ForceOn)]);
+
+        let engine = StorageEngine::open(&config).expect("open engine with page_ecc");
+        engine
+            .put(Partition::Node, b"k-ecc", b"v-ecc")
+            .expect("put");
+        // Flush memtable → SST so the page-ECC block codec runs on disk.
+        engine.persist().expect("persist to SST");
+        drop(engine);
+
+        // Reopen and read back through the ECC-decoded SST block path.
+        let reopened = StorageEngine::open(&config).expect("reopen engine with page_ecc");
+        assert_eq!(
+            reopened
+                .get(Partition::Node, b"k-ecc")
+                .expect("get")
+                .as_deref(),
+            Some(b"v-ecc".as_ref()),
+            "value must round-trip through page-ECC SST blocks",
+        );
+    }
+
     #[test]
     fn checkpoint_round_trips_all_partitions() {
         let src_dir = TempDir::new().expect("src tempdir");

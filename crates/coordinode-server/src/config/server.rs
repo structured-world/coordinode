@@ -13,7 +13,33 @@
 //! Each parameter has exactly one field here; adding a knob means adding it once
 //! to `ServerConfig`, once to `CliOverrides`, and one line to `apply_overrides`.
 
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use serde::Deserialize;
+
+/// Storage topology: the physical endpoints this node manages.
+///
+/// An endpoint is one mount point with its own media, durability class, tier,
+/// capacity, and per-block ECC policy (see [`EndpointConfig`]).
+/// Declaring more than one endpoint is the multi-disk case (CoordiNode runs
+/// against 40-disk JBODs routinely); the per-LSM-level placement, cascade
+/// eviction, and WAL/oplog routing across them are driven by the storage layer
+/// that consumes this list.
+///
+/// Empty (the default) means "derive a single endpoint from `data_dir`": a
+/// durable HDD warm-tier endpoint named `default` rooted at the configured
+/// data directory. This keeps the common single-disk deployment a one-liner
+/// (`data_dir`) while letting a production operator declare the full topology
+/// explicitly in the config file. Because a topology is a list of structured
+/// records, it lives in the YAML config file only; the `--data` command-line
+/// flag configures the single-endpoint case (and overrides any file topology,
+/// see [`ServerConfig::apply_overrides`]).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StorageTopology {
+    /// Explicit endpoint list. Empty = derive a single durable HDD warm-tier
+    /// endpoint rooted at [`ServerConfig::data_dir`].
+    pub endpoints: Vec<EndpointConfig>,
+}
 
 /// Errors from loading the YAML config file.
 #[derive(Debug, thiserror::Error)]
@@ -46,8 +72,12 @@ pub struct ServerConfig {
     pub rest_addr: String,
     /// Ops/metrics listen address.
     pub ops_addr: String,
-    /// Data directory.
+    /// Data directory. Used by the consensus log, CDC, and the single-endpoint
+    /// storage desugar when `storage.endpoints` is empty.
     pub data_dir: String,
+    /// Physical storage topology (multi-endpoint). Empty = single endpoint
+    /// derived from `data_dir`. See [`StorageTopology`].
+    pub storage: StorageTopology,
     /// Cluster peer addresses (empty = standalone single-node).
     pub peers: Vec<String>,
     /// Open-file-descriptor target (`None` = raise soft limit to hard limit).
@@ -86,6 +116,7 @@ impl Default for ServerConfig {
             rest_addr: "[::]:7081".to_string(),
             ops_addr: "[::]:7084".to_string(),
             data_dir: "./data".to_string(),
+            storage: StorageTopology::default(),
             peers: Vec::new(),
             nofile: None,
             max_connections: None,
@@ -171,6 +202,11 @@ impl ServerConfig {
         }
         if let Some(v) = &o.data_dir {
             self.data_dir = v.clone();
+            // The command line wins over the file: an explicit `--data` names
+            // a single directory, which cannot express a multi-endpoint
+            // topology, so it overrides any `storage.endpoints` the file set
+            // and collapses to the single-endpoint desugar at this path.
+            self.storage.endpoints.clear();
         }
         if let Some(v) = &o.peers {
             self.peers = v.clone();
@@ -211,6 +247,49 @@ impl ServerConfig {
         if let Some(v) = o.interactive_txn_max_bytes {
             self.interactive_txn_max_bytes = v;
         }
+    }
+
+    /// Resolve the storage endpoints for this node.
+    ///
+    /// With an explicit `storage.endpoints` list, that list is the topology
+    /// verbatim. With no endpoints configured (the common single-disk case),
+    /// desugar `data_dir` into one durable HDD warm-tier endpoint named
+    /// `default` — the historical single-endpoint behaviour.
+    #[must_use]
+    pub fn storage_endpoints(&self) -> Vec<EndpointConfig> {
+        if self.storage.endpoints.is_empty() {
+            vec![EndpointConfig::new(
+                "default",
+                &self.data_dir,
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]
+        } else {
+            self.storage.endpoints.clone()
+        }
+    }
+
+    /// Build the [`StorageConfig`] for this node from the resolved endpoint
+    /// topology ([`Self::storage_endpoints`]). This is the single place the
+    /// server turns operator config into a storage-engine config; every
+    /// subcommand that opens the engine routes through it.
+    #[must_use]
+    pub fn resolve_storage_config(&self) -> StorageConfig {
+        StorageConfig::with_endpoints(self.storage_endpoints())
+    }
+
+    /// Whether any configured endpoint's effective ECC policy is "on".
+    ///
+    /// Used at startup to warn when an operator requested per-block ECC
+    /// (`page_ecc: force_on`, or a `degraded` endpoint under the `auto` rule)
+    /// but the binary was built without the `page_ecc` feature, so the request
+    /// has no on-disk effect.
+    #[must_use]
+    pub fn page_ecc_requested(&self) -> bool {
+        self.storage_endpoints()
+            .iter()
+            .any(EndpointConfig::is_page_ecc_enabled)
     }
 }
 
@@ -292,5 +371,176 @@ mod tests {
         let path = dir.path().join("c.yaml");
         std::fs::write(&path, "node_id: \"not a number\"\n").unwrap();
         assert!(ServerConfig::load(Some(path.to_str().unwrap())).is_err());
+    }
+
+    // ── Storage topology ────────────────────────────────────────────────
+
+    #[test]
+    fn default_storage_desugars_to_single_endpoint_at_data_dir() {
+        let c = ServerConfig {
+            data_dir: "/var/lib/coordinode/data".to_string(),
+            ..ServerConfig::default()
+        };
+        assert!(
+            c.storage.endpoints.is_empty(),
+            "default has no explicit list"
+        );
+        let eps = c.storage_endpoints();
+        assert_eq!(eps.len(), 1, "desugar yields exactly one endpoint");
+        assert_eq!(eps[0].id, "default");
+        assert_eq!(eps[0].path.to_str().unwrap(), "/var/lib/coordinode/data");
+        assert_eq!(eps[0].media, Media::Hdd);
+        assert_eq!(eps[0].durability, Durability::Durable);
+        assert_eq!(eps[0].tier, Tier::Warm);
+    }
+
+    #[test]
+    fn explicit_multi_endpoint_topology_parses_from_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.yaml");
+        std::fs::write(
+            &path,
+            "data_dir: /var/lib/coordinode/data\n\
+             storage:\n\
+             \x20 endpoints:\n\
+             \x20   - id: nvme-hot\n\
+             \x20     path: /mnt/nvme0\n\
+             \x20     media: nvme\n\
+             \x20     durability: durable\n\
+             \x20     tier: hot\n\
+             \x20   - id: hdd-cold\n\
+             \x20     path: /mnt/hdd0\n\
+             \x20     media: hdd\n\
+             \x20     durability: degraded\n\
+             \x20     tier: cold\n\
+             \x20     page_ecc: force_on\n\
+             \x20     capacity_bytes: 16000000000000\n",
+        )
+        .unwrap();
+        let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+        let eps = c.storage_endpoints();
+        assert_eq!(eps.len(), 2, "both endpoints parsed");
+        assert_eq!(eps[0].id, "nvme-hot");
+        assert_eq!(eps[0].media, Media::Nvme);
+        assert_eq!(eps[0].tier, Tier::Hot);
+        // Omitted capacity/hard_limit default to 0 (untracked / no limit).
+        assert_eq!(eps[0].capacity_bytes, 0);
+        assert_eq!(eps[0].hard_limit_bytes, 0);
+        assert_eq!(eps[1].id, "hdd-cold");
+        assert_eq!(eps[1].durability, Durability::Degraded);
+        assert_eq!(eps[1].capacity_bytes, 16_000_000_000_000);
+    }
+
+    #[test]
+    fn cli_data_flag_overrides_file_topology() {
+        // File declares a two-endpoint topology...
+        let mut c = ServerConfig {
+            storage: StorageTopology {
+                endpoints: vec![
+                    EndpointConfig::new("a", "/mnt/a", Media::Nvme, Durability::Durable, Tier::Hot),
+                    EndpointConfig::new("b", "/mnt/b", Media::Hdd, Durability::Durable, Tier::Cold),
+                ],
+            },
+            ..ServerConfig::default()
+        };
+        // ...but the operator passes --data on the CLI for a one-off.
+        c.apply_overrides(&CliOverrides {
+            data_dir: Some("/tmp/oneoff".to_string()),
+            ..CliOverrides::default()
+        });
+        assert!(
+            c.storage.endpoints.is_empty(),
+            "CLI --data collapses the file topology"
+        );
+        let eps = c.storage_endpoints();
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].path.to_str().unwrap(), "/tmp/oneoff");
+    }
+
+    #[test]
+    fn unknown_endpoint_key_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.yaml");
+        std::fs::write(
+            &path,
+            "storage:\n\
+             \x20 endpoints:\n\
+             \x20   - id: ep0\n\
+             \x20     path: /mnt/ep0\n\
+             \x20     media: ssd\n\
+             \x20     durability: durable\n\
+             \x20     tier: warm\n\
+             \x20     typo_field: 1\n",
+        )
+        .unwrap();
+        assert!(
+            ServerConfig::load(Some(path.to_str().unwrap())).is_err(),
+            "a typo in an endpoint key must fail loud"
+        );
+    }
+
+    #[test]
+    fn page_ecc_requested_tracks_endpoint_policy() {
+        // Auto + durable → off.
+        let durable = ServerConfig {
+            storage: StorageTopology {
+                endpoints: vec![EndpointConfig::new(
+                    "d",
+                    "/mnt/d",
+                    Media::Ssd,
+                    Durability::Durable,
+                    Tier::Warm,
+                )],
+            },
+            ..ServerConfig::default()
+        };
+        assert!(!durable.page_ecc_requested());
+
+        // Auto + degraded → on.
+        let degraded = ServerConfig {
+            storage: StorageTopology {
+                endpoints: vec![EndpointConfig::new(
+                    "g",
+                    "/mnt/g",
+                    Media::Ssd,
+                    Durability::Degraded,
+                    Tier::Warm,
+                )],
+            },
+            ..ServerConfig::default()
+        };
+        assert!(degraded.page_ecc_requested());
+    }
+
+    #[test]
+    fn packaged_conf_parses_against_current_schema() {
+        // The shipped /etc/coordinode/coordinode.conf must stay valid against
+        // ServerConfig (deny_unknown_fields): a key removed here but left in the
+        // packaged file, or vice versa, is a release regression. Resolve the
+        // file relative to this crate's manifest dir.
+        let conf = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging/coordinode.conf");
+        let c = ServerConfig::load(Some(conf.to_str().unwrap()))
+            .expect("packaged coordinode.conf must parse against ServerConfig");
+        // It ships the single-endpoint default (storage.endpoints empty).
+        assert!(c.storage.endpoints.is_empty());
+        assert_eq!(c.storage_endpoints().len(), 1);
+    }
+
+    #[test]
+    fn resolve_storage_config_carries_endpoints() {
+        let c = ServerConfig {
+            storage: StorageTopology {
+                endpoints: vec![
+                    EndpointConfig::new("a", "/mnt/a", Media::Nvme, Durability::Durable, Tier::Hot),
+                    EndpointConfig::new("b", "/mnt/b", Media::Hdd, Durability::Durable, Tier::Cold),
+                ],
+            },
+            ..ServerConfig::default()
+        };
+        let sc = c.resolve_storage_config();
+        assert_eq!(sc.endpoints.len(), 2);
+        assert_eq!(sc.endpoints[0].id, "a");
+        assert_eq!(sc.endpoints[1].id, "b");
     }
 }

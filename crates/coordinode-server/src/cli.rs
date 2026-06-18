@@ -29,8 +29,11 @@ pub enum Command {
     Version,
     /// Verify storage integrity.
     Verify {
-        /// Data directory.
+        /// Single-endpoint data directory (used when `config_path` is `None`).
         data_dir: String,
+        /// Optional config file. When given, the storage topology (including a
+        /// multi-endpoint layout) is resolved from it and `data_dir` is ignored.
+        config_path: Option<String>,
         /// Deep verification (checksums on all pages).
         deep: bool,
     },
@@ -39,8 +42,11 @@ pub enum Command {
     /// Takes a consistent MVCC snapshot at the start — ongoing writes
     /// are not blocked during backup.
     Backup {
-        /// Data directory (source database).
+        /// Single-endpoint data directory (used when `config_path` is `None`).
         data_dir: String,
+        /// Optional config file. When given, the storage topology is resolved
+        /// from it and `data_dir` is ignored.
+        config_path: Option<String>,
         /// Output file path.
         output: String,
         /// Backup format: json, cypher, or binary.
@@ -53,8 +59,11 @@ pub enum Command {
     },
     /// Restore database from a backup file.
     Restore {
-        /// Data directory (target database — will be created if empty).
+        /// Single-endpoint data directory (used when `config_path` is `None`).
         data_dir: String,
+        /// Optional config file. When given, the storage topology is resolved
+        /// from it and `data_dir` is ignored.
+        config_path: Option<String>,
         /// Input file path.
         input: String,
         /// Backup format: json, cypher, or binary.
@@ -78,8 +87,11 @@ pub enum Command {
     /// pointing `serve --data` at the checkpoint (or a copy of it). Orders
     /// of magnitude faster than a logical `backup` dump for large data.
     Checkpoint {
-        /// Data directory (source database).
+        /// Single-endpoint data directory (used when `config_path` is `None`).
         data_dir: String,
+        /// Optional config file. When given, the storage topology is resolved
+        /// from it and `data_dir` is ignored.
+        config_path: Option<String>,
         /// Output directory for the checkpoint (must not exist).
         output: String,
     },
@@ -91,8 +103,11 @@ pub enum Command {
     /// instead of O(operands). The server must not be running against the same
     /// data directory.
     Compact {
-        /// Data directory (database to compact).
+        /// Single-endpoint data directory (used when `config_path` is `None`).
         data_dir: String,
+        /// Optional config file. When given, the storage topology is resolved
+        /// from it and `data_dir` is ignored.
+        config_path: Option<String>,
     },
     /// Admin commands for a running cluster.
     AdminNodeJoin {
@@ -200,8 +215,13 @@ pub fn parse_args_from(args: &[String]) -> Command {
         "version" | "--version" | "-v" => Command::Version,
         "verify" => {
             let data_dir = find_flag(args, "--data").unwrap_or_else(|| "./data".to_string());
+            let config_path = find_flag(args, "--config");
             let deep = args.iter().any(|a| a == "--deep");
-            Command::Verify { data_dir, deep }
+            Command::Verify {
+                data_dir,
+                config_path,
+                deep,
+            }
         }
         "backup" => {
             let data_dir = find_flag(args, "--data").unwrap_or_else(|| "./data".to_string());
@@ -220,8 +240,10 @@ pub fn parse_args_from(args: &[String]) -> Command {
                     std::process::exit(1);
                 })
             });
+            let config_path = find_flag(args, "--config");
             Command::Backup {
                 data_dir,
+                config_path,
                 output,
                 format,
                 namespace,
@@ -248,8 +270,10 @@ pub fn parse_args_from(args: &[String]) -> Command {
                 })
                 .unwrap_or_default();
             let force = args.iter().any(|a| a == "--force");
+            let config_path = find_flag(args, "--config");
             Command::Restore {
                 data_dir,
+                config_path,
                 input,
                 format,
                 namespace,
@@ -266,11 +290,20 @@ pub fn parse_args_from(args: &[String]) -> Command {
                     std::process::exit(1);
                 }
             };
-            Command::Checkpoint { data_dir, output }
+            let config_path = find_flag(args, "--config");
+            Command::Checkpoint {
+                data_dir,
+                config_path,
+                output,
+            }
         }
         "compact" => {
             let data_dir = find_flag(args, "--data").unwrap_or_else(|| "./data".to_string());
-            Command::Compact { data_dir }
+            let config_path = find_flag(args, "--config");
+            Command::Compact {
+                data_dir,
+                config_path,
+            }
         }
         "admin" => parse_admin_args(args),
         _ => {
@@ -282,11 +315,11 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  [--nofile N] [--max-connections N] [--max-request-size-mb N] [--request-timeout-secs N]\n          \
                  [--http2-keepalive-secs N] [--cache-size-mb N] [--write-buffer-mb N]\n          \
                  [--retention-window-secs N] [--registry-heartbeat-ms N] [--registry-eviction-ms N]\n  \
-                 coordinode backup --output FILE [--data DIR] [--format json|cypher|binary|snapshot] [--namespace NS] [--since SEQNO]\n  \
-                 coordinode restore --input FILE [--data DIR] [--format json|cypher|binary|snapshot|apoc-json|apoc-cypher|hetio-json] [--namespace NS] [--only-labels L1,L2] [--force]\n  \
-                 coordinode checkpoint --output DIR [--data DIR]\n  \
-                 coordinode compact [--data DIR]\n  \
-                 coordinode verify [--data DIR] [--deep]\n  \
+                 coordinode backup --output FILE [--data DIR | --config FILE] [--format json|cypher|binary|snapshot] [--namespace NS] [--since SEQNO]\n  \
+                 coordinode restore --input FILE [--data DIR | --config FILE] [--format json|cypher|binary|snapshot|apoc-json|apoc-cypher|hetio-json] [--namespace NS] [--only-labels L1,L2] [--force]\n  \
+                 coordinode checkpoint --output DIR [--data DIR | --config FILE]\n  \
+                 coordinode compact [--data DIR | --config FILE]\n  \
+                 coordinode verify [--data DIR | --config FILE] [--deep]\n  \
                  coordinode version\n  \
                  coordinode admin node join --node CLUSTER_ADDR --id NODE_ID --addr NODE_ADDR [--pre-seeded] [--follow]\n  \
                  coordinode admin node decommission --node CLUSTER_ADDR --id NODE_ID [--pruning] [--force] [--skip-confirmation]\n",
@@ -865,7 +898,13 @@ mod tests {
     fn compact_uses_explicit_data_dir() {
         let cmd = parse_args_from(&args("coordinode compact --data /var/lib/coordinode"));
         match cmd {
-            Command::Compact { data_dir } => assert_eq!(data_dir, "/var/lib/coordinode"),
+            Command::Compact {
+                data_dir,
+                config_path,
+            } => {
+                assert_eq!(data_dir, "/var/lib/coordinode");
+                assert!(config_path.is_none());
+            }
             _ => panic!("expected Compact command"),
         }
     }
@@ -874,8 +913,62 @@ mod tests {
     fn compact_defaults_data_dir() {
         let cmd = parse_args_from(&args("coordinode compact"));
         match cmd {
-            Command::Compact { data_dir } => assert_eq!(data_dir, "./data"),
+            Command::Compact {
+                data_dir,
+                config_path,
+            } => {
+                assert_eq!(data_dir, "./data");
+                assert!(config_path.is_none());
+            }
             _ => panic!("expected Compact command"),
+        }
+    }
+
+    #[test]
+    fn compact_accepts_config_path() {
+        let cmd = parse_args_from(&args(
+            "coordinode compact --config /etc/coordinode/coordinode.conf",
+        ));
+        match cmd {
+            Command::Compact { config_path, .. } => {
+                assert_eq!(
+                    config_path.as_deref(),
+                    Some("/etc/coordinode/coordinode.conf")
+                );
+            }
+            _ => panic!("expected Compact command"),
+        }
+    }
+
+    #[test]
+    fn backup_accepts_config_path() {
+        let cmd = parse_args_from(&args(
+            "coordinode backup --output /tmp/b.bin --config /etc/coordinode/coordinode.conf",
+        ));
+        match cmd {
+            Command::Backup { config_path, .. } => {
+                assert_eq!(
+                    config_path.as_deref(),
+                    Some("/etc/coordinode/coordinode.conf")
+                );
+            }
+            _ => panic!("expected Backup command"),
+        }
+    }
+
+    #[test]
+    fn restore_accepts_config_path() {
+        let cmd = parse_args_from(&args(
+            "coordinode restore --input /tmp/b.bin --config /etc/coordinode/coordinode.conf",
+        ));
+        match cmd {
+            Command::Restore { config_path, .. } => {
+                assert_eq!(
+                    config_path.as_deref(),
+                    Some("/etc/coordinode/coordinode.conf")
+                );
+            }
+            _ => panic!("expected Restore command"),
         }
     }
 

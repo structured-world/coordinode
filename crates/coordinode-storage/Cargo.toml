@@ -12,6 +12,12 @@ default = ["lz4"]
 lz4 = ["lsm-tree/lz4", "dep:lz4_flex"]
 zstd = ["lsm-tree/zstd", "dep:zstd"]
 encryption = ["lsm-tree/encryption"]
+# Per-block Reed-Solomon page ECC (build-time gated, default-off). When
+# enabled, a tree spanning a Degraded / ForceOn endpoint gets an ECC
+# trailer per SST block so an unrecoverable read can be repaired in
+# place. Off by default so the storage-format freeze ships without the
+# Reed-Solomon dependency; lights up via this feature post-freeze.
+page_ecc = ["lsm-tree/page_ecc"]
 
 [dependencies]
 coordinode-core = { workspace = true }

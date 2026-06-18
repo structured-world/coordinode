@@ -13,7 +13,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, Tier};
 use coordinode_storage::Guard;
 use tonic::transport::Server;
 use tracing::info;
@@ -90,6 +89,29 @@ fn set_nofile_limit(_target: Option<u64>) -> Option<(u64, u64)> {
     None
 }
 
+/// Resolve the storage config for an offline admin command (`verify`,
+/// `checkpoint`, `compact`).
+///
+/// With `--config`, the storage topology (including a multi-endpoint layout)
+/// is read from the same file the server uses, so an admin op opens the
+/// database at the configured endpoint paths. Without it, the command operates
+/// on a single endpoint rooted at `data_dir`. Both paths funnel through
+/// [`config::ServerConfig::resolve_storage_config`] so the desugar matches the
+/// server exactly.
+fn admin_storage_config(
+    config_path: Option<&str>,
+    data_dir: &str,
+) -> Result<coordinode_storage::engine::config::StorageConfig, Box<dyn std::error::Error>> {
+    let cfg = match config_path {
+        Some(p) => config::ServerConfig::load(Some(p)).map_err(|e| format!("config error: {e}"))?,
+        None => config::ServerConfig {
+            data_dir: data_dir.to_string(),
+            ..config::ServerConfig::default()
+        },
+    };
+    Ok(cfg.resolve_storage_config())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let command = cli::parse_args();
@@ -99,19 +121,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("coordinode v{}", env!("CARGO_PKG_VERSION"));
         }
 
-        cli::Command::Verify { data_dir, deep } => {
+        cli::Command::Verify {
+            data_dir,
+            config_path,
+            deep,
+        } => {
             logging::init_logging();
             info!(data_dir = %data_dir, deep = deep, "verifying storage integrity");
 
-            let config = coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
-                EndpointConfig::new(
-                    "default",
-                    &data_dir,
-                    Media::Hdd,
-                    Durability::Durable,
-                    Tier::Warm,
-                ),
-            ]);
+            let config = admin_storage_config(config_path.as_deref(), &data_dir)?;
             let engine = coordinode_storage::engine::core::StorageEngine::open(&config)?;
             let disk = engine.disk_space()?;
             info!(disk_bytes = disk, "storage opened successfully");
@@ -136,19 +154,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("verification complete");
         }
 
-        cli::Command::Checkpoint { data_dir, output } => {
+        cli::Command::Checkpoint {
+            data_dir,
+            config_path,
+            output,
+        } => {
             logging::init_logging();
             info!(data_dir = %data_dir, output = %output, "creating checkpoint");
 
-            let config = coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
-                EndpointConfig::new(
-                    "default",
-                    &data_dir,
-                    Media::Hdd,
-                    Durability::Durable,
-                    Tier::Warm,
-                ),
-            ]);
+            let config = admin_storage_config(config_path.as_deref(), &data_dir)?;
             let engine = coordinode_storage::engine::core::StorageEngine::open(&config)?;
             let summary = engine
                 .create_checkpoint(std::path::Path::new(&output))
@@ -163,19 +177,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        cli::Command::Compact { data_dir } => {
+        cli::Command::Compact {
+            data_dir,
+            config_path,
+        } => {
             logging::init_logging();
             info!(data_dir = %data_dir, "compacting database");
 
-            let config = coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
-                EndpointConfig::new(
-                    "default",
-                    &data_dir,
-                    Media::Hdd,
-                    Durability::Durable,
-                    Tier::Warm,
-                ),
-            ]);
+            let config = admin_storage_config(config_path.as_deref(), &data_dir)?;
             let engine = coordinode_storage::engine::core::StorageEngine::open(&config)?;
             for &part in coordinode_storage::engine::partition::Partition::all() {
                 engine
@@ -208,6 +217,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
+            // Resolve the storage topology (an explicit multi-endpoint list or
+            // the single-endpoint `data_dir` desugar) and the page-ECC request
+            // once, while the config is still whole — the destructure below
+            // moves it field-by-field.
+            let mut storage_config = cfg.resolve_storage_config();
+            let page_ecc_requested = cfg.page_ecc_requested();
+
             // Bind the resolved settings into the local names the rest of the
             // handler uses. `peers` becomes `None` when empty (= standalone),
             // matching the cluster-detection contract below.
@@ -218,6 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rest_addr,
                 ops_addr,
                 data_dir,
+                storage: _,
                 nofile,
                 max_connections,
                 max_request_size_mb,
@@ -288,22 +305,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // `raft_node_shared` provides the read fence (R141), ClusterService
             // administration, and ensures consistent apply ordering via oracle.
 
-            // Common setup: open storage engine + timestamp oracle.
-            let mut storage_config =
-                coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
-                    EndpointConfig::new(
-                        "default",
-                        &data_dir,
-                        Media::Hdd,
-                        Durability::Durable,
-                        Tier::Warm,
-                    ),
-                ]);
+            // Common setup: open storage engine + timestamp oracle. The storage
+            // topology was resolved from config above (a multi-endpoint list or
+            // the single-endpoint `data_dir` desugar); apply the cache / write-
+            // buffer size overrides on top.
             if let Some(mb) = cache_size_mb {
                 storage_config.block_cache_bytes = mb.saturating_mul(1024 * 1024);
             }
             if let Some(mb) = write_buffer_mb {
                 storage_config.max_write_buffer_bytes = mb.saturating_mul(1024 * 1024);
+            }
+            // Surface the page-ECC build/config mismatch: an operator who asked
+            // for per-block ECC on a binary built without the feature gets a
+            // no-op, not a silent one.
+            if page_ecc_requested && !cfg!(feature = "page_ecc") {
+                tracing::warn!(
+                    "a storage endpoint requests per-block ECC (page_ecc) but \
+                     this binary was built without the `page_ecc` feature — the \
+                     request has no on-disk effect; rebuild with \
+                     `--features page_ecc` to enable it"
+                );
             }
             let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
             let engine = coordinode_storage::engine::core::StorageEngine::open_with_oracle(
@@ -699,6 +720,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         cli::Command::Backup {
             data_dir,
+            config_path,
             output,
             format,
             namespace: _namespace,
@@ -712,7 +734,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "starting backup"
             );
 
-            let db = coordinode_embed::Database::open(&data_dir)
+            let storage_config = admin_storage_config(config_path.as_deref(), &data_dir)?;
+            let db = coordinode_embed::Database::open_with_config(storage_config)
                 .map_err(|e| format!("failed to open database: {e}"))?;
 
             let snapshot = db.engine().snapshot();
@@ -827,6 +850,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         cli::Command::Restore {
             data_dir,
+            config_path,
             input,
             format,
             namespace: _namespace,
@@ -850,7 +874,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(only_labels.into_iter().collect())
             };
 
-            let db = coordinode_embed::Database::open(&data_dir)
+            let storage_config = admin_storage_config(config_path.as_deref(), &data_dir)?;
+            let db = coordinode_embed::Database::open_with_config(storage_config)
                 .map_err(|e| format!("failed to open database: {e}"))?;
 
             let file = std::fs::File::open(&input)

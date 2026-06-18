@@ -515,12 +515,27 @@ impl Database {
             Durability::Durable,
             Tier::Warm,
         )]);
+        Self::open_with_config(config)
+    }
+
+    /// Open or create a database from an explicit [`StorageConfig`].
+    ///
+    /// Like [`Self::open`] but takes a pre-resolved storage configuration, so
+    /// the caller can open a multi-endpoint topology rather than the single
+    /// default endpoint `open` derives from a path. The maintenance CLI
+    /// (`backup` / `restore`) uses this to open the same topology the server
+    /// runs with. The primary data directory is the first endpoint's path.
+    ///
+    /// Uses `OwnedLocalProposalPipeline` for embedded single-node mode; for
+    /// cluster mode use [`Self::from_engine`] with a `RaftProposalPipeline`.
+    pub fn open_with_config(config: StorageConfig) -> Result<Self, DatabaseError> {
+        let path = config.data_dir().to_path_buf();
         let oracle = Arc::new(TimestampOracle::new());
         let engine = StorageEngine::open_with_oracle(&config, oracle.clone())?;
         let engine = Arc::new(engine);
         let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
             Arc::new(OwnedLocalProposalPipeline::new(&engine));
-        Self::finish_open(path.as_ref(), config, oracle, engine, pipeline)
+        Self::finish_open(&path, config, oracle, engine, pipeline)
     }
 
     /// Open an in-memory database backed by `lsm_tree::fs::MemFs`.

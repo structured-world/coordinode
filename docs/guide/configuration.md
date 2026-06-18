@@ -147,6 +147,15 @@ ops_addr: "127.0.0.1:7084"
 # Data directory. Owned by the coordinode system user.
 data_dir: /var/lib/coordinode/data
 
+# Storage topology. Empty = a single endpoint at data_dir. Declare endpoints to
+# spread storage across disks (see "Storage topology" above for every key):
+# storage:
+#   endpoints:
+#     - { id: nvme-hot, path: /mnt/nvme0, media: nvme, durability: durable, tier: hot }
+#     - { id: hdd-cold, path: /mnt/hdd0,  media: hdd,  durability: degraded, tier: cold }
+storage:
+  endpoints: []
+
 # Cluster peers (empty = standalone). For HA list the other members:
 # peers:
 #   - "node2.internal:7080"
@@ -251,6 +260,84 @@ reason.
 - `--write-buffer-mb N` sets the in-memory write buffer (memtable). Larger
   buffers flush to disk less often, trading memory for fewer, larger flushes.
 
+## Storage topology
+
+By default a node uses a single storage endpoint: a durable HDD warm-tier
+endpoint rooted at `data_dir`. That covers the common single-disk deployment
+without any extra configuration; `--data` (or the `data_dir` config key) is all
+you set.
+
+To spread storage across several disks — an NVMe cache in front of an SSD tier
+in front of an HDD JBOD, for example — declare each mount point as an *endpoint*
+under `storage.endpoints` in the config file. A topology is a list of structured
+records, so it lives in the YAML config file only; there is no command-line flag
+for the list. The per-LSM-level placement (hot levels on fast media, cold levels
+on slow), cascade eviction between endpoints, and WAL / oplog routing are all
+driven from this list.
+
+Each endpoint has these keys:
+
+| Key | Required | Values | Meaning |
+|-----|----------|--------|---------|
+| `id` | yes | unique string | Endpoint name, used in metrics, logs, and placement rules. |
+| `path` | yes | directory | Exclusive mount-point directory. Two endpoints must not share a path. |
+| `media` | yes | `hdd` `ssd` `nvme` `ram` | Physical media kind (metadata; does not set durability). |
+| `durability` | yes | `durable` `degraded` `volatile` | `durable` = hardware-redundant (RAID); `degraded` = single drive; `volatile` = lost on restart. Drives the per-block ECC `auto` rule and cluster redundancy invariants. |
+| `tier` | yes | `memory` `hot_cache` `hot` `warm` `cold` | Placement preference (fastest first). Hot LSM levels prefer hotter tiers. |
+| `capacity_bytes` | no | integer | Physical capacity. `0` or omitted = untracked. |
+| `hard_limit_bytes` | no | integer | The placement engine never writes past this. `0` or omitted = no limit. Must be `<= capacity_bytes` when both are set. |
+| `page_ecc` | no | `auto` `force_on` `force_off` | Per-block Reed-Solomon ECC policy. `auto` (default) turns ECC **on** for `degraded` endpoints and **off** for `durable` / `volatile`. See the note below. |
+| `hard_limit_strategy` | no | `reject` `cascade_evict` | What to do when a write would exceed `hard_limit_bytes`. `reject` (default) fails the write; `cascade_evict` demotes data to a cooler endpoint and retries. |
+
+Example: NVMe hot tier plus an HDD cold tier on a single drive (so ECC is forced
+on to catch media read errors):
+
+```yaml
+data_dir: /var/lib/coordinode/data
+storage:
+  endpoints:
+    - id: nvme-hot
+      path: /mnt/nvme0/coordinode
+      media: nvme
+      durability: durable
+      tier: hot
+    - id: hdd-cold
+      path: /mnt/hdd0/coordinode
+      media: hdd
+      durability: degraded
+      tier: cold
+      page_ecc: force_on
+      capacity_bytes: 16000000000000
+```
+
+Precedence: when `storage.endpoints` is set it overrides `data_dir` for storage
+placement (`data_dir` still anchors the consensus log and CDC). Passing `--data`
+on the command line wins over the file — it names a single directory, so it
+collapses any file topology back to one endpoint at that path. A typo in an
+endpoint key is a startup error, like any other unknown config key.
+
+**Page ECC is a build-time feature.** The Reed-Solomon page-ECC codec is compiled
+in only when the binary is built with `--features page_ecc` (off by default). On a
+binary built without it, `page_ecc: force_on` (or a `degraded` endpoint under the
+`auto` rule) is accepted but has no on-disk effect, and the server logs a warning
+at startup. Build with the feature to make the policy take effect.
+
+### Maintenance commands on a multi-endpoint node
+
+The offline maintenance commands (`backup`, `restore`, `verify`, `checkpoint`,
+`compact`) must open the database with the same topology the server uses, or
+they would look for data at the wrong path. Pass them the same config file:
+
+```bash
+coordinode compact --config /etc/coordinode/coordinode.conf
+coordinode verify  --config /etc/coordinode/coordinode.conf --deep
+coordinode backup  --config /etc/coordinode/coordinode.conf --output dump.bin
+```
+
+Without `--config` they operate on a single endpoint at `--data` (default
+`./data`) — correct only for single-disk nodes. With `--config`, `--data` is
+ignored and the topology comes from the file.
+
 ## Retention and time-travel
 
 MVCC keeps superseded versions so `AS OF TIMESTAMP` queries can read the past
@@ -272,15 +359,20 @@ horizon for both time-travel reads and lagging-consumer recovery.
 
 ## Other subcommands
 
-The same binary runs maintenance and cluster operations. Each shares the
-`--data` flag pointing at the database directory.
+The same binary runs maintenance and cluster operations. Each opens the database
+at a directory given by `--data` (default `./data`); every command that opens
+the storage engine (`backup`, `restore`, `verify`, `checkpoint`, `compact`) also
+accepts `--config FILE` to open a multi-endpoint node at its configured paths
+(see [Storage topology](#storage-topology)). With `--config`, `--data` is
+ignored.
 
 | Command | Required flags | Notable options |
 |---------|----------------|-----------------|
-| `coordinode backup` | `--output FILE` | `--format json\|cypher\|binary\|snapshot`, `--namespace NS`, `--since SEQNO` (incremental snapshot) |
-| `coordinode restore` | `--input FILE` | `--format ...` (plus import-only `apoc-json`, `apoc-cypher`, `hetio-json`), `--namespace NS`, `--only-labels L1,L2`, `--force` |
-| `coordinode checkpoint` | `--output DIR` | Hard-linked physical checkpoint; restore by pointing `serve --data` at it |
-| `coordinode verify` | (none) | `--deep` for full-page checksum verification |
+| `coordinode backup` | `--output FILE` | `--config FILE` (multi-endpoint); `--format json\|cypher\|binary\|snapshot`, `--namespace NS`, `--since SEQNO` (incremental snapshot) |
+| `coordinode restore` | `--input FILE` | `--config FILE` (multi-endpoint); `--format ...` (plus import-only `apoc-json`, `apoc-cypher`, `hetio-json`), `--namespace NS`, `--only-labels L1,L2`, `--force` |
+| `coordinode checkpoint` | `--output DIR` | `--config FILE` (multi-endpoint); hard-linked physical checkpoint; restore by pointing `serve --data` at it |
+| `coordinode compact` | (none) | `--config FILE` (multi-endpoint); offline major-compaction folding merge operands |
+| `coordinode verify` | (none) | `--config FILE` (multi-endpoint); `--deep` for full-page checksum verification |
 | `coordinode version` | (none) | Print version and exit |
 | `coordinode admin node join` | `--node ADDR --id ID --addr ADDR` | `--pre-seeded`, `--follow` |
 | `coordinode admin node decommission` | `--node ADDR --id ID` | `--pruning`, `--force`, `--skip-confirmation` |

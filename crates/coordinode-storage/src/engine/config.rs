@@ -107,6 +107,7 @@ pub enum Tier {
 /// driven by the placement and capacity-tracking layers that consume this
 /// type. This module establishes only the configuration surface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EndpointConfig {
     /// Unique identifier for this endpoint (operator-chosen; appears in
     /// metrics, logs, placement rules). Example: `"ep-3b"`, `"nvme-cache-0"`.
@@ -134,7 +135,9 @@ pub struct EndpointConfig {
     /// Storage tier — drives placement preference.
     pub tier: Tier,
     /// Physical capacity in bytes. `0` means "untracked" — the placement
-    /// engine cannot enforce INV-D3 without this.
+    /// engine cannot enforce INV-D3 without this. Optional in config:
+    /// omitting it leaves the endpoint untracked.
+    #[serde(default)]
     pub capacity_bytes: u64,
     /// Hard-limit in bytes — placement engine NEVER writes past this point
     /// (INV-D3). `0` means "no hard limit" (placement engine still observes
@@ -142,7 +145,9 @@ pub struct EndpointConfig {
     /// `hard_limit_bytes` are non-zero, `hard_limit_bytes` MUST be
     /// `<= capacity_bytes` — validated in [`StorageConfig::with_endpoints`].
     /// Cascade eviction triggers at 95% of `hard_limit_bytes` when non-zero.
-    /// Behaviour implemented by the hard-limit enforcement layer.
+    /// Behaviour implemented by the hard-limit enforcement layer. Optional in
+    /// config: omitting it means no hard limit.
+    #[serde(default)]
     pub hard_limit_bytes: u64,
     /// Per-block Reed-Solomon ECC policy for SST blocks on this endpoint.
     ///
@@ -955,6 +960,29 @@ impl StorageConfig {
         // so one extractor serves all. Biggest impact on adj: partition where
         // prefix_scan("adj:KNOWS:out:") is the hot path for graph traversal.
         config = config.prefix_extractor(Arc::new(ColonSeparatedPrefix));
+
+        // Per-block Reed-Solomon page ECC (R159 Part C). The lsm-tree
+        // flag is per-tree, but the ECC policy is per-endpoint, and a
+        // tree's levels can span endpoints of different durability via
+        // routing. Take the most-protective decision: enable ECC for the
+        // tree if ANY endpoint it spans requires it (`Degraded` under
+        // Auto, or `ForceOn`). Over-protecting a `Durable` level is just
+        // spare parity bytes; under-protecting a `Degraded` one would
+        // lose the only in-place recovery mechanism.
+        //
+        // Build-time gated: without the `page_ecc` feature the codec is
+        // absent from lsm-tree, so we must not request it (open would
+        // return `PageEccUnsupported`). Off-by-default is the accepted
+        // pre-freeze state — the page xxh3 checksum is always present
+        // regardless, only the Reed-Solomon trailer is gated.
+        #[cfg(feature = "page_ecc")]
+        {
+            let ecc_required = self
+                .endpoints
+                .iter()
+                .any(EndpointConfig::is_page_ecc_enabled);
+            config = config.page_ecc(ecc_required);
+        }
 
         config
     }

@@ -20,6 +20,10 @@ full-text = ["dep:coordinode-search"]
 # Embed structured-proxy for REST/JSON transcoding (disable for embedded/iOS builds
 # to reduce binary size — the gRPC API on :7080 remains fully functional).
 rest-proxy = ["dep:structured-proxy"]
+# Build the storage engine with per-block Reed-Solomon page ECC (forwards to
+# coordinode-storage/page_ecc). Default-off; lets an operator who configures
+# `page_ecc: force_on` (or a `degraded` endpoint) get the ECC trailer on disk.
+page_ecc = ["coordinode-storage/page_ecc"]
 
 [dependencies]
 coordinode-core = { workspace = true }
