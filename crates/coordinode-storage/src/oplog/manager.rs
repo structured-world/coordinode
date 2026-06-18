@@ -477,6 +477,41 @@ mod tests {
         }
     }
 
+    /// The on-disk segment filename is a backup / recovery contract:
+    /// once shipped, external tooling depends on it. Pin the exact
+    /// shape so an accidental change to `segment_path` /
+    /// `parse_first_index` fails loudly here.
+    #[test]
+    fn segment_filename_is_canonical_contract() {
+        let dir = Path::new("/oplog");
+        let name = |idx| {
+            segment_path(dir, idx)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_owned)
+                .expect("utf8 filename")
+        };
+        // `oplog-<first_index:020>.bin` — 20-digit zero-padded first_index.
+        assert_eq!(name(1), "oplog-00000000000000000001.bin");
+        assert_eq!(name(u64::MAX), "oplog-18446744073709551615.bin");
+
+        // first_index round-trips out of the name.
+        for idx in [0u64, 1, 42, 1_000_000, u64::MAX] {
+            assert_eq!(
+                parse_first_index(&segment_path(dir, idx)),
+                Some(idx),
+                "round-trip failed for {idx}",
+            );
+        }
+
+        // 20-digit zero-pad makes lexicographic filename order == index
+        // order (what recovery relies on to locate a segment by index).
+        assert!(
+            name(2) > name(1) && name(1_000_000) > name(999_999),
+            "lexicographic filename order must match first_index order",
+        );
+    }
+
     fn test_manager(dir: &Path) -> OplogManager {
         OplogManager::open(
             dir,
