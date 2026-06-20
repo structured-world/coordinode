@@ -570,6 +570,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 static DESCRIPTOR_BYTES: &[u8] =
                     include_bytes!("../../../coordinode.descriptor.bin");
                 let grpc_upstream = format!("http://127.0.0.1:{}", addr.port());
+                // structured-proxy 2.0.1 makes the embedded-constructed config structs
+                // hand-buildable again (no longer #[non_exhaustive]), so the config is built
+                // programmatically. serve() is gone in 2.x; the proxy exposes an axum Router
+                // that we bind and serve here.
                 let config = ProxyConfig {
                     upstream: UpstreamConfig {
                         default: grpc_upstream,
@@ -577,7 +581,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     descriptors: vec![DescriptorSource::Embedded {
                         bytes: DESCRIPTOR_BYTES,
                     }],
-                    listen: ListenConfig { http: rest_addr },
+                    listen: ListenConfig {
+                        http: rest_addr.clone(),
+                    },
                     service: ServiceConfig {
                         name: "coordinode".into(),
                     },
@@ -592,17 +598,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     metrics_classes: vec![],
                     forwarded_headers: vec![
                         "authorization".into(),
+                        "dpop".into(),
                         "x-request-id".into(),
                         "x-forwarded-for".into(),
+                        "x-forwarded-proto".into(),
                         "x-real-ip".into(),
                         "user-agent".into(),
                         "accept-language".into(),
+                        "idempotency-key".into(),
                     ],
                 };
                 let proxy = structured_proxy::ProxyServer::from_config(config);
                 tokio::spawn(async move {
-                    if let Err(e) = proxy.serve().await {
-                        tracing::error!("REST proxy error: {e}");
+                    match proxy.router() {
+                        Ok(router) => match tokio::net::TcpListener::bind(rest_addr.as_str()).await
+                        {
+                            Ok(listener) => {
+                                if let Err(e) = axum::serve(listener, router).await {
+                                    tracing::error!("REST proxy serve error: {e}");
+                                }
+                            }
+                            Err(e) => tracing::error!("REST proxy bind error: {e}"),
+                        },
+                        Err(e) => tracing::error!("REST proxy router build error: {e}"),
                     }
                 });
             }

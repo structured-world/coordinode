@@ -19,7 +19,7 @@ vector = ["dep:coordinode-vector"]
 full-text = ["dep:coordinode-search"]
 # Embed structured-proxy for REST/JSON transcoding (disable for embedded/iOS builds
 # to reduce binary size — the gRPC API on :7080 remains fully functional).
-rest-proxy = ["dep:structured-proxy"]
+rest-proxy = ["dep:structured-proxy", "dep:axum"]
 # Build the storage engine with per-block Reed-Solomon page ECC (forwards to
 # coordinode-storage/page_ecc). Default-off; lets an operator who configures
 # `page_ecc: force_on` (or a `degraded` endpoint) get the ECC trailer on disk.
@@ -38,7 +38,10 @@ coordinode-auth = { workspace = true }
 # Decompression for the restore CLI only (tool-side, never the DB runtime).
 bzip2-rs = { workspace = true }
 flate2 = { workspace = true }
-structured-proxy = { version = "1", optional = true }
+structured-proxy = { version = "2", optional = true }
+# axum: serve the Router that structured-proxy 2.x exposes (it removed its own serve()).
+# Pinned to the same minor structured-proxy depends on so the Router type unifies.
+axum = { version = "0.8", optional = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 parking_lot = { workspace = true }
