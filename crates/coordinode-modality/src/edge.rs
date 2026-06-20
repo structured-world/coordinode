@@ -33,13 +33,15 @@
 //! posting lists) is a separate ADR and intentionally NOT decided here.
 
 use coordinode_core::graph::edge::{
-    decode_temporal_edgeprop_key, encode_adj_key_forward, encode_adj_key_reverse,
-    encode_edge_props, encode_edgeprop_key, encode_temporal_edgeprop_key,
-    temporal_edgeprop_pair_prefix, valid_from_upper_bound_key, write_adj_key_forward,
-    write_adj_key_reverse, EdgeProperties, PostingList,
+    decode_discriminated_edgeprop_key, decode_temporal_edgeprop_key, encode_adj_key_forward,
+    encode_adj_key_reverse, encode_discriminated_edgeprop_key, encode_edge_props,
+    encode_edgeprop_key, encode_temporal_edgeprop_key, temporal_edgeprop_pair_prefix,
+    valid_from_upper_bound_key, write_adj_key_forward, write_adj_key_reverse, EdgeProperties,
+    PostingList,
 };
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
+use coordinode_core::schema::definition::PropertyType;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
@@ -151,6 +153,48 @@ pub trait EdgeStore {
         tgt: NodeId,
         valid_from_ms: i64,
     ) -> StoreResult<()>;
+
+    /// Write one instance of a `DISCRIMINATED BY (col)` edge (ADR-029): the
+    /// edgeprop body is keyed by the discriminator value, and the adjacency
+    /// posting gets a set-semantics add (a target appears iff at least one
+    /// instance exists for the pair). `discriminator` must be an ADR-029
+    /// supported type (Int / Timestamp / Float / Bool / String / Blob); a
+    /// non-supported value is a [`StoreError::Invariant`] — the schema validates
+    /// the column type at DDL time, so this cannot happen for correct callers.
+    fn put_edge_discriminated(
+        &self,
+        txn: &mut Transaction,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        discriminator: &Value,
+        props: &EdgeProperties,
+    ) -> StoreResult<()>;
+
+    /// Point-read the properties of one discriminated edge instance, keyed by
+    /// the exact `discriminator` value. `None` if no such instance exists.
+    fn get_props_for(
+        &self,
+        txn: &Transaction,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        discriminator: &Value,
+    ) -> StoreResult<Option<EdgeProperties>>;
+
+    /// Enumerate every discriminated instance of `(edge_type, src, tgt)`,
+    /// returning `(discriminator_value, props)` pairs sorted ascending by the
+    /// order-preserving key encoding. `discriminator_kind` is the column's
+    /// declared [`PropertyType`] (read from the edge type schema by the caller),
+    /// needed to decode the discriminator suffix.
+    fn scan_discriminators(
+        &self,
+        txn: &Transaction,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        discriminator_kind: &PropertyType,
+    ) -> StoreResult<Vec<(Value, EdgeProperties)>>;
 
     // ── Query-execution edge-property API (executor `Vec<(field_id, Value)>`
     // shape) ──────────────────────────────────────────────────────────────
@@ -599,6 +643,71 @@ impl EdgeStore for LocalEdgeStore {
         let key = encode_temporal_edgeprop_key(edge_type, src, tgt, valid_from_ms);
         txn.delete(Partition::EdgeProp, &key)?;
         Ok(())
+    }
+
+    fn put_edge_discriminated(
+        &self,
+        txn: &mut Transaction,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        discriminator: &Value,
+        props: &EdgeProperties,
+    ) -> StoreResult<()> {
+        let ep_key = encode_discriminated_edgeprop_key(edge_type, src, tgt, discriminator)
+            .ok_or_else(|| {
+                StoreError::Invariant(format!(
+                    "unsupported discriminator value for edge type {edge_type}: {discriminator:?}"
+                ))
+            })?;
+        let body = Self::encode_props(props)?;
+        txn.merge_adj_add(&encode_adj_key_forward(edge_type, src), tgt.as_raw());
+        txn.merge_adj_add(&encode_adj_key_reverse(edge_type, tgt), src.as_raw());
+        txn.put(Partition::EdgeProp, &ep_key, &body)?;
+        Ok(())
+    }
+
+    fn get_props_for(
+        &self,
+        txn: &Transaction,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        discriminator: &Value,
+    ) -> StoreResult<Option<EdgeProperties>> {
+        let key = encode_discriminated_edgeprop_key(edge_type, src, tgt, discriminator)
+            .ok_or_else(|| {
+                StoreError::Invariant(format!(
+                    "unsupported discriminator value for edge type {edge_type}: {discriminator:?}"
+                ))
+            })?;
+        match txn.read_untracked(Partition::EdgeProp, &key)? {
+            Some(bytes) => Self::decode_props(&bytes).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn scan_discriminators(
+        &self,
+        txn: &Transaction,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        discriminator_kind: &PropertyType,
+    ) -> StoreResult<Vec<(Value, EdgeProperties)>> {
+        let prefix = temporal_edgeprop_pair_prefix(edge_type, src, tgt);
+        let mut rows: Vec<(Vec<u8>, Value, EdgeProperties)> = Vec::new();
+        for (key, value) in txn.base_prefix_scan(Partition::EdgeProp, &prefix)? {
+            if let Some((_, _, _, disc)) =
+                decode_discriminated_edgeprop_key(&key, discriminator_kind)
+            {
+                rows.push((key, disc, Self::decode_props(&value)?));
+            }
+        }
+        // Sort by the order-preserving key so callers see discriminators in
+        // ascending value order regardless of the scan iterator's ordering.
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(rows.into_iter().map(|(_, d, p)| (d, p)).collect())
     }
 
     fn get_props_raw_tracked(
@@ -1452,5 +1561,104 @@ mod tests {
             .expect("ok");
         assert!(got.is_some(), "present empty key reads as Some");
         assert!(got.expect("some").is_empty());
+    }
+
+    // -- Discriminated edges (ADR-029) --
+
+    #[test]
+    fn discriminated_put_get_roundtrip_and_absent_is_none() {
+        let db = open();
+        let a = NodeId::from_raw(10);
+        let b = NodeId::from_raw(20);
+        db.write(|s, t| {
+            s.put_edge_discriminated(
+                t,
+                "KNOWS",
+                a,
+                b,
+                &Value::String("work".into()),
+                &props_with(1, 100),
+            )
+            .unwrap();
+            s.put_edge_discriminated(
+                t,
+                "KNOWS",
+                a,
+                b,
+                &Value::String("college".into()),
+                &props_with(1, 200),
+            )
+            .unwrap();
+        });
+        let store = LocalEdgeStore;
+        let r = db.read();
+        let work = store
+            .get_props_for(&r, "KNOWS", a, b, &Value::String("work".into()))
+            .unwrap()
+            .expect("work instance present");
+        assert_eq!(work.get(1), Some(&Value::Int(100)));
+        let college = store
+            .get_props_for(&r, "KNOWS", a, b, &Value::String("college".into()))
+            .unwrap()
+            .expect("college instance present");
+        assert_eq!(college.get(1), Some(&Value::Int(200)));
+        // A discriminator value with no instance reads as None.
+        assert!(store
+            .get_props_for(&r, "KNOWS", a, b, &Value::String("gym".into()))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn scan_discriminators_sorted_with_set_adjacency() {
+        let db = open();
+        let a = NodeId::from_raw(10);
+        let b = NodeId::from_raw(20);
+        db.write(|s, t| {
+            s.put_edge_discriminated(
+                t,
+                "KNOWS",
+                a,
+                b,
+                &Value::String("work".into()),
+                &props_with(1, 100),
+            )
+            .unwrap();
+            s.put_edge_discriminated(
+                t,
+                "KNOWS",
+                a,
+                b,
+                &Value::String("college".into()),
+                &props_with(1, 200),
+            )
+            .unwrap();
+        });
+        let store = LocalEdgeStore;
+        let r = db.read();
+        let all = store
+            .scan_discriminators(&r, "KNOWS", a, b, &PropertyType::String)
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        // Ascending by order-preserving key: "college" < "work".
+        assert_eq!(all[0].0, Value::String("college".into()));
+        assert_eq!(all[1].0, Value::String("work".into()));
+        assert_eq!(all[0].1.get(1), Some(&Value::Int(200)));
+        // Adjacency stays set semantics: the target appears exactly once.
+        assert_eq!(store.scan_neighbors_out(&r, "KNOWS", a).unwrap(), vec![b]);
+    }
+
+    #[test]
+    fn put_edge_discriminated_rejects_unsupported_discriminator() {
+        let db = open();
+        let a = NodeId::from_raw(1);
+        let b = NodeId::from_raw(2);
+        db.write(|s, t| {
+            let err = s.put_edge_discriminated(t, "E", a, b, &Value::Null, &props_with(1, 1));
+            assert!(
+                matches!(err, Err(StoreError::Invariant(_))),
+                "Null is not a supported discriminator"
+            );
+        });
     }
 }

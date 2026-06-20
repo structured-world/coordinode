@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::node::{NodeId, PropertyValue};
+use crate::schema::definition::PropertyType;
 
 // -- Key encoding --
 
@@ -266,6 +267,145 @@ pub fn valid_from_upper_bound_key(
 ) -> Vec<u8> {
     let bound = upper_ms.saturating_add(1);
     encode_temporal_edgeprop_key(edge_type, source_id, target_id, bound)
+}
+
+// -- Discriminated edge property keys (ADR-029) --
+//
+// A `DISCRIMINATED BY (col)` edge type stores one edgeprop entry per discriminator
+// value, keyed `edgeprop:<TYPE>:<src>:<tgt>:<discriminator>`. The discriminator is
+// the LAST key component, so its encoding is order-preserving: a literal-equality
+// predicate is a point lookup, a range predicate is a bounded prefix scan, and a
+// bare pair prefix (`temporal_edgeprop_pair_prefix`, which is discriminator-agnostic)
+// enumerates every instance. Adj posting set semantics are unchanged — a target
+// appears iff at least one instance exists.
+//
+// TEMPORAL is the special case `DISCRIMINATED BY (valid_from)`: a `Timestamp`
+// discriminator encodes to the same i64 sortable bytes as `valid_from`, so the two
+// share one storage shape (no parallel path). `temporal_edgeprop_key_matches_disc`
+// in the tests proves the byte-identity.
+
+/// Order-preserving 8-byte encoding of an `f64` (total order matching `f64`
+/// comparison, NaN sorting last). Positive: set the sign bit; negative: flip all
+/// bits. The inverse of [`decode_f64_sortable`].
+pub(crate) fn encode_f64_sortable(v: f64) -> [u8; 8] {
+    let bits = v.to_bits();
+    let sortable = if bits & (1u64 << 63) == 0 {
+        bits | (1u64 << 63)
+    } else {
+        !bits
+    };
+    sortable.to_be_bytes()
+}
+
+pub(crate) fn decode_f64_sortable(bytes: [u8; 8]) -> f64 {
+    let sortable = u64::from_be_bytes(bytes);
+    let bits = if sortable & (1u64 << 63) != 0 {
+        sortable & !(1u64 << 63)
+    } else {
+        !sortable
+    };
+    f64::from_bits(bits)
+}
+
+/// Encode a discriminator value as an order-preserving key suffix (ADR-029).
+///
+/// Supported discriminator types: `Int` / `Timestamp` (8-byte sign-flipped BE,
+/// byte-identical to temporal `valid_from`), `Float` (8-byte sortable), `Bool`
+/// (1 byte), `String` (raw UTF-8) and `Blob` (32-byte SHA-256 of the blob bytes).
+/// `String` uses raw UTF-8, not a length prefix: the discriminator is the last key
+/// component (so the encoding is unambiguous without one) and raw UTF-8 keeps
+/// byte-order == value-order, which the planner relies on for range push-down on
+/// the discriminator column. Returns `None` for any other (unsupported) `Value`.
+pub fn encode_discriminator_value(value: &PropertyValue) -> Option<Vec<u8>> {
+    match value {
+        PropertyValue::Int(v) | PropertyValue::Timestamp(v) => {
+            Some(encode_valid_from_sortable(*v).to_vec())
+        }
+        PropertyValue::Float(f) => Some(encode_f64_sortable(*f).to_vec()),
+        PropertyValue::Bool(b) => Some(vec![u8::from(*b)]),
+        PropertyValue::String(s) => Some(s.as_bytes().to_vec()),
+        PropertyValue::Blob(bytes) => {
+            use sha2::{Digest, Sha256};
+            Some(Sha256::digest(bytes).to_vec())
+        }
+        _ => None,
+    }
+}
+
+/// Decode a discriminator key suffix back into a `Value`, given the declared
+/// discriminator [`PropertyType`] (read from the edge type schema by the caller —
+/// the store stays schema-agnostic). `Blob` is one-way (the suffix is a SHA-256,
+/// not the original bytes); it decodes to `Value::Blob(<32-byte digest>)`,
+/// sufficient for equality but not for recovering the original blob.
+pub fn decode_discriminator_value(bytes: &[u8], kind: &PropertyType) -> Option<PropertyValue> {
+    match kind {
+        PropertyType::Int => Some(PropertyValue::Int(decode_valid_from_sortable(
+            bytes.try_into().ok()?,
+        ))),
+        PropertyType::Timestamp => Some(PropertyValue::Timestamp(decode_valid_from_sortable(
+            bytes.try_into().ok()?,
+        ))),
+        PropertyType::Float => Some(PropertyValue::Float(decode_f64_sortable(
+            bytes.try_into().ok()?,
+        ))),
+        PropertyType::Bool => match bytes {
+            [0] => Some(PropertyValue::Bool(false)),
+            [1] => Some(PropertyValue::Bool(true)),
+            _ => None,
+        },
+        PropertyType::String => Some(PropertyValue::String(
+            std::str::from_utf8(bytes).ok()?.to_string(),
+        )),
+        PropertyType::Blob => Some(PropertyValue::Blob(bytes.to_vec())),
+        _ => None,
+    }
+}
+
+/// Encode a discriminated edge property key:
+/// `edgeprop:<edge_type>:<src BE>:<tgt BE>:<discriminator>`.
+///
+/// Returns `None` if `discriminator` is not an ADR-029-supported type.
+pub fn encode_discriminated_edgeprop_key(
+    edge_type: &str,
+    source_id: NodeId,
+    target_id: NodeId,
+    discriminator: &PropertyValue,
+) -> Option<Vec<u8>> {
+    let suffix = encode_discriminator_value(discriminator)?;
+    let mut key = temporal_edgeprop_pair_prefix(edge_type, source_id, target_id);
+    key.extend_from_slice(&suffix);
+    Some(key)
+}
+
+/// Decode a discriminated edge property key into
+/// `(edge_type, src, tgt, discriminator)`, given the discriminator's declared type.
+///
+/// Forward-parses (edge type names are colon-free identifiers) so a variable-length
+/// `String` discriminator decodes unambiguously.
+pub fn decode_discriminated_edgeprop_key(
+    key: &[u8],
+    kind: &PropertyType,
+) -> Option<(String, NodeId, NodeId, PropertyValue)> {
+    let rest = key.strip_prefix(b"edgeprop:")?;
+    let type_end = rest.iter().position(|&b| b == b':')?;
+    let edge_type = std::str::from_utf8(&rest[..type_end]).ok()?.to_string();
+    let tail = &rest[type_end + 1..];
+    // src(8) ':' tgt(8) ':' <discriminator>
+    if tail.len() < 8 + 1 + 8 + 1 {
+        return None;
+    }
+    if tail[8] != b':' || tail[17] != b':' {
+        return None;
+    }
+    let source_id = u64::from_be_bytes(tail[0..8].try_into().ok()?);
+    let target_id = u64::from_be_bytes(tail[9..17].try_into().ok()?);
+    let discriminator = decode_discriminator_value(&tail[18..], kind)?;
+    Some((
+        edge_type,
+        NodeId::from_raw(source_id),
+        NodeId::from_raw(target_id),
+        discriminator,
+    ))
 }
 
 // -- Edge properties (facets) --
@@ -1049,5 +1189,110 @@ mod tests {
         let bytes = ep.to_msgpack().expect("serialize");
         let restored = EdgeProperties::from_msgpack(&bytes).expect("deserialize");
         assert_eq!(ep, restored);
+    }
+
+    // -- Discriminated edge keys (ADR-029) --
+
+    #[test]
+    fn discriminator_int_key_roundtrips() {
+        let key = encode_discriminated_edgeprop_key(
+            "KNOWS",
+            NodeId::from_raw(7),
+            NodeId::from_raw(9),
+            &PropertyValue::Int(-42),
+        )
+        .expect("int is a supported discriminator");
+        let (ty, src, tgt, disc) =
+            decode_discriminated_edgeprop_key(&key, &PropertyType::Int).expect("decode");
+        assert_eq!(ty, "KNOWS");
+        assert_eq!(src, NodeId::from_raw(7));
+        assert_eq!(tgt, NodeId::from_raw(9));
+        assert_eq!(disc, PropertyValue::Int(-42));
+    }
+
+    #[test]
+    fn discriminator_timestamp_is_byte_identical_to_temporal_key() {
+        // ADR-029: TEMPORAL is DISCRIMINATED BY (valid_from) — one storage shape.
+        let vf = 1_710_000_000_000i64;
+        let temporal =
+            encode_temporal_edgeprop_key("WORKS_AT", NodeId::from_raw(1), NodeId::from_raw(2), vf);
+        let discriminated = encode_discriminated_edgeprop_key(
+            "WORKS_AT",
+            NodeId::from_raw(1),
+            NodeId::from_raw(2),
+            &PropertyValue::Timestamp(vf),
+        )
+        .expect("timestamp is supported");
+        assert_eq!(temporal, discriminated);
+    }
+
+    #[test]
+    fn discriminator_string_roundtrips_and_sorts_lexicographically() {
+        let mk = |s: &str| {
+            encode_discriminated_edgeprop_key(
+                "KNOWS",
+                NodeId::from_raw(1),
+                NodeId::from_raw(2),
+                &PropertyValue::String(s.to_string()),
+            )
+            .expect("string supported")
+        };
+        let work = mk("work");
+        let (_, _, _, disc) =
+            decode_discriminated_edgeprop_key(&work, &PropertyType::String).expect("decode");
+        assert_eq!(disc, PropertyValue::String("work".to_string()));
+        // Raw UTF-8 keeps byte-order == value-order (range push-down on the column).
+        assert!(mk("college") < work);
+    }
+
+    #[test]
+    fn discriminator_float_roundtrips_and_preserves_order() {
+        let enc = |f: f64| encode_discriminator_value(&PropertyValue::Float(f)).expect("float");
+        assert!(enc(-1.0) < enc(0.0));
+        assert!(enc(0.0) < enc(1.5));
+        let back = decode_discriminator_value(&enc(3.25), &PropertyType::Float).expect("decode");
+        assert_eq!(back, PropertyValue::Float(3.25));
+    }
+
+    #[test]
+    fn discriminator_int_keys_sort_by_value() {
+        let k = |v: i64| {
+            encode_discriminated_edgeprop_key(
+                "E",
+                NodeId::from_raw(1),
+                NodeId::from_raw(2),
+                &PropertyValue::Int(v),
+            )
+            .expect("int supported")
+        };
+        assert!(k(-5) < k(-1));
+        assert!(k(-1) < k(0));
+        assert!(k(0) < k(7));
+    }
+
+    #[test]
+    fn discriminator_bool_roundtrips() {
+        for b in [false, true] {
+            let bytes = encode_discriminator_value(&PropertyValue::Bool(b)).expect("bool");
+            assert_eq!(
+                decode_discriminator_value(&bytes, &PropertyType::Bool).expect("decode"),
+                PropertyValue::Bool(b)
+            );
+        }
+    }
+
+    #[test]
+    fn discriminator_blob_is_sha256_digest() {
+        let bytes = encode_discriminator_value(&PropertyValue::Blob(vec![1, 2, 3])).expect("blob");
+        assert_eq!(bytes.len(), 32);
+        // One-way: decodes to the digest, not the original blob bytes.
+        let back = decode_discriminator_value(&bytes, &PropertyType::Blob).expect("decode");
+        assert_eq!(back, PropertyValue::Blob(bytes));
+    }
+
+    #[test]
+    fn unsupported_discriminator_type_is_none() {
+        assert!(encode_discriminator_value(&PropertyValue::Null).is_none());
+        assert!(encode_discriminator_value(&PropertyValue::Vector(vec![1.0_f32])).is_none());
     }
 }
