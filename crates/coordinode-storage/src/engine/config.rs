@@ -425,8 +425,9 @@ pub struct CompressionConfig {
 
     /// Codec for cold levels (cold_level_threshold and above). Default: Lz4.
     ///
-    /// Architecture specifies zstd here. Once our zstd fork is merged
-    /// upstream, this will use `CompressionCodec::Zstd(3)`.
+    /// Architecture specifies zstd here. lsm-tree's `zstd` feature now provides
+    /// zstd via pure-Rust `structured-zstd` (no C FFI); wiring a
+    /// `CompressionCodec::Zstd(3)` variant over it is the follow-up.
     pub cold_codec: CompressionCodec,
 
     /// LSM level at which to switch from hot_codec to cold_codec. Default: 4.
