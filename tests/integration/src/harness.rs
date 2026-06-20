@@ -50,6 +50,34 @@ impl CoordinodeProcess {
         proc
     }
 
+    /// Spawn a cluster member: `serve --node-id N --addr [::1]:port
+    /// --advertise-addr http://[::1]:port --peers <peer advertise addrs> ...`.
+    ///
+    /// `node_id == 1` bootstraps as the single-voter leader (the cluster grows
+    /// via `JoinNode`); `node_id > 1` starts in joining-wait state until the
+    /// leader adds it. `peer_ports` are the gRPC ports of the OTHER members —
+    /// a non-empty list is what puts the binary in cluster mode (and `node_id
+    /// > 1` requires it).
+    ///
+    /// Waits only for the gRPC port to accept TCP: a joining member is not a
+    /// leader, so [`wait_for_leader`](Self::wait_for_leader) would never return
+    /// for it.
+    pub async fn start_cluster_member(node_id: u64, port: u16, peer_ports: &[u16]) -> Self {
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        let peers: Vec<String> = peer_ports
+            .iter()
+            .map(|p| format!("http://[::1]:{p}"))
+            .collect();
+        let child = spawn_cluster_binary(node_id, port, &peers, data_dir.path().to_path_buf());
+        let proc = Self {
+            child,
+            port,
+            data_dir: Some(data_dir),
+        };
+        proc.wait_for_grpc(Duration::from_secs(15)).await;
+        proc
+    }
+
     /// Crash the running process with SIGKILL then re-spawn against the same
     /// data directory.
     ///
@@ -350,8 +378,41 @@ fn spawn_binary(port: u16, data_dir: PathBuf) -> Child {
         .unwrap_or_else(|e| panic!("failed to spawn {}: {}", bin.display(), e))
 }
 
+/// Spawn a cluster member with explicit `--node-id`, `--advertise-addr`, and
+/// `--peers`. See [`CoordinodeProcess::start_cluster_member`].
+fn spawn_cluster_binary(node_id: u64, port: u16, peers: &[String], data_dir: PathBuf) -> Child {
+    let bin = binary_path();
+    let mut cmd = Command::new(&bin);
+    cmd.arg("serve")
+        .arg("--node-id")
+        .arg(node_id.to_string())
+        .arg("--addr")
+        .arg(format!("[::1]:{port}"))
+        .arg("--advertise-addr")
+        .arg(format!("http://[::1]:{port}"))
+        .arg("--peers")
+        .arg(peers.join(","))
+        .arg("--ops-addr")
+        .arg("[::1]:0")
+        .arg("--data")
+        .arg(&data_dir)
+        .env(
+            "RUST_LOG",
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "error".into()),
+        );
+
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    cmd.spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {}: {}", bin.display(), e))
+}
+
 /// Bind port 0 to get a free ephemeral port from the OS.
-fn free_port() -> u16 {
+///
+/// Exposed `pub` so multi-node tests can pre-allocate every member's port
+/// before spawning (each member's `--peers` needs the others' ports up front).
+pub fn free_port() -> u16 {
     // Bind to [::1] with port 0 — the OS assigns a free port.
     // We immediately close the listener so coordinode can bind the same port.
     // Tiny race window, but acceptable for local integration tests.
