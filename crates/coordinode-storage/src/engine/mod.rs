@@ -25,3 +25,10 @@ pub type StorageSnapshot = lsm_tree::SeqNo;
 /// Iterator over key-value guards from an lsm-tree prefix or range scan.
 pub type StorageIter =
     Box<dyn DoubleEndedIterator<Item = lsm_tree::IterGuardImpl> + Send + 'static>;
+
+/// Seekable range-scan iterator: like [`StorageIter`] but can reposition in
+/// place via `seek_to` / `seek_to_for_prev` (RocksDB `Seek` / `SeekForPrev`)
+/// without reopening per-SST readers. Lets a consumer drive one open iterator
+/// across disjoint subranges (skip-scan) — e.g. spatial Z-curve dead-zone
+/// skipping — and `peek_key` the current position for leapfrog joins.
+pub type SeekableStorageIter = Box<dyn lsm_tree::SeekableGuardIter + 'static>;

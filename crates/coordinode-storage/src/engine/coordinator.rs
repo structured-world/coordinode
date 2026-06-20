@@ -51,7 +51,7 @@ use std::sync::{Arc, Mutex};
 
 use lsm_tree::{AbstractTree, Guard};
 
-use super::StorageIter;
+use super::{SeekableStorageIter, StorageIter};
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
 
@@ -317,6 +317,19 @@ pub trait MultiModalCoordinator: Send + Sync {
     /// scanning the in-between keys that a single broad
     /// `prefix_scan` would walk.
     fn range_scan(&self, part: Partition, start: &[u8], end: &[u8]) -> StorageResult<StorageIter>;
+
+    /// Seekable range scan over `[start, end]` at `seqno`: like [`Self::range_scan`]
+    /// but the returned iterator can `seek_to` an arbitrary key mid-walk, so one
+    /// open iterator can jump across disjoint subranges (skip-scan) without
+    /// reopening per-SST readers per jump. Used for spatial Z-curve dead-zone
+    /// skipping; `seqno` pins the snapshot.
+    fn range_seekable(
+        &self,
+        part: Partition,
+        start: &[u8],
+        end: &[u8],
+        seqno: lsm_tree::SeqNo,
+    ) -> StorageResult<SeekableStorageIter>;
 
     /// Snapshot-pinned prefix scan, materialised owned. Convenience
     /// over `prefix_scan_at` for callers that need eager collection.
@@ -764,6 +777,23 @@ impl MultiModalCoordinator for LocalMultiModalCoordinator {
         Ok(Box::new(tree.range(range, seqno, None)))
     }
 
+    fn range_seekable(
+        &self,
+        part: Partition,
+        start: &[u8],
+        end: &[u8],
+        seqno: lsm_tree::SeqNo,
+    ) -> StorageResult<SeekableStorageIter> {
+        let tree = self.tree(part)?;
+        // Owned bounds outlive the call (lsm-tree borrows internally). The
+        // returned `SeekableGuardIter` is already boxed by `range_seekable`.
+        let range = (
+            std::ops::Bound::Included(start.to_vec()),
+            std::ops::Bound::Included(end.to_vec()),
+        );
+        Ok(tree.range_seekable(range, seqno, None))
+    }
+
     fn snapshot_prefix_scan(
         &self,
         snapshot: &lsm_tree::SeqNo,
@@ -950,6 +980,58 @@ mod tests {
             .expect("range");
         let count = iter.count();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn range_seekable_yields_window_without_seek() {
+        // Without any seek, a seekable scan walks the window exactly like
+        // range_scan (inclusive bounds, dead zones outside excluded).
+        let (_dir, engine) = open_engine();
+        for k in [b"a" as &[u8], b"b", b"c", b"d", b"e"] {
+            engine.put(Partition::Node, k, b"v").expect("put");
+        }
+        let seqno = engine.snapshot();
+        let it = engine
+            .range_seekable(Partition::Node, b"b", b"d", seqno)
+            .expect("range_seekable");
+        let mut keys = Vec::new();
+        for g in it {
+            keys.push(g.into_inner().expect("guard").0.to_vec());
+        }
+        assert_eq!(keys, vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]);
+    }
+
+    #[test]
+    fn range_seekable_seek_to_skips_dead_zone() {
+        // The skip-scan contract G101 relies on: open one iterator over the
+        // broad window, jump past a dead zone with seek_to — the in-between
+        // keys are skipped at the iterator (never yielded), not post-filtered.
+        let (_dir, engine) = open_engine();
+        for k in [b"a" as &[u8], b"b", b"c", b"d", b"e", b"f", b"g"] {
+            engine.put(Partition::Node, k, b"v").expect("put");
+        }
+        let seqno = engine.snapshot();
+        let mut it = engine
+            .range_seekable(Partition::Node, b"a", b"g", seqno)
+            .expect("range_seekable");
+        let first = it
+            .next()
+            .expect("first")
+            .into_inner()
+            .expect("guard")
+            .0
+            .to_vec();
+        assert_eq!(first, b"a".to_vec());
+        // Jump past b, c — next yields the first key >= "d".
+        it.seek_to(b"d");
+        let mut rest = Vec::new();
+        for g in it {
+            rest.push(g.into_inner().expect("guard").0.to_vec());
+        }
+        assert_eq!(
+            rest,
+            vec![b"d".to_vec(), b"e".to_vec(), b"f".to_vec(), b"g".to_vec()]
+        );
     }
 
     #[test]

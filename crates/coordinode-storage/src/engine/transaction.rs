@@ -430,6 +430,23 @@ impl<'a> Transaction<'a> {
         self.engine.prefix_scan(part, prefix)
     }
 
+    /// Snapshot-isolated seekable range scan over `[start, end]` (inclusive).
+    /// The returned iterator can `seek_to` an arbitrary key mid-walk, so one
+    /// open iterator skips the dead bytes between disjoint subranges without
+    /// reopening per-SST readers per jump (e.g. spatial Z-curve dead-zone
+    /// skipping). Reads the transaction's pinned snapshot when present, else the
+    /// latest committed seqno. Untracked (no OCC read-set, no buffer overlay) —
+    /// for committed-snapshot index scans, like [`Self::base_prefix_scan`].
+    pub fn base_range_seekable(
+        &self,
+        part: Partition,
+        start: &[u8],
+        end: &[u8],
+    ) -> StorageResult<crate::engine::SeekableStorageIter> {
+        let seqno = self.snapshot.unwrap_or_else(|| self.engine.snapshot());
+        self.engine.range_seekable(part, start, end, seqno)
+    }
+
     /// Point read at an explicit snapshot seqno (not the transaction's own read
     /// snapshot), untracked. For visibility probes that pin a caller-supplied
     /// point-in-time (e.g. the MVCC reachability filter).

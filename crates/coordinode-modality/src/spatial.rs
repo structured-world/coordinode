@@ -77,6 +77,7 @@ use std::cmp::Ordering;
 use coordinode_core::graph::node::NodeId;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
+use coordinode_storage::Guard; // IterGuard trait — `guard.into_inner()` on seekable scans
 use serde::{Deserialize, Serialize};
 
 use crate::error::{StoreError, StoreResult};
@@ -402,36 +403,36 @@ fn morton_2d_decompose_rec(
 ///
 /// Decomposition is a NET WIN only when the broad `[morton_min,
 /// morton_max]` interval contains substantially more curve range
-/// than the decomposed total. For square-ish bboxes in dense
-/// indices the per-interval `range_scan` setup cost (~1µs each)
-/// dominates the dead-zone savings and we degrade vs the broad
-/// scan.
+/// than the decomposed total. The multi-interval path drives one seekable
+/// iterator and `seek_to`s each interval (a cheap in-place reposition), so
+/// decomposition wins once the broad span is a modest multiple of the
+/// decomposed total; near-square bboxes (ratio ≈ 1) stay on the broad scan.
 ///
 /// Rule: use decomposition iff
 ///   `broad_span / decomposed_total_span >= GAIN_THRESHOLD`
 /// AND `decomposed.len() >= 2` (otherwise broad is trivially equal).
-/// Bench-tuned: equatorial-band scenario (full lon, 1° lat) has
-/// ratio ~1e6 (clear win); square 1%-of-area scenarios have ratio
-/// ~1 (broad wins).
+/// The equatorial-band scenario (full lon, ±0.5° lat) has ratio = 3 (a clear
+/// win — 85% faster at 100k); square / tight scenarios have ratio ≈ 1 (broad
+/// wins, no regression).
 fn morton_intervals(bbox: &Bbox) -> Vec<(u64, u64)> {
-    // **Bench-tuned threshold (2026-05-21):** lsm-tree's `range`
-    // API has a per-call setup cost (~100µs per SST seek-to-start
-    // in a 5-SST tree) that the decomposition can only amortise
-    // when the broad-span / decomposed-span ratio is extremely
-    // high. Empirical sweep over `spatial_scan_within_bbox_*`
-    // benches found NO realistic bbox where decomposition beats
-    // the broad prefix_scan + early-break path with current
-    // lsm-tree primitives — even the canonical equatorial-band
-    // case (broad/decomp ratio ≈ 256, ~256 disjoint intervals)
-    // regresses 23ms → 39ms because per-range setup × 256 calls
-    // exceeds the savings.
-    //
-    // Threshold set effectively-disabling: decomposition only
-    // triggers on ratios above 100_000, which no current bbox
-    // shape produces. The function and helpers remain in tree as
-    // scaffold for the proper upstream-supported re-attempt once the
-    // lsm-tree iterator-level skip primitive lands.
-    const GAIN_THRESHOLD: u64 = 100_000;
+    // **Threshold (seekable skip-scan):** the multi-interval read path drives
+    // ONE seekable iterator (`base_range_seekable` → lsm-tree `range_seekable`)
+    // and `seek_to`s each interval in place — an SST cursor reposition, not a
+    // per-interval iterator reopen. With that cheap jump, decomposition pays off
+    // even when the broad curve-span is only a small multiple of the useful
+    // (decomposed) span: the dead-zone bytes between intervals are skipped
+    // instead of scanned-then-filtered. Bench-tuned to 2: the equatorial band
+    // (full lon, ±0.5° lat) has broad/decomposed ratio = 3 — Z-interleaving makes
+    // a narrow-lat full-lon strip occupy ~1/3 of the curve, not 0.55% — and
+    // decomposes into ~257 intervals; the seekable path runs it 85% faster than
+    // the broad scan (44.9ms → 7.0ms at 100k; threshold 4 reverts it to broad,
+    // +377%). The band sits exactly at ratio 3, so the threshold is 2 (not 3) for
+    // margin: a slightly denser strip that quantises to ratio 2 still decomposes,
+    // and reseeks are cheap enough (257 of them at ratio 3 still win 85%) that a
+    // ratio-2 shape wins too. Near-square / tight bboxes have ratio ≈ 1, stay
+    // below the threshold, and keep the broad prefix scan + early-break (no
+    // regression — within noise on every square/tight bench).
+    const GAIN_THRESHOLD: u64 = 2;
 
     let (x_min, x_max, y_min, y_max) = match bbox.lower.crs {
         Crs::Wgs84_2d => (
@@ -713,17 +714,17 @@ impl SpatialStore for LocalSpatialStore {
         // intervals (sparse on the curve — a long thin equatorial band
         // etc.).
         //
-        // Key layout: `<prefix><curve:8 BE><node_id:8 BE>`. The Layer-3
-        // [`Transaction`] read path exposes only prefix scans (no
-        // engine-level byte-range scan), so both paths walk the
-        // `(label_id, crs)` prefix once on the committed snapshot and
-        // apply the curve-interval filter in memory. The covering
-        // invariant (every bbox point's curve lies in some interval)
-        // makes the in-memory membership test exact; the dense-window
-        // path keeps the sorted early-break.
+        // Key layout: `<prefix><curve:8 BE><node_id:8 BE>`. The dense-window
+        // path (<=1 interval) walks the `(label_id, crs)` prefix once with a
+        // sorted early-break. The multi-interval path drives ONE seekable range
+        // iterator: it `seek_to`s each disjoint interval's start and drains to
+        // its `hi`, so the dead bytes between intervals are skipped at the
+        // iterator (no I/O) rather than scanned-then-filtered. The covering
+        // invariant (every bbox point's curve lies in some interval) plus the
+        // exact `point_in_bbox` post-filter (depth-cap fallback cells admit
+        // intra-interval Z-shape false positives) make the result exact.
         let prefix = encode_spatial_prefix(label_id, crs);
         let intervals = morton_intervals(bbox);
-        let pairs = txn.base_prefix_scan(Partition::Idx, &prefix)?;
         let mut out = Vec::new();
 
         if intervals.len() <= 1 {
@@ -733,7 +734,7 @@ impl SpatialStore for LocalSpatialStore {
                 .unwrap_or_else(|| morton_window(bbox));
             // base_prefix_scan yields keys in sorted (curve-ascending)
             // order, so we can break once the curve passes curve_max.
-            for (key, value) in pairs {
+            for (key, value) in txn.base_prefix_scan(Partition::Idx, &prefix)? {
                 let Some(curve) = decode_curve_from_key(&key) else {
                     continue;
                 };
@@ -754,23 +755,33 @@ impl SpatialStore for LocalSpatialStore {
             return Ok(out);
         }
 
-        // Multi-interval path: a row qualifies if its curve falls in any
-        // decomposition interval. Intra-interval Z-shape false positives
-        // are still possible at depth-cap fallback cells, so the exact
-        // `point_in_bbox` post-filter is mandatory.
-        for (key, value) in pairs {
-            let Some(curve) = decode_curve_from_key(&key) else {
-                continue;
-            };
-            if !intervals.iter().any(|&(lo, hi)| curve >= lo && curve <= hi) {
-                continue;
-            }
-            let Some(node_id) = decode_node_id_from_key(&key) else {
-                continue;
-            };
-            let point = decode_body(&value)?;
-            if point_in_bbox(&point, bbox) {
-                out.push((node_id, point));
+        // Multi-interval skip-scan. Intervals are sorted ascending by
+        // `morton_intervals`; open one seekable iterator over the broad
+        // [first_lo, last_hi] window, then jump to each interval's start with
+        // `seek_to` and drain to its `hi`. Bytes in the dead zones between
+        // intervals are never read (the Z-curve decomposition's whole point).
+        let (first_lo, _) = intervals[0];
+        let (_, last_hi) = intervals[intervals.len() - 1];
+        let lo_key = encode_spatial_key(label_id, crs, first_lo, NodeId::from_raw(0));
+        let hi_key = encode_spatial_key(label_id, crs, last_hi, NodeId::from_raw(u64::MAX));
+        let mut it = txn.base_range_seekable(Partition::Idx, &lo_key, &hi_key)?;
+        for &(lo, hi) in &intervals {
+            it.seek_to(&encode_spatial_key(label_id, crs, lo, NodeId::from_raw(0)));
+            for guard in it.by_ref() {
+                let (key, value) = guard.into_inner()?;
+                let Some(curve) = decode_curve_from_key(key.as_ref()) else {
+                    continue;
+                };
+                if curve > hi {
+                    break; // past this interval; outer loop seeks to the next lo
+                }
+                let Some(node_id) = decode_node_id_from_key(key.as_ref()) else {
+                    continue;
+                };
+                let point = decode_body(value.as_ref())?;
+                if point_in_bbox(&point, bbox) {
+                    out.push((node_id, point));
+                }
             }
         }
         Ok(out)
@@ -812,6 +823,23 @@ mod tests {
     use coordinode_core::txn::write_concern::WriteConcern;
     use coordinode_storage::engine::core::StorageEngine;
     use coordinode_storage::engine::transaction::CommitContext;
+
+    #[test]
+    fn morton_intervals_decomposes_equatorial_band() {
+        // Regression lock for the G101 seekable skip-scan win: the equatorial
+        // band (full lon, ±0.5° lat) has broad/decomposed ratio = 3, so it must
+        // take the decomposed (multi-interval) path. If a future GAIN_THRESHOLD
+        // bump pushes it back to the broad scan, the 85%-faster band path
+        // silently regresses — this catches it.
+        let bbox = Bbox {
+            lower: Point::new_2d(Crs::Wgs84_2d, -180.0, -0.5),
+            upper: Point::new_2d(Crs::Wgs84_2d, 180.0, 0.5),
+        };
+        assert!(
+            morton_intervals(&bbox).len() > 1,
+            "equatorial band must decompose for the seekable skip-scan win",
+        );
+    }
 
     /// Logic-test fixture (memory backing, env-flippable). Spatial
     /// Z-curve tests verify encoding/scan correctness, not

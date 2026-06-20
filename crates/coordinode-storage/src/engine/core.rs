@@ -14,7 +14,7 @@ use coordinode_core::txn::proposal::Mutation;
 use lsm_tree::{AbstractTree, Guard};
 use tracing::info;
 
-use super::StorageIter;
+use super::{SeekableStorageIter, StorageIter};
 use crate::cache::access::AccessTracker;
 use crate::cache::tiered::TieredCache;
 use crate::engine::batch::WriteBatch;
@@ -1221,6 +1221,20 @@ impl StorageEngine {
         end: &[u8],
     ) -> StorageResult<StorageIter> {
         self.coordinator.range_scan(part, start, end)
+    }
+
+    /// Seekable range scan over `[start, end]` at `seqno`. The returned iterator
+    /// can `seek_to` an arbitrary key mid-walk, so one open iterator skips the
+    /// dead bytes between disjoint subranges without reopening per-SST readers
+    /// (spatial Z-curve skip-scan). `seqno` pins the read snapshot.
+    pub fn range_seekable(
+        &self,
+        part: Partition,
+        start: &[u8],
+        end: &[u8],
+        seqno: lsm_tree::SeqNo,
+    ) -> StorageResult<SeekableStorageIter> {
+        self.coordinator.range_seekable(part, start, end, seqno)
     }
 
     /// Get the tiered cache, if enabled.
