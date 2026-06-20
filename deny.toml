@@ -30,6 +30,15 @@ ignore = [
     # via include-flate-codegen. Tracking upstream migration; safe to
     # ignore in CI until include-flate drops the dep.
     "RUSTSEC-2026-0173",
+    # rsa "Marvin Attack" (timing sidechannel on RSA private-key operations).
+    # Reached only via jsonwebtoken's pure-Rust `rust_crypto` backend (RSA JWT
+    # verification in the REST proxy). No fixed `rsa` release exists (latest is
+    # 0.10.0-rc; the advisory lists patched: []). We deliberately keep the
+    # `rust_crypto` backend over jsonwebtoken's `aws_lc_rs` backend, which would
+    # reintroduce a C/asm dependency (ADR-013: pure-Rust, no FFI). JWT verify is a
+    # public-key operation, so the private-key timing leak is not exploitable here.
+    # Revisit once RustCrypto ships a constant-time `rsa` stable.
+    "RUSTSEC-2023-0071",
 ]
 
 [bans]

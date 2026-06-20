@@ -1,0 +1,13 @@
+# cargo-audit configuration, read by `rustsec/audit-check@v2` in CI.
+# Keep the ignore list in sync with deny.toml [advisories].
+
+[advisories]
+ignore = [
+    # proc-macro-error2 unmaintained (transitive via include-flate-codegen).
+    "RUSTSEC-2026-0173",
+    # rsa "Marvin Attack" timing sidechannel. Reached via jsonwebtoken's pure-Rust
+    # rust_crypto backend (RSA JWT verify). No fixed rsa release exists; we keep
+    # rust_crypto over the aws_lc_rs C-FFI backend (ADR-013); JWT verify is a
+    # public-key op, so the private-key timing leak is not exploitable here.
+    "RUSTSEC-2023-0071",
+]
