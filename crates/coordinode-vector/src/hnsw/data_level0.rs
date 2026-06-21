@@ -74,6 +74,12 @@ pub(super) struct DataLevel0Block {
     m_max0: usize,
     /// Vector dimension.
     dim: usize,
+    /// Whether per-node blocks still carry the f32 vector. Set false by
+    /// [`DataLevel0Block::drop_f32`] when the offload path frees the f32
+    /// payload (search then runs on quantized codes, rerank loads f32 from
+    /// disk). When false, the stride no longer reserves f32 space and
+    /// `vector_ptr` must not be called.
+    has_f32: bool,
 }
 
 #[inline(always)]
@@ -114,7 +120,71 @@ impl DataLevel0Block {
             vector_offset,
             m_max0,
             dim,
+            has_f32: true,
         }
+    }
+
+    /// Whether per-node blocks still carry the f32 vector (false after
+    /// [`DataLevel0Block::drop_f32`]).
+    #[inline]
+    pub(super) fn has_f32(&self) -> bool {
+        self.has_f32
+    }
+
+    /// Free the f32 vectors, re-laying the block out to neighbours-only so the
+    /// f32 bytes are actually returned to the allocator (the offload path calls
+    /// this after calibration: search runs on quantized codes and rerank loads
+    /// f32 from disk). Idempotent. Under `&mut self`, so no concurrent reader
+    /// holds a pointer into the old backing. After this, `has_f32` is false and
+    /// `vector_ptr` must not be called.
+    pub(super) fn drop_f32(&mut self) {
+        if !self.has_f32 {
+            return;
+        }
+        // New stride keeps only `[neighbour_count: u32][neighbour_ids:
+        // M_MAX0 u32]`, dropping the trailing f32 vector.
+        let new_stride = align_up(self.vector_offset, NODE_ALIGN);
+        let mut new_backing = vec![0u8; new_stride * self.capacity].into_boxed_slice();
+        for idx in 0..self.capacity {
+            let old = idx * self.stride;
+            let new = idx * new_stride;
+            new_backing[new..new + self.vector_offset]
+                .copy_from_slice(&self.backing[old..old + self.vector_offset]);
+        }
+        self.backing = new_backing;
+        self.stride = new_stride;
+        self.has_f32 = false;
+    }
+
+    /// Grow the backing allocation so the block holds at least `required`
+    /// node slots, reallocating-and-copying if it does not already fit.
+    /// Capacity at least doubles to amortise repeated growth. Called only
+    /// from the insert path under `&mut self`, so no concurrent `&self`
+    /// reader holds a raw pointer into the old backing while it is replaced
+    /// (the wrapping `HnswIndex` enforces search-holds-&self / insert-holds-
+    /// &mut self).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `stride * new_capacity` overflows `usize` — a pathological
+    /// allocation far beyond addressable memory; aborting beats silently
+    /// dropping vectors.
+    #[allow(
+        clippy::panic,
+        reason = "growth past usize::MAX bytes is unreachable on real hardware and must abort, not silently lose vectors"
+    )]
+    pub(super) fn ensure_capacity(&mut self, required: usize) {
+        if required <= self.capacity {
+            return;
+        }
+        let new_capacity = required.max(self.capacity.saturating_mul(2));
+        let Some(total) = self.stride.checked_mul(new_capacity) else {
+            panic!("DataLevel0Block: stride * capacity overflow on grow");
+        };
+        let mut new_backing = vec![0u8; total].into_boxed_slice();
+        new_backing[..self.backing.len()].copy_from_slice(&self.backing);
+        self.backing = new_backing;
+        self.capacity = new_capacity;
     }
 
     /// Capacity in node slots.
@@ -366,6 +436,79 @@ mod tests {
         // values written by `set_vector`.
         let slice = unsafe { core::slice::from_raw_parts(ptr, dim) };
         assert_eq!(slice, v.as_slice());
+    }
+
+    #[test]
+    fn ensure_capacity_grows_and_preserves_existing_vectors() {
+        let dim = 8;
+        let mut block = DataLevel0Block::new(2, M_MAX0, dim);
+        let v0: Vec<f32> = (0..dim).map(|i| i as f32).collect();
+        let v1: Vec<f32> = (0..dim).map(|i| i as f32 + 100.0).collect();
+        // SAFETY: idx < capacity, len == dim.
+        unsafe {
+            block.set_vector(0, &v0);
+            block.set_vector(1, &v1);
+        }
+        assert_eq!(block.capacity(), 2);
+
+        // Grow to fit idx 5 (beyond the initial capacity).
+        block.ensure_capacity(6);
+        assert!(block.capacity() >= 6, "capacity must grow to fit");
+
+        // Existing vectors survive the reallocate-and-copy.
+        // SAFETY: idx < capacity, ptr is f32-aligned for `dim` values.
+        unsafe {
+            let s0 = core::slice::from_raw_parts(block.vector_ptr(0), dim);
+            let s1 = core::slice::from_raw_parts(block.vector_ptr(1), dim);
+            assert_eq!(s0, v0.as_slice());
+            assert_eq!(s1, v1.as_slice());
+        }
+
+        // The newly available slot is usable.
+        let v5: Vec<f32> = (0..dim).map(|i| i as f32 + 200.0).collect();
+        // SAFETY: idx 5 < capacity after growth, len == dim.
+        unsafe {
+            block.set_vector(5, &v5);
+            let s5 = core::slice::from_raw_parts(block.vector_ptr(5), dim);
+            assert_eq!(s5, v5.as_slice());
+        }
+
+        // No-op when already large enough — no shrink, no realloc.
+        let cap = block.capacity();
+        block.ensure_capacity(3);
+        assert_eq!(block.capacity(), cap);
+    }
+
+    #[test]
+    fn drop_f32_shrinks_stride_and_preserves_neighbours() {
+        let dim = 8;
+        let mut block = DataLevel0Block::new(4, M_MAX0, dim);
+        // SAFETY: idx < capacity, neighbour ids fit M_MAX0, vector len == dim.
+        unsafe {
+            block.set_neighbours(0, &[10, 20, 30]);
+            block.set_neighbours(2, &[40]);
+            block.set_vector(0, &[1.0f32; 8]);
+        }
+        assert!(block.has_f32());
+        let stride_before = block.stride();
+
+        block.drop_f32();
+
+        assert!(!block.has_f32(), "f32 marked absent after drop");
+        assert!(
+            block.stride() < stride_before,
+            "stride shrinks once the f32 slot is gone"
+        );
+        // Neighbours survive the re-layout into the smaller stride.
+        // SAFETY: idx < capacity.
+        unsafe {
+            assert_eq!(block.neighbour_count(0), 3);
+            assert_eq!(block.neighbour_count(2), 1);
+            assert_eq!(block.neighbour_count(1), 0);
+        }
+        // Idempotent.
+        block.drop_f32();
+        assert!(!block.has_f32());
     }
 
     #[test]

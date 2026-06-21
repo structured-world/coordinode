@@ -382,11 +382,6 @@ pub struct HnswIndex {
     /// invariant: parallel arrays sized to `nodes.len()`, lock-step on
     /// every push.
     nodes: Vec<HnswNode>,
-    /// Original f32 vector data, parallel to `nodes`. `None` when offloaded
-    /// to disk (see `HnswConfig::offload_vectors`). Read by the rerank path
-    /// (`compute_exact_distance`) and the build path (`distance_between_
-    /// nodes`).
-    node_vectors: Vec<Option<Vec<f32>>>,
     /// Pre-computed L2 norm per node, parallel to `nodes`. Cosine search
     /// uses this to skip a per-visit pass over the neighbour vector
     /// (`norm_l2(b)` inside `cosine_similarity_with_query_norm`), so the
@@ -773,7 +768,6 @@ impl HnswIndex {
         Self {
             config,
             nodes: Vec::with_capacity(capacity),
-            node_vectors: Vec::with_capacity(capacity),
             node_norms: Vec::with_capacity(capacity),
             node_inv_norms: Vec::with_capacity(capacity),
             node_quantized: Vec::with_capacity(capacity),
@@ -876,13 +870,10 @@ impl HnswIndex {
         // assign back via `&mut self`. The encoded vector is `Option<_>` —
         // mismatched dims / disabled codec yield None and the slot stays
         // empty (consistent with prior behaviour).
-        let encoded: Vec<(usize, Option<RabitqEncoded>)> = self
-            .node_vectors
-            .iter()
-            .enumerate()
-            .map(|(i, v_opt)| {
-                let enc = v_opt
-                    .as_deref()
+        let encoded: Vec<(usize, Option<RabitqEncoded>)> = (0..self.nodes.len())
+            .map(|i| {
+                let enc = self
+                    .read_node_f32(i)
                     .and_then(|v| self.encode_rabitq(&params, v));
                 (i, enc)
             })
@@ -899,24 +890,40 @@ impl HnswIndex {
     /// If `offload_vectors` is enabled, drops f32 after quantizing.
     pub fn set_sq8_params(&mut self, params: Sq8Params) {
         for idx in 0..self.nodes.len() {
-            if let Some(v) = self.node_vectors[idx].as_ref() {
-                self.node_quantized[idx] = Some(params.quantize(v));
+            if let Some(code) = self.read_node_f32(idx).map(|v| params.quantize(v)) {
+                self.node_quantized[idx] = Some(code);
             }
-            if self.config.offload_vectors {
-                self.node_vectors[idx] = None;
+        }
+        // Offload: free the f32 from the contiguous blocks too so the RAM is
+        // actually returned and `read_node_f32` reports None (rerank then
+        // loads f32 from disk).
+        if self.config.offload_vectors {
+            if let Some(b) = self.data_level0.as_mut() {
+                b.drop_f32();
+            }
+            if let Some(b) = self.inline_layer0.as_mut() {
+                b.drop_f32();
             }
         }
         self.sq8_params = Some(params);
     }
 
     /// Check if the node at `idx` has an in-memory f32 vector.
+    ///
+    /// Routed through [`Self::read_node_f32`] so the answer reflects every f32
+    /// store (the contiguous `data_level0` / `inline_layer0` blocks as well as
+    /// the legacy SoA), not just the SoA copy. Offloaded nodes (f32 on disk)
+    /// correctly report `false`.
     pub fn has_f32_vector(&self, idx: usize) -> bool {
-        self.node_vectors.get(idx).is_some_and(|v| v.is_some())
+        self.read_node_f32(idx).is_some()
     }
 
     /// Get a reference to the f32 vector at node index `idx`, if present.
+    ///
+    /// Reads from the contiguous f32 block first, falling back to the SoA copy
+    /// (see [`Self::read_node_f32`]).
     pub fn get_vector(&self, idx: usize) -> Option<&[f32]> {
-        self.node_vectors.get(idx).and_then(|v| v.as_deref())
+        self.read_node_f32(idx)
     }
 
     /// Auto-calibrate SQ8 from all currently stored vectors.
@@ -936,19 +943,25 @@ impl HnswIndex {
                 SQ8_MIN_VECTORS,
             );
         }
-        let refs: Vec<&[f32]> = self
-            .node_vectors
-            .iter()
-            .filter_map(|v| v.as_deref())
+        let refs: Vec<&[f32]> = (0..self.nodes.len())
+            .filter_map(|idx| self.read_node_f32(idx))
             .collect();
         if let Some(params) = Sq8Params::calibrate(&refs) {
             for idx in 0..self.nodes.len() {
-                if let Some(v) = self.node_vectors[idx].as_ref() {
-                    let code = params.quantize(v);
+                if let Some(code) = self.read_node_f32(idx).map(|v| params.quantize(v)) {
                     self.node_quantized[idx] = Some(code);
                 }
-                if self.config.offload_vectors {
-                    self.node_vectors[idx] = None;
+            }
+            // Offload: free the f32 from the contiguous blocks too (not only
+            // the SoA copy), re-laying them out without the f32 slot so the
+            // RAM is actually returned and `read_node_f32` reports None for
+            // these nodes (rerank then loads f32 from disk via VectorLoader).
+            if self.config.offload_vectors {
+                if let Some(b) = self.data_level0.as_mut() {
+                    b.drop_f32();
+                }
+                if let Some(b) = self.inline_layer0.as_mut() {
+                    b.drop_f32();
                 }
             }
             self.sq8_params = Some(params);
@@ -964,7 +977,7 @@ impl HnswIndex {
     /// one (R860 starting point; a per-shard seed comes with R-PUSH chains).
     fn auto_calibrate_rabitq(&mut self) {
         // Need at least one vector to infer D.
-        let dims = match self.node_vectors.iter().find_map(|v| v.as_ref()) {
+        let dims = match (0..self.nodes.len()).find_map(|idx| self.read_node_f32(idx)) {
             Some(v) => v.len(),
             None => return,
         };
@@ -990,7 +1003,9 @@ impl HnswIndex {
         // upper bound of 12 iterations caps calibration latency well
         // under one second even at calibration_threshold = 100k.
         const N_CLUSTERS: u32 = 16;
-        let training: Vec<Vec<f32>> = self.node_vectors.iter().filter_map(|v| v.clone()).collect();
+        let training: Vec<Vec<f32>> = (0..self.nodes.len())
+            .filter_map(|idx| self.read_node_f32(idx).map(<[f32]>::to_vec))
+            .collect();
         let params = if training.is_empty() {
             RaBitQParams::calibrate(dims as u32, seed)
         } else {
@@ -999,13 +1014,10 @@ impl HnswIndex {
 
         // Two-pass borrow split — encode_rabitq needs `&self.config`
         // while encoding, then we mutate node.rabitq_code separately.
-        let encoded: Vec<(usize, Option<RabitqEncoded>)> = self
-            .node_vectors
-            .iter()
-            .enumerate()
-            .map(|(i, v_opt)| {
-                let enc = v_opt
-                    .as_deref()
+        let encoded: Vec<(usize, Option<RabitqEncoded>)> = (0..self.nodes.len())
+            .map(|i| {
+                let enc = self
+                    .read_node_f32(i)
                     .and_then(|v| self.encode_rabitq(&params, v));
                 (i, enc)
             })
@@ -1334,11 +1346,18 @@ impl HnswIndex {
         let Some(block) = self.data_level0.as_mut() else {
             return;
         };
-        if idx >= block.capacity() || vector.len() != block.dim() {
+        if !block.has_f32() || vector.len() != block.dim() {
             return;
         }
-        // SAFETY: idx < capacity and vector.len() == block.dim() per the
-        // gates above; block was allocated with the same dim.
+        // Grow the contiguous block to fit `idx` rather than skipping past
+        // capacity — the contiguous store is now the authoritative f32 source
+        // (the SoA `node_vectors` copy is being removed), so it must hold
+        // every node, including those inserted beyond the initial
+        // `max_elements` estimate.
+        block.ensure_capacity(idx + 1);
+        // SAFETY: idx < capacity after `ensure_capacity` and vector.len()
+        // == block.dim() per the gate above; block was allocated with the
+        // same dim.
         unsafe {
             block.set_vector(idx, vector);
         }
@@ -1400,7 +1419,7 @@ impl HnswIndex {
         // companion read for the prefetch issued in
         // `prefetch_node_vector`.
         if let Some(block) = self.data_level0.as_ref() {
-            if idx < block.capacity() {
+            if block.has_f32() && idx < block.capacity() {
                 // SAFETY: idx < capacity per the gate above; the block
                 // was sized for `dim` f32 values at construction; the
                 // borrow lifetime is tied to `&self`.
@@ -1410,11 +1429,8 @@ impl HnswIndex {
                 }
             }
         }
-        if let Some(vec) = self.node_vectors.get(idx).and_then(|v| v.as_deref()) {
-            return Some(vec);
-        }
         if let Some(inline) = self.inline_layer0.as_ref() {
-            if idx < inline.capacity() {
+            if inline.has_f32() && idx < inline.capacity() {
                 // SAFETY: idx < capacity per the gate above; payload
                 // bytes were installed under &mut self and we only ever
                 // take &self after that.
@@ -1634,7 +1650,6 @@ impl HnswIndex {
         let norm = metrics::norm_l2(&vector);
         self.node_norms.push(norm);
         self.node_inv_norms.push(inv_or_zero(norm));
-        self.node_vectors.push(Some(vector));
         self.node_quantized.push(quantized);
         let rabitq_for_mirror = rabitq_code.clone();
         self.node_rabitq_codes.push(rabitq_code);
@@ -1750,7 +1765,6 @@ impl HnswIndex {
             let norm = metrics::norm_l2(&vec);
             self.node_norms.push(norm);
             self.node_inv_norms.push(inv_or_zero(norm));
-            self.node_vectors.push(Some(vec));
             self.node_quantized.push(quantized);
             let rabitq_for_mirror = rabitq_code.clone();
             self.node_rabitq_codes.push(rabitq_code);
@@ -1878,7 +1892,7 @@ impl HnswIndex {
 
     /// Auto-calibrate SQ8 if threshold reached, then offload the just-inserted
     /// node's f32 if offloading is active. Called at the end of `insert()`.
-    fn maybe_calibrate_and_offload(&mut self, just_inserted_idx: usize) {
+    fn maybe_calibrate_and_offload(&mut self, _just_inserted_idx: usize) {
         // Step 1: Auto-calibrate the configured codec when threshold reached.
         let threshold_reached = self.nodes.len() >= self.config.calibration_threshold;
         match self.config.quantization {
@@ -1893,12 +1907,11 @@ impl HnswIndex {
             _ => {}
         }
 
-        // Step 2: Offload f32 of the just-inserted node (construction complete).
-        // Offload is only valid for SQ8 today; RaBitQ disk-rerank with SQ8 on
-        // disk is the R861 follow-up.
-        if self.is_offloaded() {
-            self.node_vectors[just_inserted_idx] = None;
-        }
+        // Offload is handled at calibration: `auto_calibrate` / `set_sq8_params`
+        // free the f32 from the contiguous blocks (drop_f32), and the mirror is
+        // gated so post-calibration inserts never write f32 for an offloaded
+        // index. SQ8-only today; RaBitQ disk-rerank with SQ8 on disk is a
+        // follow-up.
     }
 
     /// Search for K nearest neighbors.
@@ -2415,7 +2428,6 @@ impl HnswIndex {
         // mirror left over from the original insert.
         self.mirror_inline_layer0(idx, id, &vector);
         self.mirror_data_level0_vector(idx, &vector);
-        self.node_vectors[idx] = Some(vector);
         self.node_quantized[idx] = quantized;
         let rabitq_for_mirror = rabitq_code.clone();
         self.node_rabitq_codes[idx] = rabitq_code;
@@ -2424,9 +2436,6 @@ impl HnswIndex {
         // Step 4: Re-insert into the graph from a valid entry point.
         // A single-node index has no connections to rebuild.
         if self.nodes.len() == 1 {
-            if self.is_offloaded() {
-                self.node_vectors[idx] = None;
-            }
             return;
         }
 
@@ -2494,10 +2503,9 @@ impl HnswIndex {
             }
         }
 
-        // Step 5: Offload f32 if offloading is active (calibration already done).
-        if self.is_offloaded() {
-            self.node_vectors[idx] = None;
-        }
+        // Offload (when active) freed the f32 from the contiguous blocks at
+        // calibration; the per-insert mirror is gated, so a re-inserted node in
+        // an offloaded index keeps no in-RAM f32 (rerank loads from disk).
     }
 
     /// Greedy search on a single layer (for traversal from top layers).
@@ -3462,8 +3470,7 @@ impl HnswIndex {
 
     fn distance_between_nodes(&self, a_idx: usize, b_idx: usize) -> f32 {
         // Try exact f32 for both nodes
-        if let (Some(ref va), Some(ref vb)) = (&self.node_vectors[a_idx], &self.node_vectors[b_idx])
-        {
+        if let (Some(va), Some(vb)) = (self.read_node_f32(a_idx), self.read_node_f32(b_idx)) {
             // Cosine fast path: both norms are precomputed per node, so
             // skip QueryCtx entirely. The generic path recomputes ||a||
             // on every call (QueryCtx::new), and this function runs
@@ -3505,8 +3512,8 @@ impl HnswIndex {
     /// Used by search_layer_greedy/search_layer during insert when the node
     /// should have f32 but may not if auto_calibrate offloaded early.
     fn get_node_f32_or_dequantized(&self, idx: usize) -> Vec<f32> {
-        if let Some(ref v) = self.node_vectors[idx] {
-            return v.clone();
+        if let Some(v) = self.read_node_f32(idx) {
+            return v.to_vec();
         }
         if let Some(ref params) = self.sq8_params {
             if let Some(ref q) = self.node_quantized[idx] {
@@ -3518,8 +3525,8 @@ impl HnswIndex {
 
     /// Get a node's vector: f32 if available, otherwise dequantize from SQ8.
     fn get_node_vector_or_dequantized(&self, idx: usize, params: &Sq8Params) -> Vec<f32> {
-        if let Some(ref v) = self.node_vectors[idx] {
-            return v.clone();
+        if let Some(v) = self.read_node_f32(idx) {
+            return v.to_vec();
         }
         if let Some(ref q) = self.node_quantized[idx] {
             return params.dequantize(q);
@@ -3585,14 +3592,12 @@ impl HnswIndex {
         // SoA cache misses. Matches hnswlib's `_mm_prefetch(data_level0_memory_
         // + idx * size_data_per_element_)` shape.
         if let Some(block) = self.data_level0.as_ref() {
-            if idx < block.capacity() {
+            if block.has_f32() && idx < block.capacity() {
                 block.prefetch(idx);
                 return;
             }
         }
-        if let Some(ref v) = self.node_vectors[idx] {
-            prefetch_read_data(v.as_ptr() as *const u8);
-        } else if let Some(ref q) = self.node_quantized[idx] {
+        if let Some(ref q) = self.node_quantized[idx] {
             prefetch_read_data(q.as_ptr());
         }
     }
@@ -3667,10 +3672,12 @@ mod tests {
                 let expected_id = index.nodes[idx].id;
                 assert_eq!(label, expected_id, "label mismatch at idx={idx}");
                 let inline_vec: Vec<f32> = inline.vector_f32(idx).to_vec();
-                let soa_vec = index.node_vectors[idx]
-                    .as_ref()
-                    .expect("SoA vector present");
-                assert_eq!(inline_vec, *soa_vec, "vector mismatch at idx={idx}");
+                let block_vec = index.read_node_f32(idx).expect("f32 present");
+                assert_eq!(
+                    inline_vec.as_slice(),
+                    block_vec,
+                    "vector mismatch at idx={idx}"
+                );
             }
         }
     }
@@ -3740,10 +3747,12 @@ mod tests {
                 let expected_id = index.nodes[idx].id;
                 assert_eq!(label, expected_id, "label mismatch at idx={idx}");
                 let inline_vec: Vec<f32> = inline.vector_f32(idx).to_vec();
-                let soa_vec = index.node_vectors[idx]
-                    .as_ref()
-                    .expect("SoA vector present");
-                assert_eq!(inline_vec, *soa_vec, "vector mismatch at idx={idx}");
+                let block_vec = index.read_node_f32(idx).expect("f32 present");
+                assert_eq!(
+                    inline_vec.as_slice(),
+                    block_vec,
+                    "vector mismatch at idx={idx}"
+                );
             }
         }
     }
@@ -4967,7 +4976,7 @@ mod tests {
             );
             let code = code_opt.as_ref().expect("checked is_some above");
             let expected = RabitqEncoded::OneBit(
-                persisted.encode(index.node_vectors[i].as_ref().expect("f32 retained")),
+                persisted.encode(index.read_node_f32(i).expect("f32 retained")),
             );
             assert_eq!(*code, expected, "node {i} code mismatch after reload");
         }
@@ -4987,15 +4996,15 @@ mod tests {
         assert!(index.is_quantized());
 
         for i in 0..index.nodes.len() {
-            let v = index.node_vectors[i]
-                .as_ref()
+            let v = index
+                .read_node_f32(i)
                 .expect("f32 should be retained (offload_vectors=false)");
             assert_eq!(v.len(), dims as usize);
             let q = index.node_quantized[i]
                 .as_ref()
                 .expect("should be quantized");
             assert_eq!(q.len(), dims as usize);
-            assert_eq!(v.len() * std::mem::size_of::<f32>(), q.len() * 4);
+            assert_eq!(std::mem::size_of_val(v), q.len() * 4);
         }
     }
 
@@ -5278,7 +5287,7 @@ mod tests {
         // Verify f32 vectors are dropped from in-memory nodes
         for (i, node) in index.nodes.iter().enumerate() {
             assert!(
-                index.node_vectors[i].is_none(),
+                index.read_node_f32(i).is_none(),
                 "f32 should be None when offloaded (node {})",
                 node.id
             );
@@ -5383,24 +5392,30 @@ mod tests {
             retained.insert(i, v);
         }
 
-        // Count f32 memory: offloaded should have 0, retained should have n*dims*4
-        let offloaded_f32_bytes: usize = offloaded
-            .node_vectors
-            .iter()
-            .map(|v| v.as_ref().map_or(0, |x| x.len() * 4))
-            .sum();
-        let retained_f32_bytes: usize = retained
-            .node_vectors
-            .iter()
-            .map(|v| v.as_ref().map_or(0, |x| x.len() * 4))
-            .sum();
-
-        assert_eq!(offloaded_f32_bytes, 0, "offloaded should have 0 f32 bytes");
-        assert_eq!(
-            retained_f32_bytes,
-            n as usize * dims * 4,
-            "retained should have all f32 bytes"
+        // f32 now lives in the contiguous data_level0 block; offload's
+        // drop_f32 re-lays it out without the f32 slot, actually freeing the
+        // bytes. The offloaded index must hold no in-RAM f32 so rerank loads
+        // from disk; the retained index keeps it.
+        let offloaded_has_f32 = offloaded.data_level0.as_ref().is_some_and(|b| b.has_f32());
+        let retained_has_f32 = retained.data_level0.as_ref().is_some_and(|b| b.has_f32());
+        assert!(
+            !offloaded_has_f32,
+            "offloaded index must free contiguous-block f32"
         );
+        assert!(
+            retained_has_f32,
+            "retained index must keep contiguous-block f32"
+        );
+        // read_node_f32 reflects it: None when offloaded, Some otherwise.
+        assert!(
+            offloaded.read_node_f32(0).is_none(),
+            "offloaded f32 read is None"
+        );
+        assert!(
+            retained.read_node_f32(0).is_some(),
+            "retained f32 read is Some"
+        );
+        let _ = (n, dims);
     }
 
     /// Regression test for G082: HNSW must update the graph when a vector

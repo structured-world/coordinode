@@ -227,6 +227,59 @@ impl InlineLayer0 {
         }
     }
 
+    /// Whether per-node blocks still carry the f32 vector (false after
+    /// [`InlineLayer0::drop_f32`]).
+    #[inline]
+    pub fn has_f32(&self) -> bool {
+        self.f32_bytes > 0
+    }
+
+    /// Free the f32 vectors, re-laying every per-node block out without the
+    /// f32 slot so the bytes are returned to the allocator (the offload path
+    /// calls this after calibration: search runs on quantized codes and rerank
+    /// loads f32 from disk). The neighbours, neighbour_len, RaBitQ code, RaBitQ
+    /// scalars, and label are preserved; the label moves up into the space the
+    /// f32 vector vacated and the stride shrinks. Idempotent. Under `&mut
+    /// self`, so no concurrent reader holds a pointer into the old backing.
+    pub fn drop_f32(&mut self) {
+        if self.f32_bytes == 0 {
+            return;
+        }
+        // The prefix [0 .. f32_offset] (neighbours + len + rabitq + scalars)
+        // keeps its layout; the label slides up to where the f32 vector was.
+        let new_label_offset = align_up(self.f32_offset, 8);
+        let new_stride = align_up(new_label_offset + 8, 8);
+        let new_u64_len = (new_stride * self.capacity).div_ceil(8);
+        let mut new_backing: Box<[u64]> = vec![0u64; new_u64_len].into_boxed_slice();
+        // SAFETY: byte views span each backing's full allocation. Per node,
+        // the prefix copy stays within `f32_offset < old stride`, and the
+        // 8-byte label copy stays within both blocks (label_offset + 8 <=
+        // old stride; new_label_offset + 8 <= new stride). `&mut self` means
+        // no concurrent `&self` reader observes the swap.
+        unsafe {
+            let old = self.backing.as_ptr() as *const u8;
+            let new = new_backing.as_mut_ptr() as *mut u8;
+            for idx in 0..self.capacity {
+                let old_base = idx * self.stride_bytes;
+                let new_base = idx * new_stride;
+                core::ptr::copy_nonoverlapping(
+                    old.add(old_base),
+                    new.add(new_base),
+                    self.f32_offset,
+                );
+                core::ptr::copy_nonoverlapping(
+                    old.add(old_base + self.label_offset),
+                    new.add(new_base + new_label_offset),
+                    8,
+                );
+            }
+        }
+        self.backing = new_backing;
+        self.stride_bytes = new_stride;
+        self.label_offset = new_label_offset;
+        self.f32_bytes = 0;
+    }
+
     /// Capacity in nodes.
     #[inline]
     pub fn capacity(&self) -> usize {
@@ -690,6 +743,43 @@ mod tests {
             assert_eq!(layer.neighbour_len(2).load(Ordering::Relaxed), 32);
             assert_eq!(layer.neighbour_len(3).load(Ordering::Relaxed), 0);
         }
+    }
+
+    #[test]
+    fn drop_f32_preserves_neighbours_and_label() {
+        let mut layer = InlineLayer0::new(4, 16, 64);
+        // SAFETY: idx < 4, slot < m_max0.
+        unsafe {
+            layer.set_neighbour(0, 0, 111);
+            layer.set_neighbour(0, 1, 222);
+            layer.set_label(0, 0xABCD_0000_0000_1234);
+            layer.set_neighbour(2, 0, 333);
+            layer.set_label(2, 0x9999_8888_7777_6666);
+        }
+        assert!(layer.has_f32());
+
+        layer.drop_f32();
+
+        assert!(!layer.has_f32(), "f32 marked absent after drop");
+        // Neighbours + label survive the re-layout (the label slides up into
+        // the space the dropped f32 vector vacated).
+        // SAFETY: idx < 4, slot < m_max0.
+        unsafe {
+            assert_eq!(layer.neighbour(0, 0).load(Ordering::Relaxed), 111);
+            assert_eq!(layer.neighbour(0, 1).load(Ordering::Relaxed), 222);
+            assert_eq!(
+                layer.label(0).load(Ordering::Relaxed),
+                0xABCD_0000_0000_1234
+            );
+            assert_eq!(layer.neighbour(2, 0).load(Ordering::Relaxed), 333);
+            assert_eq!(
+                layer.label(2).load(Ordering::Relaxed),
+                0x9999_8888_7777_6666
+            );
+        }
+        // Idempotent.
+        layer.drop_f32();
+        assert!(!layer.has_f32());
     }
 
     #[test]
