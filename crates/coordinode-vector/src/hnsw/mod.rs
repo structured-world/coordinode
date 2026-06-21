@@ -350,8 +350,8 @@ impl HnswConfig {
 
 /// A single element in the HNSW graph.
 ///
-/// Per-layer neighbour lists are stored separately on
-/// [`HnswIndex::neighbours_l0`] (hot path, layer 0) and
+/// Per-layer neighbour lists are stored separately: layer 0 in the contiguous
+/// `data_level0` block (hot path, co-located with the f32 vector) and
 /// [`HnswIndex::neighbours_upper`] (cold path, layers ≥1) using lock-free
 /// [`AtomicNeighbourList`]s — never inside this struct. The node's layer
 /// count equals `HnswIndex::node_levels(node_idx)`; the node's max layer
@@ -405,15 +405,6 @@ pub struct HnswIndex {
     /// index. This is the array the cosine-RaBitQ hot path hits on every
     /// neighbour visit.
     node_rabitq_codes: Vec<Option<RabitqEncoded>>,
-    /// Lock-free layer-0 neighbour lists, one entry per node. Flat `Vec`
-    /// indexed by node index — a search visit reads `neighbours_l0[idx]`
-    /// with ONE pointer-stride into a contiguous heap allocation, no inner
-    /// `Vec` heap chase. Mirrors the d365611 SmallVec inline pattern for
-    /// RaBitQ codes: the same `Vec<Vec<…>>` double-indirection that hurt
-    /// code reads also showed up here on the dominant visit-time lookup
-    /// (every neighbour walk touches layer 0; upper layers only fire on
-    /// the top-down descent in `search_layer`).
-    neighbours_l0: Vec<AtomicNeighbourList<M_MAX0>>,
     /// Lock-free upper-layer neighbour lists. `neighbours_upper[idx]`
     /// holds layers 1..=top_level for node `idx` (length =
     /// `nodes[idx].max_layer`). Cold path — only walked during the
@@ -772,7 +763,6 @@ impl HnswIndex {
             node_inv_norms: Vec::with_capacity(capacity),
             node_quantized: Vec::with_capacity(capacity),
             node_rabitq_codes: Vec::with_capacity(capacity),
-            neighbours_l0: Vec::with_capacity(capacity),
             neighbours_upper: Vec::with_capacity(capacity),
             id_to_idx,
             entry_point: EntryPoint::new(),
@@ -1450,30 +1440,23 @@ impl HnswIndex {
     /// hnswlib's super-linear MT4 scaling on sift-128 f32.
     #[inline]
     fn read_layer0_neighbours_into(&self, idx: usize, out: &mut Vec<u64>) {
-        out.clear();
-        if let Some(inline) = self.inline_layer0.as_ref() {
-            if idx < inline.capacity() {
-                // SAFETY: idx < inline.capacity() by the gate above; slots
-                // bounded by inline.m_max0() which the constructor enforces
-                // is the in-bounds slot count.
+        // Primary: the contiguous `data_level0` block holds the neighbour ids
+        // (u32) in the SAME per-node block as the f32 vector, so a search visit
+        // reads both from one cache-resident block (hnswlib one-block-per-
+        // visit). Reads straight into `out`, widening u32 -> u64.
+        if let Some(block) = self.data_level0.as_ref() {
+            if idx < block.capacity() {
+                // SAFETY: idx < capacity per the gate.
                 unsafe {
-                    let raw_len = inline
-                        .neighbour_len(idx)
-                        .load(core::sync::atomic::Ordering::Relaxed)
-                        as usize;
-                    let len = raw_len.min(inline.m_max0());
-                    out.reserve(len);
-                    for slot in 0..len {
-                        let id = inline
-                            .neighbour(idx, slot)
-                            .load(core::sync::atomic::Ordering::Relaxed);
-                        out.push(id);
-                    }
+                    block.read_neighbours_into_u64(idx, out);
                 }
                 return;
             }
         }
-        self.neighbours_l0[idx].snapshot_into(out);
+        // data_level0 is the sole layer-0 neighbour store and is grown to
+        // cover every node during allocation, so this fallback only fires for
+        // an idx with no block yet (no nodes inserted) — an empty list.
+        out.clear();
     }
 
     /// Mirror the RaBitQ code (packed bytes) and scalar header for node
@@ -1568,38 +1551,31 @@ impl HnswIndex {
         self.inline_layer0.as_ref()
     }
 
-    /// Refresh the layer-0 neighbour ids and `neighbour_len` for node
-    /// `idx` in the contiguous store from the authoritative SoA
-    /// `AtomicNeighbourList`. Called from every layer-0 mutator
-    /// (`set_outgoing`, `cas_add_neighbour_to`, `add_neighbour_to`) so the
-    /// inline store stays in sync with SoA. Search still reads SoA, so
-    /// brief transient divergence under concurrent back-edge writers
-    /// resolves itself on the next mirror call from any writer; the
-    /// search-side switch on the same plan adds the synchronisation that
-    /// removes the race entirely.
-    fn mirror_layer0_neighbours_to_inline(&self, idx: usize) {
-        let Some(inline) = self.inline_layer0.as_ref() else {
+    /// Write-through the full layer-0 neighbour set for `idx` into the
+    /// contiguous `data_level0` block (bulk replace, single-writer-per-node —
+    /// same contract as `set_outgoing`'s SoA `set`). Bridges the u64 graph
+    /// indices to the block's u32 slots (per-shard node count is well below
+    /// `u32::MAX`). No-op when the block is absent or does not yet cover `idx`.
+    ///
+    /// This is the write-through twin of [`Self::mirror_layer0_neighbours_to_inline`]
+    /// for the contiguous-block neighbour collapse: the block becomes the
+    /// single search source for both neighbours and the f32 vector.
+    fn mirror_layer0_neighbours_to_data_level0(&self, idx: usize, ids: &[u64]) {
+        let Some(block) = self.data_level0.as_ref() else {
             return;
         };
-        if idx >= inline.capacity() {
+        if idx >= block.capacity() {
             return;
         }
-        let list = &self.neighbours_l0[idx];
-        let mut snap: Vec<u64> = Vec::with_capacity(M_MAX0);
-        list.snapshot_into(&mut snap);
-        let take = snap.len().min(inline.m_max0());
-        let len_byte = u8::try_from(take).unwrap_or(u8::MAX);
-        // SAFETY: idx < inline.capacity() per the gate above. Slot writes
-        // are bounded by inline.m_max0() which the constructor guarantees
-        // is the in-bounds slot count.
+        let n = ids.len().min(block.m_max0());
+        let mut buf = [0u32; M_MAX0];
+        for (slot, &id) in ids.iter().take(n).enumerate() {
+            buf[slot] = id as u32;
+        }
+        // SAFETY: idx < capacity (gate above); n <= m_max0 <= M_MAX0 so the
+        // slice fits the block's neighbour region.
         unsafe {
-            for (slot, &id) in snap.iter().enumerate().take(take) {
-                inline.set_neighbour(idx, slot, id);
-            }
-            for slot in take..inline.m_max0() {
-                inline.set_neighbour(idx, slot, 0);
-            }
-            inline.set_neighbour_len(idx, len_byte);
+            block.set_neighbours(idx, &buf[..n]);
         }
     }
 
@@ -1659,9 +1635,9 @@ impl HnswIndex {
 
         // Allocate atomic neighbour storage in lockstep — write helpers
         // index by (node, layer) and would panic on a missing entry.
-        // Layer 0 goes in the flat hot vec; upper layers (if any) in the
-        // cold per-node Vec.
-        self.neighbours_l0.push(AtomicNeighbourList::new());
+        // Layer 0 lives in the contiguous data_level0 block (populated by the
+        // f32 mirror + neighbour write-through); upper layers in the cold
+        // per-node Vec.
         let mut upper = Vec::with_capacity(new_level);
         for _ in 0..new_level {
             upper.push(AtomicNeighbourList::new());
@@ -1772,7 +1748,6 @@ impl HnswIndex {
             self.mirror_rabitq_to_inline(mirror_idx, rabitq_for_mirror.as_ref());
             self.id_to_idx.insert(plan.id, idx);
 
-            self.neighbours_l0.push(AtomicNeighbourList::new());
             let mut upper = Vec::with_capacity(new_level);
             for _ in 0..new_level {
                 upper.push(AtomicNeighbourList::new());
@@ -2394,7 +2369,7 @@ impl HnswIndex {
         // Step 1: Remove this node from every neighbour's connection list.
         // Snapshot first to avoid simultaneous mutable + immutable borrows.
         for level in 0..n_levels {
-            let neighbours = self.neighbours_at(idx, level).snapshot();
+            let neighbours = self.layer_snapshot(idx, level);
             for neighbour_idx_u64 in neighbours {
                 let neighbour_idx = neighbour_idx_u64 as usize;
                 if neighbour_idx < self.nodes.len() && level < self.node_levels(neighbour_idx) {
@@ -2898,56 +2873,19 @@ impl HnswIndex {
             // predict (hnswlib issues the same hint on its candidate
             // top inside `searchBaseLayerST`).
             if level == 0 {
-                if let (Some(next), Some(inline)) = (candidates.peek(), self.inline_layer0.as_ref())
-                {
-                    inline.prefetch_neighbours(next.idx as usize);
+                if let (Some(next), Some(block)) = (candidates.peek(), self.data_level0.as_ref()) {
+                    block.prefetch_neighbours(next.idx as usize);
                 }
             }
 
             if level < self.node_levels(closest.idx as usize) {
                 unvisited_neighbors.clear();
-                // Layer-0 fast path: walk the inline block's neighbour row
-                // in place instead of materialising it into `connections`
-                // first — the copy paid a second pass plus a buffer write
-                // per edge on the hottest loop in the search. The visited
-                // one-ahead prefetch (hnswlib `hnswalg.h:371-374` trick:
-                // the counters array is ~N bytes, random reads spill out
-                // of L1 every iteration, hinting one ahead hides that
-                // latency) is preserved by peeking the next slot's id.
-                let mut walked_inline = false;
-                if level == 0 {
-                    if let Some(inline) = self.inline_layer0.as_ref() {
-                        let cidx = closest.idx as usize;
-                        if cidx < inline.capacity() {
-                            walked_inline = true;
-                            // SAFETY: cidx < capacity gate above; slot is
-                            // bounded by m_max0 (len clamped below), which
-                            // is the in-bounds slot count by construction.
-                            unsafe {
-                                use core::sync::atomic::Ordering::Relaxed;
-                                let len = (inline.neighbour_len(cidx).load(Relaxed) as usize)
-                                    .min(inline.m_max0());
-                                for slot in 0..len {
-                                    let neighbor_idx =
-                                        inline.neighbour(cidx, slot).load(Relaxed) as usize;
-                                    if slot + 1 < len {
-                                        let next_idx =
-                                            inline.neighbour(cidx, slot + 1).load(Relaxed) as usize;
-                                        if let Some(p) = visited.counter_ptr(next_idx) {
-                                            prefetch_read_data(p);
-                                        }
-                                    }
-                                    if neighbor_idx < n_nodes
-                                        && !visited.check_and_mark_unchecked(neighbor_idx)
-                                    {
-                                        unvisited_neighbors.push(neighbor_idx);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if !walked_inline {
+                // Read this node's neighbour row: layer 0 from the contiguous
+                // data_level0 block (co-located with the f32 vector, ids u32),
+                // layers >= 1 from the SoA upper store. The hnswlib one-ahead
+                // prefetch trick (`hnswalg.h:371-374`) is preserved by peeking
+                // the next id in `connections`.
+                {
                     if level == 0 {
                         self.read_layer0_neighbours_into(closest.idx as usize, &mut connections);
                     } else {
@@ -3242,7 +3180,7 @@ impl HnswIndex {
     ) {
         // Stored u64s ARE neighbour indices now (not NodeIds) — no
         // id_to_idx hop. Dedupe via HashSet on those indices.
-        let neighbours = self.neighbours_at(node_idx, level).snapshot();
+        let neighbours = self.layer_snapshot(node_idx, level);
         let mut seen: std::collections::HashSet<u64> =
             std::collections::HashSet::with_capacity(neighbours.len() + extras.len());
         let mut scored: Vec<(f32, u64)> = Vec::with_capacity(neighbours.len() + extras.len());
@@ -3288,18 +3226,90 @@ impl HnswIndex {
     // / `clear_outgoing` paths are kept for the sequential C1/C2 callers
     // (update_existing_node's rebuild, prune fallback).
 
-    /// Resolve `(node, layer)` to the underlying
-    /// [`AtomicNeighbourList`]. Layer 0 lives in the flat hot-path
-    /// `neighbours_l0` vec; layers ≥1 live in `neighbours_upper[idx]`
-    /// (cold path). One source of truth so call-sites read the same
-    /// addressing rule whether they're hot (per-visit) or cold
-    /// (top-down descent / rebuild).
+    /// Resolve `(node, layer >= 1)` to the underlying [`AtomicNeighbourList`]
+    /// in the SoA `neighbours_upper` store. **Layer 0 no longer lives here** —
+    /// it is the contiguous `data_level0` block; layer-0 callers go through the
+    /// `layer_*` helpers below. Calling this with `level == 0` is a bug.
     #[inline]
     fn neighbours_at(&self, idx: usize, level: usize) -> &AtomicNeighbourList<M_MAX0> {
+        debug_assert!(
+            level >= 1,
+            "layer 0 neighbours live in data_level0; use the layer_* helpers"
+        );
+        &self.neighbours_upper[idx][level - 1]
+    }
+
+    /// Snapshot node `idx`'s neighbours at `level` into `out` (cleared first).
+    /// Layer 0 reads the contiguous `data_level0` block (the sole layer-0
+    /// store, ids widened u32 -> u64); layers >= 1 read `neighbours_upper`.
+    fn layer_snapshot_into(&self, idx: usize, level: usize, out: &mut Vec<u64>) {
         if level == 0 {
-            &self.neighbours_l0[idx]
+            if let Some(block) = self.data_level0.as_ref() {
+                if idx < block.capacity() {
+                    // SAFETY: idx < capacity per the gate.
+                    unsafe {
+                        block.read_neighbours_into_u64(idx, out);
+                    }
+                    return;
+                }
+            }
+            out.clear();
         } else {
-            &self.neighbours_upper[idx][level - 1]
+            out.clear();
+            self.neighbours_upper[idx][level - 1].snapshot_into(out);
+        }
+    }
+
+    /// Allocating variant of [`Self::layer_snapshot_into`].
+    fn layer_snapshot(&self, idx: usize, level: usize) -> Vec<u64> {
+        let mut out = Vec::new();
+        self.layer_snapshot_into(idx, level, &mut out);
+        out
+    }
+
+    /// Number of neighbours published at `(idx, level)`. Layer 0 from
+    /// `data_level0`'s atomic count.
+    fn layer_len(&self, idx: usize, level: usize) -> usize {
+        if level == 0 {
+            self.data_level0.as_ref().map_or(0, |block| {
+                if idx < block.capacity() {
+                    // SAFETY: idx < capacity per the gate.
+                    unsafe { block.neighbour_count(idx) as usize }
+                } else {
+                    0
+                }
+            })
+        } else {
+            self.neighbours_upper[idx][level - 1].len()
+        }
+    }
+
+    /// Concurrent append of `id` at `(idx, level)`; `false` if at capacity.
+    /// Layer 0 appends to `data_level0` (atomic CAS, multi-writer-safe).
+    fn layer_cas_append(&self, idx: usize, level: usize, id: u64) -> bool {
+        if level == 0 {
+            self.data_level0.as_ref().is_some_and(|block| {
+                if idx < block.capacity() {
+                    // SAFETY: idx < capacity per the gate.
+                    unsafe { block.cas_append_neighbour(idx, id as u32) }
+                } else {
+                    false
+                }
+            })
+        } else {
+            self.neighbours_upper[idx][level - 1].cas_append(id)
+        }
+    }
+
+    /// Bulk-replace the neighbour set at `(idx, level)`. Layer 0 writes the
+    /// contiguous block (single-writer-per-node, same contract as the SoA
+    /// `set`); layers >= 1 write `neighbours_upper`.
+    fn layer_set(&self, idx: usize, level: usize, ids: &[u64]) {
+        if level == 0 {
+            self.mirror_layer0_neighbours_to_data_level0(idx, ids);
+        } else {
+            let n = ids.len().min(M_MAX0);
+            self.neighbours_upper[idx][level - 1].set(&ids[..n]);
         }
     }
 
@@ -3315,10 +3325,7 @@ impl HnswIndex {
     /// Truncates to `M_MAX0` on overflow (logged at construction time).
     fn set_outgoing(&self, idx: usize, level: usize, ids: &[u64]) {
         let n = ids.len().min(M_MAX0);
-        self.neighbours_at(idx, level).set(&ids[..n]);
-        if level == 0 {
-            self.mirror_layer0_neighbours_to_inline(idx);
-        }
+        self.layer_set(idx, level, &ids[..n]);
     }
 
     /// Multi-writer append-edge primitive (C3). Tries to append `id` to
@@ -3331,11 +3338,7 @@ impl HnswIndex {
     /// commit). C2's serial apply continues to use [`add_neighbour_to`].
     #[allow(dead_code)] // Wired into parallel apply in C3 day 3.
     fn cas_add_neighbour_to(&self, neighbour_idx: usize, level: usize, id: u64) -> bool {
-        let ok = self.neighbours_at(neighbour_idx, level).cas_append(id);
-        if ok && level == 0 {
-            self.mirror_layer0_neighbours_to_inline(neighbour_idx);
-        }
-        ok
+        self.layer_cas_append(neighbour_idx, level, id)
     }
 
     /// Append `id` to `(neighbour_idx, level)`. If the resulting list
@@ -3347,15 +3350,14 @@ impl HnswIndex {
     /// `len` counter, but the prune branch needs `&mut self` because
     /// `prune_connections` reads vectors + reorders the list.
     fn add_neighbour_to(&mut self, neighbour_idx: usize, level: usize, id: u64, max_conn: usize) {
-        if self.neighbours_at(neighbour_idx, level).cas_append(id) {
-            let len_now = self.neighbours_at(neighbour_idx, level).len();
+        if self.layer_cas_append(neighbour_idx, level, id) {
+            let len_now = self.layer_len(neighbour_idx, level);
             if len_now > max_conn {
                 self.prune_connections(neighbour_idx, level, max_conn);
-                // prune_connections funnels through set_outgoing, which
-                // mirrors. Done.
-            } else if level == 0 {
-                self.mirror_layer0_neighbours_to_inline(neighbour_idx);
+                // prune_connections funnels through set_outgoing. Done.
             }
+            // Otherwise the append already landed in the sole neighbour store
+            // for this layer; there is nothing else to mirror.
         } else {
             // List at the inline cap (`M_MAX0`). When `max_conn == M_MAX0`
             // (default config: `m_max0 = 2 * m = 64` matches the compile-
@@ -3369,7 +3371,7 @@ impl HnswIndex {
             // competes fairly against existing neighbours. The kept set
             // has ≤ `max_conn` elements (`≤ M_MAX0`) so `set_outgoing` is
             // guaranteed to fit without truncation.
-            let mut snap = self.neighbours_at(neighbour_idx, level).snapshot();
+            let mut snap = self.layer_snapshot(neighbour_idx, level);
             snap.push(id);
             // Stored u64s ARE neighbour indices — direct cast, no map hop.
             let mut scored: Vec<(f32, u64)> = Vec::with_capacity(snap.len());
@@ -3390,14 +3392,14 @@ impl HnswIndex {
     /// Remove every occurrence of `id` from `(idx, level)`. No-op if `id`
     /// is absent.
     fn remove_neighbour_from(&mut self, idx: usize, level: usize, id: u64) {
-        let mut snap = self.neighbours_at(idx, level).snapshot();
+        let mut snap = self.layer_snapshot(idx, level);
         snap.retain(|&nid| nid != id);
         self.set_outgoing(idx, level, &snap);
     }
 
     /// Clear the entire neighbour set at `(idx, level)`.
     fn clear_outgoing(&mut self, idx: usize, level: usize) {
-        self.neighbours_at(idx, level).set(&[]);
+        self.layer_set(idx, level, &[]);
     }
 
     /// Compute distance between two nodes in the graph.
@@ -3648,6 +3650,54 @@ mod tests {
     }
 
     #[test]
+    fn data_level0_neighbours_form_valid_layer0_graph() {
+        // The contiguous data_level0 block is the sole layer-0 neighbour store
+        // (SoA neighbours_l0 removed). After a build, every node's neighbour
+        // ids must be valid indices (no EMPTY sentinel leak, no torn u32, no
+        // self-loops) and the graph must connect essentially every node.
+        let mut cfg = make_config(VectorMetric::L2);
+        cfg.max_elements = 128;
+        let mut index = HnswIndex::new(cfg);
+        let dim = 8;
+        for i in 0..96u64 {
+            let v: Vec<f32> = (0..dim)
+                .map(|d| ((i * 13 + d as u64 * 7) as f32).sin())
+                .collect();
+            index.insert(i, v);
+        }
+        let block = index
+            .data_level0
+            .as_ref()
+            .expect("data_level0 present after inserts");
+        let n = index.nodes.len();
+        let mut with_neighbours = 0usize;
+        for idx in 0..n {
+            let mut blk = Vec::new();
+            // SAFETY: idx < nodes.len() <= block.capacity().
+            unsafe {
+                block.read_neighbours_into(idx, &mut blk);
+            }
+            // Every stored id is a valid node index (no EMPTY sentinel leak,
+            // no torn u32) and no node links to itself.
+            for &nid in &blk {
+                assert!(
+                    (nid as usize) < n,
+                    "node {idx}: neighbour {nid} out of range"
+                );
+                assert_ne!(nid as usize, idx, "node {idx} links to itself");
+            }
+            if !blk.is_empty() {
+                with_neighbours += 1;
+            }
+        }
+        // A built graph connects essentially every node at layer 0.
+        assert!(
+            with_neighbours >= n - 1,
+            "only {with_neighbours}/{n} nodes have layer-0 neighbours"
+        );
+    }
+
+    #[test]
     fn inline_layer0_mirrors_soa_on_per_item_insert() {
         let mut cfg = make_config(VectorMetric::L2);
         // Cap small so the test does not allocate 100s of MB for the
@@ -3678,48 +3728,6 @@ mod tests {
                     block_vec,
                     "vector mismatch at idx={idx}"
                 );
-            }
-        }
-    }
-
-    #[test]
-    fn inline_layer0_mirrors_soa_layer0_neighbours() {
-        // Insert enough nodes for the build to populate non-trivial layer-0
-        // neighbour lists. After the build, every node's layer-0 neighbour
-        // ids and length must match between SoA and the contiguous store.
-        let mut cfg = make_config(VectorMetric::L2);
-        cfg.max_elements = 64;
-        let mut index = HnswIndex::new(cfg);
-        for i in 0..32u64 {
-            let v: Vec<f32> = (0..8)
-                .map(|d| ((i as f32) * 0.7 + (d as f32) * 0.13).sin())
-                .collect();
-            index.insert(i, v);
-        }
-        let inline = index
-            .inline_layer0()
-            .expect("inline store must be populated");
-        for idx in 0..index.nodes.len() {
-            let soa = &index.neighbours_l0[idx];
-            let mut soa_snap: Vec<u64> = Vec::with_capacity(M_MAX0);
-            soa.snapshot_into(&mut soa_snap);
-            let soa_len = soa_snap.len();
-            // SAFETY: idx < inline.capacity() and slots < m_max0.
-            unsafe {
-                let inline_len = inline
-                    .neighbour_len(idx)
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    as usize;
-                assert_eq!(inline_len, soa_len, "neighbour_len mismatch at idx={idx}");
-                for (slot, &expected) in soa_snap.iter().enumerate().take(soa_len) {
-                    let inline_id = inline
-                        .neighbour(idx, slot)
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    assert_eq!(
-                        inline_id, expected,
-                        "neighbour id mismatch at idx={idx} slot={slot}"
-                    );
-                }
             }
         }
     }
@@ -5500,7 +5508,12 @@ mod tests {
         // Re-insert one node to exercise update_existing_node.
         idx.insert(7, vec![0.5, -0.5, 0.5, -0.5]);
 
-        assert_eq!(idx.neighbours_l0.len(), idx.nodes.len());
+        // Layer-0 neighbours live in the contiguous block now; it must cover
+        // every node.
+        assert!(idx
+            .data_level0
+            .as_ref()
+            .is_some_and(|b| b.capacity() >= idx.nodes.len()));
         assert_eq!(idx.neighbours_upper.len(), idx.nodes.len());
 
         let mut scratch = Vec::with_capacity(M_MAX0);
@@ -5512,8 +5525,7 @@ mod tests {
                 "node {node_idx} layer count diverged from max_layer + 1",
             );
             for level in 0..idx.node_levels(node_idx) {
-                idx.neighbours_at(node_idx, level)
-                    .snapshot_into(&mut scratch);
+                idx.layer_snapshot_into(node_idx, level, &mut scratch);
                 assert!(
                     scratch.len() <= M_MAX0,
                     "node {node_idx} level {level} exceeds m_max0 cap",
@@ -5631,14 +5643,17 @@ mod tests {
 
     #[test]
     fn max_elements_preallocates_node_storage() {
-        // C1 day 6: HnswConfig::max_elements drives Vec::with_capacity for
-        // nodes + neighbours_l0 / neighbours_upper so steady-state inserts
-        // don't pay reallocation cost on the hot path.
+        // HnswConfig::max_elements drives Vec::with_capacity for nodes +
+        // neighbours_upper, and sizes the contiguous data_level0 block, so
+        // steady-state inserts don't pay reallocation cost on the hot path.
         let cfg = HnswConfig {
             max_elements: 50_000,
             ..HnswConfig::default()
         };
-        let idx = HnswIndex::new(cfg);
+        let mut idx = HnswIndex::new(cfg);
+        // data_level0 (layer-0 neighbours + f32) allocates lazily on the first
+        // insert, sized to max_elements.
+        idx.insert(0, vec![0.1; 16]);
 
         assert!(
             idx.nodes.capacity() >= 50_000,
@@ -5646,9 +5661,10 @@ mod tests {
             idx.nodes.capacity()
         );
         assert!(
-            idx.neighbours_l0.capacity() >= 50_000,
-            "neighbours_l0 Vec capacity {} < max_elements 50_000",
-            idx.neighbours_l0.capacity()
+            idx.data_level0
+                .as_ref()
+                .is_some_and(|b| b.capacity() >= 50_000),
+            "data_level0 capacity < max_elements 50_000"
         );
         // HashMap::with_capacity may round up; just assert it's non-zero.
         assert!(idx.id_to_idx.capacity() >= 50_000);

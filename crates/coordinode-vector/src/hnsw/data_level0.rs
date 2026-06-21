@@ -33,15 +33,26 @@
 //!
 //! ## Concurrency
 //!
-//! All writes go through `&mut self` accessors; all reads go through
-//! `&self` accessors. Standard Rust aliasing rules apply — no `UnsafeCell`,
-//! no atomics. The wrapping `HnswIndex` enforces "search holds &self,
-//! insert holds &mut self" already.
+//! Neighbour ids + count are **atomic** (`AtomicU32`): [`DataLevel0Block::
+//! cas_append_neighbour`] lets concurrent back-edge writers append under
+//! `&self`, mirroring [`super::neighbours::AtomicNeighbourList`] — CAS the
+//! count to reserve a slot, `Release`-store the id; readers `Acquire` the
+//! count then read slots, filtering the [`EMPTY_ID`] sentinel that marks a
+//! reserved-but-not-yet-written slot. The f32 vector is written once under
+//! `&mut self` ([`DataLevel0Block::set_vector`]) and read under `&self`
+//! ([`DataLevel0Block::vector_ptr`]); it carries no atomics because the
+//! wrapping `HnswIndex` never appends to it concurrently (insert holds
+//! `&mut self`, search holds `&self`). Bulk neighbour replace
+//! ([`DataLevel0Block::set_neighbours`]) is single-writer-per-node by caller
+//! contract (gated against `cas_append_neighbour` on the same node, exactly
+//! like `AtomicNeighbourList::set`).
 
 #![allow(
     dead_code,
     reason = "consumers land in the search-path wiring chunks on the same plan; tests exercise the round-trip"
 )]
+
+use core::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(test)]
 use super::M_MAX0;
@@ -51,6 +62,15 @@ use super::M_MAX0;
 /// gives the f32 vector itself a clean 4-byte alignment via the
 /// `vector_offset` computation in [`DataLevel0Block::new`].
 const NODE_ALIGN: usize = 8;
+
+/// Sentinel for a reserved-but-not-yet-written neighbour slot (u32-wide
+/// analogue of [`super::neighbours::EMPTY`]). Node ids are dense from `0`, so
+/// `u32::MAX` is safe to reserve — an index would need >4 billion vectors in
+/// one shard to collide, well past the LSM-backed sharding threshold.
+/// [`DataLevel0Block::cas_append_neighbour`] reserves a slot (count CAS)
+/// before storing the id; a concurrent reader observing the bumped count but
+/// the unwritten slot sees this sentinel and filters it out.
+const EMPTY_ID: u32 = u32::MAX;
 
 /// One contiguous f32-side layer-0 store. See the module doc for layout
 /// rationale and the chunked execution plan that wires it up.
@@ -87,6 +107,26 @@ fn align_up(n: usize, align: usize) -> usize {
     (n + align - 1) & !(align - 1)
 }
 
+/// Fill the neighbour-id region of nodes `start..end` with the [`EMPTY_ID`]
+/// sentinel (0xFF bytes), leaving the count field (offset 0) and the f32
+/// region zeroed. Called by [`DataLevel0Block::new`] (all nodes) and
+/// [`DataLevel0Block::ensure_capacity`] (the freshly grown nodes) so the
+/// lock-free `cas_append_neighbour` reserve-before-write window never lets a
+/// reader observe a zero-initialised slot as the real node id `0`.
+fn init_neighbour_slots(
+    backing: &mut [u8],
+    start: usize,
+    end: usize,
+    stride: usize,
+    neighbour_ids_offset: usize,
+    m_max0: usize,
+) {
+    for idx in start..end {
+        let ids = idx * stride + neighbour_ids_offset;
+        backing[ids..ids + m_max0 * 4].fill(0xFF);
+    }
+}
+
 impl DataLevel0Block {
     /// Allocate a fresh layer-0 store sized for `capacity` nodes, each
     /// holding `m_max0` neighbour slots and a `dim`-dimensional f32
@@ -112,8 +152,28 @@ impl DataLevel0Block {
             panic!("DataLevel0Block: stride * capacity overflow");
         };
 
+        let mut backing = vec![0u8; total].into_boxed_slice();
+        // Atomic neighbour access casts per-node bytes to `AtomicU32`. The
+        // global allocator returns >=16-aligned blocks for any non-zero size,
+        // so the Vec<u8> base (and every `idx * stride` node start, stride
+        // being a multiple of 8) is >=4-aligned. Assert it rather than trust
+        // it silently — a custom allocator violating this would be loud UB.
+        assert_eq!(
+            backing.as_ptr() as usize % core::mem::align_of::<AtomicU32>(),
+            0,
+            "DataLevel0Block backing must be AtomicU32-aligned"
+        );
+        init_neighbour_slots(
+            &mut backing,
+            0,
+            capacity,
+            stride,
+            neighbour_ids_offset,
+            m_max0,
+        );
+
         Self {
-            backing: vec![0u8; total].into_boxed_slice(),
+            backing,
             capacity,
             stride,
             neighbour_ids_offset,
@@ -182,7 +242,22 @@ impl DataLevel0Block {
             panic!("DataLevel0Block: stride * capacity overflow on grow");
         };
         let mut new_backing = vec![0u8; total].into_boxed_slice();
+        assert_eq!(
+            new_backing.as_ptr() as usize % core::mem::align_of::<AtomicU32>(),
+            0,
+            "DataLevel0Block backing must be AtomicU32-aligned"
+        );
         new_backing[..self.backing.len()].copy_from_slice(&self.backing);
+        // Existing nodes were copied verbatim (slots intact); the grown nodes
+        // are zeroed, so EMPTY-init their neighbour slots for safe cas_append.
+        init_neighbour_slots(
+            &mut new_backing,
+            self.capacity,
+            new_capacity,
+            self.stride,
+            self.neighbour_ids_offset,
+            self.m_max0,
+        );
         self.backing = new_backing;
         self.capacity = new_capacity;
     }
@@ -237,65 +312,185 @@ impl DataLevel0Block {
         unsafe { self.backing.as_mut_ptr().add(idx * self.stride) }
     }
 
-    /// Number of valid neighbours stored for node `idx`. Zero before
-    /// the first `set_neighbours` call.
+    /// Reference to node `idx`'s neighbour-count atomic (per-node offset 0).
+    ///
+    /// # Safety
+    ///
+    /// `idx < self.capacity`. The bytes are `AtomicU32`-aligned (asserted at
+    /// construction / grow) and the neighbour region is only ever accessed
+    /// atomically, so the shared atomic reference races nothing.
+    #[inline(always)]
+    unsafe fn count_atomic(&self, idx: usize) -> &AtomicU32 {
+        // SAFETY: idx bound per contract; offset 0 is a 4-aligned u32; the
+        // &AtomicU32 borrows `self`.
+        unsafe { &*(self.node_base(idx) as *const AtomicU32) }
+    }
+
+    /// Reference to slot `j` of node `idx`'s neighbour-id array.
+    ///
+    /// # Safety
+    ///
+    /// `idx < self.capacity` and `j < self.m_max0`.
+    #[inline(always)]
+    unsafe fn slot_atomic(&self, idx: usize, j: usize) -> &AtomicU32 {
+        // SAFETY: idx/j bounds per contract; `neighbour_ids_offset + j*4` is
+        // 4-aligned and inside the per-node neighbour region.
+        unsafe {
+            &*(self.node_base(idx).add(self.neighbour_ids_offset + j * 4) as *const AtomicU32)
+        }
+    }
+
+    /// Number of valid neighbours published for node `idx`. Zero before the
+    /// first append / `set_neighbours`. `Acquire`-ordered so any slot written
+    /// before the publishing `Release` is visible to a subsequent slot read.
     ///
     /// # Safety
     ///
     /// `idx < self.capacity`.
     #[inline]
     pub(super) unsafe fn neighbour_count(&self, idx: usize) -> u32 {
-        // SAFETY: the per-node block starts with a u32 by construction;
-        // `node_base` returns a valid pointer to it.
-        unsafe { core::ptr::read(self.node_base(idx) as *const u32) }
+        // SAFETY: idx bound per contract.
+        unsafe { self.count_atomic(idx) }.load(Ordering::Acquire)
     }
 
-    /// Install the neighbour ids for node `idx`. Stores the count and
-    /// the prefix of the `[u32; M_MAX0]` slot. Subsequent entries past
-    /// `ids.len()` are left untouched.
+    /// Bulk-publish the neighbour ids for node `idx`, overwriting the prior
+    /// set: write the live slots `Relaxed`, wipe the tail to [`EMPTY_ID`] so a
+    /// later [`Self::cas_append_neighbour`] reader walking past the count sees
+    /// the sentinel, then publish the count `Release`.
+    ///
+    /// **Single-writer-per-node** by caller contract: must not run concurrently
+    /// with `cas_append_neighbour` (or another `set_neighbours`) on the same
+    /// node — identical to `AtomicNeighbourList::set`. Takes `&self` because the
+    /// writes are atomic; the wrapping `HnswIndex` gates the bulk-replace
+    /// (prune) path against concurrent appends.
     ///
     /// # Safety
     ///
     /// `idx < self.capacity` and `ids.len() <= self.m_max0`.
     #[inline]
-    pub(super) unsafe fn set_neighbours(&mut self, idx: usize, ids: &[u32]) {
+    pub(super) unsafe fn set_neighbours(&self, idx: usize, ids: &[u32]) {
         debug_assert!(idx < self.capacity, "idx out of bounds");
         debug_assert!(ids.len() <= self.m_max0, "ids overflow neighbour slot");
+        let n = ids.len().min(self.m_max0);
 
-        // SAFETY: caller guarantees the bounds; `node_base_mut` returns
-        // a valid pointer; the writes stay inside the per-node block.
+        // SAFETY: idx/j bounds per the asserts above.
         unsafe {
-            let base = self.node_base_mut(idx);
-            core::ptr::write(base as *mut u32, ids.len() as u32);
-            let ids_ptr = base.add(self.neighbour_ids_offset) as *mut u32;
-            core::ptr::copy_nonoverlapping(ids.as_ptr(), ids_ptr, ids.len());
+            // Phase 1: write the live slots (Relaxed; the count Release orders them).
+            for (j, &id) in ids.iter().take(n).enumerate() {
+                self.slot_atomic(idx, j).store(id, Ordering::Relaxed);
+            }
+            // Wipe the tail so an appender reader past the count sees EMPTY.
+            for j in n..self.m_max0 {
+                self.slot_atomic(idx, j).store(EMPTY_ID, Ordering::Relaxed);
+            }
+            // Phase 2: publish the count (Release makes the slot stores visible).
+            self.count_atomic(idx).store(n as u32, Ordering::Release);
         }
     }
 
-    /// Snapshot the neighbour ids of node `idx` into `out`, clearing
-    /// `out` first. Reads exactly `neighbour_count(idx)` ids — anything
-    /// past that is whatever the prior caller left in those slots.
+    /// Snapshot the live neighbour ids of node `idx` into `out`, clearing it
+    /// first. Wait-free: `Acquire`-load the count, read that many slots
+    /// `Relaxed`, filtering the [`EMPTY_ID`] sentinel. Safe under a concurrent
+    /// `cas_append_neighbour` — a slot reserved (count bumped) but not yet
+    /// written reads `EMPTY_ID` and is skipped, so the reader sees either the
+    /// pre- or post-append set, never a torn id (slot stores are atomic u32).
     ///
     /// # Safety
     ///
-    /// `idx < self.capacity`. No concurrent writer is mutating node
-    /// `idx` (the `&mut self` writer holds exclusive access during
-    /// insert; search reads under `&self`).
+    /// `idx < self.capacity`.
     #[inline]
     pub(super) unsafe fn read_neighbours_into(&self, idx: usize, out: &mut Vec<u32>) {
-        // SAFETY: per the method-level safety contract.
-        let count = unsafe { self.neighbour_count(idx) } as usize;
-        debug_assert!(count <= self.m_max0, "stored count exceeds m_max0");
-
         out.clear();
+        // SAFETY: idx bound per contract.
+        let count =
+            (unsafe { self.count_atomic(idx) }.load(Ordering::Acquire) as usize).min(self.m_max0);
         out.reserve(count);
-        // SAFETY: caller guarantees `idx < capacity`; `count <= m_max0`
-        // bounds the read to within the neighbour-ids region.
+        for j in 0..count {
+            // SAFETY: j < count <= m_max0.
+            let v = unsafe { self.slot_atomic(idx, j) }.load(Ordering::Relaxed);
+            if v != EMPTY_ID {
+                out.push(v);
+            }
+        }
+    }
+
+    /// Prefetch the neighbour region (count + ids, per-node offsets
+    /// `0..vector_offset`) of node `idx` — exactly the bytes
+    /// [`Self::read_neighbours_into`] / [`Self::read_neighbours_into_u64`]
+    /// touch on the next search visit. No-op when `idx` is out of range;
+    /// prefetch is a hint, the pointer is never dereferenced here.
+    #[inline(always)]
+    pub(super) fn prefetch_neighbours(&self, idx: usize) {
+        if idx >= self.capacity {
+            return;
+        }
+        // SAFETY: idx < capacity; the count + ids region lies in the per-node
+        // block by construction.
         unsafe {
             let base = self.node_base(idx);
-            let ids_ptr = base.add(self.neighbour_ids_offset) as *const u32;
-            for j in 0..count {
-                out.push(core::ptr::read(ids_ptr.add(j)));
+            let mut off = 0;
+            while off < self.vector_offset {
+                super::prefetch_read_data(base.add(off));
+                off += 64;
+            }
+        }
+    }
+
+    /// Like [`Self::read_neighbours_into`] but widening each id to `u64` for
+    /// the search hot path's `Vec<u64>` candidate buffer — reads straight into
+    /// `out` so the per-visit read allocates nothing beyond `out`'s growth.
+    /// Same wait-free, `EMPTY_ID`-filtering, concurrent-append-safe semantics.
+    ///
+    /// # Safety
+    ///
+    /// `idx < self.capacity`.
+    #[inline]
+    pub(super) unsafe fn read_neighbours_into_u64(&self, idx: usize, out: &mut Vec<u64>) {
+        out.clear();
+        // SAFETY: idx bound per contract.
+        let count =
+            (unsafe { self.count_atomic(idx) }.load(Ordering::Acquire) as usize).min(self.m_max0);
+        out.reserve(count);
+        for j in 0..count {
+            // SAFETY: j < count <= m_max0.
+            let v = unsafe { self.slot_atomic(idx, j) }.load(Ordering::Relaxed);
+            if v != EMPTY_ID {
+                out.push(v as u64);
+            }
+        }
+    }
+
+    /// Append `id` to node `idx`'s neighbour list under concurrent writers.
+    /// Returns `true` on success, `false` if already at `m_max0` (caller runs
+    /// the prune protocol). Mirrors
+    /// [`super::neighbours::AtomicNeighbourList::cas_append`]: CAS-loop the
+    /// count to reserve a slot, then `Release`-store the id. A reader between
+    /// reserve and store sees the [`EMPTY_ID`] sentinel and filters it.
+    ///
+    /// # Safety
+    ///
+    /// `idx < self.capacity`.
+    pub(super) unsafe fn cas_append_neighbour(&self, idx: usize, id: u32) -> bool {
+        // SAFETY: idx bound per contract.
+        let count = unsafe { self.count_atomic(idx) };
+        loop {
+            let current = count.load(Ordering::Acquire) as usize;
+            if current >= self.m_max0 {
+                return false;
+            }
+            match count.compare_exchange(
+                current as u32,
+                current as u32 + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    // We own slot `current`; publish the id with Release.
+                    // SAFETY: current < m_max0 per the gate above.
+                    unsafe { self.slot_atomic(idx, current) }.store(id, Ordering::Release);
+                    return true;
+                }
+                Err(_) => core::hint::spin_loop(),
             }
         }
     }
@@ -395,7 +590,7 @@ mod tests {
 
     #[test]
     fn neighbours_round_trip() {
-        let mut block = DataLevel0Block::new(4, M_MAX0, 32);
+        let block = DataLevel0Block::new(4, M_MAX0, 32);
         let ids = vec![10u32, 20, 30, 40, 50];
 
         // SAFETY: idx < capacity, ids.len() <= M_MAX0.
@@ -569,5 +764,126 @@ mod tests {
     #[should_panic(expected = "capacity must be > 0")]
     fn rejects_zero_capacity() {
         let _ = DataLevel0Block::new(0, M_MAX0, 8);
+    }
+
+    #[test]
+    fn cas_append_grows_in_order() {
+        let block = DataLevel0Block::new(2, M_MAX0, 8);
+        // SAFETY: idx 0 < capacity.
+        unsafe {
+            assert!(block.cas_append_neighbour(0, 5));
+            assert!(block.cas_append_neighbour(0, 7));
+            assert!(block.cas_append_neighbour(0, 9));
+            assert_eq!(block.neighbour_count(0), 3);
+        }
+        let mut out = Vec::new();
+        // SAFETY: idx 0 < capacity.
+        unsafe {
+            block.read_neighbours_into(0, &mut out);
+        }
+        assert_eq!(out, vec![5, 7, 9]);
+    }
+
+    #[test]
+    fn cas_append_returns_false_when_full() {
+        // m_max0 = 4 so the list fills quickly.
+        let block = DataLevel0Block::new(1, 4, 8);
+        // SAFETY: idx 0 < capacity.
+        unsafe {
+            for i in 0..4 {
+                assert!(block.cas_append_neighbour(0, i), "append {i} should fit");
+            }
+            assert!(
+                !block.cas_append_neighbour(0, 99),
+                "append past m_max0 must fail"
+            );
+        }
+        let mut out = Vec::new();
+        // SAFETY: idx 0 < capacity.
+        unsafe {
+            block.read_neighbours_into(0, &mut out);
+        }
+        assert_eq!(out, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn set_neighbours_then_cas_append_extends() {
+        let block = DataLevel0Block::new(1, M_MAX0, 8);
+        // SAFETY: idx 0 < capacity, ids fit m_max0.
+        unsafe {
+            block.set_neighbours(0, &[1, 2, 3]);
+            assert!(block.cas_append_neighbour(0, 4));
+        }
+        let mut out = Vec::new();
+        // SAFETY: idx 0 < capacity.
+        unsafe {
+            block.read_neighbours_into(0, &mut out);
+        }
+        assert_eq!(out, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn cas_append_concurrent_writers_keep_count_consistent() {
+        let block = DataLevel0Block::new(1, M_MAX0, 8);
+        let block_ref = &block;
+        let n_writers: u32 = 32;
+        std::thread::scope(|s| {
+            for w in 0..n_writers {
+                s.spawn(move || {
+                    // SAFETY: idx 0 < capacity; concurrent cas_append is the
+                    // documented contract.
+                    unsafe {
+                        assert!(block_ref.cas_append_neighbour(0, w));
+                    }
+                });
+            }
+        });
+        let mut out = Vec::new();
+        // SAFETY: idx 0 < capacity.
+        unsafe {
+            assert_eq!(block.neighbour_count(0), n_writers);
+            block.read_neighbours_into(0, &mut out);
+        }
+        out.sort_unstable();
+        assert_eq!(out, (0..n_writers).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cas_append_concurrent_append_and_snapshot_no_torn_state() {
+        let block = DataLevel0Block::new(1, M_MAX0, 8);
+        let block_ref = &block;
+        std::thread::scope(|s| {
+            // Appender fills the list one id at a time.
+            s.spawn(move || {
+                for i in 0..M_MAX0 as u32 {
+                    // SAFETY: idx 0 < capacity.
+                    unsafe {
+                        block_ref.cas_append_neighbour(0, i);
+                    }
+                }
+            });
+            // Snapshotter races it: every observed id must be a real appended
+            // id (filtered EMPTY sentinel, atomic slot => no torn read), and
+            // the count never exceeds m_max0.
+            s.spawn(move || {
+                let mut out = Vec::new();
+                for _ in 0..2000 {
+                    // SAFETY: idx 0 < capacity.
+                    unsafe {
+                        block_ref.read_neighbours_into(0, &mut out);
+                    }
+                    assert!(out.len() <= M_MAX0, "count overshoot");
+                    for &id in &out {
+                        assert!((id as usize) < M_MAX0, "snapshot saw garbage id {id}");
+                    }
+                }
+            });
+        });
+        let mut out = Vec::new();
+        // SAFETY: idx 0 < capacity.
+        unsafe {
+            block.read_neighbours_into(0, &mut out);
+        }
+        assert_eq!(out.len(), M_MAX0, "all appends land");
     }
 }
