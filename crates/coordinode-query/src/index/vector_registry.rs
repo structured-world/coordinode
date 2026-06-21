@@ -128,11 +128,11 @@ impl VectorIndexRegistry {
             m: config.m,
             m_max0: config.m * 2,
             ef_construction: config.ef_construction,
-            ef_search: 200,
+            ef_search: config.ef_search.unwrap_or(200),
             metric: config.metric,
             max_dimensions: config.dimensions,
             quantization: config.quantization,
-            rerank_candidates: 100,
+            rerank_candidates: config.rerank_candidates.unwrap_or(100),
             calibration_threshold: 1000,
             offload_vectors: config.offload_vectors,
             property_name: def.property().to_string(),
@@ -577,6 +577,8 @@ mod tests {
             ef_construction: 200,
             quantization: coordinode_vector::hnsw::QuantizationCodec::None,
             offload_vectors: false,
+            ef_search: None,
+            rerank_candidates: None,
         }
     }
 

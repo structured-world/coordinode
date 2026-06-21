@@ -437,6 +437,12 @@ pub enum LogicalOp {
         /// Reader behaviour while the index is in the Building state,
         /// resolved from the Cypher `online_during_build` OPTIONS field.
         online_during_build: crate::index::OnlineDuringBuild,
+        /// Default HNSW `ef_search` from the Cypher `ef_search` OPTIONS field
+        /// (`None` = engine default 200). Stored on the index definition.
+        ef_search: Option<usize>,
+        /// Default rerank-candidate count from the Cypher `rerank_candidates`
+        /// OPTIONS field (`None` = engine default 100).
+        rerank_candidates: Option<usize>,
     },
 
     /// DROP VECTOR INDEX: remove an HNSW vector index by name.
@@ -2239,9 +2245,11 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             dimensions,
             quantization,
             online_during_build,
+            ef_search,
+            rerank_candidates,
         } => {
             output.push_str(&format!(
-                "{prefix}CreateVectorIndex({name} ON :{label}({property}), m={m}, ef={ef_construction}, metric={metric:?}, dim={dimensions}, quant={quantization:?}, online={online_during_build:?})\n"
+                "{prefix}CreateVectorIndex({name} ON :{label}({property}), m={m}, ef={ef_construction}, metric={metric:?}, dim={dimensions}, quant={quantization:?}, online={online_during_build:?}, ef_search={ef_search:?}, rerank={rerank_candidates:?})\n"
             ));
         }
         LogicalOp::DropVectorIndex { name } => {

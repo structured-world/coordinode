@@ -9313,6 +9313,8 @@ fn setup_rrf_indices(
         ef_construction: 200,
         quantization: coordinode_vector::hnsw::QuantizationCodec::None,
         offload_vectors: false,
+        ef_search: None,
+        rerank_candidates: None,
     };
     let vec_def = IndexDefinition::hnsw(
         format!("{label}_{vector_prop}_idx"),
@@ -11015,6 +11017,8 @@ fn hnsw_scan_executor_returns_index_top_k() {
                 ef_construction: 64,
                 quantization: coordinode_vector::hnsw::QuantizationCodec::None,
                 offload_vectors: false,
+                ef_search: None,
+                rerank_candidates: None,
             },
         ),
         hnsw,

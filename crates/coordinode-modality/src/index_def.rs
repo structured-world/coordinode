@@ -217,6 +217,17 @@ pub struct VectorIndexConfig {
     /// not retained in HNSW memory. Reranking loads f32 from storage via
     /// VectorLoader. Gives 4x RAM reduction at ~1-2ms rerank cost per search.
     pub offload_vectors: bool,
+    /// Default size of the dynamic candidate list during search (HNSW
+    /// `ef_search`). Larger values trade latency for recall; required to be
+    /// raised on adversarial / sparsely-connected data. `None` uses the engine
+    /// default (200). Configured via the `ef_search` CREATE VECTOR INDEX option.
+    #[serde(default)]
+    pub ef_search: Option<usize>,
+    /// Number of approximate candidates re-scored with exact f32 distance
+    /// before returning the top-k. `None` uses the engine default (100).
+    /// Configured via the `rerank_candidates` CREATE VECTOR INDEX option.
+    #[serde(default)]
+    pub rerank_candidates: Option<usize>,
 }
 
 impl Default for VectorIndexConfig {
@@ -228,6 +239,8 @@ impl Default for VectorIndexConfig {
             ef_construction: 200,
             quantization: coordinode_vector::hnsw::QuantizationCodec::None,
             offload_vectors: false,
+            ef_search: None,
+            rerank_candidates: None,
         }
     }
 }

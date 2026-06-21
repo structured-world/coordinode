@@ -948,6 +948,88 @@ fn create_vector_index_with_rabitq_2bit_quantization() {
     }
 }
 
+/// Exposing `ef_search` via CREATE VECTOR INDEX OPTIONS lets a user recover
+/// recall on adversarial low-bit-RaBitQ data. Single-non-zero unit vectors are
+/// the worst case for 2-bit cheap-distance navigation: at the default
+/// ef_search=200 the search lands in the wrong cluster, but raising ef_search
+/// through the new option navigates correctly. Proves the option is parsed,
+/// threaded through planner/executor into the live HnswIndex, and takes effect
+/// end-to-end.
+#[test]
+fn create_vector_index_ef_search_option_recovers_adversarial_recall() {
+    let (mut db, _dir) = open_db();
+
+    // ef_search=5000 >> N forces a near-exhaustive candidate list, so the
+    // 2-bit cheap-distance noise floor no longer traps the search in an
+    // adjacent cluster (the failure mode at the default ef_search=200).
+    db.execute_cypher(
+        "CREATE VECTOR INDEX adv_idx ON :Adv(emb) \
+         OPTIONS {m: 8, ef_construction: 64, metric: \"cosine\", \
+                  dimensions: 64, quantization: \"rabitq-2bit\", ef_search: 5000}",
+    )
+    .expect("create vector index with ef_search override");
+
+    // 1100 unit vectors, each a single non-zero dim at position (i mod 64).
+    // The dim-0 family {i : i % 64 == 0} are the only exact matches for a
+    // query along dim 0; every other vector is orthogonal (cosine 0).
+    const N: usize = 1100;
+    let mut rows = String::from("[");
+    for i in 0..N {
+        if i > 0 {
+            rows.push_str(", ");
+        }
+        let pos = i % 64;
+        let mut v = [0.0f32; 64];
+        v[pos] = 1.0;
+        rows.push_str(&format!("{{i: {i}, emb: ["));
+        for (j, x) in v.iter().enumerate() {
+            if j > 0 {
+                rows.push_str(", ");
+            }
+            rows.push_str(&format!("{x}"));
+        }
+        rows.push_str("]}");
+    }
+    rows.push(']');
+    let created = db
+        .execute_cypher(&format!(
+            "UNWIND {rows} AS r CREATE (m:Adv) SET m = r RETURN m"
+        ))
+        .expect("bulk create adversarial vectors");
+    assert_eq!(created.len(), N, "bulk create returned wrong row count");
+
+    // Query e_0 (non-zero at dim 0 only).
+    let mut q = String::from("[1.0");
+    for _ in 1..64 {
+        q.push_str(", 0.0");
+    }
+    q.push(']');
+    let result = db
+        .execute_cypher(&format!(
+            "MATCH (n:Adv) WITH n, vector_similarity(n.emb, {q}) AS s \
+             ORDER BY s DESC LIMIT 5 RETURN n.i AS i"
+        ))
+        .expect("adversarial vector search with high ef_search");
+    let top5_ids: Vec<i64> = result
+        .iter()
+        .filter_map(|r| match r.get("i") {
+            Some(Value::Int(x)) => Some(*x),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(top5_ids.len(), 5, "expected top-5 from adversarial search");
+    // Every result must be a dim-0 vector — the only exact matches. Exact ids
+    // are not asserted (the dim-0 family members are identical, so tie-break
+    // ordering is not load-bearing); family membership proves recall recovery.
+    for id in &top5_ids {
+        assert_eq!(
+            (*id as usize) % 64,
+            0,
+            "ef_search=5000 must keep top-5 in the dim-0 family; leaked id={id}, full={top5_ids:?}",
+        );
+    }
+}
+
 // ── R858b-pre3 Step 3: online_during_build policy tests ──────────────────
 
 /// Default policy ("block") must let CREATE-then-SEARCH succeed: the gate

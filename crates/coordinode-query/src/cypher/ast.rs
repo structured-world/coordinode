@@ -305,6 +305,13 @@ pub struct CreateVectorIndexClause {
     /// / `"partial_recall"`, `"offline"`. Unrecognized values fall back
     /// to `"block"`.
     pub online_during_build: Option<String>,
+    /// HNSW ef_search: default dynamic candidate-list size during search
+    /// (default: 200). Raise for higher recall on adversarial / sparsely
+    /// connected data, at a latency cost.
+    pub ef_search: Option<usize>,
+    /// Number of approximate candidates re-scored with exact f32 distance
+    /// before returning top-k (default: 100).
+    pub rerank_candidates: Option<usize>,
 }
 
 /// CREATE EDGE TYPE clause.

@@ -635,6 +635,8 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 dimensions: c.dimensions.unwrap_or(0),
                 quantization,
                 online_during_build,
+                ef_search: c.ef_search,
+                rerank_candidates: c.rerank_candidates,
             })
         }
         Clause::DropVectorIndex(c) => Ok(LogicalOp::DropVectorIndex {
@@ -5802,6 +5804,8 @@ mod tests {
                 ef_construction: 200,
                 quantization: coordinode_vector::hnsw::QuantizationCodec::None,
                 offload_vectors: false,
+                ef_search: None,
+                rerank_candidates: None,
             },
         ));
         registry

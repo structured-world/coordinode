@@ -3475,6 +3475,8 @@ mod tests {
                 ef_construction: 200,
                 quantization: coordinode_vector::hnsw::QuantizationCodec::None,
                 offload_vectors: false,
+                ef_search: None,
+                rerank_candidates: None,
             },
         );
         // Seed one vector so size > 0.
@@ -3530,6 +3532,8 @@ mod tests {
                 ef_construction: 200,
                 quantization: coordinode_vector::hnsw::QuantizationCodec::Sq8,
                 offload_vectors: false,
+                ef_search: None,
+                rerank_candidates: None,
             },
         );
         let graph_stats = db.compute_stats().expect("compute_stats");
@@ -3565,6 +3569,8 @@ mod tests {
                 ef_construction: 200,
                 quantization: coordinode_vector::hnsw::QuantizationCodec::None,
                 offload_vectors: false,
+                ef_search: None,
+                rerank_candidates: None,
             },
         );
         // Drive the index into a non-ready state so EXPLAIN shows more than the

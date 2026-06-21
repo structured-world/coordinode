@@ -476,6 +476,8 @@ mod tests {
             ef_construction: 200,
             quantization: coordinode_vector::hnsw::QuantizationCodec::None,
             offload_vectors: false,
+            ef_search: None,
+            rerank_candidates: None,
         };
         database.create_vector_index("test_vec_idx", label, property, config);
 

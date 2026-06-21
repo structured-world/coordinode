@@ -2574,6 +2574,8 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             dimensions,
             quantization,
             online_during_build,
+            ef_search,
+            rerank_candidates,
         } => execute_create_vector_index(
             name,
             label,
@@ -2584,6 +2586,8 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             *dimensions,
             *quantization,
             *online_during_build,
+            *ef_search,
+            *rerank_candidates,
             ctx,
         ),
 
@@ -13843,6 +13847,8 @@ fn execute_create_vector_index(
     dimensions: u32,
     quantization: coordinode_vector::hnsw::QuantizationCodec,
     online_during_build: crate::index::OnlineDuringBuild,
+    ef_search: Option<usize>,
+    rerank_candidates: Option<usize>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let Some(registry) = ctx.vector_index_registry else {
@@ -13868,6 +13874,8 @@ fn execute_create_vector_index(
         ef_construction,
         quantization,
         offload_vectors: false,
+        ef_search,
+        rerank_candidates,
     };
     let mut def = crate::index::IndexDefinition::hnsw(name, label, property, config);
     def.online_during_build = online_during_build;

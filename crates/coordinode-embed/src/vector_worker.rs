@@ -212,6 +212,8 @@ mod tests {
             ef_construction: 32,
             quantization: coordinode_vector::hnsw::QuantizationCodec::None,
             offload_vectors: false,
+            ef_search: None,
+            rerank_candidates: None,
         };
         registry.register(IndexDefinition::hnsw(
             "item_emb",

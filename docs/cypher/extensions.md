@@ -55,6 +55,8 @@ DROP VECTOR INDEX product_embedding
 | `metric` | `"cosine"` | Distance metric: `cosine`, `euclidean`, `dot` |
 | `dimensions` | — | Vector dimensionality (required) |
 | `quantization` | `"none"` | In-RAM codec: `none`, `sq8`, `rabitq`, `rabitq-2bit`, `rabitq-3bit`, `rabitq-4bit` |
+| `ef_search` | 200 | Dynamic candidate-list size during search. Raise for higher recall (especially with low-bit quantization or sparsely connected data) at a latency cost |
+| `rerank_candidates` | 100 | Approximate candidates re-scored with exact f32 distance before returning the top-k |
 | `online_during_build` | `"block"` | Reader behaviour while the index backfills (see below) |
 
 #### Online-during-build policy

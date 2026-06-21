@@ -1420,6 +1420,8 @@ fn build_create_vector_index_clause(
     let mut dimensions: Option<u32> = None;
     let mut quantization: Option<String> = None;
     let mut online_during_build: Option<String> = None;
+    let mut ef_search: Option<usize> = None;
+    let mut rerank_candidates: Option<usize> = None;
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
@@ -1449,6 +1451,8 @@ fn build_create_vector_index_clause(
                             "dimensions" => dimensions = val_str.parse().ok(),
                             "quantization" => quantization = Some(val_str),
                             "online_during_build" => online_during_build = Some(val_str),
+                            "ef_search" => ef_search = val_str.parse().ok(),
+                            "rerank_candidates" => rerank_candidates = val_str.parse().ok(),
                             _ => {} // unknown options silently ignored
                         }
                     }
@@ -1474,6 +1478,8 @@ fn build_create_vector_index_clause(
         dimensions,
         quantization,
         online_during_build,
+        ef_search,
+        rerank_candidates,
     })
 }
 
