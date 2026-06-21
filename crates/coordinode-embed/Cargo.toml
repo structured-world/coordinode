@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Use the io_uring storage backend on Linux (forwards to
+# coordinode-storage/io-uring). Default-off; no-op on non-Linux targets.
+io-uring = ["coordinode-storage/io-uring"]
+
 [dependencies]
 coordinode-core = { workspace = true }
 coordinode-query = { workspace = true }

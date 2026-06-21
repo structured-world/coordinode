@@ -322,6 +322,15 @@ binary built without it, `page_ecc: force_on` (or a `degraded` endpoint under th
 `auto` rule) is accepted but has no on-disk effect, and the server logs a warning
 at startup. Build with the feature to make the policy take effect.
 
+**The io_uring storage backend is a build-time feature (Linux only).** Building
+with `--features io-uring` opens the storage engine on a single shared io_uring
+ring instead of the default `StdFs` (synchronous `pread`/`pwrite`) backend, for
+higher-throughput I/O on Linux 5.6+. It is off by default and is a no-op on
+non-Linux targets. If the running kernel lacks io_uring, the engine logs a
+warning and falls back to `StdFs` at startup, so a binary built with the feature
+is always safe to run. There is no runtime config knob; the backend is selected
+at build time.
+
 ### Maintenance commands on a multi-endpoint node
 
 The offline maintenance commands (`backup`, `restore`, `verify`, `checkpoint`,

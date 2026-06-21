@@ -973,6 +973,7 @@ dependencies = [
  "cpufeatures 0.3.0",
  "enum_dispatch",
  "hashbrown 0.17.1",
+ "io-uring",
  "libc",
  "libm",
  "log",
@@ -2693,6 +2694,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4f0c30c76f2f4ccee3fe55a2435f691ca00c0e4bd87abe4f4a851b1d4dac39b"
 dependencies = [
  "rustversion",
+]
+
+[[package]]
+name = "io-uring"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d09b98f7eace8982db770e4408e7470b028ce513ac28fecdc6bf4c30fe92b62"
+dependencies = [
+ "bitflags 2.11.1",
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]

@@ -24,6 +24,9 @@ rest-proxy = ["dep:structured-proxy", "dep:axum"]
 # coordinode-storage/page_ecc). Default-off; lets an operator who configures
 # `page_ecc: force_on` (or a `degraded` endpoint) get the ECC trailer on disk.
 page_ecc = ["coordinode-storage/page_ecc"]
+# Use the io_uring storage backend on Linux (forwards to
+# coordinode-storage/io-uring). Default-off; no-op on non-Linux targets.
+io-uring = ["coordinode-storage/io-uring"]
 
 [dependencies]
 coordinode-core = { workspace = true }

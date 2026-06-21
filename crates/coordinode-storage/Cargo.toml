@@ -18,6 +18,12 @@ encryption = ["lsm-tree/encryption"]
 # place. Off by default so the storage-format freeze ships without the
 # Reed-Solomon dependency; lights up via this feature post-freeze.
 page_ecc = ["lsm-tree/page_ecc"]
+# Use the io_uring filesystem backend (Linux 5.6+ only; the lsm-tree dep is
+# itself target-gated to Linux, so enabling this is a no-op on other
+# platforms). When enabled, the engine opens its partition trees on a single
+# shared io_uring ring; if the kernel lacks io_uring at runtime it falls back
+# to StdFs. Off by default.
+io-uring = ["lsm-tree/io-uring"]
 
 [dependencies]
 coordinode-core = { workspace = true }

@@ -196,6 +196,36 @@ impl StorageEngine {
         wal_config: Option<WalConfig>,
         oracle: Option<std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
     ) -> StorageResult<Self> {
+        // When built with `--features io-uring` on Linux and no explicit
+        // filesystem backend was configured, default every partition tree to a
+        // single shared io_uring ring. Falls back to StdFs if the running
+        // kernel lacks io_uring (pre-5.6 or restricted). An explicit
+        // `StorageConfig::with_fs` always wins. On non-Linux targets or without
+        // the feature this block does not exist and `config` is the argument
+        // unchanged (byte-identical to a build without io-uring).
+        #[cfg(all(target_os = "linux", feature = "io-uring"))]
+        let _io_uring_backing;
+        #[cfg(all(target_os = "linux", feature = "io-uring"))]
+        let config = if config.fs.is_none() {
+            match lsm_tree::fs::IoUringFs::new() {
+                Ok(fs) => {
+                    _io_uring_backing = config
+                        .clone()
+                        .with_fs(Arc::new(fs) as Arc<dyn lsm_tree::fs::Fs>);
+                    &_io_uring_backing
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "io-uring feature enabled but io_uring is unavailable; using StdFs"
+                    );
+                    config
+                }
+            }
+        } else {
+            config
+        };
+
         // Shared block cache across all partition trees.
         let cache = Arc::new(lsm_tree::Cache::with_capacity_bytes(
             config.block_cache_bytes,
@@ -1835,6 +1865,36 @@ mod tests {
     use super::*;
     use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
     use tempfile::TempDir;
+
+    /// With `--features io-uring` on Linux, a disk engine opened with no
+    /// explicit filesystem override runs on the shared `IoUringFs` ring.
+    /// Confirm the host kernel supports io_uring, then prove a write/read
+    /// roundtrip through the io_uring path. The whole disk-backed suite also
+    /// exercises io_uring under this feature; this is its focused marker.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[test]
+    fn io_uring_backend_opens_and_roundtrips() {
+        assert!(
+            lsm_tree::fs::is_io_uring_available(),
+            "io-uring feature build requires an io_uring-capable kernel (Linux 5.6+)",
+        );
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
+        let engine = StorageEngine::open(&config).expect("open io_uring-backed engine");
+        engine
+            .put(Partition::Schema, b"io_uring_key", b"io_uring_val")
+            .expect("put via io_uring backend");
+        let got = engine
+            .get(Partition::Schema, b"io_uring_key")
+            .expect("get via io_uring backend");
+        assert_eq!(got.as_deref(), Some(&b"io_uring_val"[..]));
+    }
 
     /// Counter for unique MemFs paths across parallel tests.
     static MEMFS_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
