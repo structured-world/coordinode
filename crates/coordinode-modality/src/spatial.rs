@@ -78,6 +78,10 @@ use coordinode_core::graph::node::NodeId;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
 use coordinode_storage::Guard; // IterGuard trait — `guard.into_inner()` on seekable scans
+use s2::cellid::CellID;
+use s2::latlng::LatLng;
+use s2::rect::Rect;
+use s2::region::RegionCoverer;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{StoreError, StoreResult};
@@ -573,25 +577,356 @@ fn morton_3d(x: u32, y: u32, z: u32) -> u64 {
     spread(x) | (spread(y) << 1) | (spread(z) << 2)
 }
 
+/// 2D Hilbert curve index for a 32-bit-per-dimension grid (side `2^32`),
+/// yielding a full `u64` key. Standard `xy2d` algorithm (Wikipedia).
+///
+/// Unlike Morton/Z-order, the Hilbert curve has no long "Z" jumps: consecutive
+/// curve positions are always grid-adjacent, so a bbox maps to fewer, tighter
+/// runs and proximate points cluster better in the LSM key order. The flip side
+/// (vs Morton) is that the index is NOT monotone in either coordinate, so a bbox
+/// scan cannot use a single `[corner_lo, corner_hi]` window + early-break — it
+/// needs a recursive interval cover (see `hilbert_2d_decompose`).
+fn hilbert_2d(x: u32, y: u32) -> u64 {
+    hilbert_2d_bits(x, y, 32)
+}
+
+/// Hilbert index of `(x, y)` on a `2^bits × 2^bits` grid (`bits` in `1..=32`),
+/// generalising [`hilbert_2d`] (the `bits = 32` case). Used to compute the
+/// contiguous Hilbert range of an aligned quad at an arbitrary level. `bits == 0`
+/// is the degenerate single-cell grid (index 0).
+fn hilbert_2d_bits(x: u32, y: u32, bits: u32) -> u64 {
+    if bits == 0 {
+        return 0;
+    }
+    // Grid side N = 2^bits; rotation reflects within [0, N). Bit budget:
+    // s*s ≤ 2^62, *3 < 2^64; accumulated total is a valid index in [0, 4^bits).
+    let n_minus_1: u64 = (1u64 << bits) - 1;
+    let mut x = u64::from(x);
+    let mut y = u64::from(y);
+    let mut d: u64 = 0;
+    let mut s: u64 = 1u64 << (bits - 1);
+    while s > 0 {
+        let rx = u64::from((x & s) > 0);
+        let ry = u64::from((y & s) > 0);
+        d += s * s * ((3 * rx) ^ ry);
+        // rotate/reflect the quadrant so children keep curve continuity
+        if ry == 0 {
+            if rx == 1 {
+                x = n_minus_1 - x;
+                y = n_minus_1 - y;
+            }
+            std::mem::swap(&mut x, &mut y);
+        }
+        s >>= 1;
+    }
+    d
+}
+
+/// Inverse of [`hilbert_2d`]: map a Hilbert index back to its `(x, y)` grid
+/// coordinates. Test-only — verifies the encoder (round-trip + the curve's
+/// grid-adjacency property); the production cover needs only the forward map.
+#[cfg(test)]
+fn hilbert_2d_to_xy(d: u64) -> (u32, u32) {
+    let mut x: u64 = 0;
+    let mut y: u64 = 0;
+    let mut t = d;
+    let mut s: u64 = 1;
+    while s < (1 << 32) {
+        let rx = 1 & (t / 2);
+        let ry = 1 & (t ^ rx);
+        // inverse rotation (uses the current sub-grid size s; x, y < s here)
+        if ry == 0 {
+            if rx == 1 {
+                x = s - 1 - x;
+                y = s - 1 - y;
+            }
+            std::mem::swap(&mut x, &mut y);
+        }
+        x += s * rx;
+        y += s * ry;
+        t /= 4;
+        s <<= 1;
+    }
+    (x as u32, y as u32)
+}
+
+/// Contiguous Hilbert index range `[lo, hi]` of an aligned `size × size` quad
+/// (`size = 2^k`) anchored at `(cx_min, cy_min)`. The Hilbert curve visits every
+/// quadtree node contiguously, so the quad occupies exactly `[prefix·4^k,
+/// prefix·4^k + 4^k − 1]`, where `prefix` is the quad's Hilbert index on the
+/// coarse `(32−k)`-bit grid. (Rotation only reorders cells *within* the range.)
+fn hilbert_quad_range(cx_min: u64, cy_min: u64, size: u64) -> (u64, u64) {
+    let k = size.trailing_zeros();
+    if k >= 32 {
+        return (0, u64::MAX); // whole space
+    }
+    let coarse_bits = 32 - k;
+    let prefix = hilbert_2d_bits((cx_min >> k) as u32, (cy_min >> k) as u32, coarse_bits);
+    let span = 1u64 << (2 * k); // 4^k cells
+    let lo = prefix << (2 * k);
+    // `lo + (span - 1)`, not `lo + span - 1`: the top quad (prefix=3, k=31) has
+    // lo + span == 2^64, so the parenthesised form avoids the add overflow.
+    (lo, lo + (span - 1))
+}
+
+/// Decompose a bbox (in quantised `u32` grid coords) into a minimal set of
+/// Hilbert index intervals whose union covers every bbox cell. Mirrors
+/// [`morton_2d_decompose`]'s quadtree recursion, but emits each aligned quad's
+/// contiguous Hilbert range.
+///
+/// Unlike Morton, Hilbert has no order-preserving `[corner_lo, corner_hi]`
+/// broad window (it is not coordinate-monotone), so the multi-interval cover is
+/// the ONLY correct scan shape — there is no broad-window fast path. Boundary
+/// quads that can't be resolved within the caps emit their full quad range as a
+/// SUPERSET; the exact `point_in_bbox` post-filter removes the false positives.
+fn hilbert_2d_decompose(bx_min: u32, bx_max: u32, by_min: u32, by_max: u32) -> Vec<(u64, u64)> {
+    // Hilbert boundary leaves emit the WHOLE quad (not a tight intersection, which
+    // isn't a contiguous Hilbert range), so resolve boundaries finely (deep cap)
+    // and bound the count with the output cap. The G101 seekable skip-scan makes
+    // many intervals cheap (in-place reseek), so a generous interval budget pays.
+    // Recursion work is O(bbox perimeter), not O(depth) — only boundary quads
+    // recurse — so a deep cap buys tight boundary leaves for small bboxes; the
+    // output cap bounds the interval count (coarser supersets past it). Both are
+    // bench-tunable (no Cartesian-2D bench yet; correctness holds for any value).
+    const DEPTH_CAP: u32 = 30;
+    const OUTPUT_CAP: usize = 256;
+    let mut raw: Vec<(u64, u64)> = Vec::new();
+    hilbert_2d_decompose_rec(
+        0,
+        0,
+        1u64 << 32,
+        u64::from(bx_min),
+        u64::from(bx_max),
+        u64::from(by_min),
+        u64::from(by_max),
+        &mut raw,
+        0,
+        DEPTH_CAP,
+        OUTPUT_CAP,
+    );
+    raw.sort_unstable_by_key(|&(lo, _)| lo);
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(raw.len());
+    for (lo, hi) in raw {
+        if let Some(last) = merged.last_mut() {
+            if last.1.saturating_add(1) >= lo {
+                last.1 = last.1.max(hi);
+                continue;
+            }
+        }
+        merged.push((lo, hi));
+    }
+    merged
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hilbert_2d_decompose_rec(
+    cx_min: u64,
+    cy_min: u64,
+    size: u64,
+    bx_min: u64,
+    bx_max: u64,
+    by_min: u64,
+    by_max: u64,
+    out: &mut Vec<(u64, u64)>,
+    depth: u32,
+    depth_cap: u32,
+    output_cap: usize,
+) {
+    let cx_max = cx_min + size - 1;
+    let cy_max = cy_min + size - 1;
+
+    // Quad entirely outside bbox: skip (the dead-zone win).
+    if cx_max < bx_min || cx_min > bx_max || cy_max < by_min || cy_min > by_max {
+        return;
+    }
+
+    // Quad entirely inside bbox: emit its exact contiguous Hilbert range.
+    if cx_min >= bx_min && cx_max <= bx_max && cy_min >= by_min && cy_max <= by_max {
+        out.push(hilbert_quad_range(cx_min, cy_min, size));
+        return;
+    }
+
+    // Boundary quad at a cap: emit the WHOLE quad range as a superset (an
+    // intersection sub-rect is not a contiguous Hilbert range). point_in_bbox
+    // post-filters the false positives.
+    if depth >= depth_cap || size == 1 || out.len() >= output_cap {
+        out.push(hilbert_quad_range(cx_min, cy_min, size));
+        return;
+    }
+
+    let half = size / 2;
+    let next_depth = depth + 1;
+    for (dx, dy) in [(0, 0), (half, 0), (0, half), (half, half)] {
+        hilbert_2d_decompose_rec(
+            cx_min + dx,
+            cy_min + dy,
+            half,
+            bx_min,
+            bx_max,
+            by_min,
+            by_max,
+            out,
+            next_depth,
+            depth_cap,
+            output_cap,
+        );
+    }
+}
+
+/// Resolve a bbox into the set of curve index intervals to scan, dispatching on
+/// the CRS's space-filling curve: Cartesian-2D uses the Hilbert cover (always a
+/// multi-interval cover — Hilbert has no order-preserving broad window), every
+/// other CRS uses the Morton cover with its adaptive broad-vs-decompose bailout.
+fn curve_intervals(bbox: &Bbox) -> Vec<(u64, u64)> {
+    match bbox.lower.crs {
+        Crs::Wgs84_2d => wgs84_s2_intervals(bbox),
+        Crs::Wgs84_3d => wgs84_3d_s2_intervals(bbox),
+        Crs::Cartesian2d => {
+            let x_min = quantise_u32(bbox.lower.coords[0], -1e9, 1e9);
+            let y_min = quantise_u32(bbox.lower.coords[1], -1e9, 1e9);
+            let x_max = quantise_u32(bbox.upper.coords[0], -1e9, 1e9);
+            let y_max = quantise_u32(bbox.upper.coords[1], -1e9, 1e9);
+            hilbert_2d_decompose(x_min, x_max, y_min, y_max)
+        }
+        _ => morton_intervals(bbox),
+    }
+}
+
+/// WGS-84-3D packs the horizontal S2 cell into the high bits of the u64 curve
+/// key and the quantised altitude into the low [`WGS84_3D_ALT_BITS`] bits, so a
+/// single u64 carries both axes (the curve-key invariant). The split trades the
+/// bottom S2 levels (~5m horizontal) for ~7m vertical resolution over the alt
+/// range — comparable to the prior 21-bit-per-axis Morton, but pole-correct.
+const WGS84_3D_ALT_BITS: u32 = 14;
+const WGS84_3D_ALT_MASK: u64 = (1 << WGS84_3D_ALT_BITS) - 1;
+const WGS84_3D_ALT_LO: f64 = -11_000.0;
+const WGS84_3D_ALT_HI: f64 = 100_000.0;
+
+/// S2 covering of a WGS-84-3D bbox → packed (horizontal | altitude) key
+/// intervals. Covers the lat/lng rect horizontally with S2 cells (as in
+/// [`wgs84_s2_intervals`]); for each cell the interval spans the cell's
+/// horizontal key range OR'd with the altitude range `[amin, amax]`. The
+/// interval is a superset (intermediate horizontals carry the full alt range);
+/// the exact 3D `point_in_bbox` post-filter drops the vertical overhang.
+fn wgs84_3d_s2_intervals(bbox: &Bbox) -> Vec<(u64, u64)> {
+    // coords: [0] = lon, [1] = lat, [2] = alt (metres).
+    let rect = Rect::from_degrees(
+        bbox.lower.coords[1],
+        bbox.lower.coords[0],
+        bbox.upper.coords[1],
+        bbox.upper.coords[0],
+    );
+    let amin = u64::from(quantise_bits(
+        bbox.lower.coords[2],
+        WGS84_3D_ALT_LO,
+        WGS84_3D_ALT_HI,
+        WGS84_3D_ALT_BITS,
+    ));
+    let amax = u64::from(quantise_bits(
+        bbox.upper.coords[2],
+        WGS84_3D_ALT_LO,
+        WGS84_3D_ALT_HI,
+        WGS84_3D_ALT_BITS,
+    ));
+    let coverer = RegionCoverer {
+        min_level: 0,
+        max_level: 24,
+        level_mod: 1,
+        max_cells: 16,
+    };
+    let mut intervals: Vec<(u64, u64)> = coverer
+        .covering(&rect)
+        .0
+        .iter()
+        .map(|c| {
+            let hmin = c.range_min().0 & !WGS84_3D_ALT_MASK;
+            let hmax = c.range_max().0 & !WGS84_3D_ALT_MASK;
+            (hmin | amin, hmax | amax)
+        })
+        .collect();
+    intervals.sort_unstable_by_key(|&(lo, _)| lo);
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(intervals.len());
+    for (lo, hi) in intervals {
+        if let Some(last) = merged.last_mut() {
+            if last.1.saturating_add(1) >= lo {
+                last.1 = last.1.max(hi);
+                continue;
+            }
+        }
+        merged.push((lo, hi));
+    }
+    merged
+}
+
+/// S2 cell covering of a WGS-84 bbox → leaf-cell-id intervals. The `s2` crate's
+/// `RegionCoverer` approximates the lat/lng rectangle with a handful of cells
+/// (typically 4-16); each cell's `[range_min, range_max]` is the contiguous
+/// leaf-id range of its descendants, so the union is a superset of the bbox's
+/// leaf ids. The exact `point_in_bbox` post-filter removes the cells' overhang.
+/// No pole / antimeridian distortion — the sphere is covered natively.
+fn wgs84_s2_intervals(bbox: &Bbox) -> Vec<(u64, u64)> {
+    // coords: [0] = lon, [1] = lat. Rect::from_degrees(lat_lo, lng_lo, lat_hi, lng_hi).
+    let rect = Rect::from_degrees(
+        bbox.lower.coords[1],
+        bbox.lower.coords[0],
+        bbox.upper.coords[1],
+        bbox.upper.coords[0],
+    );
+    let coverer = RegionCoverer {
+        min_level: 0,
+        max_level: 30,
+        level_mod: 1,
+        max_cells: 16,
+    };
+    let mut intervals: Vec<(u64, u64)> = coverer
+        .covering(&rect)
+        .0
+        .iter()
+        .map(|c| (c.range_min().0, c.range_max().0))
+        .collect();
+    intervals.sort_unstable_by_key(|&(lo, _)| lo);
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(intervals.len());
+    for (lo, hi) in intervals {
+        if let Some(last) = merged.last_mut() {
+            if last.1.saturating_add(1) >= lo {
+                last.1 = last.1.max(hi);
+                continue;
+            }
+        }
+        merged.push((lo, hi));
+    }
+    merged
+}
+
 /// Encode a 2D or 3D point into a 64-bit curve key per its CRS.
 fn encode_curve(point: &Point) -> u64 {
     match point.crs {
         Crs::Wgs84_2d => {
-            // lon ∈ [-180, 180], lat ∈ [-90, 90]
-            let lon = quantise_u32(point.coords[0], -180.0, 180.0);
-            let lat = quantise_u32(point.coords[1], -90.0, 90.0);
-            morton_2d(lon, lat)
+            // S2 leaf cell id (level 30): Hilbert order on the sphere, no pole or
+            // antimeridian distortion (vs the old lat/lon Morton). coords[0]=lon,
+            // coords[1]=lat; the leaf cell id IS the curve key.
+            CellID::from(LatLng::from_degrees(point.coords[1], point.coords[0])).0
         }
         Crs::Cartesian2d => {
+            // Hilbert (not Morton): better spatial locality for flat Cartesian
+            // spaces, per arch/core/spatial.md. WGS-84 keeps Morton until the S2
+            // swap; Cartesian-3D keeps Morton (3D Hilbert is a follow-up).
             let x = quantise_u32(point.coords[0], -1e9, 1e9);
             let y = quantise_u32(point.coords[1], -1e9, 1e9);
-            morton_2d(x, y)
+            hilbert_2d(x, y)
         }
         Crs::Wgs84_3d => {
-            let lon = quantise_bits(point.coords[0], -180.0, 180.0, 21);
-            let lat = quantise_bits(point.coords[1], -90.0, 90.0, 21);
-            let alt = quantise_bits(point.coords[2], -11_000.0, 100_000.0, 21);
-            morton_3d(lon, lat, alt)
+            // S2 horizontal (top bits of the level-30 leaf) + altitude (low
+            // WGS84_3D_ALT_BITS bits), packed in one u64. coords[0]=lon,
+            // coords[1]=lat, coords[2]=alt(m). No pole distortion horizontally.
+            let leaf = CellID::from(LatLng::from_degrees(point.coords[1], point.coords[0])).0;
+            let alt = u64::from(quantise_bits(
+                point.coords[2],
+                WGS84_3D_ALT_LO,
+                WGS84_3D_ALT_HI,
+                WGS84_3D_ALT_BITS,
+            ));
+            (leaf & !WGS84_3D_ALT_MASK) | alt
         }
         Crs::Cartesian3d => {
             let x = quantise_bits(point.coords[0], -1e6, 1e6, 21);
@@ -707,59 +1042,23 @@ impl SpatialStore for LocalSpatialStore {
         crs: Crs,
         bbox: &Bbox,
     ) -> StoreResult<Vec<(NodeId, Point)>> {
-        // Z-curve subrange decomposition with
-        // hard caps + cell-merging + adaptive bailout.
-        // `morton_intervals` decides between a single broad interval
-        // (bbox spans the curve window densely) and multiple disjoint
-        // intervals (sparse on the curve — a long thin equatorial band
-        // etc.).
+        // Per-CRS space-filling-curve decomposition into a set of index
+        // intervals covering the bbox, scanned with ONE seekable iterator:
+        // `seek_to` each interval's start and drain to its `hi`, so the dead-zone
+        // bytes between intervals are skipped at the iterator (no I/O) rather than
+        // scanned-then-filtered. Morton CRS (WGS-84 2D, WGS-84-3D, Cartesian-3D)
+        // may collapse to a single broad interval; Hilbert (Cartesian-2D) always
+        // yields a multi-interval cover (it has no order-preserving broad window).
         //
-        // Key layout: `<prefix><curve:8 BE><node_id:8 BE>`. The dense-window
-        // path (<=1 interval) walks the `(label_id, crs)` prefix once with a
-        // sorted early-break. The multi-interval path drives ONE seekable range
-        // iterator: it `seek_to`s each disjoint interval's start and drains to
-        // its `hi`, so the dead bytes between intervals are skipped at the
-        // iterator (no I/O) rather than scanned-then-filtered. The covering
-        // invariant (every bbox point's curve lies in some interval) plus the
-        // exact `point_in_bbox` post-filter (depth-cap fallback cells admit
-        // intra-interval Z-shape false positives) make the result exact.
-        let prefix = encode_spatial_prefix(label_id, crs);
-        let intervals = morton_intervals(bbox);
+        // Key layout: `<prefix><curve:8 BE><node_id:8 BE>`. The covering invariant
+        // (every bbox point's curve lies in some interval) plus the exact
+        // `point_in_bbox` post-filter (boundary-quad supersets admit curve false
+        // positives) make the result exact.
+        let intervals = curve_intervals(bbox);
         let mut out = Vec::new();
-
-        if intervals.len() <= 1 {
-            let (curve_min, curve_max) = intervals
-                .first()
-                .copied()
-                .unwrap_or_else(|| morton_window(bbox));
-            // base_prefix_scan yields keys in sorted (curve-ascending)
-            // order, so we can break once the curve passes curve_max.
-            for (key, value) in txn.base_prefix_scan(Partition::Idx, &prefix)? {
-                let Some(curve) = decode_curve_from_key(&key) else {
-                    continue;
-                };
-                if curve > curve_max {
-                    break;
-                }
-                if curve < curve_min {
-                    continue;
-                }
-                let Some(node_id) = decode_node_id_from_key(&key) else {
-                    continue;
-                };
-                let point = decode_body(&value)?;
-                if point_in_bbox(&point, bbox) {
-                    out.push((node_id, point));
-                }
-            }
+        if intervals.is_empty() {
             return Ok(out);
         }
-
-        // Multi-interval skip-scan. Intervals are sorted ascending by
-        // `morton_intervals`; open one seekable iterator over the broad
-        // [first_lo, last_hi] window, then jump to each interval's start with
-        // `seek_to` and drain to its `hi`. Bytes in the dead zones between
-        // intervals are never read (the Z-curve decomposition's whole point).
         let (first_lo, _) = intervals[0];
         let (_, last_hi) = intervals[intervals.len() - 1];
         let lo_key = encode_spatial_key(label_id, crs, first_lo, NodeId::from_raw(0));
@@ -839,6 +1138,135 @@ mod tests {
             morton_intervals(&bbox).len() > 1,
             "equatorial band must decompose for the seekable skip-scan win",
         );
+    }
+
+    #[test]
+    fn hilbert_2d_roundtrips() {
+        for &(x, y) in &[
+            (0u32, 0u32),
+            (1, 0),
+            (0, 1),
+            (5, 9),
+            (u32::MAX, u32::MAX),
+            (u32::MAX, 0),
+            (0, u32::MAX),
+            (1 << 31, 1 << 30),
+            (123_456, 7_654_321),
+        ] {
+            let d = hilbert_2d(x, y);
+            assert_eq!(hilbert_2d_to_xy(d), (x, y), "roundtrip ({x},{y})");
+        }
+        assert_eq!(hilbert_2d(0, 0), 0, "origin maps to curve index 0");
+    }
+
+    #[test]
+    fn hilbert_2d_consecutive_indices_are_grid_adjacent() {
+        // Defining Hilbert property: stepping the index by 1 moves exactly one
+        // grid cell (Manhattan distance 1) — no Z-order long jumps. This is the
+        // locality win over Morton.
+        let mut prev = hilbert_2d_to_xy(0);
+        for d in 1..2_000u64 {
+            let cur = hilbert_2d_to_xy(d);
+            let dx = (i64::from(cur.0) - i64::from(prev.0)).abs();
+            let dy = (i64::from(cur.1) - i64::from(prev.1)).abs();
+            assert_eq!(dx + dy, 1, "index {d}: {prev:?} -> {cur:?} not adjacent");
+            prev = cur;
+        }
+    }
+
+    #[test]
+    fn hilbert_decompose_covers_every_cell() {
+        // Superset invariant: every grid cell inside the bbox has its Hilbert
+        // index in some emitted interval (the cover never drops a bbox cell —
+        // the load-bearing correctness property of the Cartesian-2D scan).
+        for &(bx0, bx1, by0, by1) in &[
+            (0u32, 3u32, 0u32, 3u32),
+            (5, 20, 7, 19),
+            (1000, 1050, 2000, 2080),
+            (100, 100, 200, 200),
+            (0, 0, 0, 0),
+        ] {
+            let intervals = hilbert_2d_decompose(bx0, bx1, by0, by1);
+            assert!(!intervals.is_empty(), "non-empty bbox yields a cover");
+            for x in bx0..=bx1 {
+                for y in by0..=by1 {
+                    let d = hilbert_2d(x, y);
+                    assert!(
+                        intervals.iter().any(|&(lo, hi)| d >= lo && d <= hi),
+                        "cell ({x},{y}) idx {d} not covered by {intervals:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wgs84_s2_encode_deterministic_and_distinct() {
+        let paris = || encode_curve(&Point::new_2d(Crs::Wgs84_2d, 2.3522, 48.8566));
+        let kyiv = encode_curve(&Point::new_2d(Crs::Wgs84_2d, 30.5234, 50.4501));
+        assert_eq!(paris(), paris(), "S2 leaf id is deterministic");
+        assert_ne!(paris(), kyiv, "distinct points map to distinct leaf ids");
+    }
+
+    #[test]
+    fn wgs84_s2_point_in_bbox_is_covered() {
+        // Findability/superset: a point inside a WGS-84 bbox has its S2 leaf id
+        // in some covering interval, so the scan would surface it.
+        let bbox = Bbox {
+            lower: Point::new_2d(Crs::Wgs84_2d, 2.0, 48.0), // lon, lat
+            upper: Point::new_2d(Crs::Wgs84_2d, 3.0, 49.0),
+        };
+        let intervals = curve_intervals(&bbox);
+        assert!(!intervals.is_empty(), "non-empty bbox yields a covering");
+        for &(lon, lat) in &[(2.3, 48.5), (2.0, 48.0), (3.0, 49.0), (2.9, 48.1)] {
+            let id = encode_curve(&Point::new_2d(Crs::Wgs84_2d, lon, lat));
+            assert!(
+                intervals.iter().any(|&(lo, hi)| id >= lo && id <= hi),
+                "({lon},{lat}) id {id} not in covering {intervals:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn wgs84_s2_pole_region_is_covered() {
+        // No pole distortion (the S2 win over lat/lon Morton): a polar-band bbox
+        // covers a near-pole point. With Morton, the pole is a quantisation
+        // singularity; with S2 it is an ordinary cube-face cell.
+        let polar = Bbox {
+            lower: Point::new_2d(Crs::Wgs84_2d, -180.0, 89.0),
+            upper: Point::new_2d(Crs::Wgs84_2d, 180.0, 90.0),
+        };
+        let intervals = curve_intervals(&polar);
+        assert!(!intervals.is_empty(), "polar bbox yields a covering");
+        let id = encode_curve(&Point::new_2d(Crs::Wgs84_2d, 10.0, 89.7));
+        assert!(
+            intervals.iter().any(|&(lo, hi)| id >= lo && id <= hi),
+            "near-pole point not covered by {intervals:?}",
+        );
+    }
+
+    #[test]
+    fn wgs84_3d_s2_point_in_bbox_is_covered() {
+        // 3D findability/superset: a point inside a lat/lon/alt bbox has its
+        // packed (S2 horizontal | altitude) key in some covering interval.
+        let bbox = Bbox {
+            lower: Point::new_3d(Crs::Wgs84_3d, 2.0, 48.0, 0.0), // lon, lat, alt(m)
+            upper: Point::new_3d(Crs::Wgs84_3d, 3.0, 49.0, 5000.0),
+        };
+        let intervals = curve_intervals(&bbox);
+        assert!(!intervals.is_empty(), "3D bbox yields a covering");
+        for &(lon, lat, alt) in &[
+            (2.3, 48.5, 1000.0),
+            (2.0, 48.0, 0.0),
+            (3.0, 49.0, 5000.0),
+            (2.9, 48.1, 4999.0),
+        ] {
+            let id = encode_curve(&Point::new_3d(Crs::Wgs84_3d, lon, lat, alt));
+            assert!(
+                intervals.iter().any(|&(lo, hi)| id >= lo && id <= hi),
+                "({lon},{lat},{alt}m) id {id} not in covering {intervals:?}",
+            );
+        }
     }
 
     /// Logic-test fixture (memory backing, env-flippable). Spatial
@@ -1378,22 +1806,27 @@ mod tests {
 
     #[test]
     fn morton_window_brackets_every_bbox_point() {
-        // Property: every point inside the bbox quantises to a curve
-        // inside [curve_min, curve_max]. This is the correctness
-        // contract the early-break in scan_within_bbox depends on.
+        // Property: on a Morton CRS, every point inside the bbox quantises to a
+        // curve inside [curve_min, curve_max] — the bracketing contract the
+        // Morton broad-window case of `morton_intervals` relies on. The live
+        // Morton path is now 3D only (the broad window, no decomposition): the
+        // 2D CRS moved to Hilbert (Cartesian-2D) and S2 (WGS-84), neither of which
+        // has an order-preserving broad window.
         let bbox = Bbox {
-            lower: Point::new_2d(Crs::Cartesian2d, -100.0, -50.0),
-            upper: Point::new_2d(Crs::Cartesian2d, 100.0, 50.0),
+            lower: Point::new_3d(Crs::Cartesian3d, -100.0, -50.0, -10.0),
+            upper: Point::new_3d(Crs::Cartesian3d, 100.0, 50.0, 10.0),
         };
         let (cmin, cmax) = morton_window(&bbox);
-        for x in [-99.0, -10.0, 0.0, 10.0, 99.0] {
-            for y in [-49.0, -5.0, 0.0, 5.0, 49.0] {
-                let p = Point::new_2d(Crs::Cartesian2d, x, y);
-                let c = encode_curve(&p);
-                assert!(
-                    (cmin..=cmax).contains(&c),
-                    "point ({x},{y}) curve {c} outside [{cmin},{cmax}]",
-                );
+        for x in [-99.0, 0.0, 99.0] {
+            for y in [-49.0, 0.0, 49.0] {
+                for z in [-9.0, 0.0, 9.0] {
+                    let p = Point::new_3d(Crs::Cartesian3d, x, y, z);
+                    let c = encode_curve(&p);
+                    assert!(
+                        (cmin..=cmax).contains(&c),
+                        "point ({x},{y},{z}) curve {c} outside [{cmin},{cmax}]",
+                    );
+                }
             }
         }
     }

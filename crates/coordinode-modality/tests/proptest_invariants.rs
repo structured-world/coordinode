@@ -195,4 +195,175 @@ proptest! {
         let hits = store.scan_within_bbox(&rtxn, 1, Crs::Cartesian2d, &bbox).unwrap();
         prop_assert!(hits.is_empty());
     }
+
+    /// WGS-84 (S2) findability: a point anywhere on the globe is found by
+    /// scan_within_bbox over a whole-globe bbox. Randomized counterpart of the
+    /// Cartesian-2D (Hilbert) property, exercising the S2 covering + leaf-id
+    /// range scan + post-filter.
+    #[test]
+    fn spatial_wgs84_inserted_point_is_findable(
+        lon in -179.9_f64 .. 179.9,
+        lat in -89.9_f64 .. 89.9,
+    ) {
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore;
+        let id = NodeId::from_raw(1);
+        let p = Point::new_2d(Crs::Wgs84_2d, lon, lat);
+        {
+            let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+            let read_ts = oracle.next();
+            let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+            store.insert(&mut txn, 1, id, &p).unwrap();
+            let wc = WriteConcern::majority();
+            let ctx = CommitContext {
+                write_concern: &wc,
+                pipeline: None,
+                id_gen: None,
+                drain_buffer: None,
+                nvme_write_buffer: None,
+            };
+            txn.commit(&ctx).unwrap();
+        }
+        let bbox = Bbox {
+            lower: Point::new_2d(Crs::Wgs84_2d, -180.0, -90.0),
+            upper: Point::new_2d(Crs::Wgs84_2d, 180.0, 90.0),
+        };
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let rtxn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let hits = store.scan_within_bbox(&rtxn, 1, Crs::Wgs84_2d, &bbox).unwrap();
+        prop_assert_eq!(hits.len(), 1);
+        prop_assert_eq!(hits[0].0, id);
+    }
+
+    /// Symmetric WGS-84 (S2) property: a point outside the bbox is never
+    /// returned, regardless of where its S2 leaf id falls relative to the
+    /// covering. The exact lon/lat post-filter must drop the cells' overhang.
+    #[test]
+    fn spatial_wgs84_out_of_bbox_never_returned(
+        olon in 10.0_f64 .. 170.0,
+        olat in 10.0_f64 .. 80.0,
+    ) {
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore;
+        {
+            let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+            let read_ts = oracle.next();
+            let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+            store
+                .insert(
+                    &mut txn,
+                    1,
+                    NodeId::from_raw(99),
+                    &Point::new_2d(Crs::Wgs84_2d, olon, olat),
+                )
+                .unwrap();
+            let wc = WriteConcern::majority();
+            let ctx = CommitContext {
+                write_concern: &wc,
+                pipeline: None,
+                id_gen: None,
+                drain_buffer: None,
+                nvme_write_buffer: None,
+            };
+            txn.commit(&ctx).unwrap();
+        }
+        let bbox = Bbox {
+            lower: Point::new_2d(Crs::Wgs84_2d, -5.0, -5.0),
+            upper: Point::new_2d(Crs::Wgs84_2d, 5.0, 5.0),
+        };
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let rtxn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let hits = store.scan_within_bbox(&rtxn, 1, Crs::Wgs84_2d, &bbox).unwrap();
+        prop_assert!(hits.is_empty());
+    }
+
+    /// WGS-84-3D (S2 horizontal + packed altitude) findability: a point anywhere
+    /// in the globe × alt range is found by a whole-volume scan. Exercises the
+    /// packed-key encode + 3D covering + range scan + 3D post-filter.
+    #[test]
+    fn spatial_wgs84_3d_inserted_point_is_findable(
+        lon in -179.9_f64 .. 179.9,
+        lat in -89.9_f64 .. 89.9,
+        alt in -10_000.0_f64 .. 90_000.0,
+    ) {
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore;
+        let id = NodeId::from_raw(1);
+        let p = Point::new_3d(Crs::Wgs84_3d, lon, lat, alt);
+        {
+            let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+            let read_ts = oracle.next();
+            let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+            store.insert(&mut txn, 1, id, &p).unwrap();
+            let wc = WriteConcern::majority();
+            let ctx = CommitContext {
+                write_concern: &wc,
+                pipeline: None,
+                id_gen: None,
+                drain_buffer: None,
+                nvme_write_buffer: None,
+            };
+            txn.commit(&ctx).unwrap();
+        }
+        let bbox = Bbox {
+            lower: Point::new_3d(Crs::Wgs84_3d, -180.0, -90.0, -11_000.0),
+            upper: Point::new_3d(Crs::Wgs84_3d, 180.0, 90.0, 100_000.0),
+        };
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let rtxn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let hits = store.scan_within_bbox(&rtxn, 1, Crs::Wgs84_3d, &bbox).unwrap();
+        prop_assert_eq!(hits.len(), 1);
+        prop_assert_eq!(hits[0].0, id);
+    }
+
+    /// WGS-84-3D vertical filter: a point whose horizontal lies INSIDE the bbox
+    /// but whose altitude is ABOVE the bbox alt range must be filtered out — the
+    /// load-bearing 3D-specific property (the altitude axis is real, not just an
+    /// overhang the packed key ignores).
+    #[test]
+    fn spatial_wgs84_3d_out_of_alt_range_never_returned(
+        oalt in 20_000.0_f64 .. 90_000.0,
+    ) {
+        let fx = open_engine();
+        let engine = &fx.engine;
+        let store = LocalSpatialStore;
+        {
+            let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+            let read_ts = oracle.next();
+            let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+            store
+                .insert(
+                    &mut txn,
+                    1,
+                    NodeId::from_raw(99),
+                    // horizontal inside [2,3]×[48,49]; altitude above the bbox.
+                    &Point::new_3d(Crs::Wgs84_3d, 2.5, 48.5, oalt),
+                )
+                .unwrap();
+            let wc = WriteConcern::majority();
+            let ctx = CommitContext {
+                write_concern: &wc,
+                pipeline: None,
+                id_gen: None,
+                drain_buffer: None,
+                nvme_write_buffer: None,
+            };
+            txn.commit(&ctx).unwrap();
+        }
+        let bbox = Bbox {
+            lower: Point::new_3d(Crs::Wgs84_3d, 2.0, 48.0, 0.0),
+            upper: Point::new_3d(Crs::Wgs84_3d, 3.0, 49.0, 5_000.0),
+        };
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let rtxn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let hits = store.scan_within_bbox(&rtxn, 1, Crs::Wgs84_3d, &bbox).unwrap();
+        prop_assert!(hits.is_empty());
+    }
 }
