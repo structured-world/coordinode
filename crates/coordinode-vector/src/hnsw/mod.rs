@@ -3192,7 +3192,7 @@ impl HnswIndex {
         let neighbours = self.layer_snapshot(node_idx, level);
         let mut seen: std::collections::HashSet<u64> =
             std::collections::HashSet::with_capacity(neighbours.len() + extras.len());
-        let mut scored: Vec<(f32, u64)> = Vec::with_capacity(neighbours.len() + extras.len());
+        let mut candidates: Vec<Candidate> = Vec::with_capacity(neighbours.len() + extras.len());
         for &neighbor_idx_u64 in neighbours.iter().chain(extras.iter()) {
             if !seen.insert(neighbor_idx_u64) {
                 continue;
@@ -3200,14 +3200,47 @@ impl HnswIndex {
             let neighbor_idx = neighbor_idx_u64 as usize;
             if neighbor_idx < self.nodes.len() {
                 let dist = self.distance_between_nodes(node_idx, neighbor_idx);
-                scored.push((dist, neighbor_idx_u64));
+                candidates.push(Candidate {
+                    distance: dist,
+                    idx: neighbor_idx_u64 as u32,
+                });
             }
         }
 
-        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(max_conn);
-
-        let kept: Vec<u64> = scored.into_iter().map(|(_, idx)| idx).collect();
+        // Prune back-edges with the SAME diversity heuristic used for new-node
+        // selection (RobustPrune / hnswlib `getNeighborsByHeuristic2`), not a
+        // naive closest-`max_conn` truncation. Truncation drops the long-range /
+        // diverse edges that keep the graph navigable, which measurably lowers
+        // recall-per-ef; the heuristic keeps them. Construction-time only, so the
+        // extra pairwise-distance cost is off the search hot path.
+        let mut kept: Vec<u64> = self
+            .select_neighbours_robust_prune(&candidates, max_conn)
+            .into_iter()
+            .map(|idx| idx as u64)
+            .collect();
+        // hnswlib `keepPrunedConnections`: if the diversity heuristic kept fewer
+        // than `max_conn`, backfill with the closest not-yet-kept candidates so
+        // the back-edge list stays dense. A sparse list (heuristic alone) loses
+        // recall, especially on low-dim / small graphs; this keeps the diverse
+        // long-range edges first, then fills the remaining slots by distance.
+        if kept.len() < max_conn {
+            let kept_set: std::collections::HashSet<u64> = kept.iter().copied().collect();
+            let mut rest: Vec<&Candidate> = candidates
+                .iter()
+                .filter(|c| !kept_set.contains(&u64::from(c.idx)))
+                .collect();
+            rest.sort_by(|a, b| {
+                a.distance
+                    .partial_cmp(&b.distance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for c in rest {
+                if kept.len() >= max_conn {
+                    break;
+                }
+                kept.push(u64::from(c.idx));
+            }
+        }
         self.set_outgoing(node_idx, level, &kept);
     }
 
