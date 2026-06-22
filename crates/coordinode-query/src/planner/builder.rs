@@ -79,7 +79,9 @@ pub enum PlanError {
     )]
     DocScoreMultipleCalls { location: String },
 
-    #[error("doc_score() cannot appear in {location} — it is a correlated aggregate over HAS_CHUNK children")]
+    #[error(
+        "doc_score() cannot appear in {location} — it is a correlated aggregate over HAS_CHUNK children"
+    )]
     DocScoreIllegalPosition { location: String },
 
     #[error("failed to encode extension-op payload: {0}")]
@@ -823,6 +825,48 @@ fn parse_quantization_codec(s: Option<&str>) -> coordinode_vector::hnsw::Quantiz
         Some("rabitq-4bit") => QuantizationCodec::RaBitQ { bits: 4 },
         _ => QuantizationCodec::None,
     }
+}
+
+/// Reconstruct a vector index definition and its distance metric from a parsed
+/// CREATE VECTOR INDEX clause, applying the same option defaults and string
+/// parsing the planner uses for the non-extension path. An engine extension
+/// (e.g. a sharded-index handler) calls this to rebuild the definition from the
+/// clause carried verbatim in an `Extension` op payload, keeping the parsing of
+/// metric / quantization / online-build options as a single source of truth.
+pub fn vector_index_definition_from_clause(
+    clause: &crate::cypher::ast::CreateVectorIndexClause,
+) -> (
+    crate::index::IndexDefinition,
+    coordinode_core::graph::types::VectorMetric,
+) {
+    let metric = parse_vector_metric(clause.metric.as_deref());
+    let quantization = parse_quantization_codec(clause.quantization.as_deref());
+    let online_during_build = match clause
+        .online_during_build
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("partial-recall") | Some("partial_recall") => {
+            crate::index::OnlineDuringBuild::PartialRecall
+        }
+        Some("offline") => crate::index::OnlineDuringBuild::Offline,
+        _ => crate::index::OnlineDuringBuild::Block,
+    };
+    let config = crate::index::VectorIndexConfig {
+        dimensions: clause.dimensions.unwrap_or(0),
+        metric,
+        m: clause.m.unwrap_or(16),
+        ef_construction: clause.ef_construction.unwrap_or(200),
+        quantization,
+        offload_vectors: false,
+        ef_search: clause.ef_search,
+        rerank_candidates: clause.rerank_candidates,
+    };
+    let mut def =
+        crate::index::IndexDefinition::hnsw(&clause.name, &clause.label, &clause.property, config);
+    def.online_during_build = online_during_build;
+    (def, metric)
 }
 
 /// Attempt to convert a WHERE expression to a `PartialFilter` predicate.
