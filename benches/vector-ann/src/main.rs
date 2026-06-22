@@ -272,12 +272,48 @@ struct Args {
     /// geometry). Ignored for `modulo` routing.
     #[arg(long, default_value_t = 1)]
     route_top_m: usize,
+
+    /// SPANN-style closure replication for `--shard-routing centroid`. A
+    /// vector is also written to every centroid whose routing distance
+    /// (squared-L2 or cosine) is within `replication_eps` x its nearest
+    /// distance, capped at `--max-replicas`. `1.0` (default) replicates only
+    /// exact ties (single assignment); `>1.0` duplicates boundary points so a
+    /// low `route_top_m` still finds cross-boundary neighbours. Modulo-ignored.
+    #[arg(long, default_value_t = 1.0)]
+    replication_eps: f32,
+
+    /// Cap on closure replicas per vector (SPANN bounds this at ~8 — beyond
+    /// that recall gains vanish while index size keeps growing). `1` disables
+    /// replication regardless of `replication_eps`.
+    #[arg(long, default_value_t = 1)]
+    max_replicas: usize,
+
+    /// Query-adaptive fan-out for `--shard-routing centroid`. A query routes to
+    /// every centroid within `route_eps` x its nearest-centroid distance,
+    /// capped at `--route-top-m`. `1.0` (default) probes only the nearest (or
+    /// exact ties), so interior queries touch one shard and only boundary
+    /// queries fan out — cheaper than a fixed `route_top_m` for every query.
+    #[arg(long, default_value_t = 1.0)]
+    route_eps: f32,
+
+    /// Pyramid meta-index size for `--shard-routing pyramid`: a labeled data
+    /// subsample of this many points is the routing index instead of the
+    /// `n_shards` centroids. Captures boundary geometry the coarse centroids
+    /// miss at high shard counts.
+    #[arg(long, default_value_t = 4000)]
+    meta_sample: usize,
+
+    /// Pyramid: gather shard labels from this many nearest meta-points per
+    /// query (then dedup + cap at `--route-top-m`). Larger = wider coverage.
+    #[arg(long, default_value_t = 64)]
+    meta_k: usize,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum ShardRoutingArg {
     Modulo,
     Centroid,
+    Pyramid,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -504,22 +540,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // fan-out floor). `centroid` clusters the space with deterministic
     // k-means so a query can route to the top-m closest shards only —
     // the IVF-style fan-out the distributed design uses.
-    let router: Option<CentroidRouter> =
-        if n_shards > 1 && args.shard_routing == ShardRoutingArg::Centroid {
-            let centroids = train_centroids(&train_flat, d, n_train, n_shards, metric);
+    // Centroid partition shared by `centroid` and `pyramid` routing: k-means
+    // clusters the space so each shard owns a region. `modulo` skips this.
+    let centroids: Option<Vec<Vec<f32>>> = if n_shards > 1
+        && matches!(
+            args.shard_routing,
+            ShardRoutingArg::Centroid | ShardRoutingArg::Pyramid
+        ) {
+        Some(train_centroids(&train_flat, d, n_train, n_shards, metric))
+    } else {
+        None
+    };
+    let assignment: Vec<Vec<usize>> = match &centroids {
+        Some(c) => (0..n_train)
+            .map(|i| {
+                closure_assign(
+                    &train_flat[i * d..(i + 1) * d],
+                    c,
+                    metric,
+                    args.replication_eps,
+                    args.max_replicas,
+                )
+            })
+            .collect(),
+        None => (0..n_train).map(|i| vec![i % n_shards]).collect(),
+    };
+    let total_assigned: usize = assignment.iter().map(Vec::len).sum();
+    info!(
+        n_train,
+        total_assigned,
+        replication_factor = total_assigned as f64 / n_train as f64,
+        "closure assignment complete"
+    );
+    // Query router. `centroid`: route on the k-means centroids (one route
+    // point per shard). `pyramid`: route on a labeled subsample (meta-index) —
+    // finer than centroids, capturing boundary geometry coarse centroids miss
+    // at high shard counts (Pyramid meta-routing). Both share one router type;
+    // only the route-point set + labels + probe width differ.
+    let router: Option<CentroidRouter> = match (&centroids, args.shard_routing) {
+        (Some(c), ShardRoutingArg::Centroid) => Some(CentroidRouter {
+            route_points: c.clone(),
+            route_labels: (0..n_shards).collect(),
+            n_probe: n_shards,
+            top_m: args.route_top_m.clamp(1, n_shards),
+            route_eps: args.route_eps,
+            metric,
+        }),
+        (Some(c), ShardRoutingArg::Pyramid) => {
+            let m = args.meta_sample.clamp(n_shards, n_train);
+            let stride = (n_train / m).max(1);
+            let mut route_points = Vec::with_capacity(m);
+            let mut route_labels = Vec::with_capacity(m);
+            for i in (0..n_train).step_by(stride).take(m) {
+                let v = &train_flat[i * d..(i + 1) * d];
+                route_points.push(v.to_vec());
+                route_labels.push(nearest_centroid(v, c, metric));
+            }
+            info!(meta_points = route_points.len(), "pyramid meta-index built");
             Some(CentroidRouter {
-                centroids,
+                route_points,
+                route_labels,
+                n_probe: args.meta_k.clamp(1, m),
                 top_m: args.route_top_m.clamp(1, n_shards),
+                route_eps: args.route_eps,
                 metric,
             })
-        } else {
-            None
-        };
-    let assignment: Vec<usize> = match &router {
-        Some(r) => (0..n_train)
-            .map(|i| nearest_centroid(&train_flat[i * d..(i + 1) * d], &r.centroids, metric))
-            .collect(),
-        None => (0..n_train).map(|i| i % n_shards).collect(),
+        }
+        _ => None,
     };
     info!(n_shards, routing = ?args.shard_routing, "building shard fleet");
     // Chunked `insert_batch` (R858b). The apply-phase backfill bug that
@@ -530,7 +617,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (shard_id, shard) in shards.iter_mut().enumerate() {
         let mut buf: Vec<(u64, Vec<f32>)> = Vec::with_capacity(BUILD_CHUNK);
         let mut shard_inserted = 0usize;
-        for row_idx in (0..n_train).filter(|i| assignment[*i] == shard_id) {
+        for row_idx in (0..n_train).filter(|i| assignment[*i].contains(&shard_id)) {
             let start = row_idx * d;
             buf.push((row_idx as u64, train_flat[start..start + d].to_vec()));
             if buf.len() == BUILD_CHUNK {
@@ -655,9 +742,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match args.shard_routing {
             ShardRoutingArg::Modulo => "modulo",
             ShardRoutingArg::Centroid => "centroid",
+            ShardRoutingArg::Pyramid => "pyramid",
         },
     )?;
-    if args.shard_routing == ShardRoutingArg::Centroid {
+    if matches!(
+        args.shard_routing,
+        ShardRoutingArg::Centroid | ShardRoutingArg::Pyramid
+    ) {
         report.record("route_top_m", args.route_top_m.clamp(1, n_shards))?;
     }
     // Bit-width only meaningful for `rabitq`; record unconditionally so
@@ -708,7 +799,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     // Centroid-routed shard runs get a `-Cm` suffix (m = fan-out width)
     // so they never overwrite scatter-all cells with the same M/codec.
-    let tag = if n_shards > 1 && args.shard_routing == ShardRoutingArg::Centroid {
+    let tag = if n_shards > 1
+        && matches!(
+            args.shard_routing,
+            ShardRoutingArg::Centroid | ShardRoutingArg::Pyramid
+        ) {
         format!("{tag}-C{}", args.route_top_m.clamp(1, n_shards))
     } else {
         tag
@@ -901,6 +996,11 @@ fn multi_search(
         .flat_map_iter(|&s| shards[s].search_with_mode(query, k, mode))
         .collect();
     merged.sort_by(|a, b| a.score.total_cmp(&b.score));
+    // Closure replication (and overlapping routed shards) can place a vector
+    // in several probed shards; keep only its best-scoring occurrence so the
+    // top-K is K distinct ids.
+    let mut seen = std::collections::HashSet::with_capacity(merged.len());
+    merged.retain(|r| seen.insert(r.id));
     merged.truncate(k);
     merged
 }
@@ -910,24 +1010,50 @@ fn multi_search(
 /// distributed design — routing cost is `n_shards` distance computations
 /// on the coordinator, after which only `top_m` shards do real work.
 struct CentroidRouter {
-    centroids: Vec<Vec<f32>>,
+    /// Route points: the k-means centroids (centroid routing, one per shard)
+    /// or a labeled data subsample (pyramid meta-index, many per shard).
+    route_points: Vec<Vec<f32>>,
+    /// Shard id of each route point. Identity (`j -> j`) for centroid routing;
+    /// the point's nearest-centroid shard for pyramid routing.
+    route_labels: Vec<usize>,
+    /// How many nearest route points to scan for shard labels: `n_shards` for
+    /// centroid routing (all of them), `meta_k` for pyramid.
+    n_probe: usize,
     top_m: usize,
+    route_eps: f32,
     metric: VectorMetric,
 }
 
 impl CentroidRouter {
-    /// Shard indices of the `top_m` centroids closest to `query`,
-    /// best-first.
+    /// Distinct shard ids the query routes to. Scan the `n_probe` nearest route
+    /// points best-first; keep the nearest shard unconditionally, then any
+    /// not-yet-seen shard whose route point is within `route_eps` x the nearest
+    /// route-point distance, capped at `top_m`. Centroid points + `route_eps=1`
+    /// = the nearest shard only; `route_eps > 1` makes the fan-out
+    /// query-adaptive; a labeled subsample makes it pyramid meta-routing.
     fn route(&self, query: &[f32]) -> Vec<usize> {
         let mut scored: Vec<(usize, f32)> = self
-            .centroids
+            .route_points
             .iter()
             .enumerate()
-            .map(|(j, c)| (j, centroid_distance(query, c, self.metric)))
+            .map(|(i, p)| (i, centroid_distance(query, p, self.metric)))
             .collect();
         scored.sort_by(|a, b| a.1.total_cmp(&b.1));
-        scored.truncate(self.top_m);
-        scored.into_iter().map(|(j, _)| j).collect()
+        let thresh = scored[0].1 * self.route_eps.max(1.0);
+        let mut out: Vec<usize> = Vec::with_capacity(self.top_m);
+        for (i, dist) in scored.into_iter().take(self.n_probe) {
+            if out.len() >= self.top_m {
+                break;
+            }
+            let shard = self.route_labels[i];
+            if out.contains(&shard) {
+                continue;
+            }
+            if out.is_empty() || dist <= thresh {
+                out.push(shard);
+            }
+        }
+        out
     }
 }
 
@@ -939,6 +1065,41 @@ fn centroid_distance(v: &[f32], c: &[f32], metric: VectorMetric) -> f32 {
         VectorMetric::Cosine => 1.0 - cosine_sim(v, c),
         _ => l2_sq(v, c),
     }
+}
+
+/// SPANN-style closure assignment: the nearest centroid plus every centroid
+/// within `eps` x the nearest routing distance, capped at `max_replicas`.
+/// Always returns at least the nearest shard. `eps <= 1.0` or
+/// `max_replicas <= 1` yields a single shard (no replication). Replicating
+/// only boundary points (those with several near-equidistant centroids) lets a
+/// low `route_top_m` recover the cross-boundary neighbours a single probe
+/// misses (SPANN, NeurIPS 2021).
+fn closure_assign(
+    v: &[f32],
+    centroids: &[Vec<f32>],
+    metric: VectorMetric,
+    eps: f32,
+    max_replicas: usize,
+) -> Vec<usize> {
+    let mut scored: Vec<(usize, f32)> = centroids
+        .iter()
+        .enumerate()
+        .map(|(j, c)| (j, centroid_distance(v, c, metric)))
+        .collect();
+    scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let thresh = scored[0].1 * eps.max(1.0);
+    let cap = max_replicas.max(1);
+    let mut out = Vec::with_capacity(cap);
+    for (j, dist) in scored {
+        if out.is_empty() {
+            out.push(j); // always keep the nearest centroid
+        } else if out.len() < cap && dist <= thresh {
+            out.push(j);
+        } else {
+            break;
+        }
+    }
+    out
 }
 
 /// Index of the centroid closest to `v`.
