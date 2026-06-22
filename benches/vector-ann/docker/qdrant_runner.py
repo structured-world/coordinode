@@ -243,9 +243,7 @@ def main() -> int:
     # qdrant's actual index, so benching it would compare against the
     # wrong engine. Expects a qdrant server reachable at $QDRANT_HOST.
     qdrant_host = os.environ.get("QDRANT_HOST", "localhost")
-    client = QdrantClient(
-        host=qdrant_host, grpc_port=6334, prefer_grpc=True, timeout=600, check_version=False
-    )
+    client = QdrantClient(host=qdrant_host, grpc_port=6334, prefer_grpc=True, timeout=600)
     # Fresh collection each run so a persistent server keeps no prior build.
     client.delete_collection(collection_name="bench")
     # `full_scan_threshold=0` is the critical knob: it forces qdrant

@@ -44,6 +44,7 @@ from pathlib import Path
 
 import chromadb  # type: ignore[import-untyped]
 import numpy as np
+from chromadb.config import Settings  # type: ignore[import-untyped]
 import psutil
 
 
@@ -212,7 +213,9 @@ def main() -> int:
     # collection with the target search_ef baked into the creation metadata
     # for each sweep point. Construction params (M, construction_ef) are
     # identical across points; only search_ef varies.
-    client = chromadb.Client()
+    # Disable telemetry: its posthog event handler raises a KeyError on
+    # `CollectionQueryEvent` under concurrent (MT) queries, crashing the t=4 run.
+    client = chromadb.Client(Settings(anonymized_telemetry=False))
     ids_all = [str(i) for i in range(n_train)]
     emb_all = train.tolist()
 
