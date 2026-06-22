@@ -199,6 +199,64 @@ impl Default for TextIndexConfig {
     }
 }
 
+/// Per-label shard-routing strategy for a vector index: how the label's
+/// vectors are distributed across shards and how a query routes to them.
+///
+/// `Unsharded` (the default) is the single-index-per-label model. The other
+/// variants split a label across `n_shards` and are rebuilt asynchronously
+/// when the strategy changes, so a label can be re-sharded online without
+/// disrupting serving.
+///
+/// Thresholds are stored in permille of a distance ratio (1000 = 1.0x) to keep
+/// the type `Eq` (no floats); the router scales them back to `f32` at use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ShardStrategy {
+    /// One HNSW for the whole label on a single shard (today's model).
+    #[default]
+    Unsharded,
+    /// Centroid (k-means) partitioning with SPANN-style closure replication and
+    /// query-adaptive fan-out. Boundary vectors are replicated to nearby shards
+    /// so a low fan-out still recovers cross-boundary neighbours.
+    Centroid {
+        /// Number of shards to split the label across.
+        n_shards: u32,
+        /// Closure replication threshold, permille of the nearest-centroid
+        /// distance: a vector also lands on every centroid within this factor.
+        /// `1000` (1.0x) replicates only exact ties (no replication).
+        replication_eps_permille: u32,
+        /// Cap on closure replicas per vector (SPANN bounds this at ~8).
+        max_replicas: u32,
+        /// Query-adaptive fan-out threshold, permille of the nearest-centroid
+        /// distance. `1000` (1.0x) routes to the nearest shard only; larger
+        /// fans out only for queries near a cluster boundary.
+        route_eps_permille: u32,
+    },
+    /// Hash-bucket partitioning: geometry-blind round-robin, every query
+    /// scatters to all shards. Simple, balanced, but no routing savings.
+    Hash {
+        /// Number of shards.
+        n_shards: u32,
+    },
+}
+
+impl ShardStrategy {
+    /// Number of shards this strategy spreads the label across (`1` for
+    /// `Unsharded`).
+    #[must_use]
+    pub fn n_shards(&self) -> u32 {
+        match self {
+            Self::Unsharded => 1,
+            Self::Centroid { n_shards, .. } | Self::Hash { n_shards } => (*n_shards).max(1),
+        }
+    }
+
+    /// Whether the label is split across more than one shard.
+    #[must_use]
+    pub fn is_sharded(&self) -> bool {
+        self.n_shards() > 1
+    }
+}
+
 /// Configuration for vector indexes (HNSW or Flat).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VectorIndexConfig {
@@ -228,6 +286,13 @@ pub struct VectorIndexConfig {
     /// Configured via the `rerank_candidates` CREATE VECTOR INDEX option.
     #[serde(default)]
     pub rerank_candidates: Option<usize>,
+    /// How the label's vectors are sharded + routed. `Unsharded` (default) is
+    /// the single-index-per-label model. Changing this re-shards the label
+    /// online (async rebuild, no serving disruption). MUST stay the last field:
+    /// `IndexDefinition` uses rmp-serde positional encoding, so the
+    /// `#[serde(default)]` only round-trips old records correctly at the tail.
+    #[serde(default)]
+    pub shard_strategy: ShardStrategy,
 }
 
 impl Default for VectorIndexConfig {
@@ -241,6 +306,7 @@ impl Default for VectorIndexConfig {
             offload_vectors: false,
             ef_search: None,
             rerank_candidates: None,
+            shard_strategy: ShardStrategy::Unsharded,
         }
     }
 }
@@ -533,5 +599,74 @@ mod tests {
             rmp_serde::from_slice(&bytes).expect("decode legacy as current");
         assert_eq!(back.state, IndexState::Ready);
         assert_eq!(back.name, "u");
+    }
+
+    #[test]
+    fn shard_strategy_defaults_to_unsharded() {
+        assert_eq!(
+            VectorIndexConfig::default().shard_strategy,
+            ShardStrategy::Unsharded
+        );
+        assert_eq!(ShardStrategy::default(), ShardStrategy::Unsharded);
+        assert!(!ShardStrategy::Unsharded.is_sharded());
+        assert_eq!(ShardStrategy::Unsharded.n_shards(), 1);
+    }
+
+    #[test]
+    fn shard_strategy_centroid_roundtrip_serde() {
+        let strat = ShardStrategy::Centroid {
+            n_shards: 4,
+            replication_eps_permille: 1300,
+            max_replicas: 3,
+            route_eps_permille: 1500,
+        };
+        assert!(strat.is_sharded());
+        assert_eq!(strat.n_shards(), 4);
+        let cfg = VectorIndexConfig {
+            dimensions: 128,
+            shard_strategy: strat,
+            ..Default::default()
+        };
+        let idx = IndexDefinition::hnsw("v", "L", "p", cfg);
+        let bytes = rmp_serde::to_vec(&idx).expect("encode");
+        let back: IndexDefinition = rmp_serde::from_slice(&bytes).expect("decode");
+        assert_eq!(
+            back.vector_config.expect("vector_config").shard_strategy,
+            strat
+        );
+    }
+
+    #[test]
+    fn legacy_vector_config_without_shard_strategy_defaults_unsharded() {
+        // A pre-strategy VectorIndexConfig record has the field layout MINUS
+        // `shard_strategy` (the new tail field). rmp-serde accepts the shorter
+        // struct because `shard_strategy` is `#[serde(default)]`, and the
+        // missing value fills as Unsharded — the backward-compat contract.
+        #[derive(serde::Serialize)]
+        struct LegacyVectorConfig {
+            dimensions: u32,
+            metric: VectorMetric,
+            m: usize,
+            ef_construction: usize,
+            quantization: coordinode_vector::hnsw::QuantizationCodec,
+            offload_vectors: bool,
+            ef_search: Option<usize>,
+            rerank_candidates: Option<usize>,
+        }
+        let legacy = LegacyVectorConfig {
+            dimensions: 64,
+            metric: VectorMetric::Cosine,
+            m: 16,
+            ef_construction: 200,
+            quantization: coordinode_vector::hnsw::QuantizationCodec::None,
+            offload_vectors: false,
+            ef_search: None,
+            rerank_candidates: None,
+        };
+        let bytes = rmp_serde::to_vec(&legacy).expect("encode legacy vector config");
+        let back: VectorIndexConfig =
+            rmp_serde::from_slice(&bytes).expect("decode legacy as current");
+        assert_eq!(back.shard_strategy, ShardStrategy::Unsharded);
+        assert_eq!(back.dimensions, 64);
     }
 }

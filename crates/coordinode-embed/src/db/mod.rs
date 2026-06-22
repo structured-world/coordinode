@@ -3477,6 +3477,7 @@ mod tests {
                 offload_vectors: false,
                 ef_search: None,
                 rerank_candidates: None,
+                shard_strategy: Default::default(),
             },
         );
         // Seed one vector so size > 0.
@@ -3534,6 +3535,7 @@ mod tests {
                 offload_vectors: false,
                 ef_search: None,
                 rerank_candidates: None,
+                shard_strategy: Default::default(),
             },
         );
         let graph_stats = db.compute_stats().expect("compute_stats");
@@ -3571,6 +3573,7 @@ mod tests {
                 offload_vectors: false,
                 ef_search: None,
                 rerank_candidates: None,
+                shard_strategy: Default::default(),
             },
         );
         // Drive the index into a non-ready state so EXPLAIN shows more than the

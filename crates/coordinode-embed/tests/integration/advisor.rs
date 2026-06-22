@@ -398,6 +398,7 @@ fn explain_suggest_skips_knn_suggestion_when_index_exists() {
             offload_vectors: false,
             ef_search: None,
             rerank_candidates: None,
+            shard_strategy: Default::default(),
         },
     );
 
@@ -442,6 +443,7 @@ fn explain_suggest_suggests_for_different_property_when_one_indexed() {
             offload_vectors: false,
             ef_search: None,
             rerank_candidates: None,
+            shard_strategy: Default::default(),
         },
     );
 
