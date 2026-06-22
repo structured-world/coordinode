@@ -23,8 +23,8 @@ use coordinode_query::advisor::{
 use coordinode_query::cypher;
 use coordinode_query::executor::row::Row;
 use coordinode_query::executor::runner::{
-    execute, execute_no_commit, AdaptiveConfig, ExecutionContext, ExecutionError, FeedbackCache,
-    WriteStats,
+    execute, execute_no_commit, AdaptiveConfig, ExecutionContext, ExecutionError, ExtensionHandler,
+    ExtensionRegistry, FeedbackCache, WriteStats,
 };
 use coordinode_query::planner;
 use coordinode_raft::proposal::OwnedLocalProposalPipeline;
@@ -335,6 +335,12 @@ pub struct Database {
     _vector_worker: Option<crate::vector_worker::VectorIndexWorker>,
     /// Text index registry — holds live tantivy indexes for full-text search.
     text_index_registry: coordinode_query::index::TextIndexRegistry,
+    /// Extension-op handler registry threaded into every ExecutionContext.
+    /// Empty for a plain CE Database (no extension ops dispatchable);
+    /// populated via [`Database::register_extension`] by an enterprise layer
+    /// or an integration test so extension operators (e.g. a sharded
+    /// CREATE VECTOR INDEX) reach their handler.
+    extension_registry: ExtensionRegistry,
     /// Adaptive query plan configuration — controls parallel traversal thresholds.
     adaptive_config: AdaptiveConfig,
     /// Feedback cache for known super-node fan-out degrees.
@@ -782,6 +788,7 @@ impl Database {
             vector_index_registry,
             _vector_worker: vector_worker,
             text_index_registry,
+            extension_registry: ExtensionRegistry::new(),
             adaptive_config: AdaptiveConfig::default(),
             feedback_cache: FeedbackCache::default(),
             drain_buffer,
@@ -1228,6 +1235,19 @@ impl Database {
     ///
     /// Automatically tracks query fingerprint and execution time in the
     /// query advisor registry for performance analysis.
+    /// Register an extension-op handler under `name`. An enterprise layer (or
+    /// an integration test) calls this at setup so that extension operators
+    /// (a trailing clause on CREATE VECTOR INDEX, etc.) dispatch to it; a plain
+    /// CE Database registers none. Idempotent on the name (last registration
+    /// wins). Must be called before the queries that produce the op.
+    pub fn register_extension(
+        &mut self,
+        name: impl Into<String>,
+        handler: Arc<dyn ExtensionHandler>,
+    ) {
+        self.extension_registry.register(name, handler);
+    }
+
     pub fn execute_cypher(&mut self, query: &str) -> Result<Vec<Row>, DatabaseError> {
         if self.try_apply_session_set(query) {
             return Ok(Vec::new());
@@ -1773,10 +1793,11 @@ impl Database {
             text_index_registry: Some(&self.text_index_registry),
             vector_index_registry: Some(&self.vector_index_registry),
             btree_index_registry: Some(&self.index_registry),
-            // CE registers no extension-op handlers; the EE server populates
-            // this so its parser/executor extensions (e.g. sharded vector
-            // indexes) dispatch. CE path leaves it unset.
-            extensions: None,
+            // Extension-op handlers for this Database (empty by default). An
+            // enterprise layer / integration test populates it via
+            // Database::register_extension so SHARDED-BY-style extension ops
+            // dispatch; an empty registry means none are dispatchable.
+            extensions: Some(&self.extension_registry),
             vector_loader: Some(&vector_loader),
             mvcc_oracle: Some(&self.oracle),
             mvcc_read_ts: read_ts,
@@ -2883,6 +2904,49 @@ mod tests {
         // which will fail with a parse error
         let result = db.execute_cypher("SET vector_consistency = 'invalid_mode'");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn extension_op_dispatches_through_database() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct CountingHandler {
+            called: Arc<AtomicBool>,
+        }
+        impl ExtensionHandler for CountingHandler {
+            fn execute(
+                &self,
+                _ctx: &mut ExecutionContext<'_>,
+                _payload: &[u8],
+            ) -> Result<Vec<Row>, ExecutionError> {
+                self.called.store(true, Ordering::SeqCst);
+                Ok(vec![])
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = Database::open(dir.path()).expect("open");
+        // Ensure the :Doc label exists before the index DDL.
+        db.execute_cypher("CREATE (:Doc {x: 1})")
+            .expect("seed label");
+
+        let called = Arc::new(AtomicBool::new(false));
+        db.register_extension(
+            "vector_index.create_ext",
+            Arc::new(CountingHandler {
+                called: Arc::clone(&called),
+            }),
+        );
+
+        // A SHARDED-BY tail on CREATE VECTOR INDEX routes end-to-end through the
+        // Database: the parser captures the tail, the planner emits an Extension
+        // op, and the executor dispatches it to the registered handler.
+        db.execute_cypher("CREATE VECTOR INDEX foo ON :Doc(embedding) SHARDED BY CENTROID(8)")
+            .expect("extension op executes");
+        assert!(
+            called.load(Ordering::SeqCst),
+            "registered extension handler ran via Database"
+        );
     }
 
     /// engine_shared() returns an Arc pointing to the same engine as engine().
