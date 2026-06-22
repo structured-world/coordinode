@@ -200,6 +200,7 @@ pub mod migration;
 pub mod routing;
 pub mod topology;
 pub mod types;
+pub mod vector_routing;
 
 pub use error::{TopologyError, TopologyResult};
 pub use migration::{
@@ -213,3 +214,4 @@ pub use types::{
     CrushRule, EndpointId, FailureDomain, Modality, NodeAddr, ServerId, ShardDescriptor, ShardId,
     TopologyTree,
 };
+pub use vector_routing::{PartitionId, PartitionSet, SinglePartitionRouter, VectorShardRouter};
