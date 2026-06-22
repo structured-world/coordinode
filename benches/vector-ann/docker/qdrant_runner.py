@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import socket
 import struct
@@ -234,10 +235,16 @@ def main() -> int:
         flush=True,
     )
 
-    # `:memory:` mode runs the qdrant store in-process, the same way
-    # hnswlib and chromadb adapters operate, so the comparison stays
-    # apples-to-apples (no network RTT, no separate server box).
-    client = QdrantClient(":memory:")
+    # Connect to a real qdrant SERVER (the Rust HNSW engine). The
+    # in-process `:memory:` client is a Python reference implementation
+    # that qdrant-client itself warns is unusable above ~20k points
+    # (orders of magnitude slower than the server) and does not exercise
+    # qdrant's actual index, so benching it would compare against the
+    # wrong engine. Expects a qdrant server reachable at $QDRANT_HOST.
+    qdrant_host = os.environ.get("QDRANT_HOST", "localhost")
+    client = QdrantClient(host=qdrant_host, grpc_port=6334, prefer_grpc=True, timeout=600)
+    # Fresh collection each run so a persistent server keeps no prior build.
+    client.delete_collection(collection_name="bench")
     # `full_scan_threshold=0` is the critical knob: it forces qdrant
     # to use the HNSW index even on small collections where it would
     # otherwise fall back to exact search and produce the bogus flat
@@ -275,8 +282,19 @@ def main() -> int:
             for i in range(start, end)
         ]
         client.upsert(collection_name="bench", points=points)
+    # qdrant builds the HNSW index asynchronously after upsert; wait until
+    # every vector is indexed so the sweep measures HNSW search rather than
+    # the pre-index exact-scan fallback. Bounded so a stall cannot hang.
+    idx_deadline = time.time() + 600
+    info = client.get_collection(collection_name="bench")
+    while (info.indexed_vectors_count or 0) < n_train and time.time() < idx_deadline:
+        time.sleep(0.5)
+        info = client.get_collection(collection_name="bench")
     build_secs = time.time() - t0
-    print(f"[qdrant] build_secs={build_secs:.2f}", flush=True)
+    print(
+        f"[qdrant] build_secs={build_secs:.2f} indexed={info.indexed_vectors_count}/{n_train}",
+        flush=True,
+    )
 
     sweep_values = [int(x) for x in args.ef_sweep.split(",")]
     points_out = []
