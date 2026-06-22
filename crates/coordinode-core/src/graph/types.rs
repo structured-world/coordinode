@@ -181,6 +181,33 @@ pub struct PathValue {
     pub rels: Vec<PathRel>,
 }
 
+/// Extract an owned f32 vector from a [`Value`], accepting both the native
+/// [`Value::Vector`] and a numeric [`Value::Array`] of `Float`/`Int` elements
+/// (the shape a Cypher array literal like `[1.0, 0.0]` parses to). Returns
+/// `None` for any other variant or an empty array. Canonical vector coercion
+/// shared by index build/backfill, the write path, and extension handlers.
+pub fn try_extract_vector(val: &Value) -> Option<Vec<f32>> {
+    match val {
+        Value::Vector(v) => Some(v.clone()),
+        Value::Array(arr) => {
+            let mut vec = Vec::with_capacity(arr.len());
+            for item in arr {
+                match item {
+                    Value::Float(f) => vec.push(*f as f32),
+                    Value::Int(i) => vec.push(*i as f32),
+                    _ => return None,
+                }
+            }
+            if vec.is_empty() {
+                None
+            } else {
+                Some(vec)
+            }
+        }
+        _ => None,
+    }
+}
+
 impl Value {
     /// Returns the type name as a static string.
     pub fn type_name(&self) -> &'static str {

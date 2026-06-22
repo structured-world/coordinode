@@ -143,32 +143,10 @@ const SCHEMA_KEY_NEXT_NODE_ID: &[u8] = b"meta:next_node_id";
 /// Loaded on Database::open, updated after queries that intern new fields.
 const SCHEMA_KEY_FIELD_INTERNER: &[u8] = b"meta:field_interner";
 
-/// Try to extract f32 vector data from a Value.
-///
-/// Handles both `Value::Vector` (native) and `Value::Array` containing
-/// only Float/Int elements (Cypher array literals like `[1.0, 0.0]`).
-pub(crate) fn try_extract_vector(val: &coordinode_core::graph::types::Value) -> Option<Vec<f32>> {
-    use coordinode_core::graph::types::Value;
-    match val {
-        Value::Vector(v) => Some(v.clone()),
-        Value::Array(arr) => {
-            let mut vec = Vec::with_capacity(arr.len());
-            for item in arr {
-                match item {
-                    Value::Float(f) => vec.push(*f as f32),
-                    Value::Int(i) => vec.push(*i as f32),
-                    _ => return None,
-                }
-            }
-            if vec.is_empty() {
-                None
-            } else {
-                Some(vec)
-            }
-        }
-        _ => None,
-    }
-}
+/// Canonical f32-vector coercion (handles `Value::Vector` and numeric
+/// `Value::Array`). Re-exported so `crate::db::try_extract_vector` callers
+/// keep resolving; the single definition lives in `coordinode-core`.
+pub(crate) use coordinode_core::graph::types::try_extract_vector;
 
 /// One-line human description of a vector index's serving health, for EXPLAIN
 /// output.

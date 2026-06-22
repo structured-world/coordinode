@@ -7922,27 +7922,7 @@ fn gate_vector_index_read(
     }
 }
 
-fn try_extract_vector(val: &Value) -> Option<Vec<f32>> {
-    match val {
-        Value::Vector(v) => Some(v.clone()),
-        Value::Array(arr) => {
-            let mut vec = Vec::with_capacity(arr.len());
-            for item in arr {
-                match item {
-                    Value::Float(f) => vec.push(*f as f32),
-                    Value::Int(i) => vec.push(*i as f32),
-                    _ => return None,
-                }
-            }
-            if vec.is_empty() {
-                None
-            } else {
-                Some(vec)
-            }
-        }
-        _ => None,
-    }
-}
+use coordinode_core::graph::types::try_extract_vector;
 
 /// CREATE node: allocate ID, build record, write to storage.
 fn execute_create_node(
