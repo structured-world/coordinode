@@ -101,18 +101,24 @@ const reports = ref<BenchReport[]>([]);
 interface EngineMeta {
   name: string;
   kind: "coordinode" | "specialist" | "multi-model";
+  // QPS is only comparable WITHIN a transport tier: `embedded` engines run
+  // in-process (no network), `server` engines answer each query over the wire
+  // (gRPC / HTTP round-trip). recall@ef is comparable across tiers; QPS is not.
+  transport: "embedded" | "server";
   license: string;
   status: "live" | "planned";
   note?: string;
 }
 const ENGINES: EngineMeta[] = [
-  { name: "coordinode", kind: "coordinode", license: "AGPL-3.0", status: "live" },
-  { name: "hnswlib", kind: "specialist", license: "Apache-2.0", status: "live", note: "reference implementation" },
-  { name: "Faiss (HNSW)", kind: "specialist", license: "MIT", status: "planned" },
-  { name: "Qdrant", kind: "specialist", license: "Apache-2.0", status: "planned" },
-  { name: "Milvus", kind: "specialist", license: "Apache-2.0", status: "planned" },
-  { name: "pgvector", kind: "multi-model", license: "PostgreSQL", status: "planned" },
-  { name: "MongoDB Atlas Vector", kind: "multi-model", license: "SSPL", status: "planned" },
+  { name: "coordinode", kind: "coordinode", transport: "embedded", license: "AGPL-3.0", status: "live", note: "in-process engine" },
+  { name: "coordinode-grpc", kind: "coordinode", transport: "server", license: "AGPL-3.0", status: "live", note: "same engine, served over gRPC" },
+  { name: "hnswlib", kind: "specialist", transport: "embedded", license: "Apache-2.0", status: "live", note: "reference implementation" },
+  { name: "chromadb", kind: "specialist", transport: "embedded", license: "Apache-2.0", status: "live", note: "hnswlib backend" },
+  { name: "qdrant", kind: "specialist", transport: "server", license: "Apache-2.0", status: "live", note: "multi-segment search" },
+  { name: "Faiss (HNSW)", kind: "specialist", transport: "embedded", license: "MIT", status: "planned" },
+  { name: "Milvus", kind: "specialist", transport: "server", license: "Apache-2.0", status: "planned" },
+  { name: "pgvector", kind: "multi-model", transport: "server", license: "PostgreSQL", status: "planned" },
+  { name: "MongoDB Atlas Vector", kind: "multi-model", transport: "server", license: "SSPL", status: "planned" },
 ];
 
 // UI state
@@ -637,6 +643,7 @@ onMounted(render);
             <th class="col-toggle">On</th>
             <th>Engine</th>
             <th>Type</th>
+            <th>Transport</th>
             <th>License</th>
             <th>Status</th>
             <th>Note</th>
@@ -658,6 +665,14 @@ onMounted(render);
             <td>
               <span :class="['kind-pill', `kind-${e.kind}`]">
                 {{ e.kind === "coordinode" ? "this engine" : e.kind }}
+              </span>
+            </td>
+            <td>
+              <span
+                :class="['transport-pill', `transport-${e.transport}`]"
+                :title="e.transport === 'server' ? 'answers each query over the wire (gRPC/HTTP); QPS comparable only to other server-tier engines' : 'runs in-process, no network; QPS comparable only to other embedded-tier engines'"
+              >
+                {{ e.transport }}
               </span>
             </td>
             <td><code>{{ e.license }}</code></td>
@@ -858,6 +873,22 @@ h3 {
   background: var(--vp-c-bg-soft);
   color: var(--vp-c-text-3);
   border: 1px dashed var(--vp-c-divider);
+}
+.transport-pill {
+  display: inline-block;
+  font-size: 0.78rem;
+  font-weight: 500;
+  padding: 0.12rem 0.5rem;
+  border-radius: 10px;
+  white-space: nowrap;
+}
+.transport-pill.transport-embedded {
+  background: rgba(56, 139, 253, 0.16);
+  color: var(--vp-c-brand-1, #388bfd);
+}
+.transport-pill.transport-server {
+  background: rgba(219, 109, 40, 0.16);
+  color: rgb(219, 109, 40);
 }
 .note-cell {
   color: var(--vp-c-text-2);
