@@ -1331,7 +1331,16 @@ impl HnswIndex {
         }
         if self.data_level0.is_none() {
             let capacity = (self.config.max_elements as usize).max(idx + 1);
-            self.data_level0 = Some(data_level0::DataLevel0Block::new(capacity, M_MAX0, dim));
+            // Size the block to the effective per-node layer-0 degree
+            // (`config.m_max0`, already capped to `M_MAX0`), not the
+            // compile-time `M_MAX0` cap: for M=16 (m_max0=32) this halves the
+            // neighbour-id region, shrinking the stride and the cache lines
+            // touched per visit, which closes the small-M scaling regression.
+            self.data_level0 = Some(data_level0::DataLevel0Block::new(
+                capacity,
+                self.config.m_max0,
+                dim,
+            ));
         }
         let Some(block) = self.data_level0.as_mut() else {
             return;
