@@ -205,46 +205,56 @@ def main() -> int:
     metric = detect_metric(args.dataset_name)
     print(f"[chromadb] metric={metric} n_train={n_train} dim={d} n_test={n_test}", flush=True)
 
-    # Build — in-memory client, single collection, HNSW config matching
-    # the CN side (M, ef_construction, distance). chromadb stores ids
-    # as strings on the wire; convert int → str at insert.
+    # chromadb honours `hnsw:search_ef` only at collection creation/load —
+    # `modify()` on a live index does NOT change query-time ef, it silently
+    # leaves the default (ef=10) in force, collapsing the recall curve to a
+    # flat line (the bug this adapter previously shipped). So rebuild the
+    # collection with the target search_ef baked into the creation metadata
+    # for each sweep point. Construction params (M, construction_ef) are
+    # identical across points; only search_ef varies.
     client = chromadb.Client()
-    collection = client.create_collection(
-        name="bench",
-        metadata={
-            "hnsw:space": metric,
-            "hnsw:M": args.m,
-            "hnsw:construction_ef": args.ef_construction,
-            "hnsw:num_threads": args.threads,
-        },
-    )
-    t0 = time.time()
-    # Batch inserts. chromadb v0.5 has a hard limit around 41_666 per
-    # add() call (`MAX_BATCH_SIZE`); use 32_000 to stay safely below.
-    batch_size = 32_000
     ids_all = [str(i) for i in range(n_train)]
-    for start in range(0, n_train, batch_size):
-        end = min(start + batch_size, n_train)
-        collection.add(
-            ids=ids_all[start:end],
-            embeddings=train[start:end].tolist(),
-        )
-    build_secs = time.time() - t0
-    print(f"[chromadb] build_secs={build_secs:.2f}", flush=True)
+    emb_all = train.tolist()
 
-    # Sweep
+    def build_collection(search_ef: int):
+        try:
+            client.delete_collection(name="bench")
+        except Exception:
+            pass
+        coll = client.create_collection(
+            name="bench",
+            metadata={
+                "hnsw:space": metric,
+                "hnsw:M": args.m,
+                "hnsw:construction_ef": args.ef_construction,
+                "hnsw:search_ef": search_ef,
+                "hnsw:num_threads": args.threads,
+            },
+        )
+        # chromadb v0.5 caps add() around 41_666 points; 32_000 stays safe.
+        batch_size = 32_000
+        for start in range(0, n_train, batch_size):
+            end = min(start + batch_size, n_train)
+            coll.add(ids=ids_all[start:end], embeddings=emb_all[start:end])
+        return coll
+
+    # Sweep — rebuild per ef so search_ef takes effect (see build_collection).
     sweep_values = [int(x) for x in args.ef_sweep.split(",")]
-    def single_search(q_vec):
-        return collection.query(
-            query_embeddings=[q_vec.tolist()],
-            n_results=args.k,
-        )
-
     points = []
-    for ef in sweep_values:
-        # chromadb exposes ef_search through collection.modify; the
-        # metadata key is `hnsw:search_ef`.
-        collection.modify(metadata={"hnsw:search_ef": ef})
+    build_secs = 0.0
+    for ef_i, ef in enumerate(sweep_values):
+        t_build = time.time()
+        collection = build_collection(ef)
+        if ef_i == 0:
+            build_secs = time.time() - t_build
+            print(f"[chromadb] build_secs={build_secs:.2f}", flush=True)
+
+        def single_search(q_vec, _coll=collection):
+            return _coll.query(
+                query_embeddings=[q_vec.tolist()],
+                n_results=args.k,
+            )
+
         latencies_us: list[float] = []
         hits = 0
         total = 0

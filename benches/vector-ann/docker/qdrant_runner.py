@@ -62,6 +62,7 @@ from qdrant_client.models import (
     BinaryQuantizationConfig,
     Distance,
     HnswConfigDiff,
+    OptimizersConfigDiff,
     PointStruct,
     ProductQuantization,
     ProductQuantizationConfig,
@@ -242,7 +243,9 @@ def main() -> int:
     # qdrant's actual index, so benching it would compare against the
     # wrong engine. Expects a qdrant server reachable at $QDRANT_HOST.
     qdrant_host = os.environ.get("QDRANT_HOST", "localhost")
-    client = QdrantClient(host=qdrant_host, grpc_port=6334, prefer_grpc=True, timeout=600)
+    client = QdrantClient(
+        host=qdrant_host, grpc_port=6334, prefer_grpc=True, timeout=600, check_version=False
+    )
     # Fresh collection each run so a persistent server keeps no prior build.
     client.delete_collection(collection_name="bench")
     # `full_scan_threshold=0` is the critical knob: it forces qdrant
@@ -271,6 +274,12 @@ def main() -> int:
             full_scan_threshold=0,
             max_indexing_threads=args.threads,
         ),
+        # Force qdrant to build the HNSW index on every segment regardless of
+        # size. Without this it leaves segments below the default
+        # `indexing_threshold` (20000 vectors) unindexed and silently falls
+        # back to exact search, which shows up as a flat recall=1.0 curve that
+        # does not respond to the ef sweep (and is not an HNSW measurement).
+        optimizers_config=OptimizersConfigDiff(indexing_threshold=1),
         quantization_config=quant,
     )
     t0 = time.time()
