@@ -1017,6 +1017,7 @@ dependencies = [
 name = "coordinode-query"
 version = "0.4.3"
 dependencies = [
+ "coordinode-cluster",
  "coordinode-core",
  "coordinode-embed",
  "coordinode-modality",

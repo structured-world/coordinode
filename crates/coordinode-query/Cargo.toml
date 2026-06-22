@@ -18,6 +18,7 @@ coordinode-core = { workspace = true }
 coordinode-storage = { workspace = true }
 coordinode-modality = { workspace = true }
 coordinode-vector = { workspace = true }
+coordinode-cluster = { workspace = true }
 coordinode-search = { workspace = true }
 pest = { workspace = true }
 pest_derive = { workspace = true }

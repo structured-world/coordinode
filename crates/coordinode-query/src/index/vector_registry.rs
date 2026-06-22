@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use coordinode_cluster::VectorShardRouter;
 use coordinode_core::graph::node::NodeId;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_vector::health::{HealthSignal, IndexHealthState};
@@ -24,6 +25,24 @@ type VectorIndexKey = (String, String);
 /// writers (insert/delete) acquire exclusive access.
 pub type HnswHandle = Arc<RwLock<HnswIndex>>;
 
+/// A similarity-partitioned (sharded) vector index: N per-partition HNSW
+/// handles plus the router that maps a vector to its partitions.
+///
+/// This is the index-internal partition axis (not cross-node sharding): a
+/// label whose index is partitioned by embedding similarity holds one
+/// `HnswHandle` per partition, and the [`VectorShardRouter`] decides which
+/// partitions a build vector lands in (closure replication may write to
+/// several) and which a query scatters to (adaptive fan-out). The CE registry
+/// only provides the mechanism; the router itself (the partitioning
+/// intelligence) is injected, defaulting to a single partition for the
+/// Unsharded path, with the EE centroid router swapped in for sharded labels.
+struct ShardedLayout {
+    /// One HNSW handle per partition, indexed by `PartitionId`.
+    shards: Vec<HnswHandle>,
+    /// Maps a vector to its partitions (build `assign` / query `route`).
+    router: Arc<dyn VectorShardRouter>,
+}
+
 /// Registry of active HNSW vector indexes.
 ///
 /// Uses interior mutability (`RwLock`) so `register` / `unregister` can be
@@ -36,8 +55,15 @@ pub type HnswHandle = Arc<RwLock<HnswIndex>>;
 /// schema partition. The HNSW graph itself is rebuilt from stored vectors
 /// on startup and maintained incrementally during writes.
 pub struct VectorIndexRegistry {
-    /// Active HNSW indexes: (label, property) → live HNSW graph.
+    /// Active HNSW indexes: (label, property) → live HNSW graph. Holds the
+    /// Unsharded (single-partition) indexes; sharded labels live in
+    /// [`Self::sharded`] instead and are absent from this map.
     indexes: RwLock<HashMap<VectorIndexKey, HnswHandle>>,
+    /// Similarity-partitioned indexes: (label, property) → N per-partition
+    /// HNSW handles + router. A key is in exactly one of `indexes` (Unsharded)
+    /// or `sharded` (partitioned), never both. Empty unless a label was
+    /// registered with a multi-partition router via [`Self::register_sharded`].
+    sharded: RwLock<HashMap<VectorIndexKey, ShardedLayout>>,
     /// Index definitions keyed by (label, property) for metadata lookup.
     definitions: RwLock<HashMap<VectorIndexKey, IndexDefinition>>,
     /// Per-index lifecycle + freshness signal. Held as an
@@ -61,6 +87,7 @@ impl VectorIndexRegistry {
     pub fn new() -> Self {
         Self {
             indexes: RwLock::new(HashMap::new()),
+            sharded: RwLock::new(HashMap::new()),
             definitions: RwLock::new(HashMap::new()),
             health: RwLock::new(HashMap::new()),
             tier_backend: None,
@@ -80,6 +107,7 @@ impl VectorIndexRegistry {
         let backend: Arc<dyn VectorTierStorage> = Arc::new(LsmVectorTier::new(engine));
         Self {
             indexes: RwLock::new(HashMap::new()),
+            sharded: RwLock::new(HashMap::new()),
             definitions: RwLock::new(HashMap::new()),
             health: RwLock::new(HashMap::new()),
             tier_backend: Some(backend),
@@ -124,23 +152,7 @@ impl VectorIndexRegistry {
             return;
         };
 
-        let hnsw_config = HnswConfig {
-            m: config.m,
-            m_max0: config.m * 2,
-            ef_construction: config.ef_construction,
-            ef_search: config.ef_search.unwrap_or(200),
-            metric: config.metric,
-            max_dimensions: config.dimensions,
-            quantization: config.quantization,
-            rerank_candidates: config.rerank_candidates.unwrap_or(100),
-            calibration_threshold: 1000,
-            offload_vectors: config.offload_vectors,
-            property_name: def.property().to_string(),
-            max_elements: 1_000_000,
-            ..HnswConfig::default()
-        };
-
-        let mut hnsw = HnswIndex::new(hnsw_config);
+        let mut hnsw = HnswIndex::new(Self::hnsw_config_from(config, def.property()));
         // Bind the caller-resolved tier handle BEFORE the index is
         // moved into the registry so subsequent inserts persist f32
         // to disk per ADR-033. `None` keeps the index pure in-RAM
@@ -160,6 +172,161 @@ impl VectorIndexRegistry {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(key, def);
+    }
+
+    /// Build the [`HnswConfig`] for an index from its vector config + property
+    /// name. Shared by the Unsharded ([`Self::register_with_tier`]) and sharded
+    /// ([`Self::register_sharded`]) registration paths so every per-partition
+    /// graph uses identical parameters.
+    fn hnsw_config_from(config: &crate::index::VectorIndexConfig, property: &str) -> HnswConfig {
+        HnswConfig {
+            m: config.m,
+            m_max0: config.m * 2,
+            ef_construction: config.ef_construction,
+            ef_search: config.ef_search.unwrap_or(200),
+            metric: config.metric,
+            max_dimensions: config.dimensions,
+            quantization: config.quantization,
+            rerank_candidates: config.rerank_candidates.unwrap_or(100),
+            calibration_threshold: 1000,
+            offload_vectors: config.offload_vectors,
+            property_name: property.to_string(),
+            max_elements: 1_000_000,
+            ..HnswConfig::default()
+        }
+    }
+
+    /// Register a similarity-partitioned vector index: one empty HNSW graph per
+    /// partition, routed by `router`. The label is stored in [`Self::sharded`]
+    /// (not [`Self::indexes`]); the build path distributes vectors via
+    /// [`VectorShardRouter::assign`] (closure replication may write a boundary
+    /// vector to several partitions) and search scatter-gathers via
+    /// [`VectorShardRouter::route`] (adaptive fan-out), merging by ascending
+    /// score with dedup-by-id.
+    ///
+    /// `router.n_partitions()` graphs are created. The per-partition graphs are
+    /// in-RAM (truth-tier wiring for the sharded path is a follow-up); the
+    /// router (the partitioning intelligence) is injected, so the EE centroid
+    /// router plugs in here without the registry depending on EE.
+    ///
+    /// Uses interior mutability — safe to call via `&self`.
+    pub fn register_sharded(&self, def: IndexDefinition, router: Arc<dyn VectorShardRouter>) {
+        let Some(config) = def.vector_config.as_ref() else {
+            tracing::error!(
+                "register_sharded called with non-vector IndexDefinition: {}",
+                def.name
+            );
+            return;
+        };
+        let n = router.n_partitions().max(1);
+        let shards: Vec<HnswHandle> = (0..n)
+            .map(|_| {
+                Arc::new(RwLock::new(HnswIndex::new(Self::hnsw_config_from(
+                    config,
+                    def.property(),
+                ))))
+            })
+            .collect();
+
+        let key = (def.label.clone(), def.property().to_string());
+        self.sharded
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), ShardedLayout { shards, router });
+        self.health
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), HealthSignal::new_ready());
+        self.definitions
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, def);
+    }
+
+    /// Whether `(label, property)` is a similarity-partitioned (sharded) index.
+    /// When `true`, build / search / insert route through the per-partition
+    /// layout; when `false`, the single-graph Unsharded path is used,
+    /// bit-identical to a registry with no sharding.
+    pub fn is_sharded(&self, label: &str, property: &str) -> bool {
+        self.sharded
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&(label.to_string(), property.to_string()))
+    }
+
+    /// Scatter-gather search over a sharded layout: route the query to its
+    /// partitions, search each routed partition for `k`, then merge by
+    /// ascending score keeping the best occurrence of each id (a vector
+    /// replicated across partitions by closure replication appears once).
+    /// `loader` is forwarded to each partition for disk-backed f32 rerank.
+    fn search_sharded(
+        &self,
+        layout: &ShardedLayout,
+        query: &[f32],
+        k: usize,
+        loader: Option<&dyn VectorLoader>,
+    ) -> Vec<SearchResult> {
+        let parts = layout.router.route(query, layout.shards.len());
+        let mut best: HashMap<u64, f32> = HashMap::new();
+        for &p in &parts {
+            let Some(handle) = layout.shards.get(p as usize) else {
+                continue;
+            };
+            let Ok(hnsw) = handle.read() else {
+                continue;
+            };
+            let results = match loader {
+                Some(l) => hnsw.search_with_loader(query, k, l),
+                None => hnsw.search(query, k),
+            };
+            for r in results {
+                best.entry(r.id)
+                    .and_modify(|s| {
+                        if r.score < *s {
+                            *s = r.score;
+                        }
+                    })
+                    .or_insert(r.score);
+            }
+        }
+        let mut out: Vec<SearchResult> = best
+            .into_iter()
+            .map(|(id, score)| SearchResult { id, score })
+            .collect();
+        out.sort_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out.truncate(k);
+        out
+    }
+
+    /// Distribute a batch of vectors into a sharded layout: group by assigned
+    /// partition (closure replication clones a boundary vector into each), then
+    /// `insert_batch` once per partition under a single write lock. Returns the
+    /// number of distinct vectors (not insertions). Reused by the build and
+    /// incremental-write paths.
+    fn insert_batch_sharded(layout: &ShardedLayout, items: Vec<(u64, Vec<f32>)>) -> usize {
+        let n = layout.shards.len();
+        let mut per_shard: Vec<Vec<(u64, Vec<f32>)>> = (0..n).map(|_| Vec::new()).collect();
+        let count = items.len();
+        for (id, vec) in items {
+            for &p in &layout.router.assign(&vec) {
+                if (p as usize) < n {
+                    per_shard[p as usize].push((id, vec.clone()));
+                }
+            }
+        }
+        for (p, batch) in per_shard.into_iter().enumerate() {
+            if batch.is_empty() {
+                continue;
+            }
+            if let Ok(mut hnsw) = layout.shards[p].write() {
+                hnsw.insert_batch(batch);
+            }
+        }
+        count
     }
 
     /// Register an index with a pre-built HNSW graph (e.g. after rebuild).
@@ -187,6 +354,10 @@ impl VectorIndexRegistry {
     pub fn unregister(&self, label: &str, property: &str) {
         let key = (label.to_string(), property.to_string());
         self.indexes
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        self.sharded
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&key);
@@ -350,25 +521,39 @@ impl VectorIndexRegistry {
             .collect()
     }
 
-    /// Check if a vector index exists for a (label, property).
+    /// Check if a vector index exists for a (label, property), in either the
+    /// Unsharded or the sharded layout.
     pub fn has_index(&self, label: &str, property: &str) -> bool {
+        let key = (label.to_string(), property.to_string());
         self.indexes
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&(label.to_string(), property.to_string()))
+            .contains_key(&key)
+            || self
+                .sharded
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&key)
     }
 
-    /// Number of registered vector indexes.
+    /// Number of registered vector indexes (Unsharded + sharded). A sharded
+    /// label counts once, not once per partition.
     pub fn len(&self) -> usize {
         self.indexes.read().unwrap_or_else(|e| e.into_inner()).len()
+            + self.sharded.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// Whether the registry is empty.
+    /// Whether the registry is empty (no Unsharded and no sharded indexes).
     pub fn is_empty(&self) -> bool {
         self.indexes
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty()
+            && self
+                .sharded
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
     }
 
     /// Iterate over all registered index definitions, calling `f` for each.
@@ -411,6 +596,13 @@ impl VectorIndexRegistry {
     /// write-lock across the whole batch instead of paying it per
     /// inserted vector.
     pub fn on_vector_written(&self, label: &str, node_id: NodeId, property: &str, vector: &[f32]) {
+        {
+            let sharded = self.sharded.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(layout) = sharded.get(&(label.to_string(), property.to_string())) {
+                Self::insert_batch_sharded(layout, vec![(node_id.as_raw(), vector.to_vec())]);
+                return;
+            }
+        }
         if let Some(handle) = self.get(label, property) {
             if let Ok(mut hnsw) = handle.write() {
                 hnsw.insert(node_id.as_raw(), vector.to_vec());
@@ -433,6 +625,15 @@ impl VectorIndexRegistry {
     pub fn on_vectors_written(&self, label: &str, property: &str, items: Vec<(NodeId, Vec<f32>)>) {
         if items.is_empty() {
             return;
+        }
+        {
+            let sharded = self.sharded.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(layout) = sharded.get(&(label.to_string(), property.to_string())) {
+                let batch: Vec<(u64, Vec<f32>)> =
+                    items.into_iter().map(|(id, v)| (id.as_raw(), v)).collect();
+                Self::insert_batch_sharded(layout, batch);
+                return;
+            }
         }
         if let Some(handle) = self.get(label, property) {
             if let Ok(mut hnsw) = handle.write() {
@@ -466,6 +667,12 @@ impl VectorIndexRegistry {
         query: &[f32],
         k: usize,
     ) -> Option<Vec<SearchResult>> {
+        {
+            let sharded = self.sharded.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(layout) = sharded.get(&(label.to_string(), property.to_string())) {
+                return Some(self.search_sharded(layout, query, k, None));
+            }
+        }
         let handle = self.get(label, property)?;
         let hnsw = handle.read().ok()?;
         Some(hnsw.search(query, k))
@@ -484,6 +691,12 @@ impl VectorIndexRegistry {
         k: usize,
         loader: Option<&dyn VectorLoader>,
     ) -> Option<Vec<SearchResult>> {
+        {
+            let sharded = self.sharded.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(layout) = sharded.get(&(label.to_string(), property.to_string())) {
+                return Some(self.search_sharded(layout, query, k, loader));
+            }
+        }
         let handle = self.get(label, property)?;
         let hnsw = handle.read().ok()?;
         if let Some(loader) = loader {
@@ -540,6 +753,12 @@ impl VectorIndexRegistry {
         property: &str,
         vectors: impl Iterator<Item = (u64, Vec<f32>)>,
     ) -> usize {
+        {
+            let sharded = self.sharded.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(layout) = sharded.get(&(label.to_string(), property.to_string())) {
+                return Self::insert_batch_sharded(layout, vectors.collect());
+            }
+        }
         let handle = match self.get(label, property) {
             Some(h) => h,
             None => return 0,
@@ -567,7 +786,40 @@ impl Default for VectorIndexRegistry {
 mod tests {
     use super::*;
     use crate::index::VectorIndexConfig;
+    use coordinode_cluster::{PartitionSet, VectorShardRouter};
     use coordinode_core::graph::types::VectorMetric;
+    use std::sync::Arc;
+
+    /// Test-double router: two partitions split on the sign of the first
+    /// coordinate; a near-zero first coordinate (`|x| < 0.5`) is a boundary
+    /// point replicated to BOTH partitions (closure replication) and a
+    /// boundary query fans out to both (adaptive fan-out). Deterministic, no
+    /// EE dependency.
+    struct TwoPartitionRouter;
+
+    impl VectorShardRouter for TwoPartitionRouter {
+        fn assign(&self, v: &[f32]) -> PartitionSet {
+            let x = v.first().copied().unwrap_or(0.0);
+            let mut s = PartitionSet::new();
+            if x.abs() < 0.5 {
+                s.push(0);
+                s.push(1);
+            } else if x < 0.0 {
+                s.push(0);
+            } else {
+                s.push(1);
+            }
+            s
+        }
+
+        fn route(&self, q: &[f32], _top_m: usize) -> PartitionSet {
+            self.assign(q)
+        }
+
+        fn n_partitions(&self) -> usize {
+            2
+        }
+    }
 
     fn test_config() -> VectorIndexConfig {
         VectorIndexConfig {
@@ -732,5 +984,100 @@ mod tests {
         let reg = VectorIndexRegistry::new();
         let results = reg.search("Movie", "embedding", &[1.0, 0.0, 0.0], 10);
         assert!(results.is_none());
+    }
+
+    #[test]
+    fn register_sharded_marks_label_sharded() {
+        let reg = VectorIndexRegistry::new();
+        reg.register_sharded(
+            IndexDefinition::hnsw("emb", "Doc", "embedding", test_config()),
+            Arc::new(TwoPartitionRouter),
+        );
+        assert!(reg.is_sharded("Doc", "embedding"));
+        assert!(reg.has_index("Doc", "embedding"));
+        // A sharded key lives in the sharded map, not the single-index map.
+        assert!(reg.get("Doc", "embedding").is_none());
+        assert_eq!(reg.len(), 1);
+
+        // Unregister clears the sharded entry too.
+        reg.unregister("Doc", "embedding");
+        assert!(!reg.is_sharded("Doc", "embedding"));
+        assert!(!reg.has_index("Doc", "embedding"));
+    }
+
+    #[test]
+    fn unsharded_register_is_not_sharded() {
+        let reg = VectorIndexRegistry::new();
+        reg.register(IndexDefinition::hnsw(
+            "emb",
+            "Doc",
+            "embedding",
+            test_config(),
+        ));
+        assert!(!reg.is_sharded("Doc", "embedding"));
+        assert!(reg.get("Doc", "embedding").is_some());
+    }
+
+    #[test]
+    fn sharded_search_matches_single_index_top1() {
+        let vectors = [
+            (1u64, vec![-1.0, 0.0, 0.0]),
+            (2, vec![-0.9, 0.1, 0.0]),
+            (3, vec![-0.8, 0.0, 0.1]),
+            (4, vec![1.0, 0.0, 0.0]),
+            (5, vec![0.9, 0.1, 0.0]),
+            (6, vec![0.8, 0.0, 0.1]),
+        ];
+
+        // Single-index baseline.
+        let single = VectorIndexRegistry::new();
+        single.register(IndexDefinition::hnsw(
+            "emb",
+            "Doc",
+            "embedding",
+            test_config(),
+        ));
+        single.bulk_insert("Doc", "embedding", vectors.iter().cloned());
+
+        // Sharded index, 2 partitions split on the first-coord sign.
+        let sharded = VectorIndexRegistry::new();
+        sharded.register_sharded(
+            IndexDefinition::hnsw("emb", "Doc", "embedding", test_config()),
+            Arc::new(TwoPartitionRouter),
+        );
+        sharded.bulk_insert("Doc", "embedding", vectors.iter().cloned());
+
+        for q in [vec![-1.0, 0.0, 0.0], vec![1.0, 0.0, 0.0]] {
+            let base = single.search("Doc", "embedding", &q, 1).unwrap();
+            let sh = sharded.search("Doc", "embedding", &q, 1).unwrap();
+            assert_eq!(sh.len(), 1);
+            assert_eq!(
+                sh[0].id, base[0].id,
+                "sharded top-1 must match the single-index baseline"
+            );
+        }
+    }
+
+    #[test]
+    fn sharded_dedup_replicated_boundary_id() {
+        let reg = VectorIndexRegistry::new();
+        reg.register_sharded(
+            IndexDefinition::hnsw("emb", "Doc", "embedding", test_config()),
+            Arc::new(TwoPartitionRouter),
+        );
+        // id 7 sits on the boundary (|x| < 0.5) -> replicated into BOTH
+        // partitions; id 4 lands only in the positive partition.
+        reg.bulk_insert(
+            "Doc",
+            "embedding",
+            [(4u64, vec![1.0, 0.0, 0.0]), (7, vec![0.0, 1.0, 0.0])].into_iter(),
+        );
+        // The boundary query fans out to both partitions, so id 7 is found in
+        // each; the merge must dedup it to a single result.
+        let results = reg
+            .search("Doc", "embedding", &[0.0, 1.0, 0.0], 10)
+            .unwrap();
+        let sevens = results.iter().filter(|r| r.id == 7).count();
+        assert_eq!(sevens, 1, "a replicated id must appear once after merge");
     }
 }
