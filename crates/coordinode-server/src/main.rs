@@ -595,6 +595,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     maintenance: Default::default(),
                     cors: Default::default(),
                     logging: Default::default(),
+                    streaming: Default::default(),
                     metrics_classes: vec![],
                     forwarded_headers: vec![
                         "authorization".into(),
