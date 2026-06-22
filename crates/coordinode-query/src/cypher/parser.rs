@@ -1422,6 +1422,7 @@ fn build_create_vector_index_clause(
     let mut online_during_build: Option<String> = None;
     let mut ef_search: Option<usize> = None;
     let mut rerank_candidates: Option<usize> = None;
+    let mut extension_tail: Option<String> = None;
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
@@ -1458,6 +1459,9 @@ fn build_create_vector_index_clause(
                     }
                 }
             }
+            Rule::extension_tail => {
+                extension_tail = Some(inner.as_str().trim().to_string());
+            }
             _ => {}
         }
     }
@@ -1480,6 +1484,7 @@ fn build_create_vector_index_clause(
         online_during_build,
         ef_search,
         rerank_candidates,
+        extension_tail,
     })
 }
 

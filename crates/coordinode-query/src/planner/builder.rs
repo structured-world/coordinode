@@ -81,6 +81,9 @@ pub enum PlanError {
 
     #[error("doc_score() cannot appear in {location} — it is a correlated aggregate over HAS_CHUNK children")]
     DocScoreIllegalPosition { location: String },
+
+    #[error("failed to encode extension-op payload: {0}")]
+    ExtensionPayloadEncode(String),
 }
 
 /// Build a logical plan from a validated Cypher AST.
@@ -608,6 +611,20 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             name: c.name.clone(),
         }),
         Clause::CreateVectorIndex(c) => {
+            // A trailing extension clause (e.g. an engine-extension's `SHARDED BY
+            // ...`) after the known CREATE VECTOR INDEX syntax routes to an
+            // extension handler: serialize the parsed clause (params + raw tail)
+            // as the opaque payload and emit an Extension op. The base engine
+            // registers no handler, so this errors clearly at execution; an
+            // extension layer parses the tail in its own handler.
+            if c.extension_tail.is_some() {
+                let payload = rmp_serde::to_vec(c)
+                    .map_err(|e| PlanError::ExtensionPayloadEncode(e.to_string()))?;
+                return Ok(LogicalOp::Extension {
+                    name: "vector_index.create_ext".to_string(),
+                    payload,
+                });
+            }
             let metric = parse_vector_metric(c.metric.as_deref());
             let quantization = parse_quantization_codec(c.quantization.as_deref());
             let online_during_build = match c
@@ -4961,6 +4978,32 @@ mod tests {
 
     fn plan_root(input: &str) -> LogicalOp {
         plan(input).root
+    }
+
+    #[test]
+    fn create_vector_index_extension_tail_routes_to_extension_op() {
+        // Plain create (no trailing clause) stays a CreateVectorIndex op.
+        assert!(matches!(
+            plan_root("CREATE VECTOR INDEX foo ON :Doc(embedding) OPTIONS {m: 16}"),
+            LogicalOp::CreateVectorIndex { .. }
+        ));
+
+        // A trailing extension clause routes to an Extension op whose opaque
+        // payload round-trips the parsed clause (params + the verbatim tail).
+        let root = plan_root("CREATE VECTOR INDEX foo ON :Doc(embedding) SHARDED BY CENTROID(8)");
+        let LogicalOp::Extension { name, payload } = &root else {
+            panic!("expected Extension op, got {root:?}");
+        };
+        assert_eq!(name, "vector_index.create_ext");
+        let decoded: crate::cypher::ast::CreateVectorIndexClause =
+            rmp_serde::from_slice(payload).expect("extension payload decodes");
+        assert_eq!(decoded.name, "foo");
+        assert_eq!(decoded.label, "Doc");
+        assert_eq!(decoded.property, "embedding");
+        assert_eq!(
+            decoded.extension_tail.as_deref(),
+            Some("SHARDED BY CENTROID(8)")
+        );
     }
 
     // -- Basic MATCH → NodeScan --

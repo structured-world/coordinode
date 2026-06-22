@@ -195,11 +195,18 @@ drop_encrypted_index_clause = { kw_drop ~ kw_encrypted ~ kw_index ~ identifier }
 create_vector_index_clause = {
     kw_create ~ kw_vector ~ kw_index ~ identifier ~ kw_on ~ ":" ~ identifier ~ "(" ~ identifier ~ ")"
     ~ (kw_options ~ vector_index_options)?
+    ~ extension_tail?
 }
 
 // Vector index OPTIONS map: { key: value, ... }
 vector_index_options = { "{" ~ vector_index_option ~ ("," ~ vector_index_option)* ~ ","? ~ "}" }
 vector_index_option  = { identifier ~ ":" ~ (float_literal | integer_literal | string_literal) }
+
+// Opaque trailing clause: any text after the engine-known CREATE VECTOR INDEX
+// clauses, captured verbatim (atomic, so internal whitespace is preserved) for
+// an extension handler to parse. The base engine registers no handler, so a
+// non-empty tail surfaces as an unsupported-extension error at execution.
+extension_tail = @{ (!EOI ~ ANY)+ }
 
 // DROP VECTOR INDEX idx_name
 drop_vector_index_clause = { kw_drop ~ kw_vector ~ kw_index ~ identifier }

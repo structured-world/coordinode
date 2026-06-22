@@ -273,7 +273,7 @@ pub struct DropIndexClause {
 ///
 /// Creates an HNSW approximate nearest-neighbor index for vector similarity search.
 /// After creation, `VectorTopK` plans use HnswScan instead of brute-force O(N) scan.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CreateVectorIndexClause {
     /// Index name.
     pub name: String,
@@ -312,6 +312,11 @@ pub struct CreateVectorIndexClause {
     /// Number of approximate candidates re-scored with exact f32 distance
     /// before returning top-k (default: 100).
     pub rerank_candidates: Option<usize>,
+    /// Verbatim trailing clause after the engine-known syntax, captured by the
+    /// `extension_tail` grammar rule. `None` for a plain `CREATE VECTOR INDEX`;
+    /// `Some(raw)` when an extension layer's clause (parsed by its own handler)
+    /// follows. The planner routes a `Some` to a `LogicalOp::Extension`.
+    pub extension_tail: Option<String>,
 }
 
 /// CREATE EDGE TYPE clause.
