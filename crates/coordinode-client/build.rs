@@ -22,28 +22,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;
     let proto_root_path = std::path::Path::new(&manifest_dir).join("../../proto");
 
-    // Guard against un-initialised proto submodule (release-plz temp worktrees,
-    // shallow clones without --recurse-submodules, CI without submodule init, etc.).
-    // Use a sentinel file that only exists when the submodule is checked out.
+    // The generated proto bindings are a pure build artifact: regenerated from
+    // the proto submodule on every build, never committed. Require the submodule
+    // so a fresh checkout fails loudly here instead of silently compiling against
+    // stale, drifted bindings. A sentinel file only exists when it is checked out.
     let sentinel = proto_root_path.join("coordinode/v1/query/cypher.proto");
     if !sentinel.exists() {
-        // Copy pre-generated files (committed in proto_gen/) to OUT_DIR so that
-        // the `include!()` macros in lib.rs compile without a live proto submodule.
-        // These files must be regenerated when proto changes (run `cargo build -p
-        // coordinode-client` and copy target/debug/build/coordinode-client-*/out/
-        // coordinode.v1.*.rs to crates/coordinode-client/proto_gen/).
-        let out_dir = std::env::var("OUT_DIR")?;
-        let fallback_dir = std::path::Path::new(&manifest_dir).join("proto_gen");
-        for entry in std::fs::read_dir(&fallback_dir)? {
-            let entry = entry?;
-            let dest = std::path::Path::new(&out_dir).join(entry.file_name());
-            std::fs::copy(entry.path(), dest)?;
-        }
-        return Ok(());
+        return Err(format!(
+            "proto submodule is not checked out (missing {}). \
+             Run `git submodule update --init --recursive`.",
+            sentinel.display()
+        )
+        .into());
     }
 
     let proto_root = canonicalize_for_protoc(&proto_root_path);
     let proto_root_str = proto_root.display().to_string();
+
+    // Regenerate whenever any `.proto` under the submodule changes. Without this,
+    // cargo never re-runs build.rs after the submodule is updated (the proto tree
+    // lives outside the crate), so the OUT_DIR bindings silently go stale.
+    println!("cargo:rerun-if-changed={proto_root_str}/coordinode");
 
     let mut includes = vec![proto_root_str.clone()];
     for candidate in [
