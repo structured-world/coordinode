@@ -13876,9 +13876,6 @@ fn execute_create_vector_index(
         offload_vectors: false,
         ef_search,
         rerank_candidates,
-        // Unsharded until a SHARD STRATEGY option / ALTER wires it; changing
-        // it later re-shards the label online.
-        shard_strategy: Default::default(),
     };
     let mut def = crate::index::IndexDefinition::hnsw(name, label, property, config);
     def.online_during_build = online_during_build;

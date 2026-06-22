@@ -5,7 +5,6 @@ pub mod health;
 pub mod hnsw;
 pub mod metrics;
 pub mod quantize;
-pub mod shard_strategy;
 pub mod storage;
 
 pub use build_scheduler::{BuildPermit, HnswBuildScheduler, Priority};

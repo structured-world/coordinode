@@ -9315,7 +9315,6 @@ fn setup_rrf_indices(
         offload_vectors: false,
         ef_search: None,
         rerank_candidates: None,
-        shard_strategy: Default::default(),
     };
     let vec_def = IndexDefinition::hnsw(
         format!("{label}_{vector_prop}_idx"),
@@ -11020,7 +11019,6 @@ fn hnsw_scan_executor_returns_index_top_k() {
                 offload_vectors: false,
                 ef_search: None,
                 rerank_candidates: None,
-                shard_strategy: Default::default(),
             },
         ),
         hnsw,

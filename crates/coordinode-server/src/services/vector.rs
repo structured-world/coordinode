@@ -478,7 +478,6 @@ mod tests {
             offload_vectors: false,
             ef_search: None,
             rerank_candidates: None,
-            shard_strategy: Default::default(),
         };
         database.create_vector_index("test_vec_idx", label, property, config);
 

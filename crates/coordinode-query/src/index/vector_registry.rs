@@ -579,7 +579,6 @@ mod tests {
             offload_vectors: false,
             ef_search: None,
             rerank_candidates: None,
-            shard_strategy: Default::default(),
         }
     }
 
