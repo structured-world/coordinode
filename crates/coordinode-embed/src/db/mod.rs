@@ -1773,6 +1773,10 @@ impl Database {
             text_index_registry: Some(&self.text_index_registry),
             vector_index_registry: Some(&self.vector_index_registry),
             btree_index_registry: Some(&self.index_registry),
+            // CE registers no extension-op handlers; the EE server populates
+            // this so its parser/executor extensions (e.g. sharded vector
+            // indexes) dispatch. CE path leaves it unset.
+            extensions: None,
             vector_loader: Some(&vector_loader),
             mvcc_oracle: Some(&self.oracle),
             mvcc_read_ts: read_ts,

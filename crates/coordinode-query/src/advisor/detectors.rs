@@ -348,7 +348,8 @@ fn detect_vector_without_prefilter(op: &LogicalOp, suggestions: &mut Vec<Suggest
 /// Get direct children of an operator for recursive traversal.
 fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
     match op {
-        LogicalOp::NodeScan { .. }
+        LogicalOp::Extension { .. }
+        | LogicalOp::NodeScan { .. }
         | LogicalOp::HnswScan { .. }
         | LogicalOp::Empty
         | LogicalOp::ProcedureCall { .. }

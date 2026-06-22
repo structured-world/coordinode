@@ -137,6 +137,12 @@ pub enum NumericCmp {
 /// A logical operator in the query plan tree.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalOp {
+    /// An extension operator dispatched to a registered `ExtensionHandler`
+    /// (the EE server registers handlers at startup). `name` selects the
+    /// handler; `payload` is the opaque, extension-defined config the
+    /// parser-extension produced. CE registers no handlers, so this variant
+    /// never appears in a plan built by a pure-CE engine.
+    Extension { name: String, payload: Vec<u8> },
     /// Scan all nodes, optionally filtered by label.
     /// Produced from MATCH (n:Label).
     NodeScan {
@@ -799,6 +805,8 @@ impl LogicalOp {
     /// Replace all `Expr::Parameter` nodes in this operator tree with literal values.
     pub fn substitute_params(&mut self, params: &HashMap<String, Value>) {
         match self {
+            // Opaque extension payload carries no Expr params to substitute.
+            LogicalOp::Extension { .. } => {}
             LogicalOp::NodeScan {
                 property_filters, ..
             } => {
@@ -1289,6 +1297,9 @@ fn estimate_op_cost(
     hints: &mut Vec<String>,
 ) -> (f64, f64) {
     match op {
+        // Extension ops are EE-handled and never appear in a CE plan; give the
+        // planner a trivial, neutral cost estimate.
+        LogicalOp::Extension { .. } => (1.0, 1.0),
         LogicalOp::NodeScan {
             labels,
             property_filters,
@@ -1730,6 +1741,9 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
     let prefix = "  ".repeat(indent);
 
     match op {
+        LogicalOp::Extension { name, .. } => {
+            output.push_str(&format!("{prefix}Extension({name})\n"));
+        }
         LogicalOp::NodeScan {
             variable, labels, ..
         } => {

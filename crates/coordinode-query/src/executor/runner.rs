@@ -240,6 +240,57 @@ impl WriteStats {
 /// When `mvcc_oracle` is `None`, the executor operates in legacy mode
 /// (direct engine reads/writes without MVCC versioning) for backward
 /// compatibility with existing tests.
+/// A registered handler for an extension operator ([`LogicalOp::Extension`]).
+/// The CE engine carries an empty [`ExtensionRegistry`] by default; the EE
+/// server registers handlers at startup so the executor can dispatch extension
+/// ops without any CE crate depending on EE. The handler decodes the opaque
+/// `payload` the parser-extension produced for its named op.
+pub trait ExtensionHandler: Send + Sync {
+    /// Execute the named extension op against the opaque `payload`.
+    fn execute(
+        &self,
+        ctx: &mut ExecutionContext<'_>,
+        payload: &[u8],
+    ) -> Result<Vec<Row>, ExecutionError>;
+}
+
+/// Registry of [`ExtensionHandler`]s keyed by op name. CE default is empty (no
+/// extensions registered, so [`LogicalOp::Extension`] never appears in a CE
+/// plan); the EE server populates it once at startup and shares it by
+/// reference into every [`ExecutionContext`]. Lookup is one hash probe on the
+/// cold extension path; the query hot path never touches it.
+#[derive(Default)]
+pub struct ExtensionRegistry {
+    handlers: std::collections::HashMap<String, std::sync::Arc<dyn ExtensionHandler>>,
+}
+
+impl ExtensionRegistry {
+    /// Create an empty registry (the CE default).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register `handler` under `name`; a later registration with the same
+    /// name replaces the earlier one.
+    pub fn register(
+        &mut self,
+        name: impl Into<String>,
+        handler: std::sync::Arc<dyn ExtensionHandler>,
+    ) {
+        self.handlers.insert(name.into(), handler);
+    }
+
+    /// Look up (and clone the `Arc` of) the handler registered under `name`.
+    pub fn get(&self, name: &str) -> Option<std::sync::Arc<dyn ExtensionHandler>> {
+        self.handlers.get(name).cloned()
+    }
+
+    /// Whether no handlers are registered (the CE default state).
+    pub fn is_empty(&self) -> bool {
+        self.handlers.is_empty()
+    }
+}
+
 pub struct ExecutionContext<'a> {
     pub engine: &'a StorageEngine,
     /// Optional `Arc` handle to the same engine the borrow above points at.
@@ -295,6 +346,10 @@ pub struct ExecutionContext<'a> {
     /// When set, `execute_create_node` calls `on_node_created` to check
     /// unique constraints and maintain B-tree index entries.
     pub btree_index_registry: Option<&'a crate::index::IndexRegistry>,
+    /// Registry of extension-op handlers (EE-populated, CE default empty).
+    /// Reached only by the [`LogicalOp::Extension`] dispatch arm; `None` /
+    /// empty in pure-CE contexts means no extension ops are dispatchable.
+    pub extensions: Option<&'a ExtensionRegistry>,
     /// Optional VectorLoader for disk-backed f32 reranking (G009).
     /// When HNSW indexes have `offload_vectors` enabled, this loader provides
     /// f32 vectors from storage for exact reranking of SQ8 candidates.
@@ -1909,6 +1964,17 @@ pub fn execute_no_commit(
 /// Execute a single logical operator recursively.
 fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>, ExecutionError> {
     match op {
+        // Extension ops are dispatched to the registered handler by name. The
+        // Arc is cloned out first so the registry borrow ends before the
+        // handler takes `&mut ctx`. CE registers no handlers, so an Extension
+        // op without a registered handler is a clear error rather than silent.
+        LogicalOp::Extension { name, payload } => {
+            let handler = ctx.extensions.and_then(|r| r.get(name)).ok_or_else(|| {
+                ExecutionError::Unsupported(format!("no handler for extension op: {name}"))
+            })?;
+            handler.execute(ctx, payload)
+        }
+
         LogicalOp::NodeScan {
             variable,
             labels,
@@ -14572,6 +14638,7 @@ mod tests {
             text_index_registry: None,
             vector_index_registry: None,
             btree_index_registry: None,
+            extensions: None,
             vector_loader: None,
             mvcc_oracle: None,
             mvcc_read_ts: coordinode_core::txn::timestamp::Timestamp::ZERO,
@@ -14610,6 +14677,68 @@ mod tests {
             params: std::collections::HashMap::new(),
             pending_vector_writes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn extension_op_dispatches_to_registered_handler() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct RecordingHandler {
+            called: Arc<AtomicBool>,
+        }
+        impl ExtensionHandler for RecordingHandler {
+            fn execute(
+                &self,
+                _ctx: &mut ExecutionContext<'_>,
+                payload: &[u8],
+            ) -> Result<Vec<Row>, ExecutionError> {
+                self.called.store(true, Ordering::SeqCst);
+                // One row per payload byte: proves the opaque payload reaches
+                // the handler intact through the dispatch arm.
+                Ok((0..payload.len()).map(|_| Row::new()).collect())
+            }
+        }
+
+        let (_dir, engine, mut interner) = setup_test_graph();
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+
+        let called = Arc::new(AtomicBool::new(false));
+        let mut registry = ExtensionRegistry::new();
+        registry.register(
+            "ee.create_index.sharded",
+            Arc::new(RecordingHandler {
+                called: Arc::clone(&called),
+            }),
+        );
+
+        let mut ctx = ExecutionContext {
+            extensions: Some(&registry),
+            ..make_ctx(&engine, &mut interner, &allocator)
+        };
+
+        // A registered handler runs and receives the opaque payload.
+        let op = LogicalOp::Extension {
+            name: "ee.create_index.sharded".to_string(),
+            payload: vec![7, 8, 9],
+        };
+        let rows = execute_op(&op, &mut ctx).expect("registered extension handler runs");
+        assert!(called.load(Ordering::SeqCst), "handler was invoked");
+        assert_eq!(
+            rows.len(),
+            3,
+            "payload (3 bytes) reached the handler intact"
+        );
+
+        // An unknown op errors clearly — the CE default registers no handlers,
+        // so this is the state of a pure-CE engine seeing an extension op.
+        let unknown = LogicalOp::Extension {
+            name: "ee.nonexistent".to_string(),
+            payload: vec![],
+        };
+        assert!(matches!(
+            execute_op(&unknown, &mut ctx).unwrap_err(),
+            ExecutionError::Unsupported(_)
+        ));
     }
 
     // -- NodeScan --
