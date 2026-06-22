@@ -254,6 +254,38 @@ impl VectorIndexRegistry {
             .contains_key(&(label.to_string(), property.to_string()))
     }
 
+    /// Fold one partition's hits into the cross-partition best-by-id map,
+    /// keeping the minimum score (closest occurrence) for an id seen in more
+    /// than one partition (closure replication). `SearchResult.score` is a
+    /// distance, so smaller wins.
+    fn accumulate_best(best: &mut HashMap<u64, f32>, results: Vec<SearchResult>) {
+        for r in results {
+            best.entry(r.id)
+                .and_modify(|s| {
+                    if r.score < *s {
+                        *s = r.score;
+                    }
+                })
+                .or_insert(r.score);
+        }
+    }
+
+    /// Materialise the merged best-by-id map into the final top-`k`: ascending
+    /// by score (distance), truncated to `k`.
+    fn finalize_merge(best: HashMap<u64, f32>, k: usize) -> Vec<SearchResult> {
+        let mut out: Vec<SearchResult> = best
+            .into_iter()
+            .map(|(id, score)| SearchResult { id, score })
+            .collect();
+        out.sort_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out.truncate(k);
+        out
+    }
+
     /// Scatter-gather search over a sharded layout: route the query to its
     /// partitions, search each routed partition for `k`, then merge by
     /// ascending score keeping the best occurrence of each id (a vector
@@ -279,27 +311,47 @@ impl VectorIndexRegistry {
                 Some(l) => hnsw.search_with_loader(query, k, l),
                 None => hnsw.search(query, k),
             };
-            for r in results {
-                best.entry(r.id)
-                    .and_modify(|s| {
-                        if r.score < *s {
-                            *s = r.score;
-                        }
-                    })
-                    .or_insert(r.score);
-            }
+            Self::accumulate_best(&mut best, results);
         }
-        let mut out: Vec<SearchResult> = best
-            .into_iter()
-            .map(|(id, score)| SearchResult { id, score })
-            .collect();
-        out.sort_by(|a, b| {
-            a.score
-                .partial_cmp(&b.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        out.truncate(k);
-        out
+        Self::finalize_merge(best, k)
+    }
+
+    /// Scatter-gather filtered (ACORN-style) search over a sharded layout: the
+    /// same `is_visible` predicate runs on every routed partition, results
+    /// merge by ascending score with dedup-by-id. The predicate is keyed by
+    /// node id, so it is partition-independent and shared by reference across
+    /// the routed partitions.
+    fn search_visibility_sharded<F>(
+        &self,
+        layout: &ShardedLayout,
+        query: &[f32],
+        k: usize,
+        overfetch_factor: f64,
+        max_expansion_rounds: usize,
+        is_visible: F,
+    ) -> Vec<SearchResult>
+    where
+        F: Fn(u64) -> bool,
+    {
+        let parts = layout.router.route(query, layout.shards.len());
+        let mut best: HashMap<u64, f32> = HashMap::new();
+        for &p in &parts {
+            let Some(handle) = layout.shards.get(p as usize) else {
+                continue;
+            };
+            let Ok(hnsw) = handle.read() else {
+                continue;
+            };
+            let (results, _stats) = hnsw.search_with_visibility(
+                query,
+                k,
+                overfetch_factor,
+                max_expansion_rounds,
+                &is_visible,
+            );
+            Self::accumulate_best(&mut best, results);
+        }
+        Self::finalize_merge(best, k)
     }
 
     /// Distribute a batch of vectors into a sharded layout: group by assigned
@@ -730,6 +782,19 @@ impl VectorIndexRegistry {
     where
         F: Fn(u64) -> bool,
     {
+        {
+            let sharded = self.sharded.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(layout) = sharded.get(&(label.to_string(), property.to_string())) {
+                return Some(self.search_visibility_sharded(
+                    layout,
+                    query,
+                    k,
+                    overfetch_factor,
+                    max_expansion_rounds,
+                    is_visible,
+                ));
+            }
+        }
         let handle = self.get(label, property)?;
         let hnsw = handle.read().ok()?;
         let (results, _stats) = hnsw.search_with_visibility(
@@ -1079,5 +1144,50 @@ mod tests {
             .unwrap();
         let sevens = results.iter().filter(|r| r.id == 7).count();
         assert_eq!(sevens, 1, "a replicated id must appear once after merge");
+    }
+
+    #[test]
+    fn sharded_search_with_visibility_filters_hidden_ids() {
+        let reg = VectorIndexRegistry::new();
+        reg.register_sharded(
+            IndexDefinition::hnsw("emb", "Doc", "embedding", test_config()),
+            Arc::new(TwoPartitionRouter),
+        );
+        reg.bulk_insert(
+            "Doc",
+            "embedding",
+            [
+                (1u64, vec![-1.0, 0.0, 0.0]),
+                (2, vec![-0.9, 0.1, 0.0]),
+                (4, vec![1.0, 0.0, 0.0]),
+            ]
+            .into_iter(),
+        );
+
+        // The query routes to the negative partition {1, 2}. Hiding id 1 must
+        // prune it from the scatter-gathered, merged result.
+        let filtered = reg
+            .search_with_visibility("Doc", "embedding", &[-1.0, 0.0, 0.0], 5, 2.0, 4, |id| {
+                id != 1
+            })
+            .unwrap();
+        assert!(
+            filtered.iter().all(|r| r.id != 1),
+            "hidden id must not appear in sharded filtered search"
+        );
+        assert!(
+            filtered.iter().any(|r| r.id == 2),
+            "a visible neighbour is still returned"
+        );
+
+        // Unfiltered, the exact match (id 1) is the top hit through the
+        // sharded visibility path.
+        let unfiltered = reg
+            .search_with_visibility("Doc", "embedding", &[-1.0, 0.0, 0.0], 5, 2.0, 4, |_| true)
+            .unwrap();
+        assert_eq!(
+            unfiltered[0].id, 1,
+            "unfiltered sharded top-1 is the exact match"
+        );
     }
 }
