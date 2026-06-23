@@ -21,6 +21,11 @@ fn make_full_entry() -> OplogEntry {
                 key: b"k".to_vec(),
                 operand: b"delta".to_vec(),
             },
+            OplogOp::RemoveRange {
+                partition: 4,
+                start: b"adj:T:out:\x00\x00\x00\x01".to_vec(),
+                end: b"adj:T:out:\x00\x00\x00\x05".to_vec(),
+            },
             OplogOp::Noop,
         ],
         is_migration: false,
@@ -33,6 +38,26 @@ fn encode_decode_roundtrip() {
     let entry = make_full_entry();
     let encoded = entry.encode().expect("encode");
     let decoded = OplogEntry::decode(&encoded).expect("decode");
+    assert_eq!(entry, decoded);
+}
+
+#[test]
+fn remove_range_op_roundtrips() {
+    // The new range-delete op survives the oplog wire format (replication / PITR).
+    let entry = OplogEntry {
+        ts: 1 << 18,
+        term: 1,
+        index: 1,
+        shard: 0,
+        ops: vec![OplogOp::RemoveRange {
+            partition: 4,
+            start: vec![0, 0, 0, 1],
+            end: vec![0, 0, 0, 5],
+        }],
+        is_migration: false,
+        pre_images: None,
+    };
+    let decoded = OplogEntry::decode(&entry.encode().expect("encode")).expect("decode");
     assert_eq!(entry, decoded);
 }
 

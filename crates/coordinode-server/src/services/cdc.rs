@@ -175,6 +175,17 @@ fn oplog_op_to_proto(op: OplogOp) -> ChangeOp {
             key,
             value: operand,
         },
+        OplogOp::RemoveRange {
+            partition,
+            start,
+            end,
+        } => ChangeOp {
+            r#type: ChangeOpType::RemoveRange as i32,
+            partition: partition as u32,
+            // Half-open range [start, end): key carries start, value carries end.
+            key: start,
+            value: end,
+        },
         OplogOp::Noop => ChangeOp {
             r#type: ChangeOpType::Noop as i32,
             partition: 0,
