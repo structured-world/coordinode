@@ -9,6 +9,7 @@ members = [
     "crates/coordinode-modality",
     "crates/coordinode-timeseries",
     "crates/coordinode-cluster",
+    "crates/coordinode-swarm",
     "crates/coordinode-raft",
     "crates/coordinode-auth",
     "crates/coordinode-server",
