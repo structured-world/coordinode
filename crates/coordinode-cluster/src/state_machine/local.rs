@@ -249,6 +249,96 @@ impl LocalStateMachine {
         self.idem.write().insert(idem_key(&request), id);
         inner
     }
+
+    /// Spawn the background task that drives `inner` through `action`: mark
+    /// InProgress, run the action, then settle on a terminal state (Cancelled if
+    /// the cancel flag is set — including a recovered Cancelling op — else
+    /// Completed / Failed). Shared by [`start`](StateMachineBackend::start) and
+    /// [`recover`](Self::recover).
+    fn spawn_driver(&self, inner: Arc<OpInner>, action: Action) {
+        let log = Arc::clone(&self.log);
+        let request = inner.request.clone();
+        tokio::spawn(async move {
+            inner.transition(OperationState::InProgress, log.as_ref());
+            let ctx = ActionContext {
+                request,
+                inner: Arc::clone(&inner),
+                log: Arc::clone(&log),
+            };
+            let result = action(ctx).await;
+            let terminal = if inner.cancel.load(Ordering::Acquire) {
+                OperationState::Cancelled
+            } else {
+                match result {
+                    Ok(()) => OperationState::Completed,
+                    Err(reason) => {
+                        *inner.error.write() = Some(reason);
+                        OperationState::Failed
+                    }
+                }
+            };
+            inner.transition(terminal, log.as_ref());
+        });
+    }
+
+    /// Rebuild the registry from persisted checkpoints after a restart (ADR-038
+    /// crash recovery). The caller replays committed metadata-Raft entries
+    /// (decoded to [`TransitionCheckpoint`]) in commit order; this folds them to
+    /// each operation's last committed state, re-registers every operation
+    /// (terminal ones stay queryable and keep deduping repeat starts), and
+    /// **resumes** every non-terminal operation by re-driving its action from
+    /// the `from` resting state — safe because transition actions are idempotent.
+    /// A recovered `Cancelling` op resumes with its cancel flag set so it unwinds
+    /// to `Cancelled`. A non-terminal op whose edge is not registered in this
+    /// build is settled `Failed` (config mismatch).
+    ///
+    /// Must run inside a tokio runtime (it may spawn resume tasks). Call once at
+    /// startup before serving the topology API.
+    pub fn recover<I: IntoIterator<Item = TransitionCheckpoint>>(&self, checkpoints: I) {
+        let mut last: HashMap<OperationId, TransitionCheckpoint> = HashMap::new();
+        let mut max_id = 0u64;
+        for c in checkpoints {
+            max_id = max_id.max(c.operation.0);
+            last.insert(c.operation, c);
+        }
+        // New operations must not reuse a recovered id.
+        self.next_id.fetch_max(max_id + 1, Ordering::Relaxed);
+
+        for (id, c) in last {
+            let request = TransitionRequest {
+                context: c.context,
+                from: c.from,
+                to: c.to,
+            };
+            let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+            let inner = Arc::new(OpInner {
+                id,
+                request: request.clone(),
+                state: RwLock::new(c.state),
+                progress: RwLock::new(c.progress),
+                error: RwLock::new(None),
+                cancel: AtomicBool::new(c.state == OperationState::Cancelling),
+                events,
+            });
+            self.ops.write().insert(id, Arc::clone(&inner));
+            self.idem.write().insert(idem_key(&request), id);
+
+            if c.state.is_terminal() {
+                continue;
+            }
+            match self
+                .actions
+                .get(&(request.from.clone(), request.to.clone()))
+            {
+                Some(action) => self.spawn_driver(inner, Arc::clone(action)),
+                None => {
+                    *inner.error.write() =
+                        Some("no action registered for recovered transition".to_string());
+                    inner.transition(OperationState::Failed, self.log.as_ref());
+                }
+            }
+        }
+    }
 }
 
 impl StateMachineBackend for LocalStateMachine {
@@ -277,32 +367,9 @@ impl StateMachineBackend for LocalStateMachine {
                     to: request.to.clone(),
                 })?;
 
-        let inner = self.insert(request.clone(), OperationState::Queued);
+        let inner = self.insert(request, OperationState::Queued);
         inner.transition(OperationState::Queued, self.log.as_ref());
-
-        let task_inner = Arc::clone(&inner);
-        let log = Arc::clone(&self.log);
-        tokio::spawn(async move {
-            task_inner.transition(OperationState::InProgress, log.as_ref());
-            let ctx = ActionContext {
-                request,
-                inner: Arc::clone(&task_inner),
-                log: Arc::clone(&log),
-            };
-            let result = action(ctx).await;
-            let terminal = if task_inner.cancel.load(Ordering::Acquire) {
-                OperationState::Cancelled
-            } else {
-                match result {
-                    Ok(()) => OperationState::Completed,
-                    Err(reason) => {
-                        *task_inner.error.write() = Some(reason);
-                        OperationState::Failed
-                    }
-                }
-            };
-            task_inner.transition(terminal, log.as_ref());
-        });
+        self.spawn_driver(Arc::clone(&inner), action);
 
         Ok(inner.id)
     }

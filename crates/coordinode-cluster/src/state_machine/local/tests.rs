@@ -190,6 +190,104 @@ async fn observe_delivers_current_state_then_updates() {
     assert!(saw_terminal, "observer must see a terminal event");
 }
 
+fn checkpoint(
+    id: u64,
+    context: &str,
+    state: OperationState,
+    completed: u64,
+) -> TransitionCheckpoint {
+    TransitionCheckpoint {
+        operation: OperationId(id),
+        context: ctx_id(context),
+        from: label("compute"),
+        to: label("full-storage"),
+        state,
+        progress: Progress {
+            current_step: "transfer".to_string(),
+            completed_units: completed,
+            total_units: 10,
+            eta_ms: None,
+            last_updated_at_ms: 1,
+        },
+    }
+}
+
+#[tokio::test]
+async fn recover_restores_terminal_and_resumes_inflight() {
+    let log = Arc::new(RecordingLog::default());
+    let m = machine(Arc::clone(&log));
+
+    // Simulate a prior run's committed log: op 1 completed; op 2 crashed mid
+    // InProgress; both for distinct contexts. Commit order — last wins per op.
+    m.recover([
+        checkpoint(1, "node-1", OperationState::Queued, 0),
+        checkpoint(1, "node-1", OperationState::InProgress, 5),
+        checkpoint(1, "node-1", OperationState::Completed, 10),
+        checkpoint(2, "node-2", OperationState::Queued, 0),
+        checkpoint(2, "node-2", OperationState::InProgress, 3),
+    ]);
+
+    // Terminal op restored as-is, queryable.
+    assert_eq!(
+        m.status(OperationId(1)).expect("op1").state,
+        OperationState::Completed
+    );
+    // In-flight op resumes (its action re-runs to completion).
+    assert_eq!(
+        await_terminal(&m, OperationId(2)).await,
+        OperationState::Completed
+    );
+}
+
+#[tokio::test]
+async fn recover_bumps_id_allocator_past_recovered_ids() {
+    let m = machine(Arc::new(RecordingLog::default()));
+    m.recover([checkpoint(7, "node-7", OperationState::Completed, 10)]);
+    // A fresh start must not collide with recovered id 7.
+    let new_op = m
+        .start(req("compute", "full-storage", "node-new"))
+        .expect("start");
+    assert!(
+        new_op.0 > 7,
+        "new op id {} must exceed recovered max 7",
+        new_op.0
+    );
+}
+
+#[tokio::test]
+async fn recover_preserves_idempotency() {
+    let m = machine(Arc::new(RecordingLog::default()));
+    m.recover([checkpoint(3, "node-3", OperationState::Completed, 10)]);
+    // A start matching the recovered (from,to,context) dedupes to the same op.
+    let op = m
+        .start(req("compute", "full-storage", "node-3"))
+        .expect("start");
+    assert_eq!(op, OperationId(3));
+}
+
+#[tokio::test]
+async fn recover_cancelling_op_unwinds_to_cancelled() {
+    // Action that would loop forever unless cancelled — proves the recovered
+    // cancel flag is honoured (resumes straight into unwind).
+    let m = LocalStateMachine::builder()
+        .transition(label("compute"), label("full-storage"), |ctx| async move {
+            for tick in 0..100_000 {
+                if ctx.is_cancelled() {
+                    return Ok(());
+                }
+                ctx.report("transfer", tick, 100_000, None, tick as i64);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Ok(())
+        })
+        .build(Arc::new(RecordingLog::default()));
+    m.recover([checkpoint(9, "node-9", OperationState::Cancelling, 4)]);
+    assert_eq!(
+        await_terminal(&m, OperationId(9)).await,
+        OperationState::Cancelled
+    );
+}
+
 #[tokio::test]
 async fn list_filters_by_state_and_context() {
     let m = machine(Arc::new(RecordingLog::default()));
