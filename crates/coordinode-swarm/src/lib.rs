@@ -15,8 +15,11 @@
 //! See [`SegmentManifest`], [`split_segment`], [`verify_piece`], [`assemble`],
 //! and [`MediaClass`] for media-tuned piece sizing.
 //!
-//! Swarm scheduling (rarest-first selection, tit-for-tat fairness) and the gRPC
-//! piece-exchange transport build on this model in subsequent increments.
+//! Swarm scheduling: [`SwarmState`] tracks which peers hold which pieces and
+//! drives rarest-first piece selection ([`SwarmState::select_next_piece`]) so
+//! scarce pieces replicate first. Source-selection scoring (tit-for-tat
+//! fairness, locality) and the gRPC piece-exchange transport build on this in
+//! subsequent increments.
 //!
 //! # Crate tier
 //!
@@ -25,8 +28,10 @@
 //! crates, and can drop to `no_std + alloc` once the workspace adds the CI job.
 
 mod segment;
+mod state;
 
 pub use segment::{
     assemble, cross_tier_piece_size, split_segment, verify_piece, MediaClass, PieceIndex,
     SegmentManifest, SwarmError, SwarmResult,
 };
+pub use state::{NodeId, PieceBitfield, SwarmState};
