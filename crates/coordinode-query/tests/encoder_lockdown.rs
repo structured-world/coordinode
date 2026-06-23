@@ -169,12 +169,18 @@ fn encoder_lockdown_no_new_files_with_raw_encoders() {
     walk(&src_root, &mut all_src_files);
 
     for path in &all_src_files {
-        // Extracted unit-test modules live in `<module>/tests.rs` (moved out of
-        // the inline `#[cfg(test)] mod tests`). They are test code, exempt from
-        // the production encoder lockdown exactly as the inline `cfg(test)`
-        // modules they replaced were — fixtures may build raw probe keys
-        // (migrating in R166). Only production source is gated here.
-        if path.file_name().is_some_and(|n| n == "tests.rs") {
+        // Extracted unit-test modules live in sibling files whose names end in
+        // `tests.rs` (`<module>/tests.rs`, plus multi-module cases like
+        // `runner/fusion_kernel_tests.rs`, `builder/numeric_predicate_tests.rs`),
+        // moved out of the inline `#[cfg(test)] mod ...`. They are test code,
+        // exempt from the production encoder lockdown exactly as the inline
+        // `cfg(test)` modules they replaced were — fixtures may build raw probe
+        // keys (migrating in R166). No production source file is named `*tests.rs`,
+        // so this gates production only.
+        if path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().ends_with("tests.rs"))
+        {
             continue;
         }
         let rel = path
