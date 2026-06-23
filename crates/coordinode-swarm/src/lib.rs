@@ -27,11 +27,13 @@
 //! it is shipped as a plain `std` crate today, matching the sibling cluster
 //! crates, and can drop to `no_std + alloc` once the workspace adds the CI job.
 
+mod config;
 mod segment;
 mod state;
 
+pub use config::SwarmConfig;
 pub use segment::{
-    assemble, cross_tier_piece_size, split_segment, verify_piece, MediaClass, PieceEncoding,
-    PieceIndex, SegmentManifest, SwarmError, SwarmResult,
+    assemble, build_manifest, cross_tier_piece_size, split_segment, verify_piece, MediaClass,
+    PieceEncoding, PieceIndex, SegmentManifest, SegmentWriter, SwarmError, SwarmResult, ZstdLevel,
 };
 pub use state::{NodeId, PieceBitfield, SwarmState};

@@ -1,14 +1,21 @@
 //! Segment piece model: split a segment into per-piece-encoded, checksummed
-//! pieces, verify each piece on arrival, and assemble the whole with an
-//! end-to-end checksum.
+//! pieces, verify each piece on arrival, and stream-decode them into a sink with
+//! an end-to-end checksum.
 //!
 //! Pieces may be transferred raw or compressed ([`PieceEncoding`]); the manifest
 //! records the encoding. Piece checksums are taken over the **wire** (encoded)
 //! bytes so a receiver verifies what it received before spending CPU to decode,
 //! while the total checksum is over the **raw** segment so the fully decoded
 //! result is verified end to end.
+//!
+//! Assembly is **streaming**: [`SegmentWriter`] decodes each piece into a caller
+//! sink ([`std::io::Write`]) as it arrives, holding only one piece at a time —
+//! never the whole (16-64 MB) segment — and folds the raw bytes into a running
+//! checksum. [`assemble`] is a thin `Vec`-backed convenience over it.
 
-use xxhash_rust::xxh3::xxh3_64;
+use std::io::{self, Write};
+
+use xxhash_rust::xxh3::{xxh3_64, Xxh3};
 
 /// Index of a piece within a segment.
 pub type PieceIndex = u32;
@@ -42,20 +49,45 @@ impl MediaClass {
 /// Piece size for a cross-tier transfer: the smaller of the two endpoints'
 /// optimal sizes, so neither side is fed pieces larger than it prefers.
 pub fn cross_tier_piece_size(source: MediaClass, target: MediaClass) -> usize {
-    source
-        .optimal_piece_size()
-        .min(target.optimal_piece_size())
+    source.optimal_piece_size().min(target.optimal_piece_size())
+}
+
+/// zstd compression effort for transfer. Transfer favours cheap compression
+/// (the bytes are transient on the wire), so [`ZstdLevel::Fastest`] is the
+/// default; cold-tier bulk moves can trade CPU for ratio with the higher levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ZstdLevel {
+    /// Lowest CPU, lowest ratio — the transfer default.
+    #[default]
+    Fastest,
+    /// Balanced.
+    Default,
+    /// Higher ratio, more CPU.
+    Better,
+}
+
+impl ZstdLevel {
+    fn to_structured(self) -> structured_zstd::encoding::CompressionLevel {
+        use structured_zstd::encoding::CompressionLevel;
+        match self {
+            ZstdLevel::Fastest => CompressionLevel::Fastest,
+            ZstdLevel::Default => CompressionLevel::Default,
+            ZstdLevel::Better => CompressionLevel::Better,
+        }
+    }
 }
 
 /// How a segment's pieces are encoded on the wire. A segment uses one encoding
 /// for all its pieces, chosen from its data kind (hot posting lists compress
-/// well with LZ4; already-compressed data uses `None`).
+/// well with LZ4; cold bulk data with zstd; already-compressed data uses `None`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PieceEncoding {
     /// Pieces transferred raw (no compression).
     None,
     /// Pieces compressed with LZ4 (fast; hot-data segments).
     Lz4,
+    /// Pieces compressed with zstd at the given effort (cold-data segments).
+    Zstd(ZstdLevel),
 }
 
 impl PieceEncoding {
@@ -64,15 +96,32 @@ impl PieceEncoding {
         match self {
             PieceEncoding::None => raw.to_vec(),
             PieceEncoding::Lz4 => lz4_flex::compress_prepend_size(raw),
+            PieceEncoding::Zstd(level) => {
+                structured_zstd::encoding::compress_to_vec(raw, level.to_structured())
+            }
         }
     }
 
-    /// Decode a wire piece back to its raw form.
-    fn decode(self, wire: &[u8]) -> SwarmResult<Vec<u8>> {
+    /// Stream-decode a wire piece directly into `sink`, holding no more than the
+    /// codec's internal window in memory.
+    fn decode_into<W: Write>(self, wire: &[u8], sink: &mut W) -> SwarmResult<()> {
         match self {
-            PieceEncoding::None => Ok(wire.to_vec()),
-            PieceEncoding::Lz4 => lz4_flex::decompress_size_prepended(wire)
-                .map_err(|e| SwarmError::Source(format!("lz4 decode: {e}"))),
+            PieceEncoding::None => sink
+                .write_all(wire)
+                .map_err(|e| SwarmError::Source(format!("write piece: {e}"))),
+            PieceEncoding::Lz4 => {
+                let raw = lz4_flex::decompress_size_prepended(wire)
+                    .map_err(|e| SwarmError::Source(format!("lz4 decode: {e}")))?;
+                sink.write_all(&raw)
+                    .map_err(|e| SwarmError::Source(format!("write piece: {e}")))
+            }
+            PieceEncoding::Zstd(_) => {
+                let mut decoder = structured_zstd::decoding::StreamingDecoder::new(wire)
+                    .map_err(|e| SwarmError::Source(format!("zstd decoder: {e}")))?;
+                io::copy(&mut decoder, sink)
+                    .map(|_| ())
+                    .map_err(|e| SwarmError::Source(format!("zstd decode: {e}")))
+            }
         }
     }
 }
@@ -140,7 +189,7 @@ pub struct SegmentManifest {
 impl SegmentManifest {
     /// Number of pieces the segment is split into.
     pub fn piece_count(&self) -> u32 {
-        // A manifest is only ever built by `split_segment`, which caps piece
+        // A manifest is only ever built by `build_manifest`, which caps piece
         // count at the input length in bytes — far below u32::MAX in practice;
         // the conversion saturates rather than wraps on absurd inputs.
         u32::try_from(self.piece_hashes.len()).unwrap_or(u32::MAX)
@@ -161,9 +210,39 @@ impl SegmentManifest {
     }
 }
 
-/// Split a segment into `piece_size`-byte raw pieces, encode each per `encoding`,
-/// and build its [`SegmentManifest`]. Returns the manifest plus the owned **wire**
-/// (encoded) pieces ready to transfer.
+/// Build a segment's [`SegmentManifest`] in a single streaming pass: encode each
+/// raw chunk, checksum the wire bytes, and fold the raw bytes into the total
+/// checksum — without materializing the encoded pieces. The source serves pieces
+/// on demand via [`PieceEncoding::encode`] over [`SegmentManifest::piece_range`].
+///
+/// # Errors
+/// [`SwarmError::ZeroPieceSize`] if `piece_size == 0`.
+pub fn build_manifest(
+    data: &[u8],
+    piece_size: usize,
+    encoding: PieceEncoding,
+) -> SwarmResult<SegmentManifest> {
+    if piece_size == 0 {
+        return Err(SwarmError::ZeroPieceSize);
+    }
+    let mut piece_hashes = Vec::new();
+    if !data.is_empty() {
+        for raw in data.chunks(piece_size) {
+            piece_hashes.push(xxh3_64(&encoding.encode(raw)));
+        }
+    }
+    Ok(SegmentManifest {
+        piece_size,
+        total_len: data.len(),
+        encoding,
+        piece_hashes,
+        total_hash: xxh3_64(data),
+    })
+}
+
+/// Split a segment into encoded wire pieces plus its manifest. Materializes all
+/// pieces — a convenience for tests and small segments; the transport streams
+/// instead via [`build_manifest`] + on-demand [`PieceEncoding::encode`].
 ///
 /// # Errors
 /// [`SwarmError::ZeroPieceSize`] if `piece_size == 0`.
@@ -172,21 +251,13 @@ pub fn split_segment(
     piece_size: usize,
     encoding: PieceEncoding,
 ) -> SwarmResult<(SegmentManifest, Vec<Vec<u8>>)> {
-    if piece_size == 0 {
-        return Err(SwarmError::ZeroPieceSize);
-    }
+    let manifest = build_manifest(data, piece_size, encoding)?;
     let wire: Vec<Vec<u8>> = if data.is_empty() {
         Vec::new()
     } else {
-        data.chunks(piece_size).map(|raw| encoding.encode(raw)).collect()
-    };
-    let piece_hashes: Vec<u64> = wire.iter().map(|p| xxh3_64(p)).collect();
-    let manifest = SegmentManifest {
-        piece_size,
-        total_len: data.len(),
-        encoding,
-        piece_hashes,
-        total_hash: xxh3_64(data),
+        data.chunks(piece_size)
+            .map(|raw| encoding.encode(raw))
+            .collect()
     };
     Ok((manifest, wire))
 }
@@ -197,45 +268,122 @@ pub fn split_segment(
 /// [`SwarmError::PieceIndexOutOfRange`] if `index` is past the piece count;
 /// [`SwarmError::PieceHashMismatch`] if the bytes do not match.
 pub fn verify_piece(manifest: &SegmentManifest, index: PieceIndex, wire: &[u8]) -> SwarmResult<()> {
-    let expected = manifest
-        .piece_hashes
-        .get(index as usize)
-        .ok_or(SwarmError::PieceIndexOutOfRange {
-            index,
-            count: manifest.piece_count(),
-        })?;
+    let expected =
+        manifest
+            .piece_hashes
+            .get(index as usize)
+            .ok_or(SwarmError::PieceIndexOutOfRange {
+                index,
+                count: manifest.piece_count(),
+            })?;
     if xxh3_64(wire) != *expected {
         return Err(SwarmError::PieceHashMismatch { index });
     }
     Ok(())
 }
 
-/// Assemble received wire pieces (in index order) into the full raw segment:
-/// verify every piece against the manifest, decode it, concatenate, and verify
-/// the assembled whole against `total_hash`.
+/// A [`Write`] that folds everything written into a running xxh3 before passing
+/// it to the inner sink — lets the segment's total checksum be computed in the
+/// same streaming pass that writes the decoded bytes out.
+struct HashingWriter<'a, W: Write> {
+    inner: &'a mut W,
+    hasher: &'a mut Xxh3,
+}
+
+impl<W: Write> Write for HashingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Streaming segment assembler: feed wire pieces in index order with [`push`];
+/// each is verified, stream-decoded into the sink, and folded into the running
+/// total checksum. [`finish`] verifies the piece count and total checksum and
+/// returns the sink. Holds only one piece at a time, never the whole segment.
+///
+/// [`push`]: SegmentWriter::push
+/// [`finish`]: SegmentWriter::finish
+pub struct SegmentWriter<'a, W: Write> {
+    manifest: &'a SegmentManifest,
+    sink: W,
+    hasher: Xxh3,
+    next: PieceIndex,
+}
+
+impl<'a, W: Write> SegmentWriter<'a, W> {
+    /// Begin assembling `manifest`'s segment into `sink`.
+    pub fn new(manifest: &'a SegmentManifest, sink: W) -> Self {
+        Self {
+            manifest,
+            sink,
+            hasher: Xxh3::new(),
+            next: 0,
+        }
+    }
+
+    /// Verify the next wire piece, stream-decode it into the sink, and fold its
+    /// raw bytes into the running checksum.
+    ///
+    /// # Errors
+    /// [`SwarmError::PieceIndexOutOfRange`] if more pieces are pushed than the
+    /// manifest describes; [`SwarmError::PieceHashMismatch`] on corruption;
+    /// [`SwarmError::Source`] on a decode or sink-write failure.
+    pub fn push(&mut self, wire: &[u8]) -> SwarmResult<()> {
+        verify_piece(self.manifest, self.next, wire)?;
+        let mut hashing = HashingWriter {
+            inner: &mut self.sink,
+            hasher: &mut self.hasher,
+        };
+        self.manifest.encoding.decode_into(wire, &mut hashing)?;
+        self.next += 1;
+        Ok(())
+    }
+
+    /// Finish: verify all pieces were supplied and the total checksum matches,
+    /// then return the sink.
+    ///
+    /// # Errors
+    /// [`SwarmError::PieceCountMismatch`] if fewer pieces were pushed than
+    /// expected; [`SwarmError::TotalHashMismatch`] if the decoded bytes are wrong.
+    pub fn finish(self) -> SwarmResult<W> {
+        let expected = self.manifest.piece_count();
+        if self.next != expected {
+            return Err(SwarmError::PieceCountMismatch {
+                expected,
+                actual: self.next,
+            });
+        }
+        if self.hasher.digest() != self.manifest.total_hash {
+            return Err(SwarmError::TotalHashMismatch);
+        }
+        Ok(self.sink)
+    }
+}
+
+/// Assemble wire pieces (in index order) into the raw segment as a `Vec` — a
+/// convenience over [`SegmentWriter`] for tests and small segments.
 ///
 /// # Errors
-/// [`SwarmError::PieceCountMismatch`] if the wrong number of pieces is supplied;
-/// [`SwarmError::PieceHashMismatch`] if any wire piece is corrupt;
-/// [`SwarmError::Source`] if a piece fails to decode;
-/// [`SwarmError::TotalHashMismatch`] if the reassembled bytes are wrong despite
-/// each piece verifying (e.g. misordered pieces).
+/// Same as [`SegmentWriter::push`] / [`SegmentWriter::finish`].
 pub fn assemble(manifest: &SegmentManifest, wire_pieces: &[Vec<u8>]) -> SwarmResult<Vec<u8>> {
-    let expected = manifest.piece_count();
     let actual = u32::try_from(wire_pieces.len()).unwrap_or(u32::MAX);
-    if actual != expected {
-        return Err(SwarmError::PieceCountMismatch { expected, actual });
+    if actual != manifest.piece_count() {
+        return Err(SwarmError::PieceCountMismatch {
+            expected: manifest.piece_count(),
+            actual,
+        });
     }
-    let mut out = Vec::with_capacity(manifest.total_len);
-    for (i, wire) in wire_pieces.iter().enumerate() {
-        // The conversion is bounded by `expected` (checked above) ≤ u32::MAX.
-        verify_piece(manifest, i as PieceIndex, wire)?;
-        out.extend_from_slice(&manifest.encoding.decode(wire)?);
+    let mut writer = SegmentWriter::new(manifest, Vec::with_capacity(manifest.total_len));
+    for wire in wire_pieces {
+        writer.push(wire)?;
     }
-    if xxh3_64(&out) != manifest.total_hash {
-        return Err(SwarmError::TotalHashMismatch);
-    }
-    Ok(out)
+    writer.finish()
 }
 
 #[cfg(test)]
@@ -244,11 +392,15 @@ mod tests {
     use super::*;
 
     fn segment(len: usize) -> Vec<u8> {
-        // Repetitive enough that LZ4 actually compresses (exercises the codec).
+        // Repetitive enough that compression actually shrinks it.
         (0..len).map(|i| ((i / 7) % 17) as u8).collect()
     }
 
-    const ENCODINGS: [PieceEncoding; 2] = [PieceEncoding::None, PieceEncoding::Lz4];
+    const ENCODINGS: [PieceEncoding; 3] = [
+        PieceEncoding::None,
+        PieceEncoding::Lz4,
+        PieceEncoding::Zstd(ZstdLevel::Fastest),
+    ];
 
     #[test]
     fn media_class_piece_sizes_match_spec() {
@@ -263,29 +415,54 @@ mod tests {
     }
 
     #[test]
-    fn split_then_assemble_round_trips_each_encoding() {
+    fn round_trips_each_encoding_via_split_and_streaming_writer() {
         for enc in ENCODINGS {
             for len in [48 * 1024, 48 * 1024 + 7, 1, 1023] {
                 let data = segment(len);
                 let (manifest, wire) = split_segment(&data, 1024, enc).expect("split");
                 assert_eq!(manifest.encoding, enc);
-                let restored = assemble(&manifest, &wire).expect("assemble");
-                assert_eq!(restored, data, "round-trip enc={enc:?} len={len}");
+
+                // Vec convenience.
+                assert_eq!(assemble(&manifest, &wire).expect("assemble"), data);
+
+                // Streaming writer into an arbitrary sink, piece by piece.
+                let mut w = SegmentWriter::new(&manifest, Vec::new());
+                for piece in &wire {
+                    w.push(piece).expect("push");
+                }
+                assert_eq!(
+                    w.finish().expect("finish"),
+                    data,
+                    "stream enc={enc:?} len={len}"
+                );
             }
         }
     }
 
     #[test]
-    fn lz4_pieces_are_smaller_than_raw_for_compressible_data() {
+    fn build_manifest_matches_split_and_records_encoding() {
+        let data = segment(40 * 1024);
+        for enc in ENCODINGS {
+            let m1 = build_manifest(&data, 4096, enc).expect("manifest");
+            let (m2, _) = split_segment(&data, 4096, enc).expect("split");
+            assert_eq!(m1, m2);
+            assert_eq!(m1.encoding, enc);
+        }
+    }
+
+    #[test]
+    fn compression_shrinks_compressible_data() {
         let data = segment(64 * 1024);
         let (_, raw) = split_segment(&data, 64 * 1024, PieceEncoding::None).expect("raw");
-        let (_, lz4) = split_segment(&data, 64 * 1024, PieceEncoding::Lz4).expect("lz4");
-        assert!(
-            lz4[0].len() < raw[0].len(),
-            "lz4 wire piece ({}) should compress below raw ({})",
-            lz4[0].len(),
-            raw[0].len()
-        );
+        for enc in [PieceEncoding::Lz4, PieceEncoding::Zstd(ZstdLevel::Fastest)] {
+            let (_, comp) = split_segment(&data, 64 * 1024, enc).expect("comp");
+            assert!(
+                comp[0].len() < raw[0].len(),
+                "{enc:?} wire piece ({}) should compress below raw ({})",
+                comp[0].len(),
+                raw[0].len()
+            );
+        }
     }
 
     #[test]
@@ -295,14 +472,15 @@ mod tests {
         assert_eq!(manifest.piece_count(), 3);
         assert_eq!(wire.len(), 3);
         assert_eq!(manifest.piece_range(0).expect("r0"), (0, 1000));
-        assert_eq!(manifest.piece_range(2).expect("r2"), (2000, 2500)); // ragged tail
-        assert!(manifest.piece_range(3).is_err(), "out of range");
+        assert_eq!(manifest.piece_range(2).expect("r2"), (2000, 2500));
+        assert!(manifest.piece_range(3).is_err());
     }
 
     #[test]
     fn verify_piece_detects_corruption() {
         let data = segment(4096);
-        let (manifest, wire) = split_segment(&data, 1024, PieceEncoding::Lz4).expect("split");
+        let (manifest, wire) =
+            split_segment(&data, 1024, PieceEncoding::Zstd(ZstdLevel::Fastest)).expect("split");
         verify_piece(&manifest, 1, &wire[1]).expect("clean");
         let mut bad = wire[1].clone();
         bad[0] ^= 0xFF;
@@ -342,6 +520,21 @@ mod tests {
     }
 
     #[test]
+    fn writer_finish_detects_short_count() {
+        let data = segment(3000);
+        let (manifest, wire) = split_segment(&data, 1000, PieceEncoding::None).expect("split");
+        let mut w = SegmentWriter::new(&manifest, Vec::new());
+        w.push(&wire[0]).expect("push 0");
+        assert!(matches!(
+            w.finish(),
+            Err(SwarmError::PieceCountMismatch {
+                expected: 3,
+                actual: 1
+            })
+        ));
+    }
+
+    #[test]
     fn empty_segment_has_no_pieces() {
         for enc in ENCODINGS {
             let (manifest, wire) = split_segment(&[], 1024, enc).expect("split empty");
@@ -357,7 +550,7 @@ mod tests {
     #[test]
     fn zero_piece_size_rejected() {
         assert_eq!(
-            split_segment(&segment(10), 0, PieceEncoding::None),
+            build_manifest(&segment(10), 0, PieceEncoding::None),
             Err(SwarmError::ZeroPieceSize)
         );
     }
