@@ -138,6 +138,7 @@ coordinode-auth = { path = "crates/coordinode-auth" }
 coordinode-server = { path = "crates/coordinode-server" }
 coordinode-s3 = { path = "crates/coordinode-s3" }
 coordinode-embed = { path = "crates/coordinode-embed" }
+coordinode-swarm = { path = "crates/coordinode-swarm" }
 coordinode-replicate = { path = "crates/coordinode-replicate" }
 coordinode-client = { path = "crates/coordinode-client" }
 coordinode-test-fixtures = { path = "crates/coordinode-test-fixtures" }

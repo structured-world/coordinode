@@ -12,6 +12,7 @@ coordinode-core = { workspace = true }
 coordinode-embed = { workspace = true }
 coordinode-query = { workspace = true }
 coordinode-storage = { workspace = true }
+coordinode-swarm = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 rmp-serde = { workspace = true }
@@ -19,6 +20,15 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 metrics = { workspace = true }
+# Inter-node segment-transfer gRPC (SegmentTransferService): the transport that
+# carries swarm pieces between nodes for replication repair, migration, resync.
+tonic = { workspace = true }
+tonic-prost = "0.14"
+prost = { workspace = true }
+futures-util = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tempfile = { workspace = true }
