@@ -73,6 +73,65 @@ fn entry_neighbours_get_early_indices() {
     }
 }
 
+/// The core invariant: reorder only renumbers nodes (and remaps stored indices)
+/// — the graph and all vectors are unchanged, so every query returns the exact
+/// same top-K node ids in the same order, before and after. A remap bug in any
+/// store (SoA arrays, layer-0 block, upper lists, entry point, id->idx) would
+/// corrupt the graph and change results, failing this test.
+#[test]
+fn reorder_preserves_search_results() {
+    let n = 800;
+    let dim = 24;
+    let mut index = build_index(n, dim);
+
+    let queries: Vec<Vec<f32>> = (0..40)
+        .map(|q| {
+            (0..dim)
+                .map(|d| {
+                    let s = ((q * 97 + d * 31 + 7) as u32).wrapping_mul(2_654_435_761);
+                    ((s ^ (s >> 15)) & 0x00FF_FFFF) as f32 / 16_777_216.0 - 0.5
+                })
+                .collect()
+        })
+        .collect();
+
+    let k = 10;
+    let before: Vec<Vec<u64>> = queries
+        .iter()
+        .map(|q| index.search(q, k).into_iter().map(|r| r.id).collect())
+        .collect();
+
+    index.reorder_for_cache_locality();
+
+    for (q, want) in queries.iter().zip(&before) {
+        let got: Vec<u64> = index.search(q, k).into_iter().map(|r| r.id).collect();
+        assert_eq!(&got, want, "top-{k} ids must be identical after reorder");
+    }
+}
+
+/// After reorder, every node id must still resolve (the id->idx map was rebuilt
+/// for the new numbering) and the entry point must point at a valid in-range
+/// node. Exact entry position is an implementation detail; the binding
+/// correctness invariant is covered by `reorder_preserves_search_results`.
+#[test]
+fn reorder_rebuilds_id_map_and_entry() {
+    let n = 300;
+    let mut index = build_index(n, 16);
+    index.reorder_for_cache_locality();
+
+    for id in 0..n as u64 {
+        let idx = index.idx_for_id_for_test(id);
+        assert!(
+            idx.is_some_and(|i| i < n),
+            "id {id} must resolve to an in-range idx after reorder"
+        );
+    }
+    let entry = index
+        .entry_point_idx_for_test()
+        .expect("non-empty index has an entry point");
+    assert!(entry < n, "entry point idx {entry} out of range");
+}
+
 #[test]
 fn empty_index_yields_empty_permutation() {
     let index = HnswIndex::new(HnswConfig {

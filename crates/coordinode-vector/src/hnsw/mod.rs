@@ -1484,6 +1484,12 @@ impl HnswIndex {
         out
     }
 
+    /// Test accessor: resolve a node id to its current idx via the id→idx map.
+    #[cfg(test)]
+    fn idx_for_id_for_test(&self, id: u64) -> Option<usize> {
+        self.id_to_idx.get(&id).copied()
+    }
+
     /// Mirror the RaBitQ code (packed bytes) and scalar header for node
     /// `idx` into the contiguous store. Skips silently when:
     /// - the contiguous store is not allocated yet,
