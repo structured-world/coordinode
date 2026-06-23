@@ -250,5 +250,11 @@ pub trait StateMachineBackend: Send + Sync {
     fn list(&self, filter: &OperationFilter) -> Vec<OperationSummary>;
 }
 
+mod local;
+pub use local::{
+    ActionContext, LocalStateMachine, LocalStateMachineBuilder, TransitionCheckpoint, TransitionLog,
+};
+
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests;

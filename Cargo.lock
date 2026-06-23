@@ -895,12 +895,14 @@ version = "0.4.3"
 dependencies = [
  "coordinode-storage",
  "criterion",
+ "parking_lot",
  "proptest",
  "rmp-serde",
  "serde",
  "smallvec",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 

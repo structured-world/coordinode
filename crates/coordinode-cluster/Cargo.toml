@@ -13,12 +13,16 @@ serde = { workspace = true }
 smallvec = "1.13"
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# CE LocalStateMachine: background transition tasks + broadcast event streams.
+tokio = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 criterion = { workspace = true }
 rmp-serde = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 
 [[bench]]
 name = "topology_throughput"
