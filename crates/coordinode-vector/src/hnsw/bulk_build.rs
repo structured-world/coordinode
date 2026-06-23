@@ -52,7 +52,7 @@ pub(crate) const BULK_BUILD_THRESHOLD: usize = 256;
 /// stitch (Step 4). The seeded path here is a strict superset of
 /// `insert_batch` and must produce a graph with the same membership;
 /// recall comes from later steps.
-pub(crate) fn bulk_build(index: &mut HnswIndex, items: Vec<(u64, Vec<f32>)>) {
+pub(crate) fn bulk_build(index: &mut HnswIndex, items: Vec<(u64, Vec<f32>)>, cache_reorder: bool) {
     let n = items.len();
     if n == 0 {
         return;
@@ -95,6 +95,13 @@ pub(crate) fn bulk_build(index: &mut HnswIndex, items: Vec<(u64, Vec<f32>)>) {
         let leader_vecs: Vec<Vec<f32>> = leaders_for_assignment;
         let reordered = cluster_order_followers(followers, &leader_vecs, index.config().metric);
         index.insert_batch(reordered);
+    }
+
+    // Opt-in O6 cache-locality pass: renumber nodes into BFS visit order so the
+    // search hot path walks memory-adjacent nodes. One-off post-build cost,
+    // requested by the caller for read-heavy indexes built once, queried often.
+    if cache_reorder {
+        index.reorder_for_cache_locality();
     }
 }
 

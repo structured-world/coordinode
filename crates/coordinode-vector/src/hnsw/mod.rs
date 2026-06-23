@@ -1214,7 +1214,22 @@ impl HnswIndex {
             self.insert_batch(items);
             return;
         }
-        bulk_build::bulk_build(self, items);
+        bulk_build::bulk_build(self, items, false);
+    }
+
+    /// Bulk-build then run an O6 BFS cache-locality reorder (see
+    /// [`reorder_for_cache_locality`](Self::reorder_for_cache_locality)).
+    /// Renumbers nodes so graph-adjacent nodes are memory-adjacent, trading a
+    /// one-off post-build pass for better search cache locality. Prefer this for
+    /// read-heavy indexes built once and queried many times; use
+    /// [`bulk_build`](Self::bulk_build) when the index keeps mutating.
+    pub fn bulk_build_cache_optimized(&mut self, items: Vec<(u64, Vec<f32>)>) {
+        if items.len() < bulk_build::BULK_BUILD_THRESHOLD {
+            self.insert_batch(items);
+            self.reorder_for_cache_locality();
+            return;
+        }
+        bulk_build::bulk_build(self, items, true);
     }
 
     /// Read-only planning phase of an insert. Picks the new node's layer,

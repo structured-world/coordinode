@@ -132,6 +132,57 @@ fn reorder_rebuilds_id_map_and_entry() {
     assert!(entry < n, "entry point idx {entry} out of range");
 }
 
+/// End-to-end through the build path: `bulk_build_cache_optimized` (build then
+/// reorder) yields a working graph. Querying a stored point returns that point
+/// as its own nearest neighbour — a remap bug in the wired reorder would break
+/// this self-recall. (Identity of reorder vs a non-reordered index can't be
+/// asserted across two builds: the parallel `insert_batch` build is
+/// nondeterministic, so two separate builds differ regardless of reorder; the
+/// reorder-preserves-results invariant is covered on a single index above.)
+#[test]
+fn bulk_build_cache_optimized_yields_working_graph() {
+    let n: usize = 600;
+    let dim: usize = 20;
+    let items: Vec<(u64, Vec<f32>)> = (0..n)
+        .map(|i| {
+            let v: Vec<f32> = (0..dim)
+                .map(|d| {
+                    let seed = (i.wrapping_mul(2_654_435_761).wrapping_add(d * 6_700_417)) as u32;
+                    let bits = (seed ^ (seed >> 13)) & 0x00FF_FFFF;
+                    (bits as f32 / 16_777_216.0) - 0.5
+                })
+                .collect();
+            (i as u64, v)
+        })
+        .collect();
+
+    let mut index = HnswIndex::new(HnswConfig {
+        ef_search: 64,
+        metric: VectorMetric::L2,
+        max_dimensions: 65_536,
+        ..Default::default()
+    });
+    index.bulk_build_cache_optimized(items.clone());
+
+    let mut hits = 0;
+    let probes = 50;
+    for (id, v) in items.iter().step_by(n / probes).take(probes) {
+        let top = index.search(v, 1);
+        if top.first().is_some_and(|r| r.id == *id) {
+            hits += 1;
+        }
+    }
+    // A correct graph returns the query point itself as top-1 the large majority
+    // of the time. The seeded bulk-build path is an early-stage builder (~88%
+    // self-recall here), so the bar is set to distinguish a working graph from a
+    // reorder-corrupted one (which collapses self-recall toward zero), not to
+    // grade build quality.
+    assert!(
+        hits as f64 >= probes as f64 * 0.8,
+        "self-recall too low after reordered build: {hits}/{probes}"
+    );
+}
+
 #[test]
 fn empty_index_yields_empty_permutation() {
     let index = HnswIndex::new(HnswConfig {

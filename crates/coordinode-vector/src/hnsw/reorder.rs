@@ -39,10 +39,6 @@ impl HnswIndex {
     /// point. Nodes unreachable from the entry point retain their relative order
     /// and are appended after every reachable node. The result is always a
     /// bijection of `0..self.nodes.len()`.
-    #[allow(
-        dead_code,
-        reason = "applied by the reorder-apply increment on the same plan"
-    )]
     pub(super) fn compute_bfs_permutation(&self) -> Vec<usize> {
         let n = self.nodes.len();
         let mut new_of_old = vec![usize::MAX; n];
@@ -106,10 +102,6 @@ impl HnswIndex {
     /// results are identical before and after. A post-build, single-writer
     /// operation (`&mut self`); not safe to run concurrently with inserts or
     /// searches.
-    #[allow(
-        dead_code,
-        reason = "public reorder entrypoint; operator/build-path wiring lands next"
-    )]
     pub(crate) fn reorder_for_cache_locality(&mut self) {
         let n = self.nodes.len();
         if n < 2 {
