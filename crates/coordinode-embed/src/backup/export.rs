@@ -6,10 +6,11 @@
 use std::collections::HashMap;
 use std::io::Write;
 
-use coordinode_core::graph::edge::{self, PostingList};
+use coordinode_core::graph::edge::PostingList;
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::{self, NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
+use coordinode_modality::edge::{EdgeStore, LocalEdgeStore};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::StorageSnapshot;
@@ -585,25 +586,23 @@ fn load_edge_properties(
     target_id: u64,
     interner: &FieldInterner,
 ) -> Result<serde_json::Map<String, serde_json::Value>, ExportError> {
-    let ep_key = edge::encode_edgeprop_key(
-        edge_type,
-        NodeId::from_raw(source_id),
-        NodeId::from_raw(target_id),
-    );
-    match engine
-        .snapshot_get(snapshot, Partition::EdgeProp, &ep_key)
+    // Typed snapshot-aware read instead of hand-rolling the edge-prop key plus
+    // a raw snapshot_get plus a manual decode: the EdgeStore decodes through the
+    // single canonical edge-property codec and returns EdgeProperties, whose
+    // `props` map (`HashMap<u32, Value>`) is exactly the shape
+    // `resolve_properties` consumes.
+    let store = LocalEdgeStore;
+    match store
+        .get_props_snapshot(
+            engine,
+            snapshot,
+            edge_type,
+            NodeId::from_raw(source_id),
+            NodeId::from_raw(target_id),
+        )
         .map_err(|e| ExportError::Storage(e.to_string()))?
     {
-        Some(bytes) => {
-            // Edge properties use the single canonical wire format
-            // (ADR-040): a sorted MessagePack array of (field_id, value)
-            // pairs, shared by every writer.
-            let record: HashMap<u32, Value> = edge::decode_edge_props(&bytes)
-                .map_err(|e| ExportError::Serialization(e.to_string()))?
-                .into_iter()
-                .collect();
-            Ok(resolve_properties(&record, interner))
-        }
+        Some(props) => Ok(resolve_properties(&props.props, interner)),
         None => Ok(serde_json::Map::new()),
     }
 }
