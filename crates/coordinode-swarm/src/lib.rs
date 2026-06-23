@@ -30,6 +30,7 @@
 mod config;
 mod segment;
 mod state;
+mod transfer;
 
 pub use config::SwarmConfig;
 pub use segment::{
@@ -37,3 +38,4 @@ pub use segment::{
     PieceEncoding, PieceIndex, SegmentManifest, SegmentWriter, SwarmError, SwarmResult, ZstdLevel,
 };
 pub use state::{NodeId, PieceBitfield, SwarmState};
+pub use transfer::{transfer, LocalPieceStore, PieceStore, SegmentId};
