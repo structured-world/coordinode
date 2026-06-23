@@ -45,6 +45,7 @@ use coordinode_core::schema::definition::PropertyType;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
+use coordinode_storage::engine::StorageSnapshot;
 
 use crate::error::{StoreError, StoreResult};
 
@@ -71,6 +72,20 @@ pub trait EdgeStore {
     fn get_props(
         &self,
         txn: &Transaction,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+    ) -> StoreResult<Option<EdgeProperties>>;
+
+    /// Snapshot-aware read of edge properties for `(edge_type, src, tgt)`,
+    /// for callers that hold an MVCC [`StorageSnapshot`] rather than a
+    /// [`Transaction`] — backup export takes one consistent snapshot up front
+    /// and reads every edge through it (ADR-040). Same semantics as
+    /// [`Self::get_props`]: `None` when the edge carries no property body.
+    fn get_props_snapshot(
+        &self,
+        engine: &StorageEngine,
+        snapshot: &StorageSnapshot,
         edge_type: &str,
         src: NodeId,
         tgt: NodeId,
@@ -527,6 +542,21 @@ impl EdgeStore for LocalEdgeStore {
     ) -> StoreResult<Option<EdgeProperties>> {
         let key = encode_edgeprop_key(edge_type, src, tgt);
         match txn.read_untracked(Partition::EdgeProp, &key)? {
+            Some(bytes) => Self::decode_props(&bytes).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn get_props_snapshot(
+        &self,
+        engine: &StorageEngine,
+        snapshot: &StorageSnapshot,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+    ) -> StoreResult<Option<EdgeProperties>> {
+        let key = encode_edgeprop_key(edge_type, src, tgt);
+        match engine.snapshot_get(snapshot, Partition::EdgeProp, &key)? {
             Some(bytes) => Self::decode_props(&bytes).map(Some),
             None => Ok(None),
         }
@@ -1102,6 +1132,35 @@ mod tests {
         let store = LocalEdgeStore;
         let r = db.read();
         assert!(store.get_props(&r, "LIKES", a, b).expect("ok").is_none());
+    }
+
+    #[test]
+    fn get_props_snapshot_reads_body_and_none_via_mvcc_snapshot() {
+        // Snapshot-aware read (backup export path, ADR-040): an edge written
+        // with a property body is returned through a plain engine snapshot,
+        // and a property-less edge returns None (not "missing edge").
+        let db = open();
+        let a = NodeId::from_raw(11);
+        let b = NodeId::from_raw(22);
+        db.write(|s, t| {
+            s.put_edge(t, "OWNS", a, b, Some(&props_with(7, 42)))
+                .expect("put");
+        });
+
+        let store = LocalEdgeStore;
+        let snap = db.engine.snapshot();
+        let loaded = store
+            .get_props_snapshot(&db.engine, &snap, "OWNS", a, b)
+            .expect("ok")
+            .expect("Some");
+        assert_eq!(loaded.len(), 1);
+
+        db.write(|s, t| s.put_edge(t, "LIKES", a, b, None).expect("put"));
+        let snap2 = db.engine.snapshot();
+        assert!(store
+            .get_props_snapshot(&db.engine, &snap2, "LIKES", a, b)
+            .expect("ok")
+            .is_none());
     }
 
     #[test]
