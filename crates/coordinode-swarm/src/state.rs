@@ -118,6 +118,11 @@ impl SwarmState {
             .set(idx);
     }
 
+    /// Whether `node` currently holds piece `idx`.
+    pub fn peer_has(&self, node: NodeId, idx: PieceIndex) -> bool {
+        self.peer_bitfields.get(&node).is_some_and(|bf| bf.has(idx))
+    }
+
     /// How many peers currently hold piece `idx`.
     pub fn availability(&self, idx: PieceIndex) -> usize {
         self.peer_bitfields

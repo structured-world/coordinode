@@ -131,7 +131,9 @@ mod tests {
         ] {
             let data = segment(20 * 1024 + 3);
             let mut store = LocalPieceStore::new();
-            store.insert(SegmentId(42), &data, 1024, enc).expect("insert");
+            store
+                .insert(SegmentId(42), &data, 1024, enc)
+                .expect("insert");
 
             let out = transfer(&store, SegmentId(42), Vec::new()).expect("transfer");
             assert_eq!(out, data, "transfer round-trip enc={enc:?}");
