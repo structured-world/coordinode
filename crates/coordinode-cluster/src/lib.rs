@@ -198,6 +198,7 @@
 pub mod error;
 pub mod migration;
 pub mod routing;
+pub mod state_machine;
 pub mod topology;
 pub mod types;
 pub mod vector_routing;
@@ -209,6 +210,11 @@ pub use migration::{
     PlannerContext, TransferMode,
 };
 pub use routing::{ShardRouting, SingleShardRouting};
+pub use state_machine::{
+    BackendError, ContextId, HealthEvent, OperationFilter, OperationId, OperationState,
+    OperationStatus, OperationSummary, Progress, StateLabel, StateMachineBackend,
+    TransitionRequest,
+};
 pub use topology::{ClusterTopology, SingleNodeTopology};
 pub use types::{
     CrushRule, EndpointId, FailureDomain, Modality, NodeAddr, ServerId, ShardDescriptor, ShardId,
