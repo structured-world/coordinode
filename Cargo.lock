@@ -1200,6 +1200,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "coordinode-swarm"
+version = "0.4.3"
+dependencies = [
+ "lz4_flex",
+ "structured-zstd",
+ "thiserror 2.0.18",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "coordinode-test-fixtures"
 version = "0.4.3"
 dependencies = [
@@ -5317,6 +5327,9 @@ name = "structured-zstd"
 version = "0.0.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "127aed3d16d7bc37ec398587250d1cc3b42f2156caee4ab085c41c86ba227a94"
+dependencies = [
+ "twox-hash",
+]
 
 [[package]]
 name = "strum"
