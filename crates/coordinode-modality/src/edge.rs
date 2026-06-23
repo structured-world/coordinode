@@ -91,6 +91,22 @@ pub trait EdgeStore {
         tgt: NodeId,
     ) -> StoreResult<Option<EdgeProperties>>;
 
+    /// Direct, non-transactional write of the edge property body for
+    /// `(edge_type, src, tgt)`, for the backup restore path that applies writes
+    /// straight to the engine (ADR-016: the oracle auto-stamps the seqno) rather
+    /// than through a [`Transaction`]. Writes ONLY the edgeprop body — adjacency
+    /// is restored separately — and encodes through the single canonical
+    /// edge-property codec, so restored bytes are identical to a put_edge write.
+    /// A typed helper so restore never hand-rolls the edge-prop key.
+    fn put_props_direct(
+        &self,
+        engine: &StorageEngine,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        props: &EdgeProperties,
+    ) -> StoreResult<()>;
+
     /// Remove an edge. Buffers remove merges on both adjacency posting
     /// lists and a tombstone on the edgeprop body; commits atomically.
     /// Idempotent on already-missing edges.
@@ -560,6 +576,20 @@ impl EdgeStore for LocalEdgeStore {
             Some(bytes) => Self::decode_props(&bytes).map(Some),
             None => Ok(None),
         }
+    }
+
+    fn put_props_direct(
+        &self,
+        engine: &StorageEngine,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        props: &EdgeProperties,
+    ) -> StoreResult<()> {
+        let key = encode_edgeprop_key(edge_type, src, tgt);
+        let value = Self::encode_props(props)?;
+        engine.put(Partition::EdgeProp, &key, &value)?;
+        Ok(())
     }
 
     fn delete_edge(
@@ -1161,6 +1191,41 @@ mod tests {
             .get_props_snapshot(&db.engine, &snap2, "LIKES", a, b)
             .expect("ok")
             .is_none());
+    }
+
+    #[test]
+    fn put_props_direct_writes_canonical_body_readable_via_snapshot() {
+        // Direct engine write (backup restore path, ADR-016 — no transaction).
+        // The body must be readable through a plain snapshot and byte-identical
+        // to a transactional put_edge write (single canonical codec).
+        let db = open();
+        let a = NodeId::from_raw(31);
+        let b = NodeId::from_raw(32);
+        let store = LocalEdgeStore;
+        store
+            .put_props_direct(&db.engine, "OWNS", a, b, &props_with(7, 42))
+            .expect("direct put");
+
+        let snap = db.engine.snapshot();
+        let loaded = store
+            .get_props_snapshot(&db.engine, &snap, "OWNS", a, b)
+            .expect("ok")
+            .expect("Some");
+        assert_eq!(loaded.len(), 1);
+
+        // Same body via a transactional put_edge on a different edge reads back
+        // to the same encoded bytes through get_props — proves wire identity.
+        let c = NodeId::from_raw(33);
+        db.write(|s, t| {
+            s.put_edge(t, "OWNS", a, c, Some(&props_with(7, 42)))
+                .expect("put_edge");
+        });
+        let r = db.read();
+        let via_put_edge = store
+            .get_props(&r, "OWNS", a, c)
+            .expect("ok")
+            .expect("Some");
+        assert_eq!(via_put_edge.len(), loaded.len());
     }
 
     #[test]

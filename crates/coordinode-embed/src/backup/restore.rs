@@ -5,10 +5,12 @@
 
 use std::io::{BufRead, Read};
 
+use coordinode_core::graph::edge::EdgeProperties;
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::timestamp::Timestamp;
+use coordinode_modality::edge::{EdgeStore, LocalEdgeStore};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
@@ -457,22 +459,23 @@ fn write_edge_record(
 
     if let Some(props) = props {
         if !props.is_empty() {
-            // Executor-native wire shape: Vec<(field_id, Value)> (runner.rs
-            // decodes exactly this). A HashMap would make the restored props
-            // unreadable by queries.
-            let prop_vec: Vec<(u32, Value)> = props
-                .iter()
-                .map(|(name, json_val)| (interner.intern(name), json_to_value(json_val)))
-                .collect();
-            let ep_key = coordinode_core::graph::edge::encode_edgeprop_key(
-                edge_type,
-                NodeId::from_raw(source),
-                NodeId::from_raw(target),
-            );
-            let ep_value = coordinode_core::graph::edge::encode_edge_props(&prop_vec)
-                .map_err(|e| RestoreError::Deserialization(e.to_string()))?;
-            engine
-                .put(Partition::EdgeProp, &ep_key, &ep_value)
+            // Write the edge property body through the typed EdgeStore
+            // direct-write helper so restore never hand-rolls the edge-prop key
+            // (encoder lockdown). The body uses the single canonical codec, so
+            // restored bytes match a put_edge write exactly and stay readable by
+            // queries (which expect the executor-native (field_id, Value) shape).
+            let mut edge_props = EdgeProperties::new();
+            for (name, json_val) in props.iter() {
+                edge_props.set(interner.intern(name), json_to_value(json_val));
+            }
+            LocalEdgeStore
+                .put_props_direct(
+                    engine,
+                    edge_type,
+                    NodeId::from_raw(source),
+                    NodeId::from_raw(target),
+                    &edge_props,
+                )
                 .map_err(|e| RestoreError::Storage(e.to_string()))?;
         }
     }
@@ -502,9 +505,7 @@ pub fn restore_cypher<R: BufRead>(
     shard_id: u16,
     reader: &mut R,
 ) -> Result<RestoreStats, RestoreError> {
-    use coordinode_core::graph::edge::{
-        encode_adj_key_forward, encode_adj_key_reverse, encode_edgeprop_key,
-    };
+    use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse};
     use coordinode_core::graph::node::NodeRecord;
     let mut stats = RestoreStats::default();
 
@@ -542,22 +543,22 @@ pub fn restore_cypher<R: BufRead>(
                 )
                 .map_err(|e| RestoreError::Storage(e.to_string()))?;
             if !props.is_empty() {
-                // Executor-native wire shape: Vec<(field_id, Value)>
-                // (runner.rs decodes exactly this) — a HashMap would make
-                // the restored props unreadable by queries.
-                let prop_vec: Vec<(u32, Value)> = props
-                    .into_iter()
-                    .map(|(name, val)| (interner.intern(&name), val))
-                    .collect();
-                let ep_key = encode_edgeprop_key(
-                    &edge_type,
-                    NodeId::from_raw(source),
-                    NodeId::from_raw(target),
-                );
-                let ep_value = coordinode_core::graph::edge::encode_edge_props(&prop_vec)
-                    .map_err(|e| RestoreError::Deserialization(e.to_string()))?;
-                engine
-                    .put(Partition::EdgeProp, &ep_key, &ep_value)
+                // Typed direct-write so the Cypher restore path never hand-rolls
+                // the edge-prop key (encoder lockdown); the canonical codec keeps
+                // restored bytes identical to a put_edge write and readable by
+                // queries (the executor-native (field_id, Value) shape).
+                let mut edge_props = EdgeProperties::new();
+                for (name, val) in props {
+                    edge_props.set(interner.intern(&name), val);
+                }
+                LocalEdgeStore
+                    .put_props_direct(
+                        engine,
+                        &edge_type,
+                        NodeId::from_raw(source),
+                        NodeId::from_raw(target),
+                        &edge_props,
+                    )
                     .map_err(|e| RestoreError::Storage(e.to_string()))?;
             }
             stats.edges += 1;
