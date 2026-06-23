@@ -31,7 +31,7 @@ mod segment;
 mod state;
 
 pub use segment::{
-    assemble, cross_tier_piece_size, split_segment, verify_piece, MediaClass, PieceIndex,
-    SegmentManifest, SwarmError, SwarmResult,
+    assemble, cross_tier_piece_size, split_segment, verify_piece, MediaClass, PieceEncoding,
+    PieceIndex, SegmentManifest, SwarmError, SwarmResult,
 };
 pub use state::{NodeId, PieceBitfield, SwarmState};

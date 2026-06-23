@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# Per-piece transfer compression (hot-data segments). Pure-Rust LZ4.
+lz4_flex = "0.13"
 
 [lints]
 workspace = true

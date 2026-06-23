@@ -120,7 +120,10 @@ impl SwarmState {
 
     /// How many peers currently hold piece `idx`.
     pub fn availability(&self, idx: PieceIndex) -> usize {
-        self.peer_bitfields.values().filter(|bf| bf.has(idx)).count()
+        self.peer_bitfields
+            .values()
+            .filter(|bf| bf.has(idx))
+            .count()
     }
 
     /// Mark a piece transfer in flight (`source -> target`).
@@ -196,14 +199,18 @@ mod tests {
 
         assert_eq!(st.availability(0), 3);
         assert_eq!(st.availability(2), 1);
-        assert_eq!(st.select_next_piece(NodeId(99)), Some(2), "rarest, lowest-index tie");
+        assert_eq!(
+            st.select_next_piece(NodeId(99)),
+            Some(2),
+            "rarest, lowest-index tie"
+        );
     }
 
     #[test]
     fn select_skips_already_held_and_in_flight() {
         let mut st = SwarmState::new(3);
         st.set_peer_bitfield(NodeId(0), PieceBitfield::full(3)); // source has all
-        // N already holds piece 0.
+                                                                 // N already holds piece 0.
         st.mark_piece(NodeId(1), 0);
         // Piece 1 is in flight to N.
         st.mark_in_flight(1, NodeId(0), NodeId(1));
