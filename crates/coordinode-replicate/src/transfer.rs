@@ -14,7 +14,9 @@
 
 use std::sync::Arc;
 
-use coordinode_swarm::{PieceEncoding, SegmentId, SegmentManifest, SegmentWriter};
+use coordinode_swarm::{
+    PieceEncoding, PieceStore, SegmentId, SegmentManifest, SegmentWriter, SwarmResult,
+};
 use futures_util::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -72,6 +74,23 @@ pub fn build_frames(
         });
     }
     frames
+}
+
+/// Gather every wire frame for `segment` from a [`PieceStore`] (the source's
+/// manifest plus each wire piece in order), ready to stream to a peer. The
+/// network layer wraps these in the client RPC; keeping the gather here (rather
+/// than in the connection layer) lets it be tested against [`receive`] without a
+/// transport.
+///
+/// # Errors
+/// Any [`PieceStore`] error (unknown segment, unreadable piece).
+pub fn frames_for(store: &dyn PieceStore, segment: SegmentId) -> SwarmResult<Vec<PieceData>> {
+    let manifest = store.manifest(segment)?;
+    let mut wire = Vec::with_capacity(manifest.piece_count() as usize);
+    for index in 0..manifest.piece_count() {
+        wire.push(store.wire_piece(segment, index)?);
+    }
+    Ok(build_frames(segment, &manifest, &wire))
 }
 
 /// Receive one segment from a frame stream: read the header, assemble the pieces
@@ -178,7 +197,7 @@ impl<S: SegmentSink + 'static> proto::segment_transfer_service_server::SegmentTr
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use coordinode_swarm::{split_segment, ZstdLevel};
+    use coordinode_swarm::{split_segment, LocalPieceStore, ZstdLevel};
     use parking_lot::Mutex;
     use std::collections::HashMap;
 
@@ -240,6 +259,24 @@ mod tests {
             sink.stored.lock().is_empty(),
             "corrupt segment must not be stored"
         );
+    }
+
+    #[tokio::test]
+    async fn source_frames_round_trip_to_target() {
+        // frames_for (source gather from a PieceStore) feeds receive (target
+        // assemble) — the full transport logic minus the literal wire.
+        let data = segment(8 * 1024 + 5);
+        let mut store = LocalPieceStore::new();
+        store
+            .insert(SegmentId(9), &data, 1024, PieceEncoding::Lz4)
+            .expect("insert");
+
+        let frames = frames_for(&store, SegmentId(9)).expect("frames_for");
+        let sink = CollectingSink::default();
+        let ack = receive(frame_stream(frames), &sink).await.expect("receive");
+
+        assert!(ack.ok, "round-trip ack: {}", ack.error);
+        assert_eq!(sink.stored.lock().get(&9), Some(&data));
     }
 
     #[tokio::test]
