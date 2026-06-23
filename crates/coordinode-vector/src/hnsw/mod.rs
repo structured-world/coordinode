@@ -32,6 +32,7 @@ mod data_level0;
 mod entry_point;
 mod inline_layer0;
 mod neighbours;
+mod reorder;
 mod search_scratch;
 mod visited;
 
@@ -1466,6 +1467,21 @@ impl HnswIndex {
         // cover every node during allocation, so this fallback only fires for
         // an idx with no block yet (no nodes inserted) — an empty list.
         out.clear();
+    }
+
+    /// Test accessor: the entry point's current node idx, if any. Reads private
+    /// lock-free state the reorder tests need to assert BFS rooting.
+    #[cfg(test)]
+    fn entry_point_idx_for_test(&self) -> Option<usize> {
+        self.entry_point.for_search().map(|(_, idx)| idx)
+    }
+
+    /// Test accessor: snapshot of node `idx`'s layer-0 neighbour idxs.
+    #[cfg(test)]
+    fn layer0_neighbours_for_test(&self, idx: usize) -> Vec<u64> {
+        let mut out = Vec::new();
+        self.read_layer0_neighbours_into(idx, &mut out);
+        out
     }
 
     /// Mirror the RaBitQ code (packed bytes) and scalar header for node
