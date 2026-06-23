@@ -75,6 +75,31 @@ impl ZstdLevel {
             ZstdLevel::Better => CompressionLevel::Better,
         }
     }
+
+    /// Wire discriminant for the transfer header: 0 = fastest, 1 = default,
+    /// 2 = better.
+    pub fn to_wire(self) -> u32 {
+        match self {
+            ZstdLevel::Fastest => 0,
+            ZstdLevel::Default => 1,
+            ZstdLevel::Better => 2,
+        }
+    }
+
+    /// Reconstruct from the wire discriminant.
+    ///
+    /// # Errors
+    /// [`SwarmError::Source`] for an unknown discriminant.
+    pub fn from_wire(value: u32) -> SwarmResult<Self> {
+        match value {
+            0 => Ok(ZstdLevel::Fastest),
+            1 => Ok(ZstdLevel::Default),
+            2 => Ok(ZstdLevel::Better),
+            other => Err(SwarmError::Source(format!(
+                "unknown zstd level discriminant {other}"
+            ))),
+        }
+    }
 }
 
 /// How a segment's pieces are encoded on the wire. A segment uses one encoding
@@ -122,6 +147,31 @@ impl PieceEncoding {
                     .map(|_| ())
                     .map_err(|e| SwarmError::Source(format!("zstd decode: {e}")))
             }
+        }
+    }
+
+    /// Wire discriminant pair `(encoding, zstd_level)` for the transfer header:
+    /// encoding 0 = none, 1 = lz4, 2 = zstd; the level is 0 for non-zstd.
+    pub fn to_wire(self) -> (u32, u32) {
+        match self {
+            PieceEncoding::None => (0, 0),
+            PieceEncoding::Lz4 => (1, 0),
+            PieceEncoding::Zstd(level) => (2, level.to_wire()),
+        }
+    }
+
+    /// Reconstruct from the wire discriminant pair (see [`to_wire`](Self::to_wire)).
+    ///
+    /// # Errors
+    /// [`SwarmError::Source`] for an unknown encoding or zstd-level discriminant.
+    pub fn from_wire(encoding: u32, zstd_level: u32) -> SwarmResult<Self> {
+        match encoding {
+            0 => Ok(PieceEncoding::None),
+            1 => Ok(PieceEncoding::Lz4),
+            2 => Ok(PieceEncoding::Zstd(ZstdLevel::from_wire(zstd_level)?)),
+            other => Err(SwarmError::Source(format!(
+                "unknown encoding discriminant {other}"
+            ))),
         }
     }
 }
@@ -553,5 +603,21 @@ mod tests {
             build_manifest(&segment(10), 0, PieceEncoding::None),
             Err(SwarmError::ZeroPieceSize)
         );
+    }
+
+    #[test]
+    fn encoding_wire_discriminants_round_trip() {
+        for enc in [
+            PieceEncoding::None,
+            PieceEncoding::Lz4,
+            PieceEncoding::Zstd(ZstdLevel::Fastest),
+            PieceEncoding::Zstd(ZstdLevel::Default),
+            PieceEncoding::Zstd(ZstdLevel::Better),
+        ] {
+            let (e, l) = enc.to_wire();
+            assert_eq!(PieceEncoding::from_wire(e, l).expect("from_wire"), enc);
+        }
+        assert!(PieceEncoding::from_wire(7, 0).is_err());
+        assert!(PieceEncoding::from_wire(2, 9).is_err());
     }
 }
