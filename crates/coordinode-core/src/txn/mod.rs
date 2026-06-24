@@ -1,6 +1,7 @@
 //! MVCC transaction manager: timestamps, snapshots, transactions,
 //! the Raft proposal pipeline abstraction, and volatile write drain.
 
+pub mod coalesce;
 pub mod drain;
 pub mod proposal;
 pub mod read_concern;

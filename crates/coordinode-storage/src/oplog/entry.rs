@@ -54,7 +54,7 @@ pub enum OplogOp {
     /// Delete every key in the half-open range `[start, end)` of a partition
     /// with a single range tombstone (G096). Emitted only for a **dense
     /// contiguous run** of deleted keys (run-length coalescing of the sorted
-    /// delete set, threshold-gated — see `delete_coalesce`) or a whole-prefix
+    /// delete set, threshold-gated — see `coordinode_core::txn::coalesce`) or a whole-prefix
     /// DROP (shard / edge-type / index). The range covers only keys that are all
     /// being deleted — never across a gap holding a surviving key — so it is an
     /// exact compact encoding of "delete these keys", applied symmetrically on

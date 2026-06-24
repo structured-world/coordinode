@@ -1,7 +1,6 @@
 pub mod blob;
 pub mod cache;
 pub mod compress;
-pub mod delete_coalesce;
 pub mod engine;
 pub mod error;
 pub mod oplog;
