@@ -273,6 +273,61 @@ fn eval_case_generic() {
 }
 
 #[test]
+fn eval_case_simple_with_operand() {
+    // Simple CASE: `CASE n.age WHEN 30 THEN 'thirty' WHEN 40 THEN 'forty' ELSE 'other' END`.
+    let row = sample_row(); // n.age = 30
+    let age = || Expr::PropertyAccess {
+        expr: Box::new(Expr::Variable("n".into())),
+        property: "age".into(),
+    };
+    let expr = Expr::Case {
+        operand: Some(Box::new(age())),
+        when_clauses: vec![
+            (
+                Expr::Literal(Value::Int(30)),
+                Expr::Literal(Value::String("thirty".into())),
+            ),
+            (
+                Expr::Literal(Value::Int(40)),
+                Expr::Literal(Value::String("forty".into())),
+            ),
+        ],
+        else_clause: Some(Box::new(Expr::Literal(Value::String("other".into())))),
+    };
+    assert_eq!(eval_expr(&expr, &row), Value::String("thirty".into()));
+}
+
+#[test]
+fn eval_case_else_and_nested() {
+    let row = sample_row(); // n.age = 30
+    let age = || Expr::PropertyAccess {
+        expr: Box::new(Expr::Variable("n".into())),
+        property: "age".into(),
+    };
+    // No WHEN matches → ELSE branch, which is itself a (nested) simple CASE.
+    let inner = Expr::Case {
+        operand: Some(Box::new(age())),
+        when_clauses: vec![(
+            Expr::Literal(Value::Int(30)),
+            Expr::Literal(Value::String("nested-thirty".into())),
+        )],
+        else_clause: None,
+    };
+    let outer = Expr::Case {
+        operand: Some(Box::new(age())),
+        when_clauses: vec![(
+            Expr::Literal(Value::Int(99)),
+            Expr::Literal(Value::String("never".into())),
+        )],
+        else_clause: Some(Box::new(inner)),
+    };
+    assert_eq!(
+        eval_expr(&outer, &row),
+        Value::String("nested-thirty".into())
+    );
+}
+
+#[test]
 fn eval_list_literal() {
     let expr = Expr::List(vec![
         Expr::Literal(Value::Int(1)),
