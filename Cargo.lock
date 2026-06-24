@@ -1057,6 +1057,7 @@ dependencies = [
  "prost",
  "rmp-serde",
  "serde",
+ "structured-zstd",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

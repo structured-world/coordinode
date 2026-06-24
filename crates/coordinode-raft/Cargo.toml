@@ -23,6 +23,8 @@ tempfile = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = "0.14"
 prost = { workspace = true }
+# Pure-Rust zstd for inter-node gRPC transport compression (no C FFI, ADR-013).
+structured-zstd = "0.0.44"
 
 [dev-dependencies]
 tempfile = { workspace = true }
