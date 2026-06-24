@@ -95,6 +95,7 @@ fn mutation_size(m: &Mutation) -> usize {
         Mutation::Put { key, value, .. } => 1 + key.len() + value.len(),
         Mutation::Delete { key, .. } => 1 + key.len(),
         Mutation::Merge { key, operand, .. } => 1 + key.len() + operand.len(),
+        Mutation::RemoveRange { start, end, .. } => 1 + start.len() + end.len(),
     }
 }
 

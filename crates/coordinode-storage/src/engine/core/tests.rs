@@ -62,6 +62,35 @@ fn test_engine() -> (StorageEngine, Option<TempDir>) {
     }
 }
 
+/// `remove_range` deletes exactly the keys in `[start, end)` and leaves keys
+/// outside the range intact — the MVCC range-tombstone path (G096).
+#[test]
+fn remove_range_deletes_only_keys_in_range() {
+    let engine = test_engine_memfs();
+    let key = |i: u64| {
+        let mut k = b"node:0:".to_vec();
+        k.extend_from_slice(&i.to_be_bytes());
+        k
+    };
+    for i in 0..10u64 {
+        engine.put(Partition::Node, &key(i), b"v").expect("put");
+    }
+
+    // Delete [k3, k7): removes 3,4,5,6; 0-2 and 7-9 survive.
+    engine
+        .remove_range(Partition::Node, &key(3), &key(7))
+        .expect("remove_range");
+
+    for i in 0..10u64 {
+        let got = engine.get(Partition::Node, &key(i)).expect("get");
+        if (3..7).contains(&i) {
+            assert!(got.is_none(), "key {i} inside [3,7) must be deleted");
+        } else {
+            assert!(got.is_some(), "key {i} outside [3,7) must survive");
+        }
+    }
+}
+
 fn test_engine_memfs() -> StorageEngine {
     use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
     let id = MEMFS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -65,6 +65,7 @@ const DRAINING_SUFFIX: &str = ".bin";
 const KIND_PUT: u8 = 0;
 const KIND_DELETE: u8 = 1;
 const KIND_MERGE: u8 = 2;
+const KIND_REMOVE_RANGE: u8 = 3;
 
 // ── NvmeWriteBuffer ───────────────────────────────────────────────
 
@@ -299,6 +300,16 @@ fn encode_mutation(mutation: &Mutation, buf: &mut Vec<u8>) {
             write_bytes(key, buf);
             write_bytes(operand, buf);
         }
+        Mutation::RemoveRange {
+            partition,
+            start,
+            end,
+        } => {
+            buf.push(KIND_REMOVE_RANGE);
+            buf.push(partition_to_u8(*partition));
+            write_bytes(start, buf);
+            write_bytes(end, buf);
+        }
     }
 }
 
@@ -445,6 +456,15 @@ fn decode_entry(data: &[u8]) -> Option<DrainEntry> {
                     partition,
                     key,
                     operand,
+                }
+            }
+            KIND_REMOVE_RANGE => {
+                let start = read_bytes(data, &mut pos)?;
+                let end = read_bytes(data, &mut pos)?;
+                Mutation::RemoveRange {
+                    partition,
+                    start,
+                    end,
                 }
             }
             _ => return None,

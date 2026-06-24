@@ -444,6 +444,19 @@ impl StorageEngine {
                                 })?;
                                 tree.merge(key, operand, part_seqno);
                             }
+                            CoreMutation::RemoveRange {
+                                partition,
+                                start,
+                                end,
+                            } => {
+                                let part = Partition::from(*partition);
+                                let tree = trees.get(&part).ok_or_else(|| {
+                                    StorageError::PartitionNotFound {
+                                        name: part.name().to_string(),
+                                    }
+                                })?;
+                                tree.remove_range(start.clone(), end.clone(), part_seqno);
+                            }
                         }
                     }
                 }
@@ -864,6 +877,23 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Delete the half-open range `[start, end)` of a partition with one MVCC
+    /// range tombstone (G096). Snapshot-aware and seqno'd, so it replicates and
+    /// PITR-replays correctly — unlike [`drop_range`](Self::drop_range), which is
+    /// an eager, non-MVCC table-level drop. Invalidates the partition's cache:
+    /// the tombstone leaves the shadowed keys physically present, so a stale
+    /// cache hit would otherwise return a deleted value, and the cache cannot
+    /// range-query to invalidate precisely.
+    ///
+    /// Not capacity-gated — deleting frees space.
+    pub fn remove_range(&self, part: Partition, start: &[u8], end: &[u8]) -> StorageResult<()> {
+        self.coordinator.remove_range(part, start, end)?;
+        if let Some(cache) = &self.tiered_cache {
+            cache.clear_partition(part);
+        }
+        Ok(())
+    }
+
     /// Store a merge operand for the given key in the specified partition.
     ///
     /// The operand is lazily combined with the existing value during reads
@@ -906,6 +936,11 @@ impl StorageEngine {
                 key,
                 operand,
             } => self.merge(Partition::from(*partition), key, operand),
+            Mutation::RemoveRange {
+                partition,
+                start,
+                end,
+            } => self.remove_range(Partition::from(*partition), start, end),
         }
     }
 

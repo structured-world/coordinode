@@ -689,6 +689,22 @@ impl LocalMultiModalCoordinator {
         Ok(seqno)
     }
 
+    /// Delete the half-open range `[start, end)` with one MVCC range tombstone,
+    /// stamped with the next seqno. This is the seqno'd, snapshot-aware,
+    /// replication/PITR-correct range delete (G096) — distinct from the eager,
+    /// non-MVCC `drop_range` table-drop.
+    pub(crate) fn remove_range(
+        &self,
+        part: Partition,
+        start: &[u8],
+        end: &[u8],
+    ) -> StorageResult<lsm_tree::SeqNo> {
+        let tree = self.tree(part)?;
+        let seqno = self.seqno.next();
+        tree.remove_range(start.to_vec(), end.to_vec(), seqno);
+        Ok(seqno)
+    }
+
     /// Single-key merge-operand append. Stamps with the next seqno.
     /// Capacity gating handled above.
     pub(crate) fn merge_no_capacity_check(

@@ -152,6 +152,15 @@ impl<'a> LocalProposalPipeline<'a> {
                     .merge(to_partition(*partition), key, operand)
                     .map_err(storage_to_proposal_err)?;
             }
+            Mutation::RemoveRange {
+                partition,
+                start,
+                end,
+            } => {
+                self.engine
+                    .remove_range(to_partition(*partition), start, end)
+                    .map_err(storage_to_proposal_err)?;
+            }
         }
         Ok(())
     }
@@ -249,6 +258,15 @@ impl ProposalPipeline for OwnedLocalProposalPipeline {
                 } => {
                     self.engine
                         .merge(to_partition(*partition), key, operand)
+                        .map_err(storage_to_proposal_err)?;
+                }
+                Mutation::RemoveRange {
+                    partition,
+                    start,
+                    end,
+                } => {
+                    self.engine
+                        .remove_range(to_partition(*partition), start, end)
                         .map_err(storage_to_proposal_err)?;
                 }
             }

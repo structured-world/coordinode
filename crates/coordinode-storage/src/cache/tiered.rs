@@ -73,6 +73,10 @@ struct EntryMeta {
     /// Eviction priority weight. Higher weight = stays in cache longer.
     /// Default 1.0. Labels configured as "hot" get higher weights.
     weight: f32,
+    /// Partition discriminant (`part as u8`), mirrored from the entry header so
+    /// a partition-scoped invalidation (`clear_partition`, used by range delete)
+    /// can filter the index without reading each backing entry.
+    partition: u8,
 }
 
 // ── CacheLayer: single file-backed cache ──────────────────────────
@@ -239,6 +243,7 @@ impl CacheLayer {
             value_size: value.len() as u32,
             key_len: key.len() as u16,
             weight,
+            partition: part as u8,
         };
         idx.insert(cache_key, meta);
 
@@ -259,6 +264,26 @@ impl CacheLayer {
             self.live_bytes
                 .fetch_sub(u64::from(meta.total_size), Ordering::Relaxed);
         }
+    }
+
+    /// Drop every index entry for `part`. Used by a range delete to invalidate
+    /// all cached keys of the affected partition: the cache cannot range-query,
+    /// and a range tombstone leaves the shadowed keys physically present, so a
+    /// stale cache hit would otherwise return a deleted value. Orphaned file
+    /// bytes are reclaimed by the next compaction, mirroring [`remove`].
+    fn clear_partition(&self, part: Partition) {
+        let target = part as u8;
+        let mut idx = self.index.write().unwrap_or_else(|e| e.into_inner());
+        let mut freed = 0u64;
+        idx.retain(|_, meta| {
+            if meta.partition == target {
+                freed += u64::from(meta.total_size);
+                false
+            } else {
+                true
+            }
+        });
+        self.live_bytes.fetch_sub(freed, Ordering::Relaxed);
     }
 
     fn len(&self) -> usize {
@@ -449,7 +474,8 @@ impl CacheLayer {
                 total_size,
                 value_size: value_len,
                 key_len,
-                weight: 1.0, // Recovered entries use default weight
+                weight: 1.0,          // Recovered entries use default weight
+                partition: header[8], // partition byte in the entry header
             };
 
             if let Some(old) = index.insert(cache_key, meta) {
@@ -646,6 +672,15 @@ impl TieredCache {
     pub fn remove(&self, part: Partition, key: &[u8]) {
         for layer in self.layers.iter() {
             layer.remove(part, key);
+        }
+    }
+
+    /// Invalidate every cached entry for `part` across all layers. Called by a
+    /// range delete, which cannot enumerate the affected keys cheaply and must
+    /// not leave a stale cache hit shadowing a range-tombstoned key.
+    pub fn clear_partition(&self, part: Partition) {
+        for layer in self.layers.iter() {
+            layer.clear_partition(part);
         }
     }
 

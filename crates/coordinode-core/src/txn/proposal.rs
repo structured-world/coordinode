@@ -143,6 +143,19 @@ pub enum Mutation {
         /// Encoded merge operand.
         operand: Vec<u8>,
     },
+    /// Delete every key in the half-open range `[start, end)` with one MVCC
+    /// range tombstone (G096). Produced by run-length coalescing a dense
+    /// contiguous run of deleted keys, or by a whole-prefix DROP. The range
+    /// covers only keys that are all being deleted — never across a gap holding a
+    /// surviving key.
+    RemoveRange {
+        /// Storage partition.
+        partition: PartitionId,
+        /// Inclusive start bound.
+        start: Vec<u8>,
+        /// Exclusive end bound.
+        end: Vec<u8>,
+    },
 }
 
 impl Mutation {
@@ -269,6 +282,7 @@ impl RaftProposal {
                 Mutation::Put { key, value, .. } => 1 + key.len() + value.len(),
                 Mutation::Delete { key, .. } => 1 + key.len(),
                 Mutation::Merge { key, operand, .. } => 1 + key.len() + operand.len(),
+                Mutation::RemoveRange { start, end, .. } => 1 + start.len() + end.len(),
             };
         }
         size

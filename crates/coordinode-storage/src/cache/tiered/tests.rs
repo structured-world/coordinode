@@ -70,6 +70,28 @@ fn single_layer_remove() {
 }
 
 #[test]
+fn clear_partition_drops_only_that_partition() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = one_layer_config(dir.path(), 1024 * 1024);
+    let cache = TieredCache::open(&config).expect("open");
+
+    // Two partitions cached; clear one, the other must survive — this is what a
+    // range delete relies on to invalidate cached keys without nuking the world.
+    cache.put(Partition::Node, b"n1", b"v");
+    cache.put(Partition::Node, b"n2", b"v");
+    cache.put(Partition::Counter, b"c1", b"v");
+
+    cache.clear_partition(Partition::Node);
+
+    assert!(cache.get(Partition::Node, b"n1").is_none());
+    assert!(cache.get(Partition::Node, b"n2").is_none());
+    assert_eq!(
+        cache.get(Partition::Counter, b"c1").as_deref(),
+        Some(&b"v"[..])
+    );
+}
+
+#[test]
 fn single_layer_overwrite() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = one_layer_config(dir.path(), 1024 * 1024);

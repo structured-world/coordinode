@@ -372,6 +372,15 @@ impl LogStore {
                             key: key.clone(),
                             operand: operand.clone(),
                         },
+                        Mutation::RemoveRange {
+                            partition,
+                            start,
+                            end,
+                        } => OplogOp::RemoveRange {
+                            partition: Self::partition_id_to_u8(*partition),
+                            start: start.clone(),
+                            end: end.clone(),
+                        },
                     })
                     .collect();
                 // is_migration could be derived from proposal metadata in the future;
@@ -961,6 +970,16 @@ impl CoordinodeStateMachine {
                 } => {
                     self.engine
                         .merge(to_partition(*partition), key, operand)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    count += 1;
+                }
+                Mutation::RemoveRange {
+                    partition,
+                    start,
+                    end,
+                } => {
+                    self.engine
+                        .remove_range(to_partition(*partition), start, end)
                         .map_err(|e| io::Error::other(e.to_string()))?;
                     count += 1;
                 }
