@@ -1081,6 +1081,7 @@ dependencies = [
  "metrics",
  "openraft",
  "prost",
+ "rcgen",
  "rmp-serde",
  "serde",
  "tempfile",
