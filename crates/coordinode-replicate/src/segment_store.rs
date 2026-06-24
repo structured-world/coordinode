@@ -120,6 +120,91 @@ pub fn export_segment(
     Ok(blob)
 }
 
+/// Failure modes of [`drain_segment_to_peer`].
+#[derive(Debug, thiserror::Error)]
+pub enum DrainError {
+    /// Reading the segment's key range out of local storage failed.
+    #[error("export segment: {0}")]
+    Export(#[from] StorageError),
+    /// Splitting the exported blob into swarm pieces failed.
+    #[error("split into pieces: {0}")]
+    Pieces(String),
+    /// Could not open the gRPC connection to the peer.
+    #[error("connect to {endpoint}: {source}")]
+    Connect {
+        /// The peer endpoint that could not be reached.
+        endpoint: String,
+        /// The underlying tonic transport error.
+        source: tonic::transport::Error,
+    },
+    /// The transfer stream failed at the transport level.
+    #[error("transfer rpc: {0}")]
+    Rpc(#[from] tonic::Status),
+    /// The peer received the stream but rejected the segment (checksum, decode,
+    /// or storage failure on the target — the segment was not installed).
+    #[error("peer rejected segment {segment}: {error}")]
+    Rejected {
+        /// The segment id the peer rejected.
+        segment: u64,
+        /// The peer's reported reason.
+        error: String,
+    },
+}
+
+/// Drain (push) the segment described by `descriptor` from `engine` to the
+/// [`SegmentTransferService`](crate::transfer) at `endpoint`
+/// (e.g. `"http://10.0.0.2:7080"`).
+///
+/// Reads the segment's key range into a portable blob, splits it into
+/// `piece_size`-byte swarm pieces under `encoding` (the in-flight wire encoding,
+/// independent of the target's on-disk codec), and streams them to the peer,
+/// which verifies each piece and installs the segment under its own tier/codec
+/// policy. Returns the peer's ack on success.
+///
+/// This is the source side of the `full-storage → compute` segment drain and of
+/// operator-commanded migration; the receive side is the registered
+/// [`SegmentTransferHandler`](crate::transfer::SegmentTransferHandler).
+///
+/// # Errors
+/// [`DrainError`] for an export failure, a piece-split failure, a connection
+/// failure, a transport error, or a target rejection.
+pub async fn drain_segment_to_peer(
+    engine: &StorageEngine,
+    descriptor: &SegmentDescriptor,
+    endpoint: &str,
+    piece_size: usize,
+    encoding: coordinode_swarm::PieceEncoding,
+) -> Result<crate::transfer::proto::TransferAck, DrainError> {
+    use crate::transfer::proto::segment_transfer_service_client::SegmentTransferServiceClient;
+
+    let blob = export_segment(engine, descriptor)?;
+    let seg = coordinode_swarm::SegmentId(descriptor.id.0);
+    let mut store = coordinode_swarm::LocalPieceStore::new();
+    store
+        .insert(seg, &blob, piece_size, encoding)
+        .map_err(|e| DrainError::Pieces(e.to_string()))?;
+    let frames =
+        crate::transfer::frames_for(&store, seg).map_err(|e| DrainError::Pieces(e.to_string()))?;
+
+    let mut client = SegmentTransferServiceClient::connect(endpoint.to_string())
+        .await
+        .map_err(|source| DrainError::Connect {
+            endpoint: endpoint.to_string(),
+            source,
+        })?;
+    let ack = client
+        .transfer_pieces(futures_util::stream::iter(frames))
+        .await?
+        .into_inner();
+    if !ack.ok {
+        return Err(DrainError::Rejected {
+            segment: seg.0,
+            error: ack.error,
+        });
+    }
+    Ok(ack)
+}
+
 /// Installs a received, assembled segment into the engine, routing it to the
 /// partition named by the blob's leading wire tag and writing each entry. The
 /// target re-encodes locally per its own tier/codec policy (entries are plain

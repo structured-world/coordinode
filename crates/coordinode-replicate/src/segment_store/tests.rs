@@ -107,15 +107,13 @@ fn export_transfer_install_round_trip() {
 }
 
 #[tokio::test]
-async fn grpc_transfer_installs_into_target_engine() {
-    use crate::transfer::proto::segment_transfer_service_client::SegmentTransferServiceClient;
+async fn drain_client_pushes_segment_into_target_engine() {
     use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
-    use crate::transfer::{frames_for, SegmentTransferHandler};
+    use crate::transfer::SegmentTransferHandler;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
 
-    // Source engine: write entries, materialise SSTs, derive the spanning segment,
-    // and serve it over a swarm piece store.
+    // Source engine: write entries, materialise SSTs, derive the spanning segment.
     let src_dir = tempfile::tempdir().expect("tempdir");
     let src = test_engine(src_dir.path());
     for i in 0..16u32 {
@@ -125,14 +123,7 @@ async fn grpc_transfer_installs_into_target_engine() {
     }
     src.force_compaction(Partition::Node).expect("compact");
     let map = SegmentMap::build(&src, Partition::Node, PlacementSegmentId(7)).expect("map");
-    let descriptor = &map.segments()[0];
-    let blob = export_segment(&src, descriptor).expect("export");
-    let seg = SegmentId(descriptor.id.0);
-    let mut store = LocalPieceStore::new();
-    store
-        .insert(seg, &blob, 64, PieceEncoding::None)
-        .expect("insert");
-    let frames = frames_for(&store, seg).expect("frames_for");
+    let descriptor = map.segments()[0].clone();
 
     // Target engine behind the real tonic SegmentTransferService (the same
     // service main.rs registers in cluster mode).
@@ -153,15 +144,17 @@ async fn grpc_transfer_installs_into_target_engine() {
             .expect("server");
     });
 
-    // Push the segment to the target over the wire and verify it installed.
-    let mut client = SegmentTransferServiceClient::connect(format!("http://{addr}"))
-        .await
-        .expect("connect");
-    let ack = client
-        .transfer_pieces(tokio_stream::iter(frames))
-        .await
-        .expect("transfer_pieces")
-        .into_inner();
+    // Drain the segment from the source to the peer via the public client helper
+    // (export → split → stream → install) and verify every entry installed.
+    let ack = drain_segment_to_peer(
+        &src,
+        &descriptor,
+        &format!("http://{addr}"),
+        64,
+        PieceEncoding::None,
+    )
+    .await
+    .expect("drain");
     assert!(ack.ok, "transfer ack: {}", ack.error);
 
     let snap = tgt.snapshot();
@@ -176,6 +169,32 @@ async fn grpc_transfer_installs_into_target_engine() {
     assert_eq!(
         got.get("node:0:00000003").map(Vec::as_slice),
         Some(&b"v3"[..])
+    );
+}
+
+#[tokio::test]
+async fn drain_to_unreachable_peer_is_connect_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = test_engine(dir.path());
+    src.put(Partition::Node, b"node:0:00000001", b"v")
+        .expect("put");
+    src.force_compaction(Partition::Node).expect("compact");
+    let map = SegmentMap::build(&src, Partition::Node, PlacementSegmentId(1)).expect("map");
+    let descriptor = &map.segments()[0];
+
+    // Port 1 is privileged and never listening here → connection refused.
+    let err = drain_segment_to_peer(
+        &src,
+        descriptor,
+        "http://127.0.0.1:1",
+        64,
+        PieceEncoding::None,
+    )
+    .await
+    .expect_err("unreachable peer must error");
+    assert!(
+        matches!(err, DrainError::Connect { .. }),
+        "expected Connect error, got {err:?}"
     );
 }
 
