@@ -2715,10 +2715,11 @@ fn trigger_survives_database_restart() {
 /// the index key are removed.
 #[test]
 fn trigger_drop_clears_secondary_index_entries() {
-    use coordinode_core::schema::triggers::{
-        encode_trigger_index_key, encode_trigger_key, TriggerTargetSchema,
-    };
-    use coordinode_storage::engine::partition::Partition;
+    use coordinode_core::schema::triggers::TriggerTargetSchema;
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use coordinode_modality::{LocalTriggerStore, TriggerStore as _};
+    use coordinode_storage::engine::core::StorageEngine;
+    use coordinode_storage::engine::transaction::Transaction;
     let mut db = open_db();
 
     db.execute_cypher(
@@ -2727,68 +2728,60 @@ fn trigger_drop_clears_secondary_index_entries() {
     )
     .unwrap();
 
-    let def_key = encode_trigger_key("cleanup");
     let target_seg = TriggerTargetSchema::label("Customer").index_key_segment();
-    let idx_c = encode_trigger_index_key(&target_seg, "c");
-    let idx_u = encode_trigger_index_key(&target_seg, "u");
-    let idx_d = encode_trigger_index_key(&target_seg, "d");
+
+    // Probe the trigger store at the latest snapshot: (definition, CREATE-idx,
+    // UPDATE-idx, DELETE-idx) presence. The store owns the key encoding, so the
+    // test never hand-builds `schema:trigger…` keys.
+    let probe = |engine: &StorageEngine| -> (bool, bool, bool, bool) {
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let read_ts = oracle.next();
+        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let store = LocalTriggerStore;
+        (
+            store
+                .get_definition(&mut txn, "cleanup")
+                .expect("get def")
+                .is_some(),
+            store
+                .get_index(&mut txn, &target_seg, "c")
+                .expect("get idx c")
+                .is_some(),
+            store
+                .get_index(&mut txn, &target_seg, "u")
+                .expect("get idx u")
+                .is_some(),
+            store
+                .get_index(&mut txn, &target_seg, "d")
+                .expect("get idx d")
+                .is_some(),
+        )
+    };
 
     // Pre-DROP: definition present, index entries for the two subscribed
     // events present, the unsubscribed `d` slot absent.
-    assert!(
-        db.engine_shared()
-            .get(Partition::Schema, &def_key)
-            .expect("get def")
-            .is_some(),
-        "definition must exist before DROP"
-    );
-    assert!(
-        db.engine_shared()
-            .get(Partition::Schema, &idx_c)
-            .expect("get idx c")
-            .is_some(),
-        "index entry for CREATE event must exist"
-    );
-    assert!(
-        db.engine_shared()
-            .get(Partition::Schema, &idx_u)
-            .expect("get idx u")
-            .is_some(),
-        "index entry for UPDATE event must exist"
-    );
-    assert!(
-        db.engine_shared()
-            .get(Partition::Schema, &idx_d)
-            .expect("get idx d")
-            .is_none(),
-        "unsubscribed DELETE event must have no index entry"
-    );
+    let eng = db.engine_shared();
+    let (def, c, u, d) = probe(&eng);
+    assert!(def, "definition must exist before DROP");
+    assert!(c, "index entry for CREATE event must exist");
+    assert!(u, "index entry for UPDATE event must exist");
+    assert!(!d, "unsubscribed DELETE event must have no index entry");
 
     db.execute_cypher("DROP TRIGGER cleanup").unwrap();
 
     // Post-DROP: both definition and the two subscribed-event index keys
     // must be gone. (Index entries become empty Vecs → executor removes the
     // whole key per `remove_from_trigger_index`.)
+    let eng = db.engine_shared();
+    let (def, c, u, _d) = probe(&eng);
+    assert!(!def, "definition must be deleted after DROP");
     assert!(
-        db.engine_shared()
-            .get(Partition::Schema, &def_key)
-            .expect("get def post-drop")
-            .is_none(),
-        "definition must be deleted after DROP"
-    );
-    assert!(
-        db.engine_shared()
-            .get(Partition::Schema, &idx_c)
-            .expect("get idx c post-drop")
-            .is_none(),
+        !c,
         "index entry for CREATE event must be deleted after DROP — \
          stale entries would create ghost firings once future trigger executors land"
     );
     assert!(
-        db.engine_shared()
-            .get(Partition::Schema, &idx_u)
-            .expect("get idx u post-drop")
-            .is_none(),
+        !u,
         "index entry for UPDATE event must be deleted after DROP"
     );
 }
