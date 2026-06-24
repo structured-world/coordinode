@@ -1051,13 +1051,13 @@ dependencies = [
  "bytes",
  "coordinode-core",
  "coordinode-storage",
+ "coordinode-wire",
  "futures-util",
  "metrics",
  "openraft",
  "prost",
  "rmp-serde",
  "serde",
- "structured-zstd",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1078,6 +1078,7 @@ dependencies = [
  "coordinode-raft",
  "coordinode-storage",
  "coordinode-swarm",
+ "coordinode-wire",
  "futures-util",
  "metrics",
  "parking_lot",
@@ -1152,6 +1153,7 @@ dependencies = [
  "coordinode-search",
  "coordinode-storage",
  "coordinode-vector",
+ "coordinode-wire",
  "flate2",
  "futures-util",
  "hex",
@@ -1262,6 +1264,16 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "coordinode-wire"
+version = "0.4.3"
+dependencies = [
+ "bytes",
+ "prost",
+ "structured-zstd",
+ "tonic",
 ]
 
 [[package]]

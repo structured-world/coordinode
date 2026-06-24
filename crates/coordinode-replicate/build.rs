@@ -34,6 +34,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        // SegmentTransferService payloads travel zstd-compressed on the wire via
+        // the shared pure-Rust transport codec. This build compiles only
+        // transfer.proto, so the codec scopes to SegmentTransferService and never
+        // touches the client-facing CDC ChangeStreamService (built elsewhere).
+        .codec_path("coordinode_wire::ZstdCodec")
         .compile_protos(&[transfer_proto], &[proto_root_str])?;
 
     Ok(())

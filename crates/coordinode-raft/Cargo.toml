@@ -23,8 +23,9 @@ tempfile = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = "0.14"
 prost = { workspace = true }
-# Pure-Rust zstd for inter-node gRPC transport compression (no C FFI, ADR-013).
-structured-zstd = "0.0.44"
+# Inter-node gRPC transport compression codec (pure-Rust zstd, shared with the
+# other inter-node services); wired into RaftService stubs via codec_path.
+coordinode-wire = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -208,8 +208,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg.apply_overrides(&overrides);
 
             // Set the inter-node wire compression level before any gRPC service
-            // starts; the RaftService transport codec reads it per message.
-            coordinode_raft::codec::set_wire_zstd_level(cfg.wire_compression_level);
+            // starts; the transport codec reads it per message.
+            coordinode_wire::set_wire_zstd_level(cfg.wire_compression_level);
 
             // Resolve the operational mode from the merged string value, so a
             // mode set in the config file is validated exactly like a CLI flag.

@@ -1,21 +1,21 @@
-//! Inter-node gRPC transport compression codec (zstd).
+//! Inter-node wire transport codec: pure-Rust zstd compression for gRPC.
 //!
-//! A drop-in [`tonic::codec::Codec`] that compresses every gRPC message body on
-//! the wire with pure-Rust zstd ([`structured_zstd`], no C FFI per ADR-013),
-//! independent of any node's on-disk storage codec. Wired into the inter-node
-//! services through tonic-build `codec_path`; both ends use it symmetrically, so
-//! a node's `AppendEntries` / segment-transfer payloads travel compressed
-//! between replicas — most valuable on a bandwidth-constrained geo link.
+//! [`ZstdCodec`] is a drop-in [`tonic::codec::Codec`] that compresses every gRPC
+//! message body on the wire with pure-Rust zstd ([`structured_zstd`], no C FFI
+//! per ADR-013), independent of any node's on-disk storage codec. Wire it into
+//! an inter-node service through tonic-build `codec_path = "coordinode_wire::ZstdCodec"`;
+//! both ends use it symmetrically, so a service's payloads travel compressed
+//! between replicas — most valuable on a bandwidth-constrained geo link. Shared
+//! by every inter-node service (RaftService, SegmentTransferService).
 //!
 //! The transport zstd level is process-global, set once at startup from config
-//! ([`set_wire_zstd_level`]); the default is a fast level (zstd-3) suited to the
-//! hot replication path and raised (up to 22) on links where bandwidth costs
-//! more than CPU.
+//! ([`set_wire_zstd_level`]); the default is a fast level suited to hot paths and
+//! raised on links where bandwidth costs more than CPU.
 //!
 //! The compress side uses the one-shot slice entry point so the
-//! `frame_content_size` is written into the zstd header and the decoder knows
-//! the decompressed size up front; no streaming pledged-size handshake is
-//! needed because a gRPC message is delivered to the codec whole.
+//! `frame_content_size` is written into the zstd header and the decoder knows the
+//! decompressed size up front; no streaming pledged-size handshake is needed
+//! because a gRPC message is delivered to the codec whole.
 
 use core::marker::PhantomData;
 use std::io::Read;
@@ -32,12 +32,11 @@ use tonic::Status;
 /// speed for ratio; NEGATIVE values select zstd ultra-fast modes (fastest, lowest
 /// ratio). Set once at startup from config before any RPC, then read-mostly.
 ///
-/// Defaults to 1 — zstd's fastest positive level, suited to the hot Raft
-/// replication path (measured ~11% of raw on a Raft batch, ~9× smaller on the
-/// wire). The ultra-fast `-22` mode panics in `structured-zstd` 0.0.44's huff0
-/// encoder (an internal-error bug, filed upstream), so it is not used as the
-/// default. A bandwidth-constrained link (db4 geo) can raise the level via
-/// config.
+/// Defaults to 1 — zstd's fastest positive level, suited to hot replication
+/// (measured ~11% of raw on a Raft batch, ~9× smaller on the wire). The
+/// ultra-fast `-22` mode panics in `structured-zstd` 0.0.44's huff0 encoder (an
+/// internal-error bug, filed upstream), so it is not the default. A
+/// bandwidth-constrained link (db4 geo) can raise the level via config.
 static WIRE_ZSTD_LEVEL: AtomicI32 = AtomicI32::new(1);
 
 /// Set the inter-node transport zstd level. Call once at startup from config,
@@ -86,7 +85,7 @@ fn decode_compressed<U: Message + Default>(bytes: &[u8]) -> Result<U, Status> {
 /// A [`tonic`] codec that zstd-compresses each message body on the wire.
 ///
 /// Symmetric: the same codec serves both directions. Wire it into a service via
-/// tonic-build `codec_path = "...::ZstdCodec"`.
+/// tonic-build `codec_path = "coordinode_wire::ZstdCodec"`.
 pub struct ZstdCodec<T, U>(PhantomData<(T, U)>);
 
 impl<T, U> Default for ZstdCodec<T, U> {

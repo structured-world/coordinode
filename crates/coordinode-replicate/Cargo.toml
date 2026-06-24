@@ -10,6 +10,9 @@ publish.workspace = true
 [dependencies]
 coordinode-core = { workspace = true }
 coordinode-embed = { workspace = true }
+# Shared inter-node transport codec (pure-Rust zstd); wired into the
+# SegmentTransferService stubs via codec_path.
+coordinode-wire = { workspace = true }
 coordinode-query = { workspace = true }
 coordinode-storage = { workspace = true }
 coordinode-swarm = { workspace = true }

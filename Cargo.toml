@@ -19,6 +19,7 @@ members = [
     "crates/coordinode-client",
     "crates/coordinode-test-fixtures",
     "crates/coordinode-bench",
+    "crates/coordinode-wire",
     "tests/integration",
 ]
 exclude = [
@@ -143,6 +144,7 @@ coordinode-replicate = { path = "crates/coordinode-replicate" }
 coordinode-client = { path = "crates/coordinode-client" }
 coordinode-test-fixtures = { path = "crates/coordinode-test-fixtures" }
 coordinode-bench = { path = "crates/coordinode-bench" }
+coordinode-wire = { path = "crates/coordinode-wire" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

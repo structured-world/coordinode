@@ -33,9 +33,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         // Inter-node RaftService RPCs travel zstd-compressed on the wire via the
-        // pure-Rust transport codec (no C FFI). Both generated client and server
-        // use it, so the framing stays symmetric.
-        .codec_path("crate::codec::ZstdCodec")
+        // shared pure-Rust transport codec (no C FFI). Both generated client and
+        // server use it, so the framing stays symmetric.
+        .codec_path("coordinode_wire::ZstdCodec")
         .compile_protos(&[raft_proto], &[proto_root_str])?;
 
     Ok(())

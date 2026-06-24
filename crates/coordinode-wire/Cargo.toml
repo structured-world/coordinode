@@ -1,0 +1,18 @@
+[package]
+name = "coordinode-wire"
+description = "Inter-node wire transport codec: pure-Rust zstd compression for gRPC messages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+bytes = { workspace = true }
+# Pure-Rust zstd (no C FFI, ADR-013) for transport compression.
+structured-zstd = "0.0.44"
+
+[lints]
+workspace = true

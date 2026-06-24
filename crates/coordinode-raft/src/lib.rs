@@ -1,5 +1,4 @@
 pub mod cluster;
-pub mod codec;
 pub mod proposal;
 pub mod read_fence;
 pub mod snapshot;
