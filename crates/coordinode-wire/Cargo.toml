@@ -13,6 +13,17 @@ prost = { workspace = true }
 bytes = { workspace = true }
 # Pure-Rust zstd (no C FFI, ADR-013) for transport compression.
 structured-zstd = "0.0.44"
+# Inter-node TLS/mTLS. CE crypto provider is pure-Rust rustls-rustcrypto (no C
+# FFI, ADR-013); EE swaps the process-default CryptoProvider to aws-lc-rs.
+rustls = { version = "0.23", default-features = false }
+rustls-rustcrypto = "0.0.2-alpha"
+rustls-pemfile = "2"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rcgen = "0.13"
+tokio-rustls = "0.26"
+tokio = { workspace = true }
 
 [lints]
 workspace = true

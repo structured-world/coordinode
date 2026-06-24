@@ -28,6 +28,8 @@ use structured_zstd::encoding::{compress_slice_to_vec, CompressionLevel};
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::Status;
 
+pub mod tls;
+
 /// Process-global transport zstd level (C-zstd numbering). Positive 1..=22 trade
 /// speed for ratio; NEGATIVE values select zstd ultra-fast modes (fastest, lowest
 /// ratio). Set once at startup from config before any RPC, then read-mostly.
