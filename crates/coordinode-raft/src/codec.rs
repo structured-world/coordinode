@@ -28,10 +28,17 @@ use structured_zstd::encoding::{compress_slice_to_vec, CompressionLevel};
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::Status;
 
-/// Process-global transport zstd level (C-zstd numbering: 1..=22; 0 = default,
-/// negatives = ultra-fast). Set once at startup from config before any RPC, then
-/// read-mostly. Defaults to 3 — fast with a good ratio for the hot Raft path.
-static WIRE_ZSTD_LEVEL: AtomicI32 = AtomicI32::new(3);
+/// Process-global transport zstd level (C-zstd numbering). Positive 1..=22 trade
+/// speed for ratio; NEGATIVE values select zstd ultra-fast modes (fastest, lowest
+/// ratio). Set once at startup from config before any RPC, then read-mostly.
+///
+/// Defaults to 1 — zstd's fastest positive level, suited to the hot Raft
+/// replication path (measured ~11% of raw on a Raft batch, ~9× smaller on the
+/// wire). The ultra-fast `-22` mode panics in `structured-zstd` 0.0.44's huff0
+/// encoder (an internal-error bug, filed upstream), so it is not used as the
+/// default. A bandwidth-constrained link (db4 geo) can raise the level via
+/// config.
+static WIRE_ZSTD_LEVEL: AtomicI32 = AtomicI32::new(1);
 
 /// Set the inter-node transport zstd level. Call once at startup from config,
 /// before the gRPC services begin serving. Process-wide; each node configures
