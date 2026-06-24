@@ -251,3 +251,96 @@ fn reason_wire_strings_are_stable() {
         "fallback_default"
     );
 }
+
+// ── EXPLAIN push_down JSON contract: parse + version boundary (R-PUSH4) ──
+
+/// The hand-rendered EXPLAIN block must be well-formed JSON whose every
+/// frozen field is present with the contract-mandated JSON type and the
+/// `strategy` / `reason` values are members of the frozen slug sets. This is
+/// stronger than the `contains`-based shape tests above: it proves the block
+/// parses as real JSON (a consumer can `JSON.parse` it) and pins each field's
+/// type, not just its presence as a substring.
+#[test]
+fn explain_json_parses_with_frozen_field_types() {
+    let d = select_push_down_strategy(150, idx_default(1_000_000, 128, 200), 0.5, 10);
+    let v: serde_json::Value = serde_json::from_str(&d.to_explain_json())
+        .expect("EXPLAIN push_down block must be valid JSON");
+    let obj = v.as_object().expect("push_down block is a JSON object");
+
+    assert_eq!(obj["stage"], "VECTOR_FILTER");
+    assert!(
+        ["graph_first", "acorn_filtered", "vector_first"]
+            .contains(&obj["strategy"].as_str().expect("strategy is a string")),
+        "strategy must be a frozen slug, got {:?}",
+        obj["strategy"]
+    );
+    assert!(
+        obj["estimated_candidates"].is_u64(),
+        "estimated_candidates must be an integer"
+    );
+    assert!(
+        obj["estimated_selectivity_vs_index"].is_number(),
+        "estimated_selectivity_vs_index must be a number"
+    );
+    assert!(
+        obj["crossover_threshold"].is_u64(),
+        "crossover_threshold must be an integer"
+    );
+    assert!(
+        [
+            "candidate_set_below_crossover",
+            "selectivity_in_acorn_band",
+            "loose_graph_pattern",
+            "vector_highly_selective",
+            "fallback_default",
+        ]
+        .contains(&obj["reason"].as_str().expect("reason is a string")),
+        "reason must be a frozen slug, got {:?}",
+        obj["reason"]
+    );
+    assert!(
+        obj["cost_units_chosen"].is_number(),
+        "cost_units_chosen must be a number"
+    );
+    let alts = obj["cost_units_alternatives"]
+        .as_object()
+        .expect("cost_units_alternatives is an object");
+    for k in ["graph_first", "acorn_filtered", "vector_first"] {
+        assert!(
+            alts[k].is_number(),
+            "cost_units_alternatives.{k} must be a number"
+        );
+    }
+}
+
+/// Version-boundary forward compatibility: a future server may ADD fields to
+/// the `push_down` block. A consumer pinned to the current contract must still
+/// read every frozen field unchanged when an unknown field is present — adding
+/// a field is non-breaking, renaming/removing one is breaking. This simulates
+/// the boundary by injecting an unknown field into the emitted block and
+/// re-reading the frozen fields.
+#[test]
+fn explain_json_tolerates_added_fields_across_version_boundary() {
+    let d = select_push_down_strategy(150, idx_default(1_000_000, 128, 200), 0.5, 10);
+    let mut v: serde_json::Value = serde_json::from_str(&d.to_explain_json()).expect("valid JSON");
+    // A future minor version adds a field the current consumer does not know.
+    v.as_object_mut()
+        .expect("object")
+        .insert("future_field_v2".to_string(), serde_json::json!({"x": 1}));
+    let round_tripped = serde_json::to_string(&v).expect("re-serialize");
+    let reparsed: serde_json::Value = serde_json::from_str(&round_tripped).expect("re-parse");
+
+    // Every frozen field a current consumer relies on is still readable.
+    assert_eq!(reparsed["stage"], "VECTOR_FILTER");
+    assert_eq!(reparsed["strategy"], d.strategy.as_wire_str());
+    assert_eq!(reparsed["reason"], d.reason.as_wire_str());
+    assert_eq!(
+        reparsed["estimated_candidates"].as_u64(),
+        Some(d.estimated_candidates as u64)
+    );
+    assert_eq!(
+        reparsed["crossover_threshold"].as_u64(),
+        Some(d.crossover_threshold as u64)
+    );
+    assert!(reparsed["cost_units_alternatives"]["graph_first"].is_number());
+}

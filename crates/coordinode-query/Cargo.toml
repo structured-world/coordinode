@@ -39,6 +39,7 @@ tempfile = { workspace = true }
 criterion = { workspace = true }
 coordinode-embed = { workspace = true }
 coordinode-test-fixtures = { workspace = true }
+serde_json = { workspace = true }
 
 [[bench]]
 name = "edge_vector_strategy"

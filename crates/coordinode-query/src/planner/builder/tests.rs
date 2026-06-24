@@ -1402,6 +1402,50 @@ fn push_down_invariant_passes_when_decision_attached() {
     assert_push_down_invariant(&valid).expect("plan with decision attached must pass");
 }
 
+/// Contract sweep (R-PUSH4): NO plan produced by the planner for any
+/// representative graph+vector query shape may place a `TRAVERSE` before an
+/// unfiltered `VECTOR_FILTER`. This generalises the single-shape invariant
+/// tests above into a corpus, so the "zero plans in the suite violate the
+/// invariant" guarantee is asserted directly rather than implied by a handful
+/// of examples. A new query shape that regresses the push-down pass fails
+/// here; a new shape that legitimately has no TRAVERSE→VECTOR_FILTER pair
+/// passes trivially (the invariant only constrains that pairing).
+#[test]
+fn push_down_invariant_holds_across_graph_vector_query_shapes() {
+    let shapes = [
+        // outgoing single-hop, vector_distance
+        "MATCH (a:User)-[:LIKES]->(b:Movie) \
+         WHERE vector_distance(b.embedding, [1.0, 0.0, 0.0]) < 0.5 RETURN b",
+        // incoming single-hop
+        "MATCH (b:Movie)<-[:LIKES]-(a:User) \
+         WHERE vector_distance(b.embedding, [1.0, 0.0, 0.0]) < 0.5 RETURN b",
+        // vector_similarity (greater-than) predicate
+        "MATCH (u:User)-[:WATCHED]->(m:Movie) \
+         WHERE vector_similarity(m.embedding, [0.1, 0.2, 0.3]) > 0.8 RETURN m",
+        // compound predicate: property filter AND vector predicate
+        "MATCH (a:User)-[:LIKES]->(b:Movie) \
+         WHERE b.year > 2000 AND vector_distance(b.embedding, [1.0, 0.0]) < 0.5 RETURN b",
+        // LIMIT present (feeds top-K into the cost model)
+        "MATCH (a:User)-[:LIKES]->(b:Movie) \
+         WHERE vector_distance(b.embedding, [1.0, 0.0]) < 0.5 RETURN b LIMIT 25",
+        // ORDER BY + LIMIT
+        "MATCH (a:User)-[:LIKES]->(b:Movie) \
+         WHERE vector_distance(b.embedding, [1.0, 0.0]) < 0.5 RETURN b ORDER BY b.title LIMIT 10",
+        // different labels / edge type
+        "MATCH (p:Person)-[:AUTHORED]->(d:Doc) \
+         WHERE vector_distance(d.embedding, [0.5, 0.5]) < 0.3 RETURN d",
+        // two-hop traversal before the vector filter
+        "MATCH (a:User)-[:FOLLOWS]->(f:User)-[:LIKES]->(m:Movie) \
+         WHERE vector_distance(m.embedding, [1.0, 0.0]) < 0.5 RETURN m",
+    ];
+
+    for q in shapes {
+        let root = optimized_plan(q);
+        assert_push_down_invariant(&root)
+            .unwrap_or_else(|e| panic!("push-down invariant violated for shape:\n  {q}\n  -> {e}"));
+    }
+}
+
 #[test]
 fn top_k_extracted_from_limit_clause() {
     // Plan structure: Project → Limit { count: 25 } → Traverse → NodeScan
