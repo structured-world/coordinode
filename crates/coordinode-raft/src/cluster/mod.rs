@@ -83,6 +83,9 @@ pub struct RaftNode {
     node_id: u64,
     /// Storage engine — held so `shutdown()` can flush before returning.
     engine: Arc<StorageEngine>,
+    /// Shared handle to the Raft oplog, for reading committed entries since a
+    /// checkpoint (WAL-replay repair). Shares the `LogStore`'s manager.
+    oplog: Arc<std::sync::Mutex<coordinode_storage::oplog::OplogManager>>,
     /// gRPC server shutdown signal. Dropped on shutdown to stop the server.
     _grpc_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     /// Snapshot trigger background task abort handle.
@@ -116,6 +119,9 @@ impl RaftNode {
         let config = Arc::new(default_raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
+        // Clone the oplog handle before openraft consumes the LogStore, so
+        // WAL-replay repair can read committed entries since a checkpoint.
+        let oplog = log_store.oplog_handle();
         // Explicit oracle wins; otherwise fall back to the oracle the
         // engine itself stamps writes with (see the cluster constructors
         // for why the state machine must advance it).
@@ -177,6 +183,7 @@ impl RaftNode {
             snapshot_builds,
             node_id,
             engine,
+            oplog,
             _grpc_shutdown: None,
             _snapshot_trigger: None,
         })
@@ -232,6 +239,9 @@ impl RaftNode {
         let config = Arc::new(default_raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
+        // Clone the oplog handle before openraft consumes the LogStore, so
+        // WAL-replay repair can read committed entries since a checkpoint.
+        let oplog = log_store.oplog_handle();
         // Wire the engine's own timestamp oracle into the state machine:
         // applied entries carry the leader's commit timestamps, and the
         // local oracle must advance past them or MVCC readers on this
@@ -305,6 +315,7 @@ impl RaftNode {
             snapshot_builds,
             node_id,
             engine,
+            oplog,
             _grpc_shutdown: Some(shutdown_tx),
             _snapshot_trigger: Some(snap_handle),
         })
@@ -358,6 +369,9 @@ impl RaftNode {
         let config = Arc::new(default_raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
+        // Clone the oplog handle before openraft consumes the LogStore, so
+        // WAL-replay repair can read committed entries since a checkpoint.
+        let oplog = log_store.oplog_handle();
         // Wire the engine's own timestamp oracle into the state machine:
         // applied entries carry the leader's commit timestamps, and the
         // local oracle must advance past them or MVCC readers on this
@@ -418,6 +432,7 @@ impl RaftNode {
             snapshot_builds,
             node_id,
             engine,
+            oplog,
             _grpc_shutdown: None, // no internal server — caller manages the router
             _snapshot_trigger: Some(snap_handle),
         };
@@ -454,6 +469,9 @@ impl RaftNode {
         let config = Arc::new(default_raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
+        // Clone the oplog handle before openraft consumes the LogStore, so
+        // WAL-replay repair can read committed entries since a checkpoint.
+        let oplog = log_store.oplog_handle();
         // Wire the engine's own timestamp oracle into the state machine:
         // applied entries carry the leader's commit timestamps, and the
         // local oracle must advance past them or MVCC readers on this
@@ -492,6 +510,7 @@ impl RaftNode {
             snapshot_builds,
             node_id,
             engine,
+            oplog,
             _grpc_shutdown: None, // no internal server — caller manages the router
             _snapshot_trigger: Some(snap_handle),
         };
@@ -530,6 +549,9 @@ impl RaftNode {
         let config = Arc::new(default_raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
+        // Clone the oplog handle before openraft consumes the LogStore, so
+        // WAL-replay repair can read committed entries since a checkpoint.
+        let oplog = log_store.oplog_handle();
         // Wire the engine's own timestamp oracle into the state machine:
         // applied entries carry the leader's commit timestamps, and the
         // local oracle must advance past them or MVCC readers on this
@@ -577,6 +599,7 @@ impl RaftNode {
             snapshot_builds,
             node_id,
             engine,
+            oplog,
             _grpc_shutdown: Some(shutdown_tx),
             _snapshot_trigger: Some(snap_handle),
         })
@@ -805,6 +828,26 @@ impl RaftNode {
     /// Get the current applied log index (non-blocking).
     pub fn applied_index(&self) -> u64 {
         *self.applied_rx.borrow()
+    }
+
+    /// Read committed oplog entries with index in `[from_index, applied]` — the
+    /// changes since a checkpoint cursor, for WAL-replay repair. Reads serialize
+    /// against Raft appends via the oplog manager's lock.
+    ///
+    /// # Errors
+    /// [`RaftNodeError::Init`] if the oplog lock is poisoned or the read fails.
+    pub fn read_oplog_since(
+        &self,
+        from_index: u64,
+    ) -> Result<Vec<coordinode_storage::oplog::OplogEntry>, RaftNodeError> {
+        let to = self.applied_index().saturating_add(1);
+        let mut oplog = self
+            .oplog
+            .lock()
+            .map_err(|_| RaftNodeError::Init("oplog mutex poisoned".into()))?;
+        oplog
+            .read_range(from_index, to)
+            .map_err(|e| RaftNodeError::Init(e.to_string()))
     }
 
     /// Number of full snapshot builds this node has performed. Every

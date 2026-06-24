@@ -177,6 +177,14 @@ pub struct LogStore {
 }
 
 impl LogStore {
+    /// A shared handle to the Raft oplog manager. Cloned out before the
+    /// `LogStore` is moved into `openraft::Raft` so a subsystem (e.g. WAL-replay
+    /// repair) can read committed entries since a checkpoint without going
+    /// through openraft. Reads serialize against appends via the inner `Mutex`.
+    pub fn oplog_handle(&self) -> Arc<Mutex<OplogManager>> {
+        Arc::clone(&self.oplog)
+    }
+
     /// Open the LogStore, routing oplog segments to the oplog-eligible
     /// endpoint chosen for shard 0
     /// ([arch/core/storage-stack.md](../../../arch/core/storage-stack.md)
