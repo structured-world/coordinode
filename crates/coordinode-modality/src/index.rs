@@ -219,6 +219,23 @@ fn index_prefix(name: &str) -> Vec<u8> {
     p
 }
 
+/// Smallest key strictly greater than every key with `prefix` — the exclusive
+/// upper bound of the prefix range `[prefix, upper)`. Increments the last
+/// non-`0xFF` byte and drops the `0xFF` tail. `None` when every byte is `0xFF`
+/// (no finite upper bound); `index_prefix` always ends in `:` so this is only a
+/// theoretical guard.
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.last_mut() {
+        if *last < 0xFF {
+            *last += 1;
+            return Some(end);
+        }
+        end.pop();
+    }
+    None
+}
+
 fn definition_key(name: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(11 + name.len());
     key.extend_from_slice(b"schema:idx:");
@@ -279,18 +296,35 @@ impl IndexStore for LocalIndexStore<'_> {
 
     fn clear(&self, name: &str) -> StoreResult<usize> {
         let prefix = index_prefix(name);
+        // Count the entries (for the return) by scanning the prefix.
         let iter = self.engine.prefix_scan(Partition::Idx, &prefix)?;
-        // Collect first, then delete: deleting while holding the scan
-        // iterator over the same partition is not guaranteed safe across
-        // engine implementations.
-        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut removed = 0usize;
         for guard in iter {
-            let (key, _) = guard.into_inner()?;
-            keys.push(key.to_vec());
+            guard.into_inner()?;
+            removed += 1;
         }
-        let removed = keys.len();
-        for key in &keys {
-            self.engine.delete(Partition::Idx, key)?;
+        if removed == 0 {
+            return Ok(0);
+        }
+        // Drop the whole `idx:name:` prefix with a single range tombstone (G096)
+        // instead of `removed` point tombstones — the index keyspace is a dense
+        // contiguous prefix. Falls back to per-key only for the degenerate
+        // all-0xFF prefix (never produced by `index_prefix`).
+        match prefix_upper_bound(&prefix) {
+            Some(end) => {
+                self.engine.remove_range(Partition::Idx, &prefix, &end)?;
+            }
+            None => {
+                let iter = self.engine.prefix_scan(Partition::Idx, &prefix)?;
+                let mut keys: Vec<Vec<u8>> = Vec::new();
+                for guard in iter {
+                    let (key, _) = guard.into_inner()?;
+                    keys.push(key.to_vec());
+                }
+                for key in &keys {
+                    self.engine.delete(Partition::Idx, key)?;
+                }
+            }
         }
         Ok(removed)
     }
