@@ -2574,6 +2574,22 @@ fn build_comparison_tail(left: Expr, tail: Pair<'_, Rule>) -> Result<Expr, Parse
             expr: Box::new(left),
             negated: false,
         }),
+        Rule::is_typed_op => {
+            let mut negated = false;
+            let mut type_name = String::new();
+            for p in first.clone().into_inner() {
+                match p.as_rule() {
+                    Rule::kw_not => negated = true,
+                    Rule::type_name => type_name = p.as_str().to_string(),
+                    _ => {}
+                }
+            }
+            Ok(Expr::IsTyped {
+                expr: Box::new(left),
+                type_name,
+                negated,
+            })
+        }
         Rule::in_op => {
             let right = build_expression(
                 children
@@ -2681,12 +2697,36 @@ fn build_postfix(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
         .ok_or_else(|| ParseError::Invalid("postfix: missing atom".into()))?;
     let mut expr = build_expression(atom_pair)?;
 
-    // Each remaining pair is an index expression (the content between `[` and `]`).
-    for index_pair in inner {
-        let index = build_expression(index_pair)?;
-        expr = Expr::Subscript {
-            expr: Box::new(expr),
-            index: Box::new(index),
+    // Each remaining pair is an `index_access`: either a single-element index
+    // `[i]` or a slice `[s..e]`.
+    for access in inner {
+        let body = access
+            .into_inner()
+            .next()
+            .ok_or_else(|| ParseError::Invalid("postfix: empty index access".into()))?;
+        expr = match body.as_rule() {
+            Rule::list_slice => {
+                let mut start = None;
+                let mut end = None;
+                for b in body.into_inner() {
+                    match b.as_rule() {
+                        Rule::slice_start => {
+                            start = Some(Box::new(build_expression(first_inner(b)?)?))
+                        }
+                        Rule::slice_end => end = Some(Box::new(build_expression(first_inner(b)?)?)),
+                        _ => {}
+                    }
+                }
+                Expr::Slice {
+                    expr: Box::new(expr),
+                    start,
+                    end,
+                }
+            }
+            _ => Expr::Subscript {
+                expr: Box::new(expr),
+                index: Box::new(build_expression(body)?),
+            },
         };
     }
     Ok(expr)

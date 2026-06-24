@@ -6244,6 +6244,7 @@ fn collect_expr_vars(expr: &Expr, vars: &mut Vec<String>) {
             collect_expr_vars(list, vars);
         }
         Expr::IsNull { expr, .. } => collect_expr_vars(expr, vars),
+        Expr::IsTyped { expr, .. } => collect_expr_vars(expr, vars),
         Expr::StringMatch { expr, pattern, .. } => {
             collect_expr_vars(expr, vars);
             collect_expr_vars(pattern, vars);
@@ -6289,6 +6290,15 @@ fn collect_expr_vars(expr: &Expr, vars: &mut Vec<String>) {
         Expr::Subscript { expr, index } => {
             collect_expr_vars(expr, vars);
             collect_expr_vars(index, vars);
+        }
+        Expr::Slice { expr, start, end } => {
+            collect_expr_vars(expr, vars);
+            if let Some(s) = start {
+                collect_expr_vars(s, vars);
+            }
+            if let Some(e) = end {
+                collect_expr_vars(e, vars);
+            }
         }
         Expr::Reduce {
             acc,

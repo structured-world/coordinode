@@ -3545,6 +3545,7 @@ fn collect_expr_variables_inner(expr: &Expr, vars: &mut Vec<String>) {
             collect_expr_variables_inner(list, vars);
         }
         Expr::IsNull { expr, .. } => collect_expr_variables_inner(expr, vars),
+        Expr::IsTyped { expr, .. } => collect_expr_variables_inner(expr, vars),
         Expr::StringMatch { expr, pattern, .. } => {
             collect_expr_variables_inner(expr, vars);
             collect_expr_variables_inner(pattern, vars);
@@ -3579,6 +3580,15 @@ fn collect_expr_variables_inner(expr: &Expr, vars: &mut Vec<String>) {
         Expr::Subscript { expr, index } => {
             collect_expr_variables_inner(expr, vars);
             collect_expr_variables_inner(index, vars);
+        }
+        Expr::Slice { expr, start, end } => {
+            collect_expr_variables_inner(expr, vars);
+            if let Some(s) = start {
+                collect_expr_variables_inner(s, vars);
+            }
+            if let Some(e) = end {
+                collect_expr_variables_inner(e, vars);
+            }
         }
         Expr::Reduce {
             acc,

@@ -252,6 +252,25 @@ pub fn eval_expr(expr: &Expr, row: &Row) -> Value {
             let is_null = v.is_null();
             Value::Bool(if *negated { !is_null } else { is_null })
         }
+        Expr::IsTyped {
+            expr,
+            type_name,
+            negated,
+        } => {
+            let v = eval_expr(expr, row);
+            let matches = match type_name.to_ascii_uppercase().as_str() {
+                "INTEGER" | "INT" => matches!(v, Value::Int(_)),
+                "FLOAT" => matches!(v, Value::Float(_)),
+                "NUMBER" => matches!(v, Value::Int(_) | Value::Float(_)),
+                "STRING" => matches!(v, Value::String(_)),
+                "BOOLEAN" | "BOOL" => matches!(v, Value::Bool(_)),
+                "NULL" | "NOTHING" => matches!(v, Value::Null),
+                "LIST" => matches!(v, Value::Array(_)),
+                "MAP" => matches!(v, Value::Map(_) | Value::Document(_)),
+                _ => false,
+            };
+            Value::Bool(matches ^ *negated)
+        }
         Expr::StringMatch { expr, op, pattern } => {
             let s = eval_expr(expr, row);
             let p = eval_expr(pattern, row);
@@ -333,6 +352,34 @@ pub fn eval_expr(expr: &Expr, row: &Row) -> Value {
                 _ => Value::Null,
             }
         }
+
+        // List slice expr[start..end]: 0-indexed, end-exclusive; negative bounds
+        // count from the end; bounds clamp to [0, len]. Non-list → NULL.
+        Expr::Slice { expr, start, end } => match eval_expr(expr, row) {
+            Value::Array(arr) => {
+                let len = arr.len() as i64;
+                let resolve = |bound: &Option<Box<Expr>>, default: i64| -> i64 {
+                    match bound {
+                        Some(e) => match eval_expr(e, row) {
+                            Value::Int(i) => {
+                                let idx = if i < 0 { len + i } else { i };
+                                idx.clamp(0, len)
+                            }
+                            _ => default,
+                        },
+                        None => default,
+                    }
+                };
+                let s = resolve(start, 0);
+                let e = resolve(end, len);
+                if s >= e {
+                    Value::Array(vec![])
+                } else {
+                    Value::Array(arr[s as usize..e as usize].to_vec())
+                }
+            }
+            _ => Value::Null,
+        },
 
         // EXISTS { MATCH … } needs the storage engine to run the inner pattern,
         // so the pure evaluator cannot resolve it — the WHERE path routes such
@@ -449,6 +496,23 @@ pub(crate) fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) ->
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
             (Value::String(a), Value::String(b)) => Value::String(format!("{a}{b}")),
+            // List concatenation / append / prepend (Cypher `+`).
+            (Value::Array(a), Value::Array(b)) => {
+                let mut out = a.clone();
+                out.extend(b.iter().cloned());
+                Value::Array(out)
+            }
+            (Value::Array(a), other) => {
+                let mut out = a.clone();
+                out.push(other.clone());
+                Value::Array(out)
+            }
+            (other, Value::Array(b)) => {
+                let mut out = Vec::with_capacity(b.len() + 1);
+                out.push(other.clone());
+                out.extend(b.iter().cloned());
+                Value::Array(out)
+            }
             _ => Value::Null,
         },
         BinaryOperator::Sub => match (left, right) {

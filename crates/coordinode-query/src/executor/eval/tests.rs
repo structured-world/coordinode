@@ -240,6 +240,83 @@ fn eval_string_regex_match() {
 }
 
 #[test]
+fn eval_list_slice() {
+    let arr = || {
+        Box::new(Expr::List(
+            (1..=5).map(|i| Expr::Literal(Value::Int(i * 10))).collect(),
+        ))
+    };
+    let lit = |i: i64| Some(Box::new(Expr::Literal(Value::Int(i))));
+    let int_arr = |xs: &[i64]| Value::Array(xs.iter().map(|i| Value::Int(*i)).collect());
+    let mk = |start, end| Expr::Slice {
+        expr: arr(),
+        start,
+        end,
+    };
+    // [10,20,30,40,50]
+    assert_eq!(
+        eval_expr(&mk(lit(1), lit(3)), &empty_row()),
+        int_arr(&[20, 30])
+    );
+    assert_eq!(
+        eval_expr(&mk(None, lit(2)), &empty_row()),
+        int_arr(&[10, 20])
+    );
+    assert_eq!(
+        eval_expr(&mk(lit(3), None), &empty_row()),
+        int_arr(&[40, 50])
+    );
+    // negative start counts from the end
+    assert_eq!(
+        eval_expr(&mk(lit(-2), None), &empty_row()),
+        int_arr(&[40, 50])
+    );
+    // full slice
+    assert_eq!(
+        eval_expr(&mk(None, None), &empty_row()),
+        int_arr(&[10, 20, 30, 40, 50])
+    );
+    // empty when start >= end
+    assert_eq!(eval_expr(&mk(lit(3), lit(1)), &empty_row()), int_arr(&[]));
+}
+
+#[test]
+fn eval_list_concat() {
+    let l = |xs: &[i64]| {
+        Box::new(Expr::List(
+            xs.iter().map(|i| Expr::Literal(Value::Int(*i))).collect(),
+        ))
+    };
+    let add = |a, b| Expr::BinaryOp {
+        left: a,
+        op: BinaryOperator::Add,
+        right: b,
+    };
+    let int_arr = |xs: &[i64]| Value::Array(xs.iter().map(|i| Value::Int(*i)).collect());
+    // list + list
+    assert_eq!(
+        eval_expr(&add(l(&[1, 2]), l(&[3, 4])), &empty_row()),
+        int_arr(&[1, 2, 3, 4])
+    );
+    // list + element (append)
+    assert_eq!(
+        eval_expr(
+            &add(l(&[1, 2]), Box::new(Expr::Literal(Value::Int(3)))),
+            &empty_row()
+        ),
+        int_arr(&[1, 2, 3])
+    );
+    // element + list (prepend)
+    assert_eq!(
+        eval_expr(
+            &add(Box::new(Expr::Literal(Value::Int(0))), l(&[1, 2])),
+            &empty_row()
+        ),
+        int_arr(&[0, 1, 2])
+    );
+}
+
+#[test]
 fn eval_is_null() {
     let expr = Expr::IsNull {
         expr: Box::new(Expr::Literal(Value::Null)),
@@ -247,6 +324,48 @@ fn eval_is_null() {
     };
     let v = eval_expr(&expr, &empty_row());
     assert_eq!(v, Value::Bool(true));
+}
+
+#[test]
+fn eval_is_typed() {
+    let mk = |v: Value, t: &str, neg: bool| Expr::IsTyped {
+        expr: Box::new(Expr::Literal(v)),
+        type_name: t.into(),
+        negated: neg,
+    };
+    assert_eq!(
+        eval_expr(&mk(Value::Int(5), "INTEGER", false), &empty_row()),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_expr(&mk(Value::Int(5), "STRING", false), &empty_row()),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        eval_expr(
+            &mk(Value::String("x".into()), "STRING", false),
+            &empty_row()
+        ),
+        Value::Bool(true)
+    );
+    // IS NOT :: negates.
+    assert_eq!(
+        eval_expr(&mk(Value::Int(5), "STRING", true), &empty_row()),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_expr(&mk(Value::Null, "NULL", false), &empty_row()),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_expr(&mk(Value::Float(1.0), "FLOAT", false), &empty_row()),
+        Value::Bool(true)
+    );
+    // case-insensitive type name
+    assert_eq!(
+        eval_expr(&mk(Value::Bool(true), "boolean", false), &empty_row()),
+        Value::Bool(true)
+    );
 }
 
 #[test]

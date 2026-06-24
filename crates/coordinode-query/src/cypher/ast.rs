@@ -670,6 +670,17 @@ pub enum Expr {
     /// `x IS NULL` / `x IS NOT NULL`.
     IsNull { expr: Box<Expr>, negated: bool },
 
+    /// Type predicate `expr IS :: TYPE` / `expr IS NOT :: TYPE`. `type_name` is
+    /// a base type keyword (INTEGER, FLOAT, STRING, BOOLEAN, LIST, MAP, NULL).
+    IsTyped {
+        /// The value being type-checked.
+        expr: Box<Expr>,
+        /// The asserted base type name (as written, case-insensitive at eval).
+        type_name: String,
+        /// `IS NOT ::` negates the check.
+        negated: bool,
+    },
+
     /// `x STARTS WITH y`, `x ENDS WITH y`, `x CONTAINS y`.
     StringMatch {
         expr: Box<Expr>,
@@ -695,6 +706,17 @@ pub enum Expr {
     /// For map values: `map["key"]` → value at key.
     /// Out-of-bounds list access and missing map keys evaluate to `null`.
     Subscript { expr: Box<Expr>, index: Box<Expr> },
+
+    /// List slice `list[start..end]` — both bounds optional (`[..e]`, `[s..]`,
+    /// `[..]`). 0-indexed, end-exclusive; negative bounds count from the end.
+    Slice {
+        /// The list being sliced.
+        expr: Box<Expr>,
+        /// Inclusive start bound (default 0).
+        start: Option<Box<Expr>>,
+        /// Exclusive end bound (default len).
+        end: Option<Box<Expr>>,
+    },
 
     /// Existential subquery: `EXISTS { MATCH … [WHERE …] }`. Evaluates to
     /// `true` when the inner MATCH produces at least one row, correlated with
@@ -807,6 +829,7 @@ impl Expr {
                 list.substitute_params(params);
             }
             Expr::IsNull { expr, .. } => expr.substitute_params(params),
+            Expr::IsTyped { expr, .. } => expr.substitute_params(params),
             Expr::StringMatch { expr, pattern, .. } => {
                 expr.substitute_params(params);
                 pattern.substitute_params(params);
@@ -843,6 +866,15 @@ impl Expr {
             Expr::Subscript { expr, index } => {
                 expr.substitute_params(params);
                 index.substitute_params(params);
+            }
+            Expr::Slice { expr, start, end } => {
+                expr.substitute_params(params);
+                if let Some(s) = start {
+                    s.substitute_params(params);
+                }
+                if let Some(e) = end {
+                    e.substitute_params(params);
+                }
             }
             Expr::Reduce {
                 init, list, expr, ..

@@ -637,6 +637,63 @@ fn list_comprehension_end_to_end() {
     );
 }
 
+/// List slice `[s..e]` and list concatenation `+` end-to-end.
+#[test]
+fn list_slice_and_concat_end_to_end() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    let results = run_cypher(
+        "RETURN [10, 20, 30, 40][1..3] AS sl, [1, 2] + [3, 4] AS cat, [1, 2] + 3 AS app",
+        engine,
+        &mut interner,
+    );
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].get("sl"),
+        Some(&Value::Array(vec![Value::Int(20), Value::Int(30)]))
+    );
+    assert_eq!(
+        results[0].get("cat"),
+        Some(&Value::Array(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4)
+        ]))
+    );
+    assert_eq!(
+        results[0].get("app"),
+        Some(&Value::Array(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3)
+        ]))
+    );
+}
+
+/// `IS :: TYPE` / `IS NOT :: TYPE` type predicate.
+#[test]
+fn is_typed_predicate_end_to_end() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    let results = run_cypher(
+        "RETURN 5 IS :: INTEGER AS a, 'x' IS :: STRING AS b, \
+         5 IS NOT :: STRING AS c, 1.5 IS :: FLOAT AS d, \
+         5 IS :: NUMBER AS e, null IS :: NULL AS f",
+        engine,
+        &mut interner,
+    );
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get("a"), Some(&Value::Bool(true)));
+    assert_eq!(results[0].get("b"), Some(&Value::Bool(true)));
+    assert_eq!(results[0].get("c"), Some(&Value::Bool(true)));
+    assert_eq!(results[0].get("d"), Some(&Value::Bool(true)));
+    assert_eq!(results[0].get("e"), Some(&Value::Bool(true)));
+    assert_eq!(results[0].get("f"), Some(&Value::Bool(true)));
+}
+
 /// `=~` regex match operator in WHERE (whole-string, anchored).
 #[test]
 fn regex_match_end_to_end() {

@@ -633,6 +633,15 @@ fn write_expr(buf: &mut String, expr: &Expr) {
                 buf.push_str(" IS NULL");
             }
         }
+        Expr::IsTyped {
+            expr,
+            type_name,
+            negated,
+        } => {
+            write_expr(buf, expr);
+            buf.push_str(if *negated { " IS NOT :: " } else { " IS :: " });
+            buf.push_str(type_name);
+        }
         Expr::StringMatch { expr, op, pattern } => {
             write_expr(buf, expr);
             buf.push(' ');
@@ -690,6 +699,18 @@ fn write_expr(buf: &mut String, expr: &Expr) {
             write_expr(buf, expr);
             buf.push('[');
             write_expr(buf, index);
+            buf.push(']');
+        }
+        Expr::Slice { expr, start, end } => {
+            write_expr(buf, expr);
+            buf.push('[');
+            if let Some(s) = start {
+                write_expr(buf, s);
+            }
+            buf.push_str("..");
+            if let Some(e) = end {
+                write_expr(buf, e);
+            }
             buf.push(']');
         }
         Expr::ExistsSubquery(mc) => {

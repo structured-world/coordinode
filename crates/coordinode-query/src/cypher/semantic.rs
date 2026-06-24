@@ -455,6 +455,9 @@ impl<'a> Analyzer<'a> {
             Expr::IsNull { expr, .. } => {
                 self.check_expr(expr);
             }
+            Expr::IsTyped { expr, .. } => {
+                self.check_expr(expr);
+            }
             Expr::StringMatch { expr, pattern, .. } => {
                 self.check_expr(expr);
                 self.check_expr(pattern);
@@ -510,6 +513,15 @@ impl<'a> Analyzer<'a> {
             Expr::Subscript { expr, index } => {
                 self.check_expr(expr);
                 self.check_expr(index);
+            }
+            Expr::Slice { expr, start, end } => {
+                self.check_expr(expr);
+                if let Some(s) = start {
+                    self.check_expr(s);
+                }
+                if let Some(e) = end {
+                    self.check_expr(e);
+                }
             }
             Expr::Reduce {
                 acc,
