@@ -591,6 +591,7 @@ atom = {
     exists_subquery
   | reduce_expr
   | list_predicate
+  | list_comprehension
   | function_call
   | case_expr
   | list_literal
@@ -622,6 +623,13 @@ function_args = { star | expression ~ ("," ~ expression)* }
 // EXISTS { MATCH … [WHERE …] } — existential subquery; true if the inner
 // MATCH yields at least one row (correlated with outer-scope bindings).
 exists_subquery = { kw_exists ~ "{" ~ match_clause ~ "}" }
+
+// [x IN list WHERE pred | expr] — list comprehension; WHERE and `| expr` both
+// optional. Must precede list_literal in `atom` (both open with `[`); the
+// `identifier ~ kw_in` prefix disambiguates from a plain list.
+list_comprehension = {
+    "[" ~ identifier ~ kw_in ~ expression ~ (kw_where ~ expression)? ~ ("|" ~ expression)? ~ "]"
+}
 
 // all/any/none/single(x IN list WHERE pred) — list quantifier predicates.
 list_predicate = {

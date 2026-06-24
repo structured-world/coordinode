@@ -6309,6 +6309,22 @@ fn collect_expr_vars(expr: &Expr, vars: &mut Vec<String>) {
             collect_expr_vars(pred, &mut inner);
             vars.extend(inner.into_iter().filter(|v| v != var));
         }
+        Expr::ListComprehension {
+            var,
+            list,
+            pred,
+            map,
+        } => {
+            collect_expr_vars(list, vars);
+            let mut inner = Vec::new();
+            if let Some(p) = pred {
+                collect_expr_vars(p, &mut inner);
+            }
+            if let Some(m) = map {
+                collect_expr_vars(m, &mut inner);
+            }
+            vars.extend(inner.into_iter().filter(|v| v != var));
+        }
         // The inner MATCH binds its own variables; any outer-correlation
         // variables it references are already provisioned by the outer clauses,
         // so it contributes no extra outer dependencies here.

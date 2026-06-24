@@ -699,6 +699,26 @@ fn write_expr(buf: &mut String, expr: &Expr) {
             buf.push_str("EXISTS");
             buf.push_str(&format!("{mc:?}"));
         }
+        Expr::ListComprehension {
+            var,
+            list,
+            pred,
+            map,
+        } => {
+            buf.push('[');
+            buf.push_str(var);
+            buf.push_str(" IN ");
+            write_expr(buf, list);
+            if let Some(p) = pred {
+                buf.push_str(" WHERE ");
+                write_expr(buf, p);
+            }
+            if let Some(m) = map {
+                buf.push_str(" | ");
+                write_expr(buf, m);
+            }
+            buf.push(']');
+        }
         Expr::ListPredicate {
             kind,
             var,

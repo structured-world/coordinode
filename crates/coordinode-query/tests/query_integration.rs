@@ -605,6 +605,38 @@ fn reduce_end_to_end() {
     assert_eq!(results[0].get("cat"), Some(&Value::String("abc".into())));
 }
 
+/// List comprehension (filter + map) end-to-end.
+#[test]
+fn list_comprehension_end_to_end() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    let results = run_cypher(
+        "RETURN [x IN [1, 2, 3, 4, 5] WHERE x > 2 | x * x] AS squares, \
+                [y IN [10, 20, 30]] AS copy",
+        engine,
+        &mut interner,
+    );
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].get("squares"),
+        Some(&Value::Array(vec![
+            Value::Int(9),
+            Value::Int(16),
+            Value::Int(25)
+        ]))
+    );
+    assert_eq!(
+        results[0].get("copy"),
+        Some(&Value::Array(vec![
+            Value::Int(10),
+            Value::Int(20),
+            Value::Int(30)
+        ]))
+    );
+}
+
 /// List quantifier predicates all/any/none/single execute end-to-end.
 #[test]
 fn list_predicates_end_to_end() {

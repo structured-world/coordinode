@@ -2348,6 +2348,7 @@ fn build_expression(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
         Rule::reduce_expr => build_reduce_expr(pair),
         Rule::exists_subquery => build_exists_subquery(pair),
         Rule::list_predicate => build_list_predicate(pair),
+        Rule::list_comprehension => build_list_comprehension(pair),
         Rule::list_literal => build_list_literal(pair),
         Rule::map_literal => build_map_literal(pair),
         Rule::map_projection => build_map_projection(pair),
@@ -2746,6 +2747,42 @@ fn build_exists_subquery(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
     Err(ParseError::Invalid(
         "EXISTS subquery requires a MATCH clause".into(),
     ))
+}
+
+fn build_list_comprehension(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
+    let mut var: Option<String> = None;
+    let mut list: Option<Expr> = None;
+    let mut pred: Option<Expr> = None;
+    let mut map: Option<Expr> = None;
+    let mut saw_where = false;
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::identifier => var = Some(extract_identifier(inner)),
+            Rule::kw_where => saw_where = true,
+            Rule::kw_in => {}
+            _ => {
+                let e = build_expression(inner)?;
+                if list.is_none() {
+                    list = Some(e);
+                } else if saw_where && pred.is_none() {
+                    pred = Some(e);
+                } else {
+                    map = Some(e);
+                }
+            }
+        }
+    }
+
+    match (var, list) {
+        (Some(var), Some(list)) => Ok(Expr::ListComprehension {
+            var,
+            list: Box::new(list),
+            pred: pred.map(Box::new),
+            map: map.map(Box::new),
+        }),
+        _ => Err(ParseError::Invalid("malformed list comprehension".into())),
+    }
 }
 
 fn build_list_predicate(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {

@@ -1426,6 +1426,98 @@ fn reduce_null_list_is_null() {
 }
 
 #[test]
+fn list_comprehension_forms() {
+    let src = || {
+        Box::new(Expr::List(vec![
+            Expr::Literal(Value::Int(1)),
+            Expr::Literal(Value::Int(2)),
+            Expr::Literal(Value::Int(3)),
+            Expr::Literal(Value::Int(4)),
+        ]))
+    };
+    let gt2 = || {
+        Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Variable("x".into())),
+            op: BinaryOperator::Gt,
+            right: Box::new(Expr::Literal(Value::Int(2))),
+        })
+    };
+    let square = || {
+        Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Variable("x".into())),
+            op: BinaryOperator::Mul,
+            right: Box::new(Expr::Variable("x".into())),
+        })
+    };
+
+    // [x IN list] → the list unchanged.
+    assert_eq!(
+        eval_expr(
+            &Expr::ListComprehension {
+                var: "x".into(),
+                list: src(),
+                pred: None,
+                map: None,
+            },
+            &empty_row(),
+        ),
+        Value::Array(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4)
+        ])
+    );
+
+    // [x IN list WHERE x > 2] → [3, 4].
+    assert_eq!(
+        eval_expr(
+            &Expr::ListComprehension {
+                var: "x".into(),
+                list: src(),
+                pred: Some(gt2()),
+                map: None,
+            },
+            &empty_row(),
+        ),
+        Value::Array(vec![Value::Int(3), Value::Int(4)])
+    );
+
+    // [x IN list | x*x] → [1, 4, 9, 16].
+    assert_eq!(
+        eval_expr(
+            &Expr::ListComprehension {
+                var: "x".into(),
+                list: src(),
+                pred: None,
+                map: Some(square()),
+            },
+            &empty_row(),
+        ),
+        Value::Array(vec![
+            Value::Int(1),
+            Value::Int(4),
+            Value::Int(9),
+            Value::Int(16)
+        ])
+    );
+
+    // [x IN list WHERE x > 2 | x*x] → [9, 16].
+    assert_eq!(
+        eval_expr(
+            &Expr::ListComprehension {
+                var: "x".into(),
+                list: src(),
+                pred: Some(gt2()),
+                map: Some(square()),
+            },
+            &empty_row(),
+        ),
+        Value::Array(vec![Value::Int(9), Value::Int(16)])
+    );
+}
+
+#[test]
 fn list_predicate_quantifiers() {
     // list [2,4,6], predicate x > 3 → true for 4 and 6 (2 of 3).
     let mk = |kind| Expr::ListPredicate {

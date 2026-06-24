@@ -334,6 +334,37 @@ pub fn eval_expr(expr: &Expr, row: &Row) -> Value {
         // means EXISTS appeared in a context without engine access; yield NULL.
         Expr::ExistsSubquery(_) => Value::Null,
 
+        // [x IN list WHERE pred | map]: bind each element to `var`, keep those
+        // passing the optional `pred`, project through the optional `map`
+        // (default = the element itself), collecting into a new list.
+        Expr::ListComprehension {
+            var,
+            list,
+            pred,
+            map,
+        } => match eval_expr(list, row) {
+            Value::Array(items) => {
+                let mut scratch = row.clone();
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    scratch.insert(var.clone(), item.clone());
+                    let keep = match pred {
+                        Some(p) => matches!(eval_expr(p, &scratch), Value::Bool(true)),
+                        None => true,
+                    };
+                    if keep {
+                        out.push(match map {
+                            Some(m) => eval_expr(m, &scratch),
+                            None => item,
+                        });
+                    }
+                }
+                Value::Array(out)
+            }
+            // Null list → NULL (Cypher null propagation); non-list → NULL.
+            _ => Value::Null,
+        },
+
         // all/any/none/single(x IN list WHERE pred): bind each element to `var`,
         // evaluate `pred`, and combine the per-element booleans per the
         // quantifier. Empty list → all/none true, any false, single false.

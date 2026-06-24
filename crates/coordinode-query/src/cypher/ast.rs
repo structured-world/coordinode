@@ -702,6 +702,20 @@ pub enum Expr {
     /// top-level query (no second pattern-matching implementation).
     ExistsSubquery(Box<MatchClause>),
 
+    /// List comprehension: `[x IN list WHERE pred | expr]`. For each element
+    /// bound to `var`, the optional `pred` filters and the optional `map`
+    /// projects (defaulting to `var` itself). Produces a new list.
+    ListComprehension {
+        /// Per-element variable name.
+        var: String,
+        /// Source list.
+        list: Box<Expr>,
+        /// Optional filter predicate over `var`.
+        pred: Option<Box<Expr>>,
+        /// Optional projection expression over `var` (defaults to `var`).
+        map: Option<Box<Expr>>,
+    },
+
     /// List quantifier predicate: `all/any/none/single(x IN list WHERE pred)`.
     /// Binds each list element to `var` and evaluates `pred`; the `kind`
     /// determines how the per-element booleans combine into the result.
@@ -827,6 +841,17 @@ impl Expr {
             Expr::ListPredicate { list, pred, .. } => {
                 list.substitute_params(params);
                 pred.substitute_params(params);
+            }
+            Expr::ListComprehension {
+                list, pred, map, ..
+            } => {
+                list.substitute_params(params);
+                if let Some(p) = pred {
+                    p.substitute_params(params);
+                }
+                if let Some(m) = map {
+                    m.substitute_params(params);
+                }
             }
             Expr::ExistsSubquery(mc) => {
                 for pattern in &mut mc.patterns {

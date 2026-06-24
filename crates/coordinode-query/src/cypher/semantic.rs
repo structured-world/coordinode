@@ -564,6 +564,29 @@ impl<'a> Analyzer<'a> {
                     }
                 }
             }
+            Expr::ListComprehension {
+                var,
+                list,
+                pred,
+                map,
+            } => {
+                self.check_expr(list);
+                let prev = self.scope.insert(var.clone(), Vec::new());
+                if let Some(p) = pred {
+                    self.check_expr(p);
+                }
+                if let Some(m) = map {
+                    self.check_expr(m);
+                }
+                match prev {
+                    Some(v) => {
+                        self.scope.insert(var.clone(), v);
+                    }
+                    None => {
+                        self.scope.remove(var);
+                    }
+                }
+            }
             // Literals, parameters, star — no variable references
             Expr::Literal(_) | Expr::Parameter(_) | Expr::Star => {}
         }
