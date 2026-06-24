@@ -78,6 +78,17 @@ config file nor a flag sets the value.
 | `--tls-ca` | (none) | PEM path to the CA that verifies peer certificates — trusted by clients to verify the server, and (with `--tls-require-client-auth`) by the server to verify connecting nodes. |
 | `--tls-require-client-auth` | `false` | Require and verify a client certificate (mutual TLS) on incoming connections. Needs `--tls-ca`. |
 
+### TLS trust and self-signed certificates
+
+There is no "skip verification" switch: whenever TLS is on, the peer certificate
+is always verified against `--tls-ca`, which is the trust root. For a cluster,
+issue every node certificate from one internal CA and point `--tls-ca` at that
+CA on every node (`--tls-require-client-auth` then gives node-to-node mutual
+TLS). For a single self-signed certificate, point `--tls-ca` at the certificate
+itself: a self-signed cert is its own trust anchor. If you want no certificate
+management at all, leave TLS off (the default) and serve plaintext on a trusted
+network, rather than running TLS without verification.
+
 Single-node start:
 
 ```bash
