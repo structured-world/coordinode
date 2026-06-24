@@ -80,7 +80,11 @@ rmpv = { version = "1", features = ["with-serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 metrics = "0.24"
-metrics-exporter-prometheus = "0.18"
+# default-features off: we use install_recorder() + text render via our own ops
+# server, not the crate's built-in http-listener / push-gateway — whose default
+# features pull hyper-rustls and link aws-lc-sys (C FFI). Dropping them keeps the
+# server tier off C crypto from this path.
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 # Parser
 pest = "2"
