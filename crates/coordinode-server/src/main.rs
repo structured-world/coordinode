@@ -378,6 +378,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("failed to open storage: {e}"))?;
             let engine = Arc::new(engine);
 
+            // Shared slot for this node's RaftNode, filled once it is built below.
+            // The scrub task (spawned now) reads it for WAL-replay repair; its
+            // first run is jitter-delayed by minutes, long after the slot is set.
+            let raft_slot: Arc<std::sync::OnceLock<Arc<coordinode_raft::cluster::RaftNode>>> =
+                Arc::new(std::sync::OnceLock::new());
+
             // Background integrity scrub. Each node verifies its OWN local
             // storage independently (no leader election — silent bit rot is a
             // per-node, per-disk concern), so this is multi-instance-safe with
@@ -388,6 +394,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if scrub_cfg.enabled {
                     let scrub_engine = Arc::clone(&engine);
                     let interval = scrub_cfg.interval;
+                    // For WAL-replay repair: the Raft oplog source + the checkpoint
+                    // base directory.
+                    let scrub_raft = Arc::clone(&raft_slot);
+                    let scrub_ckpt_dir = checkpoint_dir.clone();
                     // Peers to pull a fresh copy from when scrub finds corruption
                     // (CE basic replica-fetch repair). Normalised to URIs; empty
                     // when standalone (nothing to repair from). Each node repairs
@@ -457,37 +467,103 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         // affected partition from healthy peers over
                                         // the swarm transport and re-install it. A
                                         // standalone node has no peer to repair from.
-                                        if repair_peers.is_empty() {
-                                            tracing::warn!(
-                                                "corruption detected but no peers configured to repair from"
-                                            );
-                                        } else {
-                                            for part in corrupt {
-                                                match repair_installer
-                                                    .repair_partition(
-                                                        &repair_peers,
-                                                        part,
-                                                        1 << 20,
-                                                        coordinode_replicate::PieceEncoding::None,
-                                                    )
-                                                    .await
-                                                {
-                                                    Ok(bytes) => {
-                                                        metrics::counter!(
-                                                            "coordinode_scrub_repairs_total"
+                                        for part in corrupt {
+                                            // 1) Replica-fetch repair from healthy peers.
+                                            let from_peers = if repair_peers.is_empty() {
+                                                None
+                                            } else {
+                                                Some(
+                                                    repair_installer
+                                                        .repair_partition(
+                                                            &repair_peers,
+                                                            part,
+                                                            1 << 20,
+                                                            coordinode_replicate::PieceEncoding::None,
                                                         )
-                                                        .increment(1);
-                                                        tracing::info!(
-                                                            partition = part.name(),
-                                                            bytes,
-                                                            "repaired partition from peers"
-                                                        );
-                                                    }
-                                                    Err(e) => tracing::warn!(
+                                                        .await,
+                                                )
+                                            };
+                                            match from_peers {
+                                                Some(Ok(bytes)) => {
+                                                    metrics::counter!(
+                                                        "coordinode_scrub_repairs_total"
+                                                    )
+                                                    .increment(1);
+                                                    tracing::info!(
+                                                        partition = part.name(),
+                                                        bytes,
+                                                        "repaired partition from peers"
+                                                    );
+                                                    continue;
+                                                }
+                                                // No reachable replica (or none configured) → fall
+                                                // through to WAL-replay repair below.
+                                                None
+                                                | Some(Err(
+                                                    coordinode_replicate::RepairError::NoSource(_),
+                                                )) => {}
+                                                Some(Err(e)) => {
+                                                    tracing::warn!(
                                                         partition = part.name(),
                                                         %e,
                                                         "partition repair failed"
-                                                    ),
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+
+                                            // 2) WAL-replay repair: rebuild from the latest local
+                                            // checkpoint + Raft oplog replay (needs the Raft oplog —
+                                            // cluster mode; a standalone node has neither replica nor
+                                            // oplog, see the single-node gap).
+                                            let Some(raft) = scrub_raft.get() else {
+                                                tracing::warn!(
+                                                    partition = part.name(),
+                                                    "no replica and no Raft oplog (standalone) — cannot repair"
+                                                );
+                                                continue;
+                                            };
+                                            let Some(ckpt) =
+                                                checkpoint::latest_checkpoint(&scrub_ckpt_dir)
+                                            else {
+                                                tracing::warn!(
+                                                    partition = part.name(),
+                                                    "no checkpoint available for WAL-replay repair"
+                                                );
+                                                continue;
+                                            };
+                                            let from = coordinode_raft::storage::checkpoint_oplog_last_index(&ckpt)
+                                                .map_or(0, |i| i + 1);
+                                            let oplog_since = match raft.read_oplog_since(from) {
+                                                Ok(v) => v,
+                                                Err(e) => {
+                                                    tracing::warn!(partition = part.name(), %e, "read oplog for WAL-replay failed");
+                                                    continue;
+                                                }
+                                            };
+                                            let inst = Arc::clone(&repair_installer);
+                                            let ckpt2 = ckpt.clone();
+                                            match tokio::task::spawn_blocking(move || {
+                                                inst.wal_replay_repair(&ckpt2, &oplog_since, part)
+                                            })
+                                            .await
+                                            {
+                                                Ok(Ok(bytes)) => {
+                                                    metrics::counter!(
+                                                        "coordinode_scrub_wal_repairs_total"
+                                                    )
+                                                    .increment(1);
+                                                    tracing::info!(
+                                                        partition = part.name(),
+                                                        bytes,
+                                                        "repaired partition by WAL replay from checkpoint"
+                                                    );
+                                                }
+                                                Ok(Err(e)) => {
+                                                    tracing::warn!(partition = part.name(), %e, "WAL-replay repair failed")
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(partition = part.name(), %e, "WAL-replay repair task panicked")
                                                 }
                                             }
                                         }
@@ -711,6 +787,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let raft_node_shared: Option<Arc<coordinode_raft::cluster::RaftNode>> =
                 Some(Arc::clone(&raft_node));
+
+            // Hand the RaftNode to the scrub task so WAL-replay repair can read
+            // the oplog. Set-once; the scrub's first (jitter-delayed) run is well
+            // after this point.
+            let _ = raft_slot.set(Arc::clone(&raft_node));
 
             // Refresh node-local derived state when replicated entries
             // apply: property values are encoded against interner ids,

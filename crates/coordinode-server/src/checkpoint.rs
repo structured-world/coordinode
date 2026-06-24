@@ -57,6 +57,15 @@ pub fn prune_checkpoints(dir: &Path, keep: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// The most recent checkpoint directory under `dir` (newest by name, which is
+/// chronological), or `None` when there is none. The base for WAL-replay repair.
+#[must_use]
+pub fn latest_checkpoint(dir: &Path) -> Option<PathBuf> {
+    let mut ckpts = list_checkpoints(dir).ok()?;
+    ckpts.sort();
+    ckpts.pop()
+}
+
 /// All `ckpt-*` directories directly under `dir` (unsorted).
 fn list_checkpoints(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let entries =

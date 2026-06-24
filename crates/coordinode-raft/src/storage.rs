@@ -149,6 +149,28 @@ const RAFT_OPLOG_MAX_BYTES: u64 = 64 * 1024 * 1024; // 64 MB per segment
 const RAFT_OPLOG_MAX_ENTRIES: u32 = 50_000;
 const RAFT_OPLOG_RETENTION_SECS: u64 = 7 * 24 * 3600; // 7 days (index-based purge is primary)
 
+/// The last committed oplog index captured in a checkpoint (its copied oplog at
+/// `<checkpoint_dir>/oplog/0`), or `None` if the checkpoint carries no oplog or
+/// it is empty. The WAL-replay-repair cursor: replay live oplog entries with
+/// index after this on top of the checkpoint base.
+#[must_use]
+pub fn checkpoint_oplog_last_index(checkpoint_dir: &std::path::Path) -> Option<u64> {
+    let oplog_dir = checkpoint_dir.join("oplog").join("0");
+    if !oplog_dir.exists() {
+        return None;
+    }
+    let mgr = OplogManager::open_multi(
+        &oplog_dir,
+        &[],
+        0,
+        RAFT_OPLOG_MAX_BYTES,
+        RAFT_OPLOG_MAX_ENTRIES,
+        RAFT_OPLOG_RETENTION_SECS,
+    )
+    .ok()?;
+    mgr.recover_last_entry().ok().flatten().map(|e| e.index)
+}
+
 // ── Log Store ─────────────────────────────────────────────────
 
 /// Storage-backed Raft log storage.

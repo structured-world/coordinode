@@ -80,6 +80,10 @@ fn register_storage_metrics() {
         "Partitions repaired from healthy peers after the scrub found corruption"
     );
     metrics::describe_counter!(
+        "coordinode_scrub_wal_repairs_total",
+        "Partitions repaired by WAL replay from a checkpoint (no healthy replica)"
+    );
+    metrics::describe_counter!(
         "coordinode_checkpoint_total",
         "Periodic local checkpoints completed"
     );
