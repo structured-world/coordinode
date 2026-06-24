@@ -21,6 +21,28 @@ fn test_engine(dir: &std::path::Path) -> StorageEngine {
     StorageEngine::open(&cfg).expect("open engine")
 }
 
+/// Recursively collect every regular file under `root`.
+fn collect_files(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(root).expect("read_dir") {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            collect_files(&path, out);
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+}
+
+/// The largest regular file under `root` — after a flush, the data SST.
+fn largest_file(root: &std::path::Path) -> std::path::PathBuf {
+    let mut files = Vec::new();
+    collect_files(root, &mut files);
+    files
+        .into_iter()
+        .max_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .expect("at least one file on disk")
+}
+
 #[test]
 fn kv_blob_round_trips() {
     let entries = vec![
@@ -422,6 +444,93 @@ async fn repair_partition_no_reachable_peer_errors() {
         matches!(err, RepairError::NoSource(_)),
         "expected NoSource, got {err:?}"
     );
+}
+
+#[tokio::test]
+async fn repair_heals_corrupt_partition_so_rescrub_is_clean() {
+    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
+    use crate::transfer::SegmentTransferHandler;
+    use coordinode_storage::scrub::{scrub_all, ScrubConfig};
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+
+    let entries = 60u32;
+    let put_all = |engine: &StorageEngine| {
+        for i in 0..entries {
+            engine
+                .put(
+                    Partition::Node,
+                    format!("node:0:{i:08}").as_bytes(),
+                    format!("value-{i}").as_bytes(),
+                )
+                .expect("put");
+        }
+    };
+
+    // Healthy peer with the clean data, behind the real service.
+    let peer_dir = tempfile::tempdir().expect("tempdir");
+    let peer = std::sync::Arc::new(test_engine(peer_dir.path()));
+    put_all(&peer);
+    peer.persist().expect("persist");
+    let handler = SegmentTransferHandler::new(std::sync::Arc::new(SegmentInstaller::new(
+        std::sync::Arc::clone(&peer),
+    )));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let incoming = TcpListenerStream::new(listener);
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(SegmentTransferServiceServer::new(handler))
+            .serve_with_incoming(incoming)
+            .await
+            .expect("server");
+    });
+
+    // Local node with the same data, then one SST physically corrupted.
+    let local_dir = tempfile::tempdir().expect("tempdir");
+    let local = std::sync::Arc::new(test_engine(local_dir.path()));
+    put_all(&local);
+    local.persist().expect("persist");
+    let victim = largest_file(local_dir.path());
+    let mut bytes = std::fs::read(&victim).expect("read sst");
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xFF;
+    std::fs::write(&victim, &bytes).expect("corrupt sst");
+
+    // Scrub detects the injected corruption.
+    let before = scrub_all(&local, &ScrubConfig::default()).expect("scrub");
+    assert!(
+        before.has_errors(),
+        "scrub must detect the injected corruption"
+    );
+
+    // Repair from the peer, then flush the reinstalled data so the scrub (which
+    // reads on-disk SSTs) sees it.
+    let installer = std::sync::Arc::new(SegmentInstaller::new(std::sync::Arc::clone(&local)));
+    installer
+        .repair_partition(
+            &[format!("http://{addr}")],
+            Partition::Node,
+            256,
+            PieceEncoding::None,
+        )
+        .await
+        .expect("repair");
+    local.persist().expect("persist");
+
+    // The corruption is physically gone (the corrupt SST was dropped, not
+    // shadowed) and the data is intact.
+    let after = scrub_all(&local, &ScrubConfig::default()).expect("scrub");
+    assert!(
+        !after.has_errors(),
+        "repair must physically heal the corruption: {:?}",
+        after.errors
+    );
+    let v = local
+        .get(Partition::Node, b"node:0:00000042")
+        .expect("get")
+        .expect("entry present after repair");
+    assert_eq!(v.as_ref(), b"value-42");
 }
 
 #[test]
