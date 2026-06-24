@@ -34,6 +34,7 @@
 #![forbid(unsafe_code)]
 
 pub mod registry;
+pub mod segment_store;
 pub mod transfer;
 mod writer;
 
