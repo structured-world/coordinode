@@ -435,6 +435,10 @@ fn submit_proposal(
     commit_ts: Timestamp,
     start_ts: Timestamp,
 ) -> Result<(), ()> {
+    // Coalesce dense runs of point deletes into range deletes before proposing,
+    // shrinking the Raft payload / oplog / PITR log on bulk deletes (G096).
+    let mutations =
+        super::coalesce::coalesce_delete_mutations(mutations, super::coalesce::DEFAULT_MIN_RUN);
     let count = mutations.len();
     let proposal = RaftProposal {
         id: id_gen.next(),

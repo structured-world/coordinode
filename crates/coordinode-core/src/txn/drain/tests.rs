@@ -49,6 +49,41 @@ fn test_entry(n_mutations: usize, ts: u64) -> DrainEntry {
     DrainEntry::new(mutations, Timestamp::from_raw(ts), Timestamp::from_raw(1))
 }
 
+/// A drained batch of consecutive point deletes is coalesced into a range delete
+/// in the submitted proposal (G096) — the producer wiring, end to end.
+#[test]
+fn drain_coalesces_consecutive_deletes_into_range() {
+    let buf = DrainBuffer::new(1 << 20);
+    let dels: Vec<Mutation> = (0..8u64)
+        .map(|i| Mutation::Delete {
+            partition: PartitionId::EdgeProp,
+            key: i.to_be_bytes().to_vec(),
+        })
+        .collect();
+    buf.append(DrainEntry::new(
+        dels,
+        Timestamp::from_raw(100),
+        Timestamp::from_raw(1),
+    ))
+    .expect("append");
+
+    let pipeline = Arc::new(RecordingPipeline::new());
+    let id_gen = ProposalIdGenerator::new();
+    drain_once(&buf, pipeline.as_ref(), &id_gen, 10_000, None);
+
+    let proposals = pipeline.proposals.lock().unwrap();
+    assert_eq!(proposals.len(), 1);
+    // The 8 point deletes became one range delete.
+    assert_eq!(proposals[0].mutations.len(), 1);
+    assert!(matches!(
+        &proposals[0].mutations[0],
+        Mutation::RemoveRange {
+            partition: PartitionId::EdgeProp,
+            ..
+        }
+    ));
+}
+
 #[test]
 fn buffer_append_and_take() {
     let buf = DrainBuffer::new(1024 * 1024);
