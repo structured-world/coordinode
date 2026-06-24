@@ -88,16 +88,18 @@ pub enum PlanError {
     ExtensionPayloadEncode(String),
 }
 
-/// Build a logical plan from a validated Cypher AST.
-pub fn build_logical_plan(query: &Query) -> Result<LogicalPlan, PlanError> {
-    if query.clauses.is_empty() {
+/// Build the optimized logical root for a single query branch (one clause
+/// sequence). Shared by the leading query and each `UNION` branch. Returns the
+/// optimized root plus any `AS OF TIMESTAMP` snapshot expression found.
+fn build_branch_root(clauses: &[Clause]) -> Result<(LogicalOp, Option<Expr>), PlanError> {
+    if clauses.is_empty() {
         return Err(PlanError::EmptyQuery);
     }
 
     let mut current: Option<LogicalOp> = None;
     let mut snapshot_ts: Option<Expr> = None;
 
-    for clause in &query.clauses {
+    for clause in clauses {
         if let Clause::AsOfTimestamp(expr) = clause {
             snapshot_ts = Some(expr.clone());
             continue;
@@ -126,6 +128,37 @@ pub fn build_logical_plan(query: &Query) -> Result<LogicalPlan, PlanError> {
     // the parent Traverse's `temporal_filter`. Bounds the per-version edgeprop
     // scan in the executor instead of materializing every stored version.
     let root = lift_temporal_filter(root);
+
+    Ok((root, snapshot_ts))
+}
+
+/// Build a logical plan from a validated Cypher AST.
+pub fn build_logical_plan(query: &Query) -> Result<LogicalPlan, PlanError> {
+    if query.clauses.is_empty() {
+        return Err(PlanError::EmptyQuery);
+    }
+
+    let (mut root, mut snapshot_ts) = build_branch_root(&query.clauses)?;
+
+    // UNION / UNION ALL: build each subsequent branch independently and wrap
+    // all branches in a Union node. A plain `UNION` anywhere de-duplicates the
+    // combined result (Neo4j forbids mixing UNION and UNION ALL in one query,
+    // so in practice every branch shares the same flag).
+    if !query.unions.is_empty() {
+        let mut inputs = vec![root];
+        let mut all = true;
+        for branch in &query.unions {
+            let (branch_root, branch_snapshot) = build_branch_root(&branch.clauses)?;
+            if !branch.all {
+                all = false;
+            }
+            if branch_snapshot.is_some() && snapshot_ts.is_none() {
+                snapshot_ts = branch_snapshot;
+            }
+            inputs.push(branch_root);
+        }
+        root = LogicalOp::Union { inputs, all };
+    }
 
     // Extract per-query hints. Both hints are optional; an explicit hint
     // always overrides the planner default or auto-promotion.
@@ -307,6 +340,7 @@ fn op_children(op: &LogicalOp) -> Vec<&LogicalOp> {
         }
         LogicalOp::CreateNode { input, .. } => input.as_deref().into_iter().collect(),
         LogicalOp::Merge { pattern, .. } | LogicalOp::Upsert { pattern, .. } => vec![pattern],
+        LogicalOp::Union { inputs, .. } => inputs.iter().collect(),
         _ => Vec::new(),
     }
 }

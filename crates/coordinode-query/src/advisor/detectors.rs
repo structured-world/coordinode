@@ -400,6 +400,8 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
 
         LogicalOp::Merge { pattern, .. } | LogicalOp::Upsert { pattern, .. } => vec![pattern],
 
+        LogicalOp::Union { inputs, .. } => inputs.iter().collect(),
+
         LogicalOp::CreateIndex { .. }
         | LogicalOp::DropIndex { .. }
         | LogicalOp::IndexScan { .. } => vec![],

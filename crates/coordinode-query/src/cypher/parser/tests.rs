@@ -2454,6 +2454,22 @@ fn create_node_type_temporal_case_insensitive() {
 }
 
 #[test]
+fn union_branches_parsed() {
+    // Plain UNION: one extra branch, not ALL.
+    let q = parse_ok("MATCH (a) RETURN a UNION MATCH (b) RETURN b");
+    assert_eq!(q.clauses.len(), 2);
+    assert_eq!(q.unions.len(), 1);
+    assert!(!q.unions[0].all);
+    assert_eq!(q.unions[0].clauses.len(), 2);
+
+    // UNION ALL across three branches.
+    let q =
+        parse_ok("MATCH (a) RETURN a UNION ALL MATCH (b) RETURN b UNION ALL MATCH (c) RETURN c");
+    assert_eq!(q.unions.len(), 2);
+    assert!(q.unions.iter().all(|b| b.all));
+}
+
+#[test]
 fn on_violation_skip_parsed() {
     // SET ... ON VIOLATION SKIP should set ViolationMode::Skip.
     let q = parse_ok("MATCH (n:X) SET n.y = 1 ON VIOLATION SKIP");

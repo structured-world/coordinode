@@ -2364,6 +2364,26 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             Ok(result)
         }
 
+        // UNION / UNION ALL: run each branch, concatenate the rows in branch
+        // order. Plain UNION (`all == false`) de-duplicates the combined set,
+        // preserving first-seen order; UNION ALL keeps every row.
+        LogicalOp::Union { inputs, all } => {
+            let mut result: Vec<Row> = Vec::new();
+            for branch in inputs {
+                let rows = execute_op(branch, ctx)?;
+                if *all {
+                    result.extend(rows);
+                } else {
+                    for row in rows {
+                        if !result.contains(&row) {
+                            result.push(row);
+                        }
+                    }
+                }
+            }
+            Ok(result)
+        }
+
         LogicalOp::VectorFilter {
             input,
             vector_expr,
@@ -7300,6 +7320,7 @@ fn exists_subquery_matches(
             }),
         ],
         hints: Vec::new(),
+        unions: Vec::new(),
     };
     let plan = crate::planner::builder::build_logical_plan(&query).map_err(|e| {
         ExecutionError::Unsupported(format!("EXISTS subquery planning failed: {e}"))
@@ -7349,6 +7370,7 @@ fn pattern_comprehension_eval(
             }),
         ],
         hints: Vec::new(),
+        unions: Vec::new(),
     };
     let plan = crate::planner::builder::build_logical_plan(&query).map_err(|e| {
         ExecutionError::Unsupported(format!("pattern comprehension planning failed: {e}"))

@@ -46,6 +46,14 @@ pub enum SemanticError {
     /// DELETE on non-variable expression.
     #[error("DELETE requires a variable, got expression")]
     DeleteNonVariable,
+
+    /// UNION branches project different column names. All branches of a
+    /// UNION / UNION ALL must return the same columns in the same order.
+    #[error("all UNION branches must have the same column names: {left:?} vs {right:?}")]
+    UnionColumnMismatch {
+        left: Vec<String>,
+        right: Vec<String>,
+    },
 }
 
 /// Provides schema information for semantic validation.
@@ -109,6 +117,43 @@ pub fn analyze(query: &Query, schema: Option<&dyn SchemaProvider>) -> Vec<Semant
     analyzer.errors
 }
 
+/// Output column names of a query branch, taken from its final RETURN clause.
+///
+/// Returns `None` when the branch has no RETURN or projects `*` (the column
+/// set then depends on runtime scope and can't be compared statically — the
+/// UNION column check is skipped in that case).
+fn return_columns(clauses: &[Clause]) -> Option<Vec<String>> {
+    let rc = clauses.iter().rev().find_map(|c| match c {
+        Clause::Return(rc) => Some(rc),
+        _ => None,
+    })?;
+    let mut cols = Vec::with_capacity(rc.items.len());
+    for item in &rc.items {
+        if matches!(item.expr, Expr::Star) {
+            return None;
+        }
+        cols.push(
+            item.alias
+                .clone()
+                .unwrap_or_else(|| column_display_name(&item.expr)),
+        );
+    }
+    Some(cols)
+}
+
+/// Derive a stable column name from a projection expression (used only for the
+/// UNION column-compatibility check; mirrors the executor's projection naming).
+fn column_display_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Variable(name) => name.clone(),
+        Expr::PropertyAccess { expr, property } => {
+            format!("{}.{property}", column_display_name(expr))
+        }
+        Expr::FunctionCall { name, .. } => name.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
 struct Analyzer<'a> {
     /// Current variable scope: name → labels (if known).
     scope: HashMap<String, Vec<String>>,
@@ -130,6 +175,32 @@ impl<'a> Analyzer<'a> {
     fn analyze_query(&mut self, query: &Query) {
         for clause in &query.clauses {
             self.analyze_clause(clause);
+        }
+
+        if query.unions.is_empty() {
+            return;
+        }
+
+        // Each UNION branch is its own variable scope.
+        let first_cols = return_columns(&query.clauses);
+        for branch in &query.unions {
+            let saved = std::mem::take(&mut self.scope);
+            for clause in &branch.clauses {
+                self.analyze_clause(clause);
+            }
+            self.scope = saved;
+
+            // Column-name compatibility: all branches must project the same
+            // columns in the same order. `*` projections can't be compared
+            // statically, so a branch using `RETURN *` skips the check.
+            if let (Some(left), Some(right)) = (&first_cols, return_columns(&branch.clauses)) {
+                if *left != right {
+                    self.errors.push(SemanticError::UnionColumnMismatch {
+                        left: left.clone(),
+                        right,
+                    });
+                }
+            }
         }
     }
 

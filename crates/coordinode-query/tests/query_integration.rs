@@ -694,6 +694,61 @@ fn is_typed_predicate_end_to_end() {
     assert_eq!(results[0].get("f"), Some(&Value::Bool(true)));
 }
 
+/// `UNION` de-duplicates the combined result; `UNION ALL` keeps duplicates.
+#[test]
+fn union_dedup_and_all_end_to_end() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    // Same branch twice. UNION collapses the duplicate to one row.
+    let dedup = run_cypher(
+        "MATCH (n:Person) WHERE n.name = 'Alice' RETURN n.name AS name \
+         UNION \
+         MATCH (n:Person) WHERE n.name = 'Alice' RETURN n.name AS name",
+        engine,
+        &mut interner,
+    );
+    assert_eq!(dedup.len(), 1);
+    assert_eq!(dedup[0].get("name"), Some(&Value::String("Alice".into())));
+
+    // UNION ALL keeps both copies.
+    let all = run_cypher(
+        "MATCH (n:Person) WHERE n.name = 'Alice' RETURN n.name AS name \
+         UNION ALL \
+         MATCH (n:Person) WHERE n.name = 'Alice' RETURN n.name AS name",
+        engine,
+        &mut interner,
+    );
+    assert_eq!(all.len(), 2);
+    assert!(all
+        .iter()
+        .all(|r| r.get("name") == Some(&Value::String("Alice".into()))));
+}
+
+/// `UNION` merges two distinct branches into one result set.
+#[test]
+fn union_distinct_branches_end_to_end() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    let results = run_cypher(
+        "MATCH (n:Person) WHERE n.name = 'Alice' RETURN n.name AS name \
+         UNION \
+         MATCH (n:Person) WHERE n.name = 'Bob' RETURN n.name AS name",
+        engine,
+        &mut interner,
+    );
+    let mut names: Vec<String> = results
+        .iter()
+        .filter_map(|r| match r.get("name") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
+}
+
 /// `=~` regex match operator in WHERE (whole-string, anchored).
 #[test]
 fn regex_match_end_to_end() {

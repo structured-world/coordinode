@@ -249,6 +249,12 @@ pub enum LogicalOp {
         right: Box<LogicalOp>,
     },
 
+    /// `UNION` / `UNION ALL`: concatenate the result sets of two or more
+    /// independent query branches. Every branch must project the same column
+    /// names in the same order. When `all` is `false` (plain `UNION`) the
+    /// combined result is de-duplicated; `true` (`UNION ALL`) keeps all rows.
+    Union { inputs: Vec<LogicalOp>, all: bool },
+
     /// Create nodes from pattern.
     CreateNode {
         input: Option<Box<LogicalOp>>,
@@ -869,6 +875,11 @@ impl LogicalOp {
                 left.substitute_params(params);
                 right.substitute_params(params);
             }
+            LogicalOp::Union { inputs, .. } => {
+                for input in inputs {
+                    input.substitute_params(params);
+                }
+            }
             LogicalOp::CreateNode {
                 input, properties, ..
             } => {
@@ -1461,6 +1472,19 @@ fn estimate_op_cost(
             (left_cost + right_cost + rows * 0.01, rows)
         }
 
+        LogicalOp::Union { inputs, .. } => {
+            // Cost and row count are the sum across branches; the dedup pass for
+            // plain UNION adds a near-linear scan over the combined rows.
+            let mut total_cost = 0.0;
+            let mut total_rows = 0.0;
+            for input in inputs {
+                let (c, r) = estimate_op_cost(input, defaults, stats, hints);
+                total_cost += c;
+                total_rows += r;
+            }
+            (total_cost + total_rows * 0.01, total_rows)
+        }
+
         LogicalOp::VectorFilter {
             input, threshold, ..
         } => {
@@ -1891,6 +1915,13 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             output.push_str(&format!("{prefix}CartesianProduct\n"));
             explain_op(left, indent + 1, output);
             explain_op(right, indent + 1, output);
+        }
+        LogicalOp::Union { inputs, all } => {
+            let kind = if *all { "UnionAll" } else { "Union" };
+            output.push_str(&format!("{prefix}{kind}\n"));
+            for input in inputs {
+                explain_op(input, indent + 1, output);
+            }
         }
         LogicalOp::CreateNode {
             input,

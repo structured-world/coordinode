@@ -245,6 +245,7 @@ fn return_star_no_variables() {
             }],
         })],
         hints: Vec::new(),
+        unions: Vec::new(),
     };
     let errors = analyze(&query, None);
     assert!(errors
@@ -405,4 +406,28 @@ fn aggregation_in_return() {
 fn nested_property_access() {
     let errors = parse_and_analyze("MATCH (n:User) WHERE n.age > 18 AND n.name = 'Alice' RETURN n");
     assert!(errors.is_empty());
+}
+
+#[test]
+fn union_matching_columns_ok() {
+    let errors =
+        parse_and_analyze("MATCH (a) RETURN a.name AS name UNION MATCH (b) RETURN b.name AS name");
+    assert!(
+        !errors
+            .iter()
+            .any(|e| matches!(e, SemanticError::UnionColumnMismatch { .. })),
+        "matching UNION columns should not error: {errors:?}"
+    );
+}
+
+#[test]
+fn union_mismatched_columns_error() {
+    let errors =
+        parse_and_analyze("MATCH (a) RETURN a.name AS name UNION MATCH (b) RETURN b.age AS age");
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, SemanticError::UnionColumnMismatch { .. })),
+        "mismatched UNION columns should error: {errors:?}"
+    );
 }

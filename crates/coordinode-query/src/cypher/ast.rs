@@ -14,6 +14,20 @@ pub struct Query {
     pub clauses: Vec<Clause>,
     /// Per-query optimizer hints extracted from `/*+ key('value') */` comments.
     pub hints: Vec<QueryHint>,
+    /// Additional `UNION` / `UNION ALL` branches. Empty for a plain single
+    /// query. The first branch is `clauses`; each entry here is a subsequent
+    /// branch whose result set is unioned with the preceding ones.
+    pub unions: Vec<UnionBranch>,
+}
+
+/// One `UNION` / `UNION ALL` branch following the initial query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnionBranch {
+    /// `true` for `UNION ALL` (keep duplicates), `false` for `UNION` (dedup
+    /// the combined result set).
+    pub all: bool,
+    /// The branch's own clause sequence (its own MATCH/WHERE/RETURN/...).
+    pub clauses: Vec<Clause>,
 }
 
 impl Query {
@@ -27,31 +41,34 @@ impl Query {
     /// `writeConcern >= majority` to avoid dangling `operationTime` references
     /// when the leader crashes before replicating.
     pub fn is_write(&self) -> bool {
-        self.clauses.iter().any(|c| {
-            matches!(
-                c,
-                Clause::Create(_)
-                    | Clause::Merge(_)
-                    | Clause::MergeMany(_)
-                    | Clause::Upsert(_)
-                    | Clause::Delete(_)
-                    | Clause::Set(_, _)
-                    | Clause::Remove(_)
-                    | Clause::DetachDocument(_)
-                    | Clause::AttachDocument(_)
-                    | Clause::AlterLabel(_)
-                    | Clause::CreateTextIndex(_)
-                    | Clause::DropTextIndex(_)
-                    | Clause::CreateEncryptedIndex(_)
-                    | Clause::DropEncryptedIndex(_)
-                    | Clause::CreateIndex(_)
-                    | Clause::DropIndex(_)
-                    | Clause::CreateVectorIndex(_)
-                    | Clause::DropVectorIndex(_)
-                    | Clause::CreateEdgeType(_)
-                    | Clause::CreateNodeType(_)
-            )
-        })
+        let branch_is_write = |clauses: &[Clause]| {
+            clauses.iter().any(|c| {
+                matches!(
+                    c,
+                    Clause::Create(_)
+                        | Clause::Merge(_)
+                        | Clause::MergeMany(_)
+                        | Clause::Upsert(_)
+                        | Clause::Delete(_)
+                        | Clause::Set(_, _)
+                        | Clause::Remove(_)
+                        | Clause::DetachDocument(_)
+                        | Clause::AttachDocument(_)
+                        | Clause::AlterLabel(_)
+                        | Clause::CreateTextIndex(_)
+                        | Clause::DropTextIndex(_)
+                        | Clause::CreateEncryptedIndex(_)
+                        | Clause::DropEncryptedIndex(_)
+                        | Clause::CreateIndex(_)
+                        | Clause::DropIndex(_)
+                        | Clause::CreateVectorIndex(_)
+                        | Clause::DropVectorIndex(_)
+                        | Clause::CreateEdgeType(_)
+                        | Clause::CreateNodeType(_)
+                )
+            })
+        };
+        branch_is_write(&self.clauses) || self.unions.iter().any(|b| branch_is_write(&b.clauses))
     }
 }
 

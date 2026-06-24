@@ -9,7 +9,12 @@ COMMENT    = _{ "//" ~ (!"\n" ~ ANY)* | "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
 
 // --- Top-level ---
 
-query = { SOI ~ clause+ ~ EOI }
+query = { SOI ~ clause+ ~ union_branch* ~ EOI }
+
+// UNION / UNION ALL: each branch is its own clause sequence. `clause+` above
+// stops at the UNION keyword (no clause alternative matches it), so the
+// branches are picked up here.
+union_branch = { kw_union ~ kw_all? ~ clause+ }
 
 clause = {
     optional_match_clause
@@ -751,6 +756,7 @@ kw_end        = @{ ^"end" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_create     = @{ ^"create" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_merge      = @{ ^"merge" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_all        = @{ ^"all" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_union      = @{ ^"union" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_any        = @{ ^"any" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_none       = @{ ^"none" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_single     = @{ ^"single" ~ !(ASCII_ALPHANUMERIC | "_") }
@@ -848,5 +854,6 @@ reserved_word = @{
     | ^"create" | ^"merge" | ^"delete" | ^"detach" | ^"set" | ^"remove"
     | ^"on" | ^"upsert" | ^"call" | ^"yield"
     | ^"alter" | ^"label" | ^"schema"
+    | ^"union"
     ) ~ !(ASCII_ALPHANUMERIC | "_")
 }

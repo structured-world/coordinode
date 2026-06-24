@@ -107,9 +107,22 @@ fn parse_single_hint(body: &str) -> Option<QueryHint> {
 
 fn build_query(pairs: Pairs<'_, Rule>) -> Result<Query, ParseError> {
     let mut clauses = Vec::new();
+    let mut unions = Vec::new();
 
     for pair in pairs {
-        collect_clauses(pair, &mut clauses)?;
+        if pair.as_rule() == Rule::query {
+            // Walk the top-level `query` node directly so UNION branches are
+            // separated from the leading single query.
+            for inner in pair.into_inner() {
+                match inner.as_rule() {
+                    Rule::union_branch => unions.push(build_union_branch(inner)?),
+                    Rule::EOI => {}
+                    _ => collect_clauses(inner, &mut clauses)?,
+                }
+            }
+        } else {
+            collect_clauses(pair, &mut clauses)?;
+        }
     }
 
     if clauses.is_empty() {
@@ -119,7 +132,28 @@ fn build_query(pairs: Pairs<'_, Rule>) -> Result<Query, ParseError> {
     Ok(Query {
         clauses,
         hints: Vec::new(),
+        unions,
     })
+}
+
+/// Build one `UNION [ALL]` branch from a `union_branch` parse node.
+fn build_union_branch(pair: Pair<'_, Rule>) -> Result<UnionBranch, ParseError> {
+    let mut all = false;
+    let mut clauses = Vec::new();
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::kw_union => {}
+            Rule::kw_all => all = true,
+            _ => collect_clauses(inner, &mut clauses)?,
+        }
+    }
+
+    if clauses.is_empty() {
+        return Err(ParseError::Invalid("empty UNION branch".into()));
+    }
+
+    Ok(UnionBranch { all, clauses })
 }
 
 /// Recursively collect clause nodes from the parse tree.
