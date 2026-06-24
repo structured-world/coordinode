@@ -386,6 +386,10 @@ pub fn eval_expr(expr: &Expr, row: &Row) -> Value {
         // predicates through the storage-aware evaluator instead. Reaching here
         // means EXISTS appeared in a context without engine access; yield NULL.
         Expr::ExistsSubquery(_) => Value::Null,
+        // COUNT{}/COLLECT{} subqueries need the storage engine; the pure
+        // evaluator yields NULL (the storage-aware path computes them).
+        Expr::CountSubquery(_) => Value::Null,
+        Expr::CollectSubquery { .. } => Value::Null,
 
         // Pattern comprehension needs the engine to run its inner pattern; the
         // storage-aware evaluator (WHERE + projection paths) handles it. Reaching

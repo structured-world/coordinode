@@ -776,6 +776,21 @@ pub enum Expr {
     /// top-level query (no second pattern-matching implementation).
     ExistsSubquery(Box<MatchClause>),
 
+    /// Count subquery: `COUNT { MATCH … [WHERE …] }`. Evaluates to the number of
+    /// rows the inner MATCH produces, correlated with the outer-scope bindings.
+    /// Same MATCH planner + shared-variable correlation as [`Expr::ExistsSubquery`].
+    CountSubquery(Box<MatchClause>),
+
+    /// Collect subquery: `COLLECT { MATCH … [WHERE …] RETURN expr }`. Gathers
+    /// `expr` evaluated over each matching, outer-consistent row into a list.
+    /// Same MATCH planner + correlation as [`Expr::ExistsSubquery`].
+    CollectSubquery {
+        /// Inner MATCH (+ optional WHERE).
+        match_clause: Box<MatchClause>,
+        /// The expression collected per matching row.
+        expr: Box<Expr>,
+    },
+
     /// Pattern comprehension: `[(a)-[:R]->(b) WHERE pred | expr]`. Matches the
     /// inner pattern (correlated with the outer row), filters by the optional
     /// `pred`, and collects `map` evaluated per match into a list. Planned
@@ -974,7 +989,7 @@ impl Expr {
                 }
                 map.substitute_params(params);
             }
-            Expr::ExistsSubquery(mc) => {
+            Expr::ExistsSubquery(mc) | Expr::CountSubquery(mc) => {
                 for pattern in &mut mc.patterns {
                     for elem in &mut pattern.elements {
                         match elem {
@@ -994,6 +1009,28 @@ impl Expr {
                 if let Some(w) = &mut mc.where_clause {
                     w.substitute_params(params);
                 }
+            }
+            Expr::CollectSubquery { match_clause, expr } => {
+                for pattern in &mut match_clause.patterns {
+                    for elem in &mut pattern.elements {
+                        match elem {
+                            PatternElement::Node(node) => {
+                                for (_, v) in &mut node.properties {
+                                    v.substitute_params(params);
+                                }
+                            }
+                            PatternElement::Relationship(rel) => {
+                                for (_, v) in &mut rel.properties {
+                                    v.substitute_params(params);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(w) = &mut match_clause.where_clause {
+                    w.substitute_params(params);
+                }
+                expr.substitute_params(params);
             }
             Expr::Literal(_) | Expr::Variable(_) | Expr::Star => {}
         }

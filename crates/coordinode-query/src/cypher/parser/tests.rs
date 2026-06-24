@@ -2496,6 +2496,32 @@ fn foreach_multiple_body_clauses_parsed() {
 }
 
 #[test]
+fn count_subquery_parsed() {
+    let q = parse_ok("MATCH (a) RETURN COUNT { MATCH (a)-[:KNOWS]->(b) } AS c");
+    // The RETURN item expression is a CountSubquery.
+    let has_count = format!("{:?}", q.clauses).contains("CountSubquery");
+    assert!(has_count, "expected CountSubquery in {:?}", q.clauses);
+}
+
+#[test]
+fn collect_subquery_parsed() {
+    let q = parse_ok("MATCH (a) RETURN COLLECT { MATCH (a)-[:KNOWS]->(b) RETURN b.name } AS names");
+    let has_collect = format!("{:?}", q.clauses).contains("CollectSubquery");
+    assert!(has_collect, "expected CollectSubquery in {:?}", q.clauses);
+}
+
+#[test]
+fn count_collect_functions_still_parse() {
+    // count(...) / collect(...) aggregate functions must NOT be captured by the
+    // subquery rules (the `{` disambiguates).
+    let q = parse_ok("MATCH (a) RETURN count(a), collect(a.name)");
+    let dbg = format!("{:?}", q.clauses);
+    assert!(dbg.contains("FunctionCall"));
+    assert!(!dbg.contains("CountSubquery"));
+    assert!(!dbg.contains("CollectSubquery"));
+}
+
+#[test]
 fn call_subquery_parsed() {
     // Correlated CALL with a leading importing WITH.
     let q =

@@ -634,6 +634,8 @@ slice_end = { expression }
 
 atom = {
     exists_subquery
+  | count_subquery
+  | collect_subquery
   | reduce_expr
   | list_predicate
   | list_comprehension
@@ -669,6 +671,14 @@ function_args = { star | expression ~ ("," ~ expression)* }
 // EXISTS { MATCH … [WHERE …] } — existential subquery; true if the inner
 // MATCH yields at least one row (correlated with outer-scope bindings).
 exists_subquery = { kw_exists ~ "{" ~ match_clause ~ "}" }
+
+// COUNT { MATCH … [WHERE …] } — counts the rows the inner MATCH yields
+// (correlated with outer bindings). COLLECT { MATCH … RETURN expr } — gathers
+// `expr` over each matching row into a list. The `{` after the keyword
+// disambiguates from the `count(...)` / `collect(...)` aggregate functions, so
+// these keywords are NOT reserved.
+count_subquery = { kw_count ~ "{" ~ match_clause ~ "}" }
+collect_subquery = { kw_collect ~ "{" ~ match_clause ~ kw_return ~ expression ~ "}" }
 
 // [(a)-[:R]->(b) WHERE pred | expr] — pattern comprehension. The mandatory
 // `| expr` distinguishes it from a list literal; placed after list_comprehension
@@ -788,6 +798,8 @@ kw_any        = @{ ^"any" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_none       = @{ ^"none" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_single     = @{ ^"single" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_exists     = @{ ^"exists" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_count      = @{ ^"count" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_collect    = @{ ^"collect" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_delete     = @{ ^"delete" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_detach     = @{ ^"detach" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_set        = @{ ^"set" ~ !(ASCII_ALPHANUMERIC | "_") }

@@ -658,7 +658,7 @@ impl<'a> Analyzer<'a> {
                     }
                 }
             }
-            Expr::ExistsSubquery(_) => {
+            Expr::ExistsSubquery(_) | Expr::CountSubquery(_) | Expr::CollectSubquery { .. } => {
                 // The inner MATCH introduces its own scope (and may correlate on
                 // outer variables); it is fully validated by the logical planner
                 // when the subquery is built, so no outer-scope check here.

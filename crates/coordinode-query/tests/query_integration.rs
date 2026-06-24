@@ -695,6 +695,56 @@ fn is_typed_predicate_end_to_end() {
     assert_eq!(results[0].get("f"), Some(&Value::Bool(true)));
 }
 
+/// `COUNT { MATCH … }` subquery expression counts correlated matches.
+#[test]
+fn count_subquery_end_to_end() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+    // Alice KNOWS Bob and Charlie → COUNT{} = 2.
+    let results = run_cypher(
+        "MATCH (a:Person {name: 'Alice'}) \
+         RETURN a.name AS name, COUNT { MATCH (a)-[:KNOWS]->(b) } AS cnt",
+        engine,
+        &mut interner,
+    );
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get("cnt"), Some(&Value::Int(2)));
+    // A node with no outgoing KNOWS → 0.
+    let dave = run_cypher(
+        "MATCH (a:Person {name: 'Dave'}) \
+         RETURN COUNT { MATCH (a)-[:KNOWS]->(b) } AS cnt",
+        engine,
+        &mut interner,
+    );
+    assert_eq!(dave[0].get("cnt"), Some(&Value::Int(0)));
+}
+
+/// `COLLECT { MATCH … RETURN expr }` subquery expression gathers a list.
+#[test]
+fn collect_subquery_end_to_end() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+    let results = run_cypher(
+        "MATCH (a:Person {name: 'Alice'}) \
+         RETURN COLLECT { MATCH (a)-[:KNOWS]->(b) RETURN b.name } AS friends",
+        engine,
+        &mut interner,
+    );
+    assert_eq!(results.len(), 1);
+    let mut names: Vec<String> = match results[0].get("friends") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        other => panic!("expected friends array, got {other:?}"),
+    };
+    names.sort();
+    assert_eq!(names, vec!["Bob".to_string(), "Charlie".to_string()]);
+}
+
 /// Correlated `CALL { WITH a ... }` imports the outer variable and joins the
 /// subquery rows onto each outer row.
 #[test]

@@ -747,6 +747,15 @@ fn write_expr(buf: &mut String, expr: &Expr) {
             buf.push_str("EXISTS");
             buf.push_str(&format!("{mc:?}"));
         }
+        Expr::CountSubquery(mc) => {
+            buf.push_str("COUNT");
+            buf.push_str(&format!("{mc:?}"));
+        }
+        Expr::CollectSubquery { match_clause, expr } => {
+            buf.push_str("COLLECT");
+            buf.push_str(&format!("{match_clause:?}"));
+            write_expr(buf, expr);
+        }
         Expr::PatternComprehension {
             pattern,
             where_clause,

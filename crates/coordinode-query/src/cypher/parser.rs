@@ -2452,6 +2452,8 @@ fn build_expression(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
         Rule::case_expr => build_case_expr(pair),
         Rule::reduce_expr => build_reduce_expr(pair),
         Rule::exists_subquery => build_exists_subquery(pair),
+        Rule::count_subquery => build_count_subquery(pair),
+        Rule::collect_subquery => build_collect_subquery(pair),
         Rule::list_predicate => build_list_predicate(pair),
         Rule::list_comprehension => build_list_comprehension(pair),
         Rule::pattern_comprehension => build_pattern_comprehension(pair),
@@ -2906,6 +2908,38 @@ fn build_exists_subquery(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
     Err(ParseError::Invalid(
         "EXISTS subquery requires a MATCH clause".into(),
     ))
+}
+
+fn build_count_subquery(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
+    for inner in pair.into_inner() {
+        if inner.as_rule() == Rule::match_clause {
+            return Ok(Expr::CountSubquery(Box::new(build_match_clause(inner)?)));
+        }
+    }
+    Err(ParseError::Invalid(
+        "COUNT subquery requires a MATCH clause".into(),
+    ))
+}
+
+fn build_collect_subquery(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
+    let mut match_clause: Option<MatchClause> = None;
+    let mut expr: Option<Expr> = None;
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::match_clause => match_clause = Some(build_match_clause(inner)?),
+            Rule::expression => expr = Some(build_expression(inner)?),
+            _ => {}
+        }
+    }
+    let match_clause = match_clause
+        .ok_or_else(|| ParseError::Invalid("COLLECT subquery requires a MATCH clause".into()))?;
+    let expr = expr.ok_or_else(|| {
+        ParseError::Invalid("COLLECT subquery requires a RETURN expression".into())
+    })?;
+    Ok(Expr::CollectSubquery {
+        match_clause: Box::new(match_clause),
+        expr: Box::new(expr),
+    })
 }
 
 fn build_pattern_comprehension(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {

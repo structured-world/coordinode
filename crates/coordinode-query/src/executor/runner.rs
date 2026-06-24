@@ -6437,7 +6437,10 @@ fn collect_expr_vars(expr: &Expr, vars: &mut Vec<String>) {
         // The inner MATCH binds its own variables; any outer-correlation
         // variables it references are already provisioned by the outer clauses,
         // so it contributes no extra outer dependencies here.
-        Expr::ExistsSubquery(_) | Expr::PatternComprehension { .. } => {}
+        Expr::ExistsSubquery(_)
+        | Expr::CountSubquery(_)
+        | Expr::CollectSubquery { .. }
+        | Expr::PatternComprehension { .. } => {}
         // Literal, Parameter, Star — no variable references.
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Star => {}
     }
@@ -7299,9 +7302,11 @@ fn execute_merge_relationship_check(
 /// Check whether an expression tree contains any `PatternPredicate` nodes.
 fn expr_contains_pattern_predicate(expr: &Expr) -> bool {
     match expr {
-        Expr::PatternPredicate(_) | Expr::ExistsSubquery(_) | Expr::PatternComprehension { .. } => {
-            true
-        }
+        Expr::PatternPredicate(_)
+        | Expr::ExistsSubquery(_)
+        | Expr::CountSubquery(_)
+        | Expr::CollectSubquery { .. }
+        | Expr::PatternComprehension { .. } => true,
         Expr::UnaryOp { expr, .. } => expr_contains_pattern_predicate(expr),
         Expr::BinaryOp { left, right, .. } => {
             expr_contains_pattern_predicate(left) || expr_contains_pattern_predicate(right)
@@ -7340,6 +7345,10 @@ fn eval_predicate_with_storage(
             }
         }
         Expr::ExistsSubquery(match_clause) => exists_subquery_matches(match_clause, row, ctx),
+        Expr::CountSubquery(match_clause) => count_subquery_eval(match_clause, row, ctx),
+        Expr::CollectSubquery { match_clause, expr } => {
+            collect_subquery_eval(match_clause, expr, row, ctx)
+        }
         Expr::PatternComprehension {
             pattern,
             where_clause,
@@ -7410,6 +7419,68 @@ fn exists_subquery_matches(
         .iter()
         .any(|rr| rr.iter().all(|(k, v)| row.get(k).is_none_or(|ov| ov == v)));
     Ok(Value::Bool(any))
+}
+
+/// Execute a correlated subquery's inner MATCH (planned with `RETURN *` so the
+/// inner variables survive), keeping only rows that agree with the outer `row`
+/// on shared variables, each merged with the outer bindings. Shared by
+/// `COUNT { … }` and `COLLECT { … }` (mirrors the EXISTS correlation path).
+fn correlated_subquery_rows(
+    mc: &crate::cypher::ast::MatchClause,
+    row: &Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    use crate::cypher::ast::{Clause, Query, ReturnClause, ReturnItem};
+    let query = Query {
+        clauses: vec![
+            Clause::Match(mc.clone()),
+            Clause::Return(ReturnClause {
+                distinct: false,
+                items: vec![ReturnItem {
+                    expr: Expr::Star,
+                    alias: None,
+                }],
+            }),
+        ],
+        hints: Vec::new(),
+        unions: Vec::new(),
+    };
+    let plan = crate::planner::builder::build_logical_plan(&query)
+        .map_err(|e| ExecutionError::Unsupported(format!("subquery planning failed: {e}")))?;
+    let rows = execute_op(&plan.root, ctx)?;
+    Ok(rows
+        .into_iter()
+        .filter(|rr| rr.iter().all(|(k, v)| row.get(k).is_none_or(|ov| ov == v)))
+        .map(|rr| {
+            let mut merged = row.clone();
+            merged.extend(rr);
+            merged
+        })
+        .collect())
+}
+
+/// `COUNT { MATCH … [WHERE …] }` → the number of correlated matching rows.
+fn count_subquery_eval(
+    mc: &crate::cypher::ast::MatchClause,
+    row: &Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Value, ExecutionError> {
+    let rows = correlated_subquery_rows(mc, row, ctx)?;
+    Ok(Value::Int(i64::try_from(rows.len()).unwrap_or(i64::MAX)))
+}
+
+/// `COLLECT { MATCH … [WHERE …] RETURN expr }` → a list of `expr` evaluated over
+/// each correlated matching row.
+fn collect_subquery_eval(
+    mc: &crate::cypher::ast::MatchClause,
+    expr: &Expr,
+    row: &Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Value, ExecutionError> {
+    let rows = correlated_subquery_rows(mc, row, ctx)?;
+    Ok(Value::Array(
+        rows.iter().map(|er| eval_expr(expr, er)).collect(),
+    ))
 }
 
 /// Evaluate a `[(a)-[:R]->(b) WHERE pred | map]` pattern comprehension: match
