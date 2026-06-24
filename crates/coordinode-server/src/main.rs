@@ -732,7 +732,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Operator overrides for the retention window + background
             // cadences arrive as `coordinode serve` flags; `None` keeps the
             // built-in defaults (7-day window, 100 ms heartbeat, 1 s eviction).
-            let _registry_bg = registry::build_consumer_registry(
+            let (consumer_registry, _registry_bg) = registry::build_consumer_registry(
                 Arc::clone(&engine),
                 Arc::clone(&pipeline),
                 node_id,
@@ -842,8 +842,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let health_service = services::health::HealthServiceImpl;
             // CDC service: tails oplog/<shard>/ dir. Empty stream in embedded mode
             // (no oplog); populated in Raft cluster mode (LogStore writes oplog).
-            let cdc_service =
-                services::cdc::ChangeEventServiceImpl::new(std::path::PathBuf::from(&data_dir));
+            let cdc_service = services::cdc::ChangeEventServiceImpl::new(
+                std::path::PathBuf::from(&data_dir),
+                consumer_registry,
+            );
 
             // ClusterService: cluster join/leave lifecycle.
             // Available only in cluster mode (requires a RaftNode).

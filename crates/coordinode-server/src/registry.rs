@@ -38,17 +38,19 @@ pub(crate) struct RegistryTuning {
 /// Build the per-shard consumer-retention registry (ADR-028) and start its
 /// background service, applying any operator overrides from `tuning`.
 ///
-/// The returned [`RegistryBackground`] handle must be held for the process
-/// lifetime: dropping it shuts the background service down (with a final
-/// heartbeat flush). The registry publishes the MVCC GC watermark to the
-/// engine synchronously during construction, so the engine's retention floor
-/// already reflects the configured window by the time this returns.
+/// Returns the live [`ShardConsumerRegistry`] (cheap to clone — `Arc`-backed —
+/// so producers like the change-stream service register through it) and its
+/// [`RegistryBackground`] handle, which must be held for the process lifetime:
+/// dropping it shuts the background service down (with a final heartbeat flush).
+/// The registry publishes the MVCC GC watermark to the engine synchronously
+/// during construction, so the engine's retention floor already reflects the
+/// configured window by the time this returns.
 pub(crate) fn build_consumer_registry(
     engine: Arc<StorageEngine>,
     pipeline: Arc<dyn ProposalPipeline>,
     node_id: u64,
     tuning: RegistryTuning,
-) -> RegistryBackground {
+) -> (ShardConsumerRegistry, RegistryBackground) {
     let mut registry = ShardConsumerRegistry::new(
         engine,
         pipeline,
@@ -68,7 +70,10 @@ pub(crate) fn build_consumer_registry(
     if let Some(ms) = tuning.eviction_interval_ms {
         bg_cfg.eviction_interval_ms = ms;
     }
-    registry.start_background(bg_cfg)
+    // start_background borrows &self, so the registry stays owned and is returned
+    // for producers to register through (the bg task holds its own Arc to core).
+    let background = registry.start_background(bg_cfg);
+    (registry, background)
 }
 
 #[cfg(test)]
