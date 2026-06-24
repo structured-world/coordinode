@@ -76,6 +76,31 @@ impl PieceBitfield {
     pub fn is_complete(&self) -> bool {
         self.count_set() == self.len
     }
+
+    /// Serialize as little-endian bytes: `ceil(len / 8)` bytes, where piece `i`
+    /// is bit `i % 8` of byte `i / 8`. The wire form for a bitfield exchange.
+    pub fn to_le_bytes(&self) -> Vec<u8> {
+        let n = (self.len as usize).div_ceil(8);
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let word = self.words[i / 8];
+            out.push((word >> ((i % 8) * 8)) as u8);
+        }
+        out
+    }
+
+    /// Reconstruct a `piece_count`-sized bitfield from its little-endian byte
+    /// form ([`Self::to_le_bytes`]). Bytes beyond the bitfield's word backing are
+    /// ignored, so a malformed peer message cannot panic or over-allocate.
+    pub fn from_le_bytes(bytes: &[u8], piece_count: u32) -> Self {
+        let mut bf = Self::new(piece_count);
+        for (i, &b) in bytes.iter().enumerate() {
+            if let Some(word) = bf.words.get_mut(i / 8) {
+                *word |= (b as u64) << ((i % 8) * 8);
+            }
+        }
+        bf
+    }
 }
 
 /// Per-segment swarm scheduling state: every peer's piece bitfield plus the set

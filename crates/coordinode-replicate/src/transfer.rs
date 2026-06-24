@@ -14,14 +14,20 @@
 
 use std::sync::Arc;
 
+use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::placement::{partition_from_wire_tag, KeyRange};
 use coordinode_swarm::{
-    PieceEncoding, PieceStore, SegmentId, SegmentManifest, SegmentWriter, SwarmResult,
+    PieceBitfield, PieceEncoding, PieceStore, SegmentId, SegmentManifest, SegmentWriter,
+    SwarmResult,
 };
 use futures_util::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 
 use proto::piece_data::Frame;
-use proto::{PieceData, PieceFrame, SegmentTransferHeader, TransferAck};
+use proto::{
+    PieceData, PieceFrame, PieceRequest, SegmentDescriptorRef, SegmentManifestReply,
+    SegmentManifestRequest, SegmentTransferHeader, TransferAck,
+};
 
 /// Generated gRPC stubs for `coordinode/v1/replication/transfer.proto`:
 /// `segment_transfer_service_{server,client}`, `PieceData`,
@@ -42,6 +48,35 @@ pub trait SegmentSink: Send + Sync {
     /// Implementation-defined storage failure, surfaced to the source in the
     /// transfer ack.
     fn store_segment(&self, segment: SegmentId, data: &[u8]) -> Result<(), String>;
+}
+
+/// A built segment ready to serve: its transfer manifest plus the wire (encoded)
+/// pieces in index order.
+pub struct BuiltSegment {
+    /// Per-piece + whole-segment checksums, encoding, and sizes.
+    pub manifest: SegmentManifest,
+    /// Wire (encoded) bytes of each piece, in index order.
+    pub wire: Vec<Vec<u8>>,
+}
+
+/// Source side of the receiver-driven swarm pull: builds a segment's pieces from
+/// local storage on demand so peers can fetch the manifest and individual pieces
+/// by index. Deterministic — the same `(partition, range, piece_size, encoding)`
+/// yields byte-identical pieces on every node, so a piece pulled from one peer
+/// interleaves with pieces from another.
+pub trait SegmentSource: Send + Sync {
+    /// Build (or return a cached) [`BuiltSegment`] for the segment in `partition`
+    /// covering `range`, split into `piece_size`-byte pieces under `encoding`.
+    ///
+    /// # Errors
+    /// A storage / split failure, surfaced to the requesting peer.
+    fn build_segment(
+        &self,
+        partition: Partition,
+        range: &KeyRange,
+        piece_size: usize,
+        encoding: PieceEncoding,
+    ) -> Result<Arc<BuiltSegment>, String>;
 }
 
 /// Build the wire frames for one segment transfer: a leading header carrying the
@@ -166,30 +201,102 @@ fn manifest_from_header(h: &SegmentTransferHeader) -> Result<SegmentManifest, St
     })
 }
 
-/// The target-side tonic service: assembles inbound transfers into the injected
-/// [`SegmentSink`].
-pub struct SegmentTransferHandler<S: SegmentSink> {
-    sink: Arc<S>,
+/// Maps a wire [`SegmentDescriptorRef`] to a built segment via a
+/// [`SegmentSource`]: decodes the partition tag, key range, and split parameters,
+/// then builds (or fetches cached) the pieces.
+fn build_from_ref<Src: SegmentSource>(
+    source: &Src,
+    seg: &SegmentDescriptorRef,
+) -> Result<Arc<BuiltSegment>, Status> {
+    let tag = u8::try_from(seg.partition).map_err(|_| {
+        Status::invalid_argument(format!("partition tag {} out of range", seg.partition))
+    })?;
+    let partition = partition_from_wire_tag(tag)
+        .ok_or_else(|| Status::invalid_argument(format!("unknown partition tag {tag}")))?;
+    let range = KeyRange {
+        start: seg.range_start.clone(),
+        end: seg.range_end.clone(),
+    };
+    let encoding = PieceEncoding::from_wire(seg.encoding, seg.zstd_level)
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+    source
+        .build_segment(partition, &range, seg.piece_size as usize, encoding)
+        .map_err(Status::internal)
 }
 
-impl<S: SegmentSink> SegmentTransferHandler<S> {
-    /// Build a handler that stores received segments through `sink`.
-    pub fn new(sink: Arc<S>) -> Self {
-        Self { sink }
+/// The target-side tonic service: assembles inbound transfers into the injected
+/// store ([`SegmentSink`]) and serves the receiver-driven pull from it
+/// ([`SegmentSource`]).
+pub struct SegmentTransferHandler<S: SegmentSink + SegmentSource> {
+    store: Arc<S>,
+}
+
+impl<S: SegmentSink + SegmentSource> SegmentTransferHandler<S> {
+    /// Build a handler over `store`, which both installs received segments and
+    /// serves local ones to peers.
+    pub fn new(store: Arc<S>) -> Self {
+        Self { store }
     }
 }
 
 #[tonic::async_trait]
-impl<S: SegmentSink + 'static> proto::segment_transfer_service_server::SegmentTransferService
-    for SegmentTransferHandler<S>
+impl<S: SegmentSink + SegmentSource + 'static>
+    proto::segment_transfer_service_server::SegmentTransferService for SegmentTransferHandler<S>
 {
     async fn transfer_pieces(
         &self,
         request: Request<Streaming<PieceData>>,
     ) -> Result<Response<TransferAck>, Status> {
-        receive(request.into_inner(), self.sink.as_ref())
+        receive(request.into_inner(), self.store.as_ref())
             .await
             .map(Response::new)
+    }
+
+    async fn get_segment_manifest(
+        &self,
+        request: Request<SegmentManifestRequest>,
+    ) -> Result<Response<SegmentManifestReply>, Status> {
+        let seg = request
+            .into_inner()
+            .segment
+            .ok_or_else(|| Status::invalid_argument("missing segment descriptor"))?;
+        let built = build_from_ref(self.store.as_ref(), &seg)?;
+        let (encoding, zstd_level) = built.manifest.encoding.to_wire();
+        // A node serving from local storage built every piece, so it can serve
+        // all of them: a full bitfield.
+        let bitfield = PieceBitfield::full(built.manifest.piece_count()).to_le_bytes();
+        Ok(Response::new(SegmentManifestReply {
+            manifest: Some(SegmentTransferHeader {
+                segment_id: seg.segment_id,
+                encoding,
+                zstd_level,
+                piece_hashes: built.manifest.piece_hashes.clone(),
+                total_hash: built.manifest.total_hash,
+                piece_size: built.manifest.piece_size as u32,
+                total_len: built.manifest.total_len as u64,
+            }),
+            piece_bitfield: bitfield,
+        }))
+    }
+
+    async fn get_piece(
+        &self,
+        request: Request<PieceRequest>,
+    ) -> Result<Response<PieceFrame>, Status> {
+        let req = request.into_inner();
+        let seg = req
+            .segment
+            .ok_or_else(|| Status::invalid_argument("missing segment descriptor"))?;
+        let built = build_from_ref(self.store.as_ref(), &seg)?;
+        let wire = built
+            .wire
+            .get(req.index as usize)
+            .ok_or_else(|| Status::out_of_range(format!("piece {} out of range", req.index)))?
+            .clone();
+        Ok(Response::new(PieceFrame {
+            index: req.index,
+            wire,
+        }))
     }
 }
 

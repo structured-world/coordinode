@@ -106,6 +106,55 @@ fn export_transfer_install_round_trip() {
     );
 }
 
+#[test]
+fn segment_source_builds_and_caches_servable_pieces() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = std::sync::Arc::new(test_engine(dir.path()));
+    for i in 0..30u32 {
+        engine
+            .put(
+                Partition::Node,
+                format!("node:0:{i:08}").as_bytes(),
+                format!("v{i}").as_bytes(),
+            )
+            .expect("put");
+    }
+    engine.persist().expect("persist");
+
+    let installer = SegmentInstaller::new(std::sync::Arc::clone(&engine));
+    let range = KeyRange {
+        start: b"node:".to_vec(),
+        end: Vec::new(),
+    };
+
+    let built = installer
+        .build_segment(Partition::Node, &range, 64, PieceEncoding::None)
+        .expect("build segment");
+
+    // The served pieces assemble back to exactly the exported blob, and each
+    // piece verifies against the manifest — so a peer can pull them piece-by-piece
+    // and reconstruct the segment.
+    let blob = export_range(&engine, Partition::Node, &range).expect("export");
+    assert_eq!(built.wire.len() as u32, built.manifest.piece_count());
+    for (i, w) in built.wire.iter().enumerate() {
+        verify_piece(&built.manifest, i as u32, w).expect("verify piece");
+    }
+    let assembled = assemble(&built.manifest, &built.wire).expect("assemble");
+    assert_eq!(
+        assembled, blob,
+        "served pieces must reconstruct the segment"
+    );
+
+    // A second build for the same parameters is served from cache (same Arc).
+    let again = installer
+        .build_segment(Partition::Node, &range, 64, PieceEncoding::None)
+        .expect("build again");
+    assert!(
+        std::sync::Arc::ptr_eq(&built, &again),
+        "repeated build must hit the serve-side cache"
+    );
+}
+
 #[tokio::test]
 async fn drain_client_pushes_segment_into_target_engine() {
     use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;

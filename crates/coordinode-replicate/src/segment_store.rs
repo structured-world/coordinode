@@ -18,13 +18,18 @@
 
 use std::sync::Arc;
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::{StorageError, StorageResult};
 use coordinode_storage::placement::{
-    partition_from_wire_tag, partition_wire_tag, SegmentDescriptor,
+    partition_from_wire_tag, partition_wire_tag, KeyRange, SegmentDescriptor,
 };
+use coordinode_swarm::{split_segment, PieceEncoding};
 
-use crate::transfer::SegmentSink;
+use crate::transfer::{BuiltSegment, SegmentSink, SegmentSource};
 
 /// One key-value entry of a segment's portable representation.
 type KvEntry = (Vec<u8>, Vec<u8>);
@@ -98,12 +103,26 @@ pub fn export_segment(
     engine: &StorageEngine,
     descriptor: &SegmentDescriptor,
 ) -> StorageResult<Vec<u8>> {
-    let part = descriptor.partition;
-    let range = &descriptor.key_range;
+    export_range(engine, descriptor.partition, &descriptor.key_range)
+}
 
-    // Scan the partition at a stable snapshot and keep only entries the
-    // descriptor's half-open `[start, end)` range actually contains (an
-    // unbounded-above range is the whole partition).
+/// Export the entries of `part` covered by `range` into the portable,
+/// self-describing blob (the core of [`export_segment`], addressed by partition +
+/// key range rather than a full descriptor — what the receiver-driven swarm pull
+/// needs). The scan is deterministic (sorted key order), so every node exporting
+/// the same `(part, range)` produces byte-identical output.
+///
+/// # Errors
+/// Returns an error if the partition is unavailable, a scanned entry cannot be
+/// read, or a key/value exceeds the `u32` length bound.
+pub fn export_range(
+    engine: &StorageEngine,
+    part: Partition,
+    range: &KeyRange,
+) -> StorageResult<Vec<u8>> {
+    // Scan the partition at a stable snapshot and keep only entries the half-open
+    // `[start, end)` range actually contains (an unbounded-above range is the
+    // whole partition).
     let snapshot = engine.snapshot();
     let prefix = format!("{}:", part.name());
     let scanned = engine.snapshot_prefix_scan(&snapshot, part, prefix.as_bytes())?;
@@ -229,13 +248,76 @@ pub async fn drain_segment_to_peer(
 /// bulk ingestion and atomic replace-of-corrupt are deferred refinements.
 pub struct SegmentInstaller {
     engine: Arc<StorageEngine>,
+    // Build cache for the serve side: a recently exported+split segment keyed by
+    // its build parameters, so the many GetPiece calls of one pull do not
+    // re-export the partition per piece. Bounded crudely (cleared past a cap) —
+    // repair/migration serving is a cold path, an LRU is a future refinement.
+    // no-std: parking_lot::Mutex
+    build_cache: Mutex<HashMap<BuildKey, Arc<BuiltSegment>>>,
 }
+
+/// Cache key for [`SegmentInstaller`]'s serve-side build cache: the partition,
+/// half-open key range, piece size, and encoding discriminant — everything that
+/// makes the split pieces byte-identical.
+type BuildKey = (Partition, Vec<u8>, Vec<u8>, usize, u32);
+
+/// Max distinct segments held in the serve-side build cache before it is cleared.
+const BUILD_CACHE_CAP: usize = 8;
 
 impl SegmentInstaller {
     /// An installer over the shared engine.
     #[must_use]
     pub fn new(engine: Arc<StorageEngine>) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            build_cache: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl SegmentSource for SegmentInstaller {
+    fn build_segment(
+        &self,
+        partition: Partition,
+        range: &KeyRange,
+        piece_size: usize,
+        encoding: PieceEncoding,
+    ) -> Result<Arc<BuiltSegment>, String> {
+        let (enc_disc, _) = encoding.to_wire();
+        let key: BuildKey = (
+            partition,
+            range.start.clone(),
+            range.end.clone(),
+            piece_size,
+            enc_disc,
+        );
+
+        // Tolerate a poisoned lock: a panic in a prior holder left the cache
+        // readable; the data is a rebuildable cache, never corrupt-on-panic.
+        {
+            let cache = self
+                .build_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(hit) = cache.get(&key) {
+                return Ok(Arc::clone(hit));
+            }
+        }
+
+        let blob = export_range(&self.engine, partition, range).map_err(|e| e.to_string())?;
+        let (manifest, wire) =
+            split_segment(&blob, piece_size, encoding).map_err(|e| e.to_string())?;
+        let built = Arc::new(BuiltSegment { manifest, wire });
+
+        let mut cache = self
+            .build_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= BUILD_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, Arc::clone(&built));
+        Ok(built)
     }
 }
 
