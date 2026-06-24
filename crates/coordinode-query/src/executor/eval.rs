@@ -710,6 +710,33 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
             }
             _ => Value::Null,
         },
+        // keys(x) → the property keys of a node / relationship variable, or the
+        // keys of a map value. For a bound variable, collects `<var>.<prop>`
+        // columns (skipping internal `__…__` markers); falls back to the keys
+        // of a map-valued argument.
+        "keys" => {
+            let from_prefix = if let Some(Expr::Variable(var)) = args.first() {
+                let prefix = format!("{var}.");
+                let ks: Vec<Value> = row
+                    .keys()
+                    .filter_map(|k| k.strip_prefix(&prefix))
+                    .filter(|rest| !rest.starts_with("__"))
+                    .map(|rest| Value::String(rest.to_string()))
+                    .collect();
+                (!ks.is_empty()).then_some(ks)
+            } else {
+                None
+            };
+            match from_prefix {
+                Some(ks) => Value::Array(ks),
+                None => match evaluated.first() {
+                    Some(Value::Map(m)) => {
+                        Value::Array(m.keys().map(|k| Value::String(k.clone())).collect())
+                    }
+                    _ => Value::Null,
+                },
+            }
+        }
         // nullIf(v1, v2) → NULL if v1 == v2, otherwise v1.
         "nullIf" => match (evaluated.first(), evaluated.get(1)) {
             (Some(a), Some(b)) if a == b => Value::Null,
@@ -992,14 +1019,79 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
                 _ => Value::Null,
             }
         }
-        // String and math functions (Cypher names are case-insensitive). Kept
-        // out of the exact-case arms above so existing functions stay untouched;
-        // each helper lowercases the name and returns None for anything it does
-        // not own, falling through to the NULL contract for unknown functions.
+        // String, math, and list functions (Cypher names are case-insensitive).
+        // Kept out of the exact-case arms above so existing functions stay
+        // untouched; each helper lowercases the name and returns None for
+        // anything it does not own, falling through to the NULL contract for
+        // unknown functions.
         _ => eval_string_function(name, &evaluated)
             .or_else(|| eval_math_function(name, &evaluated))
+            .or_else(|| eval_list_function(name, &evaluated))
             .unwrap_or(Value::Null),
     }
+}
+
+/// Cypher list functions over already-evaluated values (`head`, `last`, `tail`,
+/// `range`, `isEmpty`). The path/collection accessors `nodes`, `relationships`,
+/// `length`, and `keys` need row or path context and live in the main dispatch.
+///
+/// Case-insensitive; `None` for unowned names. `head`/`last` on an empty list
+/// yield `NULL`; `tail` of an empty list is the empty list. `isEmpty` also
+/// accepts strings and maps. `range(start, end [, step])` is inclusive of both
+/// ends (Cypher semantics) and yields an integer list.
+fn eval_list_function(name: &str, args: &[Value]) -> Option<Value> {
+    let as_int = |v: Option<&Value>| match v {
+        Some(Value::Int(n)) => Some(*n),
+        _ => None,
+    };
+
+    let result = match name.to_ascii_lowercase().as_str() {
+        "head" => match args.first() {
+            Some(Value::Array(a)) => a.first().cloned().unwrap_or(Value::Null),
+            _ => Value::Null,
+        },
+        "last" => match args.first() {
+            Some(Value::Array(a)) => a.last().cloned().unwrap_or(Value::Null),
+            _ => Value::Null,
+        },
+        "tail" => match args.first() {
+            Some(Value::Array(a)) => Value::Array(a.iter().skip(1).cloned().collect()),
+            _ => Value::Null,
+        },
+        "isempty" => match args.first() {
+            Some(Value::Array(a)) => Value::Bool(a.is_empty()),
+            Some(Value::String(s)) => Value::Bool(s.is_empty()),
+            Some(Value::Map(m)) => Value::Bool(m.is_empty()),
+            _ => Value::Null,
+        },
+        // range(start, end [, step]) — inclusive both ends; step defaults to 1.
+        "range" => match (as_int(args.first()), as_int(args.get(1))) {
+            (Some(start), Some(end)) => {
+                let step = as_int(args.get(2)).unwrap_or(1);
+                if step == 0 {
+                    return Some(Value::Null);
+                }
+                let mut out = Vec::new();
+                let mut i = start;
+                if step > 0 {
+                    while i <= end {
+                        out.push(Value::Int(i));
+                        i += step;
+                    }
+                } else {
+                    while i >= end {
+                        out.push(Value::Int(i));
+                        i += step;
+                    }
+                }
+                Value::Array(out)
+            }
+            _ => Value::Null,
+        },
+        _ => return None,
+    };
+
+    Some(result)
 }
 
 /// Cypher string functions (`left`, `right`, `substring`, `toLower`/`lower`,

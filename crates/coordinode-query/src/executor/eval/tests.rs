@@ -1316,3 +1316,83 @@ fn scalar_fn_start_end_node_and_properties() {
         other => panic!("properties should be a Map, got {other:?}"),
     }
 }
+
+// ---- R524 list functions ----
+
+#[test]
+fn list_fn_head_last_tail() {
+    let lst = || Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+    assert_eq!(call_fn("head", vec![lst()]), Value::Int(1));
+    assert_eq!(call_fn("last", vec![lst()]), Value::Int(3));
+    assert_eq!(
+        call_fn("tail", vec![lst()]),
+        Value::Array(vec![Value::Int(2), Value::Int(3)])
+    );
+    // Empty-list edge cases: head/last → NULL, tail → empty list.
+    assert_eq!(call_fn("head", vec![Value::Array(vec![])]), Value::Null);
+    assert_eq!(
+        call_fn("tail", vec![Value::Array(vec![])]),
+        Value::Array(vec![])
+    );
+}
+
+#[test]
+fn list_fn_range() {
+    assert_eq!(
+        call_fn("range", vec![Value::Int(1), Value::Int(4)]),
+        Value::Array(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4)
+        ])
+    );
+    // explicit step
+    assert_eq!(
+        call_fn("range", vec![Value::Int(0), Value::Int(10), Value::Int(5)]),
+        Value::Array(vec![Value::Int(0), Value::Int(5), Value::Int(10)])
+    );
+    // descending step
+    assert_eq!(
+        call_fn("range", vec![Value::Int(3), Value::Int(1), Value::Int(-1)]),
+        Value::Array(vec![Value::Int(3), Value::Int(2), Value::Int(1)])
+    );
+    // zero step → NULL (no infinite loop)
+    assert_eq!(
+        call_fn("range", vec![Value::Int(1), Value::Int(5), Value::Int(0)]),
+        Value::Null
+    );
+}
+
+#[test]
+fn list_fn_is_empty() {
+    assert_eq!(
+        call_fn("isEmpty", vec![Value::Array(vec![])]),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        call_fn("isEmpty", vec![Value::Array(vec![Value::Int(1)])]),
+        Value::Bool(false)
+    );
+    assert_eq!(call_fn("isEmpty", vec![s("")]), Value::Bool(true));
+    assert_eq!(call_fn("isEmpty", vec![s("x")]), Value::Bool(false));
+}
+
+#[test]
+fn list_fn_keys() {
+    // keys(n) on a node variable → its property keys (BTreeMap row → sorted),
+    // internal __…__ markers excluded.
+    let mut row = Row::new();
+    row.insert("n.name".into(), s("Alice"));
+    row.insert("n.age".into(), Value::Int(30));
+    row.insert("n.__label__".into(), s("Person"));
+    let v = eval_expr(
+        &Expr::FunctionCall {
+            name: "keys".into(),
+            args: vec![Expr::Variable("n".into())],
+            distinct: false,
+        },
+        &row,
+    );
+    assert_eq!(v, Value::Array(vec![s("age"), s("name")]));
+}
