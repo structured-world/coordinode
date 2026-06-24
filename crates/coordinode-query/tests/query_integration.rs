@@ -132,12 +132,14 @@ fn insert_node(
 /// Cypher executor. In tests that insert edges directly (bypassing the executor),
 /// call this alongside `insert_edge` to keep schema and adj index in sync.
 fn register_schema_edge_type(engine: &StorageEngine, edge_type: &str) {
-    // Versioned schema key per ADR-023; tests always use version 1 since CE
-    // single-shard never invokes `ALTER LABEL SHARD BY`.
-    let key = coordinode_core::schema::definition::encode_edge_type_schema_key(edge_type, 1);
-    engine
-        .put(Partition::Schema, &key, b"")
-        .expect("put schema edge type");
+    // Register through the schema store rather than hand-building the versioned
+    // schema key. CE single-shard always uses revision 1 (no `ALTER LABEL SHARD
+    // BY`), which is exactly what `EdgeTypeSchema::new` defaults to.
+    use coordinode_core::schema::definition::EdgeTypeSchema;
+    use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+    LocalSchemaStore::new(engine)
+        .save_edge_type(&EdgeTypeSchema::new(edge_type))
+        .expect("save schema edge type");
 }
 
 fn insert_edge(engine: &StorageEngine, edge_type: &str, source_id: u64, target_id: u64) {

@@ -20,7 +20,6 @@ use coordinode_query::cypher::parse;
 use coordinode_query::executor::{execute, AdaptiveConfig, ExecutionContext, Row, WriteStats};
 use coordinode_query::planner::build_logical_plan;
 use coordinode_storage::engine::core::StorageEngine;
-use coordinode_storage::engine::partition::Partition;
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -131,10 +130,11 @@ fn insert_node(
 }
 
 fn register_schema_edge_type(engine: &StorageEngine, edge_type: &str) {
-    let key = coordinode_core::schema::definition::encode_edge_type_schema_key(edge_type, 1);
-    engine
-        .put(Partition::Schema, &key, b"")
-        .expect("put schema edge");
+    use coordinode_core::schema::definition::EdgeTypeSchema;
+    use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+    LocalSchemaStore::new(engine)
+        .save_edge_type(&EdgeTypeSchema::new(edge_type))
+        .expect("save schema edge");
 }
 
 fn insert_edge(engine: &StorageEngine, edge_type: &str, source_id: u64, target_id: u64) {
