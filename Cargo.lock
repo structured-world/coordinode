@@ -989,7 +989,7 @@ dependencies = [
  "rustc-hash",
  "self_cell",
  "spin 0.12.0",
- "structured-zstd 0.0.44",
+ "structured-zstd",
  "tempfile",
  "varint-rs",
  "xxhash-rust",
@@ -1216,7 +1216,7 @@ name = "coordinode-swarm"
 version = "0.4.3"
 dependencies = [
  "lz4_flex",
- "structured-zstd 0.0.41",
+ "structured-zstd",
  "thiserror 2.0.18",
  "xxhash-rust",
 ]
@@ -5336,18 +5336,12 @@ dependencies = [
 
 [[package]]
 name = "structured-zstd"
-version = "0.0.41"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "127aed3d16d7bc37ec398587250d1cc3b42f2156caee4ab085c41c86ba227a94"
-dependencies = [
- "twox-hash",
-]
-
-[[package]]
-name = "structured-zstd"
 version = "0.0.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "977dafbd4c9b9abd8eb98f4b44133092e9fa5a3b1530be0ae271a05d0295d5e1"
+dependencies = [
+ "twox-hash",
+]
 
 [[package]]
 name = "strum"
