@@ -214,6 +214,9 @@ pub fn parse_args_from(args: &[String]) -> Command {
                     .iter()
                     .any(|a| a == "--tls-require-client-auth")
                     .then_some(true),
+                scrub_enabled: args.iter().any(|a| a == "--no-scrub").then_some(false),
+                scrub_interval_secs: find_flag_num(args, "--scrub-interval-secs"),
+                scrub_throttle_ms: find_flag_num(args, "--scrub-throttle-ms"),
             };
             Command::Serve {
                 config_path,
@@ -324,7 +327,8 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  [--http2-keepalive-secs N] [--cache-size-mb N] [--write-buffer-mb N]\n          \
                  [--retention-window-secs N] [--registry-heartbeat-ms N] [--registry-eviction-ms N]\n          \
                  [--wire-compression-level N]\n          \
-                 [--tls-cert FILE --tls-key FILE] [--tls-ca FILE] [--tls-require-client-auth]\n  \
+                 [--tls-cert FILE --tls-key FILE] [--tls-ca FILE] [--tls-require-client-auth]\n          \
+                 [--no-scrub] [--scrub-interval-secs N] [--scrub-throttle-ms N]\n  \
                  coordinode backup --output FILE [--data DIR | --config FILE] [--format json|cypher|binary|snapshot] [--namespace NS] [--since SEQNO]\n  \
                  coordinode restore --input FILE [--data DIR | --config FILE] [--format json|cypher|binary|snapshot|apoc-json|apoc-cypher|hetio-json] [--namespace NS] [--only-labels L1,L2] [--force]\n  \
                  coordinode checkpoint --output DIR [--data DIR | --config FILE]\n  \

@@ -77,6 +77,9 @@ config file nor a flag sets the value.
 | `--tls-cert` / `--tls-key` | (none) | PEM paths to the node's TLS certificate and private key. Set both to serve inter-node + client gRPC over TLS (pure-Rust crypto, no C FFI); unset = plaintext (single-host dev). |
 | `--tls-ca` | (none) | PEM path to the CA that verifies peer certificates — trusted by clients to verify the server, and (with `--tls-require-client-auth`) by the server to verify connecting nodes. |
 | `--tls-require-client-auth` | `false` | Require and verify a client certificate (mutual TLS) on incoming connections. Needs `--tls-ca`. |
+| `--no-scrub` | (scrub on) | Disable the background integrity scrub. Each node otherwise periodically verifies every on-disk block's checksum on its own local storage. |
+| `--scrub-interval-secs` | `604800` | Seconds between background scrub cycles (default 7 days). |
+| `--scrub-throttle-ms` | `50` | Pause between SST scans during a scrub so it yields I/O to production; `0` runs at full speed. |
 
 ### TLS trust and self-signed certificates
 
@@ -196,6 +199,11 @@ wire_compression_level: 3
 # tls_key: /etc/coordinode/tls/node.key
 # tls_ca: /etc/coordinode/tls/ca.crt
 # tls_require_client_auth: false
+
+# Background integrity scrub (per-node, verifies on-disk block checksums).
+scrub_enabled: true
+# scrub_interval_secs: 604800
+# scrub_throttle_ms: 50
 ```
 
 Set any tunable directly in this file. To override one value without editing the

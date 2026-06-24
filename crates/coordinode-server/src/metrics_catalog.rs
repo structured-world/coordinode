@@ -59,6 +59,22 @@ fn register_storage_metrics() {
         "coordinode_scrub_pages_scanned_total",
         "Background scrub progress"
     );
+    metrics::describe_counter!(
+        "coordinode_scrub_errors_total",
+        "Corrupt blocks found by the background scrub"
+    );
+    metrics::describe_gauge!(
+        "coordinode_scrub_blocks_checked",
+        "Blocks verified in the last completed scrub cycle"
+    );
+    metrics::describe_gauge!(
+        "coordinode_scrub_last_timestamp_seconds",
+        "Unix time of the last completed scrub cycle"
+    );
+    metrics::describe_gauge!(
+        "coordinode_scrub_duration_seconds",
+        "Wall-clock duration of the last completed scrub cycle"
+    );
 }
 
 fn register_query_metrics() {

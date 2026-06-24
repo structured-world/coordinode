@@ -123,6 +123,15 @@ pub struct ServerConfig {
     /// Require + verify a client certificate (mutual TLS) on incoming
     /// connections. Needs `tls_ca`. Default false.
     pub tls_require_client_auth: bool,
+    /// Whether the background integrity scrub runs. Each node scrubs its own
+    /// local storage independently (no leader election). Default true.
+    pub scrub_enabled: bool,
+    /// Interval between background scrub cycles, in seconds. Default 7 days.
+    pub scrub_interval_secs: u64,
+    /// Pause between consecutive SST scans during a background scrub, in
+    /// milliseconds, so the scrub yields I/O to production traffic. `None` or 0
+    /// runs at full speed. Default 50.
+    pub scrub_throttle_ms: Option<u64>,
 }
 
 impl Default for ServerConfig {
@@ -154,6 +163,9 @@ impl Default for ServerConfig {
             tls_key: None,
             tls_ca: None,
             tls_require_client_auth: false,
+            scrub_enabled: true,
+            scrub_interval_secs: 7 * 24 * 3600,
+            scrub_throttle_ms: Some(50),
         }
     }
 }
@@ -189,6 +201,9 @@ pub struct CliOverrides {
     pub tls_key: Option<String>,
     pub tls_ca: Option<String>,
     pub tls_require_client_auth: Option<bool>,
+    pub scrub_enabled: Option<bool>,
+    pub scrub_interval_secs: Option<u64>,
+    pub scrub_throttle_ms: Option<u64>,
 }
 
 impl ServerConfig {
@@ -290,6 +305,30 @@ impl ServerConfig {
         }
         if let Some(v) = o.interactive_txn_max_bytes {
             self.interactive_txn_max_bytes = v;
+        }
+        if let Some(v) = o.scrub_enabled {
+            self.scrub_enabled = v;
+        }
+        if let Some(v) = o.scrub_interval_secs {
+            self.scrub_interval_secs = v;
+        }
+        if o.scrub_throttle_ms.is_some() {
+            self.scrub_throttle_ms = o.scrub_throttle_ms;
+        }
+    }
+
+    /// Build the background-scrub config from the resolved server settings.
+    /// A `scrub_throttle_ms` of 0 maps to "no throttle" (full speed).
+    #[must_use]
+    pub fn scrub_config(&self) -> coordinode_storage::scrub::ScrubConfig {
+        coordinode_storage::scrub::ScrubConfig {
+            enabled: self.scrub_enabled,
+            interval: std::time::Duration::from_secs(self.scrub_interval_secs),
+            throttle: self
+                .scrub_throttle_ms
+                .filter(|&ms| ms > 0)
+                .map(std::time::Duration::from_millis),
+            parallelism: 1,
         }
     }
 

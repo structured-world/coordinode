@@ -276,6 +276,42 @@ fn serve_tls_flags_parsed_and_applied() {
 }
 
 #[test]
+fn serve_scrub_flags_parsed_and_applied() {
+    use crate::config::ServerConfig;
+    let cmd = parse_args_from(&args(
+        "coordinode serve --no-scrub --scrub-interval-secs 3600 --scrub-throttle-ms 10",
+    ));
+    match cmd {
+        Command::Serve { overrides, .. } => {
+            assert_eq!(overrides.scrub_enabled, Some(false));
+            assert_eq!(overrides.scrub_interval_secs, Some(3600));
+            assert_eq!(overrides.scrub_throttle_ms, Some(10));
+            let mut cfg = ServerConfig::default();
+            assert!(cfg.scrub_enabled, "scrub on by default");
+            assert_eq!(cfg.scrub_interval_secs, 7 * 24 * 3600);
+            cfg.apply_overrides(&overrides);
+            assert!(!cfg.scrub_enabled);
+            assert_eq!(cfg.scrub_interval_secs, 3600);
+            // scrub_config() maps a positive throttle to Some(Duration).
+            let sc = cfg.scrub_config();
+            assert!(!sc.enabled);
+            assert_eq!(sc.throttle, Some(std::time::Duration::from_millis(10)));
+        }
+        _ => panic!("expected Serve command"),
+    }
+}
+
+#[test]
+fn scrub_config_zero_throttle_is_full_speed() {
+    use crate::config::ServerConfig;
+    let cfg = ServerConfig {
+        scrub_throttle_ms: Some(0),
+        ..ServerConfig::default()
+    };
+    assert_eq!(cfg.scrub_config().throttle, None, "0 ms = no throttle");
+}
+
+#[test]
 fn serve_resource_flags_default_to_none() {
     // Unset → None so the resolution step keeps config-file / built-in
     // defaults (incl. the 16 MiB request-size cap).

@@ -248,6 +248,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Bind the resolved settings into the local names the rest of the
             // handler uses. `peers` becomes `None` when empty (= standalone),
             // matching the cluster-detection contract below.
+            // Capture the scrub config before destructuring moves `cfg`.
+            let scrub_cfg = cfg.scrub_config();
             let config::ServerConfig {
                 node_id,
                 grpc_addr,
@@ -276,6 +278,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tls_key,
                 tls_ca,
                 tls_require_client_auth,
+                // Already captured above via scrub_cfg before the move.
+                scrub_enabled: _,
+                scrub_interval_secs: _,
+                scrub_throttle_ms: _,
             } = cfg;
             let peers = if peers_vec.is_empty() {
                 None
@@ -360,6 +366,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .map_err(|e| format!("failed to open storage: {e}"))?;
             let engine = Arc::new(engine);
+
+            // Background integrity scrub. Each node verifies its OWN local
+            // storage independently (no leader election — silent bit rot is a
+            // per-node, per-disk concern), so this is multi-instance-safe with
+            // no shared state. The scan is blocking file I/O, kept off the async
+            // runtime via spawn_blocking and throttled per config so it yields to
+            // production traffic.
+            {
+                if scrub_cfg.enabled {
+                    let scrub_engine = Arc::clone(&engine);
+                    let interval = scrub_cfg.interval;
+                    // Stagger the first run by node id so a fleet does not scrub
+                    // in lockstep and saturate I/O cluster-wide at once.
+                    let jitter = interval
+                        .checked_div(16)
+                        .map(|slice| slice.saturating_mul(u32::try_from(node_id % 16).unwrap_or(0)))
+                        .unwrap_or_default();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(jitter).await;
+                        let mut ticker = tokio::time::interval(interval);
+                        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            ticker.tick().await;
+                            let eng = Arc::clone(&scrub_engine);
+                            let cfg2 = scrub_cfg.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                coordinode_storage::scrub::scrub_all(&eng, &cfg2)
+                            })
+                            .await
+                            {
+                                Ok(Ok(report)) => {
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs_f64())
+                                        .unwrap_or(0.0);
+                                    metrics::gauge!("coordinode_scrub_last_timestamp_seconds")
+                                        .set(now);
+                                    metrics::gauge!("coordinode_scrub_duration_seconds")
+                                        .set(report.duration.as_secs_f64());
+                                    metrics::gauge!("coordinode_scrub_blocks_checked")
+                                        .set(report.blocks_checked as f64);
+                                    metrics::counter!("coordinode_scrub_pages_scanned_total")
+                                        .increment(report.blocks_checked);
+                                    if report.has_errors() {
+                                        metrics::counter!("coordinode_scrub_errors_total")
+                                            .increment(report.errors.len() as u64);
+                                        for err in &report.errors {
+                                            tracing::error!(
+                                                partition = err.partition.name(),
+                                                detail = %err.message,
+                                                "scrub detected corruption"
+                                            );
+                                        }
+                                    } else {
+                                        tracing::info!(
+                                            blocks = report.blocks_checked,
+                                            ssts = report.sst_files_checked,
+                                            duration_ms = report.duration.as_millis(),
+                                            "background scrub clean"
+                                        );
+                                    }
+                                }
+                                Ok(Err(e)) => tracing::warn!(%e, "background scrub failed"),
+                                Err(e) => tracing::warn!(%e, "background scrub task panicked"),
+                            }
+                        }
+                    });
+                }
+            }
 
             // Open Raft node and build database — both modes use RaftProposalPipeline.
             //
