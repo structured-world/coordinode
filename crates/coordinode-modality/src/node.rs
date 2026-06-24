@@ -59,6 +59,19 @@ pub trait NodeStore {
         node_id: NodeId,
     ) -> StoreResult<Option<NodeRecord>>;
 
+    /// Batch counterpart of [`Self::get`]: read many node records by id in one
+    /// call, returning a record (or `None`) per input id in the same order.
+    /// Resolves all keys through a single batched engine `multi_get` (one
+    /// version-snapshot acquisition + batched bloom/SST traversal) instead of a
+    /// per-id lookup loop. Untracked, same as [`Self::get`]. Use it to
+    /// materialize the node records behind an index or vector-search result set.
+    fn get_many(
+        &self,
+        txn: &Transaction,
+        shard_id: u16,
+        node_ids: &[NodeId],
+    ) -> StoreResult<Vec<Option<NodeRecord>>>;
+
     /// Tracked raw read for the query-execution path: encode the key, apply
     /// node-delta read-your-own-writes, then read the raw record bytes joining
     /// the transaction's OCC read-set (in MVCC mode; direct mode tracks
@@ -361,6 +374,23 @@ impl NodeStore for LocalNodeStore {
             Some(bytes) => Self::decode_record(&bytes).map(Some),
             None => Ok(None),
         }
+    }
+
+    fn get_many(
+        &self,
+        txn: &Transaction,
+        shard_id: u16,
+        node_ids: &[NodeId],
+    ) -> StoreResult<Vec<Option<NodeRecord>>> {
+        let keys: Vec<Vec<u8>> = node_ids
+            .iter()
+            .map(|id| encode_node_key(shard_id, *id))
+            .collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        let raws = txn.multi_read_untracked(Partition::Node, &key_refs)?;
+        raws.into_iter()
+            .map(|opt| opt.map(|bytes| Self::decode_record(&bytes)).transpose())
+            .collect()
     }
 
     fn get_raw_tracked(

@@ -73,6 +73,57 @@ fn non_temporal_round_trip() {
 }
 
 #[test]
+fn get_many_batches_and_preserves_order() {
+    let db = open();
+    let store = LocalNodeStore;
+    let ids = [
+        NodeId::from_raw(1),
+        NodeId::from_raw(2),
+        NodeId::from_raw(3),
+    ];
+    db.write(|s, t| {
+        s.put(t, 0, ids[0], &rec("A")).expect("put A");
+        s.put(t, 0, ids[2], &rec("C")).expect("put C");
+        // ids[1] intentionally left absent
+    });
+
+    let got = store.get_many(&db.read(), 0, &ids).expect("get_many");
+    assert_eq!(got.len(), 3);
+    let label = |r: &Option<NodeRecord>| r.as_ref().map(|x| x.primary_label().to_string());
+    assert_eq!(label(&got[0]).as_deref(), Some("A"));
+    assert!(got[1].is_none(), "absent id must be None in its slot");
+    assert_eq!(label(&got[2]).as_deref(), Some("C"));
+
+    // Each batch slot agrees with an individual get.
+    for (i, id) in ids.iter().enumerate() {
+        let single = store.get(&db.read(), 0, *id).expect("get");
+        assert_eq!(
+            label(&got[i]),
+            single.map(|r| r.primary_label().to_string())
+        );
+    }
+}
+
+#[test]
+fn get_many_sees_read_your_own_writes() {
+    let db = open();
+    let store = LocalNodeStore;
+    let id = NodeId::from_raw(42);
+    // A write buffered in an uncommitted transaction must be visible to a
+    // get_many on that same transaction (read-your-own-writes).
+    let mut t = mvcc_txn(&db.engine, &db.oracle);
+    store.put(&mut t, 0, id, &rec("Fresh")).expect("put");
+    let got = store.get_many(&t, 0, &[id]).expect("get_many");
+    assert_eq!(
+        got[0]
+            .as_ref()
+            .map(|r| r.primary_label().to_string())
+            .as_deref(),
+        Some("Fresh")
+    );
+}
+
+#[test]
 fn put_overwrites_existing_record() {
     let db = open();
     let id = NodeId::from_raw(1);

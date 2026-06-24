@@ -394,6 +394,46 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    /// Batch counterpart of [`Self::read_untracked`]: resolve many keys at once,
+    /// returning a value (or `None`) per input key in order. Keys already in the
+    /// write buffer are served from it (read-your-own-writes); the rest are
+    /// fetched with a single batched engine `multi_get` (snapshot-pinned when
+    /// the transaction holds an MVCC snapshot). No OCC read-set tracking — the
+    /// "untracked" contract matches the single-key form. Used by store-layer
+    /// batch reads (e.g. materializing many node records behind an index or
+    /// vector-search result set) to avoid a per-key lookup loop.
+    pub fn multi_read_untracked(
+        &self,
+        part: Partition,
+        keys: &[&[u8]],
+    ) -> StorageResult<Vec<Option<Vec<u8>>>> {
+        let mut out: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
+        let mut miss_idx: Vec<usize> = Vec::new();
+        let mut miss_keys: Vec<&[u8]> = Vec::new();
+
+        for (i, key) in keys.iter().enumerate() {
+            if let Some(buffered) = self.write_buffer.get(&(part, key.to_vec())) {
+                out[i] = buffered.clone();
+            } else {
+                miss_idx.push(i);
+                miss_keys.push(key);
+            }
+        }
+
+        if miss_keys.is_empty() {
+            return Ok(out);
+        }
+
+        let values = match self.snapshot {
+            Some(snap) => self.engine.snapshot_multi_get(&snap, part, &miss_keys)?,
+            None => self.engine.multi_get(part, &miss_keys)?,
+        };
+        for (slot, value) in miss_idx.into_iter().zip(values) {
+            out[slot] = value.map(|b| b.to_vec());
+        }
+        Ok(out)
+    }
+
     /// Untracked prefix scan over a partition: snapshot-aware (reads through
     /// the MVCC snapshot when set, else latest), no write-buffer overlay and no
     /// OCC tracking. For modality stores that walk a key prefix (temporal

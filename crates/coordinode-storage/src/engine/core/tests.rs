@@ -105,6 +105,45 @@ fn test_engine_memfs() -> StorageEngine {
     StorageEngine::open(&config).expect("failed to open memfs engine")
 }
 
+/// `multi_get` returns one slot per input key in order: present keys carry
+/// their value, absent keys carry `None`, and a cache-resident key resolves
+/// identically to a cache-miss key. Mirrors the per-key `get` contract.
+#[test]
+fn multi_get_preserves_order_and_absence() {
+    let engine = test_engine_memfs();
+    engine.put(Partition::Node, b"node:k1", b"v1").expect("put");
+    engine.put(Partition::Node, b"node:k2", b"v2").expect("put");
+    engine.put(Partition::Node, b"node:k3", b"v3").expect("put");
+
+    // Warm the cache for one key so the batch mixes a cache hit with misses.
+    let _ = engine.get(Partition::Node, b"node:k2").expect("get");
+
+    let keys: Vec<&[u8]> = vec![b"node:k1", b"absent", b"node:k3", b"node:k2"];
+    let got = engine.multi_get(Partition::Node, &keys).expect("multi_get");
+
+    assert_eq!(got.len(), 4);
+    assert_eq!(got[0].as_deref(), Some(&b"v1"[..]));
+    assert_eq!(got[1], None, "absent key must be None");
+    assert_eq!(got[2].as_deref(), Some(&b"v3"[..]));
+    assert_eq!(got[3].as_deref(), Some(&b"v2"[..]), "cache-hit slot");
+
+    // Each multi_get slot agrees with an individual get on the same key.
+    for k in &keys {
+        let single = engine.get(Partition::Node, k).expect("get");
+        let pos = keys.iter().position(|x| x == k).expect("key in set");
+        let batch = got[pos].clone();
+        assert_eq!(single, batch);
+    }
+}
+
+/// Empty key set is a no-op returning an empty vector (no tree access).
+#[test]
+fn multi_get_empty_is_empty() {
+    let engine = test_engine_memfs();
+    let got = engine.multi_get(Partition::Node, &[]).expect("multi_get");
+    assert!(got.is_empty());
+}
+
 /// `changed_keys_since` returns exactly the keys whose version
 /// history advanced past the boundary seqno — new writes, deletes, and
 /// merge-partition operands — and excludes untouched pre-boundary keys.

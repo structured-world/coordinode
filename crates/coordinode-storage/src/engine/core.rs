@@ -787,6 +787,62 @@ impl StorageEngine {
         }
     }
 
+    /// Batch point lookup: resolve many keys in one call, returning a value
+    /// (or `None`) per input key in the same order.
+    ///
+    /// Cache-resident keys are served from the tiered cache; the remaining
+    /// keys are fetched from the LSM tree through a single
+    /// [`lsm_tree::AbstractTree::multi_get`], which acquires the version
+    /// snapshot once and batches the bloom-filter + SST traversal for the whole
+    /// set — materially cheaper than calling [`Self::get`] in a loop (each of
+    /// which re-pins the snapshot and descends independently). Use this whenever
+    /// a known set of keys is resolved together (e.g. materializing the node
+    /// records behind an index or vector-search result set).
+    pub fn multi_get(
+        &self,
+        part: Partition,
+        keys: &[&[u8]],
+    ) -> StorageResult<Vec<Option<bytes::Bytes>>> {
+        let mut out: Vec<Option<bytes::Bytes>> = vec![None; keys.len()];
+
+        // Split cache hits from misses; only the misses go to the tree.
+        let mut miss_idx: Vec<usize> = Vec::new();
+        let mut miss_keys: Vec<&[u8]> = Vec::new();
+        for (i, key) in keys.iter().enumerate() {
+            if let Some(cache) = &self.tiered_cache {
+                if let Some(value) = cache.get(part, key) {
+                    self.access_tracker.record(part, key);
+                    out[i] = Some(value);
+                    continue;
+                }
+            }
+            miss_idx.push(i);
+            miss_keys.push(key);
+        }
+
+        if miss_keys.is_empty() {
+            return Ok(out);
+        }
+
+        let tree = self.tree(part)?;
+        let seqno = self.coordinator.current_seqno();
+        let values = tree.multi_get(miss_keys.iter().copied(), seqno)?;
+
+        for (slot, value) in miss_idx.into_iter().zip(values) {
+            if let Some(v) = value {
+                let bytes = bytes::Bytes::copy_from_slice(&v);
+                if let Some(cache) = &self.tiered_cache {
+                    let weight = Self::resolve_cache_weight(cache, part, &bytes);
+                    cache.put_weighted(part, keys[slot], &bytes, weight);
+                }
+                self.access_tracker.record(part, keys[slot]);
+                out[slot] = Some(bytes);
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Write a key-value pair to the given partition.
     /// Invalidates any cached entry for this key.
     ///
@@ -1347,6 +1403,26 @@ impl StorageEngine {
         let tree = self.tree(part)?;
         let value = tree.get(key, *snapshot)?;
         Ok(value.map(|v| bytes::Bytes::copy_from_slice(&v)))
+    }
+
+    /// Batch point lookup through a previously taken snapshot — the
+    /// snapshot-pinned counterpart of [`Self::multi_get`]. Returns a value (or
+    /// `None`) per input key in order, fetched with one
+    /// [`lsm_tree::AbstractTree::multi_get`] at `snapshot`. Bypasses the tiered
+    /// cache (the cache tracks the live seqno, not historical snapshots), so
+    /// MVCC reads stay snapshot-consistent.
+    pub fn snapshot_multi_get(
+        &self,
+        snapshot: &lsm_tree::SeqNo,
+        part: Partition,
+        keys: &[&[u8]],
+    ) -> StorageResult<Vec<Option<bytes::Bytes>>> {
+        let tree = self.tree(part)?;
+        let values = tree.multi_get(keys.iter().copied(), *snapshot)?;
+        Ok(values
+            .into_iter()
+            .map(|v| v.map(|b| bytes::Bytes::copy_from_slice(&b)))
+            .collect())
     }
 
     /// Scan keys by prefix through a previously taken snapshot.

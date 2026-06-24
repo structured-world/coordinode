@@ -3002,12 +3002,13 @@ fn execute_btree_index_scan(
 
     use coordinode_modality::NodeStore as _;
     let nodes = coordinode_modality::LocalNodeStore;
-    for raw_id in node_ids {
-        let node_id = NodeId::from_raw(raw_id);
 
-        // Fetch the node record.
-        let record_opt = nodes.get(&ctx.txn, ctx.shard_id, node_id)?;
+    // Materialize every matching node in one batched multi_get (single version
+    // snapshot + batched bloom/SST traversal) rather than a per-id lookup loop.
+    let ids: Vec<NodeId> = node_ids.iter().map(|&raw| NodeId::from_raw(raw)).collect();
+    let records = nodes.get_many(&ctx.txn, ctx.shard_id, &ids)?;
 
+    for (raw_id, record_opt) in node_ids.into_iter().zip(records) {
         let Some(record) = record_opt else {
             // Node was deleted since the index entry was created — skip stale entry.
             continue;
