@@ -542,6 +542,11 @@ impl<'a> Analyzer<'a> {
                     }
                 }
             }
+            Expr::ExistsSubquery(_) => {
+                // The inner MATCH introduces its own scope (and may correlate on
+                // outer variables); it is fully validated by the logical planner
+                // when the subquery is built, so no outer-scope check here.
+            }
             Expr::ListPredicate {
                 var, list, pred, ..
             } => {

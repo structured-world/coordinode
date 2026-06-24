@@ -588,7 +588,8 @@ unary = { "-" ~ unary | postfix }
 postfix = { atom ~ ("[" ~ expression ~ "]")* }
 
 atom = {
-    reduce_expr
+    exists_subquery
+  | reduce_expr
   | list_predicate
   | function_call
   | case_expr
@@ -617,6 +618,10 @@ property_or_variable = { identifier ~ ("." ~ identifier)* }
 function_call = { function_name ~ "(" ~ distinct_kw? ~ function_args? ~ ")" }
 function_name = { identifier ~ ("." ~ identifier)* }
 function_args = { star | expression ~ ("," ~ expression)* }
+
+// EXISTS { MATCH … [WHERE …] } — existential subquery; true if the inner
+// MATCH yields at least one row (correlated with outer-scope bindings).
+exists_subquery = { kw_exists ~ "{" ~ match_clause ~ "}" }
 
 // all/any/none/single(x IN list WHERE pred) — list quantifier predicates.
 list_predicate = {
@@ -718,6 +723,7 @@ kw_all        = @{ ^"all" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_any        = @{ ^"any" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_none       = @{ ^"none" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_single     = @{ ^"single" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_exists     = @{ ^"exists" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_delete     = @{ ^"delete" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_detach     = @{ ^"detach" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_set        = @{ ^"set" ~ !(ASCII_ALPHANUMERIC | "_") }

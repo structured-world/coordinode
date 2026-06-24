@@ -328,6 +328,12 @@ pub fn eval_expr(expr: &Expr, row: &Row) -> Value {
             }
         }
 
+        // EXISTS { MATCH … } needs the storage engine to run the inner pattern,
+        // so the pure evaluator cannot resolve it — the WHERE path routes such
+        // predicates through the storage-aware evaluator instead. Reaching here
+        // means EXISTS appeared in a context without engine access; yield NULL.
+        Expr::ExistsSubquery(_) => Value::Null,
+
         // all/any/none/single(x IN list WHERE pred): bind each element to `var`,
         // evaluate `pred`, and combine the per-element booleans per the
         // quantifier. Empty list → all/none true, any false, single false.

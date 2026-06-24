@@ -3603,6 +3603,9 @@ fn collect_expr_variables_inner(expr: &Expr, vars: &mut Vec<String>) {
             collect_expr_variables_inner(pred, &mut inner);
             vars.extend(inner.into_iter().filter(|v| v != var));
         }
+        // Inner MATCH binds its own scope; outer-correlation vars are
+        // provisioned by the outer clauses — no extra deps contributed here.
+        Expr::ExistsSubquery(_) => {}
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Star => {}
     }
 }

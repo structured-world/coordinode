@@ -692,6 +692,13 @@ fn write_expr(buf: &mut String, expr: &Expr) {
             write_expr(buf, index);
             buf.push(']');
         }
+        Expr::ExistsSubquery(mc) => {
+            // The inner pattern + WHERE must distinguish the plan-cache key, so
+            // fold the whole sub-clause in (Debug is structurally exact — two
+            // different EXISTS bodies never collide to one key).
+            buf.push_str("EXISTS");
+            buf.push_str(&format!("{mc:?}"));
+        }
         Expr::ListPredicate {
             kind,
             var,

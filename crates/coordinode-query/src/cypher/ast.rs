@@ -696,6 +696,12 @@ pub enum Expr {
     /// Out-of-bounds list access and missing map keys evaluate to `null`.
     Subscript { expr: Box<Expr>, index: Box<Expr> },
 
+    /// Existential subquery: `EXISTS { MATCH … [WHERE …] }`. Evaluates to
+    /// `true` when the inner MATCH produces at least one row, correlated with
+    /// the outer-scope bindings. Routed through the same MATCH planner as a
+    /// top-level query (no second pattern-matching implementation).
+    ExistsSubquery(Box<MatchClause>),
+
     /// List quantifier predicate: `all/any/none/single(x IN list WHERE pred)`.
     /// Binds each list element to `var` and evaluates `pred`; the `kind`
     /// determines how the per-element booleans combine into the result.
@@ -821,6 +827,27 @@ impl Expr {
             Expr::ListPredicate { list, pred, .. } => {
                 list.substitute_params(params);
                 pred.substitute_params(params);
+            }
+            Expr::ExistsSubquery(mc) => {
+                for pattern in &mut mc.patterns {
+                    for elem in &mut pattern.elements {
+                        match elem {
+                            PatternElement::Node(node) => {
+                                for (_, v) in &mut node.properties {
+                                    v.substitute_params(params);
+                                }
+                            }
+                            PatternElement::Relationship(rel) => {
+                                for (_, v) in &mut rel.properties {
+                                    v.substitute_params(params);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(w) = &mut mc.where_clause {
+                    w.substitute_params(params);
+                }
             }
             Expr::Literal(_) | Expr::Variable(_) | Expr::Star => {}
         }

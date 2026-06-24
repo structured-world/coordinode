@@ -627,6 +627,57 @@ fn list_predicates_end_to_end() {
     assert_eq!(results[0].get("d"), Some(&Value::Bool(true)));
 }
 
+/// EXISTS { MATCH … } correlated subquery in WHERE, positive and negated.
+#[test]
+fn exists_subquery_end_to_end() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    let names = |rows: &[coordinode_query::executor::Row]| -> Vec<String> {
+        rows.iter()
+            .filter_map(|r| match r.get("name") {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // People who KNOW someone: Alice, Bob, Charlie (Dave has no outgoing KNOWS).
+    let yes = run_cypher(
+        "MATCH (a:Person) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b) } RETURN a.name AS name",
+        engine,
+        &mut interner,
+    );
+    let yn = names(&yes);
+    assert!(yn.contains(&"Alice".to_string()));
+    assert!(yn.contains(&"Bob".to_string()));
+    assert!(yn.contains(&"Charlie".to_string()));
+    assert!(!yn.contains(&"Dave".to_string()));
+
+    // Negated: Dave (no outgoing KNOWS) must appear; Alice must not.
+    let no = run_cypher(
+        "MATCH (a:Person) WHERE NOT EXISTS { MATCH (a)-[:KNOWS]->(b) } RETURN a.name AS name",
+        engine,
+        &mut interner,
+    );
+    let nn = names(&no);
+    assert!(nn.contains(&"Dave".to_string()));
+    assert!(!nn.contains(&"Alice".to_string()));
+
+    // Inner WHERE on an inner-bound variable: who KNOWS someone older than 35?
+    // Only Charlie (→ Dave, age 40); Alice/Bob's KNOWS targets are all ≤ 30.
+    let older = run_cypher(
+        "MATCH (a:Person) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b) WHERE b.age > 35 } \
+         RETURN a.name AS name",
+        engine,
+        &mut interner,
+    );
+    let older_names = names(&older);
+    assert!(older_names.contains(&"Charlie".to_string()));
+    assert!(!older_names.contains(&"Alice".to_string()));
+    assert!(!older_names.contains(&"Bob".to_string()));
+}
+
 // ── Correlated inline property filter (regression) ──────────────────────
 
 #[test]

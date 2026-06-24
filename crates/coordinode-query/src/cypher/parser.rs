@@ -2346,6 +2346,7 @@ fn build_expression(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
         Rule::function_call => build_function_call(pair),
         Rule::case_expr => build_case_expr(pair),
         Rule::reduce_expr => build_reduce_expr(pair),
+        Rule::exists_subquery => build_exists_subquery(pair),
         Rule::list_predicate => build_list_predicate(pair),
         Rule::list_literal => build_list_literal(pair),
         Rule::map_literal => build_map_literal(pair),
@@ -2734,6 +2735,17 @@ fn build_function_call(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
         args,
         distinct,
     })
+}
+
+fn build_exists_subquery(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
+    for inner in pair.into_inner() {
+        if inner.as_rule() == Rule::match_clause {
+            return Ok(Expr::ExistsSubquery(Box::new(build_match_clause(inner)?)));
+        }
+    }
+    Err(ParseError::Invalid(
+        "EXISTS subquery requires a MATCH clause".into(),
+    ))
 }
 
 fn build_list_predicate(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {

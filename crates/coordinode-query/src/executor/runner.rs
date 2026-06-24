@@ -6309,6 +6309,10 @@ fn collect_expr_vars(expr: &Expr, vars: &mut Vec<String>) {
             collect_expr_vars(pred, &mut inner);
             vars.extend(inner.into_iter().filter(|v| v != var));
         }
+        // The inner MATCH binds its own variables; any outer-correlation
+        // variables it references are already provisioned by the outer clauses,
+        // so it contributes no extra outer dependencies here.
+        Expr::ExistsSubquery(_) => {}
         // Literal, Parameter, Star — no variable references.
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Star => {}
     }
@@ -7170,7 +7174,7 @@ fn execute_merge_relationship_check(
 /// Check whether an expression tree contains any `PatternPredicate` nodes.
 fn expr_contains_pattern_predicate(expr: &Expr) -> bool {
     match expr {
-        Expr::PatternPredicate(_) => true,
+        Expr::PatternPredicate(_) | Expr::ExistsSubquery(_) => true,
         Expr::UnaryOp { expr, .. } => expr_contains_pattern_predicate(expr),
         Expr::BinaryOp { left, right, .. } => {
             expr_contains_pattern_predicate(left) || expr_contains_pattern_predicate(right)
@@ -7188,6 +7192,7 @@ fn eval_predicate_with_storage(
 ) -> Result<Value, ExecutionError> {
     match expr {
         Expr::PatternPredicate(pattern) => check_pattern_exists(pattern, row, ctx),
+        Expr::ExistsSubquery(match_clause) => exists_subquery_matches(match_clause, row, ctx),
         Expr::UnaryOp { op, expr } => {
             let v = eval_predicate_with_storage(expr, row, ctx)?;
             Ok(eval_unary_op(*op, &v))
@@ -7205,6 +7210,53 @@ fn eval_predicate_with_storage(
         }
         other => Ok(eval_expr(other, row)),
     }
+}
+
+/// Evaluate an `EXISTS { MATCH … }` subquery: true when the inner MATCH yields
+/// at least one row consistent with the outer-scope bindings.
+///
+/// The inner MATCH (plus its optional WHERE) is wrapped in a synthetic
+/// `… RETURN 1` query and planned through the same logical planner that serves
+/// top-level queries — so pattern semantics in `EXISTS { (a)-[:R]->(b) }` match
+/// those of a top-level `MATCH (a)-[:R]->(b)` exactly. It executes correlated:
+/// the outer row is installed as `correlated_row` so inner references to
+/// outer-bound variables resolve, and only inner rows agreeing with the outer
+/// bindings on shared variables count.
+fn exists_subquery_matches(
+    mc: &crate::cypher::ast::MatchClause,
+    row: &Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Value, ExecutionError> {
+    use crate::cypher::ast::{Clause, Query, ReturnClause, ReturnItem};
+    let query = Query {
+        clauses: vec![
+            Clause::Match(mc.clone()),
+            // RETURN * so the inner pattern variables survive projection — the
+            // post-filter below matches them against the outer bindings.
+            Clause::Return(ReturnClause {
+                distinct: false,
+                items: vec![ReturnItem {
+                    expr: Expr::Star,
+                    alias: None,
+                }],
+            }),
+        ],
+        hints: Vec::new(),
+    };
+    let plan = crate::planner::builder::build_logical_plan(&query).map_err(|e| {
+        ExecutionError::Unsupported(format!("EXISTS subquery planning failed: {e}"))
+    })?;
+
+    // Execute the inner plan uncorrelated (a fresh scan), then keep only rows
+    // that agree with the outer bindings on shared variables — that post-filter
+    // IS the correlation. (Installing `correlated_row` instead would merge the
+    // outer values into every inner row, defeating the shared-variable check.)
+    // The inner plan still evaluates its own WHERE on inner-bound variables.
+    let rows = execute_op(&plan.root, ctx)?;
+    let any = rows
+        .iter()
+        .any(|rr| rr.iter().all(|(k, v)| row.get(k).is_none_or(|ov| ov == v)));
+    Ok(Value::Bool(any))
 }
 
 /// Check if a pattern predicate matches: does the described path exist in the graph?
