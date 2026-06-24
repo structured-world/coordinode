@@ -7191,7 +7191,27 @@ fn eval_predicate_with_storage(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Value, ExecutionError> {
     match expr {
-        Expr::PatternPredicate(pattern) => check_pattern_exists(pattern, row, ctx),
+        Expr::PatternPredicate(pattern) => {
+            // Trivial single-hop patterns use the fast-path existence walker.
+            // Multi-hop chains (which the walker mishandles when an intermediate
+            // node is unbound) and any pattern carrying inline edge-property
+            // filters (which the walker does not evaluate) desugar into an
+            // EXISTS subquery routed through the full MATCH planner, matching
+            // `MATCH` semantics exactly.
+            let has_edge_filter = pattern
+                .elements
+                .iter()
+                .any(|e| matches!(e, PatternElement::Relationship(r) if !r.properties.is_empty()));
+            if pattern.elements.len() > 3 || has_edge_filter {
+                let mc = crate::cypher::ast::MatchClause {
+                    patterns: vec![pattern.clone()],
+                    where_clause: None,
+                };
+                exists_subquery_matches(&mc, row, ctx)
+            } else {
+                check_pattern_exists(pattern, row, ctx)
+            }
+        }
         Expr::ExistsSubquery(match_clause) => exists_subquery_matches(match_clause, row, ctx),
         Expr::UnaryOp { op, expr } => {
             let v = eval_predicate_with_storage(expr, row, ctx)?;

@@ -678,6 +678,30 @@ fn exists_subquery_end_to_end() {
     assert!(!older_names.contains(&"Bob".to_string()));
 }
 
+/// A multi-hop pattern predicate with an unbound intermediate node desugars to
+/// an EXISTS subquery (the old single-hop walker returned false for these).
+#[test]
+fn multi_hop_pattern_predicate_unbound_intermediate() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    // Alice → Bob → Charlie is a 2-hop KNOWS path; the middle node is anonymous.
+    let results = run_cypher(
+        "MATCH (a:Person {name: 'Alice'}) \
+         WHERE (a)-[:KNOWS]->()-[:KNOWS]->(c) RETURN a.name AS name",
+        engine,
+        &mut interner,
+    );
+    let names: Vec<String> = results
+        .iter()
+        .filter_map(|r| match r.get("name") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, vec!["Alice".to_string()]);
+}
+
 // ── Correlated inline property filter (regression) ──────────────────────
 
 #[test]
