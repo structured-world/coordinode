@@ -402,6 +402,8 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
 
         LogicalOp::Union { inputs, .. } => inputs.iter().collect(),
 
+        LogicalOp::Foreach { input, body, .. } => vec![input, body],
+
         LogicalOp::CreateIndex { .. }
         | LogicalOp::DropIndex { .. }
         | LogicalOp::IndexScan { .. } => vec![],

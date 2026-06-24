@@ -271,6 +271,10 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let cc = build_create_clause(pair)?;
             clauses.push(Clause::Create(cc));
         }
+        Rule::foreach_clause => {
+            let fc = build_foreach_clause(pair)?;
+            clauses.push(Clause::Foreach(fc));
+        }
         Rule::merge_clause => {
             let mc = build_merge_clause(pair)?;
             clauses.push(Clause::Merge(mc));
@@ -1552,6 +1556,44 @@ fn build_create_clause(pair: Pair<'_, Rule>) -> Result<CreateClause, ParseError>
         }
     }
     Err(ParseError::Invalid("CREATE clause missing patterns".into()))
+}
+
+fn build_foreach_clause(pair: Pair<'_, Rule>) -> Result<ForeachClause, ParseError> {
+    let mut variable = None;
+    let mut list = None;
+    let mut body = Vec::new();
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::identifier if variable.is_none() => {
+                variable = Some(inner.as_str().to_string());
+            }
+            Rule::expression if list.is_none() => {
+                list = Some(build_expression(inner)?);
+            }
+            Rule::foreach_update_clause => {
+                // Unwrap to the actual update clause and reuse build_clause.
+                let update = first_inner(inner)?;
+                build_clause(update, &mut body)?;
+            }
+            _ => {}
+        }
+    }
+
+    let variable =
+        variable.ok_or_else(|| ParseError::Invalid("FOREACH missing variable".into()))?;
+    let list = list.ok_or_else(|| ParseError::Invalid("FOREACH missing list expression".into()))?;
+    if body.is_empty() {
+        return Err(ParseError::Invalid(
+            "FOREACH body has no update clauses".into(),
+        ));
+    }
+
+    Ok(ForeachClause {
+        variable,
+        list,
+        body,
+    })
 }
 
 fn build_merge_clause(pair: Pair<'_, Rule>) -> Result<MergeClause, ParseError> {

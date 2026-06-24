@@ -341,6 +341,7 @@ fn op_children(op: &LogicalOp) -> Vec<&LogicalOp> {
         LogicalOp::CreateNode { input, .. } => input.as_deref().into_iter().collect(),
         LogicalOp::Merge { pattern, .. } | LogicalOp::Upsert { pattern, .. } => vec![pattern],
         LogicalOp::Union { inputs, .. } => inputs.iter().collect(),
+        LogicalOp::Foreach { input, body, .. } => vec![input, body],
         _ => Vec::new(),
     }
 }
@@ -603,6 +604,22 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             Ok(LogicalOp::RemoveOp {
                 input: Box::new(input),
                 items: items.clone(),
+            })
+        }
+        Clause::Foreach(fc) => {
+            let input = current.unwrap_or(LogicalOp::Empty);
+            // Build the body as an independent update chain whose leaf is Empty;
+            // the executor injects the per-iteration scope at that leaf.
+            let mut body: Option<LogicalOp> = None;
+            for body_clause in &fc.body {
+                body = Some(apply_clause(body, body_clause)?);
+            }
+            let body = body.ok_or(PlanError::EmptyQuery)?;
+            Ok(LogicalOp::Foreach {
+                input: Box::new(input),
+                variable: fc.variable.clone(),
+                list: fc.list.clone(),
+                body: Box::new(body),
             })
         }
         Clause::Call(cc) => Ok(LogicalOp::ProcedureCall {

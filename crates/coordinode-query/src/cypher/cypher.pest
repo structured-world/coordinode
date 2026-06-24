@@ -19,6 +19,7 @@ union_branch = { kw_union ~ kw_all? ~ clause+ }
 clause = {
     optional_match_clause
   | match_clause
+  | foreach_clause
   | where_clause
   | return_clause
   | with_clause
@@ -377,6 +378,23 @@ alter_trigger_set_on_error  = { kw_set ~ on_error_clause }
 // --- CREATE ---
 
 create_clause = { kw_create ~ pattern_list }
+
+// --- FOREACH ---
+// FOREACH (x IN list | <update clauses>) — runs the inner update clauses once
+// per element of `list`, with `x` bound. Only updating clauses are permitted
+// inside (plus nested FOREACH); no MATCH/RETURN/WITH.
+foreach_clause = { kw_foreach ~ "(" ~ identifier ~ kw_in ~ expression ~ "|" ~ foreach_update_clause+ ~ ")" }
+foreach_update_clause = {
+    create_clause
+  | merge_all_clause
+  | merge_nodes_clause
+  | merge_clause
+  | detach_delete_clause
+  | delete_clause
+  | set_clause
+  | remove_clause
+  | foreach_clause
+}
 
 // --- MERGE ---
 
@@ -757,6 +775,7 @@ kw_create     = @{ ^"create" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_merge      = @{ ^"merge" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_all        = @{ ^"all" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_union      = @{ ^"union" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_foreach    = @{ ^"foreach" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_any        = @{ ^"any" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_none       = @{ ^"none" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_single     = @{ ^"single" ~ !(ASCII_ALPHANUMERIC | "_") }
@@ -854,6 +873,6 @@ reserved_word = @{
     | ^"create" | ^"merge" | ^"delete" | ^"detach" | ^"set" | ^"remove"
     | ^"on" | ^"upsert" | ^"call" | ^"yield"
     | ^"alter" | ^"label" | ^"schema"
-    | ^"union"
+    | ^"union" | ^"foreach"
     ) ~ !(ASCII_ALPHANUMERIC | "_")
 }

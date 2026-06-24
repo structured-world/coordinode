@@ -803,6 +803,18 @@ pub enum LogicalOp {
         index_name: String,
     },
 
+    /// `FOREACH (variable IN list | body)`: for each input row and each element
+    /// of `list` (evaluated per row), bind `variable` and run the `body`
+    /// sub-plan of updating operators. Pass-through: the input rows continue
+    /// downstream unchanged. The body's leaf is `Empty`, which the executor
+    /// fills with the per-iteration scope (input row + bound `variable`).
+    Foreach {
+        input: Box<LogicalOp>,
+        variable: String,
+        list: Expr,
+        body: Box<LogicalOp>,
+    },
+
     /// Empty input (no rows, used as leaf for standalone CREATE).
     Empty,
 }
@@ -879,6 +891,13 @@ impl LogicalOp {
                 for input in inputs {
                     input.substitute_params(params);
                 }
+            }
+            LogicalOp::Foreach {
+                input, list, body, ..
+            } => {
+                input.substitute_params(params);
+                list.substitute_params(params);
+                body.substitute_params(params);
             }
             LogicalOp::CreateNode {
                 input, properties, ..
@@ -1485,6 +1504,24 @@ fn estimate_op_cost(
             (total_cost + total_rows * 0.01, total_rows)
         }
 
+        LogicalOp::Foreach {
+            input, list, body, ..
+        } => {
+            let (input_cost, input_rows) = estimate_op_cost(input, defaults, stats, hints);
+            let (body_cost, _) = estimate_op_cost(body, defaults, stats, hints);
+            // Body runs once per input row times the list length. The list size
+            // is unknown statically; assume a small constant fan-out.
+            let list_factor = match list {
+                Expr::Literal(Value::Array(items)) => items.len() as f64,
+                _ => 4.0,
+            };
+            // FOREACH is pass-through: row count downstream equals input rows.
+            (
+                input_cost + input_rows * list_factor * body_cost,
+                input_rows,
+            )
+        }
+
         LogicalOp::VectorFilter {
             input, threshold, ..
         } => {
@@ -1922,6 +1959,16 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             for input in inputs {
                 explain_op(input, indent + 1, output);
             }
+        }
+        LogicalOp::Foreach {
+            input,
+            variable,
+            body,
+            ..
+        } => {
+            output.push_str(&format!("{prefix}Foreach({variable})\n"));
+            explain_op(input, indent + 1, output);
+            explain_op(body, indent + 1, output);
         }
         LogicalOp::CreateNode {
             input,

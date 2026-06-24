@@ -71,6 +71,7 @@ fn make_test_ctx<'a>(
         cascade_fanout_limit: 100,
         cascade_chain: Vec::new(),
         correlated_row: None,
+        foreach_scope: None,
         feedback_cache: None,
         schema_label_cache: HashMap::new(),
         applied_watermark: None,

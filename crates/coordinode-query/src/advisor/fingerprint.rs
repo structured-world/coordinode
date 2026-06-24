@@ -383,6 +383,20 @@ fn write_clause(buf: &mut String, clause: &Clause) {
                 buf.push(')');
             }
         }
+        Clause::Foreach(fc) => {
+            buf.push_str("FOREACH (");
+            buf.push_str(&fc.variable);
+            buf.push_str(" IN ");
+            write_expr(buf, &fc.list);
+            buf.push_str(" | ");
+            for (i, c) in fc.body.iter().enumerate() {
+                if i > 0 {
+                    buf.push(' ');
+                }
+                write_clause(buf, c);
+            }
+            buf.push(')');
+        }
     }
 }
 

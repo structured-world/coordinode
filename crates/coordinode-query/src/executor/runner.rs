@@ -484,6 +484,11 @@ pub struct ExecutionContext<'a> {
     /// `OPTIONAL MATCH (b)-[:R]->(c) WHERE c.x = a.y` where `a` comes
     /// from the outer MATCH scope.
     pub correlated_row: Option<Row>,
+    /// Per-iteration scope injected by `FOREACH`. When set, the `Empty` leaf
+    /// yields this row (instead of a bare empty row) so the body's update
+    /// operators see the outer bindings plus the bound loop variable. `None`
+    /// everywhere outside a FOREACH body, so non-FOREACH plans are unaffected.
+    pub foreach_scope: Option<Row>,
     /// Per-statement cache: NodeId → primary label string.
     ///
     /// Schema checks in PropertyPath and DocFunction SET items read the node's
@@ -2709,7 +2714,45 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             score_alias,
         } => execute_maxsim_top_k(input, doc_expr, query_expr, *k, score_alias.as_deref(), ctx),
 
-        LogicalOp::Empty => Ok(vec![Row::new()]),
+        // Empty normally yields a single empty row (standalone CREATE source).
+        // Inside a FOREACH body, the loop injects the per-iteration scope here
+        // so the body's update operators see the outer bindings + loop variable.
+        LogicalOp::Empty => Ok(vec![ctx.foreach_scope.clone().unwrap_or_default()]),
+
+        LogicalOp::Foreach {
+            input,
+            variable,
+            list,
+            body,
+        } => {
+            let input_rows = execute_op(input, ctx)?;
+            // Save any enclosing FOREACH scope; the input rows already carry it
+            // (the body's Empty leaf consumed it above), so each iteration only
+            // adds the loop variable on top of the current row.
+            let prev_scope = ctx.foreach_scope.take();
+            for row in &input_rows {
+                let elems = match eval_expr(list, row) {
+                    Value::Array(items) => items,
+                    // FOREACH over NULL is a no-op (matches Cypher).
+                    Value::Null => continue,
+                    other => {
+                        ctx.foreach_scope = prev_scope;
+                        return Err(ExecutionError::Unsupported(format!(
+                            "FOREACH expects a list, got {other:?}"
+                        )));
+                    }
+                };
+                for elem in elems {
+                    let mut scoped = row.clone();
+                    scoped.insert(variable.clone(), elem);
+                    ctx.foreach_scope = Some(scoped);
+                    // Body is run for its side effects; FOREACH is pass-through.
+                    execute_op(body, ctx)?;
+                }
+            }
+            ctx.foreach_scope = prev_scope;
+            Ok(input_rows)
+        }
 
         LogicalOp::CreateNode {
             input,

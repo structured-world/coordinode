@@ -2470,6 +2470,32 @@ fn union_branches_parsed() {
 }
 
 #[test]
+fn foreach_clause_parsed() {
+    use crate::cypher::ast::ForeachClause;
+    let q = parse_ok("MATCH (n) FOREACH (x IN [1, 2, 3] | SET n.v = x)");
+    let fc = q.clauses.iter().find_map(|c| match c {
+        Clause::Foreach(fc) => Some(fc),
+        _ => None,
+    });
+    let ForeachClause { variable, body, .. } = fc.expect("expected a FOREACH clause");
+    assert_eq!(variable, "x");
+    assert_eq!(body.len(), 1);
+    assert!(matches!(body[0], Clause::Set(_, _)));
+}
+
+#[test]
+fn foreach_multiple_body_clauses_parsed() {
+    let q = parse_ok("FOREACH (x IN [1] | CREATE (a:N {v: x}) SET a.y = 2)");
+    if let Clause::Foreach(fc) = &q.clauses[0] {
+        assert_eq!(fc.body.len(), 2);
+        assert!(matches!(fc.body[0], Clause::Create(_)));
+        assert!(matches!(fc.body[1], Clause::Set(_, _)));
+    } else {
+        panic!("expected FOREACH at index 0, got {:?}", q.clauses[0]);
+    }
+}
+
+#[test]
 fn on_violation_skip_parsed() {
     // SET ... ON VIOLATION SKIP should set ViolationMode::Skip.
     let q = parse_ok("MATCH (n:X) SET n.y = 1 ON VIOLATION SKIP");

@@ -1804,6 +1804,7 @@ impl Database {
             cascade_fanout_limit: 100,
             cascade_chain: Vec::new(),
             correlated_row: None,
+            foreach_scope: None,
             feedback_cache: Some(self.feedback_cache.clone()),
             schema_label_cache: std::collections::HashMap::new(),
             applied_watermark: None,

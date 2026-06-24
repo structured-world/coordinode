@@ -65,6 +65,7 @@ impl Query {
                         | Clause::DropVectorIndex(_)
                         | Clause::CreateEdgeType(_)
                         | Clause::CreateNodeType(_)
+                        | Clause::Foreach(_)
                 )
             })
         };
@@ -162,6 +163,23 @@ pub enum Clause {
     /// The caller receives only the rows that were successfully updated.
     Set(Vec<SetItem>, ViolationMode),
     Remove(Vec<RemoveItem>),
+
+    /// `FOREACH (x IN list | <update clauses>)` — execute the inner update
+    /// clauses once per element of `list`, with `x` bound. The body may contain
+    /// only updating clauses (CREATE / MERGE / SET / REMOVE / DELETE) and
+    /// nested FOREACH.
+    Foreach(ForeachClause),
+}
+
+/// `FOREACH (variable IN list | body)` loop over a list, applying updates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeachClause {
+    /// Loop variable bound to each element of `list` inside the body.
+    pub variable: String,
+    /// Expression evaluating to the list to iterate (NULL iterates nothing).
+    pub list: Expr,
+    /// Updating clauses applied once per element.
+    pub body: Vec<Clause>,
 }
 
 /// How to handle schema constraint violations during a SET operation.

@@ -73,6 +73,7 @@ fn make_test_ctx<'a>(
         cascade_fanout_limit: 100,
         cascade_chain: Vec::new(),
         correlated_row: None,
+        foreach_scope: None,
         feedback_cache: None,
         schema_label_cache: std::collections::HashMap::new(),
         applied_watermark: None,
@@ -1222,6 +1223,78 @@ fn create_node_and_read_back() {
     );
 
     assert_eq!(results.len(), 1, "should find the created Animal node");
+}
+
+#[test]
+fn foreach_creates_node_per_element() {
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+
+    // FOREACH over a literal list: one Counter node per element.
+    run_cypher_with_alloc(
+        "FOREACH (x IN [1, 2, 3] | CREATE (:Counter {n: x}))",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+
+    let results = run_cypher_with_alloc(
+        "MATCH (c:Counter) RETURN c.n AS n",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    let mut ns: Vec<i64> = results
+        .iter()
+        .filter_map(|r| match r.get("n") {
+            Some(Value::Int(i)) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    ns.sort_unstable();
+    assert_eq!(ns, vec![1, 2, 3]);
+}
+
+#[test]
+fn foreach_over_bound_list_property() {
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(2000));
+
+    // Seed a node carrying a list property, then FOREACH over it referencing
+    // the outer-bound variable inside the body.
+    run_cypher_with_alloc(
+        "CREATE (p:Person {name: \"Ann\", tags: [\"a\", \"b\"]})",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    run_cypher_with_alloc(
+        "MATCH (p:Person {name: \"Ann\"}) \
+         FOREACH (t IN p.tags | CREATE (:Tag {value: t}))",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+
+    let results = run_cypher_with_alloc(
+        "MATCH (t:Tag) RETURN t.value AS v",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    let mut vals: Vec<String> = results
+        .iter()
+        .filter_map(|r| match r.get("v") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    vals.sort();
+    assert_eq!(vals, vec!["a".to_string(), "b".to_string()]);
 }
 
 #[test]

@@ -320,6 +320,24 @@ impl<'a> Analyzer<'a> {
                 // re-parses and validates at execution time too (the body is a
                 // raw Cypher string captured by the parser).
             }
+            Clause::Foreach(fc) => {
+                // The list expression resolves in the outer scope.
+                self.check_expr(&fc.list);
+                // The loop variable is bound only inside the body; record it,
+                // analyze the body clauses, then restore the outer scope.
+                let had_var = self.scope.insert(fc.variable.clone(), Vec::new());
+                for body_clause in &fc.body {
+                    self.analyze_clause(body_clause);
+                }
+                match had_var {
+                    Some(prev) => {
+                        self.scope.insert(fc.variable.clone(), prev);
+                    }
+                    None => {
+                        self.scope.remove(&fc.variable);
+                    }
+                }
+            }
         }
     }
 
