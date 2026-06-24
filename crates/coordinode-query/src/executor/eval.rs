@@ -672,6 +672,62 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
                 Value::Array(vec![])
             }
         }
+        // startNode(r) / endNode(r) → the relationship's source / target node id.
+        // Relationship variables bind `<var>.__src__` / `<var>.__tgt__` in the
+        // row (Value::Int node ids); we return the id, matching how `id()`
+        // surfaces nodes as integers in this model.
+        "startNode" => match args.first() {
+            Some(Expr::Variable(var)) => row
+                .get(&format!("{var}.__src__"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            _ => Value::Null,
+        },
+        "endNode" => match args.first() {
+            Some(Expr::Variable(var)) => row
+                .get(&format!("{var}.__tgt__"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            _ => Value::Null,
+        },
+        // properties(x) → a map of the entity's user properties. Collects the
+        // row's `<var>.<prop>` columns, skipping internal `__…__` markers
+        // (label, type, src/tgt). Returns NULL when the argument is not a bound
+        // variable.
+        "properties" => match args.first() {
+            Some(Expr::Variable(var)) => {
+                let prefix = format!("{var}.");
+                let mut map: std::collections::BTreeMap<String, Value> =
+                    std::collections::BTreeMap::new();
+                for (k, v) in row {
+                    if let Some(rest) = k.strip_prefix(&prefix) {
+                        if !rest.starts_with("__") {
+                            map.insert(rest.to_string(), v.clone());
+                        }
+                    }
+                }
+                Value::Map(map)
+            }
+            _ => Value::Null,
+        },
+        // nullIf(v1, v2) → NULL if v1 == v2, otherwise v1.
+        "nullIf" => match (evaluated.first(), evaluated.get(1)) {
+            (Some(a), Some(b)) if a == b => Value::Null,
+            (Some(a), _) => a.clone(),
+            _ => Value::Null,
+        },
+        // timestamp() → milliseconds since the Unix epoch (Cypher returns an
+        // integer; `now()` above returns microseconds as a Timestamp value).
+        "timestamp" => Value::Int(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        ),
+        // randomUUID() → a random version-4 UUID string.
+        "randomUUID" => Value::String(random_uuid_v4()),
+        // valueType(v) → the Cypher type name of the value.
+        "valueType" => Value::String(cypher_value_type(evaluated.first())),
         "temporal_active_at" => {
             // temporal_active_at(r, t) → bool
             // True iff the temporal edge `r` was active at time `t` (epoch ms),
@@ -1287,6 +1343,38 @@ fn map_list(v: Option<&Value>, f: impl Fn(&Value) -> Value) -> Value {
         Some(Value::Array(items)) => Value::Array(items.iter().map(f).collect()),
         _ => Value::Null,
     }
+}
+
+/// Generate a random version-4 UUID string (`randomUUID()`). Built from 128
+/// random bits with the version (4) and variant (RFC 4122) nibbles set.
+fn random_uuid_v4() -> String {
+    let mut b = rand::random::<u128>().to_be_bytes();
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant 10xx
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13],
+        b[14], b[15]
+    )
+}
+
+/// Cypher `valueType(v)` type-name string. Scalars carry the `NOT NULL`
+/// suffix (a concrete value is never null); `NULL` itself is `"NULL"`.
+/// Compound and engine-specific values (list, map, and our temporal / vector /
+/// path / spatial variants) use a simplified label rather than Neo4j's fully
+/// elaborated nested form.
+fn cypher_value_type(v: Option<&Value>) -> String {
+    match v {
+        None | Some(Value::Null) => "NULL",
+        Some(Value::Bool(_)) => "BOOLEAN NOT NULL",
+        Some(Value::Int(_)) => "INTEGER NOT NULL",
+        Some(Value::Float(_)) => "FLOAT NOT NULL",
+        Some(Value::String(_)) => "STRING NOT NULL",
+        Some(Value::Array(_)) => "LIST<ANY> NOT NULL",
+        Some(Value::Map(_) | Value::Document(_)) => "MAP NOT NULL",
+        Some(_) => "ANY NOT NULL",
+    }
+    .to_string()
 }
 
 /// Haversine distance between two WGS84 points, in meters.

@@ -567,6 +567,26 @@ fn math_functions_end_to_end() {
     assert_eq!(r.get("tf"), Some(&Value::Float(-9.0)));
 }
 
+/// Scalar functions (nullIf, valueType) reach the executor end-to-end.
+#[test]
+fn scalar_functions_end_to_end() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    let results = run_cypher(
+        "UNWIND [7] AS n \
+         RETURN nullIf(n, 7) AS same, nullIf(n, 8) AS diff, valueType(n) AS vt",
+        engine,
+        &mut interner,
+    );
+
+    assert_eq!(results.len(), 1);
+    let r = &results[0];
+    assert_eq!(r.get("same"), Some(&Value::Null));
+    assert_eq!(r.get("diff"), Some(&Value::Int(7)));
+    assert_eq!(r.get("vt"), Some(&Value::String("INTEGER NOT NULL".into())));
+}
+
 // ── Correlated inline property filter (regression) ──────────────────────
 
 #[test]

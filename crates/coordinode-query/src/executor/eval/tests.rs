@@ -1165,3 +1165,99 @@ fn trig_fn_null_propagation() {
     assert_eq!(call_fn("sin", vec![Value::Null]), Value::Null);
     assert_eq!(call_fn("degrees", vec![s("x")]), Value::Null);
 }
+
+// ---- R523 scalar functions ----
+
+#[test]
+fn scalar_fn_nullif() {
+    assert_eq!(
+        call_fn("nullIf", vec![Value::Int(5), Value::Int(5)]),
+        Value::Null
+    );
+    assert_eq!(
+        call_fn("nullIf", vec![Value::Int(5), Value::Int(6)]),
+        Value::Int(5)
+    );
+    assert_eq!(call_fn("nullIf", vec![s("a"), s("b")]), s("a"));
+}
+
+#[test]
+fn scalar_fn_value_type() {
+    assert_eq!(
+        call_fn("valueType", vec![Value::Int(1)]),
+        s("INTEGER NOT NULL")
+    );
+    assert_eq!(call_fn("valueType", vec![s("x")]), s("STRING NOT NULL"));
+    assert_eq!(
+        call_fn("valueType", vec![Value::Bool(true)]),
+        s("BOOLEAN NOT NULL")
+    );
+    assert_eq!(
+        call_fn("valueType", vec![Value::Float(1.0)]),
+        s("FLOAT NOT NULL")
+    );
+    assert_eq!(call_fn("valueType", vec![Value::Null]), s("NULL"));
+    assert_eq!(
+        call_fn("valueType", vec![Value::Array(vec![])]),
+        s("LIST<ANY> NOT NULL")
+    );
+}
+
+#[test]
+fn scalar_fn_timestamp_is_positive_int() {
+    match call_fn("timestamp", vec![]) {
+        Value::Int(ms) => assert!(ms > 0, "timestamp must be a positive epoch ms"),
+        other => panic!("timestamp should be Int, got {other:?}"),
+    }
+}
+
+#[test]
+fn scalar_fn_random_uuid_format() {
+    let uuid_str = |v: Value| match v {
+        Value::String(s) => s,
+        other => panic!("randomUUID should be a String, got {other:?}"),
+    };
+    let a = uuid_str(call_fn("randomUUID", vec![]));
+    assert_eq!(a.len(), 36, "canonical UUID length");
+    assert_eq!(a.as_bytes()[8], b'-');
+    assert_eq!(a.as_bytes()[13], b'-');
+    assert_eq!(a.as_bytes()[14], b'4', "version-4 nibble");
+    // Two calls produce distinct ids.
+    let b = uuid_str(call_fn("randomUUID", vec![]));
+    assert_ne!(a, b);
+}
+
+#[test]
+fn scalar_fn_start_end_node_and_properties() {
+    let mut row = Row::new();
+    row.insert("r.__src__".into(), Value::Int(10));
+    row.insert("r.__tgt__".into(), Value::Int(20));
+    row.insert("n.name".into(), s("Alice"));
+    row.insert("n.age".into(), Value::Int(30));
+    row.insert("n.__label__".into(), s("Person"));
+
+    let call = |name: &str, var: &str| {
+        eval_expr(
+            &Expr::FunctionCall {
+                name: name.into(),
+                args: vec![Expr::Variable(var.into())],
+                distinct: false,
+            },
+            &row,
+        )
+    };
+
+    // startNode / endNode resolve the relationship endpoints.
+    assert_eq!(call("startNode", "r"), Value::Int(10));
+    assert_eq!(call("endNode", "r"), Value::Int(20));
+
+    // properties collects user fields, excluding internal __…__ markers.
+    match call("properties", "n") {
+        Value::Map(m) => {
+            assert_eq!(m.get("name"), Some(&s("Alice")));
+            assert_eq!(m.get("age"), Some(&Value::Int(30)));
+            assert!(!m.contains_key("__label__"), "internal markers excluded");
+        }
+        other => panic!("properties should be a Map, got {other:?}"),
+    }
+}
