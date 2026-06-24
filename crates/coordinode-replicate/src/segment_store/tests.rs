@@ -534,6 +534,124 @@ async fn repair_heals_corrupt_partition_so_rescrub_is_clean() {
 }
 
 #[test]
+fn wal_replay_repair_rebuilds_from_checkpoint_plus_oplog() {
+    use coordinode_storage::oplog::{OplogEntry, OplogOp};
+    use coordinode_storage::placement::partition_wire_tag;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = std::sync::Arc::new(test_engine(dir.path()));
+    for i in 0..40u32 {
+        engine
+            .put(
+                Partition::Node,
+                format!("node:0:{i:08}").as_bytes(),
+                format!("v{i}").as_bytes(),
+            )
+            .expect("put");
+    }
+    engine.persist().expect("persist");
+
+    // Checkpoint outside the data dir (avoid the largest-file walk + keep it a
+    // distinct location). This is the WAL-replay-repair base.
+    let ckpt_root = tempfile::tempdir().expect("ckpt tempdir");
+    let ckpt_path = ckpt_root.path().join("c1");
+    engine.create_checkpoint(&ckpt_path).expect("checkpoint");
+
+    // Post-checkpoint writes — these must be restored from the oplog, not the
+    // checkpoint (which predates them).
+    engine
+        .put(Partition::Node, b"node:0:00000005", b"v5-updated")
+        .expect("put");
+    engine
+        .put(Partition::Node, b"node:0:00000099", b"v99-new")
+        .expect("put");
+    engine
+        .delete(Partition::Node, b"node:0:00000007")
+        .expect("delete");
+    engine.persist().expect("persist");
+
+    let tag = partition_wire_tag(Partition::Node);
+    let oplog_since = vec![OplogEntry {
+        ts: 0,
+        term: 1,
+        index: 41,
+        shard: 0,
+        ops: vec![
+            OplogOp::Insert {
+                partition: tag,
+                key: b"node:0:00000005".to_vec(),
+                value: b"v5-updated".to_vec(),
+            },
+            OplogOp::Insert {
+                partition: tag,
+                key: b"node:0:00000099".to_vec(),
+                value: b"v99-new".to_vec(),
+            },
+            OplogOp::Delete {
+                partition: tag,
+                key: b"node:0:00000007".to_vec(),
+            },
+            // An op for a different partition must be ignored when repairing Node.
+            OplogOp::Insert {
+                partition: partition_wire_tag(Partition::Schema),
+                key: b"schema:should-not-apply".to_vec(),
+                value: b"x".to_vec(),
+            },
+        ],
+        is_migration: false,
+        pre_images: None,
+    }];
+
+    let installer = std::sync::Arc::new(SegmentInstaller::new(std::sync::Arc::clone(&engine)));
+    installer
+        .wal_replay_repair(&ckpt_path, &oplog_since, Partition::Node)
+        .expect("wal replay repair");
+
+    // Checkpoint base (40 keys) rolled forward by the oplog replay.
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:0:00000000")
+            .expect("get")
+            .expect("base key present")
+            .as_ref(),
+        b"v0",
+        "checkpoint base restored"
+    );
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:0:00000005")
+            .expect("get")
+            .expect("updated key present")
+            .as_ref(),
+        b"v5-updated",
+        "post-checkpoint update replayed from oplog"
+    );
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:0:00000099")
+            .expect("get")
+            .expect("new key present")
+            .as_ref(),
+        b"v99-new",
+        "post-checkpoint insert replayed from oplog"
+    );
+    assert!(
+        engine
+            .get(Partition::Node, b"node:0:00000007")
+            .expect("get")
+            .is_none(),
+        "post-checkpoint delete replayed from oplog"
+    );
+    assert!(
+        engine
+            .get(Partition::Schema, b"schema:should-not-apply")
+            .expect("get")
+            .is_none(),
+        "a different partition's oplog op must not be applied"
+    );
+}
+
+#[test]
 fn installer_rejects_empty_and_unknown_tag() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = std::sync::Arc::new(test_engine(dir.path()));
