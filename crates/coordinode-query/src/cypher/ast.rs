@@ -696,6 +696,22 @@ pub enum Expr {
     /// Out-of-bounds list access and missing map keys evaluate to `null`.
     Subscript { expr: Box<Expr>, index: Box<Expr> },
 
+    /// `reduce(acc = init, x IN list | expr)` — left fold over a list.
+    /// `acc` is seeded with `init`, then for each element bound to `var` the
+    /// `expr` (which references `acc` and `var`) produces the next accumulator.
+    Reduce {
+        /// Accumulator variable name.
+        acc: String,
+        /// Initial accumulator value.
+        init: Box<Expr>,
+        /// Per-element variable name.
+        var: String,
+        /// List being folded.
+        list: Box<Expr>,
+        /// Step expression evaluated per element to update the accumulator.
+        expr: Box<Expr>,
+    },
+
     /// Star expression for `count(*)` or `RETURN *`.
     Star,
 }
@@ -780,6 +796,13 @@ impl Expr {
             Expr::Subscript { expr, index } => {
                 expr.substitute_params(params);
                 index.substitute_params(params);
+            }
+            Expr::Reduce {
+                init, list, expr, ..
+            } => {
+                init.substitute_params(params);
+                list.substitute_params(params);
+                expr.substitute_params(params);
             }
             Expr::Literal(_) | Expr::Variable(_) | Expr::Star => {}
         }

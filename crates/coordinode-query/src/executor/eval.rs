@@ -328,6 +328,34 @@ pub fn eval_expr(expr: &Expr, row: &Row) -> Value {
             }
         }
 
+        // reduce(acc = init, x IN list | expr): left fold. Seed `acc` with
+        // `init`, then for each list element bind `acc` and `var` into a scratch
+        // row and re-evaluate `expr` to produce the next accumulator.
+        Expr::Reduce {
+            acc,
+            init,
+            var,
+            list,
+            expr,
+        } => {
+            let mut acc_val = eval_expr(init, row);
+            match eval_expr(list, row) {
+                Value::Array(items) => {
+                    let mut scratch = row.clone();
+                    for item in items {
+                        scratch.insert(acc.clone(), acc_val);
+                        scratch.insert(var.clone(), item);
+                        acc_val = eval_expr(expr, &scratch);
+                    }
+                    acc_val
+                }
+                // Null list → NULL (Cypher null propagation); a non-list,
+                // non-null argument leaves the accumulator at its initial value.
+                Value::Null => Value::Null,
+                _ => acc_val,
+            }
+        }
+
         Expr::Star => Value::Null,
     }
 }

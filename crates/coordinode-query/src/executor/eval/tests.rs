@@ -1379,6 +1379,53 @@ fn list_fn_is_empty() {
 }
 
 #[test]
+fn reduce_folds_list() {
+    // reduce(acc = 0, x IN [1,2,3,4] | acc + x) == 10
+    let expr = Expr::Reduce {
+        acc: "acc".into(),
+        init: Box::new(Expr::Literal(Value::Int(0))),
+        var: "x".into(),
+        list: Box::new(Expr::List(vec![
+            Expr::Literal(Value::Int(1)),
+            Expr::Literal(Value::Int(2)),
+            Expr::Literal(Value::Int(3)),
+            Expr::Literal(Value::Int(4)),
+        ])),
+        expr: Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Variable("acc".into())),
+            op: BinaryOperator::Add,
+            right: Box::new(Expr::Variable("x".into())),
+        }),
+    };
+    assert_eq!(eval_expr(&expr, &empty_row()), Value::Int(10));
+}
+
+#[test]
+fn reduce_empty_list_returns_init() {
+    // Empty list → accumulator stays at its initial value.
+    let expr = Expr::Reduce {
+        acc: "acc".into(),
+        init: Box::new(Expr::Literal(Value::Int(42))),
+        var: "x".into(),
+        list: Box::new(Expr::List(vec![])),
+        expr: Box::new(Expr::Variable("x".into())),
+    };
+    assert_eq!(eval_expr(&expr, &empty_row()), Value::Int(42));
+}
+
+#[test]
+fn reduce_null_list_is_null() {
+    let expr = Expr::Reduce {
+        acc: "acc".into(),
+        init: Box::new(Expr::Literal(Value::Int(0))),
+        var: "x".into(),
+        list: Box::new(Expr::Literal(Value::Null)),
+        expr: Box::new(Expr::Variable("acc".into())),
+    };
+    assert_eq!(eval_expr(&expr, &empty_row()), Value::Null);
+}
+
+#[test]
 fn list_fn_keys() {
     // keys(n) on a node variable → its property keys (BTreeMap row → sorted),
     // internal __…__ markers excluded.

@@ -588,7 +588,8 @@ unary = { "-" ~ unary | postfix }
 postfix = { atom ~ ("[" ~ expression ~ "]")* }
 
 atom = {
-    function_call
+    reduce_expr
+  | function_call
   | case_expr
   | list_literal
   | map_projection
@@ -615,6 +616,12 @@ property_or_variable = { identifier ~ ("." ~ identifier)* }
 function_call = { function_name ~ "(" ~ distinct_kw? ~ function_args? ~ ")" }
 function_name = { identifier ~ ("." ~ identifier)* }
 function_args = { star | expression ~ ("," ~ expression)* }
+
+// reduce(acc = init, x IN list | expr) — left fold over a list.
+reduce_expr = {
+    kw_reduce ~ "(" ~ identifier ~ "=" ~ expression ~ "," ~ identifier ~ kw_in ~ expression
+    ~ "|" ~ expression ~ ")"
+}
 
 case_expr = {
     kw_case ~ expression? ~ when_clause+ ~ else_clause? ~ kw_end
@@ -693,6 +700,7 @@ kw_descending = @{ ^"descending" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_of         = @{ ^"of" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_timestamp  = @{ ^"timestamp" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_case       = @{ ^"case" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_reduce     = @{ ^"reduce" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_when       = @{ ^"when" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_then       = @{ ^"then" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_else       = @{ ^"else" ~ !(ASCII_ALPHANUMERIC | "_") }

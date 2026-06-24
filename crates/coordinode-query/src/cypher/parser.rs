@@ -2345,6 +2345,7 @@ fn build_expression(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
         Rule::property_or_variable => build_property_or_variable(pair),
         Rule::function_call => build_function_call(pair),
         Rule::case_expr => build_case_expr(pair),
+        Rule::reduce_expr => build_reduce_expr(pair),
         Rule::list_literal => build_list_literal(pair),
         Rule::map_literal => build_map_literal(pair),
         Rule::map_projection => build_map_projection(pair),
@@ -2732,6 +2733,36 @@ fn build_function_call(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
         args,
         distinct,
     })
+}
+
+fn build_reduce_expr(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
+    // Grammar order: kw_reduce, identifier(acc), expression(init),
+    // identifier(var), kw_in, expression(list), expression(step). Identifiers
+    // and expressions each keep their relative order, so collect by kind.
+    let mut idents: Vec<String> = Vec::new();
+    let mut exprs: Vec<Expr> = Vec::new();
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::identifier => idents.push(extract_identifier(inner)),
+            Rule::kw_reduce | Rule::kw_in => {}
+            _ => exprs.push(build_expression(inner)?),
+        }
+    }
+
+    let mut ids = idents.into_iter();
+    let mut ex = exprs.into_iter();
+    match (ids.next(), ids.next(), ex.next(), ex.next(), ex.next()) {
+        (Some(acc), Some(var), Some(init), Some(list), Some(expr)) => Ok(Expr::Reduce {
+            acc,
+            init: Box::new(init),
+            var,
+            list: Box::new(list),
+            expr: Box::new(expr),
+        }),
+        _ => Err(ParseError::Invalid(
+            "malformed reduce(...) expression".into(),
+        )),
+    }
 }
 
 fn build_case_expr(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {

@@ -3580,6 +3580,21 @@ fn collect_expr_variables_inner(expr: &Expr, vars: &mut Vec<String>) {
             collect_expr_variables_inner(expr, vars);
             collect_expr_variables_inner(index, vars);
         }
+        Expr::Reduce {
+            acc,
+            init,
+            var,
+            list,
+            expr,
+        } => {
+            collect_expr_variables_inner(init, vars);
+            collect_expr_variables_inner(list, vars);
+            // acc / var are bound locally inside the fold; drop them from the
+            // outer variable dependencies of the step expression.
+            let mut inner = Vec::new();
+            collect_expr_variables_inner(expr, &mut inner);
+            vars.extend(inner.into_iter().filter(|v| v != acc && v != var));
+        }
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Star => {}
     }
 }

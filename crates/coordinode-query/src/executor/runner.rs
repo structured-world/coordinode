@@ -6285,6 +6285,21 @@ fn collect_expr_vars(expr: &Expr, vars: &mut Vec<String>) {
             collect_expr_vars(expr, vars);
             collect_expr_vars(index, vars);
         }
+        Expr::Reduce {
+            acc,
+            init,
+            var,
+            list,
+            expr,
+        } => {
+            collect_expr_vars(init, vars);
+            collect_expr_vars(list, vars);
+            // acc and var are bound locally inside the fold — exclude them from
+            // the outer variables the step expression depends on.
+            let mut inner = Vec::new();
+            collect_expr_vars(expr, &mut inner);
+            vars.extend(inner.into_iter().filter(|v| v != acc && v != var));
+        }
         // Literal, Parameter, Star — no variable references.
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Star => {}
     }

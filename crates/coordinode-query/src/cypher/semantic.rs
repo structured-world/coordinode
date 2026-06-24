@@ -511,6 +511,37 @@ impl<'a> Analyzer<'a> {
                 self.check_expr(expr);
                 self.check_expr(index);
             }
+            Expr::Reduce {
+                acc,
+                init,
+                var,
+                list,
+                expr,
+            } => {
+                // init and list resolve in the outer scope; acc and var are
+                // bound only while checking the step expression, then restored.
+                self.check_expr(init);
+                self.check_expr(list);
+                let prev_acc = self.scope.insert(acc.clone(), Vec::new());
+                let prev_var = self.scope.insert(var.clone(), Vec::new());
+                self.check_expr(expr);
+                match prev_var {
+                    Some(v) => {
+                        self.scope.insert(var.clone(), v);
+                    }
+                    None => {
+                        self.scope.remove(var);
+                    }
+                }
+                match prev_acc {
+                    Some(v) => {
+                        self.scope.insert(acc.clone(), v);
+                    }
+                    None => {
+                        self.scope.remove(acc);
+                    }
+                }
+            }
             // Literals, parameters, star — no variable references
             Expr::Literal(_) | Expr::Parameter(_) | Expr::Star => {}
         }

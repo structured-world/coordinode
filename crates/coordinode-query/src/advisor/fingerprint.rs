@@ -692,6 +692,25 @@ fn write_expr(buf: &mut String, expr: &Expr) {
             write_expr(buf, index);
             buf.push(']');
         }
+        Expr::Reduce {
+            acc,
+            init,
+            var,
+            list,
+            expr,
+        } => {
+            buf.push_str("reduce(");
+            buf.push_str(acc);
+            buf.push('=');
+            write_expr(buf, init);
+            buf.push_str(", ");
+            buf.push_str(var);
+            buf.push_str(" IN ");
+            write_expr(buf, list);
+            buf.push_str(" | ");
+            write_expr(buf, expr);
+            buf.push(')');
+        }
     }
 }
 

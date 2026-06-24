@@ -587,6 +587,24 @@ fn scalar_functions_end_to_end() {
     assert_eq!(r.get("vt"), Some(&Value::String("INTEGER NOT NULL".into())));
 }
 
+/// reduce(...) folds end-to-end through parse → plan → execute.
+#[test]
+fn reduce_end_to_end() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    let results = run_cypher(
+        "RETURN reduce(total = 0, x IN [1, 2, 3, 4] | total + x) AS sum, \
+                reduce(s = '', c IN ['a', 'b', 'c'] | s + c) AS cat",
+        engine,
+        &mut interner,
+    );
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get("sum"), Some(&Value::Int(10)));
+    assert_eq!(results[0].get("cat"), Some(&Value::String("abc".into())));
+}
+
 // ── Correlated inline property filter (regression) ──────────────────────
 
 #[test]
