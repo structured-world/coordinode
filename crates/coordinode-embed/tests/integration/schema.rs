@@ -271,14 +271,11 @@ fn create_edge_type_schema_persists() {
 
     {
         let db2 = Database::open(dir.path()).expect("reopen");
-        use coordinode_storage::engine::partition::Partition;
-        let key = coordinode_core::schema::definition::encode_edge_type_schema_key("WORKS_AT", 1);
-        let bytes = db2
-            .engine()
-            .get(Partition::Schema, &key)
-            .expect("storage get")
+        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        let schema = LocalSchemaStore::new(db2.engine())
+            .load_edge_type("WORKS_AT")
+            .expect("load edge schema")
             .expect("edge schema must exist after reopen");
-        let schema = EdgeTypeSchema::from_msgpack(&bytes).expect("deserialize");
         assert_eq!(schema.name, "WORKS_AT");
         assert_eq!(schema.properties.len(), 2);
         assert!(schema.get_property("since").is_some_and(|p| p.not_null));
@@ -353,6 +350,12 @@ fn current_revision_pointer_written_alongside_label_schema() {
 }
 
 /// Current-revision pointer is written for edge types as well.
+///
+/// White-box: this test verifies the on-disk two-key revision scheme itself
+/// (the `current_revision` pointer key resolving to the versioned body key), so
+/// it deliberately reads the raw keys rather than going through
+/// `SchemaStore::load_edge_type` — the store API hides exactly the indirection
+/// under test.
 #[test]
 fn current_revision_pointer_written_alongside_edge_type_schema() {
     use coordinode_core::schema::definition::{
