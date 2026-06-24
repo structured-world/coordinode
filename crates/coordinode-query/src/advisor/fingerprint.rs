@@ -692,6 +692,25 @@ fn write_expr(buf: &mut String, expr: &Expr) {
             write_expr(buf, index);
             buf.push(']');
         }
+        Expr::ListPredicate {
+            kind,
+            var,
+            list,
+            pred,
+        } => {
+            buf.push_str(match kind {
+                ListPredicateKind::All => "all(",
+                ListPredicateKind::Any => "any(",
+                ListPredicateKind::None => "none(",
+                ListPredicateKind::Single => "single(",
+            });
+            buf.push_str(var);
+            buf.push_str(" IN ");
+            write_expr(buf, list);
+            buf.push_str(" WHERE ");
+            write_expr(buf, pred);
+            buf.push(')');
+        }
         Expr::Reduce {
             acc,
             init,

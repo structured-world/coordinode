@@ -605,6 +605,28 @@ fn reduce_end_to_end() {
     assert_eq!(results[0].get("cat"), Some(&Value::String("abc".into())));
 }
 
+/// List quantifier predicates all/any/none/single execute end-to-end.
+#[test]
+fn list_predicates_end_to_end() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    let results = run_cypher(
+        "RETURN all(x IN [2, 4, 6] WHERE x > 1) AS a, \
+                any(x IN [1, 2, 3] WHERE x > 2) AS b, \
+                none(x IN [1, 2] WHERE x > 5) AS c, \
+                single(x IN [1, 2, 3] WHERE x = 2) AS d",
+        engine,
+        &mut interner,
+    );
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get("a"), Some(&Value::Bool(true)));
+    assert_eq!(results[0].get("b"), Some(&Value::Bool(true)));
+    assert_eq!(results[0].get("c"), Some(&Value::Bool(true)));
+    assert_eq!(results[0].get("d"), Some(&Value::Bool(true)));
+}
+
 // ── Correlated inline property filter (regression) ──────────────────────
 
 #[test]

@@ -1426,6 +1426,85 @@ fn reduce_null_list_is_null() {
 }
 
 #[test]
+fn list_predicate_quantifiers() {
+    // list [2,4,6], predicate x > 3 → true for 4 and 6 (2 of 3).
+    let mk = |kind| Expr::ListPredicate {
+        kind,
+        var: "x".into(),
+        list: Box::new(Expr::List(vec![
+            Expr::Literal(Value::Int(2)),
+            Expr::Literal(Value::Int(4)),
+            Expr::Literal(Value::Int(6)),
+        ])),
+        pred: Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Variable("x".into())),
+            op: BinaryOperator::Gt,
+            right: Box::new(Expr::Literal(Value::Int(3))),
+        }),
+    };
+    assert_eq!(
+        eval_expr(&mk(ListPredicateKind::All), &empty_row()),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        eval_expr(&mk(ListPredicateKind::Any), &empty_row()),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_expr(&mk(ListPredicateKind::None), &empty_row()),
+        Value::Bool(false)
+    );
+    // two elements satisfy the predicate, so `single` is false.
+    assert_eq!(
+        eval_expr(&mk(ListPredicateKind::Single), &empty_row()),
+        Value::Bool(false)
+    );
+}
+
+#[test]
+fn list_predicate_single_and_empty_list() {
+    // single: exactly one element (5) is > 3.
+    let single = Expr::ListPredicate {
+        kind: ListPredicateKind::Single,
+        var: "x".into(),
+        list: Box::new(Expr::List(vec![
+            Expr::Literal(Value::Int(1)),
+            Expr::Literal(Value::Int(5)),
+        ])),
+        pred: Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Variable("x".into())),
+            op: BinaryOperator::Gt,
+            right: Box::new(Expr::Literal(Value::Int(3))),
+        }),
+    };
+    assert_eq!(eval_expr(&single, &empty_row()), Value::Bool(true));
+
+    // Empty list: all/none → true (vacuous), any/single → false.
+    let mk = |kind| Expr::ListPredicate {
+        kind,
+        var: "x".into(),
+        list: Box::new(Expr::List(vec![])),
+        pred: Box::new(Expr::Literal(Value::Bool(true))),
+    };
+    assert_eq!(
+        eval_expr(&mk(ListPredicateKind::All), &empty_row()),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_expr(&mk(ListPredicateKind::Any), &empty_row()),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        eval_expr(&mk(ListPredicateKind::None), &empty_row()),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_expr(&mk(ListPredicateKind::Single), &empty_row()),
+        Value::Bool(false)
+    );
+}
+
+#[test]
 fn list_fn_keys() {
     // keys(n) on a node variable → its property keys (BTreeMap row → sorted),
     // internal __…__ markers excluded.

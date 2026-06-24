@@ -328,6 +328,37 @@ pub fn eval_expr(expr: &Expr, row: &Row) -> Value {
             }
         }
 
+        // all/any/none/single(x IN list WHERE pred): bind each element to `var`,
+        // evaluate `pred`, and combine the per-element booleans per the
+        // quantifier. Empty list → all/none true, any false, single false.
+        Expr::ListPredicate {
+            kind,
+            var,
+            list,
+            pred,
+        } => match eval_expr(list, row) {
+            Value::Array(items) => {
+                let total = items.len();
+                let mut scratch = row.clone();
+                let mut true_count = 0usize;
+                for item in items {
+                    scratch.insert(var.clone(), item);
+                    if matches!(eval_expr(pred, &scratch), Value::Bool(true)) {
+                        true_count += 1;
+                    }
+                }
+                let result = match kind {
+                    ListPredicateKind::All => true_count == total,
+                    ListPredicateKind::Any => true_count > 0,
+                    ListPredicateKind::None => true_count == 0,
+                    ListPredicateKind::Single => true_count == 1,
+                };
+                Value::Bool(result)
+            }
+            // Null list → NULL (Cypher null propagation); non-list → NULL.
+            _ => Value::Null,
+        },
+
         // reduce(acc = init, x IN list | expr): left fold. Seed `acc` with
         // `init`, then for each list element bind `acc` and `var` into a scratch
         // row and re-evaluate `expr` to produce the next accumulator.

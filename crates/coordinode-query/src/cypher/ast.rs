@@ -696,6 +696,20 @@ pub enum Expr {
     /// Out-of-bounds list access and missing map keys evaluate to `null`.
     Subscript { expr: Box<Expr>, index: Box<Expr> },
 
+    /// List quantifier predicate: `all/any/none/single(x IN list WHERE pred)`.
+    /// Binds each list element to `var` and evaluates `pred`; the `kind`
+    /// determines how the per-element booleans combine into the result.
+    ListPredicate {
+        /// Which quantifier (all / any / none / single).
+        kind: ListPredicateKind,
+        /// Per-element variable name.
+        var: String,
+        /// List being tested.
+        list: Box<Expr>,
+        /// Predicate evaluated per element (references `var`).
+        pred: Box<Expr>,
+    },
+
     /// `reduce(acc = init, x IN list | expr)` — left fold over a list.
     /// `acc` is seeded with `init`, then for each element bound to `var` the
     /// `expr` (which references `acc` and `var`) produces the next accumulator.
@@ -803,6 +817,10 @@ impl Expr {
                 init.substitute_params(params);
                 list.substitute_params(params);
                 expr.substitute_params(params);
+            }
+            Expr::ListPredicate { list, pred, .. } => {
+                list.substitute_params(params);
+                pred.substitute_params(params);
             }
             Expr::Literal(_) | Expr::Variable(_) | Expr::Star => {}
         }
@@ -1147,6 +1165,19 @@ pub enum BinaryOperator {
 pub enum UnaryOperator {
     Not,
     Neg,
+}
+
+/// List quantifier kind for [`Expr::ListPredicate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListPredicateKind {
+    /// `all(...)` — predicate holds for every element (vacuously true for `[]`).
+    All,
+    /// `any(...)` — predicate holds for at least one element (false for `[]`).
+    Any,
+    /// `none(...)` — predicate holds for no element (vacuously true for `[]`).
+    None,
+    /// `single(...)` — predicate holds for exactly one element.
+    Single,
 }
 
 /// String matching operators.

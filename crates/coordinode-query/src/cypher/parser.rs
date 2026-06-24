@@ -2346,6 +2346,7 @@ fn build_expression(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
         Rule::function_call => build_function_call(pair),
         Rule::case_expr => build_case_expr(pair),
         Rule::reduce_expr => build_reduce_expr(pair),
+        Rule::list_predicate => build_list_predicate(pair),
         Rule::list_literal => build_list_literal(pair),
         Rule::map_literal => build_map_literal(pair),
         Rule::map_projection => build_map_projection(pair),
@@ -2733,6 +2734,40 @@ fn build_function_call(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
         args,
         distinct,
     })
+}
+
+fn build_list_predicate(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
+    let mut kind: Option<ListPredicateKind> = None;
+    let mut var: Option<String> = None;
+    let mut exprs: Vec<Expr> = Vec::new();
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::list_quantifier => {
+                let q = first_inner(inner)?;
+                kind = Some(match q.as_rule() {
+                    Rule::kw_all => ListPredicateKind::All,
+                    Rule::kw_any => ListPredicateKind::Any,
+                    Rule::kw_none => ListPredicateKind::None,
+                    Rule::kw_single => ListPredicateKind::Single,
+                    _ => return Err(ParseError::Invalid("unknown list quantifier".into())),
+                });
+            }
+            Rule::identifier => var = Some(extract_identifier(inner)),
+            Rule::kw_in | Rule::kw_where => {}
+            _ => exprs.push(build_expression(inner)?),
+        }
+    }
+
+    let mut ex = exprs.into_iter();
+    match (kind, var, ex.next(), ex.next()) {
+        (Some(kind), Some(var), Some(list), Some(pred)) => Ok(Expr::ListPredicate {
+            kind,
+            var,
+            list: Box::new(list),
+            pred: Box::new(pred),
+        }),
+        _ => Err(ParseError::Invalid("malformed list predicate".into())),
+    }
 }
 
 fn build_reduce_expr(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {

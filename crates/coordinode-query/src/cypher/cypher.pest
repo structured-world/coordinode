@@ -589,6 +589,7 @@ postfix = { atom ~ ("[" ~ expression ~ "]")* }
 
 atom = {
     reduce_expr
+  | list_predicate
   | function_call
   | case_expr
   | list_literal
@@ -616,6 +617,12 @@ property_or_variable = { identifier ~ ("." ~ identifier)* }
 function_call = { function_name ~ "(" ~ distinct_kw? ~ function_args? ~ ")" }
 function_name = { identifier ~ ("." ~ identifier)* }
 function_args = { star | expression ~ ("," ~ expression)* }
+
+// all/any/none/single(x IN list WHERE pred) — list quantifier predicates.
+list_predicate = {
+    list_quantifier ~ "(" ~ identifier ~ kw_in ~ expression ~ kw_where ~ expression ~ ")"
+}
+list_quantifier = { kw_all | kw_any | kw_none | kw_single }
 
 // reduce(acc = init, x IN list | expr) — left fold over a list.
 reduce_expr = {
@@ -708,6 +715,9 @@ kw_end        = @{ ^"end" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_create     = @{ ^"create" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_merge      = @{ ^"merge" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_all        = @{ ^"all" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_any        = @{ ^"any" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_none       = @{ ^"none" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_single     = @{ ^"single" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_delete     = @{ ^"delete" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_detach     = @{ ^"detach" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_set        = @{ ^"set" ~ !(ASCII_ALPHANUMERIC | "_") }

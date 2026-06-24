@@ -542,6 +542,23 @@ impl<'a> Analyzer<'a> {
                     }
                 }
             }
+            Expr::ListPredicate {
+                var, list, pred, ..
+            } => {
+                // list resolves in the outer scope; var is bound only while
+                // checking the predicate, then restored.
+                self.check_expr(list);
+                let prev = self.scope.insert(var.clone(), Vec::new());
+                self.check_expr(pred);
+                match prev {
+                    Some(v) => {
+                        self.scope.insert(var.clone(), v);
+                    }
+                    None => {
+                        self.scope.remove(var);
+                    }
+                }
+            }
             // Literals, parameters, star — no variable references
             Expr::Literal(_) | Expr::Parameter(_) | Expr::Star => {}
         }

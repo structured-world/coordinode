@@ -3595,6 +3595,14 @@ fn collect_expr_variables_inner(expr: &Expr, vars: &mut Vec<String>) {
             collect_expr_variables_inner(expr, &mut inner);
             vars.extend(inner.into_iter().filter(|v| v != acc && v != var));
         }
+        Expr::ListPredicate {
+            var, list, pred, ..
+        } => {
+            collect_expr_variables_inner(list, vars);
+            let mut inner = Vec::new();
+            collect_expr_variables_inner(pred, &mut inner);
+            vars.extend(inner.into_iter().filter(|v| v != var));
+        }
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Star => {}
     }
 }

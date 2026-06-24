@@ -6300,6 +6300,15 @@ fn collect_expr_vars(expr: &Expr, vars: &mut Vec<String>) {
             collect_expr_vars(expr, &mut inner);
             vars.extend(inner.into_iter().filter(|v| v != acc && v != var));
         }
+        Expr::ListPredicate {
+            var, list, pred, ..
+        } => {
+            collect_expr_vars(list, vars);
+            // var is bound locally — exclude it from the predicate's outer deps.
+            let mut inner = Vec::new();
+            collect_expr_vars(pred, &mut inner);
+            vars.extend(inner.into_iter().filter(|v| v != var));
+        }
         // Literal, Parameter, Star — no variable references.
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Star => {}
     }
