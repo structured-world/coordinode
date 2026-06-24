@@ -342,6 +342,7 @@ fn op_children(op: &LogicalOp) -> Vec<&LogicalOp> {
         LogicalOp::Merge { pattern, .. } | LogicalOp::Upsert { pattern, .. } => vec![pattern],
         LogicalOp::Union { inputs, .. } => inputs.iter().collect(),
         LogicalOp::Foreach { input, body, .. } => vec![input, body],
+        LogicalOp::CallSubquery { input, body, .. } => vec![input, body],
         _ => Vec::new(),
     }
 }
@@ -620,6 +621,23 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 variable: fc.variable.clone(),
                 list: fc.list.clone(),
                 body: Box::new(body),
+            })
+        }
+        Clause::CallSubquery(cs) => {
+            let input = current.unwrap_or(LogicalOp::Empty);
+            // Build the subquery body as an independent plan. A leading
+            // importing WITH lands on an Empty leaf (the executor injects the
+            // outer row there for correlation); an uncorrelated body starts
+            // with its own scan.
+            let mut body: Option<LogicalOp> = None;
+            for body_clause in &cs.body {
+                body = Some(apply_clause(body, body_clause)?);
+            }
+            let body = body.ok_or(PlanError::EmptyQuery)?;
+            Ok(LogicalOp::CallSubquery {
+                input: Box::new(input),
+                body: Box::new(body),
+                optional: cs.optional,
             })
         }
         Clause::Call(cc) => Ok(LogicalOp::ProcedureCall {
@@ -3513,12 +3531,31 @@ fn collect_op_variables(op: &LogicalOp) -> Vec<String> {
             }
             vars
         }
+        // Project (WITH / RETURN) is a scope barrier: only the projected
+        // columns survive. Return the OUTPUT variable names (alias, or the bare
+        // variable for `WITH a`); `*` passes the input scope through. This is
+        // what lets a correlated subquery's leading `WITH a` (whose input is an
+        // injected Empty leaf) expose `a` for a following bound-continuation
+        // MATCH.
+        LogicalOp::Project { input, items, .. } => {
+            let mut vars = Vec::new();
+            for item in items {
+                match &item.alias {
+                    Some(a) => vars.push(a.clone()),
+                    None => match &item.expr {
+                        Expr::Variable(v) => vars.push(v.clone()),
+                        Expr::Star => vars.extend(collect_op_variables(input)),
+                        _ => {}
+                    },
+                }
+            }
+            vars
+        }
         LogicalOp::Filter { input, .. }
         | LogicalOp::VectorFilter { input, .. }
         | LogicalOp::TextFilter { input, .. }
         | LogicalOp::EncryptedFilter { input, .. }
         | LogicalOp::Aggregate { input, .. }
-        | LogicalOp::Project { input, .. }
         | LogicalOp::Sort { input, .. }
         | LogicalOp::Limit { input, .. }
         | LogicalOp::Skip { input, .. } => collect_op_variables(input),

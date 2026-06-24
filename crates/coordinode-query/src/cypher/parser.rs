@@ -275,6 +275,10 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let fc = build_foreach_clause(pair)?;
             clauses.push(Clause::Foreach(fc));
         }
+        Rule::call_subquery_clause => {
+            let cs = build_call_subquery_clause(pair)?;
+            clauses.push(Clause::CallSubquery(cs));
+        }
         Rule::merge_clause => {
             let mc = build_merge_clause(pair)?;
             clauses.push(Clause::Merge(mc));
@@ -1594,6 +1598,31 @@ fn build_foreach_clause(pair: Pair<'_, Rule>) -> Result<ForeachClause, ParseErro
         list,
         body,
     })
+}
+
+fn build_call_subquery_clause(pair: Pair<'_, Rule>) -> Result<CallSubqueryClause, ParseError> {
+    let mut optional = false;
+    let mut body = Vec::new();
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::kw_optional => optional = true,
+            Rule::kw_call => {}
+            Rule::clause => {
+                let actual = first_inner(inner)?;
+                build_clause(actual, &mut body)?;
+            }
+            _ => {}
+        }
+    }
+
+    if body.is_empty() {
+        return Err(ParseError::Invalid(
+            "CALL subquery has no body clauses".into(),
+        ));
+    }
+
+    Ok(CallSubqueryClause { optional, body })
 }
 
 fn build_merge_clause(pair: Pair<'_, Rule>) -> Result<MergeClause, ParseError> {

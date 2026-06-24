@@ -484,10 +484,11 @@ pub struct ExecutionContext<'a> {
     /// `OPTIONAL MATCH (b)-[:R]->(c) WHERE c.x = a.y` where `a` comes
     /// from the outer MATCH scope.
     pub correlated_row: Option<Row>,
-    /// Per-iteration scope injected by `FOREACH`. When set, the `Empty` leaf
-    /// yields this row (instead of a bare empty row) so the body's update
-    /// operators see the outer bindings plus the bound loop variable. `None`
-    /// everywhere outside a FOREACH body, so non-FOREACH plans are unaffected.
+    /// Scope injected at the `Empty` leaf by `FOREACH` and `CALL { subquery }`.
+    /// When set, the `Empty` leaf yields this row (instead of a bare empty row)
+    /// so a FOREACH body sees the loop variable, and a correlated CALL body's
+    /// leading `WITH` can project imported outer variables. `None` everywhere
+    /// else, so ordinary plans are unaffected.
     pub foreach_scope: Option<Row>,
     /// Per-statement cache: NodeId → primary label string.
     ///
@@ -2752,6 +2753,36 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             }
             ctx.foreach_scope = prev_scope;
             Ok(input_rows)
+        }
+
+        LogicalOp::CallSubquery {
+            input,
+            body,
+            optional,
+        } => {
+            let input_rows = execute_op(input, ctx)?;
+            let prev_scope = ctx.foreach_scope.take();
+            let mut result = Vec::new();
+            for row in &input_rows {
+                // Inject the outer row at the body's Empty leaf so a leading
+                // importing WITH can project the correlated variables. An
+                // uncorrelated body (its own scan leaf) ignores this.
+                ctx.foreach_scope = Some(row.clone());
+                let sub_rows = execute_op(body, ctx)?;
+                if sub_rows.is_empty() && *optional {
+                    // OPTIONAL CALL: keep the outer row; subquery columns read
+                    // as NULL since they are absent.
+                    result.push(row.clone());
+                } else {
+                    for sr in sub_rows {
+                        let mut merged = row.clone();
+                        merged.extend(sr);
+                        result.push(merged);
+                    }
+                }
+            }
+            ctx.foreach_scope = prev_scope;
+            Ok(result)
         }
 
         LogicalOp::CreateNode {

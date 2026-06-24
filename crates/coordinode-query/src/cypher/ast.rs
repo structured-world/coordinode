@@ -41,34 +41,35 @@ impl Query {
     /// `writeConcern >= majority` to avoid dangling `operationTime` references
     /// when the leader crashes before replicating.
     pub fn is_write(&self) -> bool {
-        let branch_is_write = |clauses: &[Clause]| {
-            clauses.iter().any(|c| {
-                matches!(
-                    c,
-                    Clause::Create(_)
-                        | Clause::Merge(_)
-                        | Clause::MergeMany(_)
-                        | Clause::Upsert(_)
-                        | Clause::Delete(_)
-                        | Clause::Set(_, _)
-                        | Clause::Remove(_)
-                        | Clause::DetachDocument(_)
-                        | Clause::AttachDocument(_)
-                        | Clause::AlterLabel(_)
-                        | Clause::CreateTextIndex(_)
-                        | Clause::DropTextIndex(_)
-                        | Clause::CreateEncryptedIndex(_)
-                        | Clause::DropEncryptedIndex(_)
-                        | Clause::CreateIndex(_)
-                        | Clause::DropIndex(_)
-                        | Clause::CreateVectorIndex(_)
-                        | Clause::DropVectorIndex(_)
-                        | Clause::CreateEdgeType(_)
-                        | Clause::CreateNodeType(_)
-                        | Clause::Foreach(_)
-                )
-            })
-        };
+        fn clause_is_write(c: &Clause) -> bool {
+            match c {
+                Clause::Create(_)
+                | Clause::Merge(_)
+                | Clause::MergeMany(_)
+                | Clause::Upsert(_)
+                | Clause::Delete(_)
+                | Clause::Set(_, _)
+                | Clause::Remove(_)
+                | Clause::DetachDocument(_)
+                | Clause::AttachDocument(_)
+                | Clause::AlterLabel(_)
+                | Clause::CreateTextIndex(_)
+                | Clause::DropTextIndex(_)
+                | Clause::CreateEncryptedIndex(_)
+                | Clause::DropEncryptedIndex(_)
+                | Clause::CreateIndex(_)
+                | Clause::DropIndex(_)
+                | Clause::CreateVectorIndex(_)
+                | Clause::DropVectorIndex(_)
+                | Clause::CreateEdgeType(_)
+                | Clause::CreateNodeType(_)
+                | Clause::Foreach(_) => true,
+                // A subquery is a write iff its body contains a write clause.
+                Clause::CallSubquery(cs) => cs.body.iter().any(clause_is_write),
+                _ => false,
+            }
+        }
+        let branch_is_write = |clauses: &[Clause]| clauses.iter().any(clause_is_write);
         branch_is_write(&self.clauses) || self.unions.iter().any(|b| branch_is_write(&b.clauses))
     }
 }
@@ -169,6 +170,22 @@ pub enum Clause {
     /// only updating clauses (CREATE / MERGE / SET / REMOVE / DELETE) and
     /// nested FOREACH.
     Foreach(ForeachClause),
+
+    /// `CALL { <subquery> }` / `OPTIONAL CALL { <subquery> }` — run an inner
+    /// query, joining its result columns onto the outer rows. A leading
+    /// `WITH <vars>` in the body imports outer variables (correlated execution).
+    CallSubquery(CallSubqueryClause),
+}
+
+/// `CALL { subquery }` block. The body is a full inner query ending in RETURN.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallSubqueryClause {
+    /// `true` for `OPTIONAL CALL` — keep the outer row (with NULLs for the
+    /// subquery columns) when the subquery yields no rows.
+    pub optional: bool,
+    /// Inner query clauses. A leading `WITH` listing outer variables makes the
+    /// subquery correlated; those variables are bound from the outer row.
+    pub body: Vec<Clause>,
 }
 
 /// `FOREACH (variable IN list | body)` loop over a list, applying updates.

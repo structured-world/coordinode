@@ -695,6 +695,75 @@ fn is_typed_predicate_end_to_end() {
     assert_eq!(results[0].get("f"), Some(&Value::Bool(true)));
 }
 
+/// Correlated `CALL { WITH a ... }` imports the outer variable and joins the
+/// subquery rows onto each outer row.
+#[test]
+fn call_subquery_correlated_end_to_end() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    // Alice KNOWS Bob and Charlie → two rows.
+    let results = run_cypher(
+        "MATCH (a:Person {name: 'Alice'}) \
+         CALL { WITH a MATCH (a)-[:KNOWS]->(b) RETURN b.name AS friend } \
+         RETURN a.name AS name, friend",
+        engine,
+        &mut interner,
+    );
+    let mut friends: Vec<String> = results
+        .iter()
+        .filter_map(|r| match r.get("friend") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    friends.sort();
+    assert_eq!(friends, vec!["Bob".to_string(), "Charlie".to_string()]);
+    // Outer variable is preserved on every joined row.
+    assert!(results
+        .iter()
+        .all(|r| r.get("name") == Some(&Value::String("Alice".into()))));
+}
+
+/// Uncorrelated `CALL { ... }` runs independently and joins to the outer row.
+#[test]
+fn call_subquery_uncorrelated_end_to_end() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    let results = run_cypher(
+        "MATCH (a:Person {name: 'Alice'}) \
+         CALL { MATCH (x:Person {name: 'Dave'}) RETURN x.name AS dn } \
+         RETURN a.name AS name, dn",
+        engine,
+        &mut interner,
+    );
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get("name"), Some(&Value::String("Alice".into())));
+    assert_eq!(results[0].get("dn"), Some(&Value::String("Dave".into())));
+}
+
+/// `OPTIONAL CALL { ... }` keeps the outer row (NULL columns) when the
+/// subquery yields nothing.
+#[test]
+fn optional_call_subquery_keeps_outer_row() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    // Dave has no outgoing KNOWS edge → subquery empty → row preserved.
+    let results = run_cypher(
+        "MATCH (a:Person {name: 'Dave'}) \
+         OPTIONAL CALL { WITH a MATCH (a)-[:KNOWS]->(b) RETURN b.name AS friend } \
+         RETURN a.name AS name, friend",
+        engine,
+        &mut interner,
+    );
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get("name"), Some(&Value::String("Dave".into())));
+    // friend column is absent/NULL for the preserved row.
+    assert!(matches!(results[0].get("friend"), None | Some(Value::Null)));
+}
+
 /// `UNION` de-duplicates the combined result; `UNION ALL` keeps duplicates.
 #[test]
 fn union_dedup_and_all_end_to_end() {

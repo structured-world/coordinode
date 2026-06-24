@@ -2496,6 +2496,48 @@ fn foreach_multiple_body_clauses_parsed() {
 }
 
 #[test]
+fn call_subquery_parsed() {
+    // Correlated CALL with a leading importing WITH.
+    let q =
+        parse_ok("MATCH (a:Person) CALL { WITH a MATCH (a)-[:KNOWS]->(b) RETURN b } RETURN a, b");
+    let cs = q.clauses.iter().find_map(|c| match c {
+        Clause::CallSubquery(cs) => Some(cs),
+        _ => None,
+    });
+    let cs = cs.expect("expected a CALL subquery clause");
+    assert!(!cs.optional);
+    // body: WITH a, MATCH, RETURN b → at least 3 clauses
+    assert!(cs.body.len() >= 3);
+    assert!(matches!(cs.body[0], Clause::With(_)));
+}
+
+#[test]
+fn optional_call_subquery_parsed() {
+    let q = parse_ok("MATCH (a) OPTIONAL CALL { MATCH (x:Y) RETURN x } RETURN a, x");
+    if let Some(Clause::CallSubquery(cs)) = q
+        .clauses
+        .iter()
+        .find(|c| matches!(c, Clause::CallSubquery(_)))
+    {
+        assert!(cs.optional);
+    } else {
+        panic!("expected an OPTIONAL CALL subquery clause");
+    }
+}
+
+#[test]
+fn call_procedure_still_parses() {
+    // CALL proc(...) must NOT be captured by the subquery rule (the `{` after
+    // CALL disambiguates). `db.test()` routes to a plain procedure call.
+    let q = parse_ok("CALL db.test() YIELD value RETURN value");
+    assert!(q.clauses.iter().any(|c| matches!(c, Clause::Call(_))));
+    assert!(!q
+        .clauses
+        .iter()
+        .any(|c| matches!(c, Clause::CallSubquery(_))));
+}
+
+#[test]
 fn on_violation_skip_parsed() {
     // SET ... ON VIOLATION SKIP should set ViolationMode::Skip.
     let q = parse_ok("MATCH (n:X) SET n.y = 1 ON VIOLATION SKIP");

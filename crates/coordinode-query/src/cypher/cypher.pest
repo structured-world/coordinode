@@ -25,6 +25,7 @@ clause = {
   | with_clause
   | unwind_clause
   | as_of_timestamp_clause
+  | call_subquery_clause
   | call_clause
   | alter_label_clause
   | create_encrypted_index_clause
@@ -139,6 +140,13 @@ as_of_timestamp_clause = { kw_as ~ kw_of ~ kw_timestamp ~ expression }
 
 // --- CALL (procedure invocation) ---
 // CALL db.advisor.suggestions() YIELD id, severity, kind, ...
+
+// CALL { <subquery> } — execute an inner query per outer row. A leading
+// `WITH <vars>` inside the braces imports outer-scope variables (correlated);
+// without it the subquery is uncorrelated. `OPTIONAL CALL { ... }` keeps the
+// outer row (with NULLs) when the subquery returns no rows. Tried before
+// `call_clause`: the `{` after CALL disambiguates from `CALL proc(...)`.
+call_subquery_clause = { kw_optional? ~ kw_call ~ "{" ~ clause+ ~ "}" }
 
 call_clause = { kw_call ~ procedure_name ~ "(" ~ procedure_args? ~ ")" ~ yield_clause? }
 procedure_name = { identifier ~ ("." ~ identifier)* }

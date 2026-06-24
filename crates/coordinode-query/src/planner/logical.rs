@@ -815,6 +815,18 @@ pub enum LogicalOp {
         body: Box<LogicalOp>,
     },
 
+    /// `CALL { subquery }` / `OPTIONAL CALL { subquery }`: run the `body`
+    /// sub-plan per input row, joining its result columns onto each outer row.
+    /// A correlated body (leading `WITH` importing outer variables) reads the
+    /// per-row scope injected at its `Empty` leaf; an uncorrelated body scans
+    /// independently. When `optional` is set and the body yields no rows, the
+    /// outer row is preserved (NULLs for the subquery columns).
+    CallSubquery {
+        input: Box<LogicalOp>,
+        body: Box<LogicalOp>,
+        optional: bool,
+    },
+
     /// Empty input (no rows, used as leaf for standalone CREATE).
     Empty,
 }
@@ -897,6 +909,10 @@ impl LogicalOp {
             } => {
                 input.substitute_params(params);
                 list.substitute_params(params);
+                body.substitute_params(params);
+            }
+            LogicalOp::CallSubquery { input, body, .. } => {
+                input.substitute_params(params);
                 body.substitute_params(params);
             }
             LogicalOp::CreateNode {
@@ -1522,6 +1538,23 @@ fn estimate_op_cost(
             )
         }
 
+        LogicalOp::CallSubquery {
+            input,
+            body,
+            optional,
+        } => {
+            let (input_cost, input_rows) = estimate_op_cost(input, defaults, stats, hints);
+            let (body_cost, body_rows) = estimate_op_cost(body, defaults, stats, hints);
+            // Body runs once per outer row; output joins outer rows with
+            // subquery rows (at least input rows when OPTIONAL).
+            let joined = if *optional {
+                (input_rows * body_rows).max(input_rows)
+            } else {
+                input_rows * body_rows
+            };
+            (input_cost + input_rows * body_cost, joined)
+        }
+
         LogicalOp::VectorFilter {
             input, threshold, ..
         } => {
@@ -1967,6 +2000,20 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             ..
         } => {
             output.push_str(&format!("{prefix}Foreach({variable})\n"));
+            explain_op(input, indent + 1, output);
+            explain_op(body, indent + 1, output);
+        }
+        LogicalOp::CallSubquery {
+            input,
+            body,
+            optional,
+        } => {
+            let kind = if *optional {
+                "OptionalCallSubquery"
+            } else {
+                "CallSubquery"
+            };
+            output.push_str(&format!("{prefix}{kind}\n"));
             explain_op(input, indent + 1, output);
             explain_op(body, indent + 1, output);
         }

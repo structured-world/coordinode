@@ -397,6 +397,19 @@ fn write_clause(buf: &mut String, clause: &Clause) {
             }
             buf.push(')');
         }
+        Clause::CallSubquery(cs) => {
+            if cs.optional {
+                buf.push_str("OPTIONAL ");
+            }
+            buf.push_str("CALL { ");
+            for (i, c) in cs.body.iter().enumerate() {
+                if i > 0 {
+                    buf.push(' ');
+                }
+                write_clause(buf, c);
+            }
+            buf.push_str(" }");
+        }
     }
 }
 

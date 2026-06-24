@@ -404,6 +404,8 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
 
         LogicalOp::Foreach { input, body, .. } => vec![input, body],
 
+        LogicalOp::CallSubquery { input, body, .. } => vec![input, body],
+
         LogicalOp::CreateIndex { .. }
         | LogicalOp::DropIndex { .. }
         | LogicalOp::IndexScan { .. } => vec![],

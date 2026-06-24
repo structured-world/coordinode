@@ -338,6 +338,21 @@ impl<'a> Analyzer<'a> {
                     }
                 }
             }
+            Clause::CallSubquery(cs) => {
+                // The subquery runs in its own scope. A leading `WITH` imports
+                // outer variables (so we keep the current scope visible while
+                // analyzing the body); the body's final RETURN columns become
+                // available to subsequent outer clauses.
+                let outer = self.scope.clone();
+                for body_clause in &cs.body {
+                    self.analyze_clause(body_clause);
+                }
+                // Variables introduced by the subquery's RETURN remain in scope;
+                // restore the outer variables that the body may have shadowed.
+                for (k, v) in outer {
+                    self.scope.entry(k).or_insert(v);
+                }
+            }
         }
     }
 
