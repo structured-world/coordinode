@@ -514,6 +514,36 @@ fn string_escape() {
 }
 
 #[test]
+fn string_literal_preserves_edge_whitespace() {
+    // A whitespace-padded (or whitespace-only) string literal must keep its
+    // spaces — the grammar's compound-atomic rule stops implicit WHITESPACE
+    // from stripping them. Regression: ' ' previously parsed to "".
+    let q = parse_ok("MATCH (n) WHERE n.name = '  hi ' RETURN n");
+    if let Clause::Match(ref m) = q.clauses[0] {
+        let w = m.where_clause.as_ref().unwrap();
+        if let Expr::BinaryOp { right, .. } = w {
+            assert_eq!(**right, Expr::Literal(Value::String("  hi ".to_string())));
+        } else {
+            panic!("expected binary op");
+        }
+    } else {
+        panic!("expected match clause");
+    }
+
+    let q = parse_ok("MATCH (n) WHERE n.sep = ' ' RETURN n");
+    if let Clause::Match(ref m) = q.clauses[0] {
+        let w = m.where_clause.as_ref().unwrap();
+        if let Expr::BinaryOp { right, .. } = w {
+            assert_eq!(**right, Expr::Literal(Value::String(" ".to_string())));
+        } else {
+            panic!("expected binary op");
+        }
+    } else {
+        panic!("expected match clause");
+    }
+}
+
+#[test]
 fn boolean_literals() {
     let q = parse_ok("MATCH (n) WHERE n.active = true RETURN n");
     if let Clause::Match(ref m) = q.clauses[0] {

@@ -646,7 +646,12 @@ float_literal   = @{
 
 integer_literal = @{ ASCII_DIGIT+ }
 
-string_literal = {
+// Compound-atomic ($): no implicit WHITESPACE between the quotes and the
+// content, so leading/trailing/whitespace-only string literals (e.g. ' ' or
+// '  hi ') keep their spaces. Inner content rules still emit tokens for the
+// builder. A plain `{ ... }` rule lets pest insert optional WHITESPACE at each
+// `~`, which silently strips edge whitespace from string literals.
+string_literal = ${
     "'" ~ single_string_content ~ "'"
   | "\"" ~ double_string_content ~ "\""
 }
