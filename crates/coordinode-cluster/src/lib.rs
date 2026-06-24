@@ -198,6 +198,7 @@
 pub mod error;
 pub mod migration;
 pub mod routing;
+pub mod shard_map;
 pub mod state_machine;
 pub mod topology;
 pub mod types;
@@ -210,6 +211,7 @@ pub use migration::{
     PlannerContext, TransferMode,
 };
 pub use routing::{ShardRouting, SingleShardRouting};
+pub use shard_map::{ChunkAssignment, ChunkAssignmentTable, ChunkRange};
 pub use state_machine::{
     BackendError, ContextId, HealthEvent, OperationFilter, OperationId, OperationState,
     OperationStatus, OperationSummary, Progress, StateLabel, StateMachineBackend,
