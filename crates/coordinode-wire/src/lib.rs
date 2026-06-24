@@ -20,15 +20,50 @@
 use core::marker::PhantomData;
 use std::io::Read;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::OnceLock;
 
 use bytes::{Buf, BufMut};
 use prost::Message;
 use structured_zstd::decoding::StreamingDecoder;
 use structured_zstd::encoding::{compress_slice_to_vec, CompressionLevel};
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 use tonic::Status;
 
 pub mod tls;
+
+/// Process-wide outbound TLS config for inter-node gRPC clients (the Raft network
+/// and segment-transfer drain). Set once at startup from config when inter-node
+/// TLS is enabled; `None` (never set) means plaintext outbound connections. The
+/// node's own certificate is a single per-process identity, so one config covers
+/// every peer dial, mirroring [`set_wire_zstd_level`].
+static WIRE_CLIENT_TLS: OnceLock<ClientTlsConfig> = OnceLock::new();
+
+/// Install the outbound inter-node client TLS config. Call once at startup,
+/// before any peer connection is opened; later calls are ignored.
+pub fn set_wire_client_tls(config: ClientTlsConfig) {
+    let _ = WIRE_CLIENT_TLS.set(config);
+}
+
+/// The installed outbound client TLS config, or `None` when inter-node TLS is
+/// off. Outbound connectors apply it to their endpoint before dialing a peer.
+#[must_use]
+pub fn wire_client_tls() -> Option<ClientTlsConfig> {
+    WIRE_CLIENT_TLS.get().cloned()
+}
+
+/// Build an outbound [`ClientTlsConfig`] from PEM bytes: `ca_pem` is the trust
+/// root that verifies the peer's certificate; `identity` is this node's
+/// `(cert_pem, key_pem)`, presented when the peer enforces mutual TLS (harmless
+/// otherwise). Pair with [`set_wire_client_tls`] at startup.
+#[must_use]
+pub fn build_client_tls(ca_pem: &[u8], identity: Option<(Vec<u8>, Vec<u8>)>) -> ClientTlsConfig {
+    let mut config = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem));
+    if let Some((cert_pem, key_pem)) = identity {
+        config = config.identity(Identity::from_pem(cert_pem, key_pem));
+    }
+    config
+}
 
 /// Process-global transport zstd level (C-zstd numbering). Positive 1..=22 trade
 /// speed for ratio; NEGATIVE values select zstd ultra-fast modes (fastest, lowest

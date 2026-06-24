@@ -106,7 +106,7 @@ impl GrpcNetwork {
         &mut self,
     ) -> Result<&mut RaftServiceClient<tonic::transport::Channel>, RPCError<C>> {
         if self.client.is_none() {
-            let endpoint = tonic::transport::Endpoint::from_shared(self.addr.clone())
+            let mut endpoint = tonic::transport::Endpoint::from_shared(self.addr.clone())
                 .map_err(|e| {
                     RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
@@ -115,6 +115,17 @@ impl GrpcNetwork {
                 })?
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(Duration::from_secs(30));
+
+            // Encrypt the peer connection when inter-node TLS is configured
+            // (process-global, set once at startup). Off = plaintext.
+            if let Some(tls) = coordinode_wire::wire_client_tls() {
+                endpoint = endpoint.tls_config(tls).map_err(|e| {
+                    RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("peer TLS config for '{}': {e}", self.addr),
+                    )))
+                })?;
+            }
 
             // connect_lazy() returns immediately without establishing a TCP
             // connection. The underlying hyper Channel will connect on first

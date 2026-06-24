@@ -698,18 +698,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| format!("read tls cert {cert_path}: {e}"))?;
                 let key =
                     std::fs::read(key_path).map_err(|e| format!("read tls key {key_path}: {e}"))?;
-                let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(cert, key));
+                // Read the CA once if configured: it verifies connecting clients
+                // (server-side mTLS) and the peers we dial (outbound client side).
+                let ca = match tls_ca.as_ref() {
+                    Some(ca_path) => Some(
+                        std::fs::read(ca_path)
+                            .map_err(|e| format!("read tls ca {ca_path}: {e}"))?,
+                    ),
+                    None => None,
+                };
+                let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(&cert, &key));
                 if tls_require_client_auth {
-                    let ca_path = tls_ca
+                    let ca = ca
                         .as_ref()
                         .ok_or("--tls-require-client-auth requires --tls-ca")?;
-                    let ca = std::fs::read(ca_path)
-                        .map_err(|e| format!("read tls ca {ca_path}: {e}"))?;
                     tls = tls.client_ca_root(Certificate::from_pem(ca));
                 }
                 server = server
                     .tls_config(tls)
                     .map_err(|e| format!("tls config: {e}"))?;
+                // Outbound inter-node TLS (Raft network + segment drain): verify
+                // peers against the CA and present our identity for mutual TLS.
+                // Without a CA the node serves TLS but cannot verify peers, so a
+                // TLS cluster would not interconnect; keep outbound plaintext and
+                // warn rather than dial unverified.
+                match ca {
+                    Some(ca) => {
+                        let client_tls = coordinode_wire::build_client_tls(&ca, Some((cert, key)));
+                        coordinode_wire::set_wire_client_tls(client_tls);
+                    }
+                    None => tracing::warn!(
+                        "gRPC TLS enabled without --tls-ca: outbound peer connections stay \
+                         plaintext; set --tls-ca to interconnect a TLS cluster"
+                    ),
+                }
                 info!(mtls = tls_require_client_auth, "gRPC TLS enabled");
             }
 

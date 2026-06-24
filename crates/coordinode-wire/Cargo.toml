@@ -8,7 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["tls-webpki-roots"] }
 prost = { workspace = true }
 bytes = { workspace = true }
 # Pure-Rust zstd (no C FFI, ADR-013) for transport compression.

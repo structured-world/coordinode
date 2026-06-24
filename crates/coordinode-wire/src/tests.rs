@@ -100,3 +100,24 @@ fn wire_level_set_and_get() {
     set_wire_zstd_level(3);
     assert_eq!(wire_zstd_level(), 3);
 }
+
+#[test]
+fn client_tls_global_unset_then_set() {
+    // Relies on nextest per-test process isolation: no other test sets the
+    // process-global, so it starts unset here.
+    assert!(wire_client_tls().is_none(), "client TLS unset by default");
+
+    let key = rcgen::KeyPair::generate().expect("keypair");
+    let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .expect("params")
+        .self_signed(&key)
+        .expect("self-sign");
+    let cert_pem = cert.pem().into_bytes();
+    let key_pem = key.serialize_pem().into_bytes();
+
+    // Build with our own identity (self-signed cert as both anchor and identity)
+    // and install it; the getter must then hand back a usable config.
+    let cfg = build_client_tls(&cert_pem, Some((cert_pem.clone(), key_pem)));
+    set_wire_client_tls(cfg);
+    assert!(wire_client_tls().is_some(), "client TLS visible after set");
+}

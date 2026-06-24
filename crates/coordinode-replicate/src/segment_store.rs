@@ -186,12 +186,26 @@ pub async fn drain_segment_to_peer(
     let frames =
         crate::transfer::frames_for(&store, seg).map_err(|e| DrainError::Pieces(e.to_string()))?;
 
-    let mut client = SegmentTransferServiceClient::connect(endpoint.to_string())
-        .await
-        .map_err(|source| DrainError::Connect {
+    let mut ep =
+        tonic::transport::Endpoint::from_shared(endpoint.to_string()).map_err(|source| {
+            DrainError::Connect {
+                endpoint: endpoint.to_string(),
+                source,
+            }
+        })?;
+    // Encrypt the drain connection when inter-node TLS is configured
+    // (process-global, set once at startup). Off = plaintext.
+    if let Some(tls) = coordinode_wire::wire_client_tls() {
+        ep = ep.tls_config(tls).map_err(|source| DrainError::Connect {
             endpoint: endpoint.to_string(),
             source,
         })?;
+    }
+    let channel = ep.connect().await.map_err(|source| DrainError::Connect {
+        endpoint: endpoint.to_string(),
+        source,
+    })?;
+    let mut client = SegmentTransferServiceClient::new(channel);
     let ack = client
         .transfer_pieces(futures_util::stream::iter(frames))
         .await?
