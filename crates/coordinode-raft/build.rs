@@ -32,6 +32,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        // Inter-node RaftService RPCs travel zstd-compressed on the wire via the
+        // pure-Rust transport codec (no C FFI). Both generated client and server
+        // use it, so the framing stays symmetric.
+        .codec_path("crate::codec::ZstdCodec")
         .compile_protos(&[raft_proto], &[proto_root_str])?;
 
     Ok(())
