@@ -408,6 +408,96 @@ async fn cluster_multiple_proposals_replicate() {
     assert!(result.is_ok(), "TIMED OUT — multi-proposal replicate");
 }
 
+/// Runtime voter↔learner transitions (R-PROD2): demote a voter to a learner
+/// (cluster keeps working at 2-voter quorum, the demoted node still receives
+/// replication), then promote it back to a voter — all live, no restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn cluster_voter_learner_transitions() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let (n1, n2, n3, _, _, _) = bootstrap_3_node().await;
+        let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+
+        // All three are voters at bootstrap.
+        let mut voters = n1.node.voter_ids();
+        voters.sort_unstable();
+        assert_eq!(voters, vec![1, 2, 3], "bootstrap should have 3 voters");
+
+        // Demote node 3 → learner. It leaves the voter set but stays in the cluster.
+        n1.node.demote_to_learner(3).await.expect("demote node 3");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut voters = n1.node.voter_ids();
+        voters.sort_unstable();
+        assert_eq!(
+            voters,
+            vec![1, 2],
+            "after demote, node 3 is no longer a voter"
+        );
+
+        // Cluster still commits at 2-voter quorum, and the demoted learner still
+        // receives the replicated write.
+        let proposal = RaftProposal {
+            id: id_gen.next(),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:1:after-demote".to_vec(),
+                value: b"committed".to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(400),
+            start_ts: Timestamp::from_raw(399),
+            bypass_rate_limiter: false,
+        };
+        n1.node
+            .pipeline()
+            .propose_and_wait(&proposal)
+            .expect("propose after demote");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(
+            n3.engine
+                .get(Partition::Node, b"node:1:after-demote")
+                .expect("read learner")
+                .as_deref(),
+            Some(b"committed".as_slice()),
+            "demoted learner must still receive replication"
+        );
+
+        // Demoting again is idempotent; demoting below 2 voters is rejected.
+        n1.node
+            .demote_to_learner(3)
+            .await
+            .expect("demote idempotent");
+        assert!(
+            n1.node.demote_to_learner(2).await.is_err(),
+            "demoting to 1 voter must be rejected by the quorum gate"
+        );
+
+        // Promote node 3 back to voter.
+        n1.node.promote_to_voter(3).await.expect("promote node 3");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut voters = n1.node.voter_ids();
+        voters.sort_unstable();
+        assert_eq!(
+            voters,
+            vec![1, 2, 3],
+            "after promote, node 3 is a voter again"
+        );
+
+        n1.node.shutdown().await.expect("shutdown 1");
+        n2.node.shutdown().await.expect("shutdown 2");
+        n3.node.shutdown().await.expect("shutdown 3");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — cluster_voter_learner_transitions"
+    );
+}
+
 /// Remove a node from cluster — membership shrinks, cluster continues working.
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_remove_node() {

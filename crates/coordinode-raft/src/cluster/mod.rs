@@ -664,6 +664,113 @@ impl RaftNode {
         Ok(())
     }
 
+    /// Promote an existing learner to a voter at runtime (ADR-031 Raft-role
+    /// transition; leader-only).
+    ///
+    /// The node must already be a learner (added via [`add_node`](Self::add_node)
+    /// and caught up on replication). Adds it to the voter set via openraft
+    /// `change_membership`; the change commits cluster-wide and takes effect live
+    /// with no process restart. Idempotent: a no-op (returns `Ok`) when the node
+    /// is already a voter.
+    ///
+    /// # Errors
+    /// - `Membership(…)` if this node is not the leader, the target is not a
+    ///   known learner, or openraft rejects the membership change.
+    pub async fn promote_to_voter(&self, node_id: u64) -> Result<(), RaftNodeError> {
+        use openraft::async_runtime::watch::WatchReceiver;
+
+        let current_voters: std::collections::BTreeSet<u64> = {
+            let metrics = self.raft.metrics().borrow_watched().clone();
+            let joint = metrics.membership_config.membership().get_joint_config();
+            joint
+                .first()
+                .map(|voters| voters.iter().copied().collect())
+                .unwrap_or_default()
+        };
+
+        // Idempotent: already a voter → nothing to do.
+        if current_voters.contains(&node_id) {
+            return Ok(());
+        }
+
+        let mut new_members = current_voters;
+        new_members.insert(node_id);
+
+        self.raft
+            .change_membership(new_members, false)
+            .await
+            .map_err(|e| RaftNodeError::Membership(format!("promote_to_voter failed: {e}")))?;
+
+        tracing::info!(node_id, "promoted learner to voter");
+        Ok(())
+    }
+
+    /// Demote a voter back to a learner at runtime (ADR-031 Raft-role
+    /// transition; leader-only). The node keeps receiving log replication but
+    /// stops voting — distinct from [`decommission_node`](Self::decommission_node)
+    /// / [`remove_node`](Self::remove_node), which drop the node from the cluster
+    /// entirely.
+    ///
+    /// Removes the node from the voter set with openraft `change_membership(…,
+    /// retain = true)`, so the demoted node is retained as a learner. The change
+    /// commits cluster-wide and takes effect live with no restart. Idempotent: a
+    /// no-op when the node is not a voter.
+    ///
+    /// # Errors
+    /// - `Membership("would leave N voter(s) …")` if the demotion would drop the
+    ///   voter set below the CE minimum of 2.
+    /// - `Membership("node … is the current leader …")` if the target is the
+    ///   leader (transfer leadership first).
+    /// - `Membership(…)` if this node is not the leader or openraft rejects it.
+    pub async fn demote_to_learner(&self, node_id: u64) -> Result<(), RaftNodeError> {
+        use openraft::async_runtime::watch::WatchReceiver;
+
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        let current_voters: std::collections::BTreeSet<u64> = {
+            let joint = metrics.membership_config.membership().get_joint_config();
+            joint
+                .first()
+                .map(|voters| voters.iter().copied().collect())
+                .unwrap_or_default()
+        };
+
+        // Idempotent: not a voter → already a learner (or unknown), nothing to do.
+        if !current_voters.contains(&node_id) {
+            return Ok(());
+        }
+
+        // Quorum gate — CE requires ≥ 2 voters after demotion.
+        let remaining = current_voters.len().saturating_sub(1);
+        if remaining < 2 {
+            return Err(RaftNodeError::Membership(format!(
+                "cannot demote node {node_id}: would leave {remaining} voter(s), \
+                 minimum 2 required for CE cluster quorum"
+            )));
+        }
+
+        // The leader cannot demote itself out of the voter set in place — a
+        // different node must be leader first (mirror of decommission_node).
+        if metrics.current_leader == Some(node_id) {
+            return Err(RaftNodeError::Membership(format!(
+                "node {node_id} is the current Raft leader — transfer leadership before demoting"
+            )));
+        }
+
+        let new_members: std::collections::BTreeSet<u64> = current_voters
+            .into_iter()
+            .filter(|&id| id != node_id)
+            .collect();
+
+        // retain = true: the removed voter stays as a learner (keeps replicating).
+        self.raft
+            .change_membership(new_members, true)
+            .await
+            .map_err(|e| RaftNodeError::Membership(format!("demote_to_learner failed: {e}")))?;
+
+        tracing::info!(node_id, "demoted voter to learner");
+        Ok(())
+    }
+
     /// Create a [`RaftProposalPipeline`] for submitting proposals.
     ///
     /// The pipeline can be shared across threads via `Arc`. It includes
@@ -785,6 +892,16 @@ impl RaftNode {
     pub fn current_term(&self) -> u64 {
         use openraft::async_runtime::watch::WatchReceiver;
         self.raft.metrics().borrow_watched().current_term
+    }
+
+    /// The current voter node IDs from the live Raft membership config. A node
+    /// that has been demoted to a learner ([`demote_to_learner`](Self::demote_to_learner))
+    /// is absent here even though it still receives replication.
+    pub fn voter_ids(&self) -> Vec<u64> {
+        use openraft::async_runtime::watch::WatchReceiver;
+        let rx = self.raft.metrics();
+        let m = rx.borrow_watched();
+        m.membership_config.membership().voter_ids().collect()
     }
 
     /// Get the current leader node ID, if known.
