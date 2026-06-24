@@ -1259,6 +1259,17 @@ impl StorageEngine {
         Ok(Box::new(tree.prefix(prefix, seqno, None)))
     }
 
+    /// Prefix scan in descending key order (high to low) — the reverse-iteration
+    /// counterpart of [`Self::prefix_scan`], walking the same double-ended LSM
+    /// iterator from its high end. A "latest" / "last N within a prefix"
+    /// consumer reads from the top and stops early instead of scanning the whole
+    /// prefix and sorting.
+    pub fn prefix_scan_rev(&self, part: Partition, prefix: &[u8]) -> StorageResult<StorageIter> {
+        let tree = self.tree(part)?;
+        let seqno = self.coordinator.current_seqno();
+        Ok(Box::new(tree.prefix(prefix, seqno, None).rev()))
+    }
+
     /// Keys touched (written, merged, or deleted) strictly after
     /// `since_seqno`, deduplicated and sorted. The O(delta) basis for
     /// incremental snapshots: the lsm-tree surfaces only the keys whose
@@ -1342,6 +1353,20 @@ impl StorageEngine {
         end: &[u8],
     ) -> StorageResult<StorageIter> {
         self.coordinator.range_scan(part, start, end)
+    }
+
+    /// Inclusive-bounded range scan in descending key order (high to low) — the
+    /// reverse-iteration counterpart of [`Self::range_scan`]. A
+    /// `descending … LIMIT n` consumer takes `n` from the high end and stops,
+    /// avoiding a full forward scan + in-memory sort. Same `[start, end]`
+    /// inclusive bounds.
+    pub fn range_scan_rev(
+        &self,
+        part: Partition,
+        start: &[u8],
+        end: &[u8],
+    ) -> StorageResult<StorageIter> {
+        self.coordinator.range_scan_rev(part, start, end)
     }
 
     /// Seekable range scan over `[start, end]` at `seqno`. The returned iterator

@@ -135,6 +135,57 @@ fn range_scan_skips_keys_outside_window() {
 }
 
 #[test]
+fn range_scan_rev_yields_descending_and_stops_early() {
+    let (_dir, engine) = open_engine();
+    for k in [b"a" as &[u8], b"b", b"c", b"d", b"e"] {
+        engine.put(Partition::Node, k, b"v").expect("put");
+    }
+    // Full reverse range → keys in descending order.
+    let keys: Vec<Vec<u8>> = engine
+        .range_scan_rev(Partition::Node, b"a", b"e")
+        .expect("rev range")
+        .map(|g| g.into_inner().unwrap().0.to_vec())
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            b"e".to_vec(),
+            b"d".to_vec(),
+            b"c".to_vec(),
+            b"b".to_vec(),
+            b"a".to_vec()
+        ],
+    );
+
+    // `descending … LIMIT 2` reads the two largest from the high end without
+    // walking the whole range (lazy take on the reverse iterator).
+    let top2: Vec<Vec<u8>> = engine
+        .range_scan_rev(Partition::Node, b"a", b"e")
+        .expect("rev range")
+        .take(2)
+        .map(|g| g.into_inner().unwrap().0.to_vec())
+        .collect();
+    assert_eq!(top2, vec![b"e".to_vec(), b"d".to_vec()]);
+}
+
+#[test]
+fn prefix_scan_rev_yields_descending() {
+    let (_dir, engine) = open_engine();
+    for k in [b"p:1" as &[u8], b"p:2", b"p:3"] {
+        engine.put(Partition::Node, k, b"v").expect("put");
+    }
+    let keys: Vec<Vec<u8>> = engine
+        .prefix_scan_rev(Partition::Node, b"p:")
+        .expect("rev prefix")
+        .map(|g| g.into_inner().unwrap().0.to_vec())
+        .collect();
+    assert_eq!(
+        keys,
+        vec![b"p:3".to_vec(), b"p:2".to_vec(), b"p:1".to_vec()],
+    );
+}
+
+#[test]
 fn range_scan_point_query_single_key() {
     // start == end → single-key probe via range API. Equivalent
     // to a get, but exercised through the range path (used by

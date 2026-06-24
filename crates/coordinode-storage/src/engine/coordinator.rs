@@ -318,6 +318,30 @@ pub trait MultiModalCoordinator: Send + Sync {
     /// `prefix_scan` would walk.
     fn range_scan(&self, part: Partition, start: &[u8], end: &[u8]) -> StorageResult<StorageIter>;
 
+    /// Inclusive-bounded range scan yielding entries in **descending** key
+    /// order (high to low). Backed by the same double-ended LSM iterator as
+    /// [`Self::range_scan`], walked from its high end via
+    /// [`DoubleEndedIterator::next_back`] — so a `descending … LIMIT n` consumer
+    /// stops after `n` instead of scanning the whole range and sorting in
+    /// memory. Same inclusive `[start, end]` bounds; same no-inversion-check
+    /// contract.
+    fn range_scan_rev(
+        &self,
+        part: Partition,
+        start: &[u8],
+        end: &[u8],
+    ) -> StorageResult<StorageIter> {
+        Ok(Box::new(self.range_scan(part, start, end)?.rev()))
+    }
+
+    /// Prefix scan yielding entries in **descending** key order (high to low) —
+    /// the reverse-iteration counterpart of [`Self::prefix_scan`]. Lets a
+    /// "latest" / "last N within a prefix" consumer read from the high end and
+    /// stop early.
+    fn prefix_scan_rev(&self, part: Partition, prefix: &[u8]) -> StorageResult<StorageIter> {
+        Ok(Box::new(self.prefix_scan(part, prefix)?.rev()))
+    }
+
     /// Seekable range scan over `[start, end]` at `seqno`: like [`Self::range_scan`]
     /// but the returned iterator can `seek_to` an arbitrary key mid-walk, so one
     /// open iterator can jump across disjoint subranges (skip-scan) without
