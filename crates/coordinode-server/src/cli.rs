@@ -206,6 +206,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
                     "--interactive-txn-idle-timeout-secs",
                 ),
                 interactive_txn_max_bytes: find_flag_num(args, "--interactive-txn-max-bytes"),
+                wire_compression_level: find_flag_num(args, "--wire-compression-level"),
             };
             Command::Serve {
                 config_path,
@@ -314,7 +315,8 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  [--rest-addr ADDR] [--ops-addr ADDR] [--data DIR] [--peers PEERS]\n          \
                  [--nofile N] [--max-connections N] [--max-request-size-mb N] [--request-timeout-secs N]\n          \
                  [--http2-keepalive-secs N] [--cache-size-mb N] [--write-buffer-mb N]\n          \
-                 [--retention-window-secs N] [--registry-heartbeat-ms N] [--registry-eviction-ms N]\n  \
+                 [--retention-window-secs N] [--registry-heartbeat-ms N] [--registry-eviction-ms N]\n          \
+                 [--wire-compression-level N]\n  \
                  coordinode backup --output FILE [--data DIR | --config FILE] [--format json|cypher|binary|snapshot] [--namespace NS] [--since SEQNO]\n  \
                  coordinode restore --input FILE [--data DIR | --config FILE] [--format json|cypher|binary|snapshot|apoc-json|apoc-cypher|hetio-json] [--namespace NS] [--only-labels L1,L2] [--force]\n  \
                  coordinode checkpoint --output DIR [--data DIR | --config FILE]\n  \

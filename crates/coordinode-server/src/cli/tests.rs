@@ -236,6 +236,22 @@ fn serve_resource_flags_parsed() {
 }
 
 #[test]
+fn serve_wire_compression_level_parsed_and_applied() {
+    use crate::config::ServerConfig;
+    let cmd = parse_args_from(&args("coordinode serve --wire-compression-level 22"));
+    match cmd {
+        Command::Serve { overrides, .. } => {
+            assert_eq!(overrides.wire_compression_level, Some(22));
+            let mut cfg = ServerConfig::default();
+            assert_eq!(cfg.wire_compression_level, 1, "default wire level is 1");
+            cfg.apply_overrides(&overrides);
+            assert_eq!(cfg.wire_compression_level, 22, "CLI override applied");
+        }
+        _ => panic!("expected Serve command"),
+    }
+}
+
+#[test]
 fn serve_resource_flags_default_to_none() {
     // Unset → None so the resolution step keeps config-file / built-in
     // defaults (incl. the 16 MiB request-size cap).

@@ -207,6 +207,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("config error: {e}"))?;
             cfg.apply_overrides(&overrides);
 
+            // Set the inter-node wire compression level before any gRPC service
+            // starts; the RaftService transport codec reads it per message.
+            coordinode_raft::codec::set_wire_zstd_level(cfg.wire_compression_level);
+
             // Resolve the operational mode from the merged string value, so a
             // mode set in the config file is validated exactly like a CLI flag.
             let mode = match config::ServeMode::parse(&cfg.mode) {
@@ -249,6 +253,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 interactive_txn_max_bytes,
                 peers: peers_vec,
                 mode: _,
+                // Already consumed above via set_wire_zstd_level before serving.
+                wire_compression_level: _,
             } = cfg;
             let peers = if peers_vec.is_empty() {
                 None

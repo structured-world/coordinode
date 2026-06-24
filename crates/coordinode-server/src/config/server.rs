@@ -104,6 +104,11 @@ pub struct ServerConfig {
     pub interactive_txn_idle_timeout_secs: u64,
     /// Max buffered (uncommitted) bytes per interactive transaction (ADR-042).
     pub interactive_txn_max_bytes: u64,
+    /// Inter-node gRPC transport zstd compression level (C-zstd numbering:
+    /// positive 1..=22 trade speed for ratio; negatives are ultra-fast). Applied
+    /// to RaftService wire traffic. Default 1 — fast, ~9x smaller on Raft
+    /// batches; raise on a bandwidth-constrained link (db4 geo).
+    pub wire_compression_level: i32,
 }
 
 impl Default for ServerConfig {
@@ -130,6 +135,7 @@ impl Default for ServerConfig {
             registry_eviction_ms: None,
             interactive_txn_idle_timeout_secs: 30,
             interactive_txn_max_bytes: 256 * 1024 * 1024,
+            wire_compression_level: 1,
         }
     }
 }
@@ -160,6 +166,7 @@ pub struct CliOverrides {
     pub registry_eviction_ms: Option<u64>,
     pub interactive_txn_idle_timeout_secs: Option<u64>,
     pub interactive_txn_max_bytes: Option<u64>,
+    pub wire_compression_level: Option<i32>,
 }
 
 impl ServerConfig {
@@ -219,6 +226,9 @@ impl ServerConfig {
         }
         if let Some(v) = o.max_request_size_mb {
             self.max_request_size_mb = v;
+        }
+        if let Some(v) = o.wire_compression_level {
+            self.wire_compression_level = v;
         }
         if o.request_timeout_secs.is_some() {
             self.request_timeout_secs = o.request_timeout_secs;
