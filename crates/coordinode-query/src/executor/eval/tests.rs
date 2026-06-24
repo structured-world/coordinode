@@ -327,6 +327,33 @@ fn eval_is_null() {
 }
 
 #[test]
+fn eval_xor() {
+    let mk = |a: Value, b: Value| Expr::BinaryOp {
+        op: BinaryOperator::Xor,
+        left: Box::new(Expr::Literal(a)),
+        right: Box::new(Expr::Literal(b)),
+    };
+    // Truth table.
+    assert_eq!(
+        eval_expr(&mk(Value::Bool(true), Value::Bool(false)), &empty_row()),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_expr(&mk(Value::Bool(true), Value::Bool(true)), &empty_row()),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        eval_expr(&mk(Value::Bool(false), Value::Bool(false)), &empty_row()),
+        Value::Bool(false)
+    );
+    // null propagates (Cypher three-valued logic).
+    assert_eq!(
+        eval_expr(&mk(Value::Bool(true), Value::Null), &empty_row()),
+        Value::Null
+    );
+}
+
+#[test]
 fn eval_is_typed() {
     let mk = |v: Value, t: &str, neg: bool| Expr::IsTyped {
         expr: Box::new(Expr::Literal(v)),
