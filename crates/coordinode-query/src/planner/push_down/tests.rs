@@ -164,6 +164,70 @@ fn strategy_wire_strings_are_stable() {
     assert_eq!(PushDownStrategy::VectorFirst.as_wire_str(), "vector_first");
 }
 
+// ── EXPLAIN push_down JSON block emission (R-PUSH2) ────────────────
+
+/// The block carries every contract field with the stable slug strings.
+#[test]
+fn explain_json_has_full_contract_shape() {
+    let d = select_push_down_strategy(150, idx_default(1_000_000, 128, 200), 0.5, 10);
+    let json = d.to_explain_json();
+    for needle in [
+        "\"stage\": \"VECTOR_FILTER\"",
+        "\"strategy\":",
+        "\"estimated_candidates\": 150",
+        "\"estimated_selectivity_vs_index\":",
+        "\"crossover_threshold\": 200",
+        "\"reason\":",
+        "\"cost_units_chosen\":",
+        "\"cost_units_alternatives\":",
+        // all three strategies considered, in the alternatives map
+        "\"graph_first\":",
+        "\"acorn_filtered\":",
+        "\"vector_first\":",
+    ] {
+        assert!(
+            json.contains(needle),
+            "push_down JSON missing {needle}:\n{json}"
+        );
+    }
+}
+
+/// (1) 150 candidates below crossover → graph_first / candidate_set_below_crossover.
+#[test]
+fn explain_json_graph_first_below_crossover() {
+    let json =
+        select_push_down_strategy(150, idx_default(1_000_000, 128, 200), 0.5, 10).to_explain_json();
+    assert!(json.contains("\"strategy\": \"graph_first\""));
+    assert!(json.contains("\"reason\": \"candidate_set_below_crossover\""));
+}
+
+/// (2) 400K candidates, 0.005 vector selectivity → vector_first / vector_highly_selective.
+#[test]
+fn explain_json_vector_first_highly_selective() {
+    let json = select_push_down_strategy(400_000, idx_default(1_000_000, 128, 200), 0.005, 10)
+        .to_explain_json();
+    assert!(json.contains("\"strategy\": \"vector_first\""));
+    assert!(json.contains("\"reason\": \"vector_highly_selective\""));
+}
+
+/// (3) 100K candidates, 10% selectivity → acorn_filtered / selectivity_in_acorn_band.
+#[test]
+fn explain_json_acorn_filtered_in_band() {
+    let json = select_push_down_strategy(100_000, idx_default(1_000_000, 128, 200), 0.5, 10)
+        .to_explain_json();
+    assert!(json.contains("\"strategy\": \"acorn_filtered\""));
+    assert!(json.contains("\"reason\": \"selectivity_in_acorn_band\""));
+}
+
+/// (4) candidate set at crossover with low vector selectivity → fallback default.
+#[test]
+fn explain_json_fallback_default() {
+    let json =
+        select_push_down_strategy(200, idx_default(1_000_000, 128, 200), 0.5, 10).to_explain_json();
+    assert!(json.contains("\"strategy\": \"acorn_filtered\""));
+    assert!(json.contains("\"reason\": \"fallback_default\""));
+}
+
 #[test]
 fn reason_wire_strings_are_stable() {
     assert_eq!(

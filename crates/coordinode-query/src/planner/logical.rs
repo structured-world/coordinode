@@ -1755,6 +1755,17 @@ impl LogicalPlan {
         self.explain_with_stats(None)
     }
 
+    /// The stable EXPLAIN `push_down` JSON block for this plan's graph→vector
+    /// push-down decision, or `None` when no `VectorFilter` carries one (no
+    /// `TRAVERSE`→`VECTOR_FILTER` shape, or the pass did not run). Schema is the
+    /// public contract in `arch/core/query-engine.md` (R-PUSH2). The block is
+    /// the SW Query Advisor's machine-readable view of the strategy choice.
+    #[must_use]
+    pub fn explain_push_down_json(&self) -> Option<String> {
+        crate::planner::builder::first_push_down_decision(&self.root)
+            .map(super::push_down::PushDownDecision::to_explain_json)
+    }
+
     /// Format the plan as EXPLAIN text output using real storage statistics.
     pub fn explain_with_stats(&self, stats: Option<&dyn StorageStats>) -> String {
         let mut output = String::new();
@@ -2143,6 +2154,7 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             threshold,
             less_than,
             decay_field,
+            push_down,
             ..
         } => {
             let op = if *less_than { "<" } else { ">" };
@@ -2151,8 +2163,14 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             } else {
                 ""
             };
+            // Surface the push-down strategy on the operator line when the
+            // planner attached a decision (graph→vector push-down, R-PUSH1/2).
+            let strategy_info = push_down
+                .as_ref()
+                .map(|d| format!(", strategy={}", d.strategy.as_wire_str()))
+                .unwrap_or_default();
             output.push_str(&format!(
-                "{prefix}VectorFilter({function}{decay_info} {op} {threshold})\n"
+                "{prefix}VectorFilter({function}{decay_info} {op} {threshold}{strategy_info})\n"
             ));
             explain_op(input, indent + 1, output);
         }

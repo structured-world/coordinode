@@ -123,6 +123,42 @@ pub struct PushDownDecision {
     pub cost_alternatives: HashMap<PushDownStrategy, f64>,
 }
 
+impl PushDownDecision {
+    /// Render the stable EXPLAIN `push_down` JSON block defined in
+    /// `arch/core/query-engine.md` § Graph Predicate Push-Down (EXPLAIN output
+    /// contract). Field names and the `strategy` / `reason` slug strings are
+    /// frozen across minor versions (R-PUSH2 / R-PUSH4); new slugs may be added
+    /// but existing ones are never renamed. `cost_units_alternatives` lists
+    /// every strategy considered, sorted by slug for deterministic output.
+    #[must_use]
+    pub fn to_explain_json(&self) -> String {
+        let mut alts: Vec<(&'static str, f64)> = self
+            .cost_alternatives
+            .iter()
+            .map(|(s, c)| (s.as_wire_str(), *c))
+            .collect();
+        alts.sort_unstable_by_key(|(name, _)| *name);
+        let alts_json = alts
+            .iter()
+            .map(|(name, cost)| format!("      \"{name}\": {cost}"))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!(
+            "{{\n  \"stage\": \"VECTOR_FILTER\",\n  \"strategy\": \"{}\",\n  \
+             \"estimated_candidates\": {},\n  \"estimated_selectivity_vs_index\": {},\n  \
+             \"crossover_threshold\": {},\n  \"reason\": \"{}\",\n  \
+             \"cost_units_chosen\": {},\n  \"cost_units_alternatives\": {{\n{}\n  }}\n}}",
+            self.strategy.as_wire_str(),
+            self.estimated_candidates,
+            self.estimated_selectivity,
+            self.crossover_threshold,
+            self.reason.as_wire_str(),
+            self.cost_chosen,
+            alts_json,
+        )
+    }
+}
+
 /// Per-vector-index parameters used by the cost model.
 ///
 /// These are properties of the HNSW index itself, cached on the

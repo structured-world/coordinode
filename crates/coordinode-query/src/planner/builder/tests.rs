@@ -1241,6 +1241,24 @@ fn push_down_invariant_simple_traverse_then_vector() {
 }
 
 #[test]
+fn push_down_explain_json_emitted_for_real_plan() {
+    // A real TRAVERSE→VECTOR_FILTER query, run through the same pass order as
+    // execute_cypher_impl, carries a push_down decision that renders the stable
+    // EXPLAIN block (R-PUSH2).
+    let root = optimized_plan(
+        "MATCH (a:User)-[:LIKES]->(b:Movie) \
+             WHERE vector_distance(b.embedding, [1.0, 0.0, 0.0]) < 0.5 \
+             RETURN b",
+    );
+    let decision = first_push_down_decision(&root)
+        .expect("real TRAVERSE→VECTOR_FILTER plan must carry a push_down decision");
+    let json = decision.to_explain_json();
+    assert!(json.contains("\"stage\": \"VECTOR_FILTER\""), "{json}");
+    assert!(json.contains("\"strategy\":"), "{json}");
+    assert!(json.contains("\"reason\":"), "{json}");
+}
+
+#[test]
 fn push_down_invariant_with_similarity() {
     let root = optimized_plan(
         "MATCH (u:User)-[:WATCHED]->(m:Movie) \

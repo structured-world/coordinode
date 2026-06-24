@@ -310,6 +310,26 @@ fn modality_count(root: &LogicalOp) -> usize {
 }
 
 /// Direct children of a logical operator for modality-walk recursion.
+/// The first `VectorFilter` push-down decision found in depth-first plan order,
+/// if any. Used to surface the EXPLAIN `push_down` block for a plan.
+pub(crate) fn first_push_down_decision(
+    op: &LogicalOp,
+) -> Option<&crate::planner::push_down::PushDownDecision> {
+    if let LogicalOp::VectorFilter {
+        push_down: Some(decision),
+        ..
+    } = op
+    {
+        return Some(decision);
+    }
+    for child in op_children(op) {
+        if let Some(d) = first_push_down_decision(child) {
+            return Some(d);
+        }
+    }
+    None
+}
+
 fn op_children(op: &LogicalOp) -> Vec<&LogicalOp> {
     match op {
         LogicalOp::Filter { input, .. }
