@@ -111,6 +111,18 @@ pub struct ServerConfig {
     /// unguarded for sub-128 KiB messages); raise on a bandwidth-constrained link
     /// (db4 geo).
     pub wire_compression_level: i32,
+    /// Path to the node's TLS certificate (PEM). Set together with [`Self::tls_key`]
+    /// to serve inter-node + client gRPC over TLS; unset = plaintext (dev).
+    pub tls_cert: Option<String>,
+    /// Path to the node's TLS private key (PEM). Required when `tls_cert` is set.
+    pub tls_key: Option<String>,
+    /// Path to the CA certificate (PEM) verifying peers — trusted by clients to
+    /// verify the server and (with `tls_require_client_auth`) by the server to
+    /// verify connecting nodes for mTLS.
+    pub tls_ca: Option<String>,
+    /// Require + verify a client certificate (mutual TLS) on incoming
+    /// connections. Needs `tls_ca`. Default false.
+    pub tls_require_client_auth: bool,
 }
 
 impl Default for ServerConfig {
@@ -138,6 +150,10 @@ impl Default for ServerConfig {
             interactive_txn_idle_timeout_secs: 30,
             interactive_txn_max_bytes: 256 * 1024 * 1024,
             wire_compression_level: 3,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca: None,
+            tls_require_client_auth: false,
         }
     }
 }
@@ -169,6 +185,10 @@ pub struct CliOverrides {
     pub interactive_txn_idle_timeout_secs: Option<u64>,
     pub interactive_txn_max_bytes: Option<u64>,
     pub wire_compression_level: Option<i32>,
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    pub tls_ca: Option<String>,
+    pub tls_require_client_auth: Option<bool>,
 }
 
 impl ServerConfig {
@@ -231,6 +251,18 @@ impl ServerConfig {
         }
         if let Some(v) = o.wire_compression_level {
             self.wire_compression_level = v;
+        }
+        if o.tls_cert.is_some() {
+            self.tls_cert = o.tls_cert.clone();
+        }
+        if o.tls_key.is_some() {
+            self.tls_key = o.tls_key.clone();
+        }
+        if o.tls_ca.is_some() {
+            self.tls_ca = o.tls_ca.clone();
+        }
+        if let Some(v) = o.tls_require_client_auth {
+            self.tls_require_client_auth = v;
         }
         if o.request_timeout_secs.is_some() {
             self.request_timeout_secs = o.request_timeout_secs;

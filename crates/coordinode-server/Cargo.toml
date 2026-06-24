@@ -47,7 +47,7 @@ structured-proxy = { version = "2", optional = true }
 # Pinned to the same minor structured-proxy depends on so the Router type unifies.
 axum = { version = "0.8", optional = true }
 tokio = { workspace = true }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["tls-webpki-roots"] }
 parking_lot = { workspace = true }
 tonic-prost = "0.14"
 prost = { workspace = true }

@@ -74,6 +74,9 @@ config file nor a flag sets the value.
 | `--interactive-txn-idle-timeout-secs` | `30` | Idle timeout for an interactive transaction (a `BeginTransaction` left open without `CommitTransaction`/`RollbackTransaction`), in seconds. An open transaction pins an MVCC snapshot and buffers writes in memory; one idle this long is auto-rolled-back to release them. |
 | `--interactive-txn-max-bytes` | `268435456` (256 MiB) | Max buffered (uncommitted) bytes per interactive transaction. A transaction whose accumulated writes exceed this is aborted, capping the leader memory a client can hold without committing. |
 | `--wire-compression-level` | `3` | Inter-node gRPC transport zstd compression level for wire traffic (C-zstd numbering: `1`..=`22` trade speed for ratio). The default `3` is zstd's standard speed/ratio default and gives roughly a 9x reduction on Raft batches; raise it on a bandwidth-constrained link (for example a geo replica) where bandwidth costs more than CPU. Independent of the on-disk storage codec. |
+| `--tls-cert` / `--tls-key` | (none) | PEM paths to the node's TLS certificate and private key. Set both to serve inter-node + client gRPC over TLS (pure-Rust crypto, no C FFI); unset = plaintext (single-host dev). |
+| `--tls-ca` | (none) | PEM path to the CA that verifies peer certificates — trusted by clients to verify the server, and (with `--tls-require-client-auth`) by the server to verify connecting nodes. |
+| `--tls-require-client-auth` | `false` | Require and verify a client certificate (mutual TLS) on incoming connections. Needs `--tls-ca`. |
 
 Single-node start:
 
@@ -176,6 +179,12 @@ interactive_txn_max_bytes: 268435456
 
 # Inter-node gRPC transport zstd level for wire traffic.
 wire_compression_level: 3
+
+# Inter-node + client gRPC TLS (PEM paths). Unset = plaintext.
+# tls_cert: /etc/coordinode/tls/node.crt
+# tls_key: /etc/coordinode/tls/node.key
+# tls_ca: /etc/coordinode/tls/ca.crt
+# tls_require_client_auth: false
 ```
 
 Set any tunable directly in this file. To override one value without editing the

@@ -20,7 +20,10 @@ rmp-serde = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
 tempfile = { workspace = true }
-tonic = { workspace = true }
+# tls-webpki-roots enables tonic's TLS API without forcing a crypto provider
+# feature (tls-ring / tls-aws-lc would link C); the process-default provider
+# (pure-Rust rustls-rustcrypto, installed at startup) is used instead.
+tonic = { workspace = true, features = ["tls-webpki-roots"] }
 tonic-prost = "0.14"
 prost = { workspace = true }
 # Inter-node gRPC transport compression codec (pure-Rust zstd, shared with the

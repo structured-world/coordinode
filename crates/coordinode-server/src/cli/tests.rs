@@ -252,6 +252,30 @@ fn serve_wire_compression_level_parsed_and_applied() {
 }
 
 #[test]
+fn serve_tls_flags_parsed_and_applied() {
+    use crate::config::ServerConfig;
+    let cmd = parse_args_from(&args(
+        "coordinode serve --tls-cert /e/c.pem --tls-key /e/k.pem --tls-ca /e/ca.pem \
+             --tls-require-client-auth",
+    ));
+    match cmd {
+        Command::Serve { overrides, .. } => {
+            assert_eq!(overrides.tls_cert.as_deref(), Some("/e/c.pem"));
+            assert_eq!(overrides.tls_key.as_deref(), Some("/e/k.pem"));
+            assert_eq!(overrides.tls_ca.as_deref(), Some("/e/ca.pem"));
+            assert_eq!(overrides.tls_require_client_auth, Some(true));
+            let mut cfg = ServerConfig::default();
+            assert_eq!(cfg.tls_cert, None, "TLS off by default");
+            assert!(!cfg.tls_require_client_auth);
+            cfg.apply_overrides(&overrides);
+            assert_eq!(cfg.tls_cert.as_deref(), Some("/e/c.pem"));
+            assert!(cfg.tls_require_client_auth);
+        }
+        _ => panic!("expected Serve command"),
+    }
+}
+
+#[test]
 fn serve_resource_flags_default_to_none() {
     // Unset → None so the resolution step keeps config-file / built-in
     // defaults (incl. the 16 MiB request-size cap).

@@ -211,6 +211,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // starts; the transport codec reads it per message.
             coordinode_wire::set_wire_zstd_level(cfg.wire_compression_level);
 
+            // Install the pure-Rust TLS crypto provider as the process default so
+            // tonic's TLS builders use it (no C FFI). Must precede any TLS config.
+            coordinode_wire::tls::install_ce_crypto_provider();
+
             // Resolve the operational mode from the merged string value, so a
             // mode set in the config file is validated exactly like a CLI flag.
             let mode = match config::ServeMode::parse(&cfg.mode) {
@@ -255,6 +259,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mode: _,
                 // Already consumed above via set_wire_zstd_level before serving.
                 wire_compression_level: _,
+                tls_cert,
+                tls_key,
+                tls_ca,
+                tls_require_client_auth,
             } = cfg;
             let peers = if peers_vec.is_empty() {
                 None
@@ -678,6 +686,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(secs) = http2_keepalive_secs {
                 server =
                     server.http2_keepalive_interval(Some(std::time::Duration::from_secs(secs)));
+            }
+
+            // TLS / mTLS for inter-node + client gRPC. Enabled when a cert+key are
+            // configured; the pure-Rust crypto provider was installed above so
+            // tonic's rustls config uses it (no C FFI). With require-client-auth,
+            // verify peer certs against the CA (mutual TLS).
+            if let (Some(cert_path), Some(key_path)) = (tls_cert.as_ref(), tls_key.as_ref()) {
+                use tonic::transport::{Certificate, Identity, ServerTlsConfig};
+                let cert = std::fs::read(cert_path)
+                    .map_err(|e| format!("read tls cert {cert_path}: {e}"))?;
+                let key =
+                    std::fs::read(key_path).map_err(|e| format!("read tls key {key_path}: {e}"))?;
+                let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(cert, key));
+                if tls_require_client_auth {
+                    let ca_path = tls_ca
+                        .as_ref()
+                        .ok_or("--tls-require-client-auth requires --tls-ca")?;
+                    let ca = std::fs::read(ca_path)
+                        .map_err(|e| format!("read tls ca {ca_path}: {e}"))?;
+                    tls = tls.client_ca_root(Certificate::from_pem(ca));
+                }
+                server = server
+                    .tls_config(tls)
+                    .map_err(|e| format!("tls config: {e}"))?;
+                info!(mtls = tls_require_client_auth, "gRPC TLS enabled");
             }
 
             // Cap the decoded size of any single request to guard against
