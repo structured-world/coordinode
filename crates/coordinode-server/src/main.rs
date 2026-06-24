@@ -13,7 +13,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use coordinode_storage::Guard;
 use tonic::transport::Server;
 use tracing::info;
 
@@ -135,19 +134,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!(disk_bytes = disk, "storage opened successfully");
 
             if deep {
-                info!("deep verification: scanning all partitions...");
-                for &part in coordinode_storage::engine::partition::Partition::all() {
-                    let iter = engine.prefix_scan(part, b"")?;
-                    let mut count = 0u64;
-                    for guard in iter {
-                        let _ = guard.into_inner()?;
-                        count += 1;
+                info!("deep verification: scrubbing all on-disk blocks...");
+                // Full-speed scrub (operator-invoked, not a background pass):
+                // verify every block's checksum across every partition.
+                let report = coordinode_storage::scrub::scrub_all(
+                    &engine,
+                    &coordinode_storage::scrub::ScrubConfig::default(),
+                )?;
+                info!(
+                    blocks_checked = report.blocks_checked,
+                    sst_files_checked = report.sst_files_checked,
+                    errors = report.errors.len(),
+                    duration_ms = report.duration.as_millis(),
+                    "deep verification complete"
+                );
+                if report.has_errors() {
+                    for err in &report.errors {
+                        tracing::error!(
+                            partition = err.partition.name(),
+                            detail = %err.message,
+                            "corruption detected"
+                        );
                     }
-                    info!(
-                        partition = part.name(),
-                        entries = count,
-                        "partition verified"
-                    );
+                    return Err(format!(
+                        "deep verification found {} corrupt block(s)",
+                        report.errors.len()
+                    )
+                    .into());
                 }
             }
 
