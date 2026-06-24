@@ -1139,10 +1139,11 @@ fn normalize_unicode(s: &str, form: &str) -> Option<String> {
     }
 }
 
-/// Cypher math functions (`abs`, `ceil`, `floor`, `round`, `sign`, `rand`,
-/// `e`, `pi`, `sqrt`, `exp`, `log`, `log10`, `isNaN`, the `toInteger` /
-/// `toFloat` / `toBoolean` conversions plus their `…OrNull` and `…List`
-/// variants).
+/// Cypher math and trigonometric functions (`abs`, `ceil`, `floor`, `round`,
+/// `sign`, `rand`, `e`, `pi`, `sqrt`, `exp`, `log`, `log10`, `isNaN`, the
+/// `toInteger` / `toFloat` / `toBoolean` conversions plus their `…OrNull` and
+/// `…List` variants; `sin`, `cos`, `tan`, `cot`, `asin`, `acos`, `atan`,
+/// `atan2`, `haversin`, `degrees`, `radians`).
 ///
 /// `name` is matched case-insensitively. Returns `None` for a name this helper
 /// does not own so the caller applies the unknown-function NULL contract. Per
@@ -1207,6 +1208,27 @@ fn eval_math_function(name: &str, args: &[Value]) -> Option<Value> {
         "tointegerlist" => map_list(args.first(), |v| to_integer(Some(v))),
         "tofloatlist" => map_list(args.first(), |v| to_float(Some(v))),
         "tobooleanlist" => map_list(args.first(), |v| to_boolean(Some(v))),
+        // Trigonometric functions (radians in/out except degrees/radians
+        // conversions). Single-argument forms map NULL/non-numeric to NULL.
+        "sin" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.sin())),
+        "cos" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.cos())),
+        "tan" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.tan())),
+        // cot(x) = 1 / tan(x).
+        "cot" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(1.0 / x.tan())),
+        "asin" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.asin())),
+        "acos" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.acos())),
+        "atan" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.atan())),
+        // atan2(y, x): two-argument arctangent.
+        "atan2" => match (as_f64(args.first()), as_f64(args.get(1))) {
+            (Some(y), Some(x)) => Value::Float(y.atan2(x)),
+            _ => Value::Null,
+        },
+        // haversin(x) = (1 - cos x) / 2.
+        "haversin" => {
+            as_f64(args.first()).map_or(Value::Null, |x| Value::Float((1.0 - x.cos()) / 2.0))
+        }
+        "degrees" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.to_degrees())),
+        "radians" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.to_radians())),
         _ => return None,
     };
 

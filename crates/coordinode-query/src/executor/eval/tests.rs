@@ -1097,3 +1097,71 @@ fn math_fn_null_propagation() {
     assert_eq!(call_fn("sqrt", vec![s("x")]), Value::Null);
     assert_eq!(call_fn("sign", vec![Value::Null]), Value::Null);
 }
+
+// ---- R522 trigonometric functions ----
+
+fn approx(v: Value, want: f64) {
+    match v {
+        Value::Float(f) => assert!((f - want).abs() < 1e-9, "got {f}, want {want}"),
+        other => panic!("expected float, got {other:?}"),
+    }
+}
+
+#[test]
+fn trig_fn_basic() {
+    approx(call_fn("sin", vec![Value::Float(0.0)]), 0.0);
+    approx(call_fn("cos", vec![Value::Float(0.0)]), 1.0);
+    approx(call_fn("tan", vec![Value::Float(0.0)]), 0.0);
+    // sin(pi/2) == 1
+    approx(
+        call_fn("sin", vec![Value::Float(std::f64::consts::FRAC_PI_2)]),
+        1.0,
+    );
+}
+
+#[test]
+fn trig_fn_cot_and_inverse() {
+    // cot(pi/4) == 1
+    approx(
+        call_fn("cot", vec![Value::Float(std::f64::consts::FRAC_PI_4)]),
+        1.0,
+    );
+    approx(
+        call_fn("asin", vec![Value::Float(1.0)]),
+        std::f64::consts::FRAC_PI_2,
+    );
+    approx(call_fn("acos", vec![Value::Float(1.0)]), 0.0);
+    approx(call_fn("atan", vec![Value::Float(0.0)]), 0.0);
+}
+
+#[test]
+fn trig_fn_atan2() {
+    // atan2(1, 1) == pi/4
+    approx(
+        call_fn("atan2", vec![Value::Float(1.0), Value::Float(1.0)]),
+        std::f64::consts::FRAC_PI_4,
+    );
+    // missing second arg → NULL
+    assert_eq!(call_fn("atan2", vec![Value::Float(1.0)]), Value::Null);
+}
+
+#[test]
+fn trig_fn_haversin_and_conversions() {
+    // haversin(0) == 0
+    approx(call_fn("haversin", vec![Value::Float(0.0)]), 0.0);
+    // degrees(pi) == 180, radians(180) == pi
+    approx(
+        call_fn("degrees", vec![Value::Float(std::f64::consts::PI)]),
+        180.0,
+    );
+    approx(
+        call_fn("radians", vec![Value::Float(180.0)]),
+        std::f64::consts::PI,
+    );
+}
+
+#[test]
+fn trig_fn_null_propagation() {
+    assert_eq!(call_fn("sin", vec![Value::Null]), Value::Null);
+    assert_eq!(call_fn("degrees", vec![s("x")]), Value::Null);
+}
