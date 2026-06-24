@@ -339,6 +339,91 @@ async fn swarm_pull_reconstructs_segment_over_grpc() {
     assert!(!assembled.is_empty());
 }
 
+#[tokio::test]
+async fn repair_partition_pulls_and_installs_from_peer() {
+    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
+    use crate::transfer::SegmentTransferHandler;
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+
+    // Healthy peer with data, behind the real SegmentTransferService.
+    let peer_dir = tempfile::tempdir().expect("tempdir");
+    let peer = std::sync::Arc::new(test_engine(peer_dir.path()));
+    for i in 0..40u32 {
+        peer.put(
+            Partition::Node,
+            format!("node:0:{i:08}").as_bytes(),
+            format!("value-{i}").as_bytes(),
+        )
+        .expect("put");
+    }
+    peer.persist().expect("persist");
+    let handler = SegmentTransferHandler::new(std::sync::Arc::new(SegmentInstaller::new(
+        std::sync::Arc::clone(&peer),
+    )));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let incoming = TcpListenerStream::new(listener);
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(SegmentTransferServiceServer::new(handler))
+            .serve_with_incoming(incoming)
+            .await
+            .expect("server");
+    });
+
+    // Local node with an empty Node partition repairs it from the peer.
+    let local_dir = tempfile::tempdir().expect("tempdir");
+    let local = std::sync::Arc::new(test_engine(local_dir.path()));
+    let installer = std::sync::Arc::new(SegmentInstaller::new(std::sync::Arc::clone(&local)));
+
+    let bytes = installer
+        .repair_partition(
+            &[format!("http://{addr}")],
+            Partition::Node,
+            256,
+            PieceEncoding::None,
+        )
+        .await
+        .expect("repair");
+    assert!(bytes > 0, "repair installed nothing");
+
+    let snap = local.snapshot();
+    let scanned = local
+        .snapshot_prefix_scan(&snap, Partition::Node, b"node:")
+        .expect("scan");
+    let mut got: HashMap<String, Vec<u8>> = HashMap::new();
+    for (key, value) in scanned {
+        got.insert(String::from_utf8(key).expect("utf8"), value.to_vec());
+    }
+    assert_eq!(got.len(), 40, "all peer entries repaired locally");
+    assert_eq!(
+        got.get("node:0:00000007").map(Vec::as_slice),
+        Some(&b"value-7"[..])
+    );
+}
+
+#[tokio::test]
+async fn repair_partition_no_reachable_peer_errors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let local = std::sync::Arc::new(test_engine(dir.path()));
+    let installer = std::sync::Arc::new(SegmentInstaller::new(local));
+    // Port 1 is never listening here → no source can be reached.
+    let err = installer
+        .repair_partition(
+            &["http://127.0.0.1:1".to_string()],
+            Partition::Node,
+            256,
+            PieceEncoding::None,
+        )
+        .await
+        .expect_err("unreachable peer must fail repair");
+    assert!(
+        matches!(err, RepairError::NoSource(_)),
+        "expected NoSource, got {err:?}"
+    );
+}
+
 #[test]
 fn installer_rejects_empty_and_unknown_tag() {
     let dir = tempfile::tempdir().expect("tempdir");

@@ -27,9 +27,13 @@ use coordinode_storage::error::{StorageError, StorageResult};
 use coordinode_storage::placement::{
     partition_from_wire_tag, partition_wire_tag, KeyRange, SegmentDescriptor,
 };
-use coordinode_swarm::{split_segment, PieceEncoding};
+use coordinode_swarm::{
+    split_segment, swarm_download, Freshness, NodeId, PieceEncoding, PieceSource, SourceCandidate,
+};
+use tonic::transport::Channel;
 
-use crate::transfer::{BuiltSegment, SegmentSink, SegmentSource};
+use crate::transfer::proto::SegmentDescriptorRef;
+use crate::transfer::{BuiltSegment, GrpcPieceSource, SegmentSink, SegmentSource};
 
 /// One key-value entry of a segment's portable representation.
 type KvEntry = (Vec<u8>, Vec<u8>);
@@ -339,6 +343,118 @@ impl SegmentSink for SegmentInstaller {
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+}
+
+/// Failure modes of [`repair_partition`].
+#[derive(Debug, thiserror::Error)]
+pub enum RepairError {
+    /// No reachable peer could serve the segment (all unreachable or none held
+    /// it), so the local copy cannot be repaired from a replica.
+    #[error("no healthy peer served {0}")]
+    NoSource(String),
+    /// The multi-source download failed (a piece checksum, assembly, or the
+    /// whole-segment checksum did not verify).
+    #[error("swarm download: {0}")]
+    Download(String),
+    /// Installing the reconstructed segment into local storage failed.
+    #[error("install: {0}")]
+    Install(String),
+}
+
+impl SegmentInstaller {
+    /// Repair a (possibly corrupt) partition by pulling a fresh copy from healthy
+    /// peers over the swarm transport and re-installing it locally.
+    ///
+    /// CE coarse repair: re-fetches the **whole** partition (Merkle page-level
+    /// localization is EE). Connects a [`GrpcPieceSource`] to each reachable peer
+    /// (TLS when inter-node TLS is configured), runs the rarest-first,
+    /// multi-source [`swarm_download`], and installs the reconstructed segment,
+    /// overwriting local data. Peers that are unreachable or do not hold the
+    /// segment are skipped; the pull proceeds from whoever answers. Returns the
+    /// number of bytes installed.
+    ///
+    /// Must be called from within a tokio runtime; the synchronous download loop
+    /// runs on a blocking thread.
+    ///
+    /// # Errors
+    /// [`RepairError`] if no peer serves the segment, the download fails its
+    /// checksums, or the install fails.
+    pub async fn repair_partition(
+        self: &Arc<Self>,
+        peers: &[String],
+        partition: Partition,
+        piece_size: usize,
+        encoding: PieceEncoding,
+    ) -> Result<usize, RepairError> {
+        let (enc_disc, zstd_level) = encoding.to_wire();
+        let tag = partition_wire_tag(partition);
+        // Whole-partition descriptor: empty range is unbounded both ends, so the
+        // serving peer exports the entire partition.
+        let descriptor = SegmentDescriptorRef {
+            segment_id: u64::from(tag),
+            partition: u32::from(tag),
+            range_start: Vec::new(),
+            range_end: Vec::new(),
+            piece_size: piece_size as u32,
+            encoding: enc_disc,
+            zstd_level,
+        };
+
+        let mut sources: Vec<GrpcPieceSource> = Vec::new();
+        let mut manifest = None;
+        for (i, endpoint) in peers.iter().enumerate() {
+            let Ok(mut ep) = Channel::from_shared(endpoint.clone()) else {
+                continue;
+            };
+            if let Some(tls) = coordinode_wire::wire_client_tls() {
+                let Ok(with_tls) = ep.tls_config(tls) else {
+                    continue;
+                };
+                ep = with_tls;
+            }
+            let Ok(channel) = ep.connect().await else {
+                continue;
+            };
+            // node id within the transfer mesh: peer index + 1 (0 is local).
+            let node = NodeId(i as u64 + 1);
+            let candidate = SourceCandidate {
+                node,
+                utilization: 0.0,
+                bandwidth_to_target: 1.0,
+                same_rack: false,
+                tit_for_tat: 1.0,
+                freshness: Freshness::Verified,
+            };
+            if let Ok((source, m)) =
+                GrpcPieceSource::connect(node, channel, descriptor.clone(), candidate).await
+            {
+                manifest.get_or_insert(m);
+                sources.push(source);
+            }
+        }
+
+        let manifest =
+            manifest.ok_or_else(|| RepairError::NoSource(format!("partition {partition:?}")))?;
+
+        // The download loop is synchronous (it block_on's the gRPC client), so it
+        // must not run on a runtime worker — hand it to a blocking thread.
+        let assembled = tokio::task::spawn_blocking(move || {
+            let refs: Vec<&dyn PieceSource> =
+                sources.iter().map(|s| s as &dyn PieceSource).collect();
+            swarm_download(NodeId(0), &manifest, &refs, Vec::new())
+        })
+        .await
+        .map_err(|e| RepairError::Download(e.to_string()))?
+        .map_err(|e| RepairError::Download(e.to_string()))?;
+
+        let bytes = assembled.len();
+        self.store_segment(
+            coordinode_swarm::SegmentId(descriptor.segment_id),
+            &assembled,
+        )
+        .map_err(RepairError::Install)?;
+        Ok(bytes)
     }
 }
 
