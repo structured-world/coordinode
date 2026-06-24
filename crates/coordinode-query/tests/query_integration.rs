@@ -1226,6 +1226,70 @@ fn create_node_and_read_back() {
 }
 
 #[test]
+fn set_map_merge_keeps_existing_keys() {
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(3000));
+
+    run_cypher_with_alloc(
+        "CREATE (n:Acct {a: 1, b: 2})",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    // `+=` merges: `a` is overwritten, `b` survives, `c` is added.
+    run_cypher_with_alloc(
+        "MATCH (n:Acct) SET n += {a: 10, c: 3}",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    let rows = run_cypher_with_alloc(
+        "MATCH (n:Acct) RETURN n.a AS a, n.b AS b, n.c AS c",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("a"), Some(&Value::Int(10)));
+    assert_eq!(rows[0].get("b"), Some(&Value::Int(2)));
+    assert_eq!(rows[0].get("c"), Some(&Value::Int(3)));
+}
+
+#[test]
+fn set_map_replace_drops_existing_keys() {
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(4000));
+
+    run_cypher_with_alloc(
+        "CREATE (n:Acct {a: 1, b: 2})",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    // `=` replaces: only `c` remains; `a` and `b` are dropped.
+    run_cypher_with_alloc(
+        "MATCH (n:Acct) SET n = {c: 3}",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    let rows = run_cypher_with_alloc(
+        "MATCH (n:Acct) RETURN n.a AS a, n.b AS b, n.c AS c",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("a"), Some(&Value::Null));
+    assert_eq!(rows[0].get("b"), Some(&Value::Null));
+    assert_eq!(rows[0].get("c"), Some(&Value::Int(3)));
+}
+
+#[test]
 fn foreach_creates_node_per_element() {
     let fx = test_engine();
     let engine = &fx.engine;
