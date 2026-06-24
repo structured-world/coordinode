@@ -75,6 +75,10 @@ fn register_storage_metrics() {
         "coordinode_scrub_duration_seconds",
         "Wall-clock duration of the last completed scrub cycle"
     );
+    metrics::describe_counter!(
+        "coordinode_scrub_repairs_total",
+        "Partitions repaired from healthy peers after the scrub found corruption"
+    );
 }
 
 fn register_query_metrics() {

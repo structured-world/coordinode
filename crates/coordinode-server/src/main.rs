@@ -377,6 +377,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if scrub_cfg.enabled {
                     let scrub_engine = Arc::clone(&engine);
                     let interval = scrub_cfg.interval;
+                    // Peers to pull a fresh copy from when scrub finds corruption
+                    // (CE basic replica-fetch repair). Normalised to URIs; empty
+                    // when standalone (nothing to repair from). Each node repairs
+                    // its own corruption independently.
+                    let repair_peers: Vec<String> = peers
+                        .as_ref()
+                        .map(|ps| {
+                            ps.iter()
+                                .map(|p| {
+                                    if p.contains("://") {
+                                        p.clone()
+                                    } else {
+                                        format!("http://{p}")
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let repair_installer = Arc::new(coordinode_replicate::SegmentInstaller::new(
+                        Arc::clone(&engine),
+                    ));
                     // Stagger the first run by node id so a fleet does not scrub
                     // in lockstep and saturate I/O cluster-wide at once.
                     let jitter = interval
@@ -412,12 +433,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     if report.has_errors() {
                                         metrics::counter!("coordinode_scrub_errors_total")
                                             .increment(report.errors.len() as u64);
+                                        let mut corrupt = std::collections::HashSet::new();
                                         for err in &report.errors {
                                             tracing::error!(
                                                 partition = err.partition.name(),
                                                 detail = %err.message,
                                                 "scrub detected corruption"
                                             );
+                                            corrupt.insert(err.partition);
+                                        }
+                                        // Basic replica-fetch repair: re-pull each
+                                        // affected partition from healthy peers over
+                                        // the swarm transport and re-install it. A
+                                        // standalone node has no peer to repair from.
+                                        if repair_peers.is_empty() {
+                                            tracing::warn!(
+                                                "corruption detected but no peers configured to repair from"
+                                            );
+                                        } else {
+                                            for part in corrupt {
+                                                match repair_installer
+                                                    .repair_partition(
+                                                        &repair_peers,
+                                                        part,
+                                                        1 << 20,
+                                                        coordinode_replicate::PieceEncoding::None,
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(bytes) => {
+                                                        metrics::counter!(
+                                                            "coordinode_scrub_repairs_total"
+                                                        )
+                                                        .increment(1);
+                                                        tracing::info!(
+                                                            partition = part.name(),
+                                                            bytes,
+                                                            "repaired partition from peers"
+                                                        );
+                                                    }
+                                                    Err(e) => tracing::warn!(
+                                                        partition = part.name(),
+                                                        %e,
+                                                        "partition repair failed"
+                                                    ),
+                                                }
+                                            }
                                         }
                                     } else {
                                         tracing::info!(

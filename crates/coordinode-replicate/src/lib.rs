@@ -43,8 +43,14 @@ pub use registry::{
     RegisteredHandle, RegistryBackground, RegistryError, SeqnoConsumerRegistry,
     ShardConsumerRegistry, SystemClock, TopologyScope,
 };
+pub use segment_store::{RepairError, SegmentInstaller};
 pub use writer::ReplicatedWriter;
 
 // Re-exported so server-side callers can name the causal token type
 // without reaching past the replication layer into core directly.
 pub use coordinode_core::txn::proposal::ProposalOutcome;
+
+// Re-exported so server-side callers (e.g. the background-scrub repair trigger)
+// can name the wire piece encoding without depending on coordinode-swarm
+// directly.
+pub use coordinode_swarm::PieceEncoding;
