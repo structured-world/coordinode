@@ -73,7 +73,7 @@ config file nor a flag sets the value.
 | `--registry-eviction-ms` | `1000` | Consumer-registry TTL-eviction sweep interval, in ms. How often expired registrations are swept and the retention floor is refreshed against the wall clock. |
 | `--interactive-txn-idle-timeout-secs` | `30` | Idle timeout for an interactive transaction (a `BeginTransaction` left open without `CommitTransaction`/`RollbackTransaction`), in seconds. An open transaction pins an MVCC snapshot and buffers writes in memory; one idle this long is auto-rolled-back to release them. |
 | `--interactive-txn-max-bytes` | `268435456` (256 MiB) | Max buffered (uncommitted) bytes per interactive transaction. A transaction whose accumulated writes exceed this is aborted, capping the leader memory a client can hold without committing. |
-| `--wire-compression-level` | `1` | Inter-node gRPC transport zstd compression level for RaftService wire traffic (C-zstd numbering: `1`..=`22` trade speed for ratio). The default `1` is fast and gives roughly a 9x reduction on Raft batches; raise it on a bandwidth-constrained link (for example a geo replica) where bandwidth costs more than CPU. Independent of the on-disk storage codec. |
+| `--wire-compression-level` | `3` | Inter-node gRPC transport zstd compression level for wire traffic (C-zstd numbering: `1`..=`22` trade speed for ratio). The default `3` is zstd's standard speed/ratio default and gives roughly a 9x reduction on Raft batches; raise it on a bandwidth-constrained link (for example a geo replica) where bandwidth costs more than CPU. Independent of the on-disk storage codec. |
 
 Single-node start:
 
@@ -174,8 +174,8 @@ max_request_size_mb: 16
 interactive_txn_idle_timeout_secs: 30
 interactive_txn_max_bytes: 268435456
 
-# Inter-node gRPC transport zstd level for RaftService wire traffic.
-wire_compression_level: 1
+# Inter-node gRPC transport zstd level for wire traffic.
+wire_compression_level: 3
 ```
 
 Set any tunable directly in this file. To override one value without editing the

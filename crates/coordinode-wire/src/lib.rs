@@ -32,12 +32,16 @@ use tonic::Status;
 /// speed for ratio; NEGATIVE values select zstd ultra-fast modes (fastest, lowest
 /// ratio). Set once at startup from config before any RPC, then read-mostly.
 ///
-/// Defaults to 1 — zstd's fastest positive level, suited to hot replication
-/// (measured ~11% of raw on a Raft batch, ~9× smaller on the wire). The
-/// ultra-fast `-22` mode panics in `structured-zstd` 0.0.44's huff0 encoder (an
-/// internal-error bug, filed upstream), so it is not the default. A
+/// Defaults to 3 — zstd's canonical speed/ratio default, and the lowest level
+/// that is panic-safe with `structured-zstd` 0.0.44: levels 1-2 (and negatives)
+/// resolve to the Fast strategy, whose huffman build skips the table-log search
+/// for messages below one 128 KiB block (i.e. essentially every Raft message)
+/// and takes an UNGUARDED path that can hit an internal-error panic on some
+/// literal distributions. Levels >= 3 use non-Fast strategies that always run
+/// the guarded search path, so they never panic. Level 3 measures the same ~11%
+/// of raw on a Raft batch as level 1 (~9x smaller on the wire). A
 /// bandwidth-constrained link (db4 geo) can raise the level via config.
-static WIRE_ZSTD_LEVEL: AtomicI32 = AtomicI32::new(1);
+static WIRE_ZSTD_LEVEL: AtomicI32 = AtomicI32::new(3);
 
 /// Set the inter-node transport zstd level. Call once at startup from config,
 /// before the gRPC services begin serving. Process-wide; each node configures

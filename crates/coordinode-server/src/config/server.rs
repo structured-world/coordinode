@@ -105,9 +105,11 @@ pub struct ServerConfig {
     /// Max buffered (uncommitted) bytes per interactive transaction (ADR-042).
     pub interactive_txn_max_bytes: u64,
     /// Inter-node gRPC transport zstd compression level (C-zstd numbering:
-    /// positive 1..=22 trade speed for ratio; negatives are ultra-fast). Applied
-    /// to RaftService wire traffic. Default 1 — fast, ~9x smaller on Raft
-    /// batches; raise on a bandwidth-constrained link (db4 geo).
+    /// positive 1..=22 trade speed for ratio). Applied to inter-node wire
+    /// traffic. Default 3 — zstd's standard speed/ratio default and the lowest
+    /// panic-safe level (levels 1-2 use the Fast strategy whose huffman build is
+    /// unguarded for sub-128 KiB messages); raise on a bandwidth-constrained link
+    /// (db4 geo).
     pub wire_compression_level: i32,
 }
 
@@ -135,7 +137,7 @@ impl Default for ServerConfig {
             registry_eviction_ms: None,
             interactive_txn_idle_timeout_secs: 30,
             interactive_txn_max_bytes: 256 * 1024 * 1024,
-            wire_compression_level: 1,
+            wire_compression_level: 3,
         }
     }
 }

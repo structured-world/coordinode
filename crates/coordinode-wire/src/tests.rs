@@ -37,7 +37,7 @@ fn compressible_payload_shrinks_on_the_wire() {
     let msg = TestMsg {
         data: vec![0u8; 8192],
     };
-    let compressed = encode_compressed(&msg, CompressionLevel::Level(1)).expect("encode");
+    let compressed = encode_compressed(&msg, CompressionLevel::Level(3)).expect("encode");
     assert!(
         compressed.len() < 8192,
         "compressible payload must shrink, got {} bytes",
@@ -48,7 +48,7 @@ fn compressible_payload_shrinks_on_the_wire() {
 #[test]
 fn empty_payload_round_trips() {
     let msg = TestMsg { data: Vec::new() };
-    let compressed = encode_compressed(&msg, CompressionLevel::Level(1)).expect("encode");
+    let compressed = encode_compressed(&msg, CompressionLevel::Level(3)).expect("encode");
     let out: TestMsg = decode_compressed(&compressed).expect("decode");
     assert_eq!(out.data, msg.data);
 }
@@ -97,6 +97,6 @@ fn measures_wire_bytes_compressed_vs_uncompressed() {
 fn wire_level_set_and_get() {
     set_wire_zstd_level(9);
     assert_eq!(wire_zstd_level(), 9);
-    set_wire_zstd_level(1);
-    assert_eq!(wire_zstd_level(), 1);
+    set_wire_zstd_level(3);
+    assert_eq!(wire_zstd_level(), 3);
 }

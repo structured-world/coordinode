@@ -243,7 +243,7 @@ fn serve_wire_compression_level_parsed_and_applied() {
         Command::Serve { overrides, .. } => {
             assert_eq!(overrides.wire_compression_level, Some(22));
             let mut cfg = ServerConfig::default();
-            assert_eq!(cfg.wire_compression_level, 1, "default wire level is 1");
+            assert_eq!(cfg.wire_compression_level, 3, "default wire level is 3");
             cfg.apply_overrides(&overrides);
             assert_eq!(cfg.wire_compression_level, 22, "CLI override applied");
         }
