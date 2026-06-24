@@ -3406,3 +3406,83 @@ async fn decommission_pruning_flag_sets_operator_cleanup_required() {
         "TIMED OUT — decommission_pruning_flag_sets_operator_cleanup_required"
     );
 }
+
+/// `read_oplog_since` returns the granular ops committed after a checkpoint
+/// cursor and excludes ops the checkpoint already captured — the exact input
+/// WAL-replay repair replays on top of the checkpoint base.
+#[tokio::test(flavor = "multi_thread")]
+async fn read_oplog_since_returns_post_checkpoint_ops() {
+    use coordinode_storage::oplog::OplogOp;
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let p1 = alloc_port();
+        let n1 = create_leader(1, p1).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(n1.node.is_leader().await, "node 1 should be leader");
+
+        let pipeline = n1.node.pipeline();
+        let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+
+        // Pre-checkpoint write.
+        pipeline
+            .propose_and_wait(&RaftProposal {
+                id: id_gen.next(),
+                mutations: vec![Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: b"node:0:pre".to_vec(),
+                    value: b"preval".to_vec(),
+                }],
+                commit_ts: Timestamp::from_raw(100),
+                start_ts: Timestamp::from_raw(99),
+                bypass_rate_limiter: false,
+            })
+            .expect("propose pre");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Checkpoint captures everything up to here.
+        let ckpt_root = tempfile::tempdir().expect("ckpt tempdir");
+        let ckpt = ckpt_root.path().join("c1");
+        n1.engine.create_checkpoint(&ckpt).expect("checkpoint");
+        let cursor = coordinode_raft::storage::checkpoint_oplog_last_index(&ckpt).unwrap_or(0);
+
+        // Post-checkpoint write.
+        pipeline
+            .propose_and_wait(&RaftProposal {
+                id: id_gen.next(),
+                mutations: vec![Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: b"node:0:post".to_vec(),
+                    value: b"postval".to_vec(),
+                }],
+                commit_ts: Timestamp::from_raw(200),
+                start_ts: Timestamp::from_raw(199),
+                bypass_rate_limiter: false,
+            })
+            .expect("propose post");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let entries = n1
+            .node
+            .read_oplog_since(cursor + 1)
+            .expect("read oplog since checkpoint");
+        let inserted = |k: &[u8]| {
+            entries
+                .iter()
+                .flat_map(|e| &e.ops)
+                .any(|op| matches!(op, OplogOp::Insert { key, .. } if key.as_slice() == k))
+        };
+        assert!(
+            inserted(b"node:0:post"),
+            "post-checkpoint op must be in read_oplog_since(cursor+1)"
+        );
+        assert!(
+            !inserted(b"node:0:pre"),
+            "pre-checkpoint op must be excluded by the cursor"
+        );
+
+        n1.node.shutdown().await.expect("shutdown");
+    })
+    .await;
+
+    assert!(result.is_ok(), "read_oplog_since test TIMED OUT");
+}
