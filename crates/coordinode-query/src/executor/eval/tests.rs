@@ -964,7 +964,136 @@ fn string_fn_null_propagation() {
 
 #[test]
 fn unknown_function_still_returns_null() {
-    // The string-function fallthrough must not swallow the unknown-function
+    // The string/math fallthrough must not swallow the unknown-function
     // NULL contract for names it does not own.
     assert_eq!(call_fn("no_such_fn", vec![s("x")]), Value::Null);
+}
+
+// ---- R521 math functions ----
+
+#[test]
+fn math_fn_abs_preserves_type() {
+    assert_eq!(call_fn("abs", vec![Value::Int(-5)]), Value::Int(5));
+    assert_eq!(call_fn("abs", vec![Value::Float(-2.5)]), Value::Float(2.5));
+    assert_eq!(call_fn("ABS", vec![Value::Int(7)]), Value::Int(7)); // case-insensitive
+}
+
+#[test]
+fn math_fn_ceil_floor_round_return_float() {
+    assert_eq!(call_fn("ceil", vec![Value::Float(1.2)]), Value::Float(2.0));
+    assert_eq!(call_fn("floor", vec![Value::Float(1.8)]), Value::Float(1.0));
+    assert_eq!(call_fn("round", vec![Value::Float(2.5)]), Value::Float(3.0));
+    assert_eq!(
+        call_fn("round", vec![Value::Float(-2.5)]),
+        Value::Float(-3.0)
+    );
+    // integer input is accepted (widened to float domain)
+    assert_eq!(call_fn("ceil", vec![Value::Int(3)]), Value::Float(3.0));
+}
+
+#[test]
+fn math_fn_sign() {
+    assert_eq!(call_fn("sign", vec![Value::Int(-9)]), Value::Int(-1));
+    assert_eq!(call_fn("sign", vec![Value::Int(0)]), Value::Int(0));
+    assert_eq!(call_fn("sign", vec![Value::Float(4.2)]), Value::Int(1));
+}
+
+#[test]
+fn math_fn_sqrt_exp_log() {
+    assert_eq!(call_fn("sqrt", vec![Value::Float(9.0)]), Value::Float(3.0));
+    assert_eq!(
+        call_fn("log10", vec![Value::Float(1000.0)]),
+        Value::Float(3.0)
+    );
+    // ln(e) == 1
+    if let Value::Float(v) = call_fn("log", vec![Value::Float(std::f64::consts::E)]) {
+        assert!((v - 1.0).abs() < 1e-12);
+    } else {
+        panic!("log should return a float");
+    }
+}
+
+#[test]
+fn math_fn_constants() {
+    if let Value::Float(p) = call_fn("pi", vec![]) {
+        assert!((p - std::f64::consts::PI).abs() < 1e-12);
+    } else {
+        panic!("pi() should return a float");
+    }
+    if let Value::Float(e) = call_fn("e", vec![]) {
+        assert!((e - std::f64::consts::E).abs() < 1e-12);
+    } else {
+        panic!("e() should return a float");
+    }
+}
+
+#[test]
+fn math_fn_rand_in_unit_interval() {
+    // rand() is non-deterministic by spec; assert only the [0, 1) contract.
+    for _ in 0..50 {
+        match call_fn("rand", vec![]) {
+            Value::Float(r) => assert!((0.0..1.0).contains(&r), "rand out of range: {r}"),
+            other => panic!("rand should return a float, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn math_fn_isnan() {
+    assert_eq!(
+        call_fn("isNaN", vec![Value::Float(f64::NAN)]),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        call_fn("isNaN", vec![Value::Float(1.0)]),
+        Value::Bool(false)
+    );
+    assert_eq!(call_fn("isNaN", vec![Value::Int(3)]), Value::Bool(false));
+}
+
+#[test]
+fn math_fn_to_integer() {
+    assert_eq!(call_fn("toInteger", vec![Value::Float(3.7)]), Value::Int(3));
+    assert_eq!(call_fn("toInteger", vec![s("42")]), Value::Int(42));
+    assert_eq!(call_fn("toInteger", vec![s("3.9")]), Value::Int(3));
+    assert_eq!(call_fn("toInteger", vec![s("nope")]), Value::Null);
+    assert_eq!(
+        call_fn("toIntegerOrNull", vec![Value::Bool(true)]),
+        Value::Int(1)
+    );
+}
+
+#[test]
+fn math_fn_to_float_and_boolean() {
+    assert_eq!(call_fn("toFloat", vec![Value::Int(5)]), Value::Float(5.0));
+    assert_eq!(call_fn("toFloat", vec![s("2.5")]), Value::Float(2.5));
+    assert_eq!(call_fn("toFloat", vec![s("x")]), Value::Null);
+    assert_eq!(call_fn("toBoolean", vec![s("TRUE")]), Value::Bool(true));
+    assert_eq!(call_fn("toBoolean", vec![s("false")]), Value::Bool(false));
+    assert_eq!(
+        call_fn("toBoolean", vec![Value::Int(0)]),
+        Value::Bool(false)
+    );
+    assert_eq!(call_fn("toBoolean", vec![s("maybe")]), Value::Null);
+}
+
+#[test]
+fn math_fn_list_conversions() {
+    let list = Value::Array(vec![s("1"), s("2"), s("bad")]);
+    assert_eq!(
+        call_fn("toIntegerList", vec![list]),
+        Value::Array(vec![Value::Int(1), Value::Int(2), Value::Null])
+    );
+    let fl = Value::Array(vec![Value::Int(1), s("2.5")]);
+    assert_eq!(
+        call_fn("toFloatList", vec![fl]),
+        Value::Array(vec![Value::Float(1.0), Value::Float(2.5)])
+    );
+}
+
+#[test]
+fn math_fn_null_propagation() {
+    assert_eq!(call_fn("abs", vec![Value::Null]), Value::Null);
+    assert_eq!(call_fn("sqrt", vec![s("x")]), Value::Null);
+    assert_eq!(call_fn("sign", vec![Value::Null]), Value::Null);
 }

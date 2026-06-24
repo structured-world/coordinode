@@ -30,6 +30,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
+rand = { workspace = true }
 unicode-normalization = "0.1"
 
 [dev-dependencies]

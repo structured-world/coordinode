@@ -1030,6 +1030,7 @@ dependencies = [
  "criterion",
  "pest",
  "pest_derive",
+ "rand 0.10.1",
  "rayon",
  "rmp-serde",
  "rmpv",

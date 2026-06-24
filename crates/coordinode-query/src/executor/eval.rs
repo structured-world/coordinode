@@ -936,11 +936,13 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
                 _ => Value::Null,
             }
         }
-        // String functions (Cypher names are case-insensitive). Kept out of the
-        // exact-case arms above so existing functions stay untouched; the helper
-        // lowercases the name and returns None for anything it does not own,
-        // which falls through to the NULL contract for unknown functions.
-        _ => eval_string_function(name, &evaluated).unwrap_or(Value::Null),
+        // String and math functions (Cypher names are case-insensitive). Kept
+        // out of the exact-case arms above so existing functions stay untouched;
+        // each helper lowercases the name and returns None for anything it does
+        // not own, falling through to the NULL contract for unknown functions.
+        _ => eval_string_function(name, &evaluated)
+            .or_else(|| eval_math_function(name, &evaluated))
+            .unwrap_or(Value::Null),
     }
 }
 
@@ -1134,6 +1136,134 @@ fn normalize_unicode(s: &str, form: &str) -> Option<String> {
         "NFKC" => Some(s.nfkc().collect()),
         "NFKD" => Some(s.nfkd().collect()),
         _ => None,
+    }
+}
+
+/// Cypher math functions (`abs`, `ceil`, `floor`, `round`, `sign`, `rand`,
+/// `e`, `pi`, `sqrt`, `exp`, `log`, `log10`, `isNaN`, the `toInteger` /
+/// `toFloat` / `toBoolean` conversions plus their `…OrNull` and `…List`
+/// variants).
+///
+/// `name` is matched case-insensitively. Returns `None` for a name this helper
+/// does not own so the caller applies the unknown-function NULL contract. Per
+/// Cypher semantics a math function applied to `NULL` (or a non-numeric value)
+/// returns `NULL`. `ceil` / `floor` / `round` / `sqrt` / `exp` / `log` /
+/// `log10` follow Neo4j in returning a Float; `abs` preserves Int vs Float;
+/// `sign` returns an Int.
+fn eval_math_function(name: &str, args: &[Value]) -> Option<Value> {
+    let lname = name.to_ascii_lowercase();
+
+    // Coerce the first argument to f64 for the float-domain functions.
+    let as_f64 = |v: Option<&Value>| match v {
+        Some(Value::Int(n)) => Some(*n as f64),
+        Some(Value::Float(f)) => Some(*f),
+        _ => None,
+    };
+
+    // Nullary constants take no argument.
+    match lname.as_str() {
+        "pi" => return Some(Value::Float(std::f64::consts::PI)),
+        "e" => return Some(Value::Float(std::f64::consts::E)),
+        "rand" => return Some(Value::Float(rand::random::<f64>())),
+        _ => {}
+    }
+
+    let result = match lname.as_str() {
+        "abs" => match args.first() {
+            Some(Value::Int(n)) => Value::Int(n.abs()),
+            Some(Value::Float(f)) => Value::Float(f.abs()),
+            _ => Value::Null,
+        },
+        "ceil" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.ceil())),
+        "floor" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.floor())),
+        // Round half away from zero (Neo4j default), returning a Float.
+        "round" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.round())),
+        "sign" => match args.first() {
+            Some(Value::Int(n)) => Value::Int(n.signum()),
+            Some(Value::Float(f)) => {
+                if *f > 0.0 {
+                    Value::Int(1)
+                } else if *f < 0.0 {
+                    Value::Int(-1)
+                } else {
+                    Value::Int(0)
+                }
+            }
+            _ => Value::Null,
+        },
+        "sqrt" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.sqrt())),
+        "exp" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.exp())),
+        "log" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.ln())),
+        "log10" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.log10())),
+        "isnan" => match args.first() {
+            Some(Value::Float(f)) => Value::Bool(f.is_nan()),
+            // Integers are never NaN; a present non-float numeric is `false`.
+            Some(Value::Int(_)) => Value::Bool(false),
+            _ => Value::Null,
+        },
+        "tointeger" | "tointegerornull" => to_integer(args.first()),
+        "tofloat" | "tofloatornull" => to_float(args.first()),
+        "toboolean" | "tobooleanornull" => to_boolean(args.first()),
+        "tointegerlist" => map_list(args.first(), |v| to_integer(Some(v))),
+        "tofloatlist" => map_list(args.first(), |v| to_float(Some(v))),
+        "tobooleanlist" => map_list(args.first(), |v| to_boolean(Some(v))),
+        _ => return None,
+    };
+
+    Some(result)
+}
+
+/// `toInteger` conversion: Int passes through; Float truncates toward zero;
+/// a numeric string parses (via Float then truncate, so "3.7" → 3); Bool →
+/// 1/0. Anything else (including a non-numeric string) → NULL.
+fn to_integer(v: Option<&Value>) -> Value {
+    match v {
+        Some(Value::Int(n)) => Value::Int(*n),
+        Some(Value::Float(f)) if f.is_finite() => Value::Int(*f as i64),
+        Some(Value::Bool(b)) => Value::Int(i64::from(*b)),
+        Some(Value::String(s)) => s
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .or_else(|| s.trim().parse::<f64>().ok().map(|f| f as i64))
+            .map_or(Value::Null, Value::Int),
+        _ => Value::Null,
+    }
+}
+
+/// `toFloat` conversion: Float passes through; Int widens; a numeric string
+/// parses; Bool is not convertible (Neo4j) → NULL. Anything else → NULL.
+fn to_float(v: Option<&Value>) -> Value {
+    match v {
+        Some(Value::Float(f)) => Value::Float(*f),
+        Some(Value::Int(n)) => Value::Float(*n as f64),
+        Some(Value::String(s)) => s.trim().parse::<f64>().map_or(Value::Null, Value::Float),
+        _ => Value::Null,
+    }
+}
+
+/// `toBoolean` conversion: Bool passes through; "true"/"false" (any case,
+/// trimmed) parse; an integer is truthy iff non-zero (Neo4j 5). Anything else
+/// → NULL.
+fn to_boolean(v: Option<&Value>) -> Value {
+    match v {
+        Some(Value::Bool(b)) => Value::Bool(*b),
+        Some(Value::Int(n)) => Value::Bool(*n != 0),
+        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => Value::Null,
+        },
+        _ => Value::Null,
+    }
+}
+
+/// Apply a per-element conversion across a list, preserving length (each
+/// unconvertible element becomes NULL). Non-list input → NULL.
+fn map_list(v: Option<&Value>, f: impl Fn(&Value) -> Value) -> Value {
+    match v {
+        Some(Value::Array(items)) => Value::Array(items.iter().map(f).collect()),
+        _ => Value::Null,
     }
 }
 

@@ -543,6 +543,30 @@ fn string_functions_end_to_end() {
     assert_eq!(r.get("rev"), Some(&Value::String("dlroW olleH".into())));
 }
 
+/// Math functions reach the executor through the real parse → plan → execute
+/// pipeline (same scalar-dispatch fallthrough as the string functions).
+#[test]
+fn math_functions_end_to_end() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    let results = run_cypher(
+        "UNWIND [-9] AS n \
+         RETURN abs(n) AS a, sign(n) AS sg, sqrt(abs(n)) AS rt, \
+                toInteger('42') AS ti, toFloat(n) AS tf",
+        engine,
+        &mut interner,
+    );
+
+    assert_eq!(results.len(), 1);
+    let r = &results[0];
+    assert_eq!(r.get("a"), Some(&Value::Int(9)));
+    assert_eq!(r.get("sg"), Some(&Value::Int(-1)));
+    assert_eq!(r.get("rt"), Some(&Value::Float(3.0)));
+    assert_eq!(r.get("ti"), Some(&Value::Int(42)));
+    assert_eq!(r.get("tf"), Some(&Value::Float(-9.0)));
+}
+
 // ── Correlated inline property filter (regression) ──────────────────────
 
 #[test]
