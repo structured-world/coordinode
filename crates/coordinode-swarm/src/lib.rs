@@ -28,12 +28,14 @@
 //! crates, and can drop to `no_std + alloc` once the workspace adds the CI job.
 
 mod config;
+mod download;
 mod scheduler;
 mod segment;
 mod state;
 mod transfer;
 
 pub use config::SwarmConfig;
+pub use download::{swarm_download, PieceSource};
 pub use scheduler::{select_source, Freshness, SourceCandidate};
 pub use segment::{
     assemble, build_manifest, cross_tier_piece_size, split_segment, verify_piece, MediaClass,
