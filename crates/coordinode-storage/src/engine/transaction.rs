@@ -917,6 +917,15 @@ impl<'a> Transaction<'a> {
                 });
             }
 
+            // Coalesce dense runs of point deletes into range deletes before
+            // proposing (G096): a bulk delete ("delete all relationships between
+            // these nodes", DROP) replicates + PITR-logs as a few range ops
+            // instead of N point tombstones. Non-deletes / short runs untouched.
+            let mutations = coordinode_core::txn::coalesce::coalesce_delete_mutations(
+                mutations,
+                coordinode_core::txn::coalesce::DEFAULT_MIN_RUN,
+            );
+
             let proposal = RaftProposal {
                 id: id_gen.next(),
                 mutations,
