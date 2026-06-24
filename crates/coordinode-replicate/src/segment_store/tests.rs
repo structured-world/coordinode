@@ -247,6 +247,98 @@ async fn drain_to_unreachable_peer_is_connect_error() {
     );
 }
 
+#[tokio::test]
+async fn swarm_pull_reconstructs_segment_over_grpc() {
+    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
+    use crate::transfer::proto::SegmentDescriptorRef;
+    use crate::transfer::{GrpcPieceSource, SegmentTransferHandler};
+    use coordinode_storage::placement::{partition_wire_tag, KeyRange};
+    use coordinode_swarm::{swarm_download, Freshness, NodeId, PieceSource, SourceCandidate};
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+
+    // Source engine with data, behind the real SegmentTransferService.
+    let src_dir = tempfile::tempdir().expect("tempdir");
+    let src = std::sync::Arc::new(test_engine(src_dir.path()));
+    for i in 0..40u32 {
+        src.put(
+            Partition::Node,
+            format!("node:0:{i:08}").as_bytes(),
+            format!("value-{i}").as_bytes(),
+        )
+        .expect("put");
+    }
+    src.persist().expect("persist");
+    let handler = SegmentTransferHandler::new(std::sync::Arc::new(SegmentInstaller::new(
+        std::sync::Arc::clone(&src),
+    )));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let incoming = TcpListenerStream::new(listener);
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(SegmentTransferServiceServer::new(handler))
+            .serve_with_incoming(incoming)
+            .await
+            .expect("server");
+    });
+
+    // Whole-Node-partition descriptor with agreed split parameters (raw pieces).
+    let descriptor = SegmentDescriptorRef {
+        segment_id: 1,
+        partition: u32::from(partition_wire_tag(Partition::Node)),
+        range_start: b"node:".to_vec(),
+        range_end: Vec::new(),
+        piece_size: 256,
+        encoding: 0,
+        zstd_level: 0,
+    };
+
+    // Connect a gRPC piece source to the peer (fetches manifest + bitfield).
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+        .expect("uri")
+        .connect()
+        .await
+        .expect("connect");
+    let candidate = SourceCandidate {
+        node: NodeId(2),
+        utilization: 0.0,
+        bandwidth_to_target: 1.0,
+        same_rack: false,
+        tit_for_tat: 1.0,
+        freshness: Freshness::Verified,
+    };
+    let (source, manifest) = GrpcPieceSource::connect(NodeId(2), channel, descriptor, candidate)
+        .await
+        .expect("connect source");
+
+    // Run the rarest-first download on a blocking thread (fetch_piece bridges the
+    // async client via block_on, which must not run on a runtime worker).
+    let assembled = tokio::task::spawn_blocking(move || {
+        let sources: Vec<&dyn PieceSource> = vec![&source];
+        swarm_download(NodeId(1), &manifest, &sources, Vec::new())
+    })
+    .await
+    .expect("join")
+    .expect("swarm download");
+
+    // The pulled segment equals what the source would export for that range.
+    let expected = export_range(
+        &src,
+        Partition::Node,
+        &KeyRange {
+            start: b"node:".to_vec(),
+            end: Vec::new(),
+        },
+    )
+    .expect("export");
+    assert_eq!(
+        assembled, expected,
+        "swarm pull over gRPC must reconstruct the segment byte-for-byte"
+    );
+    assert!(!assembled.is_empty());
+}
+
 #[test]
 fn installer_rejects_empty_and_unknown_tag() {
     let dir = tempfile::tempdir().expect("tempdir");

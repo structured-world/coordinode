@@ -17,11 +17,14 @@ use std::sync::Arc;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::placement::{partition_from_wire_tag, KeyRange};
 use coordinode_swarm::{
-    PieceBitfield, PieceEncoding, PieceStore, SegmentId, SegmentManifest, SegmentWriter,
-    SwarmResult,
+    NodeId, PieceBitfield, PieceEncoding, PieceIndex, PieceSource, PieceStore, SegmentId,
+    SegmentManifest, SegmentWriter, SourceCandidate, SwarmError, SwarmResult,
 };
 use futures_util::{Stream, StreamExt};
+use tonic::transport::Channel;
 use tonic::{Request, Response, Status, Streaming};
+
+use proto::segment_transfer_service_client::SegmentTransferServiceClient;
 
 use proto::piece_data::Frame;
 use proto::{
@@ -297,6 +300,96 @@ impl<S: SegmentSink + SegmentSource + 'static>
             index: req.index,
             wire,
         }))
+    }
+}
+
+/// A [`PieceSource`] backed by one peer's gRPC piece-exchange. Built by querying
+/// the peer's manifest (which also yields the peer's piece bitfield); pieces are
+/// then pulled with `GetPiece`.
+///
+/// [`fetch_piece`](PieceSource::fetch_piece) is synchronous (the swarm download
+/// loop is sync), so it bridges the async client through a runtime
+/// [`Handle::block_on`](tokio::runtime::Handle::block_on). The download loop must
+/// therefore run on a blocking thread (`spawn_blocking`), never a runtime worker.
+pub struct GrpcPieceSource {
+    node: NodeId,
+    descriptor: SegmentDescriptorRef,
+    bitfield: PieceBitfield,
+    candidate: SourceCandidate,
+    client: SegmentTransferServiceClient<Channel>,
+    handle: tokio::runtime::Handle,
+}
+
+impl GrpcPieceSource {
+    /// Query `channel`'s peer for the described segment's manifest + piece
+    /// bitfield, returning the source (ready to pull pieces) and the manifest the
+    /// caller drives [`swarm_download`](coordinode_swarm::swarm_download) with.
+    ///
+    /// `candidate` carries this peer's source-selection metadata (utilization,
+    /// bandwidth, locality, tit-for-tat) from the caller's view. Must be called
+    /// from within a tokio runtime (it captures the current [`Handle`] for
+    /// [`fetch_piece`](PieceSource::fetch_piece)).
+    ///
+    /// # Errors
+    /// [`Status`] if the manifest RPC fails or the reply is malformed.
+    pub async fn connect(
+        node: NodeId,
+        channel: Channel,
+        descriptor: SegmentDescriptorRef,
+        candidate: SourceCandidate,
+    ) -> Result<(Self, SegmentManifest), Status> {
+        let mut client = SegmentTransferServiceClient::new(channel);
+        let reply = client
+            .get_segment_manifest(SegmentManifestRequest {
+                segment: Some(descriptor.clone()),
+            })
+            .await?
+            .into_inner();
+        let header = reply
+            .manifest
+            .ok_or_else(|| Status::data_loss("manifest reply missing manifest"))?;
+        let manifest = manifest_from_header(&header).map_err(Status::internal)?;
+        let bitfield = PieceBitfield::from_le_bytes(&reply.piece_bitfield, manifest.piece_count());
+        let handle = tokio::runtime::Handle::current();
+        Ok((
+            Self {
+                node,
+                descriptor,
+                bitfield,
+                candidate,
+                client,
+                handle,
+            },
+            manifest,
+        ))
+    }
+}
+
+impl PieceSource for GrpcPieceSource {
+    fn node(&self) -> NodeId {
+        self.node
+    }
+
+    fn bitfield(&self) -> PieceBitfield {
+        self.bitfield.clone()
+    }
+
+    fn candidate(&self) -> SourceCandidate {
+        self.candidate
+    }
+
+    fn fetch_piece(&self, index: PieceIndex) -> SwarmResult<Vec<u8>> {
+        let mut client = self.client.clone();
+        let req = PieceRequest {
+            segment: Some(self.descriptor.clone()),
+            index,
+        };
+        let frame = self
+            .handle
+            .block_on(async move { client.get_piece(req).await })
+            .map_err(|e| SwarmError::Source(format!("get_piece {index}: {e}")))?
+            .into_inner();
+        Ok(frame.wire)
     }
 }
 
