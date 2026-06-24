@@ -3101,9 +3101,14 @@ fn execute_hnsw_scan(
     use coordinode_modality::NodeStore as _;
     let nodes = coordinode_modality::LocalNodeStore;
     let mut results = Vec::with_capacity(hits.len());
-    for hit in hits {
-        let node_id = NodeId::from_raw(hit.id);
-        let Some(record) = nodes.get(&ctx.txn, ctx.shard_id, node_id)? else {
+
+    // Hydrate the k-NN hit set in one batched multi_get; the input order is
+    // preserved, so the rows stay in similarity order.
+    let ids: Vec<NodeId> = hits.iter().map(|h| NodeId::from_raw(h.id)).collect();
+    let records = nodes.get_many(&ctx.txn, ctx.shard_id, &ids)?;
+
+    for (hit, record_opt) in hits.into_iter().zip(records) {
+        let Some(record) = record_opt else {
             // Node deleted after the index entry was written — skip.
             continue;
         };
