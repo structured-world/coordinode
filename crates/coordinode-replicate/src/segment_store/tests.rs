@@ -106,6 +106,79 @@ fn export_transfer_install_round_trip() {
     );
 }
 
+#[tokio::test]
+async fn grpc_transfer_installs_into_target_engine() {
+    use crate::transfer::proto::segment_transfer_service_client::SegmentTransferServiceClient;
+    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
+    use crate::transfer::{frames_for, SegmentTransferHandler};
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+
+    // Source engine: write entries, materialise SSTs, derive the spanning segment,
+    // and serve it over a swarm piece store.
+    let src_dir = tempfile::tempdir().expect("tempdir");
+    let src = test_engine(src_dir.path());
+    for i in 0..16u32 {
+        let key = format!("node:0:{i:08}");
+        src.put(Partition::Node, key.as_bytes(), format!("v{i}").as_bytes())
+            .expect("put");
+    }
+    src.force_compaction(Partition::Node).expect("compact");
+    let map = SegmentMap::build(&src, Partition::Node, PlacementSegmentId(7)).expect("map");
+    let descriptor = &map.segments()[0];
+    let blob = export_segment(&src, descriptor).expect("export");
+    let seg = SegmentId(descriptor.id.0);
+    let mut store = LocalPieceStore::new();
+    store
+        .insert(seg, &blob, 64, PieceEncoding::None)
+        .expect("insert");
+    let frames = frames_for(&store, seg).expect("frames_for");
+
+    // Target engine behind the real tonic SegmentTransferService (the same
+    // service main.rs registers in cluster mode).
+    let tgt_dir = tempfile::tempdir().expect("tempdir");
+    let tgt = std::sync::Arc::new(test_engine(tgt_dir.path()));
+    let handler = SegmentTransferHandler::new(std::sync::Arc::new(SegmentInstaller::new(
+        std::sync::Arc::clone(&tgt),
+    )));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let incoming = TcpListenerStream::new(listener);
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(SegmentTransferServiceServer::new(handler))
+            .serve_with_incoming(incoming)
+            .await
+            .expect("server");
+    });
+
+    // Push the segment to the target over the wire and verify it installed.
+    let mut client = SegmentTransferServiceClient::connect(format!("http://{addr}"))
+        .await
+        .expect("connect");
+    let ack = client
+        .transfer_pieces(tokio_stream::iter(frames))
+        .await
+        .expect("transfer_pieces")
+        .into_inner();
+    assert!(ack.ok, "transfer ack: {}", ack.error);
+
+    let snap = tgt.snapshot();
+    let scanned = tgt
+        .snapshot_prefix_scan(&snap, Partition::Node, b"node:")
+        .expect("scan");
+    let mut got: HashMap<String, Vec<u8>> = HashMap::new();
+    for (key, value) in scanned {
+        got.insert(String::from_utf8(key).expect("utf8"), value.to_vec());
+    }
+    assert_eq!(got.len(), 16, "all entries installed via gRPC");
+    assert_eq!(
+        got.get("node:0:00000003").map(Vec::as_slice),
+        Some(&b"v3"[..])
+    );
+}
+
 #[test]
 fn installer_rejects_empty_and_unknown_tag() {
     let dir = tempfile::tempdir().expect("tempdir");

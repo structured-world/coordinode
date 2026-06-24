@@ -33,6 +33,8 @@ tonic-prost-build = "0.14"
 [dev-dependencies]
 tempfile = { workspace = true }
 coordinode-raft = { workspace = true }
+# TcpListenerStream for the in-process SegmentTransferService gRPC round-trip test.
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [lints]
 workspace = true

@@ -726,12 +726,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!("ClusterService registered — cluster join/leave management available");
             }
 
-            // Register RaftService in cluster mode — embedded into :7080 so
-            // inter-node Raft RPCs share the main gRPC port (no separate server).
+            // Register cluster-only inter-node services in cluster mode — embedded
+            // into :7080 so inter-node RPCs share the main gRPC port (no separate
+            // server). Gated on cluster mode: raft_grpc_handler is Some only when
+            // peers are configured.
             if let Some(handler) = raft_grpc_handler {
                 use coordinode_raft::proto::replication::raft_service_server::RaftServiceServer;
                 router = router.add_service(RaftServiceServer::new(handler));
                 info!(node_id, "RaftService registered on :7080 (shared port)");
+
+                // SegmentTransferService: receive bulk segment pushes (replication
+                // repair, operator-commanded migration, node resync) and install
+                // them into local storage via the engine-backed sink.
+                use coordinode_replicate::segment_store::SegmentInstaller;
+                use coordinode_replicate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
+                use coordinode_replicate::transfer::SegmentTransferHandler;
+                let segment_handler = SegmentTransferHandler::new(Arc::new(SegmentInstaller::new(
+                    Arc::clone(&engine),
+                )));
+                router = router.add_service(
+                    SegmentTransferServiceServer::new(segment_handler)
+                        .max_decoding_message_size(max_req_bytes),
+                );
+                info!(
+                    node_id,
+                    "SegmentTransferService registered on :7080 (shared port)"
+                );
             }
 
             router.serve_with_shutdown(addr, shutdown).await?;
