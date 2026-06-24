@@ -509,6 +509,40 @@ fn unwind_list_end_to_end() {
     assert_eq!(results[2].get("x"), Some(&Value::Int(30)));
 }
 
+/// String functions reach the executor through the real parse → plan → execute
+/// pipeline (not just the expression-eval unit). Proves the grammar accepts the
+/// names and the planner routes them to the scalar evaluator.
+#[test]
+fn string_functions_end_to_end() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    let results = run_cypher(
+        "UNWIND ['Hello World'] AS w \
+         RETURN toLower(w) AS lo, toUpper(w) AS up, left(w, 5) AS lft, \
+                substring(w, 6) AS sub, charLength(w) AS len, \
+                split(w, ' ') AS parts, reverse(w) AS rev",
+        engine,
+        &mut interner,
+    );
+
+    assert_eq!(results.len(), 1);
+    let r = &results[0];
+    assert_eq!(r.get("lo"), Some(&Value::String("hello world".into())));
+    assert_eq!(r.get("up"), Some(&Value::String("HELLO WORLD".into())));
+    assert_eq!(r.get("lft"), Some(&Value::String("Hello".into())));
+    assert_eq!(r.get("sub"), Some(&Value::String("World".into())));
+    assert_eq!(r.get("len"), Some(&Value::Int(11)));
+    assert_eq!(
+        r.get("parts"),
+        Some(&Value::Array(vec![
+            Value::String("Hello".into()),
+            Value::String("World".into()),
+        ]))
+    );
+    assert_eq!(r.get("rev"), Some(&Value::String("dlroW olleH".into())));
+}
+
 // ── Correlated inline property filter (regression) ──────────────────────
 
 #[test]

@@ -792,3 +792,179 @@ fn eval_map_projection_missing_prop_is_null() {
         panic!("expected Map");
     }
 }
+
+// ---- R520 string functions ----
+
+/// Invoke a scalar function by name with literal arguments against an empty row.
+fn call_fn(name: &str, args: Vec<Value>) -> Value {
+    let expr = Expr::FunctionCall {
+        name: name.into(),
+        args: args.into_iter().map(Expr::Literal).collect(),
+        distinct: false,
+    };
+    eval_expr(&expr, &empty_row())
+}
+
+fn s(v: &str) -> Value {
+    Value::String(v.into())
+}
+
+#[test]
+fn string_fn_tolower_and_alias() {
+    assert_eq!(call_fn("toLower", vec![s("HeLLo")]), s("hello"));
+    // `lower` is an alias for `toLower`.
+    assert_eq!(call_fn("lower", vec![s("HeLLo")]), s("hello"));
+    // Names are case-insensitive per the Cypher spec.
+    assert_eq!(call_fn("TOLOWER", vec![s("ABC")]), s("abc"));
+}
+
+#[test]
+fn string_fn_toupper_and_alias() {
+    assert_eq!(call_fn("toUpper", vec![s("HeLLo")]), s("HELLO"));
+    assert_eq!(call_fn("upper", vec![s("HeLLo")]), s("HELLO"));
+}
+
+#[test]
+fn string_fn_trims() {
+    assert_eq!(call_fn("trim", vec![s("  hi  ")]), s("hi"));
+    assert_eq!(call_fn("ltrim", vec![s("  hi  ")]), s("hi  "));
+    assert_eq!(call_fn("rtrim", vec![s("  hi  ")]), s("  hi"));
+    assert_eq!(call_fn("btrim", vec![s("  hi  ")]), s("hi"));
+}
+
+#[test]
+fn string_fn_left_right() {
+    assert_eq!(call_fn("left", vec![s("hello"), Value::Int(3)]), s("hel"));
+    assert_eq!(call_fn("right", vec![s("hello"), Value::Int(3)]), s("llo"));
+    // len beyond the string length clamps to the whole string.
+    assert_eq!(call_fn("left", vec![s("hi"), Value::Int(10)]), s("hi"));
+    assert_eq!(call_fn("right", vec![s("hi"), Value::Int(10)]), s("hi"));
+    // negative length → NULL (no panic).
+    assert_eq!(call_fn("left", vec![s("hi"), Value::Int(-1)]), Value::Null);
+}
+
+#[test]
+fn string_fn_substring() {
+    // 0-indexed start, optional length.
+    assert_eq!(
+        call_fn("substring", vec![s("hello"), Value::Int(1), Value::Int(3)]),
+        s("ell")
+    );
+    // omitted length → to end.
+    assert_eq!(
+        call_fn("substring", vec![s("hello"), Value::Int(2)]),
+        s("llo")
+    );
+    // start past the end → empty string.
+    assert_eq!(call_fn("substring", vec![s("hi"), Value::Int(9)]), s(""));
+}
+
+#[test]
+fn string_fn_unicode_aware_indexing() {
+    // Multi-byte chars: "héllo" — `left`/`substring`/`charLength` count
+    // codepoints, not bytes, so we never split inside a codepoint.
+    assert_eq!(call_fn("left", vec![s("héllo"), Value::Int(2)]), s("hé"));
+    assert_eq!(call_fn("charLength", vec![s("héllo")]), Value::Int(5));
+    assert_eq!(
+        call_fn("substring", vec![s("héllo"), Value::Int(1), Value::Int(1)]),
+        s("é")
+    );
+}
+
+#[test]
+fn string_fn_replace() {
+    assert_eq!(
+        call_fn("replace", vec![s("a-b-c"), s("-"), s("+")]),
+        s("a+b+c")
+    );
+}
+
+#[test]
+fn string_fn_reverse_string_and_list() {
+    assert_eq!(call_fn("reverse", vec![s("abc")]), s("cba"));
+    // reverse also operates on a list.
+    let list = Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+    assert_eq!(
+        call_fn("reverse", vec![list]),
+        Value::Array(vec![Value::Int(3), Value::Int(2), Value::Int(1)])
+    );
+}
+
+#[test]
+fn string_fn_split() {
+    assert_eq!(
+        call_fn("split", vec![s("a,b,c"), s(",")]),
+        Value::Array(vec![s("a"), s("b"), s("c")])
+    );
+    // a list of delimiters splits on any of them.
+    let delims = Value::Array(vec![s(","), s(";")]);
+    assert_eq!(
+        call_fn("split", vec![s("a,b;c"), delims]),
+        Value::Array(vec![s("a"), s("b"), s("c")])
+    );
+    // empty delimiter → whole string as a single element.
+    assert_eq!(
+        call_fn("split", vec![s("abc"), s("")]),
+        Value::Array(vec![s("abc")])
+    );
+}
+
+#[test]
+fn string_fn_charlength() {
+    assert_eq!(call_fn("charLength", vec![s("hello")]), Value::Int(5));
+    assert_eq!(call_fn("charLength", vec![s("")]), Value::Int(0));
+}
+
+#[test]
+fn string_fn_tostring_variants() {
+    assert_eq!(call_fn("toStringOrNull", vec![Value::Int(42)]), s("42"));
+    assert_eq!(
+        call_fn("toStringOrNull", vec![Value::Bool(true)]),
+        s("true")
+    );
+    // unconvertible → NULL (not an error).
+    assert_eq!(
+        call_fn("toStringOrNull", vec![Value::Array(vec![])]),
+        Value::Null
+    );
+    // toStringList maps each element.
+    let list = Value::Array(vec![Value::Int(1), s("x"), Value::Bool(false)]);
+    assert_eq!(
+        call_fn("toStringList", vec![list]),
+        Value::Array(vec![s("1"), s("x"), s("false")])
+    );
+}
+
+#[test]
+fn string_fn_normalize() {
+    // "é" as decomposed (e + combining acute, NFD) normalizes under NFC to the
+    // single precomposed codepoint — fewer chars, same rendering.
+    let decomposed = s("e\u{0301}");
+    let nfc = call_fn("normalize", vec![decomposed.clone()]);
+    assert_eq!(nfc, s("\u{00e9}"));
+    // explicit form argument.
+    assert_eq!(
+        call_fn("normalize", vec![decomposed, s("NFC")]),
+        s("\u{00e9}")
+    );
+    // unknown form → NULL.
+    assert_eq!(call_fn("normalize", vec![s("a"), s("NFZ")]), Value::Null);
+}
+
+#[test]
+fn string_fn_null_propagation() {
+    // A string function applied to NULL (or a non-string) returns NULL.
+    assert_eq!(call_fn("toLower", vec![Value::Null]), Value::Null);
+    assert_eq!(call_fn("trim", vec![Value::Int(1)]), Value::Null);
+    assert_eq!(
+        call_fn("substring", vec![Value::Null, Value::Int(0)]),
+        Value::Null
+    );
+}
+
+#[test]
+fn unknown_function_still_returns_null() {
+    // The string-function fallthrough must not swallow the unknown-function
+    // NULL contract for names it does not own.
+    assert_eq!(call_fn("no_such_fn", vec![s("x")]), Value::Null);
+}

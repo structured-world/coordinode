@@ -936,7 +936,204 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
                 _ => Value::Null,
             }
         }
-        _ => Value::Null, // Unknown function returns null
+        // String functions (Cypher names are case-insensitive). Kept out of the
+        // exact-case arms above so existing functions stay untouched; the helper
+        // lowercases the name and returns None for anything it does not own,
+        // which falls through to the NULL contract for unknown functions.
+        _ => eval_string_function(name, &evaluated).unwrap_or(Value::Null),
+    }
+}
+
+/// Cypher string functions (`left`, `right`, `substring`, `toLower`/`lower`,
+/// `toUpper`/`upper`, `trim`/`ltrim`/`rtrim`/`btrim`, `replace`, `reverse`,
+/// `split`, `toStringOrNull`, `toStringList`, `normalize`, `charLength`).
+///
+/// `name` is matched case-insensitively (Cypher function names are
+/// case-insensitive). `args` are the already-evaluated argument values.
+/// Returns `None` for a name this helper does not handle so the caller can
+/// apply the unknown-function NULL contract. Per Cypher semantics, any string
+/// function applied to `NULL` returns `NULL`. Length / index arithmetic counts
+/// Unicode scalar values (`chars()`), not bytes, so multi-byte input behaves
+/// like Neo4j rather than splitting inside a codepoint.
+fn eval_string_function(name: &str, args: &[Value]) -> Option<Value> {
+    let lname = name.to_ascii_lowercase();
+
+    // Helpers local to string dispatch.
+    let as_str = |v: Option<&Value>| match v {
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None,
+    };
+    let as_len = |v: Option<&Value>| match v {
+        Some(Value::Int(n)) => Some(*n),
+        _ => None,
+    };
+
+    let result = match lname.as_str() {
+        "tolower" | "lower" => match args.first() {
+            Some(Value::String(s)) => Value::String(s.to_lowercase()),
+            _ => Value::Null,
+        },
+        "toupper" | "upper" => match args.first() {
+            Some(Value::String(s)) => Value::String(s.to_uppercase()),
+            _ => Value::Null,
+        },
+        "trim" | "btrim" => match args.first() {
+            Some(Value::String(s)) => Value::String(s.trim().to_string()),
+            _ => Value::Null,
+        },
+        "ltrim" => match args.first() {
+            Some(Value::String(s)) => Value::String(s.trim_start().to_string()),
+            _ => Value::Null,
+        },
+        "rtrim" => match args.first() {
+            Some(Value::String(s)) => Value::String(s.trim_end().to_string()),
+            _ => Value::Null,
+        },
+        // left(s, len): leftmost `len` Unicode chars. Negative len → NULL
+        // (Neo4j raises; we follow the project's no-panic NULL contract).
+        "left" => match (as_str(args.first()), as_len(args.get(1))) {
+            (Some(s), Some(len)) if len >= 0 => {
+                Value::String(s.chars().take(len as usize).collect())
+            }
+            _ => Value::Null,
+        },
+        // right(s, len): rightmost `len` Unicode chars.
+        "right" => match (as_str(args.first()), as_len(args.get(1))) {
+            (Some(s), Some(len)) if len >= 0 => {
+                let total = s.chars().count();
+                let skip = total.saturating_sub(len as usize);
+                Value::String(s.chars().skip(skip).collect())
+            }
+            _ => Value::Null,
+        },
+        // substring(s, start[, len]): 0-indexed start in Unicode chars; omitted
+        // len → to end. Out-of-range start → empty string (Neo4j behaviour).
+        "substring" => match (as_str(args.first()), as_len(args.get(1))) {
+            (Some(s), Some(start)) if start >= 0 => {
+                let chars = s.chars().skip(start as usize);
+                match as_len(args.get(2)) {
+                    Some(len) if len >= 0 => Value::String(chars.take(len as usize).collect()),
+                    Some(_) => Value::Null, // negative length
+                    None => Value::String(chars.collect()),
+                }
+            }
+            _ => Value::Null,
+        },
+        // replace(original, search, replacement): replace every occurrence.
+        "replace" => match (
+            as_str(args.first()),
+            as_str(args.get(1)),
+            as_str(args.get(2)),
+        ) {
+            (Some(s), Some(search), Some(rep)) => Value::String(s.replace(&search, &rep)),
+            _ => Value::Null,
+        },
+        // reverse(x): reverse a string (by Unicode chars) or a list.
+        "reverse" => match args.first() {
+            Some(Value::String(s)) => Value::String(s.chars().rev().collect()),
+            Some(Value::Array(a)) => {
+                let mut out = a.clone();
+                out.reverse();
+                Value::Array(out)
+            }
+            _ => Value::Null,
+        },
+        // split(original, delimiter): returns a list of substrings. The
+        // delimiter may be a single string or a list of strings (split on any).
+        "split" => match (as_str(args.first()), args.get(1)) {
+            (Some(s), Some(Value::String(delim))) => {
+                Value::Array(split_on(&s, std::slice::from_ref(delim)))
+            }
+            (Some(s), Some(Value::Array(delims))) => {
+                let ds: Vec<String> = delims
+                    .iter()
+                    .filter_map(|d| match d {
+                        Value::String(d) => Some(d.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                Value::Array(split_on(&s, &ds))
+            }
+            _ => Value::Null,
+        },
+        // charLength(s): number of Unicode scalar values (vs `size`, which is
+        // byte length for strings).
+        "charlength" => match args.first() {
+            Some(Value::String(s)) => Value::Int(s.chars().count() as i64),
+            _ => Value::Null,
+        },
+        // toStringOrNull(v): like toString but yields NULL for unconvertible
+        // input instead of raising.
+        "tostringornull" => match args.first() {
+            Some(Value::String(s)) => Value::String(s.clone()),
+            Some(Value::Int(n)) => Value::String(n.to_string()),
+            Some(Value::Float(f)) => Value::String(f.to_string()),
+            Some(Value::Bool(b)) => Value::String(b.to_string()),
+            _ => Value::Null,
+        },
+        // toStringList(list): convert each element via toString semantics;
+        // unconvertible elements become NULL entries (Neo4j: toStringOrNull
+        // per element).
+        "tostringlist" => match args.first() {
+            Some(Value::Array(items)) => Value::Array(
+                items
+                    .iter()
+                    .map(|v| match v {
+                        Value::String(s) => Value::String(s.clone()),
+                        Value::Int(n) => Value::String(n.to_string()),
+                        Value::Float(f) => Value::String(f.to_string()),
+                        Value::Bool(b) => Value::String(b.to_string()),
+                        _ => Value::Null,
+                    })
+                    .collect(),
+            ),
+            _ => Value::Null,
+        },
+        // normalize(s[, form]): Unicode normalization, default NFC.
+        "normalize" => match args.first() {
+            Some(Value::String(s)) => {
+                let form = match args.get(1) {
+                    Some(Value::String(f)) => f.to_uppercase(),
+                    _ => "NFC".to_string(),
+                };
+                normalize_unicode(s, &form).map_or(Value::Null, Value::String)
+            }
+            _ => Value::Null,
+        },
+        _ => return None,
+    };
+
+    Some(result)
+}
+
+/// Split `s` on any of `delims`. An empty delimiter set (or all-empty
+/// delimiters) returns the whole string as a single element, matching Neo4j's
+/// handling of a degenerate delimiter.
+fn split_on(s: &str, delims: &[String]) -> Vec<Value> {
+    let active: Vec<&String> = delims.iter().filter(|d| !d.is_empty()).collect();
+    if active.is_empty() {
+        return vec![Value::String(s.to_string())];
+    }
+    let mut parts = vec![s.to_string()];
+    for d in active {
+        parts = parts
+            .into_iter()
+            .flat_map(|p| p.split(d.as_str()).map(str::to_string).collect::<Vec<_>>())
+            .collect();
+    }
+    parts.into_iter().map(Value::String).collect()
+}
+
+/// Apply the requested Unicode normal form. Returns `None` for an unrecognised
+/// form name so the caller maps it to NULL.
+fn normalize_unicode(s: &str, form: &str) -> Option<String> {
+    use unicode_normalization::UnicodeNormalization;
+    match form {
+        "NFC" => Some(s.nfc().collect()),
+        "NFD" => Some(s.nfd().collect()),
+        "NFKC" => Some(s.nfkc().collect()),
+        "NFKD" => Some(s.nfkd().collect()),
+        _ => None,
     }
 }
 
