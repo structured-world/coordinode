@@ -592,6 +592,7 @@ atom = {
   | reduce_expr
   | list_predicate
   | list_comprehension
+  | pattern_comprehension
   | function_call
   | case_expr
   | list_literal
@@ -623,6 +624,14 @@ function_args = { star | expression ~ ("," ~ expression)* }
 // EXISTS { MATCH … [WHERE …] } — existential subquery; true if the inner
 // MATCH yields at least one row (correlated with outer-scope bindings).
 exists_subquery = { kw_exists ~ "{" ~ match_clause ~ "}" }
+
+// [(a)-[:R]->(b) WHERE pred | expr] — pattern comprehension. The mandatory
+// `| expr` distinguishes it from a list literal; placed after list_comprehension
+// in `atom` (which starts with `[` identifier IN). `pattern` is the same rule a
+// MATCH uses, so semantics match MATCH exactly.
+pattern_comprehension = {
+    "[" ~ pattern ~ (kw_where ~ expression)? ~ "|" ~ expression ~ "]"
+}
 
 // [x IN list WHERE pred | expr] — list comprehension; WHERE and `| expr` both
 // optional. Must precede list_literal in `atom` (both open with `[`); the

@@ -547,6 +547,10 @@ impl<'a> Analyzer<'a> {
                 // outer variables); it is fully validated by the logical planner
                 // when the subquery is built, so no outer-scope check here.
             }
+            Expr::PatternComprehension { .. } => {
+                // Same as EXISTS: the inner pattern introduces its own scope and
+                // is validated by the planner when the comprehension is built.
+            }
             Expr::ListPredicate {
                 var, list, pred, ..
             } => {

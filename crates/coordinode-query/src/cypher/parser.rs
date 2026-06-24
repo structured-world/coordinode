@@ -2349,6 +2349,7 @@ fn build_expression(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
         Rule::exists_subquery => build_exists_subquery(pair),
         Rule::list_predicate => build_list_predicate(pair),
         Rule::list_comprehension => build_list_comprehension(pair),
+        Rule::pattern_comprehension => build_pattern_comprehension(pair),
         Rule::list_literal => build_list_literal(pair),
         Rule::map_literal => build_map_literal(pair),
         Rule::map_projection => build_map_projection(pair),
@@ -2747,6 +2748,39 @@ fn build_exists_subquery(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
     Err(ParseError::Invalid(
         "EXISTS subquery requires a MATCH clause".into(),
     ))
+}
+
+fn build_pattern_comprehension(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
+    let mut pattern: Option<Pattern> = None;
+    let mut where_clause: Option<Expr> = None;
+    let mut map: Option<Expr> = None;
+    let mut saw_where = false;
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::pattern => pattern = Some(build_pattern(inner)?),
+            Rule::kw_where => saw_where = true,
+            _ => {
+                let e = build_expression(inner)?;
+                if saw_where && where_clause.is_none() {
+                    where_clause = Some(e);
+                } else {
+                    map = Some(e);
+                }
+            }
+        }
+    }
+
+    match (pattern, map) {
+        (Some(pattern), Some(map)) => Ok(Expr::PatternComprehension {
+            pattern: Box::new(pattern),
+            where_clause: where_clause.map(Box::new),
+            map: Box::new(map),
+        }),
+        _ => Err(ParseError::Invalid(
+            "malformed pattern comprehension".into(),
+        )),
+    }
 }
 
 fn build_list_comprehension(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {

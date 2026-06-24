@@ -2163,43 +2163,48 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 }
             }
 
-            let mut result: Vec<Row> = rows
-                .into_iter()
-                .map(|row| {
-                    let mut out = Row::new();
-                    for item in items {
-                        if item.expr == Expr::Star {
-                            // Star: copy all columns
-                            out.extend(row.clone());
+            // For-loop (not `.map`) so projection items containing pattern
+            // comprehensions / EXISTS can evaluate through the storage-aware,
+            // `&mut ctx`-borrowing path and propagate errors with `?`.
+            let mut result: Vec<Row> = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut out = Row::new();
+                for item in items {
+                    if item.expr == Expr::Star {
+                        // Star: copy all columns
+                        out.extend(row.clone());
+                    } else {
+                        let val = if expr_contains_pattern_predicate(&item.expr) {
+                            eval_predicate_with_storage(&item.expr, &row, ctx)?
                         } else {
-                            let val = eval_expr(&item.expr, &row);
-                            let key = item
-                                .alias
-                                .clone()
-                                .unwrap_or_else(|| expr_display_name(&item.expr));
-                            out.insert(key.clone(), val);
+                            eval_expr(&item.expr, &row)
+                        };
+                        let key = item
+                            .alias
+                            .clone()
+                            .unwrap_or_else(|| expr_display_name(&item.expr));
+                        out.insert(key.clone(), val);
 
-                            // Variable passthrough: when a projection item is
-                            // bare `Variable(x)` (and is left unrenamed, OR is
-                            // aliased — in which case we re-bind the alias's
-                            // property columns), also propagate every `x.prop`
-                            // and `x.__*__` auxiliary column from the input
-                            // row. Without this, `MATCH (a) WITH a RETURN
-                            // a.prop` would lose all property bindings at the
-                            // WITH barrier and `a.prop` would resolve to NULL.
-                            if let Expr::Variable(var_name) = &item.expr {
-                                let prefix = format!("{var_name}.");
-                                for (col, value) in &row {
-                                    if let Some(suffix) = col.strip_prefix(&prefix) {
-                                        out.insert(format!("{key}.{suffix}"), value.clone());
-                                    }
+                        // Variable passthrough: when a projection item is
+                        // bare `Variable(x)` (and is left unrenamed, OR is
+                        // aliased — in which case we re-bind the alias's
+                        // property columns), also propagate every `x.prop`
+                        // and `x.__*__` auxiliary column from the input
+                        // row. Without this, `MATCH (a) WITH a RETURN
+                        // a.prop` would lose all property bindings at the
+                        // WITH barrier and `a.prop` would resolve to NULL.
+                        if let Expr::Variable(var_name) = &item.expr {
+                            let prefix = format!("{var_name}.");
+                            for (col, value) in &row {
+                                if let Some(suffix) = col.strip_prefix(&prefix) {
+                                    out.insert(format!("{key}.{suffix}"), value.clone());
                                 }
                             }
                         }
                     }
-                    out
-                })
-                .collect();
+                }
+                result.push(out);
+            }
 
             if *distinct {
                 // Full dedup — not just consecutive. O(n²) but correct for
@@ -6328,7 +6333,7 @@ fn collect_expr_vars(expr: &Expr, vars: &mut Vec<String>) {
         // The inner MATCH binds its own variables; any outer-correlation
         // variables it references are already provisioned by the outer clauses,
         // so it contributes no extra outer dependencies here.
-        Expr::ExistsSubquery(_) => {}
+        Expr::ExistsSubquery(_) | Expr::PatternComprehension { .. } => {}
         // Literal, Parameter, Star — no variable references.
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Star => {}
     }
@@ -7190,7 +7195,9 @@ fn execute_merge_relationship_check(
 /// Check whether an expression tree contains any `PatternPredicate` nodes.
 fn expr_contains_pattern_predicate(expr: &Expr) -> bool {
     match expr {
-        Expr::PatternPredicate(_) | Expr::ExistsSubquery(_) => true,
+        Expr::PatternPredicate(_) | Expr::ExistsSubquery(_) | Expr::PatternComprehension { .. } => {
+            true
+        }
         Expr::UnaryOp { expr, .. } => expr_contains_pattern_predicate(expr),
         Expr::BinaryOp { left, right, .. } => {
             expr_contains_pattern_predicate(left) || expr_contains_pattern_predicate(right)
@@ -7229,6 +7236,11 @@ fn eval_predicate_with_storage(
             }
         }
         Expr::ExistsSubquery(match_clause) => exists_subquery_matches(match_clause, row, ctx),
+        Expr::PatternComprehension {
+            pattern,
+            where_clause,
+            map,
+        } => pattern_comprehension_eval(pattern, where_clause.as_deref(), map, row, ctx),
         Expr::UnaryOp { op, expr } => {
             let v = eval_predicate_with_storage(expr, row, ctx)?;
             Ok(eval_unary_op(*op, &v))
@@ -7293,6 +7305,55 @@ fn exists_subquery_matches(
         .iter()
         .any(|rr| rr.iter().all(|(k, v)| row.get(k).is_none_or(|ov| ov == v)));
     Ok(Value::Bool(any))
+}
+
+/// Evaluate a `[(a)-[:R]->(b) WHERE pred | map]` pattern comprehension: match
+/// the inner pattern (correlated with `row`), then collect `map` evaluated over
+/// each matching, outer-consistent row into a list.
+///
+/// Shares the EXISTS machinery: the pattern is planned through the MATCH planner
+/// with a `RETURN *` so the inner variables survive, executed uncorrelated, then
+/// post-filtered against the outer bindings on shared variables. For each kept
+/// row, `map` is evaluated against the outer row merged with the inner bindings.
+fn pattern_comprehension_eval(
+    pattern: &Pattern,
+    where_clause: Option<&Expr>,
+    map: &Expr,
+    row: &Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Value, ExecutionError> {
+    use crate::cypher::ast::{Clause, MatchClause, Query, ReturnClause, ReturnItem};
+    let mc = MatchClause {
+        patterns: vec![pattern.clone()],
+        where_clause: where_clause.cloned(),
+    };
+    let query = Query {
+        clauses: vec![
+            Clause::Match(mc),
+            Clause::Return(ReturnClause {
+                distinct: false,
+                items: vec![ReturnItem {
+                    expr: Expr::Star,
+                    alias: None,
+                }],
+            }),
+        ],
+        hints: Vec::new(),
+    };
+    let plan = crate::planner::builder::build_logical_plan(&query).map_err(|e| {
+        ExecutionError::Unsupported(format!("pattern comprehension planning failed: {e}"))
+    })?;
+
+    let rows = execute_op(&plan.root, ctx)?;
+    let mut out = Vec::new();
+    for rr in rows {
+        if rr.iter().all(|(k, v)| row.get(k).is_none_or(|ov| ov == v)) {
+            let mut eval_row = row.clone();
+            eval_row.extend(rr);
+            out.push(eval_expr(map, &eval_row));
+        }
+    }
+    Ok(Value::Array(out))
 }
 
 /// Check if a pattern predicate matches: does the described path exist in the graph?

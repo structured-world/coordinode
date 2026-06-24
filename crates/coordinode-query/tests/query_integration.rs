@@ -637,6 +637,48 @@ fn list_comprehension_end_to_end() {
     );
 }
 
+/// Pattern comprehension `[(a)-->(b) | expr]` in RETURN, correlated on the
+/// outer node, with and without an inner WHERE.
+#[test]
+fn pattern_comprehension_end_to_end() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    let arr_names = |row: &coordinode_query::executor::Row, key: &str| -> Vec<String> {
+        match row.get(key) {
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("expected array for {key}, got {other:?}"),
+        }
+    };
+
+    // Alice KNOWS Bob and Charlie → both names collected.
+    let res = run_cypher(
+        "MATCH (a:Person {name: 'Alice'}) \
+         RETURN [(a)-[:KNOWS]->(b) | b.name] AS friends",
+        engine,
+        &mut interner,
+    );
+    assert_eq!(res.len(), 1);
+    let mut friends = arr_names(&res[0], "friends");
+    friends.sort();
+    assert_eq!(friends, vec!["Bob".to_string(), "Charlie".to_string()]);
+
+    // Inner WHERE on the inner node: only friends older than 28 → Charlie (30).
+    let res2 = run_cypher(
+        "MATCH (a:Person {name: 'Alice'}) \
+         RETURN [(a)-[:KNOWS]->(b) WHERE b.age > 28 | b.name] AS older",
+        engine,
+        &mut interner,
+    );
+    assert_eq!(arr_names(&res2[0], "older"), vec!["Charlie".to_string()]);
+}
+
 /// List quantifier predicates all/any/none/single execute end-to-end.
 #[test]
 fn list_predicates_end_to_end() {

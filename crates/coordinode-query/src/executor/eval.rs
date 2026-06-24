@@ -334,6 +334,11 @@ pub fn eval_expr(expr: &Expr, row: &Row) -> Value {
         // means EXISTS appeared in a context without engine access; yield NULL.
         Expr::ExistsSubquery(_) => Value::Null,
 
+        // Pattern comprehension needs the engine to run its inner pattern; the
+        // storage-aware evaluator (WHERE + projection paths) handles it. Reaching
+        // the pure evaluator means no engine access — yield NULL.
+        Expr::PatternComprehension { .. } => Value::Null,
+
         // [x IN list WHERE pred | map]: bind each element to `var`, keep those
         // passing the optional `pred`, project through the optional `map`
         // (default = the element itself), collecting into a new list.

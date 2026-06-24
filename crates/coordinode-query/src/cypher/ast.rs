@@ -702,6 +702,19 @@ pub enum Expr {
     /// top-level query (no second pattern-matching implementation).
     ExistsSubquery(Box<MatchClause>),
 
+    /// Pattern comprehension: `[(a)-[:R]->(b) WHERE pred | expr]`. Matches the
+    /// inner pattern (correlated with the outer row), filters by the optional
+    /// `pred`, and collects `map` evaluated per match into a list. Planned
+    /// through the same MATCH planner as a top-level query.
+    PatternComprehension {
+        /// The path pattern to match.
+        pattern: Box<Pattern>,
+        /// Optional filter over the matched rows.
+        where_clause: Option<Box<Expr>>,
+        /// Projection evaluated per matching row, collected into the result list.
+        map: Box<Expr>,
+    },
+
     /// List comprehension: `[x IN list WHERE pred | expr]`. For each element
     /// bound to `var`, the optional `pred` filters and the optional `map`
     /// projects (defaulting to `var` itself). Produces a new list.
@@ -852,6 +865,30 @@ impl Expr {
                 if let Some(m) = map {
                     m.substitute_params(params);
                 }
+            }
+            Expr::PatternComprehension {
+                pattern,
+                where_clause,
+                map,
+            } => {
+                for elem in &mut pattern.elements {
+                    match elem {
+                        PatternElement::Node(node) => {
+                            for (_, v) in &mut node.properties {
+                                v.substitute_params(params);
+                            }
+                        }
+                        PatternElement::Relationship(rel) => {
+                            for (_, v) in &mut rel.properties {
+                                v.substitute_params(params);
+                            }
+                        }
+                    }
+                }
+                if let Some(w) = where_clause {
+                    w.substitute_params(params);
+                }
+                map.substitute_params(params);
             }
             Expr::ExistsSubquery(mc) => {
                 for pattern in &mut mc.patterns {

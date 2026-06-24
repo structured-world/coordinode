@@ -699,6 +699,22 @@ fn write_expr(buf: &mut String, expr: &Expr) {
             buf.push_str("EXISTS");
             buf.push_str(&format!("{mc:?}"));
         }
+        Expr::PatternComprehension {
+            pattern,
+            where_clause,
+            map,
+        } => {
+            // Inner pattern distinguishes the plan-cache key — fold it in via
+            // Debug (structurally exact), then the WHERE and projection.
+            buf.push_str("PCOMP");
+            buf.push_str(&format!("{pattern:?}"));
+            if let Some(w) = where_clause {
+                buf.push_str(" WHERE ");
+                write_expr(buf, w);
+            }
+            buf.push_str(" | ");
+            write_expr(buf, map);
+        }
         Expr::ListComprehension {
             var,
             list,
