@@ -80,6 +80,10 @@ config file nor a flag sets the value.
 | `--no-scrub` | (scrub on) | Disable the background integrity scrub. Each node otherwise periodically verifies every on-disk block's checksum on its own local storage. |
 | `--scrub-interval-secs` | `604800` | Seconds between background scrub cycles (default 7 days). |
 | `--scrub-throttle-ms` | `50` | Pause between SST scans during a scrub so it yields I/O to production; `0` runs at full speed. |
+| `--no-checkpoint` | (on) | Disable periodic local checkpoints (the base for WAL-replay repair of a corrupt partition when no healthy replica is available). |
+| `--checkpoint-interval-secs` | `3600` | Seconds between periodic checkpoints (default 1 hour). |
+| `--checkpoint-dir` | `<data_dir>/checkpoints` | Directory checkpoints are written under. |
+| `--checkpoint-keep` | `3` | Number of recent checkpoints to retain; older ones are pruned. |
 
 ### TLS trust and self-signed certificates
 
@@ -204,6 +208,12 @@ wire_compression_level: 3
 scrub_enabled: true
 # scrub_interval_secs: 604800
 # scrub_throttle_ms: 50
+
+# Periodic local checkpoints (base for WAL-replay repair).
+checkpoint_enabled: true
+# checkpoint_interval_secs: 3600
+# checkpoint_dir: /var/lib/coordinode/checkpoints
+# checkpoint_keep: 3
 ```
 
 Set any tunable directly in this file. To override one value without editing the

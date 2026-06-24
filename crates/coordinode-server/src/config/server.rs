@@ -132,6 +132,17 @@ pub struct ServerConfig {
     /// milliseconds, so the scrub yields I/O to production traffic. `None` or 0
     /// runs at full speed. Default 50.
     pub scrub_throttle_ms: Option<u64>,
+    /// Whether periodic local checkpoints are taken. A checkpoint is the base for
+    /// WAL-replay repair (rebuild a corrupt partition from the last checkpoint +
+    /// oplog when no healthy replica can serve it). Per-node, no leader election.
+    /// Default true.
+    pub checkpoint_enabled: bool,
+    /// Interval between periodic checkpoints, in seconds. Default 1 hour.
+    pub checkpoint_interval_secs: u64,
+    /// Directory checkpoints are written under. `None` derives `<data_dir>/checkpoints`.
+    pub checkpoint_dir: Option<String>,
+    /// Number of recent checkpoints to retain; older ones are pruned. Default 3.
+    pub checkpoint_keep: usize,
 }
 
 impl Default for ServerConfig {
@@ -166,6 +177,10 @@ impl Default for ServerConfig {
             scrub_enabled: true,
             scrub_interval_secs: 7 * 24 * 3600,
             scrub_throttle_ms: Some(50),
+            checkpoint_enabled: true,
+            checkpoint_interval_secs: 3600,
+            checkpoint_dir: None,
+            checkpoint_keep: 3,
         }
     }
 }
@@ -204,6 +219,10 @@ pub struct CliOverrides {
     pub scrub_enabled: Option<bool>,
     pub scrub_interval_secs: Option<u64>,
     pub scrub_throttle_ms: Option<u64>,
+    pub checkpoint_enabled: Option<bool>,
+    pub checkpoint_interval_secs: Option<u64>,
+    pub checkpoint_dir: Option<String>,
+    pub checkpoint_keep: Option<usize>,
 }
 
 impl ServerConfig {
@@ -314,6 +333,28 @@ impl ServerConfig {
         }
         if o.scrub_throttle_ms.is_some() {
             self.scrub_throttle_ms = o.scrub_throttle_ms;
+        }
+        if let Some(v) = o.checkpoint_enabled {
+            self.checkpoint_enabled = v;
+        }
+        if let Some(v) = o.checkpoint_interval_secs {
+            self.checkpoint_interval_secs = v;
+        }
+        if o.checkpoint_dir.is_some() {
+            self.checkpoint_dir = o.checkpoint_dir.clone();
+        }
+        if let Some(v) = o.checkpoint_keep {
+            self.checkpoint_keep = v;
+        }
+    }
+
+    /// The directory periodic checkpoints are written under: the configured
+    /// `checkpoint_dir`, or `<data_dir>/checkpoints` when unset.
+    #[must_use]
+    pub fn checkpoint_directory(&self) -> std::path::PathBuf {
+        match &self.checkpoint_dir {
+            Some(d) => std::path::PathBuf::from(d),
+            None => std::path::Path::new(&self.data_dir).join("checkpoints"),
         }
     }
 

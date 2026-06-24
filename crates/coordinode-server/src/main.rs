@@ -49,6 +49,7 @@ pub mod proto {
     }
 }
 
+mod checkpoint;
 mod cli;
 mod config;
 mod grpc;
@@ -250,6 +251,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // matching the cluster-detection contract below.
             // Capture the scrub config before destructuring moves `cfg`.
             let scrub_cfg = cfg.scrub_config();
+            // Capture checkpoint settings before destructuring moves `cfg`.
+            let checkpoint_enabled = cfg.checkpoint_enabled;
+            let checkpoint_interval_secs = cfg.checkpoint_interval_secs;
+            let checkpoint_keep = cfg.checkpoint_keep;
+            let checkpoint_dir = cfg.checkpoint_directory();
             let config::ServerConfig {
                 node_id,
                 grpc_addr,
@@ -282,6 +288,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 scrub_enabled: _,
                 scrub_interval_secs: _,
                 scrub_throttle_ms: _,
+                // Already captured above before the move.
+                checkpoint_enabled: _,
+                checkpoint_interval_secs: _,
+                checkpoint_dir: _,
+                checkpoint_keep: _,
             } = cfg;
             let peers = if peers_vec.is_empty() {
                 None
@@ -491,6 +502,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 Ok(Err(e)) => tracing::warn!(%e, "background scrub failed"),
                                 Err(e) => tracing::warn!(%e, "background scrub task panicked"),
+                            }
+                        }
+                    });
+                }
+            }
+
+            // Periodic local checkpoints: the base WAL-replay repair rebuilds a
+            // corrupt partition from when no healthy replica can serve it. Per
+            // node, no leader election; blocking I/O kept off the runtime.
+            {
+                if checkpoint_enabled {
+                    let ckpt_engine = Arc::clone(&engine);
+                    let interval = std::time::Duration::from_secs(checkpoint_interval_secs.max(1));
+                    let jitter = interval
+                        .checked_div(16)
+                        .map(|slice| slice.saturating_mul(u32::try_from(node_id % 16).unwrap_or(0)))
+                        .unwrap_or_default();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(jitter).await;
+                        let mut ticker = tokio::time::interval(interval);
+                        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            ticker.tick().await;
+                            let eng = Arc::clone(&ckpt_engine);
+                            let dir = checkpoint_dir.clone();
+                            let now_secs = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            match tokio::task::spawn_blocking(move || {
+                                checkpoint::run_checkpoint_cycle(
+                                    &eng,
+                                    &dir,
+                                    checkpoint_keep,
+                                    now_secs,
+                                )
+                            })
+                            .await
+                            {
+                                Ok(Ok(path)) => {
+                                    metrics::counter!("coordinode_checkpoint_total").increment(1);
+                                    metrics::gauge!("coordinode_checkpoint_last_timestamp_seconds")
+                                        .set(now_secs as f64);
+                                    tracing::info!(checkpoint = %path.display(), "checkpoint written");
+                                }
+                                Ok(Err(e)) => {
+                                    metrics::counter!("coordinode_checkpoint_failures_total")
+                                        .increment(1);
+                                    tracing::warn!(%e, "periodic checkpoint failed");
+                                }
+                                Err(e) => tracing::warn!(%e, "checkpoint task panicked"),
                             }
                         }
                     });

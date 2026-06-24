@@ -79,6 +79,18 @@ fn register_storage_metrics() {
         "coordinode_scrub_repairs_total",
         "Partitions repaired from healthy peers after the scrub found corruption"
     );
+    metrics::describe_counter!(
+        "coordinode_checkpoint_total",
+        "Periodic local checkpoints completed"
+    );
+    metrics::describe_counter!(
+        "coordinode_checkpoint_failures_total",
+        "Periodic checkpoint attempts that failed"
+    );
+    metrics::describe_gauge!(
+        "coordinode_checkpoint_last_timestamp_seconds",
+        "Unix time of the last completed periodic checkpoint"
+    );
 }
 
 fn register_query_metrics() {

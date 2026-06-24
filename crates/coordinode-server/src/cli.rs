@@ -217,6 +217,10 @@ pub fn parse_args_from(args: &[String]) -> Command {
                 scrub_enabled: args.iter().any(|a| a == "--no-scrub").then_some(false),
                 scrub_interval_secs: find_flag_num(args, "--scrub-interval-secs"),
                 scrub_throttle_ms: find_flag_num(args, "--scrub-throttle-ms"),
+                checkpoint_enabled: args.iter().any(|a| a == "--no-checkpoint").then_some(false),
+                checkpoint_interval_secs: find_flag_num(args, "--checkpoint-interval-secs"),
+                checkpoint_dir: find_flag(args, "--checkpoint-dir"),
+                checkpoint_keep: find_flag_num(args, "--checkpoint-keep"),
             };
             Command::Serve {
                 config_path,
@@ -328,7 +332,8 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  [--retention-window-secs N] [--registry-heartbeat-ms N] [--registry-eviction-ms N]\n          \
                  [--wire-compression-level N]\n          \
                  [--tls-cert FILE --tls-key FILE] [--tls-ca FILE] [--tls-require-client-auth]\n          \
-                 [--no-scrub] [--scrub-interval-secs N] [--scrub-throttle-ms N]\n  \
+                 [--no-scrub] [--scrub-interval-secs N] [--scrub-throttle-ms N]\n          \
+                 [--no-checkpoint] [--checkpoint-interval-secs N] [--checkpoint-dir DIR] [--checkpoint-keep N]\n  \
                  coordinode backup --output FILE [--data DIR | --config FILE] [--format json|cypher|binary|snapshot] [--namespace NS] [--since SEQNO]\n  \
                  coordinode restore --input FILE [--data DIR | --config FILE] [--format json|cypher|binary|snapshot|apoc-json|apoc-cypher|hetio-json] [--namespace NS] [--only-labels L1,L2] [--force]\n  \
                  coordinode checkpoint --output DIR [--data DIR | --config FILE]\n  \
