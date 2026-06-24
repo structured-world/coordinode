@@ -1275,6 +1275,8 @@ pub enum StringOp {
     StartsWith,
     EndsWith,
     Contains,
+    /// `=~` regex match (whole-string, Neo4j semantics).
+    Regex,
 }
 
 #[cfg(test)]

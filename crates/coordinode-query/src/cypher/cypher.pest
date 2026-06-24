@@ -557,7 +557,8 @@ not_expr = { kw_not ~ not_expr | comparison }
 comparison = { addition ~ comparison_tail? }
 
 comparison_tail = {
-    comp_op ~ addition
+    regex_op ~ addition
+  | comp_op ~ addition
   | is_not_null_op
   | is_null_op
   | in_op ~ addition
@@ -572,6 +573,7 @@ in_op           = { kw_in }
 starts_with_op  = { kw_starts ~ kw_with }
 ends_with_op    = { kw_ends ~ kw_with }
 contains_op     = { kw_contains }
+regex_op        = { "=~" }
 
 comp_op = { "<>" | "<=" | ">=" | "=" | "<" | ">" }
 

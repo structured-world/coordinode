@@ -211,6 +211,35 @@ fn eval_string_starts_with() {
 }
 
 #[test]
+fn eval_string_regex_match() {
+    let mk = |s: &str, pat: &str| Expr::StringMatch {
+        expr: Box::new(Expr::Literal(Value::String(s.into()))),
+        op: StringOp::Regex,
+        pattern: Box::new(Expr::Literal(Value::String(pat.into()))),
+    };
+    // `=~` is a whole-string match (anchored).
+    assert_eq!(
+        eval_expr(&mk("hello", "h.*o"), &empty_row()),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_expr(&mk("hello", "hello"), &empty_row()),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_expr(&mk("abc123", "[a-z]+[0-9]+"), &empty_row()),
+        Value::Bool(true)
+    );
+    // Substring that is not a whole-string match → false (anchored).
+    assert_eq!(
+        eval_expr(&mk("hello", "ell"), &empty_row()),
+        Value::Bool(false)
+    );
+    // Invalid regex → false, never a panic.
+    assert_eq!(eval_expr(&mk("x", "["), &empty_row()), Value::Bool(false));
+}
+
+#[test]
 fn eval_is_null() {
     let expr = Expr::IsNull {
         expr: Box::new(Expr::Literal(Value::Null)),

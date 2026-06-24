@@ -807,6 +807,7 @@ fn string_op_str(op: &StringOp) -> &'static str {
         StringOp::StartsWith => "STARTS WITH",
         StringOp::EndsWith => "ENDS WITH",
         StringOp::Contains => "CONTAINS",
+        StringOp::Regex => "=~",
     }
 }
 

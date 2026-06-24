@@ -637,6 +637,28 @@ fn list_comprehension_end_to_end() {
     );
 }
 
+/// `=~` regex match operator in WHERE (whole-string, anchored).
+#[test]
+fn regex_match_end_to_end() {
+    let (_fx, mut interner) = setup_social_graph();
+    let engine = &_fx.engine;
+
+    // Names matching `A.*` (anchored) → only Alice.
+    let results = run_cypher(
+        "MATCH (n:Person) WHERE n.name =~ 'A.*' RETURN n.name AS name",
+        engine,
+        &mut interner,
+    );
+    let names: Vec<String> = results
+        .iter()
+        .filter_map(|r| match r.get("name") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, vec!["Alice".to_string()]);
+}
+
 /// Pattern comprehension `[(a)-->(b) | expr]` in RETURN, correlated on the
 /// outer node, with and without an inner WHERE.
 #[test]

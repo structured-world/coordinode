@@ -261,6 +261,12 @@ pub fn eval_expr(expr: &Expr, row: &Row) -> Value {
                         StringOp::StartsWith => s.starts_with(p),
                         StringOp::EndsWith => s.ends_with(p),
                         StringOp::Contains => s.contains(p),
+                        // `=~` is a whole-string match (Neo4j): anchor the
+                        // user pattern. An invalid pattern yields false rather
+                        // than panicking.
+                        StringOp::Regex => regex::Regex::new(&format!("^(?:{p})$"))
+                            .map(|re| re.is_match(s))
+                            .unwrap_or(false),
                     };
                     Value::Bool(result)
                 }

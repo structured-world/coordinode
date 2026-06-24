@@ -2586,6 +2586,19 @@ fn build_comparison_tail(left: Expr, tail: Pair<'_, Rule>) -> Result<Expr, Parse
                 list: Box::new(right),
             })
         }
+        Rule::regex_op => {
+            let right = build_expression(
+                children
+                    .into_iter()
+                    .nth(1)
+                    .ok_or_else(|| ParseError::Invalid("missing =~ RHS".into()))?,
+            )?;
+            Ok(Expr::StringMatch {
+                expr: Box::new(left),
+                op: StringOp::Regex,
+                pattern: Box::new(right),
+            })
+        }
         Rule::starts_with_op => {
             let right = build_expression(
                 children
