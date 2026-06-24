@@ -12,13 +12,17 @@
 //! - [`export_segment`] reads a [`SegmentDescriptor`]'s key range into a
 //!   portable blob; hand it to a [`LocalPieceStore`](coordinode_swarm::LocalPieceStore)
 //!   (`insert`) to serve it over the swarm transport.
-//! - [`StorageSegmentSink`] implements [`SegmentSink`]: it decodes a received
-//!   blob and installs the entries into a partition.
+//! - [`SegmentInstaller`] implements [`SegmentSink`]: it decodes a received
+//!   self-describing blob and installs the entries into the partition named by
+//!   the blob's leading wire tag.
+
+use std::sync::Arc;
 
 use coordinode_storage::engine::core::StorageEngine;
-use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::{StorageError, StorageResult};
-use coordinode_storage::placement::SegmentDescriptor;
+use coordinode_storage::placement::{
+    partition_from_wire_tag, partition_wire_tag, SegmentDescriptor,
+};
 
 use crate::transfer::SegmentSink;
 
@@ -77,12 +81,14 @@ fn read_chunk(blob: &[u8], pos: &mut usize) -> Result<Vec<u8>, String> {
     Ok(chunk)
 }
 
-/// Export the entries covered by `descriptor` from the engine into a portable
-/// blob, ready to be split into swarm pieces.
+/// Export the entries covered by `descriptor` from the engine into a portable,
+/// self-describing blob, ready to be split into swarm pieces.
 ///
-/// Reads the descriptor's key range (the whole partition when the range is
-/// unbounded above) and keeps only entries the range actually contains
-/// (half-open `[start, end)`), so a sub-range segment exports exactly its keys.
+/// The blob is `[u8 partition tag] [length-prefixed key-value entries]`. The
+/// leading tag lets [`SegmentInstaller`] route a received segment to the right
+/// partition with no out-of-band state. Reads the descriptor's key range (the
+/// whole partition when the range is unbounded above) and keeps only entries the
+/// range actually contains (half-open `[start, end)`).
 ///
 /// # Errors
 ///
@@ -108,38 +114,47 @@ pub fn export_segment(
             entries.push((key, value.to_vec()));
         }
     }
-    encode_kv_blob(&entries)
+    let mut blob = Vec::new();
+    blob.push(partition_wire_tag(part));
+    blob.extend_from_slice(&encode_kv_blob(&entries)?);
+    Ok(blob)
 }
 
-/// Installs a received, assembled segment into a single partition by decoding
-/// the portable blob and writing each entry. The target re-encodes locally per
-/// its own tier/codec policy (the entries are plain key-value bytes).
+/// Installs a received, assembled segment into the engine, routing it to the
+/// partition named by the blob's leading wire tag and writing each entry. The
+/// target re-encodes locally per its own tier/codec policy (entries are plain
+/// key-value bytes). Holds an `Arc<StorageEngine>` so it can be registered as a
+/// long-lived transfer handler on the server.
 ///
-/// Bound to one partition: the gRPC handler that dispatches by segment maps a
-/// segment to its partition above this sink.
-pub struct StorageSegmentSink<'a> {
-    engine: &'a StorageEngine,
-    partition: Partition,
+/// Current install is upsert-per-entry (correct for repair fill and migration);
+/// bulk ingestion and atomic replace-of-corrupt are deferred refinements.
+pub struct SegmentInstaller {
+    engine: Arc<StorageEngine>,
 }
 
-impl<'a> StorageSegmentSink<'a> {
-    /// A sink that installs received segments into `partition`.
+impl SegmentInstaller {
+    /// An installer over the shared engine.
     #[must_use]
-    pub fn new(engine: &'a StorageEngine, partition: Partition) -> Self {
-        Self { engine, partition }
+    pub fn new(engine: Arc<StorageEngine>) -> Self {
+        Self { engine }
     }
 }
 
-impl SegmentSink for StorageSegmentSink<'_> {
+impl SegmentSink for SegmentInstaller {
     fn store_segment(
         &self,
         _segment: coordinode_swarm::SegmentId,
         data: &[u8],
     ) -> Result<(), String> {
-        let entries = decode_kv_blob(data)?;
+        let (&tag, rest) = data
+            .split_first()
+            .ok_or_else(|| "empty segment blob (missing partition tag)".to_string())?;
+        let partition = partition_from_wire_tag(tag)
+            .ok_or_else(|| format!("unknown partition wire tag {tag}"))?;
+        let entries = decode_kv_blob(rest)?;
         for (key, value) in entries {
             self.engine
-                .put(self.partition, &key, &value)
+                .put(partition, &key, &value)
                 .map_err(|e| e.to_string())?;
         }
         Ok(())

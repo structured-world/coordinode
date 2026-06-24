@@ -80,11 +80,12 @@ fn export_transfer_install_round_trip() {
     let assembled = assemble(&manifest, &wire).expect("assemble");
     assert_eq!(assembled, blob, "assembled blob must equal exported blob");
 
-    // Install into a fresh target engine and verify every entry round-tripped.
+    // Install into a fresh target engine via the self-describing installer
+    // (partition routed by the blob's leading wire tag) and verify every entry.
     let tgt_dir = tempfile::tempdir().expect("tempdir");
-    let tgt = test_engine(tgt_dir.path());
-    let sink = StorageSegmentSink::new(&tgt, Partition::Node);
-    sink.store_segment(seg, &assembled).expect("install");
+    let tgt = std::sync::Arc::new(test_engine(tgt_dir.path()));
+    let installer = SegmentInstaller::new(std::sync::Arc::clone(&tgt));
+    installer.store_segment(seg, &assembled).expect("install");
 
     let mut got: HashMap<String, Vec<u8>> = HashMap::new();
     let snap = tgt.snapshot();
@@ -103,6 +104,31 @@ fn export_transfer_install_round_trip() {
         got.get("node:0:00000000").map(Vec::as_slice),
         Some(&b"val0"[..])
     );
+}
+
+#[test]
+fn installer_rejects_empty_and_unknown_tag() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = std::sync::Arc::new(test_engine(dir.path()));
+    let installer = SegmentInstaller::new(engine);
+    // Empty blob has no partition tag.
+    assert!(installer.store_segment(SegmentId(1), &[]).is_err());
+    // Unknown tag byte does not map to a partition.
+    assert!(installer.store_segment(SegmentId(1), &[250u8]).is_err());
+}
+
+#[test]
+fn exported_blob_carries_partition_tag() {
+    use coordinode_storage::placement::partition_wire_tag;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    engine
+        .put(Partition::Node, b"node:0:00000001", b"v")
+        .expect("put");
+    engine.force_compaction(Partition::Node).expect("compact");
+    let map = SegmentMap::build(&engine, Partition::Node, PlacementSegmentId(1)).expect("map");
+    let blob = export_segment(&engine, &map.segments()[0]).expect("export");
+    assert_eq!(blob.first(), Some(&partition_wire_tag(Partition::Node)));
 }
 
 #[test]

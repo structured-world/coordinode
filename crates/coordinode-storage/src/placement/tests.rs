@@ -92,6 +92,16 @@ fn data_type_from_partition() {
     );
 }
 
+/// Every partition's wire tag round-trips; unknown tags decode to `None`.
+#[test]
+fn partition_wire_tag_round_trips() {
+    for &p in Partition::all() {
+        let tag = partition_wire_tag(p);
+        assert_eq!(partition_from_wire_tag(tag), Some(p));
+    }
+    assert_eq!(partition_from_wire_tag(250), None);
+}
+
 /// Half-open range containment, including the unbounded-above case.
 #[test]
 fn key_range_containment() {

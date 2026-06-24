@@ -63,6 +63,50 @@ impl SegmentDataType {
     }
 }
 
+/// Stable wire tag identifying a partition inside a self-describing segment
+/// blob, so a single transfer handler installs a received segment into the
+/// right partition without out-of-band routing.
+///
+/// **Stable: never renumber an existing variant** (a tag travels on the wire
+/// and must decode the same on every node and across upgrades). Append new
+/// partitions with new numbers.
+#[must_use]
+pub fn partition_wire_tag(partition: Partition) -> u8 {
+    match partition {
+        Partition::Node => 0,
+        Partition::Adj => 1,
+        Partition::EdgeProp => 2,
+        Partition::Blob => 3,
+        Partition::BlobRef => 4,
+        Partition::Schema => 5,
+        Partition::Idx => 6,
+        Partition::Raft => 7,
+        Partition::Counter => 8,
+        Partition::VectorF32 => 9,
+        Partition::Registry => 10,
+    }
+}
+
+/// Inverse of [`partition_wire_tag`]; `None` for an unknown tag (a newer
+/// partition from a future version).
+#[must_use]
+pub fn partition_from_wire_tag(tag: u8) -> Option<Partition> {
+    Some(match tag {
+        0 => Partition::Node,
+        1 => Partition::Adj,
+        2 => Partition::EdgeProp,
+        3 => Partition::Blob,
+        4 => Partition::BlobRef,
+        5 => Partition::Schema,
+        6 => Partition::Idx,
+        7 => Partition::Raft,
+        8 => Partition::Counter,
+        9 => Partition::VectorF32,
+        10 => Partition::Registry,
+        _ => return None,
+    })
+}
+
 /// Unique identifier of a placement segment within a node. Stable across
 /// compaction (it tracks the logical region, not an SST file).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
