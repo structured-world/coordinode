@@ -2360,6 +2360,148 @@ fn merge_nodes_self_loop_and_other_peers_mixed_transfer() {
     assert_eq!(emails, vec!["a@x.com", "c@x.com", "d@x.com"]);
 }
 
+// ── CLONE NODE (R182) ─────────────────────────────────────────────────
+
+/// CLONE NODE deep-copies labels and properties into a fresh node; the original
+/// survives and the clone carries the same property values under a new id.
+#[test]
+fn clone_node_copies_labels_and_properties() {
+    use coordinode_core::graph::types::Value;
+    let mut db = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com', name: 'Alice'})")
+        .expect("seed a");
+
+    db.execute_cypher("MATCH (a:User {email: 'a@x.com'}) CLONE NODE a AS b")
+        .expect("clone node");
+
+    // Two User nodes now exist, both with the copied name.
+    let names = db
+        .execute_cypher("MATCH (u:User) RETURN u.name AS name")
+        .expect("scan users");
+    assert_eq!(names.len(), 2, "original + clone both present");
+    for r in &names {
+        assert_eq!(r.get("name"), Some(&Value::String("Alice".into())));
+    }
+}
+
+/// SET overrides are applied to the clone after the property copy; the original
+/// is untouched.
+#[test]
+fn clone_node_applies_set_override() {
+    use coordinode_core::graph::types::Value;
+    let mut db = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com', name: 'Alice'})")
+        .expect("seed a");
+
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}) CLONE NODE a AS b SET b.name = 'Clone of Alice'",
+    )
+    .expect("clone with set");
+
+    let names: Vec<String> = db
+        .execute_cypher("MATCH (u:User) RETURN u.name AS name")
+        .expect("scan")
+        .iter()
+        .filter_map(|r| match r.get("name") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names.len(), 2);
+    assert!(names.contains(&"Alice".to_string()), "original untouched");
+    assert!(
+        names.contains(&"Clone of Alice".to_string()),
+        "clone carries the SET override"
+    );
+}
+
+/// The clone is a distinct node: querying by a property the SET changed returns
+/// only the clone, proving it received a fresh id rather than aliasing `a`.
+#[test]
+fn clone_node_is_a_distinct_new_node() {
+    use coordinode_core::graph::types::Value;
+    let mut db = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com', tag: 'orig'})")
+        .expect("seed a");
+
+    db.execute_cypher("MATCH (a:User {email: 'a@x.com'}) CLONE NODE a AS b SET b.tag = 'clone'")
+        .expect("clone");
+
+    let clones = db
+        .execute_cypher("MATCH (u:User {tag: 'clone'}) RETURN u.email AS email")
+        .expect("scan clone");
+    assert_eq!(clones.len(), 1, "exactly one node carries the clone tag");
+    assert_eq!(
+        clones[0].get("email"),
+        Some(&Value::String("a@x.com".into())),
+        "clone copied the original's email"
+    );
+
+    let origs = db
+        .execute_cypher("MATCH (u:User {tag: 'orig'}) RETURN u.email AS email")
+        .expect("scan orig");
+    assert_eq!(origs.len(), 1, "original retains its own tag");
+}
+
+/// WITH EDGES clones the source's outgoing edges onto the clone: after cloning
+/// a node that owns an item, both the original and the clone reach that item.
+#[test]
+fn clone_node_with_edges_clones_outgoing_edge() {
+    let mut db = open_db();
+    db.execute_cypher("CREATE (a:User {email: 'a@x.com'})")
+        .expect("seed a");
+    db.execute_cypher("CREATE (x:Item {sku: 's1'})")
+        .expect("seed x");
+    db.execute_cypher(
+        "MATCH (a:User {email: 'a@x.com'}), (x:Item {sku: 's1'}) CREATE (a)-[:OWNS]->(x)",
+    )
+    .expect("seed edge a->x");
+
+    db.execute_cypher("MATCH (a:User {email: 'a@x.com'}) CLONE NODE a AS b WITH EDGES")
+        .expect("clone with edges");
+
+    // Both a→x and b→x must now exist: two OWNS edges into the same item.
+    let owns = db
+        .execute_cypher("MATCH (u:User)-[:OWNS]->(i:Item) RETURN i.sku AS sku")
+        .expect("scan OWNS");
+    assert_eq!(
+        owns.len(),
+        2,
+        "original and clone each own the item (a->x and b->x)"
+    );
+}
+
+/// A self-loop `a→a` clones to `b→b` (not `b→a`): the clone points at itself,
+/// mirroring the source's self-reference.
+#[test]
+fn clone_node_with_edges_remaps_self_loop() {
+    use coordinode_core::graph::types::Value;
+    let mut db = open_db();
+    db.execute_cypher("CREATE (a:Person {tag: 'orig'})")
+        .expect("seed a");
+    db.execute_cypher(
+        "MATCH (a:Person {tag: 'orig'}), (a2:Person {tag: 'orig'}) CREATE (a)-[:KNOWS]->(a2)",
+    )
+    .expect("seed self-loop a->a");
+
+    db.execute_cypher(
+        "MATCH (a:Person {tag: 'orig'}) CLONE NODE a AS b WITH EDGES SET b.tag = 'clone'",
+    )
+    .expect("clone with edges");
+
+    // The clone's KNOWS neighbour is the clone itself (b→b), so traversing from
+    // the clone-tagged node lands back on a clone-tagged node.
+    let neighbours = db
+        .execute_cypher("MATCH (u:Person {tag: 'clone'})-[:KNOWS]->(v:Person) RETURN v.tag AS tag")
+        .expect("scan clone KNOWS");
+    assert_eq!(neighbours.len(), 1, "clone has exactly its self-loop");
+    assert_eq!(
+        neighbours[0].get("tag"),
+        Some(&Value::String("clone".into())),
+        "self-loop remaps to b->b, not b->a"
+    );
+}
+
 // ── TRIGGER DDL ──────────────────────────────────────
 
 /// Full DDL lifecycle: CREATE → SHOW finds it → ALTER updates it → DROP

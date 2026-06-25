@@ -1037,6 +1037,65 @@ fn merge_nodes_rejects_duplicate_without_transfer() {
     );
 }
 
+// -- CLONE NODE (R182) --
+
+#[test]
+fn clone_node_minimal_defaults_copy_properties() {
+    let q = parse_ok("MATCH (a:User {id: 1}) CLONE NODE a AS b");
+    let cn = match &q.clauses[1] {
+        Clause::CloneNode(cn) => cn,
+        other => panic!("expected CloneNode, got {other:?}"),
+    };
+    assert_eq!(cn.source, "a");
+    assert_eq!(cn.target, "b");
+    assert!(!cn.with_edges, "WITH EDGES is off by default");
+    assert!(
+        cn.with_properties,
+        "properties are copied by default per arch spec"
+    );
+    assert!(cn.set_items.is_empty());
+}
+
+#[test]
+fn clone_node_with_edges_and_properties() {
+    let q = parse_ok("MATCH (a) CLONE NODE a AS b WITH EDGES WITH PROPERTIES");
+    let cn = match &q.clauses[1] {
+        Clause::CloneNode(cn) => cn,
+        _ => panic!("expected CloneNode"),
+    };
+    assert!(cn.with_edges);
+    assert!(cn.with_properties);
+}
+
+#[test]
+fn clone_node_with_set_override() {
+    let q = parse_ok("MATCH (a) CLONE NODE a AS b SET b.name = 'copy'");
+    let cn = match &q.clauses[1] {
+        Clause::CloneNode(cn) => cn,
+        _ => panic!("expected CloneNode"),
+    };
+    assert_eq!(cn.set_items.len(), 1, "one SET item parsed");
+    match &cn.set_items[0] {
+        SetItem::Property {
+            variable, property, ..
+        } => {
+            assert_eq!(variable, "b");
+            assert_eq!(property, "name");
+        }
+        other => panic!("expected Property set item, got {other:?}"),
+    }
+}
+
+#[test]
+fn clone_node_same_source_and_target_rejected() {
+    let err = parse_err("MATCH (a) CLONE NODE a AS a");
+    let msg = format!("{err}");
+    assert!(
+        msg.to_lowercase().contains("differ"),
+        "expected distinct-variable error, got: {msg}"
+    );
+}
+
 // -- TRIGGER DDL --
 
 #[test]

@@ -2930,6 +2930,26 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             )
         }
 
+        LogicalOp::CloneNode {
+            input,
+            source,
+            target,
+            with_edges,
+            with_properties,
+            set_items,
+        } => {
+            let input_rows = execute_op(input, ctx)?;
+            execute_clone_node(
+                &input_rows,
+                source,
+                target,
+                *with_edges,
+                *with_properties,
+                set_items,
+                ctx,
+            )
+        }
+
         LogicalOp::RankFuse {
             input,
             methods,
@@ -11161,6 +11181,180 @@ fn execute_merge_nodes(
     }
 
     Ok(out)
+}
+
+/// CLONE NODE executor: deep-copy a bound node into a fresh node.
+///
+/// The source's current stored record is read via `mvcc_get_node`. COMPUTED
+/// properties are never part of the stored body (they are injected on read), so
+/// they are naturally excluded from the copy. The clone is created through the
+/// same path as `CREATE` ([`execute_create_node`]) so it inherits cluster-safe
+/// id allocation, b-tree / vector / text / spatial index registration,
+/// BlobStore dedup, schema enforcement, and CREATE triggers. `SET` overrides
+/// run post-create through the standard update path so every `SetItem` form
+/// (assignment, nested path, doc-function, replace) and its index notifications
+/// are handled identically to a `SET` clause.
+///
+/// Temporal-labelled sources are safe-rejected (mirror of MERGE NODES): cloning
+/// the current version into a fresh node needs the per-version write path, and
+/// version history is never copied (it would forge the system-time axis). Edge
+/// cloning (`WITH EDGES`) is a tracked follow-up.
+fn execute_clone_node(
+    input_rows: &[Row],
+    source: &str,
+    target: &str,
+    with_edges: bool,
+    with_properties: bool,
+    set_items: &[crate::cypher::ast::SetItem],
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    if source == target {
+        return Err(ExecutionError::Unsupported(
+            "CLONE NODE source and clone variables must differ".into(),
+        ));
+    }
+
+    let mut out = Vec::with_capacity(input_rows.len());
+    for row in input_rows {
+        let a_id = match row.get(source) {
+            Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+            // Source not bound on this row — nothing to clone for it.
+            _ => continue,
+        };
+
+        let source_rec = ctx.mvcc_get_node(ctx.shard_id, a_id)?.ok_or_else(|| {
+            ExecutionError::Unsupported(format!("CLONE NODE source node {a_id} not found"))
+        })?;
+
+        let labels = source_rec.labels.clone();
+
+        for lbl in &labels {
+            if let Ok(Some(s)) = ctx.load_current_label_schema(lbl) {
+                if s.temporal {
+                    return Err(ExecutionError::Unsupported(format!(
+                        "CLONE NODE on temporal label '{lbl}' is not yet supported \
+                         (current-version clone via the per-version write path is a follow-up; \
+                         version history is never copied)."
+                    )));
+                }
+            }
+        }
+
+        // Reconstruct create-time properties from the source's stored body.
+        // `__ingestion_ts__` is engine-owned (rejected and re-derived by the
+        // create path on temporal labels), so it is never forwarded.
+        let properties: Vec<(String, Expr)> = if with_properties {
+            let mut props = Vec::new();
+            for (field_id, val) in &source_rec.props {
+                let Some(name) = ctx.interner.resolve(*field_id) else {
+                    continue;
+                };
+                if name == "__ingestion_ts__" {
+                    continue;
+                }
+                props.push((name.to_string(), Expr::Literal(val.clone())));
+            }
+            if let Some(extra) = &source_rec.extra {
+                for (k, v) in extra {
+                    props.push((k.clone(), Expr::Literal(v.clone())));
+                }
+            }
+            props
+        } else {
+            Vec::new()
+        };
+
+        let created = execute_create_node(
+            std::slice::from_ref(row),
+            Some(target),
+            &labels,
+            &properties,
+            ctx,
+        )?;
+
+        let mut rows_after = if set_items.is_empty() {
+            created
+        } else {
+            execute_update(
+                &created,
+                set_items,
+                &crate::cypher::ast::ViolationMode::Fail,
+                ctx,
+            )?
+        };
+
+        if with_edges {
+            // Clone every incident edge onto the new node. Extract the clone's
+            // id from the created row first so the immutable row borrow ends
+            // before the mutating edge writes.
+            let clone_ids: Vec<NodeId> = rows_after
+                .iter()
+                .filter_map(|r| match r.get(target) {
+                    Some(Value::Int(id)) => Some(NodeId::from_raw(*id as u64)),
+                    _ => None,
+                })
+                .collect();
+            for b_id in clone_ids {
+                clone_incident_edges(a_id, b_id, ctx)?;
+            }
+        }
+
+        out.append(&mut rows_after);
+    }
+    Ok(out)
+}
+
+/// Clone every incident edge of `a` onto `b`, preserving edge type, direction,
+/// and edge properties. Outgoing `a→x` becomes `b→x`, incoming `x→a` becomes
+/// `x→b`, and the self-loop `a→a` becomes `b→b` (handled once via the forward
+/// scan, skipped in the reverse scan to avoid a duplicate). Adjacency updates
+/// use posting-list merge operators (conflict-free with concurrent edge writes
+/// on unrelated nodes). Edge properties are copied verbatim through the
+/// canonical edge-property codec.
+///
+/// Edge-vector index registration for cloned edges carrying a vector property
+/// is not performed here (rare; a follow-up) — the property bytes are still
+/// copied, so the data is intact.
+fn clone_incident_edges(
+    a_id: NodeId,
+    b_id: NodeId,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    let edge_types = ctx.list_edge_types()?;
+    for et in &edge_types {
+        // Outgoing edges a→x  ⇒  b→x  (self-loop a→a ⇒ b→b).
+        if let Some(fwd) = ctx.adj_get_fwd(et, a_id)? {
+            let targets: Vec<u64> = fwd.iter().collect();
+            for x_uid in targets {
+                let x = NodeId::from_raw(x_uid);
+                let tgt = if x == a_id { b_id } else { x };
+                let props = ctx.mvcc_get_edge_props(et, a_id, x)?;
+                ctx.adj_merge_add_fwd(et, b_id, tgt.as_raw());
+                ctx.adj_merge_add_rev(et, tgt, b_id.as_raw());
+                if let Some(p) = props {
+                    ctx.mvcc_put_edge_props(et, b_id, tgt, &p)?;
+                }
+            }
+        }
+        // Incoming edges x→a  ⇒  x→b. The self-loop was already cloned by the
+        // forward scan, so skip x == a here.
+        if let Some(rev) = ctx.adj_get_rev(et, a_id)? {
+            let sources: Vec<u64> = rev.iter().collect();
+            for x_uid in sources {
+                let x = NodeId::from_raw(x_uid);
+                if x == a_id {
+                    continue;
+                }
+                let props = ctx.mvcc_get_edge_props(et, x, a_id)?;
+                ctx.adj_merge_add_fwd(et, x, b_id.as_raw());
+                ctx.adj_merge_add_rev(et, b_id, x.as_raw());
+                if let Some(p) = props {
+                    ctx.mvcc_put_edge_props(et, x, b_id, &p)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Merge `source.props` into `target.props` per the chosen conflict strategy.

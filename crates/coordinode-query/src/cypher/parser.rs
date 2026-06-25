@@ -291,6 +291,10 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let mn = build_merge_nodes_clause(pair)?;
             clauses.push(Clause::MergeNodes(mn));
         }
+        Rule::clone_node_clause => {
+            let cn = build_clone_node_clause(pair)?;
+            clauses.push(Clause::CloneNode(cn));
+        }
         Rule::upsert_clause => {
             let uc = build_upsert_clause(pair)?;
             clauses.push(Clause::Upsert(uc));
@@ -1827,6 +1831,64 @@ fn build_merge_nodes_clause(pair: Pair<'_, Rule>) -> Result<MergeNodesClause, Pa
         transfer_edges,
         duplicate: duplicate.unwrap_or_default(),
         transfer_edge_properties,
+    })
+}
+
+fn build_clone_node_clause(pair: Pair<'_, Rule>) -> Result<CloneNodeClause, ParseError> {
+    let mut idents = Vec::with_capacity(2);
+    let mut options = Vec::new();
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::identifier => idents.push(inner.as_str().to_string()),
+            Rule::clone_node_option => options.push(inner),
+            _ => {}
+        }
+    }
+    if idents.len() != 2 {
+        return Err(ParseError::Invalid(format!(
+            "CLONE NODE expected `a AS b` — got {} identifiers",
+            idents.len()
+        )));
+    }
+    let source = idents.remove(0);
+    let target = idents.remove(0);
+    if source == target {
+        return Err(ParseError::Invalid(
+            "CLONE NODE source and clone variables must differ".to_string(),
+        ));
+    }
+
+    let mut with_edges = false;
+    // Properties are copied by default; `WITH PROPERTIES` is an explicit,
+    // equivalent affirmation (see arch/compatibility/native-procedures.md).
+    let mut with_properties = true;
+    let mut set_items = Vec::new();
+    for opt in options {
+        let inner = first_inner(opt)?;
+        match inner.as_rule() {
+            Rule::clone_node_with_edges => with_edges = true,
+            Rule::clone_node_with_properties => with_properties = true,
+            Rule::clone_node_set => {
+                for c in inner.into_inner() {
+                    if c.as_rule() == Rule::set_items {
+                        set_items = build_set_items(c)?;
+                    }
+                }
+            }
+            other => {
+                return Err(ParseError::Invalid(format!(
+                    "CLONE NODE: unexpected option node {other:?}"
+                )));
+            }
+        }
+    }
+
+    Ok(CloneNodeClause {
+        source,
+        target,
+        with_edges,
+        with_properties,
+        set_items,
     })
 }
 

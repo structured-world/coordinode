@@ -52,6 +52,7 @@ impl Query {
                 | Clause::Remove(_)
                 | Clause::DetachDocument(_)
                 | Clause::AttachDocument(_)
+                | Clause::CloneNode(_)
                 | Clause::AlterLabel(_)
                 | Clause::CreateTextIndex(_)
                 | Clause::DropTextIndex(_)
@@ -155,6 +156,12 @@ pub enum Clause {
     /// and edges in a single MVCC transaction. Replaces APOC's
     /// `apoc.refactor.mergeNodes()` with a first-class Cypher operation.
     MergeNodes(MergeNodesClause),
+    /// `CLONE NODE a AS b [WITH EDGES] [WITH PROPERTIES] [SET ...]`
+    ///
+    /// Native node clone — deep-copies a bound node into a freshly-allocated
+    /// node in a single MVCC transaction, optionally cloning its edges. Replaces
+    /// APOC's `apoc.refactor.cloneNodes()` with a first-class Cypher operation.
+    CloneNode(CloneNodeClause),
     /// SET clause with optional ON VIOLATION SKIP modifier.
     ///
     /// Syntax: `SET n.prop = val [ON VIOLATION SKIP]`
@@ -1155,6 +1162,35 @@ pub struct TransferEdgesEndpoints {
     pub src: String,
     /// Surviving destination — must equal `MergeNodesClause::target`.
     pub dst: String,
+}
+
+/// CLONE NODE clause: deep-copy a bound node into a fresh node.
+///
+/// A first-class, distribution-safe Cypher operation (single MVCC transaction):
+/// the source `a` must be bound by a preceding MATCH, and the clone `b` is a
+/// freshly-allocated node returned to the row. See
+/// arch/compatibility/native-procedures.md § CLONE NODES. The clone goes through
+/// the same create path as `CREATE` (fresh node id, index registration, BlobStore
+/// dedup), and `WITH EDGES` clones incident edges via posting-list merge
+/// operators. For a temporal-labelled source the current version is cloned (the
+/// clone's own history begins at clone time); version history is never copied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CloneNodeClause {
+    /// Source node variable (`a` in `CLONE NODE a AS b`) — must be bound by a
+    /// preceding MATCH.
+    pub source: String,
+    /// Clone variable (`b`) — bound to the new node for the rest of the query.
+    pub target: String,
+    /// `WITH EDGES` — also clone every incident edge (outgoing, incoming,
+    /// self-loop) from `a` onto `b` with the same edge type and properties.
+    pub with_edges: bool,
+    /// Whether the source's properties are copied to the clone. Copied by
+    /// default; `WITH PROPERTIES` is an explicit, equivalent affirmation.
+    /// Retained on the AST so a future labels-only mode can flip it.
+    pub with_properties: bool,
+    /// `SET` overrides applied to the clone after the property copy. Each item
+    /// is evaluated with `b` bound to the newly created node.
+    pub set_items: Vec<SetItem>,
 }
 
 /// Property conflict resolution strategy for `MERGE NODES`.

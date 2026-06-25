@@ -41,6 +41,7 @@ clause = {
   | create_clause
   | merge_all_clause
   | merge_nodes_clause
+  | clone_node_clause
   | merge_clause
   | upsert_clause
   | detach_document_clause
@@ -466,6 +467,30 @@ mn_dup_keep_target      = { kw_keep ~ kw_target }
 
 merge_nodes_transfer_edge_props = { kw_transfer ~ kw_edge ~ kw_properties }
 
+// --- CLONE NODE (deep-copy a node, optionally its edges) ---
+//
+//   CLONE NODE a AS b [WITH EDGES] [WITH PROPERTIES] [SET b.name = ...]
+//
+// Properties are copied by default; `WITH PROPERTIES` is an explicit
+// (equivalent) affirmation. `WITH EDGES` also clones every incident edge
+// (outgoing, incoming, self-loop) from `a` onto `b` with the same edge type
+// and properties. `SET` overrides properties on the clone after the copy.
+// `a` must be bound by a preceding MATCH; `b` is a fresh node returned to
+// the row. Edge cloning uses posting-list merge operators (no read-modify-write).
+clone_node_clause = {
+    kw_clone ~ kw_node ~ identifier ~ kw_as ~ identifier
+    ~ clone_node_option*
+}
+
+clone_node_option = {
+    clone_node_with_edges
+  | clone_node_with_properties
+  | clone_node_set
+}
+clone_node_with_edges      = { kw_with ~ kw_edges }
+clone_node_with_properties = { kw_with ~ kw_properties }
+clone_node_set             = { kw_set ~ set_items }
+
 // --- UPSERT MATCH (CoordiNode extension) ---
 
 upsert_clause = { kw_upsert ~ kw_match ~ pattern ~ upsert_action* }
@@ -790,6 +815,7 @@ kw_then       = @{ ^"then" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_else       = @{ ^"else" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_end        = @{ ^"end" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_create     = @{ ^"create" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_clone      = @{ ^"clone" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_merge      = @{ ^"merge" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_all        = @{ ^"all" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_union      = @{ ^"union" ~ !(ASCII_ALPHANUMERIC | "_") }

@@ -283,6 +283,21 @@ impl<'a> Analyzer<'a> {
                     }
                 }
             }
+            Clause::CloneNode(cn) => {
+                // Source must be bound by a preceding MATCH.
+                if !self.scope.contains_key(&cn.source) {
+                    self.errors.push(SemanticError::UndefinedVariable {
+                        name: cn.source.clone(),
+                    });
+                }
+                // Bind the clone variable for subsequent clauses, inheriting the
+                // source's statically-known labels (the clone keeps them).
+                let labels = self.scope.get(&cn.source).cloned().unwrap_or_default();
+                self.scope.insert(cn.target.clone(), labels);
+                for item in &cn.set_items {
+                    self.check_set_item(item);
+                }
+            }
             Clause::Set(items, _violation_mode) => {
                 for item in items {
                     self.check_set_item(item);

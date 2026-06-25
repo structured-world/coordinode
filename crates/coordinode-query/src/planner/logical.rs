@@ -360,6 +360,19 @@ pub enum LogicalOp {
         transfer_edge_properties: bool,
     },
 
+    /// CLONE NODE: deep-copy a bound node into a fresh node, optionally cloning
+    /// its incident edges. `input` binds `source`; the clone is bound to
+    /// `target`. Single MVCC transaction; goes through the create path (fresh
+    /// id, index registration). See arch/compatibility/native-procedures.md.
+    CloneNode {
+        input: Box<LogicalOp>,
+        source: String,
+        target: String,
+        with_edges: bool,
+        with_properties: bool,
+        set_items: Vec<SetItem>,
+    },
+
     /// MERGE / MERGE ALL: match-or-create with optional ON MATCH SET / ON CREATE SET.
     ///
     /// When `multi = false` (MERGE): unique match — errors if >1 src OR >1 tgt matches.
@@ -1103,6 +1116,14 @@ impl LogicalOp {
                     }
                 }
             }
+            LogicalOp::CloneNode {
+                input, set_items, ..
+            } => {
+                input.substitute_params(params);
+                for item in set_items {
+                    substitute_params_in_set_item(item, params);
+                }
+            }
             LogicalOp::AlterLabel { .. }
             | LogicalOp::CreateTextIndex { .. }
             | LogicalOp::DropTextIndex { .. }
@@ -1743,6 +1764,20 @@ fn estimate_op_cost(
             // Edge transfer dominates: ~2 × avg_fan_out posting-list ops per merge.
             let (in_cost, in_rows) = estimate_op_cost(input, defaults, stats, hints);
             let per_row = 2.0 * defaults.avg_fan_out;
+            (in_cost + in_rows * per_row, in_rows)
+        }
+        LogicalOp::CloneNode {
+            input, with_edges, ..
+        } => {
+            // Cost ≈ input cost + per-row (one node create, plus ~avg_fan_out
+            // edge clones when WITH EDGES).
+            let (in_cost, in_rows) = estimate_op_cost(input, defaults, stats, hints);
+            let per_row = 1.0
+                + if *with_edges {
+                    defaults.avg_fan_out
+                } else {
+                    0.0
+                };
             (in_cost + in_rows * per_row, in_rows)
         }
         LogicalOp::Empty => (0.0, 1.0),
@@ -2466,6 +2501,30 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             };
             output.push_str(&format!(
                 "{prefix}MergeNodes({source_a},{source_b}) INTO {target} {conflict_tag}{transfer_tag}{dup_tag}{props_tag}\n"
+            ));
+            explain_op(input, indent + 1, output);
+        }
+        LogicalOp::CloneNode {
+            input,
+            source,
+            target,
+            with_edges,
+            with_properties,
+            set_items,
+        } => {
+            let edges_tag = if *with_edges { " WITH_EDGES" } else { "" };
+            let props_tag = if *with_properties {
+                " WITH_PROPS"
+            } else {
+                " LABELS_ONLY"
+            };
+            let set_tag = if set_items.is_empty() {
+                String::new()
+            } else {
+                format!(" SET×{}", set_items.len())
+            };
+            output.push_str(&format!(
+                "{prefix}CloneNode({source} AS {target}){edges_tag}{props_tag}{set_tag}\n"
             ));
             explain_op(input, indent + 1, output);
         }

@@ -237,6 +237,17 @@ fn write_clause(buf: &mut String, clause: &Clause) {
                 buf.push_str(" TRANSFER EDGE PROPERTIES");
             }
         }
+        Clause::CloneNode(cn) => {
+            buf.push_str("CLONE NODE ");
+            buf.push_str(&cn.source);
+            buf.push_str(" AS ");
+            buf.push_str(&cn.target);
+            // Fingerprint keeps only the structural shape: WITH EDGES changes the
+            // plan (edge cloning), WITH PROPERTIES / SET details do not.
+            if cn.with_edges {
+                buf.push_str(" WITH EDGES");
+            }
+        }
         Clause::Set(items, _violation_mode) => {
             buf.push_str("SET ");
             write_set_items(buf, items);
