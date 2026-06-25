@@ -623,6 +623,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 with_edges: cn.with_edges,
                 with_properties: cn.with_properties,
                 set_items: cn.set_items.clone(),
+                as_of: cn.as_of.clone(),
             })
         }
         Clause::RedirectEdges(re) => {

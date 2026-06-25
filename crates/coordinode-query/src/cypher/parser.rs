@@ -1867,9 +1867,13 @@ fn build_clone_node_clause(pair: Pair<'_, Rule>) -> Result<CloneNodeClause, Pars
     // equivalent affirmation (see arch/compatibility/native-procedures.md).
     let mut with_properties = true;
     let mut set_items = Vec::new();
+    let mut as_of = None;
     for opt in options {
         let inner = first_inner(opt)?;
         match inner.as_rule() {
+            Rule::clone_node_as_of => {
+                as_of = Some(find_expression(inner)?);
+            }
             Rule::clone_node_with_edges => with_edges = true,
             Rule::clone_node_with_properties => with_properties = true,
             Rule::clone_node_set => {
@@ -1893,6 +1897,7 @@ fn build_clone_node_clause(pair: Pair<'_, Rule>) -> Result<CloneNodeClause, Pars
         with_edges,
         with_properties,
         set_items,
+        as_of,
     })
 }
 

@@ -1198,6 +1198,11 @@ pub struct CloneNodeClause {
     /// `SET` overrides applied to the clone after the property copy. Each item
     /// is evaluated with `b` bound to the newly created node.
     pub set_items: Vec<SetItem>,
+    /// `AS OF <ts>` — on a temporal source, clone the valid-version of the body
+    /// active at this valid-time instant (epoch ms) instead of the current
+    /// version. The clone's own `valid_from` is still NOW; only the body is
+    /// historical. `None` clones the current version.
+    pub as_of: Option<Expr>,
 }
 
 /// Which edges `REDIRECT EDGES` moves, relative to the source node.

@@ -965,6 +965,22 @@ impl<'a> ExecutionContext<'a> {
         Ok(Some(record))
     }
 
+    /// Read a temporal node's valid-version active at `at_ms` — the version
+    /// whose `valid_from <= at_ms` is largest. Used to read the source body for
+    /// CLONE NODE on a temporal label (current version when `at_ms = NOW`, a
+    /// historical version with `AS OF <ts>`). `None` if no version is at-or-
+    /// before that instant.
+    pub fn mvcc_get_node_at(
+        &mut self,
+        shard_id: u16,
+        node_id: NodeId,
+        at_ms: i64,
+    ) -> Result<Option<NodeRecord>, ExecutionError> {
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        self.sync_txn_state();
+        Ok(LocalNodeStore.get_at(&self.txn, shard_id, node_id, at_ms)?)
+    }
+
     /// MVCC-aware typed node write. Buffers the put through
     /// [`Self::mvcc_put`] (for atomic flush + RYOW visibility). Replaces
     /// `encode_node_key + record.to_msgpack + mvcc_put` triples scattered
@@ -2937,6 +2953,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             with_edges,
             with_properties,
             set_items,
+            as_of,
         } => {
             let input_rows = execute_op(input, ctx)?;
             execute_clone_node(
@@ -2946,6 +2963,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 *with_edges,
                 *with_properties,
                 set_items,
+                as_of.as_ref(),
                 ctx,
             )
         }
@@ -11217,6 +11235,7 @@ fn execute_merge_nodes(
 /// the current version into a fresh node needs the per-version write path, and
 /// version history is never copied (it would forge the system-time axis). Edge
 /// cloning (`WITH EDGES`) is a tracked follow-up.
+#[allow(clippy::too_many_arguments)]
 fn execute_clone_node(
     input_rows: &[Row],
     source: &str,
@@ -11224,6 +11243,7 @@ fn execute_clone_node(
     with_edges: bool,
     with_properties: bool,
     set_items: &[crate::cypher::ast::SetItem],
+    as_of: Option<&Expr>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     if source == target {
@@ -11240,40 +11260,78 @@ fn execute_clone_node(
             _ => continue,
         };
 
-        let source_rec = ctx.mvcc_get_node(ctx.shard_id, a_id)?.ok_or_else(|| {
-            ExecutionError::Unsupported(format!("CLONE NODE source node {a_id} not found"))
-        })?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        // `AS OF <ts>` selects the source's valid-version active at that
+        // valid-time instant; default is the current version (active now).
+        let as_of_ms: Option<i64> = match as_of {
+            Some(expr) => match eval_expr(expr, row) {
+                Value::Int(ms) => Some(ms),
+                Value::Timestamp(ms) => Some(ms),
+                other => {
+                    return Err(ExecutionError::Unsupported(format!(
+                        "CLONE NODE AS OF requires an INT or TIMESTAMP (epoch ms), got {other:?}"
+                    )));
+                }
+            },
+            None => None,
+        };
+        // Non-temporal nodes read through the point key; temporal nodes have no
+        // point key (per-version layout), so read the valid-version active at the
+        // requested instant (the current version when there is no AS OF).
+        let source_rec = match ctx.mvcc_get_node(ctx.shard_id, a_id)? {
+            Some(r) if as_of_ms.is_none() => r,
+            _ => ctx
+                .mvcc_get_node_at(ctx.shard_id, a_id, as_of_ms.unwrap_or(now_ms))?
+                .ok_or_else(|| {
+                    let suffix = as_of_ms
+                        .map(|t| format!(" as of valid-time {t}"))
+                        .unwrap_or_default();
+                    ExecutionError::Unsupported(format!(
+                        "CLONE NODE source node {a_id} not found{suffix}"
+                    ))
+                })?,
+        };
 
         let labels = source_rec.labels.clone();
 
+        // Temporal labels are cloned into a fresh node whose FIRST version is
+        // valid from NOW (the clone's valid-time history begins at clone time;
+        // the source's transaction-time/version history is never copied). The
+        // create path requires `valid_from` on temporal labels — injected below.
+        let mut is_temporal = false;
         for lbl in &labels {
             if let Ok(Some(s)) = ctx.load_current_label_schema(lbl) {
                 if s.temporal {
-                    return Err(ExecutionError::Unsupported(format!(
-                        "CLONE NODE on temporal label '{lbl}' is not yet supported \
-                         (current-version clone via the per-version write path is a follow-up; \
-                         version history is never copied)."
-                    )));
+                    is_temporal = true;
+                    break;
                 }
             }
         }
 
         // Reconstruct create-time properties from the source's stored body.
-        // `__ingestion_ts__` is engine-owned (rejected and re-derived by the
-        // create path on temporal labels), so it is never forwarded.
-        let properties: Vec<(String, Expr)> = if with_properties {
+        // Version- and engine-axis fields are never forwarded: `__ingestion_ts__`
+        // is the engine-assigned system-time, and `valid_from` / `valid_to` are
+        // the source's valid-time interval — the clone gets its own `valid_from`
+        // (NOW) below, so inheriting the source's would back-date the clone.
+        let mut properties: Vec<(String, Expr)> = if with_properties {
             let mut props = Vec::new();
             for (field_id, val) in &source_rec.props {
                 let Some(name) = ctx.interner.resolve(*field_id) else {
                     continue;
                 };
-                if name == "__ingestion_ts__" {
+                if matches!(name, "__ingestion_ts__" | "valid_from" | "valid_to") {
                     continue;
                 }
                 props.push((name.to_string(), Expr::Literal(val.clone())));
             }
             if let Some(extra) = &source_rec.extra {
                 for (k, v) in extra {
+                    if matches!(k.as_str(), "__ingestion_ts__" | "valid_from" | "valid_to") {
+                        continue;
+                    }
                     props.push((k.clone(), Expr::Literal(v.clone())));
                 }
             }
@@ -11281,6 +11339,12 @@ fn execute_clone_node(
         } else {
             Vec::new()
         };
+
+        // valid_from = NOW for the clone's first version. An explicit
+        // `SET b.valid_from = ...` (applied after create) back-dates it.
+        if is_temporal {
+            properties.push(("valid_from".to_string(), Expr::Literal(Value::Int(now_ms))));
+        }
 
         let created = execute_create_node(
             std::slice::from_ref(row),
@@ -11340,6 +11404,23 @@ fn clone_incident_edges(
 ) -> Result<(), ExecutionError> {
     let edge_types = ctx.list_edge_types()?;
     for et in &edge_types {
+        // Temporal edge types keep one edgeprop entry per `valid_from`; cloning
+        // them needs the per-version adjacency-move path (shared with REDIRECT
+        // EDGES on temporal types). Until that lands, reject WITH EDGES when the
+        // source actually has incident edges of a temporal type rather than
+        // silently writing an adjacency with no per-version edgeprop.
+        if lookup_edge_type_temporal(et, ctx)? {
+            let has_incident =
+                ctx.adj_get_fwd(et, a_id)?.is_some() || ctx.adj_get_rev(et, a_id)?.is_some();
+            if has_incident {
+                return Err(ExecutionError::Unsupported(format!(
+                    "CLONE NODE WITH EDGES across temporal edge type '{et}' is not yet \
+                     supported (per-version edge cloning is a follow-up); the node and its \
+                     non-temporal edges are cloned, temporal edges are not."
+                )));
+            }
+            continue;
+        }
         // Outgoing edges a→x  ⇒  b→x  (self-loop a→a ⇒ b→b).
         if let Some(fwd) = ctx.adj_get_fwd(et, a_id)? {
             let targets: Vec<u64> = fwd.iter().collect();

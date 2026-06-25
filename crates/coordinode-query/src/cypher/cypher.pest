@@ -484,10 +484,12 @@ clone_node_clause = {
 }
 
 clone_node_option = {
-    clone_node_with_edges
+    clone_node_as_of
+  | clone_node_with_edges
   | clone_node_with_properties
   | clone_node_set
 }
+clone_node_as_of           = { kw_as ~ kw_of ~ expression }
 clone_node_with_edges      = { kw_with ~ kw_edges }
 clone_node_with_properties = { kw_with ~ kw_properties }
 clone_node_set             = { kw_set ~ set_items }

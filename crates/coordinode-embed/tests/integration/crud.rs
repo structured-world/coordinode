@@ -2502,6 +2502,118 @@ fn clone_node_with_edges_remaps_self_loop() {
     );
 }
 
+/// CLONE NODE on a TEMPORAL label clones the source's current valid-version into
+/// a fresh node whose first version is valid from NOW — never inheriting the
+/// source's `valid_from` (that would back-date the clone) and never copying the
+/// version/system-time history.
+#[test]
+fn clone_node_temporal_clones_current_version_at_now() {
+    use coordinode_core::graph::types::Value;
+    let mut db = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("temporal type");
+    // Source is business-valid from a fixed past instant (epoch ms = 1000).
+    db.execute_cypher("CREATE (a:Emp {name: 'Alice', valid_from: 1000})")
+        .expect("seed temporal node");
+
+    db.execute_cypher("MATCH (a:Emp {name: 'Alice'}) CLONE NODE a AS b")
+        .expect("clone temporal node");
+
+    // Both the original and the clone are current (valid_to NULL) → bare MATCH
+    // returns both. Body (name) is copied; valid_from differs: original keeps
+    // 1000, the clone starts at NOW.
+    let rows = db
+        .execute_cypher("MATCH (n:Emp) RETURN n.name AS name, n.valid_from AS vf")
+        .expect("scan emps");
+    assert_eq!(rows.len(), 2, "original + clone both current");
+    for r in &rows {
+        assert_eq!(r.get("name"), Some(&Value::String("Alice".into())));
+    }
+    let vfs: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match r.get("vf") {
+            Some(Value::Int(v)) => Some(*v),
+            Some(Value::Timestamp(v)) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(vfs.len(), 2, "both versions expose valid_from");
+    assert!(
+        vfs.contains(&1000),
+        "original keeps its valid_from = 1000: {vfs:?}"
+    );
+    assert!(
+        vfs.iter().any(|&v| v > 1_600_000_000_000),
+        "clone's first version is valid from NOW (epoch ms in 2020+): {vfs:?}"
+    );
+}
+
+/// `CLONE NODE a AS b AS OF <ts>` clones the source's valid-version active at
+/// `<ts>` (here the version valid from 1000, active at valid-time 5000). The
+/// clone's own first version is still valid from NOW — only the body is taken
+/// from the historical version.
+#[test]
+fn clone_node_temporal_as_of_clones_historical_body() {
+    use coordinode_core::graph::types::Value;
+    let mut db = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("temporal type");
+    db.execute_cypher("CREATE (a:Emp {name: 'Alice', valid_from: 1000})")
+        .expect("seed");
+
+    db.execute_cypher("MATCH (a:Emp {name: 'Alice'}) CLONE NODE a AS b AS OF 5000")
+        .expect("clone as of");
+
+    let rows = db
+        .execute_cypher("MATCH (n:Emp) RETURN n.name AS name, n.valid_from AS vf")
+        .expect("scan emps");
+    assert_eq!(rows.len(), 2, "original + clone");
+    for r in &rows {
+        assert_eq!(r.get("name"), Some(&Value::String("Alice".into())));
+    }
+    let vfs: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match r.get("vf") {
+            Some(Value::Int(v)) | Some(Value::Timestamp(v)) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        vfs.contains(&1000),
+        "original keeps valid_from 1000: {vfs:?}"
+    );
+    assert!(
+        vfs.iter().any(|&v| v > 1_600_000_000_000),
+        "clone's valid_from is NOW even when the body is historical: {vfs:?}"
+    );
+}
+
+/// `AS OF <ts>` before the source's earliest valid-version finds no version to
+/// clone and errors rather than silently cloning nothing.
+#[test]
+fn clone_node_temporal_as_of_before_existence_errors() {
+    let mut db = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("temporal type");
+    db.execute_cypher("CREATE (a:Emp {name: 'Alice', valid_from: 1000})")
+        .expect("seed");
+
+    let err = db
+        .execute_cypher("MATCH (a:Emp {name: 'Alice'}) CLONE NODE a AS b AS OF 500")
+        .expect_err("no version exists at valid-time 500");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("not found"),
+        "AS OF before the first version must error clearly: {msg}"
+    );
+}
+
 // ── REDIRECT EDGES (R183) ─────────────────────────────────────────────
 
 /// REDIRECT EDGES moves an outgoing edge off the source onto the destination:

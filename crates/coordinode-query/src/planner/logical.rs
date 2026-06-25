@@ -371,6 +371,10 @@ pub enum LogicalOp {
         with_edges: bool,
         with_properties: bool,
         set_items: Vec<SetItem>,
+        /// `AS OF <ts>`: on a temporal source, clone the valid-version of the
+        /// body active at this valid-time instant instead of the current one.
+        /// The clone's `valid_from` is still NOW. `None` clones the current.
+        as_of: Option<crate::cypher::ast::Expr>,
     },
 
     /// REDIRECT EDGES: re-point a bound node's edges onto another bound node.
@@ -1129,11 +1133,17 @@ impl LogicalOp {
                 }
             }
             LogicalOp::CloneNode {
-                input, set_items, ..
+                input,
+                set_items,
+                as_of,
+                ..
             } => {
                 input.substitute_params(params);
                 for item in set_items {
                     substitute_params_in_set_item(item, params);
+                }
+                if let Some(e) = as_of {
+                    e.substitute_params(params);
                 }
             }
             LogicalOp::RedirectEdges { input, .. } => {
@@ -2533,6 +2543,7 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             with_edges,
             with_properties,
             set_items,
+            as_of,
         } => {
             let edges_tag = if *with_edges { " WITH_EDGES" } else { "" };
             let props_tag = if *with_properties {
@@ -2545,8 +2556,9 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             } else {
                 format!(" SET×{}", set_items.len())
             };
+            let as_of_tag = if as_of.is_some() { " AS_OF" } else { "" };
             output.push_str(&format!(
-                "{prefix}CloneNode({source} AS {target}){edges_tag}{props_tag}{set_tag}\n"
+                "{prefix}CloneNode({source} AS {target}){as_of_tag}{edges_tag}{props_tag}{set_tag}\n"
             ));
             explain_op(input, indent + 1, output);
         }
