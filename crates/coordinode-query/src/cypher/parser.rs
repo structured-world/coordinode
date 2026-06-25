@@ -295,6 +295,10 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let cn = build_clone_node_clause(pair)?;
             clauses.push(Clause::CloneNode(cn));
         }
+        Rule::redirect_edges_clause => {
+            let re = build_redirect_edges_clause(pair)?;
+            clauses.push(Clause::RedirectEdges(re));
+        }
         Rule::upsert_clause => {
             let uc = build_upsert_clause(pair)?;
             clauses.push(Clause::Upsert(uc));
@@ -1889,6 +1893,61 @@ fn build_clone_node_clause(pair: Pair<'_, Rule>) -> Result<CloneNodeClause, Pars
         with_edges,
         with_properties,
         set_items,
+    })
+}
+
+fn build_redirect_edges_clause(pair: Pair<'_, Rule>) -> Result<RedirectEdgesClause, ParseError> {
+    let mut idents = Vec::with_capacity(2);
+    let mut edge_types: Option<Vec<String>> = None;
+    let mut direction = RedirectDirection::Both;
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::identifier => idents.push(inner.as_str().to_string()),
+            Rule::redirect_type_filter => {
+                let mut types = Vec::new();
+                for c in inner.into_inner() {
+                    if c.as_rule() == Rule::string_literal {
+                        if let Ok(Expr::Literal(Value::String(s))) = build_string_literal(c) {
+                            types.push(s);
+                        }
+                    }
+                }
+                edge_types = Some(types);
+            }
+            Rule::redirect_direction => {
+                for c in inner.into_inner() {
+                    direction = match c.as_rule() {
+                        Rule::kw_outgoing => RedirectDirection::Outgoing,
+                        Rule::kw_incoming => RedirectDirection::Incoming,
+                        Rule::kw_both => RedirectDirection::Both,
+                        _ => direction,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if idents.len() != 2 {
+        return Err(ParseError::Invalid(format!(
+            "REDIRECT EDGES expected `FROM a TO b` — got {} identifiers",
+            idents.len()
+        )));
+    }
+    let source = idents.remove(0);
+    let target = idents.remove(0);
+    if source == target {
+        return Err(ParseError::Invalid(
+            "REDIRECT EDGES source and destination variables must differ".to_string(),
+        ));
+    }
+
+    Ok(RedirectEdgesClause {
+        source,
+        target,
+        edge_types,
+        direction,
     })
 }
 

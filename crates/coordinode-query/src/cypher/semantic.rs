@@ -298,6 +298,16 @@ impl<'a> Analyzer<'a> {
                     self.check_set_item(item);
                 }
             }
+            Clause::RedirectEdges(re) => {
+                // Both endpoints must be bound by a preceding MATCH; the clause
+                // introduces no new variables.
+                for v in [&re.source, &re.target] {
+                    if !self.scope.contains_key(v) {
+                        self.errors
+                            .push(SemanticError::UndefinedVariable { name: v.clone() });
+                    }
+                }
+            }
             Clause::Set(items, _violation_mode) => {
                 for item in items {
                     self.check_set_item(item);

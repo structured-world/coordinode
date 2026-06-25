@@ -638,6 +638,45 @@ yet supported. The system-time (transaction-time) axis is engine-assigned and is
 never copied — copying it would forge the audit record. Cloning the current
 valid-version into a fresh node is planned.
 
+### REDIRECT EDGES ✅ 🔷
+
+Native edge re-pointing — moves a node's edges onto another node in a single
+atomic transaction via posting-list merge operators (no read-modify-write). A
+graph-refactoring building block: bulk-rewire a deprecated node onto its
+replacement, consolidate duplicates, or restructure a subgraph.
+
+```cypher
+-- Move every edge off `old` onto `new`.
+MATCH (old:Account {id: $deprecated}), (new:Account {id: $canonical})
+REDIRECT EDGES FROM old TO new
+```
+
+Outgoing `a→x` becomes `b→x`, incoming `x→a` becomes `x→b`. A self-loop `a→a`
+re-points by direction: `BOTH` ⇒ `b→b`, `OUTGOING` ⇒ `b→a`, `INCOMING` ⇒ `a→b`.
+Adjacency is a set, so re-pointing onto an edge the destination already has is
+idempotent. Edge properties move with their edge.
+
+Modifiers:
+
+| Clause | Effect |
+|--------|--------|
+| `WHERE type(r) IN ['T1', 'T2']` | Restrict to the listed edge types (default: all types). The edge variable `r` is a placeholder. |
+| `DIRECTION OUTGOING \| INCOMING \| BOTH` | Restrict to outgoing or incoming edges (default `BOTH`). |
+
+```cypher
+-- Re-point only outgoing KNOWS / FOLLOWS edges.
+MATCH (a:User {id: $a}), (b:User {id: $b})
+REDIRECT EDGES FROM a TO b
+  WHERE type(r) IN ['KNOWS', 'FOLLOWS']
+  DIRECTION OUTGOING
+```
+
+Both `a` and `b` must be bound by a preceding `MATCH`; the clause introduces no
+new variables and leaves node properties untouched (it moves only edges).
+
+**Temporal edges:** redirecting a temporal edge type is not yet supported —
+per-version re-pointing is planned.
+
 ### Native Triggers ✅ 🔷
 
 CoordiNode extension. Triggers are a first-class Cypher clause, not a

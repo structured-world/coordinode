@@ -373,6 +373,18 @@ pub enum LogicalOp {
         set_items: Vec<SetItem>,
     },
 
+    /// REDIRECT EDGES: re-point a bound node's edges onto another bound node.
+    /// `input` binds both `source` and `target`. Single MVCC transaction;
+    /// adjacency moves via posting-list merge operators. See
+    /// arch/compatibility/native-procedures.md.
+    RedirectEdges {
+        input: Box<LogicalOp>,
+        source: String,
+        target: String,
+        edge_types: Option<Vec<String>>,
+        direction: crate::cypher::ast::RedirectDirection,
+    },
+
     /// MERGE / MERGE ALL: match-or-create with optional ON MATCH SET / ON CREATE SET.
     ///
     /// When `multi = false` (MERGE): unique match — errors if >1 src OR >1 tgt matches.
@@ -1124,6 +1136,9 @@ impl LogicalOp {
                     substitute_params_in_set_item(item, params);
                 }
             }
+            LogicalOp::RedirectEdges { input, .. } => {
+                input.substitute_params(params);
+            }
             LogicalOp::AlterLabel { .. }
             | LogicalOp::CreateTextIndex { .. }
             | LogicalOp::DropTextIndex { .. }
@@ -1778,6 +1793,13 @@ fn estimate_op_cost(
                 } else {
                     0.0
                 };
+            (in_cost + in_rows * per_row, in_rows)
+        }
+        LogicalOp::RedirectEdges { input, .. } => {
+            // Cost ≈ input cost + per-row (~2 × avg_fan_out posting-list ops to
+            // re-point both endpoints of each moved edge).
+            let (in_cost, in_rows) = estimate_op_cost(input, defaults, stats, hints);
+            let per_row = 2.0 * defaults.avg_fan_out;
             (in_cost + in_rows * per_row, in_rows)
         }
         LogicalOp::Empty => (0.0, 1.0),
@@ -2525,6 +2547,27 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             };
             output.push_str(&format!(
                 "{prefix}CloneNode({source} AS {target}){edges_tag}{props_tag}{set_tag}\n"
+            ));
+            explain_op(input, indent + 1, output);
+        }
+        LogicalOp::RedirectEdges {
+            input,
+            source,
+            target,
+            edge_types,
+            direction,
+        } => {
+            let dir_tag = match direction {
+                crate::cypher::ast::RedirectDirection::Both => "",
+                crate::cypher::ast::RedirectDirection::Outgoing => " OUTGOING",
+                crate::cypher::ast::RedirectDirection::Incoming => " INCOMING",
+            };
+            let type_tag = match edge_types {
+                Some(ts) => format!(" TYPES[{}]", ts.join(",")),
+                None => String::new(),
+            };
+            output.push_str(&format!(
+                "{prefix}RedirectEdges({source} → {target}){dir_tag}{type_tag}\n"
             ));
             explain_op(input, indent + 1, output);
         }

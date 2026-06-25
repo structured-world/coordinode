@@ -179,6 +179,20 @@ CLONE NODE a AS b
   SET b.name = 'Clone of ' + a.name
 ```
 
+#### REDIRECT EDGES ✅ 🔷
+
+CoordiNode extension. Moves a bound node's edges onto another bound node in a
+single MVCC transaction, via posting-list merge operators — a graph-refactoring
+building block. Optional type and direction filters. See
+[Cypher Extensions — REDIRECT EDGES](extensions.md#redirect-edges-) for details.
+
+```cypher
+MATCH (old:Account {id: $deprecated}), (new:Account {id: $canonical})
+REDIRECT EDGES FROM old TO new
+  WHERE type(r) IN ['KNOWS', 'FOLLOWS']
+  DIRECTION OUTGOING
+```
+
 #### DELETE / DETACH DELETE ✅
 
 Deletes nodes or relationships. `DETACH DELETE` removes all connected edges before deleting the node.

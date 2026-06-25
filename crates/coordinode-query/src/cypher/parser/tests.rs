@@ -1096,6 +1096,69 @@ fn clone_node_same_source_and_target_rejected() {
     );
 }
 
+// -- REDIRECT EDGES (R183) --
+
+#[test]
+fn redirect_edges_minimal_defaults_both_all_types() {
+    let q = parse_ok("MATCH (a), (b) REDIRECT EDGES FROM a TO b");
+    let re = match &q.clauses[1] {
+        Clause::RedirectEdges(re) => re,
+        other => panic!("expected RedirectEdges, got {other:?}"),
+    };
+    assert_eq!(re.source, "a");
+    assert_eq!(re.target, "b");
+    assert!(re.edge_types.is_none(), "no filter = all edge types");
+    assert_eq!(re.direction, RedirectDirection::Both);
+}
+
+#[test]
+fn redirect_edges_with_type_filter() {
+    let q =
+        parse_ok("MATCH (a), (b) REDIRECT EDGES FROM a TO b WHERE type(r) IN ['KNOWS', 'FOLLOWS']");
+    let re = match &q.clauses[1] {
+        Clause::RedirectEdges(re) => re,
+        _ => panic!("expected RedirectEdges"),
+    };
+    assert_eq!(
+        re.edge_types,
+        Some(vec!["KNOWS".to_string(), "FOLLOWS".to_string()])
+    );
+}
+
+#[test]
+fn redirect_edges_with_direction() {
+    for (cypher, expected) in [
+        (
+            "MATCH (a), (b) REDIRECT EDGES FROM a TO b DIRECTION OUTGOING",
+            RedirectDirection::Outgoing,
+        ),
+        (
+            "MATCH (a), (b) REDIRECT EDGES FROM a TO b DIRECTION INCOMING",
+            RedirectDirection::Incoming,
+        ),
+        (
+            "MATCH (a), (b) REDIRECT EDGES FROM a TO b DIRECTION BOTH",
+            RedirectDirection::Both,
+        ),
+    ] {
+        let q = parse_ok(cypher);
+        match &q.clauses[1] {
+            Clause::RedirectEdges(re) => assert_eq!(re.direction, expected, "{cypher}"),
+            _ => panic!("expected RedirectEdges for {cypher}"),
+        }
+    }
+}
+
+#[test]
+fn redirect_edges_same_source_and_target_rejected() {
+    let err = parse_err("MATCH (a) REDIRECT EDGES FROM a TO a");
+    let msg = format!("{err}");
+    assert!(
+        msg.to_lowercase().contains("differ"),
+        "expected distinct-variable error, got: {msg}"
+    );
+}
+
 // -- TRIGGER DDL --
 
 #[test]

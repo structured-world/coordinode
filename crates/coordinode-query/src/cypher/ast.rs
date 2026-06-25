@@ -53,6 +53,7 @@ impl Query {
                 | Clause::DetachDocument(_)
                 | Clause::AttachDocument(_)
                 | Clause::CloneNode(_)
+                | Clause::RedirectEdges(_)
                 | Clause::AlterLabel(_)
                 | Clause::CreateTextIndex(_)
                 | Clause::DropTextIndex(_)
@@ -162,6 +163,12 @@ pub enum Clause {
     /// node in a single MVCC transaction, optionally cloning its edges. Replaces
     /// APOC's `apoc.refactor.cloneNodes()` with a first-class Cypher operation.
     CloneNode(CloneNodeClause),
+    /// `REDIRECT EDGES FROM a TO b [WHERE type(r) IN [...]] [DIRECTION ...]`
+    ///
+    /// Native edge re-pointing — moves a node's edges onto another node in a
+    /// single MVCC transaction. A graph-refactoring building block; replaces
+    /// hand-rolled posting-list rewrites.
+    RedirectEdges(RedirectEdgesClause),
     /// SET clause with optional ON VIOLATION SKIP modifier.
     ///
     /// Syntax: `SET n.prop = val [ON VIOLATION SKIP]`
@@ -1191,6 +1198,37 @@ pub struct CloneNodeClause {
     /// `SET` overrides applied to the clone after the property copy. Each item
     /// is evaluated with `b` bound to the newly created node.
     pub set_items: Vec<SetItem>,
+}
+
+/// Which edges `REDIRECT EDGES` moves, relative to the source node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RedirectDirection {
+    /// Both outgoing and incoming edges (default).
+    #[default]
+    Both,
+    /// Only outgoing edges `a→x`.
+    Outgoing,
+    /// Only incoming edges `x→a`.
+    Incoming,
+}
+
+/// REDIRECT EDGES clause: re-point a node's edges onto another node.
+///
+/// `REDIRECT EDGES FROM a TO b [WHERE type(r) IN [...]] [DIRECTION ...]` moves
+/// edges off the bound node `a` onto the bound node `b` in a single MVCC
+/// transaction, via posting-list merge operators (no read-modify-write). A
+/// building block for graph refactoring. See
+/// arch/compatibility/native-procedures.md § REDIRECT EDGES.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RedirectEdgesClause {
+    /// Source node variable (`a`) — edges are moved off this node. Must be bound.
+    pub source: String,
+    /// Destination node variable (`b`) — edges are moved onto this node. Must be bound.
+    pub target: String,
+    /// Edge-type filter from `WHERE type(r) IN [...]`. `None` redirects every type.
+    pub edge_types: Option<Vec<String>>,
+    /// Direction filter (`DIRECTION ...`); defaults to `Both`.
+    pub direction: RedirectDirection,
 }
 
 /// Property conflict resolution strategy for `MERGE NODES`.

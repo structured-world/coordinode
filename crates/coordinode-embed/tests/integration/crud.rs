@@ -2502,6 +2502,99 @@ fn clone_node_with_edges_remaps_self_loop() {
     );
 }
 
+// ── REDIRECT EDGES (R183) ─────────────────────────────────────────────
+
+/// REDIRECT EDGES moves an outgoing edge off the source onto the destination:
+/// after the redirect, the item is owned by `b`, not `a`.
+#[test]
+fn redirect_edges_moves_outgoing_edge() {
+    let mut db = open_db();
+    db.execute_cypher("CREATE (a:User {tag: 'a'})").expect("a");
+    db.execute_cypher("CREATE (b:User {tag: 'b'})").expect("b");
+    db.execute_cypher("CREATE (x:Item {sku: 's1'})").expect("x");
+    db.execute_cypher("MATCH (a:User {tag: 'a'}), (x:Item {sku: 's1'}) CREATE (a)-[:OWNS]->(x)")
+        .expect("edge a->x");
+
+    db.execute_cypher("MATCH (a:User {tag: 'a'}), (b:User {tag: 'b'}) REDIRECT EDGES FROM a TO b")
+        .expect("redirect");
+
+    // b now owns the item; a no longer does.
+    let from_b = db
+        .execute_cypher("MATCH (u:User {tag: 'b'})-[:OWNS]->(i:Item) RETURN i.sku AS sku")
+        .expect("scan b owns");
+    assert_eq!(from_b.len(), 1, "b owns the item after redirect");
+    let from_a = db
+        .execute_cypher("MATCH (u:User {tag: 'a'})-[:OWNS]->(i:Item) RETURN i.sku AS sku")
+        .expect("scan a owns");
+    assert_eq!(from_a.len(), 0, "a no longer owns the item");
+}
+
+/// `DIRECTION OUTGOING` moves only outgoing edges; incoming edges stay on the
+/// source.
+#[test]
+fn redirect_edges_direction_outgoing_only() {
+    let mut db = open_db();
+    db.execute_cypher("CREATE (a:User {tag: 'a'})").expect("a");
+    db.execute_cypher("CREATE (b:User {tag: 'b'})").expect("b");
+    db.execute_cypher("CREATE (x:User {tag: 'x'})").expect("x");
+    // a→x (outgoing) and x→a (incoming).
+    db.execute_cypher("MATCH (a:User {tag: 'a'}), (x:User {tag: 'x'}) CREATE (a)-[:KNOWS]->(x)")
+        .expect("a->x");
+    db.execute_cypher("MATCH (a:User {tag: 'a'}), (x:User {tag: 'x'}) CREATE (x)-[:KNOWS]->(a)")
+        .expect("x->a");
+
+    db.execute_cypher(
+        "MATCH (a:User {tag: 'a'}), (b:User {tag: 'b'}) \
+         REDIRECT EDGES FROM a TO b DIRECTION OUTGOING",
+    )
+    .expect("redirect outgoing");
+
+    // Outgoing moved: b→x exists.
+    let b_out = db
+        .execute_cypher("MATCH (u:User {tag: 'b'})-[:KNOWS]->(v:User) RETURN v.tag AS tag")
+        .expect("b out");
+    assert_eq!(b_out.len(), 1, "outgoing edge moved to b");
+    // Incoming stayed: x→a still exists.
+    let a_in = db
+        .execute_cypher("MATCH (v:User)-[:KNOWS]->(u:User {tag: 'a'}) RETURN v.tag AS tag")
+        .expect("a in");
+    assert_eq!(a_in.len(), 1, "incoming edge stayed on a");
+}
+
+/// The type filter restricts which edge types move: only the named type is
+/// redirected; others stay on the source.
+#[test]
+fn redirect_edges_type_filter() {
+    let mut db = open_db();
+    db.execute_cypher("CREATE (a:User {tag: 'a'})").expect("a");
+    db.execute_cypher("CREATE (b:User {tag: 'b'})").expect("b");
+    db.execute_cypher("CREATE (x:Item {sku: 's1'})").expect("x");
+    db.execute_cypher("MATCH (a:User {tag: 'a'}), (x:Item {sku: 's1'}) CREATE (a)-[:OWNS]->(x)")
+        .expect("a owns x");
+    db.execute_cypher("MATCH (a:User {tag: 'a'}), (x:Item {sku: 's1'}) CREATE (a)-[:WANTS]->(x)")
+        .expect("a wants x");
+
+    db.execute_cypher(
+        "MATCH (a:User {tag: 'a'}), (b:User {tag: 'b'}) \
+         REDIRECT EDGES FROM a TO b WHERE type(r) IN ['OWNS']",
+    )
+    .expect("redirect OWNS only");
+
+    // OWNS moved to b; WANTS stayed on a.
+    let b_owns = db
+        .execute_cypher("MATCH (u:User {tag: 'b'})-[:OWNS]->(i:Item) RETURN i.sku AS sku")
+        .expect("b owns");
+    assert_eq!(b_owns.len(), 1, "OWNS moved to b");
+    let a_wants = db
+        .execute_cypher("MATCH (u:User {tag: 'a'})-[:WANTS]->(i:Item) RETURN i.sku AS sku")
+        .expect("a wants");
+    assert_eq!(a_wants.len(), 1, "WANTS stayed on a (not in filter)");
+    let a_owns = db
+        .execute_cypher("MATCH (u:User {tag: 'a'})-[:OWNS]->(i:Item) RETURN i.sku AS sku")
+        .expect("a owns");
+    assert_eq!(a_owns.len(), 0, "a no longer OWNS the item");
+}
+
 // ── TRIGGER DDL ──────────────────────────────────────
 
 /// Full DDL lifecycle: CREATE → SHOW finds it → ALTER updates it → DROP

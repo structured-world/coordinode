@@ -42,6 +42,7 @@ clause = {
   | merge_all_clause
   | merge_nodes_clause
   | clone_node_clause
+  | redirect_edges_clause
   | merge_clause
   | upsert_clause
   | detach_document_clause
@@ -491,6 +492,29 @@ clone_node_with_edges      = { kw_with ~ kw_edges }
 clone_node_with_properties = { kw_with ~ kw_properties }
 clone_node_set             = { kw_set ~ set_items }
 
+// --- REDIRECT EDGES (re-point a node's edges onto another node) ---
+//
+//   REDIRECT EDGES FROM a TO b
+//     [WHERE type(r) IN ['KNOWS', 'FOLLOWS']]
+//     [DIRECTION OUTGOING | INCOMING | BOTH]
+//
+// Moves edges off `a` onto `b` via posting-list merge operators (no
+// read-modify-write). Type filter restricts which edge types move; DIRECTION
+// restricts outgoing / incoming (default BOTH). Both `a` and `b` must be bound
+// by a preceding MATCH. A building block for graph refactoring.
+redirect_edges_clause = {
+    kw_redirect ~ kw_edges ~ kw_from ~ identifier ~ kw_to ~ identifier
+    ~ redirect_type_filter? ~ redirect_direction?
+}
+
+// WHERE type(r) IN ['T1', 'T2'] — the edge variable name is a placeholder.
+redirect_type_filter = {
+    kw_where ~ kw_type ~ "(" ~ identifier ~ ")" ~ in_op
+    ~ "[" ~ string_literal ~ ("," ~ string_literal)* ~ "]"
+}
+
+redirect_direction = { kw_direction ~ (kw_outgoing | kw_incoming | kw_both) }
+
 // --- UPSERT MATCH (CoordiNode extension) ---
 
 upsert_clause = { kw_upsert ~ kw_match ~ pattern ~ upsert_action* }
@@ -816,6 +840,10 @@ kw_else       = @{ ^"else" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_end        = @{ ^"end" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_create     = @{ ^"create" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_clone      = @{ ^"clone" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_redirect   = @{ ^"redirect" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_direction  = @{ ^"direction" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_outgoing   = @{ ^"outgoing" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_incoming   = @{ ^"incoming" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_merge      = @{ ^"merge" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_all        = @{ ^"all" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_union      = @{ ^"union" ~ !(ASCII_ALPHANUMERIC | "_") }

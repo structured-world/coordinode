@@ -355,6 +355,7 @@ fn op_children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::AttachDocument { input, .. }
         | LogicalOp::MergeNodes { input, .. }
         | LogicalOp::CloneNode { input, .. }
+        | LogicalOp::RedirectEdges { input, .. }
         | LogicalOp::CreateEdge { input, .. } => vec![input],
         LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
             vec![left, right]
@@ -622,6 +623,16 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 with_edges: cn.with_edges,
                 with_properties: cn.with_properties,
                 set_items: cn.set_items.clone(),
+            })
+        }
+        Clause::RedirectEdges(re) => {
+            let input = current.unwrap_or(LogicalOp::Empty);
+            Ok(LogicalOp::RedirectEdges {
+                input: Box::new(input),
+                source: re.source.clone(),
+                target: re.target.clone(),
+                edge_types: re.edge_types.clone(),
+                direction: re.direction,
             })
         }
         Clause::Set(items, violation_mode) => {

@@ -2950,6 +2950,24 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             )
         }
 
+        LogicalOp::RedirectEdges {
+            input,
+            source,
+            target,
+            edge_types,
+            direction,
+        } => {
+            let input_rows = execute_op(input, ctx)?;
+            execute_redirect_edges(
+                &input_rows,
+                source,
+                target,
+                edge_types.as_deref(),
+                *direction,
+                ctx,
+            )
+        }
+
         LogicalOp::RankFuse {
             input,
             methods,
@@ -11355,6 +11373,159 @@ fn clone_incident_edges(
         }
     }
     Ok(())
+}
+
+/// A snapshot of one edge type's neighbours of the source node, captured before
+/// any mutation so re-pointing never reads a partially-rewritten posting list.
+struct RedirectSnap {
+    edge_type: String,
+    out_neighbours: Vec<u64>,
+    in_neighbours: Vec<u64>,
+}
+
+/// REDIRECT EDGES executor: move a bound node's edges onto another bound node.
+///
+/// Outgoing `a→x` becomes `b→x`, incoming `x→a` becomes `x→b`, via posting-list
+/// merge operators (no read-modify-write); edge properties move through the
+/// canonical edge-rewiring helper. The self-loop `a→a` re-points by direction:
+/// `BOTH` ⇒ `b→b` (both endpoints move, processed once), `OUTGOING` ⇒ `b→a`,
+/// `INCOMING` ⇒ `a→b`. Adjacency is a set, so re-pointing onto an edge the
+/// destination already has is naturally idempotent. Temporal edge types are
+/// safe-rejected (per-version re-pointing is a follow-up).
+fn execute_redirect_edges(
+    input_rows: &[Row],
+    source: &str,
+    target: &str,
+    edge_types: Option<&[String]>,
+    direction: crate::cypher::ast::RedirectDirection,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    use crate::cypher::ast::RedirectDirection;
+
+    if source == target {
+        // Redirecting a node's edges onto itself changes nothing.
+        return Ok(input_rows.to_vec());
+    }
+    let do_out = matches!(
+        direction,
+        RedirectDirection::Both | RedirectDirection::Outgoing
+    );
+    let do_in = matches!(
+        direction,
+        RedirectDirection::Both | RedirectDirection::Incoming
+    );
+    let both = matches!(direction, RedirectDirection::Both);
+
+    let types: Vec<String> = match edge_types {
+        Some(ts) => ts.to_vec(),
+        None => ctx.list_edge_types()?,
+    };
+
+    // Temporal safe-reject (mirror of CLONE / MERGE NODES).
+    for et in &types {
+        if lookup_edge_type_temporal(et, ctx)? {
+            return Err(ExecutionError::Unsupported(format!(
+                "REDIRECT EDGES on temporal edge type '{et}' is not yet supported \
+                 (per-version edge re-pointing is a follow-up)."
+            )));
+        }
+    }
+
+    let mut out = Vec::with_capacity(input_rows.len());
+    for row in input_rows {
+        let a_id = match row.get(source) {
+            Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+            _ => {
+                out.push(row.clone());
+                continue;
+            }
+        };
+        let b_id = match row.get(target) {
+            Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
+            _ => {
+                out.push(row.clone());
+                continue;
+            }
+        };
+        if a_id == b_id {
+            out.push(row.clone());
+            continue;
+        }
+
+        // Snapshot every selected type's neighbours BEFORE mutating, so a later
+        // remove never perturbs a list still being read.
+        let mut snaps: Vec<RedirectSnap> = Vec::with_capacity(types.len());
+        for et in &types {
+            let out_neighbours = if do_out {
+                ctx.adj_get_fwd(et, a_id)?
+                    .map(|p| p.iter().collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let in_neighbours = if do_in {
+                ctx.adj_get_rev(et, a_id)?
+                    .map(|p| p.iter().collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if !out_neighbours.is_empty() || !in_neighbours.is_empty() {
+                snaps.push(RedirectSnap {
+                    edge_type: et.clone(),
+                    out_neighbours,
+                    in_neighbours,
+                });
+            }
+        }
+
+        for snap in &snaps {
+            let et = &snap.edge_type;
+            // Outgoing a→x ⇒ b→x (self-loop ⇒ b→b in BOTH, else b→a).
+            for &x_uid in &snap.out_neighbours {
+                let x = NodeId::from_raw(x_uid);
+                if x == a_id {
+                    let new_tgt = if both { b_id } else { a_id };
+                    ctx.adj_merge_remove_fwd(et, a_id, a_id.as_raw());
+                    ctx.adj_merge_remove_rev(et, a_id, a_id.as_raw());
+                    ctx.adj_merge_add_fwd(et, b_id, new_tgt.as_raw());
+                    ctx.adj_merge_add_rev(et, new_tgt, b_id.as_raw());
+                    ctx.mvcc_move_edge_props(et, a_id, a_id, b_id, new_tgt)?;
+                } else {
+                    ctx.adj_merge_remove_fwd(et, a_id, x.as_raw());
+                    ctx.adj_merge_remove_rev(et, x, a_id.as_raw());
+                    ctx.adj_merge_add_fwd(et, b_id, x.as_raw());
+                    ctx.adj_merge_add_rev(et, x, b_id.as_raw());
+                    ctx.mvcc_move_edge_props(et, a_id, x, b_id, x)?;
+                }
+            }
+            // Incoming x→a ⇒ x→b.
+            for &x_uid in &snap.in_neighbours {
+                let x = NodeId::from_raw(x_uid);
+                if x == a_id {
+                    // Self-loop already handled by the outgoing pass in BOTH.
+                    if both {
+                        continue;
+                    }
+                    // INCOMING-only: a→a ⇒ a→b (target moves, source stays).
+                    ctx.adj_merge_remove_fwd(et, a_id, a_id.as_raw());
+                    ctx.adj_merge_remove_rev(et, a_id, a_id.as_raw());
+                    ctx.adj_merge_add_fwd(et, a_id, b_id.as_raw());
+                    ctx.adj_merge_add_rev(et, b_id, a_id.as_raw());
+                    ctx.mvcc_move_edge_props(et, a_id, a_id, a_id, b_id)?;
+                } else {
+                    ctx.adj_merge_remove_fwd(et, x, a_id.as_raw());
+                    ctx.adj_merge_remove_rev(et, a_id, x.as_raw());
+                    ctx.adj_merge_add_fwd(et, x, b_id.as_raw());
+                    ctx.adj_merge_add_rev(et, b_id, x.as_raw());
+                    ctx.mvcc_move_edge_props(et, x, a_id, x, b_id)?;
+                }
+            }
+        }
+
+        out.push(row.clone());
+    }
+    Ok(out)
 }
 
 /// Merge `source.props` into `target.props` per the chosen conflict strategy.

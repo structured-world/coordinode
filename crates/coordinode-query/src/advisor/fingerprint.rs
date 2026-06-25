@@ -248,6 +248,22 @@ fn write_clause(buf: &mut String, clause: &Clause) {
                 buf.push_str(" WITH EDGES");
             }
         }
+        Clause::RedirectEdges(re) => {
+            buf.push_str("REDIRECT EDGES FROM ");
+            buf.push_str(&re.source);
+            buf.push_str(" TO ");
+            buf.push_str(&re.target);
+            // Type filter and direction change the plan shape; concrete type
+            // names do not (same cache slot regardless of which types).
+            if re.edge_types.is_some() {
+                buf.push_str(" TYPES");
+            }
+            match re.direction {
+                crate::cypher::ast::RedirectDirection::Both => {}
+                crate::cypher::ast::RedirectDirection::Outgoing => buf.push_str(" OUTGOING"),
+                crate::cypher::ast::RedirectDirection::Incoming => buf.push_str(" INCOMING"),
+            }
+        }
         Clause::Set(items, _violation_mode) => {
             buf.push_str("SET ");
             write_set_items(buf, items);
