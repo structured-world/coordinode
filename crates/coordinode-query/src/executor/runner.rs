@@ -1281,6 +1281,26 @@ impl<'a> ExecutionContext<'a> {
         )?)
     }
 
+    /// Re-point an edge's properties from `(old_src, old_tgt)` to
+    /// `(new_src, new_tgt)`, moving every per-version body for a temporal edge
+    /// type (preserving each `valid_from`) or the single body otherwise. The
+    /// adjacency move is identical for both — only the edgeprop store differs.
+    pub fn mvcc_move_edge_props_versioned(
+        &mut self,
+        edge_type: &str,
+        old_src: NodeId,
+        old_tgt: NodeId,
+        new_src: NodeId,
+        new_tgt: NodeId,
+        temporal: bool,
+    ) -> Result<(), ExecutionError> {
+        if temporal {
+            self.mvcc_transfer_all_edge_prop_versions(edge_type, old_src, old_tgt, new_src, new_tgt)
+        } else {
+            self.mvcc_move_edge_props(edge_type, old_src, old_tgt, new_src, new_tgt)
+        }
+    }
+
     /// Tombstone every temporal edge-property version of `(edge_type, src, tgt)`.
     pub fn mvcc_delete_all_edge_prop_versions(
         &mut self,
@@ -11405,18 +11425,22 @@ fn clone_incident_edges(
     let edge_types = ctx.list_edge_types()?;
     for et in &edge_types {
         // Temporal edge types keep one edgeprop entry per `valid_from`; cloning
-        // them needs the per-version adjacency-move path (shared with REDIRECT
-        // EDGES on temporal types). Until that lands, reject WITH EDGES when the
-        // source actually has incident edges of a temporal type rather than
-        // silently writing an adjacency with no per-version edgeprop.
+        // Cloning a temporal node's CURRENT incident edges (never the version
+        // history) onto the clone requires the cloned edge to be injected into
+        // the per-version edgeprop store AND any vector/secondary index on that
+        // edge type — the same bitemporal index-maintenance mechanism as a
+        // version-transition (close-old / open-new active version). That
+        // mechanism is pending, so for now reject WITH EDGES when the source
+        // has incident edges of a temporal type rather than writing an
+        // adjacency with no per-version edgeprop (and a stale index).
         if lookup_edge_type_temporal(et, ctx)? {
             let has_incident =
                 ctx.adj_get_fwd(et, a_id)?.is_some() || ctx.adj_get_rev(et, a_id)?.is_some();
             if has_incident {
                 return Err(ExecutionError::Unsupported(format!(
-                    "CLONE NODE WITH EDGES across temporal edge type '{et}' is not yet \
-                     supported (per-version edge cloning is a follow-up); the node and its \
-                     non-temporal edges are cloned, temporal edges are not."
+                    "CLONE NODE WITH EDGES does not yet clone temporal edge type '{et}' \
+                     (pending bitemporal index-maintenance); the node and its non-temporal \
+                     edges clone normally."
                 )));
             }
             continue;
@@ -11462,6 +11486,9 @@ struct RedirectSnap {
     edge_type: String,
     out_neighbours: Vec<u64>,
     in_neighbours: Vec<u64>,
+    /// Whether this edge type is temporal — selects per-version vs single-body
+    /// edgeprop transfer when re-pointing (the adjacency move is identical).
+    temporal: bool,
 }
 
 /// REDIRECT EDGES executor: move a bound node's edges onto another bound node.
@@ -11501,16 +11528,6 @@ fn execute_redirect_edges(
         Some(ts) => ts.to_vec(),
         None => ctx.list_edge_types()?,
     };
-
-    // Temporal safe-reject (mirror of CLONE / MERGE NODES).
-    for et in &types {
-        if lookup_edge_type_temporal(et, ctx)? {
-            return Err(ExecutionError::Unsupported(format!(
-                "REDIRECT EDGES on temporal edge type '{et}' is not yet supported \
-                 (per-version edge re-pointing is a follow-up)."
-            )));
-        }
-    }
 
     let mut out = Vec::with_capacity(input_rows.len());
     for row in input_rows {
@@ -11556,6 +11573,7 @@ fn execute_redirect_edges(
                     edge_type: et.clone(),
                     out_neighbours,
                     in_neighbours,
+                    temporal: lookup_edge_type_temporal(et, ctx)?,
                 });
             }
         }
@@ -11571,13 +11589,20 @@ fn execute_redirect_edges(
                     ctx.adj_merge_remove_rev(et, a_id, a_id.as_raw());
                     ctx.adj_merge_add_fwd(et, b_id, new_tgt.as_raw());
                     ctx.adj_merge_add_rev(et, new_tgt, b_id.as_raw());
-                    ctx.mvcc_move_edge_props(et, a_id, a_id, b_id, new_tgt)?;
+                    ctx.mvcc_move_edge_props_versioned(
+                        et,
+                        a_id,
+                        a_id,
+                        b_id,
+                        new_tgt,
+                        snap.temporal,
+                    )?;
                 } else {
                     ctx.adj_merge_remove_fwd(et, a_id, x.as_raw());
                     ctx.adj_merge_remove_rev(et, x, a_id.as_raw());
                     ctx.adj_merge_add_fwd(et, b_id, x.as_raw());
                     ctx.adj_merge_add_rev(et, x, b_id.as_raw());
-                    ctx.mvcc_move_edge_props(et, a_id, x, b_id, x)?;
+                    ctx.mvcc_move_edge_props_versioned(et, a_id, x, b_id, x, snap.temporal)?;
                 }
             }
             // Incoming x→a ⇒ x→b.
@@ -11593,13 +11618,13 @@ fn execute_redirect_edges(
                     ctx.adj_merge_remove_rev(et, a_id, a_id.as_raw());
                     ctx.adj_merge_add_fwd(et, a_id, b_id.as_raw());
                     ctx.adj_merge_add_rev(et, b_id, a_id.as_raw());
-                    ctx.mvcc_move_edge_props(et, a_id, a_id, a_id, b_id)?;
+                    ctx.mvcc_move_edge_props_versioned(et, a_id, a_id, a_id, b_id, snap.temporal)?;
                 } else {
                     ctx.adj_merge_remove_fwd(et, x, a_id.as_raw());
                     ctx.adj_merge_remove_rev(et, a_id, x.as_raw());
                     ctx.adj_merge_add_fwd(et, x, b_id.as_raw());
                     ctx.adj_merge_add_rev(et, b_id, x.as_raw());
-                    ctx.mvcc_move_edge_props(et, x, a_id, x, b_id)?;
+                    ctx.mvcc_move_edge_props_versioned(et, x, a_id, x, b_id, snap.temporal)?;
                 }
             }
         }

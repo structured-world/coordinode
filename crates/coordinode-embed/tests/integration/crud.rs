@@ -2707,6 +2707,72 @@ fn redirect_edges_type_filter() {
     assert_eq!(a_owns.len(), 0, "a no longer OWNS the item");
 }
 
+/// REDIRECT EDGES on a TEMPORAL edge type re-points every per-version body:
+/// both `valid_from` versions of `a→Acme` move onto `b→Acme`, and `a` is left
+/// with none. The adjacency move is the same as the non-temporal path; only the
+/// edgeprop transfer carries all versions.
+#[test]
+fn redirect_edges_temporal_moves_all_versions() {
+    use coordinode_core::graph::types::Value;
+    let mut db = open_db();
+    db.execute_cypher(
+        "CREATE EDGE TYPE WORKS_AT TEMPORAL \
+         WITH (valid_from: TIMESTAMP, valid_to: TIMESTAMP, role: STRING)",
+    )
+    .unwrap();
+    db.execute_cypher("CREATE (a:Person {name: 'A'})").unwrap();
+    db.execute_cypher("CREATE (b:Person {name: 'B'})").unwrap();
+    db.execute_cypher("CREATE (co:Co {name: 'Acme'})").unwrap();
+    db.execute_cypher(
+        "MATCH (a:Person {name: 'A'}), (c:Co {name: 'Acme'}) \
+         CREATE (a)-[:WORKS_AT {valid_from: 1000, valid_to: 2000, role: 'SWE'}]->(c)",
+    )
+    .unwrap();
+    db.execute_cypher(
+        "MATCH (a:Person {name: 'A'}), (c:Co {name: 'Acme'}) \
+         CREATE (a)-[:WORKS_AT {valid_from: 2000, valid_to: 3000, role: 'Staff'}]->(c)",
+    )
+    .unwrap();
+
+    db.execute_cypher(
+        "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) REDIRECT EDGES FROM a TO b",
+    )
+    .expect("redirect temporal edges");
+
+    // Both versions are now on b→Acme.
+    let on_b = db
+        .execute_cypher(
+            "MATCH (b:Person {name: 'B'})-[r:WORKS_AT]->(c:Co) RETURN r.role AS role, r.valid_from AS vf",
+        )
+        .unwrap();
+    assert_eq!(
+        on_b.len(),
+        2,
+        "both temporal versions re-pointed onto b: {on_b:?}"
+    );
+    let roles: std::collections::HashSet<_> = on_b
+        .iter()
+        .filter_map(|r| match r.get("role") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        roles.contains("SWE") && roles.contains("Staff"),
+        "roles: {roles:?}"
+    );
+
+    // The source keeps no WORKS_AT edge.
+    let on_a = db
+        .execute_cypher("MATCH (a:Person {name: 'A'})-[r:WORKS_AT]->(c:Co) RETURN r.role")
+        .unwrap();
+    assert_eq!(
+        on_a.len(),
+        0,
+        "source has no edges after redirect: {on_a:?}"
+    );
+}
+
 // ── TRIGGER DDL ──────────────────────────────────────
 
 /// Full DDL lifecycle: CREATE → SHOW finds it → ALTER updates it → DROP
