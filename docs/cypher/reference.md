@@ -164,6 +164,21 @@ MERGE NODES (a, b) INTO a
   ON DUPLICATE MERGE PROPERTIES
 ```
 
+#### CLONE NODE ✅ 🔷
+
+CoordiNode extension. Deep-copies a matched node into a freshly-allocated node
+in a single MVCC transaction, optionally cloning its edges. Replaces Neo4j's
+`apoc.refactor.cloneNodes()` with a native, cluster-safe clause. See
+[Cypher Extensions — CLONE NODE](extensions.md#clone-node-) for the full
+modifier matrix.
+
+```cypher
+MATCH (a:Template {name: 'default'})
+CLONE NODE a AS b
+  WITH EDGES
+  SET b.name = 'Clone of ' + a.name
+```
+
 #### DELETE / DETACH DELETE ✅
 
 Deletes nodes or relationships. `DETACH DELETE` removes all connected edges before deleting the node.

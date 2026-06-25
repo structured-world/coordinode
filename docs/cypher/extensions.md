@@ -594,6 +594,50 @@ commits. `VALIDATED` mode rejects type mismatches on declared properties but
 allows source-only props into the `extra` overflow map. `FLEXIBLE` accepts
 the merge unconditionally.
 
+### CLONE NODE ✅ 🔷
+
+Native node-clone for template instantiation, snapshot creation, and test-data
+generation. Deep-copies a matched node into a freshly-allocated node in a single
+atomic transaction. Equivalent in intent to Neo4j APOC's
+`apoc.refactor.cloneNodes()` but without the plugin and with correct behaviour
+under replication.
+
+```cypher
+-- Copy a node's labels and properties into a new node `b`.
+MATCH (a:Template {name: 'default'})
+CLONE NODE a AS b
+```
+
+The clone goes through the same write path as `CREATE`, so it is registered in
+every index (b-tree, vector, full-text, spatial), reuses BlobStore content
+addressing for large values (a cloned embedding references the same blob — no
+copy), enforces the label's schema mode, and fires `CREATE` triggers. `COMPUTED`
+properties are never copied — they are derived on read, so the clone recomputes
+them from its own values.
+
+Modifiers:
+
+| Clause | Effect |
+|--------|--------|
+| `WITH PROPERTIES` (default) | Copy the source's stored properties to the clone. |
+| `WITH EDGES` | Also clone every incident edge — outgoing `a→x` becomes `b→x`, incoming `x→a` becomes `x→b`, and the self-loop `a→a` becomes `b→b` — with its edge type and properties, via posting-list merge operators. |
+| `SET <exprs>` | Override properties on the clone after the copy (`a` and `b` are both in scope). |
+
+```cypher
+-- Instantiate a template, clone its edges, and rename the copy.
+MATCH (a:Template {name: 'default'})
+CLONE NODE a AS b
+  WITH EDGES
+  SET b.name = 'Clone of ' + a.name
+```
+
+The clone is always a new node with its own id; the original is untouched.
+
+**Temporal labels:** cloning a node on a `TIMESERIES` / bitemporal label is not
+yet supported. The system-time (transaction-time) axis is engine-assigned and is
+never copied — copying it would forge the audit record. Cloning the current
+valid-version into a fresh node is planned.
+
 ### Native Triggers ✅ 🔷
 
 CoordiNode extension. Triggers are a first-class Cypher clause, not a
