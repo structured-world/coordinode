@@ -23,10 +23,13 @@ use crate::engine::config::EndpointConfig;
 use crate::engine::config::{FlushPolicy, StorageConfig};
 use crate::engine::coordinator::{LocalMultiModalCoordinator, MultiModalCoordinator, SnapshotPin};
 use crate::engine::flush::FlushManager;
+use crate::engine::oplog_journal::{
+    apply_oplog_op, op_partition, EmbeddedOplog, OplogJournalConfig,
+};
 use crate::engine::partition::Partition;
 use crate::engine::routing::PartitionRouting;
 use crate::error::{StorageError, StorageResult};
-use crate::wal::{StandaloneWal, WalConfig};
+use crate::oplog::entry::{OplogEntry, OplogOp};
 
 /// Newtype wrapper that bridges coordinode-core's `TimestampOracle` to
 /// lsm-tree's `SequenceNumberGenerator` trait. Makes every write's LSM
@@ -120,11 +123,14 @@ pub struct StorageEngine {
     /// HashMap lookup on the hot path. Schema partition is mapped to
     /// the primary endpoint id (single-tier bootstrap).
     partition_l0_endpoint: HashMap<Partition, String>,
-    /// Optional standalone WAL (embedded / no-Raft mode only).
+    /// Optional embedded oplog journal (oracle-backed, no-Raft mode).
     ///
-    /// `Some` only when opened via `open_with_wal`. In cluster mode this is
-    /// always `None` — Raft log is the crash-recovery mechanism (ADR-017).
-    wal: Option<Arc<Mutex<StandaloneWal>>>,
+    /// `Some` when opened via [`StorageEngine::open_with_oracle`] against a
+    /// persistent endpoint. The retained oplog drives crash recovery and
+    /// WAL-replay-repair (rebuild a corrupt partition from a checkpoint then
+    /// replay forward). In cluster mode this is `None` — the Raft log is the
+    /// equivalent retained oplog (ADR-017).
+    oplog: Option<Arc<Mutex<EmbeddedOplog>>>,
     /// The timestamp oracle this engine stamps writes with. `Some` only
     /// when opened via [`StorageEngine::open_with_oracle`]. Exposed via
     /// [`StorageEngine::oracle`] so subsystems applying externally
@@ -146,34 +152,6 @@ impl StorageEngine {
         Self::finish_open(config, seqno, gc_watermark, None, None)
     }
 
-    /// Open with a standalone WAL for crash durability (embedded / no-Raft mode).
-    ///
-    /// Pass `wal_config = None` to use the WAL with default settings:
-    /// - Path: `<data_dir>/standalone.wal`
-    /// - Sync: `SyncPerRecord` (full crash safety)
-    ///
-    /// Pass `wal_config = Some(WalConfig { … })` to customise path or sync
-    /// policy (e.g. `NoSync` for test environments).
-    ///
-    /// In cluster mode, pass `None` for `wal_config` to `StorageEngine::open`
-    /// directly — WAL is not used in cluster mode (Raft log = recovery, ADR-017).
-    ///
-    /// # Recovery
-    ///
-    /// If `standalone.wal` exists on open (crash recovery), all valid records
-    /// are replayed into the memtable, then a `persist()` flushes them to SST.
-    /// The WAL is then deleted and a fresh journal is started for new writes.
-    pub fn open_with_wal(
-        config: &StorageConfig,
-        wal_config: Option<WalConfig>,
-    ) -> StorageResult<Self> {
-        let gc_watermark = Arc::new(AtomicU64::new(0));
-        let seqno: lsm_tree::SharedSequenceNumberGenerator =
-            Arc::new(lsm_tree::SequenceNumberCounter::default());
-        let wal_config = wal_config.unwrap_or_default();
-        Self::finish_open(config, seqno, gc_watermark, Some(wal_config), None)
-    }
-
     /// Open with a custom `TimestampOracle` as the seqno generator.
     ///
     /// Every write's LSM seqno equals the oracle's timestamp, enabling
@@ -186,15 +164,43 @@ impl StorageEngine {
         let gc_watermark = Arc::new(AtomicU64::new(0));
         let seqno: lsm_tree::SharedSequenceNumberGenerator =
             Arc::new(OracleSeqnoGenerator(Arc::clone(&oracle)));
-        Self::finish_open(config, seqno, gc_watermark, None, Some(oracle))
+        Self::finish_open(config, seqno, gc_watermark, Some(oracle), None)
+    }
+
+    /// Open an embedded (no-Raft) engine backed by the oracle plus a RETAINED
+    /// oplog journal.
+    ///
+    /// Like [`open_with_oracle`](Self::open_with_oracle), every write's LSM
+    /// seqno equals the oracle timestamp — but in addition every proposal is
+    /// journalled to a retained oplog (at the oplog-eligible endpoint), so the
+    /// engine survives a crash by replaying the un-flushed tail and can repair
+    /// a corrupt partition from a checkpoint plus oplog replay
+    /// (`SegmentInstaller::wal_replay_repair`).
+    ///
+    /// In-memory configs (every endpoint `Volatile`) get no journal — there is
+    /// no durable place to keep it; durability there is best-effort by design.
+    pub fn open_embedded(
+        config: &StorageConfig,
+        oracle: std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>,
+    ) -> StorageResult<Self> {
+        let gc_watermark = Arc::new(AtomicU64::new(0));
+        let seqno: lsm_tree::SharedSequenceNumberGenerator =
+            Arc::new(OracleSeqnoGenerator(Arc::clone(&oracle)));
+        Self::finish_open(
+            config,
+            seqno,
+            gc_watermark,
+            Some(oracle),
+            Some(OplogJournalConfig::default()),
+        )
     }
 
     fn finish_open(
         config: &StorageConfig,
         seqno: lsm_tree::SharedSequenceNumberGenerator,
         gc_watermark: Arc<AtomicU64>,
-        wal_config: Option<WalConfig>,
         oracle: Option<std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
+        journal_config: Option<OplogJournalConfig>,
     ) -> StorageResult<Self> {
         // When built with `--features io-uring` on Linux and no explicit
         // filesystem backend was configured, default every partition tree to a
@@ -293,6 +299,58 @@ impl StorageEngine {
             trees.insert(part, tree);
         }
 
+        // ── Embedded oplog journal: open + crash recovery ────────────────────
+        // Oracle-backed standalone engines journal every proposal to a RETAINED
+        // oplog (replacing the legacy per-batch persist()). On open, replay the
+        // entries that are not yet durable in their partition — entry.ts > that
+        // partition's highest seqno — applying each at seqno = entry.ts. Because
+        // the oracle makes seqno == commit_ts == entry.ts, this is correct even
+        // when the background flush worker persisted memtables on its own (a
+        // fixed index cursor would lag those flushes and could double-apply a
+        // non-idempotent merge). The replay must precede the seqno restore below
+        // so the restored watermark covers the replayed entries.
+        let oplog = match journal_config {
+            Some(jcfg) => match config.select_oplog_endpoint(0) {
+                Ok(endpoint) => {
+                    use lsm_tree::AbstractTree;
+                    let dir = endpoint.path.join("oplog").join("0");
+                    let mut journal = EmbeddedOplog::open(&dir, 0, &jcfg)?;
+                    let entries = journal.read_all()?;
+                    let mut replayed = 0usize;
+                    for entry in &entries {
+                        for op in &entry.ops {
+                            let Some(part) = op_partition(op) else {
+                                continue;
+                            };
+                            let tree = trees.get(&part).ok_or_else(|| {
+                                StorageError::PartitionNotFound {
+                                    name: part.name().to_string(),
+                                }
+                            })?;
+                            if entry.ts > tree.get_highest_seqno().unwrap_or(0) {
+                                apply_oplog_op(tree, op, entry.ts);
+                                replayed += 1;
+                            }
+                        }
+                    }
+                    if replayed > 0 {
+                        tracing::info!(
+                            replayed,
+                            "oplog: replayed un-flushed entries from journal on open"
+                        );
+                        for tree in trees.values() {
+                            tree.flush_active_memtable(0)?;
+                        }
+                    }
+                    Some(Arc::new(Mutex::new(journal)))
+                }
+                // No oplog-eligible (Durable/Degraded) endpoint — in-memory /
+                // no-persistence config. Durability is best-effort; no journal.
+                Err(_) => None,
+            },
+            None => None,
+        };
+
         // Restore seqno counter to (max_persisted_seqno + 1) so reads see all
         // data written in a previous session. seqno_filter uses strict <, so
         // `get()` must be > the highest written seqno for those writes to be visible.
@@ -349,133 +407,6 @@ impl StorageEngine {
             compaction_workers = config.compaction_workers,
             "storage engine opened"
         );
-
-        // ── Standalone WAL setup ──────────────────────────────────────────────
-        // Open and replay WAL if requested.  Must happen AFTER the lsm-tree
-        // partitions are open so we can apply replayed mutations directly.
-        let wal = if let Some(wal_cfg) = wal_config {
-            // Standalone WAL lands at <wal_eligible_endpoint>/wal/standalone.wal
-            // by default. Caller can override with an explicit
-            // `wal_cfg.path` for tests or unusual deployments. Recovery
-            // additionally scans every WAL-eligible endpoint to discover
-            // orphaned WAL files left over by a previous config change.
-            let wal_path = if let Some(p) = wal_cfg.path.clone() {
-                p
-            } else {
-                let endpoint = config.select_wal_endpoint().map_err(|e| {
-                    StorageError::Io(format!(
-                        "standalone WAL requested but {e} — add at least one \
-                         non-volatile NVMe/SSD/Hot-tier endpoint to StorageConfig"
-                    ))
-                })?;
-                endpoint.path.join("wal").join("standalone.wal")
-            };
-            // Ensure parent dir exists (the endpoint path may exist as a
-            // tempdir without the wal/ subdir).
-            if let Some(parent) = wal_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| StorageError::Io(format!("create wal dir {parent:?}: {e}")))?;
-            }
-            // Scan other WAL-eligible endpoints for orphaned WAL
-            // files that a previous config might have left behind.
-            // Surfacing them as a warning lets the operator clean up
-            // manually; we do NOT auto-replay foreign WAL files because
-            // their lineage relative to current partition state is
-            // ambiguous.
-            for ep in config.all_wal_eligible_endpoints() {
-                let orphan_candidate = ep.path.join("wal").join("standalone.wal");
-                if orphan_candidate != wal_path && orphan_candidate.exists() {
-                    tracing::warn!(
-                        active_wal = %wal_path.display(),
-                        orphan = %orphan_candidate.display(),
-                        endpoint_id = %ep.id,
-                        "orphaned standalone WAL found on a different endpoint — \
-                         left in place for operator inspection (not replayed)"
-                    );
-                }
-            }
-            let sync = wal_cfg.sync;
-
-            let (mut standalone_wal, replay_records) = StandaloneWal::open(wal_path.clone(), sync)?;
-
-            if !replay_records.is_empty() {
-                // Replay WAL records into the lsm-tree partitions.
-                tracing::info!(
-                    count = replay_records.len(),
-                    "WAL: applying replay records to memtable"
-                );
-                for record in &replay_records {
-                    for mutation in &record.mutations {
-                        use coordinode_core::txn::proposal::Mutation as CoreMutation;
-                        let part_seqno = seqno.next();
-                        match mutation {
-                            CoreMutation::Put {
-                                partition,
-                                key,
-                                value,
-                            } => {
-                                let part = Partition::from(*partition);
-                                let tree = trees.get(&part).ok_or_else(|| {
-                                    StorageError::PartitionNotFound {
-                                        name: part.name().to_string(),
-                                    }
-                                })?;
-                                tree.insert(key, value, part_seqno);
-                            }
-                            CoreMutation::Delete { partition, key } => {
-                                let part = Partition::from(*partition);
-                                let tree = trees.get(&part).ok_or_else(|| {
-                                    StorageError::PartitionNotFound {
-                                        name: part.name().to_string(),
-                                    }
-                                })?;
-                                tree.remove(key, part_seqno);
-                            }
-                            CoreMutation::Merge {
-                                partition,
-                                key,
-                                operand,
-                            } => {
-                                let part = Partition::from(*partition);
-                                let tree = trees.get(&part).ok_or_else(|| {
-                                    StorageError::PartitionNotFound {
-                                        name: part.name().to_string(),
-                                    }
-                                })?;
-                                tree.merge(key, operand, part_seqno);
-                            }
-                            CoreMutation::RemoveRange {
-                                partition,
-                                start,
-                                end,
-                            } => {
-                                let part = Partition::from(*partition);
-                                let tree = trees.get(&part).ok_or_else(|| {
-                                    StorageError::PartitionNotFound {
-                                        name: part.name().to_string(),
-                                    }
-                                })?;
-                                tree.remove_range(start.clone(), end.clone(), part_seqno);
-                            }
-                        }
-                    }
-                }
-
-                // Flush replayed memtable data to SST for durability.
-                tracing::info!("WAL: flushing replayed data to SST");
-                for tree in trees.values() {
-                    tree.flush_active_memtable(0)?;
-                }
-
-                // WAL replay complete — checkpoint (rotate) to start fresh.
-                tracing::info!(path = %wal_path.display(), "WAL: checkpoint after recovery");
-                standalone_wal.checkpoint()?;
-            }
-
-            Some(Arc::new(Mutex::new(standalone_wal)))
-        } else {
-            None
-        };
 
         // Build the capacity tracker + warm-load persisted snapshots
         // BEFORE spawning the scanner so the first scan tick sees the
@@ -538,7 +469,7 @@ impl StorageEngine {
             capacity: capacity_arc,
             capacity_scanner,
             partition_l0_endpoint,
-            wal,
+            oplog,
             oracle,
         })
     }
@@ -659,6 +590,124 @@ impl StorageEngine {
         }
 
         Ok(summary)
+    }
+
+    /// Rebuild a corrupt partition from a checkpoint plus oplog replay
+    /// (WAL-replay-repair, repair path 2). Used when no healthy replica can
+    /// serve the partition — the single-node / embedded / RF=1 case.
+    ///
+    /// Opens `checkpoint_dir` read-only, exports the partition's base
+    /// key-values, physically drops the live (corrupt) partition tables,
+    /// reinstalls the base, then replays `oplog_since` (the journal entries
+    /// recorded after the checkpoint's cursor) to roll the partition forward to
+    /// its current state. Returns the number of base entries reinstalled.
+    ///
+    /// The checkpoint persists routing under the original single-endpoint id
+    /// `"default"`, so it is reopened with that id. Same-disk checkpoints only
+    /// protect against localized corruption; whole-device loss requires an
+    /// off-device backup (PITR).
+    pub fn repair_partition_from_checkpoint(
+        &self,
+        checkpoint_dir: &Path,
+        oplog_since: &[OplogEntry],
+        partition: Partition,
+    ) -> StorageResult<usize> {
+        use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
+
+        // 1. Open the checkpoint read-only and export the partition base. The
+        //    checkpoint engine is dropped before we mutate the live engine.
+        let base: Vec<(Vec<u8>, Vec<u8>)> = {
+            let ckpt_cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                checkpoint_dir,
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]);
+            let ckpt = StorageEngine::open(&ckpt_cfg)?;
+            let snapshot = ckpt.snapshot();
+            let prefix = format!("{}:", partition.name());
+            ckpt.snapshot_prefix_scan(&snapshot, partition, prefix.as_bytes())?
+                .into_iter()
+                .map(|(k, v)| (k, v.to_vec()))
+                .collect()
+        };
+
+        // 2. Drop the live (corrupt) tables, reinstall the base.
+        self.drop_range(partition, b"".as_slice()..)?;
+        let base_len = base.len();
+        for (key, value) in &base {
+            self.put(partition, key, value)?;
+        }
+
+        // 3. Replay the granular oplog ops since the checkpoint for this
+        //    partition, rolling the base forward to the current state.
+        for entry in oplog_since {
+            for op in &entry.ops {
+                if op_partition(op) != Some(partition) {
+                    continue;
+                }
+                match op {
+                    OplogOp::Insert { key, value, .. } => {
+                        self.put(partition, key, value)?;
+                    }
+                    OplogOp::Delete { key, .. } => {
+                        self.delete(partition, key)?;
+                    }
+                    OplogOp::Merge { key, operand, .. } => {
+                        self.merge(partition, key, operand)?;
+                    }
+                    OplogOp::RemoveRange { start, end, .. } => {
+                        self.remove_range(partition, start, end)?;
+                    }
+                    OplogOp::Noop | OplogOp::RaftEntry { .. } | OplogOp::RaftTruncation { .. } => {}
+                }
+            }
+        }
+        Ok(base_len)
+    }
+
+    /// Read journal entries with `index >= from_index` from the embedded oplog,
+    /// or `None` when no journal is active. Used by the repair orchestrator to
+    /// collect the entries to replay forward from a checkpoint cursor.
+    pub fn oplog_read_since(&self, from_index: u64) -> StorageResult<Option<Vec<OplogEntry>>> {
+        match &self.oplog {
+            None => Ok(None),
+            Some(oplog) => {
+                let mut guard = oplog
+                    .lock()
+                    .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
+                Ok(Some(guard.read_since(from_index)?))
+            }
+        }
+    }
+
+    /// The journal index to start replaying from for a checkpoint: one past the
+    /// last entry copied into `checkpoint_dir`'s oplog, or `0` if it has none.
+    /// The repair orchestrator feeds this to [`oplog_read_since`] to gather the
+    /// entries recorded after the checkpoint.
+    ///
+    /// [`oplog_read_since`]: Self::oplog_read_since
+    pub fn checkpoint_oplog_cursor(checkpoint_dir: &Path) -> StorageResult<u64> {
+        let oplog_dir = checkpoint_dir.join("oplog").join("0");
+        let last = crate::engine::oplog_journal::last_index_in_dir(&oplog_dir)?;
+        Ok(last.map(|i| i + 1).unwrap_or(0))
+    }
+
+    /// Purge journal segments outside the retention window. No-op when no
+    /// journal is active. Returns the number of segments removed. Called
+    /// periodically by the embedded checkpoint scheduler so the journal does
+    /// not grow without bound.
+    pub fn oplog_purge_expired(&self, now_secs: u64) -> StorageResult<usize> {
+        match &self.oplog {
+            None => Ok(0),
+            Some(oplog) => {
+                let mut guard = oplog
+                    .lock()
+                    .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
+                guard.purge_expired(now_secs)
+            }
+        }
     }
 
     /// Resolve the oplog target endpoint for a given shard
@@ -1098,41 +1147,40 @@ impl StorageEngine {
         for tree in self.coordinator.trees().values() {
             tree.flush_active_memtable(0)?;
         }
-        // Checkpoint WAL after successful SST flush.
-        if let Some(wal) = &self.wal {
-            let mut guard = wal
-                .lock()
-                .map_err(|_| StorageError::Io("WAL mutex poisoned".into()))?;
-            guard.checkpoint()?;
-        }
+        // The retained oplog journal is NOT truncated on flush — it must survive
+        // for WAL-replay-repair, and crash recovery skips already-durable entries
+        // via the seqno watermark (see `open_embedded`).
         Ok(())
     }
 
-    /// Append mutations to the standalone WAL before applying them to the memtable.
+    /// Append a proposal's mutations to the retained oplog journal stamped at
+    /// `commit_ts`, before they are applied to the memtable.
     ///
-    /// Called by `OwnedLocalProposalPipeline` when a WAL is configured.
-    /// Replaces the per-proposal `persist()` call: instead of flushing the
-    /// entire memtable to SST on every write, a lightweight WAL record
-    /// (≤4 KB typical, fsync ~0.1–0.5 ms) is written and memtable follows.
-    ///
-    /// Returns `Some(lsn)` if a WAL record was written, `None` when no WAL
-    /// is configured (cluster mode or plain `open()`).
-    pub fn wal_append(&self, mutations: &[Mutation]) -> StorageResult<Option<u64>> {
-        match &self.wal {
+    /// Called by `OwnedLocalProposalPipeline` on engines opened via
+    /// [`open_embedded`](Self::open_embedded). The journal is retained (not
+    /// truncated on flush) so it drives both crash recovery and
+    /// WAL-replay-repair. Returns `Some(index)` if a record was written, `None`
+    /// when no journal is configured (cluster mode, plain `open`, or in-memory).
+    pub fn oplog_append(
+        &self,
+        mutations: &[Mutation],
+        commit_ts: u64,
+    ) -> StorageResult<Option<u64>> {
+        match &self.oplog {
             None => Ok(None),
-            Some(wal) => {
-                let mut guard = wal
+            Some(oplog) => {
+                let mut guard = oplog
                     .lock()
-                    .map_err(|_| StorageError::Io("WAL mutex poisoned".into()))?;
-                let lsn = guard.append(mutations)?;
-                Ok(Some(lsn))
+                    .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
+                let index = guard.append(mutations, commit_ts)?;
+                Ok(Some(index))
             }
         }
     }
 
-    /// Return `true` if a standalone WAL is active.
-    pub fn has_wal(&self) -> bool {
-        self.wal.is_some()
+    /// Return `true` if a retained embedded oplog journal is active.
+    pub fn has_journal(&self) -> bool {
+        self.oplog.is_some()
     }
 
     /// Get approximate disk space used by the engine in bytes.
@@ -1862,7 +1910,7 @@ mod tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
-mod wal_integration_tests;
+mod oplog_journal_recovery_tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]

@@ -14,7 +14,6 @@
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_storage::wal::{WalConfig, WalSyncPolicy};
 use tempfile::TempDir;
 
 /// With a three-tier endpoint config (Hot NVMe + Warm SSD + Cold HDD),
@@ -541,13 +540,17 @@ fn reopen_with_added_endpoint_preserves_routing() {
     );
 }
 
-/// WAL replay through a multi-tier config: write data via the standalone
-/// WAL (no SST flush), crash (drop engine), reopen, verify data survives.
-/// The replay path applies mutations to memtables and the next flush
-/// places SSTs per the persisted level routing — so the multi-tier
-/// distribution must compose cleanly with WAL recovery.
+/// Oplog replay through a multi-tier config: write data via the embedded
+/// retained oplog journal (no SST flush), crash (drop engine), reopen, verify
+/// data survives. The replay path applies mutations to memtables and the next
+/// flush places SSTs per the persisted level routing — so the multi-tier
+/// distribution must compose cleanly with oplog crash recovery.
 #[test]
-fn wal_replay_through_multi_tier_routing() {
+fn oplog_replay_through_multi_tier_routing() {
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    use coordinode_core::txn::timestamp::TimestampOracle;
+    use std::sync::Arc;
+
     let hot = TempDir::new().expect("hot tempdir");
     let warm = TempDir::new().expect("warm tempdir");
     let cold = TempDir::new().expect("cold tempdir");
@@ -577,30 +580,38 @@ fn wal_replay_through_multi_tier_routing() {
             ),
         ])
     };
-    let wal_cfg = || WalConfig {
-        path: None,
-        sync: WalSyncPolicy::SyncPerRecord,
-    };
 
-    // Phase 1: open with WAL, write, drop without flush.
+    // Phase 1: open embedded (retained oplog), journal + apply, drop without flush.
     {
+        let oracle = Arc::new(TimestampOracle::new());
         let engine =
-            StorageEngine::open_with_wal(&make_config(), Some(wal_cfg())).expect("first open");
+            StorageEngine::open_embedded(&make_config(), oracle.clone()).expect("first open");
+        let ts = oracle.next().as_raw();
+        engine
+            .oplog_append(
+                &[Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: b"survives-multi-tier".to_vec(),
+                    value: b"replay-me".to_vec(),
+                }],
+                ts,
+            )
+            .expect("oplog_append")
+            .expect("journal active");
         engine
             .put(Partition::Node, b"survives-multi-tier", b"replay-me")
-            .expect("write through WAL");
-        // Drop without persist — memtable NOT flushed, only the WAL
-        // record is on disk.
+            .expect("write");
+        // Drop without persist — memtable NOT flushed, only the oplog on disk.
     }
 
-    // Phase 2: reopen. WAL replay restores the memtable; the engine is
+    // Phase 2: reopen. Oplog replay restores the memtable; the engine is
     // operational with the routing persisted from Phase 1.
-    let engine =
-        StorageEngine::open_with_wal(&make_config(), Some(wal_cfg())).expect("reopen with replay");
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine = StorageEngine::open_embedded(&make_config(), oracle).expect("reopen with replay");
     let value = engine
         .get(Partition::Node, b"survives-multi-tier")
         .expect("get after replay")
-        .expect("key must survive WAL replay across the multi-tier topology");
+        .expect("key must survive oplog replay across the multi-tier topology");
     assert_eq!(&value[..], b"replay-me");
 
     // Force a flush so the replayed data hits SST. Major-compact pushes

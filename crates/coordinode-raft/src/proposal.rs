@@ -228,10 +228,14 @@ impl ProposalPipeline for OwnedLocalProposalPipeline {
         //
         // When no WAL is configured (cluster mode or tests that use plain open):
         // fall through to the legacy persist() path below.
-        if self.engine.has_wal() {
+        // Journal-first: an embedded engine (open_embedded) appends every
+        // proposal to a RETAINED oplog before applying — this drives crash
+        // recovery and WAL-replay-repair. Engines without a journal (plain
+        // `open`, in-memory) fall through to the per-batch persist below.
+        if self.engine.has_journal() {
             self.engine
-                .wal_append(&proposal.mutations)
-                .map_err(|e| ProposalError::Storage(format!("WAL append: {e}")))?;
+                .oplog_append(&proposal.mutations, proposal.commit_ts.as_raw())
+                .map_err(|e| ProposalError::Storage(format!("oplog append: {e}")))?;
         }
 
         // Apply mutations to the memtable (same logic as LocalProposalPipeline).
@@ -276,7 +280,7 @@ impl ProposalPipeline for OwnedLocalProposalPipeline {
         // Without a WAL the only way to guarantee crash safety is a full SST
         // flush after every proposal (atomic rename — no corruption possible).
         // This is expensive but correct. Open with WAL to avoid this overhead.
-        if !self.engine.has_wal() && self.engine.flush_policy() == FlushPolicy::SyncPerBatch {
+        if !self.engine.has_journal() && self.engine.flush_policy() == FlushPolicy::SyncPerBatch {
             self.engine
                 .persist()
                 .map_err(|e| ProposalError::Storage(format!("persist failed: {e}")))?;
@@ -286,7 +290,7 @@ impl ProposalPipeline for OwnedLocalProposalPipeline {
             proposal_id = %proposal.id,
             mutations = proposal.mutation_count(),
             commit_ts = proposal.commit_ts.as_raw(),
-            has_wal = self.engine.has_wal(),
+            has_journal = self.engine.has_journal(),
             "owned local proposal applied"
         );
 

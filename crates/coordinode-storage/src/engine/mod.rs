@@ -9,6 +9,7 @@ pub mod core;
 pub(crate) mod flush;
 pub mod merge;
 pub(crate) mod mvcc_gc;
+pub mod oplog_journal;
 pub mod partition;
 pub mod routing;
 pub mod stats;

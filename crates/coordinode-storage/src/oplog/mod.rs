@@ -17,11 +17,13 @@
 //!
 //! See [`segment`] for the on-disk binary format of each file.
 
+pub mod convert;
 pub mod entry;
 pub mod manager;
 pub mod segment;
 pub mod tailer;
 
+pub use convert::{mutation_to_op, mutations_to_ops};
 pub use entry::{OplogEntry, OplogOp, PreImage, ShardId};
 pub use manager::OplogManager;
 pub use segment::{SegmentReader, SegmentWriter, FOOTER_SIZE, HEADER_SIZE, MAGIC};

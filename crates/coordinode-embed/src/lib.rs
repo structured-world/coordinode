@@ -11,6 +11,8 @@
 pub mod api;
 pub mod backup;
 pub mod db;
+pub mod repair;
 pub mod vector_worker;
 
 pub use db::{Database, DatabaseError};
+pub use repair::RepairReport;

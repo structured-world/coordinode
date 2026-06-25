@@ -515,11 +515,12 @@ impl Database {
     pub fn open_with_config(config: StorageConfig) -> Result<Self, DatabaseError> {
         let path = config.data_dir().to_path_buf();
         let oracle = Arc::new(TimestampOracle::new());
-        let engine = StorageEngine::open_with_oracle(&config, oracle.clone())?;
+        let engine = StorageEngine::open_embedded(&config, oracle.clone())?;
         let engine = Arc::new(engine);
         let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
             Arc::new(OwnedLocalProposalPipeline::new(&engine));
-        Self::finish_open(&path, config, oracle, engine, pipeline)
+        // Embedded: HNSW updated inline, no oplog-tailing worker.
+        Self::finish_open(&path, config, oracle, engine, pipeline, false)
     }
 
     /// Open an in-memory database backed by `lsm_tree::fs::MemFs`.
@@ -557,7 +558,8 @@ impl Database {
         let engine = Arc::new(engine);
         let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
             Arc::new(OwnedLocalProposalPipeline::new(&engine));
-        Self::finish_open(&virtual_path, config, oracle, engine, pipeline)
+        // Embedded in-memory: HNSW updated inline, no oplog-tailing worker.
+        Self::finish_open(&virtual_path, config, oracle, engine, pipeline, false)
     }
 
     /// Initialize a database from pre-opened engine, oracle, and pipeline.
@@ -579,7 +581,37 @@ impl Database {
             Durability::Durable,
             Tier::Warm,
         )]);
-        Self::finish_open(path.as_ref(), config, oracle, engine, pipeline)
+        // Cluster mode (RaftProposalPipeline): the state machine applies writes,
+        // so the oplog-tailing worker maintains HNSW (no inline index path).
+        Self::finish_open(path.as_ref(), config, oracle, engine, pipeline, true)
+    }
+
+    /// Create a checkpoint (repair base + oplog copy) under
+    /// `<data_dir>/checkpoints`, retaining the newest `keep`. Returns the new
+    /// checkpoint path.
+    ///
+    /// A checkpoint is the base [`verify_and_repair`](Self::verify_and_repair)
+    /// rebuilds a corrupt partition from. Take them periodically (see
+    /// [`crate::repair::CheckpointScheduler`]) or before risky operations; the
+    /// retained oplog journal rolls the base forward to the moment of repair.
+    pub fn checkpoint(&self, keep: usize) -> Result<std::path::PathBuf, DatabaseError> {
+        let root = crate::repair::checkpoint_root(self.engine.data_dir());
+        let path = crate::repair::create_checkpoint(&self.engine, &root)?;
+        crate::repair::prune_checkpoints(&root, keep)?;
+        Ok(path)
+    }
+
+    /// Scrub every partition and rebuild any corrupt one from the latest
+    /// checkpoint plus oplog replay (single-node WAL-replay-repair, repair
+    /// path 2).
+    ///
+    /// Returns a [`RepairReport`]. `report.is_clean()` is `false` only if
+    /// corruption remained — e.g. no checkpoint existed to rebuild from, in
+    /// which case the operator must restore from an off-device backup. Called
+    /// automatically on open when a checkpoint is present.
+    pub fn verify_and_repair(&self) -> Result<crate::repair::RepairReport, DatabaseError> {
+        let root = crate::repair::checkpoint_root(self.engine.data_dir());
+        Ok(crate::repair::verify_and_repair(&self.engine, &root)?)
     }
 
     /// Shared initialization logic for both `open()` and `open_with_pipeline()`.
@@ -589,7 +621,40 @@ impl Database {
         oracle: Arc<TimestampOracle>,
         engine: Arc<StorageEngine>,
         pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline>,
+        // Whether to run the oplog-tailing vector index worker. Only cluster
+        // mode (writes applied by the Raft state machine) needs it; embedded
+        // mode updates HNSW inline on the write path, so spawning the worker
+        // there would double-insert and race the inline path — degrading
+        // recall. (Embedded gained a retained oplog dir with G111, so the mere
+        // presence of `oplog/` is no longer the cluster discriminator.)
+        spawn_oplog_worker: bool,
     ) -> Result<Self, DatabaseError> {
+        // Auto-repair on open (G111). For an embedded engine with a retained
+        // oplog journal, if a checkpoint exists, scrub and rebuild any corrupt
+        // partition from that checkpoint + oplog replay BEFORE any state is read
+        // below. Cluster engines (no journal) and journal-less in-memory engines
+        // skip this; deployments that never checkpoint pay no scrub cost. A
+        // repair failure is logged, not fatal — the caller can re-run
+        // `verify_and_repair()` to inspect.
+        if engine.has_journal() {
+            let root = crate::repair::checkpoint_root(engine.data_dir());
+            if crate::repair::latest_checkpoint(&root).is_some() {
+                match crate::repair::verify_and_repair(&engine, &root) {
+                    Ok(report) if !report.repaired.is_empty() => {
+                        tracing::warn!(
+                            repaired = ?report.repaired,
+                            clean = report.clean_after,
+                            "auto-repaired corrupt partitions on open"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "auto-repair on open failed; continuing")
+                    }
+                }
+            }
+        }
+
         // Recover node ID allocator from persisted high-water mark.
         // The HWM is the ceiling of the last reserved batch — on crash,
         // some IDs in the batch may be unused (gaps), but no duplicates.
@@ -650,11 +715,11 @@ impl Database {
         // Tail the oplog for replicated vector writes. The bootstrap
         // rebuild above covered history; the worker covers the live
         // tail from here on (HNSW insert is an upsert, so any overlap
-        // between the two is harmless). Pure embedded deployments have
-        // no oplog directory and run without the worker: the executor
-        // updates indexes inline on the write path.
+        // between the two is harmless). Embedded deployments update indexes
+        // inline on the write path and run without the worker — `spawn_oplog_worker`
+        // is the cluster discriminator (embedded now also has an `oplog/` dir).
         let oplog_dir = engine.data_dir().join("oplog").join("0");
-        let vector_worker = if oplog_dir.is_dir() {
+        let vector_worker = if spawn_oplog_worker && oplog_dir.is_dir() {
             let mut tailer = coordinode_storage::oplog::tailer::OplogTailer::new(
                 &oplog_dir,
                 coordinode_storage::oplog::tailer::ResumeToken::from_start(0),

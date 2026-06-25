@@ -21,11 +21,10 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::{StorageError, StorageResult};
-use coordinode_storage::oplog::{OplogEntry, OplogOp};
+use coordinode_storage::oplog::OplogEntry;
 use coordinode_storage::placement::{
     partition_from_wire_tag, partition_wire_tag, KeyRange, SegmentDescriptor,
 };
@@ -495,86 +494,14 @@ impl SegmentInstaller {
         oplog_since: &[OplogEntry],
         partition: Partition,
     ) -> Result<usize, RepairError> {
-        // Open the checkpoint read-only and export this partition as of it. A
-        // checkpoint is an independently-openable single-endpoint database.
-        // The checkpoint's persisted routing references the original engine's
-        // single endpoint id, which is the canonical "default" for a single-
-        // endpoint (CE single-node) engine — the scope WAL-replay repair targets.
-        let ckpt_cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "default",
-            checkpoint_dir,
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]);
-        let base = {
-            let ckpt = StorageEngine::open(&ckpt_cfg)
-                .map_err(|e| RepairError::Checkpoint(format!("open {checkpoint_dir:?}: {e}")))?;
-            export_range(
-                &ckpt,
-                partition,
-                &KeyRange {
-                    start: Vec::new(),
-                    end: Vec::new(),
-                },
-            )
-            .map_err(|e| RepairError::Checkpoint(e.to_string()))?
-            // ckpt dropped here, releasing its handles before we mutate the live engine.
-        };
-
-        // Physically drop the live (corrupt) tables, then install the checkpoint
-        // base. `b""..` contains every table, so all are dropped.
+        // The rebuild-from-local-checkpoint-plus-oplog-replay logic is a
+        // storage-level capability shared with the embedded (no-Raft) repair
+        // path; the canonical implementation lives on the engine. The cluster
+        // path reaches it here after a swarm-fetch source is unavailable
+        // (`repair_partition` → `NoSource`).
         self.engine
-            .drop_range(partition, b"".as_slice()..)
-            .map_err(|e| RepairError::Install(format!("drop partition before reinstall: {e}")))?;
-        self.store_segment(
-            coordinode_swarm::SegmentId(u64::from(partition_wire_tag(partition))),
-            &base,
-        )
-        .map_err(RepairError::Install)?;
-
-        // Replay the granular oplog ops since the checkpoint for this partition,
-        // rolling the base forward to the current state.
-        let tag = partition_wire_tag(partition);
-        for entry in oplog_since {
-            for op in &entry.ops {
-                match op {
-                    OplogOp::Insert {
-                        partition: p,
-                        key,
-                        value,
-                    } if *p == tag => self
-                        .engine
-                        .put(partition, key, value)
-                        .map_err(|e| RepairError::Install(format!("replay insert: {e}")))?,
-                    OplogOp::Delete { partition: p, key } if *p == tag => self
-                        .engine
-                        .delete(partition, key)
-                        .map_err(|e| RepairError::Install(format!("replay delete: {e}")))?,
-                    OplogOp::Merge {
-                        partition: p,
-                        key,
-                        operand,
-                    } if *p == tag => self
-                        .engine
-                        .merge(partition, key, operand)
-                        .map_err(|e| RepairError::Install(format!("replay merge: {e}")))?,
-                    OplogOp::RemoveRange {
-                        partition: p,
-                        start,
-                        end,
-                    } if *p == tag => self
-                        .engine
-                        .remove_range(partition, start, end)
-                        .map_err(|e| RepairError::Install(format!("replay remove_range: {e}")))?,
-                    // Other partitions, RaftEntry, Noop, RaftTruncation: not this
-                    // partition's data — skip.
-                    _ => {}
-                }
-            }
-        }
-
-        Ok(base.len())
+            .repair_partition_from_checkpoint(checkpoint_dir, oplog_since, partition)
+            .map_err(|e| RepairError::Checkpoint(e.to_string()))
     }
 }
 
