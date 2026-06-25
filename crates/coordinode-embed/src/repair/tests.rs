@@ -179,6 +179,47 @@ fn repair_rebuilds_corrupt_partition_from_checkpoint_plus_oplog() {
 }
 
 #[test]
+fn database_open_auto_repairs_corrupt_partition() {
+    use crate::Database;
+    let dir = TempDir::new().expect("tempdir");
+
+    // Phase 1: write 100 rows through the high-level Database, take a checkpoint
+    // (flushes to SST + records the repair base), then close.
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        for i in 0..100u32 {
+            db.execute_cypher(&format!("CREATE (n:Big {{k: {i}}})"))
+                .expect("create");
+        }
+        db.checkpoint(3).expect("checkpoint");
+    }
+
+    // Phase 2: physically corrupt the live Node SST (largest_file skips the
+    // checkpoint copies + oplog).
+    let victim = largest_file(dir.path());
+    let mut bytes = std::fs::read(&victim).expect("read sst");
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xFF;
+    std::fs::write(&victim, &bytes).expect("corrupt sst");
+
+    // Phase 3: reopen via Database::open — auto-on-open repair must heal the
+    // partition from the checkpoint before serving, with no explicit call.
+    let mut db = Database::open(dir.path()).expect("reopen auto-repairs");
+    let rows = db
+        .execute_cypher("MATCH (n:Big) RETURN n.k")
+        .expect("match after auto-repair");
+    assert_eq!(
+        rows.len(),
+        100,
+        "every row must survive auto-repair on open"
+    );
+    assert!(
+        db.verify_and_repair().expect("verify").is_clean(),
+        "a re-scrub after auto-repair must be clean"
+    );
+}
+
+#[test]
 fn scheduler_starts_and_stops_cleanly() {
     let dir = TempDir::new().expect("tempdir");
     let engine = open(&dir);
