@@ -62,7 +62,7 @@ proptest = { workspace = true }
 criterion = { workspace = true }
 serde_json = { workspace = true }
 # Storage internal test dependencies (consumed from fjall per ADR-019)
-nanoid = "0.4.0"
+nanoid = "0.5"
 test-log = "0.2.18"
 rand = "0.10"
 

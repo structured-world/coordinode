@@ -35,7 +35,7 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Generate an in-memory CA + node certs for the inter-node mTLS integration test.
-rcgen = "0.13"
+rcgen = "0.14"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

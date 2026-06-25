@@ -86,10 +86,9 @@ pub fn hardware_fingerprint() -> HardwareFingerprint {
         .map(|c| c.brand().to_string())
         .unwrap_or_default();
     let cpu_threads = sys.cpus().len();
-    // sysinfo 0.32: physical_core_count is an instance method that
-    // takes &mut self (in earlier APIs it was a free function); fall
-    // back to thread count when unavailable.
-    let cpu_cores = sys.physical_core_count().unwrap_or(cpu_threads);
+    // sysinfo 0.39: physical_core_count is an associated function (no
+    // instance needed); fall back to thread count when unavailable.
+    let cpu_cores = System::physical_core_count().unwrap_or(cpu_threads);
     let ram_gb = sys.total_memory() / 1024 / 1024 / 1024;
     let os_name = System::name().unwrap_or_default();
     let os_version = System::os_version().unwrap_or_default();

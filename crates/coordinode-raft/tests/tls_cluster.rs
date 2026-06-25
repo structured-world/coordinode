@@ -49,6 +49,9 @@ fn gen_node_pki() -> (String, String, String) {
     let mut ca_params = CertificateParams::new(Vec::new()).expect("ca params");
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca_cert = ca_params.self_signed(&ca_key).expect("ca self-sign");
+    let ca_pem = ca_cert.pem();
+    // rcgen 0.14: leaf certs are signed by an `Issuer` bundling the CA params + key.
+    let ca_issuer = rcgen::Issuer::new(ca_params, ca_key);
 
     let node_key = KeyPair::generate().expect("node key");
     let mut node_params =
@@ -58,10 +61,10 @@ fn gen_node_pki() -> (String, String, String) {
         ExtendedKeyUsagePurpose::ClientAuth,
     ];
     let node_cert = node_params
-        .signed_by(&node_key, &ca_cert, &ca_key)
+        .signed_by(&node_key, &ca_issuer)
         .expect("node sign");
 
-    (ca_cert.pem(), node_cert.pem(), node_key.serialize_pem())
+    (ca_pem, node_cert.pem(), node_key.serialize_pem())
 }
 
 /// Open a fresh single-endpoint storage engine in a temp dir.

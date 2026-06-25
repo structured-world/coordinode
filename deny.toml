@@ -39,6 +39,17 @@ ignore = [
     # public-key operation, so the private-key timing leak is not exploitable here.
     # Revisit once RustCrypto ships a constant-time `rsa` stable.
     "RUSTSEC-2023-0071",
+    # rustls-webpki 0.102.x CRL / name-constraint advisories. Pulled transitively
+    # by rustls-rustcrypto 0.0.2-alpha (pure-Rust crypto provider, ADR-013 no-FFI),
+    # which pins ^0.102 and has no newer published release, so an update cannot
+    # resolve them. Inter-node mTLS uses a private CA with directly-issued node
+    # certs — we parse no CRLs and rely on no name constraints, so these code
+    # paths are not exercised. Revisit when rustls-rustcrypto ships on
+    # webpki >= 0.103.
+    "RUSTSEC-2026-0104", # reachable panic in CRL parsing
+    "RUSTSEC-2026-0098", # name constraints for URI names incorrectly accepted
+    "RUSTSEC-2026-0099", # name constraints accepted for wildcard certs
+    "RUSTSEC-2026-0049", # CRLs not considered authoritative by distribution point
 ]
 
 [bans]

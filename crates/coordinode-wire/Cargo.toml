@@ -21,7 +21,7 @@ rustls-pemfile = "2"
 thiserror = { workspace = true }
 
 [dev-dependencies]
-rcgen = "0.13"
+rcgen = "0.14"
 tokio-rustls = "0.26"
 tokio = { workspace = true }
 
