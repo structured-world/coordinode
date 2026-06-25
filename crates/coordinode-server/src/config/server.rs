@@ -100,6 +100,11 @@ pub struct ServerConfig {
     pub registry_heartbeat_ms: Option<u64>,
     /// Consumer-registry TTL-eviction sweep interval in ms (`None` = 1000).
     pub registry_eviction_ms: Option<u64>,
+    /// CDC change-stream consumer TTL in seconds (`None` = 30). How long a
+    /// disconnected/crashed CDC reader's registration holds the oplog retention
+    /// floor before it is TTL-reclaimed; connected readers heartbeat each poll
+    /// and are never evicted.
+    pub cdc_consumer_ttl_secs: Option<u64>,
     /// Interactive-transaction idle timeout in seconds (ADR-042).
     pub interactive_txn_idle_timeout_secs: u64,
     /// Max buffered (uncommitted) bytes per interactive transaction (ADR-042).
@@ -167,6 +172,7 @@ impl Default for ServerConfig {
             retention_window_secs: None,
             registry_heartbeat_ms: None,
             registry_eviction_ms: None,
+            cdc_consumer_ttl_secs: None,
             interactive_txn_idle_timeout_secs: 30,
             interactive_txn_max_bytes: 256 * 1024 * 1024,
             wire_compression_level: 3,
@@ -209,6 +215,7 @@ pub struct CliOverrides {
     pub retention_window_secs: Option<u64>,
     pub registry_heartbeat_ms: Option<u64>,
     pub registry_eviction_ms: Option<u64>,
+    pub cdc_consumer_ttl_secs: Option<u64>,
     pub interactive_txn_idle_timeout_secs: Option<u64>,
     pub interactive_txn_max_bytes: Option<u64>,
     pub wire_compression_level: Option<i32>,
@@ -318,6 +325,9 @@ impl ServerConfig {
         }
         if o.registry_eviction_ms.is_some() {
             self.registry_eviction_ms = o.registry_eviction_ms;
+        }
+        if o.cdc_consumer_ttl_secs.is_some() {
+            self.cdc_consumer_ttl_secs = o.cdc_consumer_ttl_secs;
         }
         if let Some(v) = o.interactive_txn_idle_timeout_secs {
             self.interactive_txn_idle_timeout_secs = v;

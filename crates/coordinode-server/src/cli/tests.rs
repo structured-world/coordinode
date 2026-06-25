@@ -332,13 +332,15 @@ fn serve_resource_flags_default_to_none() {
 fn serve_registry_flags_parsed() {
     let cmd = parse_args_from(&args(
         "coordinode serve --retention-window-secs 3600 \
-             --registry-heartbeat-ms 50 --registry-eviction-ms 500",
+             --registry-heartbeat-ms 50 --registry-eviction-ms 500 \
+             --cdc-consumer-ttl-secs 45",
     ));
     match cmd {
         Command::Serve { overrides, .. } => {
             assert_eq!(overrides.retention_window_secs, Some(3600));
             assert_eq!(overrides.registry_heartbeat_ms, Some(50));
             assert_eq!(overrides.registry_eviction_ms, Some(500));
+            assert_eq!(overrides.cdc_consumer_ttl_secs, Some(45));
         }
         _ => panic!("expected Serve command"),
     }
@@ -354,6 +356,7 @@ fn serve_registry_flags_default_to_none() {
             assert!(overrides.retention_window_secs.is_none());
             assert!(overrides.registry_heartbeat_ms.is_none());
             assert!(overrides.registry_eviction_ms.is_none());
+            assert!(overrides.cdc_consumer_ttl_secs.is_none());
         }
         _ => panic!("expected Serve command"),
     }

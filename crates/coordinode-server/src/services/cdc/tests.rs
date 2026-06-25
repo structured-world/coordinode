@@ -45,7 +45,11 @@ async fn subscribe_registers_then_unregisters_cdc_consumer() {
     let (registry, _bg) = build_consumer_registry(engine, pipeline, 1, RegistryTuning::default());
 
     let data_dir = tempfile::tempdir().expect("data dir");
-    let service = ChangeEventServiceImpl::new(data_dir.path().to_path_buf(), registry.clone());
+    let service = ChangeEventServiceImpl::new(
+        data_dir.path().to_path_buf(),
+        registry.clone(),
+        super::DEFAULT_CONSUMER_TTL_MS,
+    );
 
     // No oplog dir exists yet, so the stream is empty (caught up immediately)
     // — registration happens synchronously inside `subscribe` regardless.

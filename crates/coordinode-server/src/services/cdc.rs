@@ -39,14 +39,18 @@ pub struct ChangeEventServiceImpl {
     registry: ShardConsumerRegistry,
     /// Per-process counter for unique CDC consumer ids.
     next_consumer: Arc<AtomicU64>,
+    /// TTL (ms) applied to each CDC consumer registration
+    /// (`--cdc-consumer-ttl-secs`). A crashed reader is reclaimed after this.
+    consumer_ttl_ms: u64,
 }
 
 impl ChangeEventServiceImpl {
-    pub fn new(data_dir: PathBuf, registry: ShardConsumerRegistry) -> Self {
+    pub fn new(data_dir: PathBuf, registry: ShardConsumerRegistry, consumer_ttl_ms: u64) -> Self {
         Self {
             data_dir,
             registry,
             next_consumer: Arc::new(AtomicU64::new(0)),
+            consumer_ttl_ms,
         }
     }
 
@@ -57,10 +61,11 @@ impl ChangeEventServiceImpl {
     }
 }
 
-/// TTL for a CDC consumer registration. The stream heartbeats every poll
-/// (`POLL_INTERVAL`), so a connected-but-idle reader is never evicted; a reader
-/// that vanishes without unregistering (crash) is reclaimed after this.
-const CONSUMER_TTL_MS: u64 = 30_000;
+/// Default TTL for a CDC consumer registration (`--cdc-consumer-ttl-secs`,
+/// 30s). The stream heartbeats every poll (`POLL_INTERVAL`), so a
+/// connected-but-idle reader is never evicted; a reader that vanishes without
+/// unregistering (crash) is reclaimed after this.
+pub const DEFAULT_CONSUMER_TTL_MS: u64 = 30_000;
 
 /// How long to sleep between polls when caught up to the last sealed segment.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -106,7 +111,7 @@ impl ChangeStreamService for ChangeEventServiceImpl {
                 kind: ConsumerKind::OplogEvents,
                 scope: TopologyScope::Shard(shard_id as u16),
                 initial_seqno: InitialSeqno::FromEarliestRetained,
-                ttl_ms: CONSUMER_TTL_MS,
+                ttl_ms: self.consumer_ttl_ms,
             })
             .map_err(|e| Status::internal(format!("register cdc consumer: {e}")))?;
 

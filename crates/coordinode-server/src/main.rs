@@ -274,6 +274,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 retention_window_secs,
                 registry_heartbeat_ms,
                 registry_eviction_ms,
+                cdc_consumer_ttl_secs,
                 interactive_txn_idle_timeout_secs,
                 interactive_txn_max_bytes,
                 peers: peers_vec,
@@ -845,6 +846,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cdc_service = services::cdc::ChangeEventServiceImpl::new(
                 std::path::PathBuf::from(&data_dir),
                 consumer_registry,
+                // Operator-tunable CDC consumer TTL (seconds → ms); saturating
+                // so an absurdly large window means "effectively never reclaim".
+                cdc_consumer_ttl_secs
+                    .map(|s| s.saturating_mul(1000))
+                    .unwrap_or(services::cdc::DEFAULT_CONSUMER_TTL_MS),
             );
 
             // ClusterService: cluster join/leave lifecycle.

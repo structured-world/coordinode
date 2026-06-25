@@ -201,6 +201,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
                 retention_window_secs: find_flag_num(args, "--retention-window-secs"),
                 registry_heartbeat_ms: find_flag_num(args, "--registry-heartbeat-ms"),
                 registry_eviction_ms: find_flag_num(args, "--registry-eviction-ms"),
+                cdc_consumer_ttl_secs: find_flag_num(args, "--cdc-consumer-ttl-secs"),
                 interactive_txn_idle_timeout_secs: find_flag_num(
                     args,
                     "--interactive-txn-idle-timeout-secs",
@@ -330,6 +331,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  [--nofile N] [--max-connections N] [--max-request-size-mb N] [--request-timeout-secs N]\n          \
                  [--http2-keepalive-secs N] [--cache-size-mb N] [--write-buffer-mb N]\n          \
                  [--retention-window-secs N] [--registry-heartbeat-ms N] [--registry-eviction-ms N]\n          \
+                 [--cdc-consumer-ttl-secs N]\n          \
                  [--wire-compression-level N]\n          \
                  [--tls-cert FILE --tls-key FILE] [--tls-ca FILE] [--tls-require-client-auth]\n          \
                  [--no-scrub] [--scrub-interval-secs N] [--scrub-throttle-ms N]\n          \
