@@ -42,7 +42,7 @@ publish = false
 # coordinode-lsm-tree remains as external crates.io dependency (ADR-018)
 
 # Consensus
-openraft = { version = "0.10.0-alpha.17", features = ["serde"] }
+openraft = { version = "0.10.0-alpha.25", features = ["serde"] }
 
 # Full-text search.
 # default-features = false to drop `columnar-zstd-compression`, the only tantivy

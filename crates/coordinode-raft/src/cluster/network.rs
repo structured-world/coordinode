@@ -13,6 +13,7 @@ use openraft::network::{
     Backoff, NetBackoff, NetSnapshot, NetStreamAppend, NetTransferLeader, NetVote, RPCOption,
 };
 use openraft::raft::StreamAppendResult;
+use openraft::raft::TransferLeaderError;
 use openraft::{OptionalSend, RaftNetworkFactory};
 
 use crate::proto::replication::raft_service_client::RaftServiceClient;
@@ -51,17 +52,23 @@ fn tonic_to_rpc_error(status: tonic::Status) -> RPCError<C> {
 // ── Network Factory ────────────────────────────────────────────────
 
 /// gRPC-based network factory for multi-node cluster.
-pub struct GrpcNetworkFactory;
+pub struct GrpcNetworkFactory {
+    /// This node's id — paired with the per-client target id so the test-only
+    /// [`nemesis`](super::nemesis) partition matrix can gate directed RPCs.
+    pub(crate) local_node_id: u64,
+}
 
 impl RaftNetworkFactory<C> for GrpcNetworkFactory {
     type Network = GrpcNetwork;
 
     async fn new_client(
         &mut self,
-        _target: u64,
+        target: u64,
         node: &openraft::impls::BasicNode,
     ) -> Self::Network {
         GrpcNetwork {
+            local_node_id: self.local_node_id,
+            target_node_id: target,
             addr: node.addr.clone(),
             client: None,
         }
@@ -87,8 +94,33 @@ impl RaftNetworkFactory<C> for StubNetworkFactory {
 
 /// gRPC connection to a single Raft peer. Lazily connects on first use.
 pub struct GrpcNetwork {
+    /// Source node id (this node), for the test-only partition nemesis gate.
+    local_node_id: u64,
+    /// Target peer node id, for the test-only partition nemesis gate.
+    target_node_id: u64,
     addr: String,
     client: Option<RaftServiceClient<tonic::transport::Channel>>,
+}
+
+impl GrpcNetwork {
+    /// Test-only network-partition gate. Returns an `Unreachable` RPC error when
+    /// the [`nemesis`](super::nemesis) matrix has the directed link
+    /// `local → target` blocked; a no-op (single relaxed atomic load) otherwise.
+    fn partitioned(&self) -> Option<RPCError<C>> {
+        if super::nemesis::is_blocked(self.local_node_id, self.target_node_id) {
+            Some(RPCError::Unreachable(Unreachable::new(
+                &std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    format!(
+                        "nemesis: partitioned {} -> {}",
+                        self.local_node_id, self.target_node_id
+                    ),
+                ),
+            )))
+        } else {
+            None
+        }
+    }
 }
 
 impl GrpcNetwork {
@@ -160,6 +192,9 @@ impl NetVote<C> for GrpcNetwork {
         rpc: openraft::raft::VoteRequest<C>,
         _option: RPCOption,
     ) -> Result<openraft::raft::VoteResponse<C>, RPCError<C>> {
+        if let Some(e) = self.partitioned() {
+            return Err(e);
+        }
         let client = self.get_client().await?;
         let payload = RaftPayload {
             data: serialize(&rpc)?,
@@ -184,7 +219,11 @@ impl NetStreamAppend<C> for GrpcNetwork {
             + Unpin
             + 'static,
     {
+        let partition = self.partitioned();
         Box::pin(async move {
+            if let Some(e) = partition {
+                return Err(e);
+            }
             let client = self.get_client().await?;
 
             // Map openraft AppendEntriesRequest stream → msgpack bytes → RaftPayload stream
@@ -219,6 +258,17 @@ impl NetSnapshot<C> for GrpcNetwork {
         cancel: impl Future<Output = openraft::error::ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
     ) -> Result<openraft::raft::SnapshotResponse<C>, openraft::error::StreamingError<C>> {
+        if super::nemesis::is_blocked(self.local_node_id, self.target_node_id) {
+            return Err(openraft::error::StreamingError::Unreachable(
+                Unreachable::new(&std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    format!(
+                        "nemesis: partitioned {} -> {}",
+                        self.local_node_id, self.target_node_id
+                    ),
+                )),
+            ));
+        }
         let target_addr = self.addr.clone();
         let client = self.get_client().await.map_err(|e| {
             let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionAborted, e.to_string());
@@ -319,16 +369,22 @@ impl NetTransferLeader<C> for GrpcNetwork {
         &mut self,
         req: openraft::raft::TransferLeaderRequest<C>,
         _option: RPCOption,
-    ) -> Result<(), RPCError<C>> {
+    ) -> Result<Result<(), TransferLeaderError<C>>, RPCError<C>> {
+        if let Some(e) = self.partitioned() {
+            return Err(e);
+        }
         let client = self.get_client().await?;
         let payload = RaftPayload {
             data: serialize(&req)?,
         };
+        // The server maps any application-level transfer error to a gRPC
+        // Status (→ outer RPCError below); a successful RPC means the remote
+        // accepted the transfer, so the inner result is Ok.
         client
             .transfer_leader(payload)
             .await
             .map_err(tonic_to_rpc_error)?;
-        Ok(())
+        Ok(Ok(()))
     }
 }
 
@@ -400,7 +456,7 @@ impl NetTransferLeader<C> for StubNetwork {
         &mut self,
         _req: openraft::raft::TransferLeaderRequest<C>,
         _option: RPCOption,
-    ) -> Result<(), RPCError<C>> {
+    ) -> Result<Result<(), TransferLeaderError<C>>, RPCError<C>> {
         Err(RPCError::Unreachable(Unreachable::new(
             &std::io::Error::new(std::io::ErrorKind::NotConnected, "stub: no peers"),
         )))

@@ -16,6 +16,7 @@
 //! AppendEntries, Vote, and Snapshot RPCs between nodes.
 
 pub mod grpc_server;
+pub mod nemesis;
 pub(crate) mod network;
 
 use std::sync::Arc;
@@ -252,7 +253,9 @@ impl RaftNode {
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
 
-        let network = GrpcNetworkFactory;
+        let network = GrpcNetworkFactory {
+            local_node_id: node_id,
+        };
 
         let raft: RaftInstance =
             openraft::Raft::new(node_id, config, network, log_store, state_machine)
@@ -382,7 +385,9 @@ impl RaftNode {
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
 
-        let network = GrpcNetworkFactory;
+        let network = GrpcNetworkFactory {
+            local_node_id: node_id,
+        };
 
         let raft: RaftInstance =
             openraft::Raft::new(node_id, config, network, log_store, state_machine)
@@ -482,7 +487,9 @@ impl RaftNode {
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
 
-        let network = GrpcNetworkFactory;
+        let network = GrpcNetworkFactory {
+            local_node_id: node_id,
+        };
 
         let raft: RaftInstance =
             openraft::Raft::new(node_id, config, network, log_store, state_machine)
@@ -562,7 +569,9 @@ impl RaftNode {
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
 
-        let network = GrpcNetworkFactory;
+        let network = GrpcNetworkFactory {
+            local_node_id: node_id,
+        };
 
         let raft: RaftInstance =
             openraft::Raft::new(node_id, config, network, log_store, state_machine)

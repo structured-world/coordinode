@@ -12,7 +12,7 @@ tonic = { workspace = true, features = ["tls-webpki-roots"] }
 prost = { workspace = true }
 bytes = { workspace = true }
 # Pure-Rust zstd (no C FFI, ADR-013) for transport compression.
-structured-zstd = "0.0.44"
+structured-zstd = "0.0.45"
 # Inter-node TLS/mTLS. CE crypto provider is pure-Rust rustls-rustcrypto (no C
 # FFI, ADR-013); EE swaps the process-default CryptoProvider to aws-lc-rs.
 rustls = { version = "0.23", default-features = false }

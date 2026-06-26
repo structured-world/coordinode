@@ -13,7 +13,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # Per-piece transfer compression. Pure-Rust LZ4 (hot) + zstd (cold); the project
 # never links C zstd.
 lz4_flex = "0.13"
-structured-zstd = "0.0.44"
+structured-zstd = "0.0.45"
 
 [lints]
 workspace = true

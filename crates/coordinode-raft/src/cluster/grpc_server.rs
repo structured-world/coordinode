@@ -265,10 +265,15 @@ impl RaftService for RaftGrpcHandler {
         let req: openraft::raft::TransferLeaderRequest<TypeConfig> =
             de(&request.into_inner().data)?;
 
+        // alpha.25 splits the result: outer = Fatal (engine error), inner =
+        // TransferLeaderError (the transfer was rejected, e.g. not leader). Both
+        // surface to the caller as a gRPC Status so the client's network layer
+        // maps them to an RPCError.
         self.raft
             .handle_transfer_leader(req)
             .await
-            .map_err(|e| Status::internal(format!("transfer_leader: {e}")))?;
+            .map_err(|e| Status::internal(format!("transfer_leader: {e}")))?
+            .map_err(|e| Status::internal(format!("transfer_leader rejected: {e}")))?;
 
         Ok(Response::new(RaftEmpty {}))
     }

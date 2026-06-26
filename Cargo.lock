@@ -1062,7 +1062,7 @@ dependencies = [
  "rustc-hash",
  "self_cell",
  "spin 0.12.1",
- "structured-zstd",
+ "structured-zstd 0.0.44",
  "tempfile",
  "varint-rs",
  "xxhash-rust",
@@ -1294,7 +1294,7 @@ name = "coordinode-swarm"
 version = "0.4.3"
 dependencies = [
  "lz4_flex",
- "structured-zstd",
+ "structured-zstd 0.0.45",
  "thiserror 2.0.18",
  "xxhash-rust",
 ]
@@ -1351,7 +1351,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "rustls-rustcrypto",
- "structured-zstd",
+ "structured-zstd 0.0.45",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
@@ -3618,9 +3618,9 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openraft"
-version = "0.10.0-alpha.24"
+version = "0.10.0-alpha.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71c9994f816c3b71255e2b5e1c53c8feed5a8a5d5deca74f3f4e318a72615684"
+checksum = "9a66d99dfb16ed37410298bcd5e5de85b2578471fa2fe6b630123a9fe1435960"
 dependencies = [
  "anyerror",
  "backoff-series",
@@ -3647,9 +3647,9 @@ dependencies = [
 
 [[package]]
 name = "openraft-macros"
-version = "0.10.0-alpha.24"
+version = "0.10.0-alpha.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8b12005e854b4bbd471dcd27e98288a921b6e57c96f0ceb5e689e9e0ab04c7b"
+checksum = "1c842098c7cc8fb053b94daa2eb4417de160fce2bc1bc53c1164357f00b73cb6"
 dependencies = [
  "chrono",
  "proc-macro2",
@@ -3660,9 +3660,9 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt"
-version = "0.10.0-alpha.24"
+version = "0.10.0-alpha.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e33af8e5c55654111ea638c683ae6d953d98758c83d810249e4bece6ae242803"
+checksum = "cb2e39f9dbbbe5eb38d4db51e6e10efdf585ffb85bbe3e6cd466214d7562f80f"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -3673,9 +3673,9 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt-tokio"
-version = "0.10.0-alpha.24"
+version = "0.10.0-alpha.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38b2718987a0b9fc347aaf8583f4b61726aa670e715999f63609ca883edacaf5"
+checksum = "465a3a25c12eef62dfa8ff2f732993fe73efa163dc5a523ed3aec20bbb89a723"
 dependencies = [
  "futures-util",
  "openraft-rt",
@@ -5624,6 +5624,12 @@ name = "structured-zstd"
 version = "0.0.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "977dafbd4c9b9abd8eb98f4b44133092e9fa5a3b1530be0ae271a05d0295d5e1"
+
+[[package]]
+name = "structured-zstd"
+version = "0.0.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30bb97350e7c47d4cec560423d3bf3c6aa9808d1ca058e67554bee075e6258bc"
 dependencies = [
  "twox-hash",
 ]
