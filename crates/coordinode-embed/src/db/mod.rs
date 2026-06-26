@@ -338,6 +338,17 @@ pub struct Database {
     /// schemas for TTL properties and deletes expired nodes/fields/subtrees.
     /// Dropped on Database::drop (graceful shutdown).
     _ttl_reaper_handle: Option<coordinode_query::index::ttl_reaper::TtlReaperHandle>,
+    /// `true` in cluster mode (writes applied by the Raft state machine), where
+    /// the AFTER COMMIT trigger queue is drained by a leader-gated background
+    /// worker. `false` in embedded single-node mode, where the queue is drained
+    /// inline at the end of each committed write (deterministic, no extra
+    /// thread). Mirrors the `spawn_oplog_worker` discriminator.
+    cluster_mode: bool,
+    /// Operator-tunable knobs for the AFTER COMMIT trigger dispatcher (R192):
+    /// cascade-depth cap + default retry policy. Defaults match ADR-026; the
+    /// server overrides them from `coordinode.conf` via
+    /// [`Database::set_trigger_dispatch_config`].
+    trigger_dispatch_config: after_commit::TriggerDispatchConfig,
     /// Per-query-string parse + plan cache. Repeated invocations of
     /// the same Cypher text skip parse / semantic analysis / logical
     /// plan build entirely; the per-call optimizer passes still run
@@ -461,6 +472,10 @@ struct QuerySession {
     snapshot_read_ts: Option<u64>,
     write_concern: coordinode_core::txn::write_concern::WriteConcern,
     vector_consistency: VectorConsistencyMode,
+    /// Async AFTER COMMIT cascade generation for this statement. `0` for user
+    /// statements; set to the queued event's generation when the dispatcher
+    /// runs a trigger body so enqueued child events are stamped `generation + 1`.
+    after_commit_generation: u32,
 }
 
 /// Error from embedded database operations.
@@ -838,6 +853,8 @@ impl Database {
             nvme_write_buffer,
             _drain_handle: drain_handle,
             _ttl_reaper_handle: ttl_reaper_handle,
+            cluster_mode: spawn_oplog_worker,
+            trigger_dispatch_config: after_commit::TriggerDispatchConfig::default(),
             // 1024 entries is plenty for the workloads we benchmark
             // against — they repeat a small number of templates. The
             // bound prevents unbounded growth on adversarial inputs
@@ -1214,6 +1231,7 @@ impl Database {
             snapshot_read_ts: self.snapshot_read_ts.take(),
             write_concern: self.write_concern.clone(),
             vector_consistency: self.vector_consistency,
+            after_commit_generation: 0,
         }
     }
 
@@ -1425,6 +1443,7 @@ impl Database {
             snapshot_read_ts: None,
             write_concern: self.write_concern.clone(),
             vector_consistency: self.vector_consistency,
+            after_commit_generation: 0,
         };
         let params = params.and_then(|p| if p.is_empty() { None } else { Some(p) });
         // On error the state is intentionally NOT re-parked → transaction aborts.
@@ -1574,6 +1593,13 @@ impl Database {
         self.write_concern.level = level;
     }
 
+    /// Override the AFTER COMMIT trigger dispatcher knobs (cascade-depth cap +
+    /// default retry policy). The server calls this once at startup from
+    /// `coordinode.conf` / CLI flags; embedded callers may tune it directly.
+    pub fn set_trigger_dispatch_config(&mut self, cfg: TriggerDispatchConfig) {
+        self.trigger_dispatch_config = cfg;
+    }
+
     /// Set session-level write concern (full configuration including journal + timeout).
     pub fn set_write_concern_full(
         &mut self,
@@ -1630,6 +1656,7 @@ impl Database {
             snapshot_read_ts: None,
             write_concern: self.write_concern.clone(),
             vector_consistency: self.vector_consistency,
+            after_commit_generation: 0,
         };
         if let Some(rc) = read_concern {
             rc.validate()
@@ -1868,6 +1895,7 @@ impl Database {
             cascade_fire_counts: std::collections::HashMap::new(),
             cascade_fanout_limit: 100,
             cascade_chain: Vec::new(),
+            after_commit_generation: session.after_commit_generation,
             correlated_row: None,
             foreach_scope: None,
             feedback_cache: Some(self.feedback_cache.clone()),
@@ -1977,6 +2005,14 @@ impl Database {
         // the next EXPLAIN reflects the current state of the database.
         if had_mutations {
             self.invalidate_stats_cache();
+        }
+
+        // Drain AFTER COMMIT triggers enqueued by this committed write. Embedded
+        // only (cluster drains via the leader-gated worker); a no-op when no
+        // events were enqueued and when already inside a trigger body. Skipped
+        // for interactive statements — their writes are not yet committed.
+        if had_mutations && !interactive {
+            self.drive_after_commit_inline();
         }
 
         Ok((results, write_stats, out_state))
@@ -2545,6 +2581,9 @@ impl Database {
         VectorConsistencyMode::from_str_opt(unquoted)
     }
 }
+
+mod after_commit;
+pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

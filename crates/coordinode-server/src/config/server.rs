@@ -10,8 +10,14 @@
 //! 3. Command-line flag overrides ([`CliOverrides`]).
 //!
 //! So the command line overrides the config file, which overrides the defaults.
-//! Each parameter has exactly one field here; adding a knob means adding it once
-//! to `ServerConfig`, once to `CliOverrides`, and one line to `apply_overrides`.
+//!
+//! Not every knob gets a CLI flag. Per CLAUDE.md "Configuration Surface", the
+//! CLI carries only bootstrap-critical settings (bind addresses, node id, data
+//! dir, mode, peers, `--config`) — the argv length is OS-bounded (`ARG_MAX`).
+//! Fine tunables live in the YAML config file only: add such a knob to
+//! `ServerConfig` (+ its default) and the packaged `coordinode.conf`, and skip
+//! `CliOverrides` / `apply_overrides`. A knob that also gets a CLI flag (the
+//! bootstrap-critical ones) is the one added in all three places.
 
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use serde::Deserialize;
@@ -148,6 +154,28 @@ pub struct ServerConfig {
     pub checkpoint_dir: Option<String>,
     /// Number of recent checkpoints to retain; older ones are pruned. Default 3.
     pub checkpoint_keep: usize,
+    // ── AFTER COMMIT trigger dispatch (R192) ─────────────────────────────────
+    // Fine tunables: config-file only (NOT CLI — see CLAUDE.md "Configuration
+    // Surface"). The first three also have a runtime seam
+    // (`Database::set_trigger_dispatch_config`) the future `setParameters` admin
+    // command drives; `trigger_dispatch_interval_ms` is restart-only.
+    /// AFTER COMMIT trigger cascade-depth cap (the trigger architecture L1). An
+    /// async trigger chain deeper than this is dead-lettered as a cascade
+    /// overflow rather than executed. Per-trigger `CASCADE_LIMIT` overrides it.
+    /// `None` = 10.
+    pub trigger_max_cascade_depth: Option<u32>,
+    /// Default total execution attempts for an AFTER COMMIT trigger that
+    /// declares no `ON ERROR` policy, before dead-lettering. Per-trigger
+    /// `ON ERROR RETRY n` overrides it. `None` = 3.
+    pub trigger_default_retry_attempts: Option<u32>,
+    /// Default base retry backoff in ms for AFTER COMMIT triggers with no
+    /// `ON ERROR` policy (per-attempt wait = `backoff * 2^attempt`). Per-trigger
+    /// `WITH BACKOFF ms` overrides it. `None` = 1000.
+    pub trigger_default_backoff_ms: Option<u64>,
+    /// How often the leader-gated AFTER COMMIT dispatch worker wakes to fire due
+    /// retries, in ms (it also wakes immediately on each applied entry). Restart
+    /// to change. `None` = 500.
+    pub trigger_dispatch_interval_ms: Option<u64>,
 }
 
 impl Default for ServerConfig {
@@ -187,6 +215,10 @@ impl Default for ServerConfig {
             checkpoint_interval_secs: 3600,
             checkpoint_dir: None,
             checkpoint_keep: 3,
+            trigger_max_cascade_depth: None,
+            trigger_default_retry_attempts: None,
+            trigger_default_backoff_ms: None,
+            trigger_dispatch_interval_ms: None,
         }
     }
 }
@@ -206,30 +238,10 @@ pub struct CliOverrides {
     pub data_dir: Option<String>,
     pub peers: Option<Vec<String>>,
     pub nofile: Option<u64>,
-    pub max_connections: Option<usize>,
-    pub max_request_size_mb: Option<usize>,
-    pub request_timeout_secs: Option<u64>,
-    pub http2_keepalive_secs: Option<u64>,
-    pub cache_size_mb: Option<u64>,
-    pub write_buffer_mb: Option<u64>,
-    pub retention_window_secs: Option<u64>,
-    pub registry_heartbeat_ms: Option<u64>,
-    pub registry_eviction_ms: Option<u64>,
-    pub cdc_consumer_ttl_secs: Option<u64>,
-    pub interactive_txn_idle_timeout_secs: Option<u64>,
-    pub interactive_txn_max_bytes: Option<u64>,
-    pub wire_compression_level: Option<i32>,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     pub tls_ca: Option<String>,
     pub tls_require_client_auth: Option<bool>,
-    pub scrub_enabled: Option<bool>,
-    pub scrub_interval_secs: Option<u64>,
-    pub scrub_throttle_ms: Option<u64>,
-    pub checkpoint_enabled: Option<bool>,
-    pub checkpoint_interval_secs: Option<u64>,
-    pub checkpoint_dir: Option<String>,
-    pub checkpoint_keep: Option<usize>,
 }
 
 impl ServerConfig {
@@ -284,15 +296,6 @@ impl ServerConfig {
         if o.nofile.is_some() {
             self.nofile = o.nofile;
         }
-        if o.max_connections.is_some() {
-            self.max_connections = o.max_connections;
-        }
-        if let Some(v) = o.max_request_size_mb {
-            self.max_request_size_mb = v;
-        }
-        if let Some(v) = o.wire_compression_level {
-            self.wire_compression_level = v;
-        }
         if o.tls_cert.is_some() {
             self.tls_cert = o.tls_cert.clone();
         }
@@ -304,57 +307,6 @@ impl ServerConfig {
         }
         if let Some(v) = o.tls_require_client_auth {
             self.tls_require_client_auth = v;
-        }
-        if o.request_timeout_secs.is_some() {
-            self.request_timeout_secs = o.request_timeout_secs;
-        }
-        if o.http2_keepalive_secs.is_some() {
-            self.http2_keepalive_secs = o.http2_keepalive_secs;
-        }
-        if o.cache_size_mb.is_some() {
-            self.cache_size_mb = o.cache_size_mb;
-        }
-        if o.write_buffer_mb.is_some() {
-            self.write_buffer_mb = o.write_buffer_mb;
-        }
-        if o.retention_window_secs.is_some() {
-            self.retention_window_secs = o.retention_window_secs;
-        }
-        if o.registry_heartbeat_ms.is_some() {
-            self.registry_heartbeat_ms = o.registry_heartbeat_ms;
-        }
-        if o.registry_eviction_ms.is_some() {
-            self.registry_eviction_ms = o.registry_eviction_ms;
-        }
-        if o.cdc_consumer_ttl_secs.is_some() {
-            self.cdc_consumer_ttl_secs = o.cdc_consumer_ttl_secs;
-        }
-        if let Some(v) = o.interactive_txn_idle_timeout_secs {
-            self.interactive_txn_idle_timeout_secs = v;
-        }
-        if let Some(v) = o.interactive_txn_max_bytes {
-            self.interactive_txn_max_bytes = v;
-        }
-        if let Some(v) = o.scrub_enabled {
-            self.scrub_enabled = v;
-        }
-        if let Some(v) = o.scrub_interval_secs {
-            self.scrub_interval_secs = v;
-        }
-        if o.scrub_throttle_ms.is_some() {
-            self.scrub_throttle_ms = o.scrub_throttle_ms;
-        }
-        if let Some(v) = o.checkpoint_enabled {
-            self.checkpoint_enabled = v;
-        }
-        if let Some(v) = o.checkpoint_interval_secs {
-            self.checkpoint_interval_secs = v;
-        }
-        if o.checkpoint_dir.is_some() {
-            self.checkpoint_dir = o.checkpoint_dir.clone();
-        }
-        if let Some(v) = o.checkpoint_keep {
-            self.checkpoint_keep = v;
         }
     }
 
@@ -381,6 +333,33 @@ impl ServerConfig {
                 .map(std::time::Duration::from_millis),
             parallelism: 1,
         }
+    }
+
+    /// Build the runtime-tunable AFTER COMMIT trigger dispatch config (R192)
+    /// from the resolved file settings, applying ADR-026 defaults for unset
+    /// knobs. Applied to the `Database` at startup via
+    /// `set_trigger_dispatch_config`; the same setter is the future
+    /// `setParameters` seam.
+    #[must_use]
+    pub fn trigger_dispatch_config(&self) -> coordinode_embed::TriggerDispatchConfig {
+        let d = coordinode_embed::TriggerDispatchConfig::default();
+        coordinode_embed::TriggerDispatchConfig {
+            max_cascade_depth: self
+                .trigger_max_cascade_depth
+                .unwrap_or(d.max_cascade_depth),
+            default_retry_attempts: self
+                .trigger_default_retry_attempts
+                .unwrap_or(d.default_retry_attempts),
+            default_backoff_ms: self
+                .trigger_default_backoff_ms
+                .unwrap_or(d.default_backoff_ms),
+        }
+    }
+
+    /// Leader-gated AFTER COMMIT dispatch worker poll interval (default 500ms).
+    #[must_use]
+    pub fn trigger_dispatch_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.trigger_dispatch_interval_ms.unwrap_or(500))
     }
 
     /// Resolve the storage endpoints for this node.

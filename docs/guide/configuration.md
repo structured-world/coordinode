@@ -44,11 +44,13 @@ drop-in (`systemctl edit coordinode`); the command line beats the file.
 `coordinode serve` is the default subcommand (running `coordinode` with no
 arguments is the same as `coordinode serve`).
 
-Every flag below (except `--config` itself) has a YAML config-file key with the
-same name in `snake_case` (for example `--max-request-size-mb` is
-`max_request_size_mb`, `--addr` is `grpc_addr`, `--data` is `data_dir`). The
-defaults in the table are the built-in defaults that apply when neither the
-config file nor a flag sets the value.
+The CLI carries only bootstrap-critical settings (bind addresses, identity, data
+dir, peers, the TLS identity, the startup fd limit); every fine tunable is a
+config-file key with no flag (see "Config-file-only settings" below). Each flag
+below (except `--config` itself) has a YAML config-file key with the same name in
+`snake_case` (for example `--ops-addr` is `ops_addr`, `--addr` is `grpc_addr`,
+`--data` is `data_dir`). The defaults in the table are the built-in defaults that
+apply when neither the config file nor a flag sets the value.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -62,29 +64,47 @@ config file nor a flag sets the value.
 | `--data` | `./data` | Data directory. Holds the storage engine state. |
 | `--peers` | (none) | Comma-separated peer addresses, for example `node2:7080,node3:7080`. Presence enables Raft consensus. |
 | `--nofile` | hard limit | Open-file-descriptor soft limit requested at startup. Unset raises the soft limit to the hard limit. Unix only. |
-| `--max-connections` | (unbounded) | Maximum in-flight requests per client connection (gRPC concurrency limit). |
-| `--max-request-size-mb` | `16` | Maximum decoded request message size, in MiB. Guards against unbounded-allocation requests. |
-| `--request-timeout-secs` | (none) | Per-request server-side timeout, in seconds. |
-| `--http2-keepalive-secs` | (none) | HTTP/2 keepalive ping interval, in seconds. Detects half-open connections behind a load balancer. |
-| `--cache-size-mb` | engine default | Block cache size, in MiB. The read path serves hot blocks from this cache before touching disk. |
-| `--write-buffer-mb` | engine default | Write buffer (memtable) size, in MiB. Larger buffers flush less often at the cost of memory. |
-| `--retention-window-secs` | `604800` (7 days) | MVCC time-travel / `AS OF TIMESTAMP` horizon, in seconds. The GC watermark is held back to at least `now - this`, so history within the window stays queryable and CDC / backup consumers keep their checkpoint readable. |
-| `--registry-heartbeat-ms` | `100` | Consumer-registry heartbeat coalescing window, in ms. Buffered consumer heartbeats flush as one Raft proposal per window; a larger window trades freshness for fewer proposals on busy shards. |
-| `--registry-eviction-ms` | `1000` | Consumer-registry TTL-eviction sweep interval, in ms. How often expired registrations are swept and the retention floor is refreshed against the wall clock. |
-| `--cdc-consumer-ttl-secs` | `30` | CDC change-stream consumer TTL, in seconds. How long a disconnected/crashed change-stream reader's registration holds the oplog retention floor before it is reclaimed. Connected readers heartbeat every poll and are never evicted; raise it to tolerate longer reader outages without losing resume position, lower it to free retention sooner after a crash. |
-| `--interactive-txn-idle-timeout-secs` | `30` | Idle timeout for an interactive transaction (a `BeginTransaction` left open without `CommitTransaction`/`RollbackTransaction`), in seconds. An open transaction pins an MVCC snapshot and buffers writes in memory; one idle this long is auto-rolled-back to release them. |
-| `--interactive-txn-max-bytes` | `268435456` (256 MiB) | Max buffered (uncommitted) bytes per interactive transaction. A transaction whose accumulated writes exceed this is aborted, capping the leader memory a client can hold without committing. |
-| `--wire-compression-level` | `3` | Inter-node gRPC transport zstd compression level for wire traffic (C-zstd numbering: `1`..=`22` trade speed for ratio). The default `3` is zstd's standard speed/ratio default and gives roughly a 9x reduction on Raft batches; raise it on a bandwidth-constrained link (for example a geo replica) where bandwidth costs more than CPU. Independent of the on-disk storage codec. |
 | `--tls-cert` / `--tls-key` | (none) | PEM paths to the node's TLS certificate and private key. Set both to serve inter-node + client gRPC over TLS (pure-Rust crypto, no C FFI); unset = plaintext (single-host dev). |
 | `--tls-ca` | (none) | PEM path to the CA that verifies peer certificates — trusted by clients to verify the server, and (with `--tls-require-client-auth`) by the server to verify connecting nodes. |
 | `--tls-require-client-auth` | `false` | Require and verify a client certificate (mutual TLS) on incoming connections. Needs `--tls-ca`. |
-| `--no-scrub` | (scrub on) | Disable the background integrity scrub. Each node otherwise periodically verifies every on-disk block's checksum on its own local storage. |
-| `--scrub-interval-secs` | `604800` | Seconds between background scrub cycles (default 7 days). |
-| `--scrub-throttle-ms` | `50` | Pause between SST scans during a scrub so it yields I/O to production; `0` runs at full speed. |
-| `--no-checkpoint` | (on) | Disable periodic local checkpoints (the base for WAL-replay repair of a corrupt partition when no healthy replica is available). |
-| `--checkpoint-interval-secs` | `3600` | Seconds between periodic checkpoints (default 1 hour). |
-| `--checkpoint-dir` | `<data_dir>/checkpoints` | Directory checkpoints are written under. |
-| `--checkpoint-keep` | `3` | Number of recent checkpoints to retain; older ones are pruned. |
+
+### Config-file-only settings (no CLI flag)
+
+Fine tunables that are not needed to start the process have **no CLI flag** — the
+command line is reserved for bootstrap-critical settings (its length is OS-bounded
+by `ARG_MAX`). These keys live in the YAML config file only. Defaults apply when
+the key is unset.
+
+| Config key | Default | Mutability | Description |
+|------------|---------|------------|-------------|
+| `max_connections` | (unbounded) | restart | Maximum in-flight requests per client connection (gRPC concurrency limit). |
+| `max_request_size_mb` | `16` | restart | Maximum decoded request message size, in MiB. Guards against unbounded-allocation requests. |
+| `request_timeout_secs` | (none) | restart | Per-request server-side timeout, in seconds. |
+| `http2_keepalive_secs` | (none) | restart | HTTP/2 keepalive ping interval, in seconds. Detects half-open connections behind a load balancer. |
+| `cache_size_mb` | engine default | restart | Block cache size, in MiB. The read path serves hot blocks from this cache before touching disk. |
+| `write_buffer_mb` | engine default | restart | Write buffer (memtable) size, in MiB. Larger buffers flush less often at the cost of memory. |
+| `retention_window_secs` | `604800` (7 days) | restart | MVCC time-travel / `AS OF TIMESTAMP` horizon, in seconds. The GC watermark is held back to at least `now - this`, so history within the window stays queryable and CDC / backup consumers keep their checkpoint readable. |
+| `registry_heartbeat_ms` | `100` | restart | Consumer-registry heartbeat coalescing window, in ms. Buffered consumer heartbeats flush as one Raft proposal per window; a larger window trades freshness for fewer proposals on busy shards. |
+| `registry_eviction_ms` | `1000` | restart | Consumer-registry TTL-eviction sweep interval, in ms. How often expired registrations are swept and the retention floor is refreshed against the wall clock. |
+| `cdc_consumer_ttl_secs` | `30` | restart | CDC change-stream consumer TTL, in seconds. How long a disconnected/crashed change-stream reader's registration holds the oplog retention floor before it is reclaimed. Connected readers heartbeat every poll and are never evicted. |
+| `interactive_txn_idle_timeout_secs` | `30` | restart | Idle timeout for an interactive transaction (a `BeginTransaction` left open without commit/rollback), in seconds. An open transaction pins an MVCC snapshot and buffers writes; one idle this long is auto-rolled-back. |
+| `interactive_txn_max_bytes` | `268435456` (256 MiB) | restart | Max buffered (uncommitted) bytes per interactive transaction. A transaction whose accumulated writes exceed this is aborted, capping leader memory a client can hold without committing. |
+| `wire_compression_level` | `3` | restart | Inter-node gRPC transport zstd compression level (C-zstd `1`..=`22`). Default `3` is zstd's standard default (~9x reduction on Raft batches); raise on a bandwidth-constrained link. Independent of the on-disk codec. |
+| `scrub_enabled` | `true` | restart | Whether the background integrity scrub runs (each node verifies its own on-disk block checksums). |
+| `scrub_interval_secs` | `604800` (7 days) | restart | Seconds between background scrub cycles. |
+| `scrub_throttle_ms` | `50` | restart | Pause between SST scans during a scrub so it yields I/O to production; `0` runs at full speed. |
+| `checkpoint_enabled` | `true` | restart | Whether periodic local checkpoints are taken (the base for WAL-replay repair when no healthy replica is available). |
+| `checkpoint_interval_secs` | `3600` (1 hour) | restart | Seconds between periodic checkpoints. |
+| `checkpoint_dir` | `<data_dir>/checkpoints` | restart | Directory checkpoints are written under. |
+| `checkpoint_keep` | `3` | restart | Number of recent checkpoints to retain; older ones are pruned. |
+| `trigger_max_cascade_depth` | `10` | live (setParameter) | Async AFTER COMMIT cascade-depth cap. A self- or mutually-triggering chain deeper than this is dead-lettered as a cascade overflow rather than looping. Per-trigger `CASCADE_LIMIT n` overrides it. |
+| `trigger_default_retry_attempts` | `3` | live (setParameter) | Default total execution attempts for an AFTER COMMIT trigger that declares no `ON ERROR` clause, before its event is dead-lettered into `trigger_failures`. Per-trigger `ON ERROR RETRY n` overrides it. |
+| `trigger_default_backoff_ms` | `1000` | live (setParameter) | Default base retry backoff in ms for AFTER COMMIT triggers with no `ON ERROR` clause; per-attempt wait is `backoff * 2^attempt`. Per-trigger `WITH BACKOFF ms` overrides it. |
+| `trigger_dispatch_interval_ms` | `500` | restart | How often the leader's AFTER COMMIT dispatch worker wakes to fire due retries (it also wakes immediately on each replicated write). |
+
+The three `live` knobs are runtime-tunable on a running database by an owner via
+the privileged setParameter surface, without a restart; the config file sets
+their startup value.
 
 ### TLS trust and self-signed certificates
 
@@ -280,28 +300,29 @@ host or pin the process with `MemoryMax=` in a systemd drop-in.
 ## Network limits
 
 These guard the gRPC server against resource exhaustion and detect dead peers.
-All are off (unbounded / disabled) unless set.
+They are config-file keys (no CLI flag); all are off (unbounded / disabled)
+unless set.
 
-- `--max-connections N` caps the number of in-flight requests a single client
+- `max_connections` caps the number of in-flight requests a single client
   connection may have outstanding. On a stream-multiplexed transport this is the
   practical equivalent of a connection cap.
-- `--max-request-size-mb N` rejects any request whose decoded body exceeds the
-  cap (default 16 MiB), so a malformed or hostile request cannot force an
-  unbounded allocation.
-- `--request-timeout-secs N` aborts a request that runs longer than the limit.
-- `--http2-keepalive-secs N` sends keepalive pings so the server reclaims
+- `max_request_size_mb` rejects any request whose decoded body exceeds the cap
+  (default 16 MiB), so a malformed or hostile request cannot force an unbounded
+  allocation.
+- `request_timeout_secs` aborts a request that runs longer than the limit.
+- `http2_keepalive_secs` sends keepalive pings so the server reclaims
   connections that died silently (common behind a load balancer or NAT).
 
 ## Storage tuning
 
-The storage engine picks safe defaults; override them only with a measured
-reason.
+The storage engine picks safe defaults; override these config-file keys only
+with a measured reason.
 
-- `--cache-size-mb N` sets the block cache. A larger cache keeps more hot blocks
-  in memory and cuts read latency, at the cost of resident memory. Size it to
-  the working set, not the whole dataset.
-- `--write-buffer-mb N` sets the in-memory write buffer (memtable). Larger
-  buffers flush to disk less often, trading memory for fewer, larger flushes.
+- `cache_size_mb` sets the block cache. A larger cache keeps more hot blocks in
+  memory and cuts read latency, at the cost of resident memory. Size it to the
+  working set, not the whole dataset.
+- `write_buffer_mb` sets the in-memory write buffer (memtable). Larger buffers
+  flush to disk less often, trading memory for fewer, larger flushes.
 
 ## Storage topology
 
@@ -397,17 +418,19 @@ and CDC / backup consumers can resume from a checkpoint. The garbage collector
 reclaims versions older than the retention window; the window is therefore the
 horizon for both time-travel reads and lagging-consumer recovery.
 
-- `--retention-window-secs N` sets that horizon, in seconds (default seven
-  days). Shorter windows reclaim space sooner but shrink the time-travel range
-  and the grace period a slow consumer has before its checkpoint is collected.
-  A registered consumer lagging beyond the window holds the floor back for
-  itself rather than losing data silently.
-- `--registry-heartbeat-ms N` and `--registry-eviction-ms N` tune the
+- `retention_window_secs` sets that horizon, in seconds (default seven days).
+  Shorter windows reclaim space sooner but shrink the time-travel range and the
+  grace period a slow consumer has before its checkpoint is collected. A
+  registered consumer lagging beyond the window holds the floor back for itself
+  rather than losing data silently.
+- `registry_heartbeat_ms` and `registry_eviction_ms` tune the
   consumer-retention registry's background service: how often buffered consumer
   heartbeats are flushed as a coalesced proposal, and how often expired
   registrations are swept. The defaults (100 ms / 1000 ms) suit most
   deployments; raise the heartbeat window on shards with many consumers to cut
   proposal volume.
+
+These are config-file keys (no CLI flag).
 
 ## Other subcommands
 

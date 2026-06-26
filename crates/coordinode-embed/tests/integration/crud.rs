@@ -4939,6 +4939,271 @@ fn trigger_edge_update_propagate_aborts_set() {
 }
 
 // =====================================================================
+// AFTER COMMIT triggers — durable event-journal dispatch (ADR-026).
+// Embedded drains the queue inline after each committed write, so a
+// firing is observable in the same test without a background worker.
+// =====================================================================
+
+/// An AFTER COMMIT trigger fires after the originating write commits: the
+/// audit node the body creates exists once the inline dispatch drains the
+/// queue. This is the core gap closure — AFTER COMMIT triggers used to be
+/// accepted but never execute.
+#[test]
+fn trigger_after_commit_audit_fires_on_create() {
+    use coordinode_core::graph::types::Value;
+    let mut db = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER audit_create ON :User CREATE AFTER COMMIT \
+         EXECUTE CREATE (e:AuditEntry {action: $event, user_id: $node})",
+    )
+    .expect("install after-commit trigger");
+
+    db.execute_cypher("CREATE (u:User {name: 'Alice', id: 42})")
+        .expect("create user — queues the after-commit event, drained inline");
+
+    let audit = db
+        .execute_cypher("MATCH (e:AuditEntry) RETURN e.action AS action, e.user_id AS uid")
+        .unwrap();
+    assert_eq!(
+        audit.len(),
+        1,
+        "after-commit trigger must have fired exactly once on User CREATE"
+    );
+    assert_eq!(
+        audit[0].get("action"),
+        Some(&Value::String("CREATE".into()))
+    );
+    assert!(
+        matches!(audit[0].get("uid"), Some(Value::Int(_))),
+        "user_id must be set from $node; got {:?}",
+        audit[0].get("uid")
+    );
+    // Queue fully drained, nothing dead-lettered.
+    assert_eq!(db.after_commit_pending_count(), 0);
+    assert_eq!(db.after_commit_failure_count(), 0);
+}
+
+/// AFTER COMMIT UPDATE fires with `$before` / `$after` maps reflecting the
+/// pre- and post-mutation property state.
+#[test]
+fn trigger_after_commit_update_fires_with_before_and_after() {
+    use coordinode_core::graph::types::Value;
+    let mut db = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER audit_update ON :Account UPDATE AFTER COMMIT \
+         EXECUTE CREATE (e:Delta {action: $event, was: $before, now: $after})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (a:Account {id: 1, balance: 100})")
+        .unwrap();
+    db.execute_cypher("MATCH (a:Account {id: 1}) SET a.balance = 250")
+        .unwrap();
+
+    let deltas = db
+        .execute_cypher("MATCH (e:Delta) RETURN e.action AS act, e.was AS was, e.now AS now")
+        .unwrap();
+    assert_eq!(deltas.len(), 1, "update trigger must fire once");
+    assert_eq!(deltas[0].get("act"), Some(&Value::String("UPDATE".into())));
+    // $before / $after carry the pre- and post-mutation property maps.
+    assert!(matches!(
+        deltas[0].get("was"),
+        Some(Value::Map(_) | Value::Document(_))
+    ));
+    assert!(matches!(
+        deltas[0].get("now"),
+        Some(Value::Map(_) | Value::Document(_))
+    ));
+    assert_eq!(db.after_commit_pending_count(), 0);
+}
+
+/// AFTER COMMIT DELETE fires after the node is gone, carrying `$before`.
+#[test]
+fn trigger_after_commit_delete_fires_carrying_before() {
+    use coordinode_core::graph::types::Value;
+    let mut db = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER audit_delete ON :Session DELETE AFTER COMMIT \
+         EXECUTE CREATE (e:Tombstone {action: $event, was: $before})",
+    )
+    .unwrap();
+
+    db.execute_cypher("CREATE (s:Session {sid: 777})").unwrap();
+    db.execute_cypher("MATCH (s:Session {sid: 777}) DELETE s")
+        .unwrap();
+
+    let sessions = db.execute_cypher("MATCH (s:Session) RETURN s").unwrap();
+    assert_eq!(sessions.len(), 0, "session is deleted");
+
+    let tombstones = db
+        .execute_cypher("MATCH (e:Tombstone) RETURN e.action AS act, e.was AS was")
+        .unwrap();
+    assert_eq!(tombstones.len(), 1, "delete trigger must fire once");
+    assert_eq!(
+        tombstones[0].get("act"),
+        Some(&Value::String("DELETE".into()))
+    );
+    // $before carries the deleted node's property map (captured pre-delete).
+    assert!(matches!(
+        tombstones[0].get("was"),
+        Some(Value::Map(_) | Value::Document(_))
+    ));
+}
+
+/// A failing AFTER COMMIT body is retried per `ON ERROR RETRY n`, and on
+/// exhaustion is dead-lettered into `trigger_failures` — never silently
+/// dropped. With `BACKOFF 0` each dispatch pass makes one attempt.
+#[test]
+fn trigger_after_commit_retry_then_dead_letters() {
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
+    let mut db = open_db();
+
+    // STRICT :Audit allows only `action`; the body writes a forbidden field,
+    // so the body fails on every attempt.
+    let mut audit_schema = LabelSchema::new_node_id("Audit");
+    audit_schema.set_mode(SchemaMode::Strict);
+    audit_schema.add_property(PropertyDef::new("action", PropertyType::String).not_null());
+    db.create_label_schema(audit_schema).unwrap();
+
+    db.execute_cypher(
+        "CREATE TRIGGER flaky ON :User CREATE AFTER COMMIT \
+         EXECUTE CREATE (e:Audit {forbidden: $event}) \
+         ON ERROR RETRY 2 WITH BACKOFF 0",
+    )
+    .unwrap();
+
+    // The CREATE commits (AFTER COMMIT never aborts the caller); the inline
+    // drain makes attempt #1, which fails and reschedules (backoff 0 → due now).
+    db.execute_cypher("CREATE (u:User {id: 1})").unwrap();
+    assert_eq!(
+        db.after_commit_pending_count(),
+        1,
+        "one retry still queued after the first failed attempt"
+    );
+    assert_eq!(db.after_commit_failure_count(), 0);
+
+    // Second attempt exhausts RETRY 2 → dead-letter.
+    let report = db.dispatch_after_commit_triggers();
+    assert_eq!(report.dead_lettered, 1, "retries exhausted → dead-letter");
+    assert_eq!(
+        db.after_commit_pending_count(),
+        0,
+        "queue cleared after dead-letter"
+    );
+    assert_eq!(
+        db.after_commit_failure_count(),
+        1,
+        "failed event preserved durably in trigger_failures"
+    );
+    // The caller's User write is intact regardless of trigger failure.
+    let users = db.execute_cypher("MATCH (u:User) RETURN u").unwrap();
+    assert_eq!(
+        users.len(),
+        1,
+        "AFTER COMMIT failure never rolls back the caller"
+    );
+}
+
+/// A disabled AFTER COMMIT trigger does not fire — no event is enqueued for
+/// a disabled trigger (the lookup excludes it), so nothing runs.
+#[test]
+fn trigger_after_commit_disabled_does_not_fire() {
+    let mut db = open_db();
+
+    db.execute_cypher(
+        "CREATE TRIGGER off_trig ON :User CREATE AFTER COMMIT \
+         EXECUTE CREATE (e:AuditEntry {action: $event})",
+    )
+    .unwrap();
+    db.execute_cypher("ALTER TRIGGER off_trig DISABLE").unwrap();
+
+    db.execute_cypher("CREATE (u:User {id: 1})").unwrap();
+
+    let audit = db.execute_cypher("MATCH (e:AuditEntry) RETURN e").unwrap();
+    assert_eq!(audit.len(), 0, "disabled trigger must not fire");
+    assert_eq!(db.after_commit_pending_count(), 0, "nothing was enqueued");
+}
+
+/// A dropped trigger's still-queued events are discarded by the dispatcher
+/// rather than executed or stuck.
+#[test]
+fn trigger_after_commit_dropped_trigger_discards_queued_event() {
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
+    let mut db = open_db();
+
+    // Body fails so the first inline attempt leaves the event queued for retry.
+    let mut audit_schema = LabelSchema::new_node_id("Audit");
+    audit_schema.set_mode(SchemaMode::Strict);
+    audit_schema.add_property(PropertyDef::new("action", PropertyType::String).not_null());
+    db.create_label_schema(audit_schema).unwrap();
+
+    db.execute_cypher(
+        "CREATE TRIGGER doomed ON :User CREATE AFTER COMMIT \
+         EXECUTE CREATE (e:Audit {forbidden: $event}) \
+         ON ERROR RETRY 5 WITH BACKOFF 0",
+    )
+    .unwrap();
+    db.execute_cypher("CREATE (u:User {id: 1})").unwrap();
+    assert_eq!(db.after_commit_pending_count(), 1, "event queued for retry");
+
+    // Drop the trigger, then dispatch: the orphaned event is discarded.
+    db.execute_cypher("DROP TRIGGER doomed").unwrap();
+    let report = db.dispatch_after_commit_triggers();
+    assert_eq!(report.discarded, 1, "orphaned event discarded");
+    assert_eq!(db.after_commit_pending_count(), 0);
+    assert_eq!(db.after_commit_failure_count(), 0);
+}
+
+/// The async cascade depth bound is the runtime-tunable `max_cascade_depth`
+/// (set via `set_trigger_dispatch_config` — the seam a future `setParameters`
+/// admin command drives). A self-replicating AFTER COMMIT trigger fires up to
+/// the bound, then the next generation is dead-lettered as a cascade overflow
+/// instead of looping forever.
+#[test]
+fn trigger_after_commit_cascade_depth_bound_is_runtime_tunable() {
+    let mut db = open_db();
+
+    // Tighten the cascade bound to a single async generation.
+    db.set_trigger_dispatch_config(coordinode_embed::TriggerDispatchConfig {
+        max_cascade_depth: 1,
+        ..Default::default()
+    });
+
+    // A trigger whose body creates another node of the same label → each firing
+    // enqueues the next generation.
+    db.execute_cypher(
+        "CREATE TRIGGER chain ON :Chain CREATE AFTER COMMIT \
+         EXECUTE CREATE (:Chain)",
+    )
+    .unwrap();
+
+    // User write = generation 0; its event is generation 1 (fires), whose body
+    // enqueues generation 2 (> limit 1 → dead-lettered). Inline drain runs the
+    // whole bounded cascade.
+    db.execute_cypher("CREATE (:Chain)").unwrap();
+
+    // Exactly two Chain nodes: the user's + the single gen-1 body. Generation 2
+    // never executes.
+    let chains = db
+        .execute_cypher("MATCH (c:Chain) RETURN count(c) AS c")
+        .unwrap();
+    assert_eq!(
+        chains[0].get("c"),
+        Some(&coordinode_core::graph::types::Value::Int(2)),
+        "cascade fired once then stopped at the depth bound"
+    );
+    assert_eq!(db.after_commit_pending_count(), 0, "queue drained");
+    assert_eq!(
+        db.after_commit_failure_count(),
+        1,
+        "the over-depth generation is dead-lettered, not looped"
+    );
+}
+
+// =====================================================================
 // R172a — CREATE NODE TYPE DDL (per ADR-027, bitemporal nodes scaffold).
 // Only the DDL surface is verified here; per-version storage layout +
 // write/read executor support land in R172b-e.

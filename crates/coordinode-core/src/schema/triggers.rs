@@ -18,7 +18,11 @@
 //! `e:` for edge types so the two namespaces never collide on the same
 //! string. `event` is one of `c`, `u`, `d` for `CREATE / UPDATE / DELETE`.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+
+use crate::graph::types::Value;
 
 /// Persisted form of a trigger registered via `CREATE TRIGGER` (the trigger architecture).
 ///
@@ -169,6 +173,117 @@ pub fn encode_trigger_index_key(target_segment: &str, event_segment: &str) -> Ve
 /// Prefix used to scan every trigger definition (for `SHOW TRIGGERS`).
 pub fn trigger_scan_prefix() -> &'static [u8] {
     b"schema:trigger:"
+}
+
+// ── AFTER COMMIT event journal (the trigger architecture, ADR-026) ──────────────
+//
+// AFTER COMMIT triggers do not fire inline. When a mutation matches an
+// AFTER COMMIT trigger, the committing transaction enqueues a durable
+// [`PendingTriggerEvent`] under `trigger_pending:<name>:<seq>` in the same
+// (Raft-replicated) transaction as the user write. The dispatcher consumes the
+// queue out-of-band, executes the trigger body, and removes the entry on
+// success. On failure the entry is retried in place (per the trigger's
+// `ON ERROR RETRY` policy) and, once retries are exhausted (or under
+// `DEAD_LETTER`), moved to a [`FailedTriggerEvent`] under
+// `trigger_failures:<name>:<seq>`. The two key families live in the same
+// schema partition as the definitions, so the queue replicates and survives
+// failover with the rest of the metadata.
+
+/// A queued AFTER COMMIT trigger firing awaiting execution by the dispatcher.
+///
+/// The payload carries the trigger parameters (`$event`, `$before`, `$after`,
+/// `$node` / `$src` / `$tgt` / `$edge_type`) computed precisely at commit time,
+/// so the dispatcher never reconstructs them from raw storage ops. The trigger
+/// body and `ON ERROR` policy are read live from the definition at dispatch
+/// time (so `ALTER TRIGGER … SET EXECUTE / SET ON ERROR / DISABLE` take effect
+/// on still-queued events).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingTriggerEvent {
+    /// Trigger this event belongs to (key into `schema:trigger:<name>`).
+    pub trigger_name: String,
+    /// Bound parameters for the body: `event` / `before` / `after` plus the
+    /// node or edge endpoints, exactly as the synchronous param builders
+    /// produce them. Keys are the bare `$`-names (no leading `$`).
+    pub params: BTreeMap<String, Value>,
+    /// Retry attempts already spent. `0` on first enqueue.
+    pub attempt: u32,
+    /// Async cascade generation: `0` for events enqueued by a user mutation,
+    /// `n+1` for events enqueued by a generation-`n` trigger body. Bounds the
+    /// async cascade depth (L1, the trigger architecture) — a generation past
+    /// the cluster `max_cascade_depth` is dead-lettered instead of executed.
+    pub generation: u32,
+    /// HLC microseconds when the event was first enqueued.
+    pub first_seen_us: u64,
+    /// HLC microseconds before which the dispatcher must not re-attempt this
+    /// event (exponential backoff). `0` = due immediately.
+    pub next_attempt_us: u64,
+}
+
+/// A dead-lettered AFTER COMMIT trigger firing — retries exhausted, or a
+/// `DEAD_LETTER` / `PROPAGATE` policy on a committed transaction, or a cascade
+/// overflow. Inspectable via `SHOW TRIGGER FAILURES` (the trigger architecture).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FailedTriggerEvent {
+    /// Trigger this event belongs to.
+    pub trigger_name: String,
+    /// The body parameters at the time of failure (same shape as the pending form).
+    pub params: BTreeMap<String, Value>,
+    /// Error chain, newest last (e.g. body parse error → executor error).
+    pub error_chain: Vec<String>,
+    /// Number of execution attempts made before dead-lettering.
+    pub attempts: u32,
+    /// HLC microseconds of the first failure.
+    pub first_fail_us: u64,
+    /// HLC microseconds of the last (dead-lettering) failure.
+    pub last_fail_us: u64,
+    /// `true` when the event was dead-lettered by a cascade-overflow trip
+    /// rather than a body error.
+    pub cascade_overflow: bool,
+}
+
+/// Encode the key for a queued AFTER COMMIT event:
+/// `trigger_pending:<name>:<seq_be>`. `seq` is a monotonic HLC microsecond
+/// stamp assigned at enqueue; the big-endian suffix keeps queue order =
+/// enqueue order within a trigger when scanned by prefix.
+pub fn encode_trigger_pending_key(name: &str, seq: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(16 + name.len() + 1 + 8);
+    key.extend_from_slice(b"trigger_pending:");
+    key.extend_from_slice(name.as_bytes());
+    key.push(b':');
+    key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
+
+/// Encode the key for a dead-lettered AFTER COMMIT event:
+/// `trigger_failures:<name>:<seq_be>`.
+pub fn encode_trigger_failure_key(name: &str, seq: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(17 + name.len() + 1 + 8);
+    key.extend_from_slice(b"trigger_failures:");
+    key.extend_from_slice(name.as_bytes());
+    key.push(b':');
+    key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
+
+/// Prefix scanning every queued AFTER COMMIT event across all triggers.
+pub fn trigger_pending_scan_prefix() -> &'static [u8] {
+    b"trigger_pending:"
+}
+
+/// Prefix scanning every dead-lettered AFTER COMMIT event across all triggers.
+pub fn trigger_failures_scan_prefix() -> &'static [u8] {
+    b"trigger_failures:"
+}
+
+/// Recover the trailing big-endian `seq` from a `trigger_pending:` /
+/// `trigger_failures:` key. Returns `None` when the key is too short to carry
+/// the 8-byte suffix.
+pub fn decode_trigger_event_seq(key: &[u8]) -> Option<u64> {
+    if key.len() < 8 {
+        return None;
+    }
+    let suffix: [u8; 8] = key[key.len() - 8..].try_into().ok()?;
+    Some(u64::from_be_bytes(suffix))
 }
 
 #[cfg(test)]

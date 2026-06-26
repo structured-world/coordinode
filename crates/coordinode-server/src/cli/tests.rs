@@ -215,37 +215,14 @@ fn serve_node_id() {
 }
 
 #[test]
-fn serve_resource_flags_parsed() {
-    let cmd = parse_args_from(&args(
-        "coordinode serve --nofile 262144 --max-connections 1024 \
-             --max-request-size-mb 32 --request-timeout-secs 30 \
-             --http2-keepalive-secs 60 --cache-size-mb 4096 --write-buffer-mb 256",
-    ));
+fn serve_nofile_flag_parsed() {
+    // `--nofile` is the one startup resource limit kept on the CLI; the other
+    // resource tunables (connections, request size, cache/buffer sizes,
+    // timeouts) are config-file-only and have no flag.
+    let cmd = parse_args_from(&args("coordinode serve --nofile 262144"));
     match cmd {
         Command::Serve { overrides, .. } => {
             assert_eq!(overrides.nofile, Some(262144));
-            assert_eq!(overrides.max_connections, Some(1024));
-            assert_eq!(overrides.max_request_size_mb, Some(32));
-            assert_eq!(overrides.request_timeout_secs, Some(30));
-            assert_eq!(overrides.http2_keepalive_secs, Some(60));
-            assert_eq!(overrides.cache_size_mb, Some(4096));
-            assert_eq!(overrides.write_buffer_mb, Some(256));
-        }
-        _ => panic!("expected Serve command"),
-    }
-}
-
-#[test]
-fn serve_wire_compression_level_parsed_and_applied() {
-    use crate::config::ServerConfig;
-    let cmd = parse_args_from(&args("coordinode serve --wire-compression-level 22"));
-    match cmd {
-        Command::Serve { overrides, .. } => {
-            assert_eq!(overrides.wire_compression_level, Some(22));
-            let mut cfg = ServerConfig::default();
-            assert_eq!(cfg.wire_compression_level, 3, "default wire level is 3");
-            cfg.apply_overrides(&overrides);
-            assert_eq!(cfg.wire_compression_level, 22, "CLI override applied");
         }
         _ => panic!("expected Serve command"),
     }
@@ -276,32 +253,6 @@ fn serve_tls_flags_parsed_and_applied() {
 }
 
 #[test]
-fn serve_scrub_flags_parsed_and_applied() {
-    use crate::config::ServerConfig;
-    let cmd = parse_args_from(&args(
-        "coordinode serve --no-scrub --scrub-interval-secs 3600 --scrub-throttle-ms 10",
-    ));
-    match cmd {
-        Command::Serve { overrides, .. } => {
-            assert_eq!(overrides.scrub_enabled, Some(false));
-            assert_eq!(overrides.scrub_interval_secs, Some(3600));
-            assert_eq!(overrides.scrub_throttle_ms, Some(10));
-            let mut cfg = ServerConfig::default();
-            assert!(cfg.scrub_enabled, "scrub on by default");
-            assert_eq!(cfg.scrub_interval_secs, 7 * 24 * 3600);
-            cfg.apply_overrides(&overrides);
-            assert!(!cfg.scrub_enabled);
-            assert_eq!(cfg.scrub_interval_secs, 3600);
-            // scrub_config() maps a positive throttle to Some(Duration).
-            let sc = cfg.scrub_config();
-            assert!(!sc.enabled);
-            assert_eq!(sc.throttle, Some(std::time::Duration::from_millis(10)));
-        }
-        _ => panic!("expected Serve command"),
-    }
-}
-
-#[test]
 fn scrub_config_zero_throttle_is_full_speed() {
     use crate::config::ServerConfig;
     let cfg = ServerConfig {
@@ -312,80 +263,16 @@ fn scrub_config_zero_throttle_is_full_speed() {
 }
 
 #[test]
-fn serve_resource_flags_default_to_none() {
-    // Unset → None so the resolution step keeps config-file / built-in
-    // defaults (incl. the 16 MiB request-size cap).
+fn serve_no_tunable_flags_means_empty_overrides() {
+    // Bare `serve` sets no overrides; every fine tunable resolves from the
+    // config file / built-in defaults. Only the bootstrap + TLS + nofile knobs
+    // are even representable on the CLI now.
     let cmd = parse_args_from(&args("coordinode serve"));
     match cmd {
         Command::Serve { overrides, .. } => {
             assert!(overrides.nofile.is_none());
-            assert!(overrides.max_connections.is_none());
-            assert!(overrides.max_request_size_mb.is_none());
-            assert!(overrides.request_timeout_secs.is_none());
-            assert!(overrides.cache_size_mb.is_none());
-        }
-        _ => panic!("expected Serve command"),
-    }
-}
-
-#[test]
-fn serve_registry_flags_parsed() {
-    let cmd = parse_args_from(&args(
-        "coordinode serve --retention-window-secs 3600 \
-             --registry-heartbeat-ms 50 --registry-eviction-ms 500 \
-             --cdc-consumer-ttl-secs 45",
-    ));
-    match cmd {
-        Command::Serve { overrides, .. } => {
-            assert_eq!(overrides.retention_window_secs, Some(3600));
-            assert_eq!(overrides.registry_heartbeat_ms, Some(50));
-            assert_eq!(overrides.registry_eviction_ms, Some(500));
-            assert_eq!(overrides.cdc_consumer_ttl_secs, Some(45));
-        }
-        _ => panic!("expected Serve command"),
-    }
-}
-
-#[test]
-fn serve_registry_flags_default_to_none() {
-    // Unset → None so the server keeps the registry's built-in defaults
-    // (7-day retention window, 100 ms heartbeat, 1000 ms eviction sweep).
-    let cmd = parse_args_from(&args("coordinode serve"));
-    match cmd {
-        Command::Serve { overrides, .. } => {
-            assert!(overrides.retention_window_secs.is_none());
-            assert!(overrides.registry_heartbeat_ms.is_none());
-            assert!(overrides.registry_eviction_ms.is_none());
-            assert!(overrides.cdc_consumer_ttl_secs.is_none());
-        }
-        _ => panic!("expected Serve command"),
-    }
-}
-
-#[test]
-fn serve_interactive_txn_flags_parsed() {
-    let cmd = parse_args_from(&args(
-        "coordinode serve --interactive-txn-idle-timeout-secs 60 \
-             --interactive-txn-max-bytes 1048576",
-    ));
-    match cmd {
-        Command::Serve { overrides, .. } => {
-            assert_eq!(overrides.interactive_txn_idle_timeout_secs, Some(60));
-            assert_eq!(overrides.interactive_txn_max_bytes, Some(1_048_576));
-        }
-        _ => panic!("expected Serve command"),
-    }
-}
-
-#[test]
-fn serve_interactive_txn_flags_default_to_none() {
-    // Unset → None so the server keeps the ADR-042 defaults (30s idle
-    // timeout, 256 MiB buffered-write ceiling per interactive transaction).
-    let cmd = parse_args_from(&args("coordinode serve"));
-    match cmd {
-        Command::Serve { overrides, .. } => {
-            assert!(overrides.interactive_txn_idle_timeout_secs.is_none());
-            assert!(overrides.interactive_txn_max_bytes.is_none());
+            assert!(overrides.tls_cert.is_none());
+            assert!(overrides.mode.is_none());
         }
         _ => panic!("expected Serve command"),
     }

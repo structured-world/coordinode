@@ -256,6 +256,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let checkpoint_interval_secs = cfg.checkpoint_interval_secs;
             let checkpoint_keep = cfg.checkpoint_keep;
             let checkpoint_dir = cfg.checkpoint_directory();
+            // Capture AFTER COMMIT trigger dispatch settings before the move
+            // (config-file surface; applied to the Database / worker below).
+            let trigger_dispatch_cfg = cfg.trigger_dispatch_config();
+            let trigger_dispatch_interval = cfg.trigger_dispatch_interval();
             let config::ServerConfig {
                 node_id,
                 grpc_addr,
@@ -294,6 +298,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 checkpoint_interval_secs: _,
                 checkpoint_dir: _,
                 checkpoint_keep: _,
+                // Already captured above (trigger_dispatch_cfg / _interval) before the move.
+                trigger_max_cascade_depth: _,
+                trigger_default_retry_attempts: _,
+                trigger_default_backoff_ms: _,
+                trigger_dispatch_interval_ms: _,
             } = cfg;
             let peers = if peers_vec.is_empty() {
                 None
@@ -719,6 +728,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     interactive_txn_idle_timeout_secs,
                 ));
                 db.set_max_interactive_txn_bytes(interactive_txn_max_bytes as usize);
+                // AFTER COMMIT trigger dispatch knobs (R192) from the config file.
+                // The same setter is the runtime `setParameters` seam.
+                db.set_trigger_dispatch_config(trigger_dispatch_cfg);
             }
 
             // Per-shard consumer-retention registry (ADR-028). Constructing it
@@ -815,6 +827,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(0) => {}
                             Ok(n) => tracing::info!(n, "vector indexes brought live from apply"),
                             Err(e) => tracing::warn!(%e, "vector index refresh failed"),
+                        }
+                    }
+                });
+            }
+
+            // Drive AFTER COMMIT trigger dispatch on the Raft leader (R192,
+            // ADR-026). The event queue (`trigger_pending:`) is Raft-replicated,
+            // so every node sees the same backlog; gating execution on the lease
+            // holder makes each event fire exactly once cluster-wide (the body's
+            // writes have to go through the leader's pipeline anyway). Woken by
+            // each applied entry (covers fresh enqueues) and a periodic tick
+            // (covers retry backoff timers). The blocking dispatch runs off the
+            // async runtime so a long body never stalls consensus.
+            if peers.is_some() {
+                let db = Arc::clone(&database);
+                let rn = Arc::clone(&raft_node);
+                let mut applied_rx = rn.subscribe_applied();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(trigger_dispatch_interval);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            changed = applied_rx.changed() => {
+                                if changed.is_err() {
+                                    break; // RaftNode dropped — shut the worker down.
+                                }
+                            }
+                            _ = tick.tick() => {}
+                        }
+                        if rn.current_leader() != Some(rn.node_id()) {
+                            continue;
+                        }
+                        let db2 = Arc::clone(&db);
+                        match tokio::task::spawn_blocking(move || {
+                            db2.read().dispatch_after_commit_triggers()
+                        })
+                        .await
+                        {
+                            Ok(report) => {
+                                for e in &report.errors {
+                                    tracing::warn!("after-commit trigger dispatch: {e}");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(%e, "after-commit dispatch task join error")
+                            }
                         }
                     }
                 });

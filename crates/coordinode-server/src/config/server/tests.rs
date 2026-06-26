@@ -40,23 +40,27 @@ fn partial_yaml_overlays_only_its_keys() {
 
 #[test]
 fn cli_overrides_beat_the_config_file() {
+    // The CLI carries only bootstrap-critical knobs now; a fine tunable
+    // (interactive_txn_idle_timeout_secs) is config-file-only and is unaffected
+    // by CLI parsing.
     let mut c = ServerConfig {
         node_id: 7,
+        nofile: Some(1024),
         interactive_txn_idle_timeout_secs: 120,
-        max_request_size_mb: 16,
         ..ServerConfig::default()
     };
     let cli = CliOverrides {
-        // CLI sets node_id + idle timeout → wins.
+        // CLI sets node_id → wins; nofile left None → file value stands.
         node_id: Some(99),
-        interactive_txn_idle_timeout_secs: Some(5),
-        // max_request_size_mb left None on CLI → file/default stands.
         ..CliOverrides::default()
     };
     c.apply_overrides(&cli);
     assert_eq!(c.node_id, 99, "CLI overrides the file value");
-    assert_eq!(c.interactive_txn_idle_timeout_secs, 5, "CLI wins");
-    assert_eq!(c.max_request_size_mb, 16, "unset CLI keeps file/default");
+    assert_eq!(c.nofile, Some(1024), "unset CLI keeps file/default");
+    assert_eq!(
+        c.interactive_txn_idle_timeout_secs, 120,
+        "config-file-only tunable is untouched by the CLI"
+    );
 }
 
 #[test]
@@ -244,4 +248,41 @@ fn resolve_storage_config_carries_endpoints() {
     assert_eq!(sc.endpoints.len(), 2);
     assert_eq!(sc.endpoints[0].id, "a");
     assert_eq!(sc.endpoints[1].id, "b");
+}
+
+#[test]
+fn trigger_dispatch_defaults_when_unset() {
+    let c = ServerConfig::default();
+    let d = c.trigger_dispatch_config();
+    assert_eq!(d.max_cascade_depth, 10);
+    assert_eq!(d.default_retry_attempts, 3);
+    assert_eq!(d.default_backoff_ms, 1000);
+    assert_eq!(
+        c.trigger_dispatch_interval(),
+        std::time::Duration::from_millis(500)
+    );
+}
+
+#[test]
+fn trigger_dispatch_knobs_parse_from_config_file_only() {
+    // Config-file keys (no CLI flag) deserialize and resolve into the dispatch
+    // config; unset keys keep ADR-026 defaults.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(
+        &path,
+        "trigger_max_cascade_depth: 4\n\
+         trigger_default_backoff_ms: 250\n\
+         trigger_dispatch_interval_ms: 200\n",
+    )
+    .unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    let d = c.trigger_dispatch_config();
+    assert_eq!(d.max_cascade_depth, 4);
+    assert_eq!(d.default_backoff_ms, 250);
+    assert_eq!(d.default_retry_attempts, 3, "unset knob keeps the default");
+    assert_eq!(
+        c.trigger_dispatch_interval(),
+        std::time::Duration::from_millis(200)
+    );
 }

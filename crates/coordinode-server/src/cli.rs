@@ -182,6 +182,11 @@ pub fn parse_args_from(args: &[String]) -> Command {
                     .filter(|s| !s.is_empty())
                     .collect()
             });
+            // CLI carries only bootstrap-critical settings (CLAUDE.md
+            // "Configuration Surface"): bind addresses, identity, data dir,
+            // peers, the TLS identity needed to secure-bind, and the startup fd
+            // limit. Every fine tunable lives in the YAML config file only — the
+            // argv length is OS-bounded (`ARG_MAX`), so tunables do not get flags.
             let overrides = CliOverrides {
                 mode: find_flag(args, "--mode"),
                 node_id,
@@ -192,22 +197,6 @@ pub fn parse_args_from(args: &[String]) -> Command {
                 data_dir: find_flag(args, "--data"),
                 peers,
                 nofile: find_flag_num(args, "--nofile"),
-                max_connections: find_flag_num(args, "--max-connections"),
-                max_request_size_mb: find_flag_num(args, "--max-request-size-mb"),
-                request_timeout_secs: find_flag_num(args, "--request-timeout-secs"),
-                http2_keepalive_secs: find_flag_num(args, "--http2-keepalive-secs"),
-                cache_size_mb: find_flag_num(args, "--cache-size-mb"),
-                write_buffer_mb: find_flag_num(args, "--write-buffer-mb"),
-                retention_window_secs: find_flag_num(args, "--retention-window-secs"),
-                registry_heartbeat_ms: find_flag_num(args, "--registry-heartbeat-ms"),
-                registry_eviction_ms: find_flag_num(args, "--registry-eviction-ms"),
-                cdc_consumer_ttl_secs: find_flag_num(args, "--cdc-consumer-ttl-secs"),
-                interactive_txn_idle_timeout_secs: find_flag_num(
-                    args,
-                    "--interactive-txn-idle-timeout-secs",
-                ),
-                interactive_txn_max_bytes: find_flag_num(args, "--interactive-txn-max-bytes"),
-                wire_compression_level: find_flag_num(args, "--wire-compression-level"),
                 tls_cert: find_flag(args, "--tls-cert"),
                 tls_key: find_flag(args, "--tls-key"),
                 tls_ca: find_flag(args, "--tls-ca"),
@@ -215,13 +204,6 @@ pub fn parse_args_from(args: &[String]) -> Command {
                     .iter()
                     .any(|a| a == "--tls-require-client-auth")
                     .then_some(true),
-                scrub_enabled: args.iter().any(|a| a == "--no-scrub").then_some(false),
-                scrub_interval_secs: find_flag_num(args, "--scrub-interval-secs"),
-                scrub_throttle_ms: find_flag_num(args, "--scrub-throttle-ms"),
-                checkpoint_enabled: args.iter().any(|a| a == "--no-checkpoint").then_some(false),
-                checkpoint_interval_secs: find_flag_num(args, "--checkpoint-interval-secs"),
-                checkpoint_dir: find_flag(args, "--checkpoint-dir"),
-                checkpoint_keep: find_flag_num(args, "--checkpoint-keep"),
             };
             Command::Serve {
                 config_path,
@@ -326,16 +308,12 @@ pub fn parse_args_from(args: &[String]) -> Command {
             eprintln!(
                 "coordinode v{}\n\n\
                  Usage:\n  \
-                 coordinode serve [--mode full] [--node-id N] [--addr ADDR] [--advertise-addr ADDR]\n          \
-                 [--rest-addr ADDR] [--ops-addr ADDR] [--data DIR] [--peers PEERS]\n          \
-                 [--nofile N] [--max-connections N] [--max-request-size-mb N] [--request-timeout-secs N]\n          \
-                 [--http2-keepalive-secs N] [--cache-size-mb N] [--write-buffer-mb N]\n          \
-                 [--retention-window-secs N] [--registry-heartbeat-ms N] [--registry-eviction-ms N]\n          \
-                 [--cdc-consumer-ttl-secs N]\n          \
-                 [--wire-compression-level N]\n          \
+                 coordinode serve [--config FILE] [--mode full] [--node-id N] [--addr ADDR] [--advertise-addr ADDR]\n          \
+                 [--rest-addr ADDR] [--ops-addr ADDR] [--data DIR] [--peers PEERS] [--nofile N]\n          \
                  [--tls-cert FILE --tls-key FILE] [--tls-ca FILE] [--tls-require-client-auth]\n          \
-                 [--no-scrub] [--scrub-interval-secs N] [--scrub-throttle-ms N]\n          \
-                 [--no-checkpoint] [--checkpoint-interval-secs N] [--checkpoint-dir DIR] [--checkpoint-keep N]\n  \
+                 (fine tunables — cache/buffer sizes, timeouts, scrub/checkpoint, retention,\n          \
+                 registry, CDC, interactive-txn, wire compression, triggers — are config-file keys;\n          \
+                 see docs/guide/configuration.md)\n  \
                  coordinode backup --output FILE [--data DIR | --config FILE] [--format json|cypher|binary|snapshot] [--namespace NS] [--since SEQNO]\n  \
                  coordinode restore --input FILE [--data DIR | --config FILE] [--format json|cypher|binary|snapshot|apoc-json|apoc-cypher|hetio-json] [--namespace NS] [--only-labels L1,L2] [--force]\n  \
                  coordinode checkpoint --output DIR [--data DIR | --config FILE]\n  \

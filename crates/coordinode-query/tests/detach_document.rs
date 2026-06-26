@@ -70,6 +70,7 @@ fn make_test_ctx<'a>(
         cascade_fire_counts: std::collections::HashMap::new(),
         cascade_fanout_limit: 100,
         cascade_chain: Vec::new(),
+        after_commit_generation: 0,
         correlated_row: None,
         foreach_scope: None,
         feedback_cache: None,

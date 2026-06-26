@@ -15,7 +15,7 @@
 //! (`rmp_serde`) and its diagnostic error messages (ADR-041 raw-bytes pattern).
 
 use coordinode_core::schema::triggers::{
-    encode_trigger_index_key, encode_trigger_key, trigger_scan_prefix,
+    encode_trigger_index_key, encode_trigger_key, encode_trigger_pending_key, trigger_scan_prefix,
 };
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::{KvPair, Transaction};
@@ -66,6 +66,18 @@ pub trait TriggerStore {
     /// (`schema:trigger:`) ends in `:`, while index keys have `_` at that byte.
     /// Callers still skip the bare-prefix key defensively.
     fn scan_definitions(&self, txn: &mut Transaction) -> StoreResult<Vec<KvPair>>;
+
+    /// Buffer a queued AFTER COMMIT event write at
+    /// `trigger_pending:<name>:<seq>` (the trigger architecture, ADR-026). Called
+    /// inside the committing transaction so the enqueue is atomic with the user
+    /// mutation that triggered it; the dispatcher consumes the queue afterwards.
+    fn put_pending(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+        seq: u64,
+        bytes: &[u8],
+    ) -> StoreResult<()>;
 }
 
 /// CE single-shard implementation of [`TriggerStore`].
@@ -126,5 +138,20 @@ impl TriggerStore for LocalTriggerStore {
             .into_iter()
             .filter(|(k, _)| k.starts_with(prefix) && k.len() != prefix.len())
             .collect())
+    }
+
+    fn put_pending(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+        seq: u64,
+        bytes: &[u8],
+    ) -> StoreResult<()> {
+        txn.put(
+            Partition::Schema,
+            &encode_trigger_pending_key(name, seq),
+            bytes,
+        )?;
+        Ok(())
     }
 }

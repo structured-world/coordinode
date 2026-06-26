@@ -14,5 +14,5 @@ pub mod db;
 pub mod repair;
 pub mod vector_worker;
 
-pub use db::{Database, DatabaseError};
+pub use db::{AfterCommitDispatchReport, Database, DatabaseError, TriggerDispatchConfig};
 pub use repair::RepairReport;

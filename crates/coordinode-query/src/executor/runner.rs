@@ -477,6 +477,12 @@ pub struct ExecutionContext<'a> {
     /// cascade — used to populate the `cascade_chain` diagnostic field in
     /// dead-letter records when L1/L2 trip.
     pub cascade_chain: Vec<String>,
+    /// Async AFTER COMMIT cascade generation of the statement being executed
+    /// (the trigger architecture L1, ADR-026). `0` for a user statement; set to
+    /// the queued event's `generation` when the dispatcher runs a trigger body,
+    /// so any AFTER COMMIT events that body enqueues are stamped `generation + 1`
+    /// and the dispatcher can bound the async cascade depth.
+    pub after_commit_generation: u32,
     /// Outer-scope row for correlated OPTIONAL MATCH execution.
     ///
     /// When set, the Filter operator merges these variables into each row
@@ -14314,8 +14320,13 @@ fn execute_alter_trigger(
 /// dead-letter write would itself be rolled back). The doc comment in
 /// the trigger architecture document spells out this constraint.
 ///
-/// AFTER COMMIT triggers in the matched list are silently skipped — the
-/// async-trigger executor consumes them via the oplog instead.
+/// AFTER COMMIT triggers in the matched list are enqueued — not run inline.
+/// Each one writes a durable [`PendingTriggerEvent`](coordinode_core::schema::triggers::PendingTriggerEvent)
+/// into the SAME transaction as the originating mutation (atomic enqueue), and
+/// the out-of-band dispatcher (`Database::dispatch_after_commit_triggers`)
+/// executes the body afterwards with the parameters captured here (ADR-026,
+/// event-journal mechanism). The enqueued `generation` bounds async cascade
+/// depth.
 pub(crate) fn fire_before_commit_triggers(
     matched: &[coordinode_core::schema::triggers::TriggerSchema],
     params: &std::collections::HashMap<String, Value>,
@@ -14323,14 +14334,58 @@ pub(crate) fn fire_before_commit_triggers(
 ) -> Result<(), ExecutionError> {
     use coordinode_core::schema::triggers::TriggerTimingSchema;
     for trigger in matched {
-        if !matches!(trigger.timing, TriggerTimingSchema::BeforeCommit) {
-            continue;
+        match trigger.timing {
+            TriggerTimingSchema::BeforeCommit => {
+                ctx.cascade_enter(&trigger.name, trigger.cascade_limit, trigger.cascade_fanout)?;
+                let result = execute_trigger_body_inline(trigger, params, ctx);
+                ctx.cascade_exit();
+                result?;
+            }
+            TriggerTimingSchema::AfterCommit => {
+                enqueue_after_commit_trigger(trigger, params, ctx)?;
+            }
         }
-        ctx.cascade_enter(&trigger.name, trigger.cascade_limit, trigger.cascade_fanout)?;
-        let result = execute_trigger_body_inline(trigger, params, ctx);
-        ctx.cascade_exit();
-        result?;
     }
+    Ok(())
+}
+
+/// Persist a queued AFTER COMMIT event for `trigger` into the current
+/// transaction. The parameters are snapshotted now (the dispatcher must not
+/// reconstruct `$before`/`$after` after the fact); the body and `ON ERROR`
+/// policy are re-read live from the definition at dispatch time.
+fn enqueue_after_commit_trigger(
+    trigger: &coordinode_core::schema::triggers::TriggerSchema,
+    params: &std::collections::HashMap<String, Value>,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    use coordinode_core::schema::triggers::PendingTriggerEvent;
+    use coordinode_modality::{LocalTriggerStore, TriggerStore as _};
+
+    // Monotonic enqueue stamp: each call to the oracle advances the HLC, so
+    // distinct events (even within one statement) get distinct, ordered keys.
+    // Without an oracle (legacy non-MVCC mode) fall back to the wall clock —
+    // the worst case is a key collision that overwrites a sibling enqueue,
+    // which the legacy mode never exercises (triggers require MVCC).
+    let seq = match ctx.mvcc_oracle {
+        Some(oracle) => oracle.next().as_raw(),
+        None => current_hlc_us(),
+    };
+    let event = PendingTriggerEvent {
+        trigger_name: trigger.name.clone(),
+        params: params.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        attempt: 0,
+        generation: ctx.after_commit_generation.saturating_add(1),
+        first_seen_us: current_hlc_us(),
+        next_attempt_us: 0,
+    };
+    let bytes = rmp_serde::to_vec(&event).map_err(|e| {
+        ExecutionError::Serialization(format!(
+            "after-commit event for `{}` encode: {e}",
+            trigger.name
+        ))
+    })?;
+    ctx.sync_txn_state();
+    LocalTriggerStore.put_pending(&mut ctx.txn, &trigger.name, seq, &bytes)?;
     Ok(())
 }
 

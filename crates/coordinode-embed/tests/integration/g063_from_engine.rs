@@ -114,6 +114,58 @@ fn from_engine_shared_engine_visibility() {
     );
 }
 
+/// In cluster mode (`from_engine`), AFTER COMMIT triggers are NOT drained
+/// inline on the write path — the leader-gated background worker owns the
+/// drain. The event sits queued until the worker's `dispatch_after_commit_triggers`
+/// call (simulated here) executes the body. This is the cluster counterpart of
+/// the embedded inline-drain behaviour.
+#[test]
+fn from_engine_after_commit_trigger_drains_via_explicit_dispatch() {
+    use coordinode_core::graph::types::Value;
+    let dir = tempdir().unwrap();
+    let oracle = Arc::new(TimestampOracle::new());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap();
+    let engine = Arc::new(engine);
+    let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
+        Arc::new(OwnedLocalProposalPipeline::new(&engine));
+
+    let mut db = Database::from_engine(dir.path(), engine, oracle, pipeline).unwrap();
+
+    db.execute_cypher(
+        "CREATE TRIGGER audit ON :User CREATE AFTER COMMIT \
+         EXECUTE CREATE (e:AuditEntry {action: $event})",
+    )
+    .unwrap();
+    db.execute_cypher("CREATE (u:User {id: 1})").unwrap();
+
+    // Cluster mode: the write committed and the event is queued, but the inline
+    // path did NOT drain it (that is the leader worker's job).
+    assert_eq!(
+        db.after_commit_pending_count(),
+        1,
+        "cluster mode must not drain AFTER COMMIT inline"
+    );
+    let audit = db.execute_cypher("MATCH (e:AuditEntry) RETURN e").unwrap();
+    assert_eq!(audit.len(), 0, "body must not have run yet in cluster mode");
+
+    // The leader worker's call drains the queue and fires the body.
+    let report = db.dispatch_after_commit_triggers();
+    assert_eq!(report.fired, 1);
+    assert_eq!(db.after_commit_pending_count(), 0);
+    let audit = db
+        .execute_cypher("MATCH (e:AuditEntry) RETURN e.action AS act")
+        .unwrap();
+    assert_eq!(audit.len(), 1, "body fires once dispatched");
+    assert_eq!(audit[0].get("act"), Some(&Value::String("CREATE".into())));
+}
+
 /// Database::from_engine() graceful shutdown flushes DrainBuffer.
 #[test]
 fn from_engine_drop_flushes_drain() {

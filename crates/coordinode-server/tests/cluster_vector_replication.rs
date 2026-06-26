@@ -293,3 +293,80 @@ async fn follower_vector_search_matches_leader() {
     }
     panic!("follower vector search never converged to leader recall: {last_state}");
 }
+
+/// AFTER COMMIT trigger in a real 2-node Raft cluster: the event the leader
+/// enqueues is replicated, the leader's dispatch executes the body through the
+/// Raft pipeline, and the body's effect (an AuditEntry node) replicates to the
+/// follower. This is the cluster realization of R192 — the queue and the body's
+/// writes both go through consensus, so the trigger fires once cluster-wide.
+#[tokio::test(flavor = "multi_thread")]
+async fn after_commit_trigger_fires_on_leader_and_replicates_to_follower() {
+    use coordinode_core::graph::types::Value;
+
+    let p1 = alloc_port();
+    let p2 = alloc_port();
+
+    let mut n1 = open_node(1, p1, true).await;
+    let mut n2 = open_node(2, p2, false).await;
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    n1._node
+        .add_node(2, format!("http://127.0.0.1:{p2}"))
+        .await
+        .unwrap();
+    n1._node.change_membership(vec![1, 2]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Install an AFTER COMMIT trigger through the leader (definition replicates).
+    n1.db
+        .execute_cypher(
+            "CREATE TRIGGER audit_user ON :User CREATE AFTER COMMIT \
+             EXECUTE CREATE (e:AuditEntry {action: $event})",
+        )
+        .unwrap();
+
+    // A user write on the leader enqueues a durable, replicated event. The
+    // server's leader-gated worker is not running in this harness, so we invoke
+    // the dispatch the worker would call — on the leader, where writes commit.
+    n1.db.execute_cypher("CREATE (u:User {id: 1})").unwrap();
+    assert_eq!(
+        n1.db.after_commit_pending_count(),
+        1,
+        "leader enqueued the after-commit event"
+    );
+
+    let report = n1.db.dispatch_after_commit_triggers();
+    assert_eq!(report.fired, 1, "leader dispatch executed the body once");
+    assert_eq!(n1.db.after_commit_pending_count(), 0);
+
+    // Leader sees the audit node immediately.
+    let leader_audit = n1
+        .db
+        .execute_cypher("MATCH (e:AuditEntry) RETURN e.action AS act")
+        .unwrap();
+    assert_eq!(leader_audit.len(), 1);
+    assert_eq!(
+        leader_audit[0].get("act"),
+        Some(&Value::String("CREATE".into()))
+    );
+
+    // The body's write replicates: the follower must observe the same audit
+    // node once the entry applies. The follower decodes the new `action` field
+    // only after its interner catches up — the server does this on every apply
+    // (`refresh_field_interner`); the bare harness has no such task, so we drive
+    // the refresh the server would. Poll with a generous bound.
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = n2.db.refresh_field_interner();
+        let follower_audit = n2
+            .db
+            .execute_cypher("MATCH (e:AuditEntry) RETURN e.action AS act")
+            .unwrap();
+        if follower_audit.len() == 1
+            && follower_audit[0].get("act") == Some(&Value::String("CREATE".into()))
+        {
+            return; // replicated trigger effect reached the follower
+        }
+    }
+    panic!("after-commit trigger effect never replicated to the follower");
+}
