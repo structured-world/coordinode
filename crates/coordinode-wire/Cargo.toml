@@ -17,7 +17,8 @@ structured-zstd = "0.0.45"
 # FFI, ADR-013); EE swaps the process-default CryptoProvider to aws-lc-rs.
 rustls = { version = "0.23", default-features = false }
 rustls-rustcrypto = "0.0.2-alpha"
-rustls-pemfile = "2"
+# PEM parsing lives in rustls-pki-types now (rustls-pemfile is unmaintained).
+rustls-pki-types = { version = "1", features = ["std"] }
 thiserror = { workspace = true }
 
 [dev-dependencies]

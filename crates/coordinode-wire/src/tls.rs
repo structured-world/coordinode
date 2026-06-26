@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use rustls::pki_types::pem::{Error as PemError, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 
@@ -25,8 +26,8 @@ pub enum TlsError {
     Pem {
         /// What was being parsed (e.g. "certificate", "private key").
         what: &'static str,
-        /// Underlying IO/parse error.
-        source: std::io::Error,
+        /// Underlying PEM decode error.
+        source: PemError,
     },
     /// No private key found in the supplied PEM.
     #[error("no private key in PEM")]
@@ -56,8 +57,7 @@ pub fn install_ce_crypto_provider() {
 /// # Errors
 /// [`TlsError::Pem`] if a block cannot be decoded.
 pub fn load_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsError> {
-    let mut reader = std::io::BufReader::new(pem);
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_slice_iter(pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| TlsError::Pem {
             what: "certificate",
@@ -70,13 +70,13 @@ pub fn load_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsError> 
 /// # Errors
 /// [`TlsError::Pem`] on a decode error, [`TlsError::NoKey`] if none is present.
 pub fn load_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, TlsError> {
-    let mut reader = std::io::BufReader::new(pem);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|source| TlsError::Pem {
+    PrivateKeyDer::from_pem_slice(pem).map_err(|source| match source {
+        PemError::NoItemsFound => TlsError::NoKey,
+        source => TlsError::Pem {
             what: "private key",
             source,
-        })?
-        .ok_or(TlsError::NoKey)
+        },
+    })
 }
 
 /// Build a [`RootCertStore`] from PEM CA certificates.
