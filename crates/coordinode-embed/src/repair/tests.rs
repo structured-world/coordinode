@@ -44,20 +44,27 @@ fn put(engine: &StorageEngine, oracle_ts: u64, part: PartitionId, key: &[u8], va
     engine.put(Partition::from(part), key, value).expect("put");
 }
 
-/// The largest live SST beneath `search_dir` (scope it to one partition's data
-/// directory) whose blocks are NOT shared with the checkpoint.
+/// XOR-corrupt several spread-out bytes in every SST table file beneath
+/// `tables_dir` whose inode the checkpoint does not share. Returns the number of
+/// files corrupted.
 ///
-/// Checkpoints hard-link SSTs (O(1), no disk doubling, the intended design), so
-/// a file hard-linked into the checkpoint shares its physical blocks with the
-/// repair base. Corrupting such a file corrupts the base too, which no
-/// single-node repair can recover (that needs a healthy replica, or an
-/// off-device PITR backup). Picking the victim by inode makes the test honest
-/// about what it breaks: genuine *post-checkpoint* on-disk data, the scenario
-/// checkpoint+oplog repair actually recovers. Picking by size alone is
-/// non-deterministic across
-/// platforms (compaction timing differs) and can land on a checkpoint-shared
-/// SST, which was the original cross-platform CI flake.
-fn largest_post_checkpoint_file(search_dir: &Path, checkpoint_root: &Path) -> std::path::PathBuf {
+/// Three properties make this robust where a single-file heuristic was not (it
+/// flaked across platforms because compaction timing and SST byte-layout
+/// differ):
+///
+/// - **All non-checkpoint tables, not the largest one.** The live
+///   post-checkpoint table is hit regardless of which file it is or whether a
+///   compaction left obsolete tables around (the scrub ignores obsolete ones, so
+///   corrupting them is harmless).
+/// - **Excludes checkpoint-shared inodes.** Checkpoints hard-link SSTs (O(1), the
+///   intended design); a file hard-linked into the checkpoint shares its physical
+///   blocks with the repair base, so corrupting it would corrupt the base too —
+///   which no single-node repair can recover (that needs a healthy replica or an
+///   off-device PITR backup). Leaving those inodes intact keeps the base clean.
+/// - **Several offsets per file.** A single mid-byte can land in the index /
+///   footer (which the block scrub does not checksum) on a small table; flipping
+///   bytes at 1/8, 1/4, 1/2, 3/4 guarantees at least one hits a data block.
+fn corrupt_post_checkpoint_tables(tables_dir: &Path, checkpoint_root: &Path) -> usize {
     use std::os::unix::fs::MetadataExt;
 
     // Inodes the checkpoint holds via its hard links.
@@ -77,27 +84,35 @@ fn largest_post_checkpoint_file(search_dir: &Path, checkpoint_root: &Path) -> st
         }
     }
 
-    // Largest live SST whose inode the checkpoint does not also hold.
-    let mut best: Option<(u64, std::path::PathBuf)> = None;
-    let mut stack = vec![search_dir.to_path_buf()];
+    let mut corrupted = 0;
+    let mut stack = vec![tables_dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        for entry in std::fs::read_dir(&d).expect("read_dir").flatten() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in rd.flatten() {
             let p = entry.path();
             let meta = entry.metadata().expect("metadata");
             if meta.is_dir() {
-                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if matches!(name, "checkpoints" | "oplog" | "text_indexes") {
-                    continue;
-                }
                 stack.push(p);
-            } else if !ckpt_inodes.contains(&meta.ino())
-                && best.as_ref().map(|(s, _)| meta.len() > *s).unwrap_or(true)
-            {
-                best = Some((meta.len(), p));
+                continue;
             }
+            if ckpt_inodes.contains(&meta.ino()) {
+                continue;
+            }
+            let mut bytes = std::fs::read(&p).expect("read table");
+            let n = bytes.len();
+            if n < 16 {
+                continue;
+            }
+            for off in [n / 8, n / 4, n / 2, n * 3 / 4] {
+                bytes[off] ^= 0xFF;
+            }
+            std::fs::write(&p, &bytes).expect("corrupt table");
+            corrupted += 1;
         }
     }
-    best.expect("a post-checkpoint live SST to corrupt").1
+    corrupted
 }
 
 #[test]
@@ -158,28 +173,38 @@ fn repair_rebuilds_corrupt_partition_from_checkpoint_plus_oplog() {
     create_checkpoint(&engine, &root).expect("checkpoint");
 
     // B: durable AFTER the checkpoint — only in the live SSTs + the retained
-    // oplog (the checkpoint's oplog copy stops before it).
+    // oplog (the checkpoint's oplog copy stops before it). A bulk of rows makes
+    // the post-checkpoint table large enough that a corrupted byte reliably lands
+    // in a data block; the sentinel key is asserted on after repair.
+    for i in 0..64u32 {
+        let key = format!("node:0:5000{i:04}");
+        put(
+            &engine,
+            1000 + u64::from(i),
+            PartitionId::Node,
+            key.as_bytes(),
+            b"bulk-B",
+        );
+    }
     put(
         &engine,
-        1000,
+        2000,
         PartitionId::Node,
         b"node:0:99999999",
         b"tail-B",
     );
     engine.persist().expect("persist B");
 
-    // Corrupt a post-checkpoint Node SST (B's data) and confirm scrub catches
-    // it. Scoped to the Node partition dir (so scrub flags Node, not some other
-    // partition's larger post-checkpoint file) and to a non-checkpoint-shared
-    // inode (so the repair base A, hard-linked in the checkpoint, stays clean).
-    let victim = largest_post_checkpoint_file(
+    // Corrupt every post-checkpoint Node table (not the checkpoint-shared base),
+    // so the scrub flags Node while the repair base A stays a clean source.
+    let corrupted = corrupt_post_checkpoint_tables(
         &dir.path().join(Partition::Node.name()).join("tables"),
         &root,
     );
-    let mut bytes = std::fs::read(&victim).expect("read sst");
-    let mid = bytes.len() / 2;
-    bytes[mid] ^= 0xFF;
-    std::fs::write(&victim, &bytes).expect("corrupt sst");
+    assert!(
+        corrupted > 0,
+        "test must corrupt a post-checkpoint Node table"
+    );
 
     // Repair: base A from the checkpoint + replay B from the oplog.
     let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
@@ -221,10 +246,10 @@ fn database_open_auto_repairs_corrupt_partition() {
     use crate::Database;
     let dir = TempDir::new().expect("tempdir");
 
-    // Phase 1: 100 rows checkpointed (the repair base), then ONE post-checkpoint
-    // row flushed to its own SST (recorded in the oplog past the checkpoint
-    // cursor), then close. The post-checkpoint SST is what we corrupt: it is not
-    // hard-linked into the checkpoint, so the base stays a clean repair source.
+    // Phase 1: 100 rows checkpointed (the repair base), then a bulk of
+    // post-checkpoint rows flushed to their own SSTs (recorded in the oplog past
+    // the checkpoint cursor), then close. Those post-checkpoint tables are what we
+    // corrupt: not hard-linked into the checkpoint, so the base stays clean.
     {
         let mut db = Database::open(dir.path()).expect("open");
         for i in 0..100u32 {
@@ -232,35 +257,37 @@ fn database_open_auto_repairs_corrupt_partition() {
                 .expect("create");
         }
         db.checkpoint(3).expect("checkpoint");
-        db.execute_cypher("CREATE (n:Big {k: 100})")
-            .expect("create post-checkpoint");
+        for k in 100..150u32 {
+            db.execute_cypher(&format!("CREATE (n:Big {{k: {k}}})"))
+                .expect("create post-checkpoint");
+        }
         db.persist()
-            .expect("flush post-checkpoint row to its own SST");
+            .expect("flush post-checkpoint rows to their own SSTs");
     }
 
-    // Phase 2: corrupt a post-checkpoint Node SST — one whose inode the
-    // checkpoint does not also hold (corrupting a checkpoint-shared SST would
-    // corrupt the repair base, which single-node repair cannot recover).
+    // Phase 2: corrupt every post-checkpoint Node table (excluding the
+    // checkpoint-shared base), so the scrub flags Node while the repair base
+    // stays a clean source for the rebuild.
     let root = checkpoint_root(dir.path());
-    let victim = largest_post_checkpoint_file(
+    let corrupted = corrupt_post_checkpoint_tables(
         &dir.path().join(Partition::Node.name()).join("tables"),
         &root,
     );
-    let mut bytes = std::fs::read(&victim).expect("read sst");
-    let mid = bytes.len() / 2;
-    bytes[mid] ^= 0xFF;
-    std::fs::write(&victim, &bytes).expect("corrupt sst");
+    assert!(
+        corrupted > 0,
+        "test must corrupt a post-checkpoint Node table"
+    );
 
     // Phase 3: reopen via Database::open — auto-on-open repair must heal the
     // partition from the checkpoint base (100 rows) plus oplog replay (the
-    // post-checkpoint row) before serving, with no explicit call.
+    // post-checkpoint rows) before serving, with no explicit call.
     let mut db = Database::open(dir.path()).expect("reopen auto-repairs");
     let rows = db
         .execute_cypher("MATCH (n:Big) RETURN n.k")
         .expect("match after auto-repair");
     assert_eq!(
         rows.len(),
-        101,
+        150,
         "every row (checkpoint base + post-checkpoint oplog) must survive auto-repair"
     );
     assert!(
