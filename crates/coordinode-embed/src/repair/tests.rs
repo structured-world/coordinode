@@ -44,12 +44,42 @@ fn put(engine: &StorageEngine, oracle_ts: u64, part: PartitionId, key: &[u8], va
     engine.put(Partition::from(part), key, value).expect("put");
 }
 
-/// The largest live SST beneath `dir`, skipping the checkpoint copies and the
-/// oplog so the corruption victim is a partition's on-disk data the live engine
-/// actually reads.
-fn largest_file(dir: &Path) -> std::path::PathBuf {
+/// The largest live SST beneath `data_dir` whose blocks are NOT shared with the
+/// checkpoint.
+///
+/// Checkpoints hard-link SSTs (O(1), no disk doubling, the intended design), so
+/// a file hard-linked into the checkpoint shares its physical blocks with the
+/// repair base. Corrupting such a file corrupts the base too, which no
+/// single-node repair can recover (that needs a healthy replica, or an
+/// off-device PITR backup). Picking the victim by inode makes the test honest
+/// about what it breaks: genuine *post-checkpoint* on-disk data, the scenario
+/// checkpoint+oplog repair actually recovers. Picking by size alone is
+/// non-deterministic across
+/// platforms (compaction timing differs) and can land on a checkpoint-shared
+/// SST, which was the original cross-platform CI flake.
+fn largest_post_checkpoint_file(data_dir: &Path, checkpoint_root: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::MetadataExt;
+
+    // Inodes the checkpoint holds via its hard links.
+    let mut ckpt_inodes = std::collections::HashSet::new();
+    let mut stack = vec![checkpoint_root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let meta = entry.metadata().expect("metadata");
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                ckpt_inodes.insert(meta.ino());
+            }
+        }
+    }
+
+    // Largest live SST whose inode the checkpoint does not also hold.
     let mut best: Option<(u64, std::path::PathBuf)> = None;
-    let mut stack = vec![dir.to_path_buf()];
+    let mut stack = vec![data_dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         for entry in std::fs::read_dir(&d).expect("read_dir").flatten() {
             let p = entry.path();
@@ -60,12 +90,14 @@ fn largest_file(dir: &Path) -> std::path::PathBuf {
                     continue;
                 }
                 stack.push(p);
-            } else if best.as_ref().map(|(s, _)| meta.len() > *s).unwrap_or(true) {
+            } else if !ckpt_inodes.contains(&meta.ino())
+                && best.as_ref().map(|(s, _)| meta.len() > *s).unwrap_or(true)
+            {
                 best = Some((meta.len(), p));
             }
         }
     }
-    best.expect("at least one file").1
+    best.expect("a post-checkpoint live SST to corrupt").1
 }
 
 #[test]
@@ -136,8 +168,10 @@ fn repair_rebuilds_corrupt_partition_from_checkpoint_plus_oplog() {
     );
     engine.persist().expect("persist B");
 
-    // Physically corrupt the consolidated Node SST and confirm scrub catches it.
-    let victim = largest_file(dir.path());
+    // Corrupt a post-checkpoint Node SST (B's data) and confirm scrub catches
+    // it. Targeting a non-checkpoint-shared inode keeps the repair base (A,
+    // hard-linked in the checkpoint) intact, so the rebuild has a clean source.
+    let victim = largest_post_checkpoint_file(dir.path(), &root);
     let mut bytes = std::fs::read(&victim).expect("read sst");
     let mid = bytes.len() / 2;
     bytes[mid] ^= 0xFF;
@@ -183,8 +217,10 @@ fn database_open_auto_repairs_corrupt_partition() {
     use crate::Database;
     let dir = TempDir::new().expect("tempdir");
 
-    // Phase 1: write 100 rows through the high-level Database, take a checkpoint
-    // (flushes to SST + records the repair base), then close.
+    // Phase 1: 100 rows checkpointed (the repair base), then ONE post-checkpoint
+    // row flushed to its own SST (recorded in the oplog past the checkpoint
+    // cursor), then close. The post-checkpoint SST is what we corrupt: it is not
+    // hard-linked into the checkpoint, so the base stays a clean repair source.
     {
         let mut db = Database::open(dir.path()).expect("open");
         for i in 0..100u32 {
@@ -192,26 +228,33 @@ fn database_open_auto_repairs_corrupt_partition() {
                 .expect("create");
         }
         db.checkpoint(3).expect("checkpoint");
+        db.execute_cypher("CREATE (n:Big {k: 100})")
+            .expect("create post-checkpoint");
+        db.persist()
+            .expect("flush post-checkpoint row to its own SST");
     }
 
-    // Phase 2: physically corrupt the live Node SST (largest_file skips the
-    // checkpoint copies + oplog).
-    let victim = largest_file(dir.path());
+    // Phase 2: corrupt a post-checkpoint Node SST — one whose inode the
+    // checkpoint does not also hold (corrupting a checkpoint-shared SST would
+    // corrupt the repair base, which single-node repair cannot recover).
+    let root = checkpoint_root(dir.path());
+    let victim = largest_post_checkpoint_file(dir.path(), &root);
     let mut bytes = std::fs::read(&victim).expect("read sst");
     let mid = bytes.len() / 2;
     bytes[mid] ^= 0xFF;
     std::fs::write(&victim, &bytes).expect("corrupt sst");
 
     // Phase 3: reopen via Database::open — auto-on-open repair must heal the
-    // partition from the checkpoint before serving, with no explicit call.
+    // partition from the checkpoint base (100 rows) plus oplog replay (the
+    // post-checkpoint row) before serving, with no explicit call.
     let mut db = Database::open(dir.path()).expect("reopen auto-repairs");
     let rows = db
         .execute_cypher("MATCH (n:Big) RETURN n.k")
         .expect("match after auto-repair");
     assert_eq!(
         rows.len(),
-        100,
-        "every row must survive auto-repair on open"
+        101,
+        "every row (checkpoint base + post-checkpoint oplog) must survive auto-repair"
     );
     assert!(
         db.verify_and_repair().expect("verify").is_clean(),

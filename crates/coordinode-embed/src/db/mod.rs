@@ -616,6 +616,16 @@ impl Database {
         Ok(path)
     }
 
+    /// Flush all in-memory writes to durable on-disk SSTs.
+    ///
+    /// Writes are already durable in the oplog journal once they return; this
+    /// forces the active memtables out to SST segments so the on-disk image
+    /// reflects the current state without waiting for a background flush. Useful
+    /// before snapshotting the data directory or asserting on-disk layout.
+    pub fn persist(&self) -> Result<(), DatabaseError> {
+        Ok(self.engine.persist()?)
+    }
+
     /// Scrub every partition and rebuild any corrupt one from the latest
     /// checkpoint plus oplog replay (single-node WAL-replay-repair, repair
     /// path 2).
