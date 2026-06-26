@@ -44,8 +44,8 @@ fn put(engine: &StorageEngine, oracle_ts: u64, part: PartitionId, key: &[u8], va
     engine.put(Partition::from(part), key, value).expect("put");
 }
 
-/// The largest live SST beneath `data_dir` whose blocks are NOT shared with the
-/// checkpoint.
+/// The largest live SST beneath `search_dir` (scope it to one partition's data
+/// directory) whose blocks are NOT shared with the checkpoint.
 ///
 /// Checkpoints hard-link SSTs (O(1), no disk doubling, the intended design), so
 /// a file hard-linked into the checkpoint shares its physical blocks with the
@@ -57,7 +57,7 @@ fn put(engine: &StorageEngine, oracle_ts: u64, part: PartitionId, key: &[u8], va
 /// non-deterministic across
 /// platforms (compaction timing differs) and can land on a checkpoint-shared
 /// SST, which was the original cross-platform CI flake.
-fn largest_post_checkpoint_file(data_dir: &Path, checkpoint_root: &Path) -> std::path::PathBuf {
+fn largest_post_checkpoint_file(search_dir: &Path, checkpoint_root: &Path) -> std::path::PathBuf {
     use std::os::unix::fs::MetadataExt;
 
     // Inodes the checkpoint holds via its hard links.
@@ -79,7 +79,7 @@ fn largest_post_checkpoint_file(data_dir: &Path, checkpoint_root: &Path) -> std:
 
     // Largest live SST whose inode the checkpoint does not also hold.
     let mut best: Option<(u64, std::path::PathBuf)> = None;
-    let mut stack = vec![data_dir.to_path_buf()];
+    let mut stack = vec![search_dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         for entry in std::fs::read_dir(&d).expect("read_dir").flatten() {
             let p = entry.path();
@@ -169,9 +169,10 @@ fn repair_rebuilds_corrupt_partition_from_checkpoint_plus_oplog() {
     engine.persist().expect("persist B");
 
     // Corrupt a post-checkpoint Node SST (B's data) and confirm scrub catches
-    // it. Targeting a non-checkpoint-shared inode keeps the repair base (A,
-    // hard-linked in the checkpoint) intact, so the rebuild has a clean source.
-    let victim = largest_post_checkpoint_file(dir.path(), &root);
+    // it. Scoped to the Node partition dir (so scrub flags Node, not some other
+    // partition's larger post-checkpoint file) and to a non-checkpoint-shared
+    // inode (so the repair base A, hard-linked in the checkpoint, stays clean).
+    let victim = largest_post_checkpoint_file(&dir.path().join(Partition::Node.name()), &root);
     let mut bytes = std::fs::read(&victim).expect("read sst");
     let mid = bytes.len() / 2;
     bytes[mid] ^= 0xFF;
@@ -238,7 +239,7 @@ fn database_open_auto_repairs_corrupt_partition() {
     // checkpoint does not also hold (corrupting a checkpoint-shared SST would
     // corrupt the repair base, which single-node repair cannot recover).
     let root = checkpoint_root(dir.path());
-    let victim = largest_post_checkpoint_file(dir.path(), &root);
+    let victim = largest_post_checkpoint_file(&dir.path().join(Partition::Node.name()), &root);
     let mut bytes = std::fs::read(&victim).expect("read sst");
     let mid = bytes.len() / 2;
     bytes[mid] ^= 0xFF;
