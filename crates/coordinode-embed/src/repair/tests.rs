@@ -172,7 +172,10 @@ fn repair_rebuilds_corrupt_partition_from_checkpoint_plus_oplog() {
     // it. Scoped to the Node partition dir (so scrub flags Node, not some other
     // partition's larger post-checkpoint file) and to a non-checkpoint-shared
     // inode (so the repair base A, hard-linked in the checkpoint, stays clean).
-    let victim = largest_post_checkpoint_file(&dir.path().join(Partition::Node.name()), &root);
+    let victim = largest_post_checkpoint_file(
+        &dir.path().join(Partition::Node.name()).join("tables"),
+        &root,
+    );
     let mut bytes = std::fs::read(&victim).expect("read sst");
     let mid = bytes.len() / 2;
     bytes[mid] ^= 0xFF;
@@ -239,7 +242,10 @@ fn database_open_auto_repairs_corrupt_partition() {
     // checkpoint does not also hold (corrupting a checkpoint-shared SST would
     // corrupt the repair base, which single-node repair cannot recover).
     let root = checkpoint_root(dir.path());
-    let victim = largest_post_checkpoint_file(&dir.path().join(Partition::Node.name()), &root);
+    let victim = largest_post_checkpoint_file(
+        &dir.path().join(Partition::Node.name()).join("tables"),
+        &root,
+    );
     let mut bytes = std::fs::read(&victim).expect("read sst");
     let mid = bytes.len() / 2;
     bytes[mid] ^= 0xFF;
