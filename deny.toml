@@ -50,6 +50,11 @@ ignore = [
     "RUSTSEC-2026-0098", # name constraints for URI names incorrectly accepted
     "RUSTSEC-2026-0099", # name constraints accepted for wildcard certs
     "RUSTSEC-2026-0049", # CRLs not considered authoritative by distribution point
+    # `paste` marked unmaintained (author archived the repo). Pulled transitively
+    # (proc-macro helper) and has no security impact — it is a compile-time macro
+    # crate with no runtime surface. No drop-in replacement is wired by our deps
+    # yet; safe to ignore until they migrate to `pastey`.
+    "RUSTSEC-2024-0436",
 ]
 
 [bans]

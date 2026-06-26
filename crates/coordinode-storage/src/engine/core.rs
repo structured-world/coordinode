@@ -633,8 +633,12 @@ impl StorageEngine {
                 .collect()
         };
 
-        // 2. Drop the live (corrupt) tables, reinstall the base.
-        self.drop_range(partition, b"".as_slice()..)?;
+        // 2. Physically clear the live (corrupt) tables, reinstall the base.
+        //    `clear_partition` deletes the table files without reading their
+        //    blocks; a `drop_range` here would instead run a compaction that
+        //    re-reads the corrupt block we are repairing and abort with a
+        //    ChecksumMismatch.
+        self.clear_partition(partition)?;
         let base_len = base.len();
         for (key, value) in &base {
             self.put(partition, key, value)?;
@@ -1070,6 +1074,24 @@ impl StorageEngine {
         // They will miss on next read (key gone from tree) and naturally evict.
         // Per-partition cache clear is not implemented — drop_range is rare
         // and cache staleness is harmless (read returns None, cache evicts).
+        Ok(())
+    }
+
+    /// Physically reset a partition to empty: install a fresh empty version and
+    /// delete every obsolete table / blob file WITHOUT reading their blocks.
+    ///
+    /// Unlike [`drop_range`](Self::drop_range) over the full range — which runs a
+    /// drop-range *compaction* that reads the tables it rewrites — `clear` never
+    /// touches block contents. That distinction is load-bearing for repair: when
+    /// a partition is being rebuilt because one of its SSTs is corrupt, a
+    /// compaction would re-read (and trip on) the very block we are discarding.
+    /// Use this before reinstalling a known-good base.
+    pub fn clear_partition(&self, part: Partition) -> StorageResult<()> {
+        let tree = self.tree(part)?;
+        tree.clear()?;
+        if let Some(cache) = &self.tiered_cache {
+            cache.clear_partition(part);
+        }
         Ok(())
     }
 

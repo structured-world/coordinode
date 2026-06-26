@@ -454,16 +454,17 @@ impl SegmentInstaller {
 
         let bytes = assembled.len();
 
-        // Physically drop the partition's existing tables before reinstalling.
+        // Physically clear the partition's existing tables before reinstalling.
         // Done only AFTER the download succeeded, so a fetch failure never leaves
         // the partition empty. This is a true replace, not an upsert over
-        // corruption: the corrupt SST block is removed (table-level drop, which
-        // does not read the block) rather than shadowed by newer versions — a
-        // shadowed corrupt block would still break compaction and re-trip the
-        // scrub. The full range `b""..` contains every table, so all are dropped.
+        // corruption: `clear_partition` deletes the table files without reading
+        // their blocks, so the corrupt SST is removed rather than shadowed by
+        // newer versions (a shadowed corrupt block would still break compaction
+        // and re-trip the scrub). A full-range `drop_range` cannot be used here:
+        // it runs a compaction that re-reads the corrupt block and aborts.
         self.engine
-            .drop_range(partition, b"".as_slice()..)
-            .map_err(|e| RepairError::Install(format!("drop partition before reinstall: {e}")))?;
+            .clear_partition(partition)
+            .map_err(|e| RepairError::Install(format!("clear partition before reinstall: {e}")))?;
 
         self.store_segment(
             coordinode_swarm::SegmentId(descriptor.segment_id),
