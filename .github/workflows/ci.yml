@@ -79,6 +79,13 @@ jobs:
       - name: Build coordinode binary (required by integration tests)
         run: cargo build -p coordinode-server --all-features
       - name: Run unit + integration tests (nextest)
+        # The self-hosted runner is shared (CI, bench, and HNSW workflows can
+        # run concurrently), so CPU oversubscription can starve Raft heartbeats
+        # and trigger spurious elections in the election-timing-sensitive cluster
+        # tests. Give those tests generous election timeouts; production timeouts
+        # (300-600ms) are unchanged.
+        env:
+          COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS: "1"
         run: cargo nextest run --all-features --workspace
       - name: Run doc tests
         run: cargo test --doc --all-features

@@ -289,9 +289,17 @@ fn dedup_gc_removes_old_entries() {
 #[test]
 fn default_config_values() {
     let config = default_raft_config();
-    assert_eq!(config.heartbeat_interval, 150);
-    assert_eq!(config.election_timeout_min, 300);
-    assert_eq!(config.election_timeout_max, 600);
+    // default_raft_config honours the COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS
+    // escape hatch (set in CI); assert the branch matching the current env.
+    if std::env::var_os("COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS").is_some() {
+        assert_eq!(config.heartbeat_interval, 150);
+        assert_eq!(config.election_timeout_min, 1500);
+        assert_eq!(config.election_timeout_max, 3000);
+    } else {
+        assert_eq!(config.heartbeat_interval, 150);
+        assert_eq!(config.election_timeout_min, 300);
+        assert_eq!(config.election_timeout_max, 600);
+    }
     assert_eq!(config.max_payload_entries, 300);
 }
 

@@ -1361,10 +1361,28 @@ impl RaftSnapshotBuilder<TypeConfig> for CoordinodeSnapshotBuilder {
 /// - Max payload entries: 300
 /// - Snapshot policy: every 10,000 entries
 pub fn default_raft_config() -> openraft::Config {
+    // Test-only escape hatch. Shared CI runners are CPU-oversubscribed (several
+    // workflows per host), which can starve heartbeats and provoke spurious
+    // elections — and openraft has a debug-only leadership-transition assertion
+    // that such churn can trip. When `COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS` is
+    // set (only by CI / the test harness) use generous election timeouts so the
+    // election-timing-sensitive cluster tests stay deterministic under load.
+    // Production never sets it and keeps the 300-600ms values; the override only
+    // lengthens timeouts, so a stray setting is harmless.
+    // Only the election window is widened, not the heartbeat: replication and
+    // catch-up timing stay identical (tests with fixed replication waits keep
+    // working), while a starved follower tolerates many missed heartbeats before
+    // calling a spurious election.
+    let (heartbeat_interval, election_timeout_min, election_timeout_max) =
+        if std::env::var_os("COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS").is_some() {
+            (150, 1500, 3000)
+        } else {
+            (150, 300, 600)
+        };
     openraft::Config {
-        heartbeat_interval: 150,
-        election_timeout_min: 300,
-        election_timeout_max: 600,
+        heartbeat_interval,
+        election_timeout_min,
+        election_timeout_max,
         max_payload_entries: 300,
         snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(10_000),
         ..Default::default()
