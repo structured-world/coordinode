@@ -15,7 +15,7 @@ use std::sync::Arc;
 use coordinode_core::graph::types::Value;
 use tokio::sync::mpsc;
 
-use crate::engine::CursorEngine;
+use crate::engine::{CursorEngine, EngineError};
 use crate::types::{ErrorCode, SessionEvent, SessionOp};
 
 /// An inbound op tagged with its session-scoped request id.
@@ -114,6 +114,15 @@ async fn dispatch(
 
 /// Open a server-side cursor for one statement and page it into a
 /// `CursorOpen` → `Rows`* → `CursorEnd` sequence (or a single `Error`).
+///
+/// `open_cursor` and `next_batch` are synchronous and may block for a long time:
+/// a write drives a Raft commit (`block_in_place` + `block_on`) and a read pages
+/// from storage. Running them directly on the async worker thread starves the
+/// runtime: under a burst of concurrent writes every worker blocks inside a
+/// commit, leaving no worker to drive the Raft apply loop the commits wait on,
+/// which deadlocks the whole runtime. So each blocking call runs on the blocking
+/// pool via [`spawn_blocking`](tokio::task::spawn_blocking); the cursor (`Send`)
+/// moves in and back out per batch, keeping the stream's per-batch backpressure.
 async fn execute(
     engine: &Arc<dyn CursorEngine>,
     request_id: u64,
@@ -122,29 +131,23 @@ async fn execute(
     txid: u64,
     out: &mpsc::Sender<OutEvent>,
 ) {
-    let mut cursor = match engine.open_cursor(query, params, txid) {
-        Ok(cursor) => cursor,
-        Err(e) => {
-            let _ = out
-                .send((
-                    request_id,
-                    SessionEvent::Error {
-                        code: ErrorCode::Internal,
-                        message: e.0,
-                    },
-                ))
-                .await;
-            return;
-        }
+    // Open on the blocking pool: a write statement commits through Raft here.
+    let engine = Arc::clone(engine);
+    let query = query.to_string();
+    let opened = tokio::task::spawn_blocking(move || {
+        let cursor = engine.open_cursor(&query, params, txid)?;
+        let columns = cursor.columns();
+        Ok::<_, EngineError>((cursor, columns))
+    })
+    .await;
+    let (mut cursor, columns) = match opened {
+        Ok(Ok(opened)) => opened,
+        Ok(Err(e)) => return send_error(out, request_id, e.0).await,
+        Err(join) => return send_error(out, request_id, join.to_string()).await,
     };
 
     if out
-        .send((
-            request_id,
-            SessionEvent::CursorOpen {
-                columns: cursor.columns(),
-            },
-        ))
+        .send((request_id, SessionEvent::CursorOpen { columns }))
         .await
         .is_err()
     {
@@ -152,9 +155,23 @@ async fn execute(
     }
 
     loop {
-        match cursor.next_batch(CURSOR_BATCH) {
+        // Page on the blocking pool; hand the cursor in and take it back so the
+        // next iteration (and `stats()` below) still own it.
+        let pulled = tokio::task::spawn_blocking(move || {
+            let batch = cursor.next_batch(CURSOR_BATCH);
+            (cursor, batch)
+        })
+        .await;
+        let batch = match pulled {
+            Ok((returned, batch)) => {
+                cursor = returned;
+                batch
+            }
+            Err(join) => return send_error(out, request_id, join.to_string()).await,
+        };
+        match batch {
             // Empty batch = exhausted.
-            Ok(batch) if batch.is_empty() => break,
+            Ok(rows) if rows.is_empty() => break,
             Ok(rows) => {
                 if out
                     .send((request_id, SessionEvent::Rows { rows }))
@@ -164,18 +181,7 @@ async fn execute(
                     return;
                 }
             }
-            Err(e) => {
-                let _ = out
-                    .send((
-                        request_id,
-                        SessionEvent::Error {
-                            code: ErrorCode::Internal,
-                            message: e.0,
-                        },
-                    ))
-                    .await;
-                return;
-            }
+            Err(e) => return send_error(out, request_id, e.0).await,
         }
     }
 
@@ -184,6 +190,19 @@ async fn execute(
             request_id,
             SessionEvent::CursorEnd {
                 stats: cursor.stats(),
+            },
+        ))
+        .await;
+}
+
+/// Emit a single `Error` event for a failed request.
+async fn send_error(out: &mpsc::Sender<OutEvent>, request_id: u64, message: String) {
+    let _ = out
+        .send((
+            request_id,
+            SessionEvent::Error {
+                code: ErrorCode::Internal,
+                message,
             },
         ))
         .await;

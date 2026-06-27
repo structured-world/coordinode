@@ -159,6 +159,43 @@ async fn session_pages_a_label_scan_through_the_keyset_cursor() {
 }
 
 #[tokio::test]
+async fn session_runs_concurrent_writes_without_deadlocking_the_runtime() {
+    // Many auto-commit writes in one stream dispatch concurrently, each driving
+    // a Raft commit. If those synchronous commits ran on the async worker
+    // threads, a burst would block every worker inside a commit with no worker
+    // left to drive the apply loop the commits wait on, deadlocking the runtime.
+    // They run on the blocking pool instead, so the burst completes: every write
+    // opens a cursor and terminates with CursorEnd.
+    let proc = CoordinodeProcess::start().await;
+
+    let writes: Vec<ClientFrame> = (1..=40)
+        .map(|i| execute(i, &format!("CREATE (n:Conc {{k: {i}}})")))
+        .collect();
+    let by_id = run_session(&proc, writes).await;
+
+    assert_eq!(by_id.len(), 40, "every concurrent write is answered");
+    for rid in 1..=40u64 {
+        match by_id.get(&rid).map(Vec::as_slice) {
+            Some([Event::CursorOpen(_), rest @ ..]) => assert!(
+                matches!(rest.last(), Some(Event::CursorEnd(_))),
+                "write {rid} did not terminate with CursorEnd: {rest:?}"
+            ),
+            other => panic!("write {rid} did not complete cleanly: {other:?}"),
+        }
+    }
+
+    // The data is durably committed: a follow-up scan sees all 40 nodes.
+    let scan = run_session(&proc, vec![execute(1, "MATCH (n:Conc) RETURN n.k AS k")]).await;
+    let events = scan.get(&1).map(Vec::as_slice).unwrap_or_default();
+    match events {
+        [Event::CursorOpen(_), rest @ ..] => {
+            assert_eq!(row_count(rest), 40, "all concurrent writes committed");
+        }
+        other => panic!("scan got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn session_interleaves_a_transaction_with_independent_queries() {
     let proc = CoordinodeProcess::start().await;
     let by_id = run_session(
