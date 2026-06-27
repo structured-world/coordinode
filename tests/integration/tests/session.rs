@@ -25,11 +25,24 @@ use coordinode_integration::proto::session::{
     client_frame, Begin, ClientFrame, Commit, Execute, Rollback,
 };
 
+/// Begin an UNORDERED transaction (statements applied in arrival order; nonces
+/// ignored). Used by the simple transaction tests that send nonce-0 statements.
 fn begin(request_id: u64) -> ClientFrame {
     ClientFrame {
         request_id,
         op: Some(client_frame::Op::Begin(Begin {
-            ordering: 0,
+            ordering: 2, // ORDERING_UNORDERED
+            drain_timeout_ms: 0,
+        })),
+    }
+}
+
+/// Begin an ORDERED transaction (statements reassembled by nonce).
+fn begin_ordered(request_id: u64) -> ClientFrame {
+    ClientFrame {
+        request_id,
+        op: Some(client_frame::Op::Begin(Begin {
+            ordering: 1, // ORDERING_ORDERED
             drain_timeout_ms: 0,
         })),
     }
@@ -67,6 +80,27 @@ fn execute_tx(request_id: u64, query: &str, txid: u64) -> ClientFrame {
             txid,
             nonce: 0,
         })),
+    }
+}
+
+/// An Execute frame bound to a transaction with an explicit ORDERED `nonce`.
+fn execute_tx_nonce(request_id: u64, query: &str, txid: u64, nonce: u64) -> ClientFrame {
+    ClientFrame {
+        request_id,
+        op: Some(client_frame::Op::Execute(Execute {
+            query: query.to_string(),
+            parameters: Default::default(),
+            txid,
+            nonce,
+        })),
+    }
+}
+
+/// A Commit frame carrying the expected final nonce of an ORDERED chain.
+fn commit_tx_nonce(request_id: u64, txid: u64, last_nonce: u64) -> ClientFrame {
+    ClientFrame {
+        request_id,
+        op: Some(client_frame::Op::Commit(Commit { txid, last_nonce })),
     }
 }
 
@@ -371,6 +405,68 @@ async fn in_session_transaction_aborts_on_a_failed_statement() {
             assert_eq!(row_count(rest), 0, "aborted transaction left no node");
         }
         [] => {}
+        other => panic!("verify scan got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn ordered_transaction_reassembles_out_of_order_statements() {
+    // An ORDERED transaction whose statements arrive out of nonce order must
+    // still apply them in nonce order, commit cleanly, and persist every write.
+    use tokio_stream::wrappers::ReceiverStream;
+    let proc = CoordinodeProcess::start().await;
+    let channel = tonic::transport::Endpoint::from_shared(proc.endpoint())
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    let mut client = SessionServiceClient::new(channel);
+    let (tx, rx) = tokio::sync::mpsc::channel::<ClientFrame>(8);
+    let mut inbound = client
+        .session(ReceiverStream::new(rx))
+        .await
+        .expect("open session")
+        .into_inner();
+
+    tx.send(begin_ordered(1)).await.expect("begin");
+    let txid = loop {
+        let f = inbound.message().await.expect("frame").expect("not end");
+        if let (1, Some(Event::Begun(b))) = (f.request_id, f.event) {
+            break b.txid;
+        }
+    };
+
+    // Send nonce 2 before nonce 1.
+    tx.send(execute_tx_nonce(2, "CREATE (n:Ord {k: 2})", txid, 2))
+        .await
+        .expect("n2");
+    tx.send(execute_tx_nonce(3, "CREATE (n:Ord {k: 1})", txid, 1))
+        .await
+        .expect("n1");
+    tx.send(commit_tx_nonce(4, txid, 2)).await.expect("commit");
+
+    // Commit must succeed (no abort, no drain timeout): reaching past this loop
+    // means a Committed for request 4 arrived.
+    loop {
+        let f = inbound.message().await.expect("frame").expect("not end");
+        if f.request_id == 4 {
+            match f.event {
+                Some(Event::Committed(_)) => break,
+                Some(Event::Error(e)) => panic!("ordered commit errored: {}", e.message),
+                _ => {}
+            }
+        }
+    }
+    drop(tx);
+    while inbound.message().await.expect("frame").is_some() {}
+
+    // Both writes persisted.
+    let by_id = run_session(&proc, vec![execute(1, "MATCH (n:Ord) RETURN n.k AS k")]).await;
+    let events = by_id.get(&1).map(Vec::as_slice).unwrap_or_default();
+    match events {
+        [Event::CursorOpen(_), rest @ ..] => {
+            assert_eq!(row_count(rest), 2, "both ordered writes committed");
+        }
         other => panic!("verify scan got {other:?}"),
     }
 }

@@ -10,15 +10,16 @@
 //! A query is run by opening a server-side cursor through the injected
 //! [`CursorEngine`] and paging it into `CursorOpen` / `Rows`* / `CursorEnd`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 
 use coordinode_core::graph::types::Value;
 use tokio::sync::mpsc;
 
 use crate::engine::{CursorEngine, EngineError};
 use crate::registry::SessionRegistry;
-use crate::types::{ErrorCode, SessionEvent, SessionOp};
+use crate::types::{ErrorCode, Ordering, SessionEvent, SessionOp};
 
 /// An inbound op tagged with its session-scoped request id.
 pub type InOp = (u64, SessionOp);
@@ -32,6 +33,10 @@ const CURSOR_BATCH: usize = 1024;
 /// Buffered statements per transaction mailbox before a pipelining client is
 /// stalled by backpressure.
 const TXN_MAILBOX: usize = 64;
+
+/// Default wait for a missing nonce during an ORDERED commit drain when the
+/// client passed `drain_timeout_ms == 0`.
+const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Opens sessions backed by one engine and one shared registry.
 pub struct SessionManager {
@@ -86,70 +91,24 @@ impl Session {
         // lock needed). A transaction's statements and its commit/rollback route
         // to its mailbox and apply one at a time, because the transaction state
         // is checked out per statement; non-transactional requests and other
-        // transactions run concurrently alongside.
+        // transactions run concurrently alongside. An entry stays in the map
+        // until its task signals completion on `done`, NOT when its commit is
+        // sent: an ORDERED commit may still need to receive late-arriving
+        // gap-filling statements while it drains, so the transaction must remain
+        // routable until the task actually resolves.
         let mut txns: HashMap<u64, mpsc::Sender<TxnMsg>> = HashMap::new();
+        let (done_tx, mut done_rx) = mpsc::channel::<u64>(TXN_MAILBOX);
 
-        while let Some((request_id, op)) = ops.recv().await {
-            match op {
-                // A statement bound to an open transaction: route to its mailbox.
-                SessionOp::Execute {
-                    query,
-                    params,
-                    txid,
-                    ..
-                } if txid != 0 && txns.contains_key(&txid) => {
-                    let msg = TxnMsg::Statement {
-                        request_id,
-                        query,
-                        params,
-                    };
-                    // The receiver only drops after commit/rollback; a send error
-                    // means the transaction just resolved, so fall back to the
-                    // engine's unknown-transaction error.
-                    if let Some(tx) = txns.get(&txid) {
-                        if tx.send(msg).await.is_err() {
-                            self.spawn_autonomous(
-                                request_id,
-                                String::new(),
-                                HashMap::new(),
-                                txid,
-                                &out,
-                            );
-                        }
-                    }
+        loop {
+            tokio::select! {
+                maybe_op = ops.recv() => {
+                    let Some((request_id, op)) = maybe_op else { break };
+                    self.handle_op(request_id, op, &mut txns, &done_tx, &out).await;
                 }
-                // Autonomous statement, or one naming an unknown transaction
-                // (the engine produces the "unknown transaction" error): run
-                // concurrently.
-                SessionOp::Execute {
-                    query,
-                    params,
-                    txid,
-                    ..
-                } => self.spawn_autonomous(request_id, query, params, txid, &out),
-
-                SessionOp::Begin { ordering, .. } => {
-                    self.begin(request_id, ordering, &mut txns, &out).await;
+                Some(txid) = done_rx.recv() => {
+                    // A transaction task has resolved; stop routing to it.
+                    txns.remove(&txid);
                 }
-
-                SessionOp::Commit { txid, .. } => match txns.remove(&txid) {
-                    Some(tx) => {
-                        let _ = tx.send(TxnMsg::Commit { request_id }).await;
-                    }
-                    None => self.spawn_commit_unknown(request_id, txid, &out),
-                },
-
-                // Rolling back an unknown / already-resolved transaction is a
-                // silent no-op (matches the autonomous rollback contract).
-                SessionOp::Rollback { txid } => {
-                    if let Some(tx) = txns.remove(&txid) {
-                        let _ = tx.send(TxnMsg::Rollback).await;
-                    }
-                }
-
-                // Cancellation lifecycle lands with the cursor registry; accepted
-                // silently for now.
-                SessionOp::Cancel { .. } => {}
             }
         }
 
@@ -157,6 +116,87 @@ impl Session {
         // transaction task to abort (rollback), then the session is removed.
         drop(txns);
         self.registry.close_session(self.session_id);
+    }
+
+    /// Route one inbound op: a transactional statement to its mailbox, an
+    /// autonomous statement to its own task, or a transaction-control op to the
+    /// owning transaction (kept routable until its task signals `done`).
+    async fn handle_op(
+        &self,
+        request_id: u64,
+        op: SessionOp,
+        txns: &mut HashMap<u64, mpsc::Sender<TxnMsg>>,
+        done_tx: &mpsc::Sender<u64>,
+        out: &mpsc::Sender<OutEvent>,
+    ) {
+        match op {
+            // A statement bound to an open transaction: route to its mailbox.
+            SessionOp::Execute {
+                query,
+                params,
+                txid,
+                nonce,
+            } if txid != 0 && txns.contains_key(&txid) => {
+                let msg = TxnMsg::Statement {
+                    request_id,
+                    nonce,
+                    query,
+                    params,
+                };
+                // A send error means the task just resolved (rx dropped) before
+                // its `done` was processed; fall back to the engine's
+                // unknown-transaction error.
+                if let Some(tx) = txns.get(&txid) {
+                    if tx.send(msg).await.is_err() {
+                        self.spawn_autonomous(request_id, String::new(), HashMap::new(), txid, out);
+                    }
+                }
+            }
+            // Autonomous statement, or one naming an unknown transaction (the
+            // engine produces the "unknown transaction" error): run concurrently.
+            SessionOp::Execute {
+                query,
+                params,
+                txid,
+                ..
+            } => self.spawn_autonomous(request_id, query, params, txid, out),
+
+            SessionOp::Begin {
+                ordering,
+                drain_timeout_ms,
+            } => {
+                self.begin(request_id, ordering, drain_timeout_ms, txns, done_tx, out)
+                    .await;
+            }
+
+            SessionOp::Commit {
+                txid, last_nonce, ..
+            } => match txns.get(&txid) {
+                // Keep the entry: the task removes itself via `done` once it has
+                // drained and resolved.
+                Some(tx) => {
+                    let _ = tx
+                        .send(TxnMsg::Commit {
+                            request_id,
+                            last_nonce,
+                        })
+                        .await;
+                }
+                None => self.spawn_commit_unknown(request_id, txid, out),
+            },
+
+            // Rolling back an unknown / already-resolved transaction is a silent
+            // no-op (matches the autonomous rollback contract).
+            SessionOp::Rollback { txid } => {
+                if let Some(tx) = txns.get(&txid) {
+                    let _ = tx.send(TxnMsg::Rollback).await;
+                }
+            }
+
+            // Cancellation lifecycle lands with the cursor registry; accepted
+            // silently for now.
+            SessionOp::Cancel { .. } => {}
+        }
     }
 
     /// Run an autonomous statement (or one against an unknown transaction)
@@ -182,11 +222,14 @@ impl Session {
 
     /// Open a transaction inline (so a pipelined `Execute{txid}` that follows is
     /// guaranteed to find the mailbox), register it, and spawn its serial task.
+    #[allow(clippy::too_many_arguments)]
     async fn begin(
         &self,
         request_id: u64,
-        ordering: crate::types::Ordering,
+        ordering: Ordering,
+        drain_timeout_ms: u32,
         txns: &mut HashMap<u64, mpsc::Sender<TxnMsg>>,
+        done_tx: &mpsc::Sender<u64>,
         out: &mpsc::Sender<OutEvent>,
     ) {
         self.registry.request_started(self.session_id);
@@ -199,13 +242,23 @@ impl Session {
                 let (tx, rx) = mpsc::channel::<TxnMsg>(TXN_MAILBOX);
                 txns.insert(txid, tx);
                 self.registry.begin_txn(self.session_id, txid, ordering);
+                // A zero drain timeout means "use the default" rather than
+                // "never wait": an ORDERED commit must tolerate some reorder lag.
+                let drain = if drain_timeout_ms == 0 {
+                    DEFAULT_DRAIN_TIMEOUT
+                } else {
+                    Duration::from_millis(drain_timeout_ms as u64)
+                };
                 tokio::spawn(run_transaction(
                     Arc::clone(&self.engine),
                     Arc::clone(&self.registry),
                     self.session_id,
                     txid,
+                    ordering,
+                    drain,
                     rx,
                     out.clone(),
+                    done_tx.clone(),
                 ));
                 let _ = out.send((request_id, SessionEvent::Begun { txid })).await;
             }
@@ -235,36 +288,63 @@ enum TxnMsg {
     /// A statement to run inside the transaction.
     Statement {
         request_id: u64,
+        /// Client-assigned sequence number; orders ORDERED transactions, ignored
+        /// for UNORDERED.
+        nonce: u64,
         query: String,
         params: HashMap<String, Value>,
     },
-    /// Commit the transaction and finish.
-    Commit { request_id: u64 },
+    /// Commit the transaction and finish. `last_nonce` is the expected final
+    /// nonce of an ORDERED chain, so the commit can drain a reorder gap.
+    Commit { request_id: u64, last_nonce: u64 },
     /// Roll the transaction back and finish (silent, carries no request id).
     Rollback,
 }
 
-/// Serial owner of one interactive transaction: applies its statements in
-/// arrival order, then commits or rolls back. Dropping the inbound channel
-/// (stream close) aborts the transaction. Each handled message is bracketed as
-/// in-flight, and the transaction is deregistered when the task ends.
-///
-/// Statement reassembly by `nonce` for ORDERED transactions (the reorder buffer
-/// and commit-drain timeout) layers on top of this serial loop; today both
-/// ordering modes apply in arrival order.
+/// Serial owner of one interactive transaction: applies its statements, then
+/// commits or rolls back. Dropping the inbound channel (stream close) aborts the
+/// transaction; the transaction is deregistered when the task ends. UNORDERED
+/// applies statements in arrival order; ORDERED reassembles them by `nonce` in a
+/// reorder buffer and applies them strictly in nonce order, with a commit-drain
+/// timeout bounding the wait for a missing nonce.
+#[allow(clippy::too_many_arguments)]
 async fn run_transaction(
     engine: Arc<dyn CursorEngine>,
     registry: Arc<SessionRegistry>,
     session_id: u64,
     txid: u64,
-    mut rx: mpsc::Receiver<TxnMsg>,
+    ordering: Ordering,
+    drain: Duration,
+    rx: mpsc::Receiver<TxnMsg>,
     out: mpsc::Sender<OutEvent>,
+    done: mpsc::Sender<u64>,
 ) {
-    let mut resolved = false;
-    // Set once a statement fails: the engine drops the transaction state on a
-    // failed statement, so the whole transaction is dead (UNORDERED first-failure
-    // rollback). The rest of its statements and its commit are then rejected.
+    match ordering {
+        Ordering::Unordered => {
+            run_unordered(&engine, &registry, session_id, txid, rx, &out).await;
+        }
+        Ordering::Ordered => {
+            run_ordered(&engine, &registry, session_id, txid, drain, rx, &out).await;
+        }
+    }
+    registry.end_txn(session_id, txid);
+    // Tell the run loop to stop routing to this transaction.
+    let _ = done.send(txid).await;
+}
+
+/// UNORDERED loop: apply each statement as it arrives; the first failure aborts
+/// the transaction and the rest (plus the commit) are rejected. Returns whether
+/// the transaction aborted. Stream close before commit/rollback rolls back.
+async fn run_unordered(
+    engine: &Arc<dyn CursorEngine>,
+    registry: &Arc<SessionRegistry>,
+    session_id: u64,
+    txid: u64,
+    mut rx: mpsc::Receiver<TxnMsg>,
+    out: &mpsc::Sender<OutEvent>,
+) -> bool {
     let mut aborted = false;
+    let mut resolved = false;
     while let Some(msg) = rx.recv().await {
         registry.request_started(session_id);
         match msg {
@@ -272,36 +352,31 @@ async fn run_transaction(
                 request_id,
                 query,
                 params,
+                ..
             } => {
                 if aborted {
-                    send_error(&out, request_id, ABORTED_TXN.to_string()).await;
+                    send_error(out, request_id, ABORTED_TXN.to_string()).await;
                 } else {
-                    // A statement resets the transaction's auto-abort countdown.
                     registry.touch_txn(session_id, txid);
-                    if !execute(&engine, request_id, &query, params, txid, &out).await {
-                        // The engine dropped the transaction's state on the
-                        // failed statement; deregister it so introspection stops
-                        // listing a transaction that can no longer commit.
+                    if !execute(engine, request_id, &query, params, txid, out).await {
                         aborted = true;
                         registry.end_txn(session_id, txid);
                     }
                 }
             }
-            TxnMsg::Commit { request_id } => {
+            TxnMsg::Commit { request_id, .. } => {
                 if aborted {
-                    send_error(&out, request_id, ABORTED_TXN.to_string()).await;
+                    send_error(out, request_id, ABORTED_TXN.to_string()).await;
                 } else {
-                    commit(&engine, request_id, txid, &out).await;
+                    commit(engine, request_id, txid, out).await;
                 }
                 registry.request_finished(session_id);
                 resolved = true;
                 break;
             }
             TxnMsg::Rollback => {
-                // An aborted transaction is already discarded by the engine;
-                // rollback is then a silent no-op.
                 if !aborted {
-                    rollback(&engine, txid).await;
+                    rollback(engine, txid).await;
                 }
                 registry.request_finished(session_id);
                 resolved = true;
@@ -311,12 +386,191 @@ async fn run_transaction(
         registry.request_finished(session_id);
     }
     if !resolved && !aborted {
-        // Inbound channel closed before commit/rollback on a live transaction
-        // (stream closed): abort it.
-        let engine = Arc::clone(&engine);
-        let _ = tokio::task::spawn_blocking(move || engine.rollback_transaction(txid)).await;
+        rollback(engine, txid).await;
     }
-    registry.end_txn(session_id, txid);
+    aborted
+}
+
+/// ORDERED loop: buffer statements by nonce and apply the contiguous run from
+/// `next_nonce`. Commit drains what is buffered, then waits (bounded by `drain`)
+/// for any missing nonce up to `last_nonce`; a gap that does not fill in time
+/// aborts the transaction. Returns whether it aborted.
+async fn run_ordered(
+    engine: &Arc<dyn CursorEngine>,
+    registry: &Arc<SessionRegistry>,
+    session_id: u64,
+    txid: u64,
+    drain: Duration,
+    mut rx: mpsc::Receiver<TxnMsg>,
+    out: &mpsc::Sender<OutEvent>,
+) -> bool {
+    let mut next_nonce = 1u64;
+    let mut buffer: BTreeMap<u64, (u64, String, HashMap<String, Value>)> = BTreeMap::new();
+    let mut aborted = false;
+    let mut resolved = false;
+
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            TxnMsg::Statement {
+                request_id,
+                nonce,
+                query,
+                params,
+            } => {
+                registry.request_started(session_id);
+                if aborted {
+                    send_error(out, request_id, ABORTED_TXN.to_string()).await;
+                    registry.request_finished(session_id);
+                    continue;
+                }
+                registry.touch_txn(session_id, txid);
+                buffer.insert(nonce, (request_id, query, params));
+                if apply_contiguous(
+                    engine,
+                    registry,
+                    session_id,
+                    txid,
+                    &mut next_nonce,
+                    &mut buffer,
+                    out,
+                )
+                .await
+                {
+                    aborted = true;
+                }
+            }
+            TxnMsg::Commit {
+                request_id,
+                last_nonce,
+            } => {
+                registry.request_started(session_id);
+                if !aborted {
+                    aborted = drain_to_commit(
+                        engine,
+                        registry,
+                        session_id,
+                        txid,
+                        last_nonce,
+                        drain,
+                        &mut next_nonce,
+                        &mut buffer,
+                        &mut rx,
+                        out,
+                    )
+                    .await;
+                }
+                if aborted {
+                    // Discard whatever the transaction buffered or applied.
+                    rollback(engine, txid).await;
+                    send_error(out, request_id, ABORTED_TXN.to_string()).await;
+                } else {
+                    commit(engine, request_id, txid, out).await;
+                }
+                finish_buffered(registry, session_id, &mut buffer);
+                registry.request_finished(session_id);
+                resolved = true;
+                break;
+            }
+            TxnMsg::Rollback => {
+                if !aborted {
+                    rollback(engine, txid).await;
+                }
+                finish_buffered(registry, session_id, &mut buffer);
+                resolved = true;
+                break;
+            }
+        }
+    }
+    if !resolved && !aborted {
+        rollback(engine, txid).await;
+        finish_buffered(registry, session_id, &mut buffer);
+    }
+    aborted
+}
+
+/// Apply the contiguous run of buffered statements starting at `*next_nonce`,
+/// advancing it. Each applied statement is finished in the registry. Returns
+/// `true` if a statement failed (the transaction is then dead).
+async fn apply_contiguous(
+    engine: &Arc<dyn CursorEngine>,
+    registry: &Arc<SessionRegistry>,
+    session_id: u64,
+    txid: u64,
+    next_nonce: &mut u64,
+    buffer: &mut BTreeMap<u64, (u64, String, HashMap<String, Value>)>,
+    out: &mpsc::Sender<OutEvent>,
+) -> bool {
+    while let Some((request_id, query, params)) = buffer.remove(next_nonce) {
+        registry.touch_txn(session_id, txid);
+        let ok = execute(engine, request_id, &query, params, txid, out).await;
+        registry.request_finished(session_id);
+        *next_nonce += 1;
+        if !ok {
+            registry.end_txn(session_id, txid);
+            return true;
+        }
+    }
+    false
+}
+
+/// Drain the ORDERED chain up to `last_nonce`: apply what is buffered, then wait
+/// (bounded by `drain`) for each missing nonce to arrive. Returns `true` if the
+/// transaction aborted (a statement failed, the wait timed out, the stream
+/// closed, or the client rolled back mid-drain).
+#[allow(clippy::too_many_arguments)]
+async fn drain_to_commit(
+    engine: &Arc<dyn CursorEngine>,
+    registry: &Arc<SessionRegistry>,
+    session_id: u64,
+    txid: u64,
+    last_nonce: u64,
+    drain: Duration,
+    next_nonce: &mut u64,
+    buffer: &mut BTreeMap<u64, (u64, String, HashMap<String, Value>)>,
+    rx: &mut mpsc::Receiver<TxnMsg>,
+    out: &mpsc::Sender<OutEvent>,
+) -> bool {
+    if apply_contiguous(engine, registry, session_id, txid, next_nonce, buffer, out).await {
+        return true;
+    }
+    while *next_nonce <= last_nonce {
+        match tokio::time::timeout(drain, rx.recv()).await {
+            Ok(Some(TxnMsg::Statement {
+                request_id,
+                nonce,
+                query,
+                params,
+            })) => {
+                registry.request_started(session_id);
+                buffer.insert(nonce, (request_id, query, params));
+                if apply_contiguous(engine, registry, session_id, txid, next_nonce, buffer, out)
+                    .await
+                {
+                    return true;
+                }
+            }
+            // A second commit during drain is ignored; rollback, stream close, or
+            // a drain timeout all abort the partially-applied transaction.
+            Ok(Some(TxnMsg::Commit { .. })) => {}
+            Ok(Some(TxnMsg::Rollback)) | Ok(None) | Err(_) => return true,
+        }
+    }
+    false
+}
+
+/// Finish (in the registry) every still-buffered statement that was received but
+/// never applied, so the in-flight count does not leak when a transaction ends
+/// with statements still parked in its reorder buffer.
+fn finish_buffered(
+    registry: &Arc<SessionRegistry>,
+    session_id: u64,
+    buffer: &mut BTreeMap<u64, (u64, String, HashMap<String, Value>)>,
+) {
+    let parked = buffer.len();
+    buffer.clear();
+    for _ in 0..parked {
+        registry.request_finished(session_id);
+    }
 }
 
 /// Error returned for any statement or commit issued against a transaction that

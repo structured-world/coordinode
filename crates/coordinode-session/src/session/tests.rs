@@ -298,6 +298,139 @@ async fn a_failed_statement_aborts_the_transaction_and_rejects_the_rest() {
     }
 }
 
+/// Drive a session, collecting events in arrival order (cross-request order
+/// preserved, unlike `run_session`).
+async fn run_session_flat(
+    engine: Arc<dyn CursorEngine>,
+    ops: Vec<SessionOp>,
+) -> Vec<(u64, SessionEvent)> {
+    let registry = Arc::new(SessionRegistry::new(std::time::Duration::from_secs(30)));
+    let manager = SessionManager::new(engine, registry);
+    let session = manager.open("test".into());
+    let (op_tx, op_rx) = mpsc::channel(64);
+    let (ev_tx, mut ev_rx) = mpsc::channel(64);
+    let handle = tokio::spawn(session.run(op_rx, ev_tx));
+    for (i, op) in ops.into_iter().enumerate() {
+        op_tx.send((i as u64 + 1, op)).await.unwrap();
+    }
+    drop(op_tx);
+    let mut events = Vec::new();
+    while let Some(ev) = ev_rx.recv().await {
+        events.push(ev);
+    }
+    handle.await.unwrap();
+    events
+}
+
+#[tokio::test]
+async fn ordered_applies_statements_in_nonce_order_not_arrival_order() {
+    // ORDERED reorders by nonce: req2 carries nonce 2 and req3 carries nonce 1,
+    // sent in that (reversed) order. They must be applied nonce-1-then-nonce-2,
+    // so req3's cursor opens before req2's in the event stream.
+    let engine = engine(&["n"], vec![vec![Value::Int(1)]]);
+    let stmt = |nonce| SessionOp::Execute {
+        query: "x".to_string(),
+        params: HashMap::new(),
+        txid: 1,
+        nonce,
+    };
+    let events = run_session_flat(
+        engine,
+        vec![
+            SessionOp::Begin {
+                ordering: Ordering::Ordered,
+                drain_timeout_ms: 0,
+            },
+            stmt(2), // request_id 2, nonce 2 (arrives first)
+            stmt(1), // request_id 3, nonce 1 (arrives second, applies first)
+            SessionOp::Commit {
+                txid: 1,
+                last_nonce: 2,
+            },
+        ],
+    )
+    .await;
+    // Index of the first CursorOpen for each request id.
+    let first_open = |rid: u64| {
+        events
+            .iter()
+            .position(|(id, e)| *id == rid && matches!(e, SessionEvent::CursorOpen { .. }))
+    };
+    let open2 = first_open(2).expect("req2 opened");
+    let open3 = first_open(3).expect("req3 opened");
+    assert!(
+        open3 < open2,
+        "nonce 1 (req3) must be applied before nonce 2 (req2): {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn ordered_commit_drain_times_out_on_a_missing_nonce() {
+    // A gap that never fills: nonce 2 arrives, nonce 1 does not, and the commit
+    // expects last_nonce 2. The commit must error once the (short) drain timeout
+    // elapses rather than hang.
+    let engine = engine(&["n"], vec![vec![Value::Int(1)]]);
+    let registry = Arc::new(SessionRegistry::new(std::time::Duration::from_secs(30)));
+    let manager = SessionManager::new(engine, registry);
+    let session = manager.open("test".into());
+    let (op_tx, op_rx) = mpsc::channel(64);
+    let (ev_tx, mut ev_rx) = mpsc::channel(64);
+    let handle = tokio::spawn(session.run(op_rx, ev_tx));
+
+    op_tx
+        .send((
+            1,
+            SessionOp::Begin {
+                ordering: Ordering::Ordered,
+                drain_timeout_ms: 50,
+            },
+        ))
+        .await
+        .unwrap();
+    let txid = loop {
+        if let (1, SessionEvent::Begun { txid }) = ev_rx.recv().await.unwrap() {
+            break txid;
+        }
+    };
+    // Send only nonce 2 (nonce 1 is the missing gap), then commit expecting 2.
+    op_tx
+        .send((
+            2,
+            SessionOp::Execute {
+                query: "x".to_string(),
+                params: HashMap::new(),
+                txid,
+                nonce: 2,
+            },
+        ))
+        .await
+        .unwrap();
+    op_tx
+        .send((
+            3,
+            SessionOp::Commit {
+                txid,
+                last_nonce: 2,
+            },
+        ))
+        .await
+        .unwrap();
+    // Keep op_tx alive so the transaction stays routable while it drains; the
+    // commit errors after the drain timeout fires on the unfilled gap.
+    let ev = loop {
+        let (rid, e) = ev_rx.recv().await.unwrap();
+        if rid == 3 {
+            break e;
+        }
+    };
+    assert!(
+        matches!(ev, SessionEvent::Error { .. }),
+        "commit must error on drain timeout, got {ev:?}"
+    );
+    drop(op_tx);
+    handle.await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_dispatches_a_burst_concurrently_with_correlated_cursors() {
     let registry = Arc::new(SessionRegistry::new(std::time::Duration::from_secs(30)));
