@@ -2,11 +2,13 @@
 //!
 //! [`SessionManager`] opens [`Session`]s; a session is driven by [`Session::run`],
 //! which reads neutral ops from one channel and funnels neutral events to
-//! another. Concurrent dispatch (each request on its own task) and the single
-//! outbound writer live here, not in the transport binding. A query is run by
-//! opening a server-side cursor through the injected [`CursorEngine`] and paging
-//! it into `CursorOpen` → `Rows`* → `CursorEnd`; three concurrent queries are
-//! three concurrent dispatch tasks, hence three independent open cursors.
+//! another, with the single outbound writer living here, not in the transport
+//! binding. A non-transactional request runs on its own task, so three
+//! concurrent queries are three independent cursors. A request bound to an
+//! interactive transaction instead routes to that transaction's serial mailbox,
+//! so its statements apply one at a time while other traffic runs concurrently.
+//! A query is run by opening a server-side cursor through the injected
+//! [`CursorEngine`] and paging it into `CursorOpen` / `Rows`* / `CursorEnd`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -60,9 +62,9 @@ impl SessionManager {
 /// A live multiplexed session.
 ///
 /// Transport-agnostic: it consumes neutral [`SessionOp`]s and produces neutral
-/// [`SessionEvent`]s. The interactive-transaction registry and cursor registry
-/// are added with the state that fills them (transaction work and cancellation);
-/// the session holds the transaction-handle allocator and the query engine.
+/// [`SessionEvent`]s. It holds the query engine and the shared session registry;
+/// transaction handles are allocated by the engine, and each open transaction
+/// runs on its own serial mailbox spawned by [`Session::run`].
 pub struct Session {
     session_id: u64,
     engine: Arc<dyn CursorEngine>,
@@ -141,7 +143,7 @@ impl Session {
                 // silent no-op (matches the autonomous rollback contract).
                 SessionOp::Rollback { txid } => {
                     if let Some(tx) = txns.remove(&txid) {
-                        let _ = tx.send(TxnMsg::Rollback { request_id }).await;
+                        let _ = tx.send(TxnMsg::Rollback).await;
                     }
                 }
 
@@ -173,7 +175,7 @@ impl Session {
         let out = out.clone();
         registry.request_started(session_id);
         tokio::spawn(async move {
-            execute(&engine, request_id, &query, params, txid, &out).await;
+            let _ = execute(&engine, request_id, &query, params, txid, &out).await;
             registry.request_finished(session_id);
         });
     }
@@ -238,8 +240,8 @@ enum TxnMsg {
     },
     /// Commit the transaction and finish.
     Commit { request_id: u64 },
-    /// Roll the transaction back and finish.
-    Rollback { request_id: u64 },
+    /// Roll the transaction back and finish (silent, carries no request id).
+    Rollback,
 }
 
 /// Serial owner of one interactive transaction: applies its statements in
@@ -259,6 +261,10 @@ async fn run_transaction(
     out: mpsc::Sender<OutEvent>,
 ) {
     let mut resolved = false;
+    // Set once a statement fails: the engine drops the transaction state on a
+    // failed statement, so the whole transaction is dead (UNORDERED first-failure
+    // rollback). The rest of its statements and its commit are then rejected.
+    let mut aborted = false;
     while let Some(msg) = rx.recv().await {
         registry.request_started(session_id);
         match msg {
@@ -267,18 +273,36 @@ async fn run_transaction(
                 query,
                 params,
             } => {
-                // A statement resets the transaction's auto-abort countdown.
-                registry.touch_txn(session_id, txid);
-                execute(&engine, request_id, &query, params, txid, &out).await;
+                if aborted {
+                    send_error(&out, request_id, ABORTED_TXN.to_string()).await;
+                } else {
+                    // A statement resets the transaction's auto-abort countdown.
+                    registry.touch_txn(session_id, txid);
+                    if !execute(&engine, request_id, &query, params, txid, &out).await {
+                        // The engine dropped the transaction's state on the
+                        // failed statement; deregister it so introspection stops
+                        // listing a transaction that can no longer commit.
+                        aborted = true;
+                        registry.end_txn(session_id, txid);
+                    }
+                }
             }
-            TxnMsg::Commit { request_id, .. } => {
-                commit(&engine, request_id, txid, &out).await;
+            TxnMsg::Commit { request_id } => {
+                if aborted {
+                    send_error(&out, request_id, ABORTED_TXN.to_string()).await;
+                } else {
+                    commit(&engine, request_id, txid, &out).await;
+                }
                 registry.request_finished(session_id);
                 resolved = true;
                 break;
             }
-            TxnMsg::Rollback { request_id } => {
-                rollback(&engine, request_id, txid).await;
+            TxnMsg::Rollback => {
+                // An aborted transaction is already discarded by the engine;
+                // rollback is then a silent no-op.
+                if !aborted {
+                    rollback(&engine, txid).await;
+                }
                 registry.request_finished(session_id);
                 resolved = true;
                 break;
@@ -286,13 +310,18 @@ async fn run_transaction(
         }
         registry.request_finished(session_id);
     }
-    if !resolved {
-        // Inbound channel closed before commit/rollback (stream closed): abort.
+    if !resolved && !aborted {
+        // Inbound channel closed before commit/rollback on a live transaction
+        // (stream closed): abort it.
         let engine = Arc::clone(&engine);
         let _ = tokio::task::spawn_blocking(move || engine.rollback_transaction(txid)).await;
     }
     registry.end_txn(session_id, txid);
 }
+
+/// Error returned for any statement or commit issued against a transaction that
+/// already failed a statement.
+const ABORTED_TXN: &str = "transaction is aborted, roll it back";
 
 /// Commit a transaction on the blocking pool and emit `Committed` or `Error`.
 async fn commit(
@@ -313,12 +342,11 @@ async fn commit(
     }
 }
 
-/// Roll a transaction back on the blocking pool. Silent on success (matches the
-/// rollback contract); a failure surfaces as an `Error`.
-async fn rollback(engine: &Arc<dyn CursorEngine>, request_id: u64, txid: u64) {
+/// Roll a transaction back on the blocking pool. Silent (the rollback contract
+/// emits no event); a failure is swallowed because the client asked to discard.
+async fn rollback(engine: &Arc<dyn CursorEngine>, txid: u64) {
     let engine = Arc::clone(engine);
     let _ = tokio::task::spawn_blocking(move || engine.rollback_transaction(txid)).await;
-    let _ = request_id;
 }
 
 /// Open a server-side cursor for one statement and page it into a
@@ -332,6 +360,9 @@ async fn rollback(engine: &Arc<dyn CursorEngine>, request_id: u64, txid: u64) {
 /// which deadlocks the whole runtime. So each blocking call runs on the blocking
 /// pool via [`spawn_blocking`](tokio::task::spawn_blocking); the cursor (`Send`)
 /// moves in and back out per batch, keeping the stream's per-batch backpressure.
+/// Returns `true` if the statement completed (a `CursorEnd` was reached) and
+/// `false` if it ended in an `Error` (or the client's channel closed). A
+/// transaction uses this to abort on the first failing statement.
 async fn execute(
     engine: &Arc<dyn CursorEngine>,
     request_id: u64,
@@ -339,7 +370,7 @@ async fn execute(
     params: HashMap<String, Value>,
     txid: u64,
     out: &mpsc::Sender<OutEvent>,
-) {
+) -> bool {
     // Open on the blocking pool: a write statement commits through Raft here.
     let engine = Arc::clone(engine);
     let query = query.to_string();
@@ -351,8 +382,14 @@ async fn execute(
     .await;
     let (mut cursor, columns) = match opened {
         Ok(Ok(opened)) => opened,
-        Ok(Err(e)) => return send_error(out, request_id, e.0).await,
-        Err(join) => return send_error(out, request_id, join.to_string()).await,
+        Ok(Err(e)) => {
+            send_error(out, request_id, e.0).await;
+            return false;
+        }
+        Err(join) => {
+            send_error(out, request_id, join.to_string()).await;
+            return false;
+        }
     };
 
     if out
@@ -360,7 +397,7 @@ async fn execute(
         .await
         .is_err()
     {
-        return;
+        return false;
     }
 
     loop {
@@ -376,7 +413,10 @@ async fn execute(
                 cursor = returned;
                 batch
             }
-            Err(join) => return send_error(out, request_id, join.to_string()).await,
+            Err(join) => {
+                send_error(out, request_id, join.to_string()).await;
+                return false;
+            }
         };
         match batch {
             // Empty batch = exhausted.
@@ -387,10 +427,13 @@ async fn execute(
                     .await
                     .is_err()
                 {
-                    return;
+                    return false;
                 }
             }
-            Err(e) => return send_error(out, request_id, e.0).await,
+            Err(e) => {
+                send_error(out, request_id, e.0).await;
+                return false;
+            }
         }
     }
 
@@ -402,6 +445,7 @@ async fn execute(
             },
         ))
         .await;
+    true
 }
 
 /// Emit a single `Error` event for a failed request.

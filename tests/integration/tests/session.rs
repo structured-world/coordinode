@@ -291,6 +291,91 @@ async fn in_session_transaction_rollback_discards_writes() {
 }
 
 #[tokio::test]
+async fn in_session_transaction_aborts_on_a_failed_statement() {
+    // First-failure rollback end to end: a valid write then a broken statement
+    // inside one transaction. The broken statement errors, the transaction is
+    // dead, the commit is rejected, and the earlier write never persists.
+    use tokio_stream::wrappers::ReceiverStream;
+    let proc = CoordinodeProcess::start().await;
+    let channel = tonic::transport::Endpoint::from_shared(proc.endpoint())
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    let mut client = SessionServiceClient::new(channel);
+    let (tx, rx) = tokio::sync::mpsc::channel::<ClientFrame>(8);
+    let mut inbound = client
+        .session(ReceiverStream::new(rx))
+        .await
+        .expect("open session")
+        .into_inner();
+
+    // Await the terminal event (CursorEnd / Committed / Error) of one request.
+    async fn await_terminal(
+        inbound: &mut tonic::Streaming<coordinode_integration::proto::session::ServerFrame>,
+        want: u64,
+    ) -> Event {
+        loop {
+            let f = inbound.message().await.expect("frame").expect("not end");
+            if f.request_id == want {
+                match f.event {
+                    Some(e @ (Event::CursorEnd(_) | Event::Committed(_) | Event::Error(_))) => {
+                        return e
+                    }
+                    _ => continue,
+                }
+            }
+        }
+    }
+
+    tx.send(begin(1)).await.expect("begin");
+    let txid = loop {
+        let f = inbound.message().await.expect("frame").expect("not end");
+        if let (1, Some(Event::Begun(b))) = (f.request_id, f.event) {
+            break b.txid;
+        }
+    };
+
+    // Valid write inside the transaction.
+    tx.send(execute_tx(2, "CREATE (n:Ab {k: 1})", txid))
+        .await
+        .expect("write");
+    assert!(matches!(
+        await_terminal(&mut inbound, 2).await,
+        Event::CursorEnd(_)
+    ));
+
+    // Broken statement: errors and aborts the transaction.
+    tx.send(execute_tx(3, "THIS IS NOT CYPHER", txid))
+        .await
+        .expect("bad");
+    assert!(matches!(
+        await_terminal(&mut inbound, 3).await,
+        Event::Error(_)
+    ));
+
+    // Commit is rejected because the transaction is aborted.
+    tx.send(commit_tx(4, txid)).await.expect("commit");
+    assert!(
+        matches!(await_terminal(&mut inbound, 4).await, Event::Error(_)),
+        "commit of an aborted transaction must error"
+    );
+    drop(tx);
+    while inbound.message().await.expect("frame").is_some() {}
+
+    // The earlier write never became durable.
+    let by_id = run_session(&proc, vec![execute(1, "MATCH (n:Ab) RETURN n.k AS k")]).await;
+    let events = by_id.get(&1).map(Vec::as_slice).unwrap_or_default();
+    match events {
+        [Event::CursorOpen(_), rest @ ..] => {
+            assert_eq!(row_count(rest), 0, "aborted transaction left no node");
+        }
+        [] => {}
+        other => panic!("verify scan got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn show_transactions_lists_an_open_transaction_with_a_countdown() {
     // Open a transaction on a session, then run SHOW TRANSACTIONS on the SAME
     // session and confirm the live registry surfaces it with an auto-abort

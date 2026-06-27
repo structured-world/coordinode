@@ -34,25 +34,32 @@ impl QueryCursor for MockCursor {
 struct MockEngine {
     columns: Vec<String>,
     rows: Vec<Vec<Value>>,
+    /// When set, every `open_cursor` fails with this message.
     fail: Option<String>,
+    /// When set, only a statement whose query equals this string fails (the rest
+    /// succeed): used to abort a transaction mid-way.
+    fail_query: Option<String>,
     next_txn: AtomicU64,
 }
 
 impl CursorEngine for MockEngine {
     fn open_cursor(
         &self,
-        _query: &str,
+        query: &str,
         _params: HashMap<String, Value>,
         _txid: u64,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
-        match &self.fail {
-            Some(message) => Err(EngineError(message.clone())),
-            None => Ok(Box::new(MockCursor {
-                columns: self.columns.clone(),
-                rows: self.rows.clone(),
-                pos: 0,
-            })),
+        if let Some(message) = &self.fail {
+            return Err(EngineError(message.clone()));
         }
+        if self.fail_query.as_deref() == Some(query) {
+            return Err(EngineError("statement failed".to_string()));
+        }
+        Ok(Box::new(MockCursor {
+            columns: self.columns.clone(),
+            rows: self.rows.clone(),
+            pos: 0,
+        }))
     }
 
     fn begin_transaction(&self) -> Result<u64, EngineError> {
@@ -73,6 +80,7 @@ fn engine(columns: &[&str], rows: Vec<Vec<Value>>) -> Arc<dyn CursorEngine> {
         columns: columns.iter().map(|s| s.to_string()).collect(),
         rows,
         fail: None,
+        fail_query: None,
         next_txn: AtomicU64::new(0),
     })
 }
@@ -151,6 +159,7 @@ async fn execute_surfaces_an_engine_error() {
         columns: vec![],
         rows: vec![],
         fail: Some("boom".to_string()),
+        fail_query: None,
         next_txn: AtomicU64::new(0),
     });
     let events = run_one(engine, exec()).await;
@@ -219,6 +228,74 @@ async fn begin_then_commit_acknowledges_and_rollback_cancel_are_silent() {
     // Rollback of the now-resolved txn and Cancel produce no events.
     assert!(!by_id.contains_key(&3));
     assert!(!by_id.contains_key(&4));
+}
+
+#[tokio::test]
+async fn a_failed_statement_aborts_the_transaction_and_rejects_the_rest() {
+    // UNORDERED first-failure semantics: once a statement fails, the transaction
+    // is dead, so later statements and the commit are rejected with the
+    // aborted-transaction error, not run.
+    let engine: Arc<dyn CursorEngine> = Arc::new(MockEngine {
+        columns: vec!["n".to_string()],
+        rows: vec![vec![Value::Int(1)]],
+        fail: None,
+        fail_query: Some("FAIL".to_string()),
+        next_txn: AtomicU64::new(0),
+    });
+    // Begin (req1) → txid 1; ok statement (req2); failing statement (req3);
+    // a later statement (req4); commit (req5).
+    let by_id = run_session(
+        engine,
+        vec![
+            SessionOp::Begin {
+                ordering: Ordering::Unordered,
+                drain_timeout_ms: 0,
+            },
+            SessionOp::Execute {
+                query: "ok".to_string(),
+                params: HashMap::new(),
+                txid: 1,
+                nonce: 0,
+            },
+            SessionOp::Execute {
+                query: "FAIL".to_string(),
+                params: HashMap::new(),
+                txid: 1,
+                nonce: 0,
+            },
+            SessionOp::Execute {
+                query: "after".to_string(),
+                params: HashMap::new(),
+                txid: 1,
+                nonce: 0,
+            },
+            SessionOp::Commit {
+                txid: 1,
+                last_nonce: 0,
+            },
+        ],
+    )
+    .await;
+
+    // The first statement succeeded.
+    assert!(matches!(
+        by_id[&2].last(),
+        Some(SessionEvent::CursorEnd { .. })
+    ));
+    // The failing statement surfaced its error.
+    assert!(matches!(by_id[&3].as_slice(), [SessionEvent::Error { .. }]));
+    // The later statement and the commit are both rejected as aborted.
+    for rid in [4u64, 5] {
+        match by_id[&rid].as_slice() {
+            [SessionEvent::Error { message, .. }] => {
+                assert!(
+                    message.contains("aborted"),
+                    "req {rid} expected aborted error, got {message:?}"
+                );
+            }
+            other => panic!("req {rid} expected a single aborted Error, got {other:?}"),
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
