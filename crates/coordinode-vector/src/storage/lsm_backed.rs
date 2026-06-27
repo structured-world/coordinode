@@ -56,24 +56,24 @@ impl VectorTierStorage for LsmVectorTier {
         property_id: u32,
         node_ids: &[u64],
     ) -> Result<Vec<Option<Vec<f32>>>, VectorTierError> {
-        // StorageEngine doesn't expose a multi_get yet (lsm-tree has it
-        // but it's not surfaced through the engine wrapper). Iterate
-        // with per-id `get` for now — acceptable at Phase 1.5 batch
-        // sizes (~50 candidates per shard). Replace with a single
-        // batched call when the engine exposes one (R-MULTI-GET-EXPOSE).
-        let mut out = Vec::with_capacity(node_ids.len());
-        for &id in node_ids {
-            let key = encode_vec_f32_key(label_id, property_id, id);
-            match self
-                .engine
-                .get(Partition::VectorF32, &key)
-                .map_err(|e| Box::new(e) as VectorTierError)?
-            {
-                Some(bytes) => out.push(decode_f32_value(bytes.as_ref())),
-                None => out.push(None),
-            }
-        }
-        Ok(out)
+        // Resolve the whole candidate set through one batched engine
+        // `multi_get`: the version snapshot is pinned once and the bloom
+        // filter + SST traversal is batched across all keys, instead of
+        // re-pinning the snapshot and descending the tree per id. Values
+        // come back in input order, one slot per node id.
+        let keys: Vec<_> = node_ids
+            .iter()
+            .map(|&id| encode_vec_f32_key(label_id, property_id, id))
+            .collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
+        let values = self
+            .engine
+            .multi_get(Partition::VectorF32, &key_refs)
+            .map_err(|e| Box::new(e) as VectorTierError)?;
+        Ok(values
+            .into_iter()
+            .map(|opt| opt.and_then(|bytes| decode_f32_value(bytes.as_ref())))
+            .collect())
     }
 }
 
