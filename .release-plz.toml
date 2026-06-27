@@ -127,6 +127,14 @@ git_tag_name = "coordinode-timeseries-v{{ version }}"
 name = "coordinode-vector"
 git_tag_name = "coordinode-vector-v{{ version }}"
 
+[[package]]
+name = "coordinode-swarm"
+git_tag_name = "coordinode-swarm-v{{ version }}"
+
+[[package]]
+name = "coordinode-wire"
+git_tag_name = "coordinode-wire-v{{ version }}"
+
 # Bench crates (coordinode-gold-bench, coordinode-bench-vector-ann) live in
 # their own standalone workspaces under benches/. They are intentionally
 # excluded from release-plz tracking since they never ship and are versioned
