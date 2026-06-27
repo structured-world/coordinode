@@ -1370,6 +1370,54 @@ fn keyset_pageable_classifies_plan_shapes() {
 }
 
 #[test]
+fn paged_cursor_binds_parameters_per_page() {
+    // Parameters are substituted into the plan after planning; the keyset path
+    // must carry them into every page, not just the first. A `$min` filter over
+    // a multi-page scan exercises both: binding correctness and per-page reuse.
+    use coordinode_core::graph::types::Value;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    for k in 0..12 {
+        db.execute_cypher(&format!("CREATE (n:Param {{k: {k}}})"))
+            .expect("seed");
+    }
+
+    let mut params = std::collections::HashMap::new();
+    params.insert("min".to_string(), Value::Int(8));
+
+    let mut seen: Vec<i64> = Vec::new();
+    let mut resume: Option<Vec<u8>> = None;
+    let mut read_ts: Option<u64> = None;
+    loop {
+        let page = db
+            .execute_cypher_paged(
+                "MATCH (n:Param) WHERE n.k >= $min RETURN n.k",
+                Some(params.clone()),
+                read_ts,
+                resume.clone(),
+                2,
+            )
+            .expect("page");
+        for row in &page.rows {
+            if let Some(Value::Int(v)) = row.get("n.k") {
+                seen.push(*v);
+            }
+        }
+        read_ts = Some(page.read_ts);
+        resume = page.last_key.clone();
+        if page.exhausted {
+            break;
+        }
+    }
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        (8..12).collect::<Vec<_>>(),
+        "param-filtered, all pages"
+    );
+}
+
+#[test]
 fn paged_cursor_empty_label_is_exhausted_immediately() {
     // A label with no nodes yields one exhausted page, no resume token.
     let dir = tempfile::tempdir().expect("tempdir");

@@ -120,6 +120,45 @@ async fn session_runs_a_real_query_and_pages_its_rows() {
 }
 
 #[tokio::test]
+async fn session_pages_a_label_scan_through_the_keyset_cursor() {
+    // A `MATCH (n:Label) RETURN ...` scan is keyset-eligible: the server routes
+    // it to the keyset cursor and pages it by storage key. Drive it end to end
+    // through the real binary + gRPC stream and assert every seeded node comes
+    // back exactly once, with the real column header and a terminating
+    // CursorEnd. Multi-page refill across the page boundary is covered
+    // deterministically by the engine-level tests; this proves the keyset path
+    // is wired correctly through the transport.
+    let proc = CoordinodeProcess::start().await;
+
+    // Seed all nodes in a single statement (one write), drained to completion
+    // before the scan: the scan must observe a committed dataset, and a second
+    // session guarantees the write happened-before the read.
+    run_session(
+        &proc,
+        vec![execute(
+            1,
+            "UNWIND range(0, 149) AS k CREATE (n:Scan {k: k})",
+        )],
+    )
+    .await;
+
+    // Scan in a fresh session: keyset-eligible, paged across the gRPC stream.
+    let by_id = run_session(&proc, vec![execute(1, "MATCH (n:Scan) RETURN n.k AS k")]).await;
+    let events = by_id.get(&1).map(Vec::as_slice).unwrap_or_default();
+    match events {
+        [Event::CursorOpen(open), rest @ ..] => {
+            assert_eq!(open.columns, vec!["k".to_string()]);
+            assert_eq!(row_count(rest), 150, "every seeded node is streamed once");
+            assert!(
+                matches!(rest.last(), Some(Event::CursorEnd(_))),
+                "the keyset cursor closes with CursorEnd"
+            );
+        }
+        other => panic!("scan request got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn session_interleaves_a_transaction_with_independent_queries() {
     let proc = CoordinodeProcess::start().await;
     let by_id = run_session(

@@ -51,6 +51,7 @@ pub struct CypherResult {
 /// `exhausted` is `true` once the underlying scan has no more rows.
 #[derive(Debug, Clone)]
 pub struct PagedCypherResult {
+    /// Rows produced by this page (already filtered/projected by the plan).
     pub rows: Vec<Row>,
     /// Resume token for the next page: pass back as `resume`. `None` when the
     /// page produced no scan key (empty result or a non-keyset plan).
@@ -60,6 +61,8 @@ pub struct PagedCypherResult {
     /// The pinned MVCC snapshot timestamp this cursor reads against. Echo it
     /// into the next page's `read_ts` to keep the snapshot stable.
     pub read_ts: u64,
+    /// Mutation counters for this page. Zero for a read-only cursor; populated
+    /// only if the paged statement also wrote (uncommon for a cursor).
     pub write_stats: WriteStats,
 }
 
