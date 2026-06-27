@@ -1263,6 +1263,7 @@ name = "coordinode-session"
 version = "0.4.3"
 dependencies = [
  "coordinode-core",
+ "parking_lot",
  "tokio",
 ]
 

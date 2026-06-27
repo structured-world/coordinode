@@ -12,7 +12,7 @@ use std::sync::Arc;
 use coordinode_embed::Database;
 use coordinode_session::{
     ErrorCode, InOp, Ordering as CoreOrdering, OutEvent, SessionEvent, SessionManager, SessionOp,
-    SessionStats,
+    SessionRegistry, SessionStats,
 };
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
@@ -40,11 +40,13 @@ pub struct SessionSvc {
 }
 
 impl SessionSvc {
-    /// Create the binding, backing its sessions with the embedded database.
-    pub fn new(database: Arc<RwLock<Database>>) -> Self {
+    /// Create the binding, backing its sessions with the embedded database and
+    /// registering each session in the shared `registry` so it is visible to
+    /// `SHOW SESSIONS` / `SHOW TRANSACTIONS`.
+    pub fn new(database: Arc<RwLock<Database>>, registry: Arc<SessionRegistry>) -> Self {
         let engine = Arc::new(DatabaseCursorEngine::new(database));
         Self {
-            manager: SessionManager::new(engine),
+            manager: SessionManager::new(engine, registry),
         }
     }
 }
@@ -57,6 +59,12 @@ impl SessionServiceTrait for SessionSvc {
         &self,
         request: Request<Streaming<ClientFrame>>,
     ) -> Result<Response<Self::SessionStream>, Status> {
+        // Capture the peer before consuming the request, so the session shows
+        // up in introspection tagged with its remote address.
+        let peer = request
+            .remote_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
         let mut inbound = request.into_inner();
         let (op_tx, op_rx) = mpsc::channel::<InOp>(BUFFER);
         let (ev_tx, mut ev_rx) = mpsc::channel::<OutEvent>(BUFFER);
@@ -64,7 +72,7 @@ impl SessionServiceTrait for SessionSvc {
 
         // The core: concurrent dispatch + correlation + single writer, all
         // transport-agnostic.
-        tokio::spawn(self.manager.open().run(op_rx, ev_tx.clone()));
+        tokio::spawn(self.manager.open(peer).run(op_rx, ev_tx.clone()));
 
         // Reader: map each proto frame to a neutral op. A frame with no op is a
         // malformed request, answered directly with an Error event.

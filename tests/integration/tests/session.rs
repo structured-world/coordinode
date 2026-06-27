@@ -159,6 +159,86 @@ async fn session_pages_a_label_scan_through_the_keyset_cursor() {
 }
 
 #[tokio::test]
+async fn show_transactions_lists_an_open_transaction_with_a_countdown() {
+    // Open a transaction on a session, then run SHOW TRANSACTIONS on the SAME
+    // session and confirm the live registry surfaces it with an auto-abort
+    // countdown. A controlled request stream sequences Begin strictly before
+    // the SHOW so the read cannot race the registration.
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let proc = CoordinodeProcess::start().await;
+    let channel = tonic::transport::Endpoint::from_shared(proc.endpoint())
+        .expect("valid endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    let mut client = SessionServiceClient::new(channel);
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<ClientFrame>(8);
+    let response = client
+        .session(ReceiverStream::new(rx))
+        .await
+        .expect("open session");
+    let mut inbound = response.into_inner();
+
+    // Begin and wait for the handle before issuing the SHOW.
+    tx.send(begin(1)).await.expect("send begin");
+    let txid = loop {
+        let frame = inbound.message().await.expect("frame").expect("not end");
+        if frame.request_id == 1 {
+            match frame.event {
+                Some(Event::Begun(b)) => break b.txid,
+                other => panic!("expected Begun, got {other:?}"),
+            }
+        }
+    };
+    assert_ne!(txid, 0, "transaction handle is non-zero");
+
+    // SHOW TRANSACTIONS on the same session: the open transaction must appear.
+    tx.send(execute(2, "SHOW TRANSACTIONS"))
+        .await
+        .expect("send show");
+    let mut columns: Vec<String> = Vec::new();
+    let mut rows = Vec::new();
+    loop {
+        let frame = inbound.message().await.expect("frame").expect("not end");
+        if frame.request_id != 2 {
+            continue;
+        }
+        match frame.event {
+            Some(Event::CursorOpen(o)) => columns = o.columns,
+            Some(Event::Rows(b)) => rows.extend(b.rows),
+            Some(Event::CursorEnd(_)) => break,
+            Some(Event::Error(e)) => panic!("SHOW TRANSACTIONS errored: {}", e.message),
+            _ => {}
+        }
+    }
+    drop(tx);
+
+    assert_eq!(rows.len(), 1, "exactly one open transaction is listed");
+    // Columns are addressed by name (row column order is not positional).
+    use coordinode_integration::proto::common::property_value::Value as Pv;
+    let col = |name: &str| {
+        columns
+            .iter()
+            .position(|c| c == name)
+            .unwrap_or_else(|| panic!("SHOW TRANSACTIONS missing column {name}: {columns:?}"))
+    };
+    let cells = &rows[0].values;
+    assert!(
+        matches!(&cells[col("txid")].value, Some(Pv::IntValue(t)) if *t == txid as i64),
+        "the listed transaction is the one we opened"
+    );
+    match &cells[col("auto_abort_in_ms")].value {
+        Some(Pv::IntValue(auto_abort)) => assert!(
+            *auto_abort > 0,
+            "an idle transaction still has time left before auto-abort"
+        ),
+        other => panic!("auto_abort_in_ms not an int: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn session_runs_concurrent_writes_without_deadlocking_the_runtime() {
     // Many auto-commit writes in one stream dispatch concurrently, each driving
     // a Raft commit. If those synchronous commits ran on the async worker

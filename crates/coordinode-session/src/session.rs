@@ -16,6 +16,7 @@ use coordinode_core::graph::types::Value;
 use tokio::sync::mpsc;
 
 use crate::engine::{CursorEngine, EngineError};
+use crate::registry::SessionRegistry;
 use crate::types::{ErrorCode, SessionEvent, SessionOp};
 
 /// An inbound op tagged with its session-scoped request id.
@@ -31,23 +32,30 @@ const CURSOR_BATCH: usize = 1024;
 pub struct SessionManager {
     next_txid: Arc<AtomicU64>,
     engine: Arc<dyn CursorEngine>,
+    registry: Arc<SessionRegistry>,
 }
 
 impl SessionManager {
     /// Create a session manager backed by `engine`, with a fresh
-    /// transaction-handle allocator.
-    pub fn new(engine: Arc<dyn CursorEngine>) -> Self {
+    /// transaction-handle allocator and the shared session `registry` that
+    /// powers operational introspection (`SHOW SESSIONS` / `SHOW TRANSACTIONS`).
+    pub fn new(engine: Arc<dyn CursorEngine>, registry: Arc<SessionRegistry>) -> Self {
         Self {
             next_txid: Arc::new(AtomicU64::new(0)),
             engine,
+            registry,
         }
     }
 
-    /// Open a new session bound to this manager's allocator and engine.
-    pub fn open(&self) -> Session {
+    /// Open a new session for `peer`, registering it so it is visible to
+    /// introspection until its stream closes.
+    pub fn open(&self, peer: String) -> Session {
+        let session_id = self.registry.register_session(peer);
         Session {
+            session_id,
             next_txid: Arc::clone(&self.next_txid),
             engine: Arc::clone(&self.engine),
+            registry: Arc::clone(&self.registry),
         }
     }
 }
@@ -59,8 +67,10 @@ impl SessionManager {
 /// are added with the state that fills them (transaction work and cancellation);
 /// the session holds the transaction-handle allocator and the query engine.
 pub struct Session {
+    session_id: u64,
     next_txid: Arc<AtomicU64>,
     engine: Arc<dyn CursorEngine>,
+    registry: Arc<SessionRegistry>,
 }
 
 impl Session {
@@ -69,21 +79,37 @@ impl Session {
     /// funnel every event to `out`. Returns once the inbound channel is closed;
     /// in-flight dispatch tasks keep `out` alive until they complete, so the
     /// receiver observes end-of-stream only after every event is sent.
+    ///
+    /// The registry tracks each request as in-flight for its lifetime and drops
+    /// the session (with its open transactions) when the stream closes, so the
+    /// introspection snapshot mirrors what is actually running.
     pub async fn run(self, mut ops: mpsc::Receiver<InOp>, out: mpsc::Sender<OutEvent>) {
         while let Some((request_id, op)) = ops.recv().await {
             let next_txid = Arc::clone(&self.next_txid);
             let engine = Arc::clone(&self.engine);
+            let registry = Arc::clone(&self.registry);
+            let session_id = self.session_id;
             let out = out.clone();
+            registry.request_started(session_id);
             tokio::spawn(async move {
-                dispatch(&engine, &next_txid, request_id, op, &out).await;
+                dispatch(
+                    &engine, &registry, session_id, &next_txid, request_id, op, &out,
+                )
+                .await;
+                registry.request_finished(session_id);
             });
         }
+        // Stream closed: drop the session and abort its open transactions.
+        self.registry.close_session(self.session_id);
     }
 }
 
-/// Dispatch one op, emitting its events to the single writer.
+/// Dispatch one op, emitting its events to the single writer and keeping the
+/// session registry in step with the transaction lifecycle.
 async fn dispatch(
     engine: &Arc<dyn CursorEngine>,
+    registry: &SessionRegistry,
+    session_id: u64,
     next_txid: &AtomicU64,
     request_id: u64,
     op: SessionOp,
@@ -95,20 +121,32 @@ async fn dispatch(
             params,
             txid,
             ..
-        } => execute(engine, request_id, &query, params, txid, out).await,
-        SessionOp::Begin { .. } => {
+        } => {
+            // A statement inside a transaction resets that transaction's
+            // auto-abort countdown (it is no longer idle).
+            if txid != 0 {
+                registry.touch_txn(session_id, txid);
+            }
+            execute(engine, request_id, &query, params, txid, out).await
+        }
+        SessionOp::Begin { ordering, .. } => {
             // Transaction handles are non-zero by contract; start the counter at 1.
             let txid = next_txid.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+            registry.begin_txn(session_id, txid, ordering);
             let _ = out.send((request_id, SessionEvent::Begun { txid })).await;
         }
-        SessionOp::Commit { .. } => {
+        SessionOp::Commit { txid, .. } => {
+            registry.end_txn(session_id, txid);
             let _ = out
                 .send((request_id, SessionEvent::Committed { applied_index: 0 }))
                 .await;
         }
-        // Cancellation and rollback lifecycle land with the cursor/transaction
-        // registries; for now they are accepted silently.
-        SessionOp::Rollback { .. } | SessionOp::Cancel { .. } => {}
+        SessionOp::Rollback { txid } => {
+            registry.end_txn(session_id, txid);
+        }
+        // Cancellation lifecycle lands with the cursor registry; accepted
+        // silently for now.
+        SessionOp::Cancel { .. } => {}
     }
 }
 

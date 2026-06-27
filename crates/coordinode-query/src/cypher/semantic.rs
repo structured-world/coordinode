@@ -338,6 +338,8 @@ impl<'a> Analyzer<'a> {
             | Clause::CreateTrigger(_)
             | Clause::DropTrigger(_)
             | Clause::ShowTriggers
+            | Clause::ShowSessions
+            | Clause::ShowTransactions
             | Clause::AlterTrigger(_) => {
                 // DDL — no variable references to validate.
                 // Edge-type property type names are validated at execution time

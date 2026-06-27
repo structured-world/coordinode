@@ -329,6 +329,10 @@ pub struct ExecutionContext<'a> {
     /// Keyset-paging state for a server-side cursor (see [`ScanPaging`]). `None`
     /// on the normal path: the single `NodeScan` source scans the whole prefix.
     pub scan_paging: Option<ScanPaging>,
+    /// Live session registry for operational introspection, injected by the
+    /// server. `SHOW SESSIONS` / `SHOW TRANSACTIONS` read a snapshot through it;
+    /// `None` (embedded / tests) makes those statements report no sessions.
+    pub operations: Option<&'a dyn coordinode_core::operations::OperationsView>,
     /// Adaptive query plan configuration.
     pub adaptive: AdaptiveConfig,
     /// When true, variable-length traversal emits each reached target node at
@@ -2769,6 +2773,8 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         LogicalOp::CreateTrigger { clause } => execute_create_trigger(clause, ctx),
         LogicalOp::DropTrigger { name } => execute_drop_trigger(name, ctx),
         LogicalOp::ShowTriggers => execute_show_triggers(ctx),
+        LogicalOp::ShowSessions => execute_show_sessions(ctx),
+        LogicalOp::ShowTransactions => execute_show_transactions(ctx),
         LogicalOp::AlterTrigger { clause } => execute_alter_trigger(clause, ctx),
 
         LogicalOp::MaxSimTopK {
@@ -14284,6 +14290,58 @@ fn execute_show_triggers(ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>, Exe
             Value::String(schema.body_source.clone()),
         );
         rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// `SHOW SESSIONS`: one row per live client session on this node: its id, peer,
+/// age, in-flight request count, and number of open transactions. Reads the
+/// injected session registry; with none wired (embedded / tests) the result is
+/// empty.
+fn execute_show_sessions(ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>, ExecutionError> {
+    let Some(ops) = ctx.operations else {
+        return Ok(Vec::new());
+    };
+    let mut rows: Vec<Row> = Vec::new();
+    for s in ops.sessions() {
+        let mut row = Row::new();
+        row.insert("session".into(), Value::String(s.session_id));
+        row.insert("peer".into(), Value::String(s.peer));
+        row.insert("age_ms".into(), Value::Int(s.age_ms as i64));
+        row.insert("in_flight".into(), Value::Int(s.in_flight as i64));
+        row.insert(
+            "open_transactions".into(),
+            Value::Int(s.transactions.len() as i64),
+        );
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// `SHOW TRANSACTIONS`: one row per open interactive transaction across all
+/// sessions on this node: its handle, owning session, ordering mode, age, and
+/// the milliseconds left before the idle reaper auto-aborts it. Reads the
+/// injected session registry; with none wired (embedded / tests) the result is
+/// empty.
+fn execute_show_transactions(ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>, ExecutionError> {
+    let Some(ops) = ctx.operations else {
+        return Ok(Vec::new());
+    };
+    let mut rows: Vec<Row> = Vec::new();
+    for s in ops.sessions() {
+        for t in s.transactions {
+            let mut row = Row::new();
+            row.insert("txid".into(), Value::Int(t.txid as i64));
+            row.insert("session".into(), Value::String(s.session_id.clone()));
+            row.insert("peer".into(), Value::String(s.peer.clone()));
+            row.insert("ordering".into(), Value::String(t.ordering.as_str().into()));
+            row.insert("age_ms".into(), Value::Int(t.age_ms as i64));
+            row.insert(
+                "auto_abort_in_ms".into(),
+                Value::Int(t.auto_abort_in_ms as i64),
+            );
+            rows.push(row);
+        }
     }
     Ok(rows)
 }

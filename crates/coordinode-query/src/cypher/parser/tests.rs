@@ -1395,6 +1395,18 @@ fn show_triggers() {
 }
 
 #[test]
+fn show_sessions() {
+    let q = parse_ok("SHOW SESSIONS");
+    assert!(matches!(&q.clauses[0], Clause::ShowSessions));
+}
+
+#[test]
+fn show_transactions() {
+    let q = parse_ok("SHOW TRANSACTIONS");
+    assert!(matches!(&q.clauses[0], Clause::ShowTransactions));
+}
+
+#[test]
 fn alter_trigger_disable_enable() {
     let q1 = parse_ok("ALTER TRIGGER t DISABLE");
     let q2 = parse_ok("ALTER TRIGGER t ENABLE");

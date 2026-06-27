@@ -263,6 +263,12 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
         Rule::show_triggers_clause => {
             clauses.push(Clause::ShowTriggers);
         }
+        Rule::show_sessions_clause => {
+            clauses.push(Clause::ShowSessions);
+        }
+        Rule::show_transactions_clause => {
+            clauses.push(Clause::ShowTransactions);
+        }
         Rule::alter_trigger_clause => {
             let c = build_alter_trigger_clause(pair)?;
             clauses.push(Clause::AlterTrigger(c));

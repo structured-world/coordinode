@@ -365,6 +365,8 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::CreateTrigger { .. }
         | LogicalOp::DropTrigger { .. }
         | LogicalOp::ShowTriggers
+        | LogicalOp::ShowSessions
+        | LogicalOp::ShowTransactions
         | LogicalOp::AlterTrigger { .. } => vec![],
 
         LogicalOp::Filter { input, .. }

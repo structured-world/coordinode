@@ -133,6 +133,11 @@ pub enum Clause {
     DropTrigger(DropTriggerClause),
     /// `SHOW TRIGGERS`.
     ShowTriggers,
+    /// `SHOW SESSIONS`: live client sessions and their in-flight request counts.
+    ShowSessions,
+    /// `SHOW TRANSACTIONS`: open interactive transactions with their auto-abort
+    /// countdown.
+    ShowTransactions,
     /// `ALTER TRIGGER <name> { DISABLE | ENABLE | SET EXECUTE … | SET ON ERROR … }`.
     AlterTrigger(AlterTriggerClause),
 

@@ -1429,3 +1429,74 @@ fn paged_cursor_empty_label_is_exhausted_immediately() {
     assert!(page.exhausted);
     assert!(page.last_key.is_none());
 }
+
+// ----- operational introspection (SHOW SESSIONS / SHOW TRANSACTIONS) -----
+
+#[test]
+fn show_sessions_and_transactions_render_the_injected_operations_view() {
+    use coordinode_core::graph::types::Value;
+    use coordinode_core::operations::{
+        OperationsView, SessionSnapshot, TransactionSnapshot, TxnOrdering,
+    };
+
+    // A fixed snapshot stands in for the live session registry, so the test is
+    // deterministic and exercises planner + executor + embed wiring end to end.
+    struct MockOps;
+    impl OperationsView for MockOps {
+        fn sessions(&self) -> Vec<SessionSnapshot> {
+            vec![SessionSnapshot {
+                session_id: "s-1".into(),
+                peer: "10.0.0.9:42".into(),
+                age_ms: 1234,
+                in_flight: 2,
+                transactions: vec![TransactionSnapshot {
+                    txid: 7,
+                    ordering: TxnOrdering::Ordered,
+                    age_ms: 500,
+                    auto_abort_in_ms: 29_500,
+                }],
+            }]
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    db.set_operations_view(Arc::new(MockOps));
+
+    let sessions = db.execute_cypher("SHOW SESSIONS").expect("show sessions");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        sessions[0].get("session"),
+        Some(&Value::String("s-1".into()))
+    );
+    assert_eq!(
+        sessions[0].get("peer"),
+        Some(&Value::String("10.0.0.9:42".into()))
+    );
+    assert_eq!(sessions[0].get("in_flight"), Some(&Value::Int(2)));
+    assert_eq!(sessions[0].get("open_transactions"), Some(&Value::Int(1)));
+
+    let txns = db
+        .execute_cypher("SHOW TRANSACTIONS")
+        .expect("show transactions");
+    assert_eq!(txns.len(), 1);
+    assert_eq!(txns[0].get("txid"), Some(&Value::Int(7)));
+    assert_eq!(txns[0].get("session"), Some(&Value::String("s-1".into())));
+    assert_eq!(
+        txns[0].get("ordering"),
+        Some(&Value::String("ordered".into()))
+    );
+    assert_eq!(txns[0].get("auto_abort_in_ms"), Some(&Value::Int(29_500)));
+}
+
+#[test]
+fn show_transactions_without_an_operations_view_is_empty() {
+    // Embedded use has no session layer: the statement is valid but lists nothing.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    assert!(db
+        .execute_cypher("SHOW TRANSACTIONS")
+        .expect("show")
+        .is_empty());
+    assert!(db.execute_cypher("SHOW SESSIONS").expect("show").is_empty());
+}

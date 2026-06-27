@@ -8,13 +8,13 @@
 //! a pgwire binding drive the same machinery. The core never sees a wire frame
 //! or a query dialect: mapping a protocol's frames to and from the neutral
 //! types is the binding's job.
-//!
-//! See `arch/api/session-protocol.md`.
 
 mod engine;
+mod registry;
 mod session;
 mod types;
 
 pub use engine::{CursorEngine, EngineError, QueryCursor};
+pub use registry::SessionRegistry;
 pub use session::{InOp, OutEvent, Session, SessionManager};
 pub use types::{ErrorCode, Ordering, SessionEvent, SessionOp, SessionStats};

@@ -722,6 +722,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("failed to open database: {e}"))?,
             ));
 
+            // Live session registry for operational introspection
+            // (SHOW SESSIONS / SHOW TRANSACTIONS). Shared between the session
+            // binding (which updates it as sessions open and transactions
+            // begin/end) and the query engine (which reads a snapshot). Its
+            // transaction auto-abort countdown uses the same idle timeout as the
+            // interactive-transaction reaper.
+            let session_registry = Arc::new(coordinode_session::SessionRegistry::new(
+                std::time::Duration::from_secs(interactive_txn_idle_timeout_secs),
+            ));
+
             // Interactive-transaction tunables (ADR-042). Always resolved (the
             // config gate carries the built-in defaults: 30s idle timeout,
             // 256 MiB buffered-write ceiling per open transaction).
@@ -734,6 +744,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // AFTER COMMIT trigger dispatch knobs (R192) from the config file.
                 // The same setter is the runtime `setParameters` seam.
                 db.set_trigger_dispatch_config(trigger_dispatch_cfg);
+                // Let SHOW SESSIONS / SHOW TRANSACTIONS read the live registry.
+                // The annotated binding coerces the concrete `Arc<SessionRegistry>`
+                // to the trait object the setter expects.
+                let ops_view: Arc<dyn coordinode_core::operations::OperationsView> =
+                    session_registry.clone();
+                db.set_operations_view(ops_view);
+            }
+
+            // Idle reaper: periodically drop interactive transactions left
+            // untouched past the idle timeout, so an abandoned client cannot pin
+            // a transaction (and its snapshot) forever. The countdown surfaced by
+            // SHOW TRANSACTIONS hits zero exactly when a transaction is reaped
+            // here.
+            {
+                let reaper_registry = Arc::clone(&session_registry);
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                    loop {
+                        tick.tick().await;
+                        let _ = reaper_registry.reap_idle();
+                    }
+                });
             }
 
             // Per-shard consumer-retention registry (ADR-028). Constructing it
@@ -1118,7 +1150,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .add_service(
                     proto::session::session_service_server::SessionServiceServer::new(
-                        services::session::SessionSvc::new(Arc::clone(&database)),
+                        services::session::SessionSvc::new(
+                            Arc::clone(&database),
+                            Arc::clone(&session_registry),
+                        ),
                     )
                     .max_decoding_message_size(max_req_bytes),
                 )

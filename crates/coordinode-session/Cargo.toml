@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 coordinode-core = { workspace = true }
+parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
 
 [dev-dependencies]

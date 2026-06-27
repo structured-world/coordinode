@@ -40,7 +40,7 @@ coordinode-client = { path = "../../crates/coordinode-client" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

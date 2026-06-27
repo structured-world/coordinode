@@ -217,6 +217,12 @@ fn write_clause(buf: &mut String, clause: &Clause) {
         Clause::ShowTriggers => {
             buf.push_str("SHOW TRIGGERS");
         }
+        Clause::ShowSessions => {
+            buf.push_str("SHOW SESSIONS");
+        }
+        Clause::ShowTransactions => {
+            buf.push_str("SHOW TRANSACTIONS");
+        }
         Clause::AlterTrigger(c) => {
             buf.push_str("ALTER TRIGGER ");
             buf.push_str(&c.name);

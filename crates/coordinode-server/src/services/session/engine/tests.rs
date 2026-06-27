@@ -123,10 +123,13 @@ fn keyset_cursor_empty_label_yields_no_rows() {
 async fn run_execute(engine: DatabaseCursorEngine, query: &str) -> Vec<SessionEvent> {
     use tokio::sync::mpsc;
 
-    let manager = SessionManager::new(Arc::new(engine));
+    let registry = Arc::new(coordinode_session::SessionRegistry::new(
+        std::time::Duration::from_secs(30),
+    ));
+    let manager = SessionManager::new(Arc::new(engine), registry);
     let (op_tx, op_rx) = mpsc::channel(64);
     let (ev_tx, mut ev_rx) = mpsc::channel(64);
-    let handle = tokio::spawn(manager.open().run(op_rx, ev_tx));
+    let handle = tokio::spawn(manager.open("test".into()).run(op_rx, ev_tx));
 
     op_tx
         .send((

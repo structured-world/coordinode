@@ -525,6 +525,12 @@ pub enum LogicalOp {
     /// SHOW TRIGGERS — the trigger architecture. Reads schema partition and returns one row per
     /// registered trigger.
     ShowTriggers,
+    /// SHOW SESSIONS: operational introspection. Reads the live session
+    /// registry and returns one row per open client session.
+    ShowSessions,
+    /// SHOW TRANSACTIONS: operational introspection. Reads the live session
+    /// registry and returns one row per open interactive transaction.
+    ShowTransactions,
     /// ALTER TRIGGER — the trigger architecture.
     AlterTrigger {
         clause: crate::cypher::ast::AlterTriggerClause,
@@ -1163,6 +1169,8 @@ impl LogicalOp {
             | LogicalOp::CreateTrigger { .. }
             | LogicalOp::DropTrigger { .. }
             | LogicalOp::ShowTriggers
+            | LogicalOp::ShowSessions
+            | LogicalOp::ShowTransactions
             | LogicalOp::AlterTrigger { .. }
             | LogicalOp::Empty => {}
         }
@@ -1783,6 +1791,8 @@ fn estimate_op_cost(
         | LogicalOp::CreateTrigger { .. }
         | LogicalOp::DropTrigger { .. }
         | LogicalOp::ShowTriggers
+        | LogicalOp::ShowSessions
+        | LogicalOp::ShowTransactions
         | LogicalOp::AlterTrigger { .. } => (1.0, 1.0),
         LogicalOp::MergeNodes { input, .. } => {
             // Cost ≈ input cost + per-row (property merge + edge transfer over avg_fan_out).
@@ -2594,6 +2604,12 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
         }
         LogicalOp::ShowTriggers => {
             output.push_str(&format!("{prefix}ShowTriggers\n"));
+        }
+        LogicalOp::ShowSessions => {
+            output.push_str(&format!("{prefix}ShowSessions\n"));
+        }
+        LogicalOp::ShowTransactions => {
+            output.push_str(&format!("{prefix}ShowTransactions\n"));
         }
         LogicalOp::AlterTrigger { clause } => {
             output.push_str(&format!(

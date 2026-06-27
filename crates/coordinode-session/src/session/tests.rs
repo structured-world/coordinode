@@ -79,7 +79,9 @@ async fn run_op(
     op: SessionOp,
 ) -> Vec<SessionEvent> {
     let (tx, mut rx) = mpsc::channel(64);
-    dispatch(engine, counter, 1, op, &tx).await;
+    let registry = SessionRegistry::new(std::time::Duration::from_secs(30));
+    let session_id = registry.register_session("test".into());
+    dispatch(engine, &registry, session_id, counter, 1, op, &tx).await;
     drop(tx);
     let mut out = Vec::new();
     while let Some((_request_id, event)) = rx.recv().await {
@@ -188,8 +190,9 @@ async fn commit_acknowledges_while_rollback_and_cancel_are_silent() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_dispatches_a_burst_concurrently_with_correlated_cursors() {
-    let manager = SessionManager::new(engine(&["n"], vec![vec![Value::Int(7)]]));
-    let session = manager.open();
+    let registry = Arc::new(SessionRegistry::new(std::time::Duration::from_secs(30)));
+    let manager = SessionManager::new(engine(&["n"], vec![vec![Value::Int(7)]]), registry);
+    let session = manager.open("test".into());
     let (op_tx, op_rx) = mpsc::channel(64);
     let (ev_tx, mut ev_rx) = mpsc::channel(64);
     let handle = tokio::spawn(session.run(op_rx, ev_tx));

@@ -285,6 +285,10 @@ pub struct Database {
     interner: Arc<RwLock<FieldInterner>>,
     allocator: NodeIdAllocator,
     shard_id: u16,
+    /// Live session registry for operational introspection, injected by the
+    /// server (`SHOW SESSIONS` / `SHOW TRANSACTIONS`). `None` in embedded use,
+    /// where there is no session layer; those statements then report nothing.
+    operations: Option<Arc<dyn coordinode_core::operations::OperationsView>>,
     /// Query fingerprint registry — tracks execution statistics per query pattern.
     query_registry: Arc<QueryRegistry>,
     /// N+1 pattern detector — flags repeated queries from the same source location.
@@ -863,6 +867,7 @@ impl Database {
             interner: shared_interner,
             allocator,
             shard_id: 1,
+            operations: None,
             query_registry: Arc::new(QueryRegistry::new()),
             nplus1_detector: Arc::new(NPlus1Detector::new()),
             dismissed: Arc::new(DismissedSet::new()),
@@ -1854,6 +1859,17 @@ impl Database {
         }
     }
 
+    /// Inject the live session registry so `SHOW SESSIONS` / `SHOW TRANSACTIONS`
+    /// can render operational introspection. The server wires this once at
+    /// startup with the same registry its session binding updates; embedded
+    /// callers leave it unset and those statements return no rows.
+    pub fn set_operations_view(
+        &mut self,
+        operations: Arc<dyn coordinode_core::operations::OperationsView>,
+    ) {
+        self.operations = Some(operations);
+    }
+
     pub fn execute_cypher_with_read_concern(
         &mut self,
         query: &str,
@@ -2040,6 +2056,7 @@ impl Database {
             id_allocator: &self.allocator,
             shard_id: self.shard_id,
             scan_paging: scan_paging.clone(),
+            operations: self.operations.as_deref(),
             adaptive: self.adaptive_config.clone(),
             dedup_varlen_targets: false,
             snapshot_ts: None,

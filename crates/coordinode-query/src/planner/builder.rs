@@ -789,6 +789,8 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             name: c.name.clone(),
         }),
         Clause::ShowTriggers => Ok(LogicalOp::ShowTriggers),
+        Clause::ShowSessions => Ok(LogicalOp::ShowSessions),
+        Clause::ShowTransactions => Ok(LogicalOp::ShowTransactions),
         Clause::AlterTrigger(c) => Ok(LogicalOp::AlterTrigger { clause: c.clone() }),
         Clause::AttachDocument(ad) => {
             // Synthesize a MATCH for the ATTACH pattern `(a)-[:T]->(u)` so that
