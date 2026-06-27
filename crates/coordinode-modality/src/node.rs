@@ -34,7 +34,7 @@ use coordinode_core::graph::node::{
 };
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_storage::engine::transaction::Transaction;
+use coordinode_storage::engine::transaction::{PagedScan, Transaction};
 use coordinode_storage::Guard;
 
 use crate::error::{StoreError, StoreResult};
@@ -159,6 +159,18 @@ pub trait NodeStore {
         txn: &mut Transaction,
         prefix: &[u8],
     ) -> StoreResult<Vec<(Vec<u8>, Vec<u8>)>>;
+
+    /// OCC-tracked, keyset-resumed page of a prefix scan over `Partition::Node`:
+    /// the memory-bounded source for a server-side cursor. Reads the committed
+    /// snapshot only (no write-buffer overlay), so the cursor path uses it for
+    /// read queries and falls back to [`Self::prefix_scan_tracked`] otherwise.
+    fn prefix_scan_paged_tracked(
+        &self,
+        txn: &mut Transaction,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> StoreResult<PagedScan>;
 
     /// Read the temporal version of a node valid at `at_ms`: returns
     /// the version whose `valid_from <= at_ms` is largest. Returns
@@ -486,6 +498,16 @@ impl NodeStore for LocalNodeStore {
         prefix: &[u8],
     ) -> StoreResult<Vec<(Vec<u8>, Vec<u8>)>> {
         Ok(txn.prefix_scan(Partition::Node, prefix)?)
+    }
+
+    fn prefix_scan_paged_tracked(
+        &self,
+        txn: &mut Transaction,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> StoreResult<PagedScan> {
+        Ok(txn.prefix_scan_paged(Partition::Node, prefix, start_after, limit)?)
     }
 
     fn get_at(

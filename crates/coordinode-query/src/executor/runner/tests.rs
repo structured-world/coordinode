@@ -201,6 +201,7 @@ fn make_ctx<'a>(
         interner,
         id_allocator: allocator,
         shard_id: 1,
+        scan_paging: None,
         adaptive: AdaptiveConfig::default(),
         dedup_varlen_targets: false,
         snapshot_ts: None,

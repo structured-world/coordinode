@@ -291,6 +291,25 @@ impl ExtensionRegistry {
     }
 }
 
+/// Keyset-paging state for a server-side cursor over a single-`NodeScan` source.
+///
+/// `resume` / `limit` are inputs (the previous page's last key, and the cap on
+/// storage keys read per page); `last_key` / `exhausted` are written back by the
+/// scan as the next page's resume point and end-of-prefix flag. Present only for
+/// keyset-pageable plans; the normal path leaves [`ExecutionContext::scan_paging`]
+/// `None` and scans the whole prefix.
+#[derive(Default, Clone)]
+pub struct ScanPaging {
+    /// The previous page's last key; `None` starts at the prefix.
+    pub resume: Option<Vec<u8>>,
+    /// Cap on storage keys read this page.
+    pub limit: usize,
+    /// Last key read this page: the next page's resume point.
+    pub last_key: Option<Vec<u8>>,
+    /// True when the scanned prefix has no rows beyond this page.
+    pub exhausted: bool,
+}
+
 pub struct ExecutionContext<'a> {
     pub engine: &'a StorageEngine,
     /// Optional `Arc` handle to the same engine the borrow above points at.
@@ -307,6 +326,9 @@ pub struct ExecutionContext<'a> {
     pub id_allocator: &'a NodeIdAllocator,
     /// Default shard ID for single-node deployment.
     pub shard_id: u16,
+    /// Keyset-paging state for a server-side cursor (see [`ScanPaging`]). `None`
+    /// on the normal path: the single `NodeScan` source scans the whole prefix.
+    pub scan_paging: Option<ScanPaging>,
     /// Adaptive query plan configuration.
     pub adaptive: AdaptiveConfig,
     /// When true, variable-length traversal emits each reached target node at
@@ -3060,7 +3082,28 @@ fn execute_node_scan(
     use coordinode_modality::{LocalNodeStore, NodeStore as _};
     let prefix_bytes = LocalNodeStore.shard_scan_prefix(ctx.shard_id);
     ctx.sync_txn_state();
-    let scan_results = LocalNodeStore.prefix_scan_tracked(&mut ctx.txn, &prefix_bytes)?;
+    // Keyset-paged source (server-side cursor) when `scan_paging` is set;
+    // otherwise the whole-prefix scan. The decode loop below is identical.
+    let scan_results = match ctx
+        .scan_paging
+        .as_ref()
+        .map(|p| (p.resume.clone(), p.limit))
+    {
+        Some((resume, limit)) => {
+            let page = LocalNodeStore.prefix_scan_paged_tracked(
+                &mut ctx.txn,
+                &prefix_bytes,
+                resume.as_deref(),
+                limit,
+            )?;
+            if let Some(paging) = ctx.scan_paging.as_mut() {
+                paging.last_key = page.last_key;
+                paging.exhausted = page.exhausted;
+            }
+            page.rows
+        }
+        None => LocalNodeStore.prefix_scan_tracked(&mut ctx.txn, &prefix_bytes)?,
+    };
 
     for (key_bytes, value_bytes) in &scan_results {
         let record = NodeRecord::from_msgpack(value_bytes).map_err(|e| {

@@ -354,7 +354,7 @@ impl Database {
         } else {
             Some(params)
         };
-        self.execute_cypher_impl(body, None, params, &session, TxnMode::AutoCommit)
+        self.execute_cypher_impl(body, None, params, &session, TxnMode::AutoCommit, &mut None)
             .map(|_| ())
     }
 

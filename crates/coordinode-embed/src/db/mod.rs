@@ -24,7 +24,7 @@ use coordinode_query::cypher;
 use coordinode_query::executor::row::Row;
 use coordinode_query::executor::runner::{
     execute, execute_no_commit, AdaptiveConfig, ExecutionContext, ExecutionError, ExtensionHandler,
-    ExtensionRegistry, FeedbackCache, WriteStats,
+    ExtensionRegistry, FeedbackCache, ScanPaging, WriteStats,
 };
 use coordinode_query::planner;
 use coordinode_raft::proposal::OwnedLocalProposalPipeline;
@@ -39,6 +39,27 @@ use coordinode_storage::Guard;
 #[derive(Debug, Clone)]
 pub struct CypherResult {
     pub rows: Vec<Row>,
+    pub write_stats: WriteStats,
+}
+
+/// One page of a keyset-resumable server-side cursor.
+///
+/// A cursor pins `read_ts` once and feeds it back into every subsequent
+/// [`Database::execute_cypher_paged`] call, so all pages observe the same
+/// MVCC snapshot even under concurrent writes. `last_key` is the opaque
+/// resume token for the next page (the last storage key the scan emitted);
+/// `exhausted` is `true` once the underlying scan has no more rows.
+#[derive(Debug, Clone)]
+pub struct PagedCypherResult {
+    pub rows: Vec<Row>,
+    /// Resume token for the next page: pass back as `resume`. `None` when the
+    /// page produced no scan key (empty result or a non-keyset plan).
+    pub last_key: Option<Vec<u8>>,
+    /// `true` once the scan is fully drained: no further pages remain.
+    pub exhausted: bool,
+    /// The pinned MVCC snapshot timestamp this cursor reads against. Echo it
+    /// into the next page's `read_ts` to keep the snapshot stable.
+    pub read_ts: u64,
     pub write_stats: WriteStats,
 }
 
@@ -1275,8 +1296,15 @@ impl Database {
             return Ok(Vec::new());
         }
         let session = self.capture_session();
-        self.execute_cypher_impl(query, Some(source), None, &session, TxnMode::AutoCommit)
-            .map(|(rows, _, _)| rows)
+        self.execute_cypher_impl(
+            query,
+            Some(source),
+            None,
+            &session,
+            TxnMode::AutoCommit,
+            &mut None,
+        )
+        .map(|(rows, _, _)| rows)
     }
 
     /// Execute a Cypher query with both source context and bound parameters.
@@ -1298,8 +1326,15 @@ impl Database {
             return Ok(Vec::new());
         }
         let session = self.capture_session();
-        self.execute_cypher_impl(query, Some(source), params, &session, TxnMode::AutoCommit)
-            .map(|(rows, _, _)| rows)
+        self.execute_cypher_impl(
+            query,
+            Some(source),
+            params,
+            &session,
+            TxnMode::AutoCommit,
+            &mut None,
+        )
+        .map(|(rows, _, _)| rows)
     }
 
     /// Execute a Cypher query and return result rows.
@@ -1324,7 +1359,7 @@ impl Database {
             return Ok(Vec::new());
         }
         let session = self.capture_session();
-        self.execute_cypher_impl(query, None, None, &session, TxnMode::AutoCommit)
+        self.execute_cypher_impl(query, None, None, &session, TxnMode::AutoCommit, &mut None)
             .map(|(rows, _, _)| rows)
     }
 
@@ -1346,8 +1381,15 @@ impl Database {
             return Ok(Vec::new());
         }
         let session = self.capture_session();
-        self.execute_cypher_impl(query, None, params, &session, TxnMode::AutoCommit)
-            .map(|(rows, _, _)| rows)
+        self.execute_cypher_impl(
+            query,
+            None,
+            params,
+            &session,
+            TxnMode::AutoCommit,
+            &mut None,
+        )
+        .map(|(rows, _, _)| rows)
     }
 
     /// Execute a Cypher query end-to-end with full session-level overrides and
@@ -1387,8 +1429,15 @@ impl Database {
         }
 
         let params = params.and_then(|p| if p.is_empty() { None } else { Some(p) });
-        self.execute_cypher_impl(query, source, params, &session, TxnMode::AutoCommit)
-            .map(|(rows, write_stats, _)| CypherResult { rows, write_stats })
+        self.execute_cypher_impl(
+            query,
+            source,
+            params,
+            &session,
+            TxnMode::AutoCommit,
+            &mut None,
+        )
+        .map(|(rows, write_stats, _)| CypherResult { rows, write_stats })
     }
 
     /// Begin an interactive multi-statement transaction (ADR-042).
@@ -1463,6 +1512,7 @@ impl Database {
             params,
             &session,
             TxnMode::Interactive(Box::new(state)),
+            &mut None,
         )?;
         if let Some(state) = out_state {
             // Cap buffered (uncommitted) memory: a client that keeps writing
@@ -1679,8 +1729,126 @@ impl Database {
         }
 
         let params = params.and_then(|p| if p.is_empty() { None } else { Some(p) });
-        self.execute_cypher_impl(query, source, params, &session, TxnMode::AutoCommit)
-            .map(|(rows, write_stats, _)| CypherResult { rows, write_stats })
+        self.execute_cypher_impl(
+            query,
+            source,
+            params,
+            &session,
+            TxnMode::AutoCommit,
+            &mut None,
+        )
+        .map(|(rows, write_stats, _)| CypherResult { rows, write_stats })
+    }
+
+    /// Execute one page of a keyset-resumable server-side cursor.
+    ///
+    /// The cursor reads against a pinned MVCC snapshot: pass `read_ts = None`
+    /// for the first page (a fresh snapshot is taken and returned in
+    /// [`PagedCypherResult::read_ts`]); echo that timestamp back as
+    /// `read_ts = Some(t)` for every following page so the whole result set
+    /// stays stable under concurrent writes. `resume` is the previous page's
+    /// [`PagedCypherResult::last_key`] (`None` for the first page); `limit`
+    /// bounds the rows scanned per page, keeping cursor memory `O(limit)`
+    /// rather than `O(result)`.
+    ///
+    /// This is the keyset primitive: it assumes a non-blocking single-scan
+    /// plan whose scan honours `resume` + `limit` and reports `last_key` +
+    /// `exhausted`. The caller (the server cursor layer) MUST classify the
+    /// plan first and route blocking plans (sort / aggregate / distinct) to
+    /// the materialise-once cursor instead: under a blocking operator the
+    /// scan would emit only one page's worth of rows and the operator above
+    /// would compute over a partial set. A plan with no scan at all (e.g. a
+    /// bare `RETURN`) reports a single exhausted page.
+    pub fn execute_cypher_paged(
+        &self,
+        query: &str,
+        params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
+        read_ts: Option<u64>,
+        resume: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<PagedCypherResult, DatabaseError> {
+        // Pin the snapshot once; later pages re-pin to the same timestamp.
+        let pinned = read_ts.unwrap_or_else(|| self.oracle.next().as_raw());
+        let session = QuerySession {
+            read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::Snapshot,
+            snapshot_read_ts: Some(pinned),
+            write_concern: self.write_concern.clone(),
+            vector_consistency: self.vector_consistency,
+            after_commit_generation: 0,
+        };
+        let params = params.and_then(|p| if p.is_empty() { None } else { Some(p) });
+        let mut paging = Some(ScanPaging {
+            resume,
+            limit,
+            last_key: None,
+            exhausted: false,
+        });
+        let (rows, write_stats, _) = self.execute_cypher_impl(
+            query,
+            None,
+            params,
+            &session,
+            TxnMode::AutoCommit,
+            &mut paging,
+        )?;
+        // The executor leaves `paging` populated for a keyset plan; a blocking
+        // plan ignores it (the scan path never ran), so treat an untouched
+        // page as a single exhausted page over the whole materialised result.
+        let paging = paging.unwrap_or(ScanPaging {
+            resume: None,
+            limit,
+            last_key: None,
+            exhausted: true,
+        });
+        // A page is exhausted when the scan reported end, or when there is no
+        // resume token at all (a no-scan plan, or a page that emitted no key):
+        // without a `last_key` the next call has nothing to resume from.
+        let exhausted = paging.exhausted || paging.last_key.is_none();
+        Ok(PagedCypherResult {
+            rows,
+            last_key: paging.last_key,
+            exhausted,
+            read_ts: pinned,
+            write_stats,
+        })
+    }
+
+    /// Classify whether `query` can be served by a keyset-resumable cursor via
+    /// [`Database::execute_cypher_paged`].
+    ///
+    /// Eligible plans stream from a single `NodeScan` through only
+    /// row-preserving, non-collapsing operators (`Filter`, non-`DISTINCT`
+    /// `Project`), so the executor can page by storage key and the cursor stays
+    /// `O(batch)`. Any blocking operator (sort, aggregate, `DISTINCT`),
+    /// row-multiplying source (traverse, cartesian product, union), bounded
+    /// operator (`LIMIT` / `SKIP`), index point-lookup, or write makes the plan
+    /// ineligible: the cursor layer runs those materialise-once instead. A
+    /// query that fails to parse or plan is reported ineligible (the cursor
+    /// surfaces the real error on execution).
+    pub fn keyset_pageable(&self, query: &str) -> bool {
+        let Ok(ast) = cypher::parse(query) else {
+            return false;
+        };
+        let Ok(plan) = planner::build_logical_plan(&ast) else {
+            return false;
+        };
+        Self::spine_is_keyset_pageable(&plan.root)
+    }
+
+    /// Walk a plan spine: keyset-pageable iff it is a single `NodeScan` under a
+    /// chain of only `Filter` and order-preserving (`distinct == false`)
+    /// `Project` nodes.
+    fn spine_is_keyset_pageable(op: &planner::LogicalOp) -> bool {
+        match op {
+            planner::LogicalOp::NodeScan { .. } => true,
+            planner::LogicalOp::Filter { input, .. } => Self::spine_is_keyset_pageable(input),
+            planner::LogicalOp::Project {
+                input,
+                distinct: false,
+                ..
+            } => Self::spine_is_keyset_pageable(input),
+            _ => false,
+        }
     }
 
     pub fn execute_cypher_with_read_concern(
@@ -1700,7 +1868,7 @@ impl Database {
         session.read_concern = read_concern.level;
         session.snapshot_read_ts = read_concern.at_timestamp;
 
-        self.execute_cypher_impl(query, None, None, &session, TxnMode::AutoCommit)
+        self.execute_cypher_impl(query, None, None, &session, TxnMode::AutoCommit, &mut None)
             .map(|(r, _, _)| r)
     }
 
@@ -1711,6 +1879,11 @@ impl Database {
         params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
         session: &QuerySession,
         txn_mode: TxnMode,
+        // Keyset cursor in/out channel: on entry carries `resume` + `limit` for
+        // a server-side cursor page; on return the executor has overwritten
+        // `last_key` + `exhausted`. `&mut None` for a non-paged (whole-result)
+        // execution: the executor then materialises the full result set.
+        scan_paging: &mut Option<ScanPaging>,
     ) -> Result<
         (
             Vec<Row>,
@@ -1863,6 +2036,7 @@ impl Database {
             interner: &mut interner_guard,
             id_allocator: &self.allocator,
             shard_id: self.shard_id,
+            scan_paging: scan_paging.clone(),
             adaptive: self.adaptive_config.clone(),
             dedup_varlen_targets: false,
             snapshot_ts: None,
@@ -1963,6 +2137,11 @@ impl Database {
         let mut write_stats = ctx.write_stats.clone();
         let nodes_created = write_stats.nodes_created;
         let had_mutations = write_stats.has_mutations();
+        // Hand the executor-updated keyset state (last_key + exhausted) back to
+        // the caller through the in/out channel. `None` stays `None` for a
+        // non-paged execution; the cursor path reads this to build the next
+        // page's resume token.
+        *scan_paging = ctx.scan_paging.clone();
         // Drop ctx, then snapshot the interner state under the same
         // write guard before releasing it so we don't race with another
         // query that might intern between unlock and persist.

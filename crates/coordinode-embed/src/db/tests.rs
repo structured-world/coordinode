@@ -1210,3 +1210,174 @@ fn end_to_end_vector_filter_without_traverse_executes() {
         .expect("vector filter without traverse should work");
     assert!(!rows.is_empty());
 }
+
+// ----- server-side keyset cursor (execute_cypher_paged) -----
+
+#[test]
+fn paged_cursor_walks_label_in_keyset_pages() {
+    // A keyset cursor over a label must visit every node exactly once across
+    // pages of `limit` rows, then report exhaustion. Memory stays O(limit):
+    // each page only materialises `limit` rows, not the whole label.
+    use coordinode_core::graph::types::Value;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    for k in 0..7 {
+        db.execute_cypher(&format!("CREATE (n:Page {{k: {k}}})"))
+            .expect("seed");
+    }
+
+    let mut seen: Vec<i64> = Vec::new();
+    let mut resume: Option<Vec<u8>> = None;
+    let mut read_ts: Option<u64> = None;
+    let mut pages = 0;
+    loop {
+        let page = db
+            .execute_cypher_paged(
+                "MATCH (n:Page) RETURN n.k",
+                None,
+                read_ts,
+                resume.clone(),
+                2,
+            )
+            .expect("page");
+        pages += 1;
+        for row in &page.rows {
+            match row.get("n.k") {
+                Some(Value::Int(v)) => seen.push(*v),
+                other => panic!("unexpected row value: {other:?}"),
+            }
+        }
+        // Every page after the first must read against the same pinned snapshot.
+        if let Some(t) = read_ts {
+            assert_eq!(t, page.read_ts, "snapshot ts must stay pinned across pages");
+        }
+        read_ts = Some(page.read_ts);
+        resume = page.last_key.clone();
+        if page.exhausted {
+            break;
+        }
+        assert!(pages < 100, "cursor must terminate");
+    }
+
+    seen.sort_unstable();
+    assert_eq!(seen, (0..7).collect::<Vec<_>>(), "every node seen once");
+    assert!(
+        pages >= 4,
+        "limit=2 over 7 rows needs ≥4 pages, got {pages}"
+    );
+}
+
+#[test]
+fn paged_cursor_snapshot_is_stable_under_concurrent_writes() {
+    // A node inserted AFTER the cursor pins its snapshot must NOT appear in
+    // later pages: the cursor reads at a fixed MVCC timestamp (repeatable
+    // read), so the result set is stable for the cursor's life.
+    use coordinode_core::graph::types::Value;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    for k in 0..4 {
+        db.execute_cypher(&format!("CREATE (n:Snap {{k: {k}}})"))
+            .expect("seed");
+    }
+
+    // First page pins the snapshot.
+    let first = db
+        .execute_cypher_paged("MATCH (n:Snap) RETURN n.k", None, None, None, 2)
+        .expect("first page");
+    assert_eq!(first.rows.len(), 2);
+    assert!(!first.exhausted);
+
+    // Insert a fifth node while the cursor is open.
+    db.execute_cypher("CREATE (n:Snap {k: 99})")
+        .expect("late insert");
+
+    // Drain the rest against the pinned snapshot: the late node must be absent.
+    let mut seen: Vec<i64> = first
+        .rows
+        .iter()
+        .map(|r| match r.get("n.k") {
+            Some(Value::Int(v)) => *v,
+            other => panic!("unexpected: {other:?}"),
+        })
+        .collect();
+    let mut resume = first.last_key.clone();
+    let read_ts = Some(first.read_ts);
+    loop {
+        let page = db
+            .execute_cypher_paged(
+                "MATCH (n:Snap) RETURN n.k",
+                None,
+                read_ts,
+                resume.clone(),
+                2,
+            )
+            .expect("page");
+        for row in &page.rows {
+            if let Some(Value::Int(v)) = row.get("n.k") {
+                seen.push(*v);
+            }
+        }
+        resume = page.last_key.clone();
+        if page.exhausted {
+            break;
+        }
+    }
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        vec![0, 1, 2, 3],
+        "late-inserted node must not be visible"
+    );
+}
+
+#[test]
+fn keyset_pageable_classifies_plan_shapes() {
+    // The cursor layer routes only non-blocking single-scan plans to the
+    // keyset path; everything that reorders, collapses, bounds, or multiplies
+    // rows must materialise.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+
+    // Eligible: plain scan, scan + filter, scan + projection.
+    assert!(db.keyset_pageable("MATCH (n:User) RETURN n"));
+    assert!(db.keyset_pageable("MATCH (n:User) WHERE n.age > 30 RETURN n.name"));
+    assert!(db.keyset_pageable("MATCH (n:User) RETURN n.name AS name"));
+
+    // Ineligible: blocking / bounded / multi-source / collapsing.
+    assert!(
+        !db.keyset_pageable("MATCH (n:User) RETURN n ORDER BY n.name"),
+        "sort blocks"
+    );
+    assert!(
+        !db.keyset_pageable("MATCH (n:User) RETURN count(n)"),
+        "aggregate blocks"
+    );
+    assert!(
+        !db.keyset_pageable("MATCH (n:User) RETURN DISTINCT n.name"),
+        "distinct blocks"
+    );
+    assert!(
+        !db.keyset_pageable("MATCH (n:User) RETURN n LIMIT 10"),
+        "limit bounds the result"
+    );
+    assert!(
+        !db.keyset_pageable("MATCH (a:User)-[:KNOWS]->(b:User) RETURN b"),
+        "traverse is multi-source"
+    );
+
+    // Unparseable / unplannable → ineligible (error surfaces on execution).
+    assert!(!db.keyset_pageable("THIS IS NOT CYPHER"));
+}
+
+#[test]
+fn paged_cursor_empty_label_is_exhausted_immediately() {
+    // A label with no nodes yields one exhausted page, no resume token.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+    let page = db
+        .execute_cypher_paged("MATCH (n:Nothing) RETURN n.k", None, None, None, 10)
+        .expect("page");
+    assert!(page.rows.is_empty());
+    assert!(page.exhausted);
+    assert!(page.last_key.is_none());
+}
