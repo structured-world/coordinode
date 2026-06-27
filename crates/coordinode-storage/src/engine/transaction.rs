@@ -1100,6 +1100,95 @@ impl<'a> Transaction<'a> {
             }
         }
     }
+
+    /// Keyset-resumed page of a prefix scan, reading the transaction's pinned
+    /// snapshot. Returns up to `limit` rows whose key carries `prefix`, starting
+    /// strictly after `start_after` (or at the prefix start when `None`), plus
+    /// the last key returned (the next page's resume point) and whether the
+    /// prefix is exhausted. Each returned key is OCC-tracked.
+    ///
+    /// This is the cursor's memory-bounded source: it holds at most one page
+    /// regardless of the prefix's total size. It reads the committed snapshot
+    /// only and does NOT overlay this transaction's own buffered writes — the
+    /// keyset cursor falls back to a materialised scan when the transaction has
+    /// buffered writes over the prefix.
+    pub fn prefix_scan_paged(
+        &mut self,
+        part: Partition,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> StorageResult<PagedScan> {
+        let start = match start_after {
+            Some(after) => {
+                // The smallest key strictly greater than `after`.
+                let mut s = after.to_vec();
+                s.push(0);
+                s
+            }
+            None => prefix.to_vec(),
+        };
+        let end = prefix_upper_bound(prefix);
+        let iter = self.base_range_seekable(part, &start, &end)?;
+
+        let mut rows: Vec<KvPair> = Vec::with_capacity(limit);
+        let mut exhausted = true;
+        for guard in iter {
+            let (key, value) = guard.into_inner()?;
+            if !key.starts_with(prefix) {
+                continue;
+            }
+            if rows.len() == limit {
+                // At least one more matching row exists beyond this page.
+                exhausted = false;
+                break;
+            }
+            rows.push((key.to_vec(), value.to_vec()));
+        }
+
+        // OCC-track every key this page observed.
+        if let Some(scope) = self.ensure_occ_scope() {
+            for (key, _) in &rows {
+                scope.track(part, key);
+            }
+        }
+
+        let last_key = rows.last().map(|(k, _)| k.clone());
+        Ok(PagedScan {
+            rows,
+            last_key,
+            exhausted,
+        })
+    }
+}
+
+/// One page of a keyset-resumed prefix scan (see [`Transaction::prefix_scan_paged`]).
+pub struct PagedScan {
+    /// The page's rows, in key order.
+    pub rows: Vec<KvPair>,
+    /// Storage key of the last row returned: the resume point for the next page.
+    /// `None` when the page is empty.
+    pub last_key: Option<Vec<u8>>,
+    /// True when the prefix has no rows beyond this page.
+    pub exhausted: bool,
+}
+
+/// The smallest key that sorts strictly after every key carrying `prefix`, for
+/// use as an inclusive range upper bound (callers still filter with
+/// `starts_with`, since the bound itself may be a real, non-matching key).
+fn prefix_upper_bound(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last < 0xFF {
+            end.push(last + 1);
+            return end;
+        }
+    }
+    // Empty or all-0xFF prefix: extend with 0xFF to cover the rest of the
+    // keyspace (node-scan prefixes never reach this branch).
+    let mut end = prefix.to_vec();
+    end.push(0xFF);
+    end
 }
 
 #[cfg(test)]

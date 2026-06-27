@@ -159,3 +159,80 @@ fn legacy_mode_writes_directly_no_buffer() {
         Some(&b"lv"[..])
     );
 }
+
+#[test]
+fn prefix_scan_paged_walks_the_prefix_in_keyset_pages() {
+    let (engine, oracle, _d) = test_engine();
+    // Five committed rows under "p:", plus one outside it.
+    for i in 0..5u8 {
+        engine.put(Partition::Node, &[b'p', b':', i], &[i]).unwrap();
+    }
+    engine.put(Partition::Node, b"q:z", b"x").unwrap();
+    let mut txn = Transaction::new(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(engine.snapshot()),
+        Some(engine.snapshot()),
+    );
+
+    // Page in batches of two, resuming by keyset off the last key.
+    let mut all = Vec::new();
+    let mut resume: Option<Vec<u8>> = None;
+    loop {
+        let page = txn
+            .prefix_scan_paged(Partition::Node, b"p:", resume.as_deref(), 2)
+            .unwrap();
+        all.extend(page.rows.clone());
+        if page.exhausted {
+            assert!(page.rows.len() <= 2);
+            break;
+        }
+        assert_eq!(page.rows.len(), 2, "a non-final page is full");
+        resume = page.last_key;
+        assert!(resume.is_some());
+    }
+
+    // All five prefix rows, in key order, none from outside the prefix.
+    assert_eq!(all.len(), 5);
+    for (idx, (key, _)) in all.iter().enumerate() {
+        assert_eq!(key, &vec![b'p', b':', idx as u8]);
+    }
+}
+
+#[test]
+fn prefix_scan_paged_empty_prefix_is_exhausted_with_no_last_key() {
+    let (engine, oracle, _d) = test_engine();
+    engine.put(Partition::Node, b"q:a", b"x").unwrap();
+    let mut txn = Transaction::new(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(engine.snapshot()),
+        Some(engine.snapshot()),
+    );
+    let page = txn
+        .prefix_scan_paged(Partition::Node, b"p:", None, 10)
+        .unwrap();
+    assert!(page.rows.is_empty());
+    assert!(page.exhausted);
+    assert!(page.last_key.is_none());
+}
+
+#[test]
+fn prefix_scan_paged_exact_limit_reports_exhausted() {
+    let (engine, oracle, _d) = test_engine();
+    engine.put(Partition::Node, b"p:a", b"1").unwrap();
+    engine.put(Partition::Node, b"p:b", b"2").unwrap();
+    let mut txn = Transaction::new(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(engine.snapshot()),
+        Some(engine.snapshot()),
+    );
+    // Exactly `limit` matching rows: exhausted, no phantom extra page.
+    let page = txn
+        .prefix_scan_paged(Partition::Node, b"p:", None, 2)
+        .unwrap();
+    assert_eq!(page.rows.len(), 2);
+    assert!(page.exhausted);
+    assert_eq!(page.last_key, Some(b"p:b".to_vec()));
+}
