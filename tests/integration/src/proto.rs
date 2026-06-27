@@ -29,3 +29,8 @@ pub mod query {
 pub mod admin {
     include!(concat!(env!("OUT_DIR"), "/coordinode.v1.admin.rs"));
 }
+
+#[allow(clippy::all, dead_code)]
+pub mod session {
+    include!(concat!(env!("OUT_DIR"), "/coordinode.v1.session.rs"));
+}

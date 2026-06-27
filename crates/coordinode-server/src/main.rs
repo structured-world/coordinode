@@ -26,6 +26,9 @@ pub mod proto {
     pub mod query {
         tonic::include_proto!("coordinode.v1.query");
     }
+    pub mod session {
+        tonic::include_proto!("coordinode.v1.session");
+    }
     pub mod health {
         tonic::include_proto!("coordinode.v1.health");
     }
@@ -1112,6 +1115,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .add_service(
                     proto::query::cypher_service_server::CypherServiceServer::new(cypher_service)
                         .max_decoding_message_size(max_req_bytes),
+                )
+                .add_service(
+                    proto::session::session_service_server::SessionServiceServer::new(
+                        services::session::SessionSvc::new(Arc::clone(&database)),
+                    )
+                    .max_decoding_message_size(max_req_bytes),
                 )
                 .add_service(
                     proto::query::vector_service_server::VectorServiceServer::new(vector_service)

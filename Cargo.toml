@@ -20,6 +20,7 @@ members = [
     "crates/coordinode-test-fixtures",
     "crates/coordinode-bench",
     "crates/coordinode-wire",
+    "crates/coordinode-session",
     "tests/integration",
 ]
 exclude = [
@@ -132,6 +133,7 @@ criterion = { version = "0.8", features = ["html_reports"] }
 # to replace path deps with registry deps and fail with "not found on crates.io".
 coordinode-core = { path = "crates/coordinode-core" }
 coordinode-query = { path = "crates/coordinode-query" }
+coordinode-session = { path = "crates/coordinode-session" }
 coordinode-vector = { path = "crates/coordinode-vector" }
 coordinode-search = { path = "crates/coordinode-search" }
 coordinode-storage = { path = "crates/coordinode-storage" }
