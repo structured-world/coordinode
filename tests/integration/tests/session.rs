@@ -21,7 +21,9 @@ use std::collections::HashMap;
 use coordinode_integration::harness::CoordinodeProcess;
 use coordinode_integration::proto::session::server_frame::Event;
 use coordinode_integration::proto::session::session_service_client::SessionServiceClient;
-use coordinode_integration::proto::session::{client_frame, Begin, ClientFrame, Commit, Execute};
+use coordinode_integration::proto::session::{
+    client_frame, Begin, ClientFrame, Commit, Execute, Rollback,
+};
 
 fn begin(request_id: u64) -> ClientFrame {
     ClientFrame {
@@ -50,6 +52,30 @@ fn commit(request_id: u64) -> ClientFrame {
         request_id,
         op: Some(client_frame::Op::Commit(Commit {
             txid: 1,
+            last_nonce: 0,
+        })),
+    }
+}
+
+/// An Execute frame bound to an open transaction `txid`.
+fn execute_tx(request_id: u64, query: &str, txid: u64) -> ClientFrame {
+    ClientFrame {
+        request_id,
+        op: Some(client_frame::Op::Execute(Execute {
+            query: query.to_string(),
+            parameters: Default::default(),
+            txid,
+            nonce: 0,
+        })),
+    }
+}
+
+/// A Commit frame for a specific transaction.
+fn commit_tx(request_id: u64, txid: u64) -> ClientFrame {
+    ClientFrame {
+        request_id,
+        op: Some(client_frame::Op::Commit(Commit {
+            txid,
             last_nonce: 0,
         })),
     }
@@ -155,6 +181,112 @@ async fn session_pages_a_label_scan_through_the_keyset_cursor() {
             );
         }
         other => panic!("scan request got {other:?}"),
+    }
+}
+
+/// Drive a controlled session: Begin, run `write` inside the transaction, then
+/// commit (or roll back). Returns once the transaction resolves. Sequences each
+/// step on the response so Begin strictly precedes the in-transaction write.
+async fn drive_transaction(proc: &CoordinodeProcess, write: &str, do_commit: bool) {
+    use tokio_stream::wrappers::ReceiverStream;
+    let channel = tonic::transport::Endpoint::from_shared(proc.endpoint())
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    let mut client = SessionServiceClient::new(channel);
+    let (tx, rx) = tokio::sync::mpsc::channel::<ClientFrame>(8);
+    let mut inbound = client
+        .session(ReceiverStream::new(rx))
+        .await
+        .expect("open session")
+        .into_inner();
+
+    // Begin → handle.
+    tx.send(begin(1)).await.expect("send begin");
+    let txid = loop {
+        let f = inbound.message().await.expect("frame").expect("not end");
+        if f.request_id == 1 {
+            match f.event {
+                Some(Event::Begun(b)) => break b.txid,
+                other => panic!("expected Begun, got {other:?}"),
+            }
+        }
+    };
+
+    // Write inside the transaction; wait for its cursor to finish.
+    tx.send(execute_tx(2, write, txid))
+        .await
+        .expect("send write");
+    loop {
+        let f = inbound.message().await.expect("frame").expect("not end");
+        if f.request_id == 2 {
+            match f.event {
+                Some(Event::CursorEnd(_)) => break,
+                Some(Event::Error(e)) => panic!("in-txn write errored: {}", e.message),
+                _ => {}
+            }
+        }
+    }
+
+    // Resolve.
+    if do_commit {
+        tx.send(commit_tx(3, txid)).await.expect("send commit");
+        loop {
+            let f = inbound.message().await.expect("frame").expect("not end");
+            if f.request_id == 3 {
+                match f.event {
+                    Some(Event::Committed(_)) => break,
+                    Some(Event::Error(e)) => panic!("commit errored: {}", e.message),
+                    _ => {}
+                }
+            }
+        }
+    } else {
+        let rollback = ClientFrame {
+            request_id: 3,
+            op: Some(client_frame::Op::Rollback(Rollback { txid })),
+        };
+        tx.send(rollback).await.expect("send rollback");
+    }
+    drop(tx);
+    // Drain to end so the server finishes the transaction task.
+    while inbound.message().await.expect("frame").is_some() {}
+}
+
+#[tokio::test]
+async fn in_session_transaction_commit_persists_writes() {
+    // A write inside a committed interactive transaction must be durable: a
+    // fresh session sees it. Proves the real interactive transaction lifecycle
+    // runs through the session core (begin, buffered write, commit).
+    let proc = CoordinodeProcess::start().await;
+    drive_transaction(&proc, "CREATE (n:Tx {k: 1})", true).await;
+
+    let by_id = run_session(&proc, vec![execute(1, "MATCH (n:Tx) RETURN n.k AS k")]).await;
+    let events = by_id.get(&1).map(Vec::as_slice).unwrap_or_default();
+    match events {
+        [Event::CursorOpen(_), rest @ ..] => {
+            assert_eq!(row_count(rest), 1, "committed write is visible afterwards");
+        }
+        other => panic!("verify scan got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn in_session_transaction_rollback_discards_writes() {
+    // A write inside a rolled-back transaction must leave no trace.
+    let proc = CoordinodeProcess::start().await;
+    drive_transaction(&proc, "CREATE (n:Rb {k: 1})", false).await;
+
+    let by_id = run_session(&proc, vec![execute(1, "MATCH (n:Rb) RETURN n.k AS k")]).await;
+    let events = by_id.get(&1).map(Vec::as_slice).unwrap_or_default();
+    match events {
+        [Event::CursorOpen(_), rest @ ..] => {
+            assert_eq!(row_count(rest), 0, "rolled-back write left no node");
+        }
+        // No rows at all (open+end) is equally valid.
+        [] => {}
+        other => panic!("verify scan got {other:?}"),
     }
 }
 

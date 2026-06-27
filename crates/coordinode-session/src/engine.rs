@@ -37,6 +37,20 @@ pub trait CursorEngine: Send + Sync {
         params: HashMap<String, Value>,
         txid: u64,
     ) -> Result<Box<dyn QueryCursor>, EngineError>;
+
+    /// Open a new interactive transaction and return its handle. Subsequent
+    /// `open_cursor` calls carrying this `txid` run inside it, reading its pinned
+    /// snapshot and buffering writes until `commit_transaction`.
+    fn begin_transaction(&self) -> Result<u64, EngineError>;
+
+    /// Commit an interactive transaction, flushing its buffered writes in one
+    /// proposal and returning the applied Raft index (the causal token; zero in
+    /// embedded mode).
+    fn commit_transaction(&self, txid: u64) -> Result<u64, EngineError>;
+
+    /// Roll back an interactive transaction, discarding its buffered writes. No
+    /// proposal is emitted (nothing was durable).
+    fn rollback_transaction(&self, txid: u64) -> Result<(), EngineError>;
 }
 
 /// A live server-side cursor: a column header plus paged row batches.

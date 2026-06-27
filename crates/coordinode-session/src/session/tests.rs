@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use coordinode_core::graph::types::Value;
 use tokio::sync::mpsc;
@@ -35,6 +35,7 @@ struct MockEngine {
     columns: Vec<String>,
     rows: Vec<Vec<Value>>,
     fail: Option<String>,
+    next_txn: AtomicU64,
 }
 
 impl CursorEngine for MockEngine {
@@ -53,6 +54,18 @@ impl CursorEngine for MockEngine {
             })),
         }
     }
+
+    fn begin_transaction(&self) -> Result<u64, EngineError> {
+        Ok(self.next_txn.fetch_add(1, AtomicOrdering::Relaxed) + 1)
+    }
+
+    fn commit_transaction(&self, _txid: u64) -> Result<u64, EngineError> {
+        Ok(0)
+    }
+
+    fn rollback_transaction(&self, _txid: u64) -> Result<(), EngineError> {
+        Ok(())
+    }
 }
 
 fn engine(columns: &[&str], rows: Vec<Vec<Value>>) -> Arc<dyn CursorEngine> {
@@ -60,6 +73,7 @@ fn engine(columns: &[&str], rows: Vec<Vec<Value>>) -> Arc<dyn CursorEngine> {
         columns: columns.iter().map(|s| s.to_string()).collect(),
         rows,
         fail: None,
+        next_txn: AtomicU64::new(0),
     })
 }
 
@@ -72,29 +86,42 @@ fn exec() -> SessionOp {
     }
 }
 
-/// Dispatch one op against `engine` and collect the events it emits.
-async fn run_op(
-    engine: &Arc<dyn CursorEngine>,
-    counter: &AtomicU64,
-    op: SessionOp,
-) -> Vec<SessionEvent> {
-    let (tx, mut rx) = mpsc::channel(64);
-    let registry = SessionRegistry::new(std::time::Duration::from_secs(30));
-    let session_id = registry.register_session("test".into());
-    dispatch(engine, &registry, session_id, counter, 1, op, &tx).await;
-    drop(tx);
-    let mut out = Vec::new();
-    while let Some((_request_id, event)) = rx.recv().await {
-        out.push(event);
+/// Drive a fresh session with `ops` (request_id = index + 1) and collect every
+/// event grouped by request_id. Exercises the real `Session::run` path.
+async fn run_session(
+    engine: Arc<dyn CursorEngine>,
+    ops: Vec<SessionOp>,
+) -> HashMap<u64, Vec<SessionEvent>> {
+    let registry = Arc::new(SessionRegistry::new(std::time::Duration::from_secs(30)));
+    let manager = SessionManager::new(engine, registry);
+    let session = manager.open("test".into());
+    let (op_tx, op_rx) = mpsc::channel(64);
+    let (ev_tx, mut ev_rx) = mpsc::channel(64);
+    let handle = tokio::spawn(session.run(op_rx, ev_tx));
+    for (i, op) in ops.into_iter().enumerate() {
+        op_tx.send((i as u64 + 1, op)).await.unwrap();
     }
-    out
+    drop(op_tx);
+    let mut by_id: HashMap<u64, Vec<SessionEvent>> = HashMap::new();
+    while let Some((request_id, event)) = ev_rx.recv().await {
+        by_id.entry(request_id).or_default().push(event);
+    }
+    handle.await.unwrap();
+    by_id
+}
+
+/// Drive a single op and return its events.
+async fn run_one(engine: Arc<dyn CursorEngine>, op: SessionOp) -> Vec<SessionEvent> {
+    run_session(engine, vec![op])
+        .await
+        .remove(&1)
+        .unwrap_or_default()
 }
 
 #[tokio::test]
 async fn execute_pages_cursor_open_then_rows_then_end() {
     let engine = engine(&["n"], vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
-    let counter = AtomicU64::new(0);
-    let events = run_op(&engine, &counter, exec()).await;
+    let events = run_one(engine, exec()).await;
     match events.as_slice() {
         [SessionEvent::CursorOpen { columns }, SessionEvent::Rows { rows }, SessionEvent::CursorEnd { .. }] =>
         {
@@ -108,8 +135,7 @@ async fn execute_pages_cursor_open_then_rows_then_end() {
 #[tokio::test]
 async fn execute_with_an_empty_result_opens_then_ends_with_no_rows() {
     let engine = engine(&["n"], vec![]);
-    let counter = AtomicU64::new(0);
-    let events = run_op(&engine, &counter, exec()).await;
+    let events = run_one(engine, exec()).await;
     assert!(matches!(
         events.as_slice(),
         [
@@ -125,9 +151,9 @@ async fn execute_surfaces_an_engine_error() {
         columns: vec![],
         rows: vec![],
         fail: Some("boom".to_string()),
+        next_txn: AtomicU64::new(0),
     });
-    let counter = AtomicU64::new(0);
-    let events = run_op(&engine, &counter, exec()).await;
+    let events = run_one(engine, exec()).await;
     match events.as_slice() {
         [SessionEvent::Error { code, message }] => {
             assert_eq!(*code, ErrorCode::Internal);
@@ -138,54 +164,61 @@ async fn execute_surfaces_an_engine_error() {
 }
 
 #[tokio::test]
-async fn begin_allocates_monotonic_nonzero_txids() {
+async fn begin_allocates_nonzero_handles_from_the_engine() {
     let engine = engine(&[], vec![]);
-    let counter = AtomicU64::new(0);
     let begin = || SessionOp::Begin {
         ordering: Ordering::Ordered,
         drain_timeout_ms: 0,
     };
-    let t1 = match run_op(&engine, &counter, begin()).await.as_slice() {
+    let by_id = run_session(engine, vec![begin(), begin()]).await;
+    let t1 = match by_id[&1].as_slice() {
         [SessionEvent::Begun { txid }] => *txid,
         other => panic!("expected Begun, got {other:?}"),
     };
-    let t2 = match run_op(&engine, &counter, begin()).await.as_slice() {
+    let t2 = match by_id[&2].as_slice() {
         [SessionEvent::Begun { txid }] => *txid,
         other => panic!("expected Begun, got {other:?}"),
     };
     assert_ne!(t1, 0, "transaction handles are non-zero by contract");
-    assert_eq!(t2, t1 + 1, "handles are monotonic");
+    assert_ne!(t1, t2, "each begin gets a distinct handle");
 }
 
 #[tokio::test]
-async fn commit_acknowledges_while_rollback_and_cancel_are_silent() {
+async fn begin_then_commit_acknowledges_and_rollback_cancel_are_silent() {
     let engine = engine(&[], vec![]);
-    let counter = AtomicU64::new(0);
-    assert!(matches!(
-        run_op(
-            &engine,
-            &counter,
+    // Begin (req 1) → Begun{txid=1 from the mock}; Commit that txn (req 2) →
+    // Committed; Rollback an open txn (req 3, begun at req... here unknown) and
+    // Cancel (req 4) emit nothing. Begin is handled inline before the next op,
+    // so Commit{txid:1} finds the open transaction.
+    let by_id = run_session(
+        engine,
+        vec![
+            SessionOp::Begin {
+                ordering: Ordering::Ordered,
+                drain_timeout_ms: 0,
+            },
             SessionOp::Commit {
                 txid: 1,
-                last_nonce: 0
-            }
-        )
-        .await
-        .as_slice(),
+                last_nonce: 0,
+            },
+            SessionOp::Rollback { txid: 1 },
+            SessionOp::Cancel {
+                target_request_id: 1,
+            },
+        ],
+    )
+    .await;
+    assert!(matches!(
+        by_id[&1].as_slice(),
+        [SessionEvent::Begun { txid: 1 }]
+    ));
+    assert!(matches!(
+        by_id[&2].as_slice(),
         [SessionEvent::Committed { .. }]
     ));
-    assert!(run_op(&engine, &counter, SessionOp::Rollback { txid: 1 })
-        .await
-        .is_empty());
-    assert!(run_op(
-        &engine,
-        &counter,
-        SessionOp::Cancel {
-            target_request_id: 1
-        }
-    )
-    .await
-    .is_empty());
+    // Rollback of the now-resolved txn and Cancel produce no events.
+    assert!(!by_id.contains_key(&3));
+    assert!(!by_id.contains_key(&4));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

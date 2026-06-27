@@ -83,6 +83,24 @@ impl CursorEngine for DatabaseCursorEngine {
             stats,
         }))
     }
+
+    fn begin_transaction(&self) -> Result<u64, EngineError> {
+        Ok(self.database.read().begin_transaction())
+    }
+
+    fn commit_transaction(&self, txid: u64) -> Result<u64, EngineError> {
+        self.database
+            .read()
+            .commit_transaction(txid)
+            .map_err(|e| EngineError(e.to_string()))
+    }
+
+    fn rollback_transaction(&self, txid: u64) -> Result<(), EngineError> {
+        self.database
+            .read()
+            .rollback_transaction(txid)
+            .map_err(|e| EngineError(e.to_string()))
+    }
 }
 
 /// A keyset-resumable cursor: pins one MVCC snapshot and pages the result by
