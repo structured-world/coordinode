@@ -744,7 +744,25 @@ fn coerce_to_multi_vector(val: Option<&Value>) -> Option<Vec<Vec<f32>>> {
 /// Evaluate scalar (non-aggregate) functions.
 fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
     let evaluated: Vec<Value> = args.iter().map(|a| eval_expr(a, row)).collect();
+    let first_arg_var = args.first().and_then(|a| match a {
+        Expr::Variable(v) => Some(v.as_str()),
+        _ => None,
+    });
+    dispatch_scalar_function(name, evaluated, first_arg_var, row)
+}
 
+/// Dispatch a scalar function on already-evaluated argument values.
+///
+/// `first_arg_var` is the bare-variable name of the first argument when it is a
+/// variable reference (entity-introspection functions like `type` / `labels` /
+/// `startNode` / `properties` resolve it against the row). Dialect-neutral, so
+/// the cypher and neutral expression evaluators share this dispatch.
+fn dispatch_scalar_function(
+    name: &str,
+    evaluated: Vec<Value>,
+    first_arg_var: Option<&str>,
+    row: &Row,
+) -> Value {
     match name {
         "coalesce" => evaluated
             .into_iter()
@@ -798,7 +816,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
             // The executor stores edge type as `r.__type__` in the row.
             // Extract the variable name from the first argument, then look up
             // `<variable>.__type__` in the row.
-            if let Some(Expr::Variable(var)) = args.first() {
+            if let Some(var) = first_arg_var {
                 let key = format!("{var}.__type__");
                 row.get(&key).cloned().unwrap_or(Value::Null)
             } else {
@@ -811,7 +829,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
             // Value::Int (the raw NodeId) for node patterns; for edge
             // patterns it returns NULL (edges are addressed by `(src, tgt)`
             // pairs in our model, not by a single id).
-            if let Some(Expr::Variable(var)) = args.first() {
+            if let Some(var) = first_arg_var {
                 match row.get(var) {
                     Some(Value::Int(raw)) => {
                         let node_id = coordinode_core::graph::node::NodeId::from_raw(*raw as u64);
@@ -826,7 +844,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
         "id" => {
             // id(n) → raw NodeId u64 (deprecated; prefer elementId).
             // Kept for Neo4j v4 driver compatibility per arch/compatibility/neo4j.md.
-            if let Some(Expr::Variable(var)) = args.first() {
+            if let Some(var) = first_arg_var {
                 match row.get(var) {
                     Some(Value::Int(raw)) => Value::Int(*raw),
                     _ => Value::Null,
@@ -839,7 +857,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
             // labels(n) → list of label strings for a node.
             // The executor stores primary label as `n.__label__` in the row.
             // CoordiNode nodes currently have exactly one label.
-            if let Some(Expr::Variable(var)) = args.first() {
+            if let Some(var) = first_arg_var {
                 let key = format!("{var}.__label__");
                 match row.get(&key) {
                     Some(Value::String(l)) => Value::Array(vec![Value::String(l.clone())]),
@@ -853,15 +871,15 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
         // Relationship variables bind `<var>.__src__` / `<var>.__tgt__` in the
         // row (Value::Int node ids); we return the id, matching how `id()`
         // surfaces nodes as integers in this model.
-        "startNode" => match args.first() {
-            Some(Expr::Variable(var)) => row
+        "startNode" => match first_arg_var {
+            Some(var) => row
                 .get(&format!("{var}.__src__"))
                 .cloned()
                 .unwrap_or(Value::Null),
             _ => Value::Null,
         },
-        "endNode" => match args.first() {
-            Some(Expr::Variable(var)) => row
+        "endNode" => match first_arg_var {
+            Some(var) => row
                 .get(&format!("{var}.__tgt__"))
                 .cloned()
                 .unwrap_or(Value::Null),
@@ -871,8 +889,8 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
         // row's `<var>.<prop>` columns, skipping internal `__…__` markers
         // (label, type, src/tgt). Returns NULL when the argument is not a bound
         // variable.
-        "properties" => match args.first() {
-            Some(Expr::Variable(var)) => {
+        "properties" => match first_arg_var {
+            Some(var) => {
                 let prefix = format!("{var}.");
                 let mut map: std::collections::BTreeMap<String, Value> =
                     std::collections::BTreeMap::new();
@@ -892,7 +910,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
         // columns (skipping internal `__…__` markers); falls back to the keys
         // of a map-valued argument.
         "keys" => {
-            let from_prefix = if let Some(Expr::Variable(var)) = args.first() {
+            let from_prefix = if let Some(var) = first_arg_var {
                 let prefix = format!("{var}.");
                 let ks: Vec<Value> = row
                     .keys()
@@ -936,7 +954,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
             // temporal_active_at(r, t) → bool
             // True iff the temporal edge `r` was active at time `t` (epoch ms),
             // i.e. `r.valid_from <= t AND (r.valid_to IS NULL OR r.valid_to > t)`.
-            let Some(Expr::Variable(var)) = args.first() else {
+            let Some(var) = first_arg_var else {
                 return Value::Bool(false);
             };
             let t = match evaluated.get(1) {
@@ -961,7 +979,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
             // temporal_overlaps(r, t_start, t_end) → bool
             // True iff the temporal edge's validity interval overlaps `[t_start, t_end)`,
             // i.e. `r.valid_from < t_end AND (r.valid_to IS NULL OR r.valid_to > t_start)`.
-            let Some(Expr::Variable(var)) = args.first() else {
+            let Some(var) = first_arg_var else {
                 return Value::Bool(false);
             };
             let t_start = match evaluated.get(1) {
