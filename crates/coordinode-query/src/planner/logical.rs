@@ -238,10 +238,16 @@ pub enum LogicalOp {
     },
 
     /// Limit result count.
-    Limit { input: Box<LogicalOp>, count: Expr },
+    Limit {
+        input: Box<LogicalOp>,
+        count: crate::plan::expr::Expr,
+    },
 
     /// Skip first N results.
-    Skip { input: Box<LogicalOp>, count: Expr },
+    Skip {
+        input: Box<LogicalOp>,
+        count: crate::plan::expr::Expr,
+    },
 
     /// Cartesian product of two inputs (multiple MATCH patterns).
     CartesianProduct {
@@ -1525,7 +1531,7 @@ fn estimate_op_cost(
         LogicalOp::Limit { input, count } => {
             let (input_cost, input_rows) = estimate_op_cost(input, defaults, stats, hints);
             let limit_val = match count {
-                Expr::Literal(Value::Int(n)) => *n as f64,
+                crate::plan::expr::Expr::Literal(Value::Int(n)) => *n as f64,
                 _ => input_rows, // can't statically determine
             };
             (input_cost, input_rows.min(limit_val))
@@ -1534,7 +1540,7 @@ fn estimate_op_cost(
         LogicalOp::Skip { input, count } => {
             let (input_cost, input_rows) = estimate_op_cost(input, defaults, stats, hints);
             let skip_val = match count {
-                Expr::Literal(Value::Int(n)) => *n as f64,
+                crate::plan::expr::Expr::Literal(Value::Int(n)) => *n as f64,
                 _ => 0.0,
             };
             (input_cost, (input_rows - skip_val).max(0.0))

@@ -519,14 +519,14 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             let input = current.unwrap_or(LogicalOp::Empty);
             Ok(LogicalOp::Skip {
                 input: Box::new(input),
-                count: expr.clone(),
+                count: super::lower_expr(expr)?,
             })
         }
         Clause::Limit(expr) => {
             let input = current.unwrap_or(LogicalOp::Empty);
             Ok(LogicalOp::Limit {
                 input: Box::new(input),
-                count: expr.clone(),
+                count: super::lower_expr(expr)?,
             })
         }
         Clause::AsOfTimestamp(_) => {
@@ -2048,9 +2048,13 @@ fn compute_push_down_decision(
 /// (only `LIMIT 25` style, not `LIMIT $n`). Returns `None` for
 /// parameters or computed expressions — those fall through to the
 /// default top_k in `compute_push_down_decision`.
-fn extract_literal_limit(count: &Expr) -> Option<usize> {
+fn extract_literal_limit(count: &crate::plan::expr::Expr) -> Option<usize> {
     match count {
-        Expr::Literal(coordinode_core::graph::types::Value::Int(n)) if *n > 0 => Some(*n as usize),
+        crate::plan::expr::Expr::Literal(coordinode_core::graph::types::Value::Int(n))
+            if *n > 0 =>
+        {
+            Some(*n as usize)
+        }
         _ => None,
     }
 }
@@ -2512,7 +2516,7 @@ fn rewrite_top_k_at_root(op: LogicalOp) -> LogicalOp {
 
     // k must be a non-negative integer literal.
     let k = match &count {
-        Expr::Literal(Value::Int(n)) if *n >= 0 => *n as usize,
+        crate::plan::expr::Expr::Literal(Value::Int(n)) if *n >= 0 => *n as usize,
         _ => {
             return LogicalOp::Limit {
                 input: limit_input,
@@ -2801,7 +2805,7 @@ fn reconstruct_limit_sort(k: usize, sort_item: SortItem, sort_input: LogicalOp) 
             input: Box::new(sort_input),
             items: vec![sort_item],
         }),
-        count: Expr::Literal(Value::Int(k as i64)),
+        count: crate::plan::expr::Expr::Literal(Value::Int(k as i64)),
     }
 }
 
@@ -3996,6 +4000,101 @@ fn collect_rrf_presence(expr: &Expr, hit: &mut bool) {
     }
 }
 
+/// Returns true if any function call in a neutral expression tree has a name
+/// satisfying `pred`. Used to enforce illegal-position rules (fusion-score /
+/// doc-score scoring functions) on neutral operator fields such as LIMIT/SKIP
+/// counts. A scoring call inside a correlated subplan is scoped to that
+/// subquery, not the enclosing expression, so subplan forms do not count.
+fn neutral_expr_contains_call(expr: &crate::plan::expr::Expr, pred: &dyn Fn(&str) -> bool) -> bool {
+    use crate::plan::expr::{Expr as PExpr, MapProjItem};
+    match expr {
+        PExpr::Call { name, args, .. } => {
+            pred(name) || args.iter().any(|a| neutral_expr_contains_call(a, pred))
+        }
+        PExpr::Property { base, .. } => neutral_expr_contains_call(base, pred),
+        PExpr::Binary { left, right, .. } => {
+            neutral_expr_contains_call(left, pred) || neutral_expr_contains_call(right, pred)
+        }
+        PExpr::Unary { operand, .. } => neutral_expr_contains_call(operand, pred),
+        PExpr::List(items) => items.iter().any(|e| neutral_expr_contains_call(e, pred)),
+        PExpr::Map(entries) => entries
+            .iter()
+            .any(|(_, v)| neutral_expr_contains_call(v, pred)),
+        PExpr::MapProjection { base, items } => {
+            neutral_expr_contains_call(base, pred)
+                || items.iter().any(|it| match it {
+                    MapProjItem::Computed(_, e) => neutral_expr_contains_call(e, pred),
+                    MapProjItem::Property(_) => false,
+                })
+        }
+        PExpr::In { item, list } => {
+            neutral_expr_contains_call(item, pred) || neutral_expr_contains_call(list, pred)
+        }
+        PExpr::IsNull { operand, .. } | PExpr::IsTyped { operand, .. } => {
+            neutral_expr_contains_call(operand, pred)
+        }
+        PExpr::StringMatch { value, pattern, .. } => {
+            neutral_expr_contains_call(value, pred) || neutral_expr_contains_call(pattern, pred)
+        }
+        PExpr::Case {
+            operand,
+            branches,
+            otherwise,
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|e| neutral_expr_contains_call(e, pred))
+                || branches.iter().any(|(w, t)| {
+                    neutral_expr_contains_call(w, pred) || neutral_expr_contains_call(t, pred)
+                })
+                || otherwise
+                    .as_deref()
+                    .is_some_and(|e| neutral_expr_contains_call(e, pred))
+        }
+        PExpr::Subscript { base, index } => {
+            neutral_expr_contains_call(base, pred) || neutral_expr_contains_call(index, pred)
+        }
+        PExpr::Slice { base, start, end } => {
+            neutral_expr_contains_call(base, pred)
+                || start
+                    .as_deref()
+                    .is_some_and(|e| neutral_expr_contains_call(e, pred))
+                || end
+                    .as_deref()
+                    .is_some_and(|e| neutral_expr_contains_call(e, pred))
+        }
+        PExpr::ListComprehension {
+            list, filter, map, ..
+        } => {
+            neutral_expr_contains_call(list, pred)
+                || filter
+                    .as_deref()
+                    .is_some_and(|e| neutral_expr_contains_call(e, pred))
+                || map
+                    .as_deref()
+                    .is_some_and(|e| neutral_expr_contains_call(e, pred))
+        }
+        PExpr::ListQuantifier {
+            list, predicate, ..
+        } => neutral_expr_contains_call(list, pred) || neutral_expr_contains_call(predicate, pred),
+        PExpr::Reduce {
+            init, list, step, ..
+        } => {
+            neutral_expr_contains_call(init, pred)
+                || neutral_expr_contains_call(list, pred)
+                || neutral_expr_contains_call(step, pred)
+        }
+        PExpr::ExistsSubplan(_)
+        | PExpr::CountSubplan(_)
+        | PExpr::CollectSubplan { .. }
+        | PExpr::PatternComprehension { .. }
+        | PExpr::Literal(_)
+        | PExpr::Parameter(_)
+        | PExpr::Variable(_)
+        | PExpr::Star => false,
+    }
+}
+
 /// Parse and validate a fusion-scalar call. RRF takes two args
 /// (methods + query map); CC and DBSF take three (methods + query map +
 /// weights map). All three reject empty method lists and unknown query
@@ -4409,7 +4508,7 @@ fn validate_rrf_placement(op: &LogicalOp) -> Result<(), PlanError> {
             validate_rrf_placement(input)
         }
         LogicalOp::Limit { input, count } => {
-            if expr_contains_rrf_score(count) {
+            if neutral_expr_contains_call(count, &|n| FusionScalar::from_name(n).is_some()) {
                 return Err(PlanError::RrfScoreIllegalPosition {
                     location: "LIMIT expression".to_string(),
                 });
@@ -4417,7 +4516,7 @@ fn validate_rrf_placement(op: &LogicalOp) -> Result<(), PlanError> {
             validate_rrf_placement(input)
         }
         LogicalOp::Skip { input, count } => {
-            if expr_contains_rrf_score(count) {
+            if neutral_expr_contains_call(count, &|n| FusionScalar::from_name(n).is_some()) {
                 return Err(PlanError::RrfScoreIllegalPosition {
                     location: "SKIP expression".to_string(),
                 });
@@ -4895,7 +4994,7 @@ fn validate_doc_placement(op: &LogicalOp) -> Result<(), PlanError> {
             validate_doc_placement(input)
         }
         LogicalOp::Limit { input, count } | LogicalOp::Skip { input, count } => {
-            if expr_contains_doc_score(count) {
+            if neutral_expr_contains_call(count, &|n| n == "doc_score") {
                 return Err(PlanError::DocScoreIllegalPosition {
                     location: "LIMIT/SKIP expression".to_string(),
                 });

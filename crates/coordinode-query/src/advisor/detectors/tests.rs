@@ -266,7 +266,7 @@ fn knn_without_index_detected() {
     };
     let p = plan(LogicalOp::Limit {
         input: Box::new(sort_op),
-        count: Expr::Literal(Value::Int(10)),
+        count: crate::plan::expr::Expr::Literal(Value::Int(10)),
     });
     let suggestions = detect_suggestions(&p, None);
 

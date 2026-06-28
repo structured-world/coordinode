@@ -30,6 +30,7 @@ use coordinode_storage::engine::transaction::Transaction;
 use coordinode_storage::engine::StorageSnapshot;
 
 use super::eval::{eval_binary_op, eval_expr, eval_unary_op, is_truthy};
+use super::eval_neutral::eval_neutral;
 use super::row::Row;
 use crate::cypher::ast::{
     BinaryOperator, Direction, Expr, LengthBound, NodePattern, Pattern, PatternElement,
@@ -2377,7 +2378,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
 
         LogicalOp::Limit { input, count } => {
             let rows = execute_op(input, ctx)?;
-            let n = eval_expr(count, &Row::new());
+            let n = eval_neutral(count, &Row::new());
             if let Value::Int(limit) = n {
                 Ok(rows.into_iter().take(limit.max(0) as usize).collect())
             } else {
@@ -2387,7 +2388,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
 
         LogicalOp::Skip { input, count } => {
             let rows = execute_op(input, ctx)?;
-            let n = eval_expr(count, &Row::new());
+            let n = eval_neutral(count, &Row::new());
             if let Value::Int(skip) = n {
                 Ok(rows.into_iter().skip(skip.max(0) as usize).collect())
             } else {

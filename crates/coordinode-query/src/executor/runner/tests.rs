@@ -940,7 +940,7 @@ fn sort_and_limit() {
                     ascending: false,
                 }],
             }),
-            count: Expr::Literal(Value::Int(2)),
+            count: crate::plan::expr::Expr::Literal(Value::Int(2)),
         },
     };
 
