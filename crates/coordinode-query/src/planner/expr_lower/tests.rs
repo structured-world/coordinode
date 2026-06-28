@@ -351,3 +351,60 @@ fn lowers_count_collect_and_pattern_comprehension() {
         other => panic!("expected PatternComprehension, got {other:?}"),
     }
 }
+
+/// Parameter substitution must commute with lowering: binding a parameter in the
+/// cypher tree and then lowering yields the same neutral tree as lowering first
+/// and binding the parameter on the neutral side. This anchors the neutral
+/// `substitute_params` against the cypher one across the boundary.
+#[test]
+fn substitute_params_commutes_with_lowering() {
+    use crate::cypher::ast::BinaryOperator;
+    use std::collections::HashMap;
+
+    let mut params = HashMap::new();
+    params.insert("p".to_string(), Value::Int(99));
+    params.insert("q".to_string(), Value::String("x".into()));
+
+    let cases = vec![
+        CExpr::Parameter("p".into()),
+        // Unknown parameter stays unbound on both sides.
+        CExpr::Parameter("missing".into()),
+        CExpr::BinaryOp {
+            left: Box::new(CExpr::Parameter("p".into())),
+            op: BinaryOperator::Add,
+            right: Box::new(lit(1)),
+        },
+        CExpr::List(vec![
+            CExpr::Parameter("p".into()),
+            CExpr::Parameter("q".into()),
+        ]),
+        CExpr::Case {
+            operand: None,
+            when_clauses: vec![(
+                CExpr::BinaryOp {
+                    left: Box::new(CExpr::Parameter("p".into())),
+                    op: BinaryOperator::Gt,
+                    right: Box::new(lit(0)),
+                },
+                CExpr::Parameter("q".into()),
+            )],
+            else_clause: Some(Box::new(CExpr::Parameter("p".into()))),
+        },
+    ];
+
+    for c in cases {
+        // Bind first, then lower.
+        let mut bound = c.clone();
+        bound.substitute_params(&params);
+        let lower_after_bind = lower(&bound);
+
+        // Lower first, then bind.
+        let mut bind_after_lower = lower(&c);
+        bind_after_lower.substitute_params(&params);
+
+        assert_eq!(
+            lower_after_bind, bind_after_lower,
+            "substitute_params/lowering must commute for {c:?}"
+        );
+    }
+}

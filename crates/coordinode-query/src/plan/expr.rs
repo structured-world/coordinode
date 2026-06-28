@@ -6,6 +6,8 @@
 //! already-lowered neutral subplan rather than a dialect parse tree, so the
 //! executor runs the subplan directly instead of re-parsing a dialect clause.
 
+use std::collections::HashMap;
+
 use coordinode_core::graph::types::Value;
 
 use crate::planner::logical::LogicalPlan;
@@ -168,4 +170,128 @@ pub enum Expr {
     },
     /// Star expression (`count(*)` / `RETURN *`).
     Star,
+}
+
+impl Expr {
+    /// Replace every [`Expr::Parameter`] node with its bound literal from `params`.
+    ///
+    /// Parameters absent from the map are left as-is (they evaluate to `Null`).
+    /// Graph-subquery forms recurse into their embedded subplan, so a parameter
+    /// used inside a correlated subquery is bound too.
+    pub fn substitute_params(&mut self, params: &HashMap<String, Value>) {
+        match self {
+            Expr::Parameter(name) => {
+                if let Some(value) = params.get(name.as_str()) {
+                    *self = Expr::Literal(value.clone());
+                }
+            }
+            Expr::Property { base, .. } => base.substitute_params(params),
+            Expr::Binary { left, right, .. } => {
+                left.substitute_params(params);
+                right.substitute_params(params);
+            }
+            Expr::Unary { operand, .. } => operand.substitute_params(params),
+            Expr::Call { args, .. } => {
+                for arg in args {
+                    arg.substitute_params(params);
+                }
+            }
+            Expr::List(items) => {
+                for item in items {
+                    item.substitute_params(params);
+                }
+            }
+            Expr::Map(entries) => {
+                for (_, v) in entries {
+                    v.substitute_params(params);
+                }
+            }
+            Expr::MapProjection { base, items } => {
+                base.substitute_params(params);
+                for item in items {
+                    if let MapProjItem::Computed(_, ref mut value) = item {
+                        value.substitute_params(params);
+                    }
+                }
+            }
+            Expr::In { item, list } => {
+                item.substitute_params(params);
+                list.substitute_params(params);
+            }
+            Expr::IsNull { operand, .. } => operand.substitute_params(params),
+            Expr::IsTyped { operand, .. } => operand.substitute_params(params),
+            Expr::StringMatch { value, pattern, .. } => {
+                value.substitute_params(params);
+                pattern.substitute_params(params);
+            }
+            Expr::Case {
+                operand,
+                branches,
+                otherwise,
+            } => {
+                if let Some(op) = operand {
+                    op.substitute_params(params);
+                }
+                for (cond, result) in branches {
+                    cond.substitute_params(params);
+                    result.substitute_params(params);
+                }
+                if let Some(el) = otherwise {
+                    el.substitute_params(params);
+                }
+            }
+            Expr::Subscript { base, index } => {
+                base.substitute_params(params);
+                index.substitute_params(params);
+            }
+            Expr::Slice { base, start, end } => {
+                base.substitute_params(params);
+                if let Some(s) = start {
+                    s.substitute_params(params);
+                }
+                if let Some(e) = end {
+                    e.substitute_params(params);
+                }
+            }
+            Expr::ListComprehension {
+                list, filter, map, ..
+            } => {
+                list.substitute_params(params);
+                if let Some(p) = filter {
+                    p.substitute_params(params);
+                }
+                if let Some(m) = map {
+                    m.substitute_params(params);
+                }
+            }
+            Expr::ListQuantifier {
+                list, predicate, ..
+            } => {
+                list.substitute_params(params);
+                predicate.substitute_params(params);
+            }
+            Expr::Reduce {
+                init, list, step, ..
+            } => {
+                init.substitute_params(params);
+                list.substitute_params(params);
+                step.substitute_params(params);
+            }
+            Expr::ExistsSubplan(subplan) | Expr::CountSubplan(subplan) => {
+                subplan.substitute_params(params);
+            }
+            Expr::CollectSubplan {
+                subplan,
+                projection,
+            } => {
+                subplan.substitute_params(params);
+                projection.substitute_params(params);
+            }
+            Expr::PatternComprehension { subplan, map } => {
+                subplan.substitute_params(params);
+                map.substitute_params(params);
+            }
+            Expr::Literal(_) | Expr::Variable(_) | Expr::Star => {}
+        }
+    }
 }
