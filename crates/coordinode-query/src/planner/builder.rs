@@ -204,7 +204,7 @@ pub fn build_logical_plan(query: &Query) -> Result<LogicalPlan, PlanError> {
 
     Ok(LogicalPlan {
         root,
-        snapshot_ts,
+        snapshot_ts: snapshot_ts.as_ref().map(super::lower_expr).transpose()?,
         vector_consistency,
         read_consistency,
     })
@@ -623,7 +623,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 with_edges: cn.with_edges,
                 with_properties: cn.with_properties,
                 set_items: cn.set_items.clone(),
-                as_of: cn.as_of.clone(),
+                as_of: cn.as_of.as_ref().map(super::lower_expr).transpose()?,
             })
         }
         Clause::RedirectEdges(re) => {
@@ -663,7 +663,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             Ok(LogicalOp::Foreach {
                 input: Box::new(input),
                 variable: fc.variable.clone(),
-                list: fc.list.clone(),
+                list: super::lower_expr(&fc.list)?,
                 body: Box::new(body),
             })
         }
@@ -686,7 +686,11 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
         }
         Clause::Call(cc) => Ok(LogicalOp::ProcedureCall {
             procedure: cc.procedure.clone(),
-            args: cc.args.clone(),
+            args: cc
+                .args
+                .iter()
+                .map(super::lower_expr)
+                .collect::<Result<Vec<_>, _>>()?,
             yield_items: cc.yield_items.iter().map(|yi| yi.name.clone()).collect(),
         }),
         Clause::AlterLabel(ac) => Ok(LogicalOp::AlterLabel {
@@ -1391,11 +1395,8 @@ pub fn annotate_vector_top_k(
         } => {
             // Determine (variable, property) from the vector expression.
             let (variable, property) = match &vector_expr {
-                Expr::PropertyAccess {
-                    expr,
-                    property: prop,
-                } => match expr.as_ref() {
-                    Expr::Variable(v) => (Some(v.clone()), Some(prop.clone())),
+                crate::plan::expr::Expr::Property { base, key } => match base.as_ref() {
+                    crate::plan::expr::Expr::Variable(v) => (Some(v.clone()), Some(key.clone())),
                     _ => (None, None),
                 },
                 _ => (None, None),
@@ -1629,7 +1630,7 @@ pub fn apply_hnsw_scan_access_path(
 ///   order.
 fn hnsw_scan_target(
     input: &LogicalOp,
-    vector_expr: &Expr,
+    vector_expr: &crate::plan::expr::Expr,
     function: &str,
     predicate: &Option<crate::planner::logical::VectorPredicate>,
     registry: &crate::index::VectorIndexRegistry,
@@ -1647,10 +1648,14 @@ fn hnsw_scan_target(
     }
     let label = &labels[0];
 
-    let Expr::PropertyAccess { expr, property } = vector_expr else {
+    let crate::plan::expr::Expr::Property {
+        base,
+        key: property,
+    } = vector_expr
+    else {
         return None;
     };
-    let Expr::Variable(v) = expr.as_ref() else {
+    let crate::plan::expr::Expr::Variable(v) = base.as_ref() else {
         return None;
     };
     if v != variable {
@@ -1930,14 +1935,14 @@ fn contains_traverse(op: &LogicalOp) -> bool {
 /// Returns `None` for non-property expressions or when the property holder
 /// is not a single-variable reference.
 fn extract_vector_label_prop<'a>(
-    vector_expr: &'a Expr,
+    vector_expr: &'a crate::plan::expr::Expr,
     plan: &'a LogicalOp,
 ) -> Option<(&'a str, &'a str)> {
     match vector_expr {
-        Expr::PropertyAccess { expr, property } => match expr.as_ref() {
-            Expr::Variable(_) => {
+        crate::plan::expr::Expr::Property { base, key } => match base.as_ref() {
+            crate::plan::expr::Expr::Variable(_) => {
                 let label = extract_scan_label(plan)?;
-                Some((label, property.as_str()))
+                Some((label, key.as_str()))
             }
             _ => None,
         },
@@ -1962,7 +1967,7 @@ fn extract_vector_label_prop<'a>(
 /// produces a deterministic decision; the EXPLAIN-visible cost numbers
 /// will tighten over releases without breaking the strategy contract.
 fn compute_push_down_decision(
-    vector_expr: &Expr,
+    vector_expr: &crate::plan::expr::Expr,
     input: &LogicalOp,
     threshold: f64,
     less_than: bool,
@@ -2542,8 +2547,16 @@ fn rewrite_top_k_at_root(op: LogicalOp) -> LogicalOp {
     let (sort_input, mut sort_items) = inner_sort;
     let sort_item = sort_items.remove(0);
 
+    // Lower the (cypher) sort expression to the neutral IR once for the
+    // vector / maxsim rewrite probes below. A sort expression that does not
+    // lower is, by construction, not one of the scoring calls we rewrite, so
+    // `None` simply falls through to the generic Sort + Limit path.
+    let lowered_sort_expr = super::lower_expr(&sort_item.expr).ok();
+
     // Try Pattern A: the sort expression is a direct vector_distance call.
-    if let Some((vector_expr, query_vector, function)) = match_vector_distance_call(&sort_item.expr)
+    if let Some((vector_expr, query_vector, function)) = lowered_sort_expr
+        .as_ref()
+        .and_then(match_vector_distance_call)
     {
         // Ascending for distance/manhattan, descending for similarity/dot_product.
         if !is_valid_direction(&function, sort_item.ascending) {
@@ -2584,7 +2597,9 @@ fn rewrite_top_k_at_root(op: LogicalOp) -> LogicalOp {
 
     // Pattern A2: the sort expression is a direct maxsim_score call.
     // ColBERT-style late-interaction: DESC order always (higher score wins).
-    if let Some((doc_expr, query_expr)) = match_maxsim_score_call(&sort_item.expr) {
+    if let Some((doc_expr, query_expr)) =
+        lowered_sort_expr.as_ref().and_then(match_maxsim_score_call)
+    {
         if sort_item.ascending {
             // ASC would mean "lowest similarity first" which is never the
             // intent for late-interaction retrieval. Fall back to the
@@ -2652,7 +2667,7 @@ fn rewrite_top_k_at_root(op: LogicalOp) -> LogicalOp {
                         // Ensure the alias is still projected as a passthrough so
                         // downstream operators see it.
                         other_items.push(ProjectItem {
-                            expr: Expr::Variable(alias.clone()),
+                            expr: crate::plan::expr::Expr::Variable(alias.clone()),
                             alias: Some(alias.clone()),
                         });
 
@@ -2724,22 +2739,26 @@ fn op_identity_limit(op: LogicalOp) -> LogicalOp {
 ///
 /// When true, VectorTopK can run over the Project's output rows.
 /// When false, VectorTopK would see a row missing the vector column — fall back.
-fn project_preserves_vector_expr(vector_expr: &Expr, items: &[ProjectItem]) -> bool {
-    let Expr::PropertyAccess {
-        expr: inner,
-        property,
+fn project_preserves_vector_expr(
+    vector_expr: &crate::plan::expr::Expr,
+    items: &[ProjectItem],
+) -> bool {
+    use crate::plan::expr::Expr as PExpr;
+    let PExpr::Property {
+        base: inner,
+        key: property,
     } = vector_expr
     else {
         return false;
     };
-    let Expr::Variable(var_name) = inner.as_ref() else {
+    let PExpr::Variable(var_name) = inner.as_ref() else {
         return false;
     };
 
     for item in items {
         match &item.expr {
-            Expr::Star => return true,
-            Expr::Variable(v)
+            PExpr::Star => return true,
+            PExpr::Variable(v)
                 if v == var_name
                     // Only a passthrough if the alias is either None or same as var.
                     // An aliased variable (`n AS m`) would rename the row key.
@@ -2747,11 +2766,11 @@ fn project_preserves_vector_expr(vector_expr: &Expr, items: &[ProjectItem]) -> b
             {
                 return true;
             }
-            Expr::PropertyAccess {
-                expr: item_inner,
-                property: item_prop,
+            PExpr::Property {
+                base: item_inner,
+                key: item_prop,
             } => {
-                if let Expr::Variable(item_var) = item_inner.as_ref() {
+                if let PExpr::Variable(item_var) = item_inner.as_ref() {
                     if item_var == var_name && item_prop == property && item.alias.is_none() {
                         return true;
                     }
@@ -2765,8 +2784,10 @@ fn project_preserves_vector_expr(vector_expr: &Expr, items: &[ProjectItem]) -> b
 
 /// Match `vector_distance(<vector_expr>, <query_vector>)` function call.
 /// Returns `(vector_expr, query_vector, function_name)` if matched.
-fn match_vector_distance_call(expr: &Expr) -> Option<(Expr, Expr, String)> {
-    if let Expr::FunctionCall { name, args, .. } = expr {
+fn match_vector_distance_call(
+    expr: &crate::plan::expr::Expr,
+) -> Option<(crate::plan::expr::Expr, crate::plan::expr::Expr, String)> {
+    if let crate::plan::expr::Expr::Call { name, args, .. } = expr {
         if matches!(
             name.as_str(),
             "vector_distance" | "vector_similarity" | "vector_dot" | "vector_manhattan"
@@ -2781,8 +2802,10 @@ fn match_vector_distance_call(expr: &Expr) -> Option<(Expr, Expr, String)> {
 /// Match a `maxsim_score(doc_expr, query_expr)` call shape used by the
 /// MaxSimTopK rewrite. Returns `(doc_expr, query_expr)` when the call
 /// matches; otherwise `None`.
-fn match_maxsim_score_call(expr: &Expr) -> Option<(Expr, Expr)> {
-    if let Expr::FunctionCall { name, args, .. } = expr {
+fn match_maxsim_score_call(
+    expr: &crate::plan::expr::Expr,
+) -> Option<(crate::plan::expr::Expr, crate::plan::expr::Expr)> {
+    if let crate::plan::expr::Expr::Call { name, args, .. } = expr {
         if name == "maxsim_score" && args.len() == 2 {
             return Some((args[0].clone(), args[1].clone()));
         }
@@ -2814,15 +2837,11 @@ fn reconstruct_limit_sort(k: usize, sort_item: SortItem, sort_input: LogicalOp) 
 }
 
 /// Extract the property name if `expr` is `variable.property`.
-fn extract_variable_property(expr: &Expr, variable: &str) -> Option<String> {
-    if let Expr::PropertyAccess {
-        expr: inner,
-        property,
-    } = expr
-    {
-        if let Expr::Variable(var) = inner.as_ref() {
+fn extract_variable_property(expr: &crate::plan::expr::Expr, variable: &str) -> Option<String> {
+    if let crate::plan::expr::Expr::Property { base, key } = expr {
+        if let crate::plan::expr::Expr::Variable(var) = base.as_ref() {
             if var == variable {
-                return Some(property.clone());
+                return Some(key.clone());
             }
         }
     }
@@ -3102,7 +3121,10 @@ fn build_return_op(input: LogicalOp, rc: &ReturnClause) -> Result<LogicalOp, Pla
                     distinct,
                 } = &item.expr
                 {
-                    let arg = args.first().cloned().unwrap_or(Expr::Star);
+                    let arg = match args.first() {
+                        Some(a) => super::lower_expr(a)?,
+                        None => crate::plan::expr::Expr::Star,
+                    };
                     // Use alias or function name as the column key
                     let agg_col = item.alias.clone().unwrap_or_else(|| name.clone());
                     // For percentileCont/percentileDisc, store the second argument expression.
@@ -3110,7 +3132,7 @@ fn build_return_op(input: LogicalOp, rc: &ReturnClause) -> Result<LogicalOp, Pla
                     // query parameters ($p) at runtime against the params map in ExecutionContext.
                     let percentile_expr =
                         if matches!(name.as_str(), "percentileCont" | "percentileDisc") {
-                            args.get(1).cloned()
+                            args.get(1).map(super::lower_expr).transpose()?
                         } else {
                             None
                         };
@@ -3123,14 +3145,14 @@ fn build_return_op(input: LogicalOp, rc: &ReturnClause) -> Result<LogicalOp, Pla
                     });
                     // Project references the pre-computed aggregate column
                     project_items.push(ProjectItem {
-                        expr: Expr::Variable(agg_col.clone()),
+                        expr: crate::plan::expr::Expr::Variable(agg_col.clone()),
                         alias: item.alias.clone(),
                     });
                 }
             } else {
-                group_by.push(item.expr.clone());
+                group_by.push(super::lower_expr(&item.expr)?);
                 project_items.push(ProjectItem {
-                    expr: item.expr.clone(),
+                    expr: super::lower_expr(&item.expr)?,
                     alias: item.alias.clone(),
                 });
             }
@@ -3151,11 +3173,13 @@ fn build_return_op(input: LogicalOp, rc: &ReturnClause) -> Result<LogicalOp, Pla
         let items: Vec<ProjectItem> = rc
             .items
             .iter()
-            .map(|i| ProjectItem {
-                expr: i.expr.clone(),
-                alias: i.alias.clone(),
+            .map(|i| {
+                Ok(ProjectItem {
+                    expr: super::lower_expr(&i.expr)?,
+                    alias: i.alias.clone(),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, PlanError>>()?;
 
         Ok(LogicalOp::Project {
             input: Box::new(input),
@@ -3183,10 +3207,13 @@ fn build_with_op(input: LogicalOp, wc: &WithClause) -> Result<LogicalOp, PlanErr
                 } = &item.expr
                 {
                     let agg_col = item.alias.clone().unwrap_or_else(|| name.clone());
-                    let arg = args.first().cloned().unwrap_or(Expr::Star);
+                    let arg = match args.first() {
+                        Some(a) => super::lower_expr(a)?,
+                        None => crate::plan::expr::Expr::Star,
+                    };
                     let percentile_expr =
                         if matches!(name.as_str(), "percentileCont" | "percentileDisc") {
-                            args.get(1).cloned()
+                            args.get(1).map(super::lower_expr).transpose()?
                         } else {
                             None
                         };
@@ -3198,14 +3225,14 @@ fn build_with_op(input: LogicalOp, wc: &WithClause) -> Result<LogicalOp, PlanErr
                         percentile_expr,
                     });
                     project_items.push(ProjectItem {
-                        expr: Expr::Variable(agg_col.clone()),
+                        expr: crate::plan::expr::Expr::Variable(agg_col.clone()),
                         alias: item.alias.clone(),
                     });
                 }
             } else {
-                group_by.push(item.expr.clone());
+                group_by.push(super::lower_expr(&item.expr)?);
                 project_items.push(ProjectItem {
-                    expr: item.expr.clone(),
+                    expr: super::lower_expr(&item.expr)?,
                     alias: item.alias.clone(),
                 });
             }
@@ -3226,11 +3253,13 @@ fn build_with_op(input: LogicalOp, wc: &WithClause) -> Result<LogicalOp, PlanErr
         let items: Vec<ProjectItem> = wc
             .items
             .iter()
-            .map(|i| ProjectItem {
-                expr: i.expr.clone(),
-                alias: i.alias.clone(),
+            .map(|i| {
+                Ok(ProjectItem {
+                    expr: super::lower_expr(&i.expr)?,
+                    alias: i.alias.clone(),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, PlanError>>()?;
 
         LogicalOp::Project {
             input: Box::new(input),
@@ -3270,7 +3299,7 @@ fn build_create_op(current: Option<LogicalOp>, cc: &CreateClause) -> Result<Logi
                         input: Some(Box::new(result)),
                         variable: np.variable.clone(),
                         labels: np.labels.clone(),
-                        properties: np.properties.clone(),
+                        properties: lower_property_filters(&np.properties)?,
                     };
                 }
             }
@@ -3310,7 +3339,7 @@ fn build_create_op(current: Option<LogicalOp>, cc: &CreateClause) -> Result<Logi
                     edge_type: rp.rel_types.first().cloned().unwrap_or_default(),
                     direction: rp.direction,
                     variable: rp.variable.clone(),
-                    properties: rp.properties.clone(),
+                    properties: lower_property_filters(&rp.properties)?,
                 };
             }
         }
@@ -3376,8 +3405,8 @@ fn try_extract_vector_filter(expr: &Expr, input: LogicalOp) -> Option<LogicalOp>
 
             return Some(LogicalOp::VectorFilter {
                 input: Box::new(input),
-                vector_expr: args[0].clone(),
-                query_vector: args[1].clone(),
+                vector_expr: super::lower_expr(&args[0]).ok()?,
+                query_vector: super::lower_expr(&args[1]).ok()?,
                 function: name.clone(),
                 less_than,
                 threshold,
@@ -3438,12 +3467,12 @@ fn try_extract_vector_filter(expr: &Expr, input: LogicalOp) -> Option<LogicalOp>
 
                 return Some(LogicalOp::VectorFilter {
                     input: Box::new(input),
-                    vector_expr: args[0].clone(),
-                    query_vector: args[1].clone(),
+                    vector_expr: super::lower_expr(&args[0]).ok()?,
+                    query_vector: super::lower_expr(&args[1]).ok()?,
                     function: name.clone(),
                     less_than,
                     threshold,
-                    decay_field: Some(decay_expr.clone()),
+                    decay_field: Some(super::lower_expr(decay_expr).ok()?),
                     push_down: None,
                 });
             }
@@ -3597,8 +3626,8 @@ fn collect_op_variables(op: &LogicalOp) -> Vec<String> {
                 match &item.alias {
                     Some(a) => vars.push(a.clone()),
                     None => match &item.expr {
-                        Expr::Variable(v) => vars.push(v.clone()),
-                        Expr::Star => vars.extend(collect_op_variables(input)),
+                        crate::plan::expr::Expr::Variable(v) => vars.push(v.clone()),
+                        crate::plan::expr::Expr::Star => vars.extend(collect_op_variables(input)),
                         _ => {}
                     },
                 }
@@ -3829,7 +3858,7 @@ fn try_extract_text_filter(expr: &Expr, input: LogicalOp) -> Option<LogicalOp> {
                 };
                 return Some(LogicalOp::TextFilter {
                     input: Box::new(input),
-                    text_expr: args[0].clone(),
+                    text_expr: super::lower_expr(&args[0]).ok()?,
                     query_string: query_str.clone(),
                     language,
                 });
@@ -3844,8 +3873,8 @@ fn try_extract_encrypted_filter(expr: &Expr, input: LogicalOp) -> Option<Logical
         if name == "encrypted_match" && args.len() == 2 {
             return Some(LogicalOp::EncryptedFilter {
                 input: Box::new(input),
-                field_expr: args[0].clone(),
-                token_expr: args[1].clone(),
+                field_expr: super::lower_expr(&args[0]).ok()?,
+                token_expr: super::lower_expr(&args[1]).ok()?,
             });
         }
     }
@@ -3878,9 +3907,9 @@ fn find_last_variable(op: &LogicalOp) -> String {
 /// fusion variant).
 #[derive(Debug, Clone, PartialEq)]
 struct RrfCallSig {
-    methods: Vec<Expr>,
-    query_vector: Option<Expr>,
-    query_text: Option<Expr>,
+    methods: Vec<crate::plan::expr::Expr>,
+    query_vector: Option<crate::plan::expr::Expr>,
+    query_text: Option<crate::plan::expr::Expr>,
     fusion: crate::planner::logical::FusionStrategy,
 }
 
@@ -3921,16 +3950,6 @@ fn match_fusion_call(expr: &Expr) -> Option<(FusionScalar, &[Expr])> {
         }
     }
     None
-}
-
-/// Backwards-compat shim: the rest of the RRF-era code paths still call
-/// this name with the implicit `rrf_score` assumption. Delegates to the
-/// generalised matcher and forwards only the args for `rrf_score`.
-fn match_rrf_score(expr: &Expr) -> Option<&[Expr]> {
-    match match_fusion_call(expr) {
-        Some((FusionScalar::Rrf, args)) => Some(args),
-        _ => None,
-    }
 }
 
 /// Walk an expression tree and return `true` if any subexpression is a
@@ -4118,7 +4137,10 @@ fn parse_fusion_signature(kind: FusionScalar, args: &[Expr]) -> Result<RrfCallSi
 
     // Methods: Expr::List of at least one element.
     let methods = match methods_expr {
-        Expr::List(items) if !items.is_empty() => items.clone(),
+        Expr::List(items) if !items.is_empty() => items
+            .iter()
+            .map(super::lower_expr)
+            .collect::<Result<Vec<_>, _>>()?,
         Expr::List(_) => {
             return Err(PlanError::RrfScoreMethodsShape {
                 got: "empty list".to_string(),
@@ -4139,8 +4161,8 @@ fn parse_fusion_signature(kind: FusionScalar, args: &[Expr]) -> Result<RrfCallSi
             let mut qt = None;
             for (k, v) in fields {
                 match k.as_str() {
-                    "vector" => qv = Some(v.clone()),
-                    "text" => qt = Some(v.clone()),
+                    "vector" => qv = Some(super::lower_expr(v)?),
+                    "text" => qt = Some(super::lower_expr(v)?),
                     other => {
                         return Err(PlanError::RrfScoreQueryShape {
                             got: format!(
@@ -4160,7 +4182,8 @@ fn parse_fusion_signature(kind: FusionScalar, args: &[Expr]) -> Result<RrfCallSi
         // Parameter / Variable: defer shape validation to executor.
         // The executor will evaluate and reject non-map values at runtime.
         Expr::Parameter(_) | Expr::Variable(_) => {
-            (Some(query_expr.clone()), Some(query_expr.clone()))
+            let lowered = super::lower_expr(query_expr)?;
+            (Some(lowered.clone()), Some(lowered))
         }
         other => {
             return Err(PlanError::RrfScoreQueryShape {
@@ -4420,6 +4443,314 @@ fn rewrite_rrf_in_expr(expr: &mut Expr) {
     }
 }
 
+// ---- Neutral-IR twins of the fusion-rewrite machinery ----
+// The post-build fusion rewrite runs over both Project items (neutral IR) and
+// Sort items (cypher). These twins serve the neutral Project path; the cypher
+// versions above serve the cypher Sort path.
+
+fn match_fusion_call_neutral(
+    expr: &crate::plan::expr::Expr,
+) -> Option<(FusionScalar, &[crate::plan::expr::Expr])> {
+    if let crate::plan::expr::Expr::Call { name, args, .. } = expr {
+        if let Some(kind) = FusionScalar::from_name(name) {
+            return Some((kind, args));
+        }
+    }
+    None
+}
+
+fn parse_fusion_weights_neutral(
+    expr: &crate::plan::expr::Expr,
+    kind: FusionScalar,
+) -> Result<std::collections::BTreeMap<String, f64>, PlanError> {
+    use crate::plan::expr::{Expr as PExpr, UnOp};
+    let fields = match expr {
+        PExpr::Map(fields) => fields,
+        other => {
+            return Err(PlanError::RrfScoreQueryShape {
+                got: format!(
+                    "{}: weights must be a map literal, got {other:?}",
+                    kind.fn_name()
+                ),
+            });
+        }
+    };
+    let mut weights = std::collections::BTreeMap::new();
+    for (key, value) in fields {
+        let key_str = match key.as_str() {
+            "vector" | "text" => key.clone(),
+            other => {
+                return Err(PlanError::RrfScoreQueryShape {
+                    got: format!(
+                        "{}: weights has unknown key `{other}` (expected `vector` and/or `text`)",
+                        kind.fn_name()
+                    ),
+                });
+            }
+        };
+        let w = match value {
+            PExpr::Literal(Value::Float(f)) => *f,
+            PExpr::Literal(Value::Int(i)) => *i as f64,
+            PExpr::Unary {
+                op: UnOp::Neg,
+                operand: inner,
+            } => match inner.as_ref() {
+                PExpr::Literal(Value::Float(f)) => -*f,
+                PExpr::Literal(Value::Int(i)) => -(*i as f64),
+                _ => {
+                    return Err(PlanError::RrfScoreQueryShape {
+                        got: format!(
+                            "{}: weight for `{key_str}` must be a numeric literal, got {value:?}",
+                            kind.fn_name()
+                        ),
+                    });
+                }
+            },
+            other => {
+                return Err(PlanError::RrfScoreQueryShape {
+                    got: format!(
+                        "{}: weight for `{key_str}` must be a numeric literal, got {other:?}",
+                        kind.fn_name()
+                    ),
+                });
+            }
+        };
+        if !w.is_finite() || w < 0.0 {
+            return Err(PlanError::RrfScoreQueryShape {
+                got: format!(
+                    "{}: weight for `{key_str}` must be a finite non-negative number, got {w}",
+                    kind.fn_name()
+                ),
+            });
+        }
+        weights.insert(key_str, w);
+    }
+    if weights.is_empty() {
+        return Err(PlanError::RrfScoreQueryShape {
+            got: format!(
+                "{}: weights map is empty (needs at least one of `vector`, `text`)",
+                kind.fn_name()
+            ),
+        });
+    }
+    Ok(weights)
+}
+
+fn parse_fusion_signature_neutral(
+    kind: FusionScalar,
+    args: &[crate::plan::expr::Expr],
+) -> Result<RrfCallSig, PlanError> {
+    use crate::plan::expr::Expr as PExpr;
+    let expected_arity = match kind {
+        FusionScalar::Rrf => 2,
+        FusionScalar::Cc | FusionScalar::Dbsf => 3,
+    };
+    if args.len() != expected_arity {
+        return Err(PlanError::RrfScoreArity);
+    }
+    let methods = match &args[0] {
+        PExpr::List(items) if !items.is_empty() => items.clone(),
+        PExpr::List(_) => {
+            return Err(PlanError::RrfScoreMethodsShape {
+                got: "empty list".to_string(),
+            });
+        }
+        other => {
+            return Err(PlanError::RrfScoreMethodsShape {
+                got: format!("{other:?}"),
+            });
+        }
+    };
+    let (query_vector, query_text) = match &args[1] {
+        PExpr::Map(fields) => {
+            let mut qv = None;
+            let mut qt = None;
+            for (k, v) in fields {
+                match k.as_str() {
+                    "vector" => qv = Some(v.clone()),
+                    "text" => qt = Some(v.clone()),
+                    other => {
+                        return Err(PlanError::RrfScoreQueryShape {
+                            got: format!(
+                                "map with unknown key `{other}` (expected `vector` and/or `text`)"
+                            ),
+                        });
+                    }
+                }
+            }
+            if qv.is_none() && qt.is_none() {
+                return Err(PlanError::RrfScoreQueryShape {
+                    got: "empty map (needs at least one of `vector`, `text`)".to_string(),
+                });
+            }
+            (qv, qt)
+        }
+        PExpr::Parameter(_) | PExpr::Variable(_) => (Some(args[1].clone()), Some(args[1].clone())),
+        other => {
+            return Err(PlanError::RrfScoreQueryShape {
+                got: format!("{other:?}"),
+            });
+        }
+    };
+    let fusion = match kind {
+        FusionScalar::Rrf => crate::planner::logical::FusionStrategy::Rrf { k: 60 },
+        FusionScalar::Cc => crate::planner::logical::FusionStrategy::ConvexCombination {
+            weights: parse_fusion_weights_neutral(&args[2], kind)?,
+        },
+        FusionScalar::Dbsf => crate::planner::logical::FusionStrategy::Dbsf {
+            weights: parse_fusion_weights_neutral(&args[2], kind)?,
+        },
+    };
+    Ok(RrfCallSig {
+        methods,
+        query_vector,
+        query_text,
+        fusion,
+    })
+}
+
+fn collect_rrf_sig_in_expr_neutral(
+    expr: &crate::plan::expr::Expr,
+    found: &mut Option<RrfCallSig>,
+    location: &str,
+) -> Result<(), PlanError> {
+    use crate::plan::expr::Expr as PExpr;
+    if let Some((kind, args)) = match_fusion_call_neutral(expr) {
+        let sig = parse_fusion_signature_neutral(kind, args)?;
+        match found {
+            None => *found = Some(sig),
+            Some(existing) if *existing == sig => {}
+            Some(_) => {
+                return Err(PlanError::RrfScoreMultipleCalls {
+                    location: location.to_string(),
+                });
+            }
+        }
+        return Ok(());
+    }
+    match expr {
+        PExpr::Binary { left, right, .. } => {
+            collect_rrf_sig_in_expr_neutral(left, found, location)?;
+            collect_rrf_sig_in_expr_neutral(right, found, location)?;
+        }
+        PExpr::Unary { operand, .. } => collect_rrf_sig_in_expr_neutral(operand, found, location)?,
+        PExpr::Property { base, .. } => collect_rrf_sig_in_expr_neutral(base, found, location)?,
+        PExpr::List(items) => {
+            for it in items {
+                collect_rrf_sig_in_expr_neutral(it, found, location)?;
+            }
+        }
+        PExpr::Map(fields) => {
+            for (_, v) in fields {
+                collect_rrf_sig_in_expr_neutral(v, found, location)?;
+            }
+        }
+        PExpr::Call { args, .. } => {
+            for a in args {
+                collect_rrf_sig_in_expr_neutral(a, found, location)?;
+            }
+        }
+        PExpr::In { item, list } => {
+            collect_rrf_sig_in_expr_neutral(item, found, location)?;
+            collect_rrf_sig_in_expr_neutral(list, found, location)?;
+        }
+        PExpr::IsNull { operand, .. } => collect_rrf_sig_in_expr_neutral(operand, found, location)?,
+        PExpr::StringMatch { value, pattern, .. } => {
+            collect_rrf_sig_in_expr_neutral(value, found, location)?;
+            collect_rrf_sig_in_expr_neutral(pattern, found, location)?;
+        }
+        PExpr::Subscript { base, index } => {
+            collect_rrf_sig_in_expr_neutral(base, found, location)?;
+            collect_rrf_sig_in_expr_neutral(index, found, location)?;
+        }
+        PExpr::Case {
+            operand,
+            branches,
+            otherwise,
+        } => {
+            if let Some(o) = operand.as_deref() {
+                collect_rrf_sig_in_expr_neutral(o, found, location)?;
+            }
+            for (c, v) in branches {
+                collect_rrf_sig_in_expr_neutral(c, found, location)?;
+                collect_rrf_sig_in_expr_neutral(v, found, location)?;
+            }
+            if let Some(e) = otherwise.as_deref() {
+                collect_rrf_sig_in_expr_neutral(e, found, location)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn rewrite_rrf_in_expr_neutral(expr: &mut crate::plan::expr::Expr) {
+    use crate::plan::expr::Expr as PExpr;
+    if let PExpr::Call { name, .. } = expr {
+        if let Some(kind) = FusionScalar::from_name(name) {
+            let column = match kind {
+                FusionScalar::Rrf => "__rrf_score__",
+                FusionScalar::Cc | FusionScalar::Dbsf => "__hybrid_score__",
+            };
+            *expr = PExpr::Variable(column.to_string());
+            return;
+        }
+    }
+    match expr {
+        PExpr::Binary { left, right, .. } => {
+            rewrite_rrf_in_expr_neutral(left);
+            rewrite_rrf_in_expr_neutral(right);
+        }
+        PExpr::Unary { operand, .. } => rewrite_rrf_in_expr_neutral(operand),
+        PExpr::Property { base, .. } => rewrite_rrf_in_expr_neutral(base),
+        PExpr::List(items) => {
+            for it in items {
+                rewrite_rrf_in_expr_neutral(it);
+            }
+        }
+        PExpr::Map(fields) => {
+            for (_, v) in fields {
+                rewrite_rrf_in_expr_neutral(v);
+            }
+        }
+        PExpr::Call { args, .. } => {
+            for a in args {
+                rewrite_rrf_in_expr_neutral(a);
+            }
+        }
+        PExpr::In { item, list } => {
+            rewrite_rrf_in_expr_neutral(item);
+            rewrite_rrf_in_expr_neutral(list);
+        }
+        PExpr::IsNull { operand, .. } => rewrite_rrf_in_expr_neutral(operand),
+        PExpr::StringMatch { value, pattern, .. } => {
+            rewrite_rrf_in_expr_neutral(value);
+            rewrite_rrf_in_expr_neutral(pattern);
+        }
+        PExpr::Subscript { base, index } => {
+            rewrite_rrf_in_expr_neutral(base);
+            rewrite_rrf_in_expr_neutral(index);
+        }
+        PExpr::Case {
+            operand,
+            branches,
+            otherwise,
+        } => {
+            if let Some(o) = operand.as_deref_mut() {
+                rewrite_rrf_in_expr_neutral(o);
+            }
+            for (c, v) in branches {
+                rewrite_rrf_in_expr_neutral(c);
+                rewrite_rrf_in_expr_neutral(v);
+            }
+            if let Some(e) = otherwise.as_deref_mut() {
+                rewrite_rrf_in_expr_neutral(e);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Wrap the input of the topmost Project with a RankFuse operator, rewrite
 /// rrf_score call-sites, and (if Sort references `__rrf_score__` directly)
 /// inject a pass-through projection item so the score survives into Sort.
@@ -4477,14 +4808,14 @@ fn validate_rrf_placement(op: &LogicalOp) -> Result<(), PlanError> {
             aggregates,
         } => {
             for e in group_by {
-                if expr_contains_rrf_score(e) {
+                if neutral_expr_contains_call(e, &|n| FusionScalar::from_name(n).is_some()) {
                     return Err(PlanError::RrfScoreIllegalPosition {
                         location: "GROUP BY key".to_string(),
                     });
                 }
             }
             for a in aggregates {
-                if expr_contains_rrf_score(&a.arg) {
+                if neutral_expr_contains_call(&a.arg, &|n| FusionScalar::from_name(n).is_some()) {
                     return Err(PlanError::RrfScoreIllegalPosition {
                         location: "aggregate function argument".to_string(),
                     });
@@ -4497,7 +4828,7 @@ fn validate_rrf_placement(op: &LogicalOp) -> Result<(), PlanError> {
                 // rrf_score is legal here; don't recurse into its args —
                 // they're structural (method list + query map), not expressions
                 // evaluated in the normal sense.
-                if match_rrf_score(&it.expr).is_some() {
+                if match_fusion_call_neutral(&it.expr).is_some() {
                     continue;
                 }
                 // Any OTHER rrf_score inside a nested expression is legal too
@@ -4564,7 +4895,7 @@ fn collect_rrf_sig(op: &LogicalOp, sig: &mut Option<RrfCallSig>) -> Result<(), P
     match op {
         LogicalOp::Project { input, items, .. } => {
             for it in items {
-                collect_rrf_sig_in_expr(&it.expr, sig, "RETURN")?;
+                collect_rrf_sig_in_expr_neutral(&it.expr, sig, "RETURN")?;
             }
             collect_rrf_sig(input, sig)
         }
@@ -4595,7 +4926,7 @@ fn wrap_rank_fuse(op: LogicalOp, sig: &RrfCallSig, sort_touches_rrf: &mut bool) 
         } => {
             // Rewrite items first.
             for it in items.iter_mut() {
-                rewrite_rrf_in_expr(&mut it.expr);
+                rewrite_rrf_in_expr_neutral(&mut it.expr);
             }
             // Project.input is where we place RankFuse. Don't recurse further
             // into Project.input — RankFuse wraps whatever match/filter/traverse
@@ -4652,11 +4983,11 @@ fn ensure_rrf_passthrough(op: LogicalOp) -> LogicalOp {
         } => {
             let already_present = items.iter().any(|it| {
                 it.alias.as_deref() == Some("__rrf_score__")
-                    || matches!(&it.expr, Expr::Variable(v) if v == "__rrf_score__")
+                    || matches!(&it.expr, crate::plan::expr::Expr::Variable(v) if v == "__rrf_score__")
             });
             if !already_present {
                 items.push(ProjectItem {
-                    expr: Expr::Variable("__rrf_score__".to_string()),
+                    expr: crate::plan::expr::Expr::Variable("__rrf_score__".to_string()),
                     alias: Some("__rrf_score__".to_string()),
                 });
             }
@@ -4691,10 +5022,10 @@ fn ensure_rrf_passthrough(op: LogicalOp) -> LogicalOp {
 #[derive(Debug, Clone, PartialEq)]
 struct DocScoreSig {
     doc_variable: String,
-    query_vector: Expr,
-    alpha: Expr,
-    beta: Expr,
-    gamma: Expr,
+    query_vector: crate::plan::expr::Expr,
+    alpha: crate::plan::expr::Expr,
+    beta: crate::plan::expr::Expr,
+    gamma: crate::plan::expr::Expr,
 }
 
 fn match_doc_score(expr: &Expr) -> Option<&[Expr]> {
@@ -4770,8 +5101,8 @@ fn collect_doc_presence(expr: &Expr, hit: &mut bool) {
 }
 
 /// Canonical default weight expressions for doc_score.
-fn default_doc_weight(value: f64) -> Expr {
-    Expr::Literal(Value::Float(value))
+fn default_doc_weight(value: f64) -> crate::plan::expr::Expr {
+    crate::plan::expr::Expr::Literal(Value::Float(value))
 }
 
 /// Parse and validate a single `doc_score(args...)` call.
@@ -4789,7 +5120,7 @@ fn parse_doc_signature(args: &[Expr]) -> Result<DocScoreSig, PlanError> {
         }
     };
 
-    let query_vector = args[1].clone();
+    let query_vector = super::lower_expr(&args[1])?;
 
     let (alpha, beta, gamma) = match args.len() {
         2 => (
@@ -4804,9 +5135,9 @@ fn parse_doc_signature(args: &[Expr]) -> Result<DocScoreSig, PlanError> {
                 let mut g = default_doc_weight(0.2);
                 for (k, v) in fields {
                     match k.as_str() {
-                        "alpha" => a = v.clone(),
-                        "beta" => b = v.clone(),
-                        "gamma" => g = v.clone(),
+                        "alpha" => a = super::lower_expr(v)?,
+                        "beta" => b = super::lower_expr(v)?,
+                        "gamma" => g = super::lower_expr(v)?,
                         other => {
                             return Err(PlanError::DocScoreWeightsShape {
                                 got: format!(
@@ -4824,7 +5155,11 @@ fn parse_doc_signature(args: &[Expr]) -> Result<DocScoreSig, PlanError> {
                 });
             }
         },
-        5 => (args[2].clone(), args[3].clone(), args[4].clone()),
+        5 => (
+            super::lower_expr(&args[2])?,
+            super::lower_expr(&args[3])?,
+            super::lower_expr(&args[4])?,
+        ),
         _ => unreachable!("arity guard above excludes other lengths"),
     };
 
@@ -4961,6 +5296,204 @@ fn rewrite_doc_in_expr(expr: &mut Expr) {
     }
 }
 
+// ---- Neutral-IR twins of the doc-score rewrite machinery (Project path) ----
+
+fn match_doc_score_neutral(expr: &crate::plan::expr::Expr) -> Option<&[crate::plan::expr::Expr]> {
+    if let crate::plan::expr::Expr::Call { name, args, .. } = expr {
+        if name == "doc_score" {
+            return Some(args);
+        }
+    }
+    None
+}
+
+fn parse_doc_signature_neutral(args: &[crate::plan::expr::Expr]) -> Result<DocScoreSig, PlanError> {
+    use crate::plan::expr::Expr as PExpr;
+    if args.len() < 2 || args.len() > 5 || args.len() == 4 {
+        return Err(PlanError::DocScoreArity { got: args.len() });
+    }
+    let doc_variable = match &args[0] {
+        PExpr::Variable(v) => v.clone(),
+        other => {
+            return Err(PlanError::DocScoreDocShape {
+                got: format!("{other:?}"),
+            });
+        }
+    };
+    let query_vector = args[1].clone();
+    let (alpha, beta, gamma) = match args.len() {
+        2 => (
+            default_doc_weight(0.5),
+            default_doc_weight(0.3),
+            default_doc_weight(0.2),
+        ),
+        3 => match &args[2] {
+            PExpr::Map(fields) => {
+                let mut a = default_doc_weight(0.5);
+                let mut b = default_doc_weight(0.3);
+                let mut g = default_doc_weight(0.2);
+                for (k, v) in fields {
+                    match k.as_str() {
+                        "alpha" => a = v.clone(),
+                        "beta" => b = v.clone(),
+                        "gamma" => g = v.clone(),
+                        other => {
+                            return Err(PlanError::DocScoreWeightsShape {
+                                got: format!(
+                                    "map with unknown key `{other}` (expected `alpha`, `beta`, `gamma`)"
+                                ),
+                            });
+                        }
+                    }
+                }
+                (a, b, g)
+            }
+            other => {
+                return Err(PlanError::DocScoreWeightsShape {
+                    got: format!("single-arg weights must be a map literal, got {other:?}"),
+                });
+            }
+        },
+        5 => (args[2].clone(), args[3].clone(), args[4].clone()),
+        _ => unreachable!("arity guard above excludes other lengths"),
+    };
+    Ok(DocScoreSig {
+        doc_variable,
+        query_vector,
+        alpha,
+        beta,
+        gamma,
+    })
+}
+
+fn collect_doc_sig_in_expr_neutral(
+    expr: &crate::plan::expr::Expr,
+    found: &mut Option<DocScoreSig>,
+    location: &str,
+) -> Result<(), PlanError> {
+    use crate::plan::expr::Expr as PExpr;
+    if let Some(args) = match_doc_score_neutral(expr) {
+        let sig = parse_doc_signature_neutral(args)?;
+        match found {
+            None => *found = Some(sig),
+            Some(existing) if *existing == sig => {}
+            Some(_) => {
+                return Err(PlanError::DocScoreMultipleCalls {
+                    location: location.to_string(),
+                });
+            }
+        }
+        return Ok(());
+    }
+    match expr {
+        PExpr::Binary { left, right, .. } => {
+            collect_doc_sig_in_expr_neutral(left, found, location)?;
+            collect_doc_sig_in_expr_neutral(right, found, location)?;
+        }
+        PExpr::Unary { operand, .. } => collect_doc_sig_in_expr_neutral(operand, found, location)?,
+        PExpr::Property { base, .. } => collect_doc_sig_in_expr_neutral(base, found, location)?,
+        PExpr::List(items) => {
+            for it in items {
+                collect_doc_sig_in_expr_neutral(it, found, location)?;
+            }
+        }
+        PExpr::Map(fields) => {
+            for (_, v) in fields {
+                collect_doc_sig_in_expr_neutral(v, found, location)?;
+            }
+        }
+        PExpr::Call { args, .. } => {
+            for a in args {
+                collect_doc_sig_in_expr_neutral(a, found, location)?;
+            }
+        }
+        PExpr::In { item, list } => {
+            collect_doc_sig_in_expr_neutral(item, found, location)?;
+            collect_doc_sig_in_expr_neutral(list, found, location)?;
+        }
+        PExpr::IsNull { operand, .. } => collect_doc_sig_in_expr_neutral(operand, found, location)?,
+        PExpr::StringMatch { value, pattern, .. } => {
+            collect_doc_sig_in_expr_neutral(value, found, location)?;
+            collect_doc_sig_in_expr_neutral(pattern, found, location)?;
+        }
+        PExpr::Subscript { base, index } => {
+            collect_doc_sig_in_expr_neutral(base, found, location)?;
+            collect_doc_sig_in_expr_neutral(index, found, location)?;
+        }
+        PExpr::Case {
+            operand,
+            branches,
+            otherwise,
+        } => {
+            if let Some(o) = operand.as_deref() {
+                collect_doc_sig_in_expr_neutral(o, found, location)?;
+            }
+            for (c, v) in branches {
+                collect_doc_sig_in_expr_neutral(c, found, location)?;
+                collect_doc_sig_in_expr_neutral(v, found, location)?;
+            }
+            if let Some(e) = otherwise.as_deref() {
+                collect_doc_sig_in_expr_neutral(e, found, location)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn rewrite_doc_in_expr_neutral(expr: &mut crate::plan::expr::Expr) {
+    use crate::plan::expr::Expr as PExpr;
+    if let PExpr::Call { name, .. } = expr {
+        if name == "doc_score" {
+            *expr = PExpr::Variable("__doc_score__".to_string());
+            return;
+        }
+    }
+    match expr {
+        PExpr::Binary { left, right, .. } => {
+            rewrite_doc_in_expr_neutral(left);
+            rewrite_doc_in_expr_neutral(right);
+        }
+        PExpr::Unary { operand, .. } => rewrite_doc_in_expr_neutral(operand),
+        PExpr::Property { base, .. } => rewrite_doc_in_expr_neutral(base),
+        PExpr::List(items) => items.iter_mut().for_each(rewrite_doc_in_expr_neutral),
+        PExpr::Map(fields) => fields
+            .iter_mut()
+            .for_each(|(_, v)| rewrite_doc_in_expr_neutral(v)),
+        PExpr::Call { args, .. } => args.iter_mut().for_each(rewrite_doc_in_expr_neutral),
+        PExpr::In { item, list } => {
+            rewrite_doc_in_expr_neutral(item);
+            rewrite_doc_in_expr_neutral(list);
+        }
+        PExpr::IsNull { operand, .. } => rewrite_doc_in_expr_neutral(operand),
+        PExpr::StringMatch { value, pattern, .. } => {
+            rewrite_doc_in_expr_neutral(value);
+            rewrite_doc_in_expr_neutral(pattern);
+        }
+        PExpr::Subscript { base, index } => {
+            rewrite_doc_in_expr_neutral(base);
+            rewrite_doc_in_expr_neutral(index);
+        }
+        PExpr::Case {
+            operand,
+            branches,
+            otherwise,
+        } => {
+            if let Some(o) = operand.as_deref_mut() {
+                rewrite_doc_in_expr_neutral(o);
+            }
+            for (c, v) in branches {
+                rewrite_doc_in_expr_neutral(c);
+                rewrite_doc_in_expr_neutral(v);
+            }
+            if let Some(e) = otherwise.as_deref_mut() {
+                rewrite_doc_in_expr_neutral(e);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Verify no `doc_score(...)` appears in an illegal position (WHERE, GROUP BY,
 /// aggregate args, etc.). Only Project items and Sort items are legal sites.
 fn validate_doc_placement(op: &LogicalOp) -> Result<(), PlanError> {
@@ -4979,14 +5512,14 @@ fn validate_doc_placement(op: &LogicalOp) -> Result<(), PlanError> {
             aggregates,
         } => {
             for e in group_by {
-                if expr_contains_doc_score(e) {
+                if neutral_expr_contains_call(e, &|n| n == "doc_score") {
                     return Err(PlanError::DocScoreIllegalPosition {
                         location: "GROUP BY key".to_string(),
                     });
                 }
             }
             for a in aggregates {
-                if expr_contains_doc_score(&a.arg) {
+                if neutral_expr_contains_call(&a.arg, &|n| n == "doc_score") {
                     return Err(PlanError::DocScoreIllegalPosition {
                         location: "aggregate function argument".to_string(),
                     });
@@ -5043,7 +5576,7 @@ fn collect_doc_sig(op: &LogicalOp, sig: &mut Option<DocScoreSig>) -> Result<(), 
     match op {
         LogicalOp::Project { input, items, .. } => {
             for it in items {
-                collect_doc_sig_in_expr(&it.expr, sig, "RETURN")?;
+                collect_doc_sig_in_expr_neutral(&it.expr, sig, "RETURN")?;
             }
             collect_doc_sig(input, sig)
         }
@@ -5068,7 +5601,7 @@ fn wrap_doc_score(op: LogicalOp, sig: &DocScoreSig, sort_touches_doc: &mut bool)
             distinct,
         } => {
             for it in items.iter_mut() {
-                rewrite_doc_in_expr(&mut it.expr);
+                rewrite_doc_in_expr_neutral(&mut it.expr);
             }
             let fused_input = LogicalOp::DocScore {
                 input,
@@ -5117,11 +5650,11 @@ fn ensure_doc_passthrough(op: LogicalOp) -> LogicalOp {
         } => {
             let already_present = items.iter().any(|it| {
                 it.alias.as_deref() == Some("__doc_score__")
-                    || matches!(&it.expr, Expr::Variable(v) if v == "__doc_score__")
+                    || matches!(&it.expr, crate::plan::expr::Expr::Variable(v) if v == "__doc_score__")
             });
             if !already_present {
                 items.push(ProjectItem {
-                    expr: Expr::Variable("__doc_score__".to_string()),
+                    expr: crate::plan::expr::Expr::Variable("__doc_score__".to_string()),
                     alias: Some("__doc_score__".to_string()),
                 });
             }

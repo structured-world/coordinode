@@ -11692,7 +11692,10 @@ fn hnsw_scan_executor_returns_index_top_k() {
             label: "Item".to_string(),
             property: "embedding".to_string(),
             binding: "n".to_string(),
-            query_vector: Expr::Literal(Value::Array(vec![Value::Float(0.0), Value::Float(0.0)])),
+            query_vector: coordinode_query::planner::lower_expr(&Expr::Literal(Value::Array(
+                vec![Value::Float(0.0), Value::Float(0.0)],
+            )))
+            .expect("lower test expression"),
             k: 2,
             function: "vector_distance".to_string(),
             distance_alias: Some("_dist".to_string()),

@@ -115,6 +115,79 @@ fn collect_score_requirements(expr: &Expr, out: &mut ScoreRequirements) {
     }
 }
 
+/// Neutral-IR twin of [`expr_score_requirements`]: collects which cached score
+/// columns a projection expression will read. Used by the Project executor now
+/// that `ProjectItem` carries the language-neutral expression.
+pub fn expr_score_requirements_neutral(expr: &crate::plan::expr::Expr) -> ScoreRequirements {
+    let mut out = ScoreRequirements::default();
+    collect_score_requirements_neutral(expr, &mut out);
+    out
+}
+
+fn collect_score_requirements_neutral(expr: &crate::plan::expr::Expr, out: &mut ScoreRequirements) {
+    use crate::plan::expr::Expr as PExpr;
+    match expr {
+        PExpr::Call { name, args, .. } => {
+            match name.as_str() {
+                "text_score" => out.needs_text_score = true,
+                "hybrid_score" => out.needs_hybrid_score = true,
+                "rrf_score" => out.needs_rrf_score = true,
+                "doc_score" => out.needs_doc_score = true,
+                _ => {}
+            }
+            for a in args {
+                collect_score_requirements_neutral(a, out);
+            }
+        }
+        PExpr::Binary { left, right, .. } => {
+            collect_score_requirements_neutral(left, out);
+            collect_score_requirements_neutral(right, out);
+        }
+        PExpr::Unary { operand, .. } => collect_score_requirements_neutral(operand, out),
+        PExpr::Property { base, .. } => collect_score_requirements_neutral(base, out),
+        PExpr::List(items) => {
+            for it in items {
+                collect_score_requirements_neutral(it, out);
+            }
+        }
+        PExpr::Map(fields) => {
+            for (_, v) in fields {
+                collect_score_requirements_neutral(v, out);
+            }
+        }
+        PExpr::In { item, list } => {
+            collect_score_requirements_neutral(item, out);
+            collect_score_requirements_neutral(list, out);
+        }
+        PExpr::IsNull { operand, .. } => collect_score_requirements_neutral(operand, out),
+        PExpr::StringMatch { value, pattern, .. } => {
+            collect_score_requirements_neutral(value, out);
+            collect_score_requirements_neutral(pattern, out);
+        }
+        PExpr::Subscript { base, index } => {
+            collect_score_requirements_neutral(base, out);
+            collect_score_requirements_neutral(index, out);
+        }
+        PExpr::Case {
+            operand,
+            branches,
+            otherwise,
+        } => {
+            if let Some(o) = operand.as_deref() {
+                collect_score_requirements_neutral(o, out);
+            }
+            for (c, v) in branches {
+                collect_score_requirements_neutral(c, out);
+                collect_score_requirements_neutral(v, out);
+            }
+            if let Some(e) = otherwise.as_deref() {
+                collect_score_requirements_neutral(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Returns `true` when the expression tree references `text_score(...)` anywhere.
 /// Back-compatible wrapper used prior to R-HYB2; new callers should prefer
 /// [`expr_score_requirements`] to get both `text_score` and `hybrid_score`

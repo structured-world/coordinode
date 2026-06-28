@@ -2,6 +2,11 @@ use super::*;
 use crate::cypher::ast::*;
 use coordinode_core::graph::types::Value;
 
+/// Lower a cypher test expression into the neutral IR carried by operator fields.
+fn nx(e: Expr) -> crate::plan::expr::Expr {
+    crate::planner::lower_expr(&e).expect("lower test expression")
+}
+
 fn node_scan(var: &str, label: &str) -> LogicalOp {
     LogicalOp::NodeScan {
         variable: var.to_string(),
@@ -300,11 +305,11 @@ fn sort_without_limit_no_knn() {
 fn vector_without_prefilter_detected() {
     let p = plan(LogicalOp::VectorFilter {
         input: Box::new(node_scan("n", "Product")),
-        vector_expr: Expr::PropertyAccess {
+        vector_expr: nx(Expr::PropertyAccess {
             expr: Box::new(Expr::Variable("n".to_string())),
             property: "embedding".to_string(),
-        },
-        query_vector: Expr::Literal(Value::Array(vec![])),
+        }),
+        query_vector: nx(Expr::Literal(Value::Array(vec![]))),
         function: "vector_distance".to_string(),
         less_than: true,
         threshold: 0.5,
@@ -337,11 +342,11 @@ fn vector_with_prefilter_ok() {
     };
     let p = plan(LogicalOp::VectorFilter {
         input: Box::new(traverse),
-        vector_expr: Expr::PropertyAccess {
+        vector_expr: nx(Expr::PropertyAccess {
             expr: Box::new(Expr::Variable("p".to_string())),
             property: "embedding".to_string(),
-        },
-        query_vector: Expr::Literal(Value::Array(vec![])),
+        }),
+        query_vector: nx(Expr::Literal(Value::Array(vec![]))),
         function: "vector_distance".to_string(),
         less_than: true,
         threshold: 0.5,

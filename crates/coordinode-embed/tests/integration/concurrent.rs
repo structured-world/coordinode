@@ -60,8 +60,8 @@ fn create_user_plan(name: &str, age: i64) -> LogicalPlan {
             variable: Some("n".into()),
             labels: vec!["User".into()],
             properties: vec![
-                ("name".into(), Expr::Literal(Value::String(name.into()))),
-                ("age".into(), Expr::Literal(Value::Int(age))),
+                ("name".into(), nx(Expr::Literal(Value::String(name.into())))),
+                ("age".into(), nx(Expr::Literal(Value::Int(age)))),
             ],
         },
     }
@@ -92,10 +92,10 @@ fn read_user_age(
             }),
             items: vec![coordinode_query::planner::logical::ProjectItem {
                 alias: Some("n.age".into()),
-                expr: Expr::PropertyAccess {
+                expr: nx(Expr::PropertyAccess {
                     expr: Box::new(Expr::Variable("n".into())),
                     property: "age".into(),
-                },
+                }),
             }],
             distinct: false,
         },

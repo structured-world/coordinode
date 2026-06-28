@@ -14,7 +14,7 @@ use coordinode_core::graph::types::{Value, VectorConsistencyMode};
 pub struct LogicalPlan {
     pub root: LogicalOp,
     /// AS OF TIMESTAMP: if set, read data as of this timestamp expression.
-    pub snapshot_ts: Option<Expr>,
+    pub snapshot_ts: Option<crate::plan::expr::Expr>,
     /// Vector MVCC consistency mode for this plan.
     /// Set from session state or per-query hint. Shown in EXPLAIN output
     /// when the plan contains VectorFilter operators.
@@ -226,7 +226,7 @@ pub enum LogicalOp {
     Aggregate {
         input: Box<LogicalOp>,
         /// Non-aggregate expressions form the GROUP BY key.
-        group_by: Vec<Expr>,
+        group_by: Vec<crate::plan::expr::Expr>,
         /// Aggregate computations.
         aggregates: Vec<AggregateItem>,
     },
@@ -266,7 +266,7 @@ pub enum LogicalOp {
         input: Option<Box<LogicalOp>>,
         variable: Option<String>,
         labels: Vec<String>,
-        properties: Vec<(String, Expr)>,
+        properties: Vec<(String, crate::plan::expr::Expr)>,
     },
 
     /// Create an edge between existing nodes.
@@ -277,7 +277,7 @@ pub enum LogicalOp {
         edge_type: String,
         direction: Direction,
         variable: Option<String>,
-        properties: Vec<(String, Expr)>,
+        properties: Vec<(String, crate::plan::expr::Expr)>,
     },
 
     /// Update properties/labels.
@@ -380,7 +380,7 @@ pub enum LogicalOp {
         /// `AS OF <ts>`: on a temporal source, clone the valid-version of the
         /// body active at this valid-time instant instead of the current one.
         /// The clone's `valid_from` is still NOW. `None` clones the current.
-        as_of: Option<crate::cypher::ast::Expr>,
+        as_of: Option<crate::plan::expr::Expr>,
     },
 
     /// REDIRECT EDGES: re-point a bound node's edges onto another bound node.
@@ -558,9 +558,9 @@ pub enum LogicalOp {
     VectorFilter {
         input: Box<LogicalOp>,
         /// Expression for the vector property (e.g., n.embedding).
-        vector_expr: Expr,
+        vector_expr: crate::plan::expr::Expr,
         /// Query vector literal or parameter.
-        query_vector: Expr,
+        query_vector: crate::plan::expr::Expr,
         /// Distance function name: "vector_distance", "vector_similarity", etc.
         function: String,
         /// Comparison operator and threshold (e.g., < 0.5).
@@ -572,7 +572,7 @@ pub enum LogicalOp {
         /// Optional decay field expression for COMPUTED VECTOR_DECAY.
         /// When present, the effective score is `vector_score * decay_value`.
         /// Detected from `vector_similarity(...) * decay_field > threshold` pattern.
-        decay_field: Option<Expr>,
+        decay_field: Option<crate::plan::expr::Expr>,
         /// Graph predicate push-down decision (R-PUSH1). Populated by the
         /// `optimize_push_down` planner pass when the upstream input contains
         /// a `Traverse`. `None` means either the input does not contain a
@@ -602,9 +602,9 @@ pub enum LogicalOp {
         /// Vector property name on the edge.
         vector_property: String,
         /// Original vector expression (e.g., r.embedding) for evaluation.
-        vector_expr: Expr,
+        vector_expr: crate::plan::expr::Expr,
         /// Query vector expression.
-        query_vector: Expr,
+        query_vector: crate::plan::expr::Expr,
         /// Distance function name.
         function: String,
         /// Comparison: true = keep where distance < threshold.
@@ -633,9 +633,9 @@ pub enum LogicalOp {
     VectorTopK {
         input: Box<LogicalOp>,
         /// Expression for the vector property (e.g., `n.embedding`).
-        vector_expr: Expr,
+        vector_expr: crate::plan::expr::Expr,
         /// Query vector literal or parameter.
-        query_vector: Expr,
+        query_vector: crate::plan::expr::Expr,
         /// Distance function name: `vector_distance`, `vector_similarity`, `vector_dot`, `vector_manhattan`.
         function: String,
         /// Top-K count (from LIMIT clause).
@@ -668,7 +668,7 @@ pub enum LogicalOp {
     TextFilter {
         input: Box<LogicalOp>,
         /// Expression for the text field (e.g., a.body).
-        text_expr: Expr,
+        text_expr: crate::plan::expr::Expr,
         /// Query string literal.
         query_string: String,
         /// Optional language for query tokenization (3-arg text_match).
@@ -682,9 +682,9 @@ pub enum LogicalOp {
     EncryptedFilter {
         input: Box<LogicalOp>,
         /// Expression for the encrypted field (e.g., u.email).
-        field_expr: Expr,
+        field_expr: crate::plan::expr::Expr,
         /// Search token expression (parameter or literal bytes).
-        token_expr: Expr,
+        token_expr: crate::plan::expr::Expr,
     },
 
     /// Left outer join for OPTIONAL MATCH: if the right side produces no rows,
@@ -716,7 +716,7 @@ pub enum LogicalOp {
         /// Dotted procedure name.
         procedure: String,
         /// Positional arguments (evaluated to Value).
-        args: Vec<Expr>,
+        args: Vec<crate::plan::expr::Expr>,
         /// YIELD column names (empty = all columns).
         yield_items: Vec<String>,
     },
@@ -742,13 +742,13 @@ pub enum LogicalOp {
         /// `n.body`). Each is resolved at execution time to either a vector
         /// (HNSW index or edge vector property, metric from index config) or
         /// text (BM25 via `TextIndexRegistry`).
-        methods: Vec<Expr>,
+        methods: Vec<crate::plan::expr::Expr>,
         /// Query vector component (from Map key `vector`). Required when at
         /// least one method resolves to a vector.
-        query_vector: Option<Expr>,
+        query_vector: Option<crate::plan::expr::Expr>,
         /// Query text component (from Map key `text`). Required when at least
         /// one method resolves to text.
-        query_text: Option<Expr>,
+        query_text: Option<crate::plan::expr::Expr>,
         /// Per-shard overfetch cap (distributed RankFuse). `None` in CE /
         /// single-node — always processes the full input. Shape ready for
         /// R-HYB5 without call-site changes.
@@ -778,13 +778,13 @@ pub enum LogicalOp {
         /// Variable bound to a Document node whose HAS_CHUNK children get scored.
         doc_variable: String,
         /// Query vector (or expression resolving to Vec<f32>).
-        query_vector: Expr,
+        query_vector: crate::plan::expr::Expr,
         /// α weight on max_chunk_score. Default 0.5.
-        alpha: Expr,
+        alpha: crate::plan::expr::Expr,
         /// β weight on avg_chunk_score. Default 0.3.
-        beta: Expr,
+        beta: crate::plan::expr::Expr,
         /// γ weight on coverage (matching / total). Default 0.2.
-        gamma: Expr,
+        gamma: crate::plan::expr::Expr,
     },
 
     /// Late-interaction (ColBERT-style) top-K via the MaxSim scalar.
@@ -801,9 +801,9 @@ pub enum LogicalOp {
         input: Box<LogicalOp>,
         /// Expression for the document's multi-vector property
         /// (e.g. `n.token_embeddings`).
-        doc_expr: Expr,
+        doc_expr: crate::plan::expr::Expr,
         /// Query matrix expression (literal or parameter).
-        query_expr: Expr,
+        query_expr: crate::plan::expr::Expr,
         /// Top-K count (from LIMIT clause).
         k: usize,
         /// Optional score alias (`AS s` in `RETURN ... AS s`). When set,
@@ -831,7 +831,7 @@ pub enum LogicalOp {
         /// Row binding name for the fetched node (the MATCH variable).
         binding: String,
         /// Query vector expression (parameter or literal).
-        query_vector: Expr,
+        query_vector: crate::plan::expr::Expr,
         /// Top-K count (from the LIMIT clause).
         k: usize,
         /// Distance function from the original ORDER BY
@@ -852,7 +852,7 @@ pub enum LogicalOp {
     Foreach {
         input: Box<LogicalOp>,
         variable: String,
-        list: Expr,
+        list: crate::plan::expr::Expr,
         body: Box<LogicalOp>,
     },
 
@@ -1268,7 +1268,7 @@ pub fn select_edge_vector_strategy(
 /// A projected column.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectItem {
-    pub expr: Expr,
+    pub expr: crate::plan::expr::Expr,
     pub alias: Option<String>,
 }
 
@@ -1278,7 +1278,7 @@ pub struct AggregateItem {
     /// Function name (count, sum, avg, min, max, collect, etc.).
     pub function: String,
     /// Argument expression (or Star for count(*)).
-    pub arg: Expr,
+    pub arg: crate::plan::expr::Expr,
     /// DISTINCT modifier.
     pub distinct: bool,
     /// Output alias.
@@ -1287,7 +1287,7 @@ pub struct AggregateItem {
     /// Must evaluate to a Float or Int in [0.0, 1.0].
     /// Accepts literal values (`0.9`) and query parameters (`$p`).
     /// `None` means the argument was absent or not a scalar expression — executor falls back to 0.5.
-    pub percentile_expr: Option<Expr>,
+    pub percentile_expr: Option<crate::plan::expr::Expr>,
 }
 
 /// Query cost estimation result.
@@ -1589,7 +1589,7 @@ fn estimate_op_cost(
             // Body runs once per input row times the list length. The list size
             // is unknown statically; assume a small constant fan-out.
             let list_factor = match list {
-                Expr::Literal(Value::Array(items)) => items.len() as f64,
+                crate::plan::expr::Expr::Literal(Value::Array(items)) => items.len() as f64,
                 _ => 4.0,
             };
             // FOREACH is pass-through: row count downstream equals input rows.

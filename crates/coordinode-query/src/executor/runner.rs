@@ -32,10 +32,7 @@ use coordinode_storage::engine::StorageSnapshot;
 use super::eval::{eval_binary_op, eval_expr, eval_unary_op, is_truthy};
 use super::eval_neutral::eval_neutral;
 use super::row::Row;
-use crate::cypher::ast::{
-    BinaryOperator, Direction, Expr, LengthBound, NodePattern, Pattern, PatternElement,
-    RelationshipPattern, ViolationMode,
-};
+use crate::cypher::ast::{Direction, Expr, LengthBound, Pattern, PatternElement, ViolationMode};
 use crate::index::{IndexState, OnlineDuringBuild};
 use crate::planner::logical::*;
 
@@ -1804,7 +1801,7 @@ pub(crate) fn plan_allows_varlen_target_dedup(root: &LogicalOp) -> bool {
     if !item.distinct || !item.function.eq_ignore_ascii_case("count") {
         return false;
     }
-    let Expr::Variable(target_var) = &item.arg else {
+    let crate::plan::expr::Expr::Variable(target_var) = &item.arg else {
         return false;
     };
 
@@ -1917,7 +1914,7 @@ pub fn execute_no_commit(
     // Since commit_ts = seqno (ADR-016, OracleSeqnoGenerator), the timestamp value
     // is directly usable as a snapshot seqno for both node and adj partitions.
     if let Some(ref ts_expr) = plan.snapshot_ts {
-        let ts_val = eval_expr(ts_expr, &Row::new());
+        let ts_val = eval_neutral(ts_expr, &Row::new());
         let resolved_ts: Option<i64> = match ts_val {
             Value::Timestamp(ts) => {
                 // Validate within retention window
@@ -2192,7 +2189,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             // `text_score_without_text_match_errors`.
             let score_reqs: crate::executor::eval::ScoreRequirements = items
                 .iter()
-                .map(|it| crate::executor::eval::expr_score_requirements(&it.expr))
+                .map(|it| crate::executor::eval::expr_score_requirements_neutral(&it.expr))
                 .fold(Default::default(), |mut acc, r| {
                     acc.needs_text_score |= r.needs_text_score;
                     acc.needs_hybrid_score |= r.needs_hybrid_score;
@@ -2245,19 +2242,19 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             for row in rows {
                 let mut out = Row::new();
                 for item in items {
-                    if item.expr == Expr::Star {
+                    if item.expr == crate::plan::expr::Expr::Star {
                         // Star: copy all columns
                         out.extend(row.clone());
                     } else {
-                        let val = if expr_contains_pattern_predicate(&item.expr) {
-                            eval_predicate_with_storage(&item.expr, &row, ctx)?
+                        let val = if neutral_contains_subplan(&item.expr) {
+                            eval_neutral_with_storage(&item.expr, &row, ctx)?
                         } else {
-                            eval_expr(&item.expr, &row)
+                            eval_neutral(&item.expr, &row)
                         };
                         let key = item
                             .alias
                             .clone()
-                            .unwrap_or_else(|| expr_display_name(&item.expr));
+                            .unwrap_or_else(|| expr_display_name_neutral(&item.expr));
                         out.insert(key.clone(), val);
 
                         // Variable passthrough: when a projection item is
@@ -2268,7 +2265,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                         // row. Without this, `MATCH (a) WITH a RETURN
                         // a.prop` would lose all property bindings at the
                         // WITH barrier and `a.prop` would resolve to NULL.
-                        if let Expr::Variable(var_name) = &item.expr {
+                        if let crate::plan::expr::Expr::Variable(var_name) = &item.expr {
                             let prefix = format!("{var_name}.");
                             for (col, value) in &row {
                                 if let Some(suffix) = col.strip_prefix(&prefix) {
@@ -2803,7 +2800,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             // adds the loop variable on top of the current row.
             let prev_scope = ctx.foreach_scope.take();
             for row in &input_rows {
-                let elems = match eval_expr(list, row) {
+                let elems = match eval_neutral(list, row) {
                     Value::Array(items) => items,
                     // FOREACH over NULL is a no-op (matches Cypher).
                     Value::Null => continue,
@@ -3299,7 +3296,7 @@ fn execute_hnsw_scan(
     label: &str,
     property: &str,
     binding: &str,
-    query_vector: &Expr,
+    query_vector: &crate::plan::expr::Expr,
     k: usize,
     function: &str,
     distance_alias: Option<&str>,
@@ -3315,7 +3312,7 @@ fn execute_hnsw_scan(
     // scan-then-rank path does.
     gate_vector_index_read(ctx.engine, registry, label, property)?;
 
-    let qv_val = eval_expr(query_vector, &Row::new());
+    let qv_val = eval_neutral(query_vector, &Row::new());
     let Some(qv) = coerce_value_to_vec(&qv_val) else {
         return Err(ExecutionError::Unsupported(format!(
             "HnswScan({index_name}): query vector did not evaluate to a vector"
@@ -4431,13 +4428,13 @@ struct VectorScoreParams<'a> {
     function: &'a str,
     less_than: bool,
     threshold: f64,
-    decay_field: Option<&'a Expr>,
+    decay_field: Option<&'a crate::plan::expr::Expr>,
 }
 
 fn try_hnsw_vector_filter(
     rows: &[Row],
-    vector_expr: &Expr,
-    query_vector_expr: &Expr,
+    vector_expr: &crate::plan::expr::Expr,
+    query_vector_expr: &crate::plan::expr::Expr,
     params: &VectorScoreParams<'_>,
     ctx: &ExecutionContext<'_>,
 ) -> Result<Option<Vec<Row>>, ExecutionError> {
@@ -4449,8 +4446,8 @@ fn try_hnsw_vector_filter(
 
     // Extract variable name and property from vector_expr (e.g. n.embedding).
     let (variable, property) = match vector_expr {
-        Expr::PropertyAccess { expr, property } => match expr.as_ref() {
-            Expr::Variable(var) => (var.as_str(), property.as_str()),
+        crate::plan::expr::Expr::Property { base, key } => match base.as_ref() {
+            crate::plan::expr::Expr::Variable(var) => (var.as_str(), key.as_str()),
             _ => return Ok(None),
         },
         _ => return Ok(None),
@@ -4473,7 +4470,7 @@ fn try_hnsw_vector_filter(
     }
 
     // Evaluate the query vector (constant across all rows).
-    let query_val = eval_expr(query_vector_expr, &rows[0]);
+    let query_val = eval_neutral(query_vector_expr, &rows[0]);
     let query_vec = match coerce_value_to_vec(&query_val) {
         Some(v) => v,
         None => return Ok(None),
@@ -4513,7 +4510,7 @@ fn try_hnsw_vector_filter(
         }
 
         // Re-compute exact score for threshold comparison.
-        let vec_val = eval_expr(vector_expr, row);
+        let vec_val = eval_neutral(vector_expr, row);
         let a = match coerce_value_to_vec(&vec_val) {
             Some(v) if v.len() == query_vec.len() => v,
             _ => continue,
@@ -4618,8 +4615,8 @@ fn collect_predicate_property_ids(
 #[allow(clippy::too_many_arguments)]
 fn try_hnsw_vector_top_k(
     rows: &[Row],
-    vector_expr: &Expr,
-    query_vector_expr: &Expr,
+    vector_expr: &crate::plan::expr::Expr,
+    query_vector_expr: &crate::plan::expr::Expr,
     function: &str,
     k: usize,
     distance_alias: Option<&str>,
@@ -4645,8 +4642,8 @@ fn try_hnsw_vector_top_k(
 
     // Extract variable name and property from vector_expr (e.g. n.embedding).
     let (variable, property) = match vector_expr {
-        Expr::PropertyAccess { expr, property } => match expr.as_ref() {
-            Expr::Variable(var) => (var.as_str(), property.as_str()),
+        crate::plan::expr::Expr::Property { base, key } => match base.as_ref() {
+            crate::plan::expr::Expr::Variable(var) => (var.as_str(), key.as_str()),
             _ => return Ok(None),
         },
         _ => return Ok(None),
@@ -4688,7 +4685,7 @@ fn try_hnsw_vector_top_k(
     };
 
     // Evaluate the query vector (constant across all rows).
-    let query_val = eval_expr(query_vector_expr, &rows[0]);
+    let query_val = eval_neutral(query_vector_expr, &rows[0]);
     let query_vec = match coerce_value_to_vec(&query_val) {
         Some(v) => v,
         None => return Ok(None),
@@ -4813,12 +4810,12 @@ fn try_hnsw_vector_top_k(
 /// HNSW indexes return raw L2 distances; if the user asked for `vector_similarity`
 /// (cosine) or `vector_dot`, we must recompute the score from the row's vector.
 fn recompute_score_for_row(
-    vector_expr: &Expr,
+    vector_expr: &crate::plan::expr::Expr,
     query_vec: &[f32],
     function: &str,
     row: &Row,
 ) -> Option<f64> {
-    let vec_val = eval_expr(vector_expr, row);
+    let vec_val = eval_neutral(vector_expr, row);
     let a = coerce_value_to_vec(&vec_val)?;
     if a.len() != query_vec.len() {
         return None;
@@ -4839,8 +4836,8 @@ fn recompute_score_for_row(
 /// non-NodeScan input rows, or insufficient HNSW intersection).
 fn execute_vector_top_k_brute_force(
     rows: Vec<Row>,
-    vector_expr: &Expr,
-    query_vector_expr: &Expr,
+    vector_expr: &crate::plan::expr::Expr,
+    query_vector_expr: &crate::plan::expr::Expr,
     function: &str,
     k: usize,
     distance_alias: Option<&str>,
@@ -4850,7 +4847,7 @@ fn execute_vector_top_k_brute_force(
     }
 
     // Evaluate query vector once (constant across rows).
-    let query_val = eval_expr(query_vector_expr, &rows[0]);
+    let query_val = eval_neutral(query_vector_expr, &rows[0]);
     let query_vec = match coerce_value_to_vec(&query_val) {
         Some(v) => v,
         None => return Ok(Vec::new()),
@@ -4859,7 +4856,7 @@ fn execute_vector_top_k_brute_force(
     // Compute (score, row) pairs, skipping rows with missing/mismatched vectors.
     let mut scored: Vec<(f64, Row)> = Vec::with_capacity(rows.len());
     for row in rows {
-        let vec_val = eval_expr(vector_expr, &row);
+        let vec_val = eval_neutral(vector_expr, &row);
         let a = match coerce_value_to_vec(&vec_val) {
             Some(v) if v.len() == query_vec.len() => v,
             _ => continue,
@@ -4906,9 +4903,13 @@ fn execute_vector_top_k_brute_force(
 /// For each row, compute vector function(vector_expr, query_vector),
 /// compare against threshold. Keep rows that pass the comparison.
 /// Apply decay multiplier to a raw vector score when a decay field is present.
-fn apply_decay_multiplier(raw_score: f64, decay_field: Option<&Expr>, row: &Row) -> f64 {
+fn apply_decay_multiplier(
+    raw_score: f64,
+    decay_field: Option<&crate::plan::expr::Expr>,
+    row: &Row,
+) -> f64 {
     if let Some(decay_expr) = decay_field {
-        let decay_val = eval_expr(decay_expr, row);
+        let decay_val = eval_neutral(decay_expr, row);
         let decay_factor = match decay_val {
             Value::Float(f) => f,
             Value::Int(i) => i as f64,
@@ -4922,15 +4923,15 @@ fn apply_decay_multiplier(raw_score: f64, decay_field: Option<&Expr>, row: &Row)
 
 fn execute_vector_filter(
     rows: &[Row],
-    vector_expr: &Expr,
-    query_vector: &Expr,
+    vector_expr: &crate::plan::expr::Expr,
+    query_vector: &crate::plan::expr::Expr,
     params: &VectorScoreParams<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let mut results = Vec::new();
 
     for row in rows {
-        let vec_val = eval_expr(vector_expr, row);
-        let query_val = eval_expr(query_vector, row);
+        let vec_val = eval_neutral(vector_expr, row);
+        let query_val = eval_neutral(query_vector, row);
 
         // Coerce values to f32 vectors
         let vec_a = coerce_value_to_vec(&vec_val);
@@ -5032,11 +5033,11 @@ impl RankFuseMethodKind {
 ///
 /// RRF methods are always property accesses on a variable —
 /// `n.embedding`, `r.context_emb`, `c.body`, etc. Any other shape is rejected.
-fn extract_method_ident(expr: &Expr) -> Option<(String, String)> {
+fn extract_method_ident(expr: &crate::plan::expr::Expr) -> Option<(String, String)> {
     match expr {
-        Expr::PropertyAccess { expr, property } => {
-            if let Expr::Variable(var) = expr.as_ref() {
-                return Some((var.clone(), property.clone()));
+        crate::plan::expr::Expr::Property { base, key } => {
+            if let crate::plan::expr::Expr::Variable(var) = base.as_ref() {
+                return Some((var.clone(), key.clone()));
             }
             None
         }
@@ -5072,7 +5073,7 @@ fn row_node_id(row: &Row, variable: &str) -> Option<u64> {
 /// it as brute-force vector (edge vector property or schemaless vector).
 /// Returns `Err` with a user-facing message when the method cannot be scored.
 fn resolve_rank_fuse_method(
-    method_expr: &Expr,
+    method_expr: &crate::plan::expr::Expr,
     rows: &[Row],
     ctx: &ExecutionContext<'_>,
 ) -> Result<RankFuseMethodKind, ExecutionError> {
@@ -5115,7 +5116,7 @@ fn resolve_rank_fuse_method(
     // schemaless vectors. Text fields MUST have a full-text index — no fallback.
     let any_vector = rows
         .iter()
-        .any(|row| matches!(eval_expr(method_expr, row), Value::Vector(_)));
+        .any(|row| matches!(eval_neutral(method_expr, row), Value::Vector(_)));
     if any_vector {
         return Ok(RankFuseMethodKind::VectorBruteForce);
     }
@@ -5136,9 +5137,9 @@ fn resolve_rank_fuse_method(
 #[allow(clippy::too_many_arguments)]
 fn execute_rank_fuse(
     rows: Vec<Row>,
-    methods: &[Expr],
-    query_vector: Option<&Expr>,
-    query_text: Option<&Expr>,
+    methods: &[crate::plan::expr::Expr],
+    query_vector: Option<&crate::plan::expr::Expr>,
+    query_text: Option<&crate::plan::expr::Expr>,
     shard_overfetch_cap: Option<usize>,
     fusion: &crate::planner::logical::FusionStrategy,
     ctx: &mut ExecutionContext<'_>,
@@ -5175,10 +5176,10 @@ fn execute_rank_fuse(
     // zero-row eval against an empty Row is sufficient for literal / parameter
     // shapes. Params have already been substituted by `substitute_params`.
     let qv_value = query_vector
-        .map(|e| eval_expr(e, &Row::new()))
+        .map(|e| eval_neutral(e, &Row::new()))
         .unwrap_or(Value::Null);
     let qt_value = query_text
-        .map(|e| eval_expr(e, &Row::new()))
+        .map(|e| eval_neutral(e, &Row::new()))
         .unwrap_or(Value::Null);
 
     let query_vec: Option<Vec<f32>> = coerce_value_to_vec(&qv_value);
@@ -5324,10 +5325,10 @@ fn execute_rank_fuse(
     Ok(out_rows)
 }
 
-fn variable_for_method(expr: &Expr) -> String {
+fn variable_for_method(expr: &crate::plan::expr::Expr) -> String {
     match expr {
-        Expr::PropertyAccess { expr: inner, .. } => {
-            if let Expr::Variable(v) = inner.as_ref() {
+        crate::plan::expr::Expr::Property { base: inner, .. } => {
+            if let crate::plan::expr::Expr::Variable(v) = inner.as_ref() {
                 return v.clone();
             }
             String::new()
@@ -5343,7 +5344,7 @@ fn variable_for_method(expr: &Expr) -> String {
 /// When `metric` is `None`, uses cosine similarity (brute-force default).
 fn score_vector_method(
     rows: &[Row],
-    method_expr: &Expr,
+    method_expr: &crate::plan::expr::Expr,
     query_vec: &[f32],
     metric: Option<coordinode_core::graph::types::VectorMetric>,
     desc: bool,
@@ -5352,7 +5353,7 @@ fn score_vector_method(
     // (row_idx, score, node_id) for matched rows.
     let mut scored: Vec<(usize, f64, u64)> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
-        let val = eval_expr(method_expr, row);
+        let val = eval_neutral(method_expr, row);
         let Some(v) = coerce_value_to_vec(&val) else {
             continue;
         };
@@ -5384,7 +5385,7 @@ fn score_vector_method(
 /// for the (label, property) is a hard error (matches R-HYB1 guard spirit).
 fn score_text_method(
     rows: &[Row],
-    method_expr: &Expr,
+    method_expr: &crate::plan::expr::Expr,
     query_text: &str,
     label: &str,
     property: &str,
@@ -5446,7 +5447,7 @@ fn score_text_method(
 /// negated so a smaller raw distance lands as a larger score.
 fn compute_raw_method_scores(
     rows: &[Row],
-    methods: &[Expr],
+    methods: &[crate::plan::expr::Expr],
     kinds: &[RankFuseMethodKind],
     qv_slice: &[f32],
     qt_slice: &str,
@@ -5484,14 +5485,14 @@ fn compute_raw_method_scores(
 /// distance can re-negate.
 fn raw_scores_vector_method(
     rows: &[Row],
-    method_expr: &Expr,
+    method_expr: &crate::plan::expr::Expr,
     query_vec: &[f32],
     metric: Option<coordinode_core::graph::types::VectorMetric>,
     desc: bool,
 ) -> Vec<Option<f64>> {
     let mut out: Vec<Option<f64>> = vec![None; rows.len()];
     for (i, row) in rows.iter().enumerate() {
-        let val = eval_expr(method_expr, row);
+        let val = eval_neutral(method_expr, row);
         let Some(v) = coerce_value_to_vec(&val) else {
             continue;
         };
@@ -5524,7 +5525,7 @@ fn raw_scores_vector_method(
 #[allow(clippy::too_many_arguments)]
 fn raw_scores_text_method(
     rows: &[Row],
-    method_expr: &Expr,
+    method_expr: &crate::plan::expr::Expr,
     query_text: &str,
     label: &str,
     property: &str,
@@ -5695,8 +5696,8 @@ fn float_bits_eq(a: f64, b: f64) -> bool {
 /// `doc_score` weights are literal Floats / Ints in the AST after builder
 /// normalisation; Parameters are substituted before execute time. Anything
 /// that does not resolve to a finite number falls back to the default.
-fn eval_weight(expr: &Expr, default: f64) -> f64 {
-    let v = eval_expr(expr, &Row::new());
+fn eval_weight(expr: &crate::plan::expr::Expr, default: f64) -> f64 {
+    let v = eval_neutral(expr, &Row::new());
     match v {
         Value::Float(f) if f.is_finite() => f,
         Value::Int(i) => i as f64,
@@ -5712,16 +5713,16 @@ fn eval_weight(expr: &Expr, default: f64) -> f64 {
 fn execute_doc_score(
     rows: Vec<Row>,
     doc_variable: &str,
-    query_vector: &Expr,
-    alpha: &Expr,
-    beta: &Expr,
-    gamma: &Expr,
+    query_vector: &crate::plan::expr::Expr,
+    alpha: &crate::plan::expr::Expr,
+    beta: &crate::plan::expr::Expr,
+    gamma: &crate::plan::expr::Expr,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let alpha_f = eval_weight(alpha, 0.5);
     let beta_f = eval_weight(beta, 0.3);
     let gamma_f = eval_weight(gamma, 0.2);
-    let query_val = eval_expr(query_vector, &Row::new());
+    let query_val = eval_neutral(query_vector, &Row::new());
     let query_vec = coerce_value_to_vec(&query_val).ok_or_else(|| {
         ExecutionError::Unsupported(
             "doc_score(): query argument must be a vector (Vec<f32>) — resolve the parameter \
@@ -5834,8 +5835,8 @@ fn execute_doc_score(
 /// O(N log K) pass that never materialises the full sort buffer.
 fn execute_maxsim_top_k(
     input: &LogicalOp,
-    doc_expr: &Expr,
-    query_expr: &Expr,
+    doc_expr: &crate::plan::expr::Expr,
+    query_expr: &crate::plan::expr::Expr,
     k: usize,
     score_alias: Option<&str>,
     ctx: &mut ExecutionContext<'_>,
@@ -5845,7 +5846,7 @@ fn execute_maxsim_top_k(
         return Ok(Vec::new());
     }
 
-    let query_val = eval_expr(query_expr, &Row::new());
+    let query_val = eval_neutral(query_expr, &Row::new());
     let query = coerce_value_to_multi_vector(&query_val);
     let Some(query) = query else {
         // Mirror the scalar's degenerate behaviour: missing / malformed
@@ -5891,7 +5892,7 @@ fn execute_maxsim_top_k(
     let mut scores: Vec<f32> = Vec::with_capacity(rows.len());
 
     for (idx, row) in rows.iter().enumerate() {
-        let doc_val = eval_expr(doc_expr, row);
+        let doc_val = eval_neutral(doc_expr, row);
         let Some(doc) = coerce_value_to_multi_vector(&doc_val) else {
             scores.push(f32::NEG_INFINITY);
             continue;
@@ -5992,7 +5993,7 @@ fn text_match_missing_index_error(label: Option<&str>, property: Option<&str>) -
 
 fn execute_text_filter(
     rows: &[Row],
-    text_expr: &Expr,
+    text_expr: &crate::plan::expr::Expr,
     query_string: &str,
     language: Option<&str>,
     ctx: &mut ExecutionContext<'_>,
@@ -6008,14 +6009,14 @@ fn execute_text_filter(
     let limit = rows.len().max(1000);
     // Extract property name from text_expr (PropertyAccess { var, property }).
     let property = match text_expr {
-        Expr::PropertyAccess { property, .. } => Some(property.as_str()),
+        crate::plan::expr::Expr::Property { key, .. } => Some(key.as_str()),
         _ => None,
     };
     // Extract label from the first row's __label__ field, if the variable is
     // bound and carries its label.
     let label_owned: Option<String> = match text_expr {
-        Expr::PropertyAccess { expr, .. } => match expr.as_ref() {
-            Expr::Variable(var) => rows.first().and_then(|r| {
+        crate::plan::expr::Expr::Property { base, .. } => match base.as_ref() {
+            crate::plan::expr::Expr::Variable(var) => rows.first().and_then(|r| {
                 r.get(&format!("{var}.__label__"))
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
             }),
@@ -6093,8 +6094,8 @@ fn execute_text_filter(
         // text_expr is typically PropertyAccess { expr: Variable("a"), property: "body" }.
         // We need the variable's ID, not the property value.
         let node_id = match text_expr {
-            Expr::PropertyAccess { expr, .. } => {
-                if let Expr::Variable(var) = expr.as_ref() {
+            crate::plan::expr::Expr::Property { base, .. } => {
+                if let crate::plan::expr::Expr::Variable(var) = base.as_ref() {
                     row.get(var).and_then(|v| {
                         if let Value::Int(id) = v {
                             Some(*id as u64)
@@ -6153,8 +6154,8 @@ fn hex_nibble(c: u8) -> Option<u8> {
 
 fn execute_encrypted_filter(
     rows: &[Row],
-    field_expr: &Expr,
-    token_expr: &Expr,
+    field_expr: &crate::plan::expr::Expr,
+    token_expr: &crate::plan::expr::Expr,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     use coordinode_search::encrypted::{EncryptedIndex, SearchToken};
@@ -6166,7 +6167,7 @@ fn execute_encrypted_filter(
     // Evaluate token from expression (parameter or literal).
     // Use the first row for context (token expression is typically a parameter,
     // independent of row data).
-    let token_val = eval_expr(token_expr, &rows[0]);
+    let token_val = eval_neutral(token_expr, &rows[0]);
     let token_bytes = match &token_val {
         Value::Binary(b) => b.clone(),
         Value::String(s) => {
@@ -6196,9 +6197,9 @@ fn execute_encrypted_filter(
 
     // Extract variable name and property from field_expr (e.g., "u" and "email" from u.email).
     let (variable, property) = match field_expr {
-        Expr::PropertyAccess { expr, property } => {
-            if let Expr::Variable(var) = expr.as_ref() {
-                (var.clone(), property.clone())
+        crate::plan::expr::Expr::Property { base, key } => {
+            if let crate::plan::expr::Expr::Variable(var) = base.as_ref() {
+                (var.clone(), key.clone())
             } else {
                 return Ok(rows.to_vec()); // can't determine variable
             }
@@ -6708,13 +6709,14 @@ fn execute_shortest_path(
 /// where the value is expected to be a numeric constant or a bound parameter (`$p`).
 /// Returns `None` for complex expressions or unresolvable/non-numeric values.
 fn eval_scalar_expr(
-    expr: &Expr,
+    expr: &crate::plan::expr::Expr,
     params: &HashMap<String, coordinode_core::graph::types::Value>,
 ) -> Option<f64> {
+    use crate::plan::expr::Expr as PExpr;
     match expr {
-        Expr::Literal(Value::Float(f)) => Some(*f),
-        Expr::Literal(Value::Int(i)) => Some(*i as f64),
-        Expr::Parameter(name) => params.get(name).and_then(|v| match v {
+        PExpr::Literal(Value::Float(f)) => Some(*f),
+        PExpr::Literal(Value::Int(i)) => Some(*i as f64),
+        PExpr::Parameter(name) => params.get(name).and_then(|v| match v {
             Value::Float(f) => Some(*f),
             Value::Int(i) => Some(*i as f64),
             _ => None,
@@ -6726,7 +6728,7 @@ fn eval_scalar_expr(
 /// Execute aggregation: group rows and compute aggregate functions.
 fn execute_aggregate(
     rows: &[Row],
-    group_by: &[Expr],
+    group_by: &[crate::plan::expr::Expr],
     aggregates: &[AggregateItem],
     params: &HashMap<String, coordinode_core::graph::types::Value>,
 ) -> Result<Vec<Row>, ExecutionError> {
@@ -6741,7 +6743,7 @@ fn execute_aggregate(
         groups.push((Vec::new(), all));
     } else {
         for row in rows {
-            let key: Vec<Value> = group_by.iter().map(|e| eval_expr(e, row)).collect();
+            let key: Vec<Value> = group_by.iter().map(|e| eval_neutral(e, row)).collect();
             let found = groups.iter_mut().find(|(k, _)| k == &key);
             if let Some((_, group_rows)) = found {
                 group_rows.push(row);
@@ -6759,7 +6761,7 @@ fn execute_aggregate(
         // Add group-by values
         for (i, expr) in group_by.iter().enumerate() {
             let val = key.get(i).cloned().unwrap_or(Value::Null);
-            let col = expr_display_name(expr);
+            let col = expr_display_name_neutral(expr);
             out.insert(col, val);
         }
 
@@ -6781,7 +6783,7 @@ fn execute_aggregate(
 fn eval_aggregate_values(agg: &AggregateItem, rows: &[&Row]) -> Vec<Value> {
     let mut values: Vec<Value> = rows
         .iter()
-        .map(|r| eval_expr(&agg.arg, r))
+        .map(|r| eval_neutral(&agg.arg, r))
         .filter(|v| !v.is_null())
         .collect();
 
@@ -6807,7 +6809,7 @@ fn compute_aggregate(
 ) -> Value {
     match agg.function.as_str() {
         "count" => {
-            if agg.arg == Expr::Star {
+            if agg.arg == crate::plan::expr::Expr::Star {
                 // count(*) ignores DISTINCT — counts all rows
                 Value::Int(rows.len() as i64)
             } else {
@@ -7421,247 +7423,6 @@ fn execute_merge_relationship_check(
     Ok(vec![])
 }
 
-/// Check whether an expression tree contains any `PatternPredicate` nodes.
-fn expr_contains_pattern_predicate(expr: &Expr) -> bool {
-    match expr {
-        Expr::PatternPredicate(_)
-        | Expr::ExistsSubquery(_)
-        | Expr::CountSubquery(_)
-        | Expr::CollectSubquery { .. }
-        | Expr::PatternComprehension { .. } => true,
-        Expr::UnaryOp { expr, .. } => expr_contains_pattern_predicate(expr),
-        Expr::BinaryOp { left, right, .. } => {
-            expr_contains_pattern_predicate(left) || expr_contains_pattern_predicate(right)
-        }
-        _ => false,
-    }
-}
-
-/// Evaluate a predicate expression that may contain pattern predicates.
-/// Unlike `eval_expr`, this has access to the storage engine for edge lookups.
-fn eval_predicate_with_storage(
-    expr: &Expr,
-    row: &Row,
-    ctx: &mut ExecutionContext<'_>,
-) -> Result<Value, ExecutionError> {
-    match expr {
-        Expr::PatternPredicate(pattern) => {
-            // Trivial single-hop patterns use the fast-path existence walker.
-            // Multi-hop chains (which the walker mishandles when an intermediate
-            // node is unbound) and any pattern carrying inline edge-property
-            // filters (which the walker does not evaluate) desugar into an
-            // EXISTS subquery routed through the full MATCH planner, matching
-            // `MATCH` semantics exactly.
-            let has_edge_filter = pattern
-                .elements
-                .iter()
-                .any(|e| matches!(e, PatternElement::Relationship(r) if !r.properties.is_empty()));
-            if pattern.elements.len() > 3 || has_edge_filter {
-                let mc = crate::cypher::ast::MatchClause {
-                    patterns: vec![pattern.clone()],
-                    where_clause: None,
-                };
-                exists_subquery_matches(&mc, row, ctx)
-            } else {
-                check_pattern_exists(pattern, row, ctx)
-            }
-        }
-        Expr::ExistsSubquery(match_clause) => exists_subquery_matches(match_clause, row, ctx),
-        Expr::CountSubquery(match_clause) => count_subquery_eval(match_clause, row, ctx),
-        Expr::CollectSubquery { match_clause, expr } => {
-            collect_subquery_eval(match_clause, expr, row, ctx)
-        }
-        Expr::PatternComprehension {
-            pattern,
-            where_clause,
-            map,
-        } => pattern_comprehension_eval(pattern, where_clause.as_deref(), map, row, ctx),
-        Expr::UnaryOp { op, expr } => {
-            let v = eval_predicate_with_storage(expr, row, ctx)?;
-            Ok(eval_unary_op(
-                crate::planner::expr_lower::lower_unop(*op),
-                &v,
-            ))
-        }
-        Expr::BinaryOp { left, op, right } => {
-            let lv = eval_predicate_with_storage(left, row, ctx)?;
-            // Short-circuit for AND/OR
-            match op {
-                BinaryOperator::And if !is_truthy(&lv) => return Ok(Value::Bool(false)),
-                BinaryOperator::Or if is_truthy(&lv) => return Ok(Value::Bool(true)),
-                _ => {}
-            }
-            let rv = eval_predicate_with_storage(right, row, ctx)?;
-            Ok(eval_binary_op(
-                &lv,
-                crate::planner::expr_lower::lower_binop(*op),
-                &rv,
-            ))
-        }
-        other => Ok(eval_expr(other, row)),
-    }
-}
-
-/// Evaluate an `EXISTS { MATCH … }` subquery: true when the inner MATCH yields
-/// at least one row consistent with the outer-scope bindings.
-///
-/// The inner MATCH (plus its optional WHERE) is wrapped in a synthetic
-/// `… RETURN 1` query and planned through the same logical planner that serves
-/// top-level queries — so pattern semantics in `EXISTS { (a)-[:R]->(b) }` match
-/// those of a top-level `MATCH (a)-[:R]->(b)` exactly. It executes correlated:
-/// the outer row is installed as `correlated_row` so inner references to
-/// outer-bound variables resolve, and only inner rows agreeing with the outer
-/// bindings on shared variables count.
-fn exists_subquery_matches(
-    mc: &crate::cypher::ast::MatchClause,
-    row: &Row,
-    ctx: &mut ExecutionContext<'_>,
-) -> Result<Value, ExecutionError> {
-    use crate::cypher::ast::{Clause, Query, ReturnClause, ReturnItem};
-    let query = Query {
-        clauses: vec![
-            Clause::Match(mc.clone()),
-            // RETURN * so the inner pattern variables survive projection — the
-            // post-filter below matches them against the outer bindings.
-            Clause::Return(ReturnClause {
-                distinct: false,
-                items: vec![ReturnItem {
-                    expr: Expr::Star,
-                    alias: None,
-                }],
-            }),
-        ],
-        hints: Vec::new(),
-        unions: Vec::new(),
-    };
-    let plan = crate::planner::builder::build_logical_plan(&query).map_err(|e| {
-        ExecutionError::Unsupported(format!("EXISTS subquery planning failed: {e}"))
-    })?;
-
-    // Execute the inner plan uncorrelated (a fresh scan), then keep only rows
-    // that agree with the outer bindings on shared variables — that post-filter
-    // IS the correlation. (Installing `correlated_row` instead would merge the
-    // outer values into every inner row, defeating the shared-variable check.)
-    // The inner plan still evaluates its own WHERE on inner-bound variables.
-    let rows = execute_op(&plan.root, ctx)?;
-    let any = rows
-        .iter()
-        .any(|rr| rr.iter().all(|(k, v)| row.get(k).is_none_or(|ov| ov == v)));
-    Ok(Value::Bool(any))
-}
-
-/// Execute a correlated subquery's inner MATCH (planned with `RETURN *` so the
-/// inner variables survive), keeping only rows that agree with the outer `row`
-/// on shared variables, each merged with the outer bindings. Shared by
-/// `COUNT { … }` and `COLLECT { … }` (mirrors the EXISTS correlation path).
-fn correlated_subquery_rows(
-    mc: &crate::cypher::ast::MatchClause,
-    row: &Row,
-    ctx: &mut ExecutionContext<'_>,
-) -> Result<Vec<Row>, ExecutionError> {
-    use crate::cypher::ast::{Clause, Query, ReturnClause, ReturnItem};
-    let query = Query {
-        clauses: vec![
-            Clause::Match(mc.clone()),
-            Clause::Return(ReturnClause {
-                distinct: false,
-                items: vec![ReturnItem {
-                    expr: Expr::Star,
-                    alias: None,
-                }],
-            }),
-        ],
-        hints: Vec::new(),
-        unions: Vec::new(),
-    };
-    let plan = crate::planner::builder::build_logical_plan(&query)
-        .map_err(|e| ExecutionError::Unsupported(format!("subquery planning failed: {e}")))?;
-    let rows = execute_op(&plan.root, ctx)?;
-    Ok(rows
-        .into_iter()
-        .filter(|rr| rr.iter().all(|(k, v)| row.get(k).is_none_or(|ov| ov == v)))
-        .map(|rr| {
-            let mut merged = row.clone();
-            merged.extend(rr);
-            merged
-        })
-        .collect())
-}
-
-/// `COUNT { MATCH … [WHERE …] }` → the number of correlated matching rows.
-fn count_subquery_eval(
-    mc: &crate::cypher::ast::MatchClause,
-    row: &Row,
-    ctx: &mut ExecutionContext<'_>,
-) -> Result<Value, ExecutionError> {
-    let rows = correlated_subquery_rows(mc, row, ctx)?;
-    Ok(Value::Int(i64::try_from(rows.len()).unwrap_or(i64::MAX)))
-}
-
-/// `COLLECT { MATCH … [WHERE …] RETURN expr }` → a list of `expr` evaluated over
-/// each correlated matching row.
-fn collect_subquery_eval(
-    mc: &crate::cypher::ast::MatchClause,
-    expr: &Expr,
-    row: &Row,
-    ctx: &mut ExecutionContext<'_>,
-) -> Result<Value, ExecutionError> {
-    let rows = correlated_subquery_rows(mc, row, ctx)?;
-    Ok(Value::Array(
-        rows.iter().map(|er| eval_expr(expr, er)).collect(),
-    ))
-}
-
-/// Evaluate a `[(a)-[:R]->(b) WHERE pred | map]` pattern comprehension: match
-/// the inner pattern (correlated with `row`), then collect `map` evaluated over
-/// each matching, outer-consistent row into a list.
-///
-/// Shares the EXISTS machinery: the pattern is planned through the MATCH planner
-/// with a `RETURN *` so the inner variables survive, executed uncorrelated, then
-/// post-filtered against the outer bindings on shared variables. For each kept
-/// row, `map` is evaluated against the outer row merged with the inner bindings.
-fn pattern_comprehension_eval(
-    pattern: &Pattern,
-    where_clause: Option<&Expr>,
-    map: &Expr,
-    row: &Row,
-    ctx: &mut ExecutionContext<'_>,
-) -> Result<Value, ExecutionError> {
-    use crate::cypher::ast::{Clause, MatchClause, Query, ReturnClause, ReturnItem};
-    let mc = MatchClause {
-        patterns: vec![pattern.clone()],
-        where_clause: where_clause.cloned(),
-    };
-    let query = Query {
-        clauses: vec![
-            Clause::Match(mc),
-            Clause::Return(ReturnClause {
-                distinct: false,
-                items: vec![ReturnItem {
-                    expr: Expr::Star,
-                    alias: None,
-                }],
-            }),
-        ],
-        hints: Vec::new(),
-        unions: Vec::new(),
-    };
-    let plan = crate::planner::builder::build_logical_plan(&query).map_err(|e| {
-        ExecutionError::Unsupported(format!("pattern comprehension planning failed: {e}"))
-    })?;
-
-    let rows = execute_op(&plan.root, ctx)?;
-    let mut out = Vec::new();
-    for rr in rows {
-        if rr.iter().all(|(k, v)| row.get(k).is_none_or(|ov| ov == v)) {
-            let mut eval_row = row.clone();
-            eval_row.extend(rr);
-            out.push(eval_expr(map, &eval_row));
-        }
-    }
-    Ok(Value::Array(out))
-}
-
 // ----------------------------------------------------------------------------
 // Neutral storage-aware evaluation.
 //
@@ -7773,145 +7534,6 @@ fn correlated_subplan_rows(
             merged
         })
         .collect())
-}
-
-/// Check if a pattern predicate matches: does the described path exist in the graph?
-///
-/// Handles bound endpoints (variables already in the row) by checking specific
-/// edge existence via `expand_one_hop`, and unbound endpoints by checking if
-/// any matching neighbor exists.
-fn check_pattern_exists(
-    pattern: &Pattern,
-    row: &Row,
-    ctx: &mut ExecutionContext<'_>,
-) -> Result<Value, ExecutionError> {
-    // Pattern must be node-rel-node (possibly chained).
-    // Extract triples: (src_node, relationship, dst_node)
-    let elements = &pattern.elements;
-    if elements.len() < 3 {
-        return Ok(Value::Bool(false));
-    }
-
-    // Walk the pattern in (node, rel, node) triples
-    let mut i = 0;
-    while i + 2 < elements.len() {
-        let src_node = match &elements[i] {
-            PatternElement::Node(n) => n,
-            _ => return Ok(Value::Bool(false)),
-        };
-        let rel = match &elements[i + 1] {
-            PatternElement::Relationship(r) => r,
-            _ => return Ok(Value::Bool(false)),
-        };
-        let dst_node = match &elements[i + 2] {
-            PatternElement::Node(n) => n,
-            _ => return Ok(Value::Bool(false)),
-        };
-
-        let exists = check_single_hop_exists(src_node, rel, dst_node, row, ctx)?;
-        if !exists {
-            return Ok(Value::Bool(false));
-        }
-
-        i += 2; // advance to next triple (overlapping nodes)
-    }
-
-    Ok(Value::Bool(true))
-}
-
-/// Check if a single hop (src)-[rel]->(dst) exists.
-fn check_single_hop_exists(
-    src_node: &NodePattern,
-    rel: &RelationshipPattern,
-    dst_node: &NodePattern,
-    row: &Row,
-    ctx: &mut ExecutionContext<'_>,
-) -> Result<bool, ExecutionError> {
-    // R172d: pattern predicate destination label-filter on a temporal
-    // target prefix-scans every version of the candidate node and
-    // returns true if ANY version carries all the requested labels.
-    // This matches the "every version is a fact" semantics of the
-    // current label-scoped MATCH on temporal labels — without AS OF
-    // (G096), an existence check spans the full version history.
-    let dst_is_temporal = dst_node.labels.iter().any(|lbl| {
-        ctx.load_current_label_schema(lbl)
-            .ok()
-            .flatten()
-            .is_some_and(|s| s.temporal)
-    });
-
-    // Resolve source node ID from bound variable
-    let src_id = match &src_node.variable {
-        Some(name) => match row.get(name.as_str()) {
-            Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
-            _ => return Ok(false), // unbound or not a node → no match
-        },
-        None => return Ok(false), // anonymous source not supported in predicate context
-    };
-
-    // Resolve edge types (empty = wildcard)
-    let resolved_types: Vec<String>;
-    let effective_types: &[String] = if rel.rel_types.is_empty() {
-        resolved_types = ctx.list_edge_types()?;
-        &resolved_types
-    } else {
-        &rel.rel_types
-    };
-
-    // Check if destination is bound
-    let dst_bound = dst_node.variable.as_ref().and_then(|name| {
-        row.get(name.as_str()).and_then(|v| {
-            if let Value::Int(id) = v {
-                Some(*id as u64)
-            } else {
-                None
-            }
-        })
-    });
-
-    for et in effective_types {
-        let neighbors = expand_one_hop(src_id, std::slice::from_ref(et), rel.direction, ctx)?;
-        if let Some(target_raw) = dst_bound {
-            // Both endpoints bound: check specific edge
-            if neighbors.iter().any(|(tgt, _)| *tgt == target_raw) {
-                return Ok(true);
-            }
-        } else {
-            // Destination unbound: check if any neighbor exists
-            // Optionally filter by label
-            if dst_node.labels.is_empty() {
-                if !neighbors.is_empty() {
-                    return Ok(true);
-                }
-            } else {
-                // Check labels on neighbors. Temporal targets: prefix-scan
-                // every version and accept the match if ANY version
-                // carries all the requested labels.
-                for (tgt_uid, _) in &neighbors {
-                    let tgt_id = NodeId::from_raw(*tgt_uid);
-                    if dst_is_temporal {
-                        use coordinode_modality::{LocalNodeStore, NodeStore as _};
-                        let prefix = LocalNodeStore.version_prefix(ctx.shard_id, tgt_id);
-                        ctx.sync_txn_state();
-                        let versions = LocalNodeStore.prefix_scan_tracked(&mut ctx.txn, &prefix)?;
-                        for (_k, data) in versions {
-                            if let Ok(record) = NodeRecord::from_msgpack(&data) {
-                                if dst_node.labels.iter().all(|l| record.labels.contains(l)) {
-                                    return Ok(true);
-                                }
-                            }
-                        }
-                    } else if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, tgt_id)? {
-                        if dst_node.labels.iter().all(|l| record.labels.contains(l)) {
-                            return Ok(true);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(false)
 }
 
 /// Create a relationship edge described by `traverse` between the source and target
@@ -8527,7 +8149,7 @@ fn execute_create_node(
     input_rows: &[Row],
     variable: Option<&str>,
     labels: &[String],
-    properties: &[(String, Expr)],
+    properties: &[(String, crate::plan::expr::Expr)],
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let mut results = Vec::new();
@@ -8603,7 +8225,7 @@ fn execute_create_node(
         let mut record = NodeRecord::with_labels(labels.to_vec());
         for (prop_name, expr) in properties {
             // Map literals → Document for full dot-notation support in storage.
-            let val = eval_expr(expr, input_row).map_to_document();
+            let val = eval_neutral(expr, input_row).map_to_document();
 
             match mode {
                 SchemaMode::Validated => {
@@ -8689,7 +8311,7 @@ fn execute_create_node(
             let mut vf: Option<i64> = None;
             for (prop_name, expr) in properties {
                 if prop_name == "valid_from" {
-                    let val = eval_expr(expr, input_row);
+                    let val = eval_neutral(expr, input_row);
                     vf = match &val {
                         Value::Int(ms) => Some(*ms),
                         Value::Timestamp(ms) => Some(*ms),
@@ -8722,7 +8344,7 @@ fn execute_create_node(
         if let (Some(ref tlabel), Some(vf)) = (&temporal_label, valid_from_for_key) {
             for (prop_name, expr) in properties {
                 if prop_name == "valid_to" {
-                    let val = eval_expr(expr, input_row);
+                    let val = eval_neutral(expr, input_row);
                     let vt_opt: Option<i64> = match &val {
                         Value::Int(ms) => Some(*ms),
                         Value::Timestamp(ms) => Some(*ms),
@@ -8762,7 +8384,7 @@ fn execute_create_node(
             if let Some(primary_label) = labels.first() {
                 let props_for_index: Vec<(String, Value)> = properties
                     .iter()
-                    .map(|(name, expr)| (name.clone(), eval_expr(expr, input_row)))
+                    .map(|(name, expr)| (name.clone(), eval_neutral(expr, input_row)))
                     .collect();
                 btree_reg
                     .on_node_created(ctx.engine, node_id, primary_label, &props_for_index)
@@ -8797,7 +8419,7 @@ fn execute_create_node(
                     if !registry.has_index(primary_label, prop_name) {
                         continue;
                     }
-                    let val = eval_expr(expr, input_row);
+                    let val = eval_neutral(expr, input_row);
                     if let Some(vec_data) = try_extract_vector(&val) {
                         ctx.pending_vector_writes.push((
                             primary_label.clone(),
@@ -8814,7 +8436,7 @@ fn execute_create_node(
         if let Some(registry) = ctx.text_index_registry {
             if let Some(primary_label) = labels.first() {
                 for (prop_name, expr) in properties {
-                    let val = eval_expr(expr, input_row);
+                    let val = eval_neutral(expr, input_row);
                     if let Some(text) = val.as_str() {
                         registry.on_text_written(primary_label, node_id, prop_name, text);
                     }
@@ -8834,7 +8456,7 @@ fn execute_create_node(
             let props_map: std::collections::HashMap<String, Value> = properties
                 .iter()
                 .map(|(name, expr)| {
-                    let val = eval_expr(expr, input_row).map_to_document();
+                    let val = eval_neutral(expr, input_row).map_to_document();
                     (name.clone(), val)
                 })
                 .collect();
@@ -8861,7 +8483,7 @@ fn execute_create_node(
             Value::String(primary_label),
         );
         for (prop_name, expr) in properties {
-            let val = eval_expr(expr, input_row);
+            let val = eval_neutral(expr, input_row);
             row.insert(format!("{var_name}.{prop_name}"), val);
         }
 
@@ -8878,7 +8500,7 @@ fn execute_create_edge(
     target: &str,
     edge_type: &str,
     edge_variable: Option<&str>,
-    properties: &[(String, Expr)],
+    properties: &[(String, crate::plan::expr::Expr)],
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let mut results = Vec::new();
@@ -8940,7 +8562,7 @@ fn execute_create_edge(
                     )));
                 }
                 let field_id = ctx.interner.intern(prop_name);
-                let value = eval_expr(expr, row).map_to_document();
+                let value = eval_neutral(expr, row).map_to_document();
                 if is_temporal && prop_name == "valid_from" {
                     // Accept both Int (epoch ms) and Timestamp (engine native).
                     // Reject Null (explicit null violates the temporal contract)
@@ -9005,7 +8627,7 @@ fn execute_create_edge(
         // property map.
         let resolved_props: Vec<(String, Value)> = properties
             .iter()
-            .map(|(name, expr)| (name.clone(), eval_expr(expr, row).map_to_document()))
+            .map(|(name, expr)| (name.clone(), eval_neutral(expr, row).map_to_document()))
             .collect();
         let trigger_params =
             trigger_params_for_edge_create(edge_type, source_id, target_id, &resolved_props);
@@ -9025,7 +8647,7 @@ fn execute_create_edge(
             );
             // Also add edge properties to the output row
             for (prop_name, expr) in properties {
-                let value = eval_expr(expr, row);
+                let value = eval_neutral(expr, row);
                 out_row.insert(format!("{ev}.{prop_name}"), value);
             }
         }
@@ -11429,7 +11051,7 @@ fn execute_clone_node(
     with_edges: bool,
     with_properties: bool,
     set_items: &[crate::cypher::ast::SetItem],
-    as_of: Option<&Expr>,
+    as_of: Option<&crate::plan::expr::Expr>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     if source == target {
@@ -11453,7 +11075,7 @@ fn execute_clone_node(
         // `AS OF <ts>` selects the source's valid-version active at that
         // valid-time instant; default is the current version (active now).
         let as_of_ms: Option<i64> = match as_of {
-            Some(expr) => match eval_expr(expr, row) {
+            Some(expr) => match eval_neutral(expr, row) {
                 Value::Int(ms) => Some(ms),
                 Value::Timestamp(ms) => Some(ms),
                 other => {
@@ -11502,7 +11124,7 @@ fn execute_clone_node(
         // is the engine-assigned system-time, and `valid_from` / `valid_to` are
         // the source's valid-time interval — the clone gets its own `valid_from`
         // (NOW) below, so inheriting the source's would back-date the clone.
-        let mut properties: Vec<(String, Expr)> = if with_properties {
+        let mut properties: Vec<(String, crate::plan::expr::Expr)> = if with_properties {
             let mut props = Vec::new();
             for (field_id, val) in &source_rec.props {
                 let Some(name) = ctx.interner.resolve(*field_id) else {
@@ -11511,14 +11133,17 @@ fn execute_clone_node(
                 if matches!(name, "__ingestion_ts__" | "valid_from" | "valid_to") {
                     continue;
                 }
-                props.push((name.to_string(), Expr::Literal(val.clone())));
+                props.push((
+                    name.to_string(),
+                    crate::plan::expr::Expr::Literal(val.clone()),
+                ));
             }
             if let Some(extra) = &source_rec.extra {
                 for (k, v) in extra {
                     if matches!(k.as_str(), "__ingestion_ts__" | "valid_from" | "valid_to") {
                         continue;
                     }
-                    props.push((k.clone(), Expr::Literal(v.clone())));
+                    props.push((k.clone(), crate::plan::expr::Expr::Literal(v.clone())));
                 }
             }
             props
@@ -11529,7 +11154,10 @@ fn execute_clone_node(
         // valid_from = NOW for the clone's first version. An explicit
         // `SET b.valid_from = ...` (applied after create) back-dates it.
         if is_temporal {
-            properties.push(("valid_from".to_string(), Expr::Literal(Value::Int(now_ms))));
+            properties.push((
+                "valid_from".to_string(),
+                crate::plan::expr::Expr::Literal(Value::Int(now_ms)),
+            ));
         }
 
         let created = execute_create_node(
@@ -12537,9 +12165,9 @@ fn execute_detach_document(
         //    schema validation / index registries fire identically to a
         //    hand-written CREATE. Build a minimal single-row input so the
         //    executor allocates exactly one new node per detach.
-        let literal_props: Vec<(String, Expr)> = props
+        let literal_props: Vec<(String, crate::plan::expr::Expr)> = props
             .iter()
-            .map(|(k, v)| (k.clone(), Expr::Literal(v.clone())))
+            .map(|(k, v)| (k.clone(), crate::plan::expr::Expr::Literal(v.clone())))
             .collect();
         let create_rows = execute_create_node(
             std::slice::from_ref(input_row),
@@ -13902,18 +13530,18 @@ fn decode_node_id_from_key(key: &[u8]) -> u64 {
     }
 }
 
-/// Generate a display name for an expression (used as column name when no alias).
-fn expr_display_name(expr: &Expr) -> String {
+/// Neutral-IR twin of [`expr_display_name`]: derives the default projection
+/// column name for a neutral expression carried by `ProjectItem`.
+fn expr_display_name_neutral(expr: &crate::plan::expr::Expr) -> String {
+    use crate::plan::expr::Expr as PExpr;
     match expr {
-        Expr::Variable(name) => name.clone(),
-        Expr::PropertyAccess { expr, property } => {
-            // Recursively build dotted name for multi-level access:
-            // n.config.network.ssid → "n.config.network.ssid"
-            let parent = expr_display_name(expr);
-            format!("{parent}.{property}")
+        PExpr::Variable(name) => name.clone(),
+        PExpr::Property { base, key } => {
+            let parent = expr_display_name_neutral(base);
+            format!("{parent}.{key}")
         }
-        Expr::FunctionCall { name, .. } => name.clone(),
-        Expr::Star => "*".to_string(),
+        PExpr::Call { name, .. } => name.clone(),
+        PExpr::Star => "*".to_string(),
         _ => format!("{expr:?}"),
     }
 }
@@ -15433,7 +15061,7 @@ fn execute_drop_btree_index(
 /// convert output rows to Row format.
 fn execute_procedure_call(
     procedure: &str,
-    args: &[Expr],
+    args: &[crate::plan::expr::Expr],
     yield_items: &[String],
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
@@ -15444,7 +15072,7 @@ fn execute_procedure_call(
 
     // Evaluate arguments to values
     let empty_row = Row::new();
-    let arg_values: Vec<Value> = args.iter().map(|a| eval_expr(a, &empty_row)).collect();
+    let arg_values: Vec<Value> = args.iter().map(|a| eval_neutral(a, &empty_row)).collect();
 
     // Dispatch to the procedure
     let proc_rows = crate::advisor::procedures::execute_procedure(procedure, &arg_values, proc_ctx)

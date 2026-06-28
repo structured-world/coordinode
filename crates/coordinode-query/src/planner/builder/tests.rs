@@ -1064,7 +1064,7 @@ fn vector_top_k_with_parameter_query_vector() {
     {
         // query_vector must be the parameter expression (not substituted).
         assert!(
-            matches!(query_vector, Expr::Parameter(_)),
+            matches!(query_vector, crate::plan::expr::Expr::Parameter(_)),
             "query_vector should be Parameter, got {query_vector:?}"
         );
         assert_eq!(*k, 10);
@@ -1338,11 +1338,11 @@ fn push_down_invariant_teeth_catches_unannotated_violation() {
     };
     let violating = LogicalOp::VectorFilter {
         input: Box::new(traverse),
-        vector_expr: Expr::PropertyAccess {
+        vector_expr: nx(Expr::PropertyAccess {
             expr: Box::new(Expr::Variable("b".to_string())),
             property: "embedding".to_string(),
-        },
-        query_vector: Expr::Literal(Value::Array(vec![])),
+        }),
+        query_vector: nx(Expr::Literal(Value::Array(vec![]))),
         function: "vector_distance".to_string(),
         less_than: true,
         threshold: 0.5,
@@ -1393,11 +1393,11 @@ fn push_down_invariant_passes_when_decision_attached() {
         select_push_down_strategy(50, VectorIndexParams::default_node(10_000, 128), 0.5, 10);
     let valid = LogicalOp::VectorFilter {
         input: Box::new(traverse),
-        vector_expr: Expr::PropertyAccess {
+        vector_expr: nx(Expr::PropertyAccess {
             expr: Box::new(Expr::Variable("b".to_string())),
             property: "embedding".to_string(),
-        },
-        query_vector: Expr::Literal(Value::Array(vec![])),
+        }),
+        query_vector: nx(Expr::Literal(Value::Array(vec![]))),
         function: "vector_distance".to_string(),
         less_than: true,
         threshold: 0.5,
@@ -1565,11 +1565,11 @@ fn nested_vector_filters_both_get_push_down_decisions() {
         };
         LogicalOp::VectorFilter {
             input: Box::new(tr),
-            vector_expr: Expr::PropertyAccess {
+            vector_expr: nx(Expr::PropertyAccess {
                 expr: Box::new(Expr::Variable(format!("{var}_tgt"))),
                 property: "embedding".to_string(),
-            },
-            query_vector: Expr::Literal(Value::Array(vec![])),
+            }),
+            query_vector: nx(Expr::Literal(Value::Array(vec![]))),
             function: "vector_distance".to_string(),
             less_than: true,
             threshold: 0.5,

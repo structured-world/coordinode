@@ -1,5 +1,10 @@
 use super::*;
 
+/// Lower a cypher test expression into the neutral IR carried by operator fields.
+fn nx(e: crate::cypher::ast::Expr) -> crate::plan::expr::Expr {
+    crate::planner::lower_expr(&e).expect("lower test expression")
+}
+
 // --- EdgeVectorStrategy selection tests ---
 
 /// Fan-out < 200 → always Graph-first regardless of selectivity.
@@ -149,8 +154,8 @@ fn vector_predicate_and_nests() {
 fn vector_top_k_predicate_defaults_to_none() {
     let op = LogicalOp::VectorTopK {
         input: Box::new(LogicalOp::Empty),
-        vector_expr: Expr::Variable("n".into()),
-        query_vector: Expr::Variable("q".into()),
+        vector_expr: nx(Expr::Variable("n".into())),
+        query_vector: nx(Expr::Variable("q".into())),
         function: "vector_distance".into(),
         k: 5,
         distance_alias: None,

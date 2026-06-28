@@ -283,14 +283,14 @@ fn detect_knn_without_index(
 /// - no NodeScan with the matching variable is found in `input`
 /// - the NodeScan has no labels or multiple labels (ambiguous)
 fn extract_label_and_property(
-    vector_expr: &crate::cypher::ast::Expr,
+    vector_expr: &crate::plan::expr::Expr,
     input: &LogicalOp,
 ) -> Option<(String, String)> {
-    use crate::cypher::ast::Expr;
+    use crate::plan::expr::Expr as PExpr;
 
     let (var_name, property) = match vector_expr {
-        Expr::PropertyAccess { expr, property } => match expr.as_ref() {
-            Expr::Variable(v) => (v.clone(), property.clone()),
+        PExpr::Property { base, key } => match base.as_ref() {
+            PExpr::Variable(v) => (v.clone(), key.clone()),
             _ => return None,
         },
         _ => return None,

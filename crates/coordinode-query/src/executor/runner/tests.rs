@@ -342,7 +342,7 @@ fn node_scan_all() {
                 property_filters: vec![],
             }),
             items: vec![crate::planner::logical::ProjectItem {
-                expr: Expr::Star,
+                expr: nx(Expr::Star),
                 alias: None,
             }],
             distinct: false,
@@ -370,7 +370,7 @@ fn node_scan_by_label() {
                 property_filters: vec![],
             }),
             items: vec![crate::planner::logical::ProjectItem {
-                expr: Expr::Star,
+                expr: nx(Expr::Star),
                 alias: None,
             }],
             distinct: false,
@@ -401,7 +401,7 @@ fn node_scan_with_property_filter() {
                 )],
             }),
             items: vec![crate::planner::logical::ProjectItem {
-                expr: Expr::Star,
+                expr: nx(Expr::Star),
                 alias: None,
             }],
             distinct: false,
@@ -452,10 +452,10 @@ fn traverse_outgoing() {
                 path_variable: None,
             }),
             items: vec![crate::planner::logical::ProjectItem {
-                expr: Expr::PropertyAccess {
+                expr: nx(Expr::PropertyAccess {
                     expr: Box::new(Expr::Variable("b".into())),
                     property: "name".into(),
-                },
+                }),
                 alias: Some("name".into()),
             }],
             distinct: false,
@@ -500,10 +500,10 @@ fn filter_by_age() {
                 }),
             }),
             items: vec![crate::planner::logical::ProjectItem {
-                expr: Expr::PropertyAccess {
+                expr: nx(Expr::PropertyAccess {
                     expr: Box::new(Expr::Variable("n".into())),
                     property: "name".into(),
-                },
+                }),
                 alias: Some("name".into()),
             }],
             distinct: false,
@@ -536,14 +536,14 @@ fn aggregate_count() {
                 group_by: vec![],
                 aggregates: vec![AggregateItem {
                     function: "count".into(),
-                    arg: Expr::Star,
+                    arg: nx(Expr::Star),
                     distinct: false,
                     alias: Some("cnt".into()),
                     percentile_expr: None,
                 }],
             }),
             items: vec![crate::planner::logical::ProjectItem {
-                expr: Expr::Variable("cnt".into()),
+                expr: nx(Expr::Variable("cnt".into())),
                 alias: None,
             }],
             distinct: false,
@@ -577,20 +577,20 @@ fn aggregate_sum_avg() {
                 aggregates: vec![
                     AggregateItem {
                         function: "sum".into(),
-                        arg: Expr::PropertyAccess {
+                        arg: nx(Expr::PropertyAccess {
                             expr: Box::new(Expr::Variable("n".into())),
                             property: "age".into(),
-                        },
+                        }),
                         distinct: false,
                         alias: Some("total".into()),
                         percentile_expr: None,
                     },
                     AggregateItem {
                         function: "avg".into(),
-                        arg: Expr::PropertyAccess {
+                        arg: nx(Expr::PropertyAccess {
                             expr: Box::new(Expr::Variable("n".into())),
                             property: "age".into(),
-                        },
+                        }),
                         distinct: false,
                         alias: Some("average".into()),
                         percentile_expr: None,
@@ -599,11 +599,11 @@ fn aggregate_sum_avg() {
             }),
             items: vec![
                 crate::planner::logical::ProjectItem {
-                    expr: Expr::Variable("total".into()),
+                    expr: nx(Expr::Variable("total".into())),
                     alias: None,
                 },
                 crate::planner::logical::ProjectItem {
-                    expr: Expr::Variable("average".into()),
+                    expr: nx(Expr::Variable("average".into())),
                     alias: None,
                 },
             ],
@@ -637,20 +637,20 @@ fn aggregate_min_max() {
             aggregates: vec![
                 AggregateItem {
                     function: "min".into(),
-                    arg: Expr::PropertyAccess {
+                    arg: nx(Expr::PropertyAccess {
                         expr: Box::new(Expr::Variable("n".into())),
                         property: "age".into(),
-                    },
+                    }),
                     distinct: false,
                     alias: Some("youngest".into()),
                     percentile_expr: None,
                 },
                 AggregateItem {
                     function: "max".into(),
-                    arg: Expr::PropertyAccess {
+                    arg: nx(Expr::PropertyAccess {
                         expr: Box::new(Expr::Variable("n".into())),
                         property: "age".into(),
-                    },
+                    }),
                     distinct: false,
                     alias: Some("oldest".into()),
                     percentile_expr: None,
@@ -684,10 +684,10 @@ fn aggregate_collect() {
             group_by: vec![],
             aggregates: vec![AggregateItem {
                 function: "collect".into(),
-                arg: Expr::PropertyAccess {
+                arg: nx(Expr::PropertyAccess {
                     expr: Box::new(Expr::Variable("n".into())),
                     property: "name".into(),
-                },
+                }),
                 distinct: false,
                 alias: Some("names".into()),
                 percentile_expr: None,
@@ -729,10 +729,10 @@ fn aggregate_percentile_cont() {
             group_by: vec![],
             aggregates: vec![AggregateItem {
                 function: "percentileCont".into(),
-                arg: Expr::PropertyAccess {
+                arg: nx(Expr::PropertyAccess {
                     expr: Box::new(Expr::Variable("n".into())),
                     property: "age".into(),
-                },
+                }),
                 distinct: false,
                 alias: Some("median".into()),
                 percentile_expr: None,
@@ -768,13 +768,13 @@ fn aggregate_percentile_cont_non_median() {
             group_by: vec![],
             aggregates: vec![AggregateItem {
                 function: "percentileCont".into(),
-                arg: Expr::PropertyAccess {
+                arg: nx(Expr::PropertyAccess {
                     expr: Box::new(Expr::Variable("n".into())),
                     property: "age".into(),
-                },
+                }),
                 distinct: false,
                 alias: Some("p100".into()),
-                percentile_expr: Some(Expr::Literal(Value::Float(1.0))),
+                percentile_expr: Some(nx(Expr::Literal(Value::Float(1.0)))),
             }],
         },
     };
@@ -798,13 +798,13 @@ fn aggregate_percentile_cont_non_median() {
             group_by: vec![],
             aggregates: vec![AggregateItem {
                 function: "percentileDisc".into(),
-                arg: Expr::PropertyAccess {
+                arg: nx(Expr::PropertyAccess {
                     expr: Box::new(Expr::Variable("n".into())),
                     property: "age".into(),
-                },
+                }),
                 distinct: false,
                 alias: Some("p0".into()),
-                percentile_expr: Some(Expr::Literal(Value::Float(0.0))),
+                percentile_expr: Some(nx(Expr::Literal(Value::Float(0.0)))),
             }],
         },
     };
@@ -834,10 +834,10 @@ fn aggregate_stdev() {
             group_by: vec![],
             aggregates: vec![AggregateItem {
                 function: "stDev".into(),
-                arg: Expr::PropertyAccess {
+                arg: nx(Expr::PropertyAccess {
                     expr: Box::new(Expr::Variable("n".into())),
                     property: "age".into(),
-                },
+                }),
                 distinct: false,
                 alias: Some("sd".into()),
                 percentile_expr: None,
@@ -876,17 +876,17 @@ fn aggregate_empty_returns_null() {
             aggregates: vec![
                 AggregateItem {
                     function: "sum".into(),
-                    arg: Expr::PropertyAccess {
+                    arg: nx(Expr::PropertyAccess {
                         expr: Box::new(Expr::Variable("n".into())),
                         property: "age".into(),
-                    },
+                    }),
                     distinct: false,
                     alias: Some("total".into()),
                     percentile_expr: None,
                 },
                 AggregateItem {
                     function: "count".into(),
-                    arg: Expr::Star,
+                    arg: nx(Expr::Star),
                     distinct: false,
                     alias: Some("cnt".into()),
                     percentile_expr: None,
@@ -925,17 +925,17 @@ fn sort_and_limit() {
                     }),
                     items: vec![
                         crate::planner::logical::ProjectItem {
-                            expr: Expr::PropertyAccess {
+                            expr: nx(Expr::PropertyAccess {
                                 expr: Box::new(Expr::Variable("n".into())),
                                 property: "name".into(),
-                            },
+                            }),
                             alias: Some("name".into()),
                         },
                         crate::planner::logical::ProjectItem {
-                            expr: Expr::PropertyAccess {
+                            expr: nx(Expr::PropertyAccess {
                                 expr: Box::new(Expr::Variable("n".into())),
                                 property: "age".into(),
-                            },
+                            }),
                             alias: Some("age".into()),
                         },
                     ],
@@ -979,7 +979,7 @@ fn empty_scan() {
                 property_filters: vec![],
             }),
             items: vec![crate::planner::logical::ProjectItem {
-                expr: Expr::Star,
+                expr: nx(Expr::Star),
                 alias: None,
             }],
             distinct: false,
@@ -1009,8 +1009,11 @@ fn create_node_writes_to_storage() {
             variable: Some("n".into()),
             labels: vec!["User".into()],
             properties: vec![
-                ("name".into(), Expr::Literal(Value::String("Alice".into()))),
-                ("age".into(), Expr::Literal(Value::Int(30))),
+                (
+                    "name".into(),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
+                ),
+                ("age".into(), nx(Expr::Literal(Value::Int(30)))),
             ],
         },
     };
@@ -1045,13 +1048,16 @@ fn create_and_return() {
                 input: None,
                 variable: Some("n".into()),
                 labels: vec!["User".into()],
-                properties: vec![("name".into(), Expr::Literal(Value::String("Bob".into())))],
+                properties: vec![(
+                    "name".into(),
+                    nx(Expr::Literal(Value::String("Bob".into()))),
+                )],
             }),
             items: vec![crate::planner::logical::ProjectItem {
-                expr: Expr::PropertyAccess {
+                expr: nx(Expr::PropertyAccess {
                     expr: Box::new(Expr::Variable("n".into())),
                     property: "name".into(),
-                },
+                }),
                 alias: Some("name".into()),
             }],
             distinct: false,
@@ -1190,7 +1196,7 @@ fn create_multiple_nodes() {
             input: None,
             variable: Some("a".into()),
             labels: vec!["User".into()],
-            properties: vec![("name".into(), Expr::Literal(Value::String("X".into())))],
+            properties: vec![("name".into(), nx(Expr::Literal(Value::String("X".into()))))],
         },
     };
     execute(&plan1, &mut ctx).expect("create a");
@@ -1204,7 +1210,7 @@ fn create_multiple_nodes() {
             input: None,
             variable: Some("b".into()),
             labels: vec!["User".into()],
-            properties: vec![("name".into(), Expr::Literal(Value::String("Y".into())))],
+            properties: vec![("name".into(), nx(Expr::Literal(Value::String("Y".into()))))],
         },
     };
     execute(&plan2, &mut ctx).expect("create b");
@@ -1579,7 +1585,7 @@ fn adaptive_parallel_on_super_node() {
                 path_variable: None,
             }),
             items: vec![crate::planner::logical::ProjectItem {
-                expr: Expr::Star,
+                expr: nx(Expr::Star),
                 alias: None,
             }],
             distinct: false,
@@ -1850,7 +1856,7 @@ fn as_of_timestamp_sets_snapshot() {
         - 3600 * 1_000_000; // 1 hour ago
 
     let plan = LogicalPlan {
-        snapshot_ts: Some(Expr::Literal(Value::Int(recent_ts))),
+        snapshot_ts: Some(nx(Expr::Literal(Value::Int(recent_ts)))),
         vector_consistency: VectorConsistencyMode::default(),
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
         root: LogicalOp::Project {
@@ -1860,7 +1866,7 @@ fn as_of_timestamp_sets_snapshot() {
                 property_filters: vec![],
             }),
             items: vec![crate::planner::logical::ProjectItem {
-                expr: Expr::Star,
+                expr: nx(Expr::Star),
                 alias: None,
             }],
             distinct: false,
@@ -1887,7 +1893,7 @@ fn as_of_timestamp_rejects_expired() {
         - 30 * 24 * 3600 * 1_000_000; // 30 days ago
 
     let plan = LogicalPlan {
-        snapshot_ts: Some(Expr::Literal(Value::Timestamp(old_ts))),
+        snapshot_ts: Some(nx(Expr::Literal(Value::Timestamp(old_ts)))),
         vector_consistency: VectorConsistencyMode::default(),
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
         root: LogicalOp::Project {
@@ -1897,7 +1903,7 @@ fn as_of_timestamp_rejects_expired() {
                 property_filters: vec![],
             }),
             items: vec![crate::planner::logical::ProjectItem {
-                expr: Expr::Star,
+                expr: nx(Expr::Star),
                 alias: None,
             }],
             distinct: false,
@@ -1917,7 +1923,9 @@ fn as_of_timestamp_string_warning() {
     let mut ctx = make_ctx(&engine, &mut interner, &allocator);
 
     let plan = LogicalPlan {
-        snapshot_ts: Some(Expr::Literal(Value::String("2025-06-15T10:00:00Z".into()))),
+        snapshot_ts: Some(nx(Expr::Literal(Value::String(
+            "2025-06-15T10:00:00Z".into(),
+        )))),
         vector_consistency: VectorConsistencyMode::default(),
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
         root: LogicalOp::Project {
@@ -1927,7 +1935,7 @@ fn as_of_timestamp_string_warning() {
                 property_filters: vec![],
             }),
             items: vec![crate::planner::logical::ProjectItem {
-                expr: Expr::Star,
+                expr: nx(Expr::Star),
                 alias: None,
             }],
             distinct: false,
@@ -1957,7 +1965,7 @@ fn no_timestamp_leaves_snapshot_none() {
                 property_filters: vec![],
             }),
             items: vec![crate::planner::logical::ProjectItem {
-                expr: Expr::Star,
+                expr: nx(Expr::Star),
                 alias: None,
             }],
             distinct: false,
@@ -2098,7 +2106,7 @@ fn varlen_count_distinct_dedups_multipath_targets() {
             group_by: vec![],
             aggregates: vec![crate::planner::logical::AggregateItem {
                 function: "count".into(),
-                arg: Expr::Variable("b".into()),
+                arg: nx(Expr::Variable("b".into())),
                 distinct: true,
                 alias: Some("cnt".into()),
                 percentile_expr: None,
@@ -2674,20 +2682,20 @@ fn aggregate_count_distinct() {
             aggregates: vec![
                 AggregateItem {
                     function: "count".into(),
-                    arg: Expr::PropertyAccess {
+                    arg: nx(Expr::PropertyAccess {
                         expr: Box::new(Expr::Variable("n".into())),
                         property: "age".into(),
-                    },
+                    }),
                     distinct: true,
                     alias: Some("unique_ages".into()),
                     percentile_expr: None,
                 },
                 AggregateItem {
                     function: "count".into(),
-                    arg: Expr::PropertyAccess {
+                    arg: nx(Expr::PropertyAccess {
                         expr: Box::new(Expr::Variable("n".into())),
                         property: "age".into(),
-                    },
+                    }),
                     distinct: false,
                     alias: Some("total_ages".into()),
                     percentile_expr: None,
@@ -2735,10 +2743,10 @@ fn aggregate_collect_distinct() {
             group_by: vec![],
             aggregates: vec![AggregateItem {
                 function: "collect".into(),
-                arg: Expr::PropertyAccess {
+                arg: nx(Expr::PropertyAccess {
                     expr: Box::new(Expr::Variable("n".into())),
                     property: "age".into(),
-                },
+                }),
                 distinct: true,
                 alias: Some("ages".into()),
                 percentile_expr: None,
@@ -2775,10 +2783,10 @@ fn aggregate_sum_int_preserves_type() {
             group_by: vec![],
             aggregates: vec![AggregateItem {
                 function: "sum".into(),
-                arg: Expr::PropertyAccess {
+                arg: nx(Expr::PropertyAccess {
                     expr: Box::new(Expr::Variable("n".into())),
                     property: "age".into(),
-                },
+                }),
                 distinct: false,
                 alias: Some("total".into()),
                 percentile_expr: None,
@@ -2837,13 +2845,13 @@ fn aggregate_group_by_with_null() {
                 labels: vec!["Item".into()],
                 property_filters: vec![],
             }),
-            group_by: vec![Expr::PropertyAccess {
+            group_by: vec![nx(Expr::PropertyAccess {
                 expr: Box::new(Expr::Variable("n".into())),
                 property: "category".into(),
-            }],
+            })],
             aggregates: vec![AggregateItem {
                 function: "count".into(),
-                arg: Expr::Star,
+                arg: nx(Expr::Star),
                 distinct: false,
                 alias: Some("cnt".into()),
                 percentile_expr: None,
@@ -2877,21 +2885,21 @@ fn aggregate_empty_input() {
             aggregates: vec![
                 AggregateItem {
                     function: "count".into(),
-                    arg: Expr::Star,
+                    arg: nx(Expr::Star),
                     distinct: false,
                     alias: Some("cnt".into()),
                     percentile_expr: None,
                 },
                 AggregateItem {
                     function: "sum".into(),
-                    arg: Expr::Literal(Value::Int(1)),
+                    arg: nx(Expr::Literal(Value::Int(1))),
                     distinct: false,
                     alias: Some("total".into()),
                     percentile_expr: None,
                 },
                 AggregateItem {
                     function: "avg".into(),
-                    arg: Expr::Literal(Value::Int(1)),
+                    arg: nx(Expr::Literal(Value::Int(1))),
                     distinct: false,
                     alias: Some("mean".into()),
                     percentile_expr: None,
@@ -2931,20 +2939,20 @@ fn aggregate_pipeline_with_then_group_by() {
                     group_by: vec![],
                     aggregates: vec![AggregateItem {
                         function: "count".into(),
-                        arg: Expr::Star,
+                        arg: nx(Expr::Star),
                         distinct: false,
                         alias: Some("cnt".into()),
                         percentile_expr: None,
                     }],
                 }),
                 items: vec![ProjectItem {
-                    expr: Expr::Variable("cnt".into()),
+                    expr: nx(Expr::Variable("cnt".into())),
                     alias: Some("cnt".into()),
                 }],
                 distinct: false,
             }),
             items: vec![ProjectItem {
-                expr: Expr::Variable("cnt".into()),
+                expr: nx(Expr::Variable("cnt".into())),
                 alias: Some("total".into()),
             }],
             distinct: false,
@@ -5399,7 +5407,9 @@ fn create_unique_index_enforces_constraint_on_insert() {
             labels: vec!["User".to_string()],
             properties: vec![(
                 "name".to_string(),
-                crate::cypher::ast::Expr::Literal(Value::String("UniqueUser".into())),
+                nx(crate::cypher::ast::Expr::Literal(Value::String(
+                    "UniqueUser".into(),
+                ))),
             )],
         },
         &mut ctx,
@@ -5414,7 +5424,9 @@ fn create_unique_index_enforces_constraint_on_insert() {
             labels: vec!["User".to_string()],
             properties: vec![(
                 "name".to_string(),
-                crate::cypher::ast::Expr::Literal(Value::String("UniqueUser".into())),
+                nx(crate::cypher::ast::Expr::Literal(Value::String(
+                    "UniqueUser".into(),
+                ))),
             )],
         },
         &mut ctx,
