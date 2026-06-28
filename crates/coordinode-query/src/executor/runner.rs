@@ -7487,7 +7487,10 @@ fn eval_predicate_with_storage(
         } => pattern_comprehension_eval(pattern, where_clause.as_deref(), map, row, ctx),
         Expr::UnaryOp { op, expr } => {
             let v = eval_predicate_with_storage(expr, row, ctx)?;
-            Ok(eval_unary_op(*op, &v))
+            Ok(eval_unary_op(
+                crate::planner::expr_lower::lower_unop(*op),
+                &v,
+            ))
         }
         Expr::BinaryOp { left, op, right } => {
             let lv = eval_predicate_with_storage(left, row, ctx)?;
@@ -7498,7 +7501,11 @@ fn eval_predicate_with_storage(
                 _ => {}
             }
             let rv = eval_predicate_with_storage(right, row, ctx)?;
-            Ok(eval_binary_op(&lv, *op, &rv))
+            Ok(eval_binary_op(
+                &lv,
+                crate::planner::expr_lower::lower_binop(*op),
+                &rv,
+            ))
         }
         other => Ok(eval_expr(other, row)),
     }

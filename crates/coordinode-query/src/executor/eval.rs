@@ -4,6 +4,8 @@ use coordinode_core::graph::types::Value;
 
 use super::row::Row;
 use crate::cypher::ast::*;
+use crate::plan::expr::{BinOp, UnOp};
+use crate::planner::expr_lower::{lower_binop, lower_unop};
 
 /// Classifies what cached row columns a projection / sort-key expression
 /// needs. Used by `LogicalOp::Project` and `LogicalOp::Sort` executor guards
@@ -195,11 +197,11 @@ pub fn eval_expr(expr: &Expr, row: &Row) -> Value {
         Expr::BinaryOp { left, op, right } => {
             let lv = eval_expr(left, row);
             let rv = eval_expr(right, row);
-            eval_binary_op(&lv, *op, &rv)
+            eval_binary_op(&lv, lower_binop(*op), &rv)
         }
         Expr::UnaryOp { op, expr } => {
             let v = eval_expr(expr, row);
-            eval_unary_op(*op, &v)
+            eval_unary_op(lower_unop(*op), &v)
         }
         Expr::FunctionCall { name, args, .. } => {
             // Aggregation functions are handled at the Aggregate operator level,
@@ -491,10 +493,10 @@ pub fn eval_expr(expr: &Expr, row: &Row) -> Value {
 }
 
 /// Evaluate a binary operation.
-pub(crate) fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) -> Value {
+pub(crate) fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Value {
     match op {
         // Arithmetic
-        BinaryOperator::Add => match (left, right) {
+        BinOp::Add => match (left, right) {
             (Value::Int(a), Value::Int(b)) => Value::Int(a.saturating_add(*b)),
             (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
@@ -519,28 +521,28 @@ pub(crate) fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) ->
             }
             _ => Value::Null,
         },
-        BinaryOperator::Sub => match (left, right) {
+        BinOp::Sub => match (left, right) {
             (Value::Int(a), Value::Int(b)) => Value::Int(a.saturating_sub(*b)),
             (Value::Float(a), Value::Float(b)) => Value::Float(a - b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 - b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a - *b as f64),
             _ => Value::Null,
         },
-        BinaryOperator::Mul => match (left, right) {
+        BinOp::Mul => match (left, right) {
             (Value::Int(a), Value::Int(b)) => Value::Int(a.saturating_mul(*b)),
             (Value::Float(a), Value::Float(b)) => Value::Float(a * b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 * b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a * *b as f64),
             _ => Value::Null,
         },
-        BinaryOperator::Div => match (left, right) {
+        BinOp::Div => match (left, right) {
             (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a / b),
             (Value::Float(a), Value::Float(b)) if *b != 0.0 => Value::Float(a / b),
             (Value::Int(a), Value::Float(b)) if *b != 0.0 => Value::Float(*a as f64 / b),
             (Value::Float(a), Value::Int(b)) if *b != 0 => Value::Float(a / *b as f64),
             _ => Value::Null,
         },
-        BinaryOperator::Modulo => match (left, right) {
+        BinOp::Modulo => match (left, right) {
             (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a % b),
             _ => Value::Null,
         },
@@ -550,19 +552,19 @@ pub(crate) fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) ->
         // is mandatory per the openCypher spec — `n.prop = NULL` MUST NEVER
         // match, even when `n.prop` itself is NULL. Use `IS NULL` to test
         // for absent values.
-        BinaryOperator::Eq => match (left, right) {
+        BinOp::Eq => match (left, right) {
             (Value::Null, _) | (_, Value::Null) => Value::Null,
             _ => Value::Bool(left == right),
         },
-        BinaryOperator::Neq => match (left, right) {
+        BinOp::Neq => match (left, right) {
             (Value::Null, _) | (_, Value::Null) => Value::Null,
             _ => Value::Bool(left != right),
         },
-        BinaryOperator::Lt => match (left, right) {
+        BinOp::Lt => match (left, right) {
             (Value::Null, _) | (_, Value::Null) => Value::Null,
             _ => Value::Bool(compare_values(left, right) == Some(std::cmp::Ordering::Less)),
         },
-        BinaryOperator::Lte => match (left, right) {
+        BinOp::Lte => match (left, right) {
             (Value::Null, _) | (_, Value::Null) => Value::Null,
             _ => {
                 let cmp = compare_values(left, right);
@@ -572,11 +574,11 @@ pub(crate) fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) ->
                 ))
             }
         },
-        BinaryOperator::Gt => match (left, right) {
+        BinOp::Gt => match (left, right) {
             (Value::Null, _) | (_, Value::Null) => Value::Null,
             _ => Value::Bool(compare_values(left, right) == Some(std::cmp::Ordering::Greater)),
         },
-        BinaryOperator::Gte => match (left, right) {
+        BinOp::Gte => match (left, right) {
             (Value::Null, _) | (_, Value::Null) => Value::Null,
             _ => {
                 let cmp = compare_values(left, right);
@@ -588,15 +590,15 @@ pub(crate) fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) ->
         },
 
         // Logical
-        BinaryOperator::And => match (left, right) {
+        BinOp::And => match (left, right) {
             (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a && *b),
             _ => Value::Null,
         },
-        BinaryOperator::Or => match (left, right) {
+        BinOp::Or => match (left, right) {
             (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a || *b),
             _ => Value::Null,
         },
-        BinaryOperator::Xor => match (left, right) {
+        BinOp::Xor => match (left, right) {
             (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a ^ *b),
             _ => Value::Null,
         },
@@ -673,13 +675,13 @@ fn compare_values(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
 }
 
 /// Evaluate a unary operation.
-pub(crate) fn eval_unary_op(op: UnaryOperator, val: &Value) -> Value {
+pub(crate) fn eval_unary_op(op: UnOp, val: &Value) -> Value {
     match op {
-        UnaryOperator::Not => match val {
+        UnOp::Not => match val {
             Value::Bool(b) => Value::Bool(!b),
             _ => Value::Null,
         },
-        UnaryOperator::Neg => match val {
+        UnOp::Neg => match val {
             Value::Int(n) => Value::Int(-n),
             Value::Float(f) => Value::Float(-f),
             _ => Value::Null,

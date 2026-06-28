@@ -197,7 +197,7 @@ fn lower_map_proj_item(item: &MapProjectionItem) -> Result<MapProjItem, PlanErro
     })
 }
 
-fn lower_binop(op: BinaryOperator) -> BinOp {
+pub(crate) fn lower_binop(op: BinaryOperator) -> BinOp {
     match op {
         BinaryOperator::Add => BinOp::Add,
         BinaryOperator::Sub => BinOp::Sub,
@@ -216,7 +216,7 @@ fn lower_binop(op: BinaryOperator) -> BinOp {
     }
 }
 
-fn lower_unop(op: UnaryOperator) -> UnOp {
+pub(crate) fn lower_unop(op: UnaryOperator) -> UnOp {
     match op {
         UnaryOperator::Not => UnOp::Not,
         UnaryOperator::Neg => UnOp::Neg,
