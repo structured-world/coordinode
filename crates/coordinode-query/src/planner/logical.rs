@@ -149,7 +149,7 @@ pub enum LogicalOp {
         variable: String,
         labels: Vec<String>,
         /// Inline property filters from the pattern (e.g., {name: "Alice"}).
-        property_filters: Vec<(String, Expr)>,
+        property_filters: Vec<(String, crate::plan::expr::Expr)>,
     },
 
     /// Traverse edges from a source node.
@@ -171,9 +171,9 @@ pub enum LogicalOp {
         /// Edge variable (optional).
         edge_variable: Option<String>,
         /// Inline property filters on the target node.
-        target_filters: Vec<(String, Expr)>,
+        target_filters: Vec<(String, crate::plan::expr::Expr)>,
         /// Inline property filters on the edge.
-        edge_filters: Vec<(String, Expr)>,
+        edge_filters: Vec<(String, crate::plan::expr::Expr)>,
         /// Pushed-down time-slice filter for temporal edges. When set, the
         /// executor bounds the per-version edgeprop prefix scan instead of
         /// loading every stored version and filtering above. Inferred by
@@ -206,13 +206,13 @@ pub enum LogicalOp {
         /// Property being looked up.
         property: String,
         /// Lookup value expression (literal or parameter).
-        value_expr: Expr,
+        value_expr: crate::plan::expr::Expr,
     },
 
     /// Filter rows by a predicate expression.
     Filter {
         input: Box<LogicalOp>,
-        predicate: Expr,
+        predicate: crate::plan::expr::Expr,
     },
 
     /// Project columns: select, rename, compute expressions.
@@ -1380,16 +1380,17 @@ pub fn estimate_cost_with_stats(
 
 /// Check if an expression tree contains a vector function call.
 /// Used to apply vector_dims_factor to Filter cost.
-fn expr_contains_vector_fn(expr: &Expr) -> bool {
+fn expr_contains_vector_fn(expr: &crate::plan::expr::Expr) -> bool {
+    use crate::plan::expr::Expr as PExpr;
     match expr {
-        Expr::FunctionCall { name, .. } => matches!(
+        PExpr::Call { name, .. } => matches!(
             name.as_str(),
             "vector_distance" | "vector_similarity" | "vector_dot" | "vector_manhattan"
         ),
-        Expr::BinaryOp { left, right, .. } => {
+        PExpr::Binary { left, right, .. } => {
             expr_contains_vector_fn(left) || expr_contains_vector_fn(right)
         }
-        Expr::UnaryOp { expr: inner, .. } => expr_contains_vector_fn(inner),
+        PExpr::Unary { operand, .. } => expr_contains_vector_fn(operand),
         _ => false,
     }
 }

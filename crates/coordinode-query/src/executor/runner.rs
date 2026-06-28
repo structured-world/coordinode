@@ -2141,8 +2141,8 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         LogicalOp::Filter { input, predicate } => {
             let rows = execute_op(input, ctx)?;
             let corr = ctx.correlated_row.clone();
-            if expr_contains_pattern_predicate(predicate) {
-                // Storage-aware path: pattern predicates need edge lookups.
+            if neutral_contains_subplan(predicate) {
+                // Storage-aware path: correlated subplans need edge lookups.
                 let mut result = Vec::new();
                 for row in rows {
                     let effective_row = if let Some(ref outer) = corr {
@@ -2152,7 +2152,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                     } else {
                         row.clone()
                     };
-                    let val = eval_predicate_with_storage(predicate, &effective_row, ctx)?;
+                    let val = eval_neutral_with_storage(predicate, &effective_row, ctx)?;
                     if is_truthy(&val) {
                         result.push(row);
                     }
@@ -2168,9 +2168,9 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                             // Current row takes precedence over outer scope.
                             let mut merged = outer.clone();
                             merged.extend(row.iter().map(|(k, v)| (k.clone(), v.clone())));
-                            is_truthy(&eval_expr(predicate, &merged))
+                            is_truthy(&eval_neutral(predicate, &merged))
                         } else {
-                            is_truthy(&eval_expr(predicate, row))
+                            is_truthy(&eval_neutral(predicate, row))
                         }
                     })
                     .collect())
@@ -3079,7 +3079,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
 fn execute_node_scan(
     variable: &str,
     labels: &[String],
-    property_filters: &[(String, Expr)],
+    property_filters: &[(String, crate::plan::expr::Expr)],
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let mut results = Vec::new();
@@ -3171,9 +3171,9 @@ fn execute_node_scan(
                 Some(corr) => {
                     let mut eval_row = corr.clone();
                     eval_row.extend(row.clone());
-                    eval_expr(filter_expr, &eval_row)
+                    eval_neutral(filter_expr, &eval_row)
                 }
-                None => eval_expr(filter_expr, &row),
+                None => eval_neutral(filter_expr, &row),
             };
             if actual != expected {
                 matches = false;
@@ -3200,7 +3200,7 @@ fn execute_btree_index_scan(
     label: &str,
     index_name: &str,
     _property: &str,
-    value_expr: &Expr,
+    value_expr: &crate::plan::expr::Expr,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     // R172b safe-reject: B-tree index lookup returns node ids, then reads
@@ -3221,8 +3221,8 @@ fn execute_btree_index_scan(
     // driven per outer row) resolves against `correlated_row`; a literal /
     // parameter key ignores the row, so the empty-row fallback is equivalent.
     let lookup_val = match &ctx.correlated_row {
-        Some(corr) => eval_expr(value_expr, corr),
-        None => eval_expr(value_expr, &Row::new()),
+        Some(corr) => eval_neutral(value_expr, corr),
+        None => eval_neutral(value_expr, &Row::new()),
     };
 
     // Use index_scan_exact to find node IDs matching the lookup value.
@@ -3402,9 +3402,9 @@ struct TraverseParams<'a> {
     target_labels: &'a [String],
     length: Option<LengthBound>,
     edge_variable: Option<&'a str>,
-    target_filters: &'a [(String, Expr)],
+    target_filters: &'a [(String, crate::plan::expr::Expr)],
     /// Inline edge property filters from pattern (e.g., `[r:TYPE {prop: val}]`).
-    edge_filters: &'a [(String, Expr)],
+    edge_filters: &'a [(String, crate::plan::expr::Expr)],
     /// Parallel to `edge_types`: `true` if the type was declared TEMPORAL.
     /// Hoisted once per traversal so the inner loop never re-queries the
     /// schema partition.
@@ -3743,7 +3743,7 @@ fn build_target_rows(
                 .get(&format!("{target_variable}.{prop_name}"))
                 .cloned()
                 .unwrap_or(Value::Null);
-            let expected = eval_expr(filter_expr, &row);
+            let expected = eval_neutral(filter_expr, &row);
             if actual != expected {
                 continue 'each_row;
             }
@@ -3754,7 +3754,7 @@ fn build_target_rows(
                     .get(&format!("{ev}.{prop_name}"))
                     .cloned()
                     .unwrap_or(Value::Null);
-                let expected = eval_expr(filter_expr, &row);
+                let expected = eval_neutral(filter_expr, &row);
                 if actual != expected {
                     continue 'each_row;
                 }
@@ -3946,7 +3946,7 @@ fn process_targets_parallel(
                         .get(&format!("{target_variable}.{prop_name}"))
                         .cloned()
                         .unwrap_or(Value::Null);
-                    let expected = eval_expr(filter_expr, &out_row);
+                    let expected = eval_neutral(filter_expr, &out_row);
                     if actual != expected {
                         return None;
                     }
@@ -3959,7 +3959,7 @@ fn process_targets_parallel(
                             .get(&format!("{ev}.{prop_name}"))
                             .cloned()
                             .unwrap_or(Value::Null);
-                        let expected = eval_expr(filter_expr, &out_row);
+                        let expected = eval_neutral(filter_expr, &out_row);
                         if actual != expected {
                             return None;
                         }
@@ -6437,92 +6437,72 @@ fn collect_filter_variables(op: &LogicalOp, vars: &mut Vec<String>) {
 
 /// Extract variable names from an expression tree.
 /// Covers all `Expr` variants that can contain nested variables.
-fn collect_expr_vars(expr: &Expr, vars: &mut Vec<String>) {
+fn collect_expr_vars(expr: &crate::plan::expr::Expr, vars: &mut Vec<String>) {
+    use crate::plan::expr::{Expr as PExpr, MapProjItem};
     match expr {
-        Expr::Variable(name) => vars.push(name.clone()),
-        Expr::PropertyAccess { expr, .. } => collect_expr_vars(expr, vars),
-        Expr::BinaryOp { left, right, .. } => {
+        PExpr::Variable(name) => vars.push(name.clone()),
+        PExpr::Property { base, .. } => collect_expr_vars(base, vars),
+        PExpr::Binary { left, right, .. } => {
             collect_expr_vars(left, vars);
             collect_expr_vars(right, vars);
         }
-        Expr::UnaryOp { expr, .. } => collect_expr_vars(expr, vars),
-        Expr::FunctionCall { args, .. } => {
+        PExpr::Unary { operand, .. } => collect_expr_vars(operand, vars),
+        PExpr::Call { args, .. } => {
             for arg in args {
                 collect_expr_vars(arg, vars);
             }
         }
-        Expr::List(items) => {
+        PExpr::List(items) => {
             for item in items {
                 collect_expr_vars(item, vars);
             }
         }
-        Expr::MapLiteral(entries) => {
+        PExpr::Map(entries) => {
             for (_, val) in entries {
                 collect_expr_vars(val, vars);
             }
         }
-        Expr::MapProjection { expr, items } => {
-            collect_expr_vars(expr, vars);
+        PExpr::MapProjection { base, items } => {
+            collect_expr_vars(base, vars);
             for item in items {
-                if let crate::cypher::ast::MapProjectionItem::Computed(_, e) = item {
+                if let MapProjItem::Computed(_, e) = item {
                     collect_expr_vars(e, vars);
                 }
             }
         }
-        Expr::In { expr, list } => {
-            collect_expr_vars(expr, vars);
+        PExpr::In { item, list } => {
+            collect_expr_vars(item, vars);
             collect_expr_vars(list, vars);
         }
-        Expr::IsNull { expr, .. } => collect_expr_vars(expr, vars),
-        Expr::IsTyped { expr, .. } => collect_expr_vars(expr, vars),
-        Expr::StringMatch { expr, pattern, .. } => {
-            collect_expr_vars(expr, vars);
+        PExpr::IsNull { operand, .. } | PExpr::IsTyped { operand, .. } => {
+            collect_expr_vars(operand, vars)
+        }
+        PExpr::StringMatch { value, pattern, .. } => {
+            collect_expr_vars(value, vars);
             collect_expr_vars(pattern, vars);
         }
-        Expr::Case {
+        PExpr::Case {
             operand,
-            when_clauses,
-            else_clause,
+            branches,
+            otherwise,
         } => {
             if let Some(op) = operand {
                 collect_expr_vars(op, vars);
             }
-            for (cond, then) in when_clauses {
+            for (cond, then) in branches {
                 collect_expr_vars(cond, vars);
                 collect_expr_vars(then, vars);
             }
-            if let Some(el) = else_clause {
+            if let Some(el) = otherwise {
                 collect_expr_vars(el, vars);
             }
         }
-        Expr::PatternPredicate(pattern) => {
-            for elem in &pattern.elements {
-                match elem {
-                    crate::cypher::ast::PatternElement::Node(node) => {
-                        if let Some(ref name) = node.variable {
-                            vars.push(name.clone());
-                        }
-                        for (_, v) in &node.properties {
-                            collect_expr_vars(v, vars);
-                        }
-                    }
-                    crate::cypher::ast::PatternElement::Relationship(rel) => {
-                        if let Some(ref name) = rel.variable {
-                            vars.push(name.clone());
-                        }
-                        for (_, v) in &rel.properties {
-                            collect_expr_vars(v, vars);
-                        }
-                    }
-                }
-            }
-        }
-        Expr::Subscript { expr, index } => {
-            collect_expr_vars(expr, vars);
+        PExpr::Subscript { base, index } => {
+            collect_expr_vars(base, vars);
             collect_expr_vars(index, vars);
         }
-        Expr::Slice { expr, start, end } => {
-            collect_expr_vars(expr, vars);
+        PExpr::Slice { base, start, end } => {
+            collect_expr_vars(base, vars);
             if let Some(s) = start {
                 collect_expr_vars(s, vars);
             }
@@ -6530,39 +6510,42 @@ fn collect_expr_vars(expr: &Expr, vars: &mut Vec<String>) {
                 collect_expr_vars(e, vars);
             }
         }
-        Expr::Reduce {
+        PExpr::Reduce {
             acc,
             init,
             var,
             list,
-            expr,
+            step,
         } => {
             collect_expr_vars(init, vars);
             collect_expr_vars(list, vars);
-            // acc and var are bound locally inside the fold — exclude them from
+            // acc and var are bound locally inside the fold; exclude them from
             // the outer variables the step expression depends on.
             let mut inner = Vec::new();
-            collect_expr_vars(expr, &mut inner);
+            collect_expr_vars(step, &mut inner);
             vars.extend(inner.into_iter().filter(|v| v != acc && v != var));
         }
-        Expr::ListPredicate {
-            var, list, pred, ..
-        } => {
-            collect_expr_vars(list, vars);
-            // var is bound locally — exclude it from the predicate's outer deps.
-            let mut inner = Vec::new();
-            collect_expr_vars(pred, &mut inner);
-            vars.extend(inner.into_iter().filter(|v| v != var));
-        }
-        Expr::ListComprehension {
+        PExpr::ListQuantifier {
             var,
             list,
-            pred,
+            predicate,
+            ..
+        } => {
+            collect_expr_vars(list, vars);
+            // var is bound locally; exclude it from the predicate's outer deps.
+            let mut inner = Vec::new();
+            collect_expr_vars(predicate, &mut inner);
+            vars.extend(inner.into_iter().filter(|v| v != var));
+        }
+        PExpr::ListComprehension {
+            var,
+            list,
+            filter,
             map,
         } => {
             collect_expr_vars(list, vars);
             let mut inner = Vec::new();
-            if let Some(p) = pred {
+            if let Some(p) = filter {
                 collect_expr_vars(p, &mut inner);
             }
             if let Some(m) = map {
@@ -6570,15 +6553,15 @@ fn collect_expr_vars(expr: &Expr, vars: &mut Vec<String>) {
             }
             vars.extend(inner.into_iter().filter(|v| v != var));
         }
-        // The inner MATCH binds its own variables; any outer-correlation
-        // variables it references are already provisioned by the outer clauses,
-        // so it contributes no extra outer dependencies here.
-        Expr::ExistsSubquery(_)
-        | Expr::CountSubquery(_)
-        | Expr::CollectSubquery { .. }
-        | Expr::PatternComprehension { .. } => {}
+        // Embedded subplans bind their own variables; any outer-correlation
+        // variables they reference are already provisioned by the outer clauses,
+        // so they contribute no extra outer dependencies here.
+        PExpr::ExistsSubplan(_)
+        | PExpr::CountSubplan(_)
+        | PExpr::CollectSubplan { .. }
+        | PExpr::PatternComprehension { .. } => {}
         // Literal, Parameter, Star — no variable references.
-        Expr::Literal(_) | Expr::Parameter(_) | Expr::Star => {}
+        PExpr::Literal(_) | PExpr::Parameter(_) | PExpr::Star => {}
     }
 }
 
@@ -7269,16 +7252,19 @@ fn scan_filter_references_outside(
 }
 
 /// True if `expr` references any `Variable` not present in `bound`.
-fn expr_references_outside(expr: &Expr, bound: &std::collections::HashSet<String>) -> bool {
+fn expr_references_outside(
+    expr: &crate::plan::expr::Expr,
+    bound: &std::collections::HashSet<String>,
+) -> bool {
+    use crate::plan::expr::Expr as PExpr;
     match expr {
-        Expr::Variable(name) => !bound.contains(name),
-        Expr::PropertyAccess { expr, .. } | Expr::UnaryOp { expr, .. } => {
-            expr_references_outside(expr, bound)
-        }
-        Expr::BinaryOp { left, right, .. } => {
+        PExpr::Variable(name) => !bound.contains(name),
+        PExpr::Property { base, .. } => expr_references_outside(base, bound),
+        PExpr::Unary { operand, .. } => expr_references_outside(operand, bound),
+        PExpr::Binary { left, right, .. } => {
             expr_references_outside(left, bound) || expr_references_outside(right, bound)
         }
-        Expr::FunctionCall { args, .. } | Expr::List(args) => {
+        PExpr::Call { args, .. } | PExpr::List(args) => {
             args.iter().any(|e| expr_references_outside(e, bound))
         }
         _ => false,
@@ -7399,7 +7385,7 @@ fn execute_merge_relationship_check(
             // All filter expressions must match stored values.
             let filters_match = edge_filters.iter().all(|(prop_name, filter_expr)| {
                 let actual = stored.get(prop_name).cloned().unwrap_or(Value::Null);
-                let expected = eval_expr(filter_expr, correlated);
+                let expected = eval_neutral(filter_expr, correlated);
                 actual == expected
             });
             if !filters_match {
@@ -7676,6 +7662,119 @@ fn pattern_comprehension_eval(
     Ok(Value::Array(out))
 }
 
+// ----------------------------------------------------------------------------
+// Neutral storage-aware evaluation.
+//
+// The neutral expression IR carries correlated subqueries as an already-lowered
+// `Box<LogicalPlan>` (the pattern + its filter planned at build time), so the
+// neutral evaluator runs that subplan directly instead of re-planning a cypher
+// MatchClause per row. This is the language-neutral analogue of
+// `eval_predicate_with_storage` and is the path the planner converges on.
+// ----------------------------------------------------------------------------
+
+/// Does a neutral expression contain a correlated-subplan form that needs the
+/// storage engine? Mirrors `expr_contains_pattern_predicate`: only top-level,
+/// unary, and binary positions are inspected (a subplan buried inside another
+/// node is evaluated by the pure path, which yields `Null`/`false` for it, just
+/// as the cypher evaluator does).
+fn neutral_contains_subplan(expr: &crate::plan::expr::Expr) -> bool {
+    use crate::plan::expr::Expr as PExpr;
+    match expr {
+        PExpr::ExistsSubplan(_)
+        | PExpr::CountSubplan(_)
+        | PExpr::CollectSubplan { .. }
+        | PExpr::PatternComprehension { .. } => true,
+        PExpr::Unary { operand, .. } => neutral_contains_subplan(operand),
+        PExpr::Binary { left, right, .. } => {
+            neutral_contains_subplan(left) || neutral_contains_subplan(right)
+        }
+        _ => false,
+    }
+}
+
+/// Evaluate a neutral expression that may contain correlated subplans, with
+/// storage access for the embedded subqueries. Subplan-free nodes fall through
+/// to the pure neutral evaluator.
+fn eval_neutral_with_storage(
+    expr: &crate::plan::expr::Expr,
+    row: &Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Value, ExecutionError> {
+    use crate::plan::expr::{BinOp, Expr as PExpr};
+    match expr {
+        PExpr::ExistsSubplan(subplan) => exists_subplan_matches(subplan, row, ctx),
+        PExpr::CountSubplan(subplan) => {
+            let rows = correlated_subplan_rows(subplan, row, ctx)?;
+            Ok(Value::Int(i64::try_from(rows.len()).unwrap_or(i64::MAX)))
+        }
+        PExpr::CollectSubplan {
+            subplan,
+            projection,
+        } => {
+            let rows = correlated_subplan_rows(subplan, row, ctx)?;
+            Ok(Value::Array(
+                rows.iter().map(|er| eval_neutral(projection, er)).collect(),
+            ))
+        }
+        PExpr::PatternComprehension { subplan, map } => {
+            let rows = correlated_subplan_rows(subplan, row, ctx)?;
+            Ok(Value::Array(
+                rows.iter().map(|er| eval_neutral(map, er)).collect(),
+            ))
+        }
+        PExpr::Unary { op, operand } => {
+            let v = eval_neutral_with_storage(operand, row, ctx)?;
+            Ok(eval_unary_op(*op, &v))
+        }
+        PExpr::Binary { left, op, right } => {
+            let lv = eval_neutral_with_storage(left, row, ctx)?;
+            // Short-circuit AND/OR before evaluating the right side.
+            match op {
+                BinOp::And if !is_truthy(&lv) => return Ok(Value::Bool(false)),
+                BinOp::Or if is_truthy(&lv) => return Ok(Value::Bool(true)),
+                _ => {}
+            }
+            let rv = eval_neutral_with_storage(right, row, ctx)?;
+            Ok(eval_binary_op(&lv, *op, &rv))
+        }
+        other => Ok(eval_neutral(other, row)),
+    }
+}
+
+/// Neutral `EXISTS`: true when the embedded subplan yields at least one row
+/// consistent with the outer bindings on shared variables.
+fn exists_subplan_matches(
+    subplan: &crate::planner::logical::LogicalPlan,
+    row: &Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Value, ExecutionError> {
+    let rows = execute_op(&subplan.root, ctx)?;
+    let any = rows
+        .iter()
+        .any(|rr| rr.iter().all(|(k, v)| row.get(k).is_none_or(|ov| ov == v)));
+    Ok(Value::Bool(any))
+}
+
+/// Execute an embedded subplan correlated with the outer `row`: keep only rows
+/// that agree with the outer bindings on shared variables, each merged with the
+/// outer bindings. Shared by neutral `COUNT`/`COLLECT`/pattern-comprehension.
+fn correlated_subplan_rows(
+    subplan: &crate::planner::logical::LogicalPlan,
+    row: &Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    let rows = execute_op(&subplan.root, ctx)?;
+    Ok(rows
+        .into_iter()
+        .filter(|rr| rr.iter().all(|(k, v)| row.get(k).is_none_or(|ov| ov == v)))
+        .map(|rr| {
+            let mut merged = row.clone();
+            merged.extend(rr);
+            merged
+        })
+        .collect())
+}
+
 /// Check if a pattern predicate matches: does the described path exist in the graph?
 ///
 /// Handles bound endpoints (variables already in the row) by checking specific
@@ -7902,7 +8001,7 @@ fn execute_merge_relationship_create(
         let mut prop_map: Vec<(u32, Value)> = Vec::with_capacity(edge_filters.len());
         for (prop_name, expr) in edge_filters {
             let field_id = ctx.interner.intern(prop_name);
-            let value = eval_expr(expr, correlated);
+            let value = eval_neutral(expr, correlated);
             prop_map.push((field_id, value.clone()));
             resolved_props.push((prop_name.clone(), value.clone()));
             if let Some(ev) = edge_variable {
@@ -8275,7 +8374,7 @@ fn execute_create_from_pattern(
             let mut record = NodeRecord::new(&label);
             let empty_row = Row::new();
             for (prop_name, expr) in property_filters {
-                let val = eval_expr(expr, &empty_row);
+                let val = eval_neutral(expr, &empty_row);
                 let field_id = ctx.interner.intern(prop_name);
                 record.set(field_id, val);
             }
@@ -8285,7 +8384,7 @@ fn execute_create_from_pattern(
                 if !label.is_empty() {
                     let props_for_index: Vec<(String, Value)> = property_filters
                         .iter()
-                        .map(|(name, expr)| (name.clone(), eval_expr(expr, &empty_row)))
+                        .map(|(name, expr)| (name.clone(), eval_neutral(expr, &empty_row)))
                         .collect();
                     btree_reg
                         .on_node_created(ctx.engine, node_id, &label, &props_for_index)
@@ -8310,7 +8409,7 @@ fn execute_create_from_pattern(
                 let props_map: std::collections::HashMap<String, Value> = property_filters
                     .iter()
                     .map(|(name, expr)| {
-                        let val = eval_expr(expr, &empty_row).map_to_document();
+                        let val = eval_neutral(expr, &empty_row).map_to_document();
                         (name.clone(), val)
                     })
                     .collect();
@@ -8328,7 +8427,7 @@ fn execute_create_from_pattern(
             row.insert(variable.to_string(), Value::Int(node_id.as_raw() as i64));
             row.insert(format!("{variable}.__label__"), Value::String(label));
             for (prop_name, expr) in property_filters {
-                let val = eval_expr(expr, &Row::new());
+                let val = eval_neutral(expr, &Row::new());
                 row.insert(format!("{variable}.{prop_name}"), val);
             }
 

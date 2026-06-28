@@ -409,7 +409,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 {
                     let chain = build_pattern_chain(&mc.patterns[0].elements, Some(existing))?;
                     Ok(match &mc.where_clause {
-                        Some(pred) => apply_compound_where(pred, chain),
+                        Some(pred) => apply_compound_where(pred, chain)?,
                         None => chain,
                     })
                 }
@@ -463,7 +463,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                     // Apply lifted predicates above CartesianProduct where
                     // all variables are in scope.
                     if !lifted.is_empty() {
-                        result = apply_compound_where(&conjoin_predicates(lifted), result);
+                        result = apply_compound_where(&conjoin_predicates(lifted), result)?;
                     }
 
                     Ok(result)
@@ -490,7 +490,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
         }
         Clause::Where(expr) => {
             let input = current.unwrap_or(LogicalOp::Empty);
-            Ok(apply_compound_where(expr, input))
+            apply_compound_where(expr, input)
         }
         Clause::Return(rc) => {
             let input = current.unwrap_or(LogicalOp::Empty);
@@ -1074,7 +1074,7 @@ fn extract_property_name(expr: &Expr) -> Option<String> {
 /// the endpoint lookup becomes a point read instead of a full scan.
 fn try_correlated_index_join(
     input: &LogicalOp,
-    predicate: &Expr,
+    predicate: &crate::plan::expr::Expr,
     registry: &crate::index::IndexRegistry,
 ) -> Option<LogicalOp> {
     let LogicalOp::CartesianProduct { left, right } = input else {
@@ -1091,9 +1091,9 @@ fn try_correlated_index_join(
     if labels.len() != 1 || !property_filters.is_empty() {
         return None;
     }
-    let Expr::BinaryOp {
+    let crate::plan::expr::Expr::Binary {
         left: pl,
-        op: BinaryOperator::Eq,
+        op: crate::plan::expr::BinOp::Eq,
         right: pr,
     } = predicate
     else {
@@ -1128,9 +1128,9 @@ pub fn optimize_index_selection(
             } = *input
             {
                 if labels.len() == 1 && property_filters.is_empty() {
-                    if let Expr::BinaryOp {
+                    if let crate::plan::expr::Expr::Binary {
                         ref left,
-                        op: BinaryOperator::Eq,
+                        op: crate::plan::expr::BinOp::Eq,
                         ref right,
                     } = predicate
                     {
@@ -1286,13 +1286,25 @@ pub fn optimize_index_selection(
     }
 }
 
+/// Lower a pattern's inline `(property, cypher-expression)` filters into neutral
+/// expressions, so the operators that carry them (`NodeScan`, `Traverse`) hold
+/// the language-neutral IR like the rest of the plan.
+fn lower_property_filters(
+    props: &[(String, crate::cypher::ast::Expr)],
+) -> Result<Vec<(String, crate::plan::expr::Expr)>, PlanError> {
+    props
+        .iter()
+        .map(|(k, v)| Ok((k.clone(), super::lower_expr(v)?)))
+        .collect()
+}
+
 /// Build an `IndexScan` for `(label, property) = value_expr` if a B-tree index
 /// is registered for that pair. Returns None when no index matches.
 fn try_index_rewrite(
     variable: &str,
     label: &str,
     property: &str,
-    value_expr: &Expr,
+    value_expr: &crate::plan::expr::Expr,
     registry: &crate::index::IndexRegistry,
 ) -> Option<LogicalOp> {
     let idx = registry
@@ -1312,18 +1324,18 @@ fn try_index_rewrite(
 /// or a property access on `var`). Rejects self-referential equality
 /// (`a.x = a.y`) from index point-lookup rewriting while allowing literals,
 /// parameters, and correlated outer references.
-fn expr_references_var(expr: &Expr, var: &str) -> bool {
+fn expr_references_var(expr: &crate::plan::expr::Expr, var: &str) -> bool {
+    use crate::plan::expr::Expr as PExpr;
     match expr {
-        Expr::Variable(name) => {
+        PExpr::Variable(name) => {
             name == var || name.strip_prefix(var).is_some_and(|s| s.starts_with('.'))
         }
-        Expr::PropertyAccess { expr, .. } | Expr::UnaryOp { expr, .. } => {
-            expr_references_var(expr, var)
-        }
-        Expr::BinaryOp { left, right, .. } => {
+        PExpr::Property { base, .. } => expr_references_var(base, var),
+        PExpr::Unary { operand, .. } => expr_references_var(operand, var),
+        PExpr::Binary { left, right, .. } => {
             expr_references_var(left, var) || expr_references_var(right, var)
         }
-        Expr::FunctionCall { args, .. } | Expr::List(args) => {
+        PExpr::Call { args, .. } | PExpr::List(args) => {
             args.iter().any(|e| expr_references_var(e, var))
         }
         _ => false,
@@ -1333,20 +1345,18 @@ fn expr_references_var(expr: &Expr, var: &str) -> bool {
 /// Extract a property name from an expression that references `variable.property`.
 ///
 /// Matches `PropertyAccess { expr: Variable(var), property }` and `Variable("var.prop")`.
-fn extract_index_property(expr: &Expr, variable: &str) -> Option<String> {
+fn extract_index_property(expr: &crate::plan::expr::Expr, variable: &str) -> Option<String> {
+    use crate::plan::expr::Expr as PExpr;
     match expr {
-        Expr::PropertyAccess {
-            expr: inner,
-            property,
-        } => {
-            if matches!(inner.as_ref(), Expr::Variable(v) if v == variable) {
-                Some(property.clone())
+        PExpr::Property { base, key } => {
+            if matches!(base.as_ref(), PExpr::Variable(v) if v == variable) {
+                Some(key.clone())
             } else {
                 None
             }
         }
         // Fallback: some nodes use Variable("n.prop")
-        Expr::Variable(v) => {
+        PExpr::Variable(v) => {
             let expected_prefix = format!("{variable}.");
             v.strip_prefix(&expected_prefix).map(|s| s.to_string())
         }
@@ -1714,24 +1724,24 @@ fn collect_simple_property_predicates(
 /// expression. Recurses into top-level `AND` conjunctions so a filter
 /// like `n.category = 'X' AND n.active = true` yields two leaves.
 fn extract_predicate_leaves(
-    expr: &Expr,
+    expr: &crate::plan::expr::Expr,
     variable: &str,
     out: &mut Vec<crate::planner::logical::VectorPredicate>,
 ) {
-    use crate::cypher::ast::BinaryOperator;
+    use crate::plan::expr::{BinOp, Expr as PExpr};
 
     match expr {
-        Expr::BinaryOp {
+        PExpr::Binary {
             left,
-            op: BinaryOperator::And,
+            op: BinOp::And,
             right,
         } => {
             extract_predicate_leaves(left, variable, out);
             extract_predicate_leaves(right, variable, out);
         }
-        Expr::BinaryOp {
+        PExpr::Binary {
             left,
-            op: BinaryOperator::Eq,
+            op: BinOp::Eq,
             right,
         } => {
             if let Some(leaf) = property_eq_leaf(left, right, variable)
@@ -1740,13 +1750,9 @@ fn extract_predicate_leaves(
                 out.push(leaf);
             }
         }
-        Expr::BinaryOp {
+        PExpr::Binary {
             left,
-            op:
-                cmp @ (BinaryOperator::Gt
-                | BinaryOperator::Gte
-                | BinaryOperator::Lt
-                | BinaryOperator::Lte),
+            op: cmp @ (BinOp::Gt | BinOp::Gte | BinOp::Lt | BinOp::Lte),
             right,
         } => {
             // Numeric comparison: try the prop-on-left form, then prop-on-right
@@ -1764,10 +1770,8 @@ fn extract_predicate_leaves(
     }
 }
 
-fn numeric_cmp_from_op(
-    op: crate::cypher::ast::BinaryOperator,
-) -> crate::planner::logical::NumericCmp {
-    use crate::cypher::ast::BinaryOperator as B;
+fn numeric_cmp_from_op(op: crate::plan::expr::BinOp) -> crate::planner::logical::NumericCmp {
+    use crate::plan::expr::BinOp as B;
     use crate::planner::logical::NumericCmp as N;
     match op {
         B::Gt => N::Gt,
@@ -1794,10 +1798,8 @@ impl crate::planner::logical::NumericCmp {
     }
 }
 
-fn flip_numeric_cmp(
-    op: crate::cypher::ast::BinaryOperator,
-) -> Option<crate::planner::logical::NumericCmp> {
-    use crate::cypher::ast::BinaryOperator as B;
+fn flip_numeric_cmp(op: crate::plan::expr::BinOp) -> Option<crate::planner::logical::NumericCmp> {
+    use crate::plan::expr::BinOp as B;
     use crate::planner::logical::NumericCmp as N;
     Some(match op {
         // `lit < prop` ↔ `prop > lit`
@@ -1813,14 +1815,15 @@ fn flip_numeric_cmp(
 /// pair when `prop_side` is `PropertyAccess(variable, prop)` and
 /// `literal_side` is a numeric `Literal(...)`. Non-numeric literals reject.
 fn property_cmp_leaf(
-    prop_side: &Expr,
-    literal_side: &Expr,
+    prop_side: &crate::plan::expr::Expr,
+    literal_side: &crate::plan::expr::Expr,
     variable: &str,
     op: crate::planner::logical::NumericCmp,
 ) -> Option<crate::planner::logical::VectorPredicate> {
+    use crate::plan::expr::{Expr as PExpr, UnOp};
     let prop_name = match prop_side {
-        Expr::PropertyAccess { expr, property } => match expr.as_ref() {
-            Expr::Variable(v) if v == variable => property.clone(),
+        PExpr::Property { base, key } => match base.as_ref() {
+            PExpr::Variable(v) if v == variable => key.clone(),
             _ => return None,
         },
         _ => return None,
@@ -1829,19 +1832,19 @@ fn property_cmp_leaf(
     // arrays reject — the executor's numeric() helper would reject them too,
     // but rejecting at plan time keeps the predicate descriptor honest.
     let value = match literal_side {
-        Expr::Literal(coordinode_core::graph::types::Value::Int(_))
-        | Expr::Literal(coordinode_core::graph::types::Value::Float(_)) => match literal_side {
-            Expr::Literal(v) => v.clone(),
+        PExpr::Literal(coordinode_core::graph::types::Value::Int(_))
+        | PExpr::Literal(coordinode_core::graph::types::Value::Float(_)) => match literal_side {
+            PExpr::Literal(v) => v.clone(),
             _ => return None,
         },
-        Expr::UnaryOp {
-            op: crate::cypher::ast::UnaryOperator::Neg,
-            expr: inner,
+        PExpr::Unary {
+            op: UnOp::Neg,
+            operand: inner,
         } => match inner.as_ref() {
-            Expr::Literal(coordinode_core::graph::types::Value::Int(i)) => {
+            PExpr::Literal(coordinode_core::graph::types::Value::Int(i)) => {
                 coordinode_core::graph::types::Value::Int(-i)
             }
-            Expr::Literal(coordinode_core::graph::types::Value::Float(f)) => {
+            PExpr::Literal(coordinode_core::graph::types::Value::Float(f)) => {
                 coordinode_core::graph::types::Value::Float(-f)
             }
             _ => return None,
@@ -1859,19 +1862,20 @@ fn property_cmp_leaf(
 /// pair when `prop_side` is `PropertyAccess(variable, prop)` and
 /// `literal_side` is a `Literal(...)` of a directly-comparable type.
 fn property_eq_leaf(
-    prop_side: &Expr,
-    literal_side: &Expr,
+    prop_side: &crate::plan::expr::Expr,
+    literal_side: &crate::plan::expr::Expr,
     variable: &str,
 ) -> Option<crate::planner::logical::VectorPredicate> {
+    use crate::plan::expr::Expr as PExpr;
     let prop_name = match prop_side {
-        Expr::PropertyAccess { expr, property } => match expr.as_ref() {
-            Expr::Variable(v) if v == variable => property.clone(),
+        PExpr::Property { base, key } => match base.as_ref() {
+            PExpr::Variable(v) if v == variable => key.clone(),
             _ => return None,
         },
         _ => return None,
     };
     let value = match literal_side {
-        Expr::Literal(v) => v.clone(),
+        PExpr::Literal(v) => v.clone(),
         _ => return None,
     };
     Some(crate::planner::logical::VectorPredicate::PropertyEq {
@@ -2849,7 +2853,7 @@ fn build_match_op(mc: &MatchClause) -> Result<LogicalOp, PlanError> {
     // Compound predicate splitting: decomposes AND predicates into
     // VectorFilter → TextFilter → generic Filter pipeline.
     if let Some(ref pred) = mc.where_clause {
-        result = apply_compound_where(pred, result);
+        result = apply_compound_where(pred, result)?;
     }
 
     Ok(result)
@@ -2896,12 +2900,12 @@ fn build_shortest_path(pattern: &Pattern) -> Result<LogicalOp, PlanError> {
     let scan_source = LogicalOp::NodeScan {
         variable: source.clone(),
         labels: src_np.labels.clone(),
-        property_filters: src_np.properties.clone(),
+        property_filters: lower_property_filters(&src_np.properties)?,
     };
     let scan_target = LogicalOp::NodeScan {
         variable: target.clone(),
         labels: tgt_np.labels.clone(),
-        property_filters: tgt_np.properties.clone(),
+        property_filters: lower_property_filters(&tgt_np.properties)?,
     };
     let input = LogicalOp::CartesianProduct {
         left: Box::new(scan_source),
@@ -2944,7 +2948,7 @@ fn build_pattern_scan(pattern: &Pattern) -> Result<LogicalOp, PlanError> {
                     current = Some(LogicalOp::NodeScan {
                         variable: np.variable.clone().unwrap_or_default(),
                         labels: np.labels.clone(),
-                        property_filters: np.properties.clone(),
+                        property_filters: lower_property_filters(&np.properties)?,
                     });
                 }
                 // Subsequent nodes are handled as part of Traverse
@@ -2973,7 +2977,7 @@ fn build_pattern_scan(pattern: &Pattern) -> Result<LogicalOp, PlanError> {
                     length: rp.length,
                     edge_variable: rp.variable.clone(),
                     target_filters: Vec::new(),
-                    edge_filters: rp.properties.clone(),
+                    edge_filters: lower_property_filters(&rp.properties)?,
                     temporal_filter: None,
                     path_variable: None,
                 });
@@ -3026,7 +3030,7 @@ fn build_pattern_chain(
         None => LogicalOp::NodeScan {
             variable: first_node.variable.clone().unwrap_or_default(),
             labels: first_node.labels.clone(),
-            property_filters: first_node.properties.clone(),
+            property_filters: lower_property_filters(&first_node.properties)?,
         },
     };
 
@@ -3066,8 +3070,8 @@ fn build_pattern_chain(
             target_labels: target_node.labels.clone(),
             length: rel.length,
             edge_variable: rel.variable.clone(),
-            target_filters: target_node.properties.clone(),
-            edge_filters: rel.properties.clone(),
+            target_filters: lower_property_filters(&target_node.properties)?,
+            edge_filters: lower_property_filters(&rel.properties)?,
             temporal_filter: None,
             path_variable: None,
         };
@@ -3239,7 +3243,7 @@ fn build_with_op(input: LogicalOp, wc: &WithClause) -> Result<LogicalOp, PlanErr
     if let Some(ref pred) = wc.where_clause {
         result = LogicalOp::Filter {
             input: Box::new(result),
-            predicate: pred.clone(),
+            predicate: super::lower_expr(pred)?,
         };
     }
 
@@ -3461,7 +3465,7 @@ fn try_extract_vector_filter(expr: &Expr, input: LogicalOp) -> Option<LogicalOp>
 ///   → VectorFilter(input, n.e, $q, <0.3)
 ///     → TextFilter(_, n.body, "hello")
 ///       → Filter(_, n.age > 25)
-fn apply_compound_where(predicate: &Expr, input: LogicalOp) -> LogicalOp {
+fn apply_compound_where(predicate: &Expr, input: LogicalOp) -> Result<LogicalOp, PlanError> {
     // Step 1: Flatten AND into conjuncts
     let conjuncts = flatten_and(predicate);
 
@@ -3488,18 +3492,18 @@ fn apply_compound_where(predicate: &Expr, input: LogicalOp) -> LogicalOp {
         // No specialized predicates found — try the original extraction on full predicate
         // (handles cases where the top-level expression IS a vector/text/encrypted call, not AND)
         if let Some(vf) = try_extract_vector_filter(predicate, input.clone()) {
-            return vf;
+            return Ok(vf);
         }
         if let Some(tf) = try_extract_text_filter(predicate, input.clone()) {
-            return tf;
+            return Ok(tf);
         }
         if let Some(ef) = try_extract_encrypted_filter(predicate, input.clone()) {
-            return ef;
+            return Ok(ef);
         }
-        return LogicalOp::Filter {
+        return Ok(LogicalOp::Filter {
             input: Box::new(input),
-            predicate: predicate.clone(),
-        };
+            predicate: super::lower_expr(predicate)?,
+        });
     }
 
     // Step 3: Build pipeline — vector filters first (most selective typically)
@@ -3529,11 +3533,11 @@ fn apply_compound_where(predicate: &Expr, input: LogicalOp) -> LogicalOp {
         let combined = conjoin_predicates(remaining_conjuncts);
         result = LogicalOp::Filter {
             input: Box::new(result),
-            predicate: combined,
+            predicate: super::lower_expr(&combined)?,
         };
     }
 
-    result
+    Ok(result)
 }
 
 /// Collect variables introduced by a list of MATCH patterns.
@@ -4460,7 +4464,7 @@ fn rewrite_rrf_score(op: LogicalOp) -> Result<LogicalOp, PlanError> {
 fn validate_rrf_placement(op: &LogicalOp) -> Result<(), PlanError> {
     match op {
         LogicalOp::Filter { input, predicate } => {
-            if expr_contains_rrf_score(predicate) {
+            if neutral_expr_contains_call(predicate, &|n| FusionScalar::from_name(n).is_some()) {
                 return Err(PlanError::RrfScoreIllegalPosition {
                     location: "WHERE clause".to_string(),
                 });
@@ -4962,7 +4966,7 @@ fn rewrite_doc_in_expr(expr: &mut Expr) {
 fn validate_doc_placement(op: &LogicalOp) -> Result<(), PlanError> {
     match op {
         LogicalOp::Filter { input, predicate } => {
-            if expr_contains_doc_score(predicate) {
+            if neutral_expr_contains_call(predicate, &|n| n == "doc_score") {
                 return Err(PlanError::DocScoreIllegalPosition {
                     location: "WHERE clause".to_string(),
                 });
@@ -5242,27 +5246,28 @@ pub(crate) fn lift_temporal_filter(op: LogicalOp) -> LogicalOp {
 /// Parameter expressions are NOT lifted here — the planner runs before
 /// parameter substitution. A second pass (`lift_temporal_filter`) is invoked
 /// AFTER substitution in `execute()` to catch the bound-parameter case.
-fn extract_temporal_slice(predicate: &Expr) -> Option<(String, i64, i64)> {
-    let Expr::FunctionCall { name, args, .. } = predicate else {
+fn extract_temporal_slice(predicate: &crate::plan::expr::Expr) -> Option<(String, i64, i64)> {
+    use crate::plan::expr::Expr as PExpr;
+    let PExpr::Call { name, args, .. } = predicate else {
         return None;
     };
-    let literal_ts = |e: &Expr| -> Option<i64> {
+    let literal_ts = |e: &PExpr| -> Option<i64> {
         match e {
-            Expr::Literal(Value::Int(n)) => Some(*n),
-            Expr::Literal(Value::Timestamp(n)) => Some(*n),
+            PExpr::Literal(Value::Int(n)) => Some(*n),
+            PExpr::Literal(Value::Timestamp(n)) => Some(*n),
             _ => None,
         }
     };
     match name.as_str() {
         "temporal_active_at" if args.len() == 2 => {
-            let Expr::Variable(var) = &args[0] else {
+            let PExpr::Variable(var) = &args[0] else {
                 return None;
             };
             let t = literal_ts(&args[1])?;
             Some((var.clone(), t, t))
         }
         "temporal_overlaps" if args.len() == 3 => {
-            let Expr::Variable(var) = &args[0] else {
+            let PExpr::Variable(var) = &args[0] else {
                 return None;
             };
             let t0 = literal_ts(&args[1])?;

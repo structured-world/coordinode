@@ -9,6 +9,12 @@ use coordinode_core::graph::edge::{
 use coordinode_core::graph::node::NodeRecord;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 
+/// Lower a cypher test expression into the neutral IR carried by `Filter`,
+/// `NodeScan`, `Traverse`, and `IndexScan` operator fields.
+fn nx(e: crate::cypher::ast::Expr) -> crate::plan::expr::Expr {
+    crate::planner::lower_expr(&e).expect("lower test expression")
+}
+
 /// Create a test engine in a temp directory.
 fn test_engine(dir: &std::path::Path) -> StorageEngine {
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -391,7 +397,7 @@ fn node_scan_with_property_filter() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String("Alice".into())),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
             items: vec![crate::planner::logical::ProjectItem {
@@ -430,7 +436,7 @@ fn traverse_outgoing() {
                     labels: vec!["User".into()],
                     property_filters: vec![(
                         "name".into(),
-                        Expr::Literal(Value::String("Alice".into())),
+                        nx(Expr::Literal(Value::String("Alice".into()))),
                     )],
                 }),
                 source: "a".into(),
@@ -484,14 +490,14 @@ fn filter_by_age() {
                     labels: vec!["User".into()],
                     property_filters: vec![],
                 }),
-                predicate: Expr::BinaryOp {
+                predicate: nx(Expr::BinaryOp {
                     left: Box::new(Expr::PropertyAccess {
                         expr: Box::new(Expr::Variable("n".into())),
                         property: "age".into(),
                     }),
                     op: BinaryOperator::Gt,
                     right: Box::new(Expr::Literal(Value::Int(28))),
-                },
+                }),
             }),
             items: vec![crate::planner::logical::ProjectItem {
                 expr: Expr::PropertyAccess {
@@ -1074,7 +1080,7 @@ fn set_property_updates_storage() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String("Alice".into())),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
             items: vec![crate::cypher::ast::SetItem::Property {
@@ -1116,7 +1122,7 @@ fn delete_removes_from_storage() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String("Alice".into())),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
             variables: vec!["n".into()],
@@ -1147,7 +1153,7 @@ fn remove_property_from_node() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String("Alice".into())),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
             items: vec![crate::cypher::ast::RemoveItem::Property {
@@ -1228,7 +1234,7 @@ fn merge_creates_when_not_found() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "email".into(),
-                    Expr::Literal(Value::String("alice@test.com".into())),
+                    nx(Expr::Literal(Value::String("alice@test.com".into()))),
                 )],
             }),
             on_match: vec![],
@@ -1264,7 +1270,7 @@ fn merge_updates_when_found() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String("Alice".into())),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
             on_match: vec![crate::cypher::ast::SetItem::Property {
@@ -1304,7 +1310,7 @@ fn merge_no_duplicate_on_existing() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String("Alice".into())),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
             on_match: vec![],
@@ -1339,7 +1345,7 @@ fn upsert_creates_when_not_found() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "email".into(),
-                    Expr::Literal(Value::String("bob@test.com".into())),
+                    nx(Expr::Literal(Value::String("bob@test.com".into()))),
                 )],
             }),
             on_match: vec![],
@@ -1384,7 +1390,7 @@ fn upsert_updates_when_found() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String("Alice".into())),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
             on_match: vec![crate::cypher::ast::SetItem::Property {
@@ -1439,7 +1445,7 @@ fn upsert_cas_conflict_on_external_modification() {
                     labels: vec!["User".into()],
                     property_filters: vec![(
                         "name".into(),
-                        Expr::Literal(Value::String("Alice".into())),
+                        nx(Expr::Literal(Value::String("Alice".into()))),
                     )],
                 }),
                 on_match: vec![crate::cypher::ast::SetItem::Property {
@@ -1480,7 +1486,7 @@ fn upsert_cas_conflict_on_external_modification() {
                     labels: vec!["User".into()],
                     property_filters: vec![(
                         "name".into(),
-                        Expr::Literal(Value::String("Alice".into())),
+                        nx(Expr::Literal(Value::String("Alice".into()))),
                     )],
                 }),
                 on_match: vec![crate::cypher::ast::SetItem::Property {
@@ -1557,7 +1563,7 @@ fn adaptive_parallel_on_super_node() {
                     labels: vec!["User".into()],
                     property_filters: vec![(
                         "name".into(),
-                        Expr::Literal(Value::String("Hub".into())),
+                        nx(Expr::Literal(Value::String("Hub".into()))),
                     )],
                 }),
                 source: "a".into(),
@@ -1629,7 +1635,10 @@ fn adaptive_disabled_no_cap() {
             input: Box::new(LogicalOp::NodeScan {
                 variable: "a".into(),
                 labels: vec!["User".into()],
-                property_filters: vec![("name".into(), Expr::Literal(Value::String("Hub".into())))],
+                property_filters: vec![(
+                    "name".into(),
+                    nx(Expr::Literal(Value::String("Hub".into()))),
+                )],
             }),
             source: "a".into(),
             edge_types: vec!["FOLLOWS".into()],
@@ -1668,7 +1677,7 @@ fn adaptive_normal_fan_out_no_warning() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String("Alice".into())),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
             source: "a".into(),
@@ -1764,7 +1773,10 @@ fn adaptive_parallel_correctness_matches_sequential() {
             input: Box::new(LogicalOp::NodeScan {
                 variable: "a".into(),
                 labels: vec!["User".into()],
-                property_filters: vec![("name".into(), Expr::Literal(Value::String("Hub".into())))],
+                property_filters: vec![(
+                    "name".into(),
+                    nx(Expr::Literal(Value::String("Hub".into()))),
+                )],
             }),
             source: "a".into(),
             edge_types: vec!["FOLLOWS".into()],
@@ -2006,7 +2018,7 @@ fn varlen_traverse_exact_2_hops() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String("Alice".into())),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
             source: "a".into(),
@@ -2056,7 +2068,10 @@ fn varlen_count_distinct_dedups_multipath_targets() {
         input: Box::new(LogicalOp::NodeScan {
             variable: "a".into(),
             labels: vec!["User".into()],
-            property_filters: vec![("name".into(), Expr::Literal(Value::String("Alice".into())))],
+            property_filters: vec![(
+                "name".into(),
+                nx(Expr::Literal(Value::String("Alice".into()))),
+            )],
         }),
         source: "a".into(),
         edge_types: vec!["KNOWS".into()],
@@ -2128,7 +2143,7 @@ fn varlen_plain_return_keeps_path_multiplicity() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String("Alice".into())),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
             source: "a".into(),
@@ -2184,7 +2199,7 @@ fn varlen_traverse_range_1_to_3() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String("Alice".into())),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
             source: "a".into(),
@@ -2267,7 +2282,10 @@ fn varlen_traverse_cycle_detection() {
             input: Box::new(LogicalOp::NodeScan {
                 variable: "a".into(),
                 labels: vec!["User".into()],
-                property_filters: vec![("name".into(), Expr::Literal(Value::String("A".into())))],
+                property_filters: vec![(
+                    "name".into(),
+                    nx(Expr::Literal(Value::String("A".into()))),
+                )],
             }),
             source: "a".into(),
             edge_types: vec!["KNOWS".into()],
@@ -2311,7 +2329,7 @@ fn varlen_traverse_min_greater_than_max_yields_empty() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String("Alice".into())),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
             source: "a".into(),
@@ -2428,7 +2446,7 @@ fn optional_match_with_results() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String("Alice".into())),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
             right: Box::new(LogicalOp::NodeScan {
@@ -2463,7 +2481,7 @@ fn optional_match_no_results_nulls() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String("Alice".into())),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
             right: Box::new(LogicalOp::NodeScan {
@@ -2993,7 +3011,7 @@ fn detach_delete_cleans_reverse_posting_lists() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String("Alice".into())),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
             variables: vec!["n".into()],
@@ -3105,7 +3123,7 @@ fn detach_delete_cleans_incoming_edge_counterparts() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String("Alice".into())),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
             variables: vec!["n".into()],
@@ -3250,7 +3268,7 @@ fn detach_delete_multi_edge_type_targeted_lookup() {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String("Alice".into())),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
             variables: vec!["n".into()],
@@ -3317,14 +3335,14 @@ fn needs_correlated_non_correlated() {
             temporal_filter: None,
             path_variable: None,
         }),
-        predicate: Expr::BinaryOp {
+        predicate: nx(Expr::BinaryOp {
             left: Box::new(Expr::PropertyAccess {
                 expr: Box::new(Expr::Variable("b".into())),
                 property: "age".into(),
             }),
             op: BinaryOperator::Gt,
             right: Box::new(Expr::Literal(Value::Int(30))),
-        },
+        }),
     };
     assert!(
         !super::needs_correlated_execution(&right),
@@ -3343,7 +3361,7 @@ fn needs_correlated_yes_cross_scope() {
             labels: vec!["Person".into()],
             property_filters: vec![],
         }),
-        predicate: Expr::BinaryOp {
+        predicate: nx(Expr::BinaryOp {
             left: Box::new(Expr::PropertyAccess {
                 expr: Box::new(Expr::Variable("b".into())),
                 property: "age".into(),
@@ -3353,7 +3371,7 @@ fn needs_correlated_yes_cross_scope() {
                 expr: Box::new(Expr::Variable("a".into())),
                 property: "age".into(),
             }),
-        },
+        }),
     };
     assert!(
         super::needs_correlated_execution(&right),
@@ -3397,7 +3415,7 @@ fn collect_expr_vars_covers_in_and_is_null() {
         list: Box::new(Expr::List(vec![Expr::Variable("y".into())])),
     };
     let mut vars = Vec::new();
-    super::collect_expr_vars(&expr, &mut vars);
+    super::collect_expr_vars(&nx(expr), &mut vars);
     assert!(vars.contains(&"x".to_string()));
     assert!(vars.contains(&"y".to_string()));
 
@@ -3406,7 +3424,7 @@ fn collect_expr_vars_covers_in_and_is_null() {
         negated: false,
     };
     let mut vars2 = Vec::new();
-    super::collect_expr_vars(&expr2, &mut vars2);
+    super::collect_expr_vars(&nx(expr2), &mut vars2);
     assert!(vars2.contains(&"z".to_string()));
 }
 
@@ -3418,7 +3436,7 @@ fn collect_expr_vars_covers_string_match() {
         pattern: Box::new(Expr::Variable("b".into())),
     };
     let mut vars = Vec::new();
-    super::collect_expr_vars(&expr, &mut vars);
+    super::collect_expr_vars(&nx(expr), &mut vars);
     assert!(vars.contains(&"a".to_string()));
     assert!(vars.contains(&"b".to_string()));
 }
@@ -3488,7 +3506,10 @@ fn g067_parallel_traversal_populates_occ_read_set() {
             input: Box::new(LogicalOp::NodeScan {
                 variable: "a".into(),
                 labels: vec!["User".into()],
-                property_filters: vec![("name".into(), Expr::Literal(Value::String("Hub".into())))],
+                property_filters: vec![(
+                    "name".into(),
+                    nx(Expr::Literal(Value::String("Hub".into()))),
+                )],
             }),
             source: "a".into(),
             edge_types: vec!["FOLLOWS".into()],
@@ -5114,7 +5135,10 @@ fn g067_parallel_occ_detects_conflict_on_target_node() {
             input: Box::new(LogicalOp::NodeScan {
                 variable: "a".into(),
                 labels: vec!["User".into()],
-                property_filters: vec![("name".into(), Expr::Literal(Value::String("Hub".into())))],
+                property_filters: vec![(
+                    "name".into(),
+                    nx(Expr::Literal(Value::String("Hub".into()))),
+                )],
             }),
             source: "a".into(),
             edge_types: vec!["FOLLOWS".into()],
@@ -5239,7 +5263,7 @@ fn detach_delete_adj_purge_is_buffered_not_immediate() {
                 labels: vec!["Person".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String("Alice".into())),
+                    nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
             variables: vec!["n".into()],
@@ -5520,7 +5544,7 @@ fn explain_shows_index_scan_after_create_index() {
     };
     let filter_plan = LogicalOp::Filter {
         input: Box::new(node_scan),
-        predicate: Expr::BinaryOp {
+        predicate: nx(Expr::BinaryOp {
             left: Box::new(Expr::PropertyAccess {
                 expr: Box::new(Expr::Variable("n".to_string())),
                 property: "name".to_string(),
@@ -5529,7 +5553,7 @@ fn explain_shows_index_scan_after_create_index() {
             right: Box::new(Expr::Literal(coordinode_core::graph::types::Value::String(
                 "Alice".into(),
             ))),
-        },
+        }),
     };
 
     // Verify baseline EXPLAIN contains NodeScan (optimizer not applied yet).
@@ -5601,7 +5625,7 @@ fn lifted_correlated_equality_uses_index_scan() {
         labels: vec!["Person".to_string()],
         property_filters: vec![],
     };
-    let predicate = Expr::BinaryOp {
+    let predicate = nx(Expr::BinaryOp {
         left: Box::new(Expr::PropertyAccess {
             expr: Box::new(Expr::Variable("b".to_string())),
             property: "pid".to_string(),
@@ -5611,7 +5635,7 @@ fn lifted_correlated_equality_uses_index_scan() {
             expr: Box::new(Expr::Variable("e".to_string())),
             property: "d".to_string(),
         }),
-    };
+    });
     let plan = LogicalOp::Filter {
         input: Box::new(LogicalOp::CartesianProduct {
             left: Box::new(left),
@@ -5664,7 +5688,9 @@ fn index_scan_returns_correct_node() {
             label: "User".to_string(),
             index_name: "user_name_idx".to_string(),
             property: "name".to_string(),
-            value_expr: Expr::Literal(coordinode_core::graph::types::Value::String("Bob".into())),
+            value_expr: nx(Expr::Literal(coordinode_core::graph::types::Value::String(
+                "Bob".into(),
+            ))),
         },
         &mut ctx,
     )
@@ -5705,10 +5731,10 @@ fn correlated_property_filter_rewrites_to_index_scan() {
         labels: vec!["Person".to_string()],
         property_filters: vec![(
             "pid".to_string(),
-            Expr::PropertyAccess {
+            nx(Expr::PropertyAccess {
                 expr: Box::new(Expr::Variable("e".to_string())),
                 property: "s".to_string(),
-            },
+            }),
         )],
     };
     let left = LogicalOp::NodeScan {
@@ -5752,10 +5778,10 @@ fn self_referential_filter_stays_node_scan() {
         labels: vec!["Person".to_string()],
         property_filters: vec![(
             "pid".to_string(),
-            Expr::PropertyAccess {
+            nx(Expr::PropertyAccess {
                 expr: Box::new(Expr::Variable("a".to_string())),
                 property: "other".to_string(),
-            },
+            }),
         )],
     };
 
@@ -5814,10 +5840,10 @@ fn index_scan_resolves_correlated_key() {
             label: "User".to_string(),
             index_name: "user_name_idx".to_string(),
             property: "name".to_string(),
-            value_expr: Expr::PropertyAccess {
+            value_expr: nx(Expr::PropertyAccess {
                 expr: Box::new(Expr::Variable("e".to_string())),
                 property: "s".to_string(),
-            },
+            }),
         },
         &mut ctx,
     )

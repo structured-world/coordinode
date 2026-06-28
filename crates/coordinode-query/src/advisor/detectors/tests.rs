@@ -13,7 +13,7 @@ fn node_scan(var: &str, label: &str) -> LogicalOp {
 fn filter(input: LogicalOp, predicate: Expr) -> LogicalOp {
     LogicalOp::Filter {
         input: Box::new(input),
-        predicate,
+        predicate: crate::planner::lower_expr(&predicate).expect("lower test predicate"),
     }
 }
 

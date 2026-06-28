@@ -19,6 +19,11 @@ use coordinode_query::planner::logical::{LogicalOp, LogicalPlan};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 
+/// Lower a cypher test expression into the neutral IR carried by operator fields.
+fn nx(e: Expr) -> coordinode_query::plan::expr::Expr {
+    coordinode_query::planner::lower_expr(&e).expect("lower test expression")
+}
+
 /// Helper: create an UPSERT plan that matches User by name and sets age.
 fn upsert_plan(name: &str, age: i64) -> LogicalPlan {
     LogicalPlan {
@@ -31,7 +36,7 @@ fn upsert_plan(name: &str, age: i64) -> LogicalPlan {
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String(name.to_string())),
+                    nx(Expr::Literal(Value::String(name.to_string()))),
                 )],
             }),
             on_match: vec![SetItem::Property {
@@ -82,7 +87,7 @@ fn read_user_age(
                 labels: vec!["User".into()],
                 property_filters: vec![(
                     "name".into(),
-                    Expr::Literal(Value::String(target_name.into())),
+                    nx(Expr::Literal(Value::String(target_name.into()))),
                 )],
             }),
             items: vec![coordinode_query::planner::logical::ProjectItem {

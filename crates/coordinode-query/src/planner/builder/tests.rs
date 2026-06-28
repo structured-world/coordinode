@@ -1,6 +1,11 @@
 use super::*;
 use crate::cypher::parser::parse;
 
+/// Lower a cypher test expression into the neutral IR carried by operator fields.
+fn nx(e: crate::cypher::ast::Expr) -> crate::plan::expr::Expr {
+    crate::planner::lower_expr(&e).expect("lower test expression")
+}
+
 fn plan(input: &str) -> LogicalPlan {
     let query = parse(input).unwrap_or_else(|e| panic!("parse failed: {e}"));
     build_logical_plan(&query).unwrap_or_else(|e| panic!("plan failed: {e}"))
@@ -1698,7 +1703,7 @@ fn collect_simple_predicates_extracts_property_eq() {
     };
     let filter = LogicalOp::Filter {
         input: Box::new(scan),
-        predicate: pred,
+        predicate: nx(pred),
     };
 
     let mut leaves: Vec<VectorPredicate> = Vec::new();
@@ -1734,7 +1739,7 @@ fn collect_simple_predicates_handles_reversed_eq() {
     };
     let filter = LogicalOp::Filter {
         input: Box::new(scan),
-        predicate: pred,
+        predicate: nx(pred),
     };
 
     let mut leaves: Vec<VectorPredicate> = Vec::new();
@@ -1778,7 +1783,7 @@ fn collect_simple_predicates_unwraps_conjunctions() {
     };
     let filter = LogicalOp::Filter {
         input: Box::new(scan),
-        predicate: pred,
+        predicate: nx(pred),
     };
 
     let mut leaves: Vec<VectorPredicate> = Vec::new();
@@ -1810,7 +1815,7 @@ fn collect_simple_predicates_ignores_other_variable() {
     };
     let filter = LogicalOp::Filter {
         input: Box::new(scan),
-        predicate: pred,
+        predicate: nx(pred),
     };
 
     let mut leaves: Vec<VectorPredicate> = Vec::new();

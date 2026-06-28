@@ -1,6 +1,11 @@
 use super::*;
 use coordinode_core::graph::types::Value;
 
+/// Lower a cypher test expression into the neutral IR carried by operator fields.
+fn nx(e: crate::cypher::ast::Expr) -> crate::plan::expr::Expr {
+    crate::planner::lower_expr(&e).expect("lower test expression")
+}
+
 #[test]
 fn collect_simple_predicates_extracts_numeric_ge() {
     use crate::cypher::ast::BinaryOperator;
@@ -21,7 +26,7 @@ fn collect_simple_predicates_extracts_numeric_ge() {
     };
     let filter = LogicalOp::Filter {
         input: Box::new(scan),
-        predicate: pred,
+        predicate: nx(pred),
     };
     let mut leaves: Vec<VectorPredicate> = Vec::new();
     collect_simple_property_predicates(&filter, "n", &mut leaves);
@@ -61,7 +66,7 @@ fn collect_simple_predicates_flips_reversed_numeric_cmp() {
     };
     let filter = LogicalOp::Filter {
         input: Box::new(scan),
-        predicate: pred,
+        predicate: nx(pred),
     };
     let mut leaves: Vec<VectorPredicate> = Vec::new();
     collect_simple_property_predicates(&filter, "n", &mut leaves);
@@ -95,7 +100,7 @@ fn collect_simple_predicates_accepts_negative_literal() {
     };
     let filter = LogicalOp::Filter {
         input: Box::new(scan),
-        predicate: pred,
+        predicate: nx(pred),
     };
     let mut leaves: Vec<VectorPredicate> = Vec::new();
     collect_simple_property_predicates(&filter, "n", &mut leaves);

@@ -418,76 +418,73 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
 
 /// Extract property names accessed on a specific variable from an expression.
 /// E.g., for variable "n", `n.email = 'foo'` → ["email"].
-fn extract_property_accesses(expr: &crate::cypher::ast::Expr, variable: &str) -> Vec<String> {
+fn extract_property_accesses(expr: &crate::plan::expr::Expr, variable: &str) -> Vec<String> {
     let mut props = Vec::new();
     collect_property_accesses(expr, variable, &mut props);
     props
 }
 
 fn collect_property_accesses(
-    expr: &crate::cypher::ast::Expr,
+    expr: &crate::plan::expr::Expr,
     variable: &str,
     props: &mut Vec<String>,
 ) {
-    use crate::cypher::ast::Expr;
+    use crate::plan::expr::Expr as PExpr;
     match expr {
-        Expr::PropertyAccess {
-            expr: inner,
-            property,
-        } => {
+        PExpr::Property { base, key } => {
             // Check if the inner expression is the variable we're looking for
-            if let Expr::Variable(var) = inner.as_ref() {
-                if var == variable && !props.contains(property) {
-                    props.push(property.clone());
+            if let PExpr::Variable(var) = base.as_ref() {
+                if var == variable && !props.contains(key) {
+                    props.push(key.clone());
                 }
             }
-            collect_property_accesses(inner, variable, props);
+            collect_property_accesses(base, variable, props);
         }
-        Expr::BinaryOp { left, right, .. } => {
+        PExpr::Binary { left, right, .. } => {
             collect_property_accesses(left, variable, props);
             collect_property_accesses(right, variable, props);
         }
-        Expr::UnaryOp { expr, .. } => {
-            collect_property_accesses(expr, variable, props);
+        PExpr::Unary { operand, .. } => {
+            collect_property_accesses(operand, variable, props);
         }
-        Expr::FunctionCall { args, .. } => {
+        PExpr::Call { args, .. } => {
             for arg in args {
                 collect_property_accesses(arg, variable, props);
             }
         }
-        Expr::In { expr, list } => {
-            collect_property_accesses(expr, variable, props);
+        PExpr::In { item, list } => {
+            collect_property_accesses(item, variable, props);
             collect_property_accesses(list, variable, props);
         }
-        Expr::IsNull { expr, .. } => {
-            collect_property_accesses(expr, variable, props);
+        PExpr::IsNull { operand, .. } => {
+            collect_property_accesses(operand, variable, props);
         }
-        Expr::StringMatch { expr, pattern, .. } => {
-            collect_property_accesses(expr, variable, props);
+        PExpr::StringMatch { value, pattern, .. } => {
+            collect_property_accesses(value, variable, props);
             collect_property_accesses(pattern, variable, props);
         }
-        Expr::Case {
+        PExpr::Case {
             operand,
-            when_clauses,
-            else_clause,
+            branches,
+            otherwise,
         } => {
             if let Some(op) = operand {
                 collect_property_accesses(op, variable, props);
             }
-            for (cond, result) in when_clauses {
+            for (cond, result) in branches {
                 collect_property_accesses(cond, variable, props);
                 collect_property_accesses(result, variable, props);
             }
-            if let Some(el) = else_clause {
+            if let Some(el) = otherwise {
                 collect_property_accesses(el, variable, props);
             }
         }
-        Expr::List(items) => {
+        PExpr::List(items) => {
             for item in items {
                 collect_property_accesses(item, variable, props);
             }
         }
-        // Literals, variables, parameters, MapLiteral, Star — no property access to extract
+        // Literals, variables, parameters, Map, Star: no property access to extract
         _ => {}
     }
 }
