@@ -504,7 +504,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             let input = current.unwrap_or(LogicalOp::Empty);
             Ok(LogicalOp::Unwind {
                 input: Box::new(input),
-                expr: uc.expr.clone(),
+                expr: super::lower_expr(&uc.expr)?,
                 variable: uc.variable.clone(),
             })
         }

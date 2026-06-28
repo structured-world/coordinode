@@ -6259,11 +6259,15 @@ fn execute_encrypted_filter(
 /// For each input row, evaluate `expr`. If it yields a list, create one output
 /// row per element with the element bound to `variable`. Non-list values are
 /// treated as single-element lists. NULL expands to zero rows.
-fn execute_unwind(rows: &[Row], expr: &Expr, variable: &str) -> Result<Vec<Row>, ExecutionError> {
+fn execute_unwind(
+    rows: &[Row],
+    expr: &crate::plan::expr::Expr,
+    variable: &str,
+) -> Result<Vec<Row>, ExecutionError> {
     let mut results = Vec::new();
 
     for row in rows {
-        let val = eval_expr(expr, row);
+        let val = eval_neutral(expr, row);
         match val {
             Value::Array(items) => {
                 for item in items {

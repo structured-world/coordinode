@@ -2350,10 +2350,10 @@ fn unwind_list_expansion() {
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
         root: LogicalOp::Unwind {
             input: Box::new(LogicalOp::Empty),
-            expr: Expr::List(vec![
-                Expr::Literal(Value::Int(1)),
-                Expr::Literal(Value::Int(2)),
-                Expr::Literal(Value::Int(3)),
+            expr: crate::plan::expr::Expr::List(vec![
+                crate::plan::expr::Expr::Literal(Value::Int(1)),
+                crate::plan::expr::Expr::Literal(Value::Int(2)),
+                crate::plan::expr::Expr::Literal(Value::Int(3)),
             ]),
             variable: "x".into(),
         },
@@ -2378,7 +2378,7 @@ fn unwind_null_produces_empty() {
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
         root: LogicalOp::Unwind {
             input: Box::new(LogicalOp::Empty),
-            expr: Expr::Literal(Value::Null),
+            expr: crate::plan::expr::Expr::Literal(Value::Null),
             variable: "x".into(),
         },
     };
@@ -2399,7 +2399,7 @@ fn unwind_scalar_single_row() {
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
         root: LogicalOp::Unwind {
             input: Box::new(LogicalOp::Empty),
-            expr: Expr::Literal(Value::Int(42)),
+            expr: crate::plan::expr::Expr::Literal(Value::Int(42)),
             variable: "x".into(),
         },
     };

@@ -547,7 +547,7 @@ pub enum LogicalOp {
     Unwind {
         input: Box<LogicalOp>,
         /// Expression that evaluates to a list.
-        expr: Expr,
+        expr: crate::plan::expr::Expr,
         /// Variable name for each element.
         variable: String,
     },
