@@ -637,7 +637,7 @@ fn collect_property_path(expr: &Expr, outer_property: &str) -> Option<(String, V
     }
 }
 
-fn rmpv_to_value(v: &rmpv::Value) -> Value {
+pub(crate) fn rmpv_to_value(v: &rmpv::Value) -> Value {
     match v {
         rmpv::Value::Nil => Value::Null,
         rmpv::Value::Boolean(b) => Value::Bool(*b),
@@ -757,7 +757,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], row: &Row) -> Value {
 /// variable reference (entity-introspection functions like `type` / `labels` /
 /// `startNode` / `properties` resolve it against the row). Dialect-neutral, so
 /// the cypher and neutral expression evaluators share this dispatch.
-fn dispatch_scalar_function(
+pub(crate) fn dispatch_scalar_function(
     name: &str,
     evaluated: Vec<Value>,
     first_arg_var: Option<&str>,

@@ -4,6 +4,7 @@
 //! NodeScan → Traverse → Filter → Project → Aggregate → Sort → Limit/Skip.
 
 pub mod eval;
+pub mod eval_neutral;
 pub mod row;
 pub mod runner;
 pub mod vector_predicate;
