@@ -5,6 +5,7 @@
 //! EXPLAIN output is also generated from the logical plan.
 
 pub mod builder;
+pub mod expr_lower;
 pub mod logical;
 pub mod push_down;
 
@@ -12,6 +13,7 @@ pub use builder::{
     annotate_vector_top_k, apply_hnsw_scan_access_path, build_logical_plan,
     optimize_index_selection, optimize_push_down, vector_index_definition_from_clause, PlanError,
 };
+pub use expr_lower::lower_expr;
 pub use logical::{
     estimate_cost, estimate_cost_with_stats, AggregateItem, CostEstimate, LogicalOp, LogicalPlan,
     ProjectItem,
