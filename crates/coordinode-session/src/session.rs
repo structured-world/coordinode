@@ -404,6 +404,10 @@ async fn run_ordered(
     mut rx: mpsc::Receiver<TxnMsg>,
     out: &mpsc::Sender<OutEvent>,
 ) -> bool {
+    // The ORDERED nonce contract is 1-based and contiguous: a client numbers its
+    // chain 1, 2, 3, ... and sends `last_nonce` on commit. A statement at nonce 0
+    // (the UNORDERED default) therefore never becomes applicable here and the
+    // commit drains it as a gap; callers wanting arrival order use UNORDERED.
     let mut next_nonce = 1u64;
     let mut buffer: BTreeMap<u64, (u64, String, HashMap<String, Value>)> = BTreeMap::new();
     let mut aborted = false;

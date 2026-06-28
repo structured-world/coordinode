@@ -365,6 +365,58 @@ async fn ordered_applies_statements_in_nonce_order_not_arrival_order() {
 }
 
 #[tokio::test]
+async fn ordered_failed_statement_aborts_and_rejects_later_nonces() {
+    // ORDERED first-failure: nonce 2 fails, so nonce 3 and the commit are
+    // rejected. Statements arrive in nonce order here; the failure aborts the
+    // transaction once the contiguous run reaches it.
+    let engine: Arc<dyn CursorEngine> = Arc::new(MockEngine {
+        columns: vec!["n".to_string()],
+        rows: vec![vec![Value::Int(1)]],
+        fail: None,
+        fail_query: Some("FAIL".to_string()),
+        next_txn: AtomicU64::new(0),
+    });
+    let stmt = |nonce, q: &str| SessionOp::Execute {
+        query: q.to_string(),
+        params: HashMap::new(),
+        txid: 1,
+        nonce,
+    };
+    let by_id = run_session(
+        engine,
+        vec![
+            SessionOp::Begin {
+                ordering: Ordering::Ordered,
+                drain_timeout_ms: 0,
+            },
+            stmt(1, "ok"),    // req2, nonce 1: applies
+            stmt(2, "FAIL"),  // req3, nonce 2: fails, aborts
+            stmt(3, "after"), // req4, nonce 3: rejected
+            SessionOp::Commit {
+                txid: 1,
+                last_nonce: 3,
+            },
+        ],
+    )
+    .await;
+
+    assert!(matches!(
+        by_id[&2].last(),
+        Some(SessionEvent::CursorEnd { .. })
+    ));
+    assert!(matches!(by_id[&3].as_slice(), [SessionEvent::Error { .. }]));
+    for rid in [4u64, 5] {
+        match by_id[&rid].as_slice() {
+            [SessionEvent::Error { message, .. }] => assert!(
+                message.contains("aborted"),
+                "req {rid} expected aborted error, got {message:?}"
+            ),
+            other => panic!("req {rid} expected aborted Error, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn ordered_commit_drain_times_out_on_a_missing_nonce() {
     // A gap that never fills: nonce 2 arrives, nonce 1 does not, and the commit
     // expects last_nonce 2. The commit must error once the (short) drain timeout
