@@ -69,6 +69,72 @@ pub enum MergeNodesConflictStrategy {
     SetExpressions(Vec<SetItem>),
 }
 
+/// Schema-violation handling policy for `SET` mutations, in the neutral IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViolationMode {
+    /// Fail the entire query on the first violation (strict, the default).
+    #[default]
+    Fail,
+    /// Skip rows that would violate schema constraints; continue with others.
+    Skip,
+}
+
+/// Direction of the edge created by DETACH DOCUMENT relative to the source
+/// node, in the neutral IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeFromSource {
+    /// `(source)-[:TYPE]->(target)` — source is the edge's source.
+    Outgoing,
+    /// `(source)<-[:TYPE]-(target)` — source is the edge's target.
+    Incoming,
+}
+
+/// Direction filter for REDIRECT EDGES, in the neutral IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RedirectDirection {
+    /// Both outgoing and incoming edges (the default).
+    #[default]
+    Both,
+    /// Only outgoing edges `a -> x`.
+    Outgoing,
+    /// Only incoming edges `x -> a`.
+    Incoming,
+}
+
+/// Duplicate-edge resolution strategy for `MERGE NODES TRANSFER EDGES`, in the
+/// neutral IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MergeNodesDuplicateStrategy {
+    /// Both edges preserved as parallel edges (the default).
+    #[default]
+    KeepBoth,
+    /// Single edge, facets merged via COALESCE; source edge removed.
+    MergeProperties,
+    /// Keep the target edge as-is, discard the non-surviving edge.
+    KeepTarget,
+}
+
+/// Endpoints for a MERGE NODES edge transfer, in the neutral IR.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransferEdgesEndpoints {
+    /// Non-surviving source — edges are read from this node.
+    pub src: String,
+    /// Surviving destination — must equal the merge target.
+    pub dst: String,
+}
+
+/// `TRANSFER EDGES ON <node> TO <target> WHERE <predicate>` clause, in the
+/// neutral IR.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransferEdgesSpec {
+    /// The node whose edges are being re-pointed.
+    pub node_variable: String,
+    /// The node that receives the re-pointed edges.
+    pub target_variable: String,
+    /// Predicate selecting which edges to transfer. The edge variable is `r`.
+    pub predicate: Expr,
+}
+
 /// A single removal in a `REMOVE` clause, in the neutral IR. Carries no
 /// expression (targets are addressed structurally), so it mirrors the cypher
 /// shape exactly.

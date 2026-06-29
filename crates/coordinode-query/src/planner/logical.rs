@@ -285,7 +285,7 @@ pub enum LogicalOp {
         input: Box<LogicalOp>,
         items: Vec<crate::plan::SetItem>,
         /// How to handle schema violations: fail the query or skip the node.
-        violation_mode: crate::cypher::ast::ViolationMode,
+        violation_mode: crate::plan::ViolationMode,
     },
 
     /// Remove properties/labels.
@@ -318,9 +318,9 @@ pub enum LogicalOp {
         source_variable: String,
         target_variable: String,
         edge_type: String,
-        edge_direction: crate::cypher::ast::EdgeFromSource,
+        edge_direction: crate::plan::EdgeFromSource,
         target_property_path: Vec<String>,
-        transfer: Option<crate::cypher::ast::TransferEdgesSpec>,
+        transfer: Option<crate::plan::TransferEdgesSpec>,
         on_conflict_replace: bool,
         on_remaining_fail: bool,
     },
@@ -342,11 +342,11 @@ pub enum LogicalOp {
         /// derived at build time via `HAS_<UPPER_SNAKE(last_path_segment)>`).
         edge_type: String,
         /// Direction of the edge relative to the source node.
-        edge_direction: crate::cypher::ast::EdgeFromSource,
+        edge_direction: crate::plan::EdgeFromSource,
         /// Optional edge variable (not yet exposed downstream).
         edge_variable: Option<String>,
         /// Optional `TRANSFER EDGES` specification.
-        transfer: Option<crate::cypher::ast::TransferEdgesSpec>,
+        transfer: Option<crate::plan::TransferEdgesSpec>,
     },
 
     /// `MERGE NODES (a, b) INTO <target>` — native node-merge operation (R180).
@@ -361,8 +361,8 @@ pub enum LogicalOp {
         source_b: String,
         target: String,
         conflict: crate::plan::MergeNodesConflictStrategy,
-        transfer_edges: Option<crate::cypher::ast::TransferEdgesEndpoints>,
-        duplicate: crate::cypher::ast::MergeNodesDuplicateStrategy,
+        transfer_edges: Option<crate::plan::TransferEdgesEndpoints>,
+        duplicate: crate::plan::MergeNodesDuplicateStrategy,
         transfer_edge_properties: bool,
     },
 
@@ -392,7 +392,7 @@ pub enum LogicalOp {
         source: String,
         target: String,
         edge_types: Option<Vec<String>>,
-        direction: crate::cypher::ast::RedirectDirection,
+        direction: crate::plan::RedirectDirection,
     },
 
     /// MERGE / MERGE ALL: match-or-create with optional ON MATCH SET / ON CREATE SET.
@@ -2538,9 +2538,9 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
                 None => String::new(),
             };
             let dup_tag = match duplicate {
-                crate::cypher::ast::MergeNodesDuplicateStrategy::KeepBoth => "",
-                crate::cypher::ast::MergeNodesDuplicateStrategy::MergeProperties => " DUP_MERGE",
-                crate::cypher::ast::MergeNodesDuplicateStrategy::KeepTarget => " DUP_KEEP_TGT",
+                crate::plan::MergeNodesDuplicateStrategy::KeepBoth => "",
+                crate::plan::MergeNodesDuplicateStrategy::MergeProperties => " DUP_MERGE",
+                crate::plan::MergeNodesDuplicateStrategy::KeepTarget => " DUP_KEEP_TGT",
             };
             let props_tag = if *transfer_edge_properties {
                 " +EDGE_PROPS"
@@ -2586,9 +2586,9 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             direction,
         } => {
             let dir_tag = match direction {
-                crate::cypher::ast::RedirectDirection::Both => "",
-                crate::cypher::ast::RedirectDirection::Outgoing => " OUTGOING",
-                crate::cypher::ast::RedirectDirection::Incoming => " INCOMING",
+                crate::plan::RedirectDirection::Both => "",
+                crate::plan::RedirectDirection::Outgoing => " OUTGOING",
+                crate::plan::RedirectDirection::Incoming => " INCOMING",
             };
             let type_tag = match edge_types {
                 Some(ts) => format!(" TYPES[{}]", ts.join(",")),

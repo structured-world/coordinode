@@ -1,5 +1,5 @@
 use super::*;
-use crate::cypher::ast::BinaryOperator;
+use crate::cypher::ast::{BinaryOperator, Expr};
 // Adjacency key encoders are no longer used by production code in this
 // module (the typed EdgeStore wrappers own them) — only test fixtures
 // that plant/inspect raw adj posting lists need them.
@@ -1094,7 +1094,7 @@ fn set_property_updates_storage() {
                 property: "name".into(),
                 expr: nx(Expr::Literal(Value::String("Alicia".into()))),
             }],
-            violation_mode: crate::cypher::ast::ViolationMode::Fail,
+            violation_mode: crate::plan::ViolationMode::Fail,
         },
     };
 

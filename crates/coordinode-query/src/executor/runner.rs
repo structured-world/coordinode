@@ -32,8 +32,9 @@ use coordinode_storage::engine::StorageSnapshot;
 use super::eval::{eval_binary_op, eval_expr, eval_unary_op, is_truthy};
 use super::eval_neutral::eval_neutral;
 use super::row::Row;
-use crate::cypher::ast::{Direction, Expr, LengthBound, Pattern, PatternElement, ViolationMode};
+use crate::cypher::ast::{Direction, LengthBound, Pattern, PatternElement};
 use crate::index::{IndexState, OnlineDuringBuild};
+use crate::plan::ViolationMode;
 use crate::planner::logical::*;
 
 /// Default maximum hops for unbounded variable-length paths.
@@ -10739,8 +10740,8 @@ fn execute_merge_nodes(
     source_b: &str,
     target: &str,
     conflict: &crate::plan::MergeNodesConflictStrategy,
-    transfer_edges: Option<&crate::cypher::ast::TransferEdgesEndpoints>,
-    duplicate: &crate::cypher::ast::MergeNodesDuplicateStrategy,
+    transfer_edges: Option<&crate::plan::TransferEdgesEndpoints>,
+    duplicate: &crate::plan::MergeNodesDuplicateStrategy,
     transfer_edge_properties: bool,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
@@ -11163,12 +11164,7 @@ fn execute_clone_node(
         let mut rows_after = if set_items.is_empty() {
             created
         } else {
-            execute_update(
-                &created,
-                set_items,
-                &crate::cypher::ast::ViolationMode::Fail,
-                ctx,
-            )?
+            execute_update(&created, set_items, &crate::plan::ViolationMode::Fail, ctx)?
         };
 
         if with_edges {
@@ -11291,10 +11287,10 @@ fn execute_redirect_edges(
     source: &str,
     target: &str,
     edge_types: Option<&[String]>,
-    direction: crate::cypher::ast::RedirectDirection,
+    direction: crate::plan::RedirectDirection,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    use crate::cypher::ast::RedirectDirection;
+    use crate::plan::RedirectDirection;
 
     if source == target {
         // Redirecting a node's edges onto itself changes nothing.
@@ -11635,11 +11631,11 @@ fn notify_indexes_for_target_change(
 fn transfer_node_edges(
     source_id: NodeId,
     target_id: NodeId,
-    duplicate: &crate::cypher::ast::MergeNodesDuplicateStrategy,
+    duplicate: &crate::plan::MergeNodesDuplicateStrategy,
     transfer_edge_properties: bool,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<(), ExecutionError> {
-    use crate::cypher::ast::MergeNodesDuplicateStrategy as D;
+    use crate::plan::MergeNodesDuplicateStrategy as D;
 
     let edge_types = ctx.list_edge_types()?;
     for edge_type in &edge_types {
@@ -12053,8 +12049,8 @@ fn execute_detach_document(
     target_variable: &str,
     target_labels: &[String],
     edge_type: &str,
-    edge_direction: crate::cypher::ast::EdgeFromSource,
-    transfer: Option<&crate::cypher::ast::TransferEdgesSpec>,
+    edge_direction: crate::plan::EdgeFromSource,
+    transfer: Option<&crate::plan::TransferEdgesSpec>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     if property_path.is_empty() {
@@ -12187,8 +12183,8 @@ fn execute_detach_document(
         //   canonical: `(a:Address)-[:HAS_ADDRESS]->(n)` — a is target, n is source,
         //   edge flows target → source.
         let (edge_src, edge_tgt) = match edge_direction {
-            crate::cypher::ast::EdgeFromSource::Incoming => (target_id, source_id),
-            crate::cypher::ast::EdgeFromSource::Outgoing => (source_id, target_id),
+            crate::plan::EdgeFromSource::Incoming => (target_id, source_id),
+            crate::plan::EdgeFromSource::Outgoing => (source_id, target_id),
         };
         create_single_edge(edge_src, edge_tgt, edge_type, ctx)?;
 
@@ -12522,19 +12518,23 @@ fn emit_property_removal(
 ///
 /// Anything more complex returns an error; we prefer explicit scope to a
 /// misinterpreted transfer.
-fn extract_transfer_edge_types(predicate: &Expr) -> Result<Vec<String>, ExecutionError> {
-    fn is_type_of_r(expr: &Expr) -> bool {
+fn extract_transfer_edge_types(
+    predicate: &crate::plan::expr::Expr,
+) -> Result<Vec<String>, ExecutionError> {
+    use crate::plan::expr::{BinOp, Expr as NExpr};
+
+    fn is_type_of_r(expr: &NExpr) -> bool {
         matches!(
             expr,
-            Expr::FunctionCall { name, args, .. }
+            NExpr::Call { name, args, .. }
                 if name.eq_ignore_ascii_case("type")
                     && args.len() == 1
-                    && matches!(&args[0], Expr::Variable(v) if v == "r")
+                    && matches!(&args[0], NExpr::Variable(v) if v == "r")
         )
     }
 
-    fn lit_string(e: &Expr) -> Option<String> {
-        if let Expr::Literal(Value::String(s)) = e {
+    fn lit_string(e: &NExpr) -> Option<String> {
+        if let NExpr::Literal(Value::String(s)) = e {
             Some(s.clone())
         } else {
             None
@@ -12542,8 +12542,8 @@ fn extract_transfer_edge_types(predicate: &Expr) -> Result<Vec<String>, Executio
     }
 
     match predicate {
-        Expr::In { expr, list } if is_type_of_r(expr) => {
-            let Expr::List(items) = list.as_ref() else {
+        NExpr::In { item, list } if is_type_of_r(item) => {
+            let NExpr::List(items) = list.as_ref() else {
                 return Err(ExecutionError::Unsupported(
                     "TRANSFER EDGES WHERE: `IN` requires a list literal".to_string(),
                 ));
@@ -12559,9 +12559,9 @@ fn extract_transfer_edge_types(predicate: &Expr) -> Result<Vec<String>, Executio
             }
             Ok(types)
         }
-        Expr::BinaryOp {
+        NExpr::Binary {
             left,
-            op: crate::cypher::ast::BinaryOperator::Eq,
+            op: BinOp::Eq,
             right,
         } if is_type_of_r(left) => {
             let Some(s) = lit_string(right) else {
@@ -12655,9 +12655,9 @@ fn execute_attach_document(
     source_variable: &str,
     target_variable: &str,
     edge_type: &str,
-    edge_direction: crate::cypher::ast::EdgeFromSource,
+    edge_direction: crate::plan::EdgeFromSource,
     target_property_path: &[String],
-    transfer: Option<&crate::cypher::ast::TransferEdgesSpec>,
+    transfer: Option<&crate::plan::TransferEdgesSpec>,
     on_conflict_replace: bool,
     on_remaining_fail: bool,
     ctx: &mut ExecutionContext<'_>,
@@ -12843,8 +12843,8 @@ fn execute_attach_document(
 
         // --- 4. Delete the connecting edge (both directions) ---
         let (edge_src, edge_tgt) = match edge_direction {
-            crate::cypher::ast::EdgeFromSource::Outgoing => (source_id, target_id),
-            crate::cypher::ast::EdgeFromSource::Incoming => (target_id, source_id),
+            crate::plan::EdgeFromSource::Outgoing => (source_id, target_id),
+            crate::plan::EdgeFromSource::Incoming => (target_id, source_id),
         };
         delete_single_edge(edge_src, edge_tgt, edge_type, ctx)?;
 

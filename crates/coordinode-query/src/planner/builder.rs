@@ -617,8 +617,8 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 source_b: mn.source_b.clone(),
                 target: mn.target.clone(),
                 conflict: lower_merge_conflict(&mn.conflict)?,
-                transfer_edges: mn.transfer_edges.clone(),
-                duplicate: mn.duplicate.clone(),
+                transfer_edges: mn.transfer_edges.as_ref().map(lower_transfer_endpoints),
+                duplicate: lower_merge_dup_strategy(&mn.duplicate),
                 transfer_edge_properties: mn.transfer_edge_properties,
             })
         }
@@ -641,7 +641,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 source: re.source.clone(),
                 target: re.target.clone(),
                 edge_types: re.edge_types.clone(),
-                direction: re.direction,
+                direction: lower_redirect_direction(re.direction),
             })
         }
         Clause::Set(items, violation_mode) => {
@@ -649,7 +649,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             Ok(LogicalOp::Update {
                 input: Box::new(input),
                 items: lower_set_items(items)?,
-                violation_mode: violation_mode.clone(),
+                violation_mode: lower_violation_mode(violation_mode),
             })
         }
         Clause::Remove(items) => {
@@ -856,9 +856,9 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 source_variable: ad.source_variable.clone(),
                 target_variable: ad.target_variable.clone(),
                 edge_type: ad.edge_type.clone(),
-                edge_direction: ad.edge_direction,
+                edge_direction: lower_edge_from_source(ad.edge_direction),
                 target_property_path: ad.target_property_path.clone(),
-                transfer: ad.transfer.clone(),
+                transfer: ad.transfer.as_ref().map(lower_transfer_spec).transpose()?,
                 on_conflict_replace: ad.on_conflict_replace,
                 on_remaining_fail: ad.on_remaining_fail,
             })
@@ -875,9 +875,9 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                     .edge_type
                     .clone()
                     .unwrap_or_else(|| default_edge_type(&dd.property_path)),
-                edge_direction: dd.edge_direction,
+                edge_direction: lower_edge_from_source(dd.edge_direction),
                 edge_variable: dd.edge_variable.clone(),
-                transfer: dd.transfer.clone(),
+                transfer: dd.transfer.as_ref().map(lower_transfer_spec).transpose()?,
             })
         }
     }
@@ -1379,6 +1379,67 @@ fn lower_merge_conflict(
         C::KeepLast => N::KeepLast,
         C::Coalesce => N::Coalesce,
         C::SetExpressions(items) => N::SetExpressions(lower_set_items(items)?),
+    })
+}
+
+/// Map a cypher schema-violation mode to the neutral IR.
+fn lower_violation_mode(mode: &crate::cypher::ast::ViolationMode) -> crate::plan::ViolationMode {
+    match mode {
+        crate::cypher::ast::ViolationMode::Fail => crate::plan::ViolationMode::Fail,
+        crate::cypher::ast::ViolationMode::Skip => crate::plan::ViolationMode::Skip,
+    }
+}
+
+/// Map a cypher DETACH/ATTACH edge direction to the neutral IR.
+fn lower_edge_from_source(dir: crate::cypher::ast::EdgeFromSource) -> crate::plan::EdgeFromSource {
+    match dir {
+        crate::cypher::ast::EdgeFromSource::Outgoing => crate::plan::EdgeFromSource::Outgoing,
+        crate::cypher::ast::EdgeFromSource::Incoming => crate::plan::EdgeFromSource::Incoming,
+    }
+}
+
+/// Map a cypher REDIRECT EDGES direction filter to the neutral IR.
+fn lower_redirect_direction(
+    dir: crate::cypher::ast::RedirectDirection,
+) -> crate::plan::RedirectDirection {
+    match dir {
+        crate::cypher::ast::RedirectDirection::Both => crate::plan::RedirectDirection::Both,
+        crate::cypher::ast::RedirectDirection::Outgoing => crate::plan::RedirectDirection::Outgoing,
+        crate::cypher::ast::RedirectDirection::Incoming => crate::plan::RedirectDirection::Incoming,
+    }
+}
+
+/// Map a cypher MERGE NODES duplicate-edge strategy to the neutral IR.
+fn lower_merge_dup_strategy(
+    dup: &crate::cypher::ast::MergeNodesDuplicateStrategy,
+) -> crate::plan::MergeNodesDuplicateStrategy {
+    use crate::cypher::ast::MergeNodesDuplicateStrategy as C;
+    use crate::plan::MergeNodesDuplicateStrategy as N;
+    match dup {
+        C::KeepBoth => N::KeepBoth,
+        C::MergeProperties => N::MergeProperties,
+        C::KeepTarget => N::KeepTarget,
+    }
+}
+
+/// Map a cypher MERGE NODES transfer-edge endpoints to the neutral IR.
+fn lower_transfer_endpoints(
+    ep: &crate::cypher::ast::TransferEdgesEndpoints,
+) -> crate::plan::TransferEdgesEndpoints {
+    crate::plan::TransferEdgesEndpoints {
+        src: ep.src.clone(),
+        dst: ep.dst.clone(),
+    }
+}
+
+/// Map a cypher `TRANSFER EDGES` spec to the neutral IR, lowering its predicate.
+fn lower_transfer_spec(
+    spec: &crate::cypher::ast::TransferEdgesSpec,
+) -> Result<crate::plan::TransferEdgesSpec, PlanError> {
+    Ok(crate::plan::TransferEdgesSpec {
+        node_variable: spec.node_variable.clone(),
+        target_variable: spec.target_variable.clone(),
+        predicate: super::lower_expr(&spec.predicate)?,
     })
 }
 
