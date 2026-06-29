@@ -12,8 +12,12 @@
 //! Gated by the `columnar` feature (the lsm-tree columnar API is itself
 //! feature-gated).
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
 use lsm_tree::table::columnar::{column_batch_to_entries, entries_to_column_batch, ColumnBatch};
-use lsm_tree::{AnyTree, InternalValue, ValueType};
+use lsm_tree::{AnyTree, Cache, Config, InternalValue, SharedSequenceNumberGenerator, ValueType};
 
 use crate::error::{StorageError, StorageResult};
 
@@ -89,6 +93,136 @@ pub fn columnar_batch_rows(batch: &ColumnBatch) -> StorageResult<Vec<(Vec<u8>, V
         .into_iter()
         .map(|e| (e.key.user_key.to_vec(), e.value.to_vec()))
         .collect())
+}
+
+/// A registry of per-table columnar trees, keyed by table id.
+///
+/// Each `STORAGE COLUMNAR` table owns one columnar-mode tree under
+/// `<base_dir>/<table_id>`. The registry opens those trees lazily, creating one
+/// on first use (`CREATE TABLE`), handing back a cheap `AnyTree` clone for
+/// reads/writes, and dropping the tree + its directory on `DROP TABLE`. On
+/// construction it re-opens every table tree already on disk so a restart
+/// recovers them.
+///
+/// The open-handle map is per-process: it is a cache of `AnyTree` handles, not
+/// the authoritative table set. The catalogue of which tables exist is schema
+/// state (replicated); each node rebuilds its handle map from disk on open. All
+/// trees share the engine's sequence-number generator and block cache so their
+/// MVCC seqno line and cache budget match the rest of the engine.
+pub struct ColumnarTableRegistry {
+    base_dir: PathBuf,
+    seqno: SharedSequenceNumberGenerator,
+    cache: Arc<Cache>,
+    trees: Mutex<HashMap<String, AnyTree>>,
+}
+
+impl ColumnarTableRegistry {
+    /// Open the registry rooted at `base_dir`, re-opening every table tree
+    /// already present on disk (restart recovery). Trees share `seqno` and
+    /// `cache` with the engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Engine`] if the base directory cannot be created
+    /// or an existing table tree fails to re-open.
+    pub fn open(
+        base_dir: PathBuf,
+        seqno: SharedSequenceNumberGenerator,
+        cache: Arc<Cache>,
+    ) -> StorageResult<Self> {
+        std::fs::create_dir_all(&base_dir).map_err(lsm_tree::Error::from)?;
+        let mut trees = HashMap::new();
+        for entry in std::fs::read_dir(&base_dir).map_err(lsm_tree::Error::from)? {
+            let entry = entry.map_err(lsm_tree::Error::from)?;
+            if !entry.file_type().map_err(lsm_tree::Error::from)?.is_dir() {
+                continue;
+            }
+            let Some(table_id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let tree = open_columnar_tree(&entry.path(), &seqno, &cache)?;
+            trees.insert(table_id, tree);
+        }
+        Ok(Self {
+            base_dir,
+            seqno,
+            cache,
+            trees: Mutex::new(trees),
+        })
+    }
+
+    /// Return the columnar tree for `table_id`, creating + opening it on first
+    /// use. Subsequent calls hand back a clone of the same handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Engine`] if the tree cannot be opened.
+    pub fn create_or_open(&self, table_id: &str) -> StorageResult<AnyTree> {
+        let mut trees = self.trees.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tree) = trees.get(table_id) {
+            return Ok(tree.clone());
+        }
+        let tree = open_columnar_tree(&self.base_dir.join(table_id), &self.seqno, &self.cache)?;
+        trees.insert(table_id.to_owned(), tree.clone());
+        Ok(tree)
+    }
+
+    /// Return the open columnar tree for `table_id`, or `None` if no such table
+    /// is registered.
+    pub fn get(&self, table_id: &str) -> Option<AnyTree> {
+        self.trees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(table_id)
+            .cloned()
+    }
+
+    /// Drop a table: release the tree handle and delete its directory.
+    /// Idempotent — dropping an unknown table removes nothing and succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Engine`] if the directory removal fails.
+    pub fn drop_table(&self, table_id: &str) -> StorageResult<()> {
+        self.trees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(table_id);
+        let dir = self.base_dir.join(table_id);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(lsm_tree::Error::from)?;
+        }
+        Ok(())
+    }
+
+    /// Sorted list of currently-registered table ids.
+    pub fn table_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .trees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
+    }
+}
+
+/// Open (creating if absent) a columnar-mode tree at `dir`, sharing the engine
+/// seqno generator and block cache.
+fn open_columnar_tree(
+    dir: &Path,
+    seqno: &SharedSequenceNumberGenerator,
+    cache: &Arc<Cache>,
+) -> StorageResult<AnyTree> {
+    // visible_seqno = seqno: every write is immediately visible, matching the
+    // partition trees opened by the engine.
+    let tree = Config::new_with_generators(dir, seqno.clone(), seqno.clone())
+        .use_cache(Arc::clone(cache))
+        .open()?;
+    enable_columnar(&tree)?;
+    Ok(tree)
 }
 
 #[cfg(test)]
