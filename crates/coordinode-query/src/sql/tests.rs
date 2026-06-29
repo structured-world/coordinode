@@ -79,11 +79,16 @@ fn insert_lowers_to_create_node() {
 
 #[test]
 fn unsupported_statement_is_rejected() {
-    assert!(SqlFrontend::new().parse("DROP TABLE Account").is_err());
+    // ALTER TABLE is not lowered yet.
+    assert!(SqlFrontend::new()
+        .parse("ALTER TABLE Account ADD COLUMN age BIGINT")
+        .is_err());
     // Joins are not supported yet.
     assert!(SqlFrontend::new()
         .parse("SELECT a.x FROM A a JOIN B b ON a.id = b.id")
         .is_err());
+    // DROP VIEW is not a table drop.
+    assert!(SqlFrontend::new().parse("DROP VIEW v").is_err());
 }
 
 #[test]
@@ -114,6 +119,55 @@ fn update_lowers_to_update_over_filter_nodescan() {
         other => panic!("expected SetItem::Property, got {other:?}"),
     }
     assert!(matches!(*input, LogicalOp::Filter { .. }));
+}
+
+#[test]
+fn create_table_lowers_with_primary_key_and_columns() {
+    let root = plan("CREATE TABLE Account (id BIGINT PRIMARY KEY, name VARCHAR(64) NOT NULL)");
+    let LogicalOp::CreateTable {
+        name,
+        columns,
+        primary_key,
+        columnar,
+    } = root
+    else {
+        panic!("expected CreateTable, got {root:?}");
+    };
+    assert_eq!(name, "Account");
+    assert!(!columnar, "SQL CREATE TABLE is row storage");
+    assert_eq!(primary_key, vec!["id".to_string()]);
+    assert_eq!(columns.len(), 2);
+    assert_eq!(columns[0].name, "id");
+    assert_eq!(columns[0].type_name, "BIGINT");
+    assert_eq!(columns[1].name, "name");
+    // VARCHAR(64) normalizes to the base token.
+    assert_eq!(columns[1].type_name, "VARCHAR");
+    assert!(columns[1].not_null);
+}
+
+#[test]
+fn create_table_accepts_table_level_primary_key() {
+    let root = plan("CREATE TABLE T (a BIGINT, b BIGINT, PRIMARY KEY (a))");
+    let LogicalOp::CreateTable { primary_key, .. } = root else {
+        panic!("expected CreateTable");
+    };
+    assert_eq!(primary_key, vec!["a".to_string()]);
+}
+
+#[test]
+fn create_table_without_primary_key_is_rejected() {
+    assert!(SqlFrontend::new()
+        .parse("CREATE TABLE T (a BIGINT, b BIGINT)")
+        .is_err());
+}
+
+#[test]
+fn drop_table_lowers_to_drop_table() {
+    let root = plan("DROP TABLE Account");
+    let LogicalOp::DropTable { name } = root else {
+        panic!("expected DropTable, got {root:?}");
+    };
+    assert_eq!(name, "Account");
 }
 
 #[test]

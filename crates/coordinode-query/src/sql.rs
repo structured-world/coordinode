@@ -6,12 +6,14 @@
 //! translation of SQL into Cypher. This validates that the planner / executor /
 //! advisor are genuinely dialect-agnostic (the trait is not single-impl).
 //!
-//! Scope today: `SELECT` (single table, projection, `WHERE`) and `INSERT ...
-//! VALUES`. A SQL table name is a label; a row is a node. `UPDATE` / `DELETE`
-//! and joins lower in later increments.
+//! Scope today: `CREATE TABLE` / `DROP TABLE` (row storage), `INSERT ... VALUES`,
+//! `SELECT` (single table, projection, `WHERE`), `UPDATE`, and `DELETE` — the
+//! full single-table CRUD surface. A SQL table name is a label; a row is a node.
+//! Joins and the columnar `STORAGE` clause lower in later increments.
 
 use sqlparser::ast::{
-    Expr as SqlExpr, Insert, Query as SqlQuery, SelectItem, SetExpr, Statement, TableFactor,
+    ColumnOption, CreateTable as SqlCreateTable, DataType, Expr as SqlExpr, Insert, ObjectName,
+    ObjectType, Query as SqlQuery, SelectItem, SetExpr, Statement, TableConstraint, TableFactor,
     Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
@@ -97,11 +99,101 @@ fn lower_statement(statement: &Statement) -> Result<LogicalOp, FrontendError> {
             ..
         } => lower_update(table, assignments, selection.as_ref()),
         Statement::Delete(delete) => lower_delete(delete),
+        Statement::CreateTable(create) => lower_create_table(create),
+        Statement::Drop {
+            object_type, names, ..
+        } => lower_drop_table(*object_type, names),
         other => Err(unsupported(&format!(
             "statement `{}`",
             first_word(&other.to_string())
         ))),
     }
+}
+
+/// The base type token of a SQL data type, uppercased and stripped of any
+/// length / precision suffix — `VARCHAR(255)` -> `VARCHAR`, `BIGINT` -> `BIGINT`
+/// — so it matches the executor's type resolver.
+fn base_type_name(data_type: &DataType) -> String {
+    data_type
+        .to_string()
+        .split(['(', ' '])
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase()
+}
+
+/// `CREATE TABLE <name> (<col> <type> [PRIMARY KEY] [NOT NULL] [UNIQUE], ...
+/// [, PRIMARY KEY (<cols>)])` -> [`LogicalOp::CreateTable`].
+///
+/// The primary key may be a column option or a table-level constraint; both are
+/// collected. SQL has no `STORAGE ROW | COLUMNAR` clause, so a table created via
+/// SQL is row-storage; columnar tables are declared through the Cypher DDL.
+fn lower_create_table(create: &SqlCreateTable) -> Result<LogicalOp, FrontendError> {
+    let name = object_name_string(&create.name);
+    let mut columns = Vec::with_capacity(create.columns.len());
+    let mut primary_key: Vec<String> = Vec::new();
+    for col in &create.columns {
+        let col_name = col.name.value.clone();
+        let mut not_null = false;
+        let mut unique = false;
+        for opt in &col.options {
+            match &opt.option {
+                ColumnOption::NotNull => not_null = true,
+                ColumnOption::Unique { is_primary, .. } => {
+                    if *is_primary {
+                        not_null = true;
+                        if !primary_key.contains(&col_name) {
+                            primary_key.push(col_name.clone());
+                        }
+                    } else {
+                        unique = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        columns.push(crate::plan::TableColumn {
+            name: col_name,
+            type_name: base_type_name(&col.data_type),
+            not_null,
+            unique,
+        });
+    }
+    for constraint in &create.constraints {
+        if let TableConstraint::PrimaryKey { columns: pk, .. } = constraint {
+            for ident in pk {
+                if !primary_key.contains(&ident.value) {
+                    primary_key.push(ident.value.clone());
+                }
+            }
+        }
+    }
+    if primary_key.is_empty() {
+        return Err(unsupported("CREATE TABLE requires a PRIMARY KEY"));
+    }
+    Ok(LogicalOp::CreateTable {
+        name,
+        columns,
+        primary_key,
+        columnar: false,
+    })
+}
+
+/// `DROP TABLE <name>` -> [`LogicalOp::DropTable`]. Only a single table object is
+/// supported (not VIEW / SCHEMA / multi-object drops).
+fn lower_drop_table(
+    object_type: ObjectType,
+    names: &[ObjectName],
+) -> Result<LogicalOp, FrontendError> {
+    if object_type != ObjectType::Table {
+        return Err(unsupported("only DROP TABLE is supported"));
+    }
+    let [name] = names else {
+        return Err(unsupported("DROP TABLE supports exactly one table"));
+    };
+    Ok(LogicalOp::DropTable {
+        name: object_name_string(name),
+    })
 }
 
 /// Extract `(label, bound variable)` from a single (join-free) table relation.
