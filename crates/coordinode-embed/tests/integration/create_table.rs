@@ -284,3 +284,44 @@ fn sql_select_reads_rows_written_by_cypher() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("name"), Some(&Value::String("Carol".into())));
 }
+
+#[test]
+fn sql_update_modifies_matching_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).expect("open db");
+    db.execute_cypher("CREATE TABLE Account (id BIGINT PRIMARY KEY, name STRING)")
+        .expect("create");
+    db.execute_sql("INSERT INTO Account (id, name) VALUES (1, 'Alice')")
+        .expect("insert");
+
+    db.execute_sql("UPDATE Account SET name = 'Alicia' WHERE id = 1")
+        .expect("update");
+
+    let rows = db
+        .execute_sql("SELECT name FROM Account WHERE id = 1")
+        .expect("select");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Alicia".into())));
+}
+
+#[test]
+fn sql_delete_removes_matching_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).expect("open db");
+    db.execute_cypher("CREATE TABLE Account (id BIGINT PRIMARY KEY, name STRING)")
+        .expect("create");
+    db.execute_sql("INSERT INTO Account (id, name) VALUES (1, 'Alice')")
+        .expect("insert 1");
+    db.execute_sql("INSERT INTO Account (id, name) VALUES (2, 'Bob')")
+        .expect("insert 2");
+
+    db.execute_sql("DELETE FROM Account WHERE id = 1")
+        .expect("delete");
+
+    let gone = db
+        .execute_sql("SELECT name FROM Account WHERE id = 1")
+        .expect("select gone");
+    assert_eq!(gone.len(), 0, "deleted row must not be found");
+    let remaining = db.execute_sql("SELECT id FROM Account").expect("select all");
+    assert_eq!(remaining.len(), 1, "the other row remains");
+}

@@ -98,3 +98,38 @@ fn same_sql_has_stable_fingerprint() {
     // Canonicalized through the AST -> identical fingerprint regardless of case.
     assert_eq!(a.1, b.1);
 }
+
+#[test]
+fn update_lowers_to_update_over_filter_nodescan() {
+    let root = plan("UPDATE Account SET name = 'Bob' WHERE id = 1");
+    let LogicalOp::Update { input, items, .. } = root else {
+        panic!("expected Update, got {root:?}");
+    };
+    assert_eq!(items.len(), 1);
+    match &items[0] {
+        crate::plan::SetItem::Property {
+            property, expr, ..
+        } => {
+            assert_eq!(property, "name");
+            assert!(matches!(expr, Expr::Literal(Value::String(ref s)) if s == "Bob"));
+        }
+        other => panic!("expected SetItem::Property, got {other:?}"),
+    }
+    assert!(matches!(*input, LogicalOp::Filter { .. }));
+}
+
+#[test]
+fn delete_lowers_to_delete_over_filter_nodescan() {
+    let root = plan("DELETE FROM Account WHERE id = 1");
+    let LogicalOp::Delete {
+        input, variables, ..
+    } = root
+    else {
+        panic!("expected Delete, got {root:?}");
+    };
+    assert_eq!(variables, vec!["Account".to_string()]);
+    let LogicalOp::Filter { input, .. } = *input else {
+        panic!("expected Filter");
+    };
+    assert!(matches!(*input, LogicalOp::NodeScan { .. }));
+}

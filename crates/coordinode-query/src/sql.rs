@@ -22,6 +22,7 @@ use coordinode_core::txn::read_consistency::ReadConsistencyMode;
 
 use crate::frontend::{FrontendError, ParsedQuery, QueryFrontend};
 use crate::plan::expr::{BinOp, Expr};
+use crate::plan::{SetItem, ViolationMode};
 use crate::planner::logical::{LogicalOp, LogicalPlan, ProjectItem};
 
 /// The SQL frontend: `sqlparser` parse + native lowering into the neutral IR.
@@ -87,10 +88,114 @@ fn lower_statement(statement: &Statement) -> Result<LogicalOp, FrontendError> {
     match statement {
         Statement::Query(query) => lower_select(query),
         Statement::Insert(insert) => lower_insert(insert),
+        Statement::Update {
+            table,
+            assignments,
+            from: _,
+            selection,
+            returning: _,
+            ..
+        } => lower_update(table, assignments, selection.as_ref()),
+        Statement::Delete(delete) => lower_delete(delete),
         other => Err(unsupported(&format!(
             "statement `{}`",
             first_word(&other.to_string())
         ))),
+    }
+}
+
+/// Extract `(label, bound variable)` from a single (join-free) table relation.
+fn table_label_and_var(
+    table: &sqlparser::ast::TableWithJoins,
+) -> Result<(String, String), FrontendError> {
+    if !table.joins.is_empty() {
+        return Err(unsupported("joins are not supported yet"));
+    }
+    let TableFactor::Table { name, alias, .. } = &table.relation else {
+        return Err(unsupported("only a named table is supported"));
+    };
+    let label = object_name_string(name);
+    let var = alias
+        .as_ref()
+        .map(|a| a.name.value.clone())
+        .unwrap_or_else(|| label.clone());
+    Ok((label, var))
+}
+
+/// `UPDATE <table> SET <col = expr>, ... [WHERE <pred>]` ->
+/// NodeScan [-> Filter] -> Update.
+fn lower_update(
+    table: &sqlparser::ast::TableWithJoins,
+    assignments: &[sqlparser::ast::Assignment],
+    selection: Option<&SqlExpr>,
+) -> Result<LogicalOp, FrontendError> {
+    let (label, var) = table_label_and_var(table)?;
+    let scan = LogicalOp::NodeScan {
+        variable: var.clone(),
+        labels: vec![label],
+        property_filters: Vec::new(),
+    };
+    let filtered = match selection {
+        Some(pred) => LogicalOp::Filter {
+            input: Box::new(scan),
+            predicate: lower_expr(pred, &var)?,
+        },
+        None => scan,
+    };
+    let mut items = Vec::with_capacity(assignments.len());
+    for a in assignments {
+        let property = assignment_column(&a.target)?;
+        items.push(SetItem::Property {
+            variable: var.clone(),
+            property,
+            expr: lower_expr(&a.value, &var)?,
+        });
+    }
+    Ok(LogicalOp::Update {
+        input: Box::new(filtered),
+        items,
+        violation_mode: ViolationMode::Fail,
+    })
+}
+
+/// `DELETE FROM <table> [WHERE <pred>]` -> NodeScan [-> Filter] -> Delete.
+fn lower_delete(delete: &sqlparser::ast::Delete) -> Result<LogicalOp, FrontendError> {
+    let tables = match &delete.from {
+        sqlparser::ast::FromTable::WithFromKeyword(t)
+        | sqlparser::ast::FromTable::WithoutKeyword(t) => t,
+    };
+    let [table] = tables.as_slice() else {
+        return Err(unsupported("DELETE must target exactly one table"));
+    };
+    let (label, var) = table_label_and_var(table)?;
+    let scan = LogicalOp::NodeScan {
+        variable: var.clone(),
+        labels: vec![label],
+        property_filters: Vec::new(),
+    };
+    let filtered = match &delete.selection {
+        Some(pred) => LogicalOp::Filter {
+            input: Box::new(scan),
+            predicate: lower_expr(pred, &var)?,
+        },
+        None => scan,
+    };
+    Ok(LogicalOp::Delete {
+        input: Box::new(filtered),
+        variables: vec![var],
+        detach: true,
+    })
+}
+
+/// The column name targeted by a SQL `SET <col> = ...` assignment.
+fn assignment_column(target: &sqlparser::ast::AssignmentTarget) -> Result<String, FrontendError> {
+    match target {
+        sqlparser::ast::AssignmentTarget::ColumnName(name) => name
+            .0
+            .last()
+            .map(|i| i.value.clone())
+            .ok_or_else(|| unsupported("empty assignment target")),
+        other => Err(unsupported(&format!("assignment target `{other}`"))),
     }
 }
 
