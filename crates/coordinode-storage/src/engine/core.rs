@@ -139,6 +139,13 @@ pub struct StorageEngine {
     /// without that, follower reads pin a stale snapshot and observe
     /// none of the replicated data.
     oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
+    /// `STORAGE COLUMNAR` table trees, keyed by table id. Each columnar table
+    /// owns one columnar-mode tree (the whole-tree columnar layout cannot share
+    /// the row-mode partition trees); see [`crate::columnar`]. Shares this
+    /// engine's seqno generator and block cache. Re-opened from disk at engine
+    /// open so a restart recovers the tables.
+    #[cfg(feature = "columnar")]
+    columnar_tables: crate::columnar::ColumnarTableRegistry,
 }
 
 impl StorageEngine {
@@ -455,6 +462,17 @@ impl StorageEngine {
             None
         };
 
+        // Per-table columnar trees live under `<primary endpoint>/tables`,
+        // sharing this engine's seqno generator and block cache. Constructed
+        // before the cache moves into the coordinator; re-opens any table tree
+        // already on disk.
+        #[cfg(feature = "columnar")]
+        let columnar_tables = crate::columnar::ColumnarTableRegistry::open(
+            config.endpoints[0].path.join("tables"),
+            Arc::clone(&seqno),
+            Arc::clone(&cache),
+        )?;
+
         let coordinator =
             LocalMultiModalCoordinator::new(trees, Arc::clone(&seqno), cache, gc_watermark);
         Ok(Self {
@@ -471,7 +489,38 @@ impl StorageEngine {
             partition_l0_endpoint,
             oplog,
             oracle,
+            #[cfg(feature = "columnar")]
+            columnar_tables,
         })
+    }
+
+    /// Create (or open if it already exists) the columnar tree for a
+    /// `STORAGE COLUMNAR` table, returning a handle to it. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Engine`] if the tree cannot be opened.
+    #[cfg(feature = "columnar")]
+    pub fn create_columnar_table(&self, table_id: &str) -> StorageResult<lsm_tree::AnyTree> {
+        self.columnar_tables.create_or_open(table_id)
+    }
+
+    /// Handle to an existing `STORAGE COLUMNAR` table tree, or `None` if no such
+    /// table is registered on this node.
+    #[cfg(feature = "columnar")]
+    pub fn columnar_table_tree(&self, table_id: &str) -> Option<lsm_tree::AnyTree> {
+        self.columnar_tables.get(table_id)
+    }
+
+    /// Drop a `STORAGE COLUMNAR` table: release its tree handle and delete its
+    /// on-disk directory. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Engine`] if the directory removal fails.
+    #[cfg(feature = "columnar")]
+    pub fn drop_columnar_table(&self, table_id: &str) -> StorageResult<()> {
+        self.columnar_tables.drop_table(table_id)
     }
 
     /// The timestamp oracle this engine stamps writes with, when opened
@@ -1937,3 +1986,7 @@ mod oplog_journal_recovery_tests;
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod merge_tests;
+
+#[cfg(all(test, feature = "columnar"))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod columnar_table_tests;
