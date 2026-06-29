@@ -69,6 +69,72 @@ pub enum MergeNodesConflictStrategy {
     SetExpressions(Vec<SetItem>),
 }
 
+/// Relationship direction, in the neutral IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// `-->` / `-[]->`.
+    Outgoing,
+    /// `<--` / `<-[]-`.
+    Incoming,
+    /// `--` / `-[]-`.
+    Both,
+}
+
+/// Variable-length path bounds, in the neutral IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LengthBound {
+    /// Minimum hops (default 1).
+    pub min: Option<u64>,
+    /// Maximum hops (default unbounded, capped at 10 by the engine).
+    pub max: Option<u64>,
+}
+
+/// A node pattern `(variable:Label {prop: value})`, in the neutral IR.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodePattern {
+    /// Variable name (optional).
+    pub variable: Option<String>,
+    /// Labels (zero or more).
+    pub labels: Vec<String>,
+    /// Inline property map.
+    pub properties: Vec<(String, Expr)>,
+}
+
+/// A relationship pattern `-[variable:TYPE {props}]->`, in the neutral IR.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelationshipPattern {
+    /// Variable name (optional).
+    pub variable: Option<String>,
+    /// Relationship types (disjunction).
+    pub rel_types: Vec<String>,
+    /// Direction of the relationship.
+    pub direction: Direction,
+    /// Variable-length traversal bounds.
+    pub length: Option<LengthBound>,
+    /// Inline property map.
+    pub properties: Vec<(String, Expr)>,
+}
+
+/// An element in a graph pattern, in the neutral IR.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PatternElement {
+    /// A node element.
+    Node(NodePattern),
+    /// A relationship element.
+    Relationship(RelationshipPattern),
+}
+
+/// A graph pattern, in the neutral IR.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pattern {
+    /// Ordered node / relationship elements.
+    pub elements: Vec<PatternElement>,
+    /// Named-path variable from `p = <pattern>`, if any.
+    pub path_variable: Option<String>,
+    /// True when this pattern came from `shortestPath(<pattern>)`.
+    pub shortest_path: bool,
+}
+
 /// A `CREATE TRIGGER` definition in the neutral IR. Carries the already-neutral
 /// core schema descriptors (`coordinode_core::schema::triggers`); the runtime
 /// fields (`enabled`, `created_at_hlc_us`) are stamped by the executor.

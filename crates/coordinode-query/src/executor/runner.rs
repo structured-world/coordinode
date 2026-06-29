@@ -29,12 +29,12 @@ use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
 use coordinode_storage::engine::StorageSnapshot;
 
-use super::eval::{eval_binary_op, eval_expr, eval_unary_op, is_truthy};
+use super::eval::{eval_binary_op, eval_unary_op, is_truthy};
 use super::eval_neutral::eval_neutral;
 use super::row::Row;
-use crate::cypher::ast::{Direction, LengthBound, Pattern, PatternElement};
 use crate::index::{IndexState, OnlineDuringBuild};
 use crate::plan::ViolationMode;
+use crate::plan::{Direction, LengthBound, Pattern, PatternElement};
 use crate::planner::logical::*;
 
 /// Default maximum hops for unbounded variable-length paths.
@@ -7820,7 +7820,7 @@ fn execute_upsert(
 
                         let mut record = NodeRecord::new(&label);
                         for (prop_name, expr) in &np.properties {
-                            let val = eval_expr(expr, &current_row);
+                            let val = eval_neutral(expr, &current_row);
                             let field_id = ctx.interner.intern(prop_name);
                             record.set(field_id, val);
                         }
@@ -7838,7 +7838,7 @@ fn execute_upsert(
                                 .properties
                                 .iter()
                                 .map(|(name, expr)| {
-                                    let val = eval_expr(expr, row).map_to_document();
+                                    let val = eval_neutral(expr, row).map_to_document();
                                     (name.clone(), val)
                                 })
                                 .collect();
@@ -7860,7 +7860,7 @@ fn execute_upsert(
                             .insert(var_name.to_string(), Value::Int(node_id.as_raw() as i64));
                         current_row.insert(format!("{var_name}.__label__"), Value::String(label));
                         for (prop_name, expr) in &np.properties {
-                            let val = eval_expr(expr, row);
+                            let val = eval_neutral(expr, row);
                             current_row.insert(format!("{var_name}.{prop_name}"), val);
                         }
                     }

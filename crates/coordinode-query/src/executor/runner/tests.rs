@@ -1356,15 +1356,18 @@ fn upsert_creates_when_not_found() {
             }),
             on_match: vec![],
             on_create_patterns: vec![Pattern {
-                elements: vec![PatternElement::Node(crate::cypher::ast::NodePattern {
+                elements: vec![PatternElement::Node(crate::plan::NodePattern {
                     variable: Some("u".into()),
                     labels: vec!["User".into()],
                     properties: vec![
                         (
                             "email".into(),
-                            Expr::Literal(Value::String("bob@test.com".into())),
+                            nx(Expr::Literal(Value::String("bob@test.com".into()))),
                         ),
-                        ("name".into(), Expr::Literal(Value::String("Bob".into()))),
+                        (
+                            "name".into(),
+                            nx(Expr::Literal(Value::String("Bob".into()))),
+                        ),
                     ],
                 })],
                 path_variable: None,

@@ -6,10 +6,7 @@
 
 use std::collections::HashMap;
 
-// Graph-pattern AST types are the remaining cypher coupling in the logical
-// layer (Traverse direction / var-length bounds, Upsert on-create patterns).
-// Neutralizing the pattern surface is a separate slice; until then these stay.
-use crate::cypher::ast::{Direction, LengthBound, Pattern, PatternElement};
+use crate::plan::{Direction, LengthBound, Pattern, PatternElement};
 use coordinode_core::graph::stats::StorageStats;
 use coordinode_core::graph::types::{Value, VectorConsistencyMode};
 

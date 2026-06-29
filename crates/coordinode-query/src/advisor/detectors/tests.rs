@@ -1,5 +1,8 @@
 use super::*;
 use crate::cypher::ast::*;
+// LogicalOp traversal fields are neutral; the explicit imports shadow the
+// cypher glob so `Direction` / `LengthBound` here resolve to the plan kernel.
+use crate::plan::{Direction, LengthBound};
 use coordinode_core::graph::types::Value;
 
 /// Lower a cypher test expression into the neutral IR carried by operator fields.

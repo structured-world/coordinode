@@ -580,7 +580,11 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             let upsert_op = LogicalOp::Upsert {
                 pattern: Box::new(scan),
                 on_match: lower_set_items(&uc.on_match)?,
-                on_create_patterns: uc.on_create.clone(),
+                on_create_patterns: uc
+                    .on_create
+                    .iter()
+                    .map(lower_pattern)
+                    .collect::<Result<Vec<_>, _>>()?,
             };
             match current {
                 Some(existing) => Ok(LogicalOp::CartesianProduct {
@@ -1383,6 +1387,72 @@ fn lower_merge_conflict(
         C::KeepLast => N::KeepLast,
         C::Coalesce => N::Coalesce,
         C::SetExpressions(items) => N::SetExpressions(lower_set_items(items)?),
+    })
+}
+
+/// Lower a cypher relationship direction into the neutral IR.
+fn lower_direction(d: crate::cypher::ast::Direction) -> crate::plan::Direction {
+    use crate::cypher::ast::Direction as C;
+    use crate::plan::Direction as N;
+    match d {
+        C::Outgoing => N::Outgoing,
+        C::Incoming => N::Incoming,
+        C::Both => N::Both,
+    }
+}
+
+/// Lower a cypher variable-length bound into the neutral IR.
+fn lower_length_bound(l: crate::cypher::ast::LengthBound) -> crate::plan::LengthBound {
+    crate::plan::LengthBound {
+        min: l.min,
+        max: l.max,
+    }
+}
+
+/// Lower a cypher graph pattern into the neutral IR, lowering inline property
+/// expressions.
+fn lower_pattern(p: &crate::cypher::ast::Pattern) -> Result<crate::plan::Pattern, PlanError> {
+    let mut elements = Vec::with_capacity(p.elements.len());
+    for el in &p.elements {
+        elements.push(lower_pattern_element(el)?);
+    }
+    Ok(crate::plan::Pattern {
+        elements,
+        path_variable: p.path_variable.clone(),
+        shortest_path: p.shortest_path,
+    })
+}
+
+fn lower_pattern_element(
+    el: &crate::cypher::ast::PatternElement,
+) -> Result<crate::plan::PatternElement, PlanError> {
+    use crate::cypher::ast::PatternElement as C;
+    use crate::plan::PatternElement as N;
+    Ok(match el {
+        C::Node(n) => N::Node(lower_node_pattern(n)?),
+        C::Relationship(r) => N::Relationship(lower_relationship_pattern(r)?),
+    })
+}
+
+fn lower_node_pattern(
+    n: &crate::cypher::ast::NodePattern,
+) -> Result<crate::plan::NodePattern, PlanError> {
+    Ok(crate::plan::NodePattern {
+        variable: n.variable.clone(),
+        labels: n.labels.clone(),
+        properties: lower_property_filters(&n.properties)?,
+    })
+}
+
+fn lower_relationship_pattern(
+    r: &crate::cypher::ast::RelationshipPattern,
+) -> Result<crate::plan::RelationshipPattern, PlanError> {
+    Ok(crate::plan::RelationshipPattern {
+        variable: r.variable.clone(),
+        rel_types: r.rel_types.clone(),
+        direction: lower_direction(r.direction),
+        length: r.length.map(lower_length_bound),
+        properties: lower_property_filters(&r.properties)?,
     })
 }
 
@@ -3208,7 +3278,7 @@ fn build_shortest_path(pattern: &Pattern) -> Result<LogicalOp, PlanError> {
         source,
         target,
         edge_types: rel.rel_types.clone(),
-        direction: rel.direction,
+        direction: lower_direction(rel.direction),
         max_depth,
         path_variable,
     })
@@ -3257,10 +3327,10 @@ fn build_pattern_scan(pattern: &Pattern) -> Result<LogicalOp, PlanError> {
                     input: Box::new(source),
                     source: source_var,
                     edge_types: rp.rel_types.clone(),
-                    direction: rp.direction,
+                    direction: lower_direction(rp.direction),
                     target_variable: String::new(), // filled by next Node
                     target_labels: Vec::new(),
-                    length: rp.length,
+                    length: rp.length.map(lower_length_bound),
                     edge_variable: rp.variable.clone(),
                     target_filters: Vec::new(),
                     edge_filters: lower_property_filters(&rp.properties)?,
@@ -3351,10 +3421,10 @@ fn build_pattern_chain(
             input: Box::new(current),
             source: last_var.clone(),
             edge_types: rel.rel_types.clone(),
-            direction: rel.direction,
+            direction: lower_direction(rel.direction),
             target_variable: target_var.clone(),
             target_labels: target_node.labels.clone(),
-            length: rel.length,
+            length: rel.length.map(lower_length_bound),
             edge_variable: rel.variable.clone(),
             target_filters: lower_property_filters(&target_node.properties)?,
             edge_filters: lower_property_filters(&rel.properties)?,
@@ -3604,7 +3674,7 @@ fn build_create_op(current: Option<LogicalOp>, cc: &CreateClause) -> Result<Logi
                     source: src,
                     target: tgt,
                     edge_type: rp.rel_types.first().cloned().unwrap_or_default(),
-                    direction: rp.direction,
+                    direction: lower_direction(rp.direction),
                     variable: rp.variable.clone(),
                     properties: lower_property_filters(&rp.properties)?,
                 };

@@ -119,7 +119,7 @@ fn match_traverse() {
         } = input.as_ref()
         {
             assert_eq!(edge_types, &["KNOWS"]);
-            assert_eq!(*direction, Direction::Outgoing);
+            assert_eq!(*direction, crate::plan::Direction::Outgoing);
             assert_eq!(target_variable, "b");
         } else {
             panic!("expected Traverse, got: {input:?}");
@@ -1326,7 +1326,7 @@ fn push_down_invariant_teeth_catches_unannotated_violation() {
         input: Box::new(node_scan),
         source: "a".to_string(),
         edge_types: vec!["LIKES".to_string()],
-        direction: crate::cypher::ast::Direction::Outgoing,
+        direction: crate::plan::Direction::Outgoing,
         target_variable: "b".to_string(),
         target_labels: vec![],
         length: None,
@@ -1379,7 +1379,7 @@ fn push_down_invariant_passes_when_decision_attached() {
         input: Box::new(node_scan),
         source: "a".to_string(),
         edge_types: vec!["LIKES".to_string()],
-        direction: crate::cypher::ast::Direction::Outgoing,
+        direction: crate::plan::Direction::Outgoing,
         target_variable: "b".to_string(),
         target_labels: vec![],
         length: None,
@@ -1553,7 +1553,7 @@ fn nested_vector_filters_both_get_push_down_decisions() {
             input: Box::new(ns),
             source: var.to_string(),
             edge_types: vec!["LIKES".to_string()],
-            direction: crate::cypher::ast::Direction::Outgoing,
+            direction: crate::plan::Direction::Outgoing,
             target_variable: format!("{var}_tgt"),
             target_labels: vec![],
             length: None,
