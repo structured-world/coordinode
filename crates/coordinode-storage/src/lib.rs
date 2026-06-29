@@ -1,5 +1,7 @@
 pub mod blob;
 pub mod cache;
+#[cfg(feature = "columnar")]
+pub mod columnar;
 pub mod compress;
 pub mod engine;
 pub mod error;

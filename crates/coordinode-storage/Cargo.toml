@@ -8,10 +8,14 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-default = ["lz4"]
+default = ["lz4", "columnar"]
 lz4 = ["lsm-tree/lz4", "dep:lz4_flex"]
 zstd = ["lsm-tree/zstd"]
 encryption = ["lsm-tree/encryption"]
+# Native columnar SST block type for the relational TABLE modality
+# (STORAGE COLUMNAR). Enables the lsm-tree columnar batch ingest + projected
+# scan API. A CE capability, on by default; `--no-default-features` drops it.
+columnar = ["lsm-tree/columnar"]
 # Per-block Reed-Solomon page ECC (build-time gated, default-off). When
 # enabled, a tree spanning a Degraded / ForceOn endpoint gets an ECC
 # trailer per SST block so an unrecoverable read can be repaired in
