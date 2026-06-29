@@ -533,6 +533,69 @@ impl StorageEngine {
         self.columnar_tables.drop_table(table_id)
     }
 
+    /// Insert a row `(key, value)` into a `STORAGE COLUMNAR` table's tree at
+    /// `seqno`, creating the tree on first use. The engine transposes rows to
+    /// columnar blocks at flush and reconstructs them on read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Engine`] if the tree cannot be opened.
+    #[cfg(feature = "columnar")]
+    pub fn columnar_insert(
+        &self,
+        table_id: &str,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        seqno: lsm_tree::SeqNo,
+    ) -> StorageResult<()> {
+        use lsm_tree::AbstractTree;
+        let tree = self.columnar_tables.create_or_open(table_id)?;
+        tree.insert(key, value, seqno);
+        Ok(())
+    }
+
+    /// Flush a `STORAGE COLUMNAR` table's active memtable to an on-disk SST, so
+    /// its rows survive a clean restart (the runtime table tree is not yet
+    /// registered with the background flush manager). Called once per write
+    /// statement, not per row. A no-op if the table has no tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Engine`] if the flush fails.
+    #[cfg(feature = "columnar")]
+    pub fn flush_columnar_table(&self, table_id: &str) -> StorageResult<()> {
+        use lsm_tree::AbstractTree;
+        if let Some(tree) = self.columnar_tables.get(table_id) {
+            tree.flush_active_memtable(0)?;
+        }
+        Ok(())
+    }
+
+    /// Scan every row of a `STORAGE COLUMNAR` table visible at `snapshot`,
+    /// returned as `(key, value)` byte pairs in key order. Empty if the table
+    /// has no tree yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Engine`] on a block read / decode failure.
+    #[cfg(feature = "columnar")]
+    pub fn columnar_scan(
+        &self,
+        table_id: &str,
+        snapshot: lsm_tree::SeqNo,
+    ) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        use lsm_tree::AbstractTree;
+        let Some(tree) = self.columnar_tables.get(table_id) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for item in tree.range::<&[u8], std::ops::RangeFull>(.., snapshot, None) {
+            let (k, v) = item.into_inner()?;
+            out.push((k.to_vec(), v.to_vec()));
+        }
+        Ok(out)
+    }
+
     /// The timestamp oracle this engine stamps writes with, when opened
     /// via [`StorageEngine::open_with_oracle`]. Subsystems that apply
     /// externally stamped writes (the Raft state machine on followers)

@@ -182,13 +182,48 @@ fn row_table_data_survives_reopen() {
 }
 
 #[test]
-fn columnar_table_row_insert_rejected_for_now() {
+fn columnar_table_insert_and_match_by_primary_key() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = Database::open(dir.path()).expect("open db");
-    db.execute_cypher("CREATE TABLE T (id BIGINT PRIMARY KEY) STORAGE COLUMNAR")
+    db.execute_cypher(
+        "CREATE TABLE Trade (id BIGINT PRIMARY KEY, sym STRING NOT NULL) STORAGE COLUMNAR",
+    )
+    .expect("create");
+    db.execute_cypher("CREATE (t:Trade {id: 1, sym: 'AAPL'})")
+        .expect("insert 1");
+    db.execute_cypher("CREATE (t:Trade {id: 2, sym: 'MSFT'})")
+        .expect("insert 2");
+
+    let rows = db
+        .execute_cypher("MATCH (t:Trade {id: 1}) RETURN t.sym AS sym")
+        .expect("match");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("sym"), Some(&Value::String("AAPL".into())));
+
+    let all = db
+        .execute_cypher("MATCH (t:Trade) RETURN t.sym AS sym")
+        .expect("scan all");
+    assert_eq!(all.len(), 2, "both columnar rows must be scanned");
+}
+
+#[test]
+fn columnar_table_data_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut db = Database::open(dir.path()).expect("open db");
+        db.execute_cypher(
+            "CREATE TABLE Trade (id BIGINT PRIMARY KEY, sym STRING) STORAGE COLUMNAR",
+        )
         .expect("create");
-    // Columnar row writes land with the scan operator; rejected until then.
-    assert!(db.execute_cypher("CREATE (n:T {id: 1})").is_err());
+        db.execute_cypher("CREATE (t:Trade {id: 1, sym: 'AAPL'})")
+            .expect("insert");
+    }
+    let mut db = Database::open(dir.path()).expect("reopen db");
+    let rows = db
+        .execute_cypher("MATCH (t:Trade {id: 1}) RETURN t.sym AS sym")
+        .expect("match after reopen");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("sym"), Some(&Value::String("AAPL".into())));
 }
 
 #[test]

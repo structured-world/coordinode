@@ -1037,6 +1037,33 @@ impl<'a> ExecutionContext<'a> {
         Ok(LocalNodeStore.put(&mut self.txn, shard_id, node_id, record)?)
     }
 
+    /// Write a node record into a `STORAGE COLUMNAR` table's own tree (R901).
+    ///
+    /// Columnar tables live outside the Partition-based transaction, so the
+    /// write goes straight to the table's columnar tree at a fresh oracle
+    /// timestamp (the engine reconstructs rows from columnar blocks on read).
+    /// Visible to subsequent statements (read-committed across statements), not
+    /// snapshot-isolated within an open transaction. Durability follows the
+    /// tree's own flush; the oplog does not yet journal columnar writes.
+    pub fn columnar_put_node(
+        &self,
+        label: &str,
+        node_id: NodeId,
+        record: &NodeRecord,
+    ) -> Result<(), ExecutionError> {
+        let key = coordinode_core::graph::node::encode_node_key(self.shard_id, node_id);
+        let bytes = record.to_msgpack().map_err(|e| {
+            ExecutionError::Serialization(format!("columnar node {} encode: {e}", node_id.as_raw()))
+        })?;
+        let seqno = self
+            .engine
+            .oracle()
+            .map(|o| o.next().as_raw())
+            .unwrap_or_else(|| self.engine.snapshot().saturating_add(1));
+        self.engine.columnar_insert(label, key, bytes, seqno)?;
+        Ok(())
+    }
+
     /// MVCC-aware typed read of a temporal node version.
     ///
     /// Reads the row at the 25-byte temporal key (shard, id,
@@ -3099,6 +3126,17 @@ fn execute_node_scan(
 ) -> Result<Vec<Row>, ExecutionError> {
     let mut results = Vec::new();
 
+    // A COLUMNAR table's rows live in its own columnar tree, not the node path;
+    // scan there at the read snapshot. The (key, value) shape matches the node
+    // prefix scan, so the decode loop below is shared verbatim.
+    let columnar_label = labels.first().and_then(|l| {
+        ctx.load_current_label_schema(l)
+            .ok()
+            .flatten()
+            .filter(|s| s.is_columnar())
+            .map(|_| l.clone())
+    });
+
     // Scan all nodes in the shard using prefix scan. The Layer-4 store owns
     // the node-key shape; the query layer just runs the tracked prefix scan.
     use coordinode_modality::{LocalNodeStore, NodeStore as _};
@@ -3106,25 +3144,30 @@ fn execute_node_scan(
     ctx.sync_txn_state();
     // Keyset-paged source (server-side cursor) when `scan_paging` is set;
     // otherwise the whole-prefix scan. The decode loop below is identical.
-    let scan_results = match ctx
-        .scan_paging
-        .as_ref()
-        .map(|p| (p.resume.clone(), p.limit))
-    {
-        Some((resume, limit)) => {
-            let page = LocalNodeStore.prefix_scan_paged_tracked(
-                &mut ctx.txn,
-                &prefix_bytes,
-                resume.as_deref(),
-                limit,
-            )?;
-            if let Some(paging) = ctx.scan_paging.as_mut() {
-                paging.last_key = page.last_key;
-                paging.exhausted = page.exhausted;
+    let scan_results = if let Some(label) = columnar_label {
+        ctx.engine
+            .columnar_scan(&label, ctx.mvcc_read_ts.as_raw())?
+    } else {
+        match ctx
+            .scan_paging
+            .as_ref()
+            .map(|p| (p.resume.clone(), p.limit))
+        {
+            Some((resume, limit)) => {
+                let page = LocalNodeStore.prefix_scan_paged_tracked(
+                    &mut ctx.txn,
+                    &prefix_bytes,
+                    resume.as_deref(),
+                    limit,
+                )?;
+                if let Some(paging) = ctx.scan_paging.as_mut() {
+                    paging.last_key = page.last_key;
+                    paging.exhausted = page.exhausted;
+                }
+                page.rows
             }
-            page.rows
+            None => LocalNodeStore.prefix_scan_tracked(&mut ctx.txn, &prefix_bytes)?,
         }
-        None => LocalNodeStore.prefix_scan_tracked(&mut ctx.txn, &prefix_bytes)?,
     };
 
     for (key_bytes, value_bytes) in &scan_results {
@@ -8237,23 +8280,15 @@ fn execute_create_node(
         }
     }
 
-    // R901: a relational table bridges its declared primary key to a NodeId,
-    // so the same key maps to the same node (identity + upsert-by-key). A
-    // columnar table's rows live in its own columnar tree, read back by the
-    // columnar scan operator; that write path is not wired yet, so reject a
-    // columnar row insert with a clear message rather than silently writing it
-    // to the node path.
-    let table_pk: Option<Vec<String>> = match schema.as_ref() {
-        Some(s) if s.is_table() && s.is_columnar() => {
-            return Err(ExecutionError::Unsupported(
-                "writing rows into a STORAGE COLUMNAR table is not yet supported \
-                 (it lands with the columnar scan operator); use STORAGE ROW for now"
-                    .into(),
-            ));
-        }
-        Some(s) if s.is_table() => Some(s.primary_key.clone()),
-        _ => None,
+    // R901: a relational table bridges its declared primary key to a NodeId, so
+    // the same key maps to the same node (identity + upsert-by-key). A ROW table
+    // writes that node on the node path; a COLUMNAR table writes it to its own
+    // columnar tree (`table_columnar`).
+    let (table_pk, table_columnar): (Option<Vec<String>>, bool) = match schema.as_ref() {
+        Some(s) if s.is_table() => (Some(s.primary_key.clone()), s.is_columnar()),
+        _ => (None, false),
     };
+    let table_label = labels.first().cloned().unwrap_or_default();
 
     for input_row in input_rows {
         // Table rows take their identity from the primary key; plain graph
@@ -8455,10 +8490,16 @@ fn execute_create_node(
             }
         }
 
-        // `valid_from_for_key` is `Some(_)` for temporal labels and
-        // `None` otherwise — the typed dispatch helper picks the
-        // 25-byte temporal key or the 16-byte non-temporal key.
-        ctx.mvcc_put_node_either(ctx.shard_id, node_id, valid_from_for_key, &record)?;
+        if table_columnar {
+            // COLUMNAR table row → its own columnar tree (read back by the
+            // columnar scan branch of NodeScan), not the node path.
+            ctx.columnar_put_node(&table_label, node_id, &record)?;
+        } else {
+            // `valid_from_for_key` is `Some(_)` for temporal labels and
+            // `None` otherwise — the typed dispatch helper picks the
+            // 25-byte temporal key or the 16-byte non-temporal key.
+            ctx.mvcc_put_node_either(ctx.shard_id, node_id, valid_from_for_key, &record)?;
+        }
         ctx.write_stats.nodes_created += 1;
         ctx.write_stats.properties_set += properties.len() as u64;
 
@@ -8545,6 +8586,13 @@ fn execute_create_node(
         }
 
         results.push(row);
+    }
+
+    // Persist a columnar table's rows once per statement (not per row): the
+    // runtime columnar tree is not registered with the background flush
+    // manager, so flush its memtable here to survive a clean restart.
+    if table_columnar {
+        ctx.engine.flush_columnar_table(&table_label)?;
     }
 
     Ok(results)
