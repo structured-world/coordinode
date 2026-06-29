@@ -115,6 +115,40 @@ async fn sql_crud_over_the_wire() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn introspection_probes_are_answered() {
+    let (client, _dir) = connect().await;
+
+    // version() and SHOW are answered by the catalog shim, not the SQL engine.
+    let rows = data_rows(
+        &client
+            .simple_query("SELECT version()")
+            .await
+            .expect("version"),
+    );
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]
+        .get("version")
+        .is_some_and(|v| v.starts_with("PostgreSQL")));
+
+    let rows = data_rows(
+        &client
+            .simple_query("SHOW transaction_isolation")
+            .await
+            .expect("show"),
+    );
+    assert_eq!(
+        rows[0].get("transaction_isolation").map(String::as_str),
+        Some("read committed")
+    );
+
+    // The shim must not swallow real SQL: a normal query still runs.
+    client
+        .simple_query("CREATE TABLE Probe (id BIGINT PRIMARY KEY)")
+        .await
+        .expect("real SQL still executes after probes");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn invalid_sql_returns_error_not_disconnect() {
     let (client, _dir) = connect().await;
     // A parse error must come back as a Postgres ErrorResponse, and the

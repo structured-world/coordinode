@@ -9,9 +9,12 @@
 //! encoded back as Postgres rows.
 //!
 //! Scope: the Simple Query sub-protocol with trust authentication (no password).
-//! The extended (parameterized / prepared-statement) protocol and authentication
-//! are not wired yet; until then this binding is meant for trusted local / inter-
-//! service access, gated behind an explicitly-configured listen address.
+//! A small [`catalog`] shim answers the introspection probes drivers send on
+//! connect (`version()`, `SHOW ...`). The extended (parameterized /
+//! prepared-statement) protocol, authentication, and tabular catalog
+//! introspection (`information_schema` / `pg_catalog` relations) are not wired
+//! yet; until then this binding is meant for trusted local / inter-service
+//! access, gated behind an explicitly-configured listen address.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,8 +31,12 @@ use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::tokio::process_socket;
 
+use std::collections::BTreeMap;
+
 use coordinode_core::graph::types::Value;
 use coordinode_embed::Database;
+
+mod catalog;
 
 /// The database-backed Simple Query handler.
 ///
@@ -78,6 +85,39 @@ fn encode_cell(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()> 
     }
 }
 
+/// Build a `Query` response from a result set of column-keyed rows.
+///
+/// Columns come from the first row's keys (a row is a sorted key->value map, so
+/// header order and per-row encode order both follow that key order and stay
+/// consistent). A zero-row result carries no column info, so it is described
+/// with an empty schema.
+fn query_response(rows: &[BTreeMap<String, Value>]) -> PgWireResult<Response> {
+    let fields: Vec<FieldInfo> = rows
+        .first()
+        .map(|row| {
+            row.iter()
+                .map(|(name, v)| {
+                    FieldInfo::new(name.clone(), None, None, pg_type(v), FieldFormat::Text)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let schema = Arc::new(fields);
+
+    let mut encoded = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut encoder = DataRowEncoder::new(Arc::clone(&schema));
+        for value in row.values() {
+            encode_cell(&mut encoder, value)?;
+        }
+        encoded.push(Ok(encoder.take_row()));
+    }
+    Ok(Response::Query(QueryResponse::new(
+        schema,
+        stream::iter(encoded),
+    )))
+}
+
 /// Does this statement return a row set (vs. an affected-row count)? Decided from
 /// the leading keyword, because the execution path returns the same row vector
 /// for every statement (empty for writes).
@@ -119,6 +159,13 @@ impl SimpleQueryHandler for PgBackend {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
+        // Answer driver / client introspection probes (version(), SHOW, ...)
+        // without touching the execution path — they reference server built-ins
+        // the SQL frontend does not implement.
+        if let Some(rows) = catalog::intercept(query) {
+            return Ok(vec![query_response(&rows)?]);
+        }
+
         let rows = self.database.write().execute_sql(query).map_err(|e| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
@@ -130,36 +177,7 @@ impl SimpleQueryHandler for PgBackend {
         if !returns_rows(query) {
             return Ok(vec![Response::Execution(command_tag(query))]);
         }
-
-        // Columns come from the first row's keys (a row is a sorted key->value
-        // map, so header order and per-row encode order both follow that key
-        // order and stay consistent). A zero-row result carries no column info,
-        // so it is described with an empty schema.
-        let fields: Vec<FieldInfo> = rows
-            .first()
-            .map(|row| {
-                row.iter()
-                    .map(|(name, v)| {
-                        FieldInfo::new(name.clone(), None, None, pg_type(v), FieldFormat::Text)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let schema = Arc::new(fields);
-
-        let mut encoded = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let mut encoder = DataRowEncoder::new(Arc::clone(&schema));
-            for value in row.values() {
-                encode_cell(&mut encoder, value)?;
-            }
-            encoded.push(Ok(encoder.take_row()));
-        }
-
-        Ok(vec![Response::Query(QueryResponse::new(
-            schema,
-            stream::iter(encoded),
-        ))])
+        Ok(vec![query_response(&rows)?])
     }
 }
 
