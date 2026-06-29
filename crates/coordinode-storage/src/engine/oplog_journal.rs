@@ -111,6 +111,41 @@ impl EmbeddedOplog {
         Ok(index)
     }
 
+    /// Append a single `STORAGE COLUMNAR` row write as one oplog entry stamped
+    /// at `commit_ts`, then fsync. Returns the assigned entry index.
+    ///
+    /// Columnar tables live outside the `Partition` keyspace, so their writes
+    /// carry a [`OplogOp::ColumnarInsert`] tagged with the table id rather than
+    /// a partition discriminant. Like [`append`](Self::append), must be called
+    /// BEFORE the row is applied to the columnar tree's memtable so a write that
+    /// reached the journal survives a crash and is replayed.
+    pub(crate) fn append_columnar(
+        &mut self,
+        table_id: &str,
+        key: &[u8],
+        value: &[u8],
+        commit_ts: u64,
+    ) -> StorageResult<u64> {
+        let index = self.next_index;
+        self.next_index += 1;
+        let entry = OplogEntry {
+            ts: commit_ts,
+            term: 0,
+            index,
+            shard: self.shard,
+            ops: vec![OplogOp::ColumnarInsert {
+                table_id: table_id.to_owned(),
+                key: key.to_vec(),
+                value: value.to_vec(),
+            }],
+            is_migration: false,
+            pre_images: None,
+        };
+        self.manager.append(&entry)?;
+        self.manager.flush()?;
+        Ok(index)
+    }
+
     /// All retained entries, ascending by index — for crash-recovery replay.
     pub(crate) fn read_all(&mut self) -> StorageResult<Vec<OplogEntry>> {
         self.manager.read_range(0, u64::MAX)
@@ -146,7 +181,12 @@ pub(crate) fn op_partition(op: &OplogOp) -> Option<Partition> {
         | OplogOp::Delete { partition, .. }
         | OplogOp::Merge { partition, .. }
         | OplogOp::RemoveRange { partition, .. } => *partition,
-        OplogOp::Noop | OplogOp::RaftEntry { .. } | OplogOp::RaftTruncation { .. } => return None,
+        // ColumnarInsert is routed to the columnar table registry by table_id,
+        // not to a partition tree — see the columnar replay pass in `finish_open`.
+        OplogOp::Noop
+        | OplogOp::RaftEntry { .. }
+        | OplogOp::RaftTruncation { .. }
+        | OplogOp::ColumnarInsert { .. } => return None,
     };
     partition_from_wire_tag(tag)
 }
@@ -167,6 +207,12 @@ pub(crate) fn apply_oplog_op(tree: &AnyTree, op: &OplogOp, seqno: u64) {
         OplogOp::RemoveRange { start, end, .. } => {
             tree.remove_range(start.clone(), end.clone(), seqno);
         }
-        OplogOp::Noop | OplogOp::RaftEntry { .. } | OplogOp::RaftTruncation { .. } => {}
+        // Non-partition ops: Raft framing/heartbeats are not data, and
+        // ColumnarInsert targets a columnar table tree (not a partition tree),
+        // so it is replayed in a separate pass that has the registry handle.
+        OplogOp::Noop
+        | OplogOp::RaftEntry { .. }
+        | OplogOp::RaftTruncation { .. }
+        | OplogOp::ColumnarInsert { .. } => {}
     }
 }

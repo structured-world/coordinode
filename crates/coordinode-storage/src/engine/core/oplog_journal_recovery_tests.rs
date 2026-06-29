@@ -279,6 +279,79 @@ fn merge_replayed_once_not_doubled() {
     }
 }
 
+#[cfg(feature = "columnar")]
+#[test]
+fn columnar_row_survives_crash_via_journal_replay() {
+    // A columnar table write is journalled at its commit_ts before it touches
+    // the table tree. With NO explicit flush, a crash loses the memtable — the
+    // oplog must replay the row on reopen, exactly like the partition path.
+    let dir = TempDir::new().expect("temp dir");
+
+    {
+        let oracle = Arc::new(TimestampOracle::new());
+        let engine =
+            StorageEngine::open_embedded(&durable_cfg(&dir), oracle.clone()).expect("open");
+        let ts = oracle.next().as_raw();
+        engine
+            .columnar_insert("Trade", b"row:0001".to_vec(), b"AAPL".to_vec(), ts)
+            .expect("columnar_insert");
+        // Crash: drop without flush_columnar_table / persist.
+    }
+
+    {
+        let oracle = Arc::new(TimestampOracle::new());
+        let engine = StorageEngine::open_embedded(&durable_cfg(&dir), oracle).expect("reopen");
+        let rows = engine.columnar_scan("Trade", u64::MAX).expect("scan");
+        assert_eq!(
+            rows,
+            vec![(b"row:0001".to_vec(), b"AAPL".to_vec())],
+            "journal replay must restore an un-flushed columnar row"
+        );
+    }
+}
+
+#[cfg(feature = "columnar")]
+#[test]
+fn flushed_columnar_row_not_replayed_over_newer_state() {
+    // A columnar row made durable (flushed to SST) before the crash must be
+    // SKIPPED on recovery (entry.ts <= tree persisted seqno), while a later
+    // un-flushed overwrite IS replayed — no stale resurrection of the old value.
+    let dir = TempDir::new().expect("temp dir");
+
+    {
+        let oracle = Arc::new(TimestampOracle::new());
+        let engine =
+            StorageEngine::open_embedded(&durable_cfg(&dir), oracle.clone()).expect("open");
+        let ts1 = oracle.next().as_raw();
+        engine
+            .columnar_insert("Trade", b"row:0007".to_vec(), b"v1-durable".to_vec(), ts1)
+            .expect("insert v1");
+        engine.flush_columnar_table("Trade").expect("flush");
+
+        let ts2 = oracle.next().as_raw();
+        engine
+            .columnar_insert(
+                "Trade",
+                b"row:0007".to_vec(),
+                b"v2-journalled".to_vec(),
+                ts2,
+            )
+            .expect("insert v2");
+        // Crash: v2 lives only in the oplog.
+    }
+
+    {
+        let oracle = Arc::new(TimestampOracle::new());
+        let engine = StorageEngine::open_embedded(&durable_cfg(&dir), oracle).expect("reopen");
+        let rows = engine.columnar_scan("Trade", u64::MAX).expect("scan");
+        assert_eq!(
+            rows,
+            vec![(b"row:0007".to_vec(), b"v2-journalled".to_vec())],
+            "recovery must skip the flushed row and replay only the un-flushed overwrite"
+        );
+    }
+}
+
 #[test]
 fn in_memory_engine_has_no_journal() {
     // A fully volatile (in-memory) config has no oplog-eligible endpoint, so

@@ -85,6 +85,22 @@ pub enum OplogOp {
     /// a previous leader term and have been superseded by new entries from
     /// the current leader.
     RaftTruncation { after_index: u64 },
+    /// Insert a row into a `STORAGE COLUMNAR` table's own tree.
+    ///
+    /// Columnar tables live outside the `Partition` keyspace (each owns a
+    /// separate columnar-mode tree, keyed by `table_id`), so their writes
+    /// cannot be tagged with a partition discriminant like the ops above.
+    /// Recovery routes this op to the columnar table registry by `table_id`
+    /// rather than to a partition tree. Always last in the enum so the serde
+    /// variant indices of the older ops stay stable for on-disk entries.
+    ColumnarInsert {
+        /// The columnar table this row belongs to.
+        table_id: String,
+        #[serde(with = "serde_bytes")]
+        key: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        value: Vec<u8>,
+    },
 }
 
 /// One logical unit written to the oplog: a batch of ops at a Raft index/term.

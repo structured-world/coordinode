@@ -1043,8 +1043,10 @@ impl<'a> ExecutionContext<'a> {
     /// write goes straight to the table's columnar tree at a fresh oracle
     /// timestamp (the engine reconstructs rows from columnar blocks on read).
     /// Visible to subsequent statements (read-committed across statements), not
-    /// snapshot-isolated within an open transaction. Durability follows the
-    /// tree's own flush; the oplog does not yet journal columnar writes.
+    /// snapshot-isolated within an open transaction. The write is journalled to
+    /// the retained oplog at its commit_ts before it touches the tree, so an
+    /// un-flushed row is replayed on the next open (crash recovery); the
+    /// per-statement flush bounds how much must be replayed.
     pub fn columnar_put_node(
         &self,
         label: &str,

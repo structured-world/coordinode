@@ -107,9 +107,7 @@ fn update_lowers_to_update_over_filter_nodescan() {
     };
     assert_eq!(items.len(), 1);
     match &items[0] {
-        crate::plan::SetItem::Property {
-            property, expr, ..
-        } => {
+        crate::plan::SetItem::Property { property, expr, .. } => {
             assert_eq!(property, "name");
             assert!(matches!(expr, Expr::Literal(Value::String(ref s)) if s == "Bob"));
         }

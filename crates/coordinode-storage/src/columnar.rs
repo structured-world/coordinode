@@ -208,6 +208,20 @@ impl ColumnarTableRegistry {
         Ok(())
     }
 
+    /// Highest LSM seqno across every registered columnar tree, or `None` if no
+    /// table has any persisted data. Used at open time to bump the engine's
+    /// shared sequence-number generator past columnar writes (the partition-tree
+    /// restore alone would miss a columnar-only workload's seqno line).
+    pub fn max_highest_seqno(&self) -> Option<u64> {
+        use lsm_tree::AbstractTree;
+        self.trees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter_map(|t| t.get_highest_seqno())
+            .max()
+    }
+
     /// Sorted list of currently-registered table ids.
     pub fn table_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self

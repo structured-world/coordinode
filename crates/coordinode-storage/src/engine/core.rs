@@ -316,6 +316,12 @@ impl StorageEngine {
         // fixed index cursor would lag those flushes and could double-apply a
         // non-idempotent merge). The replay must precede the seqno restore below
         // so the restored watermark covers the replayed entries.
+        //
+        // Columnar tables live outside the partition trees and their registry is
+        // built further below, so columnar ops are collected here and replayed
+        // in a second pass once the registry exists.
+        #[cfg(feature = "columnar")]
+        let mut columnar_replay: Vec<(String, Vec<u8>, Vec<u8>, u64)> = Vec::new();
         let oplog = match journal_config {
             Some(jcfg) => match config.select_oplog_endpoint(0) {
                 Ok(endpoint) => {
@@ -326,6 +332,21 @@ impl StorageEngine {
                     let mut replayed = 0usize;
                     for entry in &entries {
                         for op in &entry.ops {
+                            #[cfg(feature = "columnar")]
+                            if let OplogOp::ColumnarInsert {
+                                table_id,
+                                key,
+                                value,
+                            } = op
+                            {
+                                columnar_replay.push((
+                                    table_id.clone(),
+                                    key.clone(),
+                                    value.clone(),
+                                    entry.ts,
+                                ));
+                                continue;
+                            }
                             let Some(part) = op_partition(op) else {
                                 continue;
                             };
@@ -483,6 +504,39 @@ impl StorageEngine {
             )?
         };
 
+        // Restore the shared seqno past any persisted columnar write (the
+        // partition-only restore above misses a columnar-only seqno line), then
+        // replay the journalled columnar rows that did not reach an SST — the
+        // mirror of the partition replay loop, routed to the table registry.
+        #[cfg(feature = "columnar")]
+        {
+            use lsm_tree::AbstractTree;
+            if let Some(max) = columnar_tables.max_highest_seqno() {
+                seqno.fetch_max(max + 1);
+            }
+            let mut touched: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut replayed = 0usize;
+            for (table_id, key, value, ts) in columnar_replay {
+                let tree = columnar_tables.create_or_open(&table_id)?;
+                if ts > tree.get_highest_seqno().unwrap_or(0) {
+                    tree.insert(key, value, ts);
+                    touched.insert(table_id);
+                    replayed += 1;
+                }
+            }
+            for table_id in &touched {
+                if let Some(tree) = columnar_tables.get(table_id) {
+                    tree.flush_active_memtable(0)?;
+                }
+            }
+            if replayed > 0 {
+                tracing::info!(
+                    replayed,
+                    "oplog: replayed un-flushed columnar rows from journal on open"
+                );
+            }
+        }
+
         let coordinator =
             LocalMultiModalCoordinator::new(trees, Arc::clone(&seqno), cache, gc_watermark);
         Ok(Self {
@@ -549,6 +603,19 @@ impl StorageEngine {
         seqno: lsm_tree::SeqNo,
     ) -> StorageResult<()> {
         use lsm_tree::AbstractTree;
+        // Journal the row at its commit_ts BEFORE applying it to the tree
+        // memtable, so a write that reached the retained oplog survives a crash
+        // and is replayed on the next open. Mirrors the partition write path
+        // (`oplog_append`): columnar rows live outside the Partition keyspace,
+        // so they carry a table-id-tagged ColumnarInsert op routed back to the
+        // table registry on recovery. No journal (cluster mode / plain open /
+        // in-memory) → durability follows the tree's own flush, as before.
+        if let Some(oplog) = &self.oplog {
+            let mut guard = oplog
+                .lock()
+                .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
+            guard.append_columnar(table_id, &key, &value, seqno)?;
+        }
         let tree = self.columnar_tables.create_or_open(table_id)?;
         tree.insert(key, value, seqno);
         Ok(())
@@ -786,7 +853,12 @@ impl StorageEngine {
                     OplogOp::RemoveRange { start, end, .. } => {
                         self.remove_range(partition, start, end)?;
                     }
-                    OplogOp::Noop | OplogOp::RaftEntry { .. } | OplogOp::RaftTruncation { .. } => {}
+                    // Filtered out above by `op_partition(op) != Some(partition)`
+                    // (these target no partition); the arm satisfies exhaustiveness.
+                    OplogOp::Noop
+                    | OplogOp::RaftEntry { .. }
+                    | OplogOp::RaftTruncation { .. }
+                    | OplogOp::ColumnarInsert { .. } => {}
                 }
             }
         }
