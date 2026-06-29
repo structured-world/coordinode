@@ -1388,6 +1388,30 @@ impl Database {
             .map(|(rows, _, _)| rows)
     }
 
+    /// Execute a SQL statement (`SELECT` / `INSERT`) against the relational
+    /// TABLE modality (R650a).
+    ///
+    /// SQL is parsed and lowered natively into the same neutral `LogicalPlan`
+    /// as Cypher via the [`SqlFrontend`](coordinode_query::sql::SqlFrontend),
+    /// then run through the identical dialect-agnostic execute path. The lowered
+    /// plan is seeded into the plan cache so that shared path picks it up
+    /// instead of cypher-parsing the text.
+    pub fn execute_sql(&mut self, query: &str) -> Result<Vec<Row>, DatabaseError> {
+        use coordinode_query::frontend::QueryFrontend;
+        let parsed = coordinode_query::sql::SqlFrontend::new().parse(query)?;
+        self.plan_cache.put(
+            query.to_string(),
+            Arc::new(CachedPlan {
+                canonical: parsed.canonical,
+                fingerprint: parsed.fingerprint,
+                plan: parsed.plan,
+            }),
+        );
+        let session = self.capture_session();
+        self.execute_cypher_impl(query, None, None, &session, TxnMode::AutoCommit, &mut None)
+            .map(|(rows, _, _)| rows)
+    }
+
     /// Execute a Cypher query with bound parameters.
     ///
     /// Parameters replace `$name` references in the query before execution.

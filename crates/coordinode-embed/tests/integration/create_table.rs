@@ -242,3 +242,45 @@ fn dropped_table_stays_dropped_after_reopen() {
     db.execute_cypher("CREATE TABLE T (id BIGINT PRIMARY KEY) STORAGE COLUMNAR")
         .expect("recreate after reopen");
 }
+
+#[test]
+fn sql_insert_and_select_on_row_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).expect("open db");
+    // DDL via cypher; DML via SQL — both over the one engine + IR.
+    db.execute_cypher("CREATE TABLE Account (id BIGINT PRIMARY KEY, name STRING)")
+        .expect("create table");
+    db.execute_sql("INSERT INTO Account (id, name) VALUES (1, 'Alice')")
+        .expect("sql insert");
+    db.execute_sql("INSERT INTO Account (id, name) VALUES (2, 'Bob')")
+        .expect("sql insert 2");
+
+    let rows = db
+        .execute_sql("SELECT name FROM Account WHERE id = 1")
+        .expect("sql select");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Alice".into())));
+
+    let all = db
+        .execute_sql("SELECT id FROM Account")
+        .expect("sql select all");
+    assert_eq!(all.len(), 2);
+}
+
+#[test]
+fn sql_select_reads_rows_written_by_cypher() {
+    // SQL and Cypher are two dialects over one store: a Cypher-created row is
+    // visible to a SQL SELECT on the same table.
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).expect("open db");
+    db.execute_cypher("CREATE TABLE Account (id BIGINT PRIMARY KEY, name STRING)")
+        .expect("create");
+    db.execute_cypher("CREATE (a:Account {id: 5, name: 'Carol'})")
+        .expect("cypher insert");
+
+    let rows = db
+        .execute_sql("SELECT name FROM Account WHERE id = 5")
+        .expect("sql select");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Carol".into())));
+}
