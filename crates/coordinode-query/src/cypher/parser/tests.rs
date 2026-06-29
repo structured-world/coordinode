@@ -2551,6 +2551,53 @@ fn create_node_type_rejects_unknown_property_type() {
     let _ = parse_err("CREATE NODE TYPE Person WITH (foo: QUATERNION)");
 }
 
+#[test]
+fn create_table_columnar_with_primary_key() {
+    let q = parse_ok(
+        "CREATE TABLE Trade (trade_id BIGINT PRIMARY KEY, symbol STRING NOT NULL, qty INT) STORAGE COLUMNAR",
+    );
+    match &q.clauses[0] {
+        Clause::CreateTable(c) => {
+            assert_eq!(c.name, "Trade");
+            assert_eq!(c.layout, crate::cypher::ast::TableStorageLayout::Columnar);
+            assert_eq!(c.columns.len(), 3);
+            assert_eq!(c.columns[0].name, "trade_id");
+            assert_eq!(c.columns[0].type_name, "BIGINT");
+            assert!(c.columns[0].primary_key);
+            assert_eq!(c.columns[1].name, "symbol");
+            assert!(c.columns[1].not_null);
+            assert!(!c.columns[1].primary_key);
+            assert_eq!(c.columns[2].name, "qty");
+        }
+        other => panic!("expected CreateTable, got {other:?}"),
+    }
+}
+
+#[test]
+fn create_table_defaults_to_row_storage() {
+    let q = parse_ok("CREATE TABLE Account (id BIGINT PRIMARY KEY, name STRING)");
+    match &q.clauses[0] {
+        Clause::CreateTable(c) => {
+            assert_eq!(c.name, "Account");
+            assert_eq!(c.layout, crate::cypher::ast::TableStorageLayout::Row);
+            assert_eq!(c.columns.len(), 2);
+            assert!(c.columns[0].primary_key);
+        }
+        other => panic!("expected CreateTable, got {other:?}"),
+    }
+}
+
+#[test]
+fn create_table_explicit_storage_row() {
+    let q = parse_ok("CREATE TABLE T (k INT PRIMARY KEY) STORAGE ROW");
+    match &q.clauses[0] {
+        Clause::CreateTable(c) => {
+            assert_eq!(c.layout, crate::cypher::ast::TableStorageLayout::Row);
+        }
+        other => panic!("expected CreateTable, got {other:?}"),
+    }
+}
+
 /// `node` is a context keyword (only meaningful in `CREATE NODE TYPE`),
 /// NOT in reserved_word. It must remain a valid identifier elsewhere —
 /// e.g., as a variable name in MATCH / RETURN.

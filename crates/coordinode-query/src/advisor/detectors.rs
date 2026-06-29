@@ -362,6 +362,7 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::DropVectorIndex { .. }
         | LogicalOp::CreateEdgeType { .. }
         | LogicalOp::CreateNodeType { .. }
+        | LogicalOp::CreateTable { .. }
         | LogicalOp::CreateTrigger { .. }
         | LogicalOp::DropTrigger { .. }
         | LogicalOp::ShowTriggers

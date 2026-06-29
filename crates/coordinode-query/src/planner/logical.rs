@@ -521,6 +521,18 @@ pub enum LogicalOp {
         properties: Vec<crate::plan::PropertyDecl>,
     },
 
+    /// CREATE TABLE: declare a relational TABLE label with a declared primary
+    /// key and a physical storage layout (R901). A columnar table is backed by
+    /// its own columnar-mode tree; a row table stays on the node path.
+    CreateTable {
+        name: String,
+        columns: Vec<crate::plan::TableColumn>,
+        /// Primary-key column names, in declaration order. Non-empty.
+        primary_key: Vec<String>,
+        /// `true` for `STORAGE COLUMNAR`, `false` for `STORAGE ROW`.
+        columnar: bool,
+    },
+
     /// CREATE TRIGGER — the trigger architecture. Registers a trigger definition in the
     /// schema partition, updates the `(target, event)` index, and (in EE)
     /// notifies trigger workers of the new subscription.
@@ -1169,6 +1181,7 @@ impl LogicalOp {
             | LogicalOp::DropVectorIndex { .. }
             | LogicalOp::CreateEdgeType { .. }
             | LogicalOp::CreateNodeType { .. }
+            | LogicalOp::CreateTable { .. }
             | LogicalOp::CreateTrigger { .. }
             | LogicalOp::DropTrigger { .. }
             | LogicalOp::ShowTriggers
@@ -1793,6 +1806,7 @@ fn estimate_op_cost(
         | LogicalOp::DropVectorIndex { .. }
         | LogicalOp::CreateEdgeType { .. }
         | LogicalOp::CreateNodeType { .. }
+        | LogicalOp::CreateTable { .. }
         | LogicalOp::CreateTrigger { .. }
         | LogicalOp::DropTrigger { .. }
         | LogicalOp::ShowTriggers
@@ -2514,6 +2528,19 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             output.push_str(&format!(
                 "{prefix}CreateNodeType({name}{temporal_marker}, props={})\n",
                 properties.len()
+            ));
+        }
+        LogicalOp::CreateTable {
+            name,
+            columns,
+            primary_key,
+            columnar,
+        } => {
+            let layout = if *columnar { "COLUMNAR" } else { "ROW" };
+            output.push_str(&format!(
+                "{prefix}CreateTable({name}, cols={}, pk=[{}], STORAGE {layout})\n",
+                columns.len(),
+                primary_key.join(", ")
             ));
         }
         LogicalOp::MergeNodes {

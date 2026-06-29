@@ -34,6 +34,7 @@ clause = {
   | create_index_clause
   | create_edge_type_clause
   | create_node_type_clause
+  | create_table_clause
   | create_trigger_clause
   | drop_trigger_clause
   | show_triggers_clause
@@ -279,6 +280,27 @@ property_type_name = @{
 }
 
 property_decl_modifier = { kw_not ~ kw_null }
+
+// --- CREATE TABLE (R901) — relational TABLE modality ---
+//
+//   CREATE TABLE <name> ( <col> <TYPE> [PRIMARY KEY | NOT NULL | UNIQUE]* , ... )
+//     [STORAGE (ROW | COLUMNAR)]
+//
+// SQL-shaped column declarations (`col TYPE modifiers`, not the cypher
+// `col : TYPE` form): a table is the relational surface and this DDL is shared
+// with the SQL frontend. The type name is a bare identifier resolved to a
+// PropertyType when the clause is built. STORAGE selects the physical layout
+// (defaults to ROW when omitted).
+create_table_clause = {
+    kw_create ~ kw_table ~ identifier
+    ~ "(" ~ table_column_decl_list ~ ")"
+    ~ (kw_storage ~ table_storage_layout)?
+}
+table_column_decl_list = { table_column_decl ~ ("," ~ table_column_decl)* ~ ","? }
+table_column_decl      = { identifier ~ table_column_type ~ table_column_modifier* }
+table_column_type      = { identifier }
+table_column_modifier  = { (kw_primary ~ kw_key) | (kw_not ~ kw_null) | kw_unique }
+table_storage_layout   = { kw_row | kw_columnar }
 
 // --- TRIGGER DDL (R190 — per ADR-026) ---
 //
@@ -900,6 +922,14 @@ kw_temporal   = @{ ^"temporal" ~ !(ASCII_ALPHANUMERIC | "_") }
 // CREATE NODE TYPE — bitemporal node-label DDL (R172a per ADR-027).
 // Context keyword: `node` remains a valid identifier elsewhere.
 kw_node       = @{ ^"node" ~ !(ASCII_ALPHANUMERIC | "_") }
+// CREATE TABLE — relational TABLE modality DDL (R901). Context keywords so they
+// remain valid identifiers elsewhere.
+kw_table      = @{ ^"table" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_storage    = @{ ^"storage" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_row        = @{ ^"row" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_columnar   = @{ ^"columnar" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_primary    = @{ ^"primary" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_key        = @{ ^"key" ~ !(ASCII_ALPHANUMERIC | "_") }
 // MERGE NODES (R180) — context keywords (NOT in reserved_word, so they remain
 // valid identifiers and function names like coalesce()).
 kw_nodes      = @{ ^"nodes" ~ !(ASCII_ALPHANUMERIC | "_") }

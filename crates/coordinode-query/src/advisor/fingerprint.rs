@@ -416,6 +416,33 @@ fn write_clause(buf: &mut String, clause: &Clause) {
                 buf.push(')');
             }
         }
+        Clause::CreateTable(c) => {
+            buf.push_str("CREATE TABLE ");
+            buf.push_str(&c.name);
+            buf.push_str(" (");
+            for (i, col) in c.columns.iter().enumerate() {
+                if i > 0 {
+                    buf.push_str(", ");
+                }
+                buf.push_str(&col.name);
+                buf.push(' ');
+                buf.push_str(&col.type_name);
+                if col.primary_key {
+                    buf.push_str(" PRIMARY KEY");
+                }
+                if col.not_null {
+                    buf.push_str(" NOT NULL");
+                }
+                if col.unique {
+                    buf.push_str(" UNIQUE");
+                }
+            }
+            buf.push(')');
+            buf.push_str(match c.layout {
+                crate::cypher::ast::TableStorageLayout::Columnar => " STORAGE COLUMNAR",
+                crate::cypher::ast::TableStorageLayout::Row => " STORAGE ROW",
+            });
+        }
         Clause::Foreach(fc) => {
             buf.push_str("FOREACH (");
             buf.push_str(&fc.variable);

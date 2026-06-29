@@ -252,6 +252,10 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let c = build_create_node_type_clause(pair)?;
             clauses.push(Clause::CreateNodeType(c));
         }
+        Rule::create_table_clause => {
+            let c = build_create_table_clause(pair)?;
+            clauses.push(Clause::CreateTable(c));
+        }
         Rule::create_trigger_clause => {
             let c = build_create_trigger_clause(pair)?;
             clauses.push(Clause::CreateTrigger(c));
@@ -1195,6 +1199,90 @@ fn build_create_node_type_clause(
         name,
         temporal,
         properties,
+    })
+}
+
+/// Build a `CREATE TABLE <name> ( <cols> ) [STORAGE ROW|COLUMNAR]` clause (R901).
+fn build_create_table_clause(
+    pair: Pair<'_, Rule>,
+) -> Result<crate::cypher::ast::CreateTableClause, ParseError> {
+    use crate::cypher::ast::{CreateTableClause, TableColumnDecl, TableStorageLayout};
+    let mut name = String::new();
+    let mut columns: Vec<TableColumnDecl> = Vec::new();
+    let mut layout = TableStorageLayout::Row;
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::identifier if name.is_empty() => {
+                name = inner.as_str().to_string();
+            }
+            Rule::table_column_decl_list => {
+                for decl in inner.into_inner() {
+                    if decl.as_rule() != Rule::table_column_decl {
+                        continue;
+                    }
+                    let mut col_name = String::new();
+                    let mut type_name = String::new();
+                    let mut primary_key = false;
+                    let mut not_null = false;
+                    let mut unique = false;
+                    for part in decl.into_inner() {
+                        match part.as_rule() {
+                            Rule::identifier if col_name.is_empty() => {
+                                col_name = part.as_str().to_string();
+                            }
+                            Rule::table_column_type => {
+                                type_name = part.as_str().to_uppercase();
+                            }
+                            Rule::table_column_modifier => {
+                                match part.into_inner().next().map(|p| p.as_rule()) {
+                                    Some(Rule::kw_primary) => primary_key = true,
+                                    Some(Rule::kw_not) => not_null = true,
+                                    Some(Rule::kw_unique) => unique = true,
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !col_name.is_empty() && !type_name.is_empty() {
+                        columns.push(TableColumnDecl {
+                            name: col_name,
+                            type_name,
+                            primary_key,
+                            not_null,
+                            unique,
+                        });
+                    }
+                }
+            }
+            Rule::table_storage_layout => {
+                if let Some(p) = inner.into_inner().next() {
+                    layout = match p.as_rule() {
+                        Rule::kw_columnar => TableStorageLayout::Columnar,
+                        _ => TableStorageLayout::Row,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if name.is_empty() {
+        return Err(ParseError::Invalid(
+            "CREATE TABLE requires a table name".into(),
+        ));
+    }
+    if columns.is_empty() {
+        return Err(ParseError::Invalid(
+            "CREATE TABLE requires at least one column".into(),
+        ));
+    }
+
+    Ok(CreateTableClause {
+        name,
+        columns,
+        layout,
     })
 }
 

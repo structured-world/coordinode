@@ -65,6 +65,7 @@ impl Query {
                 | Clause::DropVectorIndex(_)
                 | Clause::CreateEdgeType(_)
                 | Clause::CreateNodeType(_)
+                | Clause::CreateTable(_)
                 | Clause::Foreach(_) => true,
                 // A subquery is a write iff its body contains a write clause.
                 Clause::CallSubquery(cs) => cs.body.iter().any(clause_is_write),
@@ -126,6 +127,10 @@ pub enum Clause {
     /// `CREATE NODE TYPE <name> [TEMPORAL] [WITH (...)]` — bitemporal-capable
     /// label DDL (R172a per ADR-027). Mirror of `CreateEdgeType` for nodes.
     CreateNodeType(CreateNodeTypeClause),
+
+    /// `CREATE TABLE <name> ( <cols> ) [STORAGE ROW|COLUMNAR]` — relational
+    /// TABLE modality DDL (R901).
+    CreateTable(CreateTableClause),
 
     /// `CREATE TRIGGER … ON :Label CREATE|UPDATE|DELETE BEFORE|AFTER COMMIT EXECUTE … [ON ERROR …]`.
     CreateTrigger(CreateTriggerClause),
@@ -438,6 +443,44 @@ pub struct EdgePropertyDecl {
     pub name: String,
     pub type_name: String,
     pub not_null: bool,
+}
+
+/// Physical storage layout selected by `CREATE TABLE`'s `STORAGE` clause (R901).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TableStorageLayout {
+    /// `STORAGE ROW` (default): one record per row on the node path.
+    #[default]
+    Row,
+    /// `STORAGE COLUMNAR`: rows in the engine's native columnar block type.
+    Columnar,
+}
+
+/// A single `CREATE TABLE` column declaration: `name TYPE [modifiers]` (R901).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableColumnDecl {
+    /// Column name.
+    pub name: String,
+    /// Lexical type identifier (e.g. "BIGINT", "STRING"), resolved against
+    /// `coordinode_core::schema::PropertyType` when the clause is lowered.
+    pub type_name: String,
+    /// `PRIMARY KEY` modifier — the column is part of the table's primary key.
+    pub primary_key: bool,
+    /// `NOT NULL` modifier.
+    pub not_null: bool,
+    /// `UNIQUE` modifier.
+    pub unique: bool,
+}
+
+/// `CREATE TABLE <name> ( <columns> ) [STORAGE ROW|COLUMNAR]` — relational
+/// TABLE modality DDL (R901).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTableClause {
+    /// Table (label) name.
+    pub name: String,
+    /// Column declarations in declaration order.
+    pub columns: Vec<TableColumnDecl>,
+    /// Physical storage layout (`STORAGE` clause; defaults to `Row`).
+    pub layout: TableStorageLayout,
 }
 
 /// DROP VECTOR INDEX clause.

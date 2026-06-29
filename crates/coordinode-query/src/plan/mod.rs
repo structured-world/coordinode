@@ -180,6 +180,20 @@ pub struct AlterTriggerDef {
     pub action: AlterTriggerAction,
 }
 
+/// A column of a relational TABLE, in the neutral IR (R901). The type is a
+/// lexical name resolved to a `PropertyType` by the executor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableColumn {
+    /// Column name.
+    pub name: String,
+    /// Lexical type identifier (e.g. "BIGINT", "STRING").
+    pub type_name: String,
+    /// `NOT NULL` constraint.
+    pub not_null: bool,
+    /// `UNIQUE` constraint.
+    pub unique: bool,
+}
+
 /// Per-field configuration for `CREATE TEXT INDEX`, in the neutral IR.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextIndexFieldSpec {

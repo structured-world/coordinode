@@ -800,6 +800,30 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             temporal: c.temporal,
             properties: lower_property_decls(&c.properties),
         }),
+        Clause::CreateTable(c) => {
+            let columns = c
+                .columns
+                .iter()
+                .map(|col| crate::plan::TableColumn {
+                    name: col.name.clone(),
+                    type_name: col.type_name.clone(),
+                    not_null: col.not_null,
+                    unique: col.unique,
+                })
+                .collect();
+            let primary_key = c
+                .columns
+                .iter()
+                .filter(|col| col.primary_key)
+                .map(|col| col.name.clone())
+                .collect();
+            Ok(LogicalOp::CreateTable {
+                name: c.name.clone(),
+                columns,
+                primary_key,
+                columnar: matches!(c.layout, crate::cypher::ast::TableStorageLayout::Columnar),
+            })
+        }
         Clause::CreateTrigger(c) => Ok(LogicalOp::CreateTrigger {
             clause: lower_create_trigger(c),
         }),

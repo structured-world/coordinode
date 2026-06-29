@@ -2769,6 +2769,13 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             properties,
         } => execute_create_node_type(name, *temporal, properties, ctx),
 
+        LogicalOp::CreateTable {
+            name,
+            columns,
+            primary_key,
+            columnar,
+        } => execute_create_table(name, columns, primary_key, *columnar, ctx),
+
         LogicalOp::CreateTrigger { clause } => execute_create_trigger(clause, ctx),
         LogicalOp::DropTrigger { name } => execute_drop_trigger(name, ctx),
         LogicalOp::ShowTriggers => execute_show_triggers(ctx),
@@ -13687,6 +13694,101 @@ fn execute_create_node_type(
         "properties".to_string(),
         Value::Int(properties.len() as i64),
     );
+    Ok(vec![row])
+}
+
+/// Resolve a `CREATE TABLE` lexical column type (SQL or cypher spelling) to a
+/// `PropertyType`. Returns `None` for an unknown type name.
+fn resolve_table_column_type(
+    type_name: &str,
+) -> Option<coordinode_core::schema::definition::PropertyType> {
+    use coordinode_core::schema::definition::PropertyType;
+    Some(match type_name {
+        "BIGINT" | "INT" | "INTEGER" | "SMALLINT" => PropertyType::Int,
+        "FLOAT" | "DOUBLE" | "REAL" => PropertyType::Float,
+        "STRING" | "TEXT" | "VARCHAR" => PropertyType::String,
+        "BOOL" | "BOOLEAN" => PropertyType::Bool,
+        "TIMESTAMP" => PropertyType::Timestamp,
+        "BLOB" => PropertyType::Blob,
+        "BINARY" => PropertyType::Binary,
+        "GEO" => PropertyType::Geo,
+        "MAP" => PropertyType::Map,
+        "DOCUMENT" => PropertyType::Document,
+        _ => return None,
+    })
+}
+
+/// CREATE TABLE: declare a relational TABLE label (R901). Persists a
+/// `LabelSchema` carrying the declared primary key and storage layout, and for
+/// a columnar table opens the per-table columnar tree.
+fn execute_create_table(
+    name: &str,
+    columns: &[crate::plan::TableColumn],
+    primary_key: &[String],
+    columnar: bool,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    use coordinode_core::schema::definition::{
+        LabelSchema, PlacementPolicy, PropertyDef, StorageLayout,
+    };
+
+    if ctx.load_current_label_schema(name)?.is_some() {
+        return Err(ExecutionError::Unsupported(format!(
+            "label '{name}' already exists"
+        )));
+    }
+    if primary_key.is_empty() {
+        return Err(ExecutionError::Unsupported(format!(
+            "CREATE TABLE '{name}' requires a PRIMARY KEY"
+        )));
+    }
+
+    let mut schema = LabelSchema::new(name, PlacementPolicy::NodeId);
+    for col in columns {
+        let Some(ptype) = resolve_table_column_type(&col.type_name) else {
+            return Err(ExecutionError::Unsupported(format!(
+                "unsupported column type '{}' for table '{name}'",
+                col.type_name
+            )));
+        };
+        let mut prop = PropertyDef::new(&col.name, ptype);
+        // Primary-key columns are implicitly NOT NULL.
+        if col.not_null || primary_key.iter().any(|pk| pk == &col.name) {
+            prop = prop.not_null();
+        }
+        if col.unique {
+            prop = prop.unique();
+        }
+        schema.add_property(prop);
+    }
+    // Every primary-key column must be a declared column.
+    for pk in primary_key {
+        if !columns.iter().any(|c| &c.name == pk) {
+            return Err(ExecutionError::Unsupported(format!(
+                "PRIMARY KEY column '{pk}' is not declared in table '{name}'"
+            )));
+        }
+    }
+    schema.set_primary_key(primary_key.to_vec());
+    if columnar {
+        schema.set_storage_layout(StorageLayout::Columnar);
+    }
+
+    ctx.save_current_label_schema(&schema)?;
+
+    // A columnar table is backed by its own columnar-mode tree; open it now so
+    // it exists before any write. Row tables stay on the node path.
+    if columnar {
+        ctx.engine.create_columnar_table(name)?;
+    }
+
+    let mut row = Row::new();
+    row.insert("name".to_string(), Value::String(name.to_string()));
+    row.insert(
+        "storage".to_string(),
+        Value::String(if columnar { "COLUMNAR" } else { "ROW" }.to_string()),
+    );
+    row.insert("columns".to_string(), Value::Int(columns.len() as i64));
     Ok(vec![row])
 }
 

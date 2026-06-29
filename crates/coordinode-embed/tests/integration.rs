@@ -13,6 +13,7 @@ mod integration {
     mod computed;
     mod concurrent;
     mod crash;
+    mod create_table;
     mod cross_match;
     mod crud;
     mod cypher;
