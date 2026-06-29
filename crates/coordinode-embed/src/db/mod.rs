@@ -17,15 +17,14 @@ use coordinode_core::graph::types::VectorConsistencyMode;
 use coordinode_core::txn::proposal::ProposalIdGenerator;
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_query::advisor::nplus1::NPlus1Detector;
-use coordinode_query::advisor::{
-    normalize_and_fingerprint, DismissedSet, ProcedureContext, QueryRegistry, SourceContext,
-};
+use coordinode_query::advisor::{DismissedSet, ProcedureContext, QueryRegistry, SourceContext};
 use coordinode_query::cypher;
 use coordinode_query::executor::row::Row;
 use coordinode_query::executor::runner::{
     execute, execute_no_commit, AdaptiveConfig, ExecutionContext, ExecutionError, ExtensionHandler,
     ExtensionRegistry, FeedbackCache, ScanPaging, WriteStats,
 };
+use coordinode_query::frontend::{CypherFrontend, QueryFrontend};
 use coordinode_query::planner;
 use coordinode_raft::proposal::OwnedLocalProposalPipeline;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
@@ -526,6 +525,23 @@ pub enum DatabaseError {
 
     #[error("{0}")]
     Other(String),
+}
+
+impl From<coordinode_query::frontend::FrontendError> for DatabaseError {
+    fn from(e: coordinode_query::frontend::FrontendError) -> Self {
+        use coordinode_query::frontend::FrontendError as FE;
+        match e {
+            FE::Parse(p) => DatabaseError::Parse(p),
+            FE::Plan(p) => DatabaseError::Plan(p),
+            FE::Semantic(errors) => DatabaseError::Semantic(
+                errors
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+        }
+    }
 }
 
 impl Database {
@@ -1926,28 +1942,19 @@ impl Database {
                 cached.plan.clone(),
             ),
             None => {
-                let ast = cypher::parse(query)?;
-                let (canonical, fp) = normalize_and_fingerprint(&ast);
-                let errors = cypher::analyze(&ast, None);
-                if !errors.is_empty() {
-                    return Err(DatabaseError::Semantic(
-                        errors
-                            .iter()
-                            .map(|e| e.to_string())
-                            .collect::<Vec<_>>()
-                            .join("; "),
-                    ));
-                }
-                let plan = planner::build_logical_plan(&ast)?;
+                // Parse, validate, lower, and fingerprint through the query
+                // frontend. The frontend is the only dialect-aware component;
+                // everything below the returned plan is language-neutral.
+                let parsed = CypherFrontend::new().parse(query)?;
                 self.plan_cache.put(
                     query.to_string(),
                     Arc::new(CachedPlan {
-                        canonical: canonical.clone(),
-                        fingerprint: fp,
-                        plan: plan.clone(),
+                        canonical: parsed.canonical.clone(),
+                        fingerprint: parsed.fingerprint,
+                        plan: parsed.plan.clone(),
                     }),
                 );
-                (canonical, fp, plan)
+                (parsed.canonical, parsed.fingerprint, parsed.plan)
             }
         };
         // Inject the per-call vector consistency into the plan for EXPLAIN output.

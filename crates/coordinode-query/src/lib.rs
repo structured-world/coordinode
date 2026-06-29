@@ -8,6 +8,7 @@
 pub mod advisor;
 pub mod cypher;
 pub mod executor;
+pub mod frontend;
 pub mod graphql;
 pub mod index;
 pub mod plan;
