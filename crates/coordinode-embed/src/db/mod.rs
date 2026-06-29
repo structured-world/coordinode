@@ -1850,13 +1850,10 @@ impl Database {
     /// query that fails to parse or plan is reported ineligible (the cursor
     /// surfaces the real error on execution).
     pub fn keyset_pageable(&self, query: &str) -> bool {
-        let Ok(ast) = cypher::parse(query) else {
+        let Ok(parsed) = CypherFrontend::new().parse(query) else {
             return false;
         };
-        let Ok(plan) = planner::build_logical_plan(&ast) else {
-            return false;
-        };
-        Self::spine_is_keyset_pageable(&plan.root)
+        Self::spine_is_keyset_pageable(&parsed.plan.root)
     }
 
     /// Walk a plan spine: keyset-pageable iff it is a single `NodeScan` under a
@@ -2312,8 +2309,7 @@ impl Database {
     /// Uses real storage statistics (node counts, fan-out) for
     /// more accurate cost estimates than hardcoded defaults.
     pub fn explain_cypher(&self, query: &str) -> Result<String, DatabaseError> {
-        let ast = cypher::parse(query)?;
-        let mut plan = planner::build_logical_plan(&ast)?;
+        let mut plan = CypherFrontend::new().parse(query)?.plan;
         plan.vector_consistency = self.vector_consistency;
         // Apply index selection optimizer so EXPLAIN reflects the actual plan
         // that would be executed (IndexScan instead of Filter+NodeScan when
@@ -2369,8 +2365,7 @@ impl Database {
         &self,
         query: &str,
     ) -> Result<coordinode_query::advisor::ExplainSuggestResult, DatabaseError> {
-        let ast = cypher::parse(query)?;
-        let mut plan = planner::build_logical_plan(&ast)?;
+        let mut plan = CypherFrontend::new().parse(query)?.plan;
         plan.vector_consistency = self.vector_consistency;
         let stats = self.compute_stats();
         let stats_ref = stats

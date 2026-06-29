@@ -14,6 +14,7 @@ use coordinode_embed::{Database, DatabaseError};
 use coordinode_query::advisor::nplus1::NPlus1Detector;
 use coordinode_query::advisor::source::{self, grpc_keys, SourceContext};
 use coordinode_query::advisor::QueryRegistry;
+use coordinode_query::frontend::QueryFrontend;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::read_fence::{
     ReadConcern, ReadFenceError, ReadPreference, READ_FENCE_TIMEOUT,
@@ -539,9 +540,11 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
 
         // Advisor tracking: fingerprint + source + N+1
         // Database::execute_cypher already records in its own registry,
-        // but server has its own registry for gRPC-specific tracking.
-        if let Ok(ast) = coordinode_query::cypher::parse(&req.query) {
-            let (canonical, fp) = coordinode_query::advisor::normalize_and_fingerprint(&ast);
+        // but server has its own registry for gRPC-specific tracking. The
+        // fingerprint comes from the query frontend (no plan build needed).
+        if let Ok((canonical, fp)) =
+            coordinode_query::frontend::CypherFrontend::new().fingerprint(&req.query)
+        {
             let duration_us = start.elapsed().as_micros() as u64;
 
             match &source_ctx {

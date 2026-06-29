@@ -68,6 +68,12 @@ impl std::error::Error for FrontendError {}
 pub trait QueryFrontend {
     /// Parse, validate, and lower `text` into the neutral IR.
     fn parse(&self, text: &str) -> Result<ParsedQuery, FrontendError>;
+
+    /// Parse `text` and compute its canonical form and fingerprint without
+    /// building a plan. Advisor / query-tracking paths key off the fingerprint
+    /// but never execute, so they avoid the cost of lowering a full plan.
+    /// Canonicalization is dialect-specific, so it belongs to the frontend.
+    fn fingerprint(&self, text: &str) -> Result<(String, u64), FrontendError>;
 }
 
 /// The Cypher frontend: parses Cypher, runs semantic analysis, lowers to the
@@ -96,6 +102,11 @@ impl QueryFrontend for CypherFrontend {
             canonical,
             fingerprint,
         })
+    }
+
+    fn fingerprint(&self, text: &str) -> Result<(String, u64), FrontendError> {
+        let ast = crate::cypher::parse(text).map_err(FrontendError::Parse)?;
+        Ok(crate::advisor::normalize_and_fingerprint(&ast))
     }
 }
 
