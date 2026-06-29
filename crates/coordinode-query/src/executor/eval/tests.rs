@@ -1,4 +1,18 @@
 use super::*;
+use crate::cypher::ast::{
+    BinaryOperator, Expr, ListPredicateKind, MapProjectionItem, StringOp, UnaryOperator,
+};
+
+/// Evaluate a cypher test expression through the production path: lower it to
+/// the neutral IR, then run the neutral evaluator. The direct cypher evaluator
+/// was removed; lowering then `eval_neutral` is the only evaluation path, so
+/// these tests exercise exactly what the executor runs.
+fn eval_expr(expr: &Expr, row: &Row) -> Value {
+    crate::executor::eval_neutral::eval_neutral(
+        &crate::planner::lower_expr(expr).expect("lower test expression"),
+        row,
+    )
+}
 
 fn empty_row() -> Row {
     Row::new()

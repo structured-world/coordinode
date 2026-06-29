@@ -240,8 +240,17 @@ fn document_persists_across_reopen() {
 fn document_dot_notation_eval_through_pipeline() {
     use coordinode_core::graph::types::Value;
     use coordinode_query::cypher::ast::Expr;
-    use coordinode_query::executor::eval::eval_expr;
     use coordinode_query::executor::row::Row;
+
+    // Evaluate through the production path: lower the cypher expression to the
+    // neutral IR, then run the neutral evaluator (the direct cypher evaluator
+    // was removed; lowering + eval_neutral is the only evaluation path).
+    fn eval_expr(expr: &Expr, row: &Row) -> Value {
+        coordinode_query::executor::eval_neutral::eval_neutral(
+            &coordinode_query::planner::lower_expr(expr).expect("lower"),
+            row,
+        )
+    }
 
     let config = rmpv::Value::Map(vec![
         (
