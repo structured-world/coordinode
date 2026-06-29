@@ -66,6 +66,7 @@ impl Query {
                 | Clause::CreateEdgeType(_)
                 | Clause::CreateNodeType(_)
                 | Clause::CreateTable(_)
+                | Clause::DropTable(_)
                 | Clause::Foreach(_) => true,
                 // A subquery is a write iff its body contains a write clause.
                 Clause::CallSubquery(cs) => cs.body.iter().any(clause_is_write),
@@ -131,6 +132,9 @@ pub enum Clause {
     /// `CREATE TABLE <name> ( <cols> ) [STORAGE ROW|COLUMNAR]` — relational
     /// TABLE modality DDL (R901).
     CreateTable(CreateTableClause),
+
+    /// `DROP TABLE <name>` — relational TABLE modality DDL (R901).
+    DropTable(DropTableClause),
 
     /// `CREATE TRIGGER … ON :Label CREATE|UPDATE|DELETE BEFORE|AFTER COMMIT EXECUTE … [ON ERROR …]`.
     CreateTrigger(CreateTriggerClause),
@@ -481,6 +485,13 @@ pub struct CreateTableClause {
     pub columns: Vec<TableColumnDecl>,
     /// Physical storage layout (`STORAGE` clause; defaults to `Row`).
     pub layout: TableStorageLayout,
+}
+
+/// `DROP TABLE <name>` — relational TABLE modality DDL (R901).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropTableClause {
+    /// Table (label) name to drop.
+    pub name: String,
 }
 
 /// DROP VECTOR INDEX clause.

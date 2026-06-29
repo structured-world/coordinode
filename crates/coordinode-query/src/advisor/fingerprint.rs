@@ -443,6 +443,10 @@ fn write_clause(buf: &mut String, clause: &Clause) {
                 crate::cypher::ast::TableStorageLayout::Row => " STORAGE ROW",
             });
         }
+        Clause::DropTable(c) => {
+            buf.push_str("DROP TABLE ");
+            buf.push_str(&c.name);
+        }
         Clause::Foreach(fc) => {
             buf.push_str("FOREACH (");
             buf.push_str(&fc.variable);

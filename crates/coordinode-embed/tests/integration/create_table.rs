@@ -39,6 +39,33 @@ fn create_row_table_persists_without_columnar_tree() {
 }
 
 #[test]
+fn drop_columnar_table_removes_tree_and_allows_recreate() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).expect("open db");
+
+    db.execute_cypher("CREATE TABLE Trade (id BIGINT PRIMARY KEY, qty INT) STORAGE COLUMNAR")
+        .expect("create");
+    assert!(db.engine().columnar_table_tree("Trade").is_some());
+
+    let rows = db.execute_cypher("DROP TABLE Trade").expect("drop");
+    assert_eq!(rows.len(), 1);
+    // Tree gone, schema tombstoned.
+    assert!(db.engine().columnar_table_tree("Trade").is_none());
+
+    // The name is free again: re-create succeeds.
+    db.execute_cypher("CREATE TABLE Trade (id BIGINT PRIMARY KEY) STORAGE COLUMNAR")
+        .expect("recreate");
+    assert!(db.engine().columnar_table_tree("Trade").is_some());
+}
+
+#[test]
+fn drop_unknown_table_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).expect("open db");
+    assert!(db.execute_cypher("DROP TABLE Nope").is_err());
+}
+
+#[test]
 fn create_table_requires_primary_key() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = Database::open(dir.path()).expect("open db");

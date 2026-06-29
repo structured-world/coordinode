@@ -256,6 +256,10 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let c = build_create_table_clause(pair)?;
             clauses.push(Clause::CreateTable(c));
         }
+        Rule::drop_table_clause => {
+            let c = build_drop_table_clause(pair)?;
+            clauses.push(Clause::DropTable(c));
+        }
         Rule::create_trigger_clause => {
             let c = build_create_trigger_clause(pair)?;
             clauses.push(Clause::CreateTrigger(c));
@@ -1491,6 +1495,17 @@ fn build_drop_trigger_clause(pair: Pair<'_, Rule>) -> Result<DropTriggerClause, 
         .map(|p| p.as_str().to_string())
         .ok_or_else(|| ParseError::Invalid("DROP TRIGGER requires a name".into()))?;
     Ok(DropTriggerClause { name })
+}
+
+fn build_drop_table_clause(
+    pair: Pair<'_, Rule>,
+) -> Result<crate::cypher::ast::DropTableClause, ParseError> {
+    let name = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::identifier)
+        .map(|p| p.as_str().to_string())
+        .ok_or_else(|| ParseError::Invalid("DROP TABLE requires a table name".into()))?;
+    Ok(crate::cypher::ast::DropTableClause { name })
 }
 
 fn build_alter_trigger_clause(pair: Pair<'_, Rule>) -> Result<AlterTriggerClause, ParseError> {

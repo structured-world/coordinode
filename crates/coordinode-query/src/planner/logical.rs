@@ -539,6 +539,10 @@ pub enum LogicalOp {
     CreateTrigger { clause: crate::plan::TriggerDef },
     /// DROP TRIGGER — the trigger architecture.
     DropTrigger { name: String },
+
+    /// DROP TABLE: drop a relational TABLE label (R901). Tombstones the schema
+    /// pointer and, for a columnar table, drops its per-table columnar tree.
+    DropTable { name: String },
     /// SHOW TRIGGERS — the trigger architecture. Reads schema partition and returns one row per
     /// registered trigger.
     ShowTriggers,
@@ -1182,6 +1186,7 @@ impl LogicalOp {
             | LogicalOp::CreateEdgeType { .. }
             | LogicalOp::CreateNodeType { .. }
             | LogicalOp::CreateTable { .. }
+            | LogicalOp::DropTable { .. }
             | LogicalOp::CreateTrigger { .. }
             | LogicalOp::DropTrigger { .. }
             | LogicalOp::ShowTriggers
@@ -1807,6 +1812,7 @@ fn estimate_op_cost(
         | LogicalOp::CreateEdgeType { .. }
         | LogicalOp::CreateNodeType { .. }
         | LogicalOp::CreateTable { .. }
+        | LogicalOp::DropTable { .. }
         | LogicalOp::CreateTrigger { .. }
         | LogicalOp::DropTrigger { .. }
         | LogicalOp::ShowTriggers
@@ -2633,6 +2639,9 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
         }
         LogicalOp::DropTrigger { name } => {
             output.push_str(&format!("{prefix}DropTrigger({name})\n"));
+        }
+        LogicalOp::DropTable { name } => {
+            output.push_str(&format!("{prefix}DropTable({name})\n"));
         }
         LogicalOp::ShowTriggers => {
             output.push_str(&format!("{prefix}ShowTriggers\n"));

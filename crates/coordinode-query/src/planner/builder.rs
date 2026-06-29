@@ -824,6 +824,9 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 columnar: matches!(c.layout, crate::cypher::ast::TableStorageLayout::Columnar),
             })
         }
+        Clause::DropTable(c) => Ok(LogicalOp::DropTable {
+            name: c.name.clone(),
+        }),
         Clause::CreateTrigger(c) => Ok(LogicalOp::CreateTrigger {
             clause: lower_create_trigger(c),
         }),

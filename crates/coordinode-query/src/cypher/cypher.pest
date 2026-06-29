@@ -35,6 +35,7 @@ clause = {
   | create_edge_type_clause
   | create_node_type_clause
   | create_table_clause
+  | drop_table_clause
   | create_trigger_clause
   | drop_trigger_clause
   | show_triggers_clause
@@ -301,6 +302,10 @@ table_column_decl      = { identifier ~ table_column_type ~ table_column_modifie
 table_column_type      = { identifier }
 table_column_modifier  = { (kw_primary ~ kw_key) | (kw_not ~ kw_null) | kw_unique }
 table_storage_layout   = { kw_row | kw_columnar }
+
+// DROP TABLE <name> (R901). For a columnar table this also drops the per-table
+// columnar tree; the label schema pointer is tombstoned either way.
+drop_table_clause = { kw_drop ~ kw_table ~ identifier }
 
 // --- TRIGGER DDL (R190 — per ADR-026) ---
 //

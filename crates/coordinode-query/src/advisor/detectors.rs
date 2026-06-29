@@ -363,6 +363,7 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::CreateEdgeType { .. }
         | LogicalOp::CreateNodeType { .. }
         | LogicalOp::CreateTable { .. }
+        | LogicalOp::DropTable { .. }
         | LogicalOp::CreateTrigger { .. }
         | LogicalOp::DropTrigger { .. }
         | LogicalOp::ShowTriggers

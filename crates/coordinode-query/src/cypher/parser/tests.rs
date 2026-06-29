@@ -2598,6 +2598,15 @@ fn create_table_explicit_storage_row() {
     }
 }
 
+#[test]
+fn drop_table_parses() {
+    let q = parse_ok("DROP TABLE Trade");
+    match &q.clauses[0] {
+        Clause::DropTable(c) => assert_eq!(c.name, "Trade"),
+        other => panic!("expected DropTable, got {other:?}"),
+    }
+}
+
 /// `node` is a context keyword (only meaningful in `CREATE NODE TYPE`),
 /// NOT in reserved_word. It must remain a valid identifier elsewhere —
 /// e.g., as a variable name in MATCH / RETURN.

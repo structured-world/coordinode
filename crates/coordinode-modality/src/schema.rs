@@ -168,6 +168,12 @@ pub trait SchemaStore {
     /// transaction's write buffer; applied atomically at commit.
     fn save_label_txn(&self, txn: &mut Transaction, schema: &LabelSchema) -> StoreResult<()>;
 
+    /// Drop a label (DROP TABLE / DROP label) by tombstoning its
+    /// current-revision pointer on the transaction. The body revisions are left
+    /// in place but become unreachable, so the label resolves to "not declared"
+    /// from the next read. Applied atomically at commit.
+    fn drop_label_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()>;
+
     /// Persist an edge type schema (body + pointer) on the transaction.
     fn save_edge_type_txn(&self, txn: &mut Transaction, schema: &EdgeTypeSchema)
         -> StoreResult<()>;
@@ -482,6 +488,12 @@ impl SchemaStore for LocalSchemaStore<'_> {
             &pointer_key,
             &schema.schema_revision.to_be_bytes(),
         )?;
+        Ok(())
+    }
+
+    fn drop_label_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()> {
+        let pointer_key = encode_label_current_revision_key(name);
+        txn.delete(Partition::Schema, &pointer_key)?;
         Ok(())
     }
 

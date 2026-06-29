@@ -915,6 +915,14 @@ impl<'a> ExecutionContext<'a> {
         Ok(LocalSchemaStore::new(self.engine).save_label_txn(&mut self.txn, schema)?)
     }
 
+    /// Drop a label by tombstoning its current-revision pointer (DROP TABLE).
+    /// The label resolves to "not declared" from the next read.
+    pub fn drop_current_label_schema(&mut self, name: &str) -> Result<(), ExecutionError> {
+        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        self.sync_txn_state();
+        Ok(LocalSchemaStore::new(self.engine).drop_label_txn(&mut self.txn, name)?)
+    }
+
     /// MVCC-aware delete: buffers tombstone in write_buffer for atomic flush.
     ///
     /// When MVCC is disabled (legacy mode), deletes directly from engine.
@@ -2775,6 +2783,8 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             primary_key,
             columnar,
         } => execute_create_table(name, columns, primary_key, *columnar, ctx),
+
+        LogicalOp::DropTable { name } => execute_drop_table(name, ctx),
 
         LogicalOp::CreateTrigger { clause } => execute_create_trigger(clause, ctx),
         LogicalOp::DropTrigger { name } => execute_drop_trigger(name, ctx),
@@ -13789,6 +13799,35 @@ fn execute_create_table(
         Value::String(if columnar { "COLUMNAR" } else { "ROW" }.to_string()),
     );
     row.insert("columns".to_string(), Value::Int(columns.len() as i64));
+    Ok(vec![row])
+}
+
+/// DROP TABLE: drop a relational TABLE label (R901). Tombstones the schema
+/// pointer and, for a columnar table, drops its per-table columnar tree.
+fn execute_drop_table(
+    name: &str,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    let Some(schema) = ctx.load_current_label_schema(name)? else {
+        return Err(ExecutionError::Unsupported(format!(
+            "no such table '{name}'"
+        )));
+    };
+    if !schema.is_table() {
+        return Err(ExecutionError::Unsupported(format!(
+            "'{name}' is not a table; DROP TABLE applies only to relational tables"
+        )));
+    }
+    let columnar = schema.is_columnar();
+
+    ctx.drop_current_label_schema(name)?;
+    if columnar {
+        ctx.engine.drop_columnar_table(name)?;
+    }
+
+    let mut row = Row::new();
+    row.insert("name".to_string(), Value::String(name.to_string()));
+    row.insert("status".to_string(), Value::String("dropped".to_string()));
     Ok(vec![row])
 }
 
