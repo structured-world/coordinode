@@ -485,3 +485,32 @@ fn schema_with_computed_msgpack_roundtrip() {
     let ttl = restored.get_property("_ttl").expect("_ttl prop");
     assert!(ttl.is_computed());
 }
+
+#[test]
+fn table_schema_round_trip_with_primary_key_and_layout() {
+    let mut schema = LabelSchema::new("Trade", PlacementPolicy::NodeId);
+    schema.add_property(PropertyDef::new("trade_id", PropertyType::Int).not_null());
+    schema.add_property(PropertyDef::new("symbol", PropertyType::String).not_null());
+    schema.set_primary_key(vec!["trade_id".into()]);
+    schema.set_storage_layout(StorageLayout::Columnar);
+
+    assert!(schema.is_table());
+    assert!(schema.is_columnar());
+
+    let bytes = schema.to_msgpack().expect("serialize");
+    let restored = LabelSchema::from_msgpack(&bytes).expect("deserialize");
+
+    assert_eq!(restored.primary_key, vec!["trade_id".to_string()]);
+    assert_eq!(restored.storage_layout, StorageLayout::Columnar);
+    assert!(restored.is_table());
+    assert!(restored.is_columnar());
+}
+
+#[test]
+fn plain_label_is_not_a_table_and_defaults_to_row() {
+    let schema = LabelSchema::new("User", PlacementPolicy::NodeId);
+    assert!(!schema.is_table());
+    assert!(!schema.is_columnar());
+    assert_eq!(schema.storage_layout, StorageLayout::Row);
+    assert!(schema.primary_key.is_empty());
+}

@@ -256,6 +256,23 @@ impl ShardKeySpec {
     }
 }
 
+/// Physical storage layout for a relational TABLE label (R901). Orthogonal to
+/// the logical model: a table declares its layout independently of its schema.
+/// Only meaningful for table labels (those with a non-empty primary key); plain
+/// graph labels are always row-stored on the node path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum StorageLayout {
+    /// One MessagePack record per row on the existing node path. Best for OLTP
+    /// point reads, updates, and whole-row reads. The default.
+    #[default]
+    Row,
+    /// Rows stored in the engine's native columnar block type (per-column
+    /// chunks, zone maps, vectorized scan). Best for analytical scans over a
+    /// few columns of many rows. Each columnar table owns its own columnar
+    /// tree (see the relational TABLE modality in the architecture docs).
+    Columnar,
+}
+
 /// Schema definition for a node label.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LabelSchema {
@@ -302,6 +319,19 @@ pub struct LabelSchema {
     /// path. Default: `false` (point-in-time only — current MVCC-only
     /// behaviour for all pre-ADR-027 labels).
     pub temporal: bool,
+
+    /// Declared primary-key columns (R901). Non-empty marks this label as a
+    /// relational TABLE: the primary key is the row identity (bridged to a
+    /// NodeId) and the relational/SQL surface plans against it. Empty for a
+    /// plain graph label. Ordered as declared (composite keys allowed).
+    #[serde(default)]
+    pub primary_key: Vec<String>,
+
+    /// Physical storage layout for a table label (R901). `Row` (default) stores
+    /// each row on the node path; `Columnar` stores rows in the engine's native
+    /// columnar block type. Ignored for non-table labels.
+    #[serde(default)]
+    pub storage_layout: StorageLayout,
 }
 
 impl LabelSchema {
@@ -333,7 +363,29 @@ impl LabelSchema {
             shard_keys: vec![primary],
             schema_revision: 1,
             temporal: false,
+            primary_key: Vec::new(),
+            storage_layout: StorageLayout::Row,
         }
+    }
+
+    /// Whether this label is a relational TABLE (has a declared primary key).
+    pub fn is_table(&self) -> bool {
+        !self.primary_key.is_empty()
+    }
+
+    /// Whether this table stores its rows in the columnar layout.
+    pub fn is_columnar(&self) -> bool {
+        self.storage_layout == StorageLayout::Columnar
+    }
+
+    /// Declare the primary-key columns, marking this label as a table.
+    pub fn set_primary_key(&mut self, columns: Vec<String>) {
+        self.primary_key = columns;
+    }
+
+    /// Set the physical storage layout (only meaningful for a table).
+    pub fn set_storage_layout(&mut self, layout: StorageLayout) {
+        self.storage_layout = layout;
     }
 
     /// Convenience for CE call sites and tests: graph-default placement.
