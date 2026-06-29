@@ -7006,8 +7006,8 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
 /// MERGE: match pattern → if found apply ON MATCH SET, if not found create + ON CREATE SET.
 fn execute_merge(
     pattern: &LogicalOp,
-    on_match: &[crate::cypher::ast::SetItem],
-    on_create: &[crate::cypher::ast::SetItem],
+    on_match: &[crate::plan::SetItem],
+    on_create: &[crate::plan::SetItem],
     multi: bool,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
@@ -7094,8 +7094,8 @@ fn execute_merge(
 /// Unlike MERGE, multiple matching nodes are NOT an error — this is the intended semantics.
 fn execute_mergemany_standalone(
     traverse: &LogicalOp,
-    on_match: &[crate::cypher::ast::SetItem],
-    on_create: &[crate::cypher::ast::SetItem],
+    on_match: &[crate::plan::SetItem],
+    on_create: &[crate::plan::SetItem],
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let (input, target_variable, target_labels, target_filters) = match traverse {
@@ -7752,7 +7752,7 @@ fn execute_merge_relationship_standalone_create(
 /// Inspired by Dgraph's atomic query+mutate (edgraph/server.go do→processQuery→doMutate).
 fn execute_upsert(
     pattern: &LogicalOp,
-    on_match: &[crate::cypher::ast::SetItem],
+    on_match: &[crate::plan::SetItem],
     on_create_patterns: &[Pattern],
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
@@ -8666,7 +8666,7 @@ fn execute_create_edge(
 /// violation immediately aborts the entire SET with an error.
 fn execute_update(
     input_rows: &[Row],
-    items: &[crate::cypher::ast::SetItem],
+    items: &[crate::plan::SetItem],
     violation_mode: &ViolationMode,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
@@ -8697,12 +8697,12 @@ fn execute_update(
     for (row_idx, row) in input_rows.iter().enumerate() {
         for item in items {
             let var = match item {
-                crate::cypher::ast::SetItem::Property { variable, .. }
-                | crate::cypher::ast::SetItem::PropertyPath { variable, .. }
-                | crate::cypher::ast::SetItem::DocFunction { variable, .. }
-                | crate::cypher::ast::SetItem::ReplaceProperties { variable, .. }
-                | crate::cypher::ast::SetItem::MergeProperties { variable, .. }
-                | crate::cypher::ast::SetItem::AddLabel { variable, .. } => variable,
+                crate::plan::SetItem::Property { variable, .. }
+                | crate::plan::SetItem::PropertyPath { variable, .. }
+                | crate::plan::SetItem::DocFunction { variable, .. }
+                | crate::plan::SetItem::ReplaceProperties { variable, .. }
+                | crate::plan::SetItem::MergeProperties { variable, .. }
+                | crate::plan::SetItem::AddLabel { variable, .. } => variable,
             };
             if !matches!(row.get(var), Some(Value::Int(_))) {
                 continue;
@@ -8719,9 +8719,7 @@ fn execute_update(
                 continue;
             }
             match item {
-                crate::cypher::ast::SetItem::Property { property, .. }
-                    if property == "valid_from" =>
-                {
+                crate::plan::SetItem::Property { property, .. } if property == "valid_from" => {
                     return Err(ExecutionError::Unsupported(format!(
                         "SET {var}.valid_from is rejected on temporal label '{primary}': \
                          valid_from is the version-key suffix and is immutable. To \
@@ -8729,9 +8727,7 @@ fn execute_update(
                          the desired valid_from."
                     )));
                 }
-                crate::cypher::ast::SetItem::Property { property, .. }
-                    if property == "valid_to" =>
-                {
+                crate::plan::SetItem::Property { property, .. } if property == "valid_to" => {
                     temporal_in_place_vars.insert((row_idx, var.clone()));
                 }
                 _ => {
@@ -8827,35 +8823,33 @@ fn execute_update(
                 // the main SET loop skips it for this row.
                 for (item_idx, item) in items.iter().enumerate() {
                     let item_var = match item {
-                        crate::cypher::ast::SetItem::Property { variable, .. }
-                        | crate::cypher::ast::SetItem::PropertyPath { variable, .. }
-                        | crate::cypher::ast::SetItem::DocFunction { variable, .. }
-                        | crate::cypher::ast::SetItem::ReplaceProperties { variable, .. }
-                        | crate::cypher::ast::SetItem::MergeProperties { variable, .. }
-                        | crate::cypher::ast::SetItem::AddLabel { variable, .. } => {
-                            variable.as_str()
-                        }
+                        crate::plan::SetItem::Property { variable, .. }
+                        | crate::plan::SetItem::PropertyPath { variable, .. }
+                        | crate::plan::SetItem::DocFunction { variable, .. }
+                        | crate::plan::SetItem::ReplaceProperties { variable, .. }
+                        | crate::plan::SetItem::MergeProperties { variable, .. }
+                        | crate::plan::SetItem::AddLabel { variable, .. } => variable.as_str(),
                     };
                     if item_var != var.as_str() {
                         continue;
                     }
                     // Skip valid_to (in-place) and valid_from (rejected at pre-scan).
-                    if let crate::cypher::ast::SetItem::Property { property, .. } = item {
+                    if let crate::plan::SetItem::Property { property, .. } = item {
                         if property == "valid_to" || property == "valid_from" {
                             continue;
                         }
                     }
                     match item {
-                        crate::cypher::ast::SetItem::Property { property, expr, .. } => {
-                            let val = eval_expr(expr, &out_row).map_to_document();
+                        crate::plan::SetItem::Property { property, expr, .. } => {
+                            let val = eval_neutral(expr, &out_row).map_to_document();
                             let field_id = ctx.interner.intern(property);
                             new_record.set(field_id, val);
                         }
-                        crate::cypher::ast::SetItem::AddLabel { label, .. } => {
+                        crate::plan::SetItem::AddLabel { label, .. } => {
                             new_record.add_label(label.clone());
                         }
-                        crate::cypher::ast::SetItem::ReplaceProperties { expr, .. } => {
-                            let val = eval_expr(expr, &out_row);
+                        crate::plan::SetItem::ReplaceProperties { expr, .. } => {
+                            let val = eval_neutral(expr, &out_row);
                             if let Value::Map(map) = val {
                                 // Clear existing user props, keep engine-managed
                                 // fields (__ingestion_ts__, valid_from, valid_to
@@ -8868,8 +8862,8 @@ fn execute_update(
                                 }
                             }
                         }
-                        crate::cypher::ast::SetItem::MergeProperties { expr, .. } => {
-                            let val = eval_expr(expr, &out_row);
+                        crate::plan::SetItem::MergeProperties { expr, .. } => {
+                            let val = eval_neutral(expr, &out_row);
                             if let Value::Map(map) = val {
                                 for (k, v) in map {
                                     let fid = ctx.interner.intern(&k);
@@ -8877,13 +8871,13 @@ fn execute_update(
                                 }
                             }
                         }
-                        crate::cypher::ast::SetItem::PropertyPath { path, expr, .. } => {
+                        crate::plan::SetItem::PropertyPath { path, expr, .. } => {
                             // R172c Phase 3b: nested PropertyPath SET on
                             // temporal. Build the same DocDelta the
                             // non-temporal path queues as a merge operand,
                             // but apply it in-memory to `new_record` so the
                             // close+open writes carry the post-delta state.
-                            let val = eval_expr(expr, &out_row).map_to_document();
+                            let val = eval_neutral(expr, &out_row).map_to_document();
                             if path.is_empty() {
                                 return Err(ExecutionError::Unsupported(format!(
                                     "SET on temporal node `{var}`: empty property path"
@@ -8907,7 +8901,7 @@ fn execute_update(
                             let path_str = path.join(".");
                             out_row.insert(format!("{var}.{path_str}"), val);
                         }
-                        crate::cypher::ast::SetItem::DocFunction {
+                        crate::plan::SetItem::DocFunction {
                             function,
                             path,
                             value_expr,
@@ -8917,7 +8911,7 @@ fn execute_update(
                             // doc_add_to_set / doc_inc on temporal nodes.
                             // Same construction as the non-temporal path,
                             // but applied in-memory to `new_record`.
-                            let val = eval_expr(value_expr, &out_row);
+                            let val = eval_neutral(value_expr, &out_row);
                             let (field_id, sub_path) = if path.is_empty() {
                                 (ctx.interner.intern(var), vec![])
                             } else {
@@ -9049,12 +9043,12 @@ fn execute_update(
                 continue;
             }
             let variable = match item {
-                crate::cypher::ast::SetItem::Property { variable, .. }
-                | crate::cypher::ast::SetItem::PropertyPath { variable, .. }
-                | crate::cypher::ast::SetItem::DocFunction { variable, .. }
-                | crate::cypher::ast::SetItem::ReplaceProperties { variable, .. }
-                | crate::cypher::ast::SetItem::MergeProperties { variable, .. }
-                | crate::cypher::ast::SetItem::AddLabel { variable, .. } => variable,
+                crate::plan::SetItem::Property { variable, .. }
+                | crate::plan::SetItem::PropertyPath { variable, .. }
+                | crate::plan::SetItem::DocFunction { variable, .. }
+                | crate::plan::SetItem::ReplaceProperties { variable, .. }
+                | crate::plan::SetItem::MergeProperties { variable, .. }
+                | crate::plan::SetItem::AddLabel { variable, .. } => variable,
             };
             // Edge mutation only flows through `SetItem::Property` —
             // `update_edge_property` is the single edgeprop-writing path.
@@ -9064,7 +9058,7 @@ fn execute_update(
             // for those would fire an UPDATE trigger with `$before == $after`
             // — semantically wrong (no mutation happened) and a needless
             // round trip through the trigger body.
-            let is_property_mutation = matches!(item, crate::cypher::ast::SetItem::Property { .. });
+            let is_property_mutation = matches!(item, crate::plan::SetItem::Property { .. });
             // Edge variable: bound to Value::String(edge_type). Snapshot the
             // current edge property map so we can fire UPDATE triggers with
             // `$before` / `$after` after the mutation lands. We probe the
@@ -9142,7 +9136,7 @@ fn execute_update(
                 continue;
             }
             match item {
-                crate::cypher::ast::SetItem::Property {
+                crate::plan::SetItem::Property {
                     variable,
                     property,
                     expr,
@@ -9164,7 +9158,7 @@ fn execute_update(
                     }
 
                     // Map literals → Document for nested property storage.
-                    let val = eval_expr(expr, &out_row).map_to_document();
+                    let val = eval_neutral(expr, &out_row).map_to_document();
 
                     // Edge variable bindings carry Value::String(edge_type),
                     // not Value::Int. Route to the edge-prop update path,
@@ -9180,7 +9174,7 @@ fn execute_update(
                             &mut out_row,
                             ctx,
                         )?;
-                        out_row.insert(format!("{variable}.{property}"), eval_expr(expr, row));
+                        out_row.insert(format!("{variable}.{property}"), eval_neutral(expr, row));
                         continue;
                     }
 
@@ -9397,12 +9391,12 @@ fn execute_update(
                         out_row.insert(format!("{variable}.{property}"), val);
                     }
                 }
-                crate::cypher::ast::SetItem::PropertyPath {
+                crate::plan::SetItem::PropertyPath {
                     variable,
                     path,
                     expr,
                 } => {
-                    let val = eval_expr(expr, &out_row);
+                    let val = eval_neutral(expr, &out_row);
                     let node_id = match out_row.get(variable) {
                         Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                         _ => continue,
@@ -9482,13 +9476,13 @@ fn execute_update(
                     let path_str = path.join(".");
                     out_row.insert(format!("{variable}.{path_str}"), val);
                 }
-                crate::cypher::ast::SetItem::DocFunction {
+                crate::plan::SetItem::DocFunction {
                     function,
                     variable,
                     path,
                     value_expr,
                 } => {
-                    let val = eval_expr(value_expr, &out_row);
+                    let val = eval_neutral(value_expr, &out_row);
                     let node_id = match out_row.get(variable) {
                         Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                         _ => continue,
@@ -9604,8 +9598,8 @@ fn execute_update(
                     ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand);
                     ctx.write_stats.properties_set += 1;
                 }
-                crate::cypher::ast::SetItem::ReplaceProperties { variable, expr } => {
-                    let map_val = eval_expr(expr, &out_row);
+                crate::plan::SetItem::ReplaceProperties { variable, expr } => {
+                    let map_val = eval_neutral(expr, &out_row);
                     let node_id = match out_row.get(variable) {
                         Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                         _ => continue,
@@ -9719,8 +9713,8 @@ fn execute_update(
                         }
                     }
                 }
-                crate::cypher::ast::SetItem::MergeProperties { variable, expr } => {
-                    let map_val = eval_expr(expr, &out_row);
+                crate::plan::SetItem::MergeProperties { variable, expr } => {
+                    let map_val = eval_neutral(expr, &out_row);
                     let node_id = match out_row.get(variable) {
                         Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                         _ => continue,
@@ -9829,7 +9823,7 @@ fn execute_update(
                         }
                     }
                 }
-                crate::cypher::ast::SetItem::AddLabel { variable, label } => {
+                crate::plan::SetItem::AddLabel { variable, label } => {
                     let node_id = match out_row.get(variable) {
                         Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                         _ => continue,
@@ -9929,7 +9923,7 @@ fn execute_update(
 /// REMOVE: remove properties/labels from existing nodes.
 fn execute_remove(
     input_rows: &[Row],
-    items: &[crate::cypher::ast::RemoveItem],
+    items: &[crate::plan::RemoveItem],
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     // R172c Phase 3: REMOVE on a temporal node is a *new version* — same
@@ -9956,9 +9950,9 @@ fn execute_remove(
     for (row_idx, row) in input_rows.iter().enumerate() {
         for item in items {
             let var = match item {
-                crate::cypher::ast::RemoveItem::Property { variable, .. }
-                | crate::cypher::ast::RemoveItem::PropertyPath { variable, .. }
-                | crate::cypher::ast::RemoveItem::Label { variable, .. } => variable,
+                crate::plan::RemoveItem::Property { variable, .. }
+                | crate::plan::RemoveItem::PropertyPath { variable, .. }
+                | crate::plan::RemoveItem::Label { variable, .. } => variable,
             };
             if !matches!(row.get(var), Some(Value::Int(_))) {
                 continue;
@@ -9975,7 +9969,7 @@ fn execute_remove(
                 continue;
             }
             match item {
-                crate::cypher::ast::RemoveItem::Property { property, .. } => {
+                crate::plan::RemoveItem::Property { property, .. } => {
                     if property == "valid_from" || property == "valid_to" {
                         return Err(ExecutionError::Unsupported(format!(
                             "REMOVE {var}.{property} is rejected on temporal label \
@@ -9991,12 +9985,12 @@ fn execute_remove(
                     }
                     temporal_remove_vars.insert((row_idx, var.clone()));
                 }
-                crate::cypher::ast::RemoveItem::PropertyPath { .. } => {
+                crate::plan::RemoveItem::PropertyPath { .. } => {
                     // R172c Phase 3b: classify; the delta is built and
                     // applied to `new_record` in the close+open block.
                     temporal_remove_vars.insert((row_idx, var.clone()));
                 }
-                crate::cypher::ast::RemoveItem::Label { .. } => {
+                crate::plan::RemoveItem::Label { .. } => {
                     temporal_remove_vars.insert((row_idx, var.clone()));
                 }
             }
@@ -10055,27 +10049,25 @@ fn execute_remove(
 
                 for (item_idx, item) in items.iter().enumerate() {
                     let item_var = match item {
-                        crate::cypher::ast::RemoveItem::Property { variable, .. }
-                        | crate::cypher::ast::RemoveItem::PropertyPath { variable, .. }
-                        | crate::cypher::ast::RemoveItem::Label { variable, .. } => {
-                            variable.as_str()
-                        }
+                        crate::plan::RemoveItem::Property { variable, .. }
+                        | crate::plan::RemoveItem::PropertyPath { variable, .. }
+                        | crate::plan::RemoveItem::Label { variable, .. } => variable.as_str(),
                     };
                     if item_var != var.as_str() {
                         continue;
                     }
                     match item {
-                        crate::cypher::ast::RemoveItem::Property { property, .. } => {
+                        crate::plan::RemoveItem::Property { property, .. } => {
                             if let Some(field_id) = ctx.interner.lookup(property) {
                                 new_record.remove(field_id);
                             }
                             ctx.write_stats.properties_removed += 1;
                         }
-                        crate::cypher::ast::RemoveItem::Label { label, .. } => {
+                        crate::plan::RemoveItem::Label { label, .. } => {
                             new_record.remove_label(label);
                             ctx.write_stats.labels_removed += 1;
                         }
-                        crate::cypher::ast::RemoveItem::PropertyPath { path, .. } => {
+                        crate::plan::RemoveItem::PropertyPath { path, .. } => {
                             // R172c Phase 3b: nested REMOVE on temporal —
                             // build DeletePath DocDelta, apply in-memory.
                             if path.is_empty() {
@@ -10154,9 +10146,9 @@ fn execute_remove(
         > = std::collections::HashMap::new();
         for item in items {
             let variable = match item {
-                crate::cypher::ast::RemoveItem::Property { variable, .. }
-                | crate::cypher::ast::RemoveItem::PropertyPath { variable, .. }
-                | crate::cypher::ast::RemoveItem::Label { variable, .. } => variable,
+                crate::plan::RemoveItem::Property { variable, .. }
+                | crate::plan::RemoveItem::PropertyPath { variable, .. }
+                | crate::plan::RemoveItem::Label { variable, .. } => variable,
             };
             let node_id = match out_row.get(variable) {
                 Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
@@ -10175,7 +10167,7 @@ fn execute_remove(
                 continue;
             }
             match item {
-                crate::cypher::ast::RemoveItem::Property { variable, property } => {
+                crate::plan::RemoveItem::Property { variable, property } => {
                     let node_id = match out_row.get(variable) {
                         Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                         _ => continue,
@@ -10226,7 +10218,7 @@ fn execute_remove(
 
                     out_row.remove(&format!("{variable}.{property}"));
                 }
-                crate::cypher::ast::RemoveItem::PropertyPath { variable, path } => {
+                crate::plan::RemoveItem::PropertyPath { variable, path } => {
                     let node_id = match out_row.get(variable) {
                         Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                         _ => continue,
@@ -10249,7 +10241,7 @@ fn execute_remove(
                     let path_str = path.join(".");
                     out_row.remove(&format!("{variable}.{path_str}"));
                 }
-                crate::cypher::ast::RemoveItem::Label { variable, label } => {
+                crate::plan::RemoveItem::Label { variable, label } => {
                     let node_id = match out_row.get(variable) {
                         Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                         _ => continue,
@@ -10746,7 +10738,7 @@ fn execute_merge_nodes(
     source_a: &str,
     source_b: &str,
     target: &str,
-    conflict: &crate::cypher::ast::MergeNodesConflictStrategy,
+    conflict: &crate::plan::MergeNodesConflictStrategy,
     transfer_edges: Option<&crate::cypher::ast::TransferEdgesEndpoints>,
     duplicate: &crate::cypher::ast::MergeNodesDuplicateStrategy,
     transfer_edge_properties: bool,
@@ -11050,7 +11042,7 @@ fn execute_clone_node(
     target: &str,
     with_edges: bool,
     with_properties: bool,
-    set_items: &[crate::cypher::ast::SetItem],
+    set_items: &[crate::plan::SetItem],
     as_of: Option<&crate::plan::expr::Expr>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
@@ -11433,11 +11425,11 @@ fn execute_redirect_edges(
 fn merge_node_properties(
     target: &mut NodeRecord,
     source: &NodeRecord,
-    conflict: &crate::cypher::ast::MergeNodesConflictStrategy,
+    conflict: &crate::plan::MergeNodesConflictStrategy,
     row: &Row,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<(), ExecutionError> {
-    use crate::cypher::ast::MergeNodesConflictStrategy as S;
+    use crate::plan::MergeNodesConflictStrategy as S;
     match conflict {
         S::KeepFirst => {
             // Target wins on collision; source fills only missing keys.
@@ -11503,14 +11495,14 @@ fn merge_node_properties(
 /// strategy — explicit downstream SET clauses still go through `execute_update`.
 fn apply_merge_nodes_set_item(
     target: &mut NodeRecord,
-    item: &crate::cypher::ast::SetItem,
+    item: &crate::plan::SetItem,
     row: &Row,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<(), ExecutionError> {
-    use crate::cypher::ast::SetItem;
+    use crate::plan::SetItem;
     match item {
         SetItem::Property { property, expr, .. } => {
-            let val = eval_expr(expr, row).map_to_document();
+            let val = eval_neutral(expr, row).map_to_document();
             let field_id = ctx.interner.intern(property);
             target.set(field_id, val);
         }
@@ -11520,7 +11512,7 @@ fn apply_merge_nodes_set_item(
             // implementation, only support single-segment paths via the
             // declared props path. Multi-segment paths fall through to extra
             // with a dotted string key — matches existing executor behavior.
-            let val = eval_expr(expr, row).map_to_document();
+            let val = eval_neutral(expr, row).map_to_document();
             if path.len() == 1 {
                 let field_id = ctx.interner.intern(&path[0]);
                 target.set(field_id, val);

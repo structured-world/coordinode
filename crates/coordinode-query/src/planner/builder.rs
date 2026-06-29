@@ -547,8 +547,8 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             let scan = build_pattern_scan(&mc.pattern)?;
             let merge_op = LogicalOp::Merge {
                 pattern: Box::new(scan),
-                on_match: mc.on_match.clone(),
-                on_create: mc.on_create.clone(),
+                on_match: lower_set_items(&mc.on_match)?,
+                on_create: lower_set_items(&mc.on_create)?,
                 multi: false,
             };
             match current {
@@ -563,8 +563,8 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             let scan = build_pattern_scan(&mc.pattern)?;
             let merge_op = LogicalOp::Merge {
                 pattern: Box::new(scan),
-                on_match: mc.on_match.clone(),
-                on_create: mc.on_create.clone(),
+                on_match: lower_set_items(&mc.on_match)?,
+                on_create: lower_set_items(&mc.on_create)?,
                 multi: true,
             };
             match current {
@@ -579,7 +579,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             let scan = build_pattern_scan(&uc.pattern)?;
             let upsert_op = LogicalOp::Upsert {
                 pattern: Box::new(scan),
-                on_match: uc.on_match.clone(),
+                on_match: lower_set_items(&uc.on_match)?,
                 on_create_patterns: uc.on_create.clone(),
             };
             match current {
@@ -616,7 +616,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 source_a: mn.source_a.clone(),
                 source_b: mn.source_b.clone(),
                 target: mn.target.clone(),
-                conflict: mn.conflict.clone(),
+                conflict: lower_merge_conflict(&mn.conflict)?,
                 transfer_edges: mn.transfer_edges.clone(),
                 duplicate: mn.duplicate.clone(),
                 transfer_edge_properties: mn.transfer_edge_properties,
@@ -630,7 +630,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 target: cn.target.clone(),
                 with_edges: cn.with_edges,
                 with_properties: cn.with_properties,
-                set_items: cn.set_items.clone(),
+                set_items: lower_set_items(&cn.set_items)?,
                 as_of: cn.as_of.as_ref().map(super::lower_expr).transpose()?,
             })
         }
@@ -648,7 +648,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             let input = current.unwrap_or(LogicalOp::Empty);
             Ok(LogicalOp::Update {
                 input: Box::new(input),
-                items: items.clone(),
+                items: lower_set_items(items)?,
                 violation_mode: violation_mode.clone(),
             })
         }
@@ -656,7 +656,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             let input = current.unwrap_or(LogicalOp::Empty);
             Ok(LogicalOp::RemoveOp {
                 input: Box::new(input),
-                items: items.clone(),
+                items: items.iter().map(lower_remove_item).collect(),
             })
         }
         Clause::Foreach(fc) => {
@@ -1308,6 +1308,98 @@ fn lower_property_filters(
         .iter()
         .map(|(k, v)| Ok((k.clone(), super::lower_expr(v)?)))
         .collect()
+}
+
+/// Lower a cypher `SET` item into the neutral IR (lowering its embedded
+/// expressions). Pure structural fields (variables, paths, labels) pass through.
+fn lower_set_item(item: &crate::cypher::ast::SetItem) -> Result<crate::plan::SetItem, PlanError> {
+    use crate::cypher::ast::SetItem as C;
+    use crate::plan::SetItem as N;
+    Ok(match item {
+        C::Property {
+            variable,
+            property,
+            expr,
+        } => N::Property {
+            variable: variable.clone(),
+            property: property.clone(),
+            expr: super::lower_expr(expr)?,
+        },
+        C::PropertyPath {
+            variable,
+            path,
+            expr,
+        } => N::PropertyPath {
+            variable: variable.clone(),
+            path: path.clone(),
+            expr: super::lower_expr(expr)?,
+        },
+        C::DocFunction {
+            function,
+            variable,
+            path,
+            value_expr,
+        } => N::DocFunction {
+            function: function.clone(),
+            variable: variable.clone(),
+            path: path.clone(),
+            value_expr: super::lower_expr(value_expr)?,
+        },
+        C::ReplaceProperties { variable, expr } => N::ReplaceProperties {
+            variable: variable.clone(),
+            expr: super::lower_expr(expr)?,
+        },
+        C::MergeProperties { variable, expr } => N::MergeProperties {
+            variable: variable.clone(),
+            expr: super::lower_expr(expr)?,
+        },
+        C::AddLabel { variable, label } => N::AddLabel {
+            variable: variable.clone(),
+            label: label.clone(),
+        },
+    })
+}
+
+/// Lower a slice of cypher `SET` items into the neutral IR.
+fn lower_set_items(
+    items: &[crate::cypher::ast::SetItem],
+) -> Result<Vec<crate::plan::SetItem>, PlanError> {
+    items.iter().map(lower_set_item).collect()
+}
+
+/// Map a cypher `MERGE NODES` conflict strategy to the neutral IR, lowering any
+/// embedded `SET` expressions.
+fn lower_merge_conflict(
+    conflict: &crate::cypher::ast::MergeNodesConflictStrategy,
+) -> Result<crate::plan::MergeNodesConflictStrategy, PlanError> {
+    use crate::cypher::ast::MergeNodesConflictStrategy as C;
+    use crate::plan::MergeNodesConflictStrategy as N;
+    Ok(match conflict {
+        C::KeepFirst => N::KeepFirst,
+        C::KeepLast => N::KeepLast,
+        C::Coalesce => N::Coalesce,
+        C::SetExpressions(items) => N::SetExpressions(lower_set_items(items)?),
+    })
+}
+
+/// Map a cypher `REMOVE` item to the neutral IR (no expressions to lower).
+fn lower_remove_item(item: &crate::cypher::ast::RemoveItem) -> crate::plan::RemoveItem {
+    use crate::cypher::ast::RemoveItem as C;
+    use crate::plan::RemoveItem as N;
+    match item {
+        C::Property { variable, property } => N::Property {
+            variable: variable.clone(),
+            property: property.clone(),
+        },
+        C::PropertyPath { variable, path } => N::PropertyPath {
+            variable: variable.clone(),
+            path: path.clone(),
+        },
+        C::Label { variable, label } => N::Label {
+            variable: variable.clone(),
+            label: label.clone(),
+        },
+    }
 }
 
 /// Build an `IndexScan` for `(label, property) = value_expr` if a B-tree index

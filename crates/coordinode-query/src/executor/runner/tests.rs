@@ -1089,10 +1089,10 @@ fn set_property_updates_storage() {
                     nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
-            items: vec![crate::cypher::ast::SetItem::Property {
+            items: vec![crate::plan::SetItem::Property {
                 variable: "n".into(),
                 property: "name".into(),
-                expr: Expr::Literal(Value::String("Alicia".into())),
+                expr: nx(Expr::Literal(Value::String("Alicia".into()))),
             }],
             violation_mode: crate::cypher::ast::ViolationMode::Fail,
         },
@@ -1162,7 +1162,7 @@ fn remove_property_from_node() {
                     nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
-            items: vec![crate::cypher::ast::RemoveItem::Property {
+            items: vec![crate::plan::RemoveItem::Property {
                 variable: "n".into(),
                 property: "age".into(),
             }],
@@ -1244,10 +1244,10 @@ fn merge_creates_when_not_found() {
                 )],
             }),
             on_match: vec![],
-            on_create: vec![crate::cypher::ast::SetItem::Property {
+            on_create: vec![crate::plan::SetItem::Property {
                 variable: "n".into(),
                 property: "name".into(),
-                expr: Expr::Literal(Value::String("Alice".into())),
+                expr: nx(Expr::Literal(Value::String("Alice".into()))),
             }],
             multi: false,
         },
@@ -1279,10 +1279,10 @@ fn merge_updates_when_found() {
                     nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
-            on_match: vec![crate::cypher::ast::SetItem::Property {
+            on_match: vec![crate::plan::SetItem::Property {
                 variable: "n".into(),
                 property: "age".into(),
-                expr: Expr::Literal(Value::Int(31)),
+                expr: nx(Expr::Literal(Value::Int(31))),
             }],
             on_create: vec![],
             multi: false,
@@ -1399,10 +1399,10 @@ fn upsert_updates_when_found() {
                     nx(Expr::Literal(Value::String("Alice".into()))),
                 )],
             }),
-            on_match: vec![crate::cypher::ast::SetItem::Property {
+            on_match: vec![crate::plan::SetItem::Property {
                 variable: "n".into(),
                 property: "age".into(),
-                expr: Expr::Literal(Value::Int(31)),
+                expr: nx(Expr::Literal(Value::Int(31))),
             }],
             on_create_patterns: vec![],
         },
@@ -1454,10 +1454,10 @@ fn upsert_cas_conflict_on_external_modification() {
                         nx(Expr::Literal(Value::String("Alice".into()))),
                     )],
                 }),
-                on_match: vec![crate::cypher::ast::SetItem::Property {
+                on_match: vec![crate::plan::SetItem::Property {
                     variable: "n".into(),
                     property: "age".into(),
-                    expr: Expr::Literal(Value::Int(50)),
+                    expr: nx(Expr::Literal(Value::Int(50))),
                 }],
                 on_create_patterns: vec![],
             },
@@ -1495,10 +1495,10 @@ fn upsert_cas_conflict_on_external_modification() {
                         nx(Expr::Literal(Value::String("Alice".into()))),
                     )],
                 }),
-                on_match: vec![crate::cypher::ast::SetItem::Property {
+                on_match: vec![crate::plan::SetItem::Property {
                     variable: "n".into(),
                     property: "age".into(),
-                    expr: Expr::Literal(Value::Int(60)),
+                    expr: nx(Expr::Literal(Value::Int(60))),
                 }],
                 on_create_patterns: vec![],
             },

@@ -283,7 +283,7 @@ pub enum LogicalOp {
     /// Update properties/labels.
     Update {
         input: Box<LogicalOp>,
-        items: Vec<SetItem>,
+        items: Vec<crate::plan::SetItem>,
         /// How to handle schema violations: fail the query or skip the node.
         violation_mode: crate::cypher::ast::ViolationMode,
     },
@@ -291,7 +291,7 @@ pub enum LogicalOp {
     /// Remove properties/labels.
     RemoveOp {
         input: Box<LogicalOp>,
-        items: Vec<RemoveItem>,
+        items: Vec<crate::plan::RemoveItem>,
     },
 
     /// Delete nodes/edges.
@@ -360,7 +360,7 @@ pub enum LogicalOp {
         source_a: String,
         source_b: String,
         target: String,
-        conflict: crate::cypher::ast::MergeNodesConflictStrategy,
+        conflict: crate::plan::MergeNodesConflictStrategy,
         transfer_edges: Option<crate::cypher::ast::TransferEdgesEndpoints>,
         duplicate: crate::cypher::ast::MergeNodesDuplicateStrategy,
         transfer_edge_properties: bool,
@@ -376,7 +376,7 @@ pub enum LogicalOp {
         target: String,
         with_edges: bool,
         with_properties: bool,
-        set_items: Vec<SetItem>,
+        set_items: Vec<crate::plan::SetItem>,
         /// `AS OF <ts>`: on a temporal source, clone the valid-version of the
         /// body active at this valid-time instant instead of the current one.
         /// The clone's `valid_from` is still NOW. `None` clones the current.
@@ -404,9 +404,9 @@ pub enum LogicalOp {
         /// Pattern scan to find existing nodes/edges.
         pattern: Box<LogicalOp>,
         /// SET items to apply when pattern matches.
-        on_match: Vec<SetItem>,
+        on_match: Vec<crate::plan::SetItem>,
         /// SET items to apply when creating new pattern.
-        on_create: Vec<SetItem>,
+        on_create: Vec<crate::plan::SetItem>,
         /// `true` for MERGE ALL (Cartesian product), `false` for MERGE (unique match).
         multi: bool,
     },
@@ -416,7 +416,7 @@ pub enum LogicalOp {
         /// Pattern scan to find existing nodes/edges.
         pattern: Box<LogicalOp>,
         /// SET items to apply when pattern matches.
-        on_match: Vec<SetItem>,
+        on_match: Vec<crate::plan::SetItem>,
         /// Patterns to create when no match found.
         on_create_patterns: Vec<Pattern>,
     },
@@ -1136,9 +1136,7 @@ impl LogicalOp {
                 input, conflict, ..
             } => {
                 input.substitute_params(params);
-                if let crate::cypher::ast::MergeNodesConflictStrategy::SetExpressions(items) =
-                    conflict
-                {
+                if let crate::plan::MergeNodesConflictStrategy::SetExpressions(items) = conflict {
                     for item in items {
                         substitute_params_in_set_item(item, params);
                     }
@@ -1184,7 +1182,8 @@ impl LogicalOp {
 }
 
 /// Substitute parameters in a SetItem's expressions.
-fn substitute_params_in_set_item(item: &mut SetItem, params: &HashMap<String, Value>) {
+fn substitute_params_in_set_item(item: &mut crate::plan::SetItem, params: &HashMap<String, Value>) {
+    use crate::plan::SetItem;
     match item {
         SetItem::Property { expr, .. }
         | SetItem::PropertyPath { expr, .. }
@@ -2529,10 +2528,10 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             transfer_edge_properties,
         } => {
             let conflict_tag = match conflict {
-                crate::cypher::ast::MergeNodesConflictStrategy::KeepFirst => "KEEP_FIRST",
-                crate::cypher::ast::MergeNodesConflictStrategy::KeepLast => "KEEP_LAST",
-                crate::cypher::ast::MergeNodesConflictStrategy::Coalesce => "COALESCE",
-                crate::cypher::ast::MergeNodesConflictStrategy::SetExpressions(_) => "SET",
+                crate::plan::MergeNodesConflictStrategy::KeepFirst => "KEEP_FIRST",
+                crate::plan::MergeNodesConflictStrategy::KeepLast => "KEEP_LAST",
+                crate::plan::MergeNodesConflictStrategy::Coalesce => "COALESCE",
+                crate::plan::MergeNodesConflictStrategy::SetExpressions(_) => "SET",
             };
             let transfer_tag = match transfer_edges {
                 Some(t) => format!(" TRANSFER {}→{}", t.src, t.dst),
