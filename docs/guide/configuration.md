@@ -61,6 +61,7 @@ apply when neither the config file nor a flag sets the value.
 | `--advertise-addr` | same as `--addr` | Address other nodes use to reach this node. Set it when `--addr` binds `0.0.0.0` or `[::]` so peers learn the real host/IP. |
 | `--rest-addr` | `[::]:7081` | REST/JSON listen address. Present only when built with the `rest-proxy` feature. |
 | `--ops-addr` | `[::]:7084` | Operational HTTP address for `/metrics`, `/health`, `/ready`. Pass port `0` to let the OS assign an ephemeral port (handy in tests). |
+| `--pg-addr` | (disabled) | PostgreSQL wire-protocol listen address (for example `127.0.0.1:7085`). Unset = the Postgres frontend is off. Serves SQL over the Postgres Simple Query protocol with trust authentication (no password), so bind it to a trusted interface only. |
 | `--data` | `./data` | Data directory. Holds the storage engine state. |
 | `--peers` | (none) | Comma-separated peer addresses, for example `node2:7080,node3:7080`. Presence enables Raft consensus. |
 | `--nofile` | hard limit | Open-file-descriptor soft limit requested at startup. Unset raises the soft limit to the hard limit. Unix only. |
@@ -159,6 +160,7 @@ Environment=COORDINODE_LOG_FORMAT=json
 | 7080 | gRPC | Native API and inter-node Raft |
 | 7081 | HTTP/REST | JSON transcoding (with the `rest-proxy` feature) |
 | 7084 | HTTP | `/metrics`, `/health`, `/ready` |
+| 7085 | PostgreSQL wire | SQL over the Postgres protocol (opt-in via `--pg-addr`; trust auth) |
 
 Bind the ops address to loopback in production and scrape it through a reverse
 proxy, or keep it internal to the host's monitoring network.
@@ -186,6 +188,10 @@ rest_addr: "0.0.0.0:7081"
 
 # Operational HTTP listen address: Prometheus /metrics, /health, /ready.
 ops_addr: "127.0.0.1:7084"
+
+# PostgreSQL wire-protocol listen address. Unset = off. Trust auth only, so
+# bind it to a trusted interface (loopback / internal network).
+# pg_addr: "127.0.0.1:7085"
 
 # Data directory. Owned by the coordinode system user.
 data_dir: /var/lib/coordinode/data

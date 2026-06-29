@@ -194,6 +194,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
                 advertise_addr: find_flag(args, "--advertise-addr"),
                 rest_addr: find_flag(args, "--rest-addr"),
                 ops_addr: find_flag(args, "--ops-addr"),
+                pg_addr: find_flag(args, "--pg-addr"),
                 data_dir: find_flag(args, "--data"),
                 peers,
                 nofile: find_flag_num(args, "--nofile"),
@@ -309,7 +310,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
                 "coordinode v{}\n\n\
                  Usage:\n  \
                  coordinode serve [--config FILE] [--mode full] [--node-id N] [--addr ADDR] [--advertise-addr ADDR]\n          \
-                 [--rest-addr ADDR] [--ops-addr ADDR] [--data DIR] [--peers PEERS] [--nofile N]\n          \
+                 [--rest-addr ADDR] [--ops-addr ADDR] [--pg-addr ADDR] [--data DIR] [--peers PEERS] [--nofile N]\n          \
                  [--tls-cert FILE --tls-key FILE] [--tls-ca FILE] [--tls-require-client-auth]\n          \
                  (fine tunables — cache/buffer sizes, timeouts, scrub/checkpoint, retention,\n          \
                  registry, CDC, interactive-txn, wire compression, triggers — are config-file keys;\n          \

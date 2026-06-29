@@ -271,5 +271,16 @@ fn oplog_op_to_proto(op: OplogOp) -> ChangeOp {
             key: after_index.to_be_bytes().to_vec(),
             value: vec![],
         },
+        // A columnar table write is keyed by table id, not a partition
+        // discriminant, so it cannot be carried by the partition-shaped ChangeOp.
+        // Surfacing columnar tables on the CDC stream needs a table-id field on
+        // the wire; until then a columnar write maps to a no-op change rather
+        // than a misencoded partition op.
+        OplogOp::ColumnarInsert { .. } => ChangeOp {
+            r#type: ChangeOpType::Noop as i32,
+            partition: 0,
+            key: vec![],
+            value: vec![],
+        },
     }
 }

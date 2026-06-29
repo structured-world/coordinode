@@ -67,6 +67,9 @@ sha2 = { workspace = true }
 hex = "0.4"
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = { workspace = true }
+pgwire = "0.40.4"
+async-trait = "0.1.89"
+futures = "0.3.32"
 
 # Safe setrlimit(RLIMIT_NOFILE) wrapper for the configurable fd limit.
 [target.'cfg(unix)'.dependencies]
@@ -79,6 +82,7 @@ tonic-prost-build = "0.14"
 tempfile = { workspace = true }
 coordinode-client = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-postgres = "0.7.18"
 
 [lints]
 workspace = true

@@ -59,6 +59,7 @@ mod grpc;
 mod logging;
 mod metrics_catalog;
 mod ops;
+mod pg;
 mod registry;
 mod services;
 
@@ -269,6 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 advertise_addr,
                 rest_addr,
                 ops_addr,
+                pg_addr,
                 data_dir,
                 storage: _,
                 nofile,
@@ -1031,6 +1033,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Err(e) => tracing::error!("REST proxy router build error: {e}"),
                     }
                 });
+            }
+
+            // PostgreSQL wire-protocol frontend: opt-in (only when an address is
+            // configured), trust authentication. Shares the same database handle
+            // as the gRPC/REST services so SQL over the wire sees identical state.
+            if let Some(pg_addr) = pg_addr {
+                match pg_addr.parse::<SocketAddr>() {
+                    Ok(pg_sockaddr) => {
+                        let pg_db = Arc::clone(&database);
+                        tokio::spawn(async move {
+                            if let Err(e) = pg::serve(pg_sockaddr, pg_db).await {
+                                tracing::error!("PostgreSQL wire server error: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => tracing::error!(addr = %pg_addr, "invalid --pg-addr: {e}"),
+                }
             }
 
             info!(

@@ -78,6 +78,11 @@ pub struct ServerConfig {
     pub rest_addr: String,
     /// Ops/metrics listen address.
     pub ops_addr: String,
+    /// PostgreSQL wire-protocol listen address. `None` (default) disables the
+    /// Postgres frontend; set it (e.g. `127.0.0.1:7085`) to accept SQL over the
+    /// Postgres wire protocol. Trust authentication only — bind to a trusted
+    /// interface.
+    pub pg_addr: Option<String>,
     /// Data directory. Used by the consensus log, CDC, and the single-endpoint
     /// storage desugar when `storage.endpoints` is empty.
     pub data_dir: String,
@@ -187,6 +192,7 @@ impl Default for ServerConfig {
             advertise_addr: None,
             rest_addr: "[::]:7081".to_string(),
             ops_addr: "[::]:7084".to_string(),
+            pg_addr: None,
             data_dir: "./data".to_string(),
             storage: StorageTopology::default(),
             peers: Vec::new(),
@@ -235,6 +241,7 @@ pub struct CliOverrides {
     pub advertise_addr: Option<String>,
     pub rest_addr: Option<String>,
     pub ops_addr: Option<String>,
+    pub pg_addr: Option<String>,
     pub data_dir: Option<String>,
     pub peers: Option<Vec<String>>,
     pub nofile: Option<u64>,
@@ -281,6 +288,9 @@ impl ServerConfig {
         }
         if let Some(v) = &o.ops_addr {
             self.ops_addr = v.clone();
+        }
+        if o.pg_addr.is_some() {
+            self.pg_addr = o.pg_addr.clone();
         }
         if let Some(v) = &o.data_dir {
             self.data_dir = v.clone();
