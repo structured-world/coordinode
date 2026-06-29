@@ -540,6 +540,7 @@ impl From<coordinode_query::frontend::FrontendError> for DatabaseError {
                     .collect::<Vec<_>>()
                     .join("; "),
             ),
+            FE::Message(m) => DatabaseError::Semantic(m),
         }
     }
 }

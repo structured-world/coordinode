@@ -36,6 +36,9 @@ pub enum FrontendError {
     Semantic(Vec<SemanticError>),
     /// The query was valid but could not be lowered into a logical plan.
     Plan(PlanError),
+    /// A dialect-agnostic frontend error (parse / lowering failure not tied to
+    /// the cypher semantic-analysis types — e.g. the SQL frontend).
+    Message(String),
 }
 
 impl std::fmt::Display for FrontendError {
@@ -51,6 +54,7 @@ impl std::fmt::Display for FrontendError {
                 write!(f, "{joined}")
             }
             FrontendError::Plan(e) => write!(f, "{e}"),
+            FrontendError::Message(m) => write!(f, "{m}"),
         }
     }
 }
