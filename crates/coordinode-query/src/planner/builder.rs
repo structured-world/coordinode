@@ -512,7 +512,15 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             let input = current.unwrap_or(LogicalOp::Empty);
             Ok(LogicalOp::Sort {
                 input: Box::new(input),
-                items: items.clone(),
+                items: items
+                    .iter()
+                    .map(|s| {
+                        Ok(crate::plan::SortItem {
+                            expr: super::lower_expr(&s.expr)?,
+                            ascending: s.ascending,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, PlanError>>()?,
             })
         }
         Clause::Skip(expr) => {
@@ -2547,16 +2555,8 @@ fn rewrite_top_k_at_root(op: LogicalOp) -> LogicalOp {
     let (sort_input, mut sort_items) = inner_sort;
     let sort_item = sort_items.remove(0);
 
-    // Lower the (cypher) sort expression to the neutral IR once for the
-    // vector / maxsim rewrite probes below. A sort expression that does not
-    // lower is, by construction, not one of the scoring calls we rewrite, so
-    // `None` simply falls through to the generic Sort + Limit path.
-    let lowered_sort_expr = super::lower_expr(&sort_item.expr).ok();
-
     // Try Pattern A: the sort expression is a direct vector_distance call.
-    if let Some((vector_expr, query_vector, function)) = lowered_sort_expr
-        .as_ref()
-        .and_then(match_vector_distance_call)
+    if let Some((vector_expr, query_vector, function)) = match_vector_distance_call(&sort_item.expr)
     {
         // Ascending for distance/manhattan, descending for similarity/dot_product.
         if !is_valid_direction(&function, sort_item.ascending) {
@@ -2597,9 +2597,7 @@ fn rewrite_top_k_at_root(op: LogicalOp) -> LogicalOp {
 
     // Pattern A2: the sort expression is a direct maxsim_score call.
     // ColBERT-style late-interaction: DESC order always (higher score wins).
-    if let Some((doc_expr, query_expr)) =
-        lowered_sort_expr.as_ref().and_then(match_maxsim_score_call)
-    {
+    if let Some((doc_expr, query_expr)) = match_maxsim_score_call(&sort_item.expr) {
         if sort_item.ascending {
             // ASC would mean "lowest similarity first" which is never the
             // intent for late-interaction retrieval. Fall back to the
@@ -2634,7 +2632,7 @@ fn rewrite_top_k_at_root(op: LogicalOp) -> LogicalOp {
     // Pattern B: sort expr is a variable reference to an alias defined in
     // the inner Project.
     let alias_name = match &sort_item.expr {
-        Expr::Variable(v) => Some(v.clone()),
+        crate::plan::expr::Expr::Variable(v) => Some(v.clone()),
         _ => None,
     };
 
@@ -2826,7 +2824,11 @@ fn is_valid_direction(function: &str, ascending: bool) -> bool {
 }
 
 /// Rebuild a `Limit { Sort { ... } }` subtree (used when optimization was rejected).
-fn reconstruct_limit_sort(k: usize, sort_item: SortItem, sort_input: LogicalOp) -> LogicalOp {
+fn reconstruct_limit_sort(
+    k: usize,
+    sort_item: crate::plan::SortItem,
+    sort_input: LogicalOp,
+) -> LogicalOp {
     LogicalOp::Limit {
         input: Box::new(LogicalOp::Sort {
             input: Box::new(sort_input),
@@ -3941,88 +3943,6 @@ impl FusionScalar {
     }
 }
 
-/// Recognise a top-level fusion-scalar FunctionCall. Returns the scalar
-/// kind + its argument slice so the parser can validate arity per kind.
-fn match_fusion_call(expr: &Expr) -> Option<(FusionScalar, &[Expr])> {
-    if let Expr::FunctionCall { name, args, .. } = expr {
-        if let Some(kind) = FusionScalar::from_name(name) {
-            return Some((kind, args));
-        }
-    }
-    None
-}
-
-/// Walk an expression tree and return `true` if any subexpression is a
-/// `rrf_score(...)` call. Used to fail-fast on illegal placements (e.g. WHERE).
-fn expr_contains_rrf_score(expr: &Expr) -> bool {
-    let mut hit = false;
-    collect_rrf_presence(expr, &mut hit);
-    hit
-}
-
-fn collect_rrf_presence(expr: &Expr, hit: &mut bool) {
-    if *hit {
-        return;
-    }
-    match expr {
-        Expr::FunctionCall { name, args, .. } => {
-            if FusionScalar::from_name(name).is_some() {
-                *hit = true;
-                return;
-            }
-            for a in args {
-                collect_rrf_presence(a, hit);
-            }
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            collect_rrf_presence(left, hit);
-            collect_rrf_presence(right, hit);
-        }
-        Expr::UnaryOp { expr, .. } => collect_rrf_presence(expr, hit),
-        Expr::PropertyAccess { expr, .. } => collect_rrf_presence(expr, hit),
-        Expr::List(items) => {
-            for it in items {
-                collect_rrf_presence(it, hit);
-            }
-        }
-        Expr::MapLiteral(fields) => {
-            for (_, v) in fields {
-                collect_rrf_presence(v, hit);
-            }
-        }
-        Expr::In { expr, list } => {
-            collect_rrf_presence(expr, hit);
-            collect_rrf_presence(list, hit);
-        }
-        Expr::IsNull { expr, .. } => collect_rrf_presence(expr, hit),
-        Expr::StringMatch { expr, pattern, .. } => {
-            collect_rrf_presence(expr, hit);
-            collect_rrf_presence(pattern, hit);
-        }
-        Expr::Subscript { expr, index } => {
-            collect_rrf_presence(expr, hit);
-            collect_rrf_presence(index, hit);
-        }
-        Expr::Case {
-            operand,
-            when_clauses,
-            else_clause,
-        } => {
-            if let Some(o) = operand.as_deref() {
-                collect_rrf_presence(o, hit);
-            }
-            for (c, v) in when_clauses {
-                collect_rrf_presence(c, hit);
-                collect_rrf_presence(v, hit);
-            }
-            if let Some(e) = else_clause.as_deref() {
-                collect_rrf_presence(e, hit);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Returns true if any function call in a neutral expression tree has a name
 /// satisfying `pred`. Used to enforce illegal-position rules (fusion-score /
 /// doc-score scoring functions) on neutral operator fields such as LIMIT/SKIP
@@ -4118,335 +4038,9 @@ fn neutral_expr_contains_call(expr: &crate::plan::expr::Expr, pred: &dyn Fn(&str
     }
 }
 
-/// Parse and validate a fusion-scalar call. RRF takes two args
-/// (methods + query map); CC and DBSF take three (methods + query map +
-/// weights map). All three reject empty method lists and unknown query
-/// map keys; CC and DBSF additionally require that every weight be a
-/// finite non-negative number, and that the weights map name only the
-/// supported categories (`vector` / `text`).
-fn parse_fusion_signature(kind: FusionScalar, args: &[Expr]) -> Result<RrfCallSig, PlanError> {
-    let expected_arity = match kind {
-        FusionScalar::Rrf => 2,
-        FusionScalar::Cc | FusionScalar::Dbsf => 3,
-    };
-    if args.len() != expected_arity {
-        return Err(PlanError::RrfScoreArity);
-    }
-    let methods_expr = &args[0];
-    let query_expr = &args[1];
-
-    // Methods: Expr::List of at least one element.
-    let methods = match methods_expr {
-        Expr::List(items) if !items.is_empty() => items
-            .iter()
-            .map(super::lower_expr)
-            .collect::<Result<Vec<_>, _>>()?,
-        Expr::List(_) => {
-            return Err(PlanError::RrfScoreMethodsShape {
-                got: "empty list".to_string(),
-            });
-        }
-        other => {
-            return Err(PlanError::RrfScoreMethodsShape {
-                got: format!("{other:?}"),
-            });
-        }
-    };
-
-    // Query: MapLiteral (post-substitute, parameters resolved to Literal(Map))
-    // or Literal(Value::Map). Extract `vector` and `text` keys.
-    let (query_vector, query_text) = match query_expr {
-        Expr::MapLiteral(fields) => {
-            let mut qv = None;
-            let mut qt = None;
-            for (k, v) in fields {
-                match k.as_str() {
-                    "vector" => qv = Some(super::lower_expr(v)?),
-                    "text" => qt = Some(super::lower_expr(v)?),
-                    other => {
-                        return Err(PlanError::RrfScoreQueryShape {
-                            got: format!(
-                                "map with unknown key `{other}` (expected `vector` and/or `text`)"
-                            ),
-                        });
-                    }
-                }
-            }
-            if qv.is_none() && qt.is_none() {
-                return Err(PlanError::RrfScoreQueryShape {
-                    got: "empty map (needs at least one of `vector`, `text`)".to_string(),
-                });
-            }
-            (qv, qt)
-        }
-        // Parameter / Variable: defer shape validation to executor.
-        // The executor will evaluate and reject non-map values at runtime.
-        Expr::Parameter(_) | Expr::Variable(_) => {
-            let lowered = super::lower_expr(query_expr)?;
-            (Some(lowered.clone()), Some(lowered))
-        }
-        other => {
-            return Err(PlanError::RrfScoreQueryShape {
-                got: format!("{other:?}"),
-            });
-        }
-    };
-
-    let fusion = match kind {
-        FusionScalar::Rrf => crate::planner::logical::FusionStrategy::Rrf { k: 60 },
-        FusionScalar::Cc => {
-            let weights = parse_fusion_weights(&args[2], kind)?;
-            crate::planner::logical::FusionStrategy::ConvexCombination { weights }
-        }
-        FusionScalar::Dbsf => {
-            let weights = parse_fusion_weights(&args[2], kind)?;
-            crate::planner::logical::FusionStrategy::Dbsf { weights }
-        }
-    };
-
-    Ok(RrfCallSig {
-        methods,
-        query_vector,
-        query_text,
-        fusion,
-    })
-}
-
-/// Parse the third (weights) argument of `cc_score` / `dbsf_score`. Must
-/// be a `MapLiteral` over the supported categories (`vector`, `text`)
-/// with finite non-negative numeric values. Empty maps are rejected.
-fn parse_fusion_weights(
-    expr: &Expr,
-    kind: FusionScalar,
-) -> Result<std::collections::BTreeMap<String, f64>, PlanError> {
-    let fields = match expr {
-        Expr::MapLiteral(fields) => fields,
-        other => {
-            return Err(PlanError::RrfScoreQueryShape {
-                got: format!(
-                    "{}: weights must be a map literal, got {other:?}",
-                    kind.fn_name()
-                ),
-            });
-        }
-    };
-    let mut weights = std::collections::BTreeMap::new();
-    for (key, value) in fields {
-        let key_str = match key.as_str() {
-            "vector" | "text" => key.clone(),
-            other => {
-                return Err(PlanError::RrfScoreQueryShape {
-                    got: format!(
-                        "{}: weights has unknown key `{other}` (expected `vector` and/or `text`)",
-                        kind.fn_name()
-                    ),
-                });
-            }
-        };
-        let w = match value {
-            Expr::Literal(coordinode_core::graph::types::Value::Float(f)) => *f,
-            Expr::Literal(coordinode_core::graph::types::Value::Int(i)) => *i as f64,
-            // `-0.1` arrives from the parser as UnaryOp::Neg(Literal(...)); fold it
-            // so the non-negative check below catches negative literals cleanly.
-            Expr::UnaryOp {
-                op: crate::cypher::ast::UnaryOperator::Neg,
-                expr: inner,
-            } => match inner.as_ref() {
-                Expr::Literal(coordinode_core::graph::types::Value::Float(f)) => -*f,
-                Expr::Literal(coordinode_core::graph::types::Value::Int(i)) => -(*i as f64),
-                _ => {
-                    return Err(PlanError::RrfScoreQueryShape {
-                        got: format!(
-                            "{}: weight for `{key_str}` must be a numeric literal, got {value:?}",
-                            kind.fn_name()
-                        ),
-                    });
-                }
-            },
-            other => {
-                return Err(PlanError::RrfScoreQueryShape {
-                    got: format!(
-                        "{}: weight for `{key_str}` must be a numeric literal, got {other:?}",
-                        kind.fn_name()
-                    ),
-                });
-            }
-        };
-        if !w.is_finite() || w < 0.0 {
-            return Err(PlanError::RrfScoreQueryShape {
-                got: format!(
-                    "{}: weight for `{key_str}` must be a finite non-negative number, got {w}",
-                    kind.fn_name()
-                ),
-            });
-        }
-        weights.insert(key_str, w);
-    }
-    if weights.is_empty() {
-        return Err(PlanError::RrfScoreQueryShape {
-            got: format!(
-                "{}: weights map is empty (needs at least one of `vector`, `text`)",
-                kind.fn_name()
-            ),
-        });
-    }
-    Ok(weights)
-}
-
-/// Collect the RRF signature (if any) from an expression. Errors if multiple
-/// differing signatures are found within a single expression.
-fn collect_rrf_sig_in_expr(
-    expr: &Expr,
-    found: &mut Option<RrfCallSig>,
-    location: &str,
-) -> Result<(), PlanError> {
-    if let Some((kind, args)) = match_fusion_call(expr) {
-        let sig = parse_fusion_signature(kind, args)?;
-        match found {
-            None => *found = Some(sig),
-            Some(existing) if *existing == sig => {}
-            Some(_) => {
-                return Err(PlanError::RrfScoreMultipleCalls {
-                    location: location.to_string(),
-                });
-            }
-        }
-        // Do not recurse into the args; nested fusion call inside another
-        // fusion call's list is pathological and will hit the arity guard.
-        return Ok(());
-    }
-    match expr {
-        Expr::BinaryOp { left, right, .. } => {
-            collect_rrf_sig_in_expr(left, found, location)?;
-            collect_rrf_sig_in_expr(right, found, location)?;
-        }
-        Expr::UnaryOp { expr, .. } => collect_rrf_sig_in_expr(expr, found, location)?,
-        Expr::PropertyAccess { expr, .. } => collect_rrf_sig_in_expr(expr, found, location)?,
-        Expr::List(items) => {
-            for it in items {
-                collect_rrf_sig_in_expr(it, found, location)?;
-            }
-        }
-        Expr::MapLiteral(fields) => {
-            for (_, v) in fields {
-                collect_rrf_sig_in_expr(v, found, location)?;
-            }
-        }
-        Expr::FunctionCall { args, .. } => {
-            for a in args {
-                collect_rrf_sig_in_expr(a, found, location)?;
-            }
-        }
-        Expr::In { expr, list } => {
-            collect_rrf_sig_in_expr(expr, found, location)?;
-            collect_rrf_sig_in_expr(list, found, location)?;
-        }
-        Expr::IsNull { expr, .. } => collect_rrf_sig_in_expr(expr, found, location)?,
-        Expr::StringMatch { expr, pattern, .. } => {
-            collect_rrf_sig_in_expr(expr, found, location)?;
-            collect_rrf_sig_in_expr(pattern, found, location)?;
-        }
-        Expr::Subscript { expr, index } => {
-            collect_rrf_sig_in_expr(expr, found, location)?;
-            collect_rrf_sig_in_expr(index, found, location)?;
-        }
-        Expr::Case {
-            operand,
-            when_clauses,
-            else_clause,
-        } => {
-            if let Some(o) = operand.as_deref() {
-                collect_rrf_sig_in_expr(o, found, location)?;
-            }
-            for (c, v) in when_clauses {
-                collect_rrf_sig_in_expr(c, found, location)?;
-                collect_rrf_sig_in_expr(v, found, location)?;
-            }
-            if let Some(e) = else_clause.as_deref() {
-                collect_rrf_sig_in_expr(e, found, location)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Substitute every fusion-scalar FunctionCall in `expr` with the
-/// appropriate fused-score column variable. `rrf_score` rewrites to the
-/// historical `__rrf_score__`; `cc_score` and `dbsf_score` rewrite to the
-/// universal `__hybrid_score__` column the executor now emits regardless
-/// of strategy. RRF also writes `__hybrid_score__` so callers can sort
-/// uniformly when reading the fused result.
-fn rewrite_rrf_in_expr(expr: &mut Expr) {
-    if let Expr::FunctionCall { name, .. } = expr {
-        if let Some(kind) = FusionScalar::from_name(name) {
-            let column = match kind {
-                FusionScalar::Rrf => "__rrf_score__",
-                FusionScalar::Cc | FusionScalar::Dbsf => "__hybrid_score__",
-            };
-            *expr = Expr::Variable(column.to_string());
-            return;
-        }
-    }
-    match expr {
-        Expr::BinaryOp { left, right, .. } => {
-            rewrite_rrf_in_expr(left);
-            rewrite_rrf_in_expr(right);
-        }
-        Expr::UnaryOp { expr, .. } => rewrite_rrf_in_expr(expr),
-        Expr::PropertyAccess { expr, .. } => rewrite_rrf_in_expr(expr),
-        Expr::List(items) => {
-            for it in items {
-                rewrite_rrf_in_expr(it);
-            }
-        }
-        Expr::MapLiteral(fields) => {
-            for (_, v) in fields {
-                rewrite_rrf_in_expr(v);
-            }
-        }
-        Expr::FunctionCall { args, .. } => {
-            for a in args {
-                rewrite_rrf_in_expr(a);
-            }
-        }
-        Expr::In { expr, list } => {
-            rewrite_rrf_in_expr(expr);
-            rewrite_rrf_in_expr(list);
-        }
-        Expr::IsNull { expr, .. } => rewrite_rrf_in_expr(expr),
-        Expr::StringMatch { expr, pattern, .. } => {
-            rewrite_rrf_in_expr(expr);
-            rewrite_rrf_in_expr(pattern);
-        }
-        Expr::Subscript { expr, index } => {
-            rewrite_rrf_in_expr(expr);
-            rewrite_rrf_in_expr(index);
-        }
-        Expr::Case {
-            operand,
-            when_clauses,
-            else_clause,
-        } => {
-            if let Some(o) = operand.as_deref_mut() {
-                rewrite_rrf_in_expr(o);
-            }
-            for (c, v) in when_clauses {
-                rewrite_rrf_in_expr(c);
-                rewrite_rrf_in_expr(v);
-            }
-            if let Some(e) = else_clause.as_deref_mut() {
-                rewrite_rrf_in_expr(e);
-            }
-        }
-        _ => {}
-    }
-}
-
-// ---- Neutral-IR twins of the fusion-rewrite machinery ----
-// The post-build fusion rewrite runs over both Project items (neutral IR) and
-// Sort items (cypher). These twins serve the neutral Project path; the cypher
-// versions above serve the cypher Sort path.
+// ---- Fusion-rewrite machinery (neutral IR) ----
+// The post-build fusion rewrite runs over Project and Sort items, both of which
+// carry the neutral expression IR.
 
 fn match_fusion_call_neutral(
     expr: &crate::plan::expr::Expr,
@@ -4901,7 +4495,7 @@ fn collect_rrf_sig(op: &LogicalOp, sig: &mut Option<RrfCallSig>) -> Result<(), P
         }
         LogicalOp::Sort { input, items } => {
             for it in items {
-                collect_rrf_sig_in_expr(&it.expr, sig, "ORDER BY")?;
+                collect_rrf_sig_in_expr_neutral(&it.expr, sig, "ORDER BY")?;
             }
             collect_rrf_sig(input, sig)
         }
@@ -4947,10 +4541,10 @@ fn wrap_rank_fuse(op: LogicalOp, sig: &RrfCallSig, sort_touches_rrf: &mut bool) 
         }
         LogicalOp::Sort { input, mut items } => {
             for it in items.iter_mut() {
-                if expr_contains_rrf_score(&it.expr) {
+                if neutral_expr_contains_call(&it.expr, &|n| FusionScalar::from_name(n).is_some()) {
                     *sort_touches_rrf = true;
                 }
-                rewrite_rrf_in_expr(&mut it.expr);
+                rewrite_rrf_in_expr_neutral(&mut it.expr);
             }
             LogicalOp::Sort {
                 input: Box::new(wrap_rank_fuse(*input, sig, sort_touches_rrf)),
@@ -5028,272 +4622,9 @@ struct DocScoreSig {
     gamma: crate::plan::expr::Expr,
 }
 
-fn match_doc_score(expr: &Expr) -> Option<&[Expr]> {
-    if let Expr::FunctionCall { name, args, .. } = expr {
-        if name == "doc_score" {
-            return Some(args);
-        }
-    }
-    None
-}
-
-fn expr_contains_doc_score(expr: &Expr) -> bool {
-    let mut hit = false;
-    collect_doc_presence(expr, &mut hit);
-    hit
-}
-
-fn collect_doc_presence(expr: &Expr, hit: &mut bool) {
-    if *hit {
-        return;
-    }
-    match expr {
-        Expr::FunctionCall { name, args, .. } => {
-            if name == "doc_score" {
-                *hit = true;
-                return;
-            }
-            for a in args {
-                collect_doc_presence(a, hit);
-            }
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            collect_doc_presence(left, hit);
-            collect_doc_presence(right, hit);
-        }
-        Expr::UnaryOp { expr, .. } => collect_doc_presence(expr, hit),
-        Expr::PropertyAccess { expr, .. } => collect_doc_presence(expr, hit),
-        Expr::List(items) => items.iter().for_each(|e| collect_doc_presence(e, hit)),
-        Expr::MapLiteral(fields) => fields
-            .iter()
-            .for_each(|(_, v)| collect_doc_presence(v, hit)),
-        Expr::In { expr, list } => {
-            collect_doc_presence(expr, hit);
-            collect_doc_presence(list, hit);
-        }
-        Expr::IsNull { expr, .. } => collect_doc_presence(expr, hit),
-        Expr::StringMatch { expr, pattern, .. } => {
-            collect_doc_presence(expr, hit);
-            collect_doc_presence(pattern, hit);
-        }
-        Expr::Subscript { expr, index } => {
-            collect_doc_presence(expr, hit);
-            collect_doc_presence(index, hit);
-        }
-        Expr::Case {
-            operand,
-            when_clauses,
-            else_clause,
-        } => {
-            if let Some(o) = operand.as_deref() {
-                collect_doc_presence(o, hit);
-            }
-            for (c, v) in when_clauses {
-                collect_doc_presence(c, hit);
-                collect_doc_presence(v, hit);
-            }
-            if let Some(e) = else_clause.as_deref() {
-                collect_doc_presence(e, hit);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Canonical default weight expressions for doc_score.
 fn default_doc_weight(value: f64) -> crate::plan::expr::Expr {
     crate::plan::expr::Expr::Literal(Value::Float(value))
-}
-
-/// Parse and validate a single `doc_score(args...)` call.
-fn parse_doc_signature(args: &[Expr]) -> Result<DocScoreSig, PlanError> {
-    if args.len() < 2 || args.len() > 5 || args.len() == 4 {
-        return Err(PlanError::DocScoreArity { got: args.len() });
-    }
-
-    let doc_variable = match &args[0] {
-        Expr::Variable(v) => v.clone(),
-        other => {
-            return Err(PlanError::DocScoreDocShape {
-                got: format!("{other:?}"),
-            });
-        }
-    };
-
-    let query_vector = super::lower_expr(&args[1])?;
-
-    let (alpha, beta, gamma) = match args.len() {
-        2 => (
-            default_doc_weight(0.5),
-            default_doc_weight(0.3),
-            default_doc_weight(0.2),
-        ),
-        3 => match &args[2] {
-            Expr::MapLiteral(fields) => {
-                let mut a = default_doc_weight(0.5);
-                let mut b = default_doc_weight(0.3);
-                let mut g = default_doc_weight(0.2);
-                for (k, v) in fields {
-                    match k.as_str() {
-                        "alpha" => a = super::lower_expr(v)?,
-                        "beta" => b = super::lower_expr(v)?,
-                        "gamma" => g = super::lower_expr(v)?,
-                        other => {
-                            return Err(PlanError::DocScoreWeightsShape {
-                                got: format!(
-                                    "map with unknown key `{other}` (expected `alpha`, `beta`, `gamma`)"
-                                ),
-                            });
-                        }
-                    }
-                }
-                (a, b, g)
-            }
-            other => {
-                return Err(PlanError::DocScoreWeightsShape {
-                    got: format!("single-arg weights must be a map literal, got {other:?}"),
-                });
-            }
-        },
-        5 => (
-            super::lower_expr(&args[2])?,
-            super::lower_expr(&args[3])?,
-            super::lower_expr(&args[4])?,
-        ),
-        _ => unreachable!("arity guard above excludes other lengths"),
-    };
-
-    Ok(DocScoreSig {
-        doc_variable,
-        query_vector,
-        alpha,
-        beta,
-        gamma,
-    })
-}
-
-fn collect_doc_sig_in_expr(
-    expr: &Expr,
-    found: &mut Option<DocScoreSig>,
-    location: &str,
-) -> Result<(), PlanError> {
-    if let Some(args) = match_doc_score(expr) {
-        let sig = parse_doc_signature(args)?;
-        match found {
-            None => *found = Some(sig),
-            Some(existing) if *existing == sig => {}
-            Some(_) => {
-                return Err(PlanError::DocScoreMultipleCalls {
-                    location: location.to_string(),
-                });
-            }
-        }
-        return Ok(());
-    }
-    match expr {
-        Expr::BinaryOp { left, right, .. } => {
-            collect_doc_sig_in_expr(left, found, location)?;
-            collect_doc_sig_in_expr(right, found, location)?;
-        }
-        Expr::UnaryOp { expr, .. } => collect_doc_sig_in_expr(expr, found, location)?,
-        Expr::PropertyAccess { expr, .. } => collect_doc_sig_in_expr(expr, found, location)?,
-        Expr::List(items) => {
-            for it in items {
-                collect_doc_sig_in_expr(it, found, location)?;
-            }
-        }
-        Expr::MapLiteral(fields) => {
-            for (_, v) in fields {
-                collect_doc_sig_in_expr(v, found, location)?;
-            }
-        }
-        Expr::FunctionCall { args, .. } => {
-            for a in args {
-                collect_doc_sig_in_expr(a, found, location)?;
-            }
-        }
-        Expr::In { expr, list } => {
-            collect_doc_sig_in_expr(expr, found, location)?;
-            collect_doc_sig_in_expr(list, found, location)?;
-        }
-        Expr::IsNull { expr, .. } => collect_doc_sig_in_expr(expr, found, location)?,
-        Expr::StringMatch { expr, pattern, .. } => {
-            collect_doc_sig_in_expr(expr, found, location)?;
-            collect_doc_sig_in_expr(pattern, found, location)?;
-        }
-        Expr::Subscript { expr, index } => {
-            collect_doc_sig_in_expr(expr, found, location)?;
-            collect_doc_sig_in_expr(index, found, location)?;
-        }
-        Expr::Case {
-            operand,
-            when_clauses,
-            else_clause,
-        } => {
-            if let Some(o) = operand.as_deref() {
-                collect_doc_sig_in_expr(o, found, location)?;
-            }
-            for (c, v) in when_clauses {
-                collect_doc_sig_in_expr(c, found, location)?;
-                collect_doc_sig_in_expr(v, found, location)?;
-            }
-            if let Some(e) = else_clause.as_deref() {
-                collect_doc_sig_in_expr(e, found, location)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn rewrite_doc_in_expr(expr: &mut Expr) {
-    if let Expr::FunctionCall { name, .. } = expr {
-        if name == "doc_score" {
-            *expr = Expr::Variable("__doc_score__".to_string());
-            return;
-        }
-    }
-    match expr {
-        Expr::BinaryOp { left, right, .. } => {
-            rewrite_doc_in_expr(left);
-            rewrite_doc_in_expr(right);
-        }
-        Expr::UnaryOp { expr, .. } => rewrite_doc_in_expr(expr),
-        Expr::PropertyAccess { expr, .. } => rewrite_doc_in_expr(expr),
-        Expr::List(items) => items.iter_mut().for_each(rewrite_doc_in_expr),
-        Expr::MapLiteral(fields) => fields.iter_mut().for_each(|(_, v)| rewrite_doc_in_expr(v)),
-        Expr::FunctionCall { args, .. } => args.iter_mut().for_each(rewrite_doc_in_expr),
-        Expr::In { expr, list } => {
-            rewrite_doc_in_expr(expr);
-            rewrite_doc_in_expr(list);
-        }
-        Expr::IsNull { expr, .. } => rewrite_doc_in_expr(expr),
-        Expr::StringMatch { expr, pattern, .. } => {
-            rewrite_doc_in_expr(expr);
-            rewrite_doc_in_expr(pattern);
-        }
-        Expr::Subscript { expr, index } => {
-            rewrite_doc_in_expr(expr);
-            rewrite_doc_in_expr(index);
-        }
-        Expr::Case {
-            operand,
-            when_clauses,
-            else_clause,
-        } => {
-            if let Some(o) = operand.as_deref_mut() {
-                rewrite_doc_in_expr(o);
-            }
-            for (c, v) in when_clauses {
-                rewrite_doc_in_expr(c);
-                rewrite_doc_in_expr(v);
-            }
-            if let Some(e) = else_clause.as_deref_mut() {
-                rewrite_doc_in_expr(e);
-            }
-        }
-        _ => {}
-    }
 }
 
 // ---- Neutral-IR twins of the doc-score rewrite machinery (Project path) ----
@@ -5582,7 +4913,7 @@ fn collect_doc_sig(op: &LogicalOp, sig: &mut Option<DocScoreSig>) -> Result<(), 
         }
         LogicalOp::Sort { input, items } => {
             for it in items {
-                collect_doc_sig_in_expr(&it.expr, sig, "ORDER BY")?;
+                collect_doc_sig_in_expr_neutral(&it.expr, sig, "ORDER BY")?;
             }
             collect_doc_sig(input, sig)
         }
@@ -5619,10 +4950,10 @@ fn wrap_doc_score(op: LogicalOp, sig: &DocScoreSig, sort_touches_doc: &mut bool)
         }
         LogicalOp::Sort { input, mut items } => {
             for it in items.iter_mut() {
-                if expr_contains_doc_score(&it.expr) {
+                if neutral_expr_contains_call(&it.expr, &|n| n == "doc_score") {
                     *sort_touches_doc = true;
                 }
-                rewrite_doc_in_expr(&mut it.expr);
+                rewrite_doc_in_expr_neutral(&mut it.expr);
             }
             LogicalOp::Sort {
                 input: Box::new(wrap_doc_score(*input, sig, sort_touches_doc)),

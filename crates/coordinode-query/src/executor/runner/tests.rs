@@ -941,8 +941,8 @@ fn sort_and_limit() {
                     ],
                     distinct: false,
                 }),
-                items: vec![crate::cypher::ast::SortItem {
-                    expr: Expr::Variable("age".into()),
+                items: vec![crate::plan::SortItem {
+                    expr: nx(Expr::Variable("age".into())),
                     ascending: false,
                 }],
             }),

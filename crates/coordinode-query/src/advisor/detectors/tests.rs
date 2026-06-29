@@ -254,8 +254,8 @@ fn cartesian_product_detected() {
 fn knn_without_index_detected() {
     let sort_op = LogicalOp::Sort {
         input: Box::new(node_scan("n", "Place")),
-        items: vec![SortItem {
-            expr: Expr::FunctionCall {
+        items: vec![crate::plan::SortItem {
+            expr: nx(Expr::FunctionCall {
                 name: "point.distance".to_string(),
                 args: vec![
                     Expr::PropertyAccess {
@@ -265,7 +265,7 @@ fn knn_without_index_detected() {
                     Expr::Literal(Value::Float(0.0)),
                 ],
                 distinct: false,
-            },
+            }),
             ascending: true,
         }],
     };
@@ -285,12 +285,12 @@ fn knn_without_index_detected() {
 fn sort_without_limit_no_knn() {
     let sort_op = LogicalOp::Sort {
         input: Box::new(node_scan("n", "Place")),
-        items: vec![SortItem {
-            expr: Expr::FunctionCall {
+        items: vec![crate::plan::SortItem {
+            expr: nx(Expr::FunctionCall {
                 name: "vector_distance".to_string(),
                 args: vec![],
                 distinct: false,
-            },
+            }),
             ascending: true,
         }],
     };

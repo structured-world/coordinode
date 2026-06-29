@@ -234,7 +234,7 @@ pub enum LogicalOp {
     /// Sort by expressions.
     Sort {
         input: Box<LogicalOp>,
-        items: Vec<SortItem>,
+        items: Vec<crate::plan::SortItem>,
     },
 
     /// Limit result count.

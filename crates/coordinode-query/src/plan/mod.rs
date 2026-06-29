@@ -14,3 +14,12 @@
 pub mod expr;
 
 pub use expr::{BinOp, Expr, MapProjItem, Quantifier, StrOp, UnOp};
+
+/// A sort key in the neutral IR: an expression to order by plus direction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortItem {
+    /// Expression evaluated per row to produce the sort key.
+    pub expr: Expr,
+    /// `true` for ascending order, `false` for descending.
+    pub ascending: bool,
+}

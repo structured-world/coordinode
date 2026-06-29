@@ -2312,7 +2312,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             // by silent zeros. Error instead.
             let score_reqs: crate::executor::eval::ScoreRequirements = items
                 .iter()
-                .map(|it| crate::executor::eval::expr_score_requirements(&it.expr))
+                .map(|it| crate::executor::eval::expr_score_requirements_neutral(&it.expr))
                 .fold(Default::default(), |mut acc, r| {
                     acc.needs_text_score |= r.needs_text_score;
                     acc.needs_hybrid_score |= r.needs_hybrid_score;
@@ -2360,8 +2360,8 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
 
             rows.sort_by(|a, b| {
                 for item in items {
-                    let va = eval_expr(&item.expr, a);
-                    let vb = eval_expr(&item.expr, b);
+                    let va = eval_neutral(&item.expr, a);
+                    let vb = eval_neutral(&item.expr, b);
                     let cmp = compare_values(&va, &vb);
                     let cmp = if item.ascending { cmp } else { cmp.reverse() };
                     if cmp != std::cmp::Ordering::Equal {

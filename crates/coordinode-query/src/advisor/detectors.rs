@@ -514,17 +514,17 @@ fn collect_vars_recursive(op: &LogicalOp, vars: &mut Vec<String>) {
 }
 
 /// Check if an expression contains a distance/similarity function call.
-fn expr_contains_distance_fn(expr: &crate::cypher::ast::Expr) -> bool {
-    use crate::cypher::ast::Expr;
+fn expr_contains_distance_fn(expr: &crate::plan::expr::Expr) -> bool {
+    use crate::plan::expr::Expr as PExpr;
     match expr {
-        Expr::FunctionCall { name, .. } => {
+        PExpr::Call { name, .. } => {
             let lower = name.to_lowercase();
             lower.contains("distance") || lower.contains("similarity")
         }
-        Expr::BinaryOp { left, right, .. } => {
+        PExpr::Binary { left, right, .. } => {
             expr_contains_distance_fn(left) || expr_contains_distance_fn(right)
         }
-        Expr::UnaryOp { expr, .. } => expr_contains_distance_fn(expr),
+        PExpr::Unary { operand, .. } => expr_contains_distance_fn(operand),
         _ => false,
     }
 }
