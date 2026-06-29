@@ -44,10 +44,11 @@ fn write_columnar_rows_succeeds_on_columnar_tree() {
 }
 
 fn new_registry(base: &std::path::Path) -> ColumnarTableRegistry {
+    let fs: std::sync::Arc<dyn lsm_tree::fs::Fs> = std::sync::Arc::new(lsm_tree::fs::StdFs);
     let seqno: SharedSequenceNumberGenerator =
         std::sync::Arc::new(lsm_tree::SequenceNumberCounter::default());
     let cache = std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(8 * 1024 * 1024));
-    ColumnarTableRegistry::open(base.to_path_buf(), seqno, cache).unwrap()
+    ColumnarTableRegistry::open(base.to_path_buf(), fs, seqno, cache).unwrap()
 }
 
 #[test]

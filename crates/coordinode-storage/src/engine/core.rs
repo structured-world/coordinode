@@ -467,11 +467,21 @@ impl StorageEngine {
         // before the cache moves into the coordinator; re-opens any table tree
         // already on disk.
         #[cfg(feature = "columnar")]
-        let columnar_tables = crate::columnar::ColumnarTableRegistry::open(
-            config.endpoints[0].path.join("tables"),
-            Arc::clone(&seqno),
-            Arc::clone(&cache),
-        )?;
+        let columnar_tables = {
+            // Use the engine's configured filesystem backend (MemFs for
+            // in-memory engines) so columnar table trees never touch the host
+            // filesystem when the engine is virtual.
+            let fs: Arc<dyn lsm_tree::fs::Fs> = config
+                .fs
+                .clone()
+                .unwrap_or_else(|| Arc::new(lsm_tree::fs::StdFs));
+            crate::columnar::ColumnarTableRegistry::open(
+                config.endpoints[0].path.join("tables"),
+                fs,
+                Arc::clone(&seqno),
+                Arc::clone(&cache),
+            )?
+        };
 
         let coordinator =
             LocalMultiModalCoordinator::new(trees, Arc::clone(&seqno), cache, gc_watermark);
