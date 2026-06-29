@@ -1,11 +1,15 @@
-//! Logical query plan: relational algebra operators for Cypher queries.
+//! Logical query plan: relational algebra operators for the query engine.
 //!
-//! The logical plan is a tree of operators produced from the Cypher AST.
-//! It represents WHAT to compute, not HOW (physical plan handles that).
+//! The logical plan is a language-neutral tree of operators produced by a
+//! frontend from its dialect's AST. It represents WHAT to compute, not HOW
+//! (physical plan handles that).
 
 use std::collections::HashMap;
 
-use crate::cypher::ast::*;
+// Graph-pattern AST types are the remaining cypher coupling in the logical
+// layer (Traverse direction / var-length bounds, Upsert on-create patterns).
+// Neutralizing the pattern surface is a separate slice; until then these stay.
+use crate::cypher::ast::{Direction, LengthBound, Pattern, PatternElement};
 use coordinode_core::graph::stats::StorageStats;
 use coordinode_core::graph::types::{Value, VectorConsistencyMode};
 
@@ -429,7 +433,7 @@ pub enum LogicalOp {
     CreateTextIndex {
         name: String,
         label: String,
-        fields: Vec<crate::cypher::ast::TextIndexFieldSpec>,
+        fields: Vec<crate::plan::TextIndexFieldSpec>,
         default_language: Option<String>,
         language_override: Option<String>,
     },
@@ -504,7 +508,7 @@ pub enum LogicalOp {
     CreateEdgeType {
         name: String,
         temporal: bool,
-        properties: Vec<crate::cypher::ast::EdgePropertyDecl>,
+        properties: Vec<crate::plan::PropertyDecl>,
     },
 
     /// CREATE NODE TYPE: declare a node-label schema entry (R172a per ADR-027).
@@ -517,15 +521,13 @@ pub enum LogicalOp {
     CreateNodeType {
         name: String,
         temporal: bool,
-        properties: Vec<crate::cypher::ast::EdgePropertyDecl>,
+        properties: Vec<crate::plan::PropertyDecl>,
     },
 
     /// CREATE TRIGGER — the trigger architecture. Registers a trigger definition in the
     /// schema partition, updates the `(target, event)` index, and (in EE)
     /// notifies trigger workers of the new subscription.
-    CreateTrigger {
-        clause: crate::cypher::ast::CreateTriggerClause,
-    },
+    CreateTrigger { clause: crate::plan::TriggerDef },
     /// DROP TRIGGER — the trigger architecture.
     DropTrigger { name: String },
     /// SHOW TRIGGERS — the trigger architecture. Reads schema partition and returns one row per
@@ -539,7 +541,7 @@ pub enum LogicalOp {
     ShowTransactions,
     /// ALTER TRIGGER — the trigger architecture.
     AlterTrigger {
-        clause: crate::cypher::ast::AlterTriggerClause,
+        clause: crate::plan::AlterTriggerDef,
     },
 
     /// UNWIND: expand a list expression into individual rows.

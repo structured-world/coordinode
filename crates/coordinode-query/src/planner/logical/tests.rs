@@ -1,4 +1,5 @@
 use super::*;
+use crate::cypher::ast::Expr;
 
 /// Lower a cypher test expression into the neutral IR carried by operator fields.
 fn nx(e: crate::cypher::ast::Expr) -> crate::plan::expr::Expr {

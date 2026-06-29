@@ -69,6 +69,72 @@ pub enum MergeNodesConflictStrategy {
     SetExpressions(Vec<SetItem>),
 }
 
+/// A `CREATE TRIGGER` definition in the neutral IR. Carries the already-neutral
+/// core schema descriptors (`coordinode_core::schema::triggers`); the runtime
+/// fields (`enabled`, `created_at_hlc_us`) are stamped by the executor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TriggerDef {
+    /// Unique trigger name (DROP / ALTER / SHOW handle).
+    pub name: String,
+    /// Target schema element (`:Label` or `[:EdgeType]`).
+    pub target: coordinode_core::schema::triggers::TriggerTargetSchema,
+    /// Event kinds that fire the trigger.
+    pub events: coordinode_core::schema::triggers::TriggerEventsSchema,
+    /// Synchronous (BEFORE COMMIT) or asynchronous (AFTER COMMIT) timing.
+    pub timing: coordinode_core::schema::triggers::TriggerTimingSchema,
+    /// Trigger body, captured as a source string and re-parsed when it fires.
+    pub body_source: String,
+    /// Per-trigger L1 cascade-depth override (`None` = cluster default).
+    pub cascade_limit: Option<u32>,
+    /// Per-trigger L2 cascade-fanout override (`None` = cluster default).
+    pub cascade_fanout: Option<u32>,
+    /// Error-handling policy (`None` = timing-specific default).
+    pub on_error: Option<coordinode_core::schema::triggers::OnErrorPolicySchema>,
+}
+
+/// The change applied by `ALTER TRIGGER`, in the neutral IR.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterTriggerAction {
+    /// Stop firing without forgetting the definition.
+    Disable,
+    /// Resume firing after a prior disable.
+    Enable,
+    /// Replace the trigger body (re-validated at execution).
+    SetBody(String),
+    /// Replace the on-error policy.
+    SetOnError(coordinode_core::schema::triggers::OnErrorPolicySchema),
+}
+
+/// An `ALTER TRIGGER` definition in the neutral IR.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTriggerDef {
+    /// Target trigger name.
+    pub name: String,
+    /// What to change.
+    pub action: AlterTriggerAction,
+}
+
+/// Per-field configuration for `CREATE TEXT INDEX`, in the neutral IR.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextIndexFieldSpec {
+    /// Property name to index.
+    pub property: String,
+    /// Analyzer name: language ("english", "russian"), "auto_detect", "none".
+    pub analyzer: Option<String>,
+}
+
+/// A single property declaration in `CREATE EDGE TYPE` / `CREATE NODE TYPE`, in
+/// the neutral IR.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropertyDecl {
+    /// Property name.
+    pub name: String,
+    /// Declared type name.
+    pub type_name: String,
+    /// Whether the property is NOT NULL.
+    pub not_null: bool,
+}
+
 /// Schema-violation handling policy for `SET` mutations, in the neutral IR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ViolationMode {

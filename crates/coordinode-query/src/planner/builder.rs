@@ -708,7 +708,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
         Clause::CreateTextIndex(c) => Ok(LogicalOp::CreateTextIndex {
             name: c.name.clone(),
             label: c.label.clone(),
-            fields: c.fields.clone(),
+            fields: lower_text_index_fields(&c.fields),
             default_language: c.default_language.clone(),
             language_override: c.language_override.clone(),
         }),
@@ -789,21 +789,25 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
         Clause::CreateEdgeType(c) => Ok(LogicalOp::CreateEdgeType {
             name: c.name.clone(),
             temporal: c.temporal,
-            properties: c.properties.clone(),
+            properties: lower_property_decls(&c.properties),
         }),
         Clause::CreateNodeType(c) => Ok(LogicalOp::CreateNodeType {
             name: c.name.clone(),
             temporal: c.temporal,
-            properties: c.properties.clone(),
+            properties: lower_property_decls(&c.properties),
         }),
-        Clause::CreateTrigger(c) => Ok(LogicalOp::CreateTrigger { clause: c.clone() }),
+        Clause::CreateTrigger(c) => Ok(LogicalOp::CreateTrigger {
+            clause: lower_create_trigger(c),
+        }),
         Clause::DropTrigger(c) => Ok(LogicalOp::DropTrigger {
             name: c.name.clone(),
         }),
         Clause::ShowTriggers => Ok(LogicalOp::ShowTriggers),
         Clause::ShowSessions => Ok(LogicalOp::ShowSessions),
         Clause::ShowTransactions => Ok(LogicalOp::ShowTransactions),
-        Clause::AlterTrigger(c) => Ok(LogicalOp::AlterTrigger { clause: c.clone() }),
+        Clause::AlterTrigger(c) => Ok(LogicalOp::AlterTrigger {
+            clause: lower_alter_trigger(c),
+        }),
         Clause::AttachDocument(ad) => {
             // Synthesize a MATCH for the ATTACH pattern `(a)-[:T]->(u)` so that
             // the executor receives pre-bound `source_variable` / `target_variable`
@@ -1380,6 +1384,114 @@ fn lower_merge_conflict(
         C::Coalesce => N::Coalesce,
         C::SetExpressions(items) => N::SetExpressions(lower_set_items(items)?),
     })
+}
+
+/// Map a cypher trigger target to the neutral core schema descriptor.
+fn trigger_target_to_schema(
+    t: &crate::cypher::ast::TriggerTarget,
+) -> coordinode_core::schema::triggers::TriggerTargetSchema {
+    use crate::cypher::ast::TriggerTarget as A;
+    use coordinode_core::schema::triggers::TriggerTargetSchema as S;
+    match t {
+        A::Label(name) => S::label(name),
+        A::EdgeType(name) => S::edge_type(name),
+    }
+}
+
+/// Map cypher trigger events to the neutral core schema descriptor.
+fn trigger_events_to_schema(
+    e: crate::cypher::ast::TriggerEvents,
+) -> coordinode_core::schema::triggers::TriggerEventsSchema {
+    coordinode_core::schema::triggers::TriggerEventsSchema {
+        on_create: e.on_create,
+        on_update: e.on_update,
+        on_delete: e.on_delete,
+    }
+}
+
+/// Map a cypher trigger timing to the neutral core schema descriptor.
+fn trigger_timing_to_schema(
+    t: crate::cypher::ast::TriggerTiming,
+) -> coordinode_core::schema::triggers::TriggerTimingSchema {
+    use crate::cypher::ast::TriggerTiming as A;
+    use coordinode_core::schema::triggers::TriggerTimingSchema as S;
+    match t {
+        A::BeforeCommit => S::BeforeCommit,
+        A::AfterCommit => S::AfterCommit,
+    }
+}
+
+/// Map a cypher on-error policy to the neutral core schema descriptor.
+fn on_error_to_schema(
+    p: &crate::cypher::ast::OnErrorPolicy,
+) -> coordinode_core::schema::triggers::OnErrorPolicySchema {
+    use crate::cypher::ast::OnErrorPolicy as A;
+    use coordinode_core::schema::triggers::OnErrorPolicySchema as S;
+    match p {
+        A::Propagate => S::Propagate,
+        A::Retry { n, backoff_ms } => S::Retry {
+            n: *n,
+            backoff_ms: *backoff_ms,
+        },
+        A::DeadLetter => S::DeadLetter,
+    }
+}
+
+/// Lower a cypher `CREATE TRIGGER` clause to the neutral IR.
+fn lower_create_trigger(c: &crate::cypher::ast::CreateTriggerClause) -> crate::plan::TriggerDef {
+    crate::plan::TriggerDef {
+        name: c.name.clone(),
+        target: trigger_target_to_schema(&c.target),
+        events: trigger_events_to_schema(c.events),
+        timing: trigger_timing_to_schema(c.timing),
+        body_source: c.body_source.clone(),
+        cascade_limit: c.cascade_limit,
+        cascade_fanout: c.cascade_fanout,
+        on_error: c.on_error.as_ref().map(on_error_to_schema),
+    }
+}
+
+/// Lower a cypher `ALTER TRIGGER` clause to the neutral IR.
+fn lower_alter_trigger(c: &crate::cypher::ast::AlterTriggerClause) -> crate::plan::AlterTriggerDef {
+    use crate::cypher::ast::AlterTriggerAction as A;
+    use crate::plan::AlterTriggerAction as N;
+    let action = match &c.action {
+        A::Disable => N::Disable,
+        A::Enable => N::Enable,
+        A::SetBody(src) => N::SetBody(src.clone()),
+        A::SetOnError(pol) => N::SetOnError(on_error_to_schema(pol)),
+    };
+    crate::plan::AlterTriggerDef {
+        name: c.name.clone(),
+        action,
+    }
+}
+
+/// Map cypher `CREATE TEXT INDEX` field specs to the neutral IR.
+fn lower_text_index_fields(
+    fields: &[crate::cypher::ast::TextIndexFieldSpec],
+) -> Vec<crate::plan::TextIndexFieldSpec> {
+    fields
+        .iter()
+        .map(|f| crate::plan::TextIndexFieldSpec {
+            property: f.property.clone(),
+            analyzer: f.analyzer.clone(),
+        })
+        .collect()
+}
+
+/// Map cypher edge/node-type property declarations to the neutral IR.
+fn lower_property_decls(
+    decls: &[crate::cypher::ast::EdgePropertyDecl],
+) -> Vec<crate::plan::PropertyDecl> {
+    decls
+        .iter()
+        .map(|d| crate::plan::PropertyDecl {
+            name: d.name.clone(),
+            type_name: d.type_name.clone(),
+            not_null: d.not_null,
+        })
+        .collect()
 }
 
 /// Map a cypher schema-violation mode to the neutral IR.

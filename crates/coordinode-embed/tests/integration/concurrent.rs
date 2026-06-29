@@ -13,8 +13,9 @@ use std::thread;
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::{NodeId, NodeIdAllocator};
 use coordinode_core::graph::types::Value;
-use coordinode_query::cypher::ast::{Expr, SetItem};
+use coordinode_query::cypher::ast::Expr;
 use coordinode_query::executor::runner::{execute, ExecutionError};
+use coordinode_query::plan::SetItem;
 use coordinode_query::planner::logical::{LogicalOp, LogicalPlan};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
@@ -42,7 +43,7 @@ fn upsert_plan(name: &str, age: i64) -> LogicalPlan {
             on_match: vec![SetItem::Property {
                 variable: "n".into(),
                 property: "age".into(),
-                expr: Expr::Literal(Value::Int(age)),
+                expr: nx(Expr::Literal(Value::Int(age))),
             }],
             on_create_patterns: vec![],
         },

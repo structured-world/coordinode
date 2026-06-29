@@ -13603,7 +13603,7 @@ fn execute_alter_label(
 fn execute_create_node_type(
     name: &str,
     temporal: bool,
-    properties: &[crate::cypher::ast::EdgePropertyDecl],
+    properties: &[crate::plan::PropertyDecl],
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     use coordinode_core::schema::definition::{
@@ -13693,7 +13693,7 @@ fn execute_create_node_type(
 fn execute_create_edge_type(
     name: &str,
     temporal: bool,
-    properties: &[crate::cypher::ast::EdgePropertyDecl],
+    properties: &[crate::plan::PropertyDecl],
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     // Reject if the edge type was registered before (either via explicit DDL,
@@ -13762,56 +13762,6 @@ fn current_hlc_us() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0)
-}
-
-/// Translate parser AST → persisted schema form (no logic difference, just
-/// a layering boundary — the parser's `cypher::ast` types live in
-/// coordinode-query; storage uses coordinode-core types).
-fn trigger_target_to_schema(
-    t: &crate::cypher::ast::TriggerTarget,
-) -> coordinode_core::schema::triggers::TriggerTargetSchema {
-    use crate::cypher::ast::TriggerTarget as A;
-    use coordinode_core::schema::triggers::TriggerTargetSchema as S;
-    match t {
-        A::Label(name) => S::label(name),
-        A::EdgeType(name) => S::edge_type(name),
-    }
-}
-
-fn trigger_events_to_schema(
-    e: crate::cypher::ast::TriggerEvents,
-) -> coordinode_core::schema::triggers::TriggerEventsSchema {
-    coordinode_core::schema::triggers::TriggerEventsSchema {
-        on_create: e.on_create,
-        on_update: e.on_update,
-        on_delete: e.on_delete,
-    }
-}
-
-fn trigger_timing_to_schema(
-    t: crate::cypher::ast::TriggerTiming,
-) -> coordinode_core::schema::triggers::TriggerTimingSchema {
-    use crate::cypher::ast::TriggerTiming as A;
-    use coordinode_core::schema::triggers::TriggerTimingSchema as S;
-    match t {
-        A::BeforeCommit => S::BeforeCommit,
-        A::AfterCommit => S::AfterCommit,
-    }
-}
-
-fn on_error_to_schema(
-    p: &crate::cypher::ast::OnErrorPolicy,
-) -> coordinode_core::schema::triggers::OnErrorPolicySchema {
-    use crate::cypher::ast::OnErrorPolicy as A;
-    use coordinode_core::schema::triggers::OnErrorPolicySchema as S;
-    match p {
-        A::Propagate => S::Propagate,
-        A::Retry { n, backoff_ms } => S::Retry {
-            n: *n,
-            backoff_ms: *backoff_ms,
-        },
-        A::DeadLetter => S::DeadLetter,
-    }
 }
 
 /// Load the existing trigger-name list for an index key, append `name`, and
@@ -13888,7 +13838,7 @@ fn validate_trigger_body_source(name: &str, source: &str) -> Result<(), Executio
 }
 
 fn execute_create_trigger(
-    c: &crate::cypher::ast::CreateTriggerClause,
+    c: &crate::plan::TriggerDef,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     use coordinode_core::schema::triggers::TriggerSchema;
@@ -13907,19 +13857,18 @@ fn execute_create_trigger(
 
     validate_trigger_body_source(&c.name, &c.body_source)?;
 
-    let target_schema = trigger_target_to_schema(&c.target);
-    let target_segment = target_schema.index_key_segment();
-    let events_schema = trigger_events_to_schema(c.events);
+    let target_segment = c.target.index_key_segment();
+    let events_schema = c.events;
 
     let schema = TriggerSchema {
         name: c.name.clone(),
-        target: target_schema,
+        target: c.target.clone(),
         events: events_schema,
-        timing: trigger_timing_to_schema(c.timing),
+        timing: c.timing,
         body_source: c.body_source.clone(),
         cascade_limit: c.cascade_limit,
         cascade_fanout: c.cascade_fanout,
-        on_error: c.on_error.as_ref().map(on_error_to_schema),
+        on_error: c.on_error.clone(),
         enabled: true,
         created_at_hlc_us: current_hlc_us(),
     };
@@ -14078,10 +14027,10 @@ fn execute_show_transactions(ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>,
 }
 
 fn execute_alter_trigger(
-    c: &crate::cypher::ast::AlterTriggerClause,
+    c: &crate::plan::AlterTriggerDef,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    use crate::cypher::ast::AlterTriggerAction;
+    use crate::plan::AlterTriggerAction;
     use coordinode_core::schema::triggers::TriggerSchema;
     use coordinode_modality::{LocalTriggerStore, TriggerStore as _};
 
@@ -14116,7 +14065,7 @@ fn execute_alter_trigger(
             "body_replaced"
         }
         AlterTriggerAction::SetOnError(pol) => {
-            schema.on_error = Some(on_error_to_schema(pol));
+            schema.on_error = Some(pol.clone());
             "on_error_replaced"
         }
     };
@@ -14424,7 +14373,7 @@ fn snapshot_node_record(
 fn execute_create_text_index(
     name: &str,
     label: &str,
-    fields: &[crate::cypher::ast::TextIndexFieldSpec],
+    fields: &[crate::plan::TextIndexFieldSpec],
     default_language: Option<&str>,
     language_override: Option<&str>,
     ctx: &mut ExecutionContext<'_>,
