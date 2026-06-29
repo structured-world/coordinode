@@ -542,3 +542,21 @@ fn node_write_key_picks_correct_form() {
     assert_eq!(non_temp, encode_node_key(3, nid));
     assert_eq!(temp, encode_temporal_node_key(3, nid, 1234));
 }
+
+#[test]
+fn from_primary_key_is_deterministic_and_namespaced() {
+    // Same (label, key) -> same id, every time.
+    let a = NodeId::from_primary_key("Trade", b"1001");
+    let b = NodeId::from_primary_key("Trade", b"1001");
+    assert_eq!(a, b);
+
+    // Different key -> (almost surely) different id.
+    assert_ne!(a, NodeId::from_primary_key("Trade", b"1002"));
+
+    // Same key bytes under a different table must not collide.
+    assert_ne!(a, NodeId::from_primary_key("Order", b"1001"));
+
+    // CE invariant: derived ids carry a zero origin shard hint.
+    assert_eq!(a.origin_shard_hint(), 0);
+    assert_eq!(a.sequence(), a.as_raw());
+}

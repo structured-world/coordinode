@@ -79,6 +79,36 @@ impl NodeId {
     pub fn sequence(self) -> u64 {
         self.0 & NODE_ID_MAX_SEQUENCE
     }
+
+    /// Derive a stable NodeId from a relational table's primary key (R901).
+    ///
+    /// A `STORAGE` table bridges its declared primary key to a NodeId so the
+    /// same key always maps to the same node (identity + upsert-by-key) and the
+    /// row is a first-class graph node. The mapping is a deterministic FNV-1a
+    /// hash of the label name and the encoded key, folded into the 44-bit
+    /// sequence with a zero shard hint (matching CE's `origin_shard_hint == 0`
+    /// invariant; EE placement still routes by the key, not the hint). `label`
+    /// namespaces the key so the same key bytes under different tables never
+    /// collide. `key_encoded` is the caller's stable encoding of the primary-key
+    /// value(s).
+    pub fn from_primary_key(label: &str, key_encoded: &[u8]) -> Self {
+        // FNV-1a (64-bit) — deterministic and seed-free, so every node derives
+        // the identical NodeId for a given (label, key). Not a hasher from the
+        // standard library (those are seeded / unspecified across builds).
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = FNV_OFFSET;
+        let mut mix = |bytes: &[u8]| {
+            for &b in bytes {
+                hash ^= u64::from(b);
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+        };
+        mix(label.as_bytes());
+        mix(&[0xff]); // separator so (label, key) framing is unambiguous
+        mix(key_encoded);
+        Self::compose(0, hash & NODE_ID_MAX_SEQUENCE)
+    }
 }
 
 impl std::fmt::Display for NodeId {

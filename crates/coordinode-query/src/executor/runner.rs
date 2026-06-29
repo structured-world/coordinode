@@ -8237,8 +8237,47 @@ fn execute_create_node(
         }
     }
 
+    // R901: a relational table bridges its declared primary key to a NodeId,
+    // so the same key maps to the same node (identity + upsert-by-key). A
+    // columnar table's rows live in its own columnar tree, read back by the
+    // columnar scan operator; that write path is not wired yet, so reject a
+    // columnar row insert with a clear message rather than silently writing it
+    // to the node path.
+    let table_pk: Option<Vec<String>> = match schema.as_ref() {
+        Some(s) if s.is_table() && s.is_columnar() => {
+            return Err(ExecutionError::Unsupported(
+                "writing rows into a STORAGE COLUMNAR table is not yet supported \
+                 (it lands with the columnar scan operator); use STORAGE ROW for now"
+                    .into(),
+            ));
+        }
+        Some(s) if s.is_table() => Some(s.primary_key.clone()),
+        _ => None,
+    };
+
     for input_row in input_rows {
-        let node_id = ctx.id_allocator.next();
+        // Table rows take their identity from the primary key; plain graph
+        // nodes get a freshly allocated id.
+        let node_id = match &table_pk {
+            Some(pk_cols) => {
+                let mut key_buf = Vec::new();
+                for pk in pk_cols {
+                    let Some((_, expr)) = properties.iter().find(|(n, _)| n == pk) else {
+                        return Err(ExecutionError::SchemaViolation(format!(
+                            "primary key column '{pk}' is required to insert into table '{}'",
+                            labels.first().map_or("?", String::as_str)
+                        )));
+                    };
+                    let v = eval_neutral(expr, input_row);
+                    let enc = rmp_serde::to_vec(&v).map_err(|e| {
+                        ExecutionError::Serialization(format!("encode primary key '{pk}': {e}"))
+                    })?;
+                    key_buf.extend_from_slice(&enc);
+                }
+                NodeId::from_primary_key(labels.first().map_or("", String::as_str), &key_buf)
+            }
+            None => ctx.id_allocator.next(),
+        };
 
         let mut record = NodeRecord::with_labels(labels.to_vec());
         for (prop_name, expr) in properties {

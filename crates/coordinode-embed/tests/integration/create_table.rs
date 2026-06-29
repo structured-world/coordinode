@@ -2,6 +2,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use coordinode_core::graph::types::Value;
 use coordinode_embed::db::Database;
 
 #[test]
@@ -124,6 +125,70 @@ fn columnar_table_survives_database_reopen() {
             .is_err(),
         "table schema must survive reopen (duplicate rejected)"
     );
+}
+
+#[test]
+fn row_table_insert_and_match_by_primary_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).expect("open db");
+    db.execute_cypher("CREATE TABLE Account (id BIGINT PRIMARY KEY, name STRING)")
+        .expect("create");
+    db.execute_cypher("CREATE (a:Account {id: 1, name: 'Alice'})")
+        .expect("insert");
+
+    let rows = db
+        .execute_cypher("MATCH (a:Account {id: 1}) RETURN a.name AS name")
+        .expect("match");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Alice".into())));
+}
+
+#[test]
+fn row_table_primary_key_is_stable_identity() {
+    // The same primary key maps to the same node (identity / upsert-by-key),
+    // not two separate rows.
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).expect("open db");
+    db.execute_cypher("CREATE TABLE Account (id BIGINT PRIMARY KEY, name STRING)")
+        .expect("create");
+    db.execute_cypher("CREATE (a:Account {id: 7, name: 'First'})")
+        .expect("insert 1");
+    db.execute_cypher("CREATE (a:Account {id: 7, name: 'Second'})")
+        .expect("insert 2");
+
+    let rows = db
+        .execute_cypher("MATCH (a:Account {id: 7}) RETURN a.name AS name")
+        .expect("match");
+    assert_eq!(rows.len(), 1, "same PK must resolve to one node, not two");
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Second".into())));
+}
+
+#[test]
+fn row_table_data_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut db = Database::open(dir.path()).expect("open db");
+        db.execute_cypher("CREATE TABLE Account (id BIGINT PRIMARY KEY, name STRING)")
+            .expect("create");
+        db.execute_cypher("CREATE (a:Account {id: 1, name: 'Alice'})")
+            .expect("insert");
+    }
+    let mut db = Database::open(dir.path()).expect("reopen db");
+    let rows = db
+        .execute_cypher("MATCH (a:Account {id: 1}) RETURN a.name AS name")
+        .expect("match after reopen");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("name"), Some(&Value::String("Alice".into())));
+}
+
+#[test]
+fn columnar_table_row_insert_rejected_for_now() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).expect("open db");
+    db.execute_cypher("CREATE TABLE T (id BIGINT PRIMARY KEY) STORAGE COLUMNAR")
+        .expect("create");
+    // Columnar row writes land with the scan operator; rejected until then.
+    assert!(db.execute_cypher("CREATE (n:T {id: 1})").is_err());
 }
 
 #[test]
