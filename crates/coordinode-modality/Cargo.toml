@@ -16,7 +16,7 @@ rmp-serde = { workspace = true }
 rmpv = { workspace = true, features = ["with-serde"] }
 # S2 geometry for WGS-84 spatial indexing (Apache-2.0, pure Rust, no FFI).
 # We add an in-tree RegionCoverer over its CellID / Cap / Rect primitives.
-s2 = "0.0.13"
+s2 = "0.2"
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

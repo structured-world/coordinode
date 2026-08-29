@@ -44,7 +44,7 @@ coordinode-auth = { workspace = true }
 # Decompression for the restore CLI only (tool-side, never the DB runtime).
 bzip2-rs = { workspace = true }
 flate2 = { workspace = true }
-structured-proxy = { version = "2", optional = true }
+structured-proxy = { version = "3", optional = true }
 # axum: serve the Router that structured-proxy 2.x exposes (it removed its own serve()).
 # Pinned to the same minor structured-proxy depends on so the Router type unifies.
 axum = { version = "0.8", optional = true }

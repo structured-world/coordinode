@@ -501,8 +501,9 @@ async fn snapshot_survives_reopen() {
             "snapshot last_log_id should be 10"
         );
         assert_eq!(
-            snap.meta.snapshot_id, "snap-10-1",
-            "snapshot_id should match"
+            snap.meta.last_log_id.unwrap().committed_leader_id().term,
+            1,
+            "snapshot last_log_id term should be 1"
         );
 
         let data = snap.snapshot.into_inner();

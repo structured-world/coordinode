@@ -251,10 +251,12 @@ impl NetStreamAppend<C> for GrpcNetwork {
 }
 
 impl NetSnapshot<C> for GrpcNetwork {
+    type SnapshotData = std::io::Cursor<Vec<u8>>;
+
     async fn full_snapshot(
         &mut self,
         vote: openraft::type_config::alias::VoteOf<C>,
-        snapshot: openraft::type_config::alias::SnapshotOf<C>,
+        snapshot: openraft::type_config::alias::SnapshotOf<C, Self::SnapshotData>,
         cancel: impl Future<Output = openraft::error::ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
     ) -> Result<openraft::raft::SnapshotResponse<C>, openraft::error::StreamingError<C>> {
@@ -313,7 +315,6 @@ impl NetSnapshot<C> for GrpcNetwork {
         }
 
         tracing::info!(
-            snapshot_id = %snapshot.meta.snapshot_id,
             data_bytes = data_size,
             chunks = payloads.len() - 1,
             target = %target_addr,
@@ -435,10 +436,12 @@ impl NetStreamAppend<C> for StubNetwork {
 }
 
 impl NetSnapshot<C> for StubNetwork {
+    type SnapshotData = std::io::Cursor<Vec<u8>>;
+
     async fn full_snapshot(
         &mut self,
         _vote: openraft::type_config::alias::VoteOf<C>,
-        _snapshot: openraft::type_config::alias::SnapshotOf<C>,
+        _snapshot: openraft::type_config::alias::SnapshotOf<C, Self::SnapshotData>,
         _cancel: impl Future<Output = openraft::error::ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
     ) -> Result<openraft::raft::SnapshotResponse<C>, openraft::error::StreamingError<C>> {

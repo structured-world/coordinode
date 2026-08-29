@@ -627,7 +627,6 @@ fn test_snapshot_transfer_serde_roundtrip() {
         meta: openraft::storage::SnapshotMeta {
             last_log_id: None,
             last_membership: openraft::StoredMembership::default(),
-            snapshot_id: "test-snap".to_string(),
         },
         data: vec![1, 2, 3],
         since_ts: Some(42000),
@@ -643,7 +642,6 @@ fn test_snapshot_transfer_serde_roundtrip() {
         meta: openraft::storage::SnapshotMeta {
             last_log_id: None,
             last_membership: openraft::StoredMembership::default(),
-            snapshot_id: "full-snap".to_string(),
         },
         data: vec![4, 5],
         since_ts: None,
@@ -704,9 +702,16 @@ fn test_snapshot_chunk_message_serde_roundtrip() {
     let header = SnapshotTransferHeader {
         vote: Vote::new(1, 1),
         meta: openraft::storage::SnapshotMeta {
-            last_log_id: None,
+            // A concrete log id, so the round-trip below proves the metadata
+            // survives serialization rather than comparing two defaults.
+            last_log_id: Some(openraft::LogId::new(
+                crate::storage::CommittedLeaderId {
+                    term: 7,
+                    node_id: 0,
+                },
+                42,
+            )),
             last_membership: openraft::StoredMembership::default(),
-            snapshot_id: "chunked-test".to_string(),
         },
         data_size: 12345,
         since_ts: Some(42000),
@@ -718,7 +723,9 @@ fn test_snapshot_chunk_message_serde_roundtrip() {
         SnapshotChunkMessage::Header(h) => {
             assert_eq!(h.data_size, 12345);
             assert_eq!(h.since_ts, Some(42000));
-            assert_eq!(h.meta.snapshot_id, "chunked-test");
+            let log_id = h.meta.last_log_id.expect("last_log_id survives round-trip");
+            assert_eq!(log_id.index, 42);
+            assert_eq!(log_id.committed_leader_id().term, 7);
         }
         _ => panic!("expected Header variant"),
     }

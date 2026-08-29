@@ -49,7 +49,7 @@ use crate::storage::{SnapshotMeta, Vote};
 pub struct SnapshotTransfer {
     /// Leader's current vote (follower validates leadership).
     pub vote: Vote,
-    /// Snapshot metadata: last_log_id, membership, snapshot_id.
+    /// Snapshot metadata: last_log_id and membership.
     pub meta: SnapshotMeta,
     /// Snapshot data (binary format v1 full or v2 incremental).
     pub data: Vec<u8>,
@@ -649,7 +649,7 @@ pub const SNAPSHOT_CHUNK_SIZE: usize = 2 * 1024 * 1024;
 pub struct SnapshotTransferHeader {
     /// Leader's current vote (follower validates leadership).
     pub vote: Vote,
-    /// Snapshot metadata: last_log_id, membership, snapshot_id.
+    /// Snapshot metadata: last_log_id and membership.
     pub meta: SnapshotMeta,
     /// Total size of the CNSN data that follows in subsequent chunks.
     pub data_size: u64,

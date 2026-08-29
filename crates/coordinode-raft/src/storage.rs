@@ -1087,6 +1087,11 @@ impl CoordinodeStateMachine {
 }
 
 impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
+    // Snapshot payloads are whole in-memory blobs, so an owned cursor is the
+    // read/write handle. openraft 0.10 moved this out of the type config onto
+    // the state machine.
+    type SnapshotData = std::io::Cursor<Vec<u8>>;
+
     type SnapshotBuilder = CoordinodeSnapshotBuilder;
 
     async fn applied_state(
@@ -1203,10 +1208,6 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         }
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<std::io::Cursor<Vec<u8>>, io::Error> {
-        Ok(std::io::Cursor::new(Vec::new()))
-    }
-
     async fn install_snapshot(
         &mut self,
         meta: &openraft::type_config::alias::SnapshotMetaOf<TypeConfig>,
@@ -1215,7 +1216,6 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         let data = snapshot.into_inner();
 
         tracing::info!(
-            snapshot_id = %meta.snapshot_id,
             data_bytes = data.len(),
             last_log_index = meta.last_log_id.map(|id| id.index),
             "installing snapshot"
@@ -1306,16 +1306,14 @@ pub struct CoordinodeSnapshotBuilder {
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for CoordinodeSnapshotBuilder {
+    type SnapshotData = std::io::Cursor<Vec<u8>>;
+
     async fn build_snapshot(&mut self) -> Result<Snapshot, io::Error> {
         let last_log_id = self.last_applied;
-        let snap_id = match &last_log_id {
-            Some(id) => format!("snap-{}-{}", id.index, id.committed_leader_id().term),
-            None => "snap-0-0".to_string(),
-        };
 
         tracing::info!(
-            snapshot_id = %snap_id,
             last_log_index = last_log_id.map(|id| id.index),
+            last_log_term = last_log_id.map(|id| id.committed_leader_id().term),
             "building full storage snapshot"
         );
 
@@ -1328,7 +1326,6 @@ impl RaftSnapshotBuilder<TypeConfig> for CoordinodeSnapshotBuilder {
         let meta = SnapshotMeta {
             last_log_id,
             last_membership: self.last_membership.clone(),
-            snapshot_id: snap_id,
         };
 
         tracing::info!(snapshot_bytes = data.len(), "snapshot build complete");

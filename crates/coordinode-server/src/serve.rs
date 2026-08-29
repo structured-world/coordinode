@@ -816,10 +816,20 @@ pub(crate) async fn serve(
     #[cfg(feature = "rest-proxy")]
     {
         use structured_proxy::config::{
-            DescriptorSource, ListenConfig, ProxyConfig, ServiceConfig, UpstreamConfig,
+            DescriptorSource, HealthConfig, ListenConfig, MetricsConfig, ProxyConfig,
+            ServiceConfig, UpstreamConfig,
         };
         static DESCRIPTOR_BYTES: &[u8] = include_bytes!("../../../coordinode.descriptor.bin");
         let grpc_upstream = format!("http://127.0.0.1:{}", addr.port());
+        // The proxy would otherwise mount its own /health and /metrics on the
+        // REST port, reporting proxy state. CoordiNode publishes those for the
+        // database itself on the ops port, which is where the documented
+        // endpoints live, so keep the proxy off both paths. Both structs are
+        // #[non_exhaustive], so start from the default and clear the flag.
+        let mut proxy_health = HealthConfig::default();
+        proxy_health.enabled = false;
+        let mut proxy_metrics = MetricsConfig::default();
+        proxy_metrics.enabled = false;
         // structured-proxy 2.0.1 makes the embedded-constructed config structs
         // hand-buildable again (no longer #[non_exhaustive]), so the config is built
         // programmatically. serve() is gone in 2.x; the proxy exposes an axum Router
@@ -837,6 +847,8 @@ pub(crate) async fn serve(
             service: ServiceConfig {
                 name: "coordinode".into(),
             },
+            health: proxy_health,
+            metrics: proxy_metrics,
             aliases: vec![],
             openapi: None,
             auth: None,

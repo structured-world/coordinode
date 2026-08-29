@@ -20,4 +20,13 @@ ignore = [
     "RUSTSEC-2026-0098", # name constraints for URI names incorrectly accepted
     "RUSTSEC-2026-0099", # name constraints accepted for wildcard certs
     "RUSTSEC-2026-0049", # CRLs not considered authoritative by distribution point
+    # rkyv 0.7.x out-of-bounds read on crafted archives. No deny.toml counterpart:
+    # cargo-audit reads Cargo.lock, cargo-deny reads the resolved graph, and this
+    # crate is only in the lock. It arrives through rust_decimal's optional `rkyv`
+    # feature, which nothing here enables, so it is never built:
+    # `cargo tree --all-features -i rkyv@0.7.46` resolves to nothing. rust_decimal
+    # 1.42.1 is the latest release and still requires rkyv ^0.7, so no update on
+    # our side moves it. The 0.8 line we do build sits on 0.8.18, which is patched.
+    # Revisit when rust_decimal publishes a release built against rkyv 0.8.
+    "RUSTSEC-2026-0235",
 ]

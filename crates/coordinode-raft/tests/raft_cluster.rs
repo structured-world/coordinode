@@ -1987,7 +1987,6 @@ async fn cluster_incremental_snapshot_cross_engine() {
             meta: openraft::storage::SnapshotMeta {
                 last_log_id: None,
                 last_membership: openraft::StoredMembership::default(),
-                snapshot_id: "incr-test".to_string(),
             },
             data: incr_data.clone(),
             since_ts: Some(110),

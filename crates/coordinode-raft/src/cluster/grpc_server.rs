@@ -155,7 +155,6 @@ impl RaftService for RaftGrpcHandler {
         let expected_data_size = header.data_size as usize;
 
         tracing::info!(
-            snapshot_id = %header.meta.snapshot_id,
             data_size = expected_data_size,
             last_log_index = header.meta.last_log_id.map(|id| id.index),
             incremental = is_incremental,
