@@ -11,13 +11,11 @@
 # untouched. v0.5.1 went out that way, without the two crash fixes that were
 # already sitting on main.
 #
-# The workspace already carries one version for every crate
-# (`version.workspace = true`) and produces one artefact, so it releases as a
-# unit. `version_group` states that: a change anywhere in the workspace moves
-# the whole group, and the binary picks the fix up. Listing every crate in the
-# release PR is then accurate rather than the fake cascade #2799 was about.
-# `version_group` is a [[package]] key, so every block below carries it; the
-# [workspace] table rejects unknown fields.
+# Nothing here versions independently: all twenty crates inherit
+# `version.workspace = true` and ship as one binary, so `v{{ version }}` is the
+# only tag that means anything. Measuring every crate against that one tag is
+# what makes a library fix reach a release, plus `dependent_update` below so the
+# binary is not skipped for being `publish = false`.
 semver_check = false
 git_only = true
 publish = false
@@ -53,123 +51,91 @@ commit_parsers = [
 # CHANGELOG.md is generated here (per-crate) AND aggregated workspace-wide.
 [[package]]
 name = "coordinode-server"
-version_group = "coordinode"
+# Without this the binary is skipped as an unpublishable crate with no direct
+# commits, and a fix in any library never reaches a release.
+dependent_update = true
 git_tag_enable = true
 git_release_enable = true
 
 # ─── Library crates ────────────────────────────────────────────────────
 #
-# Every library crate gets a unique `git_tag_name`.  Reason: the workspace
-# release tag (`v0.4.x`) is owned by `coordinode-server`; without a unique
-# pattern release-plz would adopt that tag as the baseline for every other
-# crate, then fail to find the crate inside the old worktree (the crate
-# may not have existed at that point in history).
+# Listed only so their commits reach the aggregated workspace CHANGELOG.md.
+# They inherit `git_tag_enable = false` and the workspace `git_tag_name`, so
+# they create no tags of their own and measure against `v{{ version }}`.
 #
-# We do NOT set `release = false` here — that flag excludes the crate from
-# the workspace CHANGELOG.md aggregation done by our fork
-# (release-plz#2791).  With just `git_tag_enable = false` (inherited from
-# the workspace block) the crate participates in the changelog but is not
-# tagged or released to GitHub.
+# They used to carry a unique `git_tag_name` each, to stop release-plz adopting
+# the workspace tag as their baseline and then failing to find a crate that did
+# not yet exist at that commit. The cure was worse: the patterns named tags that
+# are never created, so every crate looked like an unreleased initial release,
+# never raised the version, and a fix living outside crates/coordinode-server/
+# could not produce a release at all.
+#
+# The old hazard returns only for a crate added after the last tag. Give that
+# one crate a temporary `git_tag_name` of its own until the next release covers
+# it, the way coordinode-session needed.
+#
+# We do NOT set `release = false` — that flag drops the crate from the
+# workspace CHANGELOG.md aggregation our fork does (release-plz#2791).
 
 [[package]]
 name = "coordinode-client"
-version_group = "coordinode"
-git_tag_name = "coordinode-client-v{{ version }}"
 
 [[package]]
 name = "coordinode-integration"
-version_group = "coordinode"
-git_tag_name = "coordinode-integration-v{{ version }}"
 
 [[package]]
 name = "coordinode-auth"
-version_group = "coordinode"
-git_tag_name = "coordinode-auth-v{{ version }}"
 
 [[package]]
 name = "coordinode-bench"
-version_group = "coordinode"
-git_tag_name = "coordinode-bench-v{{ version }}"
 
 [[package]]
 name = "coordinode-cluster"
-version_group = "coordinode"
-git_tag_name = "coordinode-cluster-v{{ version }}"
 
 [[package]]
 name = "coordinode-core"
-version_group = "coordinode"
-git_tag_name = "coordinode-core-v{{ version }}"
 
 [[package]]
 name = "coordinode-embed"
-version_group = "coordinode"
-git_tag_name = "coordinode-embed-v{{ version }}"
 
 [[package]]
 name = "coordinode-modality"
-version_group = "coordinode"
-git_tag_name = "coordinode-modality-v{{ version }}"
 
 [[package]]
 name = "coordinode-query"
-version_group = "coordinode"
-git_tag_name = "coordinode-query-v{{ version }}"
 
 [[package]]
 name = "coordinode-raft"
-version_group = "coordinode"
-git_tag_name = "coordinode-raft-v{{ version }}"
 
 [[package]]
 name = "coordinode-replicate"
-version_group = "coordinode"
-git_tag_name = "coordinode-replicate-v{{ version }}"
 
 [[package]]
 name = "coordinode-s3"
-version_group = "coordinode"
-git_tag_name = "coordinode-s3-v{{ version }}"
 
 [[package]]
 name = "coordinode-search"
-version_group = "coordinode"
-git_tag_name = "coordinode-search-v{{ version }}"
 
 [[package]]
 name = "coordinode-session"
-version_group = "coordinode"
-git_tag_name = "coordinode-session-v{{ version }}"
 
 [[package]]
 name = "coordinode-storage"
-version_group = "coordinode"
-git_tag_name = "coordinode-storage-v{{ version }}"
 
 [[package]]
 name = "coordinode-test-fixtures"
-version_group = "coordinode"
-git_tag_name = "coordinode-test-fixtures-v{{ version }}"
 
 [[package]]
 name = "coordinode-timeseries"
-version_group = "coordinode"
-git_tag_name = "coordinode-timeseries-v{{ version }}"
 
 [[package]]
 name = "coordinode-vector"
-version_group = "coordinode"
-git_tag_name = "coordinode-vector-v{{ version }}"
 
 [[package]]
 name = "coordinode-swarm"
-version_group = "coordinode"
-git_tag_name = "coordinode-swarm-v{{ version }}"
 
 [[package]]
 name = "coordinode-wire"
-version_group = "coordinode"
-git_tag_name = "coordinode-wire-v{{ version }}"
 
 # Bench crates (coordinode-gold-bench, coordinode-bench-vector-ann) live in
 # their own standalone workspaces under benches/. They are intentionally
