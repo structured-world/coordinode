@@ -1240,6 +1240,7 @@ dependencies = [
  "bzip2-rs",
  "coordinode-auth",
  "coordinode-client",
+ "coordinode-cluster",
  "coordinode-core",
  "coordinode-embed",
  "coordinode-query",

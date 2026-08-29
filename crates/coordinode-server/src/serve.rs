@@ -53,6 +53,7 @@ fn set_nofile_limit(_target: Option<u64>) -> Option<(u64, u64)> {
 /// `overrides` are the command-line flags, folded over the file last so the
 /// command line wins.
 pub(crate) async fn serve(
+    extensions: crate::builder::ServerBuilder,
     config_path: Option<String>,
     overrides: Box<config::CliOverrides>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -74,8 +75,14 @@ pub(crate) async fn serve(
 
     // Resolve the operational mode from the merged string value, so a
     // mode set in the config file is validated exactly like a CLI flag.
-    let mode = match config::ServeMode::parse(&cfg.mode) {
-        Ok(m) => m,
+    //
+    // `full` is the built-in and parses here. A downstream distribution makes
+    // further values legal by registering a handler for them; a value nobody
+    // registered keeps the built-in rejection, message and exit code.
+    let extension_mode = extensions.serve_modes.get(&cfg.mode).cloned();
+    let mode: String = match config::ServeMode::parse(&cfg.mode) {
+        Ok(m) => m.to_string(),
+        Err(_) if extension_mode.is_some() => cfg.mode.clone(),
         Err(e) => {
             eprintln!("error: {e}");
             std::process::exit(1);
@@ -582,6 +589,14 @@ pub(crate) async fn serve(
         let ops_view: Arc<dyn coordinode_core::operations::OperationsView> =
             session_registry.clone();
         db.set_operations_view(ops_view);
+        // Extension-op handlers registered by a downstream distribution. The
+        // planner resolves an op to its handler by name while building the
+        // plan, so this costs nothing on the row path. CE registers none and
+        // the registry stays empty.
+        for (name, handler) in &extensions.query_extensions {
+            db.register_extension(name.clone(), Arc::clone(handler));
+            info!(extension = %name, "query extension registered");
+        }
     }
 
     // Idle reaper: periodically drop interactive transactions left
@@ -972,10 +987,47 @@ pub(crate) async fn serve(
     // unbounded-allocation messages. Applied to every service.
     let max_req_bytes = max_request_size_mb.saturating_mul(1024 * 1024);
 
-    // NodeInfoLayer: inject x-coordinode-node / x-coordinode-hops /
-    // x-coordinode-load response headers on every gRPC response.
-    let mut builder = server.layer(grpc::NodeInfoLayer::new(node_id));
-    let mut router = builder
+    // Publish the running server to everything registered on the builder.
+    // Placement defaults to the single-shard, single-node strategy; a
+    // downstream distribution replaces it via `with_placement`.
+    let (routing, topology) = extensions.placement.clone().unwrap_or_else(|| {
+        (
+            Arc::new(coordinode_cluster::SingleShardRouting::new()),
+            Arc::new(coordinode_cluster::SingleNodeTopology::from_storage(
+                &storage_config,
+            )),
+        )
+    });
+    let ctx = crate::builder::ServerContext::new(
+        node_id,
+        data_dir.clone(),
+        cluster_mode,
+        max_req_bytes,
+        Arc::clone(&database),
+        Arc::clone(&engine),
+        Arc::clone(&raft_node),
+        Arc::clone(&session_registry),
+        routing,
+        topology,
+    );
+
+    // Bring the node into a registered non-built-in mode before it accepts
+    // traffic. `full` has no handler and nothing runs here.
+    if let Some(handler) = extension_mode {
+        handler.start(&ctx)?;
+        info!(mode = %mode, "serve mode handler started");
+    }
+
+    for task in &extensions.background_tasks {
+        task.start(&ctx);
+    }
+
+    // Services are collected into a `Routes` first, so a downstream
+    // distribution can contribute its own before the router is assembled.
+    // `Server::add_routes` and `Server::add_service` both end at
+    // `Router::new`, so registration order is what it always was.
+    let mut routes = tonic::service::Routes::builder();
+    routes
         .add_service(
             proto::graph::graph_service_server::GraphServiceServer::new(graph_service)
                 .max_decoding_message_size(max_req_bytes),
@@ -1022,7 +1074,7 @@ pub(crate) async fn serve(
 
     // Register ClusterService only in cluster mode (requires Raft node).
     if let Some(cs) = cluster_service {
-        router = router.add_service(
+        routes.add_service(
             proto::admin::cluster::cluster_service_server::ClusterServiceServer::new(cs)
                 .max_decoding_message_size(max_req_bytes),
         );
@@ -1035,7 +1087,7 @@ pub(crate) async fn serve(
     // peers are configured.
     if let Some(handler) = raft_grpc_handler {
         use coordinode_raft::proto::replication::raft_service_server::RaftServiceServer;
-        router = router.add_service(RaftServiceServer::new(handler));
+        routes.add_service(RaftServiceServer::new(handler));
         info!(node_id, "RaftService registered on :7080 (shared port)");
 
         // SegmentTransferService: receive bulk segment pushes (replication
@@ -1046,7 +1098,7 @@ pub(crate) async fn serve(
         use coordinode_replicate::transfer::SegmentTransferHandler;
         let segment_handler =
             SegmentTransferHandler::new(Arc::new(SegmentInstaller::new(Arc::clone(&engine))));
-        router = router.add_service(
+        routes.add_service(
             SegmentTransferServiceServer::new(segment_handler)
                 .max_decoding_message_size(max_req_bytes),
         );
@@ -1055,6 +1107,17 @@ pub(crate) async fn serve(
             "SegmentTransferService registered on :7080 (shared port)"
         );
     }
+
+    // Services contributed by a downstream distribution, added after the
+    // built-in ones. CE registers no providers and this loop does nothing.
+    for provider in &extensions.grpc_services {
+        provider.register(&ctx, &mut routes);
+    }
+
+    // NodeInfoLayer: inject x-coordinode-node / x-coordinode-hops /
+    // x-coordinode-load response headers on every gRPC response.
+    let mut server = server.layer(grpc::NodeInfoLayer::new(node_id));
+    let router = server.add_routes(routes.routes());
 
     router.serve_with_shutdown(addr, shutdown).await?;
 

@@ -47,6 +47,7 @@ pub mod proto {
 }
 
 mod admin;
+mod builder;
 mod checkpoint;
 pub mod cli;
 pub mod config;
@@ -62,11 +63,27 @@ mod services;
 use admin::{admin_node_decommission, admin_node_join, admin_storage_config};
 use tracing::info;
 
-/// Execute a parsed CLI command.
+pub use builder::{
+    BackgroundTask, GrpcServiceProvider, ServeModeHandler, ServerBuilder, ServerContext,
+};
+
+/// Execute a parsed CLI command with an unextended server.
 ///
 /// This is the whole of the `coordinode` binary's behaviour; `main` only
-/// parses argv and calls here.
+/// parses argv and calls here. To extend the server first, build a
+/// [`ServerBuilder`] and call [`ServerBuilder::run`] instead.
 pub async fn run(command: cli::Command) -> Result<(), Box<dyn std::error::Error>> {
+    run_with(ServerBuilder::new(), command).await
+}
+
+/// Execute a parsed CLI command against an assembled [`ServerBuilder`].
+///
+/// Only `serve` consults the registrations; every other subcommand is
+/// self-contained and ignores them.
+pub(crate) async fn run_with(
+    extensions: ServerBuilder,
+    command: cli::Command,
+) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         cli::Command::Version => {
             println!("coordinode v{}", env!("CARGO_PKG_VERSION"));
@@ -164,7 +181,7 @@ pub async fn run(command: cli::Command) -> Result<(), Box<dyn std::error::Error>
             config_path,
             overrides,
         } => {
-            serve::serve(config_path, overrides).await?;
+            serve::serve(extensions, config_path, overrides).await?;
         }
 
         cli::Command::Backup {

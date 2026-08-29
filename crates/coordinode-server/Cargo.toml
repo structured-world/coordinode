@@ -29,6 +29,7 @@ page_ecc = ["coordinode-storage/page_ecc"]
 io-uring = ["coordinode-storage/io-uring"]
 
 [dependencies]
+coordinode-cluster = { workspace = true }
 coordinode-core = { workspace = true }
 coordinode-embed = { workspace = true }
 coordinode-replicate = { workspace = true }
