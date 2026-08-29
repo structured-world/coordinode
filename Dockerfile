@@ -8,16 +8,25 @@
 # before building if proto/ is empty.
 
 # ─── Stage 1: Builder ────────────────────────────────────────────────
-FROM rust:1.95-bookworm AS builder
+FROM rust:1.98-bookworm AS builder
 
-# Override rust-toolchain.toml — Docker uses image's stable toolchain.
-ENV RUSTUP_TOOLCHAIN=stable
+# Must track rust-toolchain.toml. The file is authoritative for the build, so
+# a base image on a different version either pulls a second toolchain at build
+# time or, if overridden, compiles with something the repository does not pin.
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         musl-tools \
         protobuf-compiler \
         libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# The toolchain file lands before any rustup call, so the musl standard library
+# is installed into the toolchain the repository pins. Add the target first and
+# the file switches the build to a toolchain that has no musl std, which
+# surfaces much later as "can't find crate for `core`".
+COPY rust-toolchain.toml /build/
 
 # Detect build architecture and add appropriate musl target
 RUN case "$(uname -m)" in \
@@ -26,11 +35,9 @@ RUN case "$(uname -m)" in \
         *)       echo "Unsupported architecture: $(uname -m)" && exit 1 ;; \
     esac
 
-WORKDIR /build
-
 # Copy proto submodule + workspace
 COPY proto/ /build/proto/
-COPY Cargo.toml Cargo.lock rust-toolchain.toml /build/
+COPY Cargo.toml Cargo.lock /build/
 COPY crates/ /build/crates/
 # Integration test crate is a workspace member — Cargo needs its Cargo.toml
 # for workspace resolution even when building only the server binary.
