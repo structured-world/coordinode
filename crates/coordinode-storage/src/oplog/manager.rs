@@ -160,7 +160,14 @@ impl OplogManager {
         // Open a new segment on the entry's index
         if self.current.is_none() {
             let path = segment_path(&self.dir, entry.index);
-            self.current = Some(SegmentWriter::create(&path, self.shard_id, entry.index)?);
+            let writer = SegmentWriter::create_or_replace_empty(&path, self.shard_id, entry.index)?;
+            // `open` registers every file it finds as sealed, including a
+            // header-only leftover from a crash. That file has just been
+            // replaced by the active writer, so drop the stale registration or
+            // reads would visit the same path twice and return each entry
+            // twice.
+            self.sealed.retain(|(_, sealed_path)| sealed_path != &path);
+            self.current = Some(writer);
         }
 
         let writer = self

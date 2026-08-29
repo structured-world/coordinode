@@ -231,6 +231,47 @@ impl SegmentWriter {
         })
     }
 
+    /// Create the segment at `path`, replacing a leftover from an interrupted
+    /// write.
+    ///
+    /// A crash between creating a segment and durably recording its entries
+    /// leaves a file that recovery does not count towards `last_log_id`. The
+    /// log store then picks that same index again on the next append and
+    /// [`create`](Self::create) refuses it, which wedged the database: every
+    /// write failed with "File exists" until somebody deleted the file by
+    /// hand. A leftover carrying no entries is exactly that, an empty header,
+    /// and is replaced. One that carries entries is a real conflict and still
+    /// refuses, so recovery never destroys durable data.
+    pub fn create_or_replace_empty(
+        path: &Path,
+        shard_id: u32,
+        first_index: u64,
+    ) -> StorageResult<Self> {
+        match Self::create(path, shard_id, first_index) {
+            Ok(writer) => return Ok(writer),
+            // Anything other than a pre-existing file is a genuine I/O failure.
+            Err(e) if !path.exists() => return Err(e),
+            Err(_) => {}
+        }
+
+        // The segment was never sealed, so it has no footer to read a count
+        // from; scan it directly. An unreadable prefix means nothing survived
+        // the crash, which is the same as empty for our purposes.
+        let salvaged = SegmentReader::scan_without_footer(path, shard_id).unwrap_or_default();
+        if !salvaged.is_empty() {
+            return Err(StorageError::Io(format!(
+                "segment {:?} already exists and holds {} entries; refusing to \
+                 replace it",
+                path,
+                salvaged.len()
+            )));
+        }
+
+        std::fs::remove_file(path)
+            .map_err(|e| StorageError::Io(format!("remove empty segment {:?}: {e}", path)))?;
+        Self::create(path, shard_id, first_index)
+    }
+
     /// Append one [`OplogEntry`] to the segment.
     ///
     /// Frame layout: `varint(payload_len) || msgpack_bytes || crc32_le(4B)`.

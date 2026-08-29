@@ -530,3 +530,53 @@ fn open_multi_skips_missing_recovery_dirs() {
     assert_eq!(mgr.sealed.len(), 0);
     assert!(active.exists(), "active dir must be created");
 }
+
+/// A crash between creating a segment and durably recording its entries leaves
+/// a header-only file behind. Recovery does not count it towards
+/// `last_log_id`, so the next append picks the same index and used to hit
+/// `create_new` on the existing file:
+///
+///   create segment "oplog-...0004.bin": File exists (os error 17)
+///
+/// Every subsequent write failed the same way, so an unclean shutdown wedged
+/// the database until somebody deleted the file by hand.
+#[test]
+fn append_replaces_a_header_only_segment_left_by_a_crash() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Leave exactly what a crash leaves: a segment with a header and nothing
+    // after it, never sealed.
+    let orphan = segment_path(dir.path(), 4);
+    SegmentWriter::create(&orphan, 0, 4).expect("create orphan");
+    assert!(orphan.exists());
+
+    let mut mgr = OplogManager::open(dir.path(), 0, 1 << 20, 1000, 3600).expect("open");
+    mgr.append(&make_entry(4, 100))
+        .expect("append must reuse the orphaned index");
+    mgr.flush().expect("flush");
+
+    let entries = mgr.read_range(4, 5).expect("read back");
+    assert_eq!(entries.len(), 1, "entry did not survive: {entries:?}");
+    assert_eq!(entries[0].index, 4);
+}
+
+/// The replacement above must never throw away entries. A segment that holds
+/// durable entries is a real conflict, so it is refused rather than replaced.
+#[test]
+fn append_refuses_to_replace_a_segment_holding_entries() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let occupied = segment_path(dir.path(), 7);
+    let mut writer = SegmentWriter::create(&occupied, 0, 7).expect("create");
+    writer.append(&make_entry(7, 100)).expect("append");
+    writer.flush_and_sync().expect("flush");
+    drop(writer);
+
+    match SegmentWriter::create_or_replace_empty(&occupied, 0, 7) {
+        Ok(_) => panic!("must not replace a segment that holds entries"),
+        Err(e) => assert!(
+            e.to_string().contains("holds 1 entries"),
+            "unexpected error: {e}"
+        ),
+    }
+}
