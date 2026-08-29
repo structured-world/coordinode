@@ -109,7 +109,7 @@ fn read_header<R: Read>(r: &mut R) -> StorageResult<SegmentHeader> {
     if magic != MAGIC {
         return Err(StorageError::Io(format!(
             "invalid oplog magic: expected {:?}, got {:?}",
-            &MAGIC, &magic
+            MAGIC, magic
         )));
     }
 

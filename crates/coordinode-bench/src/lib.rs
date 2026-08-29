@@ -133,10 +133,10 @@ impl BenchReport {
             Some(t) if !t.is_empty() => {
                 format!(
                     "{}-{}-{}-{}.json",
-                    &self.git.sha_short, &self.subject, t, stamp
+                    self.git.sha_short, self.subject, t, stamp
                 )
             }
-            _ => format!("{}-{}-{}.json", &self.git.sha_short, &self.subject, stamp),
+            _ => format!("{}-{}-{}.json", self.git.sha_short, self.subject, stamp),
         };
         let path = dir.join(file_name);
         let bytes = serde_json::to_vec_pretty(self)?;

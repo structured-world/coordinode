@@ -95,7 +95,6 @@ fn lower_statement(statement: &Statement) -> Result<LogicalOp, FrontendError> {
             assignments,
             from: _,
             selection,
-            returning: _,
             ..
         } => lower_update(table, assignments, selection.as_ref()),
         Statement::Delete(delete) => lower_delete(delete),

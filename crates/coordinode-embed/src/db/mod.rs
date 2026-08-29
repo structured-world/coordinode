@@ -1477,7 +1477,7 @@ impl Database {
             session.write_concern = wc.clone();
         }
 
-        let params = params.and_then(|p| if p.is_empty() { None } else { Some(p) });
+        let params = params.filter(|p| !p.is_empty());
         self.execute_cypher_impl(
             query,
             source,
@@ -1553,7 +1553,7 @@ impl Database {
             vector_consistency: self.vector_consistency,
             after_commit_generation: 0,
         };
-        let params = params.and_then(|p| if p.is_empty() { None } else { Some(p) });
+        let params = params.filter(|p| !p.is_empty());
         // On error the state is intentionally NOT re-parked → transaction aborts.
         let (rows, _stats, out_state) = self.execute_cypher_impl(
             query,
@@ -1777,7 +1777,7 @@ impl Database {
             session.write_concern = wc.clone();
         }
 
-        let params = params.and_then(|p| if p.is_empty() { None } else { Some(p) });
+        let params = params.filter(|p| !p.is_empty());
         self.execute_cypher_impl(
             query,
             source,
@@ -1825,7 +1825,7 @@ impl Database {
             vector_consistency: self.vector_consistency,
             after_commit_generation: 0,
         };
-        let params = params.and_then(|p| if p.is_empty() { None } else { Some(p) });
+        let params = params.filter(|p| !p.is_empty());
         let mut paging = Some(ScanPaging {
             resume,
             limit,
