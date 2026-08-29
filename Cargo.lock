@@ -1282,7 +1282,7 @@ dependencies = [
 
 [[package]]
 name = "coordinode-session"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "coordinode-core",
  "parking_lot",
