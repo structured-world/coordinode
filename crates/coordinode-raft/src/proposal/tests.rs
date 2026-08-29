@@ -514,3 +514,35 @@ fn write_concern_timeout_error_display() {
         "error should mention write concern: {msg}"
     );
 }
+
+/// The volatile-write drain runs on a plain `std::thread`, where there is no
+/// current tokio runtime. Reaching openraft from there used to panic with
+/// "there is no reactor running", killing the drain thread and, with it, every
+/// `w:memory` and `w:cache` write the server had already acknowledged.
+#[tokio::test(flavor = "multi_thread")]
+async fn propose_and_wait_works_from_a_plain_thread() {
+    let (_dir, engine) = test_engine();
+    let node = RaftNode::open(1, Arc::clone(&engine))
+        .await
+        .expect("open raft node");
+    // Built inside the runtime, so the pipeline captures a handle to it.
+    let pipeline = Arc::new(RaftProposalPipeline::new(Arc::clone(node.raft())));
+
+    let proposal = RaftProposal {
+        id: ProposalIdGenerator::new().next(),
+        mutations: vec![Mutation::Put {
+            partition: PartitionId::Node,
+            key: b"node:1:9001".to_vec(),
+            value: b"drain-thread".to_vec(),
+        }],
+        commit_ts: Timestamp::from_raw(100),
+        start_ts: Timestamp::from_raw(99),
+        bypass_rate_limiter: false,
+    };
+
+    let outcome = std::thread::spawn(move || pipeline.propose_and_wait(&proposal))
+        .join()
+        .expect("drain-style thread must not panic");
+
+    assert!(outcome.is_ok(), "proposal failed: {outcome:?}");
+}

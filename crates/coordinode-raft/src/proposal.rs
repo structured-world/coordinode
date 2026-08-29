@@ -371,6 +371,10 @@ impl Default for RateLimiter {
 pub struct RaftProposalPipeline {
     raft: Arc<RaftInstance>,
     rate_limiter: RateLimiter,
+    /// Runtime to fall back on when a caller reaches the pipeline from a plain
+    /// OS thread. The volatile-write drain is one such caller: it runs on its
+    /// own `std::thread`, where `Handle::current()` panics.
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl RaftProposalPipeline {
@@ -379,6 +383,7 @@ impl RaftProposalPipeline {
         Self {
             raft,
             rate_limiter: RateLimiter::default(),
+            runtime: tokio::runtime::Handle::try_current().ok(),
         }
     }
 
@@ -387,6 +392,35 @@ impl RaftProposalPipeline {
         Self {
             raft,
             rate_limiter: RateLimiter::new(max_pending),
+            runtime: tokio::runtime::Handle::try_current().ok(),
+        }
+    }
+
+    /// Drive `fut` to completion from a synchronous caller.
+    ///
+    /// Two kinds of caller reach the sync `ProposalPipeline` methods, and they
+    /// need different bridges. A gRPC handler already runs on a runtime worker,
+    /// where `block_in_place` is required so the runtime can move other tasks
+    /// off this thread. The volatile-write drain runs on its own `std::thread`,
+    /// where there is no current runtime at all and `block_in_place` would
+    /// panic; there we block on the handle captured at construction.
+    fn block_on_runtime<F>(&self, fut: F) -> Result<ProposalOutcome, ProposalError>
+    where
+        F: std::future::Future<Output = Result<ProposalOutcome, ProposalError>>,
+    {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+            Err(_) => match &self.runtime {
+                Some(handle) => handle.block_on(fut),
+                // The pipeline was built outside a runtime and is now being
+                // driven from outside one too, so there is nothing to block on.
+                // Report it instead of panicking deep inside a worker thread.
+                None => Err(ProposalError::Raft(
+                    "proposal pipeline has no tokio runtime: build it from within a \
+                     runtime so callers on plain threads can reach one"
+                        .to_string(),
+                )),
+            },
         }
     }
 
@@ -496,12 +530,7 @@ fn extract_forward_leader(
 
 impl ProposalPipeline for RaftProposalPipeline {
     fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<ProposalOutcome, ProposalError> {
-        // Bridge sync ProposalPipeline trait to async openraft.
-        // block_in_place tells tokio "this thread will block" so it moves
-        // other async tasks to other worker threads. Requires rt-multi-thread.
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.propose_async(proposal))
-        })
+        self.block_on_runtime(self.propose_async(proposal))
     }
 
     fn propose_with_timeout(
@@ -513,19 +542,16 @@ impl ProposalPipeline for RaftProposalPipeline {
         // the client gets an error immediately. The proposal is NOT
         // cancelled — openraft may still commit the entry after timeout.
         // Per MongoDB spec: data is NOT rolled back on wtimeout.
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                match tokio::time::timeout(timeout, self.propose_async(proposal)).await {
-                    Ok(result) => result,
-                    Err(_elapsed) => {
-                        metrics::counter!("coordinode_raft_write_concern_timeouts_total")
-                            .increment(1);
-                        Err(ProposalError::WriteConcernTimeout {
-                            timeout_ms: timeout.as_millis() as u32,
-                        })
-                    }
+        self.block_on_runtime(async {
+            match tokio::time::timeout(timeout, self.propose_async(proposal)).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    metrics::counter!("coordinode_raft_write_concern_timeouts_total").increment(1);
+                    Err(ProposalError::WriteConcernTimeout {
+                        timeout_ms: timeout.as_millis() as u32,
+                    })
                 }
-            })
+            }
         })
     }
 }
