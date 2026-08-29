@@ -3,10 +3,21 @@
 # Releases produce musl binaries + Docker image pushed to ghcr.io.
 #
 # Because every crate has `publish = false`, our forked release-plz
-# auto-disables cascade version bumps for them (see release-plz/release-plz#2799).
-# Only crates with direct conventional commits since the last tag appear in
-# the release PR — so a change touching only `crates/coordinode-query/` no
-# longer drags every transitive dependent into the PR with a fake bump.
+# auto-disables cascade version bumps for them (see release-plz/release-plz#2799),
+# so only crates carrying direct conventional commits since the last tag get a
+# new version. On its own that silently strands every fix: what ships is the
+# `coordinode-server` binary, it owns the tag and the GitHub release, and a fix
+# living in `coordinode-storage` or `coordinode-raft` leaves its directory
+# untouched. v0.5.1 went out that way, without the two crash fixes that were
+# already sitting on main.
+#
+# The workspace already carries one version for every crate
+# (`version.workspace = true`) and produces one artefact, so it releases as a
+# unit. `version_group` states that: a change anywhere in the workspace moves
+# the whole group, and the binary picks the fix up. Listing every crate in the
+# release PR is then accurate rather than the fake cascade #2799 was about.
+# `version_group` is a [[package]] key, so every block below carries it; the
+# [workspace] table rejects unknown fields.
 semver_check = false
 git_only = true
 publish = false
@@ -42,6 +53,7 @@ commit_parsers = [
 # CHANGELOG.md is generated here (per-crate) AND aggregated workspace-wide.
 [[package]]
 name = "coordinode-server"
+version_group = "coordinode"
 git_tag_enable = true
 git_release_enable = true
 
@@ -61,82 +73,102 @@ git_release_enable = true
 
 [[package]]
 name = "coordinode-client"
+version_group = "coordinode"
 git_tag_name = "coordinode-client-v{{ version }}"
 
 [[package]]
 name = "coordinode-integration"
+version_group = "coordinode"
 git_tag_name = "coordinode-integration-v{{ version }}"
 
 [[package]]
 name = "coordinode-auth"
+version_group = "coordinode"
 git_tag_name = "coordinode-auth-v{{ version }}"
 
 [[package]]
 name = "coordinode-bench"
+version_group = "coordinode"
 git_tag_name = "coordinode-bench-v{{ version }}"
 
 [[package]]
 name = "coordinode-cluster"
+version_group = "coordinode"
 git_tag_name = "coordinode-cluster-v{{ version }}"
 
 [[package]]
 name = "coordinode-core"
+version_group = "coordinode"
 git_tag_name = "coordinode-core-v{{ version }}"
 
 [[package]]
 name = "coordinode-embed"
+version_group = "coordinode"
 git_tag_name = "coordinode-embed-v{{ version }}"
 
 [[package]]
 name = "coordinode-modality"
+version_group = "coordinode"
 git_tag_name = "coordinode-modality-v{{ version }}"
 
 [[package]]
 name = "coordinode-query"
+version_group = "coordinode"
 git_tag_name = "coordinode-query-v{{ version }}"
 
 [[package]]
 name = "coordinode-raft"
+version_group = "coordinode"
 git_tag_name = "coordinode-raft-v{{ version }}"
 
 [[package]]
 name = "coordinode-replicate"
+version_group = "coordinode"
 git_tag_name = "coordinode-replicate-v{{ version }}"
 
 [[package]]
 name = "coordinode-s3"
+version_group = "coordinode"
 git_tag_name = "coordinode-s3-v{{ version }}"
 
 [[package]]
 name = "coordinode-search"
+version_group = "coordinode"
 git_tag_name = "coordinode-search-v{{ version }}"
 
 [[package]]
 name = "coordinode-session"
+version_group = "coordinode"
 git_tag_name = "coordinode-session-v{{ version }}"
 
 [[package]]
 name = "coordinode-storage"
+version_group = "coordinode"
 git_tag_name = "coordinode-storage-v{{ version }}"
 
 [[package]]
 name = "coordinode-test-fixtures"
+version_group = "coordinode"
 git_tag_name = "coordinode-test-fixtures-v{{ version }}"
 
 [[package]]
 name = "coordinode-timeseries"
+version_group = "coordinode"
 git_tag_name = "coordinode-timeseries-v{{ version }}"
 
 [[package]]
 name = "coordinode-vector"
+version_group = "coordinode"
 git_tag_name = "coordinode-vector-v{{ version }}"
 
 [[package]]
 name = "coordinode-swarm"
+version_group = "coordinode"
 git_tag_name = "coordinode-swarm-v{{ version }}"
 
 [[package]]
 name = "coordinode-wire"
+version_group = "coordinode"
 git_tag_name = "coordinode-wire-v{{ version }}"
 
 # Bench crates (coordinode-gold-bench, coordinode-bench-vector-ann) live in
