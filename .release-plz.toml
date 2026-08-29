@@ -112,6 +112,10 @@ name = "coordinode-search"
 git_tag_name = "coordinode-search-v{{ version }}"
 
 [[package]]
+name = "coordinode-session"
+git_tag_name = "coordinode-session-v{{ version }}"
+
+[[package]]
 name = "coordinode-storage"
 git_tag_name = "coordinode-storage-v{{ version }}"
 
