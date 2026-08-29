@@ -3,6 +3,79 @@
 All notable changes to this crate are documented in this file.
 This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
+## [0.5.0](https://github.com/structured-world/coordinode/compare/v0.4.3...v0.5.0) - 2026-06-27
+
+#### Added
+
+- *(triggers)* [**breaking**] execute AFTER COMMIT triggers via durable event journal
+- *(server)* make the CDC consumer TTL configurable
+- *(server)* register CDC streams as oplog consumers for retention
+- *(server)* fall back to WAL-replay repair when no replica serves
+- *(server)* periodic local checkpoints
+- *(server)* repair corrupt partitions from peers on scrub detection
+- *(server)* run a periodic per-node background integrity scrub
+- *(server)* wire verify --deep to the block-checksum scrub
+- *(wire)* encrypt outbound inter-node gRPC with client TLS
+- *(server)* serve gRPC over TLS and mTLS
+- *(server)* make inter-node wire compression level configurable
+- *(server)* register segment-transfer service in cluster mode
+- *(storage)* OplogOp::RemoveRange wire type + CDC mapping
+- *(modality)* add per-label shard strategy to the vector index config
+- *(query)* expose ef_search and rerank_candidates as vector index options
+- *(storage)* io_uring filesystem backend behind --features io-uring
+- *(storage)* multi-endpoint topology config
+- *(server)* unified config surface with YAML file and CLI overrides
+- *(server)* gRPC RPCs for interactive transactions
+- *(vector)* serving health + HLC freshness watermark for indexes
+- *(server)* expose consumer-retention registry tuning via serve config
+- *(replicate)* replication-orchestration crate (replicated writes + retention registry)
+- *(server)* add offline compact subcommand
+- *(server)* operator config for fd, network, and storage limits
+- *(backup)* validate binary dump compatibility on restore
+- *(restore)* selective restore via --only-labels filter
+- *(restore)* transparent decompression and Hetionet hetnet-JSON import
+- *(backup)* incremental raft-snapshot via --since seqno
+- *(backup)* raft-snapshot backup and restore via the CLI
+- *(query)* add Path value type and nodes/relationships/length
+- *(backup)* restore Neo4j APOC json and cypher dumps
+- *(storage)* hard-link checkpoint of the whole database
+- *(backup)* implement cypher restore + align edge-prop wire format
+- *(embed)* wire the vector oplog worker into Database
+- *(cluster)* replicate vector index DDL to followers
+- *(core)* add MultiVector value variant
+- *(server)* wire CreateNodesBatch handler via UNWIND $rows AS r CREATE …
+- *(storage)* R156 + R157 — multi-endpoint storage placement
+
+#### Fixed
+
+- *(wire)* default to zstd level 3 to avoid the Fast-strategy panic path
+- *(cluster)* refresh follower interner on entry apply
+- *(query/server)* preserve CapacityExhausted type through Cypher pipeline → gRPC
+- *(server)* migrate remaining gRPC services to capacity-aware error mapping
+- *(storage)* gate every write path + typed propagation to gRPC client
+
+#### Performance
+
+- *(server)* route read-only handlers through .read() + execute_cypher_shared
+
+#### Refactored
+
+- extract shared wire codec, compress segment transfer too
+- extract unit tests into sibling files (server, raft, replicate, embed, timeseries)
+- *(vector)* migrate quantization config from bool to QuantizationCodec enum
+- *(server)* swap std::sync::Mutex<Database> for parking_lot::RwLock<Database>
+- *(embed)* wrap FieldInterner in Arc<RwLock> on the Database side
+
+#### Testing
+
+- *(server)* follower must answer vector search like leader
+
+#### Revert
+
+- move per-label vector shard routing out of CE
+
+---
+
 ## [0.4.3](https://github.com/structured-world/coordinode/compare/v0.4.2...v0.4.3) - 2026-05-17
 
 #### Added
