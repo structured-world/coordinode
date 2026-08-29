@@ -53,10 +53,10 @@ jobs:
     name: Test
     # GH-hosted ubuntu-latest has ~14 GB disk which the full workspace
     # debug build exceeds (linker hits "No space left on device"). Moved
-    # to the org's self-hosted runner where target/ has room.
+    # to a self-hosted runner where target/ has room.
     runs-on:
       - self-hosted
-      - gpu-private-systems
+      - coordinode
     steps:
       - uses: actions/checkout@v4
         with:
@@ -89,14 +89,27 @@ jobs:
         run: cargo nextest run --all-features --workspace
       - name: Run doc tests
         run: cargo test --doc --all-features
+      - name: Reclaim disk if the build tree passed 100 GB
+        # The runner keeps target/ between jobs so builds stay incremental.
+        # Left alone it grows without bound and eventually fills the volume,
+        # which surfaces as a linker "No space left on device". Runs even when
+        # the job failed, since a failed build still leaves artefacts behind.
+        if: always()
+        run: |
+          used_gb=$(( $(du -sk target 2>/dev/null | cut -f1 || echo 0) / 1024 / 1024 ))
+          echo "target/ occupies ${used_gb} GB"
+          if [ "$used_gb" -gt 100 ]; then
+            echo "above the 100 GB ceiling, discarding the build tree"
+            cargo clean
+          fi
 
   build:
     name: Build
-    # See `test` job — release build is even larger than debug, won't
-    # fit on GH-hosted runner disk.
+    # See `test` job: the release build is even larger than debug and
+    # won't fit on GH-hosted runner disk.
     runs-on:
       - self-hosted
-      - gpu-private-systems
+      - coordinode
     needs: [fmt, clippy, test]
     steps:
       - uses: actions/checkout@v4
@@ -117,6 +130,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build (release)
         run: cargo build --release --all-features
+      - name: Reclaim disk if the build tree passed 100 GB
+        # Same ceiling as the `test` job; the release profile adds its own
+        # target/release tree on top of the debug one.
+        if: always()
+        run: |
+          used_gb=$(( $(du -sk target 2>/dev/null | cut -f1 || echo 0) / 1024 / 1024 ))
+          echo "target/ occupies ${used_gb} GB"
+          if [ "$used_gb" -gt 100 ]; then
+            echo "above the 100 GB ceiling, discarding the build tree"
+            cargo clean
+          fi
 
   audit:
     name: Security Audit
