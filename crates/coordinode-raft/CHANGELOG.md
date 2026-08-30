@@ -3,6 +3,23 @@
 All notable changes to this crate are documented in this file.
 This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
+## 0.5.2 - 2026-08-30
+
+#### Added
+
+- *(wire)* let the TLS crypto provider be chosen at startup
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+- *(raft)* stop the volatile-write drain panicking off-runtime
+
+#### Testing
+
+- *(raft)* wait for the leader instead of sleeping past the election
+
+---
+
 ## 0.5.1 - 2026-08-29
 
 #### Added
