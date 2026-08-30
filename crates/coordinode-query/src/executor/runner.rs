@@ -7561,6 +7561,12 @@ fn bind_path_element(
     item: &Value,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<(), ExecutionError> {
+    // The scratch row is reused for every element, so last element's columns
+    // have to go first. Kept, they answer for an element that does not carry
+    // the property: a path whose middle node has no name would report the
+    // name of the node before it.
+    let prefix = format!("{var}.");
+    scratch.retain(|column, _| !column.starts_with(&prefix));
     scratch.insert(var.to_string(), item.clone());
     match item {
         Value::Int(raw) => {

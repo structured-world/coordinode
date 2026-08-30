@@ -12285,3 +12285,76 @@ fn test_path_elements_expose_their_properties() {
         other => panic!("expected an array of ids, got {other:?}"),
     }
 }
+
+/// A path element that lacks a property reports NULL, not its predecessor's.
+///
+/// Binding each element writes its properties into one scratch row reused
+/// across the whole list, so an element without the property kept whatever
+/// the element before it left there: a three-node path whose middle node has
+/// no name came back as `['a', 'a', 'c']`, inventing data for the one node
+/// that had none. Relationship hops carried the same leak.
+#[test]
+fn test_a_path_element_without_a_property_reads_null() {
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    run_cypher_with_alloc(
+        "CREATE (:Stop {name: 'a'}) RETURN 1",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    // The middle stop carries no `name` at all.
+    run_cypher_with_alloc(
+        "CREATE (:Stop {nick: 'middle'}) RETURN 1",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    run_cypher_with_alloc(
+        "CREATE (:Stop {name: 'c'}) RETURN 1",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    run_cypher_with_alloc(
+        "MATCH (a:Stop {name: 'a'}), (m:Stop {nick: 'middle'}) \
+         CREATE (a)-[:HOP {fare: 3}]->(m) RETURN 1",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    // The second hop carries no `fare`.
+    run_cypher_with_alloc(
+        "MATCH (m:Stop {nick: 'middle'}), (c:Stop {name: 'c'}) \
+         CREATE (m)-[:HOP]->(c) RETURN 1",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+
+    let rows = run_cypher_with_alloc(
+        "MATCH p = (a:Stop {name: 'a'})-[:HOP*2]->(c:Stop {name: 'c'}) \
+         RETURN [x IN nodes(p) | x.name] AS names, [r IN relationships(p) | r.fare] AS fares",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 1, "one two-hop path");
+    assert_eq!(
+        rows[0].get("names"),
+        Some(&Value::Array(vec![
+            Value::String("a".to_string()),
+            Value::Null,
+            Value::String("c".to_string()),
+        ])),
+        "the middle stop has no name and must not borrow the first one's"
+    );
+    assert_eq!(
+        rows[0].get("fares"),
+        Some(&Value::Array(vec![Value::Int(3), Value::Null])),
+        "the second hop has no fare and must not borrow the first one's"
+    );
+}
