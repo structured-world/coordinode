@@ -29,6 +29,38 @@ pub enum Value {
     List(Vec<Value>),
     /// String-keyed map.
     Map(HashMap<String, Value>),
+    /// Several equal-width vectors describing one item, as late-interaction
+    /// retrieval models produce. Distinct from a [`Value::List`] of
+    /// [`Value::Vector`], which is merely an array that happens to hold
+    /// vectors.
+    MultiVector(Vec<Vec<f32>>),
+    /// A traversal result: the alternating node and relationship sequence of
+    /// `shortestPath(...)` or a variable-length match.
+    Path(Path),
+}
+
+/// A graph path, as returned by a traversal.
+///
+/// `rels` has one fewer entry than `nodes` on a non-empty path, and the n-th
+/// hop connects `nodes[n]` to `nodes[n + 1]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Path {
+    /// Node ids along the path, start to end.
+    pub nodes: Vec<u64>,
+    /// Relationship hops, in the same order.
+    pub rels: Vec<PathRel>,
+}
+
+/// One relationship hop of a [`Path`]. Relationship properties are not carried;
+/// fetch them by endpoint pair when they are needed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathRel {
+    /// Relationship type.
+    pub edge_type: String,
+    /// Source node id.
+    pub source: u64,
+    /// Target node id.
+    pub target: u64,
 }
 
 impl std::fmt::Display for Value {
@@ -61,6 +93,11 @@ impl std::fmt::Display for Value {
                 }
                 write!(f, "}}")
             }
+            Value::MultiVector(rows) => {
+                let width = rows.first().map_or(0, Vec::len);
+                write!(f, "<multivec:{}x{}>", rows.len(), width)
+            }
+            Value::Path(p) => write!(f, "<path:{} hops>", p.rels.len()),
         }
     }
 }
@@ -85,6 +122,21 @@ pub(crate) fn from_proto(pv: PropertyValue) -> Value {
                 .map(|(k, v)| (k, from_proto(v)))
                 .collect(),
         ),
+        Some(property_value::Value::MultiVectorValue(mv)) => {
+            Value::MultiVector(mv.rows.into_iter().map(|row| row.values).collect())
+        }
+        Some(property_value::Value::PathValue(p)) => Value::Path(Path {
+            nodes: p.nodes,
+            rels: p
+                .rels
+                .into_iter()
+                .map(|r| PathRel {
+                    edge_type: r.edge_type,
+                    source: r.source,
+                    target: r.target,
+                })
+                .collect(),
+        }),
     }
 }
 
@@ -108,6 +160,25 @@ pub(crate) fn to_proto(value: Value) -> PropertyValue {
         Value::Map(m) => Some(property_value::Value::MapValue(PropertyMap {
             entries: m.into_iter().map(|(k, v)| (k, to_proto(v))).collect(),
         })),
+        Value::MultiVector(rows) => Some(property_value::Value::MultiVectorValue(
+            crate::proto::common::MultiVector {
+                rows: rows.into_iter().map(|values| Vector { values }).collect(),
+            },
+        )),
+        Value::Path(p) => Some(property_value::Value::PathValue(
+            crate::proto::common::Path {
+                nodes: p.nodes,
+                rels: p
+                    .rels
+                    .into_iter()
+                    .map(|r| crate::proto::common::PathRel {
+                        edge_type: r.edge_type,
+                        source: r.source,
+                        target: r.target,
+                    })
+                    .collect(),
+            },
+        )),
     };
     // Timestamps without wall_time are emitted as Null; client-side we
     // don't expose HlcTimestamp directly.

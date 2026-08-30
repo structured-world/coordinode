@@ -5,7 +5,7 @@ use parking_lot::RwLock;
 
 use tonic::{Request, Response, Status};
 
-use coordinode_core::graph::types::Value;
+use coordinode_core::graph::types::{PathRel, PathValue, Value};
 use coordinode_core::txn::read_concern::{
     ReadConcern as ExecutorReadConcern, ReadConcernLevel as ExecutorReadConcernLevel,
 };
@@ -87,50 +87,28 @@ fn value_to_proto(value: &Value) -> common::PropertyValue {
             let _ = rmpv::encode::write_value(&mut bytes, v);
             Some(common::property_value::Value::BytesValue(bytes))
         }
-        Value::MultiVector(rows) => {
-            // Wire as list-of-vectors. Lossy on the type tag but preserves
-            // all numeric data so the client can reconstruct the matrix.
-            let items = rows
-                .iter()
-                .map(|row| common::PropertyValue {
-                    value: Some(common::property_value::Value::VectorValue(common::Vector {
+        Value::MultiVector(rows) => Some(common::property_value::Value::MultiVectorValue(
+            common::MultiVector {
+                rows: rows
+                    .iter()
+                    .map(|row| common::Vector {
                         values: row.clone(),
-                    })),
+                    })
+                    .collect(),
+            },
+        )),
+        Value::Path(p) => Some(common::property_value::Value::PathValue(common::Path {
+            nodes: p.nodes.clone(),
+            rels: p
+                .rels
+                .iter()
+                .map(|r| common::PathRel {
+                    edge_type: r.edge_type.clone(),
+                    source: r.source,
+                    target: r.target,
                 })
-                .collect();
-            Some(common::property_value::Value::ListValue(
-                common::PropertyList { values: items },
-            ))
-        }
-        Value::Path(p) => {
-            // No dedicated proto Path type yet, so wire the path as a
-            // structured map { nodes: [...], rels: [{type, source, target}] }
-            // by reusing the Map encoding. A first-class proto Path (and Bolt
-            // Path PackStream struct) is the follow-up wire-encoding step.
-            let mut m: std::collections::BTreeMap<String, Value> =
-                std::collections::BTreeMap::new();
-            m.insert(
-                "nodes".to_string(),
-                Value::Array(p.nodes.iter().map(|n| Value::Int(*n as i64)).collect()),
-            );
-            m.insert(
-                "rels".to_string(),
-                Value::Array(
-                    p.rels
-                        .iter()
-                        .map(|r| {
-                            let mut rm: std::collections::BTreeMap<String, Value> =
-                                std::collections::BTreeMap::new();
-                            rm.insert("type".to_string(), Value::String(r.edge_type.clone()));
-                            rm.insert("source".to_string(), Value::Int(r.source as i64));
-                            rm.insert("target".to_string(), Value::Int(r.target as i64));
-                            Value::Map(rm)
-                        })
-                        .collect(),
-                ),
-            );
-            value_to_proto(&Value::Map(m)).value
-        }
+                .collect(),
+        })),
     };
     common::PropertyValue { value: v }
 }
@@ -162,6 +140,21 @@ fn proto_to_value(pv: &common::PropertyValue) -> Value {
             common::property_value::Value::TimestampValue(ts) => {
                 Value::Timestamp(ts.wall_time as i64)
             }
+            common::property_value::Value::MultiVectorValue(mv) => {
+                Value::MultiVector(mv.rows.iter().map(|row| row.values.clone()).collect())
+            }
+            common::property_value::Value::PathValue(p) => Value::Path(PathValue {
+                nodes: p.nodes.clone(),
+                rels: p
+                    .rels
+                    .iter()
+                    .map(|r| PathRel {
+                        edge_type: r.edge_type.clone(),
+                        source: r.source,
+                        target: r.target,
+                    })
+                    .collect(),
+            }),
         },
     }
 }

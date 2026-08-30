@@ -1445,3 +1445,65 @@ async fn capacity_exhausted_surfaces_as_resource_exhausted_through_grpc_handler(
         .expect("hard-limit-bytes parses as u64");
     assert_eq!(hard_limit, 40_000);
 }
+
+/// A multi-vector must survive the wire as a multi-vector.
+///
+/// It used to go out as a plain list of vectors, which carries the numbers but
+/// loses the type: a client could not tell one item's token embeddings from an
+/// ordinary array of vectors, and the value came back as `Array` rather than
+/// `MultiVector`.
+#[test]
+fn multi_vector_round_trips_with_its_type() {
+    let original = Value::MultiVector(vec![vec![0.5, 1.5], vec![2.5, 3.5]]);
+    let pv = value_to_proto(&original);
+
+    match pv.value.as_ref().expect("value present") {
+        common::property_value::Value::MultiVectorValue(mv) => {
+            assert_eq!(mv.rows.len(), 2, "both rows must be carried");
+            assert_eq!(mv.rows[0].values, vec![0.5, 1.5]);
+            assert_eq!(mv.rows[1].values, vec![2.5, 3.5]);
+        }
+        other => panic!("expected a multi-vector on the wire, got {other:?}"),
+    }
+
+    assert_eq!(proto_to_value(&pv), original, "round trip must preserve it");
+}
+
+/// A path must survive the wire as a path.
+///
+/// It used to go out as a map of `{nodes, rels}`, which a client could not
+/// distinguish from a property map the query happened to build, and which came
+/// back as `Map` rather than `Path`.
+#[test]
+fn path_round_trips_with_its_type() {
+    use coordinode_core::graph::types::{PathRel, PathValue};
+
+    let original = Value::Path(PathValue {
+        nodes: vec![7, 8, 9],
+        rels: vec![
+            PathRel {
+                edge_type: "LINK".to_string(),
+                source: 7,
+                target: 8,
+            },
+            PathRel {
+                edge_type: "LINK".to_string(),
+                source: 8,
+                target: 9,
+            },
+        ],
+    });
+    let pv = value_to_proto(&original);
+
+    match pv.value.as_ref().expect("value present") {
+        common::property_value::Value::PathValue(p) => {
+            assert_eq!(p.nodes, vec![7, 8, 9]);
+            assert_eq!(p.rels.len(), 2, "one hop fewer than nodes");
+            assert_eq!(p.rels[0].edge_type, "LINK");
+            assert_eq!((p.rels[1].source, p.rels[1].target), (8, 9));
+        }
+        other => panic!("expected a path on the wire, got {other:?}"),
+    }
+
+    assert_eq!(proto_to_value(&pv), original, "round trip must preserve it");
+}
