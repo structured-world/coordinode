@@ -67,6 +67,12 @@ pub use builder::{
     BackgroundTask, GrpcServiceProvider, ServeModeHandler, ServerBuilder, ServerContext,
 };
 
+/// Version of the server this binary is built from.
+///
+/// A distribution that wraps the server reports its own version alongside this
+/// one, so a support request names both.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Execute a parsed CLI command with an unextended server.
 ///
 /// This is the whole of the `coordinode` binary's behaviour; `main` only
