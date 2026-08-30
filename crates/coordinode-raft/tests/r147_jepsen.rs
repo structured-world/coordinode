@@ -121,8 +121,27 @@ async fn bootstrap_3_node() -> (TestNode, TestNode, TestNode) {
         .change_membership(vec![1, 2, 3])
         .await
         .expect("membership");
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    await_leader_everywhere(&[&n1, &n2, &n3], 1).await;
     (n1, n2, n3)
+}
+
+/// Block until `expected` is the leader every node agrees on.
+///
+/// Waiting a fixed interval here instead is what makes this suite flaky: on a
+/// loaded machine the election and the membership commit take longer than any
+/// constant short enough to keep the suite fast, and the first write then comes
+/// back `NotLeader` seconds into the test.
+async fn await_leader_everywhere(nodes: &[&TestNode], expected: u64) {
+    for _ in 0..150 {
+        if nodes
+            .iter()
+            .all(|n| n.node.current_leader() == Some(expected))
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("node {expected} is not the agreed leader on all nodes");
 }
 
 // ── Client ops ──────────────────────────────────────────────────────────────
