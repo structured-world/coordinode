@@ -1,28 +1,25 @@
 # Changelog
 
-## v0.5.1 — 2026-08-29
+## v0.5.1 - 2026-08-29
 
-### coordinode-auth
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-auth-v0.5.0...coordinode-auth-v0.5.1) - 2026-08-29
+### coordinode-auth 0.5.1
 
 #### Added
 
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+- CoordiNode v0.1.0-alpha.1 - graph + vector + full-text engine
 
-### coordinode-bench
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-bench-v0.5.0...coordinode-bench-v0.5.1) - 2026-08-29
+### coordinode-bench 0.5.1
 
 #### Added
 
 - *(bench)* HNSW M sweep (16, 24, 32) + UI filter
-- *(bench)* R700+R704 — coordinode-bench harness + ann-benchmarks SIFT1M adapter (Stage 1)
+- *(bench)* R700+R704 - coordinode-bench harness + ann-benchmarks SIFT1M adapter (Stage 1)
 
 #### Refactored
 
 - extract unit tests into sibling files (client, bench, cluster, s3, test-fixtures)
 
-### coordinode-client
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-client-v0.5.0...coordinode-client-v0.5.1) - 2026-08-29
+### coordinode-client 0.5.1
 
 #### Added
 
@@ -30,7 +27,7 @@
 - *(client)* expose read preference for cypher reads
 - *(identity,placement,consistency)* u20/u44 NodeId, schema_revision, gRPC concern wire-through
 - *(query)* [**breaking**] add rrf_score Cypher function with RankFuse operator
-- *(client)* causal session API — CausalToken, execute_causal_write/read (G089)
+- *(client)* causal session API - CausalToken, execute_causal_write/read (G089)
 - *(causal)* enforce writeConcern=MAJORITY in causal write sessions (G088)
 - *(consistency)* implement R142 causal consistency sessions
 - *(client)* add coordinode-client crate with source location tracking
@@ -51,8 +48,7 @@
 
 - *(client,server)* cover params+source gRPC branch and invalid endpoint
 
-### coordinode-cluster
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-cluster-v0.5.0...coordinode-cluster-v0.5.1) - 2026-08-29
+### coordinode-cluster 0.5.1
 
 #### Added
 
@@ -84,13 +80,12 @@
 - *(cluster)* planner picks remote endpoint on full source
 - *(cluster)* doctests + edge cases + ADR-028 helpers + benches + proptest
 
-### coordinode-core
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-core-v0.5.0...coordinode-core-v0.5.1) - 2026-08-29
+### coordinode-core 0.5.1
 
 #### Added
 
 - *(query)* primary-key identity and row inserts for relational tables
-- *(core)* table label schema — primary key and storage layout
+- *(core)* table label schema - primary key and storage layout
 - *(session)* SHOW SESSIONS / SHOW TRANSACTIONS introspection
 - *(triggers)* [**breaking**] execute AFTER COMMIT triggers via durable event journal
 - *(core)* coalesce delete runs at the proposal producer
@@ -110,14 +105,14 @@
 - *(temporal)* bitemporal edge types with valid-time semantics
 - *(query)* add read_consistency knob + planner auto-promotion (R-SNAP1)
 - *(txn)* add per-shard MaxAssignedWatermark + WaitForTs primitive
-- *(query)* ATTACH DOCUMENT — demote graph node to nested DOCUMENT property
+- *(query)* ATTACH DOCUMENT - demote graph node to nested DOCUMENT property
 - *(core)* implement HybridLogicalClock for CE timestamps (R143)
 - *(storage)* implement standalone WAL for crash durability
 - *(schema)* R-API5 schema modes STRICT/VALIDATED/FLEXIBLE
 - *(computed)* R085 decay interpolation tests and NVMe write buffer for w:cache
 - *(raft)* true async wtimeout via propose_with_timeout (G048)
 - *(raft)* add WaitForMajorityService for batched proposal coalescing (G047)
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+- CoordiNode v0.1.0-alpha.1 - graph + vector + full-text engine
 
 #### Documentation
 
@@ -139,15 +134,14 @@
 - extract unit tests into sibling test files
 - *(core)* hoist try_extract_vector to a single canonical helper
 - *(vector)* drop intermediate quantized disk tier (ADR-033 final)
-- *(core,query)* R165 last raw encoder — Mutation::delete_edge_props typed constructor
+- *(core,query)* R165 last raw encoder - Mutation::delete_edge_props typed constructor
 
 #### Testing
 
 - *(core)* add roundtrip test for ComputedSpec::Ttl with target_field=Some
 - *(raft)* add tests for propose_with_timeout and WriteConcernTimeout (G048)
 
-### coordinode-embed
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-embed-v0.5.0...coordinode-embed-v0.5.1) - 2026-08-29
+### coordinode-embed 0.5.1
 
 #### Added
 
@@ -205,15 +199,15 @@
 - *(storage)* per-endpoint capacity tracking + hard-limit enforcement
 - *(storage)* page-checksum wire-through + ECC policy config surface
 - *(storage)* per-LSM-level endpoint routing + cascade eviction
-- *(storage)* R156 + R157 — multi-endpoint storage placement
-- *(temporal)* R172d — pattern predicate into temporal target
-- *(temporal)* R172d initial slice — traversal into temporal target
-- *(temporal)* R172c Phase 3c — DETACH/ATTACH on temporal nodes (partial)
-- *(temporal)* R172c Phase 3b — nested PropertyPath / doc_* fns on temporal
-- *(temporal)* R172c Phase 3 — REMOVE on temporal as close+open new version
-- *(temporal)* R172c Phase 3 — DELETE on temporal as positive bitemporal fact
-- *(storage)* R172c Phase 2 — temporal node SET close-current + open-new
-- *(storage)* R172c Phase 1 — temporal node SET valid_to + valid_from immutability
+- *(storage)* R156 + R157 - multi-endpoint storage placement
+- *(temporal)* R172d - pattern predicate into temporal target
+- *(temporal)* R172d initial slice - traversal into temporal target
+- *(temporal)* R172c Phase 3c - DETACH/ATTACH on temporal nodes (partial)
+- *(temporal)* R172c Phase 3b - nested PropertyPath / doc_* fns on temporal
+- *(temporal)* R172c Phase 3 - REMOVE on temporal as close+open new version
+- *(temporal)* R172c Phase 3 - DELETE on temporal as positive bitemporal fact
+- *(storage)* R172c Phase 2 - temporal node SET close-current + open-new
+- *(storage)* R172c Phase 1 - temporal node SET valid_to + valid_from immutability
 - *(storage)* per-version node key + __ingestion_ts__ for TEMPORAL labels
 - *(cypher)* CREATE NODE TYPE DDL with TEMPORAL flag (bitemporal nodes scaffold)
 - *(triggers)* expand BEFORE COMMIT firing to edge SET/MERGE/DELETE
@@ -241,7 +235,7 @@
 - *(query)* COMPUTED VECTOR_DECAY planner pattern detection (R084)
 - *(query)* SSE encrypted search via Cypher DDL + encrypted_match() (G017)
 - *(query)* adaptive parallel traversal via rayon (G010) + varlen edge props fix (G066)
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+- CoordiNode v0.1.0-alpha.1 - graph + vector + full-text engine
 
 #### Documentation
 
@@ -277,7 +271,7 @@
 
 - *(query)* dedup variable-length traversal target emission
 - *(query)* HNSW writes from CREATE row-stream are batched per statement
-- *(embed)* plan cache — skip parse + analyze + build_logical_plan on repeats
+- *(embed)* plan cache - skip parse + analyze + build_logical_plan on repeats
 - *(executor)* cache schema label per node per statement (R-API6)
 
 #### Refactored
@@ -297,7 +291,7 @@
 - *(embed)* per-call QuerySession replaces self.* save/restore dance
 - *(embed)* wrap FieldInterner in Arc<RwLock> on the Database side
 - *(tests)* embed + storage migration to in-memory fixtures (Database::open_in_memory)
-- *(query/tests)* R166 migration — 4 query test files on dual-FS fixture
+- *(query/tests)* R166 migration - 4 query test files on dual-FS fixture
 - *(embed)* sweep raw encoder usage to LocalNodeStore
 - *(storage,query)* move OCC tracking to Layer 3 Coordinator (G104)
 
@@ -316,28 +310,27 @@
 - *(embed)* pin multi-vector property round-trip with maxsim
 - *(backup)* full data-equality roundtrip for binary dump/restore
 - *(capacity)* trigger fail-fast on CapacityExhausted, no retry loop
-- *(storage)* compaction-driven capacity recovery — writes resume automatically
+- *(storage)* compaction-driven capacity recovery - writes resume automatically
 - *(storage)* regression tests for ungated write paths + propagation
-- *(storage)* per-LSM-level routing — WAL replay + primary-evict edges
+- *(storage)* per-LSM-level routing - WAL replay + primary-evict edges
 - *(storage)* per-LSM-level routing edge cases
-- *(temporal)* edge cases — doc_pull/add_to_set, Merge/Replace, varlen, multi-label, multi-segment ATTACH
-- *(storage)* cover R172b audit gaps — valid_to type-mismatch + pre-epoch valid_from
-- *(triggers)* BEFORE COMMIT CREATE — multi-label, $after Map, multi-trigger
+- *(temporal)* edge cases - doc_pull/add_to_set, Merge/Replace, varlen, multi-label, multi-segment ATTACH
+- *(storage)* cover R172b audit gaps - valid_to type-mismatch + pre-epoch valid_from
+- *(triggers)* BEFORE COMMIT CREATE - multi-label, $after Map, multi-trigger
 - WITH passthrough composability + disabled-trigger persistence + empty-body reject
 - *(merge-nodes)* STRICT happy-path + mixed self-loop and peers
 - *(merge-nodes)* cover no-transfer drop, temporal edges, multi-type, composability
 - *(merge-nodes)* close STRICT extra-map gap + composability/index coverage
 - *(embed)* full integration coverage for CREATE/DROP VECTOR INDEX (R-API3)
 - *(embed)* complete R-API3 integration test suite for CREATE/DROP VECTOR INDEX
-- *(schema)* add reopen test — unique constraint enforced after load_all
+- *(schema)* add reopen test - unique constraint enforced after load_all
 - *(embed)* add integration test for TTL Subtree+target_field (G068)
 
 #### Revert
 
 - move per-label vector shard routing out of CE
 
-### coordinode-integration
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-integration-v0.5.0...coordinode-integration-v0.5.1) - 2026-08-29
+### coordinode-integration 0.5.1
 
 #### Added
 
@@ -349,7 +342,7 @@
 - *(embed)* bound interactive transaction buffered writes
 - *(temporal)* bitemporal edge types with valid-time semantics
 - *(query)* [**breaking**] add rrf_score Cypher function with RankFuse operator
-- *(client)* causal session API — CausalToken, execute_causal_write/read (G089)
+- *(client)* causal session API - CausalToken, execute_causal_write/read (G089)
 
 #### Fixed
 
@@ -369,10 +362,9 @@
 - *(integration)* add G088 gRPC integration tests + wire write_concern
 - *(integration)* add ClusterService gRPC integration tests for R091c
 - *(integration)* add FLEXIBLE-mode MATCH visibility regression test after restart
-- *(integration)* add G082 regression test — SET on vector property
+- *(integration)* add G082 regression test - SET on vector property
 
-### coordinode-modality
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-modality-v0.5.0...coordinode-modality-v0.5.1) - 2026-08-29
+### coordinode-modality 0.5.1
 
 #### Added
 
@@ -389,8 +381,8 @@
 - *(edge)* discriminator-aware edge property keys and EdgeStore API
 - *(modality)* add IndexStore clear + delete_raw, route index maintenance through the store
 - *(modality)* VectorStore::knn_search_with_mode for exact path
-- *(modality,timeseries)* G103 sub-system #3 — bitemporal __ingestion_ts__ axis
-- *(modality,timeseries)* G103 sub-system #4 — overflow compactor primitives
+- *(modality,timeseries)* G103 sub-system #3 - bitemporal __ingestion_ts__ axis
+- *(modality,timeseries)* G103 sub-system #4 - overflow compactor primitives
 - *(modality,query)* SchemaStore::list_labels / list_edge_types + ttl_reaper migration
 - *(modality/node)* add get_at_seqno + scan_shard + migrate build.rs (R165 slice 2)
 - *(modality/timeseries)* reopen_bucket + late-write flow test
@@ -418,7 +410,7 @@
 
 - *(spatial)* Z-curve skip-scan via seekable range iterator
 - *(tests)* modality src + proptest + cross_store_flow migrated to in-memory matrix
-- *(modality/spatial)* G101 infrastructure — adaptive bailout disabled pending upstream lsm-tree seek primitive
+- *(modality/spatial)* G101 infrastructure - adaptive bailout disabled pending upstream lsm-tree seek primitive
 - *(modality/spatial)* Z-curve subrange decomposition (G101)
 
 #### Refactored
@@ -435,7 +427,7 @@
 
 #### Testing
 
-- *(storage,modality)* G101 audit close — range_scan API + CRS dispatch + stronger exclusion
+- *(storage,modality)* G101 audit close - range_scan API + CRS dispatch + stronger exclusion
 - *(modality,storage)* reduce proptest cases for faster regression runs
 - *(modality)* proptest harness + remaining edge cases + docs hygiene
 - *(modality)* contract clarifications + cross-store integration
@@ -446,10 +438,9 @@
 #### Revert
 
 - move per-label vector shard routing out of CE
-- *(modality/spatial)* G101 reverted — naive decomposition regressed bench
+- *(modality/spatial)* G101 reverted - naive decomposition regressed bench
 
-### coordinode-query
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-query-v0.5.0...coordinode-query-v0.5.1) - 2026-08-29
+### coordinode-query 0.5.1
 
 #### Added
 
@@ -527,21 +518,21 @@
 - *(vector-index)* add IndexState enum with persisted state-only updates
 - *(cypher)* CREATE VECTOR INDEX OPTIONS {quantization}
 - *(storage)* VectorF32 + VectorRerank partitions (ADR-033 revised)
-- *(vector)* C1 day 6 — HnswConfig::max_elements drives pre-allocation
+- *(vector)* C1 day 6 - HnswConfig::max_elements drives pre-allocation
 - *(query/index)* list_index_definitions helper + registry::load_all migration
 - *(modality,query)* SchemaStore::list_labels / list_edge_types + ttl_reaper migration
 - *(storage,query)* OccScope typed contains helpers + audit-test migration
 - *(modality/node)* add get_at_seqno + scan_shard + migrate build.rs (R165 slice 2)
 - *(modality)* introduce coordinode-modality crate with Schema/Blob/Index stores
-- *(storage)* R156 + R157 — multi-endpoint storage placement
-- *(temporal)* R172d — pattern predicate into temporal target
-- *(temporal)* R172d initial slice — traversal into temporal target
-- *(temporal)* R172c Phase 3c — DETACH/ATTACH on temporal nodes (partial)
-- *(temporal)* R172c Phase 3b — nested PropertyPath / doc_* fns on temporal
-- *(temporal)* R172c Phase 3 — REMOVE on temporal as close+open new version
-- *(temporal)* R172c Phase 3 — DELETE on temporal as positive bitemporal fact
-- *(storage)* R172c Phase 2 — temporal node SET close-current + open-new
-- *(storage)* R172c Phase 1 — temporal node SET valid_to + valid_from immutability
+- *(storage)* R156 + R157 - multi-endpoint storage placement
+- *(temporal)* R172d - pattern predicate into temporal target
+- *(temporal)* R172d initial slice - traversal into temporal target
+- *(temporal)* R172c Phase 3c - DETACH/ATTACH on temporal nodes (partial)
+- *(temporal)* R172c Phase 3b - nested PropertyPath / doc_* fns on temporal
+- *(temporal)* R172c Phase 3 - REMOVE on temporal as close+open new version
+- *(temporal)* R172c Phase 3 - DELETE on temporal as positive bitemporal fact
+- *(storage)* R172c Phase 2 - temporal node SET close-current + open-new
+- *(storage)* R172c Phase 1 - temporal node SET valid_to + valid_from immutability
 - *(storage)* per-version node key + __ingestion_ts__ for TEMPORAL labels
 - *(cypher)* CREATE NODE TYPE DDL with TEMPORAL flag (bitemporal nodes scaffold)
 - *(triggers)* expand BEFORE COMMIT firing to edge SET/MERGE/DELETE
@@ -561,8 +552,8 @@
 - *(query)* [**breaking**] add rrf_score Cypher function with RankFuse operator
 - *(query)* hybrid_score() scoring helper (R-HYB2 part 1/3)
 - *(query)* text_score() composition + guard against silent-0 on missing FT index
-- *(query)* ATTACH DOCUMENT — demote graph node to nested DOCUMENT property
-- *(query)* DETACH DOCUMENT — promote nested property to graph node + edge
+- *(query)* ATTACH DOCUMENT - demote graph node to nested DOCUMENT property
+- *(query)* DETACH DOCUMENT - promote nested property to graph node + edge
 - *(causal)* enforce writeConcern=MAJORITY in causal write sessions (G088)
 - *(schema)* complete R-API5 schema modes enforcement
 - *(schema)* enforce required fields at CREATE + multi-update tests
@@ -572,7 +563,7 @@
 - *(query)* CREATE/DROP VECTOR INDEX Cypher DDL
 - *(query)* implement CREATE/DROP INDEX Cypher DDL with IndexScan optimizer
 - *(schema)* wire create_label/create_edge_type to persist schemas with unique index enforcement
-- *(query)* add MERGE ALL — Cartesian-product relationship upsert
+- *(query)* add MERGE ALL - Cartesian-product relationship upsert
 - *(query)* implement standalone MERGE relationship (G074)
 - *(query)* implement pattern predicates in WHERE clause
 - *(query)* implement type(r) and labels(n) scalar functions
@@ -582,7 +573,7 @@
 - *(query)* COMPUTED VECTOR_DECAY planner pattern detection (R084)
 - *(query)* SSE encrypted search via Cypher DDL + encrypted_match() (G017)
 - *(query)* adaptive parallel traversal via rayon (G010) + varlen edge props fix (G066)
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+- CoordiNode v0.1.0-alpha.1 - graph + vector + full-text engine
 
 #### Documentation
 
@@ -674,10 +665,10 @@
 - *(traverse)* batch frontier expansion behind one step
 - *(vector)* drop intermediate quantized disk tier (ADR-033 final)
 - *(vector)* migrate quantization config from bool to QuantizationCodec enum
-- *(query/tests)* R166 migration — 4 query test files on dual-FS fixture
-- *(core,query)* R165 last raw encoder — Mutation::delete_edge_props typed constructor
+- *(query/tests)* R166 migration - 4 query test files on dual-FS fixture
+- *(core,query)* R165 last raw encoder - Mutation::delete_edge_props typed constructor
 - *(query/tests)* migrate integration-test fixtures to LocalNodeStore
-- *(query/tests)* R166 finish — ttl_reaper fixtures migrated to LocalNodeStore
+- *(query/tests)* R166 finish - ttl_reaper fixtures migrated to LocalNodeStore
 - *(query/tests)* R166 test fixture migration to LocalNodeStore
 - *(query/index/ops)* route through LocalIndexStore (R165 slice 12)
 - *(query/runner)* typed edge-property delete + transfer/update migration (R165 slice 11)
@@ -703,10 +694,10 @@
 - *(query)* seed fixtures through Layer-4 stores, not raw key encoders
 - *(traverse)* distributed frontier-exchange matches single engine
 - *(query)* pin index access path plan for pure vector top-k
-- *(query)* R165 audit close — EdgeStore OCC invariants + lockdown coverage gate
+- *(query)* R165 audit close - EdgeStore OCC invariants + lockdown coverage gate
 - *(query)* R165 encoder lockdown regression gate (slice 13)
-- *(query)* R165 slice 4 second audit — OCC invariant + doc fix
-- *(query)* R165 slice 4 audit — edge cases + 2 more SET sites
+- *(query)* R165 slice 4 second audit - OCC invariant + doc fix
+- *(query)* R165 slice 4 audit - edge cases + 2 more SET sites
 - *(query)* mvcc_flush idempotency + read-only short-circuit
 - *(query)* RYOW + legacy-mode OCC invariants, scrub task IDs
 - *(storage,query)* edge cases + dyn dispatch for G104/G105
@@ -728,8 +719,7 @@
 
 - move per-label vector shard routing out of CE
 
-### coordinode-raft
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-raft-v0.5.0...coordinode-raft-v0.5.1) - 2026-08-29
+### coordinode-raft 0.5.1
 
 #### Added
 
@@ -745,18 +735,18 @@
 - *(replicate)* replication-orchestration crate (replicated writes + retention registry)
 - *(storage)* VectorF32 + VectorRerank partitions (ADR-033 revised)
 - *(storage)* per-LSM-level endpoint routing + cascade eviction
-- *(storage)* R156 + R157 — multi-endpoint storage placement
+- *(storage)* R156 + R157 - multi-endpoint storage placement
 - *(raft)* wire MaxAssignedWatermark into apply_proposal path
-- *(server)* R150 — monolithic binary --mode=full, shared :7080, NodeInfoLayer
+- *(server)* R150 - monolithic binary --mode=full, shared :7080, NodeInfoLayer
 - *(cluster)* node decommission protocol + unified Raft write path
 - *(cluster)* implement cluster join protocol (R091b)
 - *(storage)* implement standalone WAL for crash durability
-- *(raft)* R141 follower reads — ReadFence, SyncPerBatch persist fix
+- *(raft)* R141 follower reads - ReadFence, SyncPerBatch persist fix
 - *(raft)* chunked gRPC snapshot transfer to prevent OOM (G046)
 - *(raft)* true async wtimeout via propose_with_timeout (G048)
 - *(raft)* add retry with exponential backoff to batch drain loop (G047b)
 - *(raft)* add WaitForMajorityService for batched proposal coalescing (G047)
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+- CoordiNode v0.1.0-alpha.1 - graph + vector + full-text engine
 
 #### Fixed
 
@@ -790,11 +780,10 @@
 - *(raft)* snapshot trigger must skip idle intervals
 - *(raft)* add 3-node pruning decommission test as final R091c entry
 - *(cluster)* R091c decommission protocol test suite
-- *(raft)* R141 complete test coverage — follower scenarios + StaleReplica
+- *(raft)* R141 complete test coverage - follower scenarios + StaleReplica
 - *(raft)* add tests for propose_with_timeout and WriteConcernTimeout (G048)
 
-### coordinode-replicate
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-replicate-v0.5.0...coordinode-replicate-v0.5.1) - 2026-08-29
+### coordinode-replicate 0.5.1
 
 #### Added
 
@@ -824,29 +813,27 @@
 - extract shared wire codec, compress segment transfer too
 - extract unit tests into sibling files (server, raft, replicate, embed, timeseries)
 
-### coordinode-s3
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-s3-v0.5.0...coordinode-s3-v0.5.1) - 2026-08-29
+### coordinode-s3 0.5.1
 
 #### Added
 
 - *(storage)* io_uring filesystem backend behind --features io-uring
-- *(storage)* R156 + R157 — multi-endpoint storage placement
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+- *(storage)* R156 + R157 - multi-endpoint storage placement
+- CoordiNode v0.1.0-alpha.1 - graph + vector + full-text engine
 
 #### Refactored
 
 - extract unit tests into sibling files (client, bench, cluster, s3, test-fixtures)
 
-### coordinode-search
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-search-v0.5.0...coordinode-search-v0.5.1) - 2026-08-29
+### coordinode-search 0.5.1
 
 #### Added
 
-- *(storage)* R156 + R157 — multi-endpoint storage placement
+- *(storage)* R156 + R157 - multi-endpoint storage placement
 - *(search)* FTS MVCC snapshot filter via per-doc commit_ts + segment registry
 - *(text-search)* implement TextService gRPC with fuzzy + language-aware search
 - *(search)* external CJK dictionary loading from filesystem (G014)
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+- CoordiNode v0.1.0-alpha.1 - graph + vector + full-text engine
 
 #### Fixed
 
@@ -863,8 +850,7 @@
 - *(search)* direct unit tests for search_with_highlights_fuzzy and search_with_highlights_and_language
 - *(text-search)* Ukrainian e2e + multi-property merge coverage
 
-### coordinode-session
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-session-v0.5.0...coordinode-session-v0.5.1) - 2026-08-29
+### coordinode-session 0.5.1
 
 #### Added
 
@@ -882,8 +868,7 @@
 
 - *(session)* cover ordered first-failure abort; document nonce contract
 
-### coordinode-storage
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-storage-v0.5.0...coordinode-storage-v0.5.1) - 2026-08-29
+### coordinode-storage 0.5.1
 
 #### Added
 
@@ -919,13 +904,13 @@
 - *(storage)* per-endpoint capacity tracking + hard-limit enforcement
 - *(storage)* page-checksum wire-through + ECC policy config surface
 - *(storage)* per-LSM-level endpoint routing + cascade eviction
-- *(storage)* R156 + R157 — multi-endpoint storage placement
-- *(temporal)* R172c Phase 3b — nested PropertyPath / doc_* fns on temporal
+- *(storage)* R156 + R157 - multi-endpoint storage placement
+- *(temporal)* R172c Phase 3b - nested PropertyPath / doc_* fns on temporal
 - *(storage)* time-based memtable flush trigger to bound oplog retention
 - *(storage)* implement standalone WAL for crash durability
 - *(computed)* R085 decay interpolation tests and NVMe write buffer for w:cache
 - *(storage)* add MemFs in-memory test backend support
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+- CoordiNode v0.1.0-alpha.1 - graph + vector + full-text engine
 
 #### Fixed
 
@@ -971,16 +956,15 @@
 - *(storage)* pin oplog segment filename contract
 - *(backup)* assert checkpoint dirs by real partition name
 - *(storage)* regression test for capacity-scanner warm-load race
-- *(storage,modality)* G101 audit close — range_scan API + CRS dispatch + stronger exclusion
+- *(storage,modality)* G101 audit close - range_scan API + CRS dispatch + stronger exclusion
 - *(modality,storage)* reduce proptest cases for faster regression runs
 - *(query)* RYOW + legacy-mode OCC invariants, scrub task IDs
 - *(storage,query)* edge cases + dyn dispatch for G104/G105
 - *(storage)* final R164 coverage round + rustdoc cleanup
 - *(storage/coordinator)* edge cases + doctests + concurrency
-- *(storage)* page-ECC policy — builder + serde back-compat + Volatile edge
+- *(storage)* page-ECC policy - builder + serde back-compat + Volatile edge
 
-### coordinode-swarm
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-swarm-v0.5.0...coordinode-swarm-v0.5.1) - 2026-08-29
+### coordinode-swarm 0.5.1
 
 #### Added
 
@@ -1002,12 +986,11 @@
 - extract unit tests into sibling files (swarm)
 - extract unit tests into sibling test files
 
-### coordinode-test-fixtures
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-test-fixtures-v0.5.0...coordinode-test-fixtures-v0.5.1) - 2026-08-29
+### coordinode-test-fixtures 0.5.1
 
 #### Added
 
-- *(test-fixtures)* new crate — engine_for_logic / engine_for_disk / engine_for_memory dual-FS test fixture
+- *(test-fixtures)* new crate - engine_for_logic / engine_for_disk / engine_for_memory dual-FS test fixture
 
 #### Performance
 
@@ -1016,24 +999,23 @@
 #### Refactored
 
 - extract unit tests into sibling files (client, bench, cluster, s3, test-fixtures)
-- *(query/tests)* R166 migration — 4 query test files on dual-FS fixture
+- *(query/tests)* R166 migration - 4 query test files on dual-FS fixture
 
 #### Testing
 
-- *(test-fixtures)* audit closure — edge cases + doctest + CI matrix verification
+- *(test-fixtures)* audit closure - edge cases + doctest + CI matrix verification
 
-### coordinode-timeseries
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-timeseries-v0.5.0...coordinode-timeseries-v0.5.1) - 2026-08-29
+### coordinode-timeseries 0.5.1
 
 #### Added
 
-- *(timeseries)* ε-policy — opt-in WITH BITEMPORAL via split write entry points (β: Cypher paused)
-- *(timeseries)* close G103 #3 Gap #4 — PersistentMonotonicHlcClock with engine-backed restart monotonicity
-- *(modality,timeseries)* G103 sub-system #3 — bitemporal __ingestion_ts__ axis
-- *(modality,timeseries)* G103 sub-system #4 — overflow compactor primitives
-- *(timeseries)* G103 slice C — Tier 3 overflow routing + background compactor
-- *(timeseries)* G103 slice B — Tier 2 recently-closed LRU + reopen path
-- *(timeseries)* new crate coordinode-timeseries (G103 slice A — BucketCatalog + Tier 1 buffer)
+- *(timeseries)* ε-policy - opt-in WITH BITEMPORAL via split write entry points (β: Cypher paused)
+- *(timeseries)* close G103 #3 Gap #4 - PersistentMonotonicHlcClock with engine-backed restart monotonicity
+- *(modality,timeseries)* G103 sub-system #3 - bitemporal __ingestion_ts__ axis
+- *(modality,timeseries)* G103 sub-system #4 - overflow compactor primitives
+- *(timeseries)* G103 slice C - Tier 3 overflow routing + background compactor
+- *(timeseries)* G103 slice B - Tier 2 recently-closed LRU + reopen path
+- *(timeseries)* new crate coordinode-timeseries (G103 slice A - BucketCatalog + Tier 1 buffer)
 
 #### Refactored
 
@@ -1043,10 +1025,9 @@
 
 #### Testing
 
-- *(timeseries)* G103 #3 audit closure — backfill on compact, edge case tests, restart-monotonicity gap documented
+- *(timeseries)* G103 #3 audit closure - backfill on compact, edge case tests, restart-monotonicity gap documented
 
-### coordinode-vector
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-vector-v0.5.0...coordinode-vector-v0.5.1) - 2026-08-29
+### coordinode-vector 0.5.1
 
 #### Added
 
@@ -1077,35 +1058,35 @@
 - *(vector)* RaBitQ supports any dim via internal padding to next mult of 64
 - *(vector)* wire Extended-RaBitQ 2/3/4-bit through HnswIndex
 - *(vector)* Extended-RaBitQ 2/3/4-bit codec primitive
-- *(vector)* LsmVectorTier — production binding of VectorTierStorage
+- *(vector)* LsmVectorTier - production binding of VectorTierStorage
 - *(vector)* VectorTierStorage trait + write hooks in HnswIndex (ADR-033)
 - *(vector)* set_rabitq_params for segment reload + serde round-trip tests
 - *(vector)* wire RaBitQ codec into HNSW search hot path
 - *(vector)* RaBitQ codec foundation + popcount distance kernel
 - *(vector)* AtomicU64-packed entry-point + CAS-loop promotion
-- *(vector)* C3 day 4 — prune-pass restores recall, insert_batch wired to parallel apply
-- *(vector)* C3 day 3 — apply_insert_plans_parallel (opt-in, lossy)
-- *(vector)* C3 day 2 — &self write helpers + cas_add_neighbour_to
-- *(vector)* C3 day 1 — cas_append + replace primitives
-- *(vector)* C2 day 3 — insert_batch vs serial criterion bench
-- *(vector)* C2 day 2 — insert_batch with rayon parallel planning
-- *(vector)* C2 day 1 — split insert into compute_insert_plan + apply
-- *(vector)* C1 day 7 — parallel-search QPS bench
-- *(vector)* C1 day 6 — HnswConfig::max_elements drives pre-allocation
-- *(vector)* C1 day 5 — atomic mirror is the sole storage
-- *(vector)* C1 day 4 — granular dual-write helpers for atomic mirror
-- *(vector)* C1 day 3b — search read path now lock-free
-- *(vector)* C1 day 3a — auto-sync atomic mirror after every insert/update
-- *(vector)* C1 day 2 — atomic-mirror field + manual sync helper
+- *(vector)* C3 day 4 - prune-pass restores recall, insert_batch wired to parallel apply
+- *(vector)* C3 day 3 - apply_insert_plans_parallel (opt-in, lossy)
+- *(vector)* C3 day 2 - &self write helpers + cas_add_neighbour_to
+- *(vector)* C3 day 1 - cas_append + replace primitives
+- *(vector)* C2 day 3 - insert_batch vs serial criterion bench
+- *(vector)* C2 day 2 - insert_batch with rayon parallel planning
+- *(vector)* C2 day 1 - split insert into compute_insert_plan + apply
+- *(vector)* C1 day 7 - parallel-search QPS bench
+- *(vector)* C1 day 6 - HnswConfig::max_elements drives pre-allocation
+- *(vector)* C1 day 5 - atomic mirror is the sole storage
+- *(vector)* C1 day 4 - granular dual-write helpers for atomic mirror
+- *(vector)* C1 day 3b - search read path now lock-free
+- *(vector)* C1 day 3a - auto-sync atomic mirror after every insert/update
+- *(vector)* C1 day 2 - atomic-mirror field + manual sync helper
 - *(vector)* IndexHealthState + HnswBuildScheduler (rebalance prereqs)
-- *(vector)* C1 day 1 — AtomicNeighbourList<N> scaffold for lock-free HNSW
-- *(bench)* R700+R704 — coordinode-bench harness + ann-benchmarks SIFT1M adapter (Stage 1)
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+- *(vector)* C1 day 1 - AtomicNeighbourList<N> scaffold for lock-free HNSW
+- *(bench)* R700+R704 - coordinode-bench harness + ann-benchmarks SIFT1M adapter (Stage 1)
+- CoordiNode v0.1.0-alpha.1 - graph + vector + full-text engine
 
 #### Documentation
 
 - *(vector)* bulk_build path and follow-up boundary
-- *(vector)* C3 day 6 — record measured 14.6× speedup in bench doc
+- *(vector)* C3 day 6 - record measured 14.6× speedup in bench doc
 
 #### Fixed
 
@@ -1177,8 +1158,8 @@
 - *(vector)* criterion harness for RaBitQ popcount kernel
 - *(vector)* SQ8 dequantize into reusable scratch + SIMD
 - *(vector)* cache query L2 norm per HNSW search (cosine path)
-- *(vector)* C3 day 5b — parallel prune-pass via rayon
-- *(vector)* C3 day 5a — dedupe backfill before prune-pass
+- *(vector)* C3 day 5b - parallel prune-pass via rayon
+- *(vector)* C3 day 5a - dedupe backfill before prune-pass
 
 #### Refactored
 
@@ -1204,11 +1185,10 @@
 #### Revert
 
 - move per-label vector shard routing out of CE
-- *(vector)* undo "flat contiguous vector store" — bench regressed
-- *(vector)* undo "prefetch full vector range" — bench regressed
+- *(vector)* undo "flat contiguous vector store" - bench regressed
+- *(vector)* undo "prefetch full vector range" - bench regressed
 
-### coordinode-wire
-## [0.5.1](https://github.com/structured-world/coordinode/compare/coordinode-wire-v0.5.0...coordinode-wire-v0.5.1) - 2026-08-29
+### coordinode-wire 0.5.1
 
 #### Added
 
@@ -1226,29 +1206,26 @@
 
 ---
 
-## v0.5.0 — 2026-06-27
+## v0.5.0 - 2026-06-27
 
-### coordinode-auth
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-auth-v0.4.3...coordinode-auth-v0.5.0) - 2026-06-27
+### coordinode-auth 0.5.0
 
 #### Added
 
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+- CoordiNode v0.1.0-alpha.1 - graph + vector + full-text engine
 
-### coordinode-bench
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-bench-v0.4.3...coordinode-bench-v0.5.0) - 2026-06-27
+### coordinode-bench 0.5.0
 
 #### Added
 
 - *(bench)* HNSW M sweep (16, 24, 32) + UI filter
-- *(bench)* R700+R704 — coordinode-bench harness + ann-benchmarks SIFT1M adapter (Stage 1)
+- *(bench)* R700+R704 - coordinode-bench harness + ann-benchmarks SIFT1M adapter (Stage 1)
 
 #### Refactored
 
 - extract unit tests into sibling files (client, bench, cluster, s3, test-fixtures)
 
-### coordinode-client
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-client-v0.4.3...coordinode-client-v0.5.0) - 2026-06-27
+### coordinode-client 0.5.0
 
 #### Added
 
@@ -1256,7 +1233,7 @@
 - *(client)* expose read preference for cypher reads
 - *(identity,placement,consistency)* u20/u44 NodeId, schema_revision, gRPC concern wire-through
 - *(query)* [**breaking**] add rrf_score Cypher function with RankFuse operator
-- *(client)* causal session API — CausalToken, execute_causal_write/read (G089)
+- *(client)* causal session API - CausalToken, execute_causal_write/read (G089)
 - *(causal)* enforce writeConcern=MAJORITY in causal write sessions (G088)
 - *(consistency)* implement R142 causal consistency sessions
 - *(client)* add coordinode-client crate with source location tracking
@@ -1277,8 +1254,7 @@
 
 - *(client,server)* cover params+source gRPC branch and invalid endpoint
 
-### coordinode-cluster
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-cluster-v0.4.3...coordinode-cluster-v0.5.0) - 2026-06-27
+### coordinode-cluster 0.5.0
 
 #### Added
 
@@ -1310,8 +1286,7 @@
 - *(cluster)* planner picks remote endpoint on full source
 - *(cluster)* doctests + edge cases + ADR-028 helpers + benches + proptest
 
-### coordinode-core
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-core-v0.4.3...coordinode-core-v0.5.0) - 2026-06-27
+### coordinode-core 0.5.0
 
 #### Added
 
@@ -1333,14 +1308,14 @@
 - *(temporal)* bitemporal edge types with valid-time semantics
 - *(query)* add read_consistency knob + planner auto-promotion (R-SNAP1)
 - *(txn)* add per-shard MaxAssignedWatermark + WaitForTs primitive
-- *(query)* ATTACH DOCUMENT — demote graph node to nested DOCUMENT property
+- *(query)* ATTACH DOCUMENT - demote graph node to nested DOCUMENT property
 - *(core)* implement HybridLogicalClock for CE timestamps (R143)
 - *(storage)* implement standalone WAL for crash durability
 - *(schema)* R-API5 schema modes STRICT/VALIDATED/FLEXIBLE
 - *(computed)* R085 decay interpolation tests and NVMe write buffer for w:cache
 - *(raft)* true async wtimeout via propose_with_timeout (G048)
 - *(raft)* add WaitForMajorityService for batched proposal coalescing (G047)
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+- CoordiNode v0.1.0-alpha.1 - graph + vector + full-text engine
 
 #### Documentation
 
@@ -1362,15 +1337,14 @@
 - extract unit tests into sibling test files
 - *(core)* hoist try_extract_vector to a single canonical helper
 - *(vector)* drop intermediate quantized disk tier (ADR-033 final)
-- *(core,query)* R165 last raw encoder — Mutation::delete_edge_props typed constructor
+- *(core,query)* R165 last raw encoder - Mutation::delete_edge_props typed constructor
 
 #### Testing
 
 - *(core)* add roundtrip test for ComputedSpec::Ttl with target_field=Some
 - *(raft)* add tests for propose_with_timeout and WriteConcernTimeout (G048)
 
-### coordinode-embed
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-embed-v0.4.3...coordinode-embed-v0.5.0) - 2026-06-27
+### coordinode-embed 0.5.0
 
 #### Added
 
@@ -1417,15 +1391,15 @@
 - *(storage)* per-endpoint capacity tracking + hard-limit enforcement
 - *(storage)* page-checksum wire-through + ECC policy config surface
 - *(storage)* per-LSM-level endpoint routing + cascade eviction
-- *(storage)* R156 + R157 — multi-endpoint storage placement
-- *(temporal)* R172d — pattern predicate into temporal target
-- *(temporal)* R172d initial slice — traversal into temporal target
-- *(temporal)* R172c Phase 3c — DETACH/ATTACH on temporal nodes (partial)
-- *(temporal)* R172c Phase 3b — nested PropertyPath / doc_* fns on temporal
-- *(temporal)* R172c Phase 3 — REMOVE on temporal as close+open new version
-- *(temporal)* R172c Phase 3 — DELETE on temporal as positive bitemporal fact
-- *(storage)* R172c Phase 2 — temporal node SET close-current + open-new
-- *(storage)* R172c Phase 1 — temporal node SET valid_to + valid_from immutability
+- *(storage)* R156 + R157 - multi-endpoint storage placement
+- *(temporal)* R172d - pattern predicate into temporal target
+- *(temporal)* R172d initial slice - traversal into temporal target
+- *(temporal)* R172c Phase 3c - DETACH/ATTACH on temporal nodes (partial)
+- *(temporal)* R172c Phase 3b - nested PropertyPath / doc_* fns on temporal
+- *(temporal)* R172c Phase 3 - REMOVE on temporal as close+open new version
+- *(temporal)* R172c Phase 3 - DELETE on temporal as positive bitemporal fact
+- *(storage)* R172c Phase 2 - temporal node SET close-current + open-new
+- *(storage)* R172c Phase 1 - temporal node SET valid_to + valid_from immutability
 - *(storage)* per-version node key + __ingestion_ts__ for TEMPORAL labels
 - *(cypher)* CREATE NODE TYPE DDL with TEMPORAL flag (bitemporal nodes scaffold)
 - *(triggers)* expand BEFORE COMMIT firing to edge SET/MERGE/DELETE
@@ -1453,7 +1427,7 @@
 - *(query)* COMPUTED VECTOR_DECAY planner pattern detection (R084)
 - *(query)* SSE encrypted search via Cypher DDL + encrypted_match() (G017)
 - *(query)* adaptive parallel traversal via rayon (G010) + varlen edge props fix (G066)
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+- CoordiNode v0.1.0-alpha.1 - graph + vector + full-text engine
 
 #### Documentation
 
@@ -1489,7 +1463,7 @@
 
 - *(query)* dedup variable-length traversal target emission
 - *(query)* HNSW writes from CREATE row-stream are batched per statement
-- *(embed)* plan cache — skip parse + analyze + build_logical_plan on repeats
+- *(embed)* plan cache - skip parse + analyze + build_logical_plan on repeats
 - *(executor)* cache schema label per node per statement (R-API6)
 
 #### Refactored
@@ -1504,7 +1478,7 @@
 - *(embed)* per-call QuerySession replaces self.* save/restore dance
 - *(embed)* wrap FieldInterner in Arc<RwLock> on the Database side
 - *(tests)* embed + storage migration to in-memory fixtures (Database::open_in_memory)
-- *(query/tests)* R166 migration — 4 query test files on dual-FS fixture
+- *(query/tests)* R166 migration - 4 query test files on dual-FS fixture
 - *(embed)* sweep raw encoder usage to LocalNodeStore
 - *(storage,query)* move OCC tracking to Layer 3 Coordinator (G104)
 
@@ -1521,35 +1495,34 @@
 - *(embed)* pin multi-vector property round-trip with maxsim
 - *(backup)* full data-equality roundtrip for binary dump/restore
 - *(capacity)* trigger fail-fast on CapacityExhausted, no retry loop
-- *(storage)* compaction-driven capacity recovery — writes resume automatically
+- *(storage)* compaction-driven capacity recovery - writes resume automatically
 - *(storage)* regression tests for ungated write paths + propagation
-- *(storage)* per-LSM-level routing — WAL replay + primary-evict edges
+- *(storage)* per-LSM-level routing - WAL replay + primary-evict edges
 - *(storage)* per-LSM-level routing edge cases
-- *(temporal)* edge cases — doc_pull/add_to_set, Merge/Replace, varlen, multi-label, multi-segment ATTACH
-- *(storage)* cover R172b audit gaps — valid_to type-mismatch + pre-epoch valid_from
-- *(triggers)* BEFORE COMMIT CREATE — multi-label, $after Map, multi-trigger
+- *(temporal)* edge cases - doc_pull/add_to_set, Merge/Replace, varlen, multi-label, multi-segment ATTACH
+- *(storage)* cover R172b audit gaps - valid_to type-mismatch + pre-epoch valid_from
+- *(triggers)* BEFORE COMMIT CREATE - multi-label, $after Map, multi-trigger
 - WITH passthrough composability + disabled-trigger persistence + empty-body reject
 - *(merge-nodes)* STRICT happy-path + mixed self-loop and peers
 - *(merge-nodes)* cover no-transfer drop, temporal edges, multi-type, composability
 - *(merge-nodes)* close STRICT extra-map gap + composability/index coverage
 - *(embed)* full integration coverage for CREATE/DROP VECTOR INDEX (R-API3)
 - *(embed)* complete R-API3 integration test suite for CREATE/DROP VECTOR INDEX
-- *(schema)* add reopen test — unique constraint enforced after load_all
+- *(schema)* add reopen test - unique constraint enforced after load_all
 - *(embed)* add integration test for TTL Subtree+target_field (G068)
 
 #### Revert
 
 - move per-label vector shard routing out of CE
 
-### coordinode-integration
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-integration-v0.4.3...coordinode-integration-v0.5.0) - 2026-06-27
+### coordinode-integration 0.5.0
 
 #### Added
 
 - *(embed)* bound interactive transaction buffered writes
 - *(temporal)* bitemporal edge types with valid-time semantics
 - *(query)* [**breaking**] add rrf_score Cypher function with RankFuse operator
-- *(client)* causal session API — CausalToken, execute_causal_write/read (G089)
+- *(client)* causal session API - CausalToken, execute_causal_write/read (G089)
 
 #### Fixed
 
@@ -1567,10 +1540,9 @@
 - *(integration)* add G088 gRPC integration tests + wire write_concern
 - *(integration)* add ClusterService gRPC integration tests for R091c
 - *(integration)* add FLEXIBLE-mode MATCH visibility regression test after restart
-- *(integration)* add G082 regression test — SET on vector property
+- *(integration)* add G082 regression test - SET on vector property
 
-### coordinode-modality
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-modality-v0.4.3...coordinode-modality-v0.5.0) - 2026-06-27
+### coordinode-modality 0.5.0
 
 #### Added
 
@@ -1585,8 +1557,8 @@
 - *(edge)* discriminator-aware edge property keys and EdgeStore API
 - *(modality)* add IndexStore clear + delete_raw, route index maintenance through the store
 - *(modality)* VectorStore::knn_search_with_mode for exact path
-- *(modality,timeseries)* G103 sub-system #3 — bitemporal __ingestion_ts__ axis
-- *(modality,timeseries)* G103 sub-system #4 — overflow compactor primitives
+- *(modality,timeseries)* G103 sub-system #3 - bitemporal __ingestion_ts__ axis
+- *(modality,timeseries)* G103 sub-system #4 - overflow compactor primitives
 - *(modality,query)* SchemaStore::list_labels / list_edge_types + ttl_reaper migration
 - *(modality/node)* add get_at_seqno + scan_shard + migrate build.rs (R165 slice 2)
 - *(modality/timeseries)* reopen_bucket + late-write flow test
@@ -1614,7 +1586,7 @@
 
 - *(spatial)* Z-curve skip-scan via seekable range iterator
 - *(tests)* modality src + proptest + cross_store_flow migrated to in-memory matrix
-- *(modality/spatial)* G101 infrastructure — adaptive bailout disabled pending upstream lsm-tree seek primitive
+- *(modality/spatial)* G101 infrastructure - adaptive bailout disabled pending upstream lsm-tree seek primitive
 - *(modality/spatial)* Z-curve subrange decomposition (G101)
 
 #### Refactored
@@ -1631,7 +1603,7 @@
 
 #### Testing
 
-- *(storage,modality)* G101 audit close — range_scan API + CRS dispatch + stronger exclusion
+- *(storage,modality)* G101 audit close - range_scan API + CRS dispatch + stronger exclusion
 - *(modality,storage)* reduce proptest cases for faster regression runs
 - *(modality)* proptest harness + remaining edge cases + docs hygiene
 - *(modality)* contract clarifications + cross-store integration
@@ -1642,10 +1614,9 @@
 #### Revert
 
 - move per-label vector shard routing out of CE
-- *(modality/spatial)* G101 reverted — naive decomposition regressed bench
+- *(modality/spatial)* G101 reverted - naive decomposition regressed bench
 
-### coordinode-query
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-query-v0.4.3...coordinode-query-v0.5.0) - 2026-06-27
+### coordinode-query 0.5.0
 
 #### Added
 
@@ -1708,21 +1679,21 @@
 - *(vector-index)* add IndexState enum with persisted state-only updates
 - *(cypher)* CREATE VECTOR INDEX OPTIONS {quantization}
 - *(storage)* VectorF32 + VectorRerank partitions (ADR-033 revised)
-- *(vector)* C1 day 6 — HnswConfig::max_elements drives pre-allocation
+- *(vector)* C1 day 6 - HnswConfig::max_elements drives pre-allocation
 - *(query/index)* list_index_definitions helper + registry::load_all migration
 - *(modality,query)* SchemaStore::list_labels / list_edge_types + ttl_reaper migration
 - *(storage,query)* OccScope typed contains helpers + audit-test migration
 - *(modality/node)* add get_at_seqno + scan_shard + migrate build.rs (R165 slice 2)
 - *(modality)* introduce coordinode-modality crate with Schema/Blob/Index stores
-- *(storage)* R156 + R157 — multi-endpoint storage placement
-- *(temporal)* R172d — pattern predicate into temporal target
-- *(temporal)* R172d initial slice — traversal into temporal target
-- *(temporal)* R172c Phase 3c — DETACH/ATTACH on temporal nodes (partial)
-- *(temporal)* R172c Phase 3b — nested PropertyPath / doc_* fns on temporal
-- *(temporal)* R172c Phase 3 — REMOVE on temporal as close+open new version
-- *(temporal)* R172c Phase 3 — DELETE on temporal as positive bitemporal fact
-- *(storage)* R172c Phase 2 — temporal node SET close-current + open-new
-- *(storage)* R172c Phase 1 — temporal node SET valid_to + valid_from immutability
+- *(storage)* R156 + R157 - multi-endpoint storage placement
+- *(temporal)* R172d - pattern predicate into temporal target
+- *(temporal)* R172d initial slice - traversal into temporal target
+- *(temporal)* R172c Phase 3c - DETACH/ATTACH on temporal nodes (partial)
+- *(temporal)* R172c Phase 3b - nested PropertyPath / doc_* fns on temporal
+- *(temporal)* R172c Phase 3 - REMOVE on temporal as close+open new version
+- *(temporal)* R172c Phase 3 - DELETE on temporal as positive bitemporal fact
+- *(storage)* R172c Phase 2 - temporal node SET close-current + open-new
+- *(storage)* R172c Phase 1 - temporal node SET valid_to + valid_from immutability
 - *(storage)* per-version node key + __ingestion_ts__ for TEMPORAL labels
 - *(cypher)* CREATE NODE TYPE DDL with TEMPORAL flag (bitemporal nodes scaffold)
 - *(triggers)* expand BEFORE COMMIT firing to edge SET/MERGE/DELETE
@@ -1742,8 +1713,8 @@
 - *(query)* [**breaking**] add rrf_score Cypher function with RankFuse operator
 - *(query)* hybrid_score() scoring helper (R-HYB2 part 1/3)
 - *(query)* text_score() composition + guard against silent-0 on missing FT index
-- *(query)* ATTACH DOCUMENT — demote graph node to nested DOCUMENT property
-- *(query)* DETACH DOCUMENT — promote nested property to graph node + edge
+- *(query)* ATTACH DOCUMENT - demote graph node to nested DOCUMENT property
+- *(query)* DETACH DOCUMENT - promote nested property to graph node + edge
 - *(causal)* enforce writeConcern=MAJORITY in causal write sessions (G088)
 - *(schema)* complete R-API5 schema modes enforcement
 - *(schema)* enforce required fields at CREATE + multi-update tests
@@ -1753,7 +1724,7 @@
 - *(query)* CREATE/DROP VECTOR INDEX Cypher DDL
 - *(query)* implement CREATE/DROP INDEX Cypher DDL with IndexScan optimizer
 - *(schema)* wire create_label/create_edge_type to persist schemas with unique index enforcement
-- *(query)* add MERGE ALL — Cartesian-product relationship upsert
+- *(query)* add MERGE ALL - Cartesian-product relationship upsert
 - *(query)* implement standalone MERGE relationship (G074)
 - *(query)* implement pattern predicates in WHERE clause
 - *(query)* implement type(r) and labels(n) scalar functions
@@ -1763,7 +1734,7 @@
 - *(query)* COMPUTED VECTOR_DECAY planner pattern detection (R084)
 - *(query)* SSE encrypted search via Cypher DDL + encrypted_match() (G017)
 - *(query)* adaptive parallel traversal via rayon (G010) + varlen edge props fix (G066)
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+- CoordiNode v0.1.0-alpha.1 - graph + vector + full-text engine
 
 #### Documentation
 
@@ -1842,10 +1813,10 @@
 - *(traverse)* batch frontier expansion behind one step
 - *(vector)* drop intermediate quantized disk tier (ADR-033 final)
 - *(vector)* migrate quantization config from bool to QuantizationCodec enum
-- *(query/tests)* R166 migration — 4 query test files on dual-FS fixture
-- *(core,query)* R165 last raw encoder — Mutation::delete_edge_props typed constructor
+- *(query/tests)* R166 migration - 4 query test files on dual-FS fixture
+- *(core,query)* R165 last raw encoder - Mutation::delete_edge_props typed constructor
 - *(query/tests)* migrate integration-test fixtures to LocalNodeStore
-- *(query/tests)* R166 finish — ttl_reaper fixtures migrated to LocalNodeStore
+- *(query/tests)* R166 finish - ttl_reaper fixtures migrated to LocalNodeStore
 - *(query/tests)* R166 test fixture migration to LocalNodeStore
 - *(query/index/ops)* route through LocalIndexStore (R165 slice 12)
 - *(query/runner)* typed edge-property delete + transfer/update migration (R165 slice 11)
@@ -1870,10 +1841,10 @@
 - *(query)* seed fixtures through Layer-4 stores, not raw key encoders
 - *(traverse)* distributed frontier-exchange matches single engine
 - *(query)* pin index access path plan for pure vector top-k
-- *(query)* R165 audit close — EdgeStore OCC invariants + lockdown coverage gate
+- *(query)* R165 audit close - EdgeStore OCC invariants + lockdown coverage gate
 - *(query)* R165 encoder lockdown regression gate (slice 13)
-- *(query)* R165 slice 4 second audit — OCC invariant + doc fix
-- *(query)* R165 slice 4 audit — edge cases + 2 more SET sites
+- *(query)* R165 slice 4 second audit - OCC invariant + doc fix
+- *(query)* R165 slice 4 audit - edge cases + 2 more SET sites
 - *(query)* mvcc_flush idempotency + read-only short-circuit
 - *(query)* RYOW + legacy-mode OCC invariants, scrub task IDs
 - *(storage,query)* edge cases + dyn dispatch for G104/G105
@@ -1895,8 +1866,7 @@
 
 - move per-label vector shard routing out of CE
 
-### coordinode-raft
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-raft-v0.4.3...coordinode-raft-v0.5.0) - 2026-06-27
+### coordinode-raft 0.5.0
 
 #### Added
 
@@ -1912,18 +1882,18 @@
 - *(replicate)* replication-orchestration crate (replicated writes + retention registry)
 - *(storage)* VectorF32 + VectorRerank partitions (ADR-033 revised)
 - *(storage)* per-LSM-level endpoint routing + cascade eviction
-- *(storage)* R156 + R157 — multi-endpoint storage placement
+- *(storage)* R156 + R157 - multi-endpoint storage placement
 - *(raft)* wire MaxAssignedWatermark into apply_proposal path
-- *(server)* R150 — monolithic binary --mode=full, shared :7080, NodeInfoLayer
+- *(server)* R150 - monolithic binary --mode=full, shared :7080, NodeInfoLayer
 - *(cluster)* node decommission protocol + unified Raft write path
 - *(cluster)* implement cluster join protocol (R091b)
 - *(storage)* implement standalone WAL for crash durability
-- *(raft)* R141 follower reads — ReadFence, SyncPerBatch persist fix
+- *(raft)* R141 follower reads - ReadFence, SyncPerBatch persist fix
 - *(raft)* chunked gRPC snapshot transfer to prevent OOM (G046)
 - *(raft)* true async wtimeout via propose_with_timeout (G048)
 - *(raft)* add retry with exponential backoff to batch drain loop (G047b)
 - *(raft)* add WaitForMajorityService for batched proposal coalescing (G047)
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+- CoordiNode v0.1.0-alpha.1 - graph + vector + full-text engine
 
 #### Fixed
 
@@ -1957,11 +1927,10 @@
 - *(raft)* snapshot trigger must skip idle intervals
 - *(raft)* add 3-node pruning decommission test as final R091c entry
 - *(cluster)* R091c decommission protocol test suite
-- *(raft)* R141 complete test coverage — follower scenarios + StaleReplica
+- *(raft)* R141 complete test coverage - follower scenarios + StaleReplica
 - *(raft)* add tests for propose_with_timeout and WriteConcernTimeout (G048)
 
-### coordinode-replicate
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-replicate-v0.4.3...coordinode-replicate-v0.5.0) - 2026-06-27
+### coordinode-replicate 0.5.0
 
 #### Added
 
@@ -1991,29 +1960,27 @@
 - extract shared wire codec, compress segment transfer too
 - extract unit tests into sibling files (server, raft, replicate, embed, timeseries)
 
-### coordinode-s3
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-s3-v0.4.3...coordinode-s3-v0.5.0) - 2026-06-27
+### coordinode-s3 0.5.0
 
 #### Added
 
 - *(storage)* io_uring filesystem backend behind --features io-uring
-- *(storage)* R156 + R157 — multi-endpoint storage placement
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+- *(storage)* R156 + R157 - multi-endpoint storage placement
+- CoordiNode v0.1.0-alpha.1 - graph + vector + full-text engine
 
 #### Refactored
 
 - extract unit tests into sibling files (client, bench, cluster, s3, test-fixtures)
 
-### coordinode-search
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-search-v0.4.3...coordinode-search-v0.5.0) - 2026-06-27
+### coordinode-search 0.5.0
 
 #### Added
 
-- *(storage)* R156 + R157 — multi-endpoint storage placement
+- *(storage)* R156 + R157 - multi-endpoint storage placement
 - *(search)* FTS MVCC snapshot filter via per-doc commit_ts + segment registry
 - *(text-search)* implement TextService gRPC with fuzzy + language-aware search
 - *(search)* external CJK dictionary loading from filesystem (G014)
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+- CoordiNode v0.1.0-alpha.1 - graph + vector + full-text engine
 
 #### Fixed
 
@@ -2030,8 +1997,7 @@
 - *(search)* direct unit tests for search_with_highlights_fuzzy and search_with_highlights_and_language
 - *(text-search)* Ukrainian e2e + multi-property merge coverage
 
-### coordinode-server
-## [0.5.0](https://github.com/structured-world/coordinode/compare/v0.4.3...v0.5.0) - 2026-06-27
+### coordinode-server 0.5.0
 
 #### Added
 
@@ -2072,7 +2038,7 @@
 - *(cluster)* replicate vector index DDL to followers
 - *(core)* add MultiVector value variant
 - *(server)* wire CreateNodesBatch handler via UNWIND $rows AS r CREATE …
-- *(storage)* R156 + R157 — multi-endpoint storage placement
+- *(storage)* R156 + R157 - multi-endpoint storage placement
 
 #### Fixed
 
@@ -2102,8 +2068,7 @@
 
 - move per-label vector shard routing out of CE
 
-### coordinode-storage
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-storage-v0.4.3...coordinode-storage-v0.5.0) - 2026-06-27
+### coordinode-storage 0.5.0
 
 #### Added
 
@@ -2133,13 +2098,13 @@
 - *(storage)* per-endpoint capacity tracking + hard-limit enforcement
 - *(storage)* page-checksum wire-through + ECC policy config surface
 - *(storage)* per-LSM-level endpoint routing + cascade eviction
-- *(storage)* R156 + R157 — multi-endpoint storage placement
-- *(temporal)* R172c Phase 3b — nested PropertyPath / doc_* fns on temporal
+- *(storage)* R156 + R157 - multi-endpoint storage placement
+- *(temporal)* R172c Phase 3b - nested PropertyPath / doc_* fns on temporal
 - *(storage)* time-based memtable flush trigger to bound oplog retention
 - *(storage)* implement standalone WAL for crash durability
 - *(computed)* R085 decay interpolation tests and NVMe write buffer for w:cache
 - *(storage)* add MemFs in-memory test backend support
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+- CoordiNode v0.1.0-alpha.1 - graph + vector + full-text engine
 
 #### Fixed
 
@@ -2184,16 +2149,15 @@
 - *(storage)* pin oplog segment filename contract
 - *(backup)* assert checkpoint dirs by real partition name
 - *(storage)* regression test for capacity-scanner warm-load race
-- *(storage,modality)* G101 audit close — range_scan API + CRS dispatch + stronger exclusion
+- *(storage,modality)* G101 audit close - range_scan API + CRS dispatch + stronger exclusion
 - *(modality,storage)* reduce proptest cases for faster regression runs
 - *(query)* RYOW + legacy-mode OCC invariants, scrub task IDs
 - *(storage,query)* edge cases + dyn dispatch for G104/G105
 - *(storage)* final R164 coverage round + rustdoc cleanup
 - *(storage/coordinator)* edge cases + doctests + concurrency
-- *(storage)* page-ECC policy — builder + serde back-compat + Volatile edge
+- *(storage)* page-ECC policy - builder + serde back-compat + Volatile edge
 
-### coordinode-swarm
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-swarm-v0.4.3...coordinode-swarm-v0.5.0) - 2026-06-27
+### coordinode-swarm 0.5.0
 
 #### Added
 
@@ -2215,12 +2179,11 @@
 - extract unit tests into sibling files (swarm)
 - extract unit tests into sibling test files
 
-### coordinode-test-fixtures
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-test-fixtures-v0.4.3...coordinode-test-fixtures-v0.5.0) - 2026-06-27
+### coordinode-test-fixtures 0.5.0
 
 #### Added
 
-- *(test-fixtures)* new crate — engine_for_logic / engine_for_disk / engine_for_memory dual-FS test fixture
+- *(test-fixtures)* new crate - engine_for_logic / engine_for_disk / engine_for_memory dual-FS test fixture
 
 #### Performance
 
@@ -2229,24 +2192,23 @@
 #### Refactored
 
 - extract unit tests into sibling files (client, bench, cluster, s3, test-fixtures)
-- *(query/tests)* R166 migration — 4 query test files on dual-FS fixture
+- *(query/tests)* R166 migration - 4 query test files on dual-FS fixture
 
 #### Testing
 
-- *(test-fixtures)* audit closure — edge cases + doctest + CI matrix verification
+- *(test-fixtures)* audit closure - edge cases + doctest + CI matrix verification
 
-### coordinode-timeseries
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-timeseries-v0.4.3...coordinode-timeseries-v0.5.0) - 2026-06-27
+### coordinode-timeseries 0.5.0
 
 #### Added
 
-- *(timeseries)* ε-policy — opt-in WITH BITEMPORAL via split write entry points (β: Cypher paused)
-- *(timeseries)* close G103 #3 Gap #4 — PersistentMonotonicHlcClock with engine-backed restart monotonicity
-- *(modality,timeseries)* G103 sub-system #3 — bitemporal __ingestion_ts__ axis
-- *(modality,timeseries)* G103 sub-system #4 — overflow compactor primitives
-- *(timeseries)* G103 slice C — Tier 3 overflow routing + background compactor
-- *(timeseries)* G103 slice B — Tier 2 recently-closed LRU + reopen path
-- *(timeseries)* new crate coordinode-timeseries (G103 slice A — BucketCatalog + Tier 1 buffer)
+- *(timeseries)* ε-policy - opt-in WITH BITEMPORAL via split write entry points (β: Cypher paused)
+- *(timeseries)* close G103 #3 Gap #4 - PersistentMonotonicHlcClock with engine-backed restart monotonicity
+- *(modality,timeseries)* G103 sub-system #3 - bitemporal __ingestion_ts__ axis
+- *(modality,timeseries)* G103 sub-system #4 - overflow compactor primitives
+- *(timeseries)* G103 slice C - Tier 3 overflow routing + background compactor
+- *(timeseries)* G103 slice B - Tier 2 recently-closed LRU + reopen path
+- *(timeseries)* new crate coordinode-timeseries (G103 slice A - BucketCatalog + Tier 1 buffer)
 
 #### Refactored
 
@@ -2256,10 +2218,9 @@
 
 #### Testing
 
-- *(timeseries)* G103 #3 audit closure — backfill on compact, edge case tests, restart-monotonicity gap documented
+- *(timeseries)* G103 #3 audit closure - backfill on compact, edge case tests, restart-monotonicity gap documented
 
-### coordinode-vector
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-vector-v0.4.3...coordinode-vector-v0.5.0) - 2026-06-27
+### coordinode-vector 0.5.0
 
 #### Added
 
@@ -2290,35 +2251,35 @@
 - *(vector)* RaBitQ supports any dim via internal padding to next mult of 64
 - *(vector)* wire Extended-RaBitQ 2/3/4-bit through HnswIndex
 - *(vector)* Extended-RaBitQ 2/3/4-bit codec primitive
-- *(vector)* LsmVectorTier — production binding of VectorTierStorage
+- *(vector)* LsmVectorTier - production binding of VectorTierStorage
 - *(vector)* VectorTierStorage trait + write hooks in HnswIndex (ADR-033)
 - *(vector)* set_rabitq_params for segment reload + serde round-trip tests
 - *(vector)* wire RaBitQ codec into HNSW search hot path
 - *(vector)* RaBitQ codec foundation + popcount distance kernel
 - *(vector)* AtomicU64-packed entry-point + CAS-loop promotion
-- *(vector)* C3 day 4 — prune-pass restores recall, insert_batch wired to parallel apply
-- *(vector)* C3 day 3 — apply_insert_plans_parallel (opt-in, lossy)
-- *(vector)* C3 day 2 — &self write helpers + cas_add_neighbour_to
-- *(vector)* C3 day 1 — cas_append + replace primitives
-- *(vector)* C2 day 3 — insert_batch vs serial criterion bench
-- *(vector)* C2 day 2 — insert_batch with rayon parallel planning
-- *(vector)* C2 day 1 — split insert into compute_insert_plan + apply
-- *(vector)* C1 day 7 — parallel-search QPS bench
-- *(vector)* C1 day 6 — HnswConfig::max_elements drives pre-allocation
-- *(vector)* C1 day 5 — atomic mirror is the sole storage
-- *(vector)* C1 day 4 — granular dual-write helpers for atomic mirror
-- *(vector)* C1 day 3b — search read path now lock-free
-- *(vector)* C1 day 3a — auto-sync atomic mirror after every insert/update
-- *(vector)* C1 day 2 — atomic-mirror field + manual sync helper
+- *(vector)* C3 day 4 - prune-pass restores recall, insert_batch wired to parallel apply
+- *(vector)* C3 day 3 - apply_insert_plans_parallel (opt-in, lossy)
+- *(vector)* C3 day 2 - &self write helpers + cas_add_neighbour_to
+- *(vector)* C3 day 1 - cas_append + replace primitives
+- *(vector)* C2 day 3 - insert_batch vs serial criterion bench
+- *(vector)* C2 day 2 - insert_batch with rayon parallel planning
+- *(vector)* C2 day 1 - split insert into compute_insert_plan + apply
+- *(vector)* C1 day 7 - parallel-search QPS bench
+- *(vector)* C1 day 6 - HnswConfig::max_elements drives pre-allocation
+- *(vector)* C1 day 5 - atomic mirror is the sole storage
+- *(vector)* C1 day 4 - granular dual-write helpers for atomic mirror
+- *(vector)* C1 day 3b - search read path now lock-free
+- *(vector)* C1 day 3a - auto-sync atomic mirror after every insert/update
+- *(vector)* C1 day 2 - atomic-mirror field + manual sync helper
 - *(vector)* IndexHealthState + HnswBuildScheduler (rebalance prereqs)
-- *(vector)* C1 day 1 — AtomicNeighbourList<N> scaffold for lock-free HNSW
-- *(bench)* R700+R704 — coordinode-bench harness + ann-benchmarks SIFT1M adapter (Stage 1)
-- CoordiNode v0.1.0-alpha.1 — graph + vector + full-text engine
+- *(vector)* C1 day 1 - AtomicNeighbourList<N> scaffold for lock-free HNSW
+- *(bench)* R700+R704 - coordinode-bench harness + ann-benchmarks SIFT1M adapter (Stage 1)
+- CoordiNode v0.1.0-alpha.1 - graph + vector + full-text engine
 
 #### Documentation
 
 - *(vector)* bulk_build path and follow-up boundary
-- *(vector)* C3 day 6 — record measured 14.6× speedup in bench doc
+- *(vector)* C3 day 6 - record measured 14.6× speedup in bench doc
 
 #### Fixed
 
@@ -2389,8 +2350,8 @@
 - *(vector)* criterion harness for RaBitQ popcount kernel
 - *(vector)* SQ8 dequantize into reusable scratch + SIMD
 - *(vector)* cache query L2 norm per HNSW search (cosine path)
-- *(vector)* C3 day 5b — parallel prune-pass via rayon
-- *(vector)* C3 day 5a — dedupe backfill before prune-pass
+- *(vector)* C3 day 5b - parallel prune-pass via rayon
+- *(vector)* C3 day 5a - dedupe backfill before prune-pass
 
 #### Refactored
 
@@ -2416,11 +2377,10 @@
 #### Revert
 
 - move per-label vector shard routing out of CE
-- *(vector)* undo "flat contiguous vector store" — bench regressed
-- *(vector)* undo "prefetch full vector range" — bench regressed
+- *(vector)* undo "flat contiguous vector store" - bench regressed
+- *(vector)* undo "prefetch full vector range" - bench regressed
 
-### coordinode-wire
-## [0.5.0](https://github.com/structured-world/coordinode/compare/coordinode-wire-v0.4.3...coordinode-wire-v0.5.0) - 2026-06-27
+### coordinode-wire 0.5.0
 
 #### Added
 
@@ -2438,10 +2398,9 @@
 
 ---
 
-## v0.4.3 — 2026-05-17
+## v0.4.3 - 2026-05-17
 
-### coordinode-core
-## [0.4.3](https://github.com/structured-world/coordinode/compare/v0.4.2...v0.4.3) - 2026-05-17
+### coordinode-core 0.4.3
 
 #### Added
 
@@ -2449,8 +2408,7 @@
 - *(identity,placement,consistency)* u20/u44 NodeId, schema_revision, gRPC concern wire-through
 - *(temporal)* bitemporal edge types with valid-time semantics
 
-### coordinode-embed
-## [0.4.3](https://github.com/structured-world/coordinode/compare/v0.4.2...v0.4.3) - 2026-05-17
+### coordinode-embed 0.4.3
 
 #### Added
 
@@ -2472,8 +2430,7 @@
 - *(merge-nodes)* cover no-transfer drop, temporal edges, multi-type, composability
 - *(merge-nodes)* close STRICT extra-map gap + composability/index coverage
 
-### coordinode-query
-## [0.4.3](https://github.com/structured-world/coordinode/compare/v0.4.2...v0.4.3) - 2026-05-17
+### coordinode-query 0.4.3
 
 #### Added
 
@@ -2490,8 +2447,7 @@
 
 - *(merge-nodes)* close STRICT extra-map gap + composability/index coverage
 
-### coordinode-server
-## [0.4.3](https://github.com/structured-world/coordinode/compare/v0.4.2...v0.4.3) - 2026-05-17
+### coordinode-server 0.4.3
 
 #### Added
 
@@ -2499,17 +2455,15 @@
 
 ---
 
-## v0.4.2 — 2026-05-11
+## v0.4.2 - 2026-05-11
 
-### coordinode-raft
-## [0.4.2](https://github.com/structured-world/coordinode/compare/v0.4.1...v0.4.2) - 2026-05-11
+### coordinode-raft 0.4.2
 
 #### Fixed
 
 - *(storage)* gate oplog purge on cross-partition flush watermark
 
-### coordinode-storage
-## [0.4.2](https://github.com/structured-world/coordinode/compare/v0.4.1...v0.4.2) - 2026-05-11
+### coordinode-storage 0.4.2
 
 #### Added
 
@@ -2521,18 +2475,16 @@
 
 ---
 
-## v0.4.1 — 2026-04-18
+## v0.4.1 - 2026-04-18
 
-### coordinode-core
-## [0.4.1](https://github.com/structured-world/coordinode/compare/v0.4.0...v0.4.1) - 2026-04-18
+### coordinode-core 0.4.1
 
 #### Added
 
 - *(query)* add read_consistency knob + planner auto-promotion (R-SNAP1)
 - *(txn)* add per-shard MaxAssignedWatermark + WaitForTs primitive
 
-### coordinode-embed
-## [0.4.1](https://github.com/structured-world/coordinode/compare/v0.4.0...v0.4.1) - 2026-04-18
+### coordinode-embed 0.4.1
 
 #### Added
 
@@ -2540,8 +2492,7 @@
 - *(query)* add read_consistency knob + planner auto-promotion (R-SNAP1)
 - *(query)* expose applied_watermark handle on ExecutionContext
 
-### coordinode-query
-## [0.4.1](https://github.com/structured-world/coordinode/compare/v0.4.0...v0.4.1) - 2026-04-18
+### coordinode-query 0.4.1
 
 #### Added
 
@@ -2553,15 +2504,13 @@
 
 - *(query)* R-SNAP1 exact mode + AS OF target + hint docs
 
-### coordinode-raft
-## [0.4.1](https://github.com/structured-world/coordinode/compare/v0.4.0...v0.4.1) - 2026-04-18
+### coordinode-raft 0.4.1
 
 #### Added
 
 - *(raft)* wire MaxAssignedWatermark into apply_proposal path
 
-### coordinode-search
-## [0.4.1](https://github.com/structured-world/coordinode/compare/v0.4.0...v0.4.1) - 2026-04-18
+### coordinode-search 0.4.1
 
 #### Added
 
@@ -2569,17 +2518,15 @@
 
 ---
 
-## v0.4.0 — 2026-04-17
+## v0.4.0 - 2026-04-17
 
-### coordinode-embed
-## [0.4.0](https://github.com/structured-world/coordinode/compare/v0.3.20...v0.4.0) - 2026-04-17
+### coordinode-embed 0.4.0
 
 #### Fixed
 
 - *(query)* text_match() hard-fails on missing FT-index
 
-### coordinode-query
-## [0.4.0](https://github.com/structured-world/coordinode/compare/v0.3.20...v0.4.0) - 2026-04-17
+### coordinode-query 0.4.0
 
 #### Added
 
@@ -2600,8 +2547,7 @@
 - *(query)* add regression tests for text_match hard-fail on missing FT-index
 - *(query)* cover rrf_score edge cases missed in the initial PR
 
-### coordinode-server
-## [0.4.0](https://github.com/structured-world/coordinode/compare/v0.3.20...v0.4.0) - 2026-04-17
+### coordinode-server 0.4.0
 
 #### Added
 
@@ -2615,7 +2561,7 @@
 
 #### Added
 
-- *(query)* `rrf_score([method_exprs…], {vector: …, text: …})` — Reciprocal Rank Fusion Cypher function. N-method rank fusion with competition ranks, `k=60` (IR standard, non-tunable), per-method direction from HNSW metric config. Supports node vectors, edge vectors (brute-force), and BM25 text methods.
+- *(query)* `rrf_score([method_exprs…], {vector: …, text: …})` - Reciprocal Rank Fusion Cypher function. N-method rank fusion with competition ranks, `k=60` (IR standard, non-tunable), per-method direction from HNSW metric config. Supports node vectors, edge vectors (brute-force), and BM25 text methods.
 
 ### coordinode-server
 
@@ -2623,29 +2569,26 @@
 
 - *(proto)* `TextService.HybridTextVectorSearch` RPC, `HybridTextVectorSearchRequest` / `HybridTextVectorSearchResponse` / `HybridResult` messages, `POST /v1/query/text/hybrid` HTTP endpoint. Superseded by the general-purpose Cypher function `rrf_score([methods…], {vector, text})` invoked via `CypherService.ExecuteCypher`. The Cypher form supports N methods (not 2), edge vectors, configurable HNSW metrics, and composes with MATCH / WHERE / ORDER BY / LIMIT in a single plan. Callers: replace the RPC with an equivalent Cypher query.
 
-## v0.3.20 — 2026-04-17
+## v0.3.20 - 2026-04-17
 
-### coordinode-core
-## [0.3.20](https://github.com/structured-world/coordinode/compare/v0.3.19...v0.3.20) - 2026-04-17
-
-#### Added
-
-- *(query)* ATTACH DOCUMENT — demote graph node to nested DOCUMENT property
-
-### coordinode-query
-## [0.3.20](https://github.com/structured-world/coordinode/compare/v0.3.19...v0.3.20) - 2026-04-17
+### coordinode-core 0.3.20
 
 #### Added
 
-- *(query)* ATTACH DOCUMENT — demote graph node to nested DOCUMENT property
-- *(query)* DETACH DOCUMENT — promote nested property to graph node + edge
+- *(query)* ATTACH DOCUMENT - demote graph node to nested DOCUMENT property
+
+### coordinode-query 0.3.20
+
+#### Added
+
+- *(query)* ATTACH DOCUMENT - demote graph node to nested DOCUMENT property
+- *(query)* DETACH DOCUMENT - promote nested property to graph node + edge
 
 ---
 
-## v0.3.19 — 2026-04-17
+## v0.3.19 - 2026-04-17
 
-### coordinode-query
-## [0.3.19](https://github.com/structured-world/coordinode/compare/v0.3.18...v0.3.19) - 2026-04-17
+### coordinode-query 0.3.19
 
 #### Fixed
 
@@ -2653,28 +2596,25 @@
 
 ---
 
-## v0.3.18 — 2026-04-16
+## v0.3.18 - 2026-04-16
 
-### coordinode-raft
-## [0.3.18](https://github.com/structured-world/coordinode/compare/v0.3.17...v0.3.18) - 2026-04-16
+### coordinode-raft 0.3.18
 
 #### Added
 
-- *(server)* R150 — monolithic binary --mode=full, shared :7080, NodeInfoLayer
+- *(server)* R150 - monolithic binary --mode=full, shared :7080, NodeInfoLayer
 
 #### Fixed
 
 - *(raft)* recover last_log_id from oplog on unclean shutdown restart
 
-### coordinode-server
-## [0.3.18](https://github.com/structured-world/coordinode/compare/v0.3.17...v0.3.18) - 2026-04-16
+### coordinode-server 0.3.18
 
 #### Added
 
-- *(server)* R150 — monolithic binary --mode=full, shared :7080, NodeInfoLayer
+- *(server)* R150 - monolithic binary --mode=full, shared :7080, NodeInfoLayer
 
-### coordinode-storage
-## [0.3.18](https://github.com/structured-world/coordinode/compare/v0.3.17...v0.3.18) - 2026-04-16
+### coordinode-storage 0.3.18
 
 #### Fixed
 
@@ -2682,24 +2622,21 @@
 
 ---
 
-## v0.3.17 — 2026-04-15
+## v0.3.17 - 2026-04-15
 
-### coordinode-core
-## [0.3.17](https://github.com/structured-world/coordinode/compare/v0.3.16...v0.3.17) - 2026-04-15
+### coordinode-core 0.3.17
 
 #### Added
 
 - *(core)* implement HybridLogicalClock for CE timestamps (R143)
 
-### coordinode-embed
-## [0.3.17](https://github.com/structured-world/coordinode/compare/v0.3.16...v0.3.17) - 2026-04-15
+### coordinode-embed 0.3.17
 
 #### Fixed
 
 - *(executor)* RETURN must not expose SET value when write was not applied
 
-### coordinode-query
-## [0.3.17](https://github.com/structured-world/coordinode/compare/v0.3.16...v0.3.17) - 2026-04-15
+### coordinode-query 0.3.17
 
 #### Added
 
@@ -2714,8 +2651,7 @@
 - *(query)* verify is_write() classifies all DDL clause variants
 - *(query)* add unit tests for Query::is_write() AST predicate
 
-### coordinode-server
-## [0.3.17](https://github.com/structured-world/coordinode/compare/v0.3.16...v0.3.17) - 2026-04-15
+### coordinode-server 0.3.17
 
 #### Added
 
@@ -2724,10 +2660,9 @@
 
 ---
 
-## v0.3.16 — 2026-04-15
+## v0.3.16 - 2026-04-15
 
-### coordinode-server
-## [0.3.16](https://github.com/structured-world/coordinode/compare/v0.3.15...v0.3.16) - 2026-04-15
+### coordinode-server 0.3.16
 
 #### Added
 
@@ -2736,25 +2671,22 @@
 
 ---
 
-## v0.3.15 — 2026-04-15
+## v0.3.15 - 2026-04-15
 
-### coordinode-core
-## [0.3.15](https://github.com/structured-world/coordinode/compare/v0.3.14...v0.3.15) - 2026-04-15
+### coordinode-core 0.3.15
 
 #### Performance
 
 - *(codec)* switch UidEncoder/Decoder to StreamVByte Coder1234
 - *(query)* reuse adjacency key buffer in graph traversal hot path
 
-### coordinode-embed
-## [0.3.15](https://github.com/structured-world/coordinode/compare/v0.3.14...v0.3.15) - 2026-04-15
+### coordinode-embed 0.3.15
 
 #### Fixed
 
 - *(query)* support query parameters in percentileCont/percentileDisc
 
-### coordinode-query
-## [0.3.15](https://github.com/structured-world/coordinode/compare/v0.3.14...v0.3.15) - 2026-04-15
+### coordinode-query 0.3.15
 
 #### Fixed
 
@@ -2766,8 +2698,7 @@
 
 - *(query)* reuse adjacency key buffer in graph traversal hot path
 
-### coordinode-storage
-## [0.3.15](https://github.com/structured-world/coordinode/compare/v0.3.14...v0.3.15) - 2026-04-15
+### coordinode-storage 0.3.15
 
 #### Performance
 
@@ -2775,10 +2706,9 @@
 
 ---
 
-## v0.3.13 — 2026-04-14
+## v0.3.13 - 2026-04-14
 
-### coordinode-embed
-## [0.3.13](https://github.com/structured-world/coordinode/compare/v0.3.12...v0.3.13) - 2026-04-14
+### coordinode-embed 0.3.13
 
 #### Fixed
 
@@ -2786,8 +2716,7 @@
 - *(query)* update B-tree index on SET property
 - *(query)* clean up B-tree index entries on node DELETE/DETACH DELETE
 
-### coordinode-query
-## [0.3.13](https://github.com/structured-world/coordinode/compare/v0.3.12...v0.3.13) - 2026-04-14
+### coordinode-query 0.3.13
 
 #### Fixed
 
@@ -2797,10 +2726,9 @@
 
 ---
 
-## v0.3.12 — 2026-04-14
+## v0.3.12 - 2026-04-14
 
-### coordinode-raft
-## [0.3.12](https://github.com/structured-world/coordinode/compare/v0.3.11...v0.3.12) - 2026-04-14
+### coordinode-raft 0.3.12
 
 #### Added
 
@@ -2811,8 +2739,7 @@
 - *(raft)* add 3-node pruning decommission test as final R091c entry
 - *(cluster)* R091c decommission protocol test suite
 
-### coordinode-server
-## [0.3.12](https://github.com/structured-world/coordinode/compare/v0.3.11...v0.3.12) - 2026-04-14
+### coordinode-server 0.3.12
 
 #### Added
 
@@ -2820,24 +2747,21 @@
 
 ---
 
-## v0.3.11 — 2026-04-14
+## v0.3.11 - 2026-04-14
 
-### coordinode-core
-## [0.3.11](https://github.com/structured-world/coordinode/compare/v0.3.10...v0.3.11) - 2026-04-14
-
-#### Added
-
-- *(storage)* implement standalone WAL for crash durability
-
-### coordinode-embed
-## [0.3.11](https://github.com/structured-world/coordinode/compare/v0.3.10...v0.3.11) - 2026-04-14
+### coordinode-core 0.3.11
 
 #### Added
 
 - *(storage)* implement standalone WAL for crash durability
 
-### coordinode-raft
-## [0.3.11](https://github.com/structured-world/coordinode/compare/v0.3.10...v0.3.11) - 2026-04-14
+### coordinode-embed 0.3.11
+
+#### Added
+
+- *(storage)* implement standalone WAL for crash durability
+
+### coordinode-raft 0.3.11
 
 #### Added
 
@@ -2848,8 +2772,7 @@
 
 - *(cluster)* rollback Learner on change_membership failure in monitor_and_promote
 
-### coordinode-server
-## [0.3.11](https://github.com/structured-world/coordinode/compare/v0.3.10...v0.3.11) - 2026-04-14
+### coordinode-server 0.3.11
 
 #### Added
 
@@ -2860,15 +2783,13 @@
 
 - *(server)* add CLI unit tests for AdminNodeJoin parsing
 
-### coordinode-storage
-## [0.3.11](https://github.com/structured-world/coordinode/compare/v0.3.10...v0.3.11) - 2026-04-14
+### coordinode-storage 0.3.11
 
 #### Added
 
 - *(storage)* implement standalone WAL for crash durability
 
-### coordinode-vector
-## [0.3.11](https://github.com/structured-world/coordinode/compare/v0.3.10...v0.3.11) - 2026-04-14
+### coordinode-vector 0.3.11
 
 #### Fixed
 
@@ -2876,14 +2797,13 @@
 
 ---
 
-## v0.3.10 — 2026-04-14
+## v0.3.10 - 2026-04-14
 
-### coordinode-raft
-## [0.3.10](https://github.com/structured-world/coordinode/compare/v0.3.9...v0.3.10) - 2026-04-14
+### coordinode-raft 0.3.10
 
 #### Added
 
-- *(raft)* R141 follower reads — ReadFence, SyncPerBatch persist fix
+- *(raft)* R141 follower reads - ReadFence, SyncPerBatch persist fix
 
 #### Fixed
 
@@ -2891,22 +2811,20 @@
 
 #### Testing
 
-- *(raft)* R141 complete test coverage — follower scenarios + StaleReplica
+- *(raft)* R141 complete test coverage - follower scenarios + StaleReplica
 
-### coordinode-server
-## [0.3.10](https://github.com/structured-world/coordinode/compare/v0.3.9...v0.3.10) - 2026-04-14
+### coordinode-server 0.3.10
 
 #### Added
 
-- *(raft)* R141 follower reads — ReadFence, SyncPerBatch persist fix
+- *(raft)* R141 follower reads - ReadFence, SyncPerBatch persist fix
 
 #### Testing
 
 - *(client,server)* cover params+source gRPC branch and invalid endpoint
 - *(server)* add gRPC source tracking round-trip test
 
-### coordinode-storage
-## [0.3.10](https://github.com/structured-world/coordinode/compare/v0.3.9...v0.3.10) - 2026-04-14
+### coordinode-storage 0.3.10
 
 #### Performance
 
@@ -2914,24 +2832,21 @@
 
 ---
 
-## v0.3.9 — 2026-04-13
+## v0.3.9 - 2026-04-13
 
-### coordinode-embed
-## [0.3.9](https://github.com/structured-world/coordinode/compare/v0.3.8...v0.3.9) - 2026-04-13
-
-#### Performance
-
-- *(executor)* cache schema label per node per statement (R-API6)
-
-### coordinode-query
-## [0.3.9](https://github.com/structured-world/coordinode/compare/v0.3.8...v0.3.9) - 2026-04-13
+### coordinode-embed 0.3.9
 
 #### Performance
 
 - *(executor)* cache schema label per node per statement (R-API6)
 
-### coordinode-search
-## [0.3.9](https://github.com/structured-world/coordinode/compare/v0.3.8...v0.3.9) - 2026-04-13
+### coordinode-query 0.3.9
+
+#### Performance
+
+- *(executor)* cache schema label per node per statement (R-API6)
+
+### coordinode-search 0.3.9
 
 #### Added
 
@@ -2942,8 +2857,7 @@
 - *(search)* direct unit tests for search_with_highlights_fuzzy and search_with_highlights_and_language
 - *(text-search)* Ukrainian e2e + multi-property merge coverage
 
-### coordinode-server
-## [0.3.9](https://github.com/structured-world/coordinode/compare/v0.3.8...v0.3.9) - 2026-04-13
+### coordinode-server 0.3.9
 
 #### Added
 
@@ -2961,31 +2875,28 @@
 
 #### Testing
 
-- *(e2e)* LangChain gRPC API correctness — all search modalities
+- *(e2e)* LangChain gRPC API correctness - all search modalities
 - *(text-search)* Ukrainian e2e + multi-property merge coverage
 - *(text-search)* verify explicit language search routes to Path C
 - *(schema)* add DocFunction cache test + fix clippy in R-API6
 
 ---
 
-## v0.3.8 — 2026-04-13
+## v0.3.8 - 2026-04-13
 
-### coordinode-core
-## [0.3.8](https://github.com/structured-world/coordinode/compare/v0.3.7...v0.3.8) - 2026-04-13
-
-#### Added
-
-- *(schema)* R-API5 schema modes STRICT/VALIDATED/FLEXIBLE
-
-### coordinode-embed
-## [0.3.8](https://github.com/structured-world/coordinode/compare/v0.3.7...v0.3.8) - 2026-04-13
+### coordinode-core 0.3.8
 
 #### Added
 
 - *(schema)* R-API5 schema modes STRICT/VALIDATED/FLEXIBLE
 
-### coordinode-query
-## [0.3.8](https://github.com/structured-world/coordinode/compare/v0.3.7...v0.3.8) - 2026-04-13
+### coordinode-embed 0.3.8
+
+#### Added
+
+- *(schema)* R-API5 schema modes STRICT/VALIDATED/FLEXIBLE
+
+### coordinode-query 0.3.8
 
 #### Added
 
@@ -2998,8 +2909,7 @@
 
 - *(executor)* schema enforcement for PropertyPath, DocFunction, map SET ops
 
-### coordinode-server
-## [0.3.8](https://github.com/structured-world/coordinode/compare/v0.3.7...v0.3.8) - 2026-04-13
+### coordinode-server 0.3.8
 
 #### Added
 
@@ -3020,10 +2930,9 @@
 
 ---
 
-## v0.3.6 — 2026-04-13
+## v0.3.6 - 2026-04-13
 
-### coordinode-embed
-## [0.3.6](https://github.com/structured-world/coordinode/compare/v0.3.5...v0.3.6) - 2026-04-13
+### coordinode-embed 0.3.6
 
 #### Added
 
@@ -3035,8 +2944,7 @@
 - *(embed)* full integration coverage for CREATE/DROP VECTOR INDEX (R-API3)
 - *(embed)* complete R-API3 integration test suite for CREATE/DROP VECTOR INDEX
 
-### coordinode-query
-## [0.3.6](https://github.com/structured-world/coordinode/compare/v0.3.5...v0.3.6) - 2026-04-13
+### coordinode-query 0.3.6
 
 #### Added
 
@@ -3045,17 +2953,15 @@
 
 ---
 
-## v0.3.5 — 2026-04-13
+## v0.3.5 - 2026-04-13
 
-### coordinode-embed
-## [0.3.5](https://github.com/structured-world/coordinode/compare/v0.3.4...v0.3.5) - 2026-04-13
+### coordinode-embed 0.3.5
 
 #### Added
 
 - *(query)* implement CREATE/DROP INDEX Cypher DDL with IndexScan optimizer
 
-### coordinode-query
-## [0.3.5](https://github.com/structured-world/coordinode/compare/v0.3.4...v0.3.5) - 2026-04-13
+### coordinode-query 0.3.5
 
 #### Added
 
@@ -3063,10 +2969,9 @@
 
 ---
 
-## v0.3.4 — 2026-04-12
+## v0.3.4 - 2026-04-12
 
-### coordinode-core
-## [0.3.4](https://github.com/structured-world/coordinode/compare/v0.3.3...v0.3.4) - 2026-04-12
+### coordinode-core 0.3.4
 
 #### Fixed
 
@@ -3076,8 +2981,7 @@
 
 - *(core)* add roundtrip test for ComputedSpec::Ttl with target_field=Some
 
-### coordinode-embed
-## [0.3.4](https://github.com/structured-world/coordinode/compare/v0.3.3...v0.3.4) - 2026-04-12
+### coordinode-embed 0.3.4
 
 #### Added
 
@@ -3089,16 +2993,15 @@
 
 #### Testing
 
-- *(schema)* add reopen test — unique constraint enforced after load_all
+- *(schema)* add reopen test - unique constraint enforced after load_all
 - *(embed)* add integration test for TTL Subtree+target_field (G068)
 
-### coordinode-query
-## [0.3.4](https://github.com/structured-world/coordinode/compare/v0.3.3...v0.3.4) - 2026-04-12
+### coordinode-query 0.3.4
 
 #### Added
 
 - *(schema)* wire create_label/create_edge_type to persist schemas with unique index enforcement
-- *(query)* add MERGE ALL — Cartesian-product relationship upsert
+- *(query)* add MERGE ALL - Cartesian-product relationship upsert
 
 #### Fixed
 
@@ -3113,8 +3016,7 @@
 
 - *(semantic)* add WITH * regression tests for analyze_with fix
 
-### coordinode-server
-## [0.3.4](https://github.com/structured-world/coordinode/compare/v0.3.3...v0.3.4) - 2026-04-12
+### coordinode-server 0.3.4
 
 #### Added
 
