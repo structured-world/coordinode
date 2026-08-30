@@ -11958,3 +11958,88 @@ fn unwind_double_correlated_endpoint_create_links_correct_pair() {
         "pid 2 has no out-edges"
     );
 }
+
+/// `SET r += {map}` and `SET r = {map}` must write relationship properties.
+///
+/// Both variants used to reach a node-only path that expects the variable to
+/// carry a node id. A relationship variable carries its type instead, so the
+/// arm fell through its `continue` and the statement reported success while
+/// writing nothing. Silent, and it took every property with it: the LangChain
+/// and LlamaIndex adapters upsert relationship properties exactly this way.
+#[test]
+fn test_set_map_assign_on_relationship_persists_properties() {
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    run_cypher_with_alloc(
+        "CREATE (:Person {name: 'Alice'}), (:Person {name: 'Bob'}) RETURN 1",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    run_cypher_with_alloc(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
+         CREATE (a)-[:KNOWS {since: 2020}]->(b) RETURN 1",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // Merge: adds `weight`, leaves `since` alone.
+    run_cypher_with_alloc(
+        "MATCH (:Person {name: 'Alice'})-[r:KNOWS]->(:Person {name: 'Bob'}) \
+         SET r += {weight: 7} RETURN 1",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    let merged = run_cypher_with_alloc(
+        "MATCH (:Person {name: 'Alice'})-[r:KNOWS]->(:Person {name: 'Bob'}) \
+         RETURN r.weight AS w, r.since AS s",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(merged.len(), 1);
+    assert_eq!(
+        merged[0].get("w"),
+        Some(&Value::Int(7)),
+        "SET r += {{map}} must store the new property"
+    );
+    assert_eq!(
+        merged[0].get("s"),
+        Some(&Value::Int(2020)),
+        "SET r += {{map}} must leave properties outside the map alone"
+    );
+
+    // Replace: keeps only what the map names.
+    run_cypher_with_alloc(
+        "MATCH (:Person {name: 'Alice'})-[r:KNOWS]->(:Person {name: 'Bob'}) \
+         SET r = {weight: 9} RETURN 1",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    let replaced = run_cypher_with_alloc(
+        "MATCH (:Person {name: 'Alice'})-[r:KNOWS]->(:Person {name: 'Bob'}) \
+         RETURN r.weight AS w, r.since AS s",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(replaced.len(), 1);
+    assert_eq!(
+        replaced[0].get("w"),
+        Some(&Value::Int(9)),
+        "SET r = {{map}} must store the properties it names"
+    );
+    // A property the edge does not carry projects as NULL, which is how
+    // Cypher reports an absent property rather than a missing column.
+    assert_eq!(
+        replaced[0].get("s"),
+        Some(&Value::Null),
+        "SET r = {{map}} must drop properties the map omits"
+    );
+}

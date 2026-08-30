@@ -9157,15 +9157,18 @@ fn execute_update(
                 | crate::plan::SetItem::MergeProperties { variable, .. }
                 | crate::plan::SetItem::AddLabel { variable, .. } => variable,
             };
-            // Edge mutation only flows through `SetItem::Property` —
-            // `update_edge_property` is the single edgeprop-writing path.
-            // The other variants (`PropertyPath`, `DocFunction`,
-            // `MergeProperties`, `ReplaceProperties`, `AddLabel`) require
-            // `Value::Int` and silently no-op on edge variables. Snapshotting
-            // for those would fire an UPDATE trigger with `$before == $after`
-            // — semantically wrong (no mutation happened) and a needless
-            // round trip through the trigger body.
-            let is_property_mutation = matches!(item, crate::plan::SetItem::Property { .. });
+            // Edge mutation flows through `SetItem::Property` and the two
+            // map assignments. The remaining variants (`PropertyPath`,
+            // `DocFunction`, `AddLabel`) require `Value::Int` and no-op on
+            // edge variables; snapshotting those would fire an UPDATE trigger
+            // with `$before == $after`, semantically wrong (no mutation
+            // happened) and a needless round trip through the trigger body.
+            let is_property_mutation = matches!(
+                item,
+                crate::plan::SetItem::Property { .. }
+                    | crate::plan::SetItem::MergeProperties { .. }
+                    | crate::plan::SetItem::ReplaceProperties { .. }
+            );
             // Edge variable: bound to Value::String(edge_type). Snapshot the
             // current edge property map so we can fire UPDATE triggers with
             // `$before` / `$after` after the mutation lands. We probe the
@@ -9707,6 +9710,17 @@ fn execute_update(
                 }
                 crate::plan::SetItem::ReplaceProperties { variable, expr } => {
                     let map_val = eval_neutral(expr, &out_row);
+                    if let Some(Value::String(edge_type)) = out_row.get(variable).cloned() {
+                        update_edge_properties_from_map(
+                            variable,
+                            &edge_type,
+                            &map_val,
+                            EdgeMapAssign::Replace,
+                            &mut out_row,
+                            ctx,
+                        )?;
+                        continue;
+                    }
                     let node_id = match out_row.get(variable) {
                         Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                         _ => continue,
@@ -9822,6 +9836,20 @@ fn execute_update(
                 }
                 crate::plan::SetItem::MergeProperties { variable, expr } => {
                     let map_val = eval_neutral(expr, &out_row);
+                    // Relationship variables bind to Value::String(edge_type),
+                    // never to a node id, so they have to leave here: the node
+                    // path below would drop the write on the floor.
+                    if let Some(Value::String(edge_type)) = out_row.get(variable).cloned() {
+                        update_edge_properties_from_map(
+                            variable,
+                            &edge_type,
+                            &map_val,
+                            EdgeMapAssign::Merge,
+                            &mut out_row,
+                            ctx,
+                        )?;
+                        continue;
+                    }
                     let node_id = match out_row.get(variable) {
                         Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                         _ => continue,
@@ -13462,6 +13490,114 @@ fn update_edge_property(
     }
     ctx.mvcc_put_edge_props_either(edge_type, src, tgt, valid_from_for_key, &prop_map)?;
     ctx.write_stats.properties_set += 1;
+    Ok(())
+}
+
+/// Whether a map assignment keeps the properties it does not name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EdgeMapAssign {
+    /// `SET r += {map}`: named keys are written, the rest survive.
+    Merge,
+    /// `SET r = {map}`: the map becomes the whole property set.
+    Replace,
+}
+
+/// Apply `SET r += {map}` / `SET r = {map}` to a relationship.
+///
+/// Reads the edgeprop map once, applies every key, writes once, rather than
+/// paying a read-modify-write per key through [`update_edge_property`]. The
+/// guards are the same ones that path enforces: `valid_from` is part of the
+/// storage key on a temporal edge, and the metadata names are engine-owned.
+///
+/// A non-map right-hand side is a no-op: the parser only produces these items
+/// for map expressions, and a parameter that resolves to something else is
+/// the caller's mistake to see in the row, not a reason to corrupt the edge.
+fn update_edge_properties_from_map(
+    edge_variable: &str,
+    edge_type: &str,
+    map_val: &Value,
+    mode: EdgeMapAssign,
+    row: &mut Row,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    let Value::Map(map) = map_val else {
+        return Ok(());
+    };
+
+    let src_raw = match row.get(&format!("{edge_variable}.__src__")) {
+        Some(Value::Int(n)) => *n as u64,
+        _ => return Ok(()),
+    };
+    let tgt_raw = match row.get(&format!("{edge_variable}.__tgt__")) {
+        Some(Value::Int(n)) => *n as u64,
+        _ => return Ok(()),
+    };
+    let src = NodeId::from_raw(src_raw);
+    let tgt = NodeId::from_raw(tgt_raw);
+
+    let is_temporal = lookup_edge_type_temporal(edge_type, ctx)?;
+    for key in map.keys() {
+        if is_temporal && key == "valid_from" {
+            return Err(ExecutionError::Unsupported(format!(
+                "SET {edge_variable} with a map containing 'valid_from' is not \
+                 allowed on temporal edges: valid_from is part of the storage \
+                 key. DELETE the version and CREATE a new one with the updated \
+                 timestamp."
+            )));
+        }
+        if matches!(key.as_str(), "__src__" | "__tgt__" | "__type__") {
+            return Err(ExecutionError::Unsupported(format!(
+                "SET {edge_variable} with a map containing '{key}' is reserved: \
+                 '{key}' is engine-internal row metadata and cannot be assigned"
+            )));
+        }
+    }
+
+    let valid_from_for_key: Option<i64> = if is_temporal {
+        match row.get(&format!("{edge_variable}.valid_from")) {
+            Some(Value::Int(ms)) => Some(*ms),
+            _ => {
+                return Err(ExecutionError::Unsupported(format!(
+                    "SET on temporal edge '{edge_variable}': matched row is missing valid_from"
+                )));
+            }
+        }
+    } else {
+        None
+    };
+
+    let previous = ctx
+        .mvcc_get_edge_props_either(edge_type, src, tgt, valid_from_for_key)?
+        .unwrap_or_default();
+
+    let mut prop_map = match mode {
+        EdgeMapAssign::Merge => previous.clone(),
+        EdgeMapAssign::Replace => Vec::with_capacity(map.len()),
+    };
+    for (key, value) in map {
+        let field_id = ctx.interner.intern(key);
+        match prop_map.iter_mut().find(|entry| entry.0 == field_id) {
+            Some(entry) => entry.1 = value.clone(),
+            None => prop_map.push((field_id, value.clone())),
+        }
+        ctx.write_stats.properties_set += 1;
+    }
+    ctx.mvcc_put_edge_props_either(edge_type, src, tgt, valid_from_for_key, &prop_map)?;
+
+    // Keep the row in step so a RETURN in the same statement reads what was
+    // written. A replace drops the keys the map omits, so they have to read
+    // back as NULL rather than as their pre-write value.
+    if mode == EdgeMapAssign::Replace {
+        for (field_id, _) in &previous {
+            if let Some(name) = ctx.interner.resolve(*field_id) {
+                row.insert(format!("{edge_variable}.{name}"), Value::Null);
+            }
+        }
+    }
+    for (key, value) in map {
+        row.insert(format!("{edge_variable}.{key}"), value.clone());
+    }
+
     Ok(())
 }
 
