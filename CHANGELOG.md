@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.5.3 - 2026-08-30
+
+### coordinode-client 0.5.3
+
+#### Fixed
+
+- *(server)* give paths and multi-vectors their own wire type
+
+### coordinode-server 0.5.3
+
+#### Fixed
+
+- *(server)* give paths and multi-vectors their own wire type
+
+---
+
 ## v0.5.2 - 2026-08-30
 
 ### coordinode-auth 0.5.2
