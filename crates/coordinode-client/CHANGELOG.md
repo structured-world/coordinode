@@ -3,6 +3,14 @@
 All notable changes to this crate are documented in this file.
 This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
+## 0.5.3 - 2026-08-30
+
+#### Fixed
+
+- *(server)* give paths and multi-vectors their own wire type
+
+---
+
 ## 0.5.2 - 2026-08-30
 
 #### Fixed
