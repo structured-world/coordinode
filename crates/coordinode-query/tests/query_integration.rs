@@ -12127,3 +12127,109 @@ fn test_computed_group_key_survives_aggregation() {
     );
     assert_eq!(by_type[1].get("n"), Some(&Value::Int(1)));
 }
+
+/// Path elements carry their properties, so a predicate over `nodes(p)` filters.
+///
+/// `nodes(p)` hands back node ids. Binding one to a comprehension variable and
+/// reading `x.team` off it produced NULL, so `ALL(x IN nodes(p) WHERE ...)` was
+/// never true and matched nothing at all: the query returned an empty result
+/// rather than an error, which reads as "no such path" instead of "this cannot
+/// be asked". `[x IN nodes(p) | x.name]` had the same hole, a list of NULLs.
+#[test]
+fn test_path_elements_expose_their_properties() {
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    for (name, team) in [("a", "red"), ("b", "red"), ("c", "blue")] {
+        run_cypher_with_alloc(
+            &format!("CREATE (:Player {{name: '{name}', team: '{team}'}}) RETURN 1"),
+            engine,
+            &mut interner,
+            &allocator,
+        );
+    }
+    run_cypher_with_alloc(
+        "MATCH (a:Player {name: 'a'}), (b:Player {name: 'b'}) \
+         CREATE (a)-[:PASSES {count: 3}]->(b) RETURN 1",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    run_cypher_with_alloc(
+        "MATCH (b:Player {name: 'b'}), (c:Player {name: 'c'}) \
+         CREATE (b)-[:PASSES {count: 4}]->(c) RETURN 1",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // Projection: every node on the path names itself.
+    let names = run_cypher_with_alloc(
+        "MATCH p = (a:Player {name: 'a'})-[:PASSES*2]->(c:Player {name: 'c'}) \
+         RETURN [x IN nodes(p) | x.name] AS names",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(names.len(), 1, "one two-hop path");
+    assert_eq!(
+        names[0].get("names"),
+        Some(&Value::Array(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+            Value::String("c".to_string()),
+        ])),
+        "a path node must expose its properties, not a list of NULLs"
+    );
+
+    // Relationship properties travel the same way.
+    let counts = run_cypher_with_alloc(
+        "MATCH p = (a:Player {name: 'a'})-[:PASSES*2]->(c:Player {name: 'c'}) \
+         RETURN [r IN relationships(p) | r.count] AS counts",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(
+        counts[0].get("counts"),
+        Some(&Value::Array(vec![Value::Int(3), Value::Int(4)])),
+        "a path relationship must expose its properties"
+    );
+
+    // Predicate: the one-hop path stays inside the red team, the two-hop does not.
+    let same_team = run_cypher_with_alloc(
+        "MATCH p = (a:Player {name: 'a'})-[:PASSES*1..2]->(x:Player) \
+         WHERE ALL(n IN nodes(p) WHERE n.team = 'red') \
+         RETURN x.name AS name",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(
+        same_team.len(),
+        1,
+        "only a -> b stays within the red team: {same_team:?}"
+    );
+    assert_eq!(same_team[0].get("name"), Some(&Value::String("b".into())));
+
+    // And the element binding still is the node id, so id() keeps working.
+    let ids = run_cypher_with_alloc(
+        "MATCH p = (a:Player {name: 'a'})-[:PASSES*1]->(b:Player {name: 'b'}) \
+         RETURN [x IN nodes(p) | id(x)] AS ids",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    match ids[0].get("ids") {
+        Some(Value::Array(items)) => {
+            assert_eq!(items.len(), 2);
+            assert!(
+                items.iter().all(|v| matches!(v, Value::Int(_))),
+                "id() over path nodes must stay an id: {items:?}"
+            );
+        }
+        other => panic!("expected an array of ids, got {other:?}"),
+    }
+}

@@ -7524,12 +7524,72 @@ fn neutral_contains_subplan(expr: &crate::plan::expr::Expr) -> bool {
         | PExpr::CountSubplan(_)
         | PExpr::CollectSubplan { .. }
         | PExpr::PatternComprehension { .. } => true,
+        // A comprehension or quantifier binds each element of its list to a
+        // variable, and an element drawn from `nodes(p)` / `relationships(p)`
+        // is only an identity until its properties are read from storage.
+        // Evaluating those on the pure path leaves every `x.prop` NULL.
+        PExpr::ListComprehension { .. } | PExpr::ListQuantifier { .. } => true,
         PExpr::Unary { operand, .. } => neutral_contains_subplan(operand),
         PExpr::Binary { left, right, .. } => {
             neutral_contains_subplan(left) || neutral_contains_subplan(right)
         }
         _ => false,
     }
+}
+
+/// Bind one element of a path list under `var`, with its properties.
+///
+/// `nodes(p)` yields node ids and `relationships(p)` yields `{type, source,
+/// target}` maps, neither of which carries properties. A MATCH binding for the
+/// same node looks like `x` plus a `x.<prop>` column per property, so this
+/// writes that shape: the element keeps its identity (so `id(x)` still reads an
+/// id) and gains the columns a predicate or projection expects to find.
+fn bind_path_element(
+    scratch: &mut Row,
+    var: &str,
+    item: &Value,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    scratch.insert(var.to_string(), item.clone());
+    match item {
+        Value::Int(raw) => {
+            let node_id = NodeId::from_raw(*raw as u64);
+            if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
+                scratch.insert(
+                    format!("{var}.__label__"),
+                    Value::String(record.primary_label().to_string()),
+                );
+                for (field_id, value) in &record.props {
+                    if let Some(name) = ctx.interner.resolve(*field_id) {
+                        scratch.insert(format!("{var}.{name}"), value.clone());
+                    }
+                }
+            }
+        }
+        Value::Map(map) => {
+            let (Some(Value::String(edge_type)), Some(Value::Int(src)), Some(Value::Int(tgt))) =
+                (map.get("type"), map.get("source"), map.get("target"))
+            else {
+                return Ok(());
+            };
+            let (edge_type, src, tgt) = (
+                edge_type.clone(),
+                NodeId::from_raw(*src as u64),
+                NodeId::from_raw(*tgt as u64),
+            );
+            // Non-temporal key only: a path hop does not carry the valid_from
+            // that selects one version of a temporal edge.
+            if let Some(props) = ctx.mvcc_get_edge_props_either(&edge_type, src, tgt, None)? {
+                for (field_id, value) in &props {
+                    if let Some(name) = ctx.interner.resolve(*field_id) {
+                        scratch.insert(format!("{var}.{name}"), value.clone());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Evaluate a neutral expression that may contain correlated subplans, with
@@ -7561,6 +7621,63 @@ fn eval_neutral_with_storage(
             Ok(Value::Array(
                 rows.iter().map(|er| eval_neutral(map, er)).collect(),
             ))
+        }
+        PExpr::ListComprehension {
+            var,
+            list,
+            filter,
+            map,
+        } => {
+            let Value::Array(items) = eval_neutral_with_storage(list, row, ctx)? else {
+                return Ok(Value::Null);
+            };
+            let mut scratch = row.clone();
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                bind_path_element(&mut scratch, var, &item, ctx)?;
+                let keep = match filter {
+                    Some(p) => matches!(
+                        eval_neutral_with_storage(p, &scratch, ctx)?,
+                        Value::Bool(true)
+                    ),
+                    None => true,
+                };
+                if keep {
+                    out.push(match map {
+                        Some(m) => eval_neutral_with_storage(m, &scratch, ctx)?,
+                        None => item,
+                    });
+                }
+            }
+            Ok(Value::Array(out))
+        }
+        PExpr::ListQuantifier {
+            kind,
+            var,
+            list,
+            predicate,
+        } => {
+            let Value::Array(items) = eval_neutral_with_storage(list, row, ctx)? else {
+                return Ok(Value::Null);
+            };
+            let total = items.len();
+            let mut scratch = row.clone();
+            let mut true_count = 0usize;
+            for item in items {
+                bind_path_element(&mut scratch, var, &item, ctx)?;
+                if matches!(
+                    eval_neutral_with_storage(predicate, &scratch, ctx)?,
+                    Value::Bool(true)
+                ) {
+                    true_count += 1;
+                }
+            }
+            Ok(Value::Bool(match kind {
+                crate::plan::expr::Quantifier::All => true_count == total,
+                crate::plan::expr::Quantifier::Any => true_count > 0,
+                crate::plan::expr::Quantifier::None => true_count == 0,
+                crate::plan::expr::Quantifier::Single => true_count == 1,
+            }))
         }
         PExpr::Unary { op, operand } => {
             let v = eval_neutral_with_storage(operand, row, ctx)?;
