@@ -29,6 +29,17 @@ git_tag_name = "v{{ version }}"
 # Each crate gets its own subsection grouped under the version header.
 workspace_changelog = "CHANGELOG.md"
 
+# Only the commit types that reach the changelog can start a release, mirroring
+# the `commit_parsers` skip-list below. Without this, the release workflow
+# releases against itself: its final step regenerates the per-crate
+# CHANGELOG.md files and pushes that commit to main, which lands INSIDE two
+# crate directories after the tag was cut. release-plz reads a changed file
+# under a crate as unreleased work, so it opened a release PR bumping those
+# crates plus the binary that depends on them, with an empty changelog because
+# the only commit was a `chore`. That is where v0.5.5 came from with nothing in
+# it. A release still happens the moment any real change lands.
+release_commits = "^(feat|fix|perf|refactor|docs|test)"
+
 [changelog]
 commit_parsers = [
     { message = "^chore", skip = true },
