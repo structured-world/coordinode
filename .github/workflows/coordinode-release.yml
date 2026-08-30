@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+  # Re-run against the current main without inventing a commit, for when the
+  # release PR needs regenerating after a change to release-plz itself.
+  workflow_dispatch:
 
 permissions:
   contents: write
