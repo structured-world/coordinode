@@ -12358,3 +12358,71 @@ fn test_a_path_element_without_a_property_reads_null() {
         "the second hop has no fare and must not borrow the first one's"
     );
 }
+
+/// `SET` on a relationship bound by MERGE has to reach storage.
+///
+/// The statement answered with the new value and stored nothing: a read in
+/// the next statement found the property missing. Both forms were affected,
+/// and it is the shape every client library uses to upsert an edge together
+/// with its properties, so those properties were quietly dropped.
+#[test]
+fn test_set_on_a_merged_relationship_persists() {
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    run_cypher_with_alloc(
+        "CREATE (:Src {id: 'x'}), (:Dst {id: 'y'}) RETURN 1",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+
+    // Single property.
+    run_cypher_with_alloc(
+        "MATCH (a:Src {id: 'x'}), (b:Dst {id: 'y'}) \
+         MERGE (a)-[r:LINKS]->(b) SET r.single = 1 RETURN 1",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    let single = run_cypher_with_alloc(
+        "MATCH (:Src {id: 'x'})-[r:LINKS]->(:Dst {id: 'y'}) RETURN r.single AS v",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(single.len(), 1);
+    assert_eq!(
+        single[0].get("v"),
+        Some(&Value::Int(1)),
+        "SET r.prop after MERGE must survive the statement that wrote it"
+    );
+
+    // Map assignment, the shape the client libraries use.
+    run_cypher_with_alloc(
+        "MATCH (a:Src {id: 'x'}), (b:Dst {id: 'y'}) \
+         MERGE (a)-[r:LINKS]->(b) SET r += {since: 2023} RETURN 1",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    let merged = run_cypher_with_alloc(
+        "MATCH (:Src {id: 'x'})-[r:LINKS]->(:Dst {id: 'y'}) RETURN r.since AS since, r.single AS single",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(merged.len(), 1);
+    assert_eq!(
+        merged[0].get("since"),
+        Some(&Value::Int(2023)),
+        "SET r += {{map}} after MERGE must store the properties it names"
+    );
+    assert_eq!(
+        merged[0].get("single"),
+        Some(&Value::Int(1)),
+        "and must leave the property written earlier alone"
+    );
+}

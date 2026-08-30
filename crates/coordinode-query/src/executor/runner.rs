@@ -7489,15 +7489,21 @@ fn execute_merge_relationship_check(
         // Edge found and all property filters match.
         let mut row = correlated.clone();
         if let Some(ev) = edge_variable {
+            let (ep_src, ep_tgt) = match direction {
+                Direction::Outgoing | Direction::Both => (source_id, target_id),
+                Direction::Incoming => (target_id, source_id),
+            };
             row.insert(format!("{ev}.__type__"), Value::String(et.clone()));
             row.insert(ev.clone(), Value::String(et.clone()));
+            // The endpoints a later SET needs to find the edgeprop key. Without
+            // them every edge SET in the statement locates nothing and returns
+            // quietly, so `MERGE (a)-[r:T]->(b) SET r.x = 1` answered with the
+            // new value and stored none of it.
+            row.insert(format!("{ev}.__src__"), Value::Int(ep_src.as_raw() as i64));
+            row.insert(format!("{ev}.__tgt__"), Value::Int(ep_tgt.as_raw() as i64));
             // Populate stored edge properties into the result row so ON MATCH SET can
             // reference them via `r.prop_name`.
             if !edge_filters.is_empty() {
-                let (ep_src, ep_tgt) = match direction {
-                    Direction::Outgoing | Direction::Both => (source_id, target_id),
-                    Direction::Incoming => (target_id, source_id),
-                };
                 if let Some(prop_map) = ctx.mvcc_get_edge_props(et, ep_src, ep_tgt)? {
                     for (field_id, value) in prop_map {
                         if let Some(field_name) = ctx.interner.resolve(field_id) {
@@ -7824,6 +7830,10 @@ fn execute_merge_relationship_create(
     if let Some(ev) = edge_variable {
         row.insert(format!("{ev}.__type__"), Value::String(et.clone()));
         row.insert(ev.clone(), Value::String(et.clone()));
+        // Same endpoints the edgeprop key was written under, so a SET later in
+        // the statement can find the edge this MERGE just created.
+        row.insert(format!("{ev}.__src__"), Value::Int(from_id.as_raw() as i64));
+        row.insert(format!("{ev}.__tgt__"), Value::Int(to_id.as_raw() as i64));
     }
 
     // G075: store edge properties (from pattern `[r:TYPE {prop: val}]`) in EdgeProp partition.
