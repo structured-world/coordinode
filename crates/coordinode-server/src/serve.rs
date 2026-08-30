@@ -154,6 +154,7 @@ pub(crate) async fn serve(
         trigger_default_retry_attempts: _,
         trigger_default_backoff_ms: _,
         trigger_dispatch_interval_ms: _,
+        extensions: extension_config,
     } = cfg;
     let peers = if peers_vec.is_empty() {
         None
@@ -1021,6 +1022,7 @@ pub(crate) async fn serve(
         Arc::clone(&session_registry),
         routing,
         topology,
+        extension_config,
     );
 
     // Bring the node into a registered non-built-in mode before it accepts

@@ -102,10 +102,31 @@ the key is unset.
 | `trigger_default_retry_attempts` | `3` | live (setParameter) | Default total execution attempts for an AFTER COMMIT trigger that declares no `ON ERROR` clause, before its event is dead-lettered into `trigger_failures`. Per-trigger `ON ERROR RETRY n` overrides it. |
 | `trigger_default_backoff_ms` | `1000` | live (setParameter) | Default base retry backoff in ms for AFTER COMMIT triggers with no `ON ERROR` clause; per-attempt wait is `backoff * 2^attempt`. Per-trigger `WITH BACKOFF ms` overrides it. |
 | `trigger_dispatch_interval_ms` | `500` | restart | How often the leader's AFTER COMMIT dispatch worker wakes to fire due retries (it also wakes immediately on each replicated write). |
+| `extensions` | empty | restart | Settings belonging to a distribution built on top of this server; see below. |
 
 The three `live` knobs are runtime-tunable on a running database by an owner via
 the privileged setParameter surface, without a restart; the config file sets
 their startup value.
+
+### Settings for a downstream distribution
+
+`coordinode-server` can be linked as a library and extended, which is how the
+Enterprise build is assembled. Anything an extension needs to be told goes
+under `extensions`, keyed by the extension's own name:
+
+```yaml
+extensions:
+  pitr:
+    enabled: true
+    target: /var/lib/coordinode/pitr
+    interval_secs: 3600
+```
+
+The base server never reads this table: it passes each key through to whatever
+registered under that name, which parses its own shape. That is also why keys
+inside `extensions` escape the strict unknown-key check applied to the rest of
+the file, so a typo there surfaces from the extension rather than at startup.
+Running the stock build, leave the table out.
 
 ### TLS trust and self-signed certificates
 

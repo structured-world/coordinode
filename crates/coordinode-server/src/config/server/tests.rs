@@ -286,3 +286,36 @@ fn trigger_dispatch_knobs_parse_from_config_file_only() {
         std::time::Duration::from_millis(200)
     );
 }
+
+#[test]
+fn extension_settings_survive_the_unknown_key_check() {
+    // Keys the base server does not know are rejected, which is what makes a
+    // typo visible. An extension's own settings must still get through, so
+    // they live under `extensions` and are carried verbatim.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(
+        &path,
+        "node_id: 7\n\
+         extensions:\n\
+         \x20 pitr:\n\
+         \x20   enabled: true\n\
+         \x20   interval_secs: 900\n",
+    )
+    .unwrap();
+
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(c.node_id, 7);
+
+    let pitr = c.extensions.get("pitr").expect("extension key preserved");
+    assert_eq!(pitr.get("enabled").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        pitr.get("interval_secs").and_then(|v| v.as_u64()),
+        Some(900)
+    );
+
+    // The same key outside the table is still a typo, not a setting.
+    let stray = dir.path().join("stray.yaml");
+    std::fs::write(&stray, "pitr:\n  enabled: true\n").unwrap();
+    assert!(ServerConfig::load(Some(stray.to_str().unwrap())).is_err());
+}

@@ -19,6 +19,8 @@
 //! `CliOverrides` / `apply_overrides`. A knob that also gets a CLI flag (the
 //! bootstrap-critical ones) is the one added in all three places.
 
+use std::collections::BTreeMap;
+
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use serde::Deserialize;
 
@@ -181,6 +183,16 @@ pub struct ServerConfig {
     /// retries, in ms (it also wakes immediately on each applied entry). Restart
     /// to change. `None` = 500.
     pub trigger_dispatch_interval_ms: Option<u64>,
+    /// Keys belonging to whatever was registered on the [`crate::ServerBuilder`].
+    ///
+    /// The base server never reads this table; it exists so a registered
+    /// extension can carry its own settings in the same config file without
+    /// every key having to be declared here. Its contents are the extension's
+    /// business, so they escape the `deny_unknown_fields` above: a typo inside
+    /// this table surfaces where the extension parses it, not here.
+    ///
+    /// Read it through [`crate::ServerContext::extension_config`].
+    pub extensions: BTreeMap<String, serde_yaml_ng::Value>,
 }
 
 impl Default for ServerConfig {
@@ -225,6 +237,7 @@ impl Default for ServerConfig {
             trigger_default_retry_attempts: None,
             trigger_default_backoff_ms: None,
             trigger_dispatch_interval_ms: None,
+            extensions: BTreeMap::new(),
         }
     }
 }

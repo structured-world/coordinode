@@ -35,6 +35,7 @@ pub struct ServerContext {
     session_registry: Arc<coordinode_session::SessionRegistry>,
     routing: Arc<dyn ShardRouting>,
     topology: Arc<dyn ClusterTopology>,
+    extensions: BTreeMap<String, serde_yaml_ng::Value>,
 }
 
 impl ServerContext {
@@ -89,6 +90,17 @@ impl ServerContext {
     /// Cluster topology in force, as set by [`ServerBuilder::with_placement`].
     pub fn topology(&self) -> &Arc<dyn ClusterTopology> {
         &self.topology
+    }
+
+    /// The `extensions.<key>` block of the config file, if the operator wrote
+    /// one. The base server never reads this table, so a registration is free
+    /// to define whatever shape it needs under its own key.
+    ///
+    /// Returns `None` when the key is absent, which a registration should read
+    /// as "not configured" rather than an error, so one config file still
+    /// works with the extension left out.
+    pub fn extension_config(&self, key: &str) -> Option<&serde_yaml_ng::Value> {
+        self.extensions.get(key)
     }
 }
 
@@ -230,6 +242,7 @@ impl ServerContext {
         session_registry: Arc<coordinode_session::SessionRegistry>,
         routing: Arc<dyn ShardRouting>,
         topology: Arc<dyn ClusterTopology>,
+        extensions: BTreeMap<String, serde_yaml_ng::Value>,
     ) -> Self {
         Self {
             node_id,
@@ -242,6 +255,7 @@ impl ServerContext {
             session_registry,
             routing,
             topology,
+            extensions,
         }
     }
 }
