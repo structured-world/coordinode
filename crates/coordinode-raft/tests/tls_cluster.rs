@@ -121,7 +121,7 @@ async fn cluster_mtls_bootstrap_and_replicate() {
 
     // Install the pure-Rust crypto provider as the process default, exactly as
     // the server binary does at startup; tonic's TLS builders need it.
-    coordinode_wire::tls::install_ce_crypto_provider();
+    coordinode_wire::tls::install_crypto_provider(coordinode_wire::tls::rustcrypto_provider());
 
     let (ca, node_cert, node_key) = gen_node_pki();
     // Outbound dials present this node's cert and verify peers against the CA.

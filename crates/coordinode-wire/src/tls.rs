@@ -2,21 +2,27 @@
 //!
 //! Builds rustls server and client configs for the inter-node wire from PEM
 //! certificate material, with optional mutual TLS. The crypto provider is
-//! pluggable per tier: CE uses the pure-Rust [`rustls_rustcrypto`] provider
-//! (no C FFI, ADR-013); EE swaps the process default to `aws-lc-rs`. All builders
-//! here pin the provider explicitly via `*_with_provider`, so they are correct
-//! regardless of which (if any) process default is installed.
+//! chosen once at startup: the stock server picks the pure-Rust
+//! [`rustls_rustcrypto`] one (no C FFI, ADR-013), and a downstream distribution
+//! may select another, `aws-lc-rs` being the reason the seam exists. Every
+//! builder here pins the selected provider explicitly via `*_with_provider`
+//! rather than reading rustls' process default, so a stray `install_default`
+//! elsewhere in the process cannot change what the wire negotiates.
 //!
 //! Encryption is server-cert TLS on the shared `:7080` listener (covers
 //! client-to-server and intra-cluster TLS); mutual TLS is opt-in — pass a client
 //! CA to [`server_config`] (server then requires + verifies a peer cert) and a
 //! client identity to [`client_config`].
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rustls::pki_types::pem::{Error as PemError, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+
+/// Re-exported so a caller naming a provider is guaranteed to be naming this
+/// crate's rustls, not a second copy resolved elsewhere in the tree.
+pub use rustls::crypto::CryptoProvider;
 
 /// Errors building a TLS config from PEM material.
 #[derive(Debug, thiserror::Error)]
@@ -40,16 +46,37 @@ pub enum TlsError {
     Verifier(String),
 }
 
-/// The CE crypto provider: pure-Rust RustCrypto algorithms, zero C FFI.
-fn ce_provider() -> Arc<rustls::crypto::CryptoProvider> {
+/// The pure-Rust crypto provider: RustCrypto algorithms, zero C FFI.
+///
+/// What the stock server selects, and the fallback whenever nothing was
+/// selected before the first TLS config was built.
+#[must_use]
+pub fn rustcrypto_provider() -> Arc<CryptoProvider> {
     Arc::new(rustls_rustcrypto::provider())
 }
 
-/// Install the CE (pure-Rust) crypto provider as the process default. Idempotent:
-/// a no-op if a default is already installed (e.g. EE installed aws-lc-rs first).
-/// Call once at startup before building any TLS config that relies on the default.
-pub fn install_ce_crypto_provider() {
-    let _ = rustls_rustcrypto::provider().install_default();
+/// The provider every TLS config on this wire is built with.
+static SELECTED: OnceLock<Arc<CryptoProvider>> = OnceLock::new();
+
+/// Select the crypto provider for this process and install it as rustls'
+/// default, so dependencies that build their own configs agree with the wire.
+///
+/// Call once at startup, before any TLS config is built. First call wins: a
+/// later one is ignored and returns `false`, because changing the provider once
+/// connections exist would leave two halves of the process disagreeing about
+/// what was negotiated.
+pub fn install_crypto_provider(provider: Arc<CryptoProvider>) -> bool {
+    if SELECTED.set(Arc::clone(&provider)).is_err() {
+        return false;
+    }
+    let _ = provider.as_ref().clone().install_default();
+    true
+}
+
+/// The selected provider, falling back to the pure-Rust one when startup
+/// selected nothing (a unit test building a config directly, say).
+fn provider() -> Arc<CryptoProvider> {
+    SELECTED.get_or_init(rustcrypto_provider).clone()
 }
 
 /// Parse one or more PEM certificates into DER.
@@ -106,7 +133,7 @@ pub fn server_config(
 ) -> Result<ServerConfig, TlsError> {
     let certs = load_certs(cert_pem)?;
     let key = load_private_key(key_pem)?;
-    let provider = ce_provider();
+    let provider = provider();
 
     let builder = ServerConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -139,7 +166,7 @@ pub fn client_config(
     client_identity: Option<(&[u8], &[u8])>,
 ) -> Result<ClientConfig, TlsError> {
     let roots = root_store(root_ca_pem)?;
-    let provider = ce_provider();
+    let provider = provider();
 
     let builder = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()

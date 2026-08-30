@@ -165,6 +165,7 @@ pub struct ServerBuilder {
     pub(crate) background_tasks: Vec<Arc<dyn BackgroundTask>>,
     pub(crate) serve_modes: BTreeMap<String, Arc<dyn ServeModeHandler>>,
     pub(crate) placement: Option<(Arc<dyn ShardRouting>, Arc<dyn ClusterTopology>)>,
+    pub(crate) crypto_provider: Option<Arc<coordinode_wire::tls::CryptoProvider>>,
 }
 
 impl ServerBuilder {
@@ -207,6 +208,21 @@ impl ServerBuilder {
         topology: Arc<dyn ClusterTopology>,
     ) -> Self {
         self.placement = Some((routing, topology));
+        self
+    }
+
+    /// Select the TLS crypto provider for the whole process.
+    ///
+    /// Without this the server uses the pure-Rust RustCrypto provider, which
+    /// keeps the stock build free of C code. A distribution that would rather
+    /// have `aws-lc-rs` (faster, FIPS-capable, and C) selects it here; it then
+    /// covers both the inter-node wire and rustls' process default, so nothing
+    /// in the process negotiates with a different one.
+    pub fn with_crypto_provider(
+        mut self,
+        provider: Arc<coordinode_wire::tls::CryptoProvider>,
+    ) -> Self {
+        self.crypto_provider = Some(provider);
         self
     }
 

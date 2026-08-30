@@ -69,9 +69,15 @@ pub(crate) async fn serve(
     // starts; the transport codec reads it per message.
     coordinode_wire::set_wire_zstd_level(cfg.wire_compression_level);
 
-    // Install the pure-Rust TLS crypto provider as the process default so
-    // tonic's TLS builders use it (no C FFI). Must precede any TLS config.
-    coordinode_wire::tls::install_ce_crypto_provider();
+    // Select the TLS crypto provider before any TLS config is built. The stock
+    // server takes the pure-Rust one (no C FFI); a downstream distribution can
+    // have registered another on the builder.
+    coordinode_wire::tls::install_crypto_provider(
+        extensions
+            .crypto_provider
+            .clone()
+            .unwrap_or_else(coordinode_wire::tls::rustcrypto_provider),
+    );
 
     // Resolve the operational mode from the merged string value, so a
     // mode set in the config file is validated exactly like a CLI flag.
