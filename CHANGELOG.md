@@ -1,5 +1,149 @@
 # Changelog
 
+## v0.5.2 - 2026-08-30
+
+### coordinode-auth 0.5.2
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+
+### coordinode-bench 0.5.2
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+
+### coordinode-client 0.5.2
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+
+### coordinode-cluster 0.5.2
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+
+### coordinode-core 0.5.2
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+
+### coordinode-embed 0.5.2
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+
+### coordinode-modality 0.5.2
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+
+### coordinode-query 0.5.2
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+
+### coordinode-raft 0.5.2
+
+#### Added
+
+- *(wire)* let the TLS crypto provider be chosen at startup
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+- *(raft)* stop the volatile-write drain panicking off-runtime
+
+#### Testing
+
+- *(raft)* wait for the leader instead of sleeping past the election
+
+### coordinode-replicate 0.5.2
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+
+### coordinode-s3 0.5.2
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+
+### coordinode-search 0.5.2
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+
+### coordinode-server 0.5.2
+
+#### Added
+
+- *(server)* expose the server version to a wrapping distribution
+- *(wire)* let the TLS crypto provider be chosen at startup
+- *(server)* let a downstream distribution carry its own config keys
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+
+### coordinode-session 0.5.2
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+
+### coordinode-storage 0.5.2
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+- *(storage)* recover from a segment left behind by an interrupted write
+
+### coordinode-swarm 0.5.2
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+
+### coordinode-test-fixtures 0.5.2
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+
+### coordinode-timeseries 0.5.2
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+
+### coordinode-vector 0.5.2
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+
+### coordinode-wire 0.5.2
+
+#### Added
+
+- *(wire)* let the TLS crypto provider be chosen at startup
+
+#### Fixed
+
+- *(ci)* teach the changelog splitter the current heading layout
+
+---
+
 ## v0.5.1 - 2026-08-29
 
 ### coordinode-auth 0.5.1
