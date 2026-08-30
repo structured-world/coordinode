@@ -4286,17 +4286,21 @@ fn trigger_before_commit_explicit_delete_temporal_edge_fires_per_version() {
     }
 }
 
-/// `SET r += {...}` on an edge variable is a silent no-op in the current
-/// executor (the MergeProperties SET arm requires `Value::Int` and skips
-/// edge variables). The UPDATE trigger MUST NOT fire for a SET that did
-/// not mutate the edge.
+/// `SET r += {...}` mutates the edge, so the UPDATE trigger fires and sees
+/// the property map on both sides of the write.
+///
+/// This once asserted the opposite, because that SET arm read the variable
+/// as a node id and quietly wrote nothing on a relationship: no mutation, so
+/// nothing to fire on. The write is real now, and a trigger that stayed
+/// silent would hide it.
 #[test]
-fn trigger_edge_update_does_not_fire_when_set_is_non_mutating() {
+fn trigger_edge_update_fires_on_map_assign() {
+    use coordinode_core::graph::types::Value;
     let mut db = open_db();
 
     db.execute_cypher(
         "CREATE TRIGGER on_follow_update ON [:FOLLOWS] UPDATE BEFORE COMMIT \
-         EXECUTE CREATE (e:WronglyFired)",
+         EXECUTE CREATE (e:FollowChange {action: $event, old: $before, new: $after})",
     )
     .unwrap();
 
@@ -4308,19 +4312,37 @@ fn trigger_edge_update_does_not_fire_when_set_is_non_mutating() {
     )
     .unwrap();
 
-    // `SET r += {x: 1}` — MergeProperties variant. Current executor
-    // skips edge variables in this arm (no edgeprop mutation). The
-    // trigger MUST NOT fire on a no-op SET.
     db.execute_cypher("MATCH (a:User {id: 1})-[r:FOLLOWS]->(b:User {id: 2}) SET r += {x: 1}")
         .unwrap();
 
-    let wrongly = db
-        .execute_cypher("MATCH (e:WronglyFired) RETURN e")
+    let logs = db
+        .execute_cypher("MATCH (e:FollowChange) RETURN e.action AS act, e.old AS old, e.new AS new")
         .unwrap();
-    assert!(
-        wrongly.is_empty(),
-        "edge-UPDATE trigger must not fire on a non-mutating SET variant: {wrongly:?}"
+    assert_eq!(
+        logs.len(),
+        1,
+        "one UPDATE firing for one mutated edge: {logs:?}"
     );
+    assert_eq!(logs[0].get("act"), Some(&Value::String("UPDATE".into())));
+    assert!(matches!(
+        logs[0].get("old"),
+        Some(Value::Map(_) | Value::Document(_))
+    ));
+    assert!(matches!(
+        logs[0].get("new"),
+        Some(Value::Map(_) | Value::Document(_))
+    ));
+
+    // And the property the map named is on the edge afterwards.
+    let props = db
+        .execute_cypher(
+            "MATCH (a:User {id: 1})-[r:FOLLOWS]->(b:User {id: 2}) \
+             RETURN r.x AS x, r.weight AS weight",
+        )
+        .unwrap();
+    assert_eq!(props.len(), 1);
+    assert_eq!(props[0].get("x"), Some(&Value::Int(1)));
+    assert_eq!(props[0].get("weight"), Some(&Value::Int(5)));
 }
 
 /// SET on a temporal edge fires the UPDATE trigger against the matched

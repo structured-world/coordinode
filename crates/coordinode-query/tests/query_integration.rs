@@ -12043,3 +12043,87 @@ fn test_set_map_assign_on_relationship_persists_properties() {
         "SET r = {{map}} must drop properties the map omits"
     );
 }
+
+/// A grouping key that is not a bare property must survive the aggregation.
+///
+/// The aggregate emits each group key under the expression's rendered name,
+/// then the projection re-evaluated the expression against that aggregated
+/// row, where the underlying bindings no longer exist. Grouping was right and
+/// the counts were right, but the key column came back NULL, so
+/// `RETURN type(r) AS rel, count(*) AS n` reported correct totals for
+/// relationships it could not name.
+#[test]
+fn test_computed_group_key_survives_aggregation() {
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1));
+
+    for (name, team) in [("a", "red"), ("b", "red"), ("c", "blue")] {
+        run_cypher_with_alloc(
+            &format!("CREATE (:Player {{name: '{name}', team: '{team}'}}) RETURN 1"),
+            engine,
+            &mut interner,
+            &allocator,
+        );
+    }
+
+    let rows = run_cypher_with_alloc(
+        "MATCH (n:Player) RETURN toUpper(n.team) AS team, count(*) AS n ORDER BY team",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(rows.len(), 2, "two teams");
+    assert_eq!(
+        rows[0].get("team"),
+        Some(&Value::String("BLUE".to_string())),
+        "a computed grouping key must carry its value, not NULL"
+    );
+    assert_eq!(rows[0].get("n"), Some(&Value::Int(1)));
+    assert_eq!(
+        rows[1].get("team"),
+        Some(&Value::String("RED".to_string())),
+        "a computed grouping key must carry its value, not NULL"
+    );
+    assert_eq!(rows[1].get("n"), Some(&Value::Int(2)));
+
+    run_cypher_with_alloc(
+        "MATCH (a:Player {name: 'a'}), (b:Player {name: 'b'}) CREATE (a)-[:KNOWS]->(b) RETURN 1",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    run_cypher_with_alloc(
+        "MATCH (a:Player {name: 'a'}), (c:Player {name: 'c'}) CREATE (a)-[:KNOWS]->(c) RETURN 1",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    run_cypher_with_alloc(
+        "MATCH (b:Player {name: 'b'}), (c:Player {name: 'c'}) CREATE (b)-[:RIVALS]->(c) RETURN 1",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+
+    let by_type = run_cypher_with_alloc(
+        "MATCH (:Player)-[r]->(:Player) RETURN type(r) AS rel, count(*) AS n ORDER BY rel",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(by_type.len(), 2, "two relationship types");
+    assert_eq!(
+        by_type[0].get("rel"),
+        Some(&Value::String("KNOWS".to_string())),
+        "type(r) as a grouping key must name the relationship type"
+    );
+    assert_eq!(by_type[0].get("n"), Some(&Value::Int(2)));
+    assert_eq!(
+        by_type[1].get("rel"),
+        Some(&Value::String("RIVALS".to_string())),
+        "type(r) as a grouping key must name the relationship type"
+    );
+    assert_eq!(by_type[1].get("n"), Some(&Value::Int(1)));
+}

@@ -2284,10 +2284,26 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                         // Star: copy all columns
                         out.extend(row.clone());
                     } else {
-                        let val = if neutral_contains_subplan(&item.expr) {
-                            eval_neutral_with_storage(&item.expr, &row, ctx)?
-                        } else {
-                            eval_neutral(&item.expr, &row)
+                        // A column already carrying this expression's own
+                        // rendered name was computed upstream from bindings
+                        // this row no longer has: an aggregate emits each
+                        // grouping key that way, and by the time projection
+                        // runs, `n` and `r` are gone. Re-deriving it there
+                        // yields NULL, so `type(r) AS rel, count(*)` grouped
+                        // correctly and then could not name the group. Take
+                        // the materialised value; a bare property resolves to
+                        // the same column either way.
+                        let materialised = match &item.expr {
+                            crate::plan::expr::Expr::Variable(_)
+                            | crate::plan::expr::Expr::Star => None,
+                            expr => row.get(&expr_display_name_neutral(expr)).cloned(),
+                        };
+                        let val = match materialised {
+                            Some(v) => v,
+                            None if neutral_contains_subplan(&item.expr) => {
+                                eval_neutral_with_storage(&item.expr, &row, ctx)?
+                            }
+                            None => eval_neutral(&item.expr, &row),
                         };
                         let key = item
                             .alias
