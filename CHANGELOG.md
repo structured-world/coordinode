@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.5.4 - 2026-08-30
+
+### coordinode-embed 0.5.4
+
+#### Fixed
+
+- *(query)* keep a computed grouping key through the projection
+
+### coordinode-query 0.5.4
+
+#### Fixed
+
+- *(query)* search every relationship type in an untyped shortestPath
+- *(query)* give path elements their properties in comprehensions
+- *(query)* keep a computed grouping key through the projection
+- *(query)* write relationship properties on SET r += and SET r =
+
+---
+
 ## v0.5.3 - 2026-08-30
 
 ### coordinode-client 0.5.3
