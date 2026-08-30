@@ -6700,6 +6700,17 @@ fn execute_shortest_path(
     let max_d = sp.max_depth.min(DEFAULT_MAX_HOPS) as usize;
     let mut results = Vec::new();
 
+    // An untyped pattern names no type, and the frontier expands per named
+    // type, so without this the BFS explores nothing and calls the target
+    // unreachable. Resolved once for the whole call, not per row.
+    let resolved_types: Vec<String>;
+    let edge_types: &[String] = if sp.edge_types.is_empty() {
+        resolved_types = ctx.list_edge_types()?;
+        &resolved_types
+    } else {
+        sp.edge_types
+    };
+
     for row in rows {
         let src_uid = match row.get(sp.source) {
             Some(Value::Int(id)) => *id as u64,
@@ -6732,7 +6743,7 @@ fn execute_shortest_path(
             }
 
             let nid = NodeId::from_raw(uid);
-            let neighbors = expand_one_hop(nid, sp.edge_types, sp.direction, ctx)?;
+            let neighbors = expand_one_hop(nid, edge_types, sp.direction, ctx)?;
 
             for (neighbor_uid, et_idx) in neighbors {
                 if let std::collections::hash_map::Entry::Vacant(e) = pred.entry(neighbor_uid) {
@@ -6760,7 +6771,7 @@ fn execute_shortest_path(
             nodes.push(src_uid);
             let mut prev = src_uid;
             for (node, et_idx) in back {
-                let edge_type = sp.edge_types.get(et_idx).cloned().unwrap_or_default();
+                let edge_type = edge_types.get(et_idx).cloned().unwrap_or_default();
                 rels.push(coordinode_core::graph::types::PathRel {
                     edge_type,
                     source: prev,

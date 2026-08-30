@@ -9258,6 +9258,58 @@ fn shortest_path_end_to_end_binds_path_and_length() {
     );
 }
 
+/// `shortestPath` with no relationship type searches every type.
+///
+/// The BFS expands one hop per named type, and an untyped pattern names none,
+/// so it expanded nothing and reported the target unreachable. The row still
+/// came back, with a NULL path, which reads as "these two are not connected"
+/// rather than as a pattern the engine declined to search. Every other
+/// wildcard traversal resolves the empty list against the schema first.
+#[test]
+fn shortest_path_without_a_relationship_type_searches_all_types() {
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+
+    for (id, name) in [(1u64, "Alice"), (2, "Bob"), (3, "Carol")] {
+        insert_node(
+            engine,
+            1,
+            id,
+            "Person",
+            &[("name", Value::String(name.into()))],
+            &mut interner,
+        );
+    }
+    // Two different types on the route, so a wildcard is the only pattern
+    // that spans it.
+    insert_edge(engine, "KNOWS", 1, 2);
+    insert_edge(engine, "MANAGES", 2, 3);
+    register_schema_edge_type(engine, "KNOWS");
+    register_schema_edge_type(engine, "MANAGES");
+
+    let rows = run_cypher_with_alloc(
+        "MATCH p = shortestPath((a:Person {name: 'Alice'})-[*]->(c:Person {name: 'Carol'})) \
+         RETURN length(p) AS len, size(nodes(p)) AS hops",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+
+    assert_eq!(rows.len(), 1, "one shortest path Alice -> Carol");
+    assert_eq!(
+        rows[0].get("len"),
+        Some(&Value::Int(2)),
+        "an untyped shortestPath must cross both relationship types"
+    );
+    assert_eq!(
+        rows[0].get("hops"),
+        Some(&Value::Int(3)),
+        "path visits 3 nodes"
+    );
+}
+
 #[test]
 fn varlen_named_path_binds_route_and_length() {
     // Alice -> Bob -> Carol. `p = (a)-[:KNOWS*1..3]->(x)` binds a path per
