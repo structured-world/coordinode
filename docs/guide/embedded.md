@@ -1,3 +1,7 @@
+---
+description: "Run the full CoordiNode engine inside your Rust process with coordinode-embed: graph, vector and full-text queries with no server, no network hop and no external dependency."
+---
+
 # Embedded (Rust)
 
 `coordinode-embed` lets you run CoordiNode in-process — no separate server, no network hop, no external dependency. Ideal for desktop applications, test harnesses, and edge deployments.

@@ -1,3 +1,7 @@
+---
+description: "Use CoordiNode as a LangChain graph store: install langchain-coordinode, add graph documents, read the schema, and drive GraphCypherQAChain against graph, vector and text in one query."
+---
+
 # LangChain Integration
 
 CoordiNode integrates with LangChain via `langchain-coordinode`, a `GraphStore` implementation that supports `GraphCypherQAChain` and any LangChain component expecting a graph backend.

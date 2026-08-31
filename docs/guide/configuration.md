@@ -1,3 +1,7 @@
+---
+description: "Every CoordiNode setting: command-line flags, the YAML configuration file and the values that can be changed on a running database, each with its default and whether it needs a restart."
+---
+
 # Configuration
 
 CoordiNode resolves its configuration from a single in-code gate that layers

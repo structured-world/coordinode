@@ -1,3 +1,7 @@
+---
+description: "Combine graph traversal, vector similarity and full-text relevance in one Cypher query and one transaction, instead of joining a graph database, a vector store and a search cluster in application code."
+---
+
 # Hybrid Retrieval
 
 CoordiNode's defining capability: graph traversal, vector similarity, and full-text search in a **single atomic query**. No application-side join. No cross-database round-trip.

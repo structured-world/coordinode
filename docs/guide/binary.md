@@ -1,3 +1,7 @@
+---
+description: "Install and run CoordiNode as a single native binary without Docker, including the serve, backup, restore, verify, compact and checkpoint subcommands and their options."
+---
+
 # Binary Installation
 
 Run CoordiNode directly on your machine — no Docker required.

@@ -1,3 +1,7 @@
+---
+description: "Bitemporal relationships in Cypher: keep every version of an edge with its own valid_from and valid_to interval, query the graph as it stood at any instant, and let the planner push time-slice predicates into the scan."
+---
+
 # Temporal Edges (Bitemporal)
 
 Temporal edges let you store **multiple versions of the same relationship** between the same two nodes, each tagged with a validity interval `(valid_from, valid_to)`. CoordiNode keeps every version on disk, returns all of them on a normal `MATCH`, and lets you filter to a point or window in time with helper functions.

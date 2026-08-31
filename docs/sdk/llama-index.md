@@ -1,3 +1,7 @@
+---
+description: "Use CoordiNode as a LlamaIndex property graph store: install llama-index-graph-stores-coordinode, upsert nodes and triplets, and run structured queries for GraphRAG retrieval."
+---
+
 # LlamaIndex Integration
 
 CoordiNode integrates with LlamaIndex via `llama-index-graph-stores-coordinode`, a `PropertyGraphStore` implementation that plugs into `PropertyGraphIndex` and LlamaIndex Knowledge Graph workflows.

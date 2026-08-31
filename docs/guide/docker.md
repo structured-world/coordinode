@@ -1,3 +1,7 @@
+---
+description: "Run CoordiNode in Docker: the published image, port mapping for gRPC, REST and metrics, volume layout for persistent data, and a Compose file to start from."
+---
+
 # Docker Installation
 
 The fastest way to run CoordiNode — no build tools required.
