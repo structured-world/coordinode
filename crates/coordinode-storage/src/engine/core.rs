@@ -1555,9 +1555,14 @@ impl StorageEngine {
         let mut keys: Vec<Vec<u8>> = Vec::new();
         let mut collect = |ev: ScanSinceEvent| -> StorageResult<()> {
             match ev {
+                // A weak (single-delete) tombstone still means the key's
+                // history advanced past `since_seqno`; for a changed-keys
+                // consumer it is indistinguishable from a regular delete,
+                // since the caller re-reads the merged current value per key.
                 ScanSinceEvent::Insert { key, .. }
                 | ScanSinceEvent::MergeOperand { key, .. }
-                | ScanSinceEvent::PointTombstone { key, .. } => {
+                | ScanSinceEvent::PointTombstone { key, .. }
+                | ScanSinceEvent::WeakTombstone { key, .. } => {
                     keys.push(key.to_vec());
                     Ok(())
                 }
