@@ -49,7 +49,7 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Result<Value, EvalError> {
                 Expr::Variable(v) => Some(v.as_str()),
                 _ => None,
             });
-            dispatch_scalar_function(name, evaluated, first_arg_var, row)
+            dispatch_scalar_function(name, evaluated, first_arg_var, row)?
         }
         Expr::List(items) => Value::Array(
             items

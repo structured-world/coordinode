@@ -1220,10 +1220,44 @@ fn string_fn_null_propagation() {
 }
 
 #[test]
-fn unknown_function_still_returns_null() {
-    // The string/math fallthrough must not swallow the unknown-function
-    // NULL contract for names it does not own.
-    assert_eq!(call_fn("no_such_fn", vec![s("x")]), Value::Null);
+fn unknown_function_is_reported_by_name() {
+    // This asserted NULL until the name check landed, which made a typo
+    // indistinguishable from a property that is genuinely absent: `lenght(x)`
+    // produced an empty column rather than telling anyone it was misspelled.
+    let expr = Expr::FunctionCall {
+        name: "no_such_fn".into(),
+        args: vec![Expr::Literal(s("x"))],
+        distinct: false,
+    };
+    assert_eq!(
+        try_eval_expr(&expr, &empty_row()),
+        Err(super::EvalError::UnknownFunction("no_such_fn".into()))
+    );
+}
+
+#[test]
+fn every_implemented_function_is_still_reachable() {
+    // The guard on the check above: the name check lives in the fallthrough of
+    // the dispatcher itself, so it cannot disagree with what is implemented.
+    // A separate list of known names would drift, and it drifts in the
+    // direction that rejects working queries. One name from each family here
+    // is enough to catch the dispatcher being bypassed altogether.
+    for (name, args) in [
+        ("toUpper", vec![s("x")]),
+        ("abs", vec![Value::Int(-1)]),
+        ("head", vec![Value::Array(vec![Value::Int(1)])]),
+        ("coalesce", vec![Value::Null, Value::Int(1)]),
+    ] {
+        let expr = Expr::FunctionCall {
+            name: name.into(),
+            args: args.into_iter().map(Expr::Literal).collect(),
+            distinct: false,
+        };
+        assert!(
+            try_eval_expr(&expr, &empty_row()).is_ok(),
+            "{name} must still resolve"
+        );
+    }
 }
 
 // ---- R521 math functions ----

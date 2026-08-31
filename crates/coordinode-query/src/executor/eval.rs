@@ -122,8 +122,17 @@ fn collect_score_requirements_neutral(expr: &crate::plan::expr::Expr, out: &mut 
 /// Arithmetic is the exception, because the alternative to failing is answering
 /// a number that is simply wrong, and a caller has no way to tell one from a
 /// real result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EvalError {
+    /// A call to a function no evaluator owns.
+    ///
+    /// Answering NULL made a typo indistinguishable from a property that is
+    /// genuinely absent, so `RETURN lenght(x)` looked like an empty column
+    /// rather than a mistake. The name is reported back so the caller can see
+    /// which one it was.
+    #[error("Unknown function '{0}'")]
+    UnknownFunction(String),
+
     /// Division or modulo whose divisor is an integer zero.
     ///
     /// Only an integral zero: a floating-point zero divisor follows IEEE 754
@@ -143,6 +152,32 @@ pub enum EvalError {
 /// fit, which is the overflow this reports rather than clamps.
 fn checked(result: Option<i64>) -> Result<i64, EvalError> {
     result.ok_or(EvalError::LongOverflow)
+}
+
+/// A time argument in epoch milliseconds, accepting either representation.
+fn epoch_ms(v: Option<&Value>) -> Option<i64> {
+    match v {
+        Some(Value::Int(t)) | Some(Value::Timestamp(t)) => Some(*t),
+        _ => None,
+    }
+}
+
+/// The validity interval of the temporal edge bound to `var`, as
+/// `(valid_from, valid_to)` where an open end is `None`.
+///
+/// `None` for the pair means the row does not carry a usable interval, which
+/// the temporal predicates read as "does not match" rather than as a failure:
+/// a row without the metadata is simply not a temporal edge.
+fn temporal_bounds(var: Option<&str>, row: &Row) -> Option<(i64, Option<i64>)> {
+    let var = var?;
+    let valid_from = epoch_ms(row.get(&format!("{var}.valid_from")))?;
+    let valid_to = match row.get(&format!("{var}.valid_to")) {
+        Some(Value::Int(v)) | Some(Value::Timestamp(v)) => Some(*v),
+        Some(Value::Null) | None => None,
+        // Present but not a time: the interval cannot be read, so no match.
+        _ => return None,
+    };
+    Some((valid_from, valid_to))
 }
 
 /// Whether a divisor makes division fail rather than produce a value.
@@ -398,8 +433,8 @@ pub(crate) fn dispatch_scalar_function(
     evaluated: Vec<Value>,
     first_arg_var: Option<&str>,
     row: &Row,
-) -> Value {
-    match name {
+) -> Result<Value, EvalError> {
+    Ok(match name {
         "coalesce" => evaluated
             .into_iter()
             .find(|v| !v.is_null())
@@ -586,61 +621,33 @@ pub(crate) fn dispatch_scalar_function(
         "randomUUID" => Value::String(random_uuid_v4()),
         // valueType(v) → the Cypher type name of the value.
         "valueType" => Value::String(cypher_value_type(evaluated.first())),
-        "temporal_active_at" => {
-            // temporal_active_at(r, t) → bool
-            // True iff the temporal edge `r` was active at time `t` (epoch ms),
-            // i.e. `r.valid_from <= t AND (r.valid_to IS NULL OR r.valid_to > t)`.
-            let Some(var) = first_arg_var else {
-                return Value::Bool(false);
-            };
-            let t = match evaluated.get(1) {
-                Some(Value::Int(t)) => *t,
-                Some(Value::Timestamp(t)) => *t,
-                _ => return Value::Bool(false),
-            };
-            let vf = match row.get(&format!("{var}.valid_from")) {
-                Some(Value::Int(v)) => *v,
-                Some(Value::Timestamp(v)) => *v,
-                _ => return Value::Bool(false),
-            };
-            let vt = match row.get(&format!("{var}.valid_to")) {
-                Some(Value::Int(v)) => Some(*v),
-                Some(Value::Timestamp(v)) => Some(*v),
-                Some(Value::Null) | None => None,
-                _ => return Value::Bool(false),
-            };
-            Value::Bool(vf <= t && vt.is_none_or(|to| to > t))
-        }
-        "temporal_overlaps" => {
-            // temporal_overlaps(r, t_start, t_end) → bool
-            // True iff the temporal edge's validity interval overlaps `[t_start, t_end)`,
-            // i.e. `r.valid_from < t_end AND (r.valid_to IS NULL OR r.valid_to > t_start)`.
-            let Some(var) = first_arg_var else {
-                return Value::Bool(false);
-            };
-            let t_start = match evaluated.get(1) {
-                Some(Value::Int(t)) => *t,
-                Some(Value::Timestamp(t)) => *t,
-                _ => return Value::Bool(false),
-            };
-            let t_end = match evaluated.get(2) {
-                Some(Value::Int(t)) => *t,
-                Some(Value::Timestamp(t)) => *t,
-                _ => return Value::Bool(false),
-            };
-            let vf = match row.get(&format!("{var}.valid_from")) {
-                Some(Value::Int(v)) => *v,
-                Some(Value::Timestamp(v)) => *v,
-                _ => return Value::Bool(false),
-            };
-            let vt = match row.get(&format!("{var}.valid_to")) {
-                Some(Value::Int(v)) => Some(*v),
-                Some(Value::Timestamp(v)) => Some(*v),
-                Some(Value::Null) | None => None,
-                _ => return Value::Bool(false),
-            };
-            Value::Bool(vf < t_end && vt.is_none_or(|to| to > t_start))
-        }
+        // temporal_active_at(r, t) → bool
+        // True iff the temporal edge `r` was active at time `t` (epoch ms),
+        // i.e. `r.valid_from <= t AND (r.valid_to IS NULL OR r.valid_to > t)`.
+        "temporal_active_at" => Value::Bool(
+            match (
+                temporal_bounds(first_arg_var, row),
+                epoch_ms(evaluated.get(1)),
+            ) {
+                (Some((vf, vt)), Some(t)) => vf <= t && vt.is_none_or(|to| to > t),
+                _ => false,
+            },
+        ),
+        // temporal_overlaps(r, t_start, t_end) → bool
+        // True iff the temporal edge's validity interval overlaps `[t_start, t_end)`,
+        // i.e. `r.valid_from < t_end AND (r.valid_to IS NULL OR r.valid_to > t_start)`.
+        "temporal_overlaps" => Value::Bool(
+            match (
+                temporal_bounds(first_arg_var, row),
+                epoch_ms(evaluated.get(1)),
+                epoch_ms(evaluated.get(2)),
+            ) {
+                (Some((vf, vt)), Some(t_start), Some(t_end)) => {
+                    vf < t_end && vt.is_none_or(|to| to > t_start)
+                }
+                _ => false,
+            },
+        ),
         "now" => {
             // Return current timestamp in microseconds
             Value::Timestamp(
@@ -853,13 +860,18 @@ pub(crate) fn dispatch_scalar_function(
         // String, math, and list functions (Cypher names are case-insensitive).
         // Kept out of the exact-case arms above so existing functions stay
         // untouched; each helper lowercases the name and returns None for
-        // anything it does not own, falling through to the NULL contract for
-        // unknown functions.
+        // anything it does not own.
+        //
+        // Reaching the end of this chain means no evaluator claims the name,
+        // which is the one place that knows it, so the error is raised here
+        // rather than against a list of names kept somewhere else. A second
+        // list would drift, and the direction it drifts in rejects working
+        // queries.
         _ => eval_string_function(name, &evaluated)
             .or_else(|| eval_math_function(name, &evaluated))
             .or_else(|| eval_list_function(name, &evaluated))
-            .unwrap_or(Value::Null),
-    }
+            .ok_or_else(|| EvalError::UnknownFunction(name.to_string()))?,
+    })
 }
 
 /// Cypher list functions over already-evaluated values (`head`, `last`, `tail`,
