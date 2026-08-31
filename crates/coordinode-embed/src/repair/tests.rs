@@ -411,3 +411,54 @@ fn lossy_open_repair_forces_checkpoint_rebuild() {
         "post-checkpoint oplog tail must be replayed"
     );
 }
+
+/// The reported dead end: a lossy open repair with NO checkpoint to rebuild
+/// from. The loss must be REPORTED (partition listed, not clean), never
+/// silently absorbed, and nothing may claim a repair happened.
+#[test]
+fn lossy_open_repair_without_checkpoint_reports_not_clean() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = checkpoint_root(dir.path());
+
+    {
+        let engine = open(&dir);
+        assert!(
+            engine.open_repairs().is_empty(),
+            "a clean open must record no repairs"
+        );
+        for i in 0..64u32 {
+            let key = format!("node:0:{i:08}");
+            put(
+                &engine,
+                u64::from(i) + 1,
+                PartitionId::Node,
+                key.as_bytes(),
+                b"unbacked",
+            );
+        }
+        engine.persist().expect("persist");
+    }
+
+    // No checkpoint exists; damage the tree structurally + corrupt its
+    // tables so the open-time salvage is lossy.
+    let node_dir = dir.path().join(Partition::Node.name());
+    let corrupted = corrupt_post_checkpoint_tables(&node_dir.join("tables"), &root);
+    assert!(corrupted > 0, "test must corrupt a table");
+    std::fs::remove_file(node_dir.join("current")).expect("remove current");
+
+    let engine = open(&dir);
+    let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
+    assert!(
+        report.corrupt_partitions.contains(&Partition::Node),
+        "the loss must be reported: {report:?}"
+    );
+    assert!(
+        report.repaired.is_empty(),
+        "nothing can be rebuilt without a checkpoint: {report:?}"
+    );
+    assert!(
+        !report.is_clean(),
+        "a lossy repair without a rebuild source must not read clean: {report:?}"
+    );
+    assert!(report.checkpoint_used.is_none());
+}

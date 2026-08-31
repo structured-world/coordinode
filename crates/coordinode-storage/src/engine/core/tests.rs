@@ -813,3 +813,38 @@ fn open_repairs_partition_with_lost_manifest_pointer() {
         lsm_tree::WalReplayScope::TailOnly
     ));
 }
+
+/// Fail-closed: an open failure that is NOT positively-identified structural
+/// damage (here: the directory lock held by a live engine) must propagate as
+/// an error, never trigger an in-place repair. Repairing on an ambiguous
+/// error could rebuild the manifest around a misconfigured view and drop
+/// healthy data.
+#[test]
+fn open_does_not_repair_on_held_directory_lock() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = StorageEngine::open(&config).expect("first open");
+    engine
+        .put(Partition::Node, b"node:locked", b"v")
+        .expect("put");
+
+    // Second open against the same directory: the held lock is an
+    // environment error, not damage; it must surface, and the live
+    // engine's data must remain untouched by any repair attempt.
+    let second = StorageEngine::open(&config);
+    assert!(second.is_err(), "double open must fail, not repair");
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:locked")
+            .expect("get")
+            .as_deref(),
+        Some(&b"v"[..])
+    );
+    assert!(engine.open_repairs().is_empty());
+}
