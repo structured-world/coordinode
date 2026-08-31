@@ -1938,3 +1938,17 @@ fn arithmetic_failure_reaches_a_whole_query_expression() {
         Err(super::EvalError::DivideByZero)
     );
 }
+
+#[test]
+fn making_the_evaluator_fallible_costs_no_space() {
+    // The evaluator returns this type from every recursive step on the hot
+    // path, so the error must ride in `Value`'s spare bits rather than widen
+    // the return. It does today, and this holds the line: a future variant
+    // large enough to break the niche would grow every frame of the recursion
+    // without anything else noticing.
+    assert_eq!(
+        std::mem::size_of::<Result<Value, super::EvalError>>(),
+        std::mem::size_of::<Value>(),
+        "EvalError must stay small enough to pack into Value's niche"
+    );
+}

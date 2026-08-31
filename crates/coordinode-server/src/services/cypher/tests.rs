@@ -440,6 +440,36 @@ fn error_to_status_mapping() {
     assert_eq!(exec_err.code(), tonic::Code::Internal);
 }
 
+/// Faults in the query itself answer INVALID_ARGUMENT, not INTERNAL. A client
+/// retries INTERNAL and pages someone about it; `RETURN 1/0` deserves neither.
+#[test]
+fn query_faults_are_invalid_argument_not_internal() {
+    use coordinode_query::executor::eval::EvalError;
+    use coordinode_query::executor::runner::ExecutionError;
+
+    for (err, needle) in [
+        (EvalError::DivideByZero, "/ by zero"),
+        (EvalError::LongOverflow, "long overflow"),
+        (
+            EvalError::UnknownFunction("lenght".into()),
+            "Unknown function 'lenght'",
+        ),
+    ] {
+        let status = db_error_to_status(DatabaseError::Execution(ExecutionError::Arithmetic(err)));
+        assert_eq!(
+            status.code(),
+            tonic::Code::InvalidArgument,
+            "{needle} must be the caller's error, got {:?}",
+            status.code()
+        );
+        assert!(
+            status.message().contains(needle),
+            "message must carry the cause, got {:?}",
+            status.message()
+        );
+    }
+}
+
 // --- proto_to_value tests ---
 
 #[test]

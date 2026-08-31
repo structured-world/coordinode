@@ -207,6 +207,13 @@ fn db_error_to_status(err: DatabaseError) -> Status {
         return Status::internal(format!("Plan error: {rest}"));
     }
     if let Some(rest) = msg.strip_prefix("Cypher: execution error: ") {
+        // Faults in the QUERY, not in the server: a division by zero, an
+        // integer overflow, a misspelled function name. Retrying them cannot
+        // help and alerting on them is noise, so they map to the same code a
+        // parse error gets rather than to INTERNAL.
+        if rest == "/ by zero" || rest == "long overflow" || rest.starts_with("Unknown function") {
+            return Status::invalid_argument(rest.to_string());
+        }
         return Status::internal(format!("Execution error: {rest}"));
     }
     if let Some(rest) = msg.strip_prefix("Cypher: storage error: ") {

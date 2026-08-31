@@ -2422,21 +2422,27 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 }
             }
 
-            // Evaluate each sort key once per row, then sort on the results.
-            // A comparator has nowhere to report a failed evaluation, and it is
-            // called O(n log n) times, so the old shape also re-evaluated every
-            // key on every comparison.
-            let mut keyed: Vec<(Vec<Value>, Row)> = Vec::with_capacity(rows.len());
-            for row in rows {
-                let mut keys = Vec::with_capacity(items.len());
+            // Evaluate each sort key once per row, then sort on the results. A
+            // comparator has nowhere to report a failed evaluation, and it is
+            // called O(n log n) times, so evaluating inside it also re-computed
+            // every key on every comparison.
+            //
+            // The keys live in one flat buffer, row-major, rather than a vector
+            // per row: this is a hot path and a per-row allocation is exactly
+            // the cost worth not paying. Rows travel with their index instead
+            // of with their keys, so the whole sort allocates a fixed three
+            // times regardless of how many rows arrive.
+            let width = items.len();
+            let mut keys: Vec<Value> = Vec::with_capacity(rows.len() * width);
+            for row in &rows {
                 for item in items {
-                    keys.push(eval_neutral(&item.expr, &row)?);
+                    keys.push(eval_neutral(&item.expr, row)?);
                 }
-                keyed.push((keys, row));
             }
-            keyed.sort_by(|(ka, _), (kb, _)| {
+            let mut indexed: Vec<(usize, Row)> = rows.into_iter().enumerate().collect();
+            indexed.sort_by(|(a, _), (b, _)| {
                 for (idx, item) in items.iter().enumerate() {
-                    let cmp = compare_values(&ka[idx], &kb[idx]);
+                    let cmp = compare_values(&keys[a * width + idx], &keys[b * width + idx]);
                     let cmp = if item.ascending { cmp } else { cmp.reverse() };
                     if cmp != std::cmp::Ordering::Equal {
                         return cmp;
@@ -2444,7 +2450,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 }
                 std::cmp::Ordering::Equal
             });
-            Ok(keyed.into_iter().map(|(_, row)| row).collect())
+            Ok(indexed.into_iter().map(|(_, row)| row).collect())
         }
 
         LogicalOp::Limit { input, count } => {
