@@ -967,3 +967,74 @@ fn oplog_purge_collects_durable_expired_segments() {
         "durable time-expired sealed segments must be collected"
     );
 }
+
+/// End-to-end power-loss recovery under the crash-simulator filesystem: the
+/// trees roll back to their last-fsynced content, and reopening the engine
+/// replays the journal so every acknowledged write survives. This exercises
+/// the real durability contract (journal fsyncs on append, trees flush
+/// lazily) instead of assuming a graceful shutdown.
+#[test]
+fn power_loss_recovery_replays_journal_over_rolled_back_trees() {
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    use coordinode_core::txn::timestamp::TimestampOracle;
+    use lsm_tree::fs::{CrashFs, StdFs};
+
+    let dir = TempDir::new().expect("tempdir");
+    let crash_fs = Arc::new(CrashFs::new(StdFs));
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )])
+    .with_fs(crash_fs.clone());
+
+    let write = |engine: &StorageEngine, i: u64, value: &[u8]| {
+        let key = format!("node:crash:{i}");
+        engine
+            .oplog_append(
+                &[Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: key.clone().into_bytes(),
+                    value: value.to_vec(),
+                }],
+                i + 1,
+            )
+            .expect("oplog_append")
+            .expect("journal active");
+        engine
+            .put(Partition::Node, key.as_bytes(), value)
+            .expect("put");
+    };
+
+    {
+        let oracle = Arc::new(TimestampOracle::new());
+        let engine = StorageEngine::open_embedded(&config, oracle).expect("open before crash");
+        for i in 0..4u64 {
+            write(&engine, i, b"flushed");
+        }
+        engine.persist().expect("persist first half");
+        for i in 4..8u64 {
+            write(&engine, i, b"memtable-only");
+        }
+        // No persist for the second half: those rows exist only in memtables
+        // and the fsynced journal when the "power" goes out.
+    }
+    crash_fs.crash();
+
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine = StorageEngine::open_embedded(&config, oracle).expect("open after crash");
+    for i in 0..8u64 {
+        let key = format!("node:crash:{i}");
+        let expected: &[u8] = if i < 4 { b"flushed" } else { b"memtable-only" };
+        assert_eq!(
+            engine
+                .get(Partition::Node, key.as_bytes())
+                .expect("get")
+                .as_deref(),
+            Some(expected),
+            "row {i} lost across the simulated power loss"
+        );
+    }
+}
