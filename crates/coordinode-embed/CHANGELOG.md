@@ -3,6 +3,14 @@
 All notable changes to this crate are documented in this file.
 This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
+## 0.5.5 - 2026-08-31
+
+#### Testing
+
+- *(capacity)* wait for the reclaim to reach the filesystem
+
+---
+
 ## 0.5.4 - 2026-08-30
 
 #### Fixed

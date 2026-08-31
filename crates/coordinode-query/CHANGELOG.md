@@ -3,6 +3,15 @@
 All notable changes to this crate are documented in this file.
 This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
+## 0.5.5 - 2026-08-31
+
+#### Fixed
+
+- *(query)* persist SET on a relationship bound by MERGE
+- *(query)* stop a path element borrowing the previous one's properties
+
+---
+
 ## 0.5.4 - 2026-08-30
 
 #### Fixed
