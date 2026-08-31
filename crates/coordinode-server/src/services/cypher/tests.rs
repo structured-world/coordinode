@@ -442,17 +442,21 @@ fn error_to_status_mapping() {
 
 /// Faults in the query itself answer INVALID_ARGUMENT, not INTERNAL. A client
 /// retries INTERNAL and pages someone about it; `RETURN 1/0` deserves neither.
+/// Each also carries a machine-readable reason, so a caller telling them apart
+/// does not have to read the English message to do it.
 #[test]
-fn query_faults_are_invalid_argument_not_internal() {
+fn query_faults_are_invalid_argument_with_a_reason() {
     use coordinode_query::executor::eval::EvalError;
     use coordinode_query::executor::runner::ExecutionError;
+    use tonic_types::StatusExt;
 
-    for (err, needle) in [
-        (EvalError::DivideByZero, "/ by zero"),
-        (EvalError::LongOverflow, "long overflow"),
+    for (err, needle, reason) in [
+        (EvalError::DivideByZero, "/ by zero", "DIVIDE_BY_ZERO"),
+        (EvalError::LongOverflow, "long overflow", "LONG_OVERFLOW"),
         (
             EvalError::UnknownFunction("lenght".into()),
             "Unknown function 'lenght'",
+            "UNKNOWN_FUNCTION",
         ),
     ] {
         let status = db_error_to_status(DatabaseError::Execution(ExecutionError::Arithmetic(err)));
@@ -466,6 +470,86 @@ fn query_faults_are_invalid_argument_not_internal() {
             status.message().contains(needle),
             "message must carry the cause, got {:?}",
             status.message()
+        );
+        let details = status.get_error_details();
+        let info = details
+            .error_info()
+            .unwrap_or_else(|| panic!("{needle} must carry ErrorInfo"));
+        assert_eq!(info.reason, reason);
+    }
+}
+
+/// The offending name travels as data, not as something to be parsed back out
+/// of a sentence.
+#[test]
+fn an_unknown_function_names_itself_in_the_metadata() {
+    use coordinode_query::executor::eval::EvalError;
+    use coordinode_query::executor::runner::ExecutionError;
+    use tonic_types::StatusExt;
+
+    let status = db_error_to_status(DatabaseError::Execution(ExecutionError::Arithmetic(
+        EvalError::UnknownFunction("lenght".into()),
+    )));
+    let details = status.get_error_details();
+    let info = details.error_info().expect("ErrorInfo expected");
+    assert_eq!(
+        info.metadata.get("function").map(String::as_str),
+        Some("lenght")
+    );
+}
+
+/// Transaction lifecycle failures a client must tell apart to act correctly:
+/// a gone transaction needs no cleanup, a conflict wants the whole transaction
+/// re-run, and an oversized one will fail again unless the work is split.
+#[test]
+fn transaction_failures_carry_distinct_reasons() {
+    use tonic_types::StatusExt;
+
+    let cases = [
+        (
+            DatabaseError::UnknownTransaction(7),
+            tonic::Code::NotFound,
+            "UNKNOWN_TRANSACTION",
+            false,
+        ),
+        (
+            DatabaseError::TransactionConflict {
+                id: 7,
+                source_message: "write-write".into(),
+            },
+            tonic::Code::Aborted,
+            "TRANSACTION_CONFLICT",
+            true,
+        ),
+        (
+            DatabaseError::TransactionTooLarge {
+                id: 7,
+                buffered: 300,
+                limit: 200,
+            },
+            tonic::Code::ResourceExhausted,
+            "TRANSACTION_TOO_LARGE",
+            false,
+        ),
+    ];
+
+    for (err, code, reason, retryable) in cases {
+        let status = db_error_to_status(err);
+        assert_eq!(status.code(), code, "wrong code for {reason}");
+        let details = status.get_error_details();
+        let info = details
+            .error_info()
+            .unwrap_or_else(|| panic!("{reason} must carry ErrorInfo"));
+        assert_eq!(info.reason, reason);
+        assert_eq!(
+            info.metadata.get("transaction_id").map(String::as_str),
+            Some("7"),
+            "{reason} must name the transaction"
+        );
+        assert_eq!(
+            details.retry_info().is_some(),
+            retryable,
+            "{reason} advertises the wrong retry advice"
         );
     }
 }

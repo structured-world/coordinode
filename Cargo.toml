@@ -65,6 +65,10 @@ jieba-rs = "0.8"
 
 # gRPC
 tonic = "0.14"
+# Canonical rich error model: google.rpc.Status carried in the
+# grpc-status-details-bin trailer, so a client keys on a machine-readable
+# reason rather than on the English text of a message.
+tonic-types = "0.14"
 prost = "0.14"
 
 # Async runtime

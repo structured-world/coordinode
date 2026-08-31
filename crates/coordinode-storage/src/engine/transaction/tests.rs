@@ -51,17 +51,23 @@ fn get_absent_key_returns_none() {
 }
 
 #[test]
-fn reads_track_occ_scope_own_writes_do_not() {
+fn reads_leave_no_occ_scope() {
+    // Reads are not conflict-tracked at the default level: commit validates
+    // the WRITE set, so tracking every read would be per-read work feeding a
+    // check that never runs. The scope stays unmaterialised until FOR UPDATE
+    // or the serializable level asks for it.
     let (engine, oracle, _d) = test_engine();
     let mut txn = mvcc_txn(&engine, &oracle);
-    // A storage read tracks the key in the OCC scope.
     txn.get(Partition::Node, b"r1").unwrap();
     txn.get(Partition::EdgeProp, b"r2").unwrap();
-    assert_eq!(txn.occ_scope.as_ref().map(|s| s.tracked_count()), Some(2));
-    // Reading own buffered write does NOT add to the read-set.
+    assert!(
+        txn.occ_scope.is_none(),
+        "plain reads must not materialise a scope"
+    );
+    // Writing and reading back one's own write does not change that.
     txn.put(Partition::Node, b"w1", b"v").unwrap();
     txn.get(Partition::Node, b"w1").unwrap();
-    assert_eq!(txn.occ_scope.as_ref().map(|s| s.tracked_count()), Some(2));
+    assert!(txn.occ_scope.is_none());
 }
 
 #[test]
@@ -74,7 +80,7 @@ fn into_state_resume_preserves_buffer_occ_and_read_ts() {
     let read_ts = txn.read_ts();
     txn.put(Partition::Node, b"k1", b"v1").unwrap();
     txn.delete(Partition::Node, b"k2").unwrap();
-    txn.get(Partition::Node, b"r1").unwrap(); // tracks OCC
+    txn.get(Partition::Node, b"r1").unwrap();
     let occ_before = txn.occ_scope.as_ref().map(|s| s.tracked_count());
 
     // Park and rebuild.
@@ -89,12 +95,14 @@ fn into_state_resume_preserves_buffer_occ_and_read_ts() {
         Some(&b"v1"[..])
     );
     assert_eq!(resumed.get(Partition::Node, b"k2").unwrap(), None);
-    // OCC read-set survives; the rebuilt `r1` read does not double-count.
+    // The (unmaterialised) OCC scope state survives the park/resume cycle:
+    // reads do not create one on either side of the boundary.
     resumed.get(Partition::Node, b"r1").unwrap();
     assert_eq!(
         resumed.occ_scope.as_ref().map(|s| s.tracked_count()),
         occ_before,
     );
+    assert!(occ_before.is_none());
 }
 
 #[test]

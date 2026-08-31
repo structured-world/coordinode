@@ -2,6 +2,7 @@ pub mod blob;
 pub mod cdc;
 pub mod cluster;
 pub mod cypher;
+pub mod error_details;
 pub mod graph;
 pub mod health;
 pub mod schema;
@@ -97,7 +98,21 @@ fn capacity_exhausted_status(context: &str, err: &StorageError) -> Status {
         "{context}: endpoint {endpoint_id:?} capacity exhausted \
          (used={used_bytes}, hard_limit={hard_limit_bytes})"
     );
-    let mut status = Status::resource_exhausted(msg);
+    let mut status = error_details::status_with_reason(
+        tonic::Code::ResourceExhausted,
+        msg,
+        error_details::Reason::CapacityExhausted,
+        [
+            ("endpoint_id", endpoint_id.to_string()),
+            ("used_bytes", used_bytes.to_string()),
+            ("hard_limit_bytes", hard_limit_bytes.to_string()),
+        ],
+    );
+    // The same three values also stay in flat trailer keys, where they have
+    // been since before the canonical details existed. Clients already read
+    // them, and a published wire surface is not something to withdraw as a
+    // side effect of adding a better one; new callers should prefer the
+    // ErrorInfo metadata above.
     let meta = status.metadata_mut();
     if let Ok(v) = endpoint_id.parse() {
         meta.insert("endpoint-id", v);

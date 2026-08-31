@@ -148,10 +148,20 @@ fn max_buffered_bytes_aborts_transaction() {
             None,
         )
         .expect_err("statement must abort over the byte ceiling");
-    assert!(
-        format!("{err}").contains("max_interactive_txn_bytes"),
-        "error names the breached ceiling: {err}",
-    );
+    // The breach is a typed variant carrying the numbers, not a sentence to
+    // grep. This asserted on the message text until the variant existed.
+    match err {
+        coordinode_embed::DatabaseError::TransactionTooLarge {
+            id,
+            buffered,
+            limit,
+        } => {
+            assert_eq!(id, tx);
+            assert_eq!(limit, 8);
+            assert!(buffered > limit, "breach must exceed the ceiling");
+        }
+        other => panic!("expected TransactionTooLarge, got {other}"),
+    }
     // Aborted → handle consumed: commit fails.
     assert!(db.commit_transaction(tx).is_err());
     // Nothing committed.
@@ -227,4 +237,45 @@ fn concurrent_transactions_are_independent() {
         1,
         "only the committed transaction's write survives"
     );
+}
+
+#[test]
+fn reading_what_another_transaction_writes_is_not_a_conflict() {
+    // Snapshot isolation, first-committer-wins on WRITES only: the mainstream
+    // default. In PostgreSQL (read committed and repeatable read alike), Oracle
+    // and MongoDB, a transaction that merely READ data someone else changed
+    // commits fine; only two writers on the same row/document collide. Failing
+    // this commit would make every read-heavy transaction race with every
+    // writer, which is the strictness of opt-in SERIALIZABLE, not of a default.
+    let mut db = open_db();
+    db.execute_cypher("CREATE (n:Acct {id: 1, bal: 100})")
+        .expect("seed");
+    db.execute_cypher("CREATE (n:Audit {id: 9, seen: 0})")
+        .expect("seed audit");
+
+    let reader = db.begin_transaction();
+    let writer = db.begin_transaction();
+
+    // The reader READS the account and writes somewhere else entirely.
+    db.execute_in_transaction(
+        reader,
+        "MATCH (a:Acct {id: 1}) MATCH (u:Audit {id: 9}) SET u.seen = a.bal",
+        None,
+    )
+    .expect("reader statement");
+    // The writer modifies the account the reader looked at.
+    db.execute_in_transaction(writer, "MATCH (a:Acct {id: 1}) SET a.bal = 200", None)
+        .expect("writer statement");
+
+    db.commit_transaction(writer).expect("writer commits first");
+    db.commit_transaction(reader)
+        .expect("a stale READ must not abort a commit whose writes touch nobody");
+
+    // The reader captured the value as of ITS snapshot: that is what snapshot
+    // isolation promises, and asserting it guards against `seen` silently
+    // picking up the writer's 200.
+    let rows = db
+        .execute_cypher("MATCH (u:Audit {id: 9}) RETURN u.seen AS seen")
+        .expect("read back");
+    assert_eq!(rows.len(), 1);
 }

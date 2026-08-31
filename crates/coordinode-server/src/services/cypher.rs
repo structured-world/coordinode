@@ -182,47 +182,108 @@ fn convert_params(
 /// Remaining variants keep their pre-existing categorisation:
 /// Parse/Semantic → `invalid_argument`; Plan/Execution/Storage(other)/Other
 /// → `internal`.
+/// Translate a database failure into the status a client sees.
+///
+/// Classification is by TYPE, never by the text of a message. An earlier
+/// version rebuilt the category by matching English prefixes on the rendered
+/// error ("Cypher: execution error: /
+/// by zero"), which made every message a wire contract: rewording one silently
+/// changed the code a client received.
+///
+/// Whatever a caller may branch on also carries a machine-readable reason in
+/// the status details, so branching does not require reading prose either. See
+/// [`crate::services::error_details`].
 fn db_error_to_status(err: DatabaseError) -> Status {
-    // Capacity-exhausted check FIRST — wins over the per-variant
-    // category mapping below. The helper drills into both
-    // `Storage(...)` and `Execution(Storage(...))` shapes; if it
-    // identifies a `CapacityExhausted` it returns `ResourceExhausted`
-    // with structured metadata. Otherwise it returns `Internal`,
-    // which we override with the legacy category-specific mapping.
-    let probe = crate::services::db_err_to_status("Cypher", err);
-    if probe.code() == tonic::Code::ResourceExhausted {
-        return probe;
-    }
-    // Probe was Internal — re-classify by inspecting the message
-    // prefix (Display always emits `"<category> error: ..."` from the
-    // `thiserror` annotations on `DatabaseError`).
-    let msg = probe.message();
-    if let Some(rest) = msg.strip_prefix("Cypher: parse error: ") {
-        return Status::invalid_argument(format!("Parse error: {rest}"));
-    }
-    if let Some(rest) = msg.strip_prefix("Cypher: semantic error: ") {
-        return Status::invalid_argument(format!("Semantic error: {rest}"));
-    }
-    if let Some(rest) = msg.strip_prefix("Cypher: plan error: ") {
-        return Status::internal(format!("Plan error: {rest}"));
-    }
-    if let Some(rest) = msg.strip_prefix("Cypher: execution error: ") {
-        // Faults in the QUERY, not in the server: a division by zero, an
-        // integer overflow, a misspelled function name. Retrying them cannot
-        // help and alerting on them is noise, so they map to the same code a
-        // parse error gets rather than to INTERNAL.
-        if rest == "/ by zero" || rest == "long overflow" || rest.starts_with("Unknown function") {
-            return Status::invalid_argument(rest.to_string());
+    use crate::services::error_details::{Reason, status_with_reason};
+    use coordinode_query::executor::eval::EvalError;
+    use coordinode_query::executor::runner::ExecutionError;
+    use tonic::Code;
+
+    let rendered = err.to_string();
+    match &err {
+        // Faults in the QUERY rather than in the server. Retrying them cannot
+        // help and paging someone about them is noise, so they answer
+        // INVALID_ARGUMENT, the same class a syntax error gets.
+        DatabaseError::Parse(_) => {
+            return status_with_reason(
+                Code::InvalidArgument,
+                format!("Parse error: {rendered}"),
+                Reason::QuerySyntax,
+                [],
+            );
         }
-        return Status::internal(format!("Execution error: {rest}"));
+        DatabaseError::Semantic(detail) => {
+            return status_with_reason(
+                Code::InvalidArgument,
+                format!("Semantic error: {detail}"),
+                Reason::QuerySemantics,
+                [],
+            );
+        }
+        DatabaseError::Execution(ExecutionError::Arithmetic(eval)) => {
+            let (reason, metadata) = match eval {
+                EvalError::DivideByZero => (Reason::DivideByZero, Vec::new()),
+                EvalError::LongOverflow => (Reason::LongOverflow, Vec::new()),
+                EvalError::UnknownFunction(name) => (
+                    Reason::UnknownFunction,
+                    // The name is what a caller acts on, whether to suggest a
+                    // spelling or to report which call failed. Reading it back
+                    // out of the message would be the same mistake this
+                    // classification exists to undo.
+                    vec![("function", name.clone())],
+                ),
+            };
+            return status_with_reason(Code::InvalidArgument, eval.to_string(), reason, metadata);
+        }
+        DatabaseError::Execution(ExecutionError::SchemaViolation(detail)) => {
+            return status_with_reason(
+                Code::FailedPrecondition,
+                format!("Schema violation: {detail}"),
+                Reason::SchemaViolation,
+                [],
+            );
+        }
+        // Transaction lifecycle. NOT_FOUND rather than INVALID_ARGUMENT: the
+        // id was well-formed, there is simply nothing under it any more.
+        DatabaseError::UnknownTransaction(id) => {
+            return status_with_reason(
+                Code::NotFound,
+                rendered,
+                Reason::UnknownTransaction,
+                [("transaction_id", id.to_string())],
+            );
+        }
+        DatabaseError::TransactionConflict { id, .. } => {
+            return status_with_reason(
+                Code::Aborted,
+                rendered,
+                Reason::TransactionConflict,
+                [("transaction_id", id.to_string())],
+            );
+        }
+        DatabaseError::TransactionTooLarge {
+            id,
+            buffered,
+            limit,
+        } => {
+            return status_with_reason(
+                Code::ResourceExhausted,
+                rendered,
+                Reason::TransactionTooLarge,
+                [
+                    ("transaction_id", id.to_string()),
+                    ("buffered_bytes", buffered.to_string()),
+                    ("limit_bytes", limit.to_string()),
+                ],
+            );
+        }
+        _ => {}
     }
-    if let Some(rest) = msg.strip_prefix("Cypher: storage error: ") {
-        return Status::internal(format!("Storage error: {rest}"));
-    }
-    if let Some(rest) = msg.strip_prefix("Cypher: ") {
-        return Status::internal(format!("Error: {rest}"));
-    }
-    probe
+    // Capacity exhaustion arrives wrapped in either a Storage or an Execution
+    // variant, and the shared helper knows how to find it in both. Everything
+    // it does not recognise stays INTERNAL, which is the honest answer for a
+    // failure the server cannot attribute to the request.
+    crate::services::db_err_to_status("Cypher", err)
 }
 
 /// Translate the proto `ReadConcernLevel` integer to the executor enum. The

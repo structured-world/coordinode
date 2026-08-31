@@ -4143,11 +4143,12 @@ fn execute_single_hop_traverse(
                 shard_id: ctx.shard_id,
                 mvcc_snapshot: ctx.mvcc_snapshot,
                 chunk_size: ctx.adaptive.parallel_chunk_size,
-                occ_read_keys: if ctx.mvcc_oracle.is_some() {
-                    Some(OccReadKeys::default())
-                } else {
-                    None
-                },
+                // Read keys are not collected: the default conflict level
+                // validates writes only, so commit never consults a read set.
+                // FOR UPDATE / the serializable level re-enable collection
+                // selectively when they land; until then filling these vectors
+                // was per-row work feeding a set nobody read.
+                occ_read_keys: None,
             };
             let src_raw = source_id.as_raw();
             let with_src: Vec<(u64, u64, usize)> = neighbors
@@ -4466,11 +4467,9 @@ fn execute_varlen_traverse(
                     shard_id: ctx.shard_id,
                     mvcc_snapshot: ctx.mvcc_snapshot,
                     chunk_size: ctx.adaptive.parallel_chunk_size,
-                    occ_read_keys: if ctx.mvcc_oracle.is_some() {
-                        Some(OccReadKeys::default())
-                    } else {
-                        None
-                    },
+                    // See the single-hop site: reads are not conflict-tracked
+                    // at the default level, so nothing collects here either.
+                    occ_read_keys: None,
                 };
                 let parallel_rows = process_targets_parallel(&depth_neighbors, row, params, &pctx)?;
                 // Merge OCC read keys from parallel workers into the Layer-3

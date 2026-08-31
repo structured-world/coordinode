@@ -50,6 +50,7 @@ structured-proxy = { version = "3", optional = true }
 axum = { version = "0.8", optional = true }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["tls-webpki-roots"] }
+tonic-types = { workspace = true }
 parking_lot = { workspace = true }
 tonic-prost = "0.14"
 prost = { workspace = true }

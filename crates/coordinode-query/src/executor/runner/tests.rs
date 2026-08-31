@@ -3457,11 +3457,7 @@ fn collect_expr_vars_covers_string_match() {
 // -- G067: Parallel path OCC read-set tracking --
 
 #[test]
-fn g067_parallel_traversal_populates_occ_read_set() {
-    // Verify that parallel traversal collects read keys into
-    // the Layer-3 OccScope so OCC conflict detection works for
-    // write transactions on super-nodes.
-    // so OCC conflict detection works for write transactions on super-nodes.
+fn g067_parallel_traversal_leaves_no_occ_scope() {
     let dir = tempfile::tempdir().expect("tempdir");
     let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
     let engine = StorageEngine::open_with_oracle(
@@ -3548,35 +3544,16 @@ fn g067_parallel_traversal_populates_occ_read_set() {
         ctx.warnings,
     );
 
-    // Verify OCC read-set contains Node keys for target nodes.
-    // The source node (Hub, id=1) is read via sequential mvcc_get in NodeScan,
-    // and 10 target nodes are read via parallel path — all should be tracked.
-    let scope = ctx
-        .txn
-        .occ_scope()
-        .expect("MVCC mode must have an OCC scope");
-
-    // Verify specific target keys are tracked via the typed OCC probe
-    // (builds the key internally — no raw encoder). Done before draining.
-    for target_id in 2..=11u64 {
-        assert!(
-            scope.contains_node(1, NodeId::from_raw(target_id)),
-            "target node {target_id} should be in OCC read-set",
-        );
-    }
-
-    // Drain to count Node-partition entries.
-    let tracked: Vec<_> = scope.drain();
-    let node_read_keys: Vec<_> = tracked
-        .iter()
-        .filter(|(part, _)| *part == Partition::Node)
-        .collect();
-    // At least 10 target Node keys must be in read-set (from parallel path)
-    // plus 1 for the Hub node (from sequential NodeScan).
+    // No OCC scope materialises: reads are not conflict-tracked at the
+    // default level, sequential or parallel alike. This test asserted the
+    // opposite while the engine validated read sets; it now pins the absence,
+    // because the collection it used to verify was per-row work (a key copy
+    // into a mutex-guarded set) feeding a check that no mainstream engine's
+    // default performs. FOR UPDATE and the serializable level re-enable
+    // tracking selectively when they land, with their own tests.
     assert!(
-        node_read_keys.len() >= 10,
-        "expected ≥10 Node keys in OCC read-set (parallel targets), got {}",
-        node_read_keys.len(),
+        ctx.txn.occ_scope().is_none(),
+        "a plain traversal must not materialise an OCC scope",
     );
 }
 
@@ -3620,11 +3597,11 @@ fn g104_ensure_occ_scope_idempotent_in_mvcc_mode() {
 }
 
 #[test]
-fn mvcc_get_node_temporal_tracks_temporal_key_in_occ_scope() {
-    // Critical correctness: the temporal helper must enter the
-    // 25-byte temporal key (NOT the 16-byte non-temporal key) into
-    // the OCC scope. A bug here would silently miss conflicts on
-    // bitemporal reads.
+fn mvcc_get_node_temporal_leaves_no_occ_scope() {
+    // Reads are not conflict-tracked at the default level, temporal reads
+    // included. The 25-byte-vs-16-byte key precision this asserted on the
+    // read side lives on the WRITE side (temporal writes buffer under
+    // per-version keys, so different versions never write-write conflict).
     let dir = tempfile::tempdir().expect("tempdir");
     let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
     let engine = StorageEngine::open_with_oracle(
@@ -3657,16 +3634,9 @@ fn mvcc_get_node_temporal_tracks_temporal_key_in_occ_scope() {
         .expect("get")
         .expect("Some");
 
-    let scope = ctx.txn.occ_scope().expect("scope");
     assert!(
-        scope.contains_node_temporal(0, id, 1234567890),
-        "OCC scope must contain the 25-byte temporal key, not the non-temporal one",
-    );
-    // Cross-check: non-temporal 16-byte key for the same id must NOT
-    // be tracked — temporal reads are version-specific.
-    assert!(
-        !scope.contains_node(0, id),
-        "temporal read must NOT track the non-temporal 16-byte key",
+        ctx.txn.occ_scope().is_none(),
+        "a temporal node read must not materialise an OCC scope",
     );
 }
 
@@ -3787,11 +3757,12 @@ fn mvcc_temporal_handles_negative_valid_from_ms() {
 }
 
 #[test]
-fn mvcc_get_edge_props_tracks_key_in_occ_scope() {
-    // Critical correctness — typed edge-prop read must enter the
-    // Layer-3 OCC scope under the encoded EdgeProp key, otherwise
-    // OCC misses concurrent writers on edges that a transaction
-    // reads but does not write.
+fn mvcc_get_edge_props_leaves_no_occ_scope() {
+    // Reads are not conflict-tracked at the default level, typed edge-prop
+    // reads included: an edge a transaction reads but does not write cannot
+    // abort its commit. This asserted tracking while the engine validated
+    // read sets; that strictness now belongs to the opt-in serializable
+    // level and FOR UPDATE.
     let dir = tempfile::tempdir().expect("tempdir");
     let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
     let engine = StorageEngine::open_with_oracle(
@@ -3847,13 +3818,9 @@ fn mvcc_get_edge_props_tracks_key_in_occ_scope() {
         .expect("get")
         .expect("Some");
 
-    // Typed OCC-scope assertion — `contains_edge_props` builds
-    // the key internally so the assertion is raw-encoder-free
-    // even though the fixture seeding above is not.
-    let scope = ctx.txn.occ_scope().expect("scope");
     assert!(
-        scope.contains_edge_props("REL", src, tgt),
-        "OCC scope must contain the encoded EdgeProp key after a typed read",
+        ctx.txn.occ_scope().is_none(),
+        "a typed edge-prop read must not materialise an OCC scope",
     );
 }
 
@@ -3916,17 +3883,15 @@ fn mvcc_get_edge_props_temporal_tracks_25byte_key_not_short() {
         .expect("get")
         .expect("Some");
 
-    // Typed OCC-scope assertions — verify the temporal key is
-    // tracked but the non-temporal (short) one for the same
-    // pair is NOT.
-    let scope = ctx.txn.occ_scope().expect("scope");
+    // A temporal read tracks nothing: reads are outside conflict detection at
+    // the default level. The per-version-vs-short-key precision this test
+    // used to assert on the READ side still matters, but it lives on the
+    // WRITE side now (temporal writes buffer under per-version keys, so two
+    // transactions on different versions never write-write conflict), which
+    // the temporal write-path tests cover.
     assert!(
-        scope.contains_edge_props_temporal("REL", src, tgt, 5000),
-        "OCC scope must record the temporal (per-version) key",
-    );
-    assert!(
-        !scope.contains_edge_props("REL", src, tgt),
-        "OCC scope must NOT record the short non-temporal key on a temporal read",
+        ctx.txn.occ_scope().is_none(),
+        "a temporal read must not materialise an OCC scope",
     );
 }
 
@@ -4166,10 +4131,9 @@ fn upsert_on_match_concurrent_write_is_caught_by_layer3_occ() {
     // "concurrent writer modified a matched node between MATCH
     // and SET" scenario at commit time via has_write_after.
     //
-    // Scenario: txn reads node `k`, then a sibling txn writes to
-    // `k`, then the original txn writes (independent key) and
-    // flushes — the OCC scope tracked `k` during the read, so
-    // validate_occ at flush must surface ExecutionError::Conflict.
+    // Scenario: txn MATCH-reads node `k`, a sibling txn writes `k`, then the
+    // original txn's ON MATCH SET writes `k` and flushes — a write-write
+    // overlap, surfaced as ExecutionError::Conflict at commit.
     let dir = tempfile::tempdir().expect("tempdir");
     let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
     let engine = StorageEngine::open_with_oracle(
@@ -4197,30 +4161,32 @@ fn upsert_on_match_concurrent_write_is_caught_by_layer3_occ() {
     ctx.mvcc_read_ts = oracle.next();
     ctx.write_concern = coordinode_core::txn::write_concern::WriteConcern::w0();
 
-    // MATCH-phase read: populates the OCC scope with `k`.
+    // MATCH-phase read of the node the upsert matched.
     let _ = ctx.mvcc_get_node(0, id).expect("match read").expect("Some");
 
-    // Concurrent writer modifies the same key out-of-band.
-    // Stamps a fresh seqno that is necessarily > mvcc_read_ts.
+    // Concurrent writer modifies the same node out-of-band, stamping a fresh
+    // seqno that is necessarily > mvcc_read_ts.
     let mut altered = NodeRecord::new("U");
     altered.set(ctx.interner.intern("name"), Value::String("Bob".into()));
     seed_node_record(&engine, 0, id, &altered);
 
-    // ON MATCH SET: buffer a write on an UNRELATED key so the txn
-    // is not read-only and flush actually runs OCC validation.
-    let other = NodeId::from_raw(701);
-    ctx.mvcc_put_node(0, other, &NodeRecord::new("Other"))
-        .expect("unrelated put");
+    // ON MATCH SET writes the MATCHED node, which is what the production
+    // MERGE flow does: the SET's target is the node the MATCH found. That
+    // makes the race a write-write overlap, so the conflict survives the
+    // move from read-set to write-set validation. (A SET that wrote only
+    // unrelated keys would commit under the new model, as it does in every
+    // mainstream engine; guarding read-then-elsewhere-write is FOR UPDATE's
+    // job.)
+    let mut updated = NodeRecord::new("U");
+    updated.set(ctx.interner.intern("name"), Value::String("Carol".into()));
+    ctx.mvcc_put_node(0, id, &updated).expect("on-match set");
 
     let err = ctx
         .mvcc_flush()
-        .expect_err("flush must surface the OCC conflict on the MATCH-read key");
+        .expect_err("flush must surface the write-write conflict on the matched node");
     match err {
         ExecutionError::Conflict(msg) => {
-            assert!(
-                msg.contains("OCC") || msg.contains("conflict"),
-                "conflict message expected: {msg}",
-            );
+            assert!(msg.contains("conflict"), "conflict message expected: {msg}",);
         }
         other => panic!("expected ExecutionError::Conflict, got {other:?}"),
     }
@@ -4642,11 +4608,11 @@ fn mvcc_put_node_does_not_track_in_occ_scope() {
 }
 
 #[test]
-fn mvcc_get_node_tracks_in_occ_scope() {
-    // Critical correctness: typed read must enter the Layer-3
-    // OCC scope (otherwise OCC conflict detection misses node
-    // dependencies and writes appear to commit cleanly even
-    // when another transaction modified the read node).
+fn mvcc_get_node_leaves_no_occ_scope() {
+    // Reads are not conflict-tracked at the default level: a node a
+    // transaction read but did not write cannot abort its commit, matching
+    // every mainstream engine's default. Read-dependency conflicts are the
+    // opt-in serializable level's and FOR UPDATE's job.
     let dir = tempfile::tempdir().expect("tempdir");
     let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
     let engine = StorageEngine::open_with_oracle(
@@ -4674,11 +4640,9 @@ fn mvcc_get_node_tracks_in_occ_scope() {
     ctx.mvcc_read_ts = oracle.next();
 
     let _ = ctx.mvcc_get_node(0, id).expect("get").expect("Some");
-    // OCC scope must contain the encoded node key.
-    let scope = ctx.txn.occ_scope().expect("MVCC mode → scope present");
     assert!(
-        scope.contains_node(0, id),
-        "typed read must populate OCC scope under Node partition",
+        ctx.txn.occ_scope().is_none(),
+        "a typed node read must not materialise an OCC scope",
     );
 }
 
@@ -5180,23 +5144,32 @@ fn g067_parallel_occ_detects_conflict_on_target_node() {
     modified_record.set(0, Value::String("T5-modified".into()));
     seed_node_record(&engine, 1, NodeId::from_raw(5), &modified_record);
 
-    // T1: Add a dummy write so mvcc_flush doesn't skip conflict check
-    // (read-only transactions return early without OCC check)
+    // A write to an UNRELATED key commits fine: traversal reads are not
+    // conflict-tracked at the default level, so the concurrent write to
+    // target 5 is invisible to this commit. This test asserted the abort
+    // while the engine validated the read set; that strictness now belongs to
+    // the opt-in serializable level and FOR UPDATE.
     let dummy_key = coordinode_core::graph::node::encode_node_key(1, NodeId::from_raw(999));
     ctx.txn
         .write_buffer_mut()
         .insert((Partition::Node, dummy_key), Some(b"dummy".to_vec()));
 
-    // T1: OCC conflict check via mvcc_flush should detect the write to target 5
+    // But a write to the SAME node the concurrent writer touched is a
+    // write-write overlap and must lose (first committer wins).
+    let contested_key = coordinode_core::graph::node::encode_node_key(1, NodeId::from_raw(5));
+    ctx.txn
+        .write_buffer_mut()
+        .insert((Partition::Node, contested_key), Some(b"from-txn".to_vec()));
+
     let conflict = ctx.mvcc_flush();
     assert!(
         conflict.is_err(),
-        "OCC should detect conflict on target node 5 modified after read_ts",
+        "a write to target node 5, also written after read_ts, must conflict",
     );
     let err_msg = format!("{}", conflict.unwrap_err());
     assert!(
-        err_msg.contains("OCC conflict"),
-        "expected OCC conflict error, got: {err_msg}",
+        err_msg.contains("write conflict"),
+        "expected a write conflict, got: {err_msg}",
     );
 }
 

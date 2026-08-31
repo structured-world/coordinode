@@ -523,6 +523,33 @@ pub enum DatabaseError {
     #[error("semantic error: {0}")]
     Semantic(String),
 
+    /// No interactive transaction is held under this id.
+    ///
+    /// Either it was never opened, or it is already finished: committed,
+    /// rolled back, aborted by a failed statement, or collected by the idle
+    /// sweep. A caller cannot tell those apart from the id alone, and does not
+    /// need to: in every case the server holds nothing for it.
+    #[error("unknown transaction id {0}")]
+    UnknownTransaction(u64),
+
+    /// A commit refused by OCC validation: a key this transaction READ was
+    /// modified by a concurrent writer after the snapshot was pinned at begin,
+    /// so the transaction's view is no longer the state it would commit into.
+    /// Nothing was applied; re-running the whole transaction from begin is the
+    /// intended response, and the only failure of the commit for which that
+    /// helps.
+    #[error("transaction {id} conflicts with a concurrent write: {source_message}")]
+    TransactionConflict { id: u64, source_message: String },
+
+    /// A transaction buffered more uncommitted data than it is allowed to, and
+    /// was discarded. Splitting the work into smaller transactions is the fix.
+    #[error("transaction {id} exceeded its buffer limit ({buffered} > {limit} bytes)")]
+    TransactionTooLarge {
+        id: u64,
+        buffered: usize,
+        limit: usize,
+    },
+
     #[error("{0}")]
     Other(String),
 }
@@ -1539,11 +1566,7 @@ impl Database {
                 .unwrap_or_else(|p| p.into_inner());
             match reg.remove(&txn_id) {
                 Some((state, _touched)) => state,
-                None => {
-                    return Err(DatabaseError::Other(format!(
-                        "unknown transaction id {txn_id}"
-                    )));
-                }
+                None => return Err(DatabaseError::UnknownTransaction(txn_id)),
             }
         };
         let session = QuerySession {
@@ -1569,11 +1592,11 @@ impl Database {
             // breach the transaction aborts (state dropped, handle consumed).
             let buffered = state.buffered_bytes();
             if buffered > self.max_interactive_txn_bytes {
-                return Err(DatabaseError::Other(format!(
-                    "interactive transaction {txn_id} exceeded max_interactive_txn_bytes \
-                     ({buffered} > {}); transaction aborted",
-                    self.max_interactive_txn_bytes
-                )));
+                return Err(DatabaseError::TransactionTooLarge {
+                    id: txn_id,
+                    buffered,
+                    limit: self.max_interactive_txn_bytes,
+                });
             }
             self.interactive_txns
                 .lock()
@@ -1597,9 +1620,7 @@ impl Database {
             .remove(&txn_id)
             .map(|(s, _)| s);
         let Some(state) = state else {
-            return Err(DatabaseError::Other(format!(
-                "unknown transaction id {txn_id}"
-            )));
+            return Err(DatabaseError::UnknownTransaction(txn_id));
         };
         let mut txn = coordinode_storage::engine::transaction::Transaction::resume(
             &self.engine,
@@ -1614,9 +1635,23 @@ impl Database {
             drain_buffer: Some(&self.drain_buffer),
             nvme_write_buffer: self.nvme_write_buffer.as_deref(),
         };
-        let outcome = txn
-            .commit(&commit_ctx)
-            .map_err(|e| DatabaseError::Other(format!("commit failed: {e}")))?;
+        // Split by variant, because the three failures call for opposite
+        // reactions. Only an OCC conflict is worth retrying: the read-set was
+        // invalidated by a concurrent writer and re-running the transaction
+        // resolves it. A storage or pipeline failure retried immediately just
+        // fails again, and telling the client otherwise would be a lie with a
+        // retry storm attached.
+        use coordinode_storage::engine::transaction::CommitError;
+        let outcome = txn.commit(&commit_ctx).map_err(|e| match e {
+            CommitError::Conflict(detail) => DatabaseError::TransactionConflict {
+                id: txn_id,
+                source_message: detail,
+            },
+            CommitError::Storage(s) => DatabaseError::Storage(s),
+            CommitError::Serialization(detail) => {
+                DatabaseError::Other(format!("commit failed: {detail}"))
+            }
+        })?;
         Ok(outcome.applied_index.unwrap_or(0))
     }
 
@@ -1633,9 +1668,7 @@ impl Database {
         {
             Ok(())
         } else {
-            Err(DatabaseError::Other(format!(
-                "unknown transaction id {txn_id}"
-            )))
+            Err(DatabaseError::UnknownTransaction(txn_id))
         }
     }
 

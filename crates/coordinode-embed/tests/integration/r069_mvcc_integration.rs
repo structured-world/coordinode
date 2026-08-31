@@ -151,25 +151,28 @@ fn occ_conflict_concurrent_threads() {
         &allocator,
     );
 
-    // Read the key (adds to read_set)
+    // Read the key at the pinned snapshot.
     let val = ctx.mvcc_get(Partition::Node, b"node:0:1").expect("get");
     assert_eq!(val.as_deref(), Some(b"alice_v1".as_slice()));
 
-    // Signal thread B that read is done
+    // Stage this transaction's OWN write to the same key. The conflict under
+    // test is write-write under real threads: the default level does not
+    // track reads, so without this staged write B's update would be no
+    // conflict at all.
+    ctx.mvcc_put(Partition::Node, b"node:0:1", b"alice_from_a")
+        .expect("put");
+
+    // Signal thread B that the read+stage is done
     barrier_read.wait();
     // Wait for thread B to finish writing
     barrier_write.wait();
     handle_b.join().expect("thread B join");
 
-    // Buffer a write to make transaction non-read-only
-    ctx.mvcc_put(Partition::Node, b"node:0:2", b"new_data")
-        .expect("put");
-
-    // Flush should detect OCC conflict (thread B modified our read key)
+    // Flush must lose to thread B's committed write (first committer wins).
     let result = ctx.mvcc_flush();
     assert!(
         matches!(result, Err(ExecutionError::Conflict(_))),
-        "expected OCC conflict from concurrent thread write, got: {result:?}"
+        "expected a write-write conflict against the concurrent thread, got: {result:?}"
     );
 }
 

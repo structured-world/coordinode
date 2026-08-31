@@ -174,17 +174,18 @@ fn executor_mvcc_delete_via_buffer() {
     );
 }
 
-/// OCC conflict detection: mvcc_flush detects concurrent write to read key.
+/// A stale READ does not abort a commit whose writes overlap nobody's.
 ///
 /// Simulates two transactions:
-/// - Txn A reads key at start_ts, takes a snapshot
-/// - Txn B writes key concurrently (via direct engine.put)
-/// - Txn A tries to flush → OCC detects the conflict → ErrConflict
+/// - Txn A reads a key at start_ts, takes a snapshot
+/// - Txn B writes that key concurrently (via direct engine.put)
+/// - Txn A writes a DIFFERENT key and flushes → commits
+///
+/// The write-write case is `occ_conflict_on_write_write_overlap` below.
 #[test]
-fn occ_conflict_on_concurrent_write() {
+fn stale_read_does_not_abort_disjoint_commit() {
     use coordinode_core::graph::intern::FieldInterner;
     use coordinode_core::graph::node::NodeIdAllocator;
-    use coordinode_query::executor::runner::ExecutionError;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1000)));
@@ -216,25 +217,75 @@ fn occ_conflict_on_concurrent_write() {
         &allocator,
     );
 
-    // Txn A reads the key → adds to read_set
+    // Txn A reads the key. Reads are not conflict-tracked at the default
+    // level: this test asserted the opposite while the engine validated the
+    // read set, which was serializable-strength enforcement imposed on
+    // everyone. The write-write case lives right below.
     let val = ctx.mvcc_get(Partition::Node, b"node:0:1").expect("get");
     assert_eq!(val.as_deref(), Some(b"alice_v1".as_slice()));
 
-    // Txn B: concurrent transaction writes to the SAME key.
-    // With oracle-driven seqno, this write gets seqno=1002 (> read_ts=1001).
+    // Txn B: concurrent transaction writes to the SAME key A read.
     engine
         .put(Partition::Node, b"node:0:1", b"alice_v2")
         .expect("concurrent put");
 
-    // Txn A: buffers a write (to a DIFFERENT key, so it's not read-only)
+    // Txn A: buffers a write to a DIFFERENT key. Its write set does not
+    // overlap B's, so the commit must succeed even though A's read is stale:
+    // that is what every mainstream engine's default does.
     ctx.mvcc_put(Partition::Node, b"node:0:2", b"bob_data")
         .expect("put");
+    ctx.mvcc_flush()
+        .expect("a stale READ must not abort a commit whose writes touch nobody");
+}
 
-    // Txn A: tries to flush → OCC should detect conflict on node:0:1
+/// The case the default level DOES catch: two transactions writing the same
+/// key. First committer wins; the second commit aborts having applied nothing.
+#[test]
+fn occ_conflict_on_write_write_overlap() {
+    use coordinode_core::graph::intern::FieldInterner;
+    use coordinode_core::graph::node::NodeIdAllocator;
+    use coordinode_query::executor::runner::ExecutionError;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1000)));
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open");
+    let allocator = NodeIdAllocator::new(0);
+
+    engine
+        .put(Partition::Node, b"node:0:1", b"alice_v1")
+        .expect("initial put");
+
+    let read_ts = oracle.next();
+    let txn_snapshot = engine.snapshot();
+    let mut interner = FieldInterner::new();
+    let mut ctx = super::helpers::make_ctx_mvcc(
+        &engine,
+        &oracle,
+        read_ts,
+        Some(txn_snapshot),
+        &mut interner,
+        &allocator,
+    );
+
+    // Txn A buffers a write to node:0:1; txn B commits its own write to the
+    // SAME key after A's snapshot. A's flush must lose (lost update prevented).
+    ctx.mvcc_put(Partition::Node, b"node:0:1", b"alice_from_a")
+        .expect("buffer");
+    engine
+        .put(Partition::Node, b"node:0:1", b"alice_from_b")
+        .expect("concurrent committed write");
+
     let result = ctx.mvcc_flush();
     assert!(
         matches!(result, Err(ExecutionError::Conflict(_))),
-        "expected OCC conflict, got: {result:?}"
+        "two writers on one key: first committer wins, got {result:?}"
     );
 }
 
@@ -327,21 +378,20 @@ fn occ_adj_partition_excluded() {
     );
 }
 
-/// OCC conflict detection via prefix_scan path.
-///
-/// Regression test: mvcc_prefix_scan must add scanned keys to the read-set.
-/// Without this, concurrent writes to scanned nodes go undetected.
+/// Scanned keys are NOT conflict-tracked at the default level.
 ///
 /// Scenario:
 /// - Write node:0:1 at ts=1000
-/// - Txn A: prefix_scan at ts=1001 → reads node:0:1 (added to read_set)
+/// - Txn A: prefix_scan at ts=1001 → observes node:0:1
 /// - Txn B: writes node:0:1 at ts=1002
-/// - Txn A: flush → OCC detects conflict on node:0:1
+/// - Txn A: writes an unrelated key, flush → commits (no write overlap)
+///
+/// Pinning scanned rows is FOR UPDATE's explicit opt-in; done implicitly it
+/// would keep any long cursor from committing next to any writer.
 #[test]
-fn occ_conflict_via_prefix_scan() {
+fn prefix_scan_of_concurrently_written_key_commits() {
     use coordinode_core::graph::intern::FieldInterner;
     use coordinode_core::graph::node::NodeIdAllocator;
-    use coordinode_query::executor::runner::ExecutionError;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1000)));
@@ -373,36 +423,32 @@ fn occ_conflict_via_prefix_scan() {
         &allocator,
     );
 
-    // Read via prefix_scan (not mvcc_get) — must still track in read_set
+    // Read via prefix_scan. Scanned keys are not conflict-tracked at the
+    // default level; this test asserted the opposite while the engine
+    // validated the read set. Pinning every scanned row is exactly what the
+    // FOR UPDATE design reserves for an explicit opt-in, because a long
+    // cursor doing it implicitly could never commit next to any writer.
     let scan_results = ctx
         .mvcc_prefix_scan(Partition::Node, b"node:0:")
         .expect("scan");
     assert_eq!(scan_results.len(), 1, "should find one node");
     assert_eq!(scan_results[0].0, b"node:0:1");
 
-    // Verify the scanned key IS in the OCC scope (Layer 3)
-    assert!(
-        ctx.txn
-            .occ_scope()
-            .expect("MVCC mode must have OCC scope")
-            .contains(Partition::Node, b"node:0:1"),
-        "prefix_scan results must be tracked in OCC scope"
-    );
-
-    // Txn B: concurrent write to the SAME key
+    // Txn B: concurrent write to the SAME key the scan observed.
     engine
         .put(Partition::Node, b"node:0:1", b"alice_v2")
         .expect("concurrent put");
 
-    // Buffer a write to make txn non-read-only
+    // Buffer a write to an unrelated key: no write-write overlap with B.
     ctx.mvcc_put(Partition::Node, b"node:0:99", b"unrelated")
         .expect("put");
 
-    // Flush → OCC should detect conflict on node:0:1 (read via prefix_scan)
+    // Flush succeeds: a scan that observed data B later changed is not a
+    // conflict, the same answer PostgreSQL, Oracle, MongoDB and Dgraph give.
     let result = ctx.mvcc_flush();
     assert!(
-        matches!(result, Err(ExecutionError::Conflict(_))),
-        "prefix_scan reads must trigger OCC conflict: {result:?}"
+        result.is_ok(),
+        "scanned-then-changed keys must not abort a non-overlapping commit: {result:?}"
     );
 }
 
@@ -1256,26 +1302,19 @@ fn r065_occ_detects_concurrent_modification() {
     let val = ctx.mvcc_get(Partition::Node, b"node:1:99").expect("read");
     assert_eq!(val.as_deref(), Some(b"original".as_slice()));
 
-    // Concurrent write by "another transaction" — modifies the same key
+    // Concurrent write by "another transaction" — modifies the key txn 1 READ.
     engine
         .put(Partition::Node, b"node:1:99", b"modified_by_other")
         .expect("concurrent put");
 
-    // Transaction 1 tries to write something and flush
+    // Transaction 1 writes a DIFFERENT key and flushes. No write overlap: the
+    // commit must succeed. This asserted a conflict while the engine validated
+    // the read set; the default level now conflicts on writes only, matching
+    // every mainstream engine's default.
     ctx.mvcc_put(Partition::Node, b"node:1:200", b"my_write")
         .expect("buffer write");
-
-    // Flush should detect OCC conflict (read-set key was modified)
-    let result = ctx.mvcc_flush();
-    assert!(
-        result.is_err(),
-        "should detect OCC conflict: key modified by concurrent transaction"
-    );
-    let err_msg = format!("{}", result.unwrap_err());
-    assert!(
-        err_msg.contains("OCC conflict"),
-        "error should mention OCC conflict, got: {err_msg}"
-    );
+    ctx.mvcc_flush()
+        .expect("stale read with disjoint writes must commit");
 }
 
 /// R066: ABA detection — write + revert to same value still triggers conflict.
@@ -1319,9 +1358,13 @@ fn r066_occ_detects_aba_write() {
     );
     ctx.shard_id = 1;
 
-    // Txn reads "A" — adds to read-set
-    let val = ctx.mvcc_get(Partition::Node, b"node:1:aba").expect("read");
-    assert_eq!(val.as_deref(), Some(b"value_A".as_slice()));
+    // The txn stages its OWN write to the key. The ABA property under test is
+    // unchanged, but it now lives on the write set: this transaction and the
+    // concurrent writer both wrote node:1:aba, and the concurrent writes end
+    // on a value byte-identical to the original. Value comparison would say
+    // "no conflict"; seqno detection must still say lost update.
+    ctx.mvcc_put(Partition::Node, b"node:1:aba", b"value_from_txn")
+        .expect("buffer own write");
 
     // ABA: concurrent writes change A → B → A (same final value)
     engine
@@ -1331,8 +1374,7 @@ fn r066_occ_detects_aba_write() {
         .put(Partition::Node, b"node:1:aba", b"value_A")
         .expect("put A back");
 
-    // Value is identical to what txn read ("A"), but seqno is newer.
-    // Value comparison would say "no conflict". Seqno detection catches it.
+    // Value is identical to what the txn read ("A"), but seqno is newer.
     let current = engine.get(Partition::Node, b"node:1:aba").expect("get");
     assert_eq!(
         current.as_deref(),
@@ -1340,17 +1382,15 @@ fn r066_occ_detects_aba_write() {
         "value should be back to A"
     );
 
-    // Txn tries to flush — should detect conflict via seqno
-    ctx.mvcc_put(Partition::Node, b"node:1:other", b"data")
-        .expect("buffer");
+    // Flush must detect the write-write conflict via seqno.
     let result = ctx.mvcc_flush();
     assert!(
         result.is_err(),
-        "R066: should detect ABA conflict even though value is identical"
+        "seqno detection must catch a write-write ABA even though the value is identical"
     );
     let err = format!("{}", result.unwrap_err());
     assert!(
-        err.contains("OCC conflict"),
-        "should be OCC conflict, got: {err}"
+        err.contains("write conflict"),
+        "should be a write conflict, got: {err}"
     );
 }

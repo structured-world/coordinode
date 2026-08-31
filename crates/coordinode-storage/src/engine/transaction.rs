@@ -15,10 +15,13 @@
 //! transaction never knows the modality taxonomy).
 //!
 //! Scope of this module: the read path, the read-your-own-writes write buffer,
-//! OCC read tracking, and the commutative merge buffers (adjacency adds/removes
-//! and node document deltas). Commit orchestration (OCC validation + commit-ts
-//! assignment + write-concern-aware flush) still lives in the query engine,
-//! which drains these buffers via the `take_*` accessors.
+//! and the commutative merge buffers (adjacency adds/removes and node document
+//! deltas). Conflict detection is write-set first-committer-wins at commit;
+//! reads are not tracked at the default level (the OCC scope exists for the
+//! opt-in serializable level and FOR UPDATE, which pin keys selectively).
+//! Commit orchestration (validation + commit-ts assignment +
+//! write-concern-aware flush) still lives in the query engine, which drains
+//! these buffers via the `take_*` accessors.
 
 use std::collections::{HashMap, HashSet};
 
@@ -72,8 +75,10 @@ pub struct CommitOutcome {
 /// Errors from [`Transaction::commit`].
 #[derive(Debug, thiserror::Error)]
 pub enum CommitError {
-    /// OCC read-write conflict: a key this transaction read was modified by a
-    /// concurrent writer after `read_ts`. The caller should retry.
+    /// Write-write conflict: a key this transaction WROTE was also written by
+    /// a transaction that committed after `read_ts` (first-committer-wins).
+    /// Nothing was applied; re-running the whole transaction is the intended
+    /// response, and the only commit failure for which that helps.
     #[error("{0}")]
     Conflict(String),
     /// Underlying storage failure during flush.
@@ -341,10 +346,12 @@ impl<'a> Transaction<'a> {
         if let Some(buffered) = self.write_buffer.get(&(part, key.to_vec())) {
             return Ok(buffered.clone());
         }
-        // Track for conflict detection at commit.
-        if let Some(scope) = self.ensure_occ_scope() {
-            scope.track(part, key);
-        }
+        // Reads are NOT tracked for conflict detection: the default level
+        // conflicts on writes only (write-set first-committer-wins at commit),
+        // so recording every read here would be a per-read allocation into a
+        // mutex-guarded set that commit never consults. Read-dependency
+        // conflicts are the opt-in serializable level's and FOR UPDATE's job,
+        // which re-introduce tracking selectively through `ensure_occ_scope`.
         match self.snapshot {
             Some(snap) => Ok(self
                 .engine
@@ -752,16 +759,34 @@ impl<'a> Transaction<'a> {
 
         let commit_ts = oracle.next();
 
-        // OCC conflict detection (ADR-016: native seqno-based). The coordinator
-        // walks the scope's tracked keys, skips commutative partitions, and
-        // returns the first conflicting key. Detects all writes including ABA
-        // (write + revert to same value) via lsm-tree seqno inspection.
-        if let Some(scope) = self.occ_scope.as_ref() {
-            if let Some(conflict) = self.engine.coordinator().validate_occ(scope)? {
+        // First-committer-wins over the WRITE set (ADR-016 seqno probing, write
+        // keys only). Every mainstream engine conflicts on concurrent writes
+        // and never on stale reads at its default level: PostgreSQL and Oracle
+        // row-lock writers, MongoDB conflicts on a concurrently written
+        // document, Dgraph fingerprints mutations. Validating the read set
+        // instead is serializable-strength enforcement and lives behind the
+        // opt-in level and FOR UPDATE, not here — imposed by default it aborts
+        // every read-heavy transaction that raced any writer.
+        //
+        // Commutative partitions are exempt: their concurrency story is the
+        // merge operator, and adding them here would resurrect the super-node
+        // abort storms the merge path exists to prevent. Detects ABA (write +
+        // revert) via lsm-tree seqno inspection, same as the read-set probe
+        // this replaced.
+        let occ_read_ts = self.read_ts.as_raw();
+        for (part, key) in self.write_buffer.keys() {
+            if part.is_commutative() {
+                continue;
+            }
+            if self
+                .engine
+                .coordinator()
+                .has_write_after(*part, key, occ_read_ts)?
+            {
                 return Err(CommitError::Conflict(format!(
-                    "OCC conflict: key in {:?} partition was modified by another \
-                     transaction after start_ts={}. Retry the transaction.",
-                    conflict.partition, conflict.read_ts,
+                    "write conflict: key in {part:?} partition was also written by a \
+                     transaction that committed after start_ts={occ_read_ts}. Nothing \
+                     was applied; retry the whole transaction.",
                 )));
             }
         }
@@ -1070,16 +1095,11 @@ impl<'a> Transaction<'a> {
                     .into_iter()
                     .map(|(k, v)| (k, v.to_vec()))
                     .collect();
-                // OCC-track every scanned storage key except our own writes.
+                // Scanned keys are not conflict-tracked: see `get` — the
+                // default level validates writes only, and FOR UPDATE is the
+                // opt-in that pins scanned rows into the scope.
                 let buffer_keys: HashSet<Vec<u8>> =
                     buffer_matches.iter().map(|(k, _)| k.clone()).collect();
-                if let Some(scope) = self.ensure_occ_scope() {
-                    for (k, _) in &results {
-                        if !buffer_keys.contains(k) {
-                            scope.track(part, k);
-                        }
-                    }
-                }
                 // Buffer takes priority: drop storage rows shadowed by a
                 // buffered value, then append the buffered values.
                 results.retain(|(k, _)| !buffer_keys.contains(k));
@@ -1146,13 +1166,11 @@ impl<'a> Transaction<'a> {
             rows.push((key.to_vec(), value.to_vec()));
         }
 
-        // OCC-track every key this page observed.
-        if let Some(scope) = self.ensure_occ_scope() {
-            for (key, _) in &rows {
-                scope.track(part, key);
-            }
-        }
-
+        // Paged rows are not conflict-tracked by default. This is the exact
+        // case the FOR UPDATE design exists for: a long cursor pinning every
+        // observed page into the conflict set would make large read-mostly
+        // transactions unable to commit next to any writer. FOR UPDATE opts
+        // the rows the caller will update back in, via `ensure_occ_scope`.
         let last_key = rows.last().map(|(k, _)| k.clone());
         Ok(PagedScan {
             rows,
