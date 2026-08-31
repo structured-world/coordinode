@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.5.5 - 2026-08-31
+
+### coordinode-embed 0.5.5
+
+#### Testing
+
+- *(capacity)* wait for the reclaim to reach the filesystem
+
+### coordinode-query 0.5.5
+
+#### Fixed
+
+- *(query)* persist SET on a relationship bound by MERGE
+- *(query)* stop a path element borrowing the previous one's properties
+
+---
+
 ## v0.5.4 - 2026-08-30
 
 ### coordinode-embed 0.5.4
