@@ -1368,7 +1368,27 @@ fn writes_resume_after_compaction_frees_space() {
     engine
         .major_compact(Partition::Node)
         .expect("major compact");
-    engine.refresh_capacity();
+
+    // Poll rather than read once. Capacity is measured by walking the files
+    // under the endpoint, and compaction returning does not mean the segments
+    // it superseded are already unlinked: they are held on the version free
+    // list until the last reference drops, and until then the walk still
+    // counts them. On an unloaded machine that window is invisible; on a busy
+    // CI runner it is not, which is why reading once made this test fail on
+    // main roughly two runs in five. The assertion below is unchanged: the
+    // endpoint must become writable, this only allows the reclaim a moment to
+    // reach the filesystem.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        engine.refresh_capacity();
+        if engine.capacity().get("ep").expect("tracked").is_writable()
+            || std::time::Instant::now() >= deadline
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
     let usage = engine.capacity().get("ep").expect("tracked");
     assert!(
         usage.is_writable(),
