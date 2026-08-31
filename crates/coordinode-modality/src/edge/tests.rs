@@ -144,10 +144,12 @@ fn get_props_snapshot_reads_body_and_none_via_mvcc_snapshot() {
 
     db.write(|s, t| s.put_edge(t, "LIKES", a, b, None).expect("put"));
     let snap2 = db.engine.snapshot();
-    assert!(store
-        .get_props_snapshot(&db.engine, &snap2, "LIKES", a, b)
-        .expect("ok")
-        .is_none());
+    assert!(
+        store
+            .get_props_snapshot(&db.engine, &snap2, "LIKES", a, b)
+            .expect("ok")
+            .is_none()
+    );
 }
 
 #[test]
@@ -233,10 +235,12 @@ fn delete_edge_removes_from_adjacency_and_props() {
         .collect();
     assert_eq!(out, vec![3]);
     // `a` is gone from b's reverse neighbors.
-    assert!(store
-        .scan_neighbors_in(&r, "F", b)
-        .expect("scan")
-        .is_empty());
+    assert!(
+        store
+            .scan_neighbors_in(&r, "F", b)
+            .expect("scan")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -266,10 +270,12 @@ fn edge_types_are_isolated_in_adj() {
     let store = LocalEdgeStore;
     let r = db.read();
     // KNOWS gone, LIKES preserved.
-    assert!(store
-        .scan_neighbors_out(&r, "KNOWS", a)
-        .expect("scan")
-        .is_empty());
+    assert!(
+        store
+            .scan_neighbors_out(&r, "KNOWS", a)
+            .expect("scan")
+            .is_empty()
+    );
     assert_eq!(
         store.scan_neighbors_out(&r, "LIKES", a).expect("scan"),
         vec![b],
@@ -609,10 +615,12 @@ fn posting_at_snapshot_reads_committed_adjacency() {
 
     let store = LocalEdgeStore;
     // Absent key → None.
-    assert!(store
-        .posting_at_snapshot(&db.engine, None, &encode_adj_key_forward("KNOWS", bob))
-        .expect("ok")
-        .is_none());
+    assert!(
+        store
+            .posting_at_snapshot(&db.engine, None, &encode_adj_key_forward("KNOWS", bob))
+            .expect("ok")
+            .is_none()
+    );
     // Present key → the full peer set (latest committed).
     let fwd = store
         .posting_at_snapshot(&db.engine, None, &encode_adj_key_forward("KNOWS", alice))
@@ -684,10 +692,12 @@ fn discriminated_put_get_roundtrip_and_absent_is_none() {
         .expect("college instance present");
     assert_eq!(college.get(1), Some(&Value::Int(200)));
     // A discriminator value with no instance reads as None.
-    assert!(store
-        .get_props_for(&r, "KNOWS", a, b, &Value::String("gym".into()))
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .get_props_for(&r, "KNOWS", a, b, &Value::String("gym".into()))
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]

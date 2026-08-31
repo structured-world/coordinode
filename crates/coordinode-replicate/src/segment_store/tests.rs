@@ -5,7 +5,7 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::placement::{SegmentId as PlacementSegmentId, SegmentMap};
 use coordinode_swarm::{
-    assemble, verify_piece, LocalPieceStore, PieceEncoding, PieceStore, SegmentId,
+    LocalPieceStore, PieceEncoding, PieceStore, SegmentId, assemble, verify_piece,
 };
 
 use super::*;
@@ -179,8 +179,8 @@ fn segment_source_builds_and_caches_servable_pieces() {
 
 #[tokio::test]
 async fn drain_client_pushes_segment_into_target_engine() {
-    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
     use crate::transfer::SegmentTransferHandler;
+    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
 
@@ -271,11 +271,11 @@ async fn drain_to_unreachable_peer_is_connect_error() {
 
 #[tokio::test]
 async fn swarm_pull_reconstructs_segment_over_grpc() {
-    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
     use crate::transfer::proto::SegmentDescriptorRef;
+    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
     use crate::transfer::{GrpcPieceSource, SegmentTransferHandler};
-    use coordinode_storage::placement::{partition_wire_tag, KeyRange};
-    use coordinode_swarm::{swarm_download, Freshness, NodeId, PieceSource, SourceCandidate};
+    use coordinode_storage::placement::{KeyRange, partition_wire_tag};
+    use coordinode_swarm::{Freshness, NodeId, PieceSource, SourceCandidate, swarm_download};
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
 
@@ -363,8 +363,8 @@ async fn swarm_pull_reconstructs_segment_over_grpc() {
 
 #[tokio::test]
 async fn repair_partition_pulls_and_installs_from_peer() {
-    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
     use crate::transfer::SegmentTransferHandler;
+    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
 
@@ -448,9 +448,9 @@ async fn repair_partition_no_reachable_peer_errors() {
 
 #[tokio::test]
 async fn repair_heals_corrupt_partition_so_rescrub_is_clean() {
-    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
     use crate::transfer::SegmentTransferHandler;
-    use coordinode_storage::scrub::{scrub_all, ScrubConfig};
+    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
+    use coordinode_storage::scrub::{ScrubConfig, scrub_all};
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
 

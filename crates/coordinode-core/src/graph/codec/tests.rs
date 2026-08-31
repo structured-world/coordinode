@@ -249,7 +249,7 @@ fn recursive_split_with_tiny_threshold() {
     assert_eq!(pack.blocks.len(), 4);
 
     let parts = pack.recursive_split_at(1); // force maximum splitting
-                                            // Should split into 4 parts (one per block)
+    // Should split into 4 parts (one per block)
     assert_eq!(parts.len(), 4);
 
     // Verify all UIDs preserved
@@ -495,9 +495,9 @@ fn streamvbyte_decode_speed_comparison() {
     let speedup = leb_elapsed.as_nanos() as f64 / svb_elapsed.as_nanos() as f64;
 
     eprintln!(
-            "StreamVByte DECODE 10K UIDs x {}:\n  LEB128:      {:?}\n  StreamVByte: {:?}\n  Speedup:     {:.2}x",
-            iterations, leb_elapsed, svb_elapsed, speedup
-        );
+        "StreamVByte DECODE 10K UIDs x {}:\n  LEB128:      {:?}\n  StreamVByte: {:?}\n  Speedup:     {:.2}x",
+        iterations, leb_elapsed, svb_elapsed, speedup
+    );
 
     // StreamVByte should be at least competitive (not dramatically slower)
     // The actual speedup depends on SIMD availability
@@ -543,7 +543,7 @@ fn streamvbyte_encode_speed_comparison() {
     let speedup = leb_elapsed.as_nanos() as f64 / svb_elapsed.as_nanos() as f64;
 
     eprintln!(
-            "StreamVByte ENCODE 10K UIDs x {}:\n  LEB128:      {:?}\n  StreamVByte: {:?}\n  Speedup:     {:.2}x",
-            iterations, leb_elapsed, svb_elapsed, speedup
-        );
+        "StreamVByte ENCODE 10K UIDs x {}:\n  LEB128:      {:?}\n  StreamVByte: {:?}\n  Speedup:     {:.2}x",
+        iterations, leb_elapsed, svb_elapsed, speedup
+    );
 }

@@ -66,8 +66,8 @@ fn set_truncates_to_capacity_in_release() {
 fn concurrent_readers_safe_under_single_writer() {
     // C1 contract: single writer + many readers. Run a stress test
     // that interleaves writes and reads to verify no torn snapshots.
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::thread;
 
     let list: Arc<AtomicNeighbourList<16>> = Arc::new(AtomicNeighbourList::new());
@@ -228,8 +228,8 @@ fn concurrent_cas_append_and_snapshot_no_torn_state() {
     // Every observed id must be a valid input (no garbage from a
     // half-written slot), and the writer's monotonic insert order
     // must be preserved in the final snapshot (readers see a prefix).
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::thread;
 
     const CAP: usize = 64;

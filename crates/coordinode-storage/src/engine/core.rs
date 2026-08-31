@@ -24,7 +24,7 @@ use crate::engine::config::{FlushPolicy, StorageConfig};
 use crate::engine::coordinator::{LocalMultiModalCoordinator, MultiModalCoordinator, SnapshotPin};
 use crate::engine::flush::FlushManager;
 use crate::engine::oplog_journal::{
-    apply_oplog_op, op_partition, EmbeddedOplog, OplogJournalConfig,
+    EmbeddedOplog, OplogJournalConfig, apply_oplog_op, op_partition,
 };
 use crate::engine::partition::Partition;
 use crate::engine::routing::PartitionRouting;

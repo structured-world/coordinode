@@ -154,7 +154,7 @@ fn validate_manifest(
     dump_fingerprint: u64,
     force: bool,
 ) -> Result<(), RestoreError> {
-    use super::export::{schema_fingerprint, BINARY_FORMAT_VERSION};
+    use super::export::{BINARY_FORMAT_VERSION, schema_fingerprint};
 
     if format_version > BINARY_FORMAT_VERSION && !force {
         return Err(RestoreError::IncompatibleVersion(format!(

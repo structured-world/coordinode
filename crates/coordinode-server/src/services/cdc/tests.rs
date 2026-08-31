@@ -9,9 +9,9 @@ use coordinode_storage::engine::core::StorageEngine;
 use tonic::Request;
 
 use super::ChangeEventServiceImpl;
-use crate::proto::replication::cdc::change_stream_service_server::ChangeStreamService;
 use crate::proto::replication::cdc::SubscribeRequest;
-use crate::registry::{build_consumer_registry, RegistryTuning};
+use crate::proto::replication::cdc::change_stream_service_server::ChangeStreamService;
+use crate::registry::{RegistryTuning, build_consumer_registry};
 
 /// Open a fresh single-endpoint engine in a temp directory, mirroring the
 /// registry-construction tests so the CDC service exercises the same wiring

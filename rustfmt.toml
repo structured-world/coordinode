@@ -1,0 +1,8 @@
+# Pinned so formatting does not depend on where `cargo fmt` was run from.
+#
+# Left unset, rustfmt takes its style from each crate's `edition`. The
+# Enterprise workspace builds these crates through path dependencies, and its
+# own crates are edition 2024, so a `cargo fmt --all` run from there reformats
+# this tree under a different rule than the one CI checks here. The two then
+# disagree permanently: whichever ran last loses.
+style_edition = "2024"

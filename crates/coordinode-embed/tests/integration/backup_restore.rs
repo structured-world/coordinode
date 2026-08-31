@@ -24,8 +24,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use coordinode_core::graph::types::Value;
-use coordinode_embed::backup::{export, restore};
 use coordinode_embed::Database;
+use coordinode_embed::backup::{export, restore};
 
 /// Build `(db2, _tempdir_keepalive)` from `db1`'s binary dump with the
 /// restored interner properly installed. The tempdir handle must stay

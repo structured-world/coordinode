@@ -16,14 +16,14 @@
 //! valid revision number, …).
 
 use coordinode_core::schema::definition::{
-    encode_edge_type_current_revision_key, encode_edge_type_schema_key,
-    encode_label_current_revision_key, encode_label_schema_key, EdgeTypeSchema, LabelSchema,
+    EdgeTypeSchema, LabelSchema, encode_edge_type_current_revision_key,
+    encode_edge_type_schema_key, encode_label_current_revision_key, encode_label_schema_key,
 };
+use coordinode_storage::Guard;
 use coordinode_storage::engine::batch::WriteBatch;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
-use coordinode_storage::Guard;
 
 use crate::error::{StoreError, StoreResult};
 
@@ -155,7 +155,7 @@ pub trait SchemaStore {
 
     /// Load the current label schema through a transaction (tracked read).
     fn load_label_txn(&self, txn: &mut Transaction, name: &str)
-        -> StoreResult<Option<LabelSchema>>;
+    -> StoreResult<Option<LabelSchema>>;
 
     /// Load the current edge type schema through a transaction (tracked read).
     fn load_edge_type_txn(
@@ -176,7 +176,7 @@ pub trait SchemaStore {
 
     /// Persist an edge type schema (body + pointer) on the transaction.
     fn save_edge_type_txn(&self, txn: &mut Transaction, schema: &EdgeTypeSchema)
-        -> StoreResult<()>;
+    -> StoreResult<()>;
 
     /// Idempotently write the implicit edge-type existence marker (empty body
     /// at revision 1) — checks the write buffer (RYOW) then the OCC-tracked

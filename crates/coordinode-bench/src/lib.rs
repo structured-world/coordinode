@@ -33,7 +33,7 @@ pub mod error;
 pub mod fingerprint;
 
 pub use error::{BenchError, BenchResult as BenchOpResult};
-pub use fingerprint::{git_metadata, hardware_fingerprint, GitMetadata, HardwareFingerprint};
+pub use fingerprint::{GitMetadata, HardwareFingerprint, git_metadata, hardware_fingerprint};
 
 /// Current schema version. Bump on breaking changes (renamed /
 /// removed fields). Renderers that see a higher schema_version than

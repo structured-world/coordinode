@@ -26,10 +26,10 @@ use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::{StorageError, StorageResult};
 use coordinode_storage::oplog::OplogEntry;
 use coordinode_storage::placement::{
-    partition_from_wire_tag, partition_wire_tag, KeyRange, SegmentDescriptor,
+    KeyRange, SegmentDescriptor, partition_from_wire_tag, partition_wire_tag,
 };
 use coordinode_swarm::{
-    split_segment, swarm_download, Freshness, NodeId, PieceEncoding, PieceSource, SourceCandidate,
+    Freshness, NodeId, PieceEncoding, PieceSource, SourceCandidate, split_segment, swarm_download,
 };
 use tonic::transport::Channel;
 

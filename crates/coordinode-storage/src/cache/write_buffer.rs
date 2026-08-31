@@ -46,8 +46,8 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use coordinode_core::txn::drain::{DrainEntry, WriteBufferHook};
 use coordinode_core::txn::proposal::{Mutation, PartitionId};

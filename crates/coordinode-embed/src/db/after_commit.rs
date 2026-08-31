@@ -32,14 +32,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use coordinode_core::graph::types::Value;
 use coordinode_core::schema::triggers::{
+    FailedTriggerEvent, OnErrorPolicySchema, PendingTriggerEvent, TriggerSchema,
     decode_trigger_event_seq, encode_trigger_failure_key, encode_trigger_key,
-    encode_trigger_pending_key, trigger_pending_scan_prefix, FailedTriggerEvent,
-    OnErrorPolicySchema, PendingTriggerEvent, TriggerSchema,
+    encode_trigger_pending_key, trigger_pending_scan_prefix,
 };
 use coordinode_core::txn::proposal::{Mutation, PartitionId, RaftProposal};
 use coordinode_core::txn::timestamp::Timestamp;
-use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::Guard;
+use coordinode_storage::engine::partition::Partition;
 
 use super::{Database, DatabaseError, QuerySession, TxnMode};
 

@@ -22,9 +22,10 @@ fn create_columnar_table_creates_tree_and_persists_schema() {
     assert!(db.engine().columnar_table_tree("Trade").is_some());
 
     // Re-creating the same table is rejected (schema persisted).
-    assert!(db
-        .execute_cypher("CREATE TABLE Trade (trade_id BIGINT PRIMARY KEY) STORAGE COLUMNAR")
-        .is_err());
+    assert!(
+        db.execute_cypher("CREATE TABLE Trade (trade_id BIGINT PRIMARY KEY) STORAGE COLUMNAR")
+            .is_err()
+    );
 }
 
 #[test]
@@ -72,9 +73,10 @@ fn create_table_requires_primary_key() {
     let mut db = Database::open(dir.path()).expect("open db");
 
     // No PRIMARY KEY column -> rejected.
-    assert!(db
-        .execute_cypher("CREATE TABLE NoPk (a INT, b STRING)")
-        .is_err());
+    assert!(
+        db.execute_cypher("CREATE TABLE NoPk (a INT, b STRING)")
+            .is_err()
+    );
 }
 
 #[test]
@@ -83,9 +85,10 @@ fn create_table_rejects_unknown_column_type() {
     let mut db = Database::open(dir.path()).expect("open db");
 
     // QUATERNION is not a supported column type.
-    assert!(db
-        .execute_cypher("CREATE TABLE Bad (id BIGINT PRIMARY KEY, q QUATERNION)")
-        .is_err());
+    assert!(
+        db.execute_cypher("CREATE TABLE Bad (id BIGINT PRIMARY KEY, q QUATERNION)")
+            .is_err()
+    );
     // The failed CREATE left no table behind.
     assert!(db.engine().columnar_table_tree("Bad").is_none());
 }

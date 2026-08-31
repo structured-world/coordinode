@@ -14,12 +14,12 @@
 //! workload size is intentionally small enough to run on CI hardware in
 //! seconds while still saturating memory bandwidth across cores.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use coordinode_core::graph::types::VectorMetric;
 use coordinode_vector::hnsw::{HnswConfig, HnswIndex};
@@ -84,13 +84,15 @@ fn bench_parallel_search(c: &mut Criterion) {
                             let index = index.clone();
                             let query_set = query_set.clone();
                             let next_query = next_query.clone();
-                            scope.spawn(move || loop {
-                                let idx = next_query.fetch_add(1, Ordering::Relaxed);
-                                if idx >= queries {
-                                    break;
+                            scope.spawn(move || {
+                                loop {
+                                    let idx = next_query.fetch_add(1, Ordering::Relaxed);
+                                    if idx >= queries {
+                                        break;
+                                    }
+                                    let results = index.search(&query_set[idx], 10);
+                                    std::hint::black_box(results);
                                 }
-                                let results = index.search(&query_set[idx], 10);
-                                std::hint::black_box(results);
                             });
                         }
                     });
@@ -136,14 +138,16 @@ fn bench_scaling_report(c: &mut Criterion) {
                             let index = index.clone();
                             let query_set = query_set.clone();
                             let next_query = next_query.clone();
-                            scope.spawn(move || loop {
-                                let idx = next_query.fetch_add(1, Ordering::Relaxed);
-                                if idx >= total_queries {
-                                    break;
+                            scope.spawn(move || {
+                                loop {
+                                    let idx = next_query.fetch_add(1, Ordering::Relaxed);
+                                    if idx >= total_queries {
+                                        break;
+                                    }
+                                    let q = &query_set[idx % query_set.len()];
+                                    let results = index.search(q, 10);
+                                    std::hint::black_box(results);
                                 }
-                                let q = &query_set[idx % query_set.len()];
-                                let results = index.search(q, 10);
-                                std::hint::black_box(results);
                             });
                         }
                     });

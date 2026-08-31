@@ -200,10 +200,12 @@ fn empty_bucket_control_defaults_to_zero_range() {
 fn get_missing_bucket_returns_none() {
     let fx = mk_engine();
     let engine = &fx.engine;
-    assert!(ts_read(engine, |s, txn| s
-        .get_bucket(txn, 0, NodeId::from_raw(99))
-        .unwrap())
-    .is_none());
+    assert!(
+        ts_read(engine, |s, txn| s
+            .get_bucket(txn, 0, NodeId::from_raw(99))
+            .unwrap())
+        .is_none()
+    );
 }
 
 #[test]
@@ -508,8 +510,10 @@ fn compact_overflow_writes_base_and_deletes_overflow_atomically() {
     assert_eq!(after.control.count, 3);
     assert_eq!(after.control.time_min_us, 51);
     assert_eq!(after.control.time_max_us, 100);
-    assert!(ts_read(engine, |s, txn| s
-        .scan_overflow(txn, label_id, bid)
-        .unwrap())
-    .is_empty());
+    assert!(
+        ts_read(engine, |s, txn| s
+            .scan_overflow(txn, label_id, bid)
+            .unwrap())
+        .is_empty()
+    );
 }

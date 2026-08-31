@@ -1,4 +1,4 @@
-use crate::columnar::{write_columnar_rows, ColumnarRow};
+use crate::columnar::{ColumnarRow, write_columnar_rows};
 use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use crate::engine::core::StorageEngine;
 

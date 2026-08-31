@@ -17,7 +17,7 @@ use sha2::Digest;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-use coordinode_core::graph::blob::{self, encode_blob_key, BlobRef};
+use coordinode_core::graph::blob::{self, BlobRef, encode_blob_key};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 

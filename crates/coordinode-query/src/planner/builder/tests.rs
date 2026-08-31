@@ -1367,7 +1367,7 @@ fn push_down_invariant_teeth_catches_unannotated_violation() {
 fn push_down_invariant_passes_when_decision_attached() {
     // Mirror of the teeth test: same plan with a valid decision passes.
     use crate::cypher::ast::Expr;
-    use crate::planner::push_down::{select_push_down_strategy, VectorIndexParams};
+    use crate::planner::push_down::{VectorIndexParams, select_push_down_strategy};
     use coordinode_core::graph::types::Value;
 
     let node_scan = LogicalOp::NodeScan {

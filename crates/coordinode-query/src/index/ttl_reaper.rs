@@ -11,8 +11,8 @@
 //! The reaper is rate-limited to `batch_size` (default 1000) deletions per
 //! pass to avoid write stalls. Runs every `interval_secs` (default 60).
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse};

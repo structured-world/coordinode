@@ -48,7 +48,7 @@
 //! [`NodeRecord`]: coordinode_core::graph::node::NodeRecord
 
 use coordinode_core::graph::doc_delta::{DocDelta, PathTarget};
-use coordinode_core::graph::node::{encode_node_key, NodeId};
+use coordinode_core::graph::node::{NodeId, encode_node_key};
 use coordinode_storage::engine::transaction::Transaction;
 
 use crate::error::{StoreError, StoreResult};

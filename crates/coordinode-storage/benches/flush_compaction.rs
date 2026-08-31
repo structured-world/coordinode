@@ -15,7 +15,7 @@ use std::time::Duration;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use lsm_tree::AbstractTree;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

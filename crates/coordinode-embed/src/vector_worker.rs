@@ -8,8 +8,8 @@
 //! graph itself is never replicated; each replica derives its own.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use coordinode_core::graph::intern::FieldInterner;

@@ -12,7 +12,7 @@
 //! - W3C traceparent propagation enables distributed tracing across nodes.
 //! - OTLP export configured via `OTEL_EXPORTER_OTLP_ENDPOINT` (Phase 2+).
 
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 /// Initialize the tracing subscriber based on environment configuration.
 ///

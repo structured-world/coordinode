@@ -6,7 +6,7 @@
 //! 2. Edge vector query EXPLAIN generation
 //! 3. End-to-end edge vector query with real storage
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use coordinode_query::planner::logical::select_edge_vector_strategy;
 

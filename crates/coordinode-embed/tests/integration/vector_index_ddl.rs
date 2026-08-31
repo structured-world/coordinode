@@ -1089,7 +1089,7 @@ fn online_during_build_partial_recall_does_not_block() {
 /// without going through the executor, closing the DB, and reopening.
 #[test]
 fn building_state_resets_to_ready_on_reopen() {
-    use coordinode_query::index::{ops as index_ops, IndexState};
+    use coordinode_query::index::{IndexState, ops as index_ops};
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().to_path_buf();

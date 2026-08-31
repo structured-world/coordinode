@@ -25,14 +25,16 @@ fn page_ecc_force_on_round_trips_through_sst() {
     use crate::engine::config::PageEccPolicy;
 
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "ecc",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable, // ForceOn overrides Durable's Auto-off
-        Tier::Warm,
-    )
-    .with_page_ecc(PageEccPolicy::ForceOn)]);
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "ecc",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable, // ForceOn overrides Durable's Auto-off
+            Tier::Warm,
+        )
+        .with_page_ecc(PageEccPolicy::ForceOn),
+    ]);
 
     let engine = StorageEngine::open(&config).expect("open engine with page_ecc");
     engine

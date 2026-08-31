@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use crate::segment::{
-    split_segment, PieceEncoding, PieceIndex, SegmentManifest, SegmentWriter, SwarmError,
-    SwarmResult,
+    PieceEncoding, PieceIndex, SegmentManifest, SegmentWriter, SwarmError, SwarmResult,
+    split_segment,
 };
 
 /// Identity of a transferable segment. Matches the placement-layer segment id

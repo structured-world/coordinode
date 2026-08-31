@@ -200,7 +200,7 @@ fn persistence_across_reopen() {
 
 #[test]
 fn end_to_end_encrypted_field_with_storage() {
-    use crate::encrypted::field::{decrypt_field, encrypt_field, EncryptedField};
+    use crate::encrypted::field::{EncryptedField, decrypt_field, encrypt_field};
 
     let dir = tempfile::tempdir().unwrap();
     let engine = test_engine(dir.path());

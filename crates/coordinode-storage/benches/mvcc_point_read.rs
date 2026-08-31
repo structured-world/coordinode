@@ -16,7 +16,7 @@ use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 /// Write N versions of a single key, persist, return (engine, seqnos).
 fn setup_versioned_key(num_versions: usize) -> (StorageEngine, tempfile::TempDir, Vec<u64>) {

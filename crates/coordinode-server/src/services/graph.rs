@@ -75,7 +75,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             _ => {
                 return Err(Status::internal(
                     "create_node: executor did not return node id",
-                ))
+                ));
             }
         };
 
@@ -162,7 +162,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
                     _ => {
                         return Err(Status::internal(format!(
                             "create_nodes_batch: row[{i}] missing node id"
-                        )))
+                        )));
                     }
                 };
                 Ok(graph::Node {

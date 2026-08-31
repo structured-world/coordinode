@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use coordinode_core::graph::node::NodeId;
-use coordinode_search::tantivy::multi_lang::{MultiLangConfig, MultiLanguageTextIndex};
 use coordinode_search::tantivy::TextSearchResult;
+use coordinode_search::tantivy::multi_lang::{MultiLangConfig, MultiLanguageTextIndex};
 
 use super::definition::{IndexDefinition, TextIndexConfig};
 

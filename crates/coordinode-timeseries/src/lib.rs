@@ -76,8 +76,8 @@ pub use catalog::BucketCatalog;
 #[cfg(any(test, feature = "test-clock"))]
 pub use clock::ScriptedClock;
 pub use clock::{
-    load_last_stamp, persist_last_stamp, IngestionClock, MonotonicHlcClock,
-    PersistentMonotonicHlcClock,
+    IngestionClock, MonotonicHlcClock, PersistentMonotonicHlcClock, load_last_stamp,
+    persist_last_stamp,
 };
 pub use config::CatalogConfig;
 pub use error::{CatalogError, CatalogResult};

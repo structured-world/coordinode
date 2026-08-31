@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
 
-use coordinode_core::graph::edge::{decode_edge_props, AdjDirection, AdjKeyParts, PostingList};
+use coordinode_core::graph::edge::{AdjDirection, AdjKeyParts, PostingList, decode_edge_props};
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::NodeIdAllocator;
 use coordinode_core::graph::node::{NodeId, NodeRecord};
@@ -24,10 +24,10 @@ use coordinode_storage::engine::core::StorageEngine;
 // crate are the partition-parameterised transaction primitives below (which
 // take it by argument) and test fixtures. Production execution goes through the
 // typed Layer-4 stores. See the crate-level `#![deny(clippy::disallowed_types)]`.
+use coordinode_storage::engine::StorageSnapshot;
 #[allow(clippy::disallowed_types)]
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
-use coordinode_storage::engine::StorageSnapshot;
 
 use super::eval::{eval_binary_op, eval_unary_op, is_truthy};
 use super::eval_neutral::eval_neutral;
@@ -7409,7 +7409,7 @@ fn execute_merge_relationship_check(
         _ => {
             return Err(ExecutionError::Unsupported(format!(
                 "MERGE relationship: source variable '{source}' not bound in scope"
-            )))
+            )));
         }
     };
     let target_id = match correlated.get(target_variable.as_str()) {
@@ -7417,7 +7417,7 @@ fn execute_merge_relationship_check(
         _ => {
             return Err(ExecutionError::Unsupported(format!(
                 "MERGE relationship: target variable '{target_variable}' not bound in scope"
-            )))
+            )));
         }
     };
 
@@ -7798,7 +7798,7 @@ fn execute_merge_relationship_create(
         _ => {
             return Err(ExecutionError::Unsupported(format!(
                 "MERGE relationship: source variable '{source}' not bound in scope"
-            )))
+            )));
         }
     };
     let target_id = match correlated.get(target_variable.as_str()) {
@@ -7806,7 +7806,7 @@ fn execute_merge_relationship_create(
         _ => {
             return Err(ExecutionError::Unsupported(format!(
                 "MERGE relationship: target variable '{target_variable}' not bound in scope"
-            )))
+            )));
         }
     };
 
@@ -7921,7 +7921,7 @@ fn execute_merge_relationship_standalone_create(
             return Err(ExecutionError::Unsupported(format!(
                 "MERGE relationship: ambiguous source pattern — {n} nodes match. \
                  Use a more specific property filter or MERGE ALL for multi-target upsert."
-            )))
+            )));
         }
     };
 
@@ -7948,7 +7948,7 @@ fn execute_merge_relationship_standalone_create(
             return Err(ExecutionError::Unsupported(format!(
                 "MERGE relationship: ambiguous target pattern — {n} nodes match. \
                  Use a more specific property filter or MERGE ALL for multi-target upsert."
-            )))
+            )));
         }
     };
 
@@ -9896,16 +9896,20 @@ fn execute_update(
                                 for (k, v) in map {
                                     match ls.mode {
                                         SchemaMode::Strict => match ls.get_property(k) {
-                                            None => break 'schema Some(
-                                                ExecutionError::SchemaViolation(format!(
-                                                    "unknown property '{k}' for strict label '{label}'"
-                                                )),
-                                            ),
-                                            Some(def) if def.is_computed() => break 'schema Some(
-                                                ExecutionError::SchemaViolation(format!(
-                                                    "cannot SET computed property '{k}'"
-                                                )),
-                                            ),
+                                            None => {
+                                                break 'schema Some(
+                                                    ExecutionError::SchemaViolation(format!(
+                                                        "unknown property '{k}' for strict label '{label}'"
+                                                    )),
+                                                );
+                                            }
+                                            Some(def) if def.is_computed() => {
+                                                break 'schema Some(
+                                                    ExecutionError::SchemaViolation(format!(
+                                                        "cannot SET computed property '{k}'"
+                                                    )),
+                                                );
+                                            }
                                             Some(def) => {
                                                 if let Err(e) = validate_one(k, v, def) {
                                                     break 'schema Some(
@@ -10025,16 +10029,20 @@ fn execute_update(
                                 for (k, v) in map {
                                     match ls.mode {
                                         SchemaMode::Strict => match ls.get_property(k) {
-                                            None => break 'schema Some(
-                                                ExecutionError::SchemaViolation(format!(
-                                                    "unknown property '{k}' for strict label '{label}'"
-                                                )),
-                                            ),
-                                            Some(def) if def.is_computed() => break 'schema Some(
-                                                ExecutionError::SchemaViolation(format!(
-                                                    "cannot SET computed property '{k}'"
-                                                )),
-                                            ),
+                                            None => {
+                                                break 'schema Some(
+                                                    ExecutionError::SchemaViolation(format!(
+                                                        "unknown property '{k}' for strict label '{label}'"
+                                                    )),
+                                                );
+                                            }
+                                            Some(def) if def.is_computed() => {
+                                                break 'schema Some(
+                                                    ExecutionError::SchemaViolation(format!(
+                                                        "cannot SET computed property '{k}'"
+                                                    )),
+                                                );
+                                            }
                                             Some(def) => {
                                                 if let Err(e) = validate_one(k, v, def) {
                                                     break 'schema Some(

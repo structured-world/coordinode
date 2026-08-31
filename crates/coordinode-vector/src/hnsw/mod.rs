@@ -100,8 +100,8 @@ fn prefetch_read_data(ptr: *const u8) {
 use std::collections::HashMap;
 
 use crate::metrics;
-use crate::quantize::rabitq::{RaBitQCode, RaBitQExtCode, RaBitQParams, RaBitQQuery};
 use crate::quantize::Sq8Params;
+use crate::quantize::rabitq::{RaBitQCode, RaBitQExtCode, RaBitQParams, RaBitQQuery};
 
 /// Per-vector RaBitQ encoding. The variant is fixed at index calibration
 /// time from [`HnswConfig::quantization`] and must match across all nodes
@@ -699,11 +699,7 @@ impl<'a> QueryCtx<'a> {
 /// helpers return through their epsilon guard.
 #[inline]
 fn inv_or_zero(n: f32) -> f32 {
-    if n < f32::EPSILON {
-        0.0
-    } else {
-        1.0 / n
-    }
+    if n < f32::EPSILON { 0.0 } else { 1.0 / n }
 }
 
 /// Max-heap candidate (for maintaining top-K worst). 8-byte packed —

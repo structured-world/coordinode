@@ -1,6 +1,6 @@
 use super::*;
 use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
-use coordinode_core::graph::node::{encode_node_key, NodeId};
+use coordinode_core::graph::node::{NodeId, encode_node_key};
 
 fn test_engine(dir: &std::path::Path) -> StorageEngine {
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(

@@ -122,7 +122,7 @@ mod proto {
 }
 
 use proto::{
-    query::{cypher_service_client::CypherServiceClient, ExecuteCypherRequest},
+    query::{ExecuteCypherRequest, cypher_service_client::CypherServiceClient},
     replication::{ReadConcern, ReadConcernLevel, WriteConcern, WriteConcernLevel},
 };
 

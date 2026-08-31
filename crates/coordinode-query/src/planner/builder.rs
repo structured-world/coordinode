@@ -2344,7 +2344,7 @@ fn compute_push_down_decision(
     enclosing_limit: Option<usize>,
     stats: Option<&dyn coordinode_core::graph::stats::StorageStats>,
 ) -> crate::planner::push_down::PushDownDecision {
-    use crate::planner::push_down::{select_push_down_strategy, VectorIndexParams};
+    use crate::planner::push_down::{VectorIndexParams, select_push_down_strategy};
 
     // ── estimate |C| from the upstream traversal ──────────────────────
     //
@@ -3254,9 +3254,11 @@ fn build_shortest_path(pattern: &Pattern) -> Result<LogicalOp, PlanError> {
     const SHORTEST_PATH_DEFAULT_MAX_HOPS: u64 = 10;
 
     let (src_np, rel, tgt_np) = match pattern.elements.as_slice() {
-        [PatternElement::Node(a), PatternElement::Relationship(r), PatternElement::Node(b)] => {
-            (a, r, b)
-        }
+        [
+            PatternElement::Node(a),
+            PatternElement::Relationship(r),
+            PatternElement::Node(b),
+        ] => (a, r, b),
         _ => {
             return Err(PlanError::ShortestPathShape(
                 "expects a single relationship between two nodes, e.g. \

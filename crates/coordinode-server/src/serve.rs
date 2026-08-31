@@ -383,9 +383,9 @@ pub(crate) async fn serve(
                                     // oplog, see the single-node gap).
                                     let Some(raft) = scrub_raft.get() else {
                                         tracing::warn!(
-                                                    partition = part.name(),
-                                                    "no replica and no Raft oplog (standalone) — cannot repair"
-                                                );
+                                            partition = part.name(),
+                                            "no replica and no Raft oplog (standalone) — cannot repair"
+                                        );
                                         continue;
                                     };
                                     let Some(ckpt) = checkpoint::latest_checkpoint(&scrub_ckpt_dir)
@@ -1114,8 +1114,8 @@ pub(crate) async fn serve(
         // repair, operator-commanded migration, node resync) and install
         // them into local storage via the engine-backed sink.
         use coordinode_replicate::segment_store::SegmentInstaller;
-        use coordinode_replicate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
         use coordinode_replicate::transfer::SegmentTransferHandler;
+        use coordinode_replicate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
         let segment_handler =
             SegmentTransferHandler::new(Arc::new(SegmentInstaller::new(Arc::clone(&engine))));
         routes.add_service(

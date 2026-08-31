@@ -279,10 +279,12 @@ fn memfs_engine_multi_partition_writes() {
     );
 
     // Non-existent key returns None
-    assert!(engine
-        .get(Partition::Node, b"node:00:99999999")
-        .expect("get")
-        .is_none());
+    assert!(
+        engine
+            .get(Partition::Node, b"node:00:99999999")
+            .expect("get")
+            .is_none()
+    );
 }
 
 #[test]
@@ -482,13 +484,17 @@ fn put_get_delete_round_trip() {
     let value = b"test_value";
 
     // Initially missing
-    assert!(engine
-        .get(Partition::Node, key)
-        .expect("get failed")
-        .is_none());
-    assert!(!engine
-        .contains_key(Partition::Node, key)
-        .expect("contains_key failed"));
+    assert!(
+        engine
+            .get(Partition::Node, key)
+            .expect("get failed")
+            .is_none()
+    );
+    assert!(
+        !engine
+            .contains_key(Partition::Node, key)
+            .expect("contains_key failed")
+    );
 
     // Put
     engine.put(Partition::Node, key, value).expect("put failed");
@@ -496,16 +502,20 @@ fn put_get_delete_round_trip() {
     // Get
     let result = engine.get(Partition::Node, key).expect("get failed");
     assert_eq!(result.as_deref(), Some(value.as_slice()));
-    assert!(engine
-        .contains_key(Partition::Node, key)
-        .expect("contains_key failed"));
+    assert!(
+        engine
+            .contains_key(Partition::Node, key)
+            .expect("contains_key failed")
+    );
 
     // Delete
     engine.delete(Partition::Node, key).expect("delete failed");
-    assert!(engine
-        .get(Partition::Node, key)
-        .expect("get failed")
-        .is_none());
+    assert!(
+        engine
+            .get(Partition::Node, key)
+            .expect("get failed")
+            .is_none()
+    );
 }
 
 #[test]
@@ -741,9 +751,11 @@ fn all_partitions_support_crud() {
         );
 
         engine.delete(part, key.as_bytes()).expect("delete failed");
-        assert!(engine
-            .get(part, key.as_bytes())
-            .expect("get failed")
-            .is_none());
+        assert!(
+            engine
+                .get(part, key.as_bytes())
+                .expect("get failed")
+                .is_none()
+        );
     }
 }

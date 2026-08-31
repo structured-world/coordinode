@@ -25,8 +25,8 @@
 //! CE: GC watermark driven by SnapshotTracker (pins active snapshots).
 //! EE: same mechanism, configurable retention window.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lsm_tree::compaction::filter::{CompactionFilter, Context, Factory, ItemAccessor, Verdict};
 

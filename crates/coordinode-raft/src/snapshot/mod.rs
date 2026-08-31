@@ -32,10 +32,10 @@ use std::io::{self, Read as IoRead};
 
 use serde::{Deserialize, Serialize};
 
+use coordinode_storage::Guard;
 use coordinode_storage::engine::batch::WriteBatch;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_storage::Guard;
 
 use coordinode_core::txn::timestamp::Timestamp;
 

@@ -55,10 +55,12 @@ fn batch_delete_works() {
     batch.delete(Partition::Node, b"to_delete".to_vec());
     batch.commit().expect("batch commit failed");
 
-    assert!(engine
-        .get(Partition::Node, b"to_delete")
-        .expect("get failed")
-        .is_none());
+    assert!(
+        engine
+            .get(Partition::Node, b"to_delete")
+            .expect("get failed")
+            .is_none()
+    );
 }
 
 #[test]
@@ -74,10 +76,12 @@ fn batch_mixed_put_and_delete() {
     batch.delete(Partition::Node, b"old".to_vec());
     batch.commit().expect("batch commit failed");
 
-    assert!(engine
-        .get(Partition::Node, b"old")
-        .expect("get failed")
-        .is_none());
+    assert!(
+        engine
+            .get(Partition::Node, b"old")
+            .expect("get failed")
+            .is_none()
+    );
     assert_eq!(
         engine
             .get(Partition::Node, b"new")
@@ -422,10 +426,12 @@ fn batch_merge_mixed_put_and_merge() {
     batch.commit().expect("mixed batch failed");
 
     // Verify: old node gone, new node present, adj has both UIDs.
-    assert!(engine
-        .get(Partition::Node, b"node:0:1")
-        .expect("get")
-        .is_none());
+    assert!(
+        engine
+            .get(Partition::Node, b"node:0:1")
+            .expect("get")
+            .is_none()
+    );
     assert_eq!(
         engine
             .get(Partition::Node, b"node:0:2")

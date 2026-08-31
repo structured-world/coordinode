@@ -524,9 +524,11 @@ fn write_concern_causal_validation() {
     use coordinode_core::txn::write_concern::{WriteConcern, WriteConcernLevel};
 
     // Majority is causal-safe
-    assert!(WriteConcern::majority()
-        .validate_for_causal_session()
-        .is_ok());
+    assert!(
+        WriteConcern::majority()
+            .validate_for_causal_session()
+            .is_ok()
+    );
 
     // W0, W1 are NOT causal-safe
     assert!(WriteConcern::w0().validate_for_causal_session().is_err());
@@ -6351,9 +6353,10 @@ fn varlen_traverse_into_temporal_label_fans_out_versions() {
         rows.len() >= 2,
         "varlen must fan out target versions: {rows:?}"
     );
-    assert!(rows
-        .iter()
-        .any(|r| matches!(r.get("vf"), Some(Value::Int(100)))));
+    assert!(
+        rows.iter()
+            .any(|r| matches!(r.get("vf"), Some(Value::Int(100))))
+    );
 }
 
 /// R172d edge case: target node with multiple labels including a
@@ -6383,9 +6386,10 @@ fn traverse_into_multi_label_temporal_target_fans_out_versions() {
         .execute_cypher("MATCH (o:Org)-[:KNOWS]->(p:Person) RETURN p.valid_from AS vf")
         .expect("traverse");
     assert!(rows.len() >= 2, "rows: {rows:?}");
-    assert!(rows
-        .iter()
-        .any(|r| matches!(r.get("vf"), Some(Value::Int(100)))));
+    assert!(
+        rows.iter()
+            .any(|r| matches!(r.get("vf"), Some(Value::Int(100))))
+    );
 }
 
 /// R172c Phase 3b: doc_pull on a temporal node array property writes a
@@ -6428,9 +6432,11 @@ fn doc_pull_on_temporal_node_writes_new_version_with_removed_element() {
     assert_eq!(extract_items(original).len(), 3, "original keeps 3");
     let new_items = extract_items(new_version);
     assert_eq!(new_items.len(), 2, "new: {new_items:?}");
-    assert!(!new_items
-        .iter()
-        .any(|v| v == &rmpv::Value::String("b".into())));
+    assert!(
+        !new_items
+            .iter()
+            .any(|v| v == &rmpv::Value::String("b".into()))
+    );
 }
 
 /// R172c Phase 3b: doc_add_to_set on a temporal node array property

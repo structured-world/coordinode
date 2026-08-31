@@ -250,7 +250,9 @@ impl Default for IndexRegistry {
 
 /// Error when a unique constraint is violated.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("unique constraint violated on index `{index_name}`: property `{property}` already has value {value:?}")]
+#[error(
+    "unique constraint violated on index `{index_name}`: property `{property}` already has value {value:?}"
+)]
 pub struct UniqueViolation {
     pub index_name: String,
     pub property: String,

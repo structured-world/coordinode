@@ -1,5 +1,5 @@
 use super::*;
-use coordinode_swarm::{split_segment, LocalPieceStore, ZstdLevel};
+use coordinode_swarm::{LocalPieceStore, ZstdLevel, split_segment};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 

@@ -481,8 +481,8 @@ fn admin_node_join_required_flags() {
 #[test]
 fn admin_node_join_with_flags() {
     let cmd = parse_args_from(&args(
-            "coordinode admin node join --node http://n1:7080 --id 5 --addr n5:7080 --pre-seeded --follow",
-        ));
+        "coordinode admin node join --node http://n1:7080 --id 5 --addr n5:7080 --pre-seeded --follow",
+    ));
     match cmd {
         Command::AdminNodeJoin {
             node_id,
@@ -545,8 +545,8 @@ fn admin_node_decommission_with_pruning() {
 fn admin_node_decommission_force_requires_skip_confirmation() {
     // CLI parsing sets both flags independently — the enforcement is in the server.
     let cmd = parse_args_from(&args(
-            "coordinode admin node decommission --node http://n1:7080 --id 4 --force --skip-confirmation",
-        ));
+        "coordinode admin node decommission --node http://n1:7080 --id 4 --force --skip-confirmation",
+    ));
     match cmd {
         Command::AdminNodeDecommission {
             node_id,

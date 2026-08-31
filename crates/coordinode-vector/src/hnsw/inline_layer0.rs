@@ -57,7 +57,7 @@
     reason = "standalone module landed alone; HnswIndex wiring lands in the next commit on the same plan"
 )]
 
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// 24-byte scalar header that travels alongside the packed RaBitQ code
 /// in the contiguous store. Covers every numeric field the HNSW search

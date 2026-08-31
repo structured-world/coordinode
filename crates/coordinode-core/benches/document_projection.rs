@@ -7,7 +7,7 @@
 #![allow(clippy::expect_used)]
 //! Target: 10KB document, 1 path → extract_at_path_bytes <50% of full deser.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 fn build_10kb_document() -> rmpv::Value {
     // Build a document with ~10KB of MessagePack data.

@@ -27,7 +27,7 @@
 //! as the plaintext full-text search pipeline for consistency.
 
 use super::keys::SearchKey;
-use super::token::{generate_search_token, SearchToken};
+use super::token::{SearchToken, generate_search_token};
 use crate::stem;
 
 /// Stem text and generate SSE tokens for each unique stem.

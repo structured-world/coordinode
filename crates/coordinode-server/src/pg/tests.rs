@@ -126,9 +126,11 @@ async fn introspection_probes_are_answered() {
             .expect("version"),
     );
     assert_eq!(rows.len(), 1);
-    assert!(rows[0]
-        .get("version")
-        .is_some_and(|v| v.starts_with("PostgreSQL")));
+    assert!(
+        rows[0]
+            .get("version")
+            .is_some_and(|v| v.starts_with("PostgreSQL"))
+    );
 
     let rows = data_rows(
         &client

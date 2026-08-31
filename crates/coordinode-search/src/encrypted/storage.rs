@@ -10,7 +10,7 @@ use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
 
 use super::field::SseError;
-use super::token::{SearchToken, SEARCH_TOKEN_LEN};
+use super::token::{SEARCH_TOKEN_LEN, SearchToken};
 
 /// Persistent SSE token index backed by CoordiNode storage.
 ///

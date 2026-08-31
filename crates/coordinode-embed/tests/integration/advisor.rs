@@ -209,11 +209,13 @@ fn explain_suggest_detects_missing_index() {
         result.suggestions[0].kind,
         coordinode_query::advisor::SuggestionKind::CreateIndex,
     );
-    assert!(result.suggestions[0]
-        .ddl
-        .as_ref()
-        .unwrap()
-        .contains("ON User(email)"));
+    assert!(
+        result.suggestions[0]
+            .ddl
+            .as_ref()
+            .unwrap()
+            .contains("ON User(email)")
+    );
 }
 
 /// EXPLAIN SUGGEST returns no suggestions for a simple scan without filter.

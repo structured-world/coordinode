@@ -28,11 +28,7 @@ fn make_record(label: &str, category: Option<&str>) -> NodeRecord {
 }
 
 fn lookup_category(name: &str) -> Option<u32> {
-    if name == "category" {
-        Some(2)
-    } else {
-        None
-    }
+    if name == "category" { Some(2) } else { None }
 }
 
 #[test]

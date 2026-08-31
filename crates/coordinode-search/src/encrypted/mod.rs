@@ -40,9 +40,9 @@ mod stemmed;
 mod storage;
 mod token;
 
-pub use field::{decrypt_field, encrypt_field, EncryptedField, SseError};
+pub use field::{EncryptedField, SseError, decrypt_field, encrypt_field};
 pub use index::EncryptedFieldIndex;
 pub use keys::{FieldKey, KeyPair, SearchKey};
-pub use stemmed::{stem_and_tokenize, stem_and_tokenize_auto, stem_query_token, StemToken};
+pub use stemmed::{StemToken, stem_and_tokenize, stem_and_tokenize_auto, stem_query_token};
 pub use storage::EncryptedIndex;
-pub use token::{generate_search_token, SearchToken, SEARCH_TOKEN_LEN};
+pub use token::{SEARCH_TOKEN_LEN, SearchToken, generate_search_token};

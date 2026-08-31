@@ -21,16 +21,16 @@ use coordinode_query::advisor::{DismissedSet, ProcedureContext, QueryRegistry, S
 use coordinode_query::cypher;
 use coordinode_query::executor::row::Row;
 use coordinode_query::executor::runner::{
-    execute, execute_no_commit, AdaptiveConfig, ExecutionContext, ExecutionError, ExtensionHandler,
-    ExtensionRegistry, FeedbackCache, ScanPaging, WriteStats,
+    AdaptiveConfig, ExecutionContext, ExecutionError, ExtensionHandler, ExtensionRegistry,
+    FeedbackCache, ScanPaging, WriteStats, execute, execute_no_commit,
 };
 use coordinode_query::frontend::{CypherFrontend, QueryFrontend};
 use coordinode_query::planner;
 use coordinode_raft::proposal::OwnedLocalProposalPipeline;
+use coordinode_storage::Guard;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_storage::Guard;
 
 /// Outcome of a Cypher execution: result rows plus mutation statistics. Used
 /// by [`Database::execute_cypher_full`] so callers (notably the gRPC server)
@@ -1542,7 +1542,7 @@ impl Database {
                 None => {
                     return Err(DatabaseError::Other(format!(
                         "unknown transaction id {txn_id}"
-                    )))
+                    )));
                 }
             }
         };
@@ -2570,7 +2570,7 @@ impl Database {
     /// Called after a new unique B-tree index is registered via `create_label_schema`.
     /// Unique violations in pre-existing data are logged as warnings, not errors.
     fn backfill_btree_index(&self, label: &str, property: &str) {
-        use coordinode_core::graph::node::{decode_node_key, NodeRecord};
+        use coordinode_core::graph::node::{NodeRecord, decode_node_key};
         use coordinode_core::graph::types::Value;
 
         let node_prefix = {

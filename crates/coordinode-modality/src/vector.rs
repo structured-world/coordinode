@@ -152,7 +152,7 @@ pub trait VectorStore: Send + Sync {
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
     fn bulk_insert(&self, vectors: &mut dyn Iterator<Item = (u64, Vec<f32>)>)
-        -> StoreResult<usize>;
+    -> StoreResult<usize>;
 
     /// Current number of indexed vectors (including tombstoned).
     ///

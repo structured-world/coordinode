@@ -8,8 +8,8 @@
 
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -24,8 +24,9 @@ use coordinode_storage::oplog::entry::OplogOp;
 use coordinode_storage::oplog::tailer::{CdcFilters, OplogTailer, ResumeToken};
 
 use crate::proto::replication::cdc::{
-    change_stream_service_server::ChangeStreamService, CdcFilters as ProtoCdcFilters, ChangeEvent,
-    ChangeOp, ChangeOpType, ResumeToken as ProtoResumeToken, SubscribeRequest,
+    CdcFilters as ProtoCdcFilters, ChangeEvent, ChangeOp, ChangeOpType,
+    ResumeToken as ProtoResumeToken, SubscribeRequest,
+    change_stream_service_server::ChangeStreamService,
 };
 
 /// gRPC CDC service for one shard.

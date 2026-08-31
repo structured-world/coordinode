@@ -1494,9 +1494,10 @@ fn show_transactions_without_an_operations_view_is_empty() {
     // Embedded use has no session layer: the statement is valid but lists nothing.
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = Database::open(dir.path()).expect("open");
-    assert!(db
-        .execute_cypher("SHOW TRANSACTIONS")
-        .expect("show")
-        .is_empty());
+    assert!(
+        db.execute_cypher("SHOW TRANSACTIONS")
+            .expect("show")
+            .is_empty()
+    );
     assert!(db.execute_cypher("SHOW SESSIONS").expect("show").is_empty());
 }

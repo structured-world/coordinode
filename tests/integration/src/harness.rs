@@ -234,7 +234,7 @@ impl CoordinodeProcess {
     /// it succeeds or `timeout` elapses.
     pub async fn wait_for_leader(&self, timeout: Duration) {
         use crate::proto::query::{
-            cypher_service_client::CypherServiceClient, ExecuteCypherRequest,
+            ExecuteCypherRequest, cypher_service_client::CypherServiceClient,
         };
 
         let deadline = Instant::now() + timeout;

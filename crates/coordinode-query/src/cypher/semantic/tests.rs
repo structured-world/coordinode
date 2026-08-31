@@ -248,9 +248,11 @@ fn return_star_no_variables() {
         unions: Vec::new(),
     };
     let errors = analyze(&query, None);
-    assert!(errors
-        .iter()
-        .any(|e| matches!(e, SemanticError::ReturnStarEmpty)));
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, SemanticError::ReturnStarEmpty))
+    );
 }
 
 // -- ORDER BY alias resolution --

@@ -31,17 +31,17 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::Stream;
 use tokio::sync::broadcast;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
+use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status};
 
 use coordinode_raft::cluster::{JoinPhase, JoinProgressEvent, NodeRole, RaftNode};
 
 use crate::proto::admin::cluster::{
-    cluster_service_server::ClusterService, AddNodeRequest, ClusterNode, ClusterStatus,
-    DecommissionNodeRequest, DecommissionNodeResponse, GetClusterStatusRequest, JoinNodeRequest,
-    JoinNodeResponse, JoinProgressRequest, JoinStatus, NodeRole as ProtoNodeRole,
-    NodeState as ProtoNodeState, RemoveNodeRequest, RemoveNodeResponse,
+    AddNodeRequest, ClusterNode, ClusterStatus, DecommissionNodeRequest, DecommissionNodeResponse,
+    GetClusterStatusRequest, JoinNodeRequest, JoinNodeResponse, JoinProgressRequest, JoinStatus,
+    NodeRole as ProtoNodeRole, NodeState as ProtoNodeState, RemoveNodeRequest, RemoveNodeResponse,
+    cluster_service_server::ClusterService,
 };
 
 // ── Join state registry ────────────────────────────────────────────────────────

@@ -4,8 +4,8 @@
 //! Uses LFU eviction when capacity is reached (CE: 1,000 entries).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::source::{SourceContext, SourceLocationSnapshot, SourceTracker};

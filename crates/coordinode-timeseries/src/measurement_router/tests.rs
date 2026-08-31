@@ -71,7 +71,7 @@ fn time_rollover_when_span_exceeds_granularity() {
     control.count = 1;
     control.time_min_us = 0;
     control.time_max_us = 50_000; // 50ms
-                                  // cfg granularity 100ms; measurement at 200ms extends span to 200ms > 100ms
+    // cfg granularity 100ms; measurement at 200ms extends span to 200ms > 100ms
     let m = make_measurement(200_000, &[("temp", 22.5)]);
     assert_eq!(
         route(&control, 0, &m, &cfg_small_limits()),

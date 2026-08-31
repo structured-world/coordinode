@@ -19,7 +19,7 @@ use crate::clock::IngestionClock;
 use crate::config::{CatalogConfig, STRIPE_COUNT};
 use crate::error::{CatalogError, CatalogResult};
 use crate::key::BucketKey;
-use crate::measurement_router::{route, Decision};
+use crate::measurement_router::{Decision, route};
 
 /// One open-bucket entry in the catalog. Carries the in-memory
 /// buffer of measurements that haven't yet been flushed to the

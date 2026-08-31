@@ -3,7 +3,7 @@
 //! Measures search QPS at different index sizes.
 //! Baseline for R850 (visited pool) + R851 (prefetch) optimization tracking.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use coordinode_core::graph::types::VectorMetric;
 use coordinode_vector::hnsw::{HnswConfig, HnswIndex};

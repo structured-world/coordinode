@@ -30,9 +30,11 @@ fn threshold_triggers_once() {
 
     // 4 calls — no alert
     for _ in 0..4 {
-        assert!(detector
-            .record(0xABC, "MATCH (n) RETURN n", &source)
-            .is_none());
+        assert!(
+            detector
+                .record(0xABC, "MATCH (n) RETURN n", &source)
+                .is_none()
+        );
     }
 
     // 5th call — triggers alert
@@ -48,9 +50,11 @@ fn threshold_triggers_once() {
     assert_eq!(alert.suggestion.severity, Severity::Warning);
 
     // 6th call — no duplicate alert (already alerted in this window)
-    assert!(detector
-        .record(0xABC, "MATCH (n) RETURN n", &source)
-        .is_none());
+    assert!(
+        detector
+            .record(0xABC, "MATCH (n) RETURN n", &source)
+            .is_none()
+    );
 }
 
 /// Different sources are tracked independently.

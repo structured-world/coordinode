@@ -131,8 +131,11 @@ async fn execute_pages_cursor_open_then_rows_then_end() {
     let engine = engine(&["n"], vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
     let events = run_one(engine, exec()).await;
     match events.as_slice() {
-        [SessionEvent::CursorOpen { columns }, SessionEvent::Rows { rows }, SessionEvent::CursorEnd { .. }] =>
-        {
+        [
+            SessionEvent::CursorOpen { columns },
+            SessionEvent::Rows { rows },
+            SessionEvent::CursorEnd { .. },
+        ] => {
             assert_eq!(columns, &vec!["n".to_string()]);
             assert_eq!(rows, &vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
         }

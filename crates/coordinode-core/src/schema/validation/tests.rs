@@ -65,9 +65,11 @@ fn not_null_violation_explicit_null() {
     props.insert(1, Value::Null); // name is NOT NULL but set to null
 
     let errors = validate_properties(&schema, &props, &field_names).expect_err("should fail");
-    assert!(errors
-        .iter()
-        .any(|e| matches!(e, ValidationError::NotNullViolation { .. })));
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::NotNullViolation { .. }))
+    );
 }
 
 #[test]

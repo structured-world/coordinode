@@ -6,15 +6,15 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::{NodeId, NodeIdAllocator};
 use coordinode_core::graph::types::Value;
 use coordinode_query::cypher::ast::Expr;
-use coordinode_query::executor::runner::{execute, ExecutionError};
+use coordinode_query::executor::runner::{ExecutionError, execute};
 use coordinode_query::plan::SetItem;
 use coordinode_query::planner::logical::{LogicalOp, LogicalPlan};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};

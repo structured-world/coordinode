@@ -10,11 +10,11 @@ use std::sync::{Arc, RwLock};
 use coordinode_cluster::VectorShardRouter;
 use coordinode_core::graph::node::NodeId;
 use coordinode_storage::engine::core::StorageEngine;
+use coordinode_vector::VectorLoader;
 use coordinode_vector::health::{HealthSignal, IndexHealthState};
 use coordinode_vector::hnsw::{HnswConfig, HnswIndex, SearchResult};
 use coordinode_vector::storage::lsm_backed::LsmVectorTier;
 use coordinode_vector::storage::{VectorTierHandle, VectorTierStorage};
-use coordinode_vector::VectorLoader;
 
 use super::definition::IndexDefinition;
 

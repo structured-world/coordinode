@@ -77,15 +77,18 @@ fn graph_first_when_candidate_set_below_crossover() {
     assert_eq!(d.strategy, PushDownStrategy::GraphFirst);
     assert_eq!(d.reason, PushDownReason::CandidateSetBelowCrossover);
     assert_eq!(d.estimated_candidates, 50);
-    assert!(d
-        .cost_alternatives
-        .contains_key(&PushDownStrategy::GraphFirst));
-    assert!(d
-        .cost_alternatives
-        .contains_key(&PushDownStrategy::AcornFiltered));
-    assert!(d
-        .cost_alternatives
-        .contains_key(&PushDownStrategy::VectorFirst));
+    assert!(
+        d.cost_alternatives
+            .contains_key(&PushDownStrategy::GraphFirst)
+    );
+    assert!(
+        d.cost_alternatives
+            .contains_key(&PushDownStrategy::AcornFiltered)
+    );
+    assert!(
+        d.cost_alternatives
+            .contains_key(&PushDownStrategy::VectorFirst)
+    );
 }
 
 #[test]

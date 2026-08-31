@@ -130,9 +130,10 @@ fn get_pending_write_returns_none_for_missing() {
     let oracle = test_oracle();
     let txn = Transaction::begin(&oracle);
 
-    assert!(txn
-        .get_pending_write(TxnPartition::Node, b"missing")
-        .is_none());
+    assert!(
+        txn.get_pending_write(TxnPartition::Node, b"missing")
+            .is_none()
+    );
 }
 
 #[test]

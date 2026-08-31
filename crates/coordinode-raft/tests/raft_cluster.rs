@@ -2161,11 +2161,7 @@ async fn cluster_graceful_leader_transfer() {
         } else {
             // Wait a bit more for election
             tokio::time::sleep(Duration::from_secs(1)).await;
-            if n2.is_leader().await {
-                &n2
-            } else {
-                &n3
-            }
+            if n2.is_leader().await { &n2 } else { &n3 }
         };
         assert!(
             new_leader.is_leader().await,

@@ -16,7 +16,7 @@ use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::{NodeId, NodeIdAllocator, NodeRecord};
 use coordinode_core::graph::types::Value;
 use coordinode_query::cypher::parse;
-use coordinode_query::executor::{execute, AdaptiveConfig, ExecutionContext, Row, WriteStats};
+use coordinode_query::executor::{AdaptiveConfig, ExecutionContext, Row, WriteStats, execute};
 use coordinode_query::planner::build_logical_plan;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;

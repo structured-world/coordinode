@@ -80,7 +80,7 @@
 
 use std::collections::BTreeMap;
 
-use coordinode_core::graph::node::{encode_node_key, NodeId};
+use coordinode_core::graph::node::{NodeId, encode_node_key};
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
 use serde::{Deserialize, Serialize};

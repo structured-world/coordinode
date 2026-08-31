@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::proto::common::{property_value, PropertyValue};
+use crate::proto::common::{PropertyValue, property_value};
 
 /// A typed property value returned by a Cypher query.
 ///

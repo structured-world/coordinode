@@ -23,7 +23,7 @@ use coordinode_core::txn::proposal::{
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::read_fence::{
-    ReadConcern, ReadFenceError, ReadPreference, CE_STALENESS_THRESHOLD_ENTRIES,
+    CE_STALENESS_THRESHOLD_ENTRIES, ReadConcern, ReadFenceError, ReadPreference,
 };
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;

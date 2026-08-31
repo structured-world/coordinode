@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 
 use coordinode_integration::harness::CoordinodeProcess;
-use coordinode_integration::proto::common::{property_value::Value as PvKind, PropertyValue};
+use coordinode_integration::proto::common::{PropertyValue, property_value::Value as PvKind};
 use coordinode_integration::proto::query::{ExecuteCypherRequest, Row};
 use coordinode_integration::proto::replication::{ReadConcern, WriteConcern, WriteConcernLevel};
 

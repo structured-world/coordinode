@@ -76,7 +76,7 @@ fn cosine_semantics_on_normalised_rows() {
     // Unit-norm rows; dot product equals cosine similarity.
     let q = vec![vec![1.0, 0.0]];
     let d = vec![vec![0.6, 0.8]]; // 0.6^2 + 0.8^2 = 1.0, unit norm
-                                  // cos angle between q and d = 0.6
+    // cos angle between q and d = 0.6
     assert!(vec_eq(maxsim(&d, &q), 0.6, 1e-5));
 }
 

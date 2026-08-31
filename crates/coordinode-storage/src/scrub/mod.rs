@@ -20,8 +20,8 @@
 
 use std::time::{Duration, Instant};
 
-use lsm_tree::verify::VerifyOptions;
 use lsm_tree::AbstractTree;
+use lsm_tree::verify::VerifyOptions;
 
 use crate::engine::core::StorageEngine;
 use crate::engine::partition::Partition;

@@ -18,7 +18,7 @@
 //! Each iteration starts from a fresh index so the bench measures
 //! end-to-end build time, not steady-state insert throughput.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use coordinode_core::graph::types::VectorMetric;
 use coordinode_vector::hnsw::{HnswConfig, HnswIndex};

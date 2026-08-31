@@ -28,10 +28,10 @@
 
 use std::time::{Duration, Instant};
 
-use coordinode_integration::harness::{free_port, CoordinodeProcess};
+use coordinode_integration::harness::{CoordinodeProcess, free_port};
 use coordinode_integration::proto::admin::{
-    cluster_service_client::ClusterServiceClient, DecommissionNodeRequest, GetClusterStatusRequest,
-    JoinNodeRequest, NodeRole,
+    DecommissionNodeRequest, GetClusterStatusRequest, JoinNodeRequest, NodeRole,
+    cluster_service_client::ClusterServiceClient,
 };
 use tonic::transport::Channel;
 

@@ -31,10 +31,10 @@ use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::{NodeId, NodeIdAllocator, NodeRecord};
 use coordinode_core::graph::types::Value;
 use coordinode_query::cypher::parse;
-use coordinode_query::executor::{execute, AdaptiveConfig, ExecutionContext, WriteStats};
+use coordinode_query::executor::{AdaptiveConfig, ExecutionContext, WriteStats, execute};
 use coordinode_query::planner::build_logical_plan;
-use coordinode_search::tantivy::multi_lang::{MultiLangConfig, MultiLanguageTextIndex};
 use coordinode_search::tantivy::TextIndex;
+use coordinode_search::tantivy::multi_lang::{MultiLangConfig, MultiLanguageTextIndex};
 use coordinode_storage::engine::core::StorageEngine;
 
 /// Logic-test fixture (memory by default, disk via env). Most hybrid

@@ -10,7 +10,7 @@ use coordinode_cluster::{
     SingleShardRouting, TopologyTree,
 };
 use coordinode_storage::engine::config::Tier;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 fn topology_with_n(n: usize) -> SingleNodeTopology {
     let leaves: Vec<_> = (0..n)

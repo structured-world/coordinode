@@ -6,8 +6,8 @@
 use std::future::Future;
 use std::time::Duration;
 
-use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
+use futures_util::stream::BoxStream;
 use openraft::error::{RPCError, Unreachable};
 use openraft::network::{
     Backoff, NetBackoff, NetSnapshot, NetStreamAppend, NetTransferLeader, NetVote, RPCOption,
@@ -16,8 +16,8 @@ use openraft::raft::StreamAppendResult;
 use openraft::raft::TransferLeaderError;
 use openraft::{OptionalSend, RaftNetworkFactory};
 
-use crate::proto::replication::raft_service_client::RaftServiceClient;
 use crate::proto::replication::RaftPayload;
+use crate::proto::replication::raft_service_client::RaftServiceClient;
 use crate::storage::TypeConfig;
 
 type C = TypeConfig;

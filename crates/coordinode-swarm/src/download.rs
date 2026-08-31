@@ -16,9 +16,9 @@
 use std::collections::HashMap;
 use std::io::Write;
 
-use crate::scheduler::{select_source, SourceCandidate};
+use crate::scheduler::{SourceCandidate, select_source};
 use crate::segment::{
-    assemble, verify_piece, PieceIndex, SegmentManifest, SwarmError, SwarmResult,
+    PieceIndex, SegmentManifest, SwarmError, SwarmResult, assemble, verify_piece,
 };
 use crate::state::{NodeId, PieceBitfield, SwarmState};
 

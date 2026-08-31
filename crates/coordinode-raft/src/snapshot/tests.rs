@@ -146,10 +146,12 @@ fn test_snapshot_preserves_raft_keys_in_schema() {
         Some(b"{}".to_vec())
     );
     // Old application data cleared
-    assert!(engine2
-        .get(Partition::Schema, b"schema:label:Old")
-        .unwrap()
-        .is_none());
+    assert!(
+        engine2
+            .get(Partition::Schema, b"schema:label:Old")
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -167,10 +169,12 @@ fn test_snapshot_checksum_validation() {
     let engine2 = open_engine(dir2.path());
     let result = install_full_snapshot(&engine2, &data);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("checksum mismatch"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("checksum mismatch")
+    );
 }
 
 #[test]
@@ -180,10 +184,12 @@ fn test_snapshot_invalid_magic() {
     let engine = open_engine(dir.path());
     let result = install_full_snapshot(&engine, data);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("invalid snapshot magic"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid snapshot magic")
+    );
 }
 
 #[test]
@@ -217,10 +223,12 @@ fn test_snapshot_replaces_existing_data() {
         Some(b"new-value".to_vec())
     );
     // Stale data removed
-    assert!(engine2
-        .get(Partition::Node, b"node:0:99")
-        .unwrap()
-        .is_none());
+    assert!(
+        engine2
+            .get(Partition::Node, b"node:0:99")
+            .unwrap()
+            .is_none()
+    );
 }
 
 // -- Incremental snapshot tests (R135 / G057: native seqno MVCC) --
@@ -359,10 +367,12 @@ fn test_incremental_checksum_validation() {
     let engine2 = open_engine(dir2.path());
     let result = install_incremental_snapshot(&engine2, &data);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("checksum mismatch"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("checksum mismatch")
+    );
 }
 
 #[test]
@@ -466,15 +476,19 @@ fn test_incremental_multiple_partitions() {
         Some(b"new-node".to_vec())
     );
     // New adj added
-    assert!(engine2
-        .get(Partition::Adj, b"adj:LIKES:out:5")
-        .unwrap()
-        .is_some());
+    assert!(
+        engine2
+            .get(Partition::Adj, b"adj:LIKES:out:5")
+            .unwrap()
+            .is_some()
+    );
     // Unchanged EdgeProp still exists
-    assert!(engine2
-        .get(Partition::EdgeProp, b"edgeprop:KNOWS:1:2")
-        .unwrap()
-        .is_some());
+    assert!(
+        engine2
+            .get(Partition::EdgeProp, b"edgeprop:KNOWS:1:2")
+            .unwrap()
+            .is_some()
+    );
     // Schema installed
     assert_eq!(
         engine2
@@ -609,10 +623,12 @@ fn test_incremental_with_oracle_engine() {
         Some(b"charlie".to_vec())
     );
     // adj unchanged (not in delta)
-    assert!(engine2
-        .get(Partition::Adj, b"adj:KNOWS:out:1")
-        .unwrap()
-        .is_some());
+    assert!(
+        engine2
+            .get(Partition::Adj, b"adj:KNOWS:out:1")
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -796,10 +812,12 @@ fn test_install_full_snapshot_from_reader_cleans_stale() {
     install_full_snapshot_from_reader(&engine2, &mut cursor).unwrap();
 
     // Stale key removed
-    assert!(engine2
-        .get(Partition::Node, b"node:stale")
-        .unwrap()
-        .is_none());
+    assert!(
+        engine2
+            .get(Partition::Node, b"node:stale")
+            .unwrap()
+            .is_none()
+    );
     // Snapshot key present
     assert!(engine2.get(Partition::Node, b"node:1").unwrap().is_some());
 }
@@ -864,10 +882,12 @@ fn test_install_incremental_snapshot_from_reader() {
         Some(b"new".to_vec())
     );
     // adj unchanged
-    assert!(engine2
-        .get(Partition::Adj, b"adj:KNOWS:out:1")
-        .unwrap()
-        .is_some());
+    assert!(
+        engine2
+            .get(Partition::Adj, b"adj:KNOWS:out:1")
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -891,10 +911,12 @@ fn test_install_full_from_reader_checksum_validation() {
     let mut cursor = std::io::Cursor::new(&snapshot_data);
     let result = install_full_snapshot_from_reader(&engine2, &mut cursor);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("checksum mismatch"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("checksum mismatch")
+    );
 }
 
 #[test]

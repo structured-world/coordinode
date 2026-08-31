@@ -46,7 +46,7 @@ fn select_next_piece_is_rarest_first() {
 fn select_skips_already_held_and_in_flight() {
     let mut st = SwarmState::new(3);
     st.set_peer_bitfield(NodeId(0), PieceBitfield::full(3)); // source has all
-                                                             // N already holds piece 0.
+    // N already holds piece 0.
     st.mark_piece(NodeId(1), 0);
     // Piece 1 is in flight to N.
     st.mark_in_flight(1, NodeId(0), NodeId(1));

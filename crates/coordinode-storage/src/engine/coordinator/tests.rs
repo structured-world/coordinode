@@ -36,9 +36,11 @@ fn coordinator_has_write_after_detects_put() {
     let (_dir, engine) = open_engine();
     let before = engine.snapshot();
     engine.put(Partition::Node, b"k", b"v").expect("put");
-    assert!(engine
-        .has_write_after(Partition::Node, b"k", before.saturating_sub(1))
-        .expect("hwa"),);
+    assert!(
+        engine
+            .has_write_after(Partition::Node, b"k", before.saturating_sub(1))
+            .expect("hwa"),
+    );
 }
 
 #[test]
@@ -47,9 +49,11 @@ fn coordinator_has_write_after_detects_delete() {
     engine.put(Partition::Node, b"k", b"v").expect("seed");
     let snap = engine.snapshot();
     engine.delete(Partition::Node, b"k").expect("delete");
-    assert!(engine
-        .has_write_after(Partition::Node, b"k", snap)
-        .expect("hwa"),);
+    assert!(
+        engine
+            .has_write_after(Partition::Node, b"k", snap)
+            .expect("hwa"),
+    );
 }
 
 #[test]
@@ -568,10 +572,12 @@ fn multimodal_coordinator_dyn_dispatch_works() {
     );
     // Snapshot-pinned read sees nothing — the put happened after
     // we captured `snap`.
-    assert!(coord
-        .snapshot_get(&snap, Partition::Node, b"dyn_k")
-        .expect("dyn snap get")
-        .is_none());
+    assert!(
+        coord
+            .snapshot_get(&snap, Partition::Node, b"dyn_k")
+            .expect("dyn snap get")
+            .is_none()
+    );
 }
 
 #[test]

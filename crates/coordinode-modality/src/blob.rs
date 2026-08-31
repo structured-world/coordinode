@@ -49,7 +49,7 @@
 //!
 //! [`Transaction`]: coordinode_storage::engine::transaction::Transaction
 
-use coordinode_core::graph::blob::{encode_blob_key, encode_blobref_key, BlobRef, ChunkId};
+use coordinode_core::graph::blob::{BlobRef, ChunkId, encode_blob_key, encode_blobref_key};
 use coordinode_core::graph::node::NodeId;
 use coordinode_storage::engine::batch::WriteBatch;
 use coordinode_storage::engine::core::StorageEngine;
@@ -68,7 +68,7 @@ pub trait BlobStore {
     /// (data plane). Idempotent: re-putting an existing `chunk_id`
     /// overwrites identical bytes.
     fn put_chunk(&self, engine: &StorageEngine, chunk_id: &ChunkId, data: &[u8])
-        -> StoreResult<()>;
+    -> StoreResult<()>;
 
     /// Persist many chunks in one engine [`WriteBatch`] (data plane).
     /// Useful when a new blob ref pulls in multiple new chunks.
@@ -78,7 +78,7 @@ pub trait BlobStore {
     /// stored (either never written, or already swept by GC because no
     /// ref pointed at it).
     fn get_chunk(&self, engine: &StorageEngine, chunk_id: &ChunkId)
-        -> StoreResult<Option<Vec<u8>>>;
+    -> StoreResult<Option<Vec<u8>>>;
 
     /// Persist the [`BlobRef`] for a (node, prop) pair (metadata plane).
     /// Overwrites any previous ref at the same key. Buffered on `txn`.

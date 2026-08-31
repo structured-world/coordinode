@@ -11,16 +11,16 @@ use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::{NodeId, NodeIdAllocator, NodeRecord};
 use coordinode_core::graph::types::Value;
 use coordinode_query::cypher::parse;
-use coordinode_query::executor::{execute, AdaptiveConfig, ExecutionContext, WriteStats};
+use coordinode_query::executor::{AdaptiveConfig, ExecutionContext, WriteStats, execute};
 use coordinode_query::index::{
     IndexDefinition, TextIndexConfig, TextIndexRegistry, VectorIndexRegistry,
 };
 use coordinode_query::planner::{build_logical_plan, estimate_cost};
-use coordinode_search::tantivy::multi_lang::{MultiLangConfig, MultiLanguageTextIndex};
 use coordinode_search::tantivy::TextIndex;
+use coordinode_search::tantivy::multi_lang::{MultiLangConfig, MultiLanguageTextIndex};
+use coordinode_storage::Guard;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_storage::Guard;
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -775,9 +775,11 @@ fn call_subquery_correlated_end_to_end() {
     friends.sort();
     assert_eq!(friends, vec!["Bob".to_string(), "Charlie".to_string()]);
     // Outer variable is preserved on every joined row.
-    assert!(results
-        .iter()
-        .all(|r| r.get("name") == Some(&Value::String("Alice".into()))));
+    assert!(
+        results
+            .iter()
+            .all(|r| r.get("name") == Some(&Value::String("Alice".into())))
+    );
 }
 
 /// Uncorrelated `CALL { ... }` runs independently and joins to the outer row.
@@ -845,9 +847,10 @@ fn union_dedup_and_all_end_to_end() {
         &mut interner,
     );
     assert_eq!(all.len(), 2);
-    assert!(all
-        .iter()
-        .all(|r| r.get("name") == Some(&Value::String("Alice".into()))));
+    assert!(
+        all.iter()
+            .all(|r| r.get("name") == Some(&Value::String("Alice".into())))
+    );
 }
 
 /// `UNION` merges two distinct branches into one result set.
@@ -4077,7 +4080,9 @@ fn text_score_returns_bm25() {
     let multi_idx = MultiLanguageTextIndex::wrap(text_idx, MultiLangConfig::default());
     let results = run_cypher_with_text_index(
         "MATCH (d:Doc) WHERE text_match(d.body, \"rust\") RETURN text_score(d.body, \"rust\") AS score",
-        engine, &mut interner, &multi_idx,
+        engine,
+        &mut interner,
+        &multi_idx,
     );
 
     assert_eq!(results.len(), 2, "both docs match 'rust'");
@@ -5978,7 +5983,9 @@ fn detach_delete_e2e_copied_nested_doc_survives() {
     // Verify: Backup's document is FULLY intact — independent copy, not shared reference
     let backup_after = run_cypher_with_alloc(
         "MATCH (c:Config {name: 'Backup'}) RETURN c.settings.network.ssid, c.settings.network.channel, c.settings.auth.method",
-        engine, &mut interner, &allocator,
+        engine,
+        &mut interner,
+        &allocator,
     );
     assert_eq!(backup_after.len(), 1, "Backup node must survive");
     assert_eq!(
@@ -6066,7 +6073,9 @@ fn detach_delete_e2e_edge_with_map_properties() {
     // Verify edge props exist before delete
     let before_ep = run_cypher_with_alloc(
         "MATCH (a:User {name: 'Alice'})-[r:KNOWS]->(b:User {name: 'Bob'}) RETURN r.since, r.strength",
-        engine, &mut interner, &allocator,
+        engine,
+        &mut interner,
+        &allocator,
     );
     assert_eq!(before_ep.len(), 1);
     assert_eq!(before_ep[0].get("r.since"), Some(&Value::Int(2020)));
@@ -8743,7 +8752,9 @@ fn test_merge_relationship_incoming_direction() {
     // Verify the edge exists in the forward direction (Bob→Alice)
     let check = run_cypher_with_alloc(
         "MATCH (b:Person {name: 'Bob'})-[r:KNOWS]->(a:Person {name: 'Alice'}) RETURN count(*) AS cnt",
-        engine, &mut interner, &allocator,
+        engine,
+        &mut interner,
+        &allocator,
     );
     assert_eq!(
         check[0].get("cnt"),
@@ -8761,7 +8772,9 @@ fn test_merge_relationship_incoming_direction() {
     );
     let check2 = run_cypher_with_alloc(
         "MATCH (b:Person {name: 'Bob'})-[r:KNOWS]->(a:Person {name: 'Alice'}) RETURN count(*) AS cnt",
-        engine, &mut interner, &allocator,
+        engine,
+        &mut interner,
+        &allocator,
     );
     assert_eq!(
         check2[0].get("cnt"),
@@ -8980,7 +8993,9 @@ fn test_merge_two_relationship_clauses() {
 
     let knows = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) RETURN count(*) AS cnt",
-        engine, &mut interner, &allocator,
+        engine,
+        &mut interner,
+        &allocator,
     );
     assert_eq!(
         knows[0].get("cnt"),
@@ -8990,7 +9005,9 @@ fn test_merge_two_relationship_clauses() {
 
     let likes = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'})-[r:LIKES]->(b:Person {name: 'Bob'}) RETURN count(*) AS cnt",
-        engine, &mut interner, &allocator,
+        engine,
+        &mut interner,
+        &allocator,
     );
     assert_eq!(
         likes[0].get("cnt"),
@@ -9011,7 +9028,9 @@ fn test_merge_two_relationship_clauses() {
 
     let knows2 = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) RETURN count(*) AS cnt",
-        engine, &mut interner, &allocator,
+        engine,
+        &mut interner,
+        &allocator,
     );
     assert_eq!(
         knows2[0].get("cnt"),
@@ -9021,7 +9040,9 @@ fn test_merge_two_relationship_clauses() {
 
     let likes2 = run_cypher_with_alloc(
         "MATCH (a:Person {name: 'Alice'})-[r:LIKES]->(b:Person {name: 'Bob'}) RETURN count(*) AS cnt",
-        engine, &mut interner, &allocator,
+        engine,
+        &mut interner,
+        &allocator,
     );
     assert_eq!(
         likes2[0].get("cnt"),

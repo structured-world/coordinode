@@ -25,8 +25,8 @@ use crate::proto::query;
 use crate::proto::session::server_frame::Event;
 use crate::proto::session::session_service_server::SessionService as SessionServiceTrait;
 use crate::proto::session::{
-    client_frame, Begun, ClientFrame, Committed, CursorEnd, CursorOpen, Ordering as ProtoOrdering,
-    RowBatch, ServerFrame, SessionError,
+    Begun, ClientFrame, Committed, CursorEnd, CursorOpen, Ordering as ProtoOrdering, RowBatch,
+    ServerFrame, SessionError, client_frame,
 };
 
 /// In-flight messages buffered per channel before backpressure: a producer that

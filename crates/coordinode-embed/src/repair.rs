@@ -15,15 +15,15 @@
 //! loss requires an off-device backup (PITR).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::{StorageError, StorageResult};
-use coordinode_storage::scrub::{scrub_all, ScrubConfig};
+use coordinode_storage::scrub::{ScrubConfig, scrub_all};
 
 const CKPT_PREFIX: &str = "ckpt-";
 

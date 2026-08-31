@@ -364,10 +364,12 @@ fn get_at_seqno_returns_version_visible_at_snapshot() {
 fn get_at_seqno_missing_returns_none() {
     let db = open();
     let snap = db.engine.snapshot();
-    assert!(LocalNodeStore
-        .get_at_seqno(&db.read(), 0, NodeId::from_raw(999), snap)
-        .expect("ok")
-        .is_none());
+    assert!(
+        LocalNodeStore
+            .get_at_seqno(&db.read(), 0, NodeId::from_raw(999), snap)
+            .expect("ok")
+            .is_none()
+    );
 }
 
 #[test]
@@ -469,10 +471,12 @@ fn read_raw_at_snapshot_latest_round_trip() {
     let id = NodeId::from_raw(42);
     let key = encode_node_key(3, id);
     // Absent → None.
-    assert!(LocalNodeStore
-        .read_raw_at_snapshot(&db.engine, None, &key)
-        .expect("ok")
-        .is_none());
+    assert!(
+        LocalNodeStore
+            .read_raw_at_snapshot(&db.engine, None, &key)
+            .expect("ok")
+            .is_none()
+    );
     // After a committed write, the raw bytes decode back to the record.
     db.write(|s, t| s.put(t, 3, id, &rec("User")).expect("put"));
     let bytes = LocalNodeStore

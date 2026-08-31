@@ -276,7 +276,7 @@ fn large_dim_and_m_max0() {
     let mut layer = InlineLayer0::new(2, 64, 1024);
     let vec: Vec<f32> = (0..1024).map(|i| i as f32).collect();
     let code: Vec<u8> = (0..128).map(|i| i as u8).collect(); // 1024/8
-                                                             // SAFETY: idx < 2, lens match.
+    // SAFETY: idx < 2, lens match.
     unsafe {
         layer.set_vector_f32(1, &vec);
         layer.set_rabitq(1, &code);

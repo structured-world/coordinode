@@ -433,10 +433,11 @@ fn vector_distance_function() {
 #[test]
 fn as_of_timestamp() {
     let q = parse_ok("MATCH (n:User) RETURN n AS OF TIMESTAMP '2025-06-15T10:00:00Z'");
-    assert!(q
-        .clauses
-        .iter()
-        .any(|c| matches!(c, Clause::AsOfTimestamp(_))));
+    assert!(
+        q.clauses
+            .iter()
+            .any(|c| matches!(c, Clause::AsOfTimestamp(_)))
+    );
 }
 
 // -- Complex queries --
@@ -965,26 +966,26 @@ fn merge_nodes_with_transfer_and_duplicate() {
 #[test]
 fn merge_nodes_all_duplicate_strategies() {
     for (cypher, expected) in [
-            (
-                "MATCH (a), (b) MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a ON DUPLICATE KEEP BOTH",
-                MergeNodesDuplicateStrategy::KeepBoth,
-            ),
-            (
-                "MATCH (a), (b) MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a ON DUPLICATE MERGE PROPERTIES",
-                MergeNodesDuplicateStrategy::MergeProperties,
-            ),
-            (
-                "MATCH (a), (b) MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a ON DUPLICATE KEEP TARGET",
-                MergeNodesDuplicateStrategy::KeepTarget,
-            ),
-        ] {
-            let q = parse_ok(cypher);
-            let mn = match &q.clauses[1] {
-                Clause::MergeNodes(mn) => mn,
-                _ => panic!("expected MergeNodes"),
-            };
-            assert_eq!(mn.duplicate, expected, "for input {cypher}");
-        }
+        (
+            "MATCH (a), (b) MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a ON DUPLICATE KEEP BOTH",
+            MergeNodesDuplicateStrategy::KeepBoth,
+        ),
+        (
+            "MATCH (a), (b) MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a ON DUPLICATE MERGE PROPERTIES",
+            MergeNodesDuplicateStrategy::MergeProperties,
+        ),
+        (
+            "MATCH (a), (b) MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a ON DUPLICATE KEEP TARGET",
+            MergeNodesDuplicateStrategy::KeepTarget,
+        ),
+    ] {
+        let q = parse_ok(cypher);
+        let mn = match &q.clauses[1] {
+            Clause::MergeNodes(mn) => mn,
+            _ => panic!("expected MergeNodes"),
+        };
+        assert_eq!(mn.duplicate, expected, "for input {cypher}");
+    }
 }
 
 #[test]
@@ -2437,8 +2438,8 @@ fn create_edge_type_temporal_no_properties() {
 #[test]
 fn create_edge_type_temporal_with_properties() {
     let q = parse_ok(
-            "CREATE EDGE TYPE WORKS_AT TEMPORAL WITH (role: STRING, valid_from: TIMESTAMP NOT NULL, valid_to: TIMESTAMP)",
-        );
+        "CREATE EDGE TYPE WORKS_AT TEMPORAL WITH (role: STRING, valid_from: TIMESTAMP NOT NULL, valid_to: TIMESTAMP)",
+    );
     match &q.clauses[0] {
         Clause::CreateEdgeType(c) => {
             assert_eq!(c.name, "WORKS_AT");
@@ -2510,8 +2511,8 @@ fn create_node_type_temporal_no_properties() {
 #[test]
 fn create_node_type_temporal_with_properties() {
     let q = parse_ok(
-            "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING NOT NULL, valid_from: TIMESTAMP NOT NULL, valid_to: TIMESTAMP)",
-        );
+        "CREATE NODE TYPE Person TEMPORAL WITH (name: STRING NOT NULL, valid_from: TIMESTAMP NOT NULL, valid_to: TIMESTAMP)",
+    );
     match &q.clauses[0] {
         Clause::CreateNodeType(c) => {
             assert_eq!(c.name, "Person");
@@ -2747,10 +2748,11 @@ fn call_procedure_still_parses() {
     // CALL disambiguates). `db.test()` routes to a plain procedure call.
     let q = parse_ok("CALL db.test() YIELD value RETURN value");
     assert!(q.clauses.iter().any(|c| matches!(c, Clause::Call(_))));
-    assert!(!q
-        .clauses
-        .iter()
-        .any(|c| matches!(c, Clause::CallSubquery(_))));
+    assert!(
+        !q.clauses
+            .iter()
+            .any(|c| matches!(c, Clause::CallSubquery(_)))
+    );
 }
 
 #[test]

@@ -353,16 +353,18 @@ fn delete_through_shared_engine() {
 
     let key = b"blob:to_delete";
     shared.put(Partition::Blob, key, b"temp").expect("put");
-    assert!(db
-        .engine()
-        .get(Partition::Blob, key)
-        .expect("get")
-        .is_some());
+    assert!(
+        db.engine()
+            .get(Partition::Blob, key)
+            .expect("get")
+            .is_some()
+    );
 
     shared.delete(Partition::Blob, key).expect("delete");
-    assert!(db
-        .engine()
-        .get(Partition::Blob, key)
-        .expect("get after delete")
-        .is_none());
+    assert!(
+        db.engine()
+            .get(Partition::Blob, key)
+            .expect("get after delete")
+            .is_none()
+    );
 }

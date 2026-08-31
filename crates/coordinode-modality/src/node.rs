@@ -29,13 +29,13 @@
 //! [`NodeStore::get_at`] so callers don't reimplement the seek-and-pick.
 
 use coordinode_core::graph::node::{
-    decode_temporal_node_key, encode_node_key, encode_temporal_node_key, temporal_node_id_prefix,
-    NodeId, NodeRecord,
+    NodeId, NodeRecord, decode_temporal_node_key, encode_node_key, encode_temporal_node_key,
+    temporal_node_id_prefix,
 };
+use coordinode_storage::Guard;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::{PagedScan, Transaction};
-use coordinode_storage::Guard;
 
 use crate::error::{StoreError, StoreResult};
 

@@ -75,9 +75,9 @@
 use std::cmp::Ordering;
 
 use coordinode_core::graph::node::NodeId;
+use coordinode_storage::Guard; // IterGuard trait — `guard.into_inner()` on seekable scans
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
-use coordinode_storage::Guard; // IterGuard trait — `guard.into_inner()` on seekable scans
 use s2::cellid::CellID;
 use s2::latlng::LatLng;
 use s2::rect::Rect;

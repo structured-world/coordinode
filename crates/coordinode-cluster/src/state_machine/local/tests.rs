@@ -315,7 +315,9 @@ async fn list_filters_by_state_and_context() {
         state: Some(OperationState::Completed),
         context: None,
     });
-    assert!(completed
-        .iter()
-        .all(|s| s.state == OperationState::Completed));
+    assert!(
+        completed
+            .iter()
+            .all(|s| s.state == OperationState::Completed)
+    );
 }

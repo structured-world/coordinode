@@ -3040,10 +3040,12 @@ fn detach_delete_cleans_reverse_posting_lists() {
 
     // Verify Alice's own adj: keys are gone
     let alice_out_knows = encode_adj_key_forward("KNOWS", NodeId::from_raw(1));
-    assert!(engine
-        .get(Partition::Adj, &alice_out_knows)
-        .expect("get")
-        .is_none());
+    assert!(
+        engine
+            .get(Partition::Adj, &alice_out_knows)
+            .expect("get")
+            .is_none()
+    );
 
     // KEY CHECK: Bob's incoming KNOWS should NO LONGER contain Alice(1)
     let bob_in_plist = match engine.get(Partition::Adj, &bob_in_key).expect("get") {
@@ -4115,13 +4117,15 @@ fn mvcc_get_edge_props_round_trip_through_put() {
         .expect("get")
         .expect("Some");
     assert_eq!(back.len(), 2);
-    assert!(back
-        .iter()
-        .any(|(fid, v)| *fid == fid_weight
-            && matches!(v, Value::Float(f) if (*f - 0.85).abs() < 1e-9)));
-    assert!(back
-        .iter()
-        .any(|(fid, v)| *fid == fid_label && matches!(v, Value::String(s) if s == "close-friend")));
+    assert!(
+        back.iter().any(|(fid, v)| *fid == fid_weight
+            && matches!(v, Value::Float(f) if (*f - 0.85).abs() < 1e-9))
+    );
+    assert!(
+        back.iter()
+            .any(|(fid, v)| *fid == fid_label
+                && matches!(v, Value::String(s) if s == "close-friend"))
+    );
 
     // Reverse direction must NOT see the entry — key includes (src, tgt) order.
     let reverse = ctx.mvcc_get_edge_props("KNOWS", tgt, src).expect("rev");

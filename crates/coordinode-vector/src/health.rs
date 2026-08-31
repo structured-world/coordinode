@@ -22,9 +22,9 @@
 //! lagging — the Pinecone LSN-header pattern. `last_committed_hlc -
 //! indexed_hlc` is the per-shard lag.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Lifecycle state of a vector index.
 ///

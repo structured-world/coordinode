@@ -1,8 +1,8 @@
 //! Storage engine configuration.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use lsm_tree::CompressionType;
 use serde::{Deserialize, Serialize};

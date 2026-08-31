@@ -42,8 +42,8 @@
 //! new leader's watermark will not regress below any committed `T` the
 //! old leader served.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::txn::timestamp::Timestamp;

@@ -35,11 +35,11 @@ mod state;
 mod transfer;
 
 pub use config::SwarmConfig;
-pub use download::{swarm_download, PieceSource};
-pub use scheduler::{select_source, Freshness, SourceCandidate};
+pub use download::{PieceSource, swarm_download};
+pub use scheduler::{Freshness, SourceCandidate, select_source};
 pub use segment::{
-    assemble, build_manifest, cross_tier_piece_size, split_segment, verify_piece, MediaClass,
-    PieceEncoding, PieceIndex, SegmentManifest, SegmentWriter, SwarmError, SwarmResult, ZstdLevel,
+    MediaClass, PieceEncoding, PieceIndex, SegmentManifest, SegmentWriter, SwarmError, SwarmResult,
+    ZstdLevel, assemble, build_manifest, cross_tier_piece_size, split_segment, verify_piece,
 };
 pub use state::{NodeId, PieceBitfield, SwarmState};
-pub use transfer::{transfer, LocalPieceStore, PieceStore, SegmentId};
+pub use transfer::{LocalPieceStore, PieceStore, SegmentId, transfer};

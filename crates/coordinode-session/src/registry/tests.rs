@@ -12,9 +12,10 @@ fn registers_sessions_with_distinct_ids_and_snapshots_them() {
 
     let snap = reg.sessions();
     assert_eq!(snap.len(), 2);
-    assert!(snap
-        .iter()
-        .all(|s| s.in_flight == 0 && s.transactions.is_empty()));
+    assert!(
+        snap.iter()
+            .all(|s| s.in_flight == 0 && s.transactions.is_empty())
+    );
     assert!(snap.iter().any(|s| s.peer == "10.0.0.1:1"));
 }
 

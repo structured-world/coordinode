@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use coordinode_storage::engine::partition::Partition;
-use coordinode_storage::placement::{partition_from_wire_tag, KeyRange};
+use coordinode_storage::placement::{KeyRange, partition_from_wire_tag};
 use coordinode_swarm::{
     NodeId, PieceBitfield, PieceEncoding, PieceIndex, PieceSource, PieceStore, SegmentId,
     SegmentManifest, SegmentWriter, SourceCandidate, SwarmError, SwarmResult,
@@ -146,7 +146,7 @@ where
     let header = match stream.next().await.transpose()?.and_then(|pd| pd.frame) {
         Some(Frame::Header(h)) => h,
         Some(Frame::Piece(_)) => {
-            return Err(Status::invalid_argument("first frame must be a header"))
+            return Err(Status::invalid_argument("first frame must be a header"));
         }
         None => return Err(Status::invalid_argument("empty transfer stream")),
     };
@@ -165,7 +165,7 @@ where
                 received += 1;
             }
             Some(Frame::Header(_)) => {
-                return Err(Status::invalid_argument("unexpected second header"))
+                return Err(Status::invalid_argument("unexpected second header"));
             }
             None => return Err(Status::invalid_argument("empty frame")),
         }

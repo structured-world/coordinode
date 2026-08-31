@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 
 use crate::engine::partition::Partition;
 
-use super::access::{compute_cache_key, CacheKey};
+use super::access::{CacheKey, compute_cache_key};
 use super::config::{CacheLayerConfig, TieredCacheConfig};
 
 const MAGIC: &[u8; 4] = b"CNDC";

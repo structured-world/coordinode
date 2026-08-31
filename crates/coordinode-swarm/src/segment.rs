@@ -15,7 +15,7 @@
 
 use std::io::{self, Write};
 
-use xxhash_rust::xxh3::{xxh3_64, Xxh3};
+use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 /// Index of a piece within a segment.
 pub type PieceIndex = u32;

@@ -24,7 +24,7 @@ use std::sync::Arc;
 use coordinode_storage::engine::core::StorageEngine;
 
 use crate::proposal::{RaftProposalPipeline, RateLimiter};
-use crate::storage::{default_raft_config, CoordinodeStateMachine, LogStore, TypeConfig};
+use crate::storage::{CoordinodeStateMachine, LogStore, TypeConfig, default_raft_config};
 use crate::wait_majority::{BatchConfig, WaitForMajorityService};
 
 pub use grpc_server::RaftGrpcHandler;
@@ -1174,8 +1174,8 @@ impl RaftNode {
     /// Staleness = `leader_last_log_index - node_matched_index`.
     /// Used by read routing to exclude stale followers.
     pub fn replication_status(&self) -> Option<Vec<NodeReplicationStatus>> {
-        use openraft::async_runtime::watch::WatchReceiver;
         use openraft::ServerState;
+        use openraft::async_runtime::watch::WatchReceiver;
 
         let metrics = self.raft.metrics().borrow_watched().clone();
 

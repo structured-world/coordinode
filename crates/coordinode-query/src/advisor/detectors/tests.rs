@@ -98,11 +98,13 @@ fn missing_index_detected() {
     assert_eq!(suggestions[0].severity, Severity::Critical);
     assert!(suggestions[0].explanation.contains("User"));
     assert!(suggestions[0].explanation.contains("email"));
-    assert!(suggestions[0]
-        .ddl
-        .as_ref()
-        .unwrap()
-        .contains("ON User(email)"));
+    assert!(
+        suggestions[0]
+            .ddl
+            .as_ref()
+            .unwrap()
+            .contains("ON User(email)")
+    );
 }
 
 /// NodeScan without Filter → no suggestions.

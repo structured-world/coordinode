@@ -31,11 +31,11 @@ use coordinode_core::txn::write_concern::{WriteConcern, WriteConcernLevel};
 use lsm_tree::Guard;
 
 use crate::cache::write_buffer::NvmeWriteBuffer;
+use crate::engine::StorageSnapshot;
 use crate::engine::coordinator::{MultiModalCoordinator, OccScope};
 use crate::engine::core::StorageEngine;
 use crate::engine::merge::{encode_add_batch, encode_remove};
 use crate::engine::partition::Partition;
-use crate::engine::StorageSnapshot;
 use crate::error::{StorageError, StorageResult};
 
 /// A key/value pair returned by [`Transaction::prefix_scan`].
@@ -735,7 +735,7 @@ impl<'a> Transaction<'a> {
                 return Ok(CommitOutcome {
                     commit_ts: None,
                     applied_index: None,
-                })
+                });
             }
         };
 

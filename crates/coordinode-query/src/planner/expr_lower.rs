@@ -18,7 +18,7 @@ use crate::cypher::ast::{
     Pattern, Query, ReturnClause, ReturnItem, StringOp, UnaryOperator,
 };
 use crate::plan::expr::{BinOp, Expr as PExpr, MapProjItem, Quantifier, StrOp, UnOp};
-use crate::planner::builder::{build_logical_plan, PlanError};
+use crate::planner::builder::{PlanError, build_logical_plan};
 use crate::planner::logical::LogicalPlan;
 
 /// Lower a Cypher expression into the neutral plan IR.

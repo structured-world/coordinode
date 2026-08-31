@@ -1,7 +1,7 @@
 use super::*;
 use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
 use crate::engine::merge::{encode_add, encode_add_batch, encode_remove};
-use coordinode_core::graph::doc_delta::{DocDelta, PathTarget, PREFIX_NODE_RECORD};
+use coordinode_core::graph::doc_delta::{DocDelta, PREFIX_NODE_RECORD, PathTarget};
 use coordinode_core::graph::edge::PostingList;
 use coordinode_core::graph::node::NodeRecord;
 use coordinode_core::graph::types::Value;
@@ -1108,7 +1108,7 @@ fn has_write_after_different_partitions_independent() {
 fn doc_merge_through_storage_engine() {
     // Verify that DocDelta merge operands written via engine.merge()
     // are correctly combined when read back via engine.get().
-    use coordinode_core::graph::doc_delta::{DocDelta, PathTarget, PREFIX_NODE_RECORD};
+    use coordinode_core::graph::doc_delta::{DocDelta, PREFIX_NODE_RECORD, PathTarget};
     use coordinode_core::graph::node::NodeRecord;
     use coordinode_core::graph::types::Value;
 
@@ -1161,7 +1161,7 @@ fn doc_merge_through_storage_engine() {
 #[test]
 fn doc_merge_multiple_deltas_through_engine() {
     // Multiple merge operands on same key — all applied in order.
-    use coordinode_core::graph::doc_delta::{DocDelta, PathTarget, PREFIX_NODE_RECORD};
+    use coordinode_core::graph::doc_delta::{DocDelta, PREFIX_NODE_RECORD, PathTarget};
     use coordinode_core::graph::node::NodeRecord;
     use coordinode_core::graph::types::Value;
 
@@ -1224,7 +1224,7 @@ fn doc_merge_multiple_deltas_through_engine() {
 #[test]
 fn doc_merge_survives_persist_and_reopen() {
     // Write merge operands → persist → reopen → verify merged result.
-    use coordinode_core::graph::doc_delta::{DocDelta, PathTarget, PREFIX_NODE_RECORD};
+    use coordinode_core::graph::doc_delta::{DocDelta, PREFIX_NODE_RECORD, PathTarget};
     use coordinode_core::graph::node::NodeRecord;
     use coordinode_core::graph::types::Value;
 
@@ -1280,7 +1280,7 @@ fn doc_merge_survives_persist_and_reopen() {
 fn doc_merge_concurrent_different_paths_no_conflict() {
     // Multiple threads writing merge operands to different paths on same key.
     // All operands should be merged correctly — no OCC conflicts.
-    use coordinode_core::graph::doc_delta::{DocDelta, PathTarget, PREFIX_NODE_RECORD};
+    use coordinode_core::graph::doc_delta::{DocDelta, PREFIX_NODE_RECORD, PathTarget};
     use coordinode_core::graph::node::NodeRecord;
     use coordinode_core::graph::types::Value;
     use std::sync::Arc;
@@ -1357,7 +1357,7 @@ fn doc_merge_concurrent_different_paths_no_conflict() {
 fn doc_merge_concurrent_increment_same_path() {
     // Multiple threads incrementing the same counter via merge operands.
     // Increment is commutative — all increments should be summed correctly.
-    use coordinode_core::graph::doc_delta::{DocDelta, PathTarget, PREFIX_NODE_RECORD};
+    use coordinode_core::graph::doc_delta::{DocDelta, PREFIX_NODE_RECORD, PathTarget};
     use coordinode_core::graph::node::NodeRecord;
     use coordinode_core::graph::types::Value;
     use std::sync::Arc;
@@ -1421,7 +1421,7 @@ fn doc_merge_legacy_node_record_without_prefix() {
     // engine.put() writes bare msgpack. After merge with DocDelta,
     // the result should have the 0x00 prefix and contain both
     // original data and delta.
-    use coordinode_core::graph::doc_delta::{DocDelta, PathTarget, PREFIX_NODE_RECORD};
+    use coordinode_core::graph::doc_delta::{DocDelta, PREFIX_NODE_RECORD, PathTarget};
     use coordinode_core::graph::node::NodeRecord;
     use coordinode_core::graph::types::Value;
 
@@ -1638,8 +1638,10 @@ fn apply_mutation_dispatches_to_partition() {
             key: b"node:0:1".to_vec(),
         })
         .expect("delete");
-    assert!(engine
-        .get(Partition::Node, b"node:0:1")
-        .expect("get")
-        .is_none());
+    assert!(
+        engine
+            .get(Partition::Node, b"node:0:1")
+            .expect("get")
+            .is_none()
+    );
 }

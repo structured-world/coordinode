@@ -341,7 +341,7 @@ fn search_nearest_l2() {
     let results = index.search(&[0.1, 0.1], 3);
     assert_eq!(results.len(), 3);
     assert_eq!(results[0].id, 1); // Nearest to (0.1, 0.1) is (0, 0)
-                                  // IDs 2 and 3 should be next (equidistant from query)
+    // IDs 2 and 3 should be next (equidistant from query)
     assert!(results.iter().any(|r| r.id == 2));
     assert!(results.iter().any(|r| r.id == 3));
 }
@@ -599,9 +599,9 @@ fn random_level_distribution() {
     // Should NOT have all nodes at same layer (old deterministic bug)
     let unique_layers = layer_counts.iter().filter(|&&c| c > 0).count();
     assert!(
-            unique_layers >= 3,
-            "only {unique_layers} distinct layers used — expected ≥3 for proper exponential distribution"
-        );
+        unique_layers >= 3,
+        "only {unique_layers} distinct layers used — expected ≥3 for proper exponential distribution"
+    );
 }
 
 /// Integration test: multiple sequential searches correctly reuse visited pool.
@@ -1893,10 +1893,11 @@ fn atomic_neighbours_track_inserts_and_updates() {
 
     // Layer-0 neighbours live in the contiguous block now; it must cover
     // every node.
-    assert!(idx
-        .data_level0
-        .as_ref()
-        .is_some_and(|b| b.capacity() >= idx.nodes.len()));
+    assert!(
+        idx.data_level0
+            .as_ref()
+            .is_some_and(|b| b.capacity() >= idx.nodes.len())
+    );
     assert_eq!(idx.neighbours_upper.len(), idx.nodes.len());
 
     let mut scratch = Vec::with_capacity(M_MAX0);

@@ -312,8 +312,8 @@ fn create_label_schema_idempotent() {
 #[test]
 fn current_revision_pointer_written_alongside_label_schema() {
     use coordinode_core::schema::definition::{
-        encode_label_current_revision_key, encode_label_schema_key, LabelSchema, PropertyDef,
-        PropertyType,
+        LabelSchema, PropertyDef, PropertyType, encode_label_current_revision_key,
+        encode_label_schema_key,
     };
     use coordinode_storage::engine::partition::Partition;
 
@@ -359,7 +359,7 @@ fn current_revision_pointer_written_alongside_label_schema() {
 #[test]
 fn current_revision_pointer_written_alongside_edge_type_schema() {
     use coordinode_core::schema::definition::{
-        encode_edge_type_current_revision_key, encode_edge_type_schema_key, EdgeTypeSchema,
+        EdgeTypeSchema, encode_edge_type_current_revision_key, encode_edge_type_schema_key,
     };
     use coordinode_storage::engine::partition::Partition;
 
@@ -397,8 +397,8 @@ fn current_revision_pointer_written_alongside_edge_type_schema() {
 #[test]
 fn hash_placement_label_roundtrips() {
     use coordinode_core::schema::definition::{
-        encode_label_schema_key, LabelSchema, PlacementKind, PlacementPolicy, PropertyDef,
-        PropertyType, ShardKeyState,
+        LabelSchema, PlacementKind, PlacementPolicy, PropertyDef, PropertyType, ShardKeyState,
+        encode_label_schema_key,
     };
     use coordinode_storage::engine::partition::Partition;
 
@@ -433,8 +433,8 @@ fn hash_placement_label_roundtrips() {
 #[test]
 fn range_placement_label_roundtrips() {
     use coordinode_core::schema::definition::{
-        encode_label_schema_key, LabelSchema, PlacementKind, PlacementPolicy, PropertyDef,
-        PropertyType,
+        LabelSchema, PlacementKind, PlacementPolicy, PropertyDef, PropertyType,
+        encode_label_schema_key,
     };
     use coordinode_storage::engine::partition::Partition;
 
@@ -491,7 +491,7 @@ fn three_placement_kinds_coexist_in_schema_partition() {
 #[test]
 fn corrupt_label_pointer_surfaces_error() {
     use coordinode_core::schema::definition::{
-        encode_label_current_revision_key, LabelSchema, PropertyDef, PropertyType,
+        LabelSchema, PropertyDef, PropertyType, encode_label_current_revision_key,
     };
     use coordinode_storage::engine::partition::Partition;
 
@@ -529,7 +529,7 @@ fn corrupt_label_pointer_surfaces_error() {
 #[test]
 fn corrupt_edge_type_pointer_surfaces_error() {
     use coordinode_core::schema::definition::{
-        encode_edge_type_current_revision_key, EdgeTypeSchema,
+        EdgeTypeSchema, encode_edge_type_current_revision_key,
     };
     use coordinode_storage::engine::partition::Partition;
 
@@ -570,8 +570,8 @@ fn corrupt_edge_type_pointer_surfaces_error() {
 #[test]
 fn dangling_label_pointer_surfaces_error() {
     use coordinode_core::schema::definition::{
-        encode_label_current_revision_key, encode_label_schema_key, LabelSchema, PropertyDef,
-        PropertyType, SchemaMode,
+        LabelSchema, PropertyDef, PropertyType, SchemaMode, encode_label_current_revision_key,
+        encode_label_schema_key,
     };
     use coordinode_storage::engine::partition::Partition;
 

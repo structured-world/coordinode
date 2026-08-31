@@ -410,7 +410,7 @@ pub(crate) async fn admin_node_decommission(
     skip_confirmation: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use proto::admin::cluster::{
-        cluster_service_client::ClusterServiceClient, DecommissionNodeRequest,
+        DecommissionNodeRequest, cluster_service_client::ClusterServiceClient,
     };
 
     if force && !skip_confirmation {
@@ -480,8 +480,8 @@ pub(crate) async fn admin_node_join(
     follow: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use proto::admin::cluster::{
-        cluster_service_client::ClusterServiceClient, JoinNodeRequest, JoinPhase,
-        JoinProgressRequest,
+        JoinNodeRequest, JoinPhase, JoinProgressRequest,
+        cluster_service_client::ClusterServiceClient,
     };
 
     // Normalize cluster_addr to include http:// scheme for tonic.

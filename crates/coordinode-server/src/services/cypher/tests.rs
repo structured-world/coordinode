@@ -194,12 +194,13 @@ async fn grpc_interactive_transaction_rollback() {
     assert_eq!(rows.rows.len(), 0, "rolled-back write discarded");
 
     // Handle consumed: commit on the rolled-back id is an error.
-    assert!(svc
-        .commit_transaction(Request::new(query::CommitTransactionRequest {
+    assert!(
+        svc.commit_transaction(Request::new(query::CommitTransactionRequest {
             transaction_id: tx,
         }))
         .await
-        .is_err());
+        .is_err()
+    );
 }
 
 /// gRPC execute_cypher creates a node and returns it.
@@ -1334,8 +1335,8 @@ async fn grpc_write_concern_cache_accepted() {
 /// end-to-end at the handler boundary.
 #[tokio::test]
 async fn capacity_exhausted_surfaces_as_resource_exhausted_through_grpc_handler() {
-    use coordinode_query::advisor::nplus1::NPlus1Detector;
     use coordinode_query::advisor::QueryRegistry;
+    use coordinode_query::advisor::nplus1::NPlus1Detector;
     use coordinode_storage::engine::config::{
         Durability as Dur, EndpointConfig, Media, StorageConfig, Tier,
     };
@@ -1355,14 +1356,10 @@ async fn capacity_exhausted_surfaces_as_resource_exhausted_through_grpc_handler(
     // would lock us to `hard_limit_bytes = 0` (its default
     // single-endpoint config).
     let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
-    let storage_config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "ep",
-        dir.path(),
-        Media::Hdd,
-        Dur::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(40_000)]);
+    let storage_config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new("ep", dir.path(), Media::Hdd, Dur::Durable, Tier::Warm)
+            .with_hard_limit_bytes(40_000),
+    ]);
     let engine = std::sync::Arc::new(
         StorageEngine::open_with_oracle(&storage_config, std::sync::Arc::clone(&oracle))
             .expect("open engine with custom hard_limit"),

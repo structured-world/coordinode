@@ -902,9 +902,9 @@ async fn validated_mode_set_extra_accepted_mismatch_rejected() {
         // SET type mismatch on declared property — must be rejected.
         let result = db.execute_cypher("MATCH (m:Metric) SET m.value = 'not_a_float'");
         assert!(
-                result.is_err(),
-                "SET with type mismatch on declared property must be rejected in VALIDATED mode, got: {result:?}"
-            );
+            result.is_err(),
+            "SET with type mismatch on declared property must be rejected in VALIDATED mode, got: {result:?}"
+        );
     }
 }
 
@@ -1007,9 +1007,9 @@ async fn multi_update_strict_node_fails_whole_query() {
         let result =
             db.execute_cypher("MATCH (n) WHERE n.host IS NOT NULL SET n.unknown_prop = 'x'");
         assert!(
-                result.is_err(),
-                "multi-update touching a STRICT node with unknown property must fail entire query, got: {result:?}"
-            );
+            result.is_err(),
+            "multi-update touching a STRICT node with unknown property must fail entire query, got: {result:?}"
+        );
 
         // SET only on schemaless (Server) nodes — succeeds even with unknown property.
         db.execute_cypher("MATCH (s:Server) SET s.extra = 'ok'")

@@ -19,7 +19,7 @@
 //! registry holds the trait object and the EE build swaps the smart router in
 //! without the registry depending on EE.
 
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 
 /// Index-internal vector partition id: a local `u32` index into a label's
 /// shard-HNSW vector (`0..n_partitions`). **Not** a cross-node cluster

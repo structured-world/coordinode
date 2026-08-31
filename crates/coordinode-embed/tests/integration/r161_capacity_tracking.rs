@@ -30,14 +30,16 @@ use tempfile::TempDir;
 #[test]
 fn refresh_picks_up_on_disk_sst_bytes() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "only",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(10_000_000)]);
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "only",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(10_000_000),
+    ]);
     let engine = StorageEngine::open(&config).expect("open");
 
     for i in 0..500u32 {
@@ -68,14 +70,16 @@ fn refresh_picks_up_on_disk_sst_bytes() {
 fn full_endpoint_rejects_subsequent_writes() {
     let dir = TempDir::new().expect("tempdir");
     // Very small limit so a modest write blows past 100%.
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "small",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(4096)]);
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "small",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(4096),
+    ]);
     let engine = StorageEngine::open(&config).expect("open");
 
     // Write enough to exceed 4 KB on disk.
@@ -118,14 +122,16 @@ fn full_endpoint_rejects_subsequent_writes() {
 #[test]
 fn schema_and_raft_partitions_bypass_capacity_gate() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "small",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(4096)]);
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "small",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(4096),
+    ]);
     let engine = StorageEngine::open(&config).expect("open");
 
     // Fill the endpoint.
@@ -165,14 +171,16 @@ fn schema_and_raft_partitions_bypass_capacity_gate() {
 #[test]
 fn capacity_recovery_re_enables_writes() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "rec",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(200_000)]);
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "rec",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(200_000),
+    ]);
     let engine = StorageEngine::open(&config).expect("open");
 
     // Push past 200 KB with bulk writes (the scan now sees the full
@@ -355,14 +363,16 @@ fn reject_strategy_preserved_no_auto_cascade() {
 fn used_bytes_warm_load_on_reopen() {
     let dir = TempDir::new().expect("tempdir");
     let make_config = || {
-        StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(10_000_000)])
+        StorageConfig::with_endpoints(vec![
+            EndpointConfig::new(
+                "ep",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )
+            .with_hard_limit_bytes(10_000_000),
+        ])
     };
 
     // First lifecycle: write + persist + refresh → snapshot lands in
@@ -407,14 +417,16 @@ fn threshold_alert_counter_increments_on_severity_crossing() {
 
     let dir = TempDir::new().expect("tempdir");
     // 4 KB limit so a modest write crosses Warning then Full.
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "alert-ep",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(4096)]);
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "alert-ep",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(4096),
+    ]);
     let engine = StorageEngine::open(&config).expect("open");
 
     // Drive enough writes to push severity past Normal → Warning →
@@ -534,14 +546,16 @@ fn capacity_gauges_emitted_on_refresh() {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "gauge-ep",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(1_000_000)]);
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "gauge-ep",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(1_000_000),
+    ]);
     let engine = StorageEngine::open(&config).expect("open");
 
     let recorder = DebuggingRecorder::new();
@@ -599,19 +613,21 @@ fn capacity_gauges_emitted_on_refresh() {
 /// and `is_writable` semantics hold.
 #[test]
 fn concurrent_put_and_refresh_no_torn_reads() {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let dir = TempDir::new().expect("tempdir");
     // Generous limit so writers don't get gated mid-test.
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "ep",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(1_000_000_000)]);
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "ep",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(1_000_000_000),
+    ]);
     let engine = Arc::new(StorageEngine::open(&config).expect("open"));
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -691,14 +707,16 @@ fn concurrent_put_and_refresh_no_torn_reads() {
 fn warm_load_preserves_full_severity_state() {
     let dir = TempDir::new().expect("tempdir");
     let make_config = || {
-        StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "ep",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )
-        .with_hard_limit_bytes(4096)])
+        StorageConfig::with_endpoints(vec![
+            EndpointConfig::new(
+                "ep",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )
+            .with_hard_limit_bytes(4096),
+        ])
     };
 
     // Phase 1: fill past 100% + persist the snapshot.
@@ -934,14 +952,16 @@ fn down_crossing_severity_does_not_increment_alert_counter() {
     // Generous limit so engine-internal overhead (Schema manifest
     // etc., now counted by the broader scan) is well under threshold
     // at baseline. Bulk Node writes push over, SST-deletion recovers.
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "ep",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(200_000)]);
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "ep",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(200_000),
+    ]);
     let engine = StorageEngine::open(&config).expect("open");
 
     // Phase 1: write to Full (UP-crossing increments counter).
@@ -1018,14 +1038,16 @@ fn down_crossing_severity_does_not_increment_alert_counter() {
 #[test]
 fn delete_on_full_endpoint_rejects() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "small",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(4096)]);
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "small",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(4096),
+    ]);
     let engine = StorageEngine::open(&config).expect("open");
 
     for i in 0..500u32 {
@@ -1050,14 +1072,16 @@ fn delete_on_full_endpoint_rejects() {
 #[test]
 fn merge_on_full_endpoint_rejects() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "small",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(4096)]);
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "small",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(4096),
+    ]);
     let engine = StorageEngine::open(&config).expect("open");
 
     // Fill via the Adj partition (Adj is the canonical merge target —
@@ -1085,14 +1109,16 @@ fn merge_on_full_endpoint_rejects() {
 #[test]
 fn write_batch_commit_on_full_endpoint_rejects() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "small",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(4096)]);
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "small",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(4096),
+    ]);
     let engine = StorageEngine::open(&config).expect("open");
 
     for i in 0..500u32 {
@@ -1121,14 +1147,16 @@ fn write_batch_commit_on_full_endpoint_rejects() {
 #[test]
 fn write_batch_commit_rejects_when_any_partition_endpoint_full() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "small",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(4096)]);
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "small",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(4096),
+    ]);
     let engine = StorageEngine::open(&config).expect("open");
 
     for i in 0..500u32 {
@@ -1159,14 +1187,16 @@ fn write_batch_commit_rejects_when_any_partition_endpoint_full() {
 #[test]
 fn reads_remain_functional_on_full_endpoint() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "small",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(4096)]);
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "small",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(4096),
+    ]);
     let engine = StorageEngine::open(&config).expect("open");
 
     for i in 0..500u32 {
@@ -1217,14 +1247,16 @@ fn trigger_fail_fast_on_capacity_exhausted() {
     // need to populate the trigger BEFORE filling so the user-data
     // partitions are below the limit at DDL time.
     let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
-    let storage_config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "ep",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(40_000)]);
+    let storage_config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "ep",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(40_000),
+    ]);
     let engine = std::sync::Arc::new(
         coordinode_storage::engine::core::StorageEngine::open_with_oracle(
             &storage_config,
@@ -1319,14 +1351,16 @@ fn trigger_fail_fast_on_capacity_exhausted() {
 #[test]
 fn writes_resume_after_compaction_frees_space() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "ep",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(200_000)]);
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "ep",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(200_000),
+    ]);
     let engine = StorageEngine::open(&config).expect("open");
 
     // Phase 1: bulk-write the SAME 100 keys 50 times. Each rewrite
@@ -1500,14 +1534,16 @@ fn writes_resume_after_cascade_eviction_frees_hot_endpoint() {
 #[test]
 fn refresh_counts_all_endpoint_files_not_only_partition_tables() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "ep",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(10_000_000)]);
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "ep",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(10_000_000),
+    ]);
     let engine = StorageEngine::open(&config).expect("open");
 
     // Plant a few non-partition files that the OLD scanner would
@@ -1558,14 +1594,16 @@ fn refresh_counts_all_endpoint_files_not_only_partition_tables() {
 #[test]
 fn tantivy_index_bytes_can_push_endpoint_to_full() {
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "ep",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(4096)]);
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "ep",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )
+        .with_hard_limit_bytes(4096),
+    ]);
     let engine = StorageEngine::open(&config).expect("open");
 
     // Simulate a fat tantivy index without going through the query

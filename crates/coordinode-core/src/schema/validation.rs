@@ -57,7 +57,10 @@ impl std::fmt::Display for ValidationError {
                 property,
                 expected,
                 got,
-            } => write!(f, "type mismatch for '{property}': expected {expected}, got {got}"),
+            } => write!(
+                f,
+                "type mismatch for '{property}': expected {expected}, got {got}"
+            ),
             Self::NotNullViolation { property } => {
                 write!(f, "NOT NULL violation: '{property}' is required")
             }
@@ -78,7 +81,10 @@ impl std::fmt::Display for ValidationError {
                 "array not homogeneous for '{property}': expected {expected_element}, got {got_element}"
             ),
             Self::UnknownProperty { property, label } => {
-                write!(f, "unknown property '{property}' for strict label '{label}'")
+                write!(
+                    f,
+                    "unknown property '{property}' for strict label '{label}'"
+                )
             }
             Self::DocumentTooLarge {
                 property,

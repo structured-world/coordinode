@@ -13,7 +13,7 @@ use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, Stor
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::merge::{encode_add, encode_add_batch};
 use coordinode_storage::engine::partition::Partition;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 fn bench_merge_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("storage/merge_stress");

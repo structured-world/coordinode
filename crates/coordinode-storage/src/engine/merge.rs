@@ -14,7 +14,7 @@
 //!   Used for node degree cache, analytics counters. Conflict-free by construction.
 
 use coordinode_core::graph::doc_delta::{
-    DocDelta, PathTarget, PREFIX_DOC_DELTA, PREFIX_NODE_RECORD,
+    DocDelta, PREFIX_DOC_DELTA, PREFIX_NODE_RECORD, PathTarget,
 };
 use coordinode_core::graph::edge::PostingList;
 use coordinode_core::graph::node::NodeRecord;

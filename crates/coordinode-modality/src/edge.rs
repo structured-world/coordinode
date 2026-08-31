@@ -33,19 +33,19 @@
 //! posting lists) is a separate ADR and intentionally NOT decided here.
 
 use coordinode_core::graph::edge::{
-    decode_discriminated_edgeprop_key, decode_temporal_edgeprop_key, encode_adj_key_forward,
-    encode_adj_key_reverse, encode_discriminated_edgeprop_key, encode_edge_props,
-    encode_edgeprop_key, encode_temporal_edgeprop_key, temporal_edgeprop_pair_prefix,
-    valid_from_upper_bound_key, write_adj_key_forward, write_adj_key_reverse, EdgeProperties,
-    PostingList,
+    EdgeProperties, PostingList, decode_discriminated_edgeprop_key, decode_temporal_edgeprop_key,
+    encode_adj_key_forward, encode_adj_key_reverse, encode_discriminated_edgeprop_key,
+    encode_edge_props, encode_edgeprop_key, encode_temporal_edgeprop_key,
+    temporal_edgeprop_pair_prefix, valid_from_upper_bound_key, write_adj_key_forward,
+    write_adj_key_reverse,
 };
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
 use coordinode_core::schema::definition::PropertyType;
+use coordinode_storage::engine::StorageSnapshot;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
-use coordinode_storage::engine::StorageSnapshot;
 
 use crate::error::{StoreError, StoreResult};
 

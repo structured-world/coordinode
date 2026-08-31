@@ -115,9 +115,10 @@ fn repeatable_read_across_statements() {
 #[test]
 fn unknown_transaction_id_errors() {
     let db = open_db();
-    assert!(db
-        .execute_in_transaction(999, "MATCH (n) RETURN n", None)
-        .is_err());
+    assert!(
+        db.execute_in_transaction(999, "MATCH (n) RETURN n", None)
+            .is_err()
+    );
     assert!(db.commit_transaction(999).is_err());
     assert!(db.rollback_transaction(999).is_err());
 }

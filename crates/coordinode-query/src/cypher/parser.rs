@@ -4,8 +4,8 @@
 //! then converts it into the typed AST defined in `ast.rs`.
 
 use coordinode_core::graph::types::Value;
-use pest::iterators::{Pair, Pairs};
 use pest::Parser;
+use pest::iterators::{Pair, Pairs};
 
 use super::ast::*;
 use super::errors::{ErrorSpan, ParseError};

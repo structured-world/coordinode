@@ -19,16 +19,16 @@
 
 use core::marker::PhantomData;
 use std::io::Read;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use bytes::{Buf, BufMut};
 use prost::Message;
 use structured_zstd::decoding::StreamingDecoder;
-use structured_zstd::encoding::{compress_slice_to_vec, CompressionLevel};
+use structured_zstd::encoding::{CompressionLevel, compress_slice_to_vec};
+use tonic::Status;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::transport::{Certificate, ClientTlsConfig, Identity};
-use tonic::Status;
 
 pub mod tls;
 

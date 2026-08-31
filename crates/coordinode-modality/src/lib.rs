@@ -94,7 +94,7 @@ pub use index_def::{
 };
 pub use node::{LocalNodeStore, NodeStore};
 pub use schema::{LocalSchemaStore, SchemaStore};
-pub use spatial::{distance, Bbox, Crs, LocalSpatialStore, Point, SpatialStore};
+pub use spatial::{Bbox, Crs, LocalSpatialStore, Point, SpatialStore, distance};
 pub use timeseries::{
     Bucket, BucketControl, FieldStats, LocalTimeSeriesStore, Measurement, OverflowEntry,
     TimeSeriesStore,

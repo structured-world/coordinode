@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use lsm_tree::fs::Fs;
-use lsm_tree::table::columnar::{column_batch_to_entries, entries_to_column_batch, ColumnBatch};
+use lsm_tree::table::columnar::{ColumnBatch, column_batch_to_entries, entries_to_column_batch};
 use lsm_tree::{AnyTree, Cache, Config, InternalValue, SharedSequenceNumberGenerator, ValueType};
 
 use crate::error::{StorageError, StorageResult};

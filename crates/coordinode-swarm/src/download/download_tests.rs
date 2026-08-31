@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::scheduler::Freshness;
-use crate::segment::{split_segment, PieceEncoding};
+use crate::segment::{PieceEncoding, split_segment};
 
 /// In-memory [`PieceSource`] holding a subset of a segment's wire pieces.
 struct MemSource {

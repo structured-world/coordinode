@@ -11,13 +11,13 @@ use coordinode_core::txn::read_concern::{
 };
 use coordinode_core::txn::write_concern::{WriteConcern, WriteConcernLevel};
 use coordinode_embed::{Database, DatabaseError};
-use coordinode_query::advisor::nplus1::NPlus1Detector;
-use coordinode_query::advisor::source::{self, grpc_keys, SourceContext};
 use coordinode_query::advisor::QueryRegistry;
+use coordinode_query::advisor::nplus1::NPlus1Detector;
+use coordinode_query::advisor::source::{self, SourceContext, grpc_keys};
 use coordinode_query::frontend::QueryFrontend;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::read_fence::{
-    ReadConcern, ReadFenceError, ReadPreference, READ_FENCE_TIMEOUT,
+    READ_FENCE_TIMEOUT, ReadConcern, ReadFenceError, ReadPreference,
 };
 use coordinode_replicate::ReplicatedWriter;
 

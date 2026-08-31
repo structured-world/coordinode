@@ -11,8 +11,8 @@ use coordinode_core::schema::definition::{
     EdgeTypeSchema, LabelSchema, PropertyDef, PropertyType, SchemaMode,
 };
 use coordinode_embed::Database;
-use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::Guard;
+use coordinode_storage::engine::partition::Partition;
 
 use crate::proto::graph;
 use crate::services::db_err_to_status;

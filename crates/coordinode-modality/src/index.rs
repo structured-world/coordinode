@@ -29,10 +29,10 @@ use coordinode_core::graph::types::Value;
 use coordinode_core::index::encoding::{
     decode_node_id_from_index_key, encode_compound_index_key, encode_compound_value,
 };
+use coordinode_storage::Guard;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
-use coordinode_storage::Guard;
 
 use crate::error::{StoreError, StoreResult};
 use crate::index_def::{IndexDefinition, IndexState};

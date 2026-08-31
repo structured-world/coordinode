@@ -629,7 +629,7 @@ fn r106e_concurrent_insert_invisible_in_snapshot() {
 
     // Advance oracle to create a gap for the snapshot timestamp
     let _snapshot_ts = oracle.next(); // ts=1003 (commit of A was 1002)
-                                      // snapshot_ts for our read will be the NEXT one = 1004
+    // snapshot_ts for our read will be the NEXT one = 1004
     let read_ts_for_snapshot = oracle.next(); // ts=1004
 
     // Step 2: CREATE Movie B at ts AFTER our snapshot read_ts

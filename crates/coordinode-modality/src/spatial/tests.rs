@@ -296,9 +296,9 @@ fn morton_decompose_long_thin_bbox_still_covers_every_point() {
             let m = morton_2d(x, y);
             let covered = intervals.iter().any(|&(lo, hi)| m >= lo && m <= hi);
             assert!(
-                    covered,
-                    "bbox point ({x}, {y}) → morton {m} not covered (cap fired but the broad fallback should still cover the cell-bbox intersection)",
-                );
+                covered,
+                "bbox point ({x}, {y}) → morton {m} not covered (cap fired but the broad fallback should still cover the cell-bbox intersection)",
+            );
         }
     }
 }

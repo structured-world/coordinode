@@ -18,7 +18,7 @@ use coordinode_storage::engine::config::{
 };
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 /// Partitions used for multi-partition benchmarks.
 const MULTI_PARTITIONS: &[Partition] = &[

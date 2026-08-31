@@ -40,7 +40,7 @@ fn staleness_uses_30s_window() {
     assert!(!p.is_stale(1_000_000)); // same instant
     assert!(!p.is_stale(1_030_000)); // exactly 30s — not yet stale
     assert!(p.is_stale(1_030_001)); // just past 30s
-                                    // A clock that went backwards must not report stale (saturating).
+    // A clock that went backwards must not report stale (saturating).
     assert!(!p.is_stale(999_999));
 }
 

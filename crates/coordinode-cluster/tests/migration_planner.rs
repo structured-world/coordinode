@@ -14,9 +14,9 @@
 
 use coordinode_cluster::FailureDomain;
 use coordinode_cluster::{
-    estimate_cost, ClusterTopology, CostInputs, LocalMigrationPlanner, MigrationPlanner, Modality,
+    ClusterTopology, CostInputs, LocalMigrationPlanner, MigrationPlanner, Modality,
     OnlineDuringRebuild, PayloadEstimate, PlannerContext, ShardId, SingleNodeTopology,
-    TopologyTree, TransferMode,
+    TopologyTree, TransferMode, estimate_cost,
 };
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
@@ -30,14 +30,10 @@ struct EndpointFixture {
 
 fn open_endpoint(id: &str, hard_limit: u64) -> EndpointFixture {
     let dir = tempfile::tempdir().expect("tempdir");
-    let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        id,
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )
-    .with_hard_limit_bytes(hard_limit)]);
+    let cfg = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(id, dir.path(), Media::Hdd, Durability::Durable, Tier::Warm)
+            .with_hard_limit_bytes(hard_limit),
+    ]);
     let engine = StorageEngine::open(&cfg).expect("open engine");
     EndpointFixture { engine, _dir: dir }
 }

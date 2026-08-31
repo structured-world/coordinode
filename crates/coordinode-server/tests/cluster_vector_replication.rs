@@ -117,7 +117,7 @@ fn top_ids(db: &mut Database, qv: &[f64]) -> Vec<i64> {
 #[tokio::test(flavor = "multi_thread")]
 async fn follower_vector_search_matches_leader() {
     const N: usize = 1500; // above the brute-force threshold so the
-                           // planner uses the HNSW access path
+    // planner uses the HNSW access path
     const DIM: usize = 8;
 
     let p1 = alloc_port();

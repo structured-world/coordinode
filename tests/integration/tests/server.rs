@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use coordinode_integration::harness::{binary_path, CoordinodeProcess};
+use coordinode_integration::harness::{CoordinodeProcess, binary_path};
 use coordinode_integration::proto::common::property_value::Value as PvKind;
 use coordinode_integration::proto::query::ExecuteCypherRequest;
 

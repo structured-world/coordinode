@@ -198,11 +198,7 @@ pub fn try_extract_vector(val: &Value) -> Option<Vec<f32>> {
                     _ => return None,
                 }
             }
-            if vec.is_empty() {
-                None
-            } else {
-                Some(vec)
-            }
+            if vec.is_empty() { None } else { Some(vec) }
         }
         _ => None,
     }

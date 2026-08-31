@@ -17,8 +17,8 @@
 
 use std::collections::HashMap;
 
-use tantivy::index::SegmentId;
 use tantivy::Searcher;
+use tantivy::index::SegmentId;
 
 /// `(min_commit_ts, max_commit_ts)` observed in a segment's fast-field column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

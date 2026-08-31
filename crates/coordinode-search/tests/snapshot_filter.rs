@@ -13,8 +13,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use coordinode_search::tantivy::segment_registry::Visibility;
 use coordinode_search::tantivy::TextIndex;
+use coordinode_search::tantivy::segment_registry::Visibility;
 use tempfile::TempDir;
 
 fn open(dir: &TempDir) -> TextIndex {

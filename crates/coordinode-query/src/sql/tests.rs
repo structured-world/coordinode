@@ -80,13 +80,17 @@ fn insert_lowers_to_create_node() {
 #[test]
 fn unsupported_statement_is_rejected() {
     // ALTER TABLE is not lowered yet.
-    assert!(SqlFrontend::new()
-        .parse("ALTER TABLE Account ADD COLUMN age BIGINT")
-        .is_err());
+    assert!(
+        SqlFrontend::new()
+            .parse("ALTER TABLE Account ADD COLUMN age BIGINT")
+            .is_err()
+    );
     // Joins are not supported yet.
-    assert!(SqlFrontend::new()
-        .parse("SELECT a.x FROM A a JOIN B b ON a.id = b.id")
-        .is_err());
+    assert!(
+        SqlFrontend::new()
+            .parse("SELECT a.x FROM A a JOIN B b ON a.id = b.id")
+            .is_err()
+    );
     // DROP VIEW is not a table drop.
     assert!(SqlFrontend::new().parse("DROP VIEW v").is_err());
 }
@@ -156,9 +160,11 @@ fn create_table_accepts_table_level_primary_key() {
 
 #[test]
 fn create_table_without_primary_key_is_rejected() {
-    assert!(SqlFrontend::new()
-        .parse("CREATE TABLE T (a BIGINT, b BIGINT)")
-        .is_err());
+    assert!(
+        SqlFrontend::new()
+            .parse("CREATE TABLE T (a BIGINT, b BIGINT)")
+            .is_err()
+    );
 }
 
 #[test]

@@ -16,7 +16,7 @@ fn retention_default_is_7_days() {
 #[test]
 fn retention_old_version_is_expired() {
     let policy = RetentionPolicy::new(Duration::from_secs(3600)); // 1 hour
-                                                                  // Timestamp from 2 hours ago (in microseconds)
+    // Timestamp from 2 hours ago (in microseconds)
     let two_hours_ago = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)

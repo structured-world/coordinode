@@ -354,8 +354,8 @@ async fn create_edge_returns_nonzero_id() {
 async fn create_node_visible_via_cypher_service() {
     use crate::proto::query;
     use crate::services::cypher::CypherServiceImpl;
-    use coordinode_query::advisor::nplus1::NPlus1Detector;
     use coordinode_query::advisor::QueryRegistry;
+    use coordinode_query::advisor::nplus1::NPlus1Detector;
     use query::cypher_service_server::CypherService as _;
 
     let dir = tempfile::tempdir().expect("tempdir");

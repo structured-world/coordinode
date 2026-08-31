@@ -98,14 +98,18 @@ fn is_volatile() {
 
 #[test]
 fn validate_for_causal_session() {
-    assert!(WriteConcern::majority()
-        .validate_for_causal_session()
-        .is_ok());
+    assert!(
+        WriteConcern::majority()
+            .validate_for_causal_session()
+            .is_ok()
+    );
     assert!(WriteConcern::w0().validate_for_causal_session().is_err());
     assert!(WriteConcern::w1().validate_for_causal_session().is_err());
-    assert!(WriteConcern::memory()
-        .validate_for_causal_session()
-        .is_err());
+    assert!(
+        WriteConcern::memory()
+            .validate_for_causal_session()
+            .is_err()
+    );
     assert!(WriteConcern::cache().validate_for_causal_session().is_err());
 
     // j:true + W0 upgrades to W1 → still not causal-safe

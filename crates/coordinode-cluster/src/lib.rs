@@ -206,9 +206,9 @@ pub mod vector_routing;
 
 pub use error::{TopologyError, TopologyResult};
 pub use migration::{
-    estimate_cost, pick_recommended_mode, CostInputs, LocalMigrationPlanner, MigrationCost,
-    MigrationPlan, MigrationPlanner, MigrationPlannerError, OnlineDuringRebuild, PayloadEstimate,
-    PlannerContext, TransferMode,
+    CostInputs, LocalMigrationPlanner, MigrationCost, MigrationPlan, MigrationPlanner,
+    MigrationPlannerError, OnlineDuringRebuild, PayloadEstimate, PlannerContext, TransferMode,
+    estimate_cost, pick_recommended_mode,
 };
 pub use routing::{ShardRouting, SingleShardRouting};
 pub use shard_map::{ChunkAssignment, ChunkAssignmentTable, ChunkRange};

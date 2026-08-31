@@ -6,7 +6,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use coordinode_embed::Database;
-use coordinode_search::encrypted::{generate_search_token, KeyPair};
+use coordinode_search::encrypted::{KeyPair, generate_search_token};
 use coordinode_storage::engine::partition::Partition;
 
 fn open_db() -> (Database, tempfile::TempDir) {

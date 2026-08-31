@@ -36,7 +36,7 @@ use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalError, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
 use coordinode_core::txn::timestamp::{HybridLogicalClock, Timestamp};
-use coordinode_raft::cluster::{nemesis, RaftNode};
+use coordinode_raft::cluster::{RaftNode, nemesis};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;

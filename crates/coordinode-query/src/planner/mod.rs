@@ -10,16 +10,15 @@ pub mod logical;
 pub mod push_down;
 
 pub use builder::{
-    annotate_vector_top_k, apply_hnsw_scan_access_path, build_logical_plan,
-    optimize_index_selection, optimize_push_down, vector_index_definition_from_clause, PlanError,
+    PlanError, annotate_vector_top_k, apply_hnsw_scan_access_path, build_logical_plan,
+    optimize_index_selection, optimize_push_down, vector_index_definition_from_clause,
 };
 pub use expr_lower::lower_expr;
 pub use logical::{
-    estimate_cost, estimate_cost_with_stats, AggregateItem, CostEstimate, LogicalOp, LogicalPlan,
-    ProjectItem,
+    AggregateItem, CostEstimate, LogicalOp, LogicalPlan, ProjectItem, estimate_cost,
+    estimate_cost_with_stats,
 };
 pub use push_down::{
-    alpha_from_selectivity, cost_acorn_filtered, cost_graph_first, cost_vector_first,
-    select_push_down_strategy, PushDownDecision, PushDownReason, PushDownStrategy,
-    VectorIndexParams,
+    PushDownDecision, PushDownReason, PushDownStrategy, VectorIndexParams, alpha_from_selectivity,
+    cost_acorn_filtered, cost_graph_first, cost_vector_first, select_push_down_strategy,
 };

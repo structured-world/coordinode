@@ -14,25 +14,25 @@
 //! Without the background service, `heartbeat` writes eagerly (used by tests).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
 use coordinode_core::txn::timestamp::Timestamp;
+use coordinode_storage::Guard;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-use coordinode_storage::Guard;
 use parking_lot::Mutex;
 
-use super::entry::{encode_registry_key, RegistryEntry, REGISTRY_KEY_PREFIX};
+use super::SeqnoConsumerRegistry;
+use super::entry::{REGISTRY_KEY_PREFIX, RegistryEntry, encode_registry_key};
 use super::types::{
     ConsumerRegistration, ConsumerSnapshot, InitialSeqno, RegisteredHandle, RegistryError,
     TopologyScope,
 };
-use super::SeqnoConsumerRegistry;
 
 /// Wall-clock source for heartbeat / TTL accounting.
 ///

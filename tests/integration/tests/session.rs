@@ -22,7 +22,7 @@ use coordinode_integration::harness::CoordinodeProcess;
 use coordinode_integration::proto::session::server_frame::Event;
 use coordinode_integration::proto::session::session_service_client::SessionServiceClient;
 use coordinode_integration::proto::session::{
-    client_frame, Begin, ClientFrame, Commit, Execute, Rollback,
+    Begin, ClientFrame, Commit, Execute, Rollback, client_frame,
 };
 
 /// Begin an UNORDERED transaction (statements applied in arrival order; nonces
@@ -354,7 +354,7 @@ async fn in_session_transaction_aborts_on_a_failed_statement() {
             if f.request_id == want {
                 match f.event {
                     Some(e @ (Event::CursorEnd(_) | Event::Committed(_) | Event::Error(_))) => {
-                        return e
+                        return e;
                     }
                     _ => continue,
                 }

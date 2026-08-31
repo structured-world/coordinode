@@ -13,12 +13,12 @@
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use coordinode_vector::metrics;
+use coordinode_vector::quantize::Sq8Params;
 use coordinode_vector::quantize::popcount::{xor_popcount, xor_popcount_scalar};
 use coordinode_vector::quantize::rabitq::{RaBitQCode, RaBitQParams};
-use coordinode_vector::quantize::Sq8Params;
 
 const D: usize = 1024;
 const N: usize = 1000;

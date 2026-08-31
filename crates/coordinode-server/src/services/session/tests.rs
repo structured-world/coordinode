@@ -99,11 +99,13 @@ fn to_op_maps_commit_rollback_cancel() {
 
 #[test]
 fn to_op_returns_none_for_a_frame_with_no_op() {
-    assert!(to_op(ClientFrame {
-        request_id: 9,
-        op: None
-    })
-    .is_none());
+    assert!(
+        to_op(ClientFrame {
+            request_id: 9,
+            op: None
+        })
+        .is_none()
+    );
 }
 
 #[test]
@@ -140,7 +142,7 @@ fn event_to_frame_tags_the_request_id_and_maps_each_event() {
 
 #[test]
 fn to_op_converts_execute_parameters_to_engine_values() {
-    use crate::proto::common::{property_value, PropertyValue};
+    use crate::proto::common::{PropertyValue, property_value};
     use coordinode_core::graph::types::Value;
 
     let mut parameters = std::collections::HashMap::new();

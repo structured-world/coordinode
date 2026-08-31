@@ -26,5 +26,5 @@ pub mod tailer;
 pub use convert::{mutation_to_op, mutations_to_ops};
 pub use entry::{OplogEntry, OplogOp, PreImage, ShardId};
 pub use manager::OplogManager;
-pub use segment::{SegmentReader, SegmentWriter, FOOTER_SIZE, HEADER_SIZE, MAGIC};
+pub use segment::{FOOTER_SIZE, HEADER_SIZE, MAGIC, SegmentReader, SegmentWriter};
 pub use tailer::{CdcFilters, OplogTailer, ResumeToken};

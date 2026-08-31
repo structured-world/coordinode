@@ -447,34 +447,44 @@ fn partial_filter_matches_function() {
     ];
 
     // String equality
-    assert!(PartialFilter::PropertyEquals {
-        property: "status".into(),
-        value: "active".into(),
-    }
-    .matches(&props));
+    assert!(
+        PartialFilter::PropertyEquals {
+            property: "status".into(),
+            value: "active".into(),
+        }
+        .matches(&props)
+    );
 
-    assert!(!PartialFilter::PropertyEquals {
-        property: "status".into(),
-        value: "inactive".into(),
-    }
-    .matches(&props));
+    assert!(
+        !PartialFilter::PropertyEquals {
+            property: "status".into(),
+            value: "inactive".into(),
+        }
+        .matches(&props)
+    );
 
     // Int equality
-    assert!(PartialFilter::PropertyEqualsInt {
-        property: "age".into(),
-        value: 30,
-    }
-    .matches(&props));
+    assert!(
+        PartialFilter::PropertyEqualsInt {
+            property: "age".into(),
+            value: 30,
+        }
+        .matches(&props)
+    );
 
     // Exists
-    assert!(PartialFilter::PropertyExists {
-        property: "status".into(),
-    }
-    .matches(&props));
+    assert!(
+        PartialFilter::PropertyExists {
+            property: "status".into(),
+        }
+        .matches(&props)
+    );
 
     // Not exists
-    assert!(!PartialFilter::PropertyExists {
-        property: "missing".into(),
-    }
-    .matches(&props));
+    assert!(
+        !PartialFilter::PropertyExists {
+            property: "missing".into(),
+        }
+        .matches(&props)
+    );
 }

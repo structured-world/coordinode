@@ -108,9 +108,9 @@ fn cluster_order_is_stable_and_groups_clusters_together() {
     for (_, v) in &reordered {
         let c = nearest_leader_index(v, &leaders, VectorMetric::L2) as i32;
         assert!(
-                c >= last_cluster,
-                "cluster ids must be non-decreasing in cluster-ordered output, got {c} after {last_cluster}",
-            );
+            c >= last_cluster,
+            "cluster ids must be non-decreasing in cluster-ordered output, got {c} after {last_cluster}",
+        );
         last_cluster = c;
     }
 

@@ -11,6 +11,6 @@ pub mod vector_predicate;
 
 pub use row::Row;
 pub use runner::{
-    execute, execute_no_commit, AdaptiveConfig, ExecutionContext, ExecutionError, FeedbackCache,
-    WriteStats,
+    AdaptiveConfig, ExecutionContext, ExecutionError, FeedbackCache, WriteStats, execute,
+    execute_no_commit,
 };

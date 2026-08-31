@@ -19,14 +19,14 @@ use std::sync::RwLock;
 use tantivy::collector::{FilterCollector, TopDocs};
 use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
 use tantivy::schema::{
-    document::Value as TantivyValue, Field, IndexRecordOption, NumericOptions, OwnedValue, Schema,
-    TextFieldIndexing, TextOptions,
+    Field, IndexRecordOption, NumericOptions, OwnedValue, Schema, TextFieldIndexing, TextOptions,
+    document::Value as TantivyValue,
 };
 use tantivy::snippet::SnippetGenerator;
 use tantivy::tokenizer::{
     LowerCaser, PreTokenizedString, SimpleTokenizer, TextAnalyzer, Token, TokenFilter, Tokenizer,
 };
-use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
+use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, doc};
 
 use self::segment_registry::SegmentRegistry;
 

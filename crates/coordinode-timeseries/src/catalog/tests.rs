@@ -72,15 +72,17 @@ fn invalid_config_rejected_at_construction() {
         max_count: 0,
         ..CatalogConfig::default()
     };
-    assert!(BucketCatalog::new(
-        cfg,
-        0,
-        &store,
-        &engine,
-        1,
-        std::sync::Arc::new(crate::clock::MonotonicHlcClock::new())
-    )
-    .is_err());
+    assert!(
+        BucketCatalog::new(
+            cfg,
+            0,
+            &store,
+            &engine,
+            1,
+            std::sync::Arc::new(crate::clock::MonotonicHlcClock::new())
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -622,10 +624,12 @@ fn tier3_routes_to_overflow_when_tier2_ttl_expired() {
     }
     catalog.flush_all().unwrap();
     assert_eq!(catalog.recently_closed_count(), 1);
-    assert!(ts_read(&engine, |s, txn| s
-        .scan_overflow(txn, 7, NodeId::from_raw(1))
-        .unwrap())
-    .is_empty());
+    assert!(
+        ts_read(&engine, |s, txn| s
+            .scan_overflow(txn, 7, NodeId::from_raw(1))
+            .unwrap())
+        .is_empty()
+    );
 
     // Late measurement in-window (ts=500us inside [0, 1000])
     // but `now` is far past TTL → Tier 2 skips → Tier 3 should
@@ -683,10 +687,12 @@ fn tier3_skipped_when_handle_time_range_does_not_contain_measurement() {
         .write_measurement_at(7, meta, measurement(10_000_000, &[("temp", 22.0)]), future)
         .unwrap();
 
-    assert!(ts_read(&engine, |s, txn| s
-        .scan_overflow(txn, 7, NodeId::from_raw(1))
-        .unwrap())
-    .is_empty());
+    assert!(
+        ts_read(&engine, |s, txn| s
+            .scan_overflow(txn, 7, NodeId::from_raw(1))
+            .unwrap())
+        .is_empty()
+    );
     assert_eq!(catalog.open_bucket_count(), 1);
 }
 
@@ -764,10 +770,12 @@ fn compact_if_needed_merges_overflow_into_base_when_above_threshold() {
 
     // Post-compact: overflow set empty, base bucket has 2 + 51 = 53
     // measurements (merged + sorted).
-    assert!(ts_read(&engine, |s, txn| s
-        .scan_overflow(txn, 7, NodeId::from_raw(1))
-        .unwrap())
-    .is_empty());
+    assert!(
+        ts_read(&engine, |s, txn| s
+            .scan_overflow(txn, 7, NodeId::from_raw(1))
+            .unwrap())
+        .is_empty()
+    );
     let base = ts_read(&engine, |s, txn| {
         s.get_bucket(txn, 0, NodeId::from_raw(1)).unwrap()
     })
@@ -867,14 +875,18 @@ fn compact_all_pending_discovers_and_compacts_every_stale_bucket() {
     assert_eq!(compacted, 2, "A and B compacted, C below threshold");
 
     // Post-compact: A's and B's overflow sets empty; C's intact.
-    assert!(ts_read(&engine, |s, txn| s
-        .scan_overflow(txn, 7, NodeId::from_raw(1))
-        .unwrap())
-    .is_empty());
-    assert!(ts_read(&engine, |s, txn| s
-        .scan_overflow(txn, 7, NodeId::from_raw(2))
-        .unwrap())
-    .is_empty());
+    assert!(
+        ts_read(&engine, |s, txn| s
+            .scan_overflow(txn, 7, NodeId::from_raw(1))
+            .unwrap())
+        .is_empty()
+    );
+    assert!(
+        ts_read(&engine, |s, txn| s
+            .scan_overflow(txn, 7, NodeId::from_raw(2))
+            .unwrap())
+        .is_empty()
+    );
     assert_eq!(
         ts_read(&engine, |s, txn| s
             .scan_overflow(txn, 7, NodeId::from_raw(3))
