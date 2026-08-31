@@ -94,5 +94,9 @@ harness = false
 name = "coordinator_dispatch"
 harness = false
 
+[[bench]]
+name = "txn_point_read"
+harness = false
+
 [lints]
 workspace = true
