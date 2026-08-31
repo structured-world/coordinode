@@ -13,7 +13,7 @@ Built in Rust. Zero GC. Single binary. OpenCypher-compatible.
 
 ## The Problem
 
-Building relationship-aware AI today requires duct tape. You need Neo4j for the graph, Pinecone for vectors, and Elasticsearch for text. That means 3 systems, glue code, data sync pipelines, and no transactional consistency across your data.
+Relationship-aware AI usually ends up spread across systems: a graph database for traversal, a vector store for embeddings, a search cluster for text. Each is good at its own job, and the cost lands between them: sync pipelines, duplicated identifiers, drift between stores, and no single transaction that covers a write touching all three. Retrieval quality then depends on how fresh the least-fresh copy happens to be.
 
 ## The Solution: One Engine, One Query
 
@@ -34,25 +34,25 @@ RETURN doc.title,
 ORDER BY relevance LIMIT 10
 ```
 
-Today this requires Neo4j + Pinecone + Elasticsearch + custom glue code. With CoordiNode — one query.
+Across a split stack this is three round trips and a join in application code. Here it is one query, planned and executed as one pipeline, inside one snapshot.
 
 ---
 
-## Is CoordiNode Right for You? (v0.3-alpha)
+## Is CoordiNode Right for You? (v0.5.x)
 
 ### Use this today if:
 
 - You are building **GraphRAG**, knowledge retrieval, or relationship-heavy AI apps
 - You need **graph + vector + text** queries in a single transaction (no glue code)
 - You want to replace a fragile multi-database stack with a single binary
-- You need features no other graph DB offers: **vectors on edges**, spatial queries, encrypted search (SSE, programmatic API), time-travel queries, EXPLAIN SUGGEST
+- You want these in one engine: native vector search over both nodes and relationships, integrated with graph traversal and transactional query execution; spatial predicates; encrypted equality search; time-travel and bitemporal edges; a query advisor that reads plans back to you
 
 ### Do not use this yet if:
 
 - You need a 100% drop-in replacement for a mature Neo4j Enterprise deployment
 - Your application relies on APOC procedures, Neo4j Browser/Bloom, or GDS
-- You need native Bolt protocol for existing Neo4j drivers (planned for v1.2; gRPC and REST available now, GraphQL planned)
-- You need production-grade multi-node clustering today (single-node is stable; Raft clustering is in active development for v0.4)
+- You need native Bolt protocol for existing Neo4j drivers (planned; gRPC and REST available now, GraphQL planned)
+- You need a cluster with years of production mileage behind it. Raft replication, follower reads and mTLS between nodes ship today and are covered by a fault-injection suite, but the deployment history is short
 
 ---
 
@@ -106,13 +106,15 @@ ORDER BY similarity LIMIT 25
 
 ---
 
-## What Works Today (v0.3-alpha)
+## What Works Today (v0.5.x)
 
 | Capability | Status | Details |
 |-----------|--------|---------|
 | OpenCypher read + write | **Stable** | MATCH, CREATE, MERGE, DELETE, SET, REMOVE, WITH, UNWIND |
 | MVCC transactions | **Stable** | Snapshot Isolation, write conflict detection (OCC) |
-| HNSW vector search | **Stable** | Up to 65536 dims, SQ8 quantization, cosine/L2/dot/L1 |
+| HNSW vector search | **Stable** | Up to 65536 dims, cosine/L2/dot/L1, on node and relationship properties alike |
+| Vector compression | **Stable** | SQ8 scalar quantization and RaBitQ binary codes with exact rerank |
+| Late-interaction scoring | **Beta** | `maxsim_score()` for ColBERT-style multi-vector relevance, brute force over candidates in this release |
 | Full-text search | **Stable** | BM25, fuzzy, phrase, 23+ languages, CJK via feature flags |
 | Hybrid graph+vector+text | **Stable** | Compound WHERE predicates split into optimized pipeline; `hybrid_score(node, query [,weights])` opinionated blend helper (default 0.65·vector + 0.35·text) |
 | B-tree indexes | **Stable** | Single, compound, unique, partial, TTL, sparse |
@@ -130,28 +132,35 @@ ORDER BY similarity LIMIT 25
 | Bitemporal edges | **Stable** | `CREATE EDGE TYPE … TEMPORAL` declares an edge type whose instances carry a `(valid_from, valid_to)` interval. Multiple versions coexist per `(src, tgt)` pair. Helpers: `temporal_active_at(r, t)`, `temporal_overlaps(r, t0, t1)`. Planner pushes time-slice predicates into a bounded prefix scan |
 | REST API | **Stable** | HTTP/JSON on port 7081 via gRPC-to-REST transcoding |
 | Read/write concerns | **Stable** | local, majority, linearizable, causal sessions |
+| Raft replication | **Stable** | Multi-node replicated writes, leader election, snapshot transfer, log compaction. Included in CE with no per-node licensing |
+| Follower reads | **Stable** | Reads served from replicas under the requested consistency level |
+| Inter-node TLS and mTLS | **Stable** | Pure-Rust rustls stack, no OpenSSL and no C dependency |
+| Inter-node compression | **Stable** | zstd on the replication transport, level configurable |
+| Consistency test suite | **Stable** | In-process fault injection: partition matrix, crash and clock skew, linearizability checking over a live workload |
+| Scrub and repair | **Stable** | Background checksum verification, damaged segments rebuilt from a healthy replica |
+| Embedded engine | **Stable** | `coordinode-embed` runs the full engine in-process, no server; also exposed to Python as `coordinode-embedded` |
 
-| Planned | Target | Notes |
-|---------|--------|-------|
-| GraphQL API | v0.3.1 | Auto-generated schema on port 7083 |
-| 3-node Raft clustering | v0.4 | Free in CE (no per-node licensing) |
-| Bolt protocol | v1.2 | Neo4j drivers connect without code changes |
+| Planned | Notes |
+|---------|-------|
+| GraphQL API | Auto-generated schema, SDL generation already in tree |
+| Bolt protocol | Neo4j drivers connect without code changes |
+| SQL over the same engine | PostgreSQL wire protocol against the shared query IR |
 
 ## What Makes CoordiNode Different
 
-| | CoordiNode | Neo4j CE | MongoDB | SurrealDB | Pinecone |
-|---|:---:|:---:|:---:|:---:|:---:|
-| Graph + vector + text in one query | **Yes** | No | Partial ($graphLookup + Atlas) | Partial (no FTS in graph) | No graph |
-| Nested document properties | **Yes** (dot-notation) | No (flat props) | Yes | Yes | No |
-| Vector search on edges | **Yes** | No | No | No | N/A |
-| Spatial queries | **Yes** | Via APOC | Yes | No | No |
-| Encrypted search | **Yes** | No | No | No | No |
-| Time-travel queries | **Yes** | No | No | No | No |
-| Bitemporal edges (per-version valid_from / valid_to) | **Yes** | No | No | No | No |
-| Built-in query advisor | **Yes** | No | Yes (explain) | No | No |
-| OpenCypher queries | **Yes** | Yes | No | SurrealQL | No |
-| Language | Rust (zero GC) | Java (JVM) | C++ | Rust | Cloud-only |
-| License | AGPL-3.0 | GPL-3.0 | SSPL | BSL-1.1 | Proprietary |
+Other engines combine some of these. What we optimise for is the combination holding under one transaction, one planner and one storage engine:
+
+- **One planner over all three modalities.** A compound `WHERE` mixing traversal, vector distance and text match is split into one pipeline and costed as a whole, rather than executed as three lookups joined by your application.
+- **One snapshot.** Graph edges, embeddings and the text index move together under MVCC snapshot isolation, so a retrieval never reads a half-applied write.
+- **Vector search over relationships as well as nodes**, integrated with traversal and transactional execution.
+- **Rust with no garbage collector.** Tail latency is a design constraint, not a tuning exercise: no JVM pauses, no stop-the-world.
+- **Pure Rust with no FFI.** `cargo build` produces the whole engine, compression and TLS included. No OpenSSL, no C storage engine, nothing to reconcile with your base image.
+- **AGPL-3.0 with clustering included.** Replication is not held back for a paid tier.
+- **Operations answered in-engine:** entity resolution (`MERGE NODES`), document promotion and demotion (`DETACH` / `ATTACH DOCUMENT`) and triggers are native clauses, not plugins that break once you cluster.
+
+For measured comparisons rather than claims, see the [benchmarks](https://docs.coordinode.com/benchmarks/): CoordiNode and the systems we compare against run on the same host, results are JSON-recorded with a hardware fingerprint and commit SHA, and CoordiNode's numbers are regenerated by CI on every push.
+
+Coming from Neo4j? [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) lists what carries over and what does not.
 
 ## Full-Text Search: 23+ Languages
 
@@ -182,6 +191,7 @@ See [docs/QUICKSTART.md](docs/QUICKSTART.md) for a complete 5-minute tutorial wi
 
 ```bash
 pip install coordinode                               # core gRPC client
+pip install coordinode-embedded                      # in-process engine, no server
 pip install langchain-coordinode                     # LangChain GraphStore
 pip install llama-index-graph-stores-coordinode      # LlamaIndex PropertyGraphStore
 ```
@@ -208,21 +218,24 @@ Source: [structured-world/coordinode-python](https://github.com/structured-world
                     └─────────────────────────────────────────┘
 ```
 
-10 Rust crates, ~119K lines of code.
+20 Rust crates, ~232K lines of code. A multi-node deployment runs the same binary on every node: replication and routing are built in, with no separate router or coordinator process to operate.
 
 ## Documentation
 
-- [Quick Start](docs/QUICKSTART.md) — from zero to hybrid query in 5 minutes
-- [Cypher Extensions](docs/cypher/extensions.md) — vector, full-text, spatial, time-travel, encrypted search syntax
-- [Compatibility](docs/COMPATIBILITY.md) — Neo4j ecosystem compatibility matrix
+- [Quick Start](docs/QUICKSTART.md): from zero to a hybrid query in 5 minutes
+- [Cypher Extensions](docs/cypher/extensions.md): vector, full-text, spatial, time-travel and encrypted-search syntax
+- [Compatibility](docs/COMPATIBILITY.md): Neo4j ecosystem compatibility matrix
+- [Configuration](docs/guide/configuration.md): every tunable, its default, and whether it needs a restart
+- [Benchmarks](https://docs.coordinode.com/benchmarks/): per-modality results, reproducible, same hardware for every system
+- [Embedded mode](docs/guide/embedded.md): the engine as a library, with no server process
 
-## Known Limitations (alpha)
+## Known Limitations
 
-- **Single-node only** — clustering in development (v0.4). Single-node handles 100K-1M nodes comfortably.
-- **No Bolt protocol** — use gRPC or REST. Bolt planned for v1.2.
-- **No APOC/GDS** — common Cypher works; Neo4j-specific procedure libraries are not supported.
-- **HNSW index is in-memory** — vector indexes reside in RAM. At 1M vectors x 384 dims = ~1.5GB RAM.
-- **No benchmarks published yet** — we are working on reproducible benchmark suite.
+- **No Bolt protocol.** Use gRPC or REST. Bolt is planned, so existing Neo4j drivers do not connect yet.
+- **No APOC or GDS.** Common Cypher works, and the operations people reach APOC for most often (entity resolution, triggers) are native clauses here. Neo4j-specific procedure libraries are not supported.
+- **Vector indexes are held in memory.** At 1M vectors of 384 dimensions that is roughly 1.5 GB before compression; SQ8 and RaBitQ bring it down substantially in exchange for a rerank pass.
+- **The cluster is young.** Replication, follower reads and mTLS are covered by an automated fault-injection suite, but nothing substitutes for production years. Treat multi-node deployments accordingly.
+- **Horizontal sharding is an Enterprise feature.** CE replicates the full dataset to every node, which is the right shape until a dataset outgrows one machine.
 
 ## License
 
@@ -247,7 +260,7 @@ USDT (TRC-20): `TFDsezHa1cBkoeZT5q2T49Wp66K8t2DmdA`
 
 </div>
 
-Sponsorship accelerates: Raft clustering (v0.4), Bolt protocol for Neo4j driver compatibility (v1.2), and the Enterprise Edition for horizontal scaling.
+Sponsorship accelerates: the Bolt protocol so existing Neo4j drivers connect unchanged, SQL over the same engine, and hardening the cluster path that shipped in this release.
 
 ## Building from Source
 
