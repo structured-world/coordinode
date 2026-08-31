@@ -752,14 +752,25 @@ impl StorageEngine {
         table_id: &str,
         snapshot: lsm_tree::SeqNo,
     ) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>> {
-        use lsm_tree::AbstractTree;
+        use lsm_tree::table::columnar::{COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE};
+
         let Some(tree) = self.columnar_tables.get(table_id) else {
             return Ok(Vec::new());
         };
+        // Tree-level projected columnar scan: segment selection, MVCC
+        // visibility, delete-bitmap masking, and cross-segment merge run
+        // inside the engine on the vectorized batch path. Full-row readback
+        // projects all four intrinsic columns; a projected/predicate-pushed
+        // variant narrows this list instead of decoding whole rows.
         let mut out = Vec::new();
-        for item in tree.range::<&[u8], std::ops::RangeFull>(.., snapshot, None) {
-            let (k, v) = item.into_inner()?;
-            out.push((k.to_vec(), v.to_vec()));
+        for batch in tree.columnar_scan(
+            &[COL_USER_KEY, COL_SEQNO, COL_VALUE_TYPE, COL_VALUE],
+            None,
+            snapshot,
+            ..,
+        )? {
+            let batch = batch?;
+            out.extend(crate::columnar::columnar_batch_rows(&batch)?);
         }
         Ok(out)
     }
