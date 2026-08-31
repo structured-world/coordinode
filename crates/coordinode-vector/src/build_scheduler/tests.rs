@@ -4,6 +4,25 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
+/// Block until `depth` waiters are queued.
+///
+/// A spawned thread reaches `acquire` when the scheduler lets it, not after
+/// any particular number of milliseconds. Tests that need waiters queued in a
+/// known order wait for that fact instead of sleeping and hoping: a loaded
+/// machine misses a fixed delay and the queue ends up in the wrong order,
+/// which reads as a scheduler bug rather than as the test being early.
+fn wait_for_queue_depth(scheduler: &Arc<HnswBuildScheduler>, depth: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while scheduler.queue_depth() < depth {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "queue never reached depth {depth} (stuck at {})",
+            scheduler.queue_depth(),
+        );
+        thread::yield_now();
+    }
+}
+
 #[test]
 fn capacity_is_clamped_to_one_minimum() {
     let s = HnswBuildScheduler::new(0);
@@ -69,8 +88,10 @@ fn emergency_jumps_normal_queue() {
         order_n1.lock().unwrap().push("n1");
         thread::sleep(Duration::from_millis(20));
     });
-    // Give n1 time to enter the queue before emergency arrives.
-    thread::sleep(Duration::from_millis(10));
+    // n1 has to be queued before emergency arrives, or the test proves
+    // nothing about jumping a queue. Wait for that rather than assuming a
+    // fixed delay is long enough on a loaded machine.
+    wait_for_queue_depth(&s, 1);
 
     let s_em = s.clone();
     let order_em = order.clone();
@@ -79,8 +100,7 @@ fn emergency_jumps_normal_queue() {
         order_em.lock().unwrap().push("emergency");
         thread::sleep(Duration::from_millis(20));
     });
-    // Let emergency settle in queue too.
-    thread::sleep(Duration::from_millis(10));
+    wait_for_queue_depth(&s, 2);
 
     drop(hog);
     em.join().unwrap();
@@ -102,16 +122,19 @@ fn normal_priority_is_fifo() {
     let order: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
     let mut handles = Vec::new();
     for i in 0..5u32 {
-        let s = s.clone();
+        let s2 = s.clone();
         let order = order.clone();
         handles.push(thread::spawn(move || {
-            let _p = s.acquire(Priority::Normal);
+            let _p = s2.acquire(Priority::Normal);
             order.lock().unwrap().push(i);
             thread::sleep(Duration::from_millis(5));
         }));
-        // Sequential queue entries — each thread sleeps before next is
-        // spawned so FIFO ticket order matches spawn order.
-        thread::sleep(Duration::from_millis(10));
+        // Wait for this thread to be in the queue before spawning the next,
+        // so the tickets are taken in spawn order and the assertion below is
+        // about FIFO rather than about thread start-up. Sleeping a fixed
+        // 10 ms instead assumed the new thread reaches `acquire` within it,
+        // which a loaded machine does not honour: CI saw [0, 1, 3, 2, 4].
+        wait_for_queue_depth(&s, i as usize + 1);
     }
     drop(hog);
     for h in handles {
