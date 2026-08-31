@@ -21,20 +21,29 @@ fn row() -> Row {
 #[test]
 fn literal_variable_and_property() {
     let r = row();
+    // Unwrapped throughout: these expressions carry no arithmetic that can
+    // fail, so an error here is a bug rather than an outcome under test. The
+    // failing cases live in the eval module's own tests.
     assert_eq!(
-        eval_neutral(&Expr::Literal(Value::Int(42)), &r),
+        eval_neutral(&Expr::Literal(Value::Int(42)), &r).unwrap(),
         Value::Int(42)
     );
-    assert_eq!(eval_neutral(&Expr::Variable("n".into()), &r), Value::Int(7));
     assert_eq!(
-        eval_neutral(&Expr::Variable("missing".into()), &r),
+        eval_neutral(&Expr::Variable("n".into()), &r).unwrap(),
+        Value::Int(7)
+    );
+    assert_eq!(
+        eval_neutral(&Expr::Variable("missing".into()), &r).unwrap(),
         Value::Null
     );
     let prop = Expr::Property {
         base: Box::new(Expr::Variable("n".into())),
         key: "name".into(),
     };
-    assert_eq!(eval_neutral(&prop, &r), Value::String("alice".into()));
+    assert_eq!(
+        eval_neutral(&prop, &r).unwrap(),
+        Value::String("alice".into())
+    );
 }
 
 #[test]
@@ -45,14 +54,14 @@ fn binary_arithmetic_and_comparison() {
         op: BinOp::Add,
         right: Box::new(Expr::Literal(Value::Int(3))),
     };
-    assert_eq!(eval_neutral(&add, &r), Value::Int(10));
+    assert_eq!(eval_neutral(&add, &r).unwrap(), Value::Int(10));
 
     let gt = Expr::Binary {
         left: Box::new(Expr::Variable("n".into())),
         op: BinOp::Gt,
         right: Box::new(Expr::Literal(Value::Int(3))),
     };
-    assert_eq!(eval_neutral(&gt, &r), Value::Bool(true));
+    assert_eq!(eval_neutral(&gt, &r).unwrap(), Value::Bool(true));
 }
 
 #[test]
@@ -64,17 +73,17 @@ fn list_and_in() {
         Expr::Literal(Value::Int(3)),
     ]);
     assert_eq!(
-        eval_neutral(&list, &r),
+        eval_neutral(&list, &r).unwrap(),
         Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
     );
     let in_present = Expr::In {
         item: Box::new(Expr::Literal(Value::Int(2))),
         list: Box::new(list.clone()),
     };
-    assert_eq!(eval_neutral(&in_present, &r), Value::Bool(true));
+    assert_eq!(eval_neutral(&in_present, &r).unwrap(), Value::Bool(true));
     let in_absent = Expr::In {
         item: Box::new(Expr::Literal(Value::Int(9))),
         list: Box::new(list),
     };
-    assert_eq!(eval_neutral(&in_absent, &r), Value::Bool(false));
+    assert_eq!(eval_neutral(&in_absent, &r).unwrap(), Value::Bool(false));
 }

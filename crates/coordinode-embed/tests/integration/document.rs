@@ -246,10 +246,13 @@ fn document_dot_notation_eval_through_pipeline() {
     // neutral IR, then run the neutral evaluator (the direct cypher evaluator
     // was removed; lowering + eval_neutral is the only evaluation path).
     fn eval_expr(expr: &Expr, row: &Row) -> Value {
+        // Document access carries no arithmetic that can fail here, so an
+        // error is a bug in the test rather than an outcome under test.
         coordinode_query::executor::eval_neutral::eval_neutral(
             &coordinode_query::planner::lower_expr(expr).expect("lower"),
             row,
         )
+        .expect("expression must evaluate")
     }
 
     let config = rmpv::Value::Map(vec![

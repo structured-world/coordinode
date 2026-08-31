@@ -29,7 +29,7 @@ use coordinode_storage::engine::StorageSnapshot;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
 
-use super::eval::{eval_binary_op, eval_unary_op, is_truthy};
+use super::eval::{EvalError, eval_binary_op, eval_unary_op, is_truthy};
 use super::eval_neutral::eval_neutral;
 use super::row::Row;
 use crate::index::{IndexState, OnlineDuringBuild};
@@ -56,6 +56,12 @@ pub enum ExecutionError {
     /// errors propagate end-to-end.
     #[error("modality store error: {0}")]
     Modality(#[from] coordinode_modality::StoreError),
+
+    /// Arithmetic with no answer: division or modulo by an integer zero, or an
+    /// integer operation whose exact result leaves the `i64` range. Carries the
+    /// message verbatim, so a driver sees the same text it would elsewhere.
+    #[error("{0}")]
+    Arithmetic(#[from] super::eval::EvalError),
 
     #[error("serialization error: {0}")]
     Serialization(String),
@@ -1952,7 +1958,7 @@ pub fn execute_no_commit(
     // Since commit_ts = seqno (ADR-016, OracleSeqnoGenerator), the timestamp value
     // is directly usable as a snapshot seqno for both node and adj partitions.
     if let Some(ref ts_expr) = plan.snapshot_ts {
-        let ts_val = eval_neutral(ts_expr, &Row::new());
+        let ts_val = eval_neutral(ts_expr, &Row::new())?;
         let resolved_ts: Option<i64> = match ts_val {
             Value::Timestamp(ts) => {
                 // Validate within retention window
@@ -2194,21 +2200,25 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 }
                 Ok(result)
             } else {
-                Ok(rows
-                    .into_iter()
-                    .filter(|row| {
-                        if let Some(ref outer) = corr {
-                            // Correlated OPTIONAL MATCH: merge outer-scope variables
-                            // so predicates like `c.age > a.age` can resolve `a`.
-                            // Current row takes precedence over outer scope.
-                            let mut merged = outer.clone();
-                            merged.extend(row.iter().map(|(k, v)| (k.clone(), v.clone())));
-                            is_truthy(&eval_neutral(predicate, &merged))
-                        } else {
-                            is_truthy(&eval_neutral(predicate, row))
-                        }
-                    })
-                    .collect())
+                // A loop rather than `filter`, because evaluating a predicate
+                // can fail and a filter closure has nowhere to put the failure.
+                let mut kept = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let keep = if let Some(ref outer) = corr {
+                        // Correlated OPTIONAL MATCH: merge outer-scope variables
+                        // so predicates like `c.age > a.age` can resolve `a`.
+                        // Current row takes precedence over outer scope.
+                        let mut merged = outer.clone();
+                        merged.extend(row.iter().map(|(k, v)| (k.clone(), v.clone())));
+                        is_truthy(&eval_neutral(predicate, &merged)?)
+                    } else {
+                        is_truthy(&eval_neutral(predicate, &row)?)
+                    };
+                    if keep {
+                        kept.push(row);
+                    }
+                }
+                Ok(kept)
             }
         }
 
@@ -2303,7 +2313,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                             None if neutral_contains_subplan(&item.expr) => {
                                 eval_neutral_with_storage(&item.expr, &row, ctx)?
                             }
-                            None => eval_neutral(&item.expr, &row),
+                            None => eval_neutral(&item.expr, &row)?,
                         };
                         let key = item
                             .alias
@@ -2359,7 +2369,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         }
 
         LogicalOp::Sort { input, items } => {
-            let mut rows = execute_op(input, ctx)?;
+            let rows = execute_op(input, ctx)?;
 
             // Same R-HYB1 guard as Project: an `ORDER BY text_score(...)` (bare
             // or inside arithmetic) without an upstream TextFilter would sort
@@ -2412,11 +2422,21 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 }
             }
 
-            rows.sort_by(|a, b| {
+            // Evaluate each sort key once per row, then sort on the results.
+            // A comparator has nowhere to report a failed evaluation, and it is
+            // called O(n log n) times, so the old shape also re-evaluated every
+            // key on every comparison.
+            let mut keyed: Vec<(Vec<Value>, Row)> = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut keys = Vec::with_capacity(items.len());
                 for item in items {
-                    let va = eval_neutral(&item.expr, a);
-                    let vb = eval_neutral(&item.expr, b);
-                    let cmp = compare_values(&va, &vb);
+                    keys.push(eval_neutral(&item.expr, &row)?);
+                }
+                keyed.push((keys, row));
+            }
+            keyed.sort_by(|(ka, _), (kb, _)| {
+                for (idx, item) in items.iter().enumerate() {
+                    let cmp = compare_values(&ka[idx], &kb[idx]);
                     let cmp = if item.ascending { cmp } else { cmp.reverse() };
                     if cmp != std::cmp::Ordering::Equal {
                         return cmp;
@@ -2424,12 +2444,12 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 }
                 std::cmp::Ordering::Equal
             });
-            Ok(rows)
+            Ok(keyed.into_iter().map(|(_, row)| row).collect())
         }
 
         LogicalOp::Limit { input, count } => {
             let rows = execute_op(input, ctx)?;
-            let n = eval_neutral(count, &Row::new());
+            let n = eval_neutral(count, &Row::new())?;
             if let Value::Int(limit) = n {
                 Ok(rows.into_iter().take(limit.max(0) as usize).collect())
             } else {
@@ -2439,7 +2459,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
 
         LogicalOp::Skip { input, count } => {
             let rows = execute_op(input, ctx)?;
-            let n = eval_neutral(count, &Row::new());
+            let n = eval_neutral(count, &Row::new())?;
             if let Value::Int(skip) = n {
                 Ok(rows.into_iter().skip(skip.max(0) as usize).collect())
             } else {
@@ -2864,14 +2884,21 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             let prev_scope = ctx.foreach_scope.take();
             for row in &input_rows {
                 let elems = match eval_neutral(list, row) {
-                    Value::Array(items) => items,
+                    Ok(Value::Array(items)) => items,
                     // FOREACH over NULL is a no-op (matches Cypher).
-                    Value::Null => continue,
-                    other => {
+                    Ok(Value::Null) => continue,
+                    Ok(other) => {
                         ctx.foreach_scope = prev_scope;
                         return Err(ExecutionError::Unsupported(format!(
                             "FOREACH expects a list, got {other:?}"
                         )));
+                    }
+                    // Restore the enclosing scope on the way out, as the
+                    // wrong-type arm above does: a bare `?` here would leave
+                    // the loop variable's scope installed.
+                    Err(e) => {
+                        ctx.foreach_scope = prev_scope;
+                        return Err(e.into());
                     }
                 };
                 for elem in elems {
@@ -3247,9 +3274,9 @@ fn execute_node_scan(
                 Some(corr) => {
                     let mut eval_row = corr.clone();
                     eval_row.extend(row.clone());
-                    eval_neutral(filter_expr, &eval_row)
+                    eval_neutral(filter_expr, &eval_row)?
                 }
-                None => eval_neutral(filter_expr, &row),
+                None => eval_neutral(filter_expr, &row)?,
             };
             if actual != expected {
                 matches = false;
@@ -3297,8 +3324,8 @@ fn execute_btree_index_scan(
     // driven per outer row) resolves against `correlated_row`; a literal /
     // parameter key ignores the row, so the empty-row fallback is equivalent.
     let lookup_val = match &ctx.correlated_row {
-        Some(corr) => eval_neutral(value_expr, corr),
-        None => eval_neutral(value_expr, &Row::new()),
+        Some(corr) => eval_neutral(value_expr, corr)?,
+        None => eval_neutral(value_expr, &Row::new())?,
     };
 
     // Use index_scan_exact to find node IDs matching the lookup value.
@@ -3391,7 +3418,7 @@ fn execute_hnsw_scan(
     // scan-then-rank path does.
     gate_vector_index_read(ctx.engine, registry, label, property)?;
 
-    let qv_val = eval_neutral(query_vector, &Row::new());
+    let qv_val = eval_neutral(query_vector, &Row::new())?;
     let Some(qv) = coerce_value_to_vec(&qv_val) else {
         return Err(ExecutionError::Unsupported(format!(
             "HnswScan({index_name}): query vector did not evaluate to a vector"
@@ -3819,7 +3846,7 @@ fn build_target_rows(
                 .get(&format!("{target_variable}.{prop_name}"))
                 .cloned()
                 .unwrap_or(Value::Null);
-            let expected = eval_neutral(filter_expr, &row);
+            let expected = eval_neutral(filter_expr, &row)?;
             if actual != expected {
                 continue 'each_row;
             }
@@ -3830,7 +3857,7 @@ fn build_target_rows(
                     .get(&format!("{ev}.{prop_name}"))
                     .cloned()
                     .unwrap_or(Value::Null);
-                let expected = eval_neutral(filter_expr, &row);
+                let expected = eval_neutral(filter_expr, &row)?;
                 if actual != expected {
                     continue 'each_row;
                 }
@@ -3884,7 +3911,7 @@ fn process_targets_parallel(
     input_row: &Row,
     params: &TraverseParams<'_>,
     pctx: &ParallelCtx<'_>,
-) -> Vec<Row> {
+) -> Result<Vec<Row>, EvalError> {
     let target_variable = params.target_variable;
     let target_labels = params.target_labels;
     let target_filters = params.target_filters;
@@ -4016,13 +4043,19 @@ fn process_targets_parallel(
                     }
                 }
 
-                // Apply target inline property filters
+                // Apply target inline property filters. A failed evaluation is
+                // yielded as an item rather than swallowed, so the collect
+                // below turns it into the whole call's error; `None` keeps its
+                // one meaning, "this row does not match".
                 for (prop_name, filter_expr) in target_filters {
                     let actual = out_row
                         .get(&format!("{target_variable}.{prop_name}"))
                         .cloned()
                         .unwrap_or(Value::Null);
-                    let expected = eval_neutral(filter_expr, &out_row);
+                    let expected = match eval_neutral(filter_expr, &out_row) {
+                        Ok(v) => v,
+                        Err(e) => return Some(Err(e)),
+                    };
                     if actual != expected {
                         return None;
                     }
@@ -4035,14 +4068,17 @@ fn process_targets_parallel(
                             .get(&format!("{ev}.{prop_name}"))
                             .cloned()
                             .unwrap_or(Value::Null);
-                        let expected = eval_neutral(filter_expr, &out_row);
+                        let expected = match eval_neutral(filter_expr, &out_row) {
+                            Ok(v) => v,
+                            Err(e) => return Some(Err(e)),
+                        };
                         if actual != expected {
                             return None;
                         }
                     }
                 }
 
-                Some(out_row)
+                Some(Ok(out_row))
             })
         })
         .collect()
@@ -4112,7 +4148,7 @@ fn execute_single_hop_traverse(
                 .iter()
                 .map(|&(tgt, et_idx)| (src_raw, tgt, et_idx))
                 .collect();
-            let parallel_rows = process_targets_parallel(&with_src, row, params, &pctx);
+            let parallel_rows = process_targets_parallel(&with_src, row, params, &pctx)?;
             // Merge OCC read keys from parallel workers into the Layer-3 scope
             // via the typed per-partition extends.
             if let Some(ref keys) = pctx.occ_read_keys {
@@ -4430,7 +4466,7 @@ fn execute_varlen_traverse(
                         None
                     },
                 };
-                let parallel_rows = process_targets_parallel(&depth_neighbors, row, params, &pctx);
+                let parallel_rows = process_targets_parallel(&depth_neighbors, row, params, &pctx)?;
                 // Merge OCC read keys from parallel workers into the Layer-3
                 // scope via the typed per-partition extends.
                 if let Some(ref keys) = pctx.occ_read_keys {
@@ -4549,7 +4585,7 @@ fn try_hnsw_vector_filter(
     }
 
     // Evaluate the query vector (constant across all rows).
-    let query_val = eval_neutral(query_vector_expr, &rows[0]);
+    let query_val = eval_neutral(query_vector_expr, &rows[0])?;
     let query_vec = match coerce_value_to_vec(&query_val) {
         Some(v) => v,
         None => return Ok(None),
@@ -4589,7 +4625,7 @@ fn try_hnsw_vector_filter(
         }
 
         // Re-compute exact score for threshold comparison.
-        let vec_val = eval_neutral(vector_expr, row);
+        let vec_val = eval_neutral(vector_expr, row)?;
         let a = match coerce_value_to_vec(&vec_val) {
             Some(v) if v.len() == query_vec.len() => v,
             _ => continue,
@@ -4609,7 +4645,7 @@ fn try_hnsw_vector_filter(
             _ => continue,
         };
 
-        let score = apply_decay_multiplier(raw_score, params.decay_field, row);
+        let score = apply_decay_multiplier(raw_score, params.decay_field, row)?;
 
         let passes = if params.less_than {
             score < params.threshold
@@ -4764,7 +4800,7 @@ fn try_hnsw_vector_top_k(
     };
 
     // Evaluate the query vector (constant across all rows).
-    let query_val = eval_neutral(query_vector_expr, &rows[0]);
+    let query_val = eval_neutral(query_vector_expr, &rows[0])?;
     let query_vec = match coerce_value_to_vec(&query_val) {
         Some(v) => v,
         None => return Ok(None),
@@ -4872,7 +4908,7 @@ fn try_hnsw_vector_top_k(
             // Compute the exact score using the requested function — HNSW may
             // have returned raw L2 distance even when the user asked for
             // `vector_similarity`. Re-evaluate to get the correct value.
-            let recomputed = recompute_score_for_row(vector_expr, &query_vec, function, &cloned);
+            let recomputed = recompute_score_for_row(vector_expr, &query_vec, function, &cloned)?;
             cloned.insert(
                 alias.to_string(),
                 Value::Float(recomputed.unwrap_or(dist as f64)),
@@ -4893,20 +4929,24 @@ fn recompute_score_for_row(
     query_vec: &[f32],
     function: &str,
     row: &Row,
-) -> Option<f64> {
-    let vec_val = eval_neutral(vector_expr, row);
-    let a = coerce_value_to_vec(&vec_val)?;
+) -> Result<Option<f64>, EvalError> {
+    // `Ok(None)` stays "this row has no score"; an evaluation that fails is an
+    // error rather than a missing score, so the two do not get conflated.
+    let vec_val = eval_neutral(vector_expr, row)?;
+    let Some(a) = coerce_value_to_vec(&vec_val) else {
+        return Ok(None);
+    };
     if a.len() != query_vec.len() {
-        return None;
+        return Ok(None);
     }
     let score = match function {
         "vector_distance" => coordinode_vector::metrics::euclidean_distance(&a, query_vec) as f64,
         "vector_similarity" => coordinode_vector::metrics::cosine_similarity(&a, query_vec) as f64,
         "vector_dot" => coordinode_vector::metrics::dot_product(&a, query_vec) as f64,
         "vector_manhattan" => coordinode_vector::metrics::manhattan_distance(&a, query_vec) as f64,
-        _ => return None,
+        _ => return Ok(None),
     };
-    Some(score)
+    Ok(Some(score))
 }
 
 /// Brute-force top-K: compute distance per row, sort, take first K.
@@ -4926,7 +4966,7 @@ fn execute_vector_top_k_brute_force(
     }
 
     // Evaluate query vector once (constant across rows).
-    let query_val = eval_neutral(query_vector_expr, &rows[0]);
+    let query_val = eval_neutral(query_vector_expr, &rows[0])?;
     let query_vec = match coerce_value_to_vec(&query_val) {
         Some(v) => v,
         None => return Ok(Vec::new()),
@@ -4935,7 +4975,7 @@ fn execute_vector_top_k_brute_force(
     // Compute (score, row) pairs, skipping rows with missing/mismatched vectors.
     let mut scored: Vec<(f64, Row)> = Vec::with_capacity(rows.len());
     for row in rows {
-        let vec_val = eval_neutral(vector_expr, &row);
+        let vec_val = eval_neutral(vector_expr, &row)?;
         let a = match coerce_value_to_vec(&vec_val) {
             Some(v) if v.len() == query_vec.len() => v,
             _ => continue,
@@ -4986,9 +5026,9 @@ fn apply_decay_multiplier(
     raw_score: f64,
     decay_field: Option<&crate::plan::expr::Expr>,
     row: &Row,
-) -> f64 {
-    if let Some(decay_expr) = decay_field {
-        let decay_val = eval_neutral(decay_expr, row);
+) -> Result<f64, EvalError> {
+    Ok(if let Some(decay_expr) = decay_field {
+        let decay_val = eval_neutral(decay_expr, row)?;
         let decay_factor = match decay_val {
             Value::Float(f) => f,
             Value::Int(i) => i as f64,
@@ -4997,7 +5037,7 @@ fn apply_decay_multiplier(
         raw_score * decay_factor
     } else {
         raw_score
-    }
+    })
 }
 
 fn execute_vector_filter(
@@ -5009,8 +5049,8 @@ fn execute_vector_filter(
     let mut results = Vec::new();
 
     for row in rows {
-        let vec_val = eval_neutral(vector_expr, row);
-        let query_val = eval_neutral(query_vector, row);
+        let vec_val = eval_neutral(vector_expr, row)?;
+        let query_val = eval_neutral(query_vector, row)?;
 
         // Coerce values to f32 vectors
         let vec_a = coerce_value_to_vec(&vec_val);
@@ -5032,7 +5072,7 @@ fn execute_vector_filter(
             _ => continue,
         };
 
-        let score = apply_decay_multiplier(raw_score, params.decay_field, row);
+        let score = apply_decay_multiplier(raw_score, params.decay_field, row)?;
 
         let passes = if params.less_than {
             score < params.threshold
@@ -5193,9 +5233,15 @@ fn resolve_rank_fuse_method(
     // Fallback: brute-force vector if any row evaluates the method to a Vector.
     // Covers edge vector properties (no query-time edge HNSW registry yet) and
     // schemaless vectors. Text fields MUST have a full-text index — no fallback.
-    let any_vector = rows
-        .iter()
-        .any(|row| matches!(eval_neutral(method_expr, row), Value::Vector(_)));
+    // `any` short-circuits, so a row that fails to evaluate stops the scan with
+    // that failure rather than being read as "not a vector".
+    let mut any_vector = false;
+    for row in rows.iter() {
+        if matches!(eval_neutral(method_expr, row)?, Value::Vector(_)) {
+            any_vector = true;
+            break;
+        }
+    }
     if any_vector {
         return Ok(RankFuseMethodKind::VectorBruteForce);
     }
@@ -5254,12 +5300,14 @@ fn execute_rank_fuse(
     // Evaluate query once — it may be a Parameter resolved elsewhere, so a
     // zero-row eval against an empty Row is sufficient for literal / parameter
     // shapes. Params have already been substituted by `substitute_params`.
-    let qv_value = query_vector
-        .map(|e| eval_neutral(e, &Row::new()))
-        .unwrap_or(Value::Null);
-    let qt_value = query_text
-        .map(|e| eval_neutral(e, &Row::new()))
-        .unwrap_or(Value::Null);
+    let qv_value = match query_vector {
+        Some(e) => eval_neutral(e, &Row::new())?,
+        None => Value::Null,
+    };
+    let qt_value = match query_text {
+        Some(e) => eval_neutral(e, &Row::new())?,
+        None => Value::Null,
+    };
 
     let query_vec: Option<Vec<f32>> = coerce_value_to_vec(&qv_value);
     let query_text_str: Option<String> = match &qt_value {
@@ -5319,7 +5367,7 @@ fn execute_rank_fuse(
                 Some(*metric),
                 kind.desc(),
                 &variable_for_method(method_expr),
-            ),
+            )?,
             RankFuseMethodKind::VectorBruteForce => score_vector_method(
                 &rows,
                 method_expr,
@@ -5327,7 +5375,7 @@ fn execute_rank_fuse(
                 None, // default: cosine similarity
                 kind.desc(),
                 &variable_for_method(method_expr),
-            ),
+            )?,
             RankFuseMethodKind::TextBm25 { label, property } => score_text_method(
                 &rows,
                 method_expr,
@@ -5428,11 +5476,11 @@ fn score_vector_method(
     metric: Option<coordinode_core::graph::types::VectorMetric>,
     desc: bool,
     variable: &str,
-) -> Vec<Option<usize>> {
+) -> Result<Vec<Option<usize>>, EvalError> {
     // (row_idx, score, node_id) for matched rows.
     let mut scored: Vec<(usize, f64, u64)> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
-        let val = eval_neutral(method_expr, row);
+        let val = eval_neutral(method_expr, row)?;
         let Some(v) = coerce_value_to_vec(&val) else {
             continue;
         };
@@ -5457,7 +5505,7 @@ fn score_vector_method(
         scored.push((i, s, nid));
     }
 
-    assign_competition_ranks(rows.len(), &mut scored, desc)
+    Ok(assign_competition_ranks(rows.len(), &mut scored, desc))
 }
 
 /// Score rows by a text (BM25) method via `TextIndexRegistry`. Missing FT-index
@@ -5537,10 +5585,10 @@ fn compute_raw_method_scores(
         let variable = variable_for_method(method_expr);
         let scores = match kind {
             RankFuseMethodKind::VectorHnsw { metric, .. } => {
-                raw_scores_vector_method(rows, method_expr, qv_slice, Some(*metric), kind.desc())
+                raw_scores_vector_method(rows, method_expr, qv_slice, Some(*metric), kind.desc())?
             }
             RankFuseMethodKind::VectorBruteForce => {
-                raw_scores_vector_method(rows, method_expr, qv_slice, None, kind.desc())
+                raw_scores_vector_method(rows, method_expr, qv_slice, None, kind.desc())?
             }
             RankFuseMethodKind::TextBm25 { label, property } => raw_scores_text_method(
                 rows,
@@ -5568,10 +5616,10 @@ fn raw_scores_vector_method(
     query_vec: &[f32],
     metric: Option<coordinode_core::graph::types::VectorMetric>,
     desc: bool,
-) -> Vec<Option<f64>> {
+) -> Result<Vec<Option<f64>>, EvalError> {
     let mut out: Vec<Option<f64>> = vec![None; rows.len()];
     for (i, row) in rows.iter().enumerate() {
-        let val = eval_neutral(method_expr, row);
+        let val = eval_neutral(method_expr, row)?;
         let Some(v) = coerce_value_to_vec(&val) else {
             continue;
         };
@@ -5597,7 +5645,7 @@ fn raw_scores_vector_method(
         let normalised = if desc { raw } else { -raw };
         out[i] = Some(normalised);
     }
-    out
+    Ok(out)
 }
 
 /// Sibling of `score_text_method` returning raw BM25 scores per row.
@@ -5775,13 +5823,13 @@ fn float_bits_eq(a: f64, b: f64) -> bool {
 /// `doc_score` weights are literal Floats / Ints in the AST after builder
 /// normalisation; Parameters are substituted before execute time. Anything
 /// that does not resolve to a finite number falls back to the default.
-fn eval_weight(expr: &crate::plan::expr::Expr, default: f64) -> f64 {
-    let v = eval_neutral(expr, &Row::new());
-    match v {
+fn eval_weight(expr: &crate::plan::expr::Expr, default: f64) -> Result<f64, EvalError> {
+    let v = eval_neutral(expr, &Row::new())?;
+    Ok(match v {
         Value::Float(f) if f.is_finite() => f,
         Value::Int(i) => i as f64,
         _ => default,
-    }
+    })
 }
 
 /// Execute `LogicalOp::DocScore`: per doc row, traverse outward HAS_CHUNK,
@@ -5798,10 +5846,10 @@ fn execute_doc_score(
     gamma: &crate::plan::expr::Expr,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    let alpha_f = eval_weight(alpha, 0.5);
-    let beta_f = eval_weight(beta, 0.3);
-    let gamma_f = eval_weight(gamma, 0.2);
-    let query_val = eval_neutral(query_vector, &Row::new());
+    let alpha_f = eval_weight(alpha, 0.5)?;
+    let beta_f = eval_weight(beta, 0.3)?;
+    let gamma_f = eval_weight(gamma, 0.2)?;
+    let query_val = eval_neutral(query_vector, &Row::new())?;
     let query_vec = coerce_value_to_vec(&query_val).ok_or_else(|| {
         ExecutionError::Unsupported(
             "doc_score(): query argument must be a vector (Vec<f32>) — resolve the parameter \
@@ -5925,7 +5973,7 @@ fn execute_maxsim_top_k(
         return Ok(Vec::new());
     }
 
-    let query_val = eval_neutral(query_expr, &Row::new());
+    let query_val = eval_neutral(query_expr, &Row::new())?;
     let query = coerce_value_to_multi_vector(&query_val);
     let Some(query) = query else {
         // Mirror the scalar's degenerate behaviour: missing / malformed
@@ -5971,7 +6019,7 @@ fn execute_maxsim_top_k(
     let mut scores: Vec<f32> = Vec::with_capacity(rows.len());
 
     for (idx, row) in rows.iter().enumerate() {
-        let doc_val = eval_neutral(doc_expr, row);
+        let doc_val = eval_neutral(doc_expr, row)?;
         let Some(doc) = coerce_value_to_multi_vector(&doc_val) else {
             scores.push(f32::NEG_INFINITY);
             continue;
@@ -6246,7 +6294,7 @@ fn execute_encrypted_filter(
     // Evaluate token from expression (parameter or literal).
     // Use the first row for context (token expression is typically a parameter,
     // independent of row data).
-    let token_val = eval_neutral(token_expr, &rows[0]);
+    let token_val = eval_neutral(token_expr, &rows[0])?;
     let token_bytes = match &token_val {
         Value::Binary(b) => b.clone(),
         Value::String(s) => {
@@ -6347,7 +6395,7 @@ fn execute_unwind(
     let mut results = Vec::new();
 
     for row in rows {
-        let val = eval_neutral(expr, row);
+        let val = eval_neutral(expr, row)?;
         match val {
             Value::Array(items) => {
                 for item in items {
@@ -6833,7 +6881,10 @@ fn execute_aggregate(
         groups.push((Vec::new(), all));
     } else {
         for row in rows {
-            let key: Vec<Value> = group_by.iter().map(|e| eval_neutral(e, row)).collect();
+            let key: Vec<Value> = group_by
+                .iter()
+                .map(|e| eval_neutral(e, row))
+                .collect::<Result<_, _>>()?;
             let found = groups.iter_mut().find(|(k, _)| k == &key);
             if let Some((_, group_rows)) = found {
                 group_rows.push(row);
@@ -6857,7 +6908,7 @@ fn execute_aggregate(
 
         // Compute aggregates
         for agg in aggregates {
-            let val = compute_aggregate(agg, group_rows, params);
+            let val = compute_aggregate(agg, group_rows, params)?;
             let col = agg.alias.clone().unwrap_or_else(|| agg.function.clone());
             out.insert(col, val);
         }
@@ -6870,12 +6921,14 @@ fn execute_aggregate(
 
 /// Evaluate aggregate argument for all rows, applying DISTINCT dedup if needed.
 /// Returns non-null values only.
-fn eval_aggregate_values(agg: &AggregateItem, rows: &[&Row]) -> Vec<Value> {
-    let mut values: Vec<Value> = rows
-        .iter()
-        .map(|r| eval_neutral(&agg.arg, r))
-        .filter(|v| !v.is_null())
-        .collect();
+fn eval_aggregate_values(agg: &AggregateItem, rows: &[&Row]) -> Result<Vec<Value>, EvalError> {
+    let mut values: Vec<Value> = Vec::with_capacity(rows.len());
+    for r in rows.iter() {
+        let v = eval_neutral(&agg.arg, r)?;
+        if !v.is_null() {
+            values.push(v);
+        }
+    }
 
     if agg.distinct {
         // Deduplicate using linear scan (Value doesn't impl Hash).
@@ -6888,7 +6941,7 @@ fn eval_aggregate_values(agg: &AggregateItem, rows: &[&Row]) -> Vec<Value> {
         values = unique;
     }
 
-    values
+    Ok(values)
 }
 
 /// Compute a single aggregate function over a group of rows.
@@ -6896,19 +6949,19 @@ fn compute_aggregate(
     agg: &AggregateItem,
     rows: &[&Row],
     params: &HashMap<String, coordinode_core::graph::types::Value>,
-) -> Value {
-    match agg.function.as_str() {
+) -> Result<Value, EvalError> {
+    Ok(match agg.function.as_str() {
         "count" => {
             if agg.arg == crate::plan::expr::Expr::Star {
                 // count(*) ignores DISTINCT — counts all rows
                 Value::Int(rows.len() as i64)
             } else {
-                let values = eval_aggregate_values(agg, rows);
+                let values = eval_aggregate_values(agg, rows)?;
                 Value::Int(values.len() as i64)
             }
         }
         "sum" => {
-            let values = eval_aggregate_values(agg, rows);
+            let values = eval_aggregate_values(agg, rows)?;
             let mut int_sum: i64 = 0;
             let mut float_sum: f64 = 0.0;
             let mut has_float = false;
@@ -6937,7 +6990,7 @@ fn compute_aggregate(
             }
         }
         "avg" => {
-            let values = eval_aggregate_values(agg, rows);
+            let values = eval_aggregate_values(agg, rows)?;
             let mut sum = 0.0f64;
             let mut count = 0u64;
             for v in &values {
@@ -6960,7 +7013,7 @@ fn compute_aggregate(
             }
         }
         "min" => {
-            let values = eval_aggregate_values(agg, rows);
+            let values = eval_aggregate_values(agg, rows)?;
             values
                 .into_iter()
                 .reduce(|a, b| {
@@ -6973,7 +7026,7 @@ fn compute_aggregate(
                 .unwrap_or(Value::Null)
         }
         "max" => {
-            let values = eval_aggregate_values(agg, rows);
+            let values = eval_aggregate_values(agg, rows)?;
             values
                 .into_iter()
                 .reduce(|a, b| {
@@ -6986,11 +7039,11 @@ fn compute_aggregate(
                 .unwrap_or(Value::Null)
         }
         "collect" => {
-            let values = eval_aggregate_values(agg, rows);
+            let values = eval_aggregate_values(agg, rows)?;
             Value::Array(values)
         }
         "percentileCont" | "percentileDisc" => {
-            let agg_values = eval_aggregate_values(agg, rows);
+            let agg_values = eval_aggregate_values(agg, rows)?;
             let mut values: Vec<f64> = agg_values
                 .iter()
                 .filter_map(|v| match v {
@@ -7001,7 +7054,7 @@ fn compute_aggregate(
                 .collect();
 
             if values.is_empty() {
-                return Value::Null;
+                return Ok(Value::Null);
             }
 
             values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -7036,7 +7089,7 @@ fn compute_aggregate(
             }
         }
         "stDev" | "stDevP" => {
-            let agg_values = eval_aggregate_values(agg, rows);
+            let agg_values = eval_aggregate_values(agg, rows)?;
             let values: Vec<f64> = agg_values
                 .iter()
                 .filter_map(|v| match v {
@@ -7047,7 +7100,7 @@ fn compute_aggregate(
                 .collect();
 
             if values.is_empty() {
-                return Value::Null;
+                return Ok(Value::Null);
             }
 
             let n = values.len() as f64;
@@ -7067,7 +7120,7 @@ fn compute_aggregate(
             }
         }
         _ => Value::Null,
-    }
+    })
 }
 
 /// Compare two values for sorting.
@@ -7475,11 +7528,16 @@ fn execute_merge_relationship_check(
                 }
             }
             // All filter expressions must match stored values.
-            let filters_match = edge_filters.iter().all(|(prop_name, filter_expr)| {
+            // A loop rather than `all`, so a filter that cannot be evaluated
+            // stops here instead of reading as "does not match".
+            let mut filters_match = true;
+            for (prop_name, filter_expr) in edge_filters.iter() {
                 let actual = stored.get(prop_name).cloned().unwrap_or(Value::Null);
-                let expected = eval_neutral(filter_expr, correlated);
-                actual == expected
-            });
+                if actual != eval_neutral(filter_expr, correlated)? {
+                    filters_match = false;
+                    break;
+                }
+            }
             if !filters_match {
                 // This edge exists but has different property values — treat as no match.
                 continue;
@@ -7636,13 +7694,17 @@ fn eval_neutral_with_storage(
         } => {
             let rows = correlated_subplan_rows(subplan, row, ctx)?;
             Ok(Value::Array(
-                rows.iter().map(|er| eval_neutral(projection, er)).collect(),
+                rows.iter()
+                    .map(|er| eval_neutral(projection, er))
+                    .collect::<Result<_, _>>()?,
             ))
         }
         PExpr::PatternComprehension { subplan, map } => {
             let rows = correlated_subplan_rows(subplan, row, ctx)?;
             Ok(Value::Array(
-                rows.iter().map(|er| eval_neutral(map, er)).collect(),
+                rows.iter()
+                    .map(|er| eval_neutral(map, er))
+                    .collect::<Result<_, _>>()?,
             ))
         }
         PExpr::ListComprehension {
@@ -7715,9 +7777,9 @@ fn eval_neutral_with_storage(
                 _ => {}
             }
             let rv = eval_neutral_with_storage(right, row, ctx)?;
-            Ok(eval_binary_op(&lv, *op, &rv))
+            Ok(eval_binary_op(&lv, *op, &rv)?)
         }
-        other => Ok(eval_neutral(other, row)),
+        other => Ok(eval_neutral(other, row)?),
     }
 }
 
@@ -7846,7 +7908,7 @@ fn execute_merge_relationship_create(
         let mut prop_map: Vec<(u32, Value)> = Vec::with_capacity(edge_filters.len());
         for (prop_name, expr) in edge_filters {
             let field_id = ctx.interner.intern(prop_name);
-            let value = eval_neutral(expr, correlated);
+            let value = eval_neutral(expr, correlated)?;
             prop_map.push((field_id, value.clone()));
             resolved_props.push((prop_name.clone(), value.clone()));
             if let Some(ev) = edge_variable {
@@ -8042,7 +8104,7 @@ fn execute_upsert(
 
                         let mut record = NodeRecord::new(&label);
                         for (prop_name, expr) in &np.properties {
-                            let val = eval_neutral(expr, &current_row);
+                            let val = eval_neutral(expr, &current_row)?;
                             let field_id = ctx.interner.intern(prop_name);
                             record.set(field_id, val);
                         }
@@ -8056,14 +8118,12 @@ fn execute_upsert(
                         // the same trigger semantics as a hand-written
                         // CREATE.
                         if !label.is_empty() {
-                            let props_map: std::collections::HashMap<String, Value> = np
-                                .properties
-                                .iter()
-                                .map(|(name, expr)| {
-                                    let val = eval_neutral(expr, row).map_to_document();
-                                    (name.clone(), val)
-                                })
-                                .collect();
+                            let mut props_map: std::collections::HashMap<String, Value> =
+                                std::collections::HashMap::with_capacity(np.properties.len());
+                            for (name, expr) in np.properties.iter() {
+                                let val = eval_neutral(expr, row)?.map_to_document();
+                                props_map.insert(name.clone(), val);
+                            }
                             let trigger_params =
                                 trigger_params_for_node_create(node_id, &props_map);
                             let target_segment =
@@ -8082,7 +8142,7 @@ fn execute_upsert(
                             .insert(var_name.to_string(), Value::Int(node_id.as_raw() as i64));
                         current_row.insert(format!("{var_name}.__label__"), Value::String(label));
                         for (prop_name, expr) in &np.properties {
-                            let val = eval_neutral(expr, row);
+                            let val = eval_neutral(expr, row)?;
                             current_row.insert(format!("{var_name}.{prop_name}"), val);
                         }
                     }
@@ -8219,7 +8279,7 @@ fn execute_create_from_pattern(
             let mut record = NodeRecord::new(&label);
             let empty_row = Row::new();
             for (prop_name, expr) in property_filters {
-                let val = eval_neutral(expr, &empty_row);
+                let val = eval_neutral(expr, &empty_row)?;
                 let field_id = ctx.interner.intern(prop_name);
                 record.set(field_id, val);
             }
@@ -8227,10 +8287,11 @@ fn execute_create_from_pattern(
             // Enforce unique constraints via B-tree index registry.
             if let Some(btree_reg) = ctx.btree_index_registry {
                 if !label.is_empty() {
-                    let props_for_index: Vec<(String, Value)> = property_filters
-                        .iter()
-                        .map(|(name, expr)| (name.clone(), eval_neutral(expr, &empty_row)))
-                        .collect();
+                    let mut props_for_index: Vec<(String, Value)> =
+                        Vec::with_capacity(property_filters.len());
+                    for (name, expr) in property_filters.iter() {
+                        props_for_index.push((name.clone(), eval_neutral(expr, &empty_row)?));
+                    }
                     btree_reg
                         .on_node_created(ctx.engine, node_id, &label, &props_for_index)
                         .map_err(|v| {
@@ -8251,13 +8312,12 @@ fn execute_create_from_pattern(
             // endpoint node has to be invented; both must fire the same
             // CREATE trigger as `execute_create_node`.
             if !label.is_empty() {
-                let props_map: std::collections::HashMap<String, Value> = property_filters
-                    .iter()
-                    .map(|(name, expr)| {
-                        let val = eval_neutral(expr, &empty_row).map_to_document();
-                        (name.clone(), val)
-                    })
-                    .collect();
+                let mut props_map: std::collections::HashMap<String, Value> =
+                    std::collections::HashMap::with_capacity(property_filters.len());
+                for (name, expr) in property_filters.iter() {
+                    let val = eval_neutral(expr, &empty_row)?.map_to_document();
+                    props_map.insert(name.clone(), val);
+                }
                 let trigger_params = trigger_params_for_node_create(node_id, &props_map);
                 let target_segment =
                     coordinode_core::schema::triggers::TriggerTargetSchema::label(label.clone())
@@ -8272,7 +8332,7 @@ fn execute_create_from_pattern(
             row.insert(variable.to_string(), Value::Int(node_id.as_raw() as i64));
             row.insert(format!("{variable}.__label__"), Value::String(label));
             for (prop_name, expr) in property_filters {
-                let val = eval_neutral(expr, &Row::new());
+                let val = eval_neutral(expr, &Row::new())?;
                 row.insert(format!("{variable}.{prop_name}"), val);
             }
 
@@ -8465,7 +8525,7 @@ fn execute_create_node(
                             labels.first().map_or("?", String::as_str)
                         )));
                     };
-                    let v = eval_neutral(expr, input_row);
+                    let v = eval_neutral(expr, input_row)?;
                     let enc = rmp_serde::to_vec(&v).map_err(|e| {
                         ExecutionError::Serialization(format!("encode primary key '{pk}': {e}"))
                     })?;
@@ -8479,7 +8539,7 @@ fn execute_create_node(
         let mut record = NodeRecord::with_labels(labels.to_vec());
         for (prop_name, expr) in properties {
             // Map literals → Document for full dot-notation support in storage.
-            let val = eval_neutral(expr, input_row).map_to_document();
+            let val = eval_neutral(expr, input_row)?.map_to_document();
 
             match mode {
                 SchemaMode::Validated => {
@@ -8565,7 +8625,7 @@ fn execute_create_node(
             let mut vf: Option<i64> = None;
             for (prop_name, expr) in properties {
                 if prop_name == "valid_from" {
-                    let val = eval_neutral(expr, input_row);
+                    let val = eval_neutral(expr, input_row)?;
                     vf = match &val {
                         Value::Int(ms) => Some(*ms),
                         Value::Timestamp(ms) => Some(*ms),
@@ -8598,7 +8658,7 @@ fn execute_create_node(
         if let (Some(ref tlabel), Some(vf)) = (&temporal_label, valid_from_for_key) {
             for (prop_name, expr) in properties {
                 if prop_name == "valid_to" {
-                    let val = eval_neutral(expr, input_row);
+                    let val = eval_neutral(expr, input_row)?;
                     let vt_opt: Option<i64> = match &val {
                         Value::Int(ms) => Some(*ms),
                         Value::Timestamp(ms) => Some(*ms),
@@ -8636,10 +8696,11 @@ fn execute_create_node(
         // the node to storage. If a constraint would be violated, fail early.
         if let Some(btree_reg) = ctx.btree_index_registry {
             if let Some(primary_label) = labels.first() {
-                let props_for_index: Vec<(String, Value)> = properties
-                    .iter()
-                    .map(|(name, expr)| (name.clone(), eval_neutral(expr, input_row)))
-                    .collect();
+                let mut props_for_index: Vec<(String, Value)> =
+                    Vec::with_capacity(properties.len());
+                for (name, expr) in properties.iter() {
+                    props_for_index.push((name.clone(), eval_neutral(expr, input_row)?));
+                }
                 btree_reg
                     .on_node_created(ctx.engine, node_id, primary_label, &props_for_index)
                     .map_err(|v| {
@@ -8679,7 +8740,7 @@ fn execute_create_node(
                     if !registry.has_index(primary_label, prop_name) {
                         continue;
                     }
-                    let val = eval_neutral(expr, input_row);
+                    let val = eval_neutral(expr, input_row)?;
                     if let Some(vec_data) = try_extract_vector(&val) {
                         ctx.pending_vector_writes.push((
                             primary_label.clone(),
@@ -8696,7 +8757,7 @@ fn execute_create_node(
         if let Some(registry) = ctx.text_index_registry {
             if let Some(primary_label) = labels.first() {
                 for (prop_name, expr) in properties {
-                    let val = eval_neutral(expr, input_row);
+                    let val = eval_neutral(expr, input_row)?;
                     if let Some(text) = val.as_str() {
                         registry.on_text_written(primary_label, node_id, prop_name, text);
                     }
@@ -8713,13 +8774,12 @@ fn execute_create_node(
         // COMMIT triggers are skipped here; they fire through the async
         // oplog-consumer path once that lands.
         if !labels.is_empty() {
-            let props_map: std::collections::HashMap<String, Value> = properties
-                .iter()
-                .map(|(name, expr)| {
-                    let val = eval_neutral(expr, input_row).map_to_document();
-                    (name.clone(), val)
-                })
-                .collect();
+            let mut props_map: std::collections::HashMap<String, Value> =
+                std::collections::HashMap::with_capacity(properties.len());
+            for (name, expr) in properties.iter() {
+                let val = eval_neutral(expr, input_row)?.map_to_document();
+                props_map.insert(name.clone(), val);
+            }
             let trigger_params = trigger_params_for_node_create(node_id, &props_map);
 
             for label in labels {
@@ -8743,7 +8803,7 @@ fn execute_create_node(
             Value::String(primary_label),
         );
         for (prop_name, expr) in properties {
-            let val = eval_neutral(expr, input_row);
+            let val = eval_neutral(expr, input_row)?;
             row.insert(format!("{var_name}.{prop_name}"), val);
         }
 
@@ -8829,7 +8889,7 @@ fn execute_create_edge(
                     )));
                 }
                 let field_id = ctx.interner.intern(prop_name);
-                let value = eval_neutral(expr, row).map_to_document();
+                let value = eval_neutral(expr, row)?.map_to_document();
                 if is_temporal && prop_name == "valid_from" {
                     // Accept both Int (epoch ms) and Timestamp (engine native).
                     // Reject Null (explicit null violates the temporal contract)
@@ -8892,10 +8952,10 @@ fn execute_create_edge(
         // The trigger sees `$event = "CREATE"`, `$src` / `$tgt` as endpoint
         // NodeIds, `$edge_type` as the type name, and `$after` as the edge
         // property map.
-        let resolved_props: Vec<(String, Value)> = properties
-            .iter()
-            .map(|(name, expr)| (name.clone(), eval_neutral(expr, row).map_to_document()))
-            .collect();
+        let mut resolved_props: Vec<(String, Value)> = Vec::with_capacity(properties.len());
+        for (name, expr) in properties.iter() {
+            resolved_props.push((name.clone(), eval_neutral(expr, row)?.map_to_document()));
+        }
         let trigger_params =
             trigger_params_for_edge_create(edge_type, source_id, target_id, &resolved_props);
         let target_segment =
@@ -8914,7 +8974,7 @@ fn execute_create_edge(
             );
             // Also add edge properties to the output row
             for (prop_name, expr) in properties {
-                let value = eval_neutral(expr, row);
+                let value = eval_neutral(expr, row)?;
                 out_row.insert(format!("{ev}.{prop_name}"), value);
             }
         }
@@ -9108,7 +9168,7 @@ fn execute_update(
                     }
                     match item {
                         crate::plan::SetItem::Property { property, expr, .. } => {
-                            let val = eval_neutral(expr, &out_row).map_to_document();
+                            let val = eval_neutral(expr, &out_row)?.map_to_document();
                             let field_id = ctx.interner.intern(property);
                             new_record.set(field_id, val);
                         }
@@ -9116,7 +9176,7 @@ fn execute_update(
                             new_record.add_label(label.clone());
                         }
                         crate::plan::SetItem::ReplaceProperties { expr, .. } => {
-                            let val = eval_neutral(expr, &out_row);
+                            let val = eval_neutral(expr, &out_row)?;
                             if let Value::Map(map) = val {
                                 // Clear existing user props, keep engine-managed
                                 // fields (__ingestion_ts__, valid_from, valid_to
@@ -9130,7 +9190,7 @@ fn execute_update(
                             }
                         }
                         crate::plan::SetItem::MergeProperties { expr, .. } => {
-                            let val = eval_neutral(expr, &out_row);
+                            let val = eval_neutral(expr, &out_row)?;
                             if let Value::Map(map) = val {
                                 for (k, v) in map {
                                     let fid = ctx.interner.intern(&k);
@@ -9144,7 +9204,7 @@ fn execute_update(
                             // non-temporal path queues as a merge operand,
                             // but apply it in-memory to `new_record` so the
                             // close+open writes carry the post-delta state.
-                            let val = eval_neutral(expr, &out_row).map_to_document();
+                            let val = eval_neutral(expr, &out_row)?.map_to_document();
                             if path.is_empty() {
                                 return Err(ExecutionError::Unsupported(format!(
                                     "SET on temporal node `{var}`: empty property path"
@@ -9178,7 +9238,7 @@ fn execute_update(
                             // doc_add_to_set / doc_inc on temporal nodes.
                             // Same construction as the non-temporal path,
                             // but applied in-memory to `new_record`.
-                            let val = eval_neutral(value_expr, &out_row);
+                            let val = eval_neutral(value_expr, &out_row)?;
                             let (field_id, sub_path) = if path.is_empty() {
                                 (ctx.interner.intern(var), vec![])
                             } else {
@@ -9428,7 +9488,7 @@ fn execute_update(
                     }
 
                     // Map literals → Document for nested property storage.
-                    let val = eval_neutral(expr, &out_row).map_to_document();
+                    let val = eval_neutral(expr, &out_row)?.map_to_document();
 
                     // Edge variable bindings carry Value::String(edge_type),
                     // not Value::Int. Route to the edge-prop update path,
@@ -9444,7 +9504,7 @@ fn execute_update(
                             &mut out_row,
                             ctx,
                         )?;
-                        out_row.insert(format!("{variable}.{property}"), eval_neutral(expr, row));
+                        out_row.insert(format!("{variable}.{property}"), eval_neutral(expr, row)?);
                         continue;
                     }
 
@@ -9666,7 +9726,7 @@ fn execute_update(
                     path,
                     expr,
                 } => {
-                    let val = eval_neutral(expr, &out_row);
+                    let val = eval_neutral(expr, &out_row)?;
                     let node_id = match out_row.get(variable) {
                         Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                         _ => continue,
@@ -9752,7 +9812,7 @@ fn execute_update(
                     path,
                     value_expr,
                 } => {
-                    let val = eval_neutral(value_expr, &out_row);
+                    let val = eval_neutral(value_expr, &out_row)?;
                     let node_id = match out_row.get(variable) {
                         Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
                         _ => continue,
@@ -9869,7 +9929,7 @@ fn execute_update(
                     ctx.write_stats.properties_set += 1;
                 }
                 crate::plan::SetItem::ReplaceProperties { variable, expr } => {
-                    let map_val = eval_neutral(expr, &out_row);
+                    let map_val = eval_neutral(expr, &out_row)?;
                     if let Some(Value::String(edge_type)) = out_row.get(variable).cloned() {
                         update_edge_properties_from_map(
                             variable,
@@ -9999,7 +10059,7 @@ fn execute_update(
                     }
                 }
                 crate::plan::SetItem::MergeProperties { variable, expr } => {
-                    let map_val = eval_neutral(expr, &out_row);
+                    let map_val = eval_neutral(expr, &out_row)?;
                     // Relationship variables bind to Value::String(edge_type),
                     // never to a node id, so they have to leave here: the node
                     // path below would drop the write on the floor.
@@ -11370,7 +11430,7 @@ fn execute_clone_node(
         // `AS OF <ts>` selects the source's valid-version active at that
         // valid-time instant; default is the current version (active now).
         let as_of_ms: Option<i64> = match as_of {
-            Some(expr) => match eval_neutral(expr, row) {
+            Some(expr) => match eval_neutral(expr, row)? {
                 Value::Int(ms) => Some(ms),
                 Value::Timestamp(ms) => Some(ms),
                 other => {
@@ -11800,7 +11860,7 @@ fn apply_merge_nodes_set_item(
     use crate::plan::SetItem;
     match item {
         SetItem::Property { property, expr, .. } => {
-            let val = eval_neutral(expr, row).map_to_document();
+            let val = eval_neutral(expr, row)?.map_to_document();
             let field_id = ctx.interner.intern(property);
             target.set(field_id, val);
         }
@@ -11810,7 +11870,7 @@ fn apply_merge_nodes_set_item(
             // implementation, only support single-segment paths via the
             // declared props path. Multi-segment paths fall through to extra
             // with a dotted string key — matches existing executor behavior.
-            let val = eval_neutral(expr, row).map_to_document();
+            let val = eval_neutral(expr, row)?.map_to_document();
             if path.len() == 1 {
                 let field_id = ctx.interner.intern(&path[0]);
                 target.set(field_id, val);
@@ -15547,7 +15607,10 @@ fn execute_procedure_call(
 
     // Evaluate arguments to values
     let empty_row = Row::new();
-    let arg_values: Vec<Value> = args.iter().map(|a| eval_neutral(a, &empty_row)).collect();
+    let arg_values: Vec<Value> = args
+        .iter()
+        .map(|a| eval_neutral(a, &empty_row))
+        .collect::<Result<_, _>>()?;
 
     // Dispatch to the procedure
     let proc_rows = crate::advisor::procedures::execute_procedure(procedure, &arg_values, proc_ctx)

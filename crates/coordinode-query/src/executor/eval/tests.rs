@@ -8,6 +8,13 @@ use crate::cypher::ast::{
 /// was removed; lowering then `eval_neutral` is the only evaluation path, so
 /// these tests exercise exactly what the executor runs.
 fn eval_expr(expr: &Expr, row: &Row) -> Value {
+    try_eval_expr(expr, row).expect("expression must evaluate")
+}
+
+/// The same path, keeping the failure. Arithmetic with no answer (division by
+/// an integer zero, an integer operation that leaves the `i64` range) is
+/// reported rather than answered, so tests about that use this.
+fn try_eval_expr(expr: &Expr, row: &Row) -> Result<Value, super::EvalError> {
     crate::executor::eval_neutral::eval_neutral(
         &crate::planner::lower_expr(expr).expect("lower test expression"),
         row,
@@ -614,13 +621,19 @@ fn eval_string_concat() {
 
 #[test]
 fn eval_div_by_zero() {
+    // This asserted NULL until the divisor rules were corrected. NULL is what
+    // a caller gets for a missing property or a type mismatch, so answering it
+    // here made a query with no answer indistinguishable from one whose answer
+    // is genuinely absent.
     let expr = Expr::BinaryOp {
         left: Box::new(Expr::Literal(Value::Int(10))),
         op: BinaryOperator::Div,
         right: Box::new(Expr::Literal(Value::Int(0))),
     };
-    let v = eval_expr(&expr, &empty_row());
-    assert_eq!(v, Value::Null);
+    assert_eq!(
+        try_eval_expr(&expr, &empty_row()),
+        Err(super::EvalError::DivideByZero)
+    );
 }
 
 #[test]
@@ -1802,4 +1815,92 @@ fn list_fn_keys() {
         &row,
     );
     assert_eq!(v, Value::Array(vec![s("age"), s("name")]));
+}
+
+// ---- Arithmetic that has no answer ----
+//
+// Cypher evaluation is total nearly everywhere: a type mismatch or a missing
+// property answers NULL. These four cases are the exception, because the
+// alternative to failing is answering a number that is wrong, and a caller
+// cannot tell one from a real result. The reference implementation raises for
+// exactly these, and matching it is what lets a client switch over.
+
+fn binary(left: Value, op: BinOp, right: Value) -> Result<Value, super::EvalError> {
+    super::eval_binary_op(&left, op, &right)
+}
+
+#[test]
+fn division_by_an_integer_zero_fails() {
+    assert_eq!(
+        binary(Value::Int(1), BinOp::Div, Value::Int(0)),
+        Err(super::EvalError::DivideByZero)
+    );
+    // The dividend's type does not matter; the divisor's does.
+    assert_eq!(
+        binary(Value::Float(1.0), BinOp::Div, Value::Int(0)),
+        Err(super::EvalError::DivideByZero)
+    );
+}
+
+#[test]
+fn division_by_a_floating_point_zero_is_an_infinity() {
+    // IEEE 754, and what the reference implementation answers: a float zero
+    // divisor produces a value rather than a failure.
+    let Ok(Value::Float(f)) = binary(Value::Int(1), BinOp::Div, Value::Float(0.0)) else {
+        panic!("int / 0.0 should produce a float");
+    };
+    assert!(f.is_infinite() && f.is_sign_positive(), "got {f}");
+
+    let Ok(Value::Float(f)) = binary(Value::Float(-1.0), BinOp::Div, Value::Float(0.0)) else {
+        panic!("float / 0.0 should produce a float");
+    };
+    assert!(f.is_infinite() && f.is_sign_negative(), "got {f}");
+}
+
+#[test]
+fn modulo_by_an_integer_zero_fails() {
+    assert_eq!(
+        binary(Value::Int(7), BinOp::Modulo, Value::Int(0)),
+        Err(super::EvalError::DivideByZero)
+    );
+}
+
+#[test]
+fn integer_overflow_fails_rather_than_clamping() {
+    // Clamping at the bound is the failure this guards: a total that quietly
+    // stops growing reads exactly like a total.
+    assert_eq!(
+        binary(Value::Int(i64::MAX), BinOp::Add, Value::Int(1)),
+        Err(super::EvalError::LongOverflow)
+    );
+    assert_eq!(
+        binary(Value::Int(i64::MIN), BinOp::Sub, Value::Int(1)),
+        Err(super::EvalError::LongOverflow)
+    );
+    assert_eq!(
+        binary(Value::Int(i64::MAX), BinOp::Mul, Value::Int(2)),
+        Err(super::EvalError::LongOverflow)
+    );
+    // i64::MIN / -1 has no representable result either, and it is an overflow
+    // rather than a division by zero.
+    assert_eq!(
+        binary(Value::Int(i64::MIN), BinOp::Div, Value::Int(-1)),
+        Err(super::EvalError::LongOverflow)
+    );
+}
+
+#[test]
+fn arithmetic_failure_reaches_a_whole_query_expression() {
+    // Not just the operator in isolation: the failure has to travel out of the
+    // evaluator rather than being absorbed into a NULL somewhere on the way.
+    let row = Row::new();
+    let divide_by_zero = Expr::BinaryOp {
+        left: Box::new(Expr::Literal(Value::Int(1))),
+        op: crate::cypher::ast::BinaryOperator::Div,
+        right: Box::new(Expr::Literal(Value::Int(0))),
+    };
+    assert_eq!(
+        try_eval_expr(&divide_by_zero, &row),
+        Err(super::EvalError::DivideByZero)
+    );
 }

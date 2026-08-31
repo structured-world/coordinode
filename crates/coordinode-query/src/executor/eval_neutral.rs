@@ -13,7 +13,9 @@
 
 use coordinode_core::graph::types::Value;
 
-use super::eval::{dispatch_scalar_function, eval_binary_op, eval_unary_op, rmpv_to_value};
+use super::eval::{
+    EvalError, dispatch_scalar_function, eval_binary_op, eval_unary_op, rmpv_to_value,
+};
 use super::row::Row;
 use crate::plan::expr::{Expr, MapProjItem, Quantifier, StrOp};
 
@@ -22,36 +24,44 @@ use crate::plan::expr::{Expr, MapProjItem, Quantifier, StrOp};
 /// Wired into the evaluation path incrementally; the cypher evaluator currently
 /// reaches it via lowering at the boundary, and once the plan carries neutral
 /// expressions this becomes the sole pure evaluator.
-pub fn eval_neutral(expr: &Expr, row: &Row) -> Value {
-    match expr {
+pub fn eval_neutral(expr: &Expr, row: &Row) -> Result<Value, EvalError> {
+    Ok(match expr {
         Expr::Literal(v) => v.clone(),
         // Parameters are substituted before execution; unresolved → Null.
         Expr::Parameter(_) => Value::Null,
         Expr::Variable(name) => row.get(name).cloned().unwrap_or(Value::Null),
-        Expr::Property { base, key } => eval_property(base, key, row),
+        Expr::Property { base, key } => eval_property(base, key, row)?,
         Expr::Binary { left, op, right } => {
-            let lv = eval_neutral(left, row);
-            let rv = eval_neutral(right, row);
-            eval_binary_op(&lv, *op, &rv)
+            let lv = eval_neutral(left, row)?;
+            let rv = eval_neutral(right, row)?;
+            eval_binary_op(&lv, *op, &rv)?
         }
         Expr::Unary { op, operand } => {
-            let v = eval_neutral(operand, row);
+            let v = eval_neutral(operand, row)?;
             eval_unary_op(*op, &v)
         }
         Expr::Call { name, args, .. } => {
-            let evaluated: Vec<Value> = args.iter().map(|a| eval_neutral(a, row)).collect();
+            let evaluated: Vec<Value> = args
+                .iter()
+                .map(|a| eval_neutral(a, row))
+                .collect::<Result<_, _>>()?;
             let first_arg_var = args.first().and_then(|a| match a {
                 Expr::Variable(v) => Some(v.as_str()),
                 _ => None,
             });
             dispatch_scalar_function(name, evaluated, first_arg_var, row)
         }
-        Expr::List(items) => Value::Array(items.iter().map(|e| eval_neutral(e, row)).collect()),
-        Expr::Map(entries) => {
-            let map: std::collections::BTreeMap<String, Value> = entries
+        Expr::List(items) => Value::Array(
+            items
                 .iter()
-                .map(|(k, v)| (k.clone(), eval_neutral(v, row)))
-                .collect();
+                .map(|e| eval_neutral(e, row))
+                .collect::<Result<_, _>>()?,
+        ),
+        Expr::Map(entries) => {
+            let mut map = std::collections::BTreeMap::new();
+            for (k, v) in entries {
+                map.insert(k.clone(), eval_neutral(v, row)?);
+            }
             Value::Map(map)
         }
         Expr::MapProjection { base, items } => {
@@ -59,18 +69,18 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Value {
             for item in items {
                 match item {
                     MapProjItem::Property(prop) => {
-                        map.insert(prop.clone(), eval_property(base, prop, row));
+                        map.insert(prop.clone(), eval_property(base, prop, row)?);
                     }
                     MapProjItem::Computed(alias, value_expr) => {
-                        map.insert(alias.clone(), eval_neutral(value_expr, row));
+                        map.insert(alias.clone(), eval_neutral(value_expr, row)?);
                     }
                 }
             }
             Value::Map(map)
         }
         Expr::In { item, list } => {
-            let val = eval_neutral(item, row);
-            let list_val = eval_neutral(list, row);
+            let val = eval_neutral(item, row)?;
+            let list_val = eval_neutral(list, row)?;
             if let Value::Array(items) = list_val {
                 Value::Bool(items.contains(&val))
             } else {
@@ -78,7 +88,7 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Value {
             }
         }
         Expr::IsNull { operand, negated } => {
-            let v = eval_neutral(operand, row);
+            let v = eval_neutral(operand, row)?;
             let is_null = v.is_null();
             Value::Bool(if *negated { !is_null } else { is_null })
         }
@@ -87,7 +97,7 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Value {
             type_name,
             negated,
         } => {
-            let v = eval_neutral(operand, row);
+            let v = eval_neutral(operand, row)?;
             let matches = match type_name.to_ascii_uppercase().as_str() {
                 "INTEGER" | "INT" => matches!(v, Value::Int(_)),
                 "FLOAT" => matches!(v, Value::Float(_)),
@@ -102,8 +112,8 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Value {
             Value::Bool(matches ^ *negated)
         }
         Expr::StringMatch { value, op, pattern } => {
-            let s = eval_neutral(value, row);
-            let p = eval_neutral(pattern, row);
+            let s = eval_neutral(value, row)?;
+            let p = eval_neutral(pattern, row)?;
             match (s.as_str(), p.as_str()) {
                 (Some(s), Some(p)) => {
                     let result = match op {
@@ -125,27 +135,27 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Value {
             otherwise,
         } => {
             if let Some(op) = operand {
-                let op_val = eval_neutral(op, row);
+                let op_val = eval_neutral(op, row)?;
                 for (when, then) in branches {
-                    if op_val == eval_neutral(when, row) {
+                    if op_val == eval_neutral(when, row)? {
                         return eval_neutral(then, row);
                     }
                 }
             } else {
                 for (when, then) in branches {
-                    if eval_neutral(when, row) == Value::Bool(true) {
+                    if eval_neutral(when, row)? == Value::Bool(true) {
                         return eval_neutral(then, row);
                     }
                 }
             }
             match otherwise {
-                Some(el) => eval_neutral(el, row),
+                Some(el) => eval_neutral(el, row)?,
                 None => Value::Null,
             }
         }
         Expr::Subscript { base, index } => {
-            let b = eval_neutral(base, row);
-            let idx = eval_neutral(index, row);
+            let b = eval_neutral(base, row)?;
+            let idx = eval_neutral(index, row)?;
             match (b, idx) {
                 (Value::Array(arr), Value::Int(i)) => {
                     let len = arr.len() as i64;
@@ -162,12 +172,12 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Value {
                 _ => Value::Null,
             }
         }
-        Expr::Slice { base, start, end } => match eval_neutral(base, row) {
+        Expr::Slice { base, start, end } => match eval_neutral(base, row)? {
             Value::Array(arr) => {
                 let len = arr.len() as i64;
-                let resolve = |bound: &Option<Box<Expr>>, default: i64| -> i64 {
-                    match bound {
-                        Some(e) => match eval_neutral(e, row) {
+                let resolve = |bound: &Option<Box<Expr>>, default: i64| -> Result<i64, EvalError> {
+                    Ok(match bound {
+                        Some(e) => match eval_neutral(e, row)? {
                             Value::Int(i) => {
                                 let idx = if i < 0 { len + i } else { i };
                                 idx.clamp(0, len)
@@ -175,10 +185,10 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Value {
                             _ => default,
                         },
                         None => default,
-                    }
+                    })
                 };
-                let s = resolve(start, 0);
-                let e = resolve(end, len);
+                let s = resolve(start, 0)?;
+                let e = resolve(end, len)?;
                 if s >= e {
                     Value::Array(vec![])
                 } else {
@@ -192,19 +202,19 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Value {
             list,
             filter,
             map,
-        } => match eval_neutral(list, row) {
+        } => match eval_neutral(list, row)? {
             Value::Array(items) => {
                 let mut scratch = row.clone();
                 let mut out = Vec::with_capacity(items.len());
                 for item in items {
                     scratch.insert(var.clone(), item.clone());
                     let keep = match filter {
-                        Some(p) => matches!(eval_neutral(p, &scratch), Value::Bool(true)),
+                        Some(p) => matches!(eval_neutral(p, &scratch)?, Value::Bool(true)),
                         None => true,
                     };
                     if keep {
                         out.push(match map {
-                            Some(m) => eval_neutral(m, &scratch),
+                            Some(m) => eval_neutral(m, &scratch)?,
                             None => item,
                         });
                     }
@@ -218,14 +228,14 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Value {
             var,
             list,
             predicate,
-        } => match eval_neutral(list, row) {
+        } => match eval_neutral(list, row)? {
             Value::Array(items) => {
                 let total = items.len();
                 let mut scratch = row.clone();
                 let mut true_count = 0usize;
                 for item in items {
                     scratch.insert(var.clone(), item);
-                    if matches!(eval_neutral(predicate, &scratch), Value::Bool(true)) {
+                    if matches!(eval_neutral(predicate, &scratch)?, Value::Bool(true)) {
                         true_count += 1;
                     }
                 }
@@ -246,14 +256,14 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Value {
             list,
             step,
         } => {
-            let mut acc_val = eval_neutral(init, row);
-            match eval_neutral(list, row) {
+            let mut acc_val = eval_neutral(init, row)?;
+            match eval_neutral(list, row)? {
                 Value::Array(items) => {
                     let mut scratch = row.clone();
                     for item in items {
                         scratch.insert(acc.clone(), acc_val);
                         scratch.insert(var.clone(), item);
-                        acc_val = eval_neutral(step, &scratch);
+                        acc_val = eval_neutral(step, &scratch)?;
                     }
                     acc_val
                 }
@@ -268,13 +278,13 @@ pub fn eval_neutral(expr: &Expr, row: &Row) -> Value {
         Expr::CollectSubplan { .. } => Value::Null,
         Expr::PatternComprehension { .. } => Value::Null,
         Expr::Star => Value::Null,
-    }
+    })
 }
 
 /// Property access `base.key`, mirroring the cypher evaluator: collect the full
 /// dot-notation path and try progressively-longer row-key prefixes, extracting
 /// from a Document/Map for any remaining path.
-fn eval_property(base: &Expr, key: &str, row: &Row) -> Value {
+fn eval_property(base: &Expr, key: &str, row: &Row) -> Result<Value, EvalError> {
     if let Some((var_name, full_path)) = collect_property_path(base, key) {
         for split in (0..=full_path.len()).rev() {
             let row_key = if split == 0 {
@@ -285,36 +295,36 @@ fn eval_property(base: &Expr, key: &str, row: &Row) -> Value {
             if let Some(val) = row.get(&row_key) {
                 let remaining = &full_path[split..];
                 if remaining.is_empty() {
-                    return val.clone();
+                    return Ok(val.clone());
                 }
                 match val {
                     Value::Document(doc) => {
                         let path_refs: Vec<&str> = remaining.iter().map(|s| s.as_str()).collect();
                         let extracted =
                             coordinode_core::graph::document::extract_at_path(doc, &path_refs);
-                        return rmpv_to_value(&extracted);
+                        return Ok(rmpv_to_value(&extracted));
                     }
                     Value::Map(map) if remaining.len() == 1 => {
-                        return map
+                        return Ok(map
                             .get(remaining[0].as_str())
                             .cloned()
-                            .unwrap_or(Value::Null);
+                            .unwrap_or(Value::Null));
                     }
                     _ => continue,
                 }
             }
         }
-        Value::Null
+        Ok(Value::Null)
     } else {
         // Non-variable base (function result, etc.): evaluate then index.
-        match eval_neutral(base, row) {
+        Ok(match eval_neutral(base, row)? {
             Value::Map(map) => map.get(key).cloned().unwrap_or(Value::Null),
             Value::Document(ref doc) => {
                 let extracted = coordinode_core::graph::document::extract_at_path(doc, &[key]);
                 rmpv_to_value(&extracted)
             }
             _ => Value::Null,
-        }
+        })
     }
 }
 

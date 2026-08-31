@@ -115,12 +115,54 @@ fn collect_score_requirements_neutral(expr: &crate::plan::expr::Expr, out: &mut 
     }
 }
 
+/// An expression that cannot produce a value.
+///
+/// Cypher evaluation is deliberately total almost everywhere: a type mismatch,
+/// a missing property or a NULL operand answers NULL rather than failing.
+/// Arithmetic is the exception, because the alternative to failing is answering
+/// a number that is simply wrong, and a caller has no way to tell one from a
+/// real result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum EvalError {
+    /// Division or modulo whose divisor is an integer zero.
+    ///
+    /// Only an integral zero: a floating-point zero divisor follows IEEE 754
+    /// and yields an infinity, which is a value rather than a failure.
+    #[error("/ by zero")]
+    DivideByZero,
+
+    /// An integer operation whose exact result leaves the `i64` range.
+    ///
+    /// Clamping at the bound would answer a wrong number and let a total that
+    /// silently stopped growing pass for a total.
+    #[error("long overflow")]
+    LongOverflow,
+}
+
+/// `None` from a `checked_*` integer operation means the exact result does not
+/// fit, which is the overflow this reports rather than clamps.
+fn checked(result: Option<i64>) -> Result<i64, EvalError> {
+    result.ok_or(EvalError::LongOverflow)
+}
+
+/// Whether a divisor makes division fail rather than produce a value.
+///
+/// The test is on the divisor's type, not the dividend's: `1.0 / 0` fails
+/// while `1 / 0.0` is an infinity, which is what the reference implementation
+/// does and what a client switching over expects.
+fn divisor_is_integer_zero(right: &Value) -> bool {
+    matches!(right, Value::Int(0))
+}
+
 /// Evaluate a binary operation.
-pub(crate) fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Value {
-    match op {
+///
+/// Returns `Err` only for arithmetic that has no answer; every other
+/// combination the operator does not handle yields NULL, per Cypher.
+pub(crate) fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value, EvalError> {
+    let value = match op {
         // Arithmetic
         BinOp::Add => match (left, right) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a.saturating_add(*b)),
+            (Value::Int(a), Value::Int(b)) => Value::Int(checked(a.checked_add(*b))?),
             (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
@@ -145,28 +187,34 @@ pub(crate) fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Value {
             _ => Value::Null,
         },
         BinOp::Sub => match (left, right) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a.saturating_sub(*b)),
+            (Value::Int(a), Value::Int(b)) => Value::Int(checked(a.checked_sub(*b))?),
             (Value::Float(a), Value::Float(b)) => Value::Float(a - b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 - b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a - *b as f64),
             _ => Value::Null,
         },
         BinOp::Mul => match (left, right) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a.saturating_mul(*b)),
+            (Value::Int(a), Value::Int(b)) => Value::Int(checked(a.checked_mul(*b))?),
             (Value::Float(a), Value::Float(b)) => Value::Float(a * b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 * b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a * *b as f64),
             _ => Value::Null,
         },
+        // An integer zero divisor fails; a floating-point one is IEEE 754 and
+        // gives an infinity. `checked_div` also refuses `i64::MIN / -1`, whose
+        // exact result does not fit, and that is an overflow rather than a
+        // division by zero.
+        BinOp::Div if divisor_is_integer_zero(right) => return Err(EvalError::DivideByZero),
         BinOp::Div => match (left, right) {
-            (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a / b),
-            (Value::Float(a), Value::Float(b)) if *b != 0.0 => Value::Float(a / b),
-            (Value::Int(a), Value::Float(b)) if *b != 0.0 => Value::Float(*a as f64 / b),
-            (Value::Float(a), Value::Int(b)) if *b != 0 => Value::Float(a / *b as f64),
+            (Value::Int(a), Value::Int(b)) => Value::Int(checked(a.checked_div(*b))?),
+            (Value::Float(a), Value::Float(b)) => Value::Float(a / b),
+            (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 / b),
+            (Value::Float(a), Value::Int(b)) => Value::Float(a / *b as f64),
             _ => Value::Null,
         },
+        BinOp::Modulo if divisor_is_integer_zero(right) => return Err(EvalError::DivideByZero),
         BinOp::Modulo => match (left, right) {
-            (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a % b),
+            (Value::Int(a), Value::Int(b)) => Value::Int(checked(a.checked_rem(*b))?),
             _ => Value::Null,
         },
 
@@ -225,7 +273,8 @@ pub(crate) fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Value {
             (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a ^ *b),
             _ => Value::Null,
         },
-    }
+    };
+    Ok(value)
 }
 
 /// Compare two values for ordering.
