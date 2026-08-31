@@ -462,3 +462,73 @@ fn lossy_open_repair_without_checkpoint_reports_not_clean() {
     );
     assert!(report.checkpoint_used.is_none());
 }
+
+/// The repair floor: sealed, durable, time-expired oplog segments that lie at
+/// or above the latest checkpoint's replay cursor must survive the purge —
+/// dropping them would leave the checkpoint base with nothing to roll
+/// forward, silently breaking WAL-replay-repair.
+#[test]
+fn oplog_purge_keeps_entries_needed_by_checkpoint_replay() {
+    use coordinode_storage::engine::oplog_journal::OplogJournalConfig;
+
+    let dir = TempDir::new().expect("tempdir");
+    let root = checkpoint_root(dir.path());
+    let oracle = Arc::new(TimestampOracle::new());
+    // Rotate every 2 entries (sealed segments) and expire immediately.
+    let journal = OplogJournalConfig {
+        retention_secs: 1,
+        max_segment_entries: 2,
+        ..OplogJournalConfig::default()
+    };
+    let engine = Arc::new(
+        StorageEngine::open_embedded_with_journal(&durable_cfg(&dir), oracle, journal)
+            .expect("open_embedded_with_journal"),
+    );
+
+    // Base before the checkpoint.
+    for i in 0..4u32 {
+        let key = format!("node:0:{i:04}");
+        put(
+            &engine,
+            u64::from(i) + 1,
+            PartitionId::Node,
+            key.as_bytes(),
+            b"base",
+        );
+    }
+    engine.persist().expect("persist base");
+    create_checkpoint(&engine, &root).expect("checkpoint");
+    let cursor = StorageEngine::checkpoint_oplog_cursor(
+        &latest_checkpoint(&root).expect("checkpoint exists"),
+    )
+    .expect("cursor");
+
+    // Post-checkpoint tail: durable in the trees AND sealed in the journal.
+    for i in 0..4u32 {
+        let key = format!("node:0:9{i:03}");
+        put(
+            &engine,
+            100 + u64::from(i),
+            PartitionId::Node,
+            key.as_bytes(),
+            b"tail",
+        );
+    }
+    engine.persist().expect("persist tail");
+
+    // Aggressive purge with the checkpoint floor (what the scheduler passes):
+    // everything is durable and time-expired, but entries at or above the
+    // cursor must stay replayable.
+    engine
+        .oplog_purge_expired(4_000_000_000, cursor)
+        .expect("purge");
+    let replayable = engine
+        .oplog_read_since(cursor)
+        .expect("read_since")
+        .expect("journal active");
+    assert!(
+        replayable.iter().any(|e| e.ts >= 100),
+        "post-checkpoint tail must survive the purge for replay; got {} entries",
+        replayable.len()
+    );
+}

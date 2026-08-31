@@ -157,11 +157,18 @@ impl EmbeddedOplog {
         self.manager.read_range(from_index, u64::MAX)
     }
 
-    /// Delete segments fully outside the retention window. Recent un-flushed
-    /// entries are always within the window, so this never drops a record
-    /// still needed for crash recovery.
-    pub(crate) fn purge_expired(&mut self, now_secs: u64) -> StorageResult<usize> {
-        self.manager.purge_expired(now_secs)
+    /// Delete segments outside the retention window, except those still
+    /// needed at or above `keep_from_index` (the latest checkpoint's replay
+    /// cursor; `u64::MAX` when none) and those holding any entry
+    /// `is_durable` denies — a record whose only copy is this journal.
+    pub(crate) fn purge_expired(
+        &mut self,
+        now_secs: u64,
+        keep_from_index: u64,
+        is_durable: &dyn Fn(&OplogEntry) -> bool,
+    ) -> StorageResult<usize> {
+        self.manager
+            .purge_with_floor(now_secs, keep_from_index, is_durable)
     }
 }
 

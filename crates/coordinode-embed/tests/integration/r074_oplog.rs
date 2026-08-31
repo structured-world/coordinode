@@ -173,7 +173,10 @@ fn oplog_purge_expired_selective() {
 
     assert_eq!(mgr.sealed_segment_count(), 2);
 
-    let purged = mgr.purge_expired(10_000).expect("purge");
+    // Time-only policy: no consumer floor, every entry durable.
+    let purged = mgr
+        .purge_with_floor(10_000, u64::MAX, &|_| true)
+        .expect("purge");
     assert_eq!(purged, 1, "only the old segment should be purged");
     assert_eq!(mgr.sealed_segment_count(), 1, "recent segment must remain");
 

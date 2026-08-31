@@ -264,30 +264,29 @@ impl OplogManager {
         Ok(result)
     }
 
-    /// Delete segments whose `last_ts` falls outside the retention window.
-    ///
-    /// Time-only retention: equivalent to [`purge_with_floor`] with an
-    /// unconstrained consumer floor (`u64::MAX`).
-    ///
-    /// [`purge_with_floor`]: Self::purge_with_floor
-    pub fn purge_expired(&mut self, now_secs: u64) -> StorageResult<usize> {
-        self.purge_with_floor(now_secs, u64::MAX)
-    }
-
-    /// Delete segments that are BOTH outside the time window AND fully below
-    /// the consumer oplog-retention floor (ADR-028 feed b, logical OR keep):
+    /// Delete segments that are outside the time window, fully below the
+    /// consumer oplog-retention floor, and hold only durable entries
+    /// (logical OR keep):
     ///
     /// ```text
     /// keep segment  iff  last_ts within retention_secs   (time safety net)
-    ///                OR  last_index >= oplog_index_floor  (a CDC consumer needs it)
+    ///                OR  last_index >= oplog_index_floor  (a consumer needs it)
+    ///                OR  any entry !is_durable(entry)      (crash recovery needs it)
     /// purge         iff  NOT kept
     /// ```
     ///
-    /// `oplog_index_floor` is `min(checkpoint)` over `OplogEvents` consumers
-    /// from the `SeqnoConsumerRegistry` (Raft-index space), or `u64::MAX` when
-    /// no CDC consumer is registered — in which case only the time policy
-    /// applies. A segment covering indices `[first_idx, first_idx +
-    /// entry_count)` has `last_index = first_idx + entry_count - 1`.
+    /// `oplog_index_floor` is the minimum over registered consumers'
+    /// checkpoints (index space): CDC consumers, and the WAL-replay-repair
+    /// floor (the latest checkpoint's replay cursor). `u64::MAX` when no
+    /// consumer is registered.
+    ///
+    /// `is_durable` answers whether one entry's writes are all persisted in
+    /// their partition trees. A record whose only copy is the journal (its
+    /// write still lives in a memtable) must survive any purge, or a crash
+    /// after the purge silently loses it. The predicate is consulted only for
+    /// segments the other two conditions would drop, so its cost is bounded
+    /// by the data actually about to be deleted. Pass `&|_| true` when every
+    /// journaled write is known durable (tests, post-persist maintenance).
     ///
     /// `now_secs` — current Unix time in seconds. HLC `last_ts` packs wall ms
     /// in the upper bits, so the cutoff is `(now_secs - retention_secs) * 1000
@@ -296,6 +295,7 @@ impl OplogManager {
         &mut self,
         now_secs: u64,
         oplog_index_floor: u64,
+        is_durable: &dyn Fn(&OplogEntry) -> bool,
     ) -> StorageResult<usize> {
         let cutoff_ms = now_secs
             .saturating_sub(self.retention_secs)
@@ -314,7 +314,12 @@ impl OplogManager {
             let last_index =
                 first_idx.saturating_add(u64::from(reader.footer.entry_count).saturating_sub(1));
             let needed_by_consumer = last_index >= oplog_index_floor;
-            if within_window || needed_by_consumer {
+            // Only a segment already outside both keep conditions pays for
+            // the entry scan; SegmentReader::open loaded the entries above.
+            let holds_non_durable = !within_window
+                && !needed_by_consumer
+                && reader.entries().iter().any(|e| !is_durable(e));
+            if within_window || needed_by_consumer || holds_non_durable {
                 remaining.push((first_idx, path));
             } else {
                 std::fs::remove_file(&path).map_err(|e| {

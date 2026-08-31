@@ -251,7 +251,20 @@ impl CheckpointScheduler {
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
-                        if let Err(e) = engine.oplog_purge_expired(now) {
+                        // The repair floor: keep every entry at or above the
+                        // latest checkpoint's replay cursor so a rebuild can
+                        // always roll forward from that base.
+                        let keep_from = match latest_checkpoint(&root)
+                            .map(|c| StorageEngine::checkpoint_oplog_cursor(&c))
+                        {
+                            Some(Ok(cursor)) => cursor,
+                            Some(Err(e)) => {
+                                tracing::warn!(error = %e, "checkpoint cursor unreadable; skipping oplog purge");
+                                continue;
+                            }
+                            None => u64::MAX,
+                        };
+                        if let Err(e) = engine.oplog_purge_expired(now, keep_from) {
                             tracing::warn!(error = %e, "oplog purge failed");
                         }
                     }

@@ -848,3 +848,122 @@ fn open_does_not_repair_on_held_directory_lock() {
     );
     assert!(engine.open_repairs().is_empty());
 }
+
+/// The oplog trim contract: a record may be dropped only once its write is
+/// durable in the partition trees (and not needed by the checkpoint floor).
+/// Time-based retention alone must never discard a sealed segment whose
+/// entries still exist only in memtables — that would lose them on crash.
+#[test]
+fn oplog_purge_never_drops_entries_not_yet_durable() {
+    use crate::engine::oplog_journal::OplogJournalConfig;
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    use coordinode_core::txn::timestamp::TimestampOracle;
+
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let oracle = Arc::new(TimestampOracle::new());
+    // Rotate every 2 entries so the appends below land in SEALED segments
+    // (the purge never touches the active one); 1-second retention makes
+    // every sealed segment time-expired immediately.
+    let journal = OplogJournalConfig {
+        retention_secs: 1,
+        max_segment_entries: 2,
+        ..OplogJournalConfig::default()
+    };
+    let engine = StorageEngine::open_embedded_with_journal(&config, oracle, journal)
+        .expect("open_embedded_with_journal");
+
+    for i in 0..6u64 {
+        let key = format!("node:purge:{i}");
+        engine
+            .oplog_append(
+                &[Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: key.into_bytes(),
+                    value: b"journal-only".to_vec(),
+                }],
+                i + 1,
+            )
+            .expect("oplog_append")
+            .expect("journal active");
+        // Deliberately NOT applied to the tree: the journal is the only copy.
+    }
+
+    // Far-future clock: every sealed segment is far outside the time window.
+    let far_future = 4_000_000_000u64;
+    engine
+        .oplog_purge_expired(far_future, u64::MAX)
+        .expect("purge");
+
+    let entries = engine
+        .oplog_read_since(0)
+        .expect("read_since")
+        .expect("journal active");
+    let seen: Vec<u64> = entries.iter().map(|e| e.ts).collect();
+    assert!(
+        (1..=6).all(|ts| seen.contains(&ts)),
+        "non-durable journal entries were purged; surviving ts = {seen:?}"
+    );
+}
+
+/// The other direction of the durability guard: once the writes ARE persisted
+/// (and no checkpoint floor holds them), time-expired sealed segments must be
+/// collected — the guard may not turn into unbounded retention.
+#[test]
+fn oplog_purge_collects_durable_expired_segments() {
+    use crate::engine::oplog_journal::OplogJournalConfig;
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    use coordinode_core::txn::timestamp::TimestampOracle;
+
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let oracle = Arc::new(TimestampOracle::new());
+    let journal = OplogJournalConfig {
+        retention_secs: 1,
+        max_segment_entries: 2,
+        ..OplogJournalConfig::default()
+    };
+    let engine = StorageEngine::open_embedded_with_journal(&config, oracle, journal)
+        .expect("open_embedded_with_journal");
+
+    for i in 0..6u64 {
+        let key = format!("node:purge:{i}");
+        engine
+            .oplog_append(
+                &[Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: key.clone().into_bytes(),
+                    value: b"applied".to_vec(),
+                }],
+                i + 1,
+            )
+            .expect("oplog_append")
+            .expect("journal active");
+        // Applied to the tree, then persisted below: journal + SST copies.
+        engine
+            .put(Partition::Node, key.as_bytes(), b"applied")
+            .expect("put");
+    }
+    engine.persist().expect("persist");
+
+    let far_future = 4_000_000_000u64;
+    let purged = engine
+        .oplog_purge_expired(far_future, u64::MAX)
+        .expect("purge");
+    assert!(
+        purged > 0,
+        "durable time-expired sealed segments must be collected"
+    );
+}

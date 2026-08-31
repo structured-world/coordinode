@@ -238,6 +238,19 @@ impl StorageEngine {
         )
     }
 
+    /// [`open_embedded`](Self::open_embedded) with an explicit oplog journal
+    /// configuration (retention window, segment rotation thresholds).
+    pub fn open_embedded_with_journal(
+        config: &StorageConfig,
+        oracle: std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>,
+        journal: OplogJournalConfig,
+    ) -> StorageResult<Self> {
+        let gc_watermark = Arc::new(AtomicU64::new(0));
+        let seqno: lsm_tree::SharedSequenceNumberGenerator =
+            Arc::new(OracleSeqnoGenerator(Arc::clone(&oracle)));
+        Self::finish_open(config, seqno, gc_watermark, Some(oracle), Some(journal))
+    }
+
     fn finish_open(
         config: &StorageConfig,
         seqno: lsm_tree::SharedSequenceNumberGenerator,
@@ -786,8 +799,8 @@ impl StorageEngine {
         &self.data_dir
     }
 
-    /// Configured endpoints ([storage-stack.md](../../arch/core/storage-stack.md)
-    /// Layer 1). Subsystems consult this to resolve WAL/oplog/SST placement
+    /// Configured endpoints (the storage-stack endpoint layer).
+    /// Subsystems consult this to resolve WAL/oplog/SST placement
     /// targets. Returned by reference — endpoints are config-time immutable
     /// after engine open.
     pub fn endpoints(&self) -> &[crate::engine::config::EndpointConfig] {
@@ -984,21 +997,64 @@ impl StorageEngine {
     /// journal is active. Returns the number of segments removed. Called
     /// periodically by the embedded checkpoint scheduler so the journal does
     /// not grow without bound.
-    pub fn oplog_purge_expired(&self, now_secs: u64) -> StorageResult<usize> {
+    /// `keep_from_index` is the WAL-replay-repair floor: the latest
+    /// checkpoint's oplog cursor. Segments holding entries at or above it are
+    /// kept regardless of age, so a checkpoint rebuild can always replay
+    /// forward. Pass `u64::MAX` when no checkpoint exists (only the time
+    /// window and the durability guard apply).
+    ///
+    /// Independently of the time window and the index floor, a segment
+    /// holding any entry whose write is not yet persisted in its partition
+    /// tree (the journal is its only copy) always survives the purge:
+    /// dropping it would silently lose the write on the next crash.
+    pub fn oplog_purge_expired(&self, now_secs: u64, keep_from_index: u64) -> StorageResult<usize> {
+        use lsm_tree::AbstractTree;
+
         match &self.oplog {
             None => Ok(0),
             Some(oplog) => {
+                // Per-partition persisted watermarks: everything at or below
+                // a tree's highest persisted seqno is durable in its SSTs (a
+                // flush persists the whole memtable prefix). A partition with
+                // data only in its memtable answers 0, keeping every one of
+                // its journal entries.
+                let mut persisted: HashMap<Partition, u64> = HashMap::new();
+                for &part in Partition::all() {
+                    let tree = self.tree(part)?;
+                    persisted.insert(part, tree.get_highest_persisted_seqno().unwrap_or(0));
+                }
+                let is_durable = |entry: &OplogEntry| -> bool {
+                    entry.ops.iter().all(|op| match op_partition(op) {
+                        Some(part) => entry.ts <= persisted.get(&part).copied().unwrap_or(0),
+                        // Columnar rows live outside the partition trees:
+                        // check the table's own tree when the registry knows
+                        // it, otherwise keep the entry (fail-safe).
+                        #[cfg(feature = "columnar")]
+                        None => match op {
+                            OplogOp::ColumnarInsert { table_id, .. } => self
+                                .columnar_table_tree(table_id)
+                                .and_then(|t| {
+                                    t.get_highest_persisted_seqno().map(|w| entry.ts <= w)
+                                })
+                                .unwrap_or(false),
+                            // Noop / Raft bookkeeping carries no partition
+                            // data; nothing is lost by purging it.
+                            _ => true,
+                        },
+                        #[cfg(not(feature = "columnar"))]
+                        None => !matches!(op, OplogOp::ColumnarInsert { .. }),
+                    })
+                };
                 let mut guard = oplog
                     .lock()
                     .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
-                guard.purge_expired(now_secs)
+                guard.purge_expired(now_secs, keep_from_index, &is_durable)
             }
         }
     }
 
-    /// Resolve the oplog target endpoint for a given shard
-    /// ([storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2,
-    /// INV-D1). Convenience accessor that re-runs the per-shard
+    /// Resolve the oplog target endpoint for a given shard (the
+    /// endpoint-to-journal placement rule). Convenience accessor that re-runs the per-shard
     /// round-robin selection logic from [`crate::engine::config::StorageConfig::select_oplog_endpoint`]
     /// against the stored endpoint list. Returns an `Io` error if no
     /// endpoint qualifies — typical caller is `LogStore::open` (Raft),

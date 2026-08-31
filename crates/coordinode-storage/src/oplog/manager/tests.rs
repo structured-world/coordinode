@@ -188,7 +188,10 @@ fn purge_expired_removes_old_segments() {
 
     // now_secs=10000; cutoff = 10000-3600 = 6400s = 6_400_000ms
     // old segment last_ts ≈ 100ms << 18 ≪ 6_400_000ms << 18 → purged
-    let purged = mgr.purge_expired(10_000).expect("purge");
+    // (no consumer floor, every entry durable)
+    let purged = mgr
+        .purge_with_floor(10_000, u64::MAX, &|_| true)
+        .expect("purge");
     assert_eq!(purged, 1, "one expired segment should be removed");
     assert_eq!(mgr.sealed.len(), 0);
 }
@@ -207,7 +210,9 @@ fn purge_keeps_recent_segments() {
     }
     mgr.rotate().expect("rotate");
 
-    let purged = mgr.purge_expired(10_000).expect("purge");
+    let purged = mgr
+        .purge_with_floor(10_000, u64::MAX, &|_| true)
+        .expect("purge");
     assert_eq!(purged, 0, "recent segment must not be purged");
     assert_eq!(mgr.sealed.len(), 1);
 }
@@ -239,7 +244,9 @@ fn purge_with_floor_keeps_consumer_needed_segments() {
     // Consumer floor = 4: seg0 (last_index 2 < 4) is expired AND below the
     // floor → purged; seg1 (last_index 5 >= 4) is needed → kept despite
     // being time-expired.
-    let purged = mgr.purge_with_floor(10_000, 4).expect("purge with floor");
+    let purged = mgr
+        .purge_with_floor(10_000, 4, &|_| true)
+        .expect("purge with floor");
     assert_eq!(
         purged, 1,
         "only the segment fully below the floor is purged"
@@ -249,7 +256,7 @@ fn purge_with_floor_keeps_consumer_needed_segments() {
     // Once the consumer advances past it (or none registered → u64::MAX),
     // the time-expired segment is collected.
     let purged = mgr
-        .purge_with_floor(10_000, u64::MAX)
+        .purge_with_floor(10_000, u64::MAX, &|_| true)
         .expect("purge time-only");
     assert_eq!(purged, 1, "no consumer need → pure time retention");
     assert_eq!(mgr.sealed.len(), 0);
