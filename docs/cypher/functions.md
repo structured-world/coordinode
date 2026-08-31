@@ -1,12 +1,12 @@
 ---
-description: "CoordiNode Cypher function reference — scalar, aggregation, vector, full-text, spatial, and document functions with implementation status."
+description: "Every Cypher function CoordiNode implements: scalar, string, math, list, aggregation, vector, late-interaction, full-text, spatial, temporal and encrypted-search, with signatures and return types."
 ---
 
 # Functions Reference
 
-::: warning Functions that silently return null
-Several standard OpenCypher scalar functions (`toInteger`, `toLower`, `length`, `abs`, and others) are recognized by the parser but not yet implemented — they return `null` without error. This table lists every function and its current status so you can avoid silent failures.
-:::
+Every function on this page is implemented. Where one returns `null` it does so
+for a documented reason, such as a conversion that cannot succeed on the given
+input, and the notes column says which.
 
 ## Scalar Functions
 
@@ -291,77 +291,71 @@ ORDER BY point.distance(r.location, point({latitude: 40.7128, longitude: -74.006
 
 ---
 
-### Not Yet Implemented 📋
+### Type Conversion ✅
 
-These functions are recognized by the parser but return `null`. Using them produces no error — just a silent `null` result.
+`toInteger`, `toFloat` and `toBoolean` return `null` when the input cannot be
+converted. The `…OrNull` spellings are accepted as synonyms, and the `…List`
+spellings apply the conversion to every element of a list.
 
-::: danger Silently return null
-Do not use the following functions in production code until they are implemented. They parse successfully but always return `null`.
-:::
+| Function | Signature | Returns | Notes |
+|----------|-----------|---------|-------|
+| `toInteger` | `toInteger(x)` | Integer | Float truncates toward zero; unparseable String gives `null` |
+| `toFloat` | `toFloat(x)` | Float | |
+| `toBoolean` | `toBoolean(x)` | Boolean | Accepts `"true"` / `"false"`, case-insensitive |
+| `toString` | `toString(x)` | String | Also `toStringOrNull(x)` |
+| `toIntegerList` | `toIntegerList(list)` | List\<Integer\> | Element-wise; a failed element becomes `null` |
+| `toFloatList` | `toFloatList(list)` | List\<Float\> | |
+| `toBooleanList` | `toBooleanList(list)` | List\<Boolean\> | |
+| `toStringList` | `toStringList(list)` | List\<String\> | |
 
-**Type conversion:**
+### String ✅
 
-| Function | Expected behavior |
-|----------|------------------|
-| `toInteger(x)` | Convert String/Float to Integer |
-| `toFloat(x)` | Convert String/Integer to Float |
-| `toBoolean(x)` | Convert String to Boolean |
+| Function | Signature | Returns | Notes |
+|----------|-----------|---------|-------|
+| `toLower` | `toLower(x)` | String | Also spelled `lower` |
+| `toUpper` | `toUpper(x)` | String | Also spelled `upper` |
+| `trim` | `trim(x)` | String | Also `ltrim`, `rtrim`, `btrim` |
+| `left` | `left(x, n)` | String | First `n` characters |
+| `right` | `right(x, n)` | String | Last `n` characters |
+| `substring` | `substring(x, start [, length])` | String | Zero-based start |
+| `replace` | `replace(x, find, repl)` | String | Replaces every occurrence |
+| `split` | `split(x, delimiter)` | List\<String\> | |
+| `reverse` | `reverse(x)` | String or List | Works on both |
+| `normalize` | `normalize(x [, form])` | String | Unicode normalisation; the form defaults to NFC |
+| `charLength` | `charLength(x)` | Integer | Character count, where `size()` counts UTF-8 bytes |
+| `isEmpty` | `isEmpty(x)` | Boolean | Empty string, list or map |
 
-**String:**
+### Math ✅
 
-| Function | Expected behavior |
-|----------|------------------|
-| `toLower(x)` | Lowercase string |
-| `toUpper(x)` | Uppercase string |
-| `trim(x)` | Strip leading/trailing whitespace |
-| `ltrim(x)` | Strip leading whitespace |
-| `rtrim(x)` | Strip trailing whitespace |
-| `length(x)` | String length (char count) |
-| `left(x, n)` | First n characters |
-| `right(x, n)` | Last n characters |
-| `substring(x, start, length)` | Substring |
-| `replace(x, find, repl)` | String replacement |
-| `split(x, delimiter)` | Split string to list |
-| `reverse(x)` | Reverse string or list |
+| Function | Signature | Returns | Notes |
+|----------|-----------|---------|-------|
+| `abs` | `abs(x)` | Integer or Float | Preserves the input type |
+| `ceil` / `floor` / `round` | `ceil(x)` | Float | |
+| `sign` | `sign(x)` | Integer | -1, 0 or 1 |
+| `sqrt` / `exp` / `log` / `log10` | `sqrt(x)` | Float | `log` is the natural logarithm |
+| `sin` / `cos` / `tan` | `sin(x)` | Float | Radians |
+| `asin` / `acos` / `atan` | `asin(x)` | Float | Radians |
+| `atan2` | `atan2(y, x)` | Float | Quadrant-aware arc tangent |
+| `cot` | `cot(x)` | Float | |
+| `degrees` / `radians` | `degrees(x)` | Float | Angle conversion |
+| `haversin` | `haversin(x)` | Float | Half the versine, for great-circle work |
+| `isNaN` | `isNaN(x)` | Boolean | |
+| `rand` | `rand()` | Float | `[0.0, 1.0)` |
+| `pi` | `pi()` | Float | |
+| `e` | `e()` | Float | |
 
-**Math:**
+### List and Graph ✅
 
-| Function | Expected behavior |
-|----------|------------------|
-| `abs(x)` | Absolute value |
-| `ceil(x)` | Round up to integer |
-| `floor(x)` | Round down to integer |
-| `round(x)` | Round to nearest integer |
-| `sign(x)` | -1, 0, or 1 |
-| `sqrt(x)` | Square root |
-| `exp(x)` | e^x |
-| `log(x)` | Natural logarithm |
-| `log10(x)` | Base-10 logarithm |
-| `sin(x)`, `cos(x)`, `tan(x)` | Trigonometric |
-| `rand()` | Random float [0.0, 1.0) |
-
-**List:**
-
-| Function | Expected behavior |
-|----------|------------------|
-| `head(list)` | First element |
-| `tail(list)` | All elements except first |
-| `last(list)` | Last element |
-| `range(start, end)` | Integer list [start..end] |
-| `range(start, end, step)` | Integer list with step |
-| `reverse(list)` | Reverse list |
-
-**Node / graph:**
-
-| Function | Expected behavior |
-|----------|------------------|
-| `id(n)` | Internal node ID |
-| `elementId(n)` | Element ID string |
-| `properties(n)` | All properties as map |
-| `keys(n)` | Property key list |
-| `nodes(path)` | Nodes in a path |
-| `relationships(path)` | Relationships in a path |
-| `length(path)` | Hop count in a path |
+| Function | Signature | Returns | Notes |
+|----------|-----------|---------|-------|
+| `head` / `last` | `head(list)` | any | First or last element, `null` on an empty list |
+| `tail` | `tail(list)` | List | Everything after the first element |
+| `range` | `range(start, end [, step])` | List\<Integer\> | Inclusive of `start` |
+| `properties` | `properties(n)` | Map | Every property of a node or relationship |
+| `keys` | `keys(n)` | List\<String\> | Property names |
+| `nodes` / `relationships` | `nodes(path)` | List | The two sequences of a path |
+| `length` | `length(path)` | Integer | Hop count on a path; character count on a string |
+| `timestamp` | `timestamp()` | Integer | Milliseconds since the epoch, where `now()` returns microseconds |
 
 ---
 

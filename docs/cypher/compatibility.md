@@ -42,16 +42,18 @@ The Neo4j wire protocol (Bolt) is not yet implemented. In this release, use the 
 
 ## Scalar Functions
 
-Most Neo4j scalar functions are not yet implemented. See [Functions reference](./functions#not-yet-implemented) for the full list.
+The common Neo4j scalar surface is implemented. See the [functions reference](./functions) for signatures, return types and the exact null behaviour of each.
 
 | Function category | Status |
 |------------------|--------|
-| `coalesce`, `toString`, `size`, `now`, `type`, `labels` | ✅ Supported |
-| `toInteger`, `toFloat`, `toLower`, `toUpper` | 📋 Returns null (planned) |
-| `length`, `abs`, `ceil`, `floor`, `round`, `sqrt` | 📋 Returns null (planned) |
-| `trim`, `substring`, `replace`, `split` | 📋 Returns null (planned) |
-| `head`, `tail`, `last`, `range`, `reverse` | 📋 Returns null (planned) |
-| `id`, `elementId`, `properties`, `keys` | 📋 Returns null (planned) |
+| `coalesce`, `toString`, `size`, `now`, `timestamp`, `type`, `labels` | ✅ Supported |
+| `toInteger`, `toFloat`, `toBoolean`, `toLower`, `toUpper`, and their `…OrNull` and `…List` forms | ✅ Supported |
+| `length`, `abs`, `ceil`, `floor`, `round`, `sign`, `sqrt`, `exp`, `log`, `log10`, `rand` | ✅ Supported |
+| `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `cot`, `degrees`, `radians`, `haversin`, `pi`, `e`, `isNaN` | ✅ Supported |
+| `trim`, `ltrim`, `rtrim`, `btrim`, `left`, `right`, `substring`, `replace`, `split`, `reverse`, `normalize`, `charLength`, `isEmpty` | ✅ Supported |
+| `head`, `tail`, `last`, `range`, `nodes`, `relationships` | ✅ Supported |
+| `id`, `elementId`, `properties`, `keys` | ✅ Supported |
+| `apoc.*`, `db.*`, `dbms.*` procedure libraries | ❌ Not supported |
 
 ## Data Types
 
@@ -118,8 +120,8 @@ Most Neo4j scalar functions are not yet implemented. See [Functions reference](.
 - **Document properties** — nested maps with dot-notation access and concurrent-safe array mutations.
 - **Vectors on edges** — SIMILAR edges can store embeddings.
 - **SET ON VIOLATION SKIP** — skip constraint-violating nodes without aborting the query.
-- **MERGE NODES** — native first-class entity-resolution / deduplication. `MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a` collapses two nodes in a single transaction with property merge (KEEP FIRST / KEEP LAST / COALESCE / SET) and duplicate-edge handling (KEEP BOTH / MERGE PROPERTIES / KEEP TARGET). Neo4j requires the APOC plugin (`apoc.refactor.mergeNodes()`), which is fragile under clustering.
-- **Native triggers** — `CREATE / DROP / SHOW / ALTER TRIGGER` as first-class Cypher clauses (not a plugin). Definitions persist in the schema partition, replicate through Raft, survive backups. BEFORE / AFTER COMMIT timing, per-trigger `ON ERROR PROPAGATE | RETRY n [WITH BACKOFF ms] | DEAD_LETTER`, plus four-layer cycle protection: L1 cascade depth + L2 unique-trigger fanout (per-trigger overrides `CASCADE_LIMIT` / `CASCADE_FANOUT`), L3 static cycle detection at DDL (planned), L4 auto-disable circuit breaker (planned). Neo4j's equivalent is APOC's `apoc.trigger.add()` — a JAR that breaks under clustering, doesn't survive `neo4j-admin restore`, and has no cycle protection beyond per-trigger MAXDEPTH.
+- **MERGE NODES**: native first-class entity resolution and deduplication. `MERGE NODES (a, b) INTO a TRANSFER EDGES FROM b TO a` collapses two nodes in a single transaction with property merge (KEEP FIRST / KEEP LAST / COALESCE / SET) and duplicate-edge handling (KEEP BOTH / MERGE PROPERTIES / KEEP TARGET). The closest Neo4j equivalent is the APOC procedure `apoc.refactor.mergeNodes()`, which is a plugin rather than part of the query language.
+- **Native triggers**: `CREATE / DROP / SHOW / ALTER TRIGGER` as first-class Cypher clauses, not a plugin. Definitions persist in the schema partition, replicate through Raft, survive backups. BEFORE / AFTER COMMIT timing, per-trigger `ON ERROR PROPAGATE | RETRY n [WITH BACKOFF ms] | DEAD_LETTER`, plus four-layer cycle protection: L1 cascade depth + L2 unique-trigger fanout (per-trigger overrides `CASCADE_LIMIT` / `CASCADE_FANOUT`), L3 static cycle detection at DDL (planned), L4 auto-disable circuit breaker (planned). The closest Neo4j equivalent is APOC's `apoc.trigger.add()`, which lives in a plugin: definitions are managed outside the query language, and the guarantees they inherit are the plugin's rather than the database's.
 
 ### Neo4j has, CoordiNode doesn't (yet):
 
