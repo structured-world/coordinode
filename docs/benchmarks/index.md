@@ -1,6 +1,6 @@
 ---
 title: Benchmarks
-description: CoordiNode benchmark results across every modality — vector, graph, document, time-series, spatial, full-text. Compared against multi-model competitors and modality specialists on identical hardware.
+description: CoordiNode benchmark results, measured against multi-model competitors and modality specialists on identical hardware, with a hardware fingerprint and commit SHA recorded per run. Vector search has published results; the remaining modalities are in progress.
 pageClass: benchmarks-wide
 outline: false
 aside: false
@@ -45,4 +45,4 @@ This is intentionally **modest desktop-class hardware** — when CoordiNode repo
 
 ## Why every modality is on one page
 
-CoordiNode is a single engine, single transaction, single query language across all six modalities. A real workload mixes them — graph traversal feeding a vector search filtered by a time-series predicate over geo-indexed documents. Benchmarking each modality in isolation is the first step; the cross-modality workloads land as the per-modality binaries mature. The bench harness ([`crates/coordinode-bench`](https://github.com/structured-world/coordinode/tree/main/crates/coordinode-bench)) is modality-agnostic — adding a new dataset is a JSON + chart-spec addition.
+CoordiNode is one engine, one transaction and one query language, and a real workload mixes modalities: a graph traversal feeding a vector search, filtered by a predicate over indexed document properties. Benchmarking each modality in isolation is the first step, and the tabs below say plainly which ones have published numbers today. Cross-modality workloads land as the per-modality harnesses mature. The bench harness ([`crates/coordinode-bench`](https://github.com/structured-world/coordinode/tree/main/crates/coordinode-bench)) is modality-agnostic: adding a new dataset is a JSON and chart-spec addition.

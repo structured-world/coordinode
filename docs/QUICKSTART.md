@@ -1,3 +1,7 @@
+---
+description: "Run CoordiNode with Docker, load seed data, and write your first query that combines graph traversal, vector similarity and full-text search in one transaction. Five minutes, no prior setup."
+---
+
 # Quick Start: From Zero to Hybrid Query in 5 Minutes
 
 ## 0. Clone the Repository
@@ -211,11 +215,11 @@ Response (suggestions are in `plan.details.suggestions`, logical plan in `plan.d
 - [Cypher Extensions](/cypher/extensions) — vector, full-text, spatial, time-travel, encrypted search syntax
 - [Compatibility](COMPATIBILITY.md) — what works from the Neo4j ecosystem
 
-## Known Limitations (alpha)
+## Known Limitations
 
-- **Single-node only** — Raft clustering in development (v0.4). Single-node handles 100K-1M nodes.
-- **No Bolt protocol** — use gRPC, REST, or GraphQL. Neo4j driver support planned for v1.2.
-- **HNSW index is in-memory** — vector indexes reside in RAM. At 1M vectors x 384 dims = ~1.5GB.
+- **The cluster is young.** Raft replication, follower reads and mutual TLS ship today and are covered by an automated fault-injection suite, but the deployment history behind them is short.
+- **No Bolt protocol.** Use gRPC or REST. Neo4j driver support is planned, so existing Bolt drivers do not connect yet.
+- **HNSW index is in-memory.** Vector indexes reside in RAM. At 1M vectors x 384 dims that is roughly 1.5GB before compression; SQ8 and RaBitQ reduce it in exchange for a rerank pass.
 - **No APOC/GDS** — standard OpenCypher works; Neo4j procedure libraries are not supported.
 - **text_match() requires text index** — create via programmatic API; DDL syntax coming soon.
 - **Exact response values may vary** — floating-point distances depend on platform. Values shown are approximate.

@@ -1,3 +1,7 @@
+---
+description: "CoordiNode's transaction model: MVCC snapshot isolation, optimistic conflict detection, write concerns from W0 to majority, read concerns, causal sessions and how replication factor relates to each."
+---
+
 # MVCC Transactions
 
 CoordiNode uses **Multi-Version Concurrency Control (MVCC)** with Snapshot Isolation. Every read sees a consistent point-in-time snapshot; writers never block readers.
@@ -112,7 +116,7 @@ Replication factor (`RF`) is a deployment-time choice, independent of `WriteConc
 - **`MAJORITY` waits for `⌊RF / 2⌋ + 1` replicas** to acknowledge the entry before responding to the client.
 - Raft tolerates `⌊RF / 2⌋` failed replicas while preserving liveness. So `RF=3` tolerates 1 failure (majority = 2 of 3), `RF=5` tolerates 2 failures, `RF=2` tolerates **zero** failures (majority = 2, cannot lose any) — which makes `RF=2` strictly worse than `RF=1` for cluster mode.
 
-The alpha release ships with `RF=1` (single-node, no replication); production clusters typically choose `RF=3` as the minimum quorum-tolerant size. With `RF=1`, `MAJORITY` is functionally equivalent to `W1` because there is only one replica.
+A single-node deployment runs at `RF=1`, where `MAJORITY` is functionally equivalent to `W1` because there is only one replica to hear from. Multi-node deployments choose `RF=3` as the smallest quorum-tolerant size, and that is where the distinction between `W1` and `MAJORITY` starts to matter: `W1` acknowledges once the leader has the write durably, `MAJORITY` waits for the write to survive the loss of the leader.
 
 ## Next Step
 

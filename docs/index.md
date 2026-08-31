@@ -36,11 +36,17 @@ features:
     title: OpenCypher-compatible
     details: Standard Cypher syntax extended with vector_distance(), text_match(), and point.distance(). EXPLAIN SUGGEST built in.
   - icon: "🔍"
-    title: Vectors on edges, not just nodes
-    details: Vector similarity search on edge properties. First-class support for GraphRAG, recommendation engines, and fraud detection.
+    title: Vector search on nodes and relationships
+    details: Native vector search over both node and relationship properties, integrated with graph traversal and transactional query execution.
+  - icon: "🧩"
+    title: Replication included, not upsold
+    details: Raft replication, follower reads and mutual TLS between nodes ship in the open-source edition, with no per-node licensing.
   - icon: "🏠"
     title: Single binary. Embedded mode.
     details: One binary, three ports (gRPC, REST, metrics). Add coordinode-embed to your Rust project — no separate process.
+  - icon: "🧬"
+    title: Entity resolution as a Cypher clause
+    details: MERGE NODES collapses duplicates in one MVCC transaction, with property merge rules and edge re-pointing. No plugin to install, no cluster caveat.
 ---
 
 ## The Magic Moment
@@ -69,7 +75,7 @@ docker run -p 7080:7080 -p 7081:7081 -p 7084:7084 \
 
 ```toml [Embedded (Cargo.toml)]
 [dependencies]
-coordinode-embed = "0.3"
+coordinode-embed = "0.5"
 ```
 
 :::

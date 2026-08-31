@@ -1,6 +1,10 @@
+---
+description: "How CoordiNode models data: nodes, relationships and labels, with vector, spatial and nested-document properties in one property graph, plus the three schema modes that govern validation."
+---
+
 # Data Model
 
-CoordiNode uses a **property graph** extended with vector, spatial, time-series, and document capabilities — all within a single unified model.
+CoordiNode uses a **property graph** extended with vector, spatial, and document capabilities, all within a single unified model.
 
 ## Core Primitives
 

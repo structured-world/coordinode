@@ -25,9 +25,10 @@ One query language (OpenCypher-compatible), one transaction model (MVCC, Snapsho
 
 ### Not yet ready for:
 
-- 100% drop-in Neo4j Enterprise replacement (gRPC and REST are available now; Bolt protocol planned for v1.2)
+- 100% drop-in Neo4j Enterprise replacement (gRPC and REST are available now; the Bolt protocol is planned)
 - APOC procedures, Neo4j Browser/Bloom, or GDS
-- Production multi-node clustering (single-node is stable; Raft clustering in active development for v0.4)
+- A cluster with years of production mileage. Raft replication, follower reads and mutual TLS ship today under an automated fault-injection suite; the operational history behind them is still short
+- Datasets larger than one machine holds. The open-source edition replicates the full dataset to every node; horizontal sharding is an Enterprise feature
 
 ## Next Steps
 

@@ -1,3 +1,7 @@
+---
+description: "What CoordiNode ships today, what is being built next, and what is further out: query engine, vector search, replication, Cypher DDL, Bolt protocol and SQL over the same engine."
+---
+
 # CoordiNode Roadmap
 
 Public roadmap in Now / Next / Later format.
@@ -6,7 +10,7 @@ For feature requests and bug reports, use [GitHub Issues](https://github.com/str
 
 ---
 
-## Now (v0.3-alpha — current release)
+## Now (v0.5.x, current release)
 
 These features are implemented, tested, and available today.
 
@@ -20,10 +24,11 @@ These features are implemented, tested, and available today.
 
 **Vector Search**
 - HNSW index up to 65,536 dimensions
-- SQ8 scalar quantization (4x memory reduction)
+- SQ8 scalar quantization (4x memory reduction) and RaBitQ binary codes with exact rerank
 - Distance metrics: cosine, L2, dot product, L1
-- Vector search on edges (not just nodes)
+- Vector search over relationship properties as well as node properties
 - Hybrid graph traversal + vector filter in a single query
+- `maxsim_score()` for ColBERT-style late-interaction relevance
 
 **Full-Text Search**
 - BM25 scoring with fuzzy, phrase, and wildcard queries
@@ -59,6 +64,27 @@ These features are implemented, tested, and available today.
 **Document Operations**
 - Path-targeted partial updates (`SET n.config.ssid = "home"` without read-modify-write)
 - Array operators (push, pull, addToSet, increment) as merge operands
+- Graph-document transformations: `DETACH DOCUMENT` promotes a nested property to a node and edge, `ATTACH DOCUMENT` demotes it back
+
+**Schema and Index DDL**
+- `CREATE LABEL` with typed properties, `CREATE EDGE TYPE`, and `CREATE VECTOR INDEX ... OPTIONS {m, ef_construction}` as Cypher statements
+- `CREATE ENCRYPTED INDEX` with `encrypted_match()` in `WHERE`
+
+**Entity Resolution**
+- `MERGE NODES (a, b) INTO a` collapses duplicates in one MVCC transaction, with property merge rules, edge re-pointing and duplicate-edge handling
+
+**Triggers**
+- `CREATE / DROP / SHOW / ALTER TRIGGER` as first-class clauses, replicated through Raft, with cascade limits and per-trigger error policy
+
+**Temporal**
+- Bitemporal edge types: multiple `(valid_from, valid_to)` versions per pair, with time-slice predicates pushed into the scan
+
+**Replication and Cluster**
+- Multi-node Raft replication with leader election, snapshot transfer and log compaction, included in the open-source edition
+- Follower reads with staleness tracking, and causal-consistency sessions
+- Mutual TLS between nodes over a pure-Rust stack, with zstd compression on the replication transport
+- Background scrub, with damaged segments rebuilt from a healthy replica
+- Fault-injection test suite: partition matrix, crash and clock skew, linearizability checking over a live workload
 
 **API**
 - gRPC on port 7080 (native, all services)
@@ -81,24 +107,15 @@ When a feature is completed, the corresponding documentation will be updated.
 - Live query subscriptions via WebSocket (port 7083)
   - *Closes:* COMPATIBILITY.md "WebSocket → Planned"
 
-**Document Operations**
-- Graph-document transformations (promote nested documents to graph nodes and back)
+**Trigger Firing**
+- BEFORE and AFTER COMMIT execution for the trigger definitions the DDL already accepts
+- Static cycle detection at definition time, and an auto-disable circuit breaker
 
-**Schema & Index DDL**
-- `CREATE LABEL ... (typed properties)` and `CREATE EDGE_TYPE` Cypher DDL
-  - *Closes:* CYPHER_EXTENSIONS.md "Schema (planned DDL)" note
-- `CREATE VECTOR INDEX ... OPTIONS {m, ef_construction}` Cypher DDL
-  - *Closes:* CYPHER_EXTENSIONS.md "Vector Index (planned DDL)" note
+**Late-Interaction Retrieval**
+- Centroid-based candidate selection for `maxsim_score()`, replacing the brute-force pass over candidates
 
-**Replication**
-- 3-node Raft clustering with automatic failover (free in CE) — consensus implemented, server binary wiring in progress
-  - *Closes:* COMPATIBILITY.md "Free 3-node HA clustering ... server binary wiring in progress"
-- Follower reads with staleness tracking
-- Causal consistency sessions
-
-**Encrypted Search DDL**
-- `CREATE ENCRYPTED INDEX` and `encrypted_match()` Cypher syntax (crypto primitives implemented, query engine wiring planned)
-  - *Closes:* CYPHER_EXTENSIONS.md "Encrypted Search (SSE)" note, COMPATIBILITY.md "programmatic API; Cypher DDL planned"
+**SQL**
+- PostgreSQL wire protocol over the same query IR, so SQL and Cypher reach one engine and one transaction model
 
 ---
 
