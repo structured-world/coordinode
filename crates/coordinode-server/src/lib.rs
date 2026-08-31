@@ -69,8 +69,9 @@ pub use builder::{
 
 /// Version of the server this binary is built from.
 ///
-/// A distribution that wraps the server reports its own version alongside this
-/// one, so a support request names both.
+/// A distribution that wraps the server reports this number as its own: the
+/// wrapper ships the same release with more of it enabled, so there is one
+/// version to name in a support request, not two to reconcile.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Execute a parsed CLI command with an unextended server.
