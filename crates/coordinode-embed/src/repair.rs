@@ -102,7 +102,9 @@ pub fn prune_checkpoints(root: &Path, keep: usize) -> StorageResult<usize> {
 /// Outcome of a [`verify_and_repair`] pass.
 #[derive(Debug, Clone, Default)]
 pub struct RepairReport {
-    /// Distinct partitions the scrub found corrupt (ascending discriminant).
+    /// Distinct partitions needing a rebuild: found corrupt by the scrub, or
+    /// structurally repaired at engine open with data loss (ascending
+    /// discriminant).
     pub corrupt_partitions: Vec<Partition>,
     /// Partitions actually rebuilt from a checkpoint this pass.
     pub repaired: Vec<Partition>,
@@ -123,7 +125,9 @@ impl RepairReport {
 }
 
 /// Scrub every partition; rebuild each corrupt one from the latest checkpoint
-/// plus oplog replay. A no-op (clean report) when scrub finds nothing.
+/// plus oplog replay. A partition whose tree was structurally repaired at
+/// engine open with data loss counts as corrupt too, even though it now
+/// scrubs clean. A no-op (clean report) when neither source flags anything.
 ///
 /// If corruption is found but no checkpoint exists, the report lists the
 /// corrupt partitions with `clean_after = false` and an empty `repaired` set —
@@ -133,7 +137,20 @@ pub fn verify_and_repair(
     checkpoint_root: &Path,
 ) -> StorageResult<RepairReport> {
     let scrub = scrub_all(engine, &ScrubConfig::default())?;
-    if !scrub.has_errors() {
+    let mut corrupt: Vec<Partition> = scrub.errors.iter().map(|e| e.partition).collect();
+
+    // A tree structurally repaired at open with a LOSSY replay scope reads
+    // checksum-clean afterwards (salvage rewrote it through the normal table
+    // writer), so the scrub cannot see the dropped key ranges. The engine's
+    // open-repair record is the only evidence of that loss; treat the
+    // partition as corrupt so the checkpoint + oplog rebuild restores it.
+    for r in engine.open_repairs() {
+        if r.is_lossy() {
+            corrupt.push(r.partition);
+        }
+    }
+
+    if corrupt.is_empty() {
         return Ok(RepairReport {
             clean_after: true,
             ..RepairReport::default()
@@ -141,7 +158,6 @@ pub fn verify_and_repair(
     }
 
     // Distinct corrupt partitions, deduplicated and ordered.
-    let mut corrupt: Vec<Partition> = scrub.errors.iter().map(|e| e.partition).collect();
     corrupt.sort_by_key(|p| coordinode_storage::placement::partition_wire_tag(*p));
     corrupt.dedup();
 

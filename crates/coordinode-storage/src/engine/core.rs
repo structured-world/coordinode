@@ -146,6 +146,42 @@ pub struct StorageEngine {
     /// open so a restart recovers the tables.
     #[cfg(feature = "columnar")]
     columnar_tables: crate::columnar::ColumnarTableRegistry,
+    /// Partitions whose tree failed to open with positively-identified
+    /// structural damage and was repaired (manifest rebuild, block salvage)
+    /// during THIS open. Consumed by the repair orchestrator: a lossy
+    /// [`replay_scope`](OpenRepair::replay_scope) means the partition owes a
+    /// checkpoint + oplog rebuild even though its tree now opens cleanly.
+    open_repairs: Vec<OpenRepair>,
+}
+
+/// One partition tree repaired during engine open.
+///
+/// Produced when the tree's `open` failed structurally (lost manifest
+/// pointer, corrupt version log) and the block-salvaging repair rebuilt it
+/// from the SSTs on disk. [`replay_scope`](Self::replay_scope) is the replay
+/// obligation the repair left behind: `TailOnly` when every block survived,
+/// lossy otherwise.
+#[derive(Debug)]
+pub struct OpenRepair {
+    /// The partition whose tree was repaired.
+    pub partition: Partition,
+    /// How far back a retained-oplog replay must reach to restore what the
+    /// repair could not recover.
+    pub replay_scope: lsm_tree::WalReplayScope,
+    /// The full repair outcome (recovered / salvaged / unreadable counts,
+    /// lost key coverage) for logging and diagnostics.
+    pub report: lsm_tree::RepairReport,
+}
+
+impl OpenRepair {
+    /// `true` when the repair could not recover everything: block salvage
+    /// dropped key ranges (or a table's coverage never parsed), so the
+    /// partition owes a rebuild from a checkpoint plus oplog replay even
+    /// though its tree now reads checksum-clean.
+    #[must_use]
+    pub fn is_lossy(&self) -> bool {
+        !matches!(self.replay_scope, lsm_tree::WalReplayScope::TailOnly)
+    }
 }
 
 impl StorageEngine {
@@ -258,12 +294,35 @@ impl StorageEngine {
         // on first open against this endpoint set. Open the partition tree
         // with `level_routes` derived from the routing.
         let mut trees = HashMap::with_capacity(Partition::all().len());
+        let mut open_repairs: Vec<OpenRepair> = Vec::new();
+
+        // Structural open failures (lost `current` pointer, corrupt version
+        // log) are repaired in place with block salvage rather than failing
+        // the whole engine open: recovery must always yield an openable
+        // engine, with any loss REPORTED (via `open_repairs`) for the repair
+        // orchestrator to replay, never a dead end. Config-level mistakes
+        // (wrong comparator, missing dictionary) still propagate as errors.
+        let repair_policy = lsm_tree::RepairPolicy::default().salvage(true);
 
         // Pass 1: Schema partition (single-tier, no routing).
         let schema_config = config
             .to_tree_config(Partition::Schema, Arc::clone(&seqno), &gc_watermark)
             .use_cache(Arc::clone(&cache));
-        let schema_tree = schema_config.open()?;
+        let (schema_tree, schema_repair) = schema_config.open_or_repair(repair_policy)?;
+        if let Some(report) = schema_repair {
+            tracing::warn!(
+                partition = Partition::Schema.name(),
+                recovered = report.recovered,
+                salvaged = report.salvaged,
+                scope = ?report.wal_replay_scope(),
+                "partition tree structurally repaired at open"
+            );
+            open_repairs.push(OpenRepair {
+                partition: Partition::Schema,
+                replay_scope: report.wal_replay_scope(),
+                report,
+            });
+        }
         trees.insert(Partition::Schema, schema_tree.clone());
 
         // Restore seqno from Schema BEFORE reading routing — the routing
@@ -302,7 +361,21 @@ impl StorageEngine {
                     Some(&routing),
                 )
                 .use_cache(Arc::clone(&cache));
-            let tree = tree_config.open()?;
+            let (tree, repair) = tree_config.open_or_repair(repair_policy)?;
+            if let Some(report) = repair {
+                tracing::warn!(
+                    partition = part.name(),
+                    recovered = report.recovered,
+                    salvaged = report.salvaged,
+                    scope = ?report.wal_replay_scope(),
+                    "partition tree structurally repaired at open"
+                );
+                open_repairs.push(OpenRepair {
+                    partition: part,
+                    replay_scope: report.wal_replay_scope(),
+                    report,
+                });
+            }
             trees.insert(part, tree);
         }
 
@@ -555,7 +628,22 @@ impl StorageEngine {
             oracle,
             #[cfg(feature = "columnar")]
             columnar_tables,
+            open_repairs,
         })
+    }
+
+    /// Partition trees that were structurally repaired during this open, with
+    /// the replay obligation each repair left behind. Empty on a clean open.
+    ///
+    /// A caller running WAL-replay-repair (the embedded repair orchestrator)
+    /// must treat any entry whose scope is not
+    /// [`TailOnly`](lsm_tree::WalReplayScope::TailOnly) as a partition to
+    /// rebuild from a checkpoint plus oplog replay: its tree opens and reads
+    /// cleanly, but block salvage dropped the key ranges in
+    /// [`OpenRepair::report`]`.lost_coverage`.
+    #[must_use]
+    pub fn open_repairs(&self) -> &[OpenRepair] {
+        &self.open_repairs
     }
 
     /// Create (or open if it already exists) the columnar tree for a

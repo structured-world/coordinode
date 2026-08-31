@@ -759,3 +759,57 @@ fn all_partitions_support_crud() {
         );
     }
 }
+
+/// Losing a partition's `current` manifest pointer (artifacts intact) must not
+/// make the whole engine unopenable: open repairs the tree from its SSTs and
+/// reports the repair so the caller can decide whether a replay is owed.
+#[test]
+fn open_repairs_partition_with_lost_manifest_pointer() {
+    use lsm_tree::AbstractTree;
+
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+
+    // Seed a flushed SST in the Node partition, then close the engine.
+    {
+        let engine = StorageEngine::open(&config).expect("initial open");
+        engine
+            .put(Partition::Node, b"node:manifest-loss", b"survives")
+            .expect("put");
+        engine
+            .tree(Partition::Node)
+            .expect("tree")
+            .flush_active_memtable(0)
+            .expect("flush");
+    }
+
+    // Simulate manifest-pointer loss: artifacts present, `current` gone.
+    let current = dir.path().join(Partition::Node.name()).join("current");
+    assert!(current.exists(), "layout changed: no current pointer file");
+    std::fs::remove_file(&current).expect("remove current");
+
+    // Reopen: the engine must come up (repairing the Node tree), the data
+    // must still be readable, and the repair must be reported.
+    let engine = StorageEngine::open(&config).expect("open after manifest loss");
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:manifest-loss")
+            .expect("get")
+            .as_deref(),
+        Some(&b"survives"[..])
+    );
+    let repairs = engine.open_repairs();
+    assert_eq!(repairs.len(), 1, "exactly one partition was repaired");
+    assert_eq!(repairs[0].partition, Partition::Node);
+    // Nothing was lost (every SST intact), so no replay is owed.
+    assert!(matches!(
+        repairs[0].replay_scope,
+        lsm_tree::WalReplayScope::TailOnly
+    ));
+}

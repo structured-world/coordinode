@@ -317,3 +317,97 @@ fn scheduler_starts_and_stops_cleanly() {
         "scheduler should have produced a checkpoint"
     );
 }
+
+/// A partition tree that was structurally repaired AT OPEN with data loss
+/// (lost `current` pointer + corrupt blocks the salvage had to drop) reads
+/// checksum-clean afterwards, so the scrub cannot see the loss. The
+/// open-repair record is the only evidence: `verify_and_repair` must treat a
+/// lossy open repair as corruption and rebuild the partition from the
+/// checkpoint plus oplog replay.
+#[test]
+fn lossy_open_repair_forces_checkpoint_rebuild() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = checkpoint_root(dir.path());
+
+    // Base A before the checkpoint, tail B after it (same shape as
+    // repair_rebuilds_corrupt_partition_from_checkpoint_plus_oplog).
+    {
+        let engine = open(&dir);
+        for i in 0..100u32 {
+            let key = format!("node:0:{i:08}");
+            put(
+                &engine,
+                u64::from(i) + 1,
+                PartitionId::Node,
+                key.as_bytes(),
+                b"base-A",
+            );
+        }
+        engine.persist().expect("persist A");
+        create_checkpoint(&engine, &root).expect("checkpoint");
+        for i in 0..64u32 {
+            let key = format!("node:0:5000{i:04}");
+            put(
+                &engine,
+                1000 + u64::from(i),
+                PartitionId::Node,
+                key.as_bytes(),
+                b"bulk-B",
+            );
+        }
+        put(
+            &engine,
+            2000,
+            PartitionId::Node,
+            b"node:0:99999999",
+            b"tail-B",
+        );
+        engine.persist().expect("persist B");
+    } // engine closed: the damage below must hit a quiesced tree
+
+    // Structural damage + content damage: the lost `current` pointer makes
+    // the next open run a repair, and the corrupt post-checkpoint tables
+    // force that repair's salvage to drop blocks (a lossy replay scope).
+    let node_dir = dir.path().join(Partition::Node.name());
+    let corrupted = corrupt_post_checkpoint_tables(&node_dir.join("tables"), &root);
+    assert!(corrupted > 0, "test must corrupt a post-checkpoint table");
+    std::fs::remove_file(node_dir.join("current")).expect("remove current");
+
+    // Reopen: open succeeds by structural repair, and the repair is lossy.
+    let engine = open(&dir);
+    let lossy = engine
+        .open_repairs()
+        .iter()
+        .find(|r| r.partition == Partition::Node)
+        .expect("Node open repair must be recorded");
+    assert!(
+        lossy.is_lossy(),
+        "salvage over corrupt tables must report a lossy scope: {:?}",
+        lossy.replay_scope
+    );
+
+    // The orchestrator must rebuild Node even though the salvaged tree now
+    // scrubs clean, and the rebuild must restore both A and B in full.
+    let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
+    assert!(
+        report.repaired.contains(&Partition::Node),
+        "lossy open repair must force a rebuild: {report:?}"
+    );
+    assert!(report.is_clean(), "post-rebuild re-scrub: {report:?}");
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:0:00000042")
+            .expect("get A")
+            .as_deref(),
+        Some(b"base-A".as_slice()),
+        "checkpoint base row must be restored"
+    );
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:0:99999999")
+            .expect("get B")
+            .as_deref(),
+        Some(b"tail-B".as_slice()),
+        "post-checkpoint oplog tail must be replayed"
+    );
+}
