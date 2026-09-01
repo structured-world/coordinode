@@ -1,5 +1,96 @@
 # Changelog
 
+## v0.5.7 - 2026-09-01
+
+### coordinode-embed 0.5.7
+
+#### Added
+
+- *(server)* tell a client its write went to the wrong node
+- *(vector)* drain writes into an index while it builds
+
+#### Fixed
+
+- *(vector)* give the index ownership of its background build
+
+### coordinode-integration 0.5.7
+
+#### Added
+
+- *(session)* tell a client what its connection can do, and let it configure one
+
+### coordinode-modality 0.5.7
+
+#### Added
+
+- *(vector)* drain writes into an index while it builds
+
+### coordinode-query 0.5.7
+
+#### Added
+
+- *(server)* tell a client its write went to the wrong node
+- *(vector)* drain writes into an index while it builds
+
+#### Fixed
+
+- *(vector)* give the index ownership of its background build
+
+### coordinode-raft 0.5.7
+
+#### Added
+
+- *(session)* tell a client what its connection can do, and let it configure one
+- *(server)* carry a write to the leader instead of refusing it
+
+#### Fixed
+
+- *(raft)* bind gRPC listener eagerly and free the port on shutdown
+
+#### Testing
+
+- *(raft)* wait for the cluster instead of guessing how long it takes
+- *(raft)* stop the consensus suite from testing election timing
+
+### coordinode-replicate 0.5.7
+
+#### Added
+
+- *(session)* tell a client what its connection can do, and let it configure one
+
+### coordinode-server 0.5.7
+
+#### Added
+
+- *(session)* tell a client what its connection can do, and let it configure one
+- *(server)* carry a write to the leader instead of refusing it
+- *(server)* tell a client its write went to the wrong node
+
+### coordinode-session 0.5.7
+
+#### Added
+
+- *(session)* tell a client what its connection can do, and let it configure one
+
+### coordinode-storage 0.5.7
+
+#### Added
+
+- *(server)* tell a client its write went to the wrong node
+- *(vector)* drain writes into an index while it builds
+
+#### Fixed
+
+- *(vector)* give the index ownership of its background build
+
+### coordinode-vector 0.5.7
+
+#### Added
+
+- *(vector)* drain writes into an index while it builds
+
+---
+
 ## v0.5.6 - 2026-09-01
 
 ### coordinode-core 0.5.6
