@@ -146,6 +146,12 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
+          # The proto submodule feeds coordinode-client's codegen. On a
+          # self-hosted runner the workdir persists between runs, so
+          # without this the stale proto/ tree from an earlier run
+          # satisfies the build.rs sentinel and the client compiles
+          # against drifted bindings.
+          submodules: recursive
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
