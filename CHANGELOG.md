@@ -1,5 +1,108 @@
 # Changelog
 
+## v0.5.6 - 2026-09-01
+
+### coordinode-core 0.5.6
+
+#### Performance
+
+- *(stats)* incremental node/label counters replace the statistics scan
+
+### coordinode-embed 0.5.6
+
+#### Added
+
+- *(storage+server)* compaction-debt backpressure with stop-only admission
+- *(storage)* range-scoped WAL-replay-repair for scopable salvage losses
+- *(storage)* structural self-repair of partition trees at engine open
+- *(txn+server)* write-set conflicts by default; machine-readable error reasons
+
+#### Fixed
+
+- *(storage)* oplog trim guarded by durability and checkpoint floors
+- *(query)* fail arithmetic that has no answer instead of guessing
+
+#### Performance
+
+- *(stats)* incremental node/label counters replace the statistics scan
+
+#### Testing
+
+- *(storage)* failure-path coverage for open-time structural repair
+
+### coordinode-modality 0.5.6
+
+#### Performance
+
+- *(txn)* coalesce counter deltas per key in the transaction buffer
+- *(stats)* incremental node/label counters replace the statistics scan
+
+### coordinode-query 0.5.6
+
+#### Added
+
+- *(storage+server)* compaction-debt backpressure with stop-only admission
+- *(txn+server)* write-set conflicts by default; machine-readable error reasons
+
+#### Fixed
+
+- *(query+server)* query faults answer INVALID_ARGUMENT; sort keys go flat
+- *(query)* report a call to an unknown function
+- *(query)* fail arithmetic that has no answer instead of guessing
+
+#### Performance
+
+- *(stats)* incremental node/label counters replace the statistics scan
+
+### coordinode-server 0.5.6
+
+#### Added
+
+- *(storage+server)* compaction-debt backpressure with stop-only admission
+- *(txn+server)* write-set conflicts by default; machine-readable error reasons
+
+#### Documentation
+
+- *(server)* say that a wrapper distribution reports this version
+
+#### Fixed
+
+- *(query+server)* query faults answer INVALID_ARGUMENT; sort keys go flat
+
+### coordinode-storage 0.5.6
+
+#### Added
+
+- *(storage+server)* compaction-debt backpressure with stop-only admission
+- *(storage)* range-scoped WAL-replay-repair for scopable salvage losses
+- *(storage)* structural self-repair of partition trees at engine open
+- *(txn+server)* write-set conflicts by default; machine-readable error reasons
+
+#### Fixed
+
+- *(storage)* oplog trim guarded by durability and checkpoint floors
+- *(storage)* handle weak tombstones in changed-keys scan
+
+#### Performance
+
+- *(txn)* coalesce counter deltas per key in the transaction buffer
+- *(stats)* incremental node/label counters replace the statistics scan
+- *(storage)* columnar table readback through the tree-level projected scan
+- *(storage)* bench the transactional read wrapper, with numbers
+
+#### Testing
+
+- *(storage)* power-loss recovery through the crash-simulator filesystem
+- *(storage)* failure-path coverage for open-time structural repair
+
+### coordinode-vector 0.5.6
+
+#### Testing
+
+- *(vector)* wait for waiters to queue instead of sleeping
+
+---
+
 ## v0.5.5 - 2026-08-31
 
 ### coordinode-embed 0.5.5
