@@ -3,6 +3,30 @@
 All notable changes to this crate are documented in this file.
 This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
+## 0.5.6 - 2026-09-01
+
+#### Added
+
+- *(storage+server)* compaction-debt backpressure with stop-only admission
+- *(storage)* range-scoped WAL-replay-repair for scopable salvage losses
+- *(storage)* structural self-repair of partition trees at engine open
+- *(txn+server)* write-set conflicts by default; machine-readable error reasons
+
+#### Fixed
+
+- *(storage)* oplog trim guarded by durability and checkpoint floors
+- *(query)* fail arithmetic that has no answer instead of guessing
+
+#### Performance
+
+- *(stats)* incremental node/label counters replace the statistics scan
+
+#### Testing
+
+- *(storage)* failure-path coverage for open-time structural repair
+
+---
+
 ## 0.5.5 - 2026-08-31
 
 #### Testing

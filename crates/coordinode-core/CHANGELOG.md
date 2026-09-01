@@ -3,6 +3,14 @@
 All notable changes to this crate are documented in this file.
 This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
+## 0.5.6 - 2026-09-01
+
+#### Performance
+
+- *(stats)* incremental node/label counters replace the statistics scan
+
+---
+
 ## 0.5.2 - 2026-08-30
 
 #### Fixed

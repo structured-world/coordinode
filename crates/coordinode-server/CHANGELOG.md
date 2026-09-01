@@ -3,6 +3,23 @@
 All notable changes to this crate are documented in this file.
 This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
+## 0.5.6 - 2026-09-01
+
+#### Added
+
+- *(storage+server)* compaction-debt backpressure with stop-only admission
+- *(txn+server)* write-set conflicts by default; machine-readable error reasons
+
+#### Documentation
+
+- *(server)* say that a wrapper distribution reports this version
+
+#### Fixed
+
+- *(query+server)* query faults answer INVALID_ARGUMENT; sort keys go flat
+
+---
+
 ## 0.5.3 - 2026-08-30
 
 #### Fixed
