@@ -532,3 +532,212 @@ fn oplog_purge_keeps_entries_needed_by_checkpoint_replay() {
         replayable.len()
     );
 }
+
+/// A lossy open repair with a KNOWN lost span must be repaired range-scoped:
+/// only the lost key ranges are cleared and rebuilt from checkpoint + oplog,
+/// while untouched pre-checkpoint rows keep their original versions (their
+/// SSTs are not rewritten). A full-partition rebuild would re-put the base at
+/// fresh seqnos, so the original-snapshot read below is the discriminator.
+#[test]
+fn lossy_open_repair_with_known_span_repairs_only_the_lost_ranges() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = checkpoint_root(dir.path());
+
+    // The MVCC snapshot covering everything written below, captured before
+    // the engine closed: the scoped-vs-full discriminator at the bottom.
+    let snap_before_damage = {
+        let engine = open(&dir);
+        // Base A at ts 1..=100, checkpointed: lives in a checkpoint-shared
+        // SST that the corruption below never touches.
+        for i in 0..100u32 {
+            let key = format!("node:0:{i:08}");
+            put(
+                &engine,
+                u64::from(i) + 1,
+                PartitionId::Node,
+                key.as_bytes(),
+                b"base-A",
+            );
+        }
+        engine.persist().expect("persist A");
+        create_checkpoint(&engine, &root).expect("checkpoint");
+        // Tail B after the checkpoint: this table gets corrupted, so the
+        // lost coverage spans only B's key range.
+        for i in 0..64u32 {
+            let key = format!("node:0:5000{i:04}");
+            put(
+                &engine,
+                1000 + u64::from(i),
+                PartitionId::Node,
+                key.as_bytes(),
+                b"bulk-B",
+            );
+        }
+        put(
+            &engine,
+            2000,
+            PartitionId::Node,
+            b"node:0:99999999",
+            b"tail-B",
+        );
+        engine.persist().expect("persist B");
+        engine.snapshot()
+    };
+
+    let node_dir = dir.path().join(Partition::Node.name());
+    let corrupted = corrupt_post_checkpoint_tables(&node_dir.join("tables"), &root);
+    assert!(corrupted > 0, "test must corrupt a post-checkpoint table");
+    std::fs::remove_file(node_dir.join("current")).expect("remove current");
+
+    let engine = open(&dir);
+    let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
+    assert!(
+        report.repaired.contains(&Partition::Node),
+        "lossy open repair must be repaired: {report:?}"
+    );
+    assert!(
+        report.scoped.contains(&Partition::Node),
+        "a known lost span must be repaired range-scoped, not full: {report:?}"
+    );
+    assert!(report.is_clean(), "{report:?}");
+
+    // Current values: both halves fully restored.
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:0:00000042")
+            .expect("get A")
+            .as_deref(),
+        Some(b"base-A".as_slice())
+    );
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:0:99999999")
+            .expect("get B")
+            .as_deref(),
+        Some(b"tail-B".as_slice())
+    );
+
+    // The discriminator: base row 42's SST was never lost, so the pre-damage
+    // snapshot must still see it (its original version survives). A full
+    // rebuild re-puts the base at fresh post-repair seqnos, above that
+    // snapshot, and this read comes back empty.
+    let at_original_ts = engine
+        .prefix_scan_at(Partition::Node, b"node:0:00000042", snap_before_damage)
+        .expect("scan_at")
+        .count();
+    assert!(
+        at_original_ts > 0,
+        "untouched base row must keep its original version (scoped repair \
+         must not rewrite SSTs outside the lost ranges)"
+    );
+}
+
+/// The scoped-repair fallback: when a lost table's coverage is unknowable
+/// (its metadata never parsed), no key bound can prove a retained row is
+/// unaffected, so the partition must take the FULL rebuild, and the report
+/// must not claim a scoped repair.
+#[test]
+fn unscopable_loss_falls_back_to_full_rebuild() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = checkpoint_root(dir.path());
+
+    {
+        let engine = open(&dir);
+        for i in 0..50u32 {
+            let key = format!("node:0:{i:08}");
+            put(
+                &engine,
+                u64::from(i) + 1,
+                PartitionId::Node,
+                key.as_bytes(),
+                b"base-A",
+            );
+        }
+        engine.persist().expect("persist A");
+        create_checkpoint(&engine, &root).expect("checkpoint");
+        put(
+            &engine,
+            2000,
+            PartitionId::Node,
+            b"node:0:99999999",
+            b"tail-B",
+        );
+        engine.persist().expect("persist B");
+    }
+
+    // Obliterate every post-checkpoint table wholesale: no readable
+    // metadata, no coverage, an unknowable loss.
+    let node_dir = dir.path().join(Partition::Node.name());
+    let tables_dir = node_dir.join("tables");
+    let ckpt = latest_checkpoint(&root).expect("checkpoint exists");
+    let mut obliterated = 0usize;
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mut ckpt_inodes = std::collections::HashSet::new();
+        let mut stack = vec![ckpt.clone()];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let meta = entry.metadata().expect("metadata");
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    ckpt_inodes.insert(meta.ino());
+                }
+            }
+        }
+        let mut stack = vec![tables_dir.clone()];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let p = entry.path();
+                let meta = entry.metadata().expect("metadata");
+                if meta.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if ckpt_inodes.contains(&meta.ino()) {
+                    continue;
+                }
+                let len = meta.len() as usize;
+                std::fs::write(&p, vec![0xFFu8; len]).expect("obliterate table");
+                obliterated += 1;
+            }
+        }
+    }
+    assert!(
+        obliterated > 0,
+        "test must obliterate a post-checkpoint table"
+    );
+    std::fs::remove_file(node_dir.join("current")).expect("remove current");
+
+    let engine = open(&dir);
+    let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
+    assert!(
+        report.repaired.contains(&Partition::Node),
+        "unscopable loss must still be repaired: {report:?}"
+    );
+    assert!(
+        !report.scoped.contains(&Partition::Node),
+        "an unknowable loss must not claim a scoped repair: {report:?}"
+    );
+    assert!(report.is_clean(), "{report:?}");
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:0:00000042")
+            .expect("get A")
+            .as_deref(),
+        Some(b"base-A".as_slice())
+    );
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:0:99999999")
+            .expect("get B")
+            .as_deref(),
+        Some(b"tail-B".as_slice())
+    );
+}

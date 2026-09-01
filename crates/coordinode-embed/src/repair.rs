@@ -108,6 +108,12 @@ pub struct RepairReport {
     pub corrupt_partitions: Vec<Partition>,
     /// Partitions actually rebuilt from a checkpoint this pass.
     pub repaired: Vec<Partition>,
+    /// The subset of [`repaired`](Self::repaired) restored range-scoped:
+    /// only the key ranges the open-time salvage dropped were cleared and
+    /// rebuilt, leaving every other SST untouched. Partitions repaired by a
+    /// full rebuild (scrub-detected corruption, or an unscopable loss) are
+    /// listed in `repaired` only.
+    pub scoped: Vec<Partition>,
     /// The checkpoint used as the rebuild base, if repair ran.
     pub checkpoint_used: Option<PathBuf>,
     /// `true` if a re-scrub after repair found no remaining corruption.
@@ -137,18 +143,35 @@ pub fn verify_and_repair(
     checkpoint_root: &Path,
 ) -> StorageResult<RepairReport> {
     let scrub = scrub_all(engine, &ScrubConfig::default())?;
-    let mut corrupt: Vec<Partition> = scrub.errors.iter().map(|e| e.partition).collect();
+    let mut full: Vec<Partition> = scrub.errors.iter().map(|e| e.partition).collect();
+    full.sort_by_key(|p| coordinode_storage::placement::partition_wire_tag(*p));
+    full.dedup();
 
     // A tree structurally repaired at open with a LOSSY replay scope reads
     // checksum-clean afterwards (salvage rewrote it through the normal table
     // writer), so the scrub cannot see the dropped key ranges. The engine's
-    // open-repair record is the only evidence of that loss; treat the
-    // partition as corrupt so the checkpoint + oplog rebuild restores it.
+    // open-repair record is the only evidence of that loss. When every loss
+    // is key-scopable the rebuild is range-scoped (cost proportional to the
+    // loss); an unscopable loss, or a partition the scrub also flagged,
+    // takes the full rebuild.
+    let mut scoped_jobs: Vec<(Partition, Vec<coordinode_storage::engine::core::KeyRange>)> =
+        Vec::new();
     for r in engine.open_repairs() {
-        if r.is_lossy() {
-            corrupt.push(r.partition);
+        if !r.is_lossy() || full.contains(&r.partition) {
+            continue;
+        }
+        match r.scoped_ranges() {
+            Some(ranges) if !ranges.is_empty() => scoped_jobs.push((r.partition, ranges)),
+            _ => full.push(r.partition),
         }
     }
+    full.sort_by_key(|p| coordinode_storage::placement::partition_wire_tag(*p));
+    full.dedup();
+
+    let mut corrupt: Vec<Partition> = full.clone();
+    corrupt.extend(scoped_jobs.iter().map(|(p, _)| *p));
+    corrupt.sort_by_key(|p| coordinode_storage::placement::partition_wire_tag(*p));
+    corrupt.dedup();
 
     if corrupt.is_empty() {
         return Ok(RepairReport {
@@ -156,10 +179,6 @@ pub fn verify_and_repair(
             ..RepairReport::default()
         });
     }
-
-    // Distinct corrupt partitions, deduplicated and ordered.
-    corrupt.sort_by_key(|p| coordinode_storage::placement::partition_wire_tag(*p));
-    corrupt.dedup();
 
     let Some(checkpoint) = latest_checkpoint(checkpoint_root) else {
         tracing::error!(
@@ -178,15 +197,22 @@ pub fn verify_and_repair(
     let oplog_since = engine.oplog_read_since(from)?.unwrap_or_default();
 
     let mut repaired = Vec::with_capacity(corrupt.len());
-    for &part in &corrupt {
+    let mut scoped = Vec::with_capacity(scoped_jobs.len());
+    for &part in &full {
         engine.repair_partition_from_checkpoint(&checkpoint, &oplog_since, part)?;
         repaired.push(part);
+    }
+    for (part, ranges) in &scoped_jobs {
+        engine.repair_partition_ranges_from_checkpoint(&checkpoint, &oplog_since, *part, ranges)?;
+        repaired.push(*part);
+        scoped.push(*part);
     }
 
     let after = scrub_all(engine, &ScrubConfig::default())?;
     Ok(RepairReport {
         corrupt_partitions: corrupt,
         repaired,
+        scoped,
         checkpoint_used: Some(checkpoint),
         clean_after: !after.has_errors(),
     })

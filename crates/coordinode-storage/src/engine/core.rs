@@ -154,6 +154,11 @@ pub struct StorageEngine {
     open_repairs: Vec<OpenRepair>,
 }
 
+/// An inclusive `[min, max]` user-key range, as reported by a lossy open
+/// repair ([`OpenRepair::scoped_ranges`]) and consumed by the range-scoped
+/// rebuild ([`StorageEngine::repair_partition_ranges_from_checkpoint`]).
+pub type KeyRange = (Vec<u8>, Vec<u8>);
+
 /// One partition tree repaired during engine open.
 ///
 /// Produced when the tree's `open` failed structurally (lost manifest
@@ -181,6 +186,26 @@ impl OpenRepair {
     #[must_use]
     pub fn is_lossy(&self) -> bool {
         !matches!(self.replay_scope, lsm_tree::WalReplayScope::TailOnly)
+    }
+
+    /// The inclusive `[min, max]` key ranges the repair lost, when every loss
+    /// is key-scopable — the precondition for a range-scoped rebuild
+    /// ([`StorageEngine::repair_partition_ranges_from_checkpoint`]) instead
+    /// of a full one. `None` when any excluded table's coverage never parsed
+    /// (`unknowable_losses`): no key bound can prove a retained row is
+    /// unaffected, so only a full rebuild is sound.
+    #[must_use]
+    pub fn scoped_ranges(&self) -> Option<Vec<KeyRange>> {
+        if !self.report.unknowable_losses.is_empty() {
+            return None;
+        }
+        Some(
+            self.report
+                .lost_coverage
+                .iter()
+                .map(|(_, min, max, _)| (min.to_vec(), max.to_vec()))
+                .collect(),
+        )
     }
 }
 
@@ -952,21 +977,132 @@ impl StorageEngine {
                 if op_partition(op) != Some(partition) {
                     continue;
                 }
+                self.apply_repair_op(partition, op)?;
+            }
+        }
+        Ok(base_len)
+    }
+
+    /// Apply one journal op during a checkpoint rebuild (shared by the full
+    /// and range-scoped repair paths). Ops that target no partition (Noop,
+    /// Raft bookkeeping, columnar rows) are no-ops here; the callers filter
+    /// them out by partition before calling.
+    fn apply_repair_op(&self, partition: Partition, op: &OplogOp) -> StorageResult<()> {
+        match op {
+            OplogOp::Insert { key, value, .. } => self.put(partition, key, value),
+            OplogOp::Delete { key, .. } => self.delete(partition, key),
+            OplogOp::Merge { key, operand, .. } => self.merge(partition, key, operand),
+            OplogOp::RemoveRange { start, end, .. } => self.remove_range(partition, start, end),
+            OplogOp::Noop
+            | OplogOp::RaftEntry { .. }
+            | OplogOp::RaftTruncation { .. }
+            | OplogOp::ColumnarInsert { .. } => Ok(()),
+        }
+    }
+
+    /// Range-scoped WAL-replay-repair: rebuild ONLY the inclusive `[min, max]`
+    /// key ranges of `partition` from a checkpoint plus oplog replay, leaving
+    /// every SST outside those ranges untouched. Used after a lossy open-time
+    /// salvage whose losses are key-scopable
+    /// ([`OpenRepair::scoped_ranges`]); the cost is proportional to the lost
+    /// data plus the post-checkpoint oplog window, not the partition size.
+    ///
+    /// Exactly-once per range: each range is cleared with a range tombstone
+    /// (safe here — salvage already rewrote the tree checksum-clean, so no
+    /// corrupt block can be re-read), the checkpoint base rows inside it are
+    /// reinstalled, and the post-checkpoint ops whose keys fall inside it are
+    /// replayed in order. A replayed `RemoveRange` op is CLIPPED to its
+    /// intersection with the lost ranges: outside them the live tree already
+    /// holds the op's final effect, and re-applying the delete at a fresh
+    /// seqno would erase writes that originally landed after it.
+    ///
+    /// Returns the number of checkpoint base entries reinstalled.
+    pub fn repair_partition_ranges_from_checkpoint(
+        &self,
+        checkpoint_dir: &Path,
+        oplog_since: &[OplogEntry],
+        partition: Partition,
+        ranges: &[KeyRange],
+    ) -> StorageResult<usize> {
+        use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
+
+        // The exclusive upper bound one past an inclusive `max` key.
+        fn succ(max: &[u8]) -> Vec<u8> {
+            let mut s = Vec::with_capacity(max.len() + 1);
+            s.extend_from_slice(max);
+            s.push(0);
+            s
+        }
+        let in_ranges = |key: &[u8]| {
+            ranges
+                .iter()
+                .any(|(min, max)| key >= &min[..] && key <= &max[..])
+        };
+
+        // 1. Open the checkpoint read-only and export the base rows inside
+        //    each lost range. The checkpoint engine is dropped before the
+        //    live engine is mutated.
+        let base: Vec<(Vec<u8>, Vec<u8>)> = {
+            let ckpt_cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                checkpoint_dir,
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]);
+            let ckpt = StorageEngine::open(&ckpt_cfg)?;
+            let mut rows = Vec::new();
+            for (min, max) in ranges {
+                for guard in ckpt.range_scan(partition, min, max)? {
+                    let (k, v) = guard.into_inner()?;
+                    rows.push((k.to_vec(), v.to_vec()));
+                }
+            }
+            rows
+        };
+
+        // 2. Clear the lost ranges on the live tree, reinstall the base.
+        for (min, max) in ranges {
+            self.remove_range(partition, min, &succ(max))?;
+        }
+        let base_len = base.len();
+        for (key, value) in &base {
+            self.put(partition, key, value)?;
+        }
+
+        // 3. Replay post-checkpoint ops intersecting the lost ranges, in
+        //    journal order.
+        for entry in oplog_since {
+            for op in &entry.ops {
+                if op_partition(op) != Some(partition) {
+                    continue;
+                }
                 match op {
-                    OplogOp::Insert { key, value, .. } => {
-                        self.put(partition, key, value)?;
-                    }
-                    OplogOp::Delete { key, .. } => {
-                        self.delete(partition, key)?;
-                    }
-                    OplogOp::Merge { key, operand, .. } => {
-                        self.merge(partition, key, operand)?;
+                    OplogOp::Insert { key, .. }
+                    | OplogOp::Delete { key, .. }
+                    | OplogOp::Merge { key, .. } => {
+                        if in_ranges(key) {
+                            self.apply_repair_op(partition, op)?;
+                        }
                     }
                     OplogOp::RemoveRange { start, end, .. } => {
-                        self.remove_range(partition, start, end)?;
+                        for (min, max) in ranges {
+                            let s = if start[..] > min[..] {
+                                start.clone()
+                            } else {
+                                min.clone()
+                            };
+                            let bound = succ(max);
+                            let e = if end[..] < bound[..] {
+                                end.clone()
+                            } else {
+                                bound
+                            };
+                            if s < e {
+                                self.remove_range(partition, &s, &e)?;
+                            }
+                        }
                     }
-                    // Filtered out above by `op_partition(op) != Some(partition)`
-                    // (these target no partition); the arm satisfies exhaustiveness.
                     OplogOp::Noop
                     | OplogOp::RaftEntry { .. }
                     | OplogOp::RaftTruncation { .. }
