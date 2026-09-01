@@ -273,6 +273,25 @@ pub trait NodeStore {
         visit: &mut ShardVisitor<'_>,
     ) -> StoreResult<()>;
 
+    /// Nodes whose record changed after `since_seqno`, as `(shard, id)`.
+    ///
+    /// The delta an incremental consumer needs: an index catching up after its
+    /// scan, a snapshot shipping only what moved. Ids rather than records,
+    /// because a caller re-reads the ones it cares about (and a batched
+    /// [`Self::get_many`] is the cheap way to do it); a node that was deleted
+    /// appears here too, and its re-read simply comes back empty.
+    fn changed_since(
+        &self,
+        engine: &StorageEngine,
+        since_seqno: lsm_tree::SeqNo,
+    ) -> StoreResult<Vec<(u16, NodeId)>>;
+
+    /// Rough number of node records held, for progress and sizing.
+    ///
+    /// Read off LSM metadata, so it costs no scan and counts versions and
+    /// tombstones the levels still hold: an upper bound, never a row count.
+    fn approximate_count(&self, engine: &StorageEngine) -> StoreResult<usize>;
+
     /// Iterate every non-temporal node record in a shard, latest
     /// visible seqno. Yields `(NodeId, NodeRecord)` pairs in key
     /// order. Materialised into a `Vec` — callers walking very large
@@ -685,6 +704,22 @@ impl NodeStore for LocalNodeStore {
             }
         }
         Ok(())
+    }
+
+    fn changed_since(
+        &self,
+        engine: &StorageEngine,
+        since_seqno: lsm_tree::SeqNo,
+    ) -> StoreResult<Vec<(u16, NodeId)>> {
+        Ok(engine
+            .changed_keys_since(Partition::Node, since_seqno)?
+            .iter()
+            .filter_map(|key| coordinode_core::graph::node::decode_node_key(key))
+            .collect())
+    }
+
+    fn approximate_count(&self, engine: &StorageEngine) -> StoreResult<usize> {
+        Ok(engine.approximate_len(Partition::Node)?)
     }
 
     fn for_each_in_shard(

@@ -523,6 +523,20 @@ impl VectorIndexRegistry {
         }
     }
 
+    /// Whether a running build, not the writer, is responsible for folding
+    /// writes into this index right now.
+    ///
+    /// While an index is being built the writer skips it: the build is
+    /// scanning and draining in batches, which encodes and links far cheaper
+    /// per vector than a write at a time, and it will pick this write up in
+    /// its next drain pass anyway. Doing both would pay the expensive path
+    /// during exactly the window the batched path exists for. Readers see the
+    /// partial index under the documented rebuild policy until the build ends.
+    fn build_owns_writes(&self, label: &str, property: &str) -> bool {
+        self.health_handle(label, property)
+            .is_some_and(|h| h.snapshot().is_rebuilding())
+    }
+
     /// Mint a cancellation token for a build that is about to start.
     ///
     /// The caller spawns the build with this token, then hands the thread to
@@ -545,6 +559,7 @@ impl VectorIndexRegistry {
         thread: std::thread::JoinHandle<()>,
     ) {
         self.cancel_build(name);
+        self.reap_finished_builds();
         let handle = BuildHandle {
             stop: Arc::clone(&token.0),
             thread,
@@ -595,8 +610,30 @@ impl VectorIndexRegistry {
         }
     }
 
+    /// Drop the bookkeeping for builds that have finished on their own.
+    ///
+    /// A build that runs to completion has nobody to cancel it, so its handle
+    /// would otherwise sit in the table forever, holding a joinable thread and
+    /// making every progress query report a build that ended. Reaping is lazy
+    /// (done on the paths that read or write the table) because there is no
+    /// one to notify us, and joining a finished thread returns at once.
+    fn reap_finished_builds(&self) {
+        let mut builds = self.builds.lock().unwrap_or_else(|e| e.into_inner());
+        let finished: Vec<String> = builds
+            .iter()
+            .filter(|(_, h)| h.thread.is_finished())
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in finished {
+            if let Some(handle) = builds.remove(&name) {
+                let _ = handle.thread.join();
+            }
+        }
+    }
+
     /// Names of the backfills running right now.
     pub fn running_builds(&self) -> Vec<String> {
+        self.reap_finished_builds();
         self.builds
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -613,6 +650,7 @@ impl VectorIndexRegistry {
     /// cluster-wide picture. The progress comes from the same atomic signal
     /// the search path reads, so asking costs no lock on the build.
     pub fn build_progress(&self) -> Vec<(String, String, String, Option<IndexHealthState>)> {
+        self.reap_finished_builds();
         let running: Vec<(String, String, String)> = self
             .builds
             .lock()
@@ -793,6 +831,9 @@ impl VectorIndexRegistry {
     /// write-lock across the whole batch instead of paying it per
     /// inserted vector.
     pub fn on_vector_written(&self, label: &str, node_id: NodeId, property: &str, vector: &[f32]) {
+        if self.build_owns_writes(label, property) {
+            return;
+        }
         {
             let sharded = self.sharded.read().unwrap_or_else(|e| e.into_inner());
             if let Some(layout) = sharded.get(&(label.to_string(), property.to_string())) {
@@ -820,7 +861,7 @@ impl VectorIndexRegistry {
     /// `items` is consumed: each `(NodeId, Vec<f32>)` is forwarded
     /// to the HNSW insert path without further copies.
     pub fn on_vectors_written(&self, label: &str, property: &str, items: Vec<(NodeId, Vec<f32>)>) {
-        if items.is_empty() {
+        if items.is_empty() || self.build_owns_writes(label, property) {
             return;
         }
         {

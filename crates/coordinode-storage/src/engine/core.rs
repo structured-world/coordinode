@@ -1762,6 +1762,17 @@ impl StorageEngine {
         self.oplog.is_some()
     }
 
+    /// The engine's current sequence number: every write already applied has a
+    /// seqno at or below it, and every later write a higher one.
+    ///
+    /// Read it before starting work that must later fold in "everything since",
+    /// then feed it to [`Self::changed_keys_since`]. Saves callers from
+    /// importing the Layer-3 coordinator trait to reach the same value.
+    pub fn current_seqno(&self) -> lsm_tree::SeqNo {
+        use crate::engine::coordinator::MultiModalCoordinator as _;
+        self.coordinator.current_seqno()
+    }
+
     /// Approximate live item count in a partition.
     ///
     /// Read straight off the LSM metadata, so it costs no scan — but it counts

@@ -141,6 +141,17 @@ pub struct HealthSignal {
     eta_ms: AtomicU64,
     indexed_hlc: AtomicU64,
     offline_reason: Mutex<Option<String>>,
+    /// Entries the graph still holds for nodes that are no longer members of
+    /// this index: deleted, relabelled, or stripped of the indexed property.
+    ///
+    /// An HNSW has no removal — physical eviction is a rebuild, not an
+    /// operation — so membership loss is counted here rather than applied.
+    /// Correctness at read comes from re-validating a candidate against the
+    /// record it points at; this counter is what tells the rebuild scheduler
+    /// when the stale fraction has grown enough to be worth a rebuild, the
+    /// same trade Qdrant makes with its vacuum threshold and pgvector with
+    /// VACUUM.
+    tombstones: AtomicU64,
 }
 
 impl HealthSignal {
@@ -152,6 +163,7 @@ impl HealthSignal {
             eta_ms: AtomicU64::new(0),
             indexed_hlc: AtomicU64::new(0),
             offline_reason: Mutex::new(None),
+            tombstones: AtomicU64::new(0),
         })
     }
 
@@ -163,6 +175,7 @@ impl HealthSignal {
             eta_ms: AtomicU64::new(0),
             indexed_hlc: AtomicU64::new(0),
             offline_reason: Mutex::new(None),
+            tombstones: AtomicU64::new(0),
         })
     }
 
@@ -210,6 +223,30 @@ impl HealthSignal {
         self.indexed_hlc.fetch_max(hlc, Ordering::Release);
     }
 
+    /// Count one graph entry whose node is no longer a member of this index.
+    ///
+    /// Called wherever membership loss is observed (a drain pass reconciling
+    /// changed records, a delete on the write path). It does not touch the
+    /// graph: the entry stays until a rebuild, and the read path is what keeps
+    /// results correct in the meantime.
+    pub fn record_tombstone(&self) {
+        self.tombstones.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Graph entries counted as no longer being members.
+    ///
+    /// Compared against the graph's live size, this is the stale fraction the
+    /// rebuild scheduler thresholds on.
+    pub fn tombstones(&self) -> u64 {
+        self.tombstones.load(Ordering::Relaxed)
+    }
+
+    /// Reset the tombstone count. Called by a rebuild once it has produced a
+    /// graph that holds only current members.
+    pub fn clear_tombstones(&self) {
+        self.tombstones.store(0, Ordering::Relaxed);
+    }
+
     /// Transition to `Ready`. Clears any stored offline reason. Leaves the
     /// freshness watermark untouched — readiness and freshness are orthogonal.
     pub fn mark_ready(&self) {
@@ -252,6 +289,7 @@ impl Default for HealthSignal {
             eta_ms: AtomicU64::new(0),
             indexed_hlc: AtomicU64::new(0),
             offline_reason: Mutex::new(None),
+            tombstones: AtomicU64::new(0),
         }
     }
 }

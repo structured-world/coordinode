@@ -15371,13 +15371,23 @@ fn execute_create_vector_index(
                         "vector index '{name}' has no health signal to publish build progress on"
                     ))
                 })?;
+                // Published before the thread exists: from here writers leave
+                // this index to the build, so there is no window in which a
+                // write is neither applied by a writer nor owned by a drain.
+                health.report_rebuild_progress(0.0, 0);
 
                 let thread = std::thread::Builder::new()
                     .name(format!("vec-backfill-{name}"))
                     .spawn(move || {
                         let outcome =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                backfill_vector_index(
+                                // Scan phase, then drain: the scan covers
+                                // history as of its start, the drain folds in
+                                // everything written since, repeating until it
+                                // has nothing left to fold. Only then does the
+                                // index count as built.
+                                let start_seqno = engine.current_seqno();
+                                let scanned = backfill_vector_index(
                                     engine.as_ref(),
                                     hnsw.as_ref(),
                                     health.as_ref(),
@@ -15385,7 +15395,43 @@ fn execute_create_vector_index(
                                     &label_owned,
                                     fid,
                                     shard_id,
-                                )
+                                )?;
+                                if matches!(scanned, BackfillOutcome::Cancelled) {
+                                    return Ok(scanned);
+                                }
+                                let watermark = drain_vector_index(
+                                    engine.as_ref(),
+                                    hnsw.as_ref(),
+                                    health.as_ref(),
+                                    &build_token,
+                                    &label_owned,
+                                    fid,
+                                    start_seqno,
+                                )?;
+                                if build_token.is_cancelled() {
+                                    return Ok(BackfillOutcome::Cancelled);
+                                }
+                                // Hand maintenance back to the writers BEFORE
+                                // the last pass, then drain once more from the
+                                // watermark that pass started at. A write
+                                // landing in between is therefore either
+                                // folded by the pass or applied by the writer,
+                                // and a vector covered twice costs nothing:
+                                // an insert of a known id is an upsert. Doing
+                                // it the other way round would leave exactly
+                                // that window unowned.
+                                health.mark_ready();
+                                let watermark = drain_vector_index(
+                                    engine.as_ref(),
+                                    hnsw.as_ref(),
+                                    health.as_ref(),
+                                    &build_token,
+                                    &label_owned,
+                                    fid,
+                                    watermark,
+                                )?;
+                                health.advance_indexed_hlc(watermark);
+                                Ok(scanned)
                             }));
                         let terminal = match outcome {
                             Ok(Ok(BackfillOutcome::Complete { written })) => {
@@ -15531,10 +15577,7 @@ fn backfill_vector_index(
     // Upper bound over every version and tombstone the levels hold, for the
     // whole partition rather than this label — deliberately generous, since a
     // progress bar that overshoots and stalls at 100% reads as a hang.
-    let estimated_total = engine
-        .approximate_len(coordinode_storage::engine::partition::Partition::Node)
-        .unwrap_or(0)
-        .max(1) as f64;
+    let estimated_total = LocalNodeStore.approximate_count(engine).unwrap_or(0).max(1) as f64;
     let mut written = 0u64;
     let mut since_checkpoint = 0u64;
     let mut scanned = 0u64;
@@ -15575,6 +15618,93 @@ fn backfill_vector_index(
         return Ok(BackfillOutcome::Cancelled);
     }
     Ok(BackfillOutcome::Complete { written })
+}
+
+/// Fold every write that landed since `since_seqno` into the index, repeating
+/// until there is nothing left to fold.
+///
+/// This is the drain phase of the scan-drain-commit build. MongoDB needs a
+/// side-writes table for it because WiredTiger cannot enumerate what changed
+/// since a point; our LSM can, so storage IS the side-writes table and
+/// `changed_keys_since` is the drain's input.
+///
+/// Each candidate is reconciled rather than merely inserted: membership can be
+/// LOST while the node lives (its vector property removed, its label changed),
+/// and that is decidable from the current record alone, so no before-image is
+/// needed. A node that is still a member is upserted; one that is not is
+/// counted as a tombstone and left in the graph, which is what every engine in
+/// this space does — physical removal from an HNSW is a rebuild, not an
+/// operation, and correctness at read comes from re-validating the candidate.
+///
+/// Returns the watermark reached, so the caller can hand it to the steady-state
+/// maintainer.
+fn drain_vector_index(
+    engine: &StorageEngine,
+    hnsw: &std::sync::RwLock<coordinode_vector::hnsw::HnswIndex>,
+    health: &coordinode_vector::health::HealthSignal,
+    token: &crate::index::BuildToken,
+    label: &str,
+    field_id: u32,
+    since_seqno: u64,
+) -> std::result::Result<u64, String> {
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+
+    let mut watermark = since_seqno;
+    loop {
+        if token.is_cancelled() {
+            return Ok(watermark);
+        }
+        // Read the watermark BEFORE collecting, so a write racing this pass is
+        // caught by the next one instead of falling between two passes.
+        let next_watermark = engine.current_seqno();
+        let changed = LocalNodeStore
+            .changed_since(engine, watermark)
+            .map_err(|e| format!("drain scan: {e}"))?;
+        if changed.is_empty() {
+            return Ok(next_watermark);
+        }
+
+        // Group by shard so each group resolves through one batched multi_get
+        // rather than a lookup per candidate.
+        let mut by_shard: std::collections::HashMap<
+            u16,
+            Vec<coordinode_core::graph::node::NodeId>,
+        > = std::collections::HashMap::new();
+        for (shard, node_id) in changed {
+            by_shard.entry(shard).or_default().push(node_id);
+        }
+
+        let read_txn = coordinode_storage::engine::transaction::Transaction::new(
+            engine,
+            None,
+            coordinode_core::txn::timestamp::Timestamp::ZERO,
+            None,
+        );
+        let mut batch: Vec<(u64, Vec<f32>)> = Vec::new();
+        for (shard, ids) in by_shard {
+            let records = LocalNodeStore
+                .get_many(&read_txn, shard, &ids)
+                .map_err(|e| format!("drain read: {e}"))?;
+            for (node_id, record) in ids.iter().zip(records) {
+                let member = record
+                    .filter(|r| r.primary_label() == label)
+                    .and_then(|r| r.props.get(&field_id).and_then(try_extract_vector));
+                match member {
+                    Some(vec_data) => batch.push((node_id.as_raw(), vec_data)),
+                    // Deleted, relabelled, or stripped of its vector: the
+                    // graph keeps the stale entry and the read path filters
+                    // it, the same trade every HNSW in this space makes.
+                    None => health.record_tombstone(),
+                }
+            }
+        }
+        if !batch.is_empty() {
+            if let Ok(mut graph) = hnsw.write() {
+                graph.insert_batch(batch);
+            }
+        }
+        watermark = next_watermark;
+    }
 }
 
 /// Execute `DROP VECTOR INDEX idx`: removes an HNSW vector index by name.

@@ -81,3 +81,65 @@ fn drop_cancels_a_running_build_and_it_stays_dropped() {
         )
         .expect("re-create after the cancelled build");
 }
+
+/// Writes that land WHILE the index is building must end up in it.
+///
+/// While a build runs the writer leaves the index alone: batching the vectors
+/// through the build is much cheaper per vector than encoding and linking one
+/// at a time. What makes that safe is the drain, which folds in everything
+/// written since the scan started and repeats until there is nothing left, and
+/// only then hands maintenance back to the writers. Without it those writes
+/// would simply be missing from the graph.
+#[test]
+fn writes_during_a_build_are_drained_into_the_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open db");
+
+    db.execute_cypher(
+        "UNWIND range(1, 3000) AS i CREATE (:Doc {tag: 'seed', embedding: [toFloat(i), 0.0, 0.0]})",
+    )
+    .expect("seed vectors");
+
+    db.execute_cypher(
+        "CREATE VECTOR INDEX doc_emb ON :Doc(embedding) OPTIONS {metric: \"cosine\", online_during_build: \"partial-recall\"}",
+    )
+    .expect("create vector index");
+
+    // Written while the build is in flight, so only the drain can place them.
+    db.execute_cypher(
+        "UNWIND range(1, 200) AS i \
+         CREATE (:Doc {tag: 'late', embedding: [0.0, toFloat(i), 0.0]})",
+    )
+    .expect("write during build");
+
+    // Wait for the build to finish rather than sleeping a guess.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !db.index_builds().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "build never finished");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // Every late vector must be its own nearest neighbour. A vector the drain
+    // missed answers with something else entirely.
+    for i in [1.0_f32, 97.0, 200.0] {
+        let rows = db
+            .execute_cypher(&format!(
+                "MATCH (n:Doc) WITH n, vector_similarity(n.embedding, [0.0, {i:.1}, 0.0]) AS s \
+                 ORDER BY s DESC LIMIT 1 RETURN n.tag AS tag"
+            ))
+            .expect("vector search");
+        assert_eq!(
+            rows.len(),
+            1,
+            "expected one nearest neighbour for the late vector {i}"
+        );
+        let tag = rows[0]
+            .get("tag")
+            .and_then(|v| v.as_str().map(String::from));
+        assert_eq!(
+            tag.as_deref(),
+            Some("late"),
+            "a vector written during the build was not drained into the index"
+        );
+    }
+}
