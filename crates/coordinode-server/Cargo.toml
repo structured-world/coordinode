@@ -83,6 +83,7 @@ tonic-prost-build = "0.14"
 [dev-dependencies]
 tempfile = { workspace = true }
 coordinode-client = { workspace = true }
+coordinode-test-fixtures = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-postgres = "0.7.18"
 

@@ -23,12 +23,7 @@ use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, Stor
 use coordinode_storage::engine::core::StorageEngine;
 use parking_lot::RwLock;
 
-fn alloc_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
+use coordinode_test_fixtures::alloc_port;
 
 struct Node {
     db: Arc<RwLock<Database>>,

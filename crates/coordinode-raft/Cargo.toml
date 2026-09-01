@@ -31,6 +31,7 @@ prost = { workspace = true }
 coordinode-wire = { workspace = true }
 
 [dev-dependencies]
+coordinode-test-fixtures = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

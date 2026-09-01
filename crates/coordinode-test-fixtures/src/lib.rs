@@ -210,6 +210,60 @@ pub fn engine_for_memory() -> EngineFixture {
     }
 }
 
+/// Ports this process has already handed out.
+///
+/// Deliberately global: the property being enforced is that no port is
+/// returned twice for the lifetime of the process, and a caller that had to
+/// thread state through to get that could simply forget to. Contention is
+/// nil (a handful of allocations per test), so a plain std mutex is enough
+/// and keeps this crate free of another dependency.
+static HANDED_OUT: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+
+/// Reserve a loopback port for a test that needs to know an address before
+/// the code under test binds it.
+///
+/// Binding to `:0` asks the kernel for a free port, but the probe has to be
+/// closed before the port can be handed over, and a closed probe leaves the
+/// port free for the next one to be given the same answer. A test that
+/// allocates several addresses up front could therefore hand two nodes the
+/// same port, and the second to bind it dies with `EADDRINUSE`. Remembering
+/// what has been handed out and asking again on a repeat removes that.
+///
+/// What remains is a genuine race with the rest of the machine: the port is
+/// free between this call and the bind, so bind as early as the code under
+/// test allows.
+pub fn alloc_port() -> u16 {
+    // Generous relative to the number of ports a test asks for, and small
+    // enough that a kernel with nothing left to give fails the test rather
+    // than hanging it.
+    const ATTEMPTS: usize = 64;
+
+    for _ in 0..ATTEMPTS {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0 for port alloc");
+        let port = probe.local_addr().expect("local_addr").port();
+        drop(probe);
+
+        let mut handed_out = HANDED_OUT.lock().expect("port registry poisoned");
+        if !handed_out.contains(&port) {
+            handed_out.push(port);
+            return port;
+        }
+    }
+    panic!("no unused loopback port after {ATTEMPTS} attempts");
+}
+
+/// Reserve `N` distinct loopback ports at once, for tests that read better
+/// naming them together. Each comes from [`alloc_port`], so they are
+/// distinct for the same reason.
+///
+/// ```
+/// let [a, b] = coordinode_test_fixtures::alloc_ports();
+/// assert_ne!(a, b);
+/// ```
+pub fn alloc_ports<const N: usize>() -> [u16; N] {
+    std::array::from_fn(|_| alloc_port())
+}
+
 /// Which backend the env var selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TestBackend {

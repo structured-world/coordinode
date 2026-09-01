@@ -192,3 +192,24 @@ fn usage_example_logic_test_pattern() {
     // scratch_path for Tantivy-style ancillary state:
     let _scratch_for_text_idx = fx.scratch_path().join("text_idx");
 }
+
+/// The property a cluster test depends on: two nodes are never handed the
+/// same address. Asking the kernel one port at a time, releasing each
+/// before the next, gives no such guarantee, and a repeat means the second
+/// node to bind dies with `EADDRINUSE`.
+#[test]
+fn allocated_ports_are_never_repeated() {
+    let ports: Vec<u16> = (0..64).map(|_| alloc_port()).collect();
+    let unique: std::collections::HashSet<u16> = ports.iter().copied().collect();
+    assert_eq!(unique.len(), ports.len(), "a port was handed out twice");
+}
+
+/// Allocating as a group is the same guarantee, in the shape a test that
+/// names its nodes reads better with.
+#[test]
+fn grouped_allocation_yields_distinct_ports() {
+    let [a, b, c] = alloc_ports();
+    assert_ne!(a, b);
+    assert_ne!(b, c);
+    assert_ne!(a, c);
+}

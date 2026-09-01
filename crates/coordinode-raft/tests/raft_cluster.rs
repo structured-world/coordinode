@@ -23,16 +23,7 @@ use coordinode_storage::engine::partition::Partition;
 /// Hard timeout for cluster tests.
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Allocate a random available port by binding to :0 and reading the assigned port.
-///
-/// Each nextest process gets its own address space, so static counters don't work.
-/// Bind-to-zero guarantees OS-level uniqueness across parallel test processes.
-fn alloc_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0 for port alloc");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
-}
+use coordinode_test_fixtures::alloc_port;
 
 struct TestNode {
     node: RaftNode,
