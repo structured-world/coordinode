@@ -141,6 +141,20 @@ jobs:
         run: |
           rm -rf /tmp/cn-server-bench-* /tmp/cn-cluster-bench-* || true
 
+      - name: Drop stale submodule credentials
+        # The checkout action strips the auth header it persisted into each
+        # submodule before writing a fresh one, but it can only walk the
+        # submodules present in the tree it finds. A run interrupted while
+        # the tree was on another branch leaves the header behind, and the
+        # next fetch then sends two Authorization headers and is answered
+        # with 400. Nothing here needs a submodule to be checked out, so
+        # this clears the header wherever it survived.
+        run: |
+          for cfg in "$GITHUB_WORKSPACE"/.git/modules/*/config; do
+            [ -f "$cfg" ] || continue
+            git config --file "$cfg" --unset-all 'http.https://github.com/.extraheader' || true
+          done
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -615,6 +629,12 @@ jobs:
         # tree, so history never compounds (we keep a few generations
         # via the GH workflow artifact upload step for forensic
         # reproducibility, not in git).
+        #
+        # The commit is built out of a scratch index and pushed by object
+        # id, so the working tree is never switched to bench-data. On this
+        # persistent runner a switch would outlive the run: the workdir
+        # would sit on a branch that carries no submodules, where the next
+        # checkout cannot reach the credentials it persisted into them.
         run: |
           set -euo pipefail
           NEW_FILES=$(git status --porcelain bench-results/ | awk '{print $2}')
@@ -633,31 +653,41 @@ jobs:
               | tar -x -C "$SNAPSHOT" 2>/dev/null \
               || echo "::notice::bench-data archive empty — starting fresh"
           fi
-          # Overlay the new files on top of the snapshot.
-          cp -R bench-results/. "$SNAPSHOT/bench-results/" 2>/dev/null || true
+          # Overlay the new files on top of the snapshot. The directory is
+          # created first because the archive above leaves none when the
+          # branch is new, and the copy is what carries this run's results.
+          mkdir -p "$SNAPSHOT/bench-results"
+          cp -R bench-results/. "$SNAPSHOT/bench-results/"
 
           git config user.name  "coordinode-bench-bot"
           git config user.email "bench-bot@users.noreply.github.com"
 
-          # If the fetch above created a local bench-data branch, drop it
-          # — otherwise `git checkout --orphan bench-data` fails with
-          # "a branch named 'bench-data' already exists".
+          # The archive above has read everything the local branch was
+          # fetched for, and it must not survive the run: the remote one
+          # is replaced wholesale every time, so the next fetch into a
+          # local branch left behind here would be a non-fast-forward.
           git branch -D bench-data 2>/dev/null || true
 
-          # Recreate bench-data as a fresh orphan branch each run.
-          git checkout --orphan bench-data
-          git rm -rf . 2>/dev/null || true
-          # Copy snapshot back into the working tree.
-          mkdir -p bench-results
-          cp -R "$SNAPSHOT/bench-results/." bench-results/
-          git add bench-results/
-          git commit \
+          MODALITIES=$(find "$SNAPSHOT/bench-results" -mindepth 1 -maxdepth 1 -type d \
+            -exec basename {} \; | sort -u | xargs)
+
+          # Stage the snapshot through an index of its own, so the real
+          # index and working tree are untouched.
+          GIT_INDEX_FILE=$(mktemp -u)
+          export GIT_INDEX_FILE
+          git --work-tree="$SNAPSHOT" add -A bench-results
+          TREE=$(git write-tree)
+          # No parent: the commit carries the whole tree, which is what
+          # makes each push a replacement rather than a growing history.
+          COMMIT=$(git commit-tree "$TREE" \
             -m "chore(bench): results @ ${{ github.sha }}" \
-            -m "Modalities: $(find bench-results -mindepth 1 -maxdepth 1 -type d | xargs -I{} basename {} | sort -u | xargs)" \
-            -m "Auto-committed by .github/workflows/bench.yml (runner: gpu-private-systems)"
-          # Force-push the orphan branch — overwrites history every run,
-          # which is the intended pattern for this branch.
-          git push origin bench-data --force
+            -m "Modalities: $MODALITIES" \
+            -m "Auto-committed by .github/workflows/bench.yml (runner: gpu-private-systems)")
+          unset GIT_INDEX_FILE
+
+          # Force-push by object id — overwrites history every run, which
+          # is the intended pattern for this branch.
+          git push --force origin "$COMMIT:refs/heads/bench-data"
 
       - name: Upload workflow artifact (90-day retention)
         uses: actions/upload-artifact@v4
