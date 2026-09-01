@@ -87,8 +87,15 @@ pub struct RaftNode {
     /// Shared handle to the Raft oplog, for reading committed entries since a
     /// checkpoint (WAL-replay repair). Shares the `LogStore`'s manager.
     oplog: Arc<std::sync::Mutex<coordinode_storage::oplog::OplogManager>>,
-    /// gRPC server shutdown signal. Dropped on shutdown to stop the server.
-    _grpc_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    /// gRPC server shutdown signal. Taken by `shutdown()` (or dropped with
+    /// the node) to stop the accept loop.
+    grpc_shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// The gRPC serve task. `shutdown()` gives its connection drain a short
+    /// grace and then aborts it: tonic holds the listener until every open
+    /// connection closes, and peers keep idle HTTP/2 channels open
+    /// indefinitely — without the abort the port stays bound and a
+    /// restarting node is locked out of its own address.
+    grpc_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Snapshot trigger background task abort handle.
     _snapshot_trigger: Option<tokio::task::JoinHandle<()>>,
 }
@@ -185,7 +192,8 @@ impl RaftNode {
             node_id,
             engine,
             oplog,
-            _grpc_shutdown: None,
+            grpc_shutdown: std::sync::Mutex::new(None),
+            grpc_task: std::sync::Mutex::new(None),
             _snapshot_trigger: None,
         })
     }
@@ -290,15 +298,27 @@ impl RaftNode {
             }
         }
 
-        // Start gRPC server for inter-node Raft RPCs with shutdown signal
+        // Start gRPC server for inter-node Raft RPCs with shutdown signal.
+        // The listener is bound EAGERLY: a busy port must fail this open
+        // instead of producing a node that reports success while its server
+        // task dies unheard — deaf to the cluster, green on every local
+        // check. Bound through tokio rather than tonic's TcpIncoming::bind
+        // because tokio sets SO_REUSEADDR: a node restarting on its own
+        // address must not be locked out by its previous life's TIME_WAIT
+        // sockets. Nodelay mirrors tonic's serve(addr) default.
+        let listener = tokio::net::TcpListener::bind(listen_addr)
+            .await
+            .map_err(|e| RaftNodeError::Init(format!("bind {listen_addr}: {e}")))?;
+        let incoming =
+            tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
         let handler = RaftGrpcHandler::new(Arc::clone(&raft), Arc::clone(&engine));
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let server =
             tonic::transport::Server::builder().add_service(RaftServiceServer::new(handler));
 
-        tokio::spawn(async move {
-            let graceful = server.serve_with_shutdown(listen_addr, async {
+        let grpc_task = tokio::spawn(async move {
+            let graceful = server.serve_with_incoming_shutdown(incoming, async {
                 let _ = shutdown_rx.await;
             });
             if let Err(e) = graceful.await {
@@ -319,7 +339,8 @@ impl RaftNode {
             node_id,
             engine,
             oplog,
-            _grpc_shutdown: Some(shutdown_tx),
+            grpc_shutdown: std::sync::Mutex::new(Some(shutdown_tx)),
+            grpc_task: std::sync::Mutex::new(Some(grpc_task)),
             _snapshot_trigger: Some(snap_handle),
         })
     }
@@ -438,7 +459,9 @@ impl RaftNode {
             node_id,
             engine,
             oplog,
-            _grpc_shutdown: None, // no internal server — caller manages the router
+            // no internal server — caller manages the router
+            grpc_shutdown: std::sync::Mutex::new(None),
+            grpc_task: std::sync::Mutex::new(None),
             _snapshot_trigger: Some(snap_handle),
         };
 
@@ -518,7 +541,9 @@ impl RaftNode {
             node_id,
             engine,
             oplog,
-            _grpc_shutdown: None, // no internal server — caller manages the router
+            // no internal server — caller manages the router
+            grpc_shutdown: std::sync::Mutex::new(None),
+            grpc_task: std::sync::Mutex::new(None),
             _snapshot_trigger: Some(snap_handle),
         };
 
@@ -582,14 +607,23 @@ impl RaftNode {
 
         let raft = Arc::new(raft);
 
+        // Bound eagerly for the same reason as in open_cluster: a busy port
+        // is a hard open error, never a deaf node. tokio's bind sets
+        // SO_REUSEADDR so a restart on the same address is not locked out
+        // by the previous life's TIME_WAIT sockets.
+        let listener = tokio::net::TcpListener::bind(listen_addr)
+            .await
+            .map_err(|e| RaftNodeError::Init(format!("bind {listen_addr}: {e}")))?;
+        let incoming =
+            tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
         let handler = RaftGrpcHandler::new(Arc::clone(&raft), Arc::clone(&engine));
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let server =
             tonic::transport::Server::builder().add_service(RaftServiceServer::new(handler));
 
-        tokio::spawn(async move {
-            let graceful = server.serve_with_shutdown(listen_addr, async {
+        let grpc_task = tokio::spawn(async move {
+            let graceful = server.serve_with_incoming_shutdown(incoming, async {
                 let _ = shutdown_rx.await;
             });
             if let Err(e) = graceful.await {
@@ -609,7 +643,8 @@ impl RaftNode {
             node_id,
             engine,
             oplog,
-            _grpc_shutdown: Some(shutdown_tx),
+            grpc_shutdown: std::sync::Mutex::new(Some(shutdown_tx)),
+            grpc_task: std::sync::Mutex::new(Some(grpc_task)),
             _snapshot_trigger: Some(snap_handle),
         })
     }
@@ -1149,6 +1184,25 @@ impl RaftNode {
                 .await
                 .map_err(|e| RaftNodeError::Shutdown(e.to_string()))
         };
+
+        // Free the listen port deterministically. Dropping the sender stops
+        // the accept loop, but tonic then holds the LISTENER until every open
+        // connection closes — and peers keep idle HTTP/2 channels open
+        // indefinitely, so without a bound the port never frees and a node
+        // restarting on its own address is locked out. Give the drain a
+        // short grace, then abort the serve task; the abort drops the
+        // listener.
+        let sender = self.grpc_shutdown.lock().ok().and_then(|mut g| g.take());
+        drop(sender);
+        let task = self.grpc_task.lock().ok().and_then(|mut g| g.take());
+        if let Some(mut task) = task {
+            if tokio::time::timeout(std::time::Duration::from_millis(500), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
+        }
 
         // Flush active memtables to SST so Phase 2 (reopen) sees all writes.
         //

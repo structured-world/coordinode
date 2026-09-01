@@ -1768,14 +1768,36 @@ async fn cluster_follower_restart_reconnection() {
             )]))
             .expect("reopen3"),
         );
-        let n3_new = RaftNode::open_cluster(
-            3,
-            Arc::clone(&e3_new),
-            format!("127.0.0.1:{p3}").parse().expect("a"),
-            format!("http://127.0.0.1:{p3}"),
-        )
-        .await
-        .expect("reopen n3");
+        // The port was released for the whole downtime window, so a
+        // concurrently running test can have grabbed it via its own
+        // alloc_port(); the eager bind then fails the reopen. Retry until
+        // the thief lets go — the peers keep dialing this same address, so
+        // moving to a fresh port would defeat the reconnection scenario.
+        let n3_new = {
+            let mut last_err = None;
+            let mut reopened = None;
+            for _ in 0..20 {
+                match RaftNode::open_cluster(
+                    3,
+                    Arc::clone(&e3_new),
+                    format!("127.0.0.1:{p3}").parse().expect("a"),
+                    format!("http://127.0.0.1:{p3}"),
+                )
+                .await
+                {
+                    Ok(n) => {
+                        reopened = Some(n);
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                }
+            }
+            assert!(reopened.is_some(), "reopen n3 after retries: {last_err:?}");
+            reopened.expect("asserted above")
+        };
 
         // Wait for reconnection + log replay
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -3480,4 +3502,31 @@ async fn read_oplog_since_returns_post_checkpoint_ops() {
     .await;
 
     assert!(result.is_ok(), "read_oplog_since test TIMED OUT");
+}
+
+/// A node whose listen port is already taken must fail at open, not come up
+/// "successfully" with a gRPC server that never bound: a deaf node passes
+/// every local check while the rest of the cluster cannot reach it, and the
+/// only trace is an error log from a detached task.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_cluster_rejects_busy_port() {
+    let port = alloc_port();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    let _occupier = std::net::TcpListener::bind(addr).expect("occupy the port");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+
+    let result = RaftNode::open_cluster(1, engine, addr, format!("http://127.0.0.1:{port}")).await;
+    assert!(
+        result.is_err(),
+        "open_cluster on a busy port must fail eagerly instead of starting a deaf node"
+    );
 }
