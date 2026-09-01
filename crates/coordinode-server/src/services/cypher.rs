@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 // no-std: spin::RwLock (drop-in).
@@ -375,6 +376,38 @@ pub struct CypherServiceImpl {
     nplus1_detector: Arc<NPlus1Detector>,
     /// Raft node for read fence (follower reads). `None` in standalone mode.
     raft_node: Option<Arc<RaftNode>>,
+    /// Lazily-connected channels to peers, keyed by advertised address, for
+    /// forwarding a write that arrived while another node holds leadership.
+    ///
+    /// Lazy channels reconnect on their own, so a peer that restarts does not
+    /// poison the entry; keeping them keyed by address means a leadership
+    /// change costs a map lookup rather than a connection.
+    peer_channels: Arc<parking_lot::Mutex<HashMap<String, tonic::transport::Channel>>>,
+}
+
+/// Marks a request that has already been forwarded once.
+///
+/// A stale leader hint could otherwise bounce a write between two nodes that
+/// each believe the other leads. One hop is enough: the second node answers
+/// with NOT_LEADER and its own hint, and the client decides.
+const FORWARDED_HEADER: &str = "x-coordinode-forwarded";
+
+/// How many nodes handled this request: 0 local, 1 forwarded, 2+ scattered.
+const HOPS_HEADER: &str = "x-coordinode-hops";
+
+/// The leader named by a failure that says this node cannot take the write.
+///
+/// `None` for any other failure, and also for a leader change during an
+/// election, when there is no node to forward to and the caller has to be told
+/// to try again.
+fn leader_hint(err: &DatabaseError) -> Option<u64> {
+    match err {
+        DatabaseError::NotLeader { leader_id }
+        | DatabaseError::Execution(
+            coordinode_query::executor::runner::ExecutionError::NotLeader { leader_id },
+        ) => *leader_id,
+        _ => None,
+    }
 }
 
 impl CypherServiceImpl {
@@ -389,6 +422,7 @@ impl CypherServiceImpl {
             query_registry,
             nplus1_detector,
             raft_node: None,
+            peer_channels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
@@ -396,6 +430,70 @@ impl CypherServiceImpl {
     pub fn with_raft_node(mut self, raft_node: Arc<RaftNode>) -> Self {
         self.raft_node = Some(raft_node);
         self
+    }
+
+    /// A lazily-connected channel to `addr`, created once and reused.
+    ///
+    /// Lazy means no connection is made here: the first RPC connects, and the
+    /// channel reconnects by itself afterwards, so a peer restart costs a
+    /// retry rather than a permanently dead entry.
+    fn peer_channel(&self, addr: &str) -> Result<tonic::transport::Channel, Status> {
+        if let Some(channel) = self.peer_channels.lock().get(addr) {
+            return Ok(channel.clone());
+        }
+        let mut endpoint = tonic::transport::Endpoint::from_shared(addr.to_string())
+            .map_err(|e| Status::internal(format!("invalid peer address '{addr}': {e}")))?
+            .connect_timeout(std::time::Duration::from_secs(5));
+        // Same process-global TLS the Raft and segment-transfer clients use: a
+        // cluster that encrypts peer traffic must not get a plaintext hop here.
+        if let Some(tls) = coordinode_wire::wire_client_tls() {
+            endpoint = endpoint
+                .tls_config(tls)
+                .map_err(|e| Status::internal(format!("peer TLS config for '{addr}': {e}")))?;
+        }
+        let channel = endpoint.connect_lazy();
+        self.peer_channels
+            .lock()
+            .insert(addr.to_string(), channel.clone());
+        Ok(channel)
+    }
+
+    /// Re-issue this write at the leader and return its answer as our own.
+    ///
+    /// The caller reached a node that cannot replicate the write. Rather than
+    /// making every client learn the cluster's topology, the node that knows
+    /// who leads passes the request along: a level-0 client keeps working
+    /// through a leader change without noticing one happened. The response
+    /// carries the hop count, so a client that DOES care can see it and start
+    /// addressing the leader directly.
+    async fn forward_to_leader(
+        &self,
+        leader_id: u64,
+        req: query::ExecuteCypherRequest,
+    ) -> Result<Response<query::ExecuteCypherResponse>, Status> {
+        let addr = self
+            .raft_node
+            .as_ref()
+            .and_then(|n| n.node_addr(leader_id))
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "not the leader; leader is node {leader_id}, whose address this node \
+                     does not know"
+                ))
+            })?;
+        let mut client =
+            query::cypher_service_client::CypherServiceClient::new(self.peer_channel(&addr)?);
+        let mut forwarded = Request::new(req);
+        forwarded.metadata_mut().insert(
+            FORWARDED_HEADER,
+            tonic::metadata::MetadataValue::from_static("1"),
+        );
+        let mut response = client.execute_cypher(forwarded).await?;
+        response.metadata_mut().insert(
+            HOPS_HEADER,
+            tonic::metadata::MetadataValue::from_static("1"),
+        );
+        Ok(response)
     }
 }
 
@@ -406,6 +504,11 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         request: Request<query::ExecuteCypherRequest>,
     ) -> Result<Response<query::ExecuteCypherResponse>, Status> {
         let source_ctx = extract_source_context(&request);
+        // Read before the request is consumed: a request that has already been
+        // passed along once is answered here, right or wrong, rather than sent
+        // on again. Two nodes with stale hints would otherwise trade it back
+        // and forth while the client waits.
+        let already_forwarded = request.metadata().contains_key(FORWARDED_HEADER);
         let req = request.into_inner();
 
         let start = std::time::Instant::now();
@@ -542,10 +645,26 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         let (applied_index, served_by_leader) = if let Some(ref raft) = self.raft_node {
             let preference = ReadPreference::from_proto(req.read_preference);
             let mut fence = raft.read_fence();
-            fence
-                .apply_default(preference, concern)
-                .await
-                .map_err(fence_error_to_status)?;
+            if let Err(e) = fence.apply_default(preference, concern).await {
+                // The request needs the leader and this node is not it. Pass it
+                // along rather than making the caller find the leader itself:
+                // that is what a client without a topology map cannot do, and
+                // this node already knows the answer. Once forwarded, a request
+                // is answered rather than passed on again.
+                match raft.current_leader() {
+                    Some(leader_id)
+                        if !already_forwarded
+                            && matches!(
+                                e,
+                                ReadFenceError::NotLeader
+                                    | ReadFenceError::LinearizableRequiresLeader
+                            ) =>
+                    {
+                        return self.forward_to_leader(leader_id, req).await;
+                    }
+                    _ => return Err(fence_error_to_status(e)),
+                }
+            }
 
             // Causal fence: block until applied_index >= after_idx.
             // after_idx = 0 means no fence (default).
@@ -610,15 +729,29 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             } else {
                 Some(convert_params(&req.parameters))
             };
-            self.writer
-                .execute(
-                    &req.query,
-                    params,
-                    source_ctx.as_ref(),
-                    Some(&executor_read_concern),
-                    executor_write_concern.as_ref(),
-                )
-                .map_err(db_error_to_status)?
+            match self.writer.execute(
+                &req.query,
+                params,
+                source_ctx.as_ref(),
+                Some(&executor_read_concern),
+                executor_write_concern.as_ref(),
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    // The write came to a node that cannot replicate it. If we
+                    // know who leads and this request has not already been
+                    // passed along once, send it there and answer with what
+                    // the leader says: the client never learns that leadership
+                    // moved. Nothing was applied here, so forwarding replays
+                    // the write rather than repeating it.
+                    match leader_hint(&e) {
+                        Some(leader_id) if !already_forwarded => {
+                            return self.forward_to_leader(leader_id, req).await;
+                        }
+                        _ => return Err(db_error_to_status(e)),
+                    }
+                }
+            }
         };
         // Read / write guard released here, held only during query execution.
         let result_rows = exec_result.rows;

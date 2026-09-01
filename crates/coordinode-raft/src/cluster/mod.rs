@@ -999,6 +999,23 @@ impl RaftNode {
         self.raft.metrics().borrow_watched().current_leader
     }
 
+    /// The advertised address of a cluster member, as recorded in membership.
+    ///
+    /// This is where another node reaches it: the address the member published
+    /// when it joined, not the address it happens to be listening on locally.
+    /// `None` for an id the current membership does not contain, which is the
+    /// honest answer for a member that has since been removed.
+    pub fn node_addr(&self, node_id: u64) -> Option<String> {
+        use openraft::async_runtime::watch::WatchReceiver;
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        metrics
+            .membership_config
+            .membership()
+            .get_node(&node_id)
+            .map(|n| n.addr.clone())
+            .filter(|addr| !addr.is_empty())
+    }
+
     /// Subscribe to applied index updates.
     ///
     /// Returns a clone of the applied watermark receiver. The receiver

@@ -43,32 +43,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Compile admin/cluster.proto with both server and client stubs.
-    // Server stub: ClusterServiceServer (registered in main.rs).
-    // Client stub: ClusterServiceClient (used by `coordinode admin node join` CLI subcommand).
+    // Every service in ONE call, with both stubs.
+    //
+    // prost writes a file per proto PACKAGE, and these protos import each
+    // other (a session runs Cypher, so session.proto pulls cypher.proto in).
+    // Compiling them in separate calls therefore has a later call regenerate a
+    // package an earlier one already wrote, silently dropping whatever the
+    // earlier call had that this one does not reach. Splitting by which stubs
+    // a service needs is the tempting arrangement and the broken one.
+    //
+    // Both stubs everywhere, then: the server stubs are what nodes serve, and
+    // the client stubs are how they talk to each other. Cypher's client is the
+    // load-bearing one, used to forward a write to whichever node leads, so a
+    // client never has to know which that is. Unused clients cost compile
+    // time and nothing else.
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
         .compile_protos(
-            &[format!(
-                "{proto_root_str}/coordinode/v1/admin/cluster.proto"
-            )],
-            &includes,
-        )?;
-
-    // Compile remaining service protos (server-only stubs).
-    tonic_prost_build::configure()
-        .build_server(true)
-        .build_client(false)
-        .compile_protos(
             &[
+                format!("{proto_root_str}/coordinode/v1/admin/cluster.proto"),
+                format!("{proto_root_str}/coordinode/v1/query/cypher.proto"),
+                format!("{proto_root_str}/coordinode/v1/query/vector.proto"),
+                format!("{proto_root_str}/coordinode/v1/query/text.proto"),
                 format!("{proto_root_str}/coordinode/v1/graph/graph.proto"),
                 format!("{proto_root_str}/coordinode/v1/graph/schema.proto"),
                 format!("{proto_root_str}/coordinode/v1/graph/blob.proto"),
-                format!("{proto_root_str}/coordinode/v1/query/cypher.proto"),
                 format!("{proto_root_str}/coordinode/v1/session/session.proto"),
-                format!("{proto_root_str}/coordinode/v1/query/vector.proto"),
-                format!("{proto_root_str}/coordinode/v1/query/text.proto"),
                 format!("{proto_root_str}/coordinode/v1/health/health.proto"),
                 format!("{proto_root_str}/coordinode/v1/replication/cdc.proto"),
             ],

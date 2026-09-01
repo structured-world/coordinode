@@ -58,7 +58,12 @@ mod ops;
 mod pg;
 mod registry;
 mod serve;
-mod services;
+/// The gRPC services this binary serves.
+///
+/// Public so an integration test can stand a service up on a port and drive it
+/// the way a client does. Nothing here is a stable API for other crates: the
+/// binary is the product, and no crate may depend on it.
+pub mod services;
 
 use admin::{admin_node_decommission, admin_node_join, admin_storage_config};
 use tracing::info;
