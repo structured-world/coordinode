@@ -27,6 +27,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         canonicalize_for_protoc(&std::path::Path::new(&manifest_dir).join("../../proto"));
 
     let proto_root_str = proto_root.display().to_string();
+
+    // Regenerate whenever any `.proto` under the submodule changes: the proto
+    // tree lives outside the crate, so without this cargo never re-runs
+    // build.rs after the submodule moves and the bindings silently go stale.
+    println!("cargo:rerun-if-changed={proto_root_str}/coordinode");
+
     let raft_proto = format!("{proto_root_str}/coordinode/v1/replication/raft.proto");
 
     tonic_prost_build::configure()

@@ -15,11 +15,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use coordinode_core::graph::types::Value;
-use tokio::sync::mpsc;
+use parking_lot::Mutex;
+use tokio::sync::{mpsc, watch};
 
 use crate::engine::{CursorEngine, EngineError};
 use crate::registry::SessionRegistry;
-use crate::types::{ErrorCode, Ordering, SessionEvent, SessionOp};
+use crate::types::{
+    ConnectionSettings, ConnectionState, ErrorCode, Ordering, SessionEvent, SessionOp,
+};
 
 /// An inbound op tagged with its session-scoped request id.
 pub type InOp = (u64, SessionOp);
@@ -42,14 +45,43 @@ const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct SessionManager {
     engine: Arc<dyn CursorEngine>,
     registry: Arc<SessionRegistry>,
+    connection: watch::Receiver<ConnectionState>,
 }
 
 impl SessionManager {
     /// Create a session manager backed by `engine` and the shared session
     /// `registry` that powers operational introspection (`SHOW SESSIONS` /
     /// `SHOW TRANSACTIONS`). Transaction handles are allocated by the engine.
+    ///
+    /// Sessions report a connection that is always writable, which is the truth
+    /// for an embedded database: there is no cluster to lose touch with. Use
+    /// [`Self::with_connection`] where there is one.
     pub fn new(engine: Arc<dyn CursorEngine>, registry: Arc<SessionRegistry>) -> Self {
-        Self { engine, registry }
+        let (_tx, rx) = watch::channel(ConnectionState {
+            writable: true,
+            connected: true,
+            leader_id: None,
+            served_by_leader: true,
+            raft_term: 0,
+            voters: 1,
+            voters_reachable: 1,
+        });
+        Self {
+            engine,
+            registry,
+            connection: rx,
+        }
+    }
+
+    /// Report connection state from `connection` instead of assuming a
+    /// standalone node.
+    ///
+    /// The sender behind it is whatever watches the cluster: sessions read the
+    /// current value and are woken on change, which is what lets a client be
+    /// told that its node reached a leader again rather than having to ask.
+    pub fn with_connection(mut self, connection: watch::Receiver<ConnectionState>) -> Self {
+        self.connection = connection;
+        self
     }
 
     /// Open a new session for `peer`, registering it so it is visible to
@@ -60,6 +92,8 @@ impl SessionManager {
             session_id,
             engine: Arc::clone(&self.engine),
             registry: Arc::clone(&self.registry),
+            connection: self.connection.clone(),
+            settings: Mutex::new(ConnectionSettings::default()),
         }
     }
 }
@@ -74,6 +108,13 @@ pub struct Session {
     session_id: u64,
     engine: Arc<dyn CursorEngine>,
     registry: Arc<SessionRegistry>,
+    /// What the serving node can currently do for this connection. Read on
+    /// demand and watched for changes, which are pushed to the client.
+    connection: watch::Receiver<ConnectionState>,
+    /// Settings this connection applies to statements that carry none. Behind
+    /// a lock because a Configure lands on the session task while statements
+    /// dispatched from it read the settings.
+    settings: Mutex<ConnectionSettings>,
 }
 
 impl Session {
@@ -86,7 +127,7 @@ impl Session {
     /// The registry tracks each request as in-flight for its lifetime and drops
     /// the session (with its open transactions) when the stream closes, so the
     /// introspection snapshot mirrors what is actually running.
-    pub async fn run(self, mut ops: mpsc::Receiver<InOp>, out: mpsc::Sender<OutEvent>) {
+    pub async fn run(mut self, mut ops: mpsc::Receiver<InOp>, out: mpsc::Sender<OutEvent>) {
         // Per-transaction serialized mailboxes owned by this single run task (no
         // lock needed). A transaction's statements and its commit/rollback route
         // to its mailbox and apply one at a time, because the transaction state
@@ -108,6 +149,18 @@ impl Session {
                 Some(txid) = done_rx.recv() => {
                     // A transaction task has resolved; stop routing to it.
                     txns.remove(&txid);
+                }
+                // The node's ability to serve this connection changed. Tell the
+                // client unsolicited, under request_id zero: the change it
+                // usually waits for is one nobody asked about, and being told
+                // beats polling with an interval guessed from how long an
+                // election might take.
+                Ok(()) = self.connection.changed() => {
+                    let state = self.connection.borrow().clone();
+                    let settings = self.settings.lock().clone();
+                    let _ = out
+                        .send((0, SessionEvent::ConnectionStatus { state, settings }))
+                        .await;
                 }
             }
         }
@@ -196,6 +249,23 @@ impl Session {
             // Cancellation lifecycle lands with the cursor registry; accepted
             // silently for now.
             SessionOp::Cancel { .. } => {}
+
+            // Settings are connection-wide, so this is handled on the session's
+            // own task rather than spawned: a change must be in effect before
+            // the next statement is dispatched, and the answer reports what is
+            // in effect rather than what was asked for.
+            SessionOp::Configure(change) => {
+                let settings = {
+                    let mut current = self.settings.lock();
+                    current.apply(&change);
+                    current.clone()
+                };
+                let event = SessionEvent::ConnectionStatus {
+                    state: self.connection.borrow().clone(),
+                    settings,
+                };
+                let _ = out.send((request_id, event)).await;
+            }
         }
     }
 

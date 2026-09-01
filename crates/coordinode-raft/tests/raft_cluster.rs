@@ -2402,11 +2402,17 @@ async fn cluster_graceful_shutdown_transfers_leadership() {
         // ── Graceful shutdown of leader (should auto-transfer) ──
         n1.shutdown().await.expect("graceful shutdown n1");
 
-        // Wait for new election to complete
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // One of the remaining nodes should become leader
-        let has_leader = n2.is_leader().await || n3.is_leader().await;
+        // One of the remaining nodes must take over. Waiting for that rather
+        // than for a fixed two seconds is the difference between testing the
+        // handover and testing how fast the machine is today.
+        let mut has_leader = false;
+        for _ in 0..150 {
+            if n2.is_leader().await || n3.is_leader().await {
+                has_leader = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         assert!(
             has_leader,
             "cluster should elect a new leader after graceful shutdown"

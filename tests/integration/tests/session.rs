@@ -22,7 +22,7 @@ use coordinode_integration::harness::CoordinodeProcess;
 use coordinode_integration::proto::session::server_frame::Event;
 use coordinode_integration::proto::session::session_service_client::SessionServiceClient;
 use coordinode_integration::proto::session::{
-    Begin, ClientFrame, Commit, Execute, Rollback, client_frame,
+    Begin, ClientFrame, Commit, Configure, Execute, Rollback, client_frame,
 };
 
 /// Begin an UNORDERED transaction (statements applied in arrival order; nonces
@@ -137,6 +137,14 @@ async fn run_session(
 
     let mut by_id: HashMap<u64, Vec<Event>> = HashMap::new();
     while let Some(frame) = inbound.message().await.expect("server frame") {
+        // Request id zero is the server speaking on its own: a connection
+        // status the client never asked for. It correlates to no request, so
+        // it is dropped here rather than counted as an answer to one. A real
+        // client reads it for what it is, which is what
+        // `session_reports_connection_status` covers.
+        if frame.request_id == 0 {
+            continue;
+        }
         by_id
             .entry(frame.request_id)
             .or_default()
@@ -644,5 +652,52 @@ async fn session_correlates_a_burst_of_concurrent_queries() {
             }
             other => panic!("request {rid} got {other:?}"),
         }
+    }
+}
+
+/// A Configure is answered with the connection's status, and a change to one
+/// setting is confirmed by what is in effect rather than by what was sent.
+///
+/// This is what a client uses to know whether its writes can go through at
+/// all: the status says whether the node can serve them and which node leads.
+/// Against a single-node server the answer is always yes, which is the point
+/// of checking it here, since a client cannot tell "standalone" from "in a
+/// cluster" and should not have to.
+#[tokio::test]
+async fn session_reports_connection_status_and_confirms_settings() {
+    let proc = CoordinodeProcess::start().await;
+
+    let configure = ClientFrame {
+        request_id: 1,
+        op: Some(client_frame::Op::Configure(Configure {
+            // Ask for MAJORITY reads by default on this connection.
+            read_concern: Some(coordinode_integration::proto::replication::ReadConcern {
+                level: 2,
+                after_index: 0,
+                at_timestamp: 0,
+            }),
+            ..Default::default()
+        })),
+    };
+    let by_id = run_session(&proc, vec![configure]).await;
+
+    match by_id.get(&1).map(Vec::as_slice) {
+        Some([Event::ConnectionStatus(status)]) => {
+            assert!(
+                status.writable,
+                "a single node serves its own writes; a client must be told so"
+            );
+            assert!(status.connected);
+            assert_eq!(
+                status
+                    .settings
+                    .as_ref()
+                    .and_then(|s| s.read_concern.as_ref())
+                    .map(|rc| rc.level),
+                Some(2),
+                "the answer must report the setting now in effect"
+            );
+        }
+        other => panic!("request 1 (configure) got {other:?}"),
     }
 }

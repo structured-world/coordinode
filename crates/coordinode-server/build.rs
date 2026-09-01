@@ -27,6 +27,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let proto_root_str = proto_root.display().to_string();
 
+    // Regenerate whenever any `.proto` under the submodule changes. Without
+    // this, cargo never re-runs build.rs after the submodule is updated (the
+    // proto tree lives outside the crate), so the OUT_DIR bindings silently go
+    // stale: the service compiles against a wire contract that no longer
+    // matches the one in the tree.
+    println!("cargo:rerun-if-changed={proto_root_str}/coordinode");
+
     // Include paths: our proto root + system protobuf includes (for google/protobuf/*.proto).
     // On macOS: /opt/homebrew/include or /usr/local/include
     // On Linux/Docker: /usr/include

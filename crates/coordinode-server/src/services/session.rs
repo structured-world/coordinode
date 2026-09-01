@@ -10,23 +10,25 @@
 use std::sync::Arc;
 
 use coordinode_embed::Database;
+use coordinode_raft::cluster::RaftNode;
 use coordinode_session::{
-    ErrorCode, InOp, Ordering as CoreOrdering, OutEvent, SessionEvent, SessionManager, SessionOp,
-    SessionRegistry, SessionStats,
+    ConnectionSettings, ConnectionState, ErrorCode, InOp, Ordering as CoreOrdering, OutEvent,
+    SessionEvent, SessionManager, SessionOp, SessionRegistry, SessionStats,
 };
 use parking_lot::RwLock;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request, Response, Status, Streaming};
 
 use self::engine::DatabaseCursorEngine;
 use super::cypher::{proto_to_value_pub, value_to_proto_pub};
 use crate::proto::query;
+use crate::proto::replication;
 use crate::proto::session::server_frame::Event;
 use crate::proto::session::session_service_server::SessionService as SessionServiceTrait;
 use crate::proto::session::{
-    Begun, ClientFrame, Committed, CursorEnd, CursorOpen, Ordering as ProtoOrdering, RowBatch,
-    ServerFrame, SessionError, client_frame,
+    Begun, ClientFrame, Committed, Configure, ConnectionStatus as ProtoConnectionStatus, CursorEnd,
+    CursorOpen, Ordering as ProtoOrdering, RowBatch, ServerFrame, SessionError, client_frame,
 };
 
 /// In-flight messages buffered per channel before backpressure: a producer that
@@ -48,6 +50,55 @@ impl SessionSvc {
         Self {
             manager: SessionManager::new(engine, registry),
         }
+    }
+
+    /// Report connection state from the cluster this node belongs to.
+    ///
+    /// Without this a session says it is always writable, which is the truth
+    /// for a standalone node and a lie for one in a cluster. A watcher task
+    /// translates Raft's view into connection state and publishes it; sessions
+    /// read the current value and are woken on change, which is what turns
+    /// "your writes are failing" into "your node reached a leader again".
+    pub fn with_cluster(mut self, raft: Arc<RaftNode>) -> Self {
+        let (tx, rx) = watch::channel(connection_state(&raft));
+        tokio::spawn(async move {
+            let mut seen = (None, 0u64);
+            loop {
+                seen = raft.next_leadership_change(seen).await;
+                // A closed receiver set means every session is gone; nothing
+                // left to tell.
+                if tx.send(connection_state(&raft)).is_err() {
+                    break;
+                }
+            }
+        });
+        self.manager = self.manager.with_connection(rx);
+        self
+    }
+}
+
+/// Translate what Raft currently reports into what it means for a client.
+///
+/// Writable covers the follower case deliberately: a write arriving at a
+/// follower is carried to the leader, so knowing a leader is what decides
+/// whether this connection can serve one, not being the leader.
+fn connection_state(raft: &RaftNode) -> ConnectionState {
+    let leader_id = raft.current_leader();
+    let voters = raft.voter_ids();
+    ConnectionState {
+        writable: leader_id.is_some(),
+        connected: leader_id.is_some(),
+        leader_id,
+        served_by_leader: leader_id == Some(raft.node_id()),
+        raft_term: raft.current_term(),
+        voters: voters.len() as u32,
+        // Reachability is a leader-side measurement: a follower knows it can
+        // reach the leader and nothing about its peers, so it reports the
+        // quorum it is part of rather than inventing a count it cannot take.
+        voters_reachable: raft
+            .replication_status()
+            .map(|s| s.len() as u32 + 1)
+            .unwrap_or(if leader_id.is_some() { 2 } else { 1 }),
     }
 }
 
@@ -149,7 +200,49 @@ fn to_op(frame: ClientFrame) -> Option<SessionOp> {
         client_frame::Op::Cancel(c) => SessionOp::Cancel {
             target_request_id: c.target_request_id,
         },
+        client_frame::Op::Configure(c) => SessionOp::Configure(settings_from_proto(&c)),
     })
+}
+
+/// Read a Configure as a settings change.
+///
+/// An absent field means "leave this as it is", which is what lets a client
+/// change one setting without restating the rest. The concern messages carry
+/// more than a level, and each part is optional in the same way: a read
+/// concern that sets a level but no fence leaves the fence alone.
+fn settings_from_proto(c: &Configure) -> ConnectionSettings {
+    ConnectionSettings {
+        read_concern: c.read_concern.as_ref().map(|rc| rc.level as u8),
+        after_index: c
+            .read_concern
+            .as_ref()
+            .and_then(|rc| (rc.after_index != 0).then_some(rc.after_index)),
+        at_timestamp: c
+            .read_concern
+            .as_ref()
+            .and_then(|rc| (rc.at_timestamp != 0).then_some(rc.at_timestamp)),
+        write_concern: c.write_concern.as_ref().map(|wc| wc.level as u8),
+        read_preference: c.read_preference.map(|p| p as u8),
+        drain_timeout_ms: c.drain_timeout_ms,
+    }
+}
+
+/// Render settings back for the client, so a Configure is confirmed by what is
+/// in effect rather than by what was asked for.
+fn settings_to_proto(s: &ConnectionSettings) -> Configure {
+    Configure {
+        read_concern: s.read_concern.map(|level| replication::ReadConcern {
+            level: level as i32,
+            after_index: s.after_index.unwrap_or(0),
+            at_timestamp: s.at_timestamp.unwrap_or(0),
+        }),
+        write_concern: s.write_concern.map(|level| replication::WriteConcern {
+            level: level as i32,
+            ..Default::default()
+        }),
+        read_preference: s.read_preference.map(|p| p as i32),
+        drain_timeout_ms: s.drain_timeout_ms,
+    }
 }
 
 /// Map a neutral event back to a gRPC server frame.
@@ -173,6 +266,18 @@ fn event_to_frame(request_id: u64, event: SessionEvent) -> ServerFrame {
             code: error_code(code) as u32,
             message,
         }),
+        SessionEvent::ConnectionStatus { state, settings } => {
+            Event::ConnectionStatus(ProtoConnectionStatus {
+                writable: state.writable,
+                connected: state.connected,
+                leader_id: state.leader_id,
+                served_by_leader: state.served_by_leader,
+                raft_term: state.raft_term,
+                voters: state.voters,
+                voters_reachable: state.voters_reachable,
+                settings: Some(settings_to_proto(&settings)),
+            })
+        }
     };
     ServerFrame {
         request_id,

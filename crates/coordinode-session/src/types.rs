@@ -42,6 +42,80 @@ pub enum SessionOp {
     Rollback { txid: u64 },
     /// Abort an in-flight request and close its cursor.
     Cancel { target_request_id: u64 },
+    /// Read, and optionally change, the connection's settings. Answered with a
+    /// [`SessionEvent::ConnectionStatus`] carrying what is now in effect.
+    Configure(ConnectionSettings),
+}
+
+/// The settings a connection applies to statements that carry none.
+///
+/// Each field is optional in the sense of "leave as it is": a client changes
+/// one setting without restating the others, and an all-empty value asks only
+/// for the current status.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectionSettings {
+    /// Default read concern level for statements that carry none.
+    pub read_concern: Option<u8>,
+    /// Fence index applied to reads that carry no concern of their own.
+    pub after_index: Option<u64>,
+    /// Snapshot pin applied to reads that carry no concern of their own.
+    pub at_timestamp: Option<u64>,
+    /// Default write concern level for statements that carry none.
+    pub write_concern: Option<u8>,
+    /// Default read preference for statements that carry none.
+    pub read_preference: Option<u8>,
+    /// Default reorder-buffer drain timeout for ordered transactions, in
+    /// milliseconds.
+    pub drain_timeout_ms: Option<u32>,
+}
+
+impl ConnectionSettings {
+    /// Fold `change` into these settings: a field the change leaves unset
+    /// keeps its current value.
+    ///
+    /// This is what makes a partial Configure mean "change this one thing"
+    /// rather than "reset everything I did not mention".
+    pub fn apply(&mut self, change: &ConnectionSettings) {
+        if change.read_concern.is_some() {
+            self.read_concern = change.read_concern;
+        }
+        if change.after_index.is_some() {
+            self.after_index = change.after_index;
+        }
+        if change.at_timestamp.is_some() {
+            self.at_timestamp = change.at_timestamp;
+        }
+        if change.write_concern.is_some() {
+            self.write_concern = change.write_concern;
+        }
+        if change.read_preference.is_some() {
+            self.read_preference = change.read_preference;
+        }
+        if change.drain_timeout_ms.is_some() {
+            self.drain_timeout_ms = change.drain_timeout_ms;
+        }
+    }
+}
+
+/// What this connection can do right now, and what the serving node can see of
+/// the cluster.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectionState {
+    /// Whether a write can be served through this connection: this node leads,
+    /// or it can reach the node that does.
+    pub writable: bool,
+    /// Whether this node has contact with the cluster at all.
+    pub connected: bool,
+    /// The node the cluster last named leader, if this node knows one.
+    pub leader_id: Option<u64>,
+    /// Whether this node is itself the leader.
+    pub served_by_leader: bool,
+    /// Raft term the observation was made in.
+    pub raft_term: u64,
+    /// Voting members the cluster is configured with.
+    pub voters: u32,
+    /// Voting members this node counts as reachable, including itself.
+    pub voters_reachable: u32,
 }
 
 /// Statistics for a completed statement, neutral over the wire protocol.
@@ -91,4 +165,15 @@ pub enum SessionEvent {
     Committed { applied_index: u64 },
     /// Reports a request failure; terminates the request's cursor.
     Error { code: ErrorCode, message: String },
+    /// The state of the connection and the settings in effect on it.
+    ///
+    /// Answers a [`SessionOp::Configure`], and is also emitted unsolicited
+    /// whenever the state changes, so a client waiting for a cut-off node to
+    /// regain a leader is told rather than left to poll.
+    ConnectionStatus {
+        /// What the connection can do and what the node can see.
+        state: ConnectionState,
+        /// The settings now in effect.
+        settings: ConnectionSettings,
+    },
 }

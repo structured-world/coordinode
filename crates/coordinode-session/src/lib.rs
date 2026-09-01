@@ -17,4 +17,6 @@ mod types;
 pub use engine::{CursorEngine, EngineError, QueryCursor};
 pub use registry::SessionRegistry;
 pub use session::{InOp, OutEvent, Session, SessionManager};
-pub use types::{ErrorCode, Ordering, SessionEvent, SessionOp, SessionStats};
+pub use types::{
+    ConnectionSettings, ConnectionState, ErrorCode, Ordering, SessionEvent, SessionOp, SessionStats,
+};

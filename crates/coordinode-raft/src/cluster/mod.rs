@@ -991,6 +991,35 @@ impl RaftNode {
         m.membership_config.membership().voter_ids().collect()
     }
 
+    /// Wait until who leads, or under which term, differs from what the caller
+    /// last saw; return the new pair.
+    ///
+    /// The transition a subscriber usually waits for is `None` becoming a
+    /// node: a client attached to a node that had lost touch with the cluster
+    /// can be told the moment it can write again, instead of retrying on a
+    /// timer whose interval is a guess about how long an election takes.
+    /// Returns immediately when the current pair already differs.
+    ///
+    /// Keeps the consensus library's watch type inside this crate: callers
+    /// deal in the pair, not in openraft's metrics.
+    pub async fn next_leadership_change(&self, seen: (Option<u64>, u64)) -> (Option<u64>, u64) {
+        use openraft::async_runtime::watch::WatchReceiver;
+        let mut rx = self.raft.metrics();
+        loop {
+            let current = {
+                let m = rx.borrow_watched();
+                (m.current_leader, m.current_term)
+            };
+            if current != seen {
+                return current;
+            }
+            if rx.changed().await.is_err() {
+                // The node is shutting down and will report nothing further.
+                return current;
+            }
+        }
+    }
+
     /// Get the current leader node ID, if known.
     ///
     /// Returns `None` if the cluster has no leader (e.g. election in progress).

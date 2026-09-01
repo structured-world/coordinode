@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 
 use super::*;
 use crate::engine::{CursorEngine, EngineError, QueryCursor};
-use crate::types::{Ordering, SessionEvent, SessionOp, SessionStats};
+use crate::types::{ConnectionSettings, Ordering, SessionEvent, SessionOp, SessionStats};
 
 /// A cursor over a fixed in-memory result, paged by `next_batch`.
 struct MockCursor {
@@ -521,4 +521,134 @@ async fn run_dispatches_a_burst_concurrently_with_correlated_cursors() {
             by_id[&i]
         );
     }
+}
+
+/// A Configure that sets one setting must leave the others alone, and the
+/// answer must report what is in effect rather than what was asked for.
+///
+/// Restating every setting on each change is what a client does when it cannot
+/// trust a partial update, and confirming from its own request is what makes a
+/// client believe a change that never took.
+#[tokio::test]
+async fn configure_changes_one_setting_and_reports_all_of_them() {
+    let engine = engine(&["n"], vec![vec![Value::Int(1)]]);
+    let events = run_session(
+        engine,
+        vec![
+            SessionOp::Configure(ConnectionSettings {
+                read_concern: Some(2),
+                write_concern: Some(4),
+                ..Default::default()
+            }),
+            // Changes only the preference; the concerns above must survive.
+            SessionOp::Configure(ConnectionSettings {
+                read_preference: Some(3),
+                ..Default::default()
+            }),
+            // Asks for nothing: a pure status request.
+            SessionOp::Configure(ConnectionSettings::default()),
+        ],
+    )
+    .await;
+
+    let settings_of = |id: u64| match events.get(&id).and_then(|e| e.first()) {
+        Some(SessionEvent::ConnectionStatus { settings, .. }) => settings.clone(),
+        other => panic!("request {id} answered with {other:?}, expected a ConnectionStatus"),
+    };
+
+    let first = settings_of(1);
+    assert_eq!(first.read_concern, Some(2));
+    assert_eq!(first.write_concern, Some(4));
+
+    let second = settings_of(2);
+    assert_eq!(second.read_preference, Some(3));
+    assert_eq!(
+        (second.read_concern, second.write_concern),
+        (Some(2), Some(4)),
+        "a partial Configure must not reset the settings it did not mention"
+    );
+
+    assert_eq!(
+        settings_of(3),
+        second,
+        "an empty Configure asks for the status and changes nothing"
+    );
+}
+
+/// The status a Configure returns describes the connection, so it carries what
+/// the node can do for this client, not just the settings.
+#[tokio::test]
+async fn configure_answers_with_the_connection_state() {
+    let engine = engine(&["n"], vec![vec![Value::Int(1)]]);
+    let events = run_one(engine, SessionOp::Configure(ConnectionSettings::default())).await;
+
+    match events.first() {
+        Some(SessionEvent::ConnectionStatus { state, .. }) => {
+            // A session with no cluster behind it is writable by definition:
+            // there is no leadership to lose.
+            assert!(state.writable);
+            assert!(state.connected);
+            assert!(state.served_by_leader);
+        }
+        other => panic!("expected a ConnectionStatus, got {other:?}"),
+    }
+}
+
+/// A change in what the connection can do is pushed to the client without
+/// being asked for.
+///
+/// This is the point of the whole frame: a client on a node that lost touch
+/// with the cluster holds its session and is told the moment writes can go
+/// through again, instead of retrying on a timer whose interval is a guess
+/// about how long an election takes. The event carries request id zero
+/// because no request produced it.
+#[tokio::test]
+async fn a_connection_that_regains_a_leader_tells_the_client() {
+    let registry = Arc::new(SessionRegistry::new(std::time::Duration::from_secs(30)));
+    let cut_off = ConnectionState {
+        writable: false,
+        connected: false,
+        leader_id: None,
+        served_by_leader: false,
+        raft_term: 7,
+        voters: 3,
+        voters_reachable: 1,
+    };
+    let (state_tx, state_rx) = tokio::sync::watch::channel(cut_off);
+    let manager = SessionManager::new(engine(&["n"], vec![vec![Value::Int(1)]]), registry)
+        .with_connection(state_rx);
+    let session = manager.open("test".into());
+    let (op_tx, op_rx) = mpsc::channel(64);
+    let (ev_tx, mut ev_rx) = mpsc::channel(64);
+    let handle = tokio::spawn(session.run(op_rx, ev_tx));
+
+    // The cluster reaches a leader again. Nobody asked about it.
+    state_tx
+        .send(ConnectionState {
+            writable: true,
+            connected: true,
+            leader_id: Some(2),
+            served_by_leader: false,
+            raft_term: 8,
+            voters: 3,
+            voters_reachable: 3,
+        })
+        .unwrap();
+
+    let (request_id, event) = ev_rx.recv().await.expect("the client must be told");
+    assert_eq!(request_id, 0, "an unsolicited event answers no request");
+    match event {
+        SessionEvent::ConnectionStatus { state, .. } => {
+            assert!(
+                state.writable,
+                "the point of the event is that writes work again"
+            );
+            assert_eq!(state.leader_id, Some(2));
+            assert_eq!(state.voters_reachable, 3);
+        }
+        other => panic!("expected a ConnectionStatus, got {other:?}"),
+    }
+
+    drop(op_tx);
+    handle.await.unwrap();
 }

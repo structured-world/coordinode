@@ -1061,12 +1061,20 @@ pub(crate) async fn serve(
                 .max_decoding_message_size(max_req_bytes),
         )
         .add_service(
-            proto::session::session_service_server::SessionServiceServer::new(
-                services::session::SessionSvc::new(
+            proto::session::session_service_server::SessionServiceServer::new({
+                let svc = services::session::SessionSvc::new(
                     Arc::clone(&database),
                     Arc::clone(&session_registry),
-                ),
-            )
+                );
+                // In a cluster, a session reports what its node can
+                // actually do: whether a leader is reachable, and so
+                // whether writes go through. Standalone keeps the
+                // always-writable default, which there is the truth.
+                match raft_node_shared.as_ref() {
+                    Some(raft) => svc.with_cluster(Arc::clone(raft)),
+                    None => svc,
+                }
+            })
             .max_decoding_message_size(max_req_bytes),
         )
         .add_service(
