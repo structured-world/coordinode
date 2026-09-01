@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "timestamp": "2026-06-06T21:05:18.461815332Z",
+  "git": {
+    "sha": "5adafec07ea16ce0de89f572e2e94403ede3735b",
+    "sha_short": "5adafec",
+    "branch": "main",
+    "dirty": true,
+    "commit_date": "2026-06-06T18:50:46Z"
+  },
+  "hardware": {
+    "cpu_brand": "Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz",
+    "cpu_cores": 8,
+    "cpu_threads": 16,
+    "ram_gb": 62,
+    "os_name": "Fedora Linux",
+    "os_version": "44",
+    "arch": "x86_64"
+  },
+  "modality": "vector",
+  "benchmark": "ann-benchmarks",
+  "dataset": "glove-100-100k-angular",
+  "subject": "coordinode",
+  "codec": "none",
+  "version": "0.4.3",
+  "metrics": {
+    "build_secs": 24.59751361,
+    "dataset_dim": 100,
+    "dataset_n_test": 10000,
+    "dataset_n_train": 100000,
+    "hnsw_alpha_pruning": 1.0,
+    "hnsw_ef_construction": 200,
+    "hnsw_m": 16,
+    "hnsw_rerank_mode": "end-of-search",
+    "hnsw_rerank_oversample": 2.0,
+    "k": 10,
+    "qps_at_recall_0_95": 3881.006161125729,
+    "qps_at_recall_peak": 2052.1944383648815,
+    "quantization": "rabitq",
+    "rabitq_bits": 1,
+    "rayon_threads": 4,
+    "rayon_threads_effective": 4,
+    "recall_at_k_peak": 0.98777,
+    "rss_kib_after_build": 778960,
+    "rss_kib_before_build": 473596,
+    "rss_kib_peak": 782128,
+    "search_threads": 4,
+    "subset_size": 100000,
+    "sweep": [
+      {
+        "ef_search": 20,
+        "latency_us_mean": 90.06568,
+        "latency_us_p50": 89.0,
+        "latency_us_p95": 117.0,
+        "latency_us_p99": 131.0,
+        "qps": 43806.573232385934,
+        "recall_at_k": 0.59435
+      },
+      {
+        "ef_search": 40,
+        "latency_us_mean": 143.59887,
+        "latency_us_p50": 145.0,
+        "latency_us_p95": 181.0,
+        "latency_us_p99": 203.0,
+        "qps": 27499.44179570585,
+        "recall_at_k": 0.73063
+      },
+      {
+        "ef_search": 80,
+        "latency_us_mean": 246.14416,
+        "latency_us_p50": 253.0,
+        "latency_us_p95": 302.0,
+        "latency_us_p99": 320.0,
+        "qps": 16170.560929281619,
+        "recall_at_k": 0.83275
+      },
+      {
+        "ef_search": 200,
+        "latency_us_mean": 530.99869,
+        "latency_us_p50": 547.0,
+        "latency_us_p95": 642.0,
+        "latency_us_p99": 670.0,
+        "qps": 7480.281214048022,
+        "recall_at_k": 0.92487
+      },
+      {
+        "ef_search": 400,
+        "latency_us_mean": 1028.25683,
+        "latency_us_p50": 1059.0,
+        "latency_us_p95": 1227.0,
+        "latency_us_p99": 1264.0,
+        "qps": 3881.006161125729,
+        "recall_at_k": 0.96619
+      },
+      {
+        "ef_search": 800,
+        "latency_us_mean": 1942.74917,
+        "latency_us_p50": 1998.0,
+        "latency_us_p95": 2243.0,
+        "latency_us_p99": 2308.0,
+        "qps": 2052.1944383648815,
+        "recall_at_k": 0.98777
+      }
+    ]
+  }
+}
