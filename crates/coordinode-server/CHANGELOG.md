@@ -3,6 +3,16 @@
 All notable changes to this crate are documented in this file.
 This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
+## 0.5.7 - 2026-09-01
+
+#### Added
+
+- *(session)* tell a client what its connection can do, and let it configure one
+- *(server)* carry a write to the leader instead of refusing it
+- *(server)* tell a client its write went to the wrong node
+
+---
+
 ## 0.5.6 - 2026-09-01
 
 #### Added

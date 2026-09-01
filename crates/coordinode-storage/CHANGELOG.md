@@ -3,6 +3,19 @@
 All notable changes to this crate are documented in this file.
 This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
+## 0.5.7 - 2026-09-01
+
+#### Added
+
+- *(server)* tell a client its write went to the wrong node
+- *(vector)* drain writes into an index while it builds
+
+#### Fixed
+
+- *(vector)* give the index ownership of its background build
+
+---
+
 ## 0.5.6 - 2026-09-01
 
 #### Added

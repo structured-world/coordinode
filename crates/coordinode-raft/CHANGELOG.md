@@ -3,6 +3,24 @@
 All notable changes to this crate are documented in this file.
 This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
 
+## 0.5.7 - 2026-09-01
+
+#### Added
+
+- *(session)* tell a client what its connection can do, and let it configure one
+- *(server)* carry a write to the leader instead of refusing it
+
+#### Fixed
+
+- *(raft)* bind gRPC listener eagerly and free the port on shutdown
+
+#### Testing
+
+- *(raft)* wait for the cluster instead of guessing how long it takes
+- *(raft)* stop the consensus suite from testing election timing
+
+---
+
 ## 0.5.2 - 2026-08-30
 
 #### Added
