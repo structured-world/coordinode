@@ -98,3 +98,66 @@ fn dropped_transaction_stages_no_counter_deltas() {
     assert_eq!(counter(&engine, &label_count_key("Ghost")), 0);
     assert_eq!(counter(&engine, NODES_TOTAL_KEY), 0);
 }
+
+/// Same-key deltas COALESCE inside one transaction: a create+delete cycle in
+/// a single transaction nets to zero and writes NO counter row at all (the
+/// zero sum is skipped at drain), and repeated increments fold to one entry.
+#[test]
+fn same_transaction_deltas_coalesce_and_zero_sums_write_nothing() {
+    let (engine, oracle, _d) = engine();
+    let snap = engine.snapshot();
+    let mut txn = Transaction::new(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(snap),
+        Some(snap),
+    );
+    // Net-zero on "Churn": created then deleted within the transaction.
+    LocalStatsStore.node_created(&mut txn, ["Churn"]);
+    LocalStatsStore.node_deleted(&mut txn, ["Churn"]);
+    // Net +3 on "Kept".
+    LocalStatsStore.node_created(&mut txn, ["Kept"]);
+    LocalStatsStore.node_created(&mut txn, ["Kept"]);
+    LocalStatsStore.node_created(&mut txn, ["Kept"]);
+    commit(&mut txn);
+
+    assert_eq!(counter(&engine, &label_count_key("Kept")), 3);
+    // The zero sum was skipped entirely: no row, not a zero-valued row.
+    assert_eq!(
+        engine
+            .get(Partition::Counter, &label_count_key("Churn"))
+            .unwrap(),
+        None,
+        "a zero-sum counter delta must not write a row"
+    );
+    // Total: +1 -1 +3 = 3.
+    assert_eq!(counter(&engine, NODES_TOTAL_KEY), 3);
+}
+
+/// Counter staging carries no OCC surface: two overlapping transactions
+/// touching the SAME counters both commit (no write-write conflict) and
+/// their deltas fold commutatively.
+#[test]
+fn concurrent_counter_transactions_do_not_conflict() {
+    let (engine, oracle, _d) = engine();
+    let snap = engine.snapshot();
+    let mut a = Transaction::new(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(snap),
+        Some(snap),
+    );
+    let mut b = Transaction::new(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(snap),
+        Some(snap),
+    );
+    LocalStatsStore.node_created(&mut a, ["Shared"]);
+    LocalStatsStore.node_created(&mut b, ["Shared"]);
+    commit(&mut a);
+    // b overlaps a (same snapshot, same counter keys) — must still commit.
+    commit(&mut b);
+    assert_eq!(counter(&engine, &label_count_key("Shared")), 2);
+    assert_eq!(counter(&engine, NODES_TOTAL_KEY), 2);
+}

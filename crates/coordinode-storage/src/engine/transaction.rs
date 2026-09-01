@@ -173,11 +173,15 @@ pub struct Transaction<'a> {
     /// -write document deltas (SET nested path) materialise these against the
     /// node record before a read; drained at commit.
     merge_node_deltas: Vec<(Vec<u8>, Vec<u8>)>,
-    /// Buffered counter merge deltas: `(counter key, signed delta)`.
+    /// Buffered counter merge deltas: `counter key -> summed signed delta`.
     /// Commutative increments on the `counter:` partition (statistics
     /// counters, degree caches); bypass OCC like the other merge buffers.
-    /// Drained at commit as `CounterMerge` operands.
-    merge_counter_deltas: Vec<(Vec<u8>, i64)>,
+    /// COALESCED per key: a bulk statement touching one counter N times
+    /// stages one entry (and one commit-time operand), not N — the buffer
+    /// and the replication proposal stay O(distinct counters), not O(ops).
+    /// Drained at commit as `CounterMerge` operands; a sum that folded to
+    /// zero is skipped at drain (nothing to apply).
+    merge_counter_deltas: HashMap<Vec<u8>, i64>,
 }
 
 /// The borrow-free owned state of a [`Transaction`] — everything except the
@@ -196,7 +200,7 @@ pub struct TransactionState {
     merge_adj_adds: HashMap<Vec<u8>, Vec<u64>>,
     merge_adj_removes: HashMap<Vec<u8>, Vec<u64>>,
     merge_node_deltas: Vec<(Vec<u8>, Vec<u8>)>,
-    merge_counter_deltas: Vec<(Vec<u8>, i64)>,
+    merge_counter_deltas: HashMap<Vec<u8>, i64>,
 }
 
 impl TransactionState {
@@ -257,7 +261,7 @@ impl<'a> Transaction<'a> {
             merge_adj_adds: HashMap::new(),
             merge_adj_removes: HashMap::new(),
             merge_node_deltas: Vec::new(),
-            merge_counter_deltas: Vec::new(),
+            merge_counter_deltas: HashMap::new(),
         }
     }
 
@@ -624,10 +628,18 @@ impl<'a> Transaction<'a> {
 
     /// Buffer a commutative counter increment at `counter_key` (statistics
     /// counters, degree caches). Applied at commit as a `CounterMerge`
-    /// operand; not OCC-tracked. A zero delta is dropped.
-    pub fn push_counter_delta(&mut self, counter_key: Vec<u8>, delta: i64) {
-        if delta != 0 {
-            self.merge_counter_deltas.push((counter_key, delta));
+    /// operand; not OCC-tracked. Deltas to the same key COALESCE (summed),
+    /// so bulk statements stage one entry per distinct counter, and a key
+    /// already present is found by slice lookup without allocating.
+    pub fn push_counter_delta(&mut self, counter_key: &[u8], delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        if let Some(sum) = self.merge_counter_deltas.get_mut(counter_key) {
+            *sum += delta;
+        } else {
+            self.merge_counter_deltas
+                .insert(counter_key.to_vec(), delta);
         }
     }
 
@@ -775,7 +787,7 @@ impl<'a> Transaction<'a> {
             for (key, operand) in self.merge_node_deltas.drain(..) {
                 self.engine.merge(Partition::Node, &key, &operand)?;
             }
-            for (key, delta) in self.merge_counter_deltas.drain(..) {
+            for (key, delta) in self.merge_counter_deltas.drain().filter(|(_, d)| *d != 0) {
                 self.engine
                     .merge(Partition::Counter, &key, &encode_counter_delta(delta))?;
             }
@@ -873,7 +885,7 @@ impl<'a> Transaction<'a> {
             for (key, operand) in self.merge_node_deltas.drain(..) {
                 self.engine.merge(Partition::Node, &key, &operand)?;
             }
-            for (key, delta) in self.merge_counter_deltas.drain(..) {
+            for (key, delta) in self.merge_counter_deltas.drain().filter(|(_, d)| *d != 0) {
                 self.engine
                     .merge(Partition::Counter, &key, &encode_counter_delta(delta))?;
             }
@@ -911,7 +923,7 @@ impl<'a> Transaction<'a> {
             for (key, operand) in &self.merge_node_deltas {
                 self.engine.merge(Partition::Node, key, operand)?;
             }
-            for (key, delta) in &self.merge_counter_deltas {
+            for (key, delta) in self.merge_counter_deltas.iter().filter(|(_, d)| **d != 0) {
                 self.engine
                     .merge(Partition::Counter, key, &encode_counter_delta(*delta))?;
             }
@@ -956,7 +968,7 @@ impl<'a> Transaction<'a> {
                         operand,
                     });
                 }
-                for (key, delta) in self.merge_counter_deltas.drain(..) {
+                for (key, delta) in self.merge_counter_deltas.drain().filter(|(_, d)| *d != 0) {
                     mutations.push(Mutation::Merge {
                         partition: PartitionId::Counter,
                         key,
@@ -1045,7 +1057,7 @@ impl<'a> Transaction<'a> {
                     operand,
                 });
             }
-            for (key, delta) in self.merge_counter_deltas.drain(..) {
+            for (key, delta) in self.merge_counter_deltas.drain().filter(|(_, d)| *d != 0) {
                 mutations.push(Mutation::Merge {
                     partition: PartitionId::Counter,
                     key,
@@ -1117,7 +1129,7 @@ impl<'a> Transaction<'a> {
             for (key, operand) in self.merge_node_deltas.drain(..) {
                 self.engine.merge(Partition::Node, &key, &operand)?;
             }
-            for (key, delta) in self.merge_counter_deltas.drain(..) {
+            for (key, delta) in self.merge_counter_deltas.drain().filter(|(_, d)| *d != 0) {
                 self.engine
                     .merge(Partition::Counter, &key, &encode_counter_delta(delta))?;
             }

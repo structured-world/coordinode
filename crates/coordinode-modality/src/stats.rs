@@ -56,25 +56,25 @@ pub struct LocalStatsStore;
 
 impl StatsStore for LocalStatsStore {
     fn node_created<'a, I: IntoIterator<Item = &'a str>>(&self, txn: &mut Transaction, labels: I) {
-        txn.push_counter_delta(NODES_TOTAL_KEY.to_vec(), 1);
+        txn.push_counter_delta(NODES_TOTAL_KEY, 1);
         for label in labels {
-            txn.push_counter_delta(label_count_key(label), 1);
+            txn.push_counter_delta(&label_count_key(label), 1);
         }
     }
 
     fn node_deleted<'a, I: IntoIterator<Item = &'a str>>(&self, txn: &mut Transaction, labels: I) {
-        txn.push_counter_delta(NODES_TOTAL_KEY.to_vec(), -1);
+        txn.push_counter_delta(NODES_TOTAL_KEY, -1);
         for label in labels {
-            txn.push_counter_delta(label_count_key(label), -1);
+            txn.push_counter_delta(&label_count_key(label), -1);
         }
     }
 
     fn label_added(&self, txn: &mut Transaction, label: &str) {
-        txn.push_counter_delta(label_count_key(label), 1);
+        txn.push_counter_delta(&label_count_key(label), 1);
     }
 
     fn label_removed(&self, txn: &mut Transaction, label: &str) {
-        txn.push_counter_delta(label_count_key(label), -1);
+        txn.push_counter_delta(&label_count_key(label), -1);
     }
 }
 

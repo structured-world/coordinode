@@ -172,3 +172,45 @@ fn multiple_edge_types() {
     // Overall: (2 + 4) / 2 = 3.0
     assert!((stats.avg_fan_out() - 3.0).abs() < 0.01);
 }
+
+/// Adversarial counter states must not poison the reader: a counter driven
+/// below zero (double-decrement drift) clamps to absent/zero, and a
+/// malformed counter value (wrong width) reads as zero instead of erroring.
+#[test]
+fn reader_clamps_underflow_and_ignores_malformed_counters() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+
+    // Drive "Gone" below zero and the total negative.
+    engine
+        .merge(
+            Partition::Counter,
+            &label_count_key("Gone"),
+            &counter_delta_operand(-2),
+        )
+        .unwrap();
+    engine
+        .merge(
+            Partition::Counter,
+            NODES_TOTAL_KEY,
+            &counter_delta_operand(-5),
+        )
+        .unwrap();
+    // A malformed (non-8-byte) value under the label prefix.
+    engine
+        .put(Partition::Counter, &label_count_key("Junk"), b"not-an-i64")
+        .unwrap();
+
+    let stats = StorageStatsComputer::compute(&engine).expect("compute stats");
+    assert_eq!(stats.total_node_count(), 0, "negative total clamps to zero");
+    assert_eq!(
+        stats.node_count_for_label("Gone"),
+        None,
+        "an underflowed label reports absent"
+    );
+    assert_eq!(
+        stats.node_count_for_label("Junk"),
+        None,
+        "a malformed counter value reads as zero, not an error"
+    );
+}
