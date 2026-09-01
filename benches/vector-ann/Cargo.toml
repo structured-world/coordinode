@@ -72,3 +72,10 @@ path = "src/graph_main.rs"
 [[bin]]
 name = "shard-traverse"
 path = "src/shard_traverse.rs"
+
+# Match the production workspace release profile: one codegen unit for
+# stable, maximally optimized benchmark binaries (run-to-run comparability).
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3

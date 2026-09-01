@@ -27,3 +27,10 @@ rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 tempfile = "3"
+
+# Match the production workspace release profile: one codegen unit for
+# stable, maximally optimized benchmark binaries (run-to-run comparability).
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
