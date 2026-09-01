@@ -559,6 +559,19 @@ pub enum DatabaseError {
     )]
     WriteBackpressure,
 
+    /// The write reached a node that is not the leader, so it could not be
+    /// replicated. Nothing was applied; the same write succeeds at the leader,
+    /// whose id is carried here when the cluster has named one.
+    #[error("not the leader{}", match leader_id {
+        Some(id) => format!("; leader is node {id}"),
+        None => String::from("; no leader known yet"),
+    })]
+    NotLeader {
+        /// The node the cluster last named leader, if any. `None` while an
+        /// election is in flight.
+        leader_id: Option<u64>,
+    },
+
     #[error("{0}")]
     Other(String),
 }
@@ -1674,6 +1687,8 @@ impl Database {
             // Retryable like a conflict, but with a delay: the engine sheds
             // writes until compaction drains its debt.
             CommitError::Backpressure => DatabaseError::WriteBackpressure,
+            // Retryable at a different address: the leader.
+            CommitError::NotLeader { leader_id } => DatabaseError::NotLeader { leader_id },
         })?;
         Ok(outcome.applied_index.unwrap_or(0))
     }

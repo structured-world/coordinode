@@ -66,6 +66,10 @@ pub enum Reason {
     /// new writes until compaction catches up. Nothing was applied; retry
     /// after the advised delay.
     WriteBackpressure,
+    /// The write reached a node that is not the leader. Nothing was applied.
+    /// Metadata carries `leader_id` when the cluster has named one, so the
+    /// caller can retry at the right node instead of guessing.
+    NotLeader,
 }
 
 impl Reason {
@@ -83,6 +87,7 @@ impl Reason {
             Reason::CapacityExhausted => "CAPACITY_EXHAUSTED",
             Reason::SchemaViolation => "SCHEMA_VIOLATION",
             Reason::WriteBackpressure => "WRITE_BACKPRESSURE",
+            Reason::NotLeader => "NOT_LEADER",
         }
     }
 
@@ -97,9 +102,15 @@ impl Reason {
     /// help. Backpressure says the opposite: the server is shedding writes
     /// until compaction catches up, so an immediate retry would bounce off
     /// the same verdict; the delay is a floor for the client's backoff.
+    ///
+    /// A leader change also says "retry now", and for the same reason a
+    /// conflict does: waiting changes nothing, the write has to go somewhere
+    /// else. When the metadata names a leader the retry is a redirect; when
+    /// an election is still in flight it is a short poll, and the client's own
+    /// backoff governs how often, which is why the floor here stays zero.
     pub const fn retry_delay(self) -> Option<std::time::Duration> {
         match self {
-            Reason::TransactionConflict => Some(std::time::Duration::ZERO),
+            Reason::TransactionConflict | Reason::NotLeader => Some(std::time::Duration::ZERO),
             Reason::WriteBackpressure => Some(std::time::Duration::from_millis(500)),
             _ => None,
         }

@@ -81,6 +81,18 @@ pub enum ExecutionError {
     )]
     Backpressure,
 
+    /// The write reached a node that is not the leader, so it could not be
+    /// replicated. Nothing was applied; the same write succeeds at the leader.
+    #[error("not the leader{}", match leader_id {
+        Some(id) => format!("; leader is node {id}"),
+        None => String::from("; no leader known yet"),
+    })]
+    NotLeader {
+        /// The node the cluster last named leader, if any. `None` while an
+        /// election is in flight.
+        leader_id: Option<u64>,
+    },
+
     /// Schema mode violation: STRICT label rejected an undeclared property, or
     /// a write attempted to SET a COMPUTED (read-only) property.
     #[error("schema violation: {0}")]
@@ -15962,6 +15974,7 @@ fn commit_err_to_execution(
         CommitError::Storage(e) => ExecutionError::Storage(e),
         CommitError::Serialization(msg) => ExecutionError::Serialization(msg),
         CommitError::Backpressure => ExecutionError::Backpressure,
+        CommitError::NotLeader { leader_id } => ExecutionError::NotLeader { leader_id },
     }
 }
 

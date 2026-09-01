@@ -82,6 +82,7 @@ fn every_reason_has_a_distinct_wire_string() {
         Reason::CapacityExhausted,
         Reason::SchemaViolation,
         Reason::WriteBackpressure,
+        Reason::NotLeader,
     ];
     let mut seen = std::collections::BTreeSet::new();
     for reason in all {
@@ -99,4 +100,58 @@ fn every_reason_has_a_distinct_wire_string() {
             reason.as_str()
         );
     }
+}
+
+/// A write that reached the wrong node must tell the caller where the right
+/// one is, and that a retry is worth making.
+///
+/// Without the id in the metadata a client can only guess which node to try
+/// next, and without the retry advice it cannot tell this apart from a
+/// failure that will repeat forever. Both live in the structured details, not
+/// in the message, so a client never has to parse prose.
+#[test]
+fn a_leader_change_carries_the_leader_and_says_retry_now() {
+    let redirect = status_with_reason(
+        Code::FailedPrecondition,
+        "not the leader; leader is node 3",
+        Reason::NotLeader,
+        [("leader_id", "3".to_string())],
+    );
+    let details = redirect.get_error_details();
+    let info = details.error_info().expect("carries ErrorInfo");
+    assert_eq!(info.reason, "NOT_LEADER");
+    assert_eq!(
+        info.metadata.get("leader_id").map(String::as_str),
+        Some("3"),
+        "the caller cannot redirect without the leader's id"
+    );
+    let retry = details.retry_info().expect("a leader change is retryable");
+    assert_eq!(
+        retry.retry_delay.unwrap_or_default(),
+        std::time::Duration::ZERO,
+        "waiting does not help; the write has to go to another node"
+    );
+
+    // An election in flight leaves no leader to name. The failure is still
+    // retryable, and the absent id is what tells the client to poll rather
+    // than redirect.
+    let electing = status_with_reason(
+        Code::FailedPrecondition,
+        "not the leader; no leader known yet",
+        Reason::NotLeader,
+        [],
+    );
+    let details = electing.get_error_details();
+    assert!(
+        !details
+            .error_info()
+            .expect("carries ErrorInfo")
+            .metadata
+            .contains_key("leader_id"),
+        "no leader is known, so none must be claimed"
+    );
+    assert!(
+        details.retry_info().is_some(),
+        "an election settles; the write is still worth retrying"
+    );
 }

@@ -292,6 +292,25 @@ fn db_error_to_status(err: DatabaseError) -> Status {
                 [],
             );
         }
+        // Both spellings again, for a write that reached a node which is not
+        // the leader. FAILED_PRECONDITION rather than UNAVAILABLE: the server
+        // is perfectly available, it is the request that came to the wrong
+        // node, and the leader id says where the right one is. Nothing was
+        // applied, so the retry is the same write, not a repair.
+        DatabaseError::NotLeader { leader_id }
+        | DatabaseError::Execution(
+            coordinode_query::executor::runner::ExecutionError::NotLeader { leader_id },
+        ) => {
+            let metadata = leader_id
+                .map(|id| vec![("leader_id", id.to_string())])
+                .unwrap_or_default();
+            return status_with_reason(
+                Code::FailedPrecondition,
+                rendered,
+                Reason::NotLeader,
+                metadata,
+            );
+        }
         _ => {}
     }
     // Capacity exhaustion arrives wrapped in either a Storage or an Execution

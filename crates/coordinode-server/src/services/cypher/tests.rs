@@ -1618,3 +1618,54 @@ fn path_round_trips_with_its_type() {
 
     assert_eq!(proto_to_value(&pv), original, "round trip must preserve it");
 }
+
+/// A write that reached a follower must come back as a redirect, not as an
+/// internal failure.
+///
+/// The code says the request went to the wrong node rather than that the node
+/// is broken, the reason is machine-readable, and the leader's id rides in the
+/// metadata so the caller retries at the right address instead of guessing.
+/// Both spellings are checked: an interactive commit fails with the typed
+/// variant, while an auto-commit statement carries it inside the execution
+/// error, and a client must not have to tell those apart.
+#[test]
+fn a_write_to_a_follower_is_a_redirect_with_the_leader_named() {
+    use tonic_types::StatusExt;
+
+    let cases = [
+        DatabaseError::NotLeader { leader_id: Some(3) },
+        DatabaseError::Execution(
+            coordinode_query::executor::runner::ExecutionError::NotLeader { leader_id: Some(3) },
+        ),
+    ];
+
+    for err in cases {
+        let status = db_error_to_status(err);
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        let details = status.get_error_details();
+        let info = details.error_info().expect("must carry ErrorInfo");
+        assert_eq!(info.reason, "NOT_LEADER");
+        assert_eq!(
+            info.metadata.get("leader_id").map(String::as_str),
+            Some("3"),
+            "the caller cannot redirect without the leader's id"
+        );
+        assert!(
+            details.retry_info().is_some(),
+            "nothing was applied; the same write succeeds at the leader"
+        );
+    }
+
+    // Mid-election there is no leader to name, and claiming one would send the
+    // caller to a node that cannot serve it either.
+    let status = db_error_to_status(DatabaseError::NotLeader { leader_id: None });
+    let details = status.get_error_details();
+    assert!(
+        !details
+            .error_info()
+            .expect("must carry ErrorInfo")
+            .metadata
+            .contains_key("leader_id")
+    );
+    assert!(details.retry_info().is_some());
+}

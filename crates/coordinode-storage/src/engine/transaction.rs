@@ -96,6 +96,21 @@ pub enum CommitError {
          retry after compaction catches up"
     )]
     Backpressure,
+    /// This node is not the leader, so it cannot replicate the write. Nothing
+    /// was applied. `leader_id` is the node the cluster last named leader, when
+    /// one is known: an election in flight leaves it `None` for a moment.
+    ///
+    /// Structured rather than folded into a message because the answer to it
+    /// is mechanical: retry the same write at the leader. Every layer above
+    /// needs the id to do that, and a string cannot carry it.
+    #[error("not the leader{}", match leader_id {
+        Some(id) => format!("; leader is node {id}"),
+        None => String::from("; no leader known yet"),
+    })]
+    NotLeader {
+        /// The node the cluster last named leader, if any.
+        leader_id: Option<u64>,
+    },
 }
 
 /// Map a storage [`Partition`] to its wire [`PartitionId`] for Raft proposals.
@@ -119,19 +134,21 @@ fn partition_to_id(p: Partition) -> PartitionId {
 /// capacity-exhaustion structured variant (operators retry on a different
 /// endpoint) and folding the rest into a serialization-class failure.
 fn proposal_err_to_commit(err: ProposalError) -> CommitError {
-    if let ProposalError::CapacityExhausted {
-        endpoint_id,
-        used_bytes,
-        hard_limit_bytes,
-    } = err
-    {
-        return CommitError::Storage(StorageError::CapacityExhausted {
+    match err {
+        ProposalError::CapacityExhausted {
             endpoint_id,
             used_bytes,
             hard_limit_bytes,
-        });
+        } => CommitError::Storage(StorageError::CapacityExhausted {
+            endpoint_id,
+            used_bytes,
+            hard_limit_bytes,
+        }),
+        // Kept structured all the way up: the caller's response is to retry at
+        // the leader, and it needs the id to do that.
+        ProposalError::NotLeader { leader_id } => CommitError::NotLeader { leader_id },
+        other => CommitError::Serialization(format!("proposal pipeline error: {other}")),
     }
-    CommitError::Serialization(format!("proposal pipeline error: {err}"))
 }
 
 /// Per-statement transaction context (ADR-041). See the module docs.
